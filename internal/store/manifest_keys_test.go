@@ -169,7 +169,7 @@ func TestRemoveKeyPairByAPISecretFingerprintDeletesExpiredKeyTableOnly(t *testin
 	}
 	sb := &types.Sandbox{
 		ID: "sandbox-key-drop", TemplateID: "bare-img-" + strings.Repeat("7", 64),
-		State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
+		Profile: types.ProfileBare, State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
 	if err := st.Put(ctx, sb); err != nil {
@@ -244,7 +244,7 @@ func TestBusinessCredentialsAreEncryptedImmutableAndIndependentOfAllowlist(t *te
 
 	sb := &types.Sandbox{
 		ID: "sandbox-1", TemplateID: "bare-img-" + strings.Repeat("c", 64),
-		State: types.StateRunning, APISecret: initial.APISecret, ManifestKey: initial.ManifestKey,
+		Profile: types.ProfileBare, State: types.StateRunning, APISecret: initial.APISecret, ManifestKey: initial.ManifestKey,
 		CreatedUnix: 1,
 	}
 	if err := st.Put(ctx, sb); err != nil {
@@ -315,7 +315,7 @@ func TestSandboxListUsesAPISecretCandidateHash(t *testing.T) {
 	second := testKeyPair("e", "f")
 	for id, pair := range map[string]KeyPair{"sandbox-1": first, "sandbox-2": second} {
 		if err := st.Put(ctx, &types.Sandbox{
-			ID: id, TemplateID: "bare-img-" + strings.Repeat("1", 64), State: types.StateRunning,
+			ID: id, Profile: types.ProfileBare, TemplateID: "bare-img-" + strings.Repeat("1", 64), State: types.StateRunning,
 			APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
 		}); err != nil {
 			t.Fatal(err)

@@ -30,6 +30,10 @@ type Store struct {
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
   id                   TEXT PRIMARY KEY,
+  profile              TEXT NOT NULL,
+  cluster_group        TEXT NOT NULL DEFAULT '',
+  cluster_route_key    TEXT NOT NULL DEFAULT '',
+  auth_sandbox_id      TEXT NOT NULL DEFAULT '',
   template_id          TEXT NOT NULL,
   state                TEXT NOT NULL,
   deadline_unix        INTEGER NOT NULL DEFAULT 0,
@@ -240,9 +244,17 @@ func ub(s string) types.BuildOptions {
 
 // --- sandboxes ---
 
-// Put upserts a sandbox record. The credential pair is written only by the
-// initial insert; later lifecycle updates cannot rebind an existing sandbox.
+// Put upserts a sandbox record. Profile, cluster identity, credential subject,
+// and tenant credential pair are written only by the initial insert; later
+// lifecycle updates cannot rebind an existing sandbox.
 func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
+	if sb == nil {
+		return errors.New("store: put: sandbox is required")
+	}
+	clusterGroup, clusterRouteKey, err := sandboxIdentityColumns(sb)
+	if err != nil {
+		return fmt.Errorf("store: put %s: %w", sb.ID, err)
+	}
 	apiHash, apiEnc, err := s.encSecret("API secret", sb.APISecret)
 	if err != nil {
 		return fmt.Errorf("store: put %s: %w", sb.ID, err)
@@ -252,10 +264,10 @@ func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
 		return fmt.Errorf("store: put %s: %w", sb.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO sandboxes (id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
-  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
-  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
+	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
+	  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   template_id=excluded.template_id, state=excluded.state, deadline_unix=excluded.deadline_unix,
   run_dir=excluded.run_dir, base_dir=excluded.base_dir, run_id=excluded.run_id, envd_uds=excluded.envd_uds,
@@ -264,7 +276,8 @@ ON CONFLICT(id) DO UPDATE SET
   snapshot_ref=excluded.snapshot_ref, envd_access_token=excluded.envd_access_token,
   traffic_access_token=excluded.traffic_access_token,
   metadata_json=excluded.metadata_json, env_json=excluded.env_json`,
-		sb.ID, sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
+		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.AuthSandboxIDValue,
+		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef,
 		sb.EnvdAccessToken, sb.TrafficAccessToken, mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix)
 	if err != nil {
@@ -273,14 +286,15 @@ ON CONFLICT(id) DO UPDATE SET
 	return nil
 }
 
-var cols = `id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
+var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
   envd_access_token,traffic_access_token,metadata_json,env_json,created_unix`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
-	var st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
-	if err := row.Scan(&sb.ID, &sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
+	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
+	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.AuthSandboxIDValue,
+		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef, &sb.EnvdAccessToken, &sb.TrafficAccessToken,
 		&meta, &env, &sb.CreatedUnix); err != nil {
@@ -292,9 +306,33 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	}
 	sb.APISecret = pair.APISecret
 	sb.ManifestKey = pair.ManifestKey
-	sb.State = types.State(st)
+	sb.Profile, sb.State = types.Profile(profile), types.State(st)
+	if !sb.Profile.Valid() {
+		return nil, fmt.Errorf("store: sandbox %s has invalid profile %q", sb.ID, profile)
+	}
+	switch {
+	case clusterGroup == "" && clusterRouteKey == "":
+		sb.Cluster = nil
+	case clusterGroup == "" || clusterRouteKey == "":
+		return nil, fmt.Errorf("store: sandbox %s has incomplete cluster context", sb.ID)
+	default:
+		sb.Cluster = &types.ClusterSandboxContext{Group: clusterGroup, RouteKey: clusterRouteKey}
+	}
 	sb.Metadata, sb.Env = uj(meta), uj(env)
 	return &sb, nil
+}
+
+func sandboxIdentityColumns(sb *types.Sandbox) (group, routeKey string, err error) {
+	if !sb.Profile.Valid() {
+		return "", "", fmt.Errorf("invalid sandbox profile %q", sb.Profile)
+	}
+	if sb.Cluster == nil {
+		return "", "", nil
+	}
+	if sb.Cluster.Group == "" || sb.Cluster.RouteKey == "" {
+		return "", "", errors.New("cluster group and route key are both required")
+	}
+	return sb.Cluster.Group, sb.Cluster.RouteKey, nil
 }
 
 // Get returns the sandbox or (nil, nil) if not found.

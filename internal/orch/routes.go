@@ -29,7 +29,7 @@ type routeLogEntry struct {
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	e := routesync.RouteEntry{
 		SandboxID:          sb.ID,
-		Profile:            string(sb.Profile()),
+		Profile:            string(sb.Profile),
 		TemplateID:         sb.TemplateID,
 		State:              string(sb.State),
 		EnvdUDS:            sb.EnvdUDS,

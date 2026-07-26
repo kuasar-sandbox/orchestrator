@@ -37,6 +37,7 @@ const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 const testAPISecret = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 const testAPIFingerprint = "5df404c22ba4e956e7ef06b6499f07ee62894450c25c928a7f5db26f6ea499a4"
 const testAccessToken = "test-access-token"
+const testTemplateRef = "e2b-snp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func updateHeartbeatAndRefreshKeyPairs(reg *Registry, ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
 	reg.updateHeartbeat(ctx, nodeID, hb)
@@ -49,13 +50,17 @@ func updateHeartbeatAndRefreshKeyPairs(reg *Registry, ctx context.Context, nodeI
 type placementFunc func(context.Context, PlaceRequest) (*Placement, error)
 
 func (f placementFunc) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
-	return f(ctx, req)
+	placement, err := f(ctx, req)
+	if err == nil && placement != nil && !req.Build && placement.TemplateRef == "" {
+		placement.TemplateRef = testTemplateRef
+	}
+	return placement, err
 }
 
 func placementWithToken(nodeID string) Placer {
 	return placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
 		return &Placement{
-			NodeID: nodeID, TemplateRef: "e2b-snp-tmpl", Config: mergeConfig(map[string]string{"a": "1"}, req.Config),
+			NodeID: nodeID, TemplateRef: testTemplateRef, Config: mergeConfig(map[string]string{"a": "1"}, req.Config),
 			APISecretFingerprint: fullFingerprint(testAPISecret), ImageRepo: "repo", RegistryAuth: "auth-json",
 		}, nil
 	})
@@ -421,7 +426,7 @@ func TestDeleteSandboxRouteSendsNodeLinkCommand(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-1", NodeID: "n1", State: StateReady,
 	}); err != nil {
 		t.Fatal(err)
@@ -911,12 +916,11 @@ func (o *remoteLifecycleOwner) SendCommand(ctx context.Context, nodeID string, c
 func (o *remoteLifecycleOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	o.commands++
 	if cmd.Kind == routesync.CmdCreate {
-		location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
-		if err != nil {
-			return nil, err
+		if cmd.Cluster == nil {
+			return nil, errors.New("missing cluster sandbox context")
 		}
-		_, _ = o.reg.stores.PutSandbox(ctx, &SandboxRecord{
-			Group: location.Group, RouteKey: location.RouteKey, SID: cmd.SID, State: StateReady, NodeID: nodeID, AccessToken: testAccessToken,
+		_, _ = o.reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: cmd.Profile,
+			Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey, SID: cmd.SID, State: StateReady, NodeID: nodeID, AccessToken: testAccessToken,
 		})
 	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
@@ -938,7 +942,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 			return
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: testAccessToken,
 		})
 	}
@@ -989,9 +993,12 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go func() {
 			<-releaseReady
-			location := commandLocation(t, cmd)
-			_, _ = reg.stores.PutSandbox(context.Background(), &SandboxRecord{
-				Group: location.Group, RouteKey: location.RouteKey, SID: cmd.SID,
+			if cmd.Cluster == nil {
+				t.Error("create command is missing cluster context")
+				return
+			}
+			_, _ = reg.stores.PutSandbox(context.Background(), &SandboxRecord{Profile: "e2b",
+				Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey, SID: cmd.SID,
 				State: StateReady, NodeID: "n1", AccessToken: testAccessToken,
 			})
 		}()
@@ -1053,7 +1060,7 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 		onCreate: func(cmd *routesync.Command) {
 			go func() {
 				time.Sleep(20 * time.Millisecond)
-				reporter.applyRoute(context.Background(), nodeID, &routesync.RouteEntry{
+				reporter.applyRoute(context.Background(), nodeID, &routesync.RouteEntry{Profile: "e2b",
 					SandboxID: cmd.SID, State: routesync.StateRunning,
 					TemplateID: cmd.TemplateRef, AccessToken: testAccessToken,
 				})
@@ -1089,7 +1096,7 @@ func TestReserveSandboxUsesNodeReportedAccessToken(t *testing.T) {
 			return
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: testAccessToken,
 		})
 	}
@@ -1103,6 +1110,9 @@ func TestReserveSandboxUsesNodeReportedAccessToken(t *testing.T) {
 	if res.AccessToken != want {
 		t.Fatalf("access token mismatch result=%q want=%q", res.AccessToken, want)
 	}
+	if res.Profile != "e2b" {
+		t.Fatalf("reserve profile=%q, want e2b", res.Profile)
+	}
 }
 
 func TestReadyRoutePreservesAccessToken(t *testing.T) {
@@ -1111,21 +1121,21 @@ func TestReadyRoutePreservesAccessToken(t *testing.T) {
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1"})
 	want := testAccessToken
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1", AccessToken: want})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1", AccessToken: want})
 
 	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.AccessToken != want {
-		t.Fatalf("ready reserve token=%q, want node-reported %q", res.AccessToken, want)
+	if res.AccessToken != want || res.Profile != "e2b" {
+		t.Fatalf("ready reserve result=%+v, want e2b profile and node-reported token %q", res, want)
 	}
 	rr, found, err := reg.ResolveSID(ctx, "/g", "rk", "sb-ready")
 	if err != nil || !found {
 		t.Fatalf("resolve found=%v err=%v", found, err)
 	}
-	if rr.AccessToken != want {
-		t.Fatalf("resolve token=%q, want node-reported %q", rr.AccessToken, want)
+	if rr.AccessToken != want || rr.Profile != "e2b" {
+		t.Fatalf("resolve result=%+v, want e2b profile and node-reported token %q", rr, want)
 	}
 	if _, found, err := reg.ResolveSID(ctx, "/other", "rk", "sb-ready"); err != nil || found {
 		t.Fatalf("wrong-group resolve found=%v err=%v", found, err)
@@ -1159,7 +1169,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		cp := *cmd
 		got = &cp
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: testAccessToken,
 		})
 	}
@@ -1171,8 +1181,15 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	if got == nil {
 		t.Fatal("create command not sent")
 	}
-	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "1" || got.Config["b"] != "2" {
+	if got.TemplateRef != testTemplateRef || got.Config["a"] != "1" || got.Config["b"] != "2" {
 		t.Fatalf("create command did not use placement config: %+v", got)
+	}
+	if got.Profile != "e2b" || got.Cluster == nil || got.Cluster.Group != "/g" || got.Cluster.RouteKey != "rk" ||
+		got.Cluster.AuthSandboxID != got.SID {
+		t.Fatalf("create command identity context=%+v, want e2b /g/rk authenticated as %q", got, got.SID)
+	}
+	if _, ok := got.Config[clusterstate.ObjectMetadataKey]; ok {
+		t.Fatalf("cluster identity leaked into create metadata: %+v", got.Config)
 	}
 	if _, ok := got.Config[sandboxcfg.NsRestore]; ok {
 		t.Fatalf("placement restore leaked without an explicit create value: %+v", got.Config)
@@ -1213,6 +1230,23 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	}
 	if _, _, found, getErr := reg.stores.GetSandbox(context.Background(), "/g", "rk"); getErr != nil || found {
 		t.Fatalf("invalid restore wrote route state: found=%v err=%v", found, getErr)
+	}
+}
+
+func TestReserveSandboxRejectsInvalidPlacementTemplate(t *testing.T) {
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		return &Placement{
+			NodeID: "n1", TemplateRef: "e2b-snp-invalid", APISecretFingerprint: testAPIFingerprint,
+		}, nil
+	}))
+
+	if _, err := reg.ReserveSandbox(context.Background(), "/g", "rk", nil); err == nil ||
+		!strings.Contains(err.Error(), "invalid placement template") {
+		t.Fatalf("ReserveSandbox error=%v, want invalid placement template", err)
+	}
+	if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
+		t.Fatalf("invalid template wrote route: found=%v err=%v", found, err)
 	}
 }
 
@@ -1260,7 +1294,7 @@ func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 	}
 	owner := &remoteLifecycleOwner{reg: reg}
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
-	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n-remote", AccessToken: "tok",
 	})
 
@@ -1280,7 +1314,7 @@ func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "replacement", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1",
 	}); err != nil {
 		t.Fatal(err)
@@ -1355,7 +1389,7 @@ func TestCreateRejectRestoresPreexistingRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-existing", State: StateReady,
 		NodeID: "n-gone", AccessToken: "existing-token",
 	}
@@ -1380,17 +1414,17 @@ func TestCreateRejectRestoresPreexistingRoute(t *testing.T) {
 func TestDeadReportDeletesRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.PutSandbox(ctx, &SandboxRecord{
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-dead", State: StateReady, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	})
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 		SandboxID: "sb-dead", Group: "/g", RouteKey: "rk", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b",
 		SandboxID: "sb-dead", State: routesync.StateDead,
 	})
 
@@ -1405,19 +1439,19 @@ func TestDeadReportDeletesRoute(t *testing.T) {
 func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReady, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 		SandboxID: "sb-old", Group: "/g", RouteKey: "rk", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-old", State: routesync.StateDead})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-old", State: routesync.StateDead})
 
 	rec, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || rec.SID != "sb-new" {
@@ -1431,13 +1465,13 @@ func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 func TestStaleLiveReportRetainsOwnershipUntilDead(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReady, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 		SandboxID: "sb-old", Group: "/g", RouteKey: "rk", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -1449,7 +1483,7 @@ func TestStaleLiveReportRetainsOwnershipUntilDead(t *testing.T) {
 		}
 	}})
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-old", State: routesync.StateRunning})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-old", State: routesync.StateRunning})
 	if deletes != 1 {
 		t.Fatalf("stale live report sent %d delete commands, want 1", deletes)
 	}
@@ -1457,13 +1491,47 @@ func TestStaleLiveReportRetainsOwnershipUntilDead(t *testing.T) {
 		t.Fatalf("stale live ownership was removed before DEAD: found=%v err=%v", found, err)
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-old", State: routesync.StateDead})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-old", State: routesync.StateDead})
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", "sb-old"); err != nil || found {
 		t.Fatalf("stale ownership remained after DEAD: found=%v err=%v", found, err)
 	}
 	got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || got.SID != "sb-new" {
 		t.Fatalf("replacement route=%+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestRouteReportProfileMustMatchOwnership(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
+		Group: "/g", RouteKey: "rk", SID: "sb-profile", State: StateReserved, NodeID: "n1",
+		APISecretFingerprint: testAPIFingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
+		SandboxID: "sb-profile", Group: "/g", RouteKey: "rk", APISecretFingerprint: testAPIFingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var deletes int
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdDelete && cmd.SID == "sb-profile" {
+			deletes++
+		}
+	}})
+
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+		SandboxID: "sb-profile", Profile: "bare", State: routesync.StateRunning,
+	})
+
+	rec, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || rec.State != StateReserved || rec.Profile != "e2b" {
+		t.Fatalf("mismatched report changed route=%+v found=%v err=%v", rec, found, err)
+	}
+	if deletes != 1 {
+		t.Fatalf("mismatched report sent %d delete commands, want 1", deletes)
 	}
 }
 
@@ -1476,7 +1544,7 @@ func TestUnownedRouteReportDoesNotDeleteNodeLocalSandbox(t *testing.T) {
 	}})
 
 	for _, state := range []string{routesync.StateRunning, routesync.StatePaused, routesync.StateDead} {
-		reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-local", State: state})
+		reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "sb-local", State: state})
 	}
 	if len(cmds) != 0 {
 		t.Fatalf("unowned node-local sandbox received cluster command: %+v", cmds)
@@ -1494,13 +1562,13 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		{node: "n1", group: "/g1", routeKey: "rk1"},
 		{node: "n2", group: "/g2", routeKey: "rk2"},
 	} {
-		if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 			Group: tc.group, RouteKey: tc.routeKey, SID: "same-sandbox", NodeID: tc.node,
 			State: StateReserved, APISecretFingerprint: testAPIFingerprint,
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := reg.stores.AddNodeSandboxRef(ctx, tc.node, clusterstate.NodeSandboxRef{
+		if err := reg.stores.AddNodeSandboxRef(ctx, tc.node, clusterstate.NodeSandboxRef{Profile: "e2b",
 			SandboxID: "same-sandbox", Group: tc.group, RouteKey: tc.routeKey,
 			APISecretFingerprint: testAPIFingerprint,
 		}); err != nil {
@@ -1508,7 +1576,7 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		}
 	}
 
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "same-sandbox", State: routesync.StateRunning, AccessToken: "n1-token"})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "same-sandbox", State: routesync.StateRunning, AccessToken: "n1-token"})
 	g1, _, found, err := reg.stores.GetSandbox(ctx, "/g1", "rk1")
 	if err != nil || !found || g1.State != StateReady || g1.AccessToken != "n1-token" {
 		t.Fatalf("g1 route=%+v found=%v err=%v", g1, found, err)
@@ -1532,13 +1600,13 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 		placeCalls++
 		if placeCalls == 1 {
 			firstSID = req.SandboxID
-			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 				Group: "/existing", RouteKey: "rk-existing", SID: firstSID, NodeID: "n1", State: StateReady,
 				APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
 				return nil, err
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 				Group: "/existing", RouteKey: "rk-existing", SandboxID: firstSID,
 				APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
@@ -1555,7 +1623,7 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 		createSIDs = append(createSIDs, cmd.SID)
 		go func() {
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: cmd.SID, State: routesync.StateRunning})
+			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: cmd.SID, State: routesync.StateRunning})
 		}()
 	}})
 
@@ -1610,14 +1678,14 @@ func TestParkTimeoutRollback(t *testing.T) {
 
 	// A create that completed after the caller timed out is still recognized as
 	// registry-owned, deleted, and retained until the node confirms DEAD.
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: sid, State: routesync.StateRunning})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateRunning})
 	if deletes != 1 {
 		t.Fatalf("late running route sent %d delete commands, want 1", deletes)
 	}
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || !found {
 		t.Fatalf("late running ownership was removed before DEAD: found=%v err=%v", found, err)
 	}
-	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: sid, State: routesync.StateDead})
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: sid, State: routesync.StateDead})
 	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || found {
 		t.Fatalf("late sandbox ownership remained after DEAD: found=%v err=%v", found, err)
 	}
@@ -1626,11 +1694,11 @@ func TestParkTimeoutRollback(t *testing.T) {
 func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old",
 		APISecretFingerprint: testAPIFingerprint,
 	}
-	reserved := &SandboxRecord{
+	reserved := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReserved, NodeID: "new",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1640,7 +1708,7 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "new"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "new", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "new", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "sb-new", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -1663,11 +1731,11 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	}
-	reserved := &SandboxRecord{
+	reserved := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReserved, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1677,7 +1745,7 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "sb-new", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -1696,11 +1764,11 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "same-sandbox", State: StateReady, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint,
 	}
-	reserved := &SandboxRecord{
+	reserved := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "same-sandbox", State: StateReserved, NodeID: "n1",
 		APISecretFingerprint: strings.Repeat("b", 64),
 	}
@@ -1710,7 +1778,7 @@ func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: reserved.SID,
 		APISecretFingerprint: reserved.APISecretFingerprint,
 	}); err != nil {
@@ -1734,14 +1802,14 @@ func TestRollbackReserveRevisionFencesConcurrentWinner(t *testing.T) {
 		t.Run(fmt.Sprintf("restore=%v", restore), func(t *testing.T) {
 			ctx := context.Background()
 			reg := testReg(t)
-			reserved := &SandboxRecord{
+			reserved := &SandboxRecord{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SID: "sb-reserved", State: StateReserved, NodeID: "candidate",
 				APISecretFingerprint: testAPIFingerprint,
 			}
 			if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "candidate", clusterstate.NodeSandboxRef{
+			if err := reg.stores.AddNodeSandboxRef(ctx, "candidate", clusterstate.NodeSandboxRef{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SandboxID: reserved.SID,
 				APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
@@ -1751,14 +1819,14 @@ func TestRollbackReserveRevisionFencesConcurrentWinner(t *testing.T) {
 			if err != nil || !found {
 				t.Fatalf("read reserved found=%v err=%v", found, err)
 			}
-			winner := &SandboxRecord{
+			winner := &SandboxRecord{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SID: "sb-winner", State: StateReady, NodeID: "winner",
 				APISecretFingerprint: testAPIFingerprint,
 			}
 			if _, err := reg.stores.PutSandbox(ctx, winner); err != nil {
 				t.Fatal(err)
 			}
-			original := &SandboxRecord{
+			original := &SandboxRecord{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SID: "sb-original", State: StatePaused, NodeID: "original",
 				APISecretFingerprint: testAPIFingerprint,
 			}
@@ -1814,7 +1882,7 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 		}
 		return nil, ErrNoNode
 	}))
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1826,7 +1894,7 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "sb-old", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -1862,7 +1930,7 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		return &Placement{NodeID: "candidate", APISecretFingerprint: strings.Repeat("b", 64)}, nil
 	}))
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1872,7 +1940,7 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "old"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "sb-old", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -1892,10 +1960,46 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	}
 }
 
+func TestReadyReplacementRejectsProfileChange(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		return &Placement{
+			NodeID: "candidate", TemplateRef: "bare-img-" + strings.Repeat("b", 64),
+			APISecretFingerprint: testAPIFingerprint,
+		}, nil
+	}))
+	orig := &SandboxRecord{
+		Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old",
+		APISecretFingerprint: testAPIFingerprint,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{
+		Profile: "e2b", Group: "/g", RouteKey: "rk", SandboxID: "sb-old",
+		APISecretFingerprint: testAPIFingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, orig); err == nil ||
+		!strings.Contains(err.Error(), "replacement profile mismatch") {
+		t.Fatalf("placeAndCreate error = %v; want profile mismatch", err)
+	}
+	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || stored.SID != orig.SID || stored.Profile != orig.Profile {
+		t.Fatalf("original route=%+v found=%v err=%v", stored, found, err)
+	}
+}
+
 func TestReadyReplacementCASRetryPreservesConcurrentCredentialBinding(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "same-sandbox", State: StateReady, NodeID: "old",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1936,7 +2040,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("new"))
-	orig := &SandboxRecord{
+	orig := &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old",
 		APISecretFingerprint: testAPIFingerprint,
 	}
@@ -1948,7 +2052,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "sb-old", APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
 		t.Fatal(err)
@@ -2003,7 +2107,7 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 			reg.applyDeleteBySID(ctx, "n1", "sb-old")
 		}},
 		{name: "dead route", report: func(ctx context.Context, reg *Registry) {
-			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b",
 				SandboxID: "sb-old", State: routesync.StateDead,
 			})
 		}},
@@ -2012,7 +2116,7 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			reg := testReg(t)
-			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReady, NodeID: "n1",
 				APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
@@ -2021,12 +2125,12 @@ func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
 			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SandboxID: "sb-new", APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SandboxID: "sb-old", APISecretFingerprint: testAPIFingerprint,
 			}); err != nil {
 				t.Fatal(err)
@@ -2060,19 +2164,19 @@ func TestLateRouteEventsDoNotCrossCredentialBinding(t *testing.T) {
 			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SandboxID: "same-sandbox", APISecretFingerprint: oldFingerprint,
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 				Group: "/g", RouteKey: "rk", SID: "same-sandbox", NodeID: "n1", State: StateReady,
 				APISecretFingerprint: currentFingerprint,
 			}); err != nil {
 				t.Fatal(err)
 			}
 
-			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "same-sandbox", State: state})
+			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{Profile: "e2b", SandboxID: "same-sandbox", State: state})
 
 			route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 			if err != nil || !found || route.APISecretFingerprint != currentFingerprint {
@@ -2115,7 +2219,7 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 		}
 		creates++
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n2", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n2", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: "tok",
 		})
 	}})
@@ -2148,7 +2252,7 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-stale", State: StateReady, NodeID: "stale",
 		APISecretFingerprint: testAPIFingerprint,
 	}); err != nil {
@@ -2159,7 +2263,7 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 			return
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "live", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "live", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: cmd.SID, State: routesync.StateRunning,
 		})
 	}})
@@ -2242,7 +2346,7 @@ func TestReservePausedResume(t *testing.T) {
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	want := testAccessToken
 	// Seed a PAUSED sandbox on n1.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "sb-x", State: StatePaused, NodeID: "n1",
 		APISecretFingerprint: testAPIFingerprint, AccessToken: want,
 	})
@@ -2255,8 +2359,12 @@ func TestReservePausedResume(t *testing.T) {
 		if cmd.APISecretFingerprint != testAPIFingerprint {
 			t.Errorf("connect fingerprint=%q", cmd.APISecretFingerprint)
 		}
+		if cmd.Profile != "e2b" || cmd.Cluster == nil || cmd.Cluster.Group != "/g" ||
+			cmd.Cluster.RouteKey != "rk" || cmd.Cluster.AuthSandboxID != "sb-x" {
+			t.Errorf("connect identity context=%+v", cmd)
+		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{Profile: "e2b",
 			SandboxID: "sb-x", State: routesync.StateRunning,
 		})
 	}
@@ -2266,7 +2374,7 @@ func TestReservePausedResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
 	}
-	if res.SID != "sb-x" || res.AccessToken != want {
+	if res.SID != "sb-x" || res.Profile != "e2b" || res.AccessToken != want {
 		t.Fatalf("resume result: %+v", res)
 	}
 }
@@ -2614,8 +2722,8 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	// Nested groups: a per-group range over /a must NOT bleed into /a/b.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a", RouteKey: "x", SID: "sb-a", State: StateReady})
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a/b", RouteKey: "y", SID: "sb-ab", State: StateReady})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/a", RouteKey: "x", SID: "sb-a", State: StateReady})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/a/b", RouteKey: "y", SID: "sb-ab", State: StateReady})
 	var got []string
 	reg.stores.RangeSandboxes(ctx, "/a", func(s *SandboxRecord) error { got = append(got, s.SID); return nil })
 	if len(got) != 1 || got[0] != "sb-a" {
@@ -2623,7 +2731,7 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 	}
 	// Aliasing across the group/route_key boundary must not overwrite:
 	// (/a, "b/y") and (/a/b, "y") must be distinct records.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a", RouteKey: "b/y", SID: "sb-1", State: StateReady})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/a", RouteKey: "b/y", SID: "sb-1", State: StateReady})
 	r1, _, _, _ := reg.stores.GetSandbox(ctx, "/a", "b/y")
 	rab, _, _, _ := reg.stores.GetSandbox(ctx, "/a/b", "y")
 	if r1 == nil || r1.SID != "sb-1" || rab == nil || rab.SID != "sb-ab" {
@@ -2635,7 +2743,7 @@ func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
 	ctx := context.Background()
 	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
 	stores := cluster["r1"]
-	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-warm", State: StateReady, NodeID: "n1"}
+	seed := &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb-warm", State: StateReady, NodeID: "n1"}
 	seedRouteShardRecord(t, ctx, cluster["r2"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
 	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
 
@@ -2668,17 +2776,17 @@ func TestNodeFullSnapshotDeletesMissingSandboxRefs(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Sandboxes: []clusterstate.NodeSandboxRef{
-		{Group: "/g", RouteKey: "keep", SandboxID: "sb-keep", APISecretFingerprint: testAPIFingerprint},
-		{Group: "/g", RouteKey: "gone", SandboxID: "sb-gone", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "keep", SandboxID: "sb-keep", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "gone", SandboxID: "sb-gone", APISecretFingerprint: testAPIFingerprint},
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "keep", SID: "sb-keep", State: StateReady, NodeID: "n1", APISecretFingerprint: testAPIFingerprint})
-	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "gone", SID: "sb-gone", State: StateReady, NodeID: "n1", APISecretFingerprint: testAPIFingerprint})
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "keep", SID: "sb-keep", State: StateReady, NodeID: "n1", APISecretFingerprint: testAPIFingerprint})
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "gone", SID: "sb-gone", State: StateReady, NodeID: "n1", APISecretFingerprint: testAPIFingerprint})
 
 	reg.applyNodeFullSnapshot(ctx, "n1", []clusterstate.NodeSandboxRef{
-		{Group: "/g", RouteKey: "keep", SandboxID: "sb-keep", APISecretFingerprint: testAPIFingerprint},
-		{Group: "/g", RouteKey: "gone", SandboxID: "sb-gone", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "keep", SandboxID: "sb-keep", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "gone", SandboxID: "sb-gone", APISecretFingerprint: testAPIFingerprint},
 	}, map[string]struct{}{"sb-keep": {}})
 
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "gone"); found {
@@ -2699,10 +2807,10 @@ func TestNodeFullSnapshotDeletesMissingSandboxRefs(t *testing.T) {
 func TestNodeFullSnapshotKeepsAssignmentAddedAfterBaseline(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	baseline := clusterstate.NodeSandboxRef{
+	baseline := clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/old", RouteKey: "rk", SandboxID: "same-sandbox", APISecretFingerprint: testAPIFingerprint,
 	}
-	current := clusterstate.NodeSandboxRef{
+	current := clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/new", RouteKey: "rk", SandboxID: "same-sandbox", APISecretFingerprint: testAPIFingerprint,
 	}
 	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", baseline); err != nil {
@@ -2714,7 +2822,7 @@ func TestNodeFullSnapshotKeepsAssignmentAddedAfterBaseline(t *testing.T) {
 	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", current); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Group: current.Group, RouteKey: current.RouteKey, SID: current.SandboxID, NodeID: "n1", State: StateReserved}); err != nil {
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: current.Group, RouteKey: current.RouteKey, SID: current.SandboxID, NodeID: "n1", State: StateReserved}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2732,7 +2840,7 @@ func TestNodeFullSnapshotKeepsAssignmentAddedAfterBaseline(t *testing.T) {
 func TestNodeFullSnapshotKeepsReboundCredentialIdentity(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	baseline := clusterstate.NodeSandboxRef{
+	baseline := clusterstate.NodeSandboxRef{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SandboxID: "same-sandbox", APISecretFingerprint: testAPIFingerprint,
 	}
 	current := baseline
@@ -2746,7 +2854,7 @@ func TestNodeFullSnapshotKeepsReboundCredentialIdentity(t *testing.T) {
 	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", current); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: current.Group, RouteKey: current.RouteKey, SID: current.SandboxID,
 		NodeID: "n1", State: StateReserved, APISecretFingerprint: current.APISecretFingerprint,
 	}); err != nil {
@@ -2771,7 +2879,7 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 	stores := cluster["r1"]
 	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-q", State: StateReady, NodeID: "n1"}
+	seed := &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb-q", State: StateReady, NodeID: "n1"}
 	seedRouteShardRecord(t, ctx, cluster["r1"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
 	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
 	if !localShardHasRecord(t, ctx, cluster["r1"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey("rk")) {
@@ -2876,16 +2984,16 @@ func TestSweepKeepsInflightReserved(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
-		{Group: "/g", RouteKey: "live", SandboxID: "sb-r", APISecretFingerprint: testAPIFingerprint},
-		{Group: "/g", RouteKey: "stale", SandboxID: "sb-s", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "live", SandboxID: "sb-r", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "stale", SandboxID: "sb-s", APISecretFingerprint: testAPIFingerprint},
 	}})
 	// A RESERVED row whose single-flight is still in flight must survive the sweep.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "live", SID: "sb-r", State: StateReserved, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "live", SID: "sb-r", State: StateReserved, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
 	reg.mu.Lock()
 	reg.inflight[flightKey("/g", "live")] = &reserveCall{done: make(chan struct{})}
 	reg.mu.Unlock()
 	// A RESERVED row with no in-flight reserve is stale → swept.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "stale", SID: "sb-s", State: StateReserved, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "stale", SID: "sb-s", State: StateReserved, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
 
 	reg.sweepNode(ctx, "dead", 30*time.Second)
 
@@ -2906,7 +3014,7 @@ func TestClaimedNodeProfileRejectsStaleRuntimeWriters(t *testing.T) {
 	const nodeID = "reaping"
 	if err := reg.stores.PutNode(ctx, &NodeRecord{
 		NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
-		Sandboxes: []clusterstate.NodeSandboxRef{{
+		Sandboxes: []clusterstate.NodeSandboxRef{{Profile: "e2b",
 			Group: "/g", RouteKey: "rk", SandboxID: "sb-old", APISecretFingerprint: testAPIFingerprint,
 		}},
 	}); err != nil {
@@ -2976,15 +3084,15 @@ func TestSweepDeadNodes(t *testing.T) {
 	reg := testReg(t)
 	// Disconnected node with a stale heartbeat + a READY sandbox → both swept.
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
-		{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g", RouteKey: "rk", SandboxID: "sb-1", APISecretFingerprint: testAPIFingerprint},
 	}})
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "dead", APISecretFingerprint: testAPIFingerprint})
 	// Connected node with a stale heartbeat → NOT swept (a live channel isn't dead).
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
-		{Group: "/g2", RouteKey: "rk", SandboxID: "sb-2", APISecretFingerprint: testAPIFingerprint},
+		{Profile: "e2b", Group: "/g2", RouteKey: "rk", SandboxID: "sb-2", APISecretFingerprint: testAPIFingerprint},
 	}})
 	reg.addNode(&fakeConn{nodeID: "live"})
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g2", RouteKey: "rk", SID: "sb-2", State: StateReady, NodeID: "live", APISecretFingerprint: testAPIFingerprint})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: "/g2", RouteKey: "rk", SID: "sb-2", State: StateReady, NodeID: "live", APISecretFingerprint: testAPIFingerprint})
 
 	reg.sweepNode(ctx, "dead", 30*time.Second)
 	reg.sweepNode(ctx, "live", 30*time.Second)
@@ -3010,13 +3118,13 @@ func TestSweepDeadNodeDoesNotDeleteReboundCredentialIdentity(t *testing.T) {
 	currentFingerprint := strings.Repeat("b", 64)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{
 		NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
-		Sandboxes: []clusterstate.NodeSandboxRef{{
+		Sandboxes: []clusterstate.NodeSandboxRef{{Profile: "e2b",
 			Group: "/g", RouteKey: "rk", SandboxID: "same-sandbox", APISecretFingerprint: oldFingerprint,
 		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b",
 		Group: "/g", RouteKey: "rk", SID: "same-sandbox", State: StateReady,
 		NodeID: "dead", APISecretFingerprint: currentFingerprint,
 	}); err != nil {

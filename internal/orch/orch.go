@@ -174,6 +174,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 
 	sb := &types.Sandbox{
 		ID:                 sid,
+		Profile:            tmpl.Profile,
 		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
@@ -469,7 +470,7 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
 	}
-	return proxy.RouteForTarget(string(sb.Profile()), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, port), nil
+	return proxy.RouteForTarget(string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, port), nil
 }
 
 // resumeIfPaused (run under the per-sid single-flight) resumes sid only if it is

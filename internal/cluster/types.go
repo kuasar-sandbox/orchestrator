@@ -58,6 +58,7 @@ type RouteRecord struct {
 	NodeID               string                    `json:"node_id,omitempty"`
 	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
 	TemplateID           string                    `json:"template_id,omitempty"`
+	Profile              string                    `json:"profile,omitempty"`
 	Config               map[string]string         `json:"config,omitempty"`
 	AccessToken          string                    `json:"access_token,omitempty"`
 	BuildID              string                    `json:"build_id,omitempty"`
@@ -121,6 +122,7 @@ type NodeSandboxRef struct {
 	Group                string `json:"group"`
 	RouteKey             string `json:"route_key"`
 	SandboxID            string `json:"sandbox_id"`
+	Profile              string `json:"profile"`
 	APISecretFingerprint string `json:"api_secret_fingerprint"`
 }
 

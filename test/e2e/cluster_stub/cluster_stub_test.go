@@ -37,6 +37,7 @@ const (
 	testGroup           = "/cell/proj/app/g1"
 	testAPISecret       = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 	testMK              = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testTemplateRef     = "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testEnvdAccessToken = "opaque-envd-access-token-from-node"
 )
 
@@ -214,7 +215,7 @@ func writeStubGroup(t *testing.T, dir string) {
 	raw, err := json.Marshal(clusterstate.SandboxGroupRecord{
 		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
 		APISecret:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
-		TemplateRef:   "tmpl-1",
+		TemplateRef:   testTemplateRef,
 		NodeSelectors: []map[string]string{{"pool": "stub"}},
 		Config:        map[string]string{"from_group": "yes"},
 	})
@@ -303,12 +304,13 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 		t.Fatalf("data by key status=%d, want 204", resp.StatusCode)
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
-	location, err := clusterstate.ObjectLocationFromMetadata(create.Config)
-	if err != nil {
-		t.Fatalf("create command metadata: %v", err)
-	}
-	if location.Group != testGroup || location.RouteKey != "u1:s1" || create.TemplateRef != "tmpl-1" || create.Config["from_group"] != "yes" {
+	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != "u1:s1" ||
+		create.Cluster.AuthSandboxID != create.SID || create.Profile != "e2b" ||
+		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
+	}
+	if _, found := create.Config[clusterstate.ObjectMetadataKey]; found {
+		t.Fatalf("create command leaked cluster context into user config: %+v", create.Config)
 	}
 	if create.APISecretFingerprint != fullFingerprint(t, testAPISecret) {
 		t.Fatalf("create APISecretFingerprint=%q, want group API secret fingerprint", create.APISecretFingerprint)
@@ -523,7 +525,7 @@ func (n *nodeStub) readLoop() {
 		case routesync.CmdCreate, routesync.CmdConnect:
 			n.sendRoute(n.t, routesync.RouteEntry{
 				SandboxID: cmd.SID, State: routesync.StateRunning,
-				AccessToken: testEnvdAccessToken, TemplateID: cmd.TemplateRef,
+				AccessToken: testEnvdAccessToken, TemplateID: cmd.TemplateRef, Profile: cmd.Profile,
 			})
 		case routesync.CmdBuildRegister:
 			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildEvent, Build: &routesync.BuildEvent{

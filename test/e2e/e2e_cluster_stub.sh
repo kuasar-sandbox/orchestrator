@@ -435,7 +435,7 @@ import json, sys, urllib.request
 hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
 assert hits, "no data hits"
 last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
+location = last.get("cluster", {})
 assert location["group"] == sys.argv[2], last
 assert location["route_key"] == "user1/session1", last
 assert last.get("access_token", "").startswith("sat_"), last
@@ -523,7 +523,7 @@ import json, sys, urllib.request
 hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
 assert hits, "no data hits"
 last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
+location = last.get("cluster", {})
 assert location["group"] == sys.argv[2], last
 assert location["route_key"] == "user1/session-cutover", last
 PY
@@ -533,8 +533,7 @@ create_count_before="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
 def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
+    return c.get("cluster", {}).get("route_key")
 print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
 PY
 )"
@@ -554,8 +553,7 @@ create_count_after="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
 def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
+    return c.get("cluster", {}).get("route_key")
 print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
 PY
 )"
@@ -593,8 +591,7 @@ import json, shlex, sys, urllib.request
 nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
 for n in nodes:
     for s in n.get("sandboxes", []):
-        raw = s.get("metadata", {}).get("kuasar-sandbox.cluster")
-        location = json.loads(raw) if raw else {}
+        location = s.get("cluster", {})
         if location.get("route_key") == "user1/session1":
             open(sys.argv[2], "w").write("NODE=%s\nSID=%s\n" % (shlex.quote(n["node_id"]), shlex.quote(s["sid"])))
             sys.exit(0)

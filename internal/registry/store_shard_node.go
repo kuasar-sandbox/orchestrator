@@ -7,6 +7,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 var errNodeSandboxIDConflict = errors.New("registry: sandbox id is already owned by another route on this node")
@@ -105,7 +106,7 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 
 func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
 	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
-		!validFullFingerprint(ref.APISecretFingerprint) {
+		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return errors.New("registry: invalid node sandbox ref")
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
@@ -128,11 +129,11 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 				return err
 			}
 			if existing.SandboxID != ref.SandboxID || existing.Group == "" || existing.RouteKey == "" ||
-				!validFullFingerprint(existing.APISecretFingerprint) {
+				!validFullFingerprint(existing.APISecretFingerprint) || !types.Profile(existing.Profile).Valid() {
 				return errors.New("registry: invalid node sandbox ref")
 			}
 			if existing.Group != ref.Group || existing.RouteKey != ref.RouteKey ||
-				existing.APISecretFingerprint != ref.APISecretFingerprint {
+				existing.Profile != ref.Profile || existing.APISecretFingerprint != ref.APISecretFingerprint {
 				return errNodeSandboxIDConflict
 			}
 			if _, ok, err := sh.CAS(ctx, key, cur.Meta.Rev, value); err != nil {
@@ -168,7 +169,7 @@ func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID s
 		return clusterstate.NodeSandboxRef{}, false, err
 	}
 	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
-		!validFullFingerprint(ref.APISecretFingerprint) {
+		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return clusterstate.NodeSandboxRef{}, false, errors.New("registry: invalid node sandbox ref")
 	}
 	return ref, true, nil
@@ -426,7 +427,7 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 		}
 		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
 		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
-			!validFullFingerprint(ref.APISecretFingerprint) {
+			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, errors.New("registry: invalid node sandbox ref")
 		}
 		out.Sandboxes = append(out.Sandboxes, nodeReapSandboxRef{Ref: ref, Revision: rec.Meta.Rev})
@@ -512,7 +513,7 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		}
 		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
 		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
-			!validFullFingerprint(ref.APISecretFingerprint) {
+			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, false, errors.New("registry: invalid node sandbox ref")
 		}
 		out.Sandboxes = append(out.Sandboxes, ref)

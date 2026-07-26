@@ -83,6 +83,9 @@ func (t TemplateID) ManifestRef() string { return "manifest://" + t.Key }
 // Sandbox is one managed sandbox instance.
 type Sandbox struct {
 	ID                 string
+	Profile            Profile
+	Cluster            *ClusterSandboxContext
+	AuthSandboxIDValue string // optional stable credential subject; empty falls back to ID
 	TemplateID         string
 	State              State
 	DeadlineUnix       int64 // 0 = no deadline
@@ -105,12 +108,26 @@ type Sandbox struct {
 	CreatedUnix        int64
 }
 
-func (s *Sandbox) Profile() Profile {
-	t, err := ParseTemplateID(s.TemplateID)
-	if err != nil {
+// ClusterSandboxContext is trusted node-local ownership state supplied by the
+// cluster control plane. It is persisted separately from user metadata. A nil
+// context identifies a standalone sandbox.
+type ClusterSandboxContext struct {
+	Group    string
+	RouteKey string
+}
+
+// AuthSandboxID returns the stable subject used by sandbox service credentials.
+// Standalone sandboxes normally leave AuthSandboxIDValue empty and therefore use
+// their local ID. Imports may preserve a non-local subject without becoming
+// cluster-owned.
+func (s *Sandbox) AuthSandboxID() string {
+	if s == nil {
 		return ""
 	}
-	return t.Profile
+	if s.AuthSandboxIDValue != "" {
+		return s.AuthSandboxIDValue
+	}
+	return s.ID
 }
 
 // PidFile is where sandbox-ctl writes its pid (config-socket auth reads it).

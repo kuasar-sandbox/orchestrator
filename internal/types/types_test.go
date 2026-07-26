@@ -21,3 +21,34 @@ func TestParseProfile(t *testing.T) {
 		})
 	}
 }
+
+func TestSandboxAuthSandboxID(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sb   *Sandbox
+		want string
+	}{
+		{name: "nil", want: ""},
+		{name: "standalone fallback", sb: &Sandbox{ID: "local"}, want: "local"},
+		{name: "standalone imported subject", sb: &Sandbox{ID: "target", AuthSandboxIDValue: "source"}, want: "source"},
+		{
+			name: "cluster fallback",
+			sb:   &Sandbox{ID: "stable-g1", Cluster: &ClusterSandboxContext{Group: "/g", RouteKey: "rk"}},
+			want: "stable-g1",
+		},
+		{
+			name: "cluster stable subject",
+			sb: &Sandbox{
+				ID: "stable-g1", Cluster: &ClusterSandboxContext{Group: "/g", RouteKey: "rk"},
+				AuthSandboxIDValue: "stable",
+			},
+			want: "stable",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.sb.AuthSandboxID(); got != tt.want {
+				t.Fatalf("AuthSandboxID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

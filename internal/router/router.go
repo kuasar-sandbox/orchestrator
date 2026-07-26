@@ -49,6 +49,7 @@ const (
 type reserveResult struct {
 	NodeID             string `json:"node_id"`
 	SID                string `json:"sid"`
+	Profile            string `json:"profile"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TargetPort         int    `json:"target_port,omitempty"`
@@ -60,6 +61,7 @@ type routeResolve struct {
 	RouteKey           string `json:"route_key"`
 	NodeID             string `json:"node_id"`
 	DataEndpoint       string `json:"data_endpoint"`
+	Profile            string `json:"profile"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TargetPort         int    `json:"target_port,omitempty"`
@@ -702,7 +704,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey, nil); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{
 				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
-				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
+				DataEndpoint: res.DataEndpoint, Profile: res.Profile, AccessToken: res.AccessToken,
 				TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 				State: "ready",
 			}
@@ -808,7 +810,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 		}
 		rr = &routeResolve{
 			SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID,
-			DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
+			DataEndpoint: res.DataEndpoint, Profile: res.Profile, AccessToken: res.AccessToken,
 			TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 			State: "ready",
 		}
@@ -1053,7 +1055,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, conf
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
-			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken,
+			DataEndpoint: f.res.DataEndpoint, Profile: f.res.Profile, AccessToken: f.res.AccessToken,
 			TrafficAccessToken: f.res.TrafficAccessToken, TargetPort: f.res.TargetPort,
 			State: "ready",
 		})

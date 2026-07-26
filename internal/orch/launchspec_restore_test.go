@@ -23,6 +23,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID:          sid,
+		Profile:     types.ProfileBare,
 		TemplateID:  "bare-snp-" + key,
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
@@ -59,6 +60,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID:          sid,
+		Profile:     types.ProfileBare,
 		TemplateID:  "bare-img-" + strings.Repeat("b", 64),
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,

@@ -18,8 +18,9 @@ import (
 
 // This file makes the orchestrator the node side of the cluster node-link
 // (nodelink.Node): it executes the registry's lifecycle commands and reports the
-// terminal state by sandbox/build ID. Cluster routing metadata is stored opaquely
-// on the object; the nodelink owner resolves it from its per-node ownership table.
+// terminal state by sandbox/build ID. Registry-owned sandbox context is persisted
+// separately from user metadata; the nodelink owner resolves cluster identity
+// from its per-node ownership table.
 
 // HandleCommand executes a registry node-link command and returns a receipt ack
 // (cluster.md): accepted once the synchronous preconditions hold (key
@@ -49,6 +50,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	case routesync.CmdConnect:
 		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 		if err != nil {
+			return reject(cmd, err)
+		}
+		if err := validateClusterSandboxContext(sb, cmd); err != nil {
 			return reject(cmd, err)
 		}
 		go func() {
@@ -348,6 +352,16 @@ func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command
 // whose failure is a rejected ack (rather than a slow create that fails only by
 // Reserve timeout).
 func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (store.KeyPair, types.TemplateID, error) {
+	if cmd == nil {
+		return store.KeyPair{}, types.TemplateID{}, fmt.Errorf("cluster create: command is required")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, fmt.Errorf("cluster create: %w", err)
+	}
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return store.KeyPair{}, types.TemplateID{}, fmt.Errorf("cluster create: group and route key are required")
+	}
 	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, err
@@ -355,6 +369,9 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
+	}
+	if tmpl.Profile != profile {
+		return store.KeyPair{}, types.TemplateID{}, fmt.Errorf("cluster create: profile %q does not match template profile %q", profile, tmpl.Profile)
 	}
 	config, err := sandboxcfg.NormalizeRestoreMetadata(cmd.Config)
 	if err != nil {
@@ -378,13 +395,13 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		}
 	}
 
-	meta := make(map[string]string, len(cmd.Config))
-	for k, v := range cmd.Config {
-		meta[k] = v
-	}
+	meta := clusterSandboxMetadata(cmd.Config)
 
 	sb := &types.Sandbox{
 		ID:                 cmd.SID,
+		Profile:            tmpl.Profile,
+		Cluster:            &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		AuthSandboxIDValue: cmd.Cluster.AuthSandboxID,
 		TemplateID:         tmpl.String(),
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + cmd.SID,
@@ -407,6 +424,16 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	o.publishUpsert(sb)
 	return sb, nil
+}
+
+func clusterSandboxMetadata(config map[string]string) map[string]string {
+	metadata := make(map[string]string, len(config))
+	for k, v := range config {
+		if k != clusterstate.ObjectMetadataKey {
+			metadata[k] = v
+		}
+	}
+	return metadata
 }
 
 func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (store.KeyPair, error) {
@@ -444,6 +471,25 @@ func (o *Orchestrator) clusterSandbox(ctx context.Context, sid, apiSecretFingerp
 		return nil, fmt.Errorf("cluster: sandbox credential binding mismatch")
 	}
 	return sb, nil
+}
+
+func validateClusterSandboxContext(sb *types.Sandbox, cmd *routesync.Command) error {
+	if sb == nil || cmd == nil {
+		return fmt.Errorf("cluster connect: sandbox and command are required")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return fmt.Errorf("cluster connect: %w", err)
+	}
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return fmt.Errorf("cluster connect: group and route key are required")
+	}
+	if sb.Profile != profile || sb.Cluster == nil ||
+		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
+		sb.AuthSandboxIDValue != cmd.Cluster.AuthSandboxID {
+		return fmt.Errorf("cluster connect: sandbox context mismatch")
+	}
+	return nil
 }
 
 // connectCluster resumes an already-authorized node-local sandbox.

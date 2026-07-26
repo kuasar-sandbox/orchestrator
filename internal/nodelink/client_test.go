@@ -41,6 +41,7 @@ type testPlacer struct{}
 func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
 	return &registry.Placement{
 		NodeID:               "n1",
+		TemplateRef:          "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		APISecretFingerprint: testFingerprint(testAPISecret),
 	}, nil
 }
@@ -103,6 +104,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	}
 	e := routesync.RouteEntry{
 		SandboxID: cmd.SID,
+		Profile:   cmd.Profile,
 		State:     routesync.StateRunning,
 	}
 	n.mu.Lock()

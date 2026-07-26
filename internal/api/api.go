@@ -641,7 +641,7 @@ func (a *API) failMigrate(w http.ResponseWriter, err error) {
 // --- response shaping ---
 
 func (a *API) envdVersion(sb *types.Sandbox) string {
-	if sb.Profile() == types.ProfileE2B {
+	if sb.Profile == types.ProfileE2B {
 		return "0.6.1"
 	}
 	return "0.1.0" // bare stub: >=0.1.0 so the SDK does not self-destruct

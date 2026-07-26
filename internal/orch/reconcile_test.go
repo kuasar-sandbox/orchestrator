@@ -59,7 +59,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID: "sandbox-1", TemplateID: "bare-img-" + strings.Repeat("b", 64),
-		State: types.StateRunning, RunID: knownRun,
+		Profile: types.ProfileBare, State: types.StateRunning, RunID: knownRun,
 		RunDir:    filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
 		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1,

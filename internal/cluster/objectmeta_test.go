@@ -4,7 +4,7 @@ import "testing"
 
 func TestObjectMetadataRoundTripDoesNotMutateInput(t *testing.T) {
 	in := map[string]string{"keep": "value", ObjectMetadataKey: "old"}
-	out, err := WithObjectLocation(in, ObjectLocation{Group: "/g", RouteKey: "rk"})
+	out, err := WithObjectLocation(in, ObjectLocation{Group: "/g"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -15,7 +15,7 @@ func TestObjectMetadataRoundTripDoesNotMutateInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if location.Group != "/g" || location.RouteKey != "rk" || out["keep"] != "value" {
+	if location.Group != "/g" || out["keep"] != "value" {
 		t.Fatalf("metadata round trip = %+v, map=%v", location, out)
 	}
 }
@@ -23,9 +23,6 @@ func TestObjectMetadataRoundTripDoesNotMutateInput(t *testing.T) {
 func TestObjectMetadataRejectsMissingIdentity(t *testing.T) {
 	if _, err := ObjectLocationFromMetadata(nil); err == nil {
 		t.Fatal("missing metadata was accepted")
-	}
-	if _, err := NodeSandboxRefFromMetadata("sb", map[string]string{ObjectMetadataKey: `{"group":"/g"}`}); err == nil {
-		t.Fatal("sandbox metadata without route key was accepted")
 	}
 	if _, err := NodeBuildRefFromMetadata("b", map[string]string{ObjectMetadataKey: `{}`}); err == nil {
 		t.Fatal("build metadata without group was accepted")

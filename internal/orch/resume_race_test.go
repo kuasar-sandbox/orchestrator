@@ -95,7 +95,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	apiSecret, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
-		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
+		ID: sid, Profile: types.ProfileBare, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
 		APISecret:   apiSecret,
 		ManifestKey: mk,
 		RunDir:      cfg.Paths.RunRoot + "/" + sid,

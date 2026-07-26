@@ -8,11 +8,12 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func (s *Stores) putRouteSandboxShard(ctx context.Context, r *SandboxRecord) (uint64, error) {
-	if r == nil || r.Group == "" || r.RouteKey == "" {
-		return 0, nil
+	if err := validateSandboxRecord(r); err != nil {
+		return 0, err
 	}
 	sh, err := s.routeLinkRecordSet(r.Group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
@@ -30,8 +31,8 @@ func (s *Stores) putRouteSandboxShard(ctx context.Context, r *SandboxRecord) (ui
 }
 
 func (s *Stores) casRouteSandboxShard(ctx context.Context, r *SandboxRecord, expectRev uint64) (uint64, bool, error) {
-	if r == nil || r.Group == "" || r.RouteKey == "" {
-		return 0, false, nil
+	if err := validateSandboxRecord(r); err != nil {
+		return 0, false, err
 	}
 	sh, err := s.routeLinkRecordSet(r.Group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
@@ -62,6 +63,9 @@ func (s *Stores) getRouteSandboxShard(ctx context.Context, group, routeKey strin
 	}
 	out, err := clusterstate.DecodeShardValue[SandboxRecord](rec.Value)
 	if err != nil {
+		return nil, 0, false, err
+	}
+	if err := validateSandboxRecord(&out); err != nil {
 		return nil, 0, false, err
 	}
 	if out.LastActive == 0 {
@@ -179,6 +183,9 @@ func (s *Stores) rangeRouteSandboxesShard(ctx context.Context, group string, fn 
 		if err != nil {
 			return err
 		}
+		if err := validateSandboxRecord(&route); err != nil {
+			return err
+		}
 		out = append(out, route)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RouteKey < out[j].RouteKey })
@@ -268,6 +275,9 @@ func routeWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 		if err != nil {
 			return WatchEvent{}, false, err
 		}
+		if err := validateSandboxRecord(&route); err != nil {
+			return WatchEvent{}, false, err
+		}
 		raw, err := json.Marshal(route)
 		if err != nil {
 			return WatchEvent{}, false, err
@@ -281,4 +291,17 @@ func routeWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 	default:
 		return WatchEvent{}, false, nil
 	}
+}
+
+func validateSandboxRecord(r *SandboxRecord) error {
+	if r == nil {
+		return errors.New("registry: sandbox route is required")
+	}
+	if r.Group == "" || r.RouteKey == "" {
+		return errors.New("registry: sandbox route group and route key are required")
+	}
+	if !types.Profile(r.Profile).Valid() {
+		return errors.New("registry: sandbox route profile is invalid")
+	}
+	return nil
 }

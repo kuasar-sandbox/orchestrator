@@ -42,7 +42,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 
 	sid := "sbx-mig-1"
 	sb := &types.Sandbox{
-		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
+		ID: sid, Profile: types.ProfileE2B, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
 		APISecret: apiSecret, ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
 		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
@@ -138,6 +138,56 @@ func TestImportRejectsSameManifestKeyWithDifferentAPISecret(t *testing.T) {
 	if _, err := o.importSandboxWithKey(ctx, targetPair, token); err == nil ||
 		!strings.Contains(err.Error(), "different tenant") {
 		t.Fatalf("import error = %v; want API-secret binding mismatch", err)
+	}
+}
+
+func TestImportRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("fake-runtime-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
+	o := testOrchCfg(t, cfg)
+
+	mk := strings.Repeat("6", 64)
+	source := migrationSandbox(t, dir, "source", mk, "manifest://"+strings.Repeat("b", 64))
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload SandboxToken
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload.Profile = string(types.ProfileBare)
+	raw, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = o.importSandboxWithKey(context.Background(), store.KeyPair{
+		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
+	}, base64.StdEncoding.EncodeToString(raw))
+	if err == nil || !strings.Contains(err.Error(), "does not match template profile") {
+		t.Fatalf("profile/template mismatch error = %v", err)
+	}
+}
+
+func TestMintSandboxTokenRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{
+		Profile: types.ProfileBare, TemplateID: "e2b-snp-" + strings.Repeat("a", 64),
+	}
+	if _, err := o.mintSandboxToken(sb, "manifest://"+strings.Repeat("b", 64)); err == nil ||
+		!strings.Contains(err.Error(), "does not match template profile") {
+		t.Fatalf("mint mismatch error = %v", err)
 	}
 }
 
@@ -268,7 +318,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 	t.Helper()
 	return &types.Sandbox{
-		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
+		ID: sid, Profile: types.ProfileE2B, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
 		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
 	}

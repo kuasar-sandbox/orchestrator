@@ -71,6 +71,9 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if err != nil {
 		return "", err
 	}
+	if sb.Profile != tmpl.Profile {
+		return "", fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
+	}
 	// Ensure the snapshot is remote (portable). A local checkpoint is a bundle
 	// path; promote it to a manifest and repoint the row (local files redundant).
 	ref := sb.SnapshotRef
@@ -118,6 +121,9 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
 		return "", err
+	}
+	if sb.Profile != tmpl.Profile {
+		return "", fmt.Errorf("mint token: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 	}
 	dig, err := sha256File(o.runtimeFileFor(tmpl.Profile))
 	if err != nil {
@@ -178,6 +184,17 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, pair store.KeyP
 	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
 		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
 	}
+	profile, err := types.ParseProfile(tok.Profile)
+	if err != nil {
+		return "", fmt.Errorf("import-sandbox: bad token profile: %w", err)
+	}
+	template, err := types.ParseTemplateID(tok.TemplateID)
+	if err != nil {
+		return "", fmt.Errorf("import-sandbox: bad token template: %w", err)
+	}
+	if template.Profile != profile {
+		return "", fmt.Errorf("import-sandbox: token profile %q does not match template profile %q", profile, template.Profile)
+	}
 	apiFingerprint, err := store.APISecretHash(pair.APISecret)
 	if err != nil {
 		return "", err
@@ -192,7 +209,7 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, pair store.KeyP
 	// The snapshot is bound to the guest runtime it was captured under; a different
 	// runtime here would fail restore — reject early with a clear message.
 	if tok.RuntimeDigest != "" {
-		dig, err := sha256File(o.runtimeFileFor(types.Profile(tok.Profile)))
+		dig, err := sha256File(o.runtimeFileFor(profile))
 		if err != nil {
 			return "", fmt.Errorf("import-sandbox: hash runtime: %w", err)
 		}
@@ -215,14 +232,14 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, pair store.KeyP
 		return "", fmt.Errorf("import-sandbox: mint traffic token: %w", err)
 	}
 	sb := &types.Sandbox{
-		ID: sid, TemplateID: tok.TemplateID, State: types.StatePaused,
+		ID: sid, Profile: profile, TemplateID: tok.TemplateID, State: types.StatePaused,
 		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: time.Now().Unix(),
 		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, SnapshotRef: tok.SnapshotRef,
 		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
 		Metadata: tok.Metadata, Env: tok.Env,
 	}
-	if types.Profile(tok.Profile) == types.ProfileE2B {
+	if profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}

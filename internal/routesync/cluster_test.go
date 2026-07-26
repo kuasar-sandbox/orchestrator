@@ -37,10 +37,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
-		CmdID: "x1", Kind: CmdCreate, SID: "s1", Config: map[string]string{"kuasar-sandbox.cluster": `{"group":"/c/p/a/g1","route_key":"u1:sess1"}`},
-		TemplateRef: "manifest://abc", APISecretFingerprint: strings.Repeat("a", 64),
+		CmdID: "x1", Kind: CmdCreate, SID: "stable-g0", Profile: "bare",
+		Cluster:     &ClusterSandboxContext{Group: "/c/p/a/g1", RouteKey: "u1:sess1", AuthSandboxID: "stable"},
+		TemplateRef: "bare-img-" + strings.Repeat("b", 64), APISecretFingerprint: strings.Repeat("a", 64),
 	}})
-	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Config["kuasar-sandbox.cluster"] == "" || c.Rev != 42 {
+	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.SID != "stable-g0" || c.Cmd.Profile != "bare" ||
+		c.Cmd.Cluster == nil || c.Cmd.Cluster.Group != "/c/p/a/g1" || c.Cmd.Cluster.RouteKey != "u1:sess1" ||
+		c.Cmd.Cluster.AuthSandboxID != "stable" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{

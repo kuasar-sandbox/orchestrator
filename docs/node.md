@@ -122,9 +122,9 @@ create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
 → 持久化 `sid ↔ run-id` → 单元内 `run-sandbox` 经 config-socket 的
 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
 → 起 microVM → (e2b)等 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户
-→ 起 TTL。集群下,该
-create 由 node-link 的 `create` 命令触发,group / route-key 经 metadata 注入并随事件回报
-registry(§10、§4.6)。
+→ 起 TTL。集群下,该 create 由 node-link 的 `create` 命令触发;profile、group、route-key
+和可选认证主体通过结构化系统上下文下发并独立持久化。事件只回报 profile 和 node-owned
+执行事实,registry 从既有节点归属记录恢复其 cluster identity(§10、§4.6)。
 
 数据面按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/`E2b-Sandbox-Port` 头解析
 `(sid, port)`,校验 `X-Access-Token` 后转发:e2b profile 的 49983/49999 拨 sandbox-ctl
@@ -504,10 +504,11 @@ X-Kuasar-Sandbox-Restore: {"prefetch":"memory"}
 metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch 能力:显式
 `memory` 在 restore 配置中原样表达,最终执行或跳过由 sandboxer 决定。
 
-`kuasar-sandbox.cluster` 不属于上述租户配置命名空间。cluster registry 在放置后把
-`{group,route_key}` 作为 cluster 自有字段写入普通 sandbox/build metadata,并覆盖请求中
-可能存在的同名值。node 只原样保存和转交 metadata,不会解析该字段、建立 group 状态或
-在 node-link 事件中回传 group;只有 cluster 层解释它。
+`kuasar-sandbox.cluster` 不属于上述租户配置命名空间。构建任务仍用该 metadata 字段携带
+cluster 自有的 group;普通 sandbox 的 `Profile`、`Group`、`RouteKey` 和可选
+`AuthSandboxID` 则通过 node-link 的结构化系统上下文下发并独立持久化,不进入用户
+metadata。node 不在事件中回传 Registry 自有的 group、route key 或认证主体;Registry
+通过节点归属记录恢复这些信息。
 
 构建端点额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
 `X-Kuasar-Sandbox-Builder`,当前形态:
@@ -528,7 +529,7 @@ metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch
   create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
   `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
   `restore` 是例外:只接受 create 请求,不进入模板构建。
-  集群下 `create` 命令亦经 metadata 注入 `cluster` 命名空间(§10)。
+  集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
   register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
@@ -949,13 +950,13 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 节点作为权威上报本机执行态:
 
 ```text
-sandbox{sid, state, snap_loc, access_token, template_id}
+sandbox{sid, profile, state, snap_loc, access_token, template_id}
 build{build_id, state, template_id?, reason?}
 delete{sid}
 bookmark{full_sync}
 ```
 
-node 不解释 sandbox/build metadata 中的 cluster 字段。nodelink owner 在任务下发前已维护
+node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelink owner 在任务下发前已维护
 本节点完整的 sandbox/build 归属表,收到事件后以 `(node_id,sid)` 或
 `(node_id,build_id)` 查表取得 group/route_key。生产 ID 由 UUIDv7 或等价随机机制保证
 全局唯一,但事件处理不依赖该假设,也不存在 cluster 全局 ID 索引。
@@ -971,8 +972,8 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, api_secret_fingerprint, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
-  | `connect{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后恢复本机 PAUSED 沙箱(§8 auto-resume) |
+  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化,不进入用户 metadata |
+  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster}` | 完整指纹、profile 和 cluster context 必须与既有 Sandbox 业务行绑定一致,随后恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按完整 APISecret 指纹解析凭据对、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
@@ -1208,7 +1209,8 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 单文件 sqlite(`paths.db_path`,WAL,文件 0600),纯 Go 驱动。三张表:
 
 ```
-sandboxes      id(uuidv7) PK, template_id, state(running|paused|dead), deadline_unix,
+sandboxes      id(uuidv7) PK, profile, cluster_group, cluster_route_key, auth_sandbox_id,
+               template_id, state(running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc, snapshot_ref,

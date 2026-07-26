@@ -32,6 +32,7 @@ type RouteResolve struct {
 	RouteKey           string `json:"route_key"`
 	NodeID             string `json:"node_id"`
 	DataEndpoint       string `json:"data_endpoint"`
+	Profile            string `json:"profile"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TargetPort         int    `json:"target_port,omitempty"`
@@ -220,7 +221,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, AccessToken: rec.AccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		State: string(rec.State),
 	}, true, nil

@@ -98,6 +98,16 @@ type BuildEvent struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
+// ClusterSandboxContext carries Registry-owned sandbox identity to a node. The
+// node persists Group and RouteKey separately from user metadata, and stores the
+// optional AuthSandboxID as the stable credential subject. It never derives any
+// of these values from Command.SID.
+type ClusterSandboxContext struct {
+	Group         string `json:"group"`
+	RouteKey      string `json:"route_key"`
+	AuthSandboxID string `json:"auth_sandbox_id,omitempty"`
+}
+
 // CmdAck statuses.
 const (
 	AckAccepted = "accepted"
@@ -154,9 +164,11 @@ type Command struct {
 	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
 	SID   string `json:"sid,omitempty"`
 	// create and lifecycle credential binding
-	TemplateRef          string            `json:"template_ref,omitempty"`           // snapshot template ref (cold start = fast restore)
-	APISecretFingerprint string            `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
-	Config               map[string]string `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
+	TemplateRef          string                 `json:"template_ref,omitempty"`           // snapshot template ref (cold start = fast restore)
+	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register
+	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
+	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
+	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put
@@ -170,7 +182,6 @@ type Command struct {
 	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
 	// delivered WITH the build task and used transiently (never persisted on the node).
 	BuildID        string          `json:"build_id,omitempty"`
-	Profile        string          `json:"profile,omitempty"`
 	BuildResources *BuildResources `json:"build_resources,omitempty"`
 	ImageRepo      string          `json:"image_repo,omitempty"`
 	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient

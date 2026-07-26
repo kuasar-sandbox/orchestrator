@@ -252,7 +252,7 @@ owner count 是 registry 内部复制因子。`placer_link.placer_replica_count`
 | `route_link` | group | `sandbox` | route_key | route 记录 |
 | `route_link` | group | `build` | build_id | build 执行态 |
 | `node_link` | node_id | `profile` | `profile` | node profile、labels、liveness、link_owner、低频容量 |
-| `node_link` | node_id | `sandbox` | sandbox_id | node 维度 sandbox 归属表,值含 group + route_key + api_secret_fingerprint |
+| `node_link` | node_id | `sandbox` | sandbox_id | node 维度 sandbox 归属表,值含 group + route_key + profile + api_secret_fingerprint |
 | `node_link` | node_id | `build` | build_id | node 维度 build 归属表,值含 group |
 | `node_link` | node_id | `key_pair` | api_secret_fingerprint | node APISecret+ManifestKey pair cache |
 | `node_list` | `node_list` | `nodes` | node_id | 低频节点目录和 WATCH_LIST |
@@ -580,17 +580,17 @@ membership 重新解析 owner。
 node_link 维护以下 recordSet:
 
 - `profile`:node_id、labels、runtime_digest、data_endpoint、build_capacity、draining、liveness、link_owner。
-- `sandbox`:该 node 上 sandbox 的 `sandbox_id -> {group,route_key,api_secret_fingerprint}` 完整归属表。
+- `sandbox`:该 node 上 sandbox 的 `sandbox_id -> {group,route_key,profile,api_secret_fingerprint}` 完整归属表。
 - `build`:该 node 上 build 的 `build_id -> group` 完整归属表。
 - `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`key_pair`
 recordSet。sandbox/build 表由 cluster 在任务下发前写入。build 终态只释放容量,归属记录保留到对应
 build record 删除;key_pair 由 selector patch 更新。
-node 既不生成也不解析 group,只把 sandbox/build metadata 原样保存。这样高频心跳不会把无关 recordSet
-的 CAS 队列拖慢。
+node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
+build 的 cluster group 仍保存在其内部 metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
 
-同一 node 内 `sandbox_id` 归属以 CAS 写入:相同 `{group,route_key,api_secret_fingerprint}` 重放为幂等刷新,不同归属返回冲突且
+同一 node 内 `sandbox_id` 归属以 CAS 写入:相同 `{group,route_key,profile,api_secret_fingerprint}` 重放为幂等刷新,不同归属返回冲突且
 不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED record,生成新 sandbox_id
 后重试同一健康 node;node 端也必须在异步 launch 前同步拒绝已有或正在创建的 sandbox_id。
 
@@ -602,7 +602,7 @@ node_link 流按事件重要性处理:
 - node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
 - `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
 
-这样 Reserve 的 READY route report 不会被心跳持久化阻塞。事件仅携带 sandbox/build ID 与执行态;
+这样 Reserve 的 READY route report 不会被心跳持久化阻塞。sandbox事件携带 sandbox ID、profile 与 node-owned 执行态;
 nodelink owner 以 `(node_id,id)` 查本节点归属表得到 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
@@ -659,7 +659,7 @@ node_link 重建第二条事实传播路径。
 
 - 稳定会话身份:`(group, route_key)`。
 - 当前运行实例:`sandbox_id`。生产创建和跨节点导入都分配全局唯一新 ID,外部不解析。
-- cluster 在 route_link 和 node 归属表中维护 `group`、`route_key`、`sandbox_id`、
+- cluster 在 route_link 和 node 归属表中维护 `group`、`route_key`、`sandbox_id`、`profile`、
   `api_secret_fingerprint`,但 node 事件不携带
   group,事件定位也不依赖 sandbox/build ID 全局唯一。不存在 cluster 全局 ID 索引。
 
@@ -672,6 +672,7 @@ node_link 重建第二条事实传播路径。
 | `sandbox_id` | 当前实例 |
 | `state` | `reserved` / `ready` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
+| `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
 | `api_secret_fingerprint` | 当前实例创建时绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
 | `access_token` | 当前实例数据面 token |
 | `traffic_access_token` | SDK 兼容返回字段,不作为数据面强制鉴权头 |
@@ -702,11 +703,11 @@ placer PlaceSandbox
   │ choose node + APISecretFingerprint + target_port
   ▼
 route owner
-  │ inject canonical {group,route_key} into metadata
+  │ attach typed {group,route_key,auth_sandbox_id} + profile
   │ record node_id/sandbox_id ownership
   ▼
 node owner
-  │ create/connect (metadata is opaque to node)
+  │ create/connect (system context is persisted separately)
   ▼
 node reports RUNNING/READY
   │ with node-issued access tokens
@@ -725,7 +726,7 @@ route_link 更新。
 孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,sandbox_id)` 查归属表;表项不存在,
 或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过
 数据面,不依赖 access token 或全局 sandbox ID 查询。全量同步、孤儿清理和节点回收均比较
-`(group,route_key,sandbox_id,api_secret_fingerprint)` 完整归属,避免迟到事件跨凭据 binding 删除新记录。
+`(group,route_key,sandbox_id,profile,api_secret_fingerprint)` 完整归属,避免迟到事件跨凭据 binding 删除新记录。
 
 ## 9. placer_link 与 placer
 
@@ -901,9 +902,9 @@ node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/bu
 不是 BuildRecord。
 
 registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
-build execution、node ref、admission 或本机 checkpoint。节点仍存活但 registry 执行 shard 完全丢失时,
-应由带持久 cluster metadata 的 node-link full report 重建投影,不能预装 ownership 让旧事件看似合法。
-这条显式 recovery/bootstrap 协议尚未实现,由
+build execution、node ref、admission 或本机 checkpoint。节点虽持久化 cluster sandbox 的独立系统上下文,
+但当前 node-link full report 不回传 Registry-owned identity;registry 执行 shard 完全丢失时不能仅靠 route event
+重建 ownership,也不能预装 ownership 让旧事件看似合法。这条显式 recovery/bootstrap 协议尚未实现,由
 [issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 跟踪;当前不得用手工写入执行 row 规避该限制。
 
 可移植 paused sandbox 的灾备对象是带 migration token 的**未绑定持久 route**,不是 SandboxRecord。

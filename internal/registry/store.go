@@ -70,6 +70,7 @@ type SandboxRecord struct {
 	NodeID               string                    `json:"node_id,omitempty"`
 	SnapLoc              string                    `json:"snap_loc,omitempty"`
 	TemplateID           string                    `json:"template_id,omitempty"`
+	Profile              string                    `json:"profile,omitempty"`
 	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
 	AccessToken          string                    `json:"access_token,omitempty"`
 	TrafficAccessToken   string                    `json:"traffic_access_token,omitempty"`

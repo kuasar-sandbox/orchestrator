@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -93,18 +94,30 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	}
 
 	create := &routesync.Command{
-		CmdID: "create-1", Kind: routesync.CmdCreate, SID: "sb1", TemplateRef: "template-1",
+		CmdID: "create-1", Kind: routesync.CmdCreate, SID: "sb1",
+		TemplateRef: "bare-img-" + strings.Repeat("b", 64), Profile: "bare",
+		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "sb1"},
 		APISecretFingerprint: apiSecretFingerprint,
-		Config:               map[string]string{"stub.create_result": "timeout"},
+		Config: map[string]string{
+			"stub.create_result":           "timeout",
+			clusterstate.ObjectMetadataKey: `{"group":"forged","route_key":"forged"}`,
+		},
 	}
 	if got := node.HandleCommand(context.Background(), create); got.Status != routesync.AckAccepted {
 		t.Fatalf("create ack = %+v", got)
 	}
 	node.mu.Lock()
-	accessToken := node.sandboxes[create.SID].AccessToken
+	storedSandbox := node.sandboxes[create.SID]
+	accessToken := storedSandbox.AccessToken
 	node.mu.Unlock()
 	if accessToken != "stub-access-"+create.SID {
 		t.Fatalf("stub access token = %q", accessToken)
+	}
+	if storedSandbox.Profile != create.Profile || !sameStubClusterContext(storedSandbox.Cluster, create.Cluster) {
+		t.Fatalf("stub sandbox context = %+v", storedSandbox)
+	}
+	if _, found := storedSandbox.Metadata[clusterstate.ObjectMetadataKey]; found {
+		t.Fatalf("stub sandbox retained reserved cluster metadata: %+v", storedSandbox.Metadata)
 	}
 
 	build := &routesync.Command{
@@ -145,9 +158,19 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	if state != routesync.StatePaused {
 		t.Fatalf("rejected connect changed state to %q", state)
 	}
+	wrongContext := *wrongConnect
+	wrongContext.CmdID = "connect-wrong-context"
+	wrongContext.APISecretFingerprint = apiSecretFingerprint
+	wrongContext.Profile = create.Profile
+	wrongContext.Cluster = &routesync.ClusterSandboxContext{Group: "/other", RouteKey: "rk", AuthSandboxID: "sb1"}
+	if got := node.HandleCommand(context.Background(), &wrongContext); got.Status != routesync.AckRejected {
+		t.Fatalf("connect with wrong context ack = %+v", got)
+	}
 	connect := *wrongConnect
 	connect.CmdID = "connect-1"
 	connect.APISecretFingerprint = apiSecretFingerprint
+	connect.Profile = create.Profile
+	connect.Cluster = create.Cluster
 	if got := node.HandleCommand(context.Background(), &connect); got.Status != routesync.AckAccepted {
 		t.Fatalf("connect after key drop ack = %+v", got)
 	}

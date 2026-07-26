@@ -520,7 +520,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	// (FC-mode envd resolves {id, token-hash} by its floating IP).
 	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
 		row := &types.Sandbox{
-			ID: "build-" + b.BuildID, TemplateID: b.TemplateID,
+			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
 			State: types.StateRunning, FloatingIP: port.FloatingIP,
 			EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
 			CreatedUnix: time.Now().Unix(),
