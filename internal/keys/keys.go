@@ -1,6 +1,6 @@
-// Package keys mints sandbox access tokens and derives sandbox-scoped MMDS
-// material. Tenant API authentication lives in internal/apikey; persisted root
-// secrets are protected by internal/secretbox.
+// Package keys mints sandbox access tokens and derives sandbox-scoped service
+// and MMDS material. Tenant API authentication lives in internal/apikey;
+// persisted root secrets are protected by internal/secretbox.
 package keys
 
 import (
@@ -11,15 +11,20 @@ import (
 	"fmt"
 )
 
-// MintToken returns a random 32-byte hex token (envd / traffic access tokens).
-// We own both the minting and verifying ends, so any unguessable value works.
-func MintToken() (string, error) {
+// MintSecret returns 32 cryptographically random bytes encoded as 64 canonical
+// lowercase hexadecimal characters.
+func MintSecret() (string, error) {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("keys: mint token: %w", err)
+		return "", fmt.Errorf("keys: mint secret: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
 }
+
+// MintToken returns a random opaque token for the existing envd and traffic
+// token fields. Those fields use the same 32-byte canonical hex representation
+// as a random secret, but retain their purpose-specific API name.
+func MintToken() (string, error) { return MintSecret() }
 
 // mmdsSecretInfo binds the derivation to its purpose + version so the key never
 // collides with another use of the manifest key.

@@ -27,14 +27,15 @@ import (
 // Namespaced metadata keys carrying the per-instance config override. Each value is
 // a JSON object; an absent key falls back to orchestrator/profile defaults.
 const (
-	NsResource = "kuasar-sandbox.resource"
-	NsNetwork  = "kuasar-sandbox.network"
-	NsLaunch   = "kuasar-sandbox.launch"
-	NsInit     = "kuasar-sandbox.init"
-	NsMounts   = "kuasar-sandbox.mounts"
-	NsFiles    = "kuasar-sandbox.files"
-	NsMetadata = "kuasar-sandbox.metadata"
-	NsRestore  = "kuasar-sandbox.restore"
+	NsResource    = "kuasar-sandbox.resource"
+	NsNetwork     = "kuasar-sandbox.network"
+	NsLaunch      = "kuasar-sandbox.launch"
+	NsInit        = "kuasar-sandbox.init"
+	NsMounts      = "kuasar-sandbox.mounts"
+	NsFiles       = "kuasar-sandbox.files"
+	NsMetadata    = "kuasar-sandbox.metadata"
+	NsRestore     = "kuasar-sandbox.restore"
+	NsCredentials = "kuasar-sandbox.credentials"
 )
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
@@ -258,16 +259,18 @@ func MergeMetadata(base, over map[string]string) map[string]string {
 }
 
 // MergeCreateMetadata layers request configuration over template, group, or
-// placement defaults while keeping the host restore policy request-scoped.
-// Only an explicitly present restore namespace in request is admitted.
+// placement defaults while keeping restore policy and credentials request-scoped.
+// Only namespaces explicitly present in request are admitted for those values.
 func MergeCreateMetadata(defaults, request map[string]string) map[string]string {
 	out := mergeStr(defaults, request)
-	delete(out, NsRestore)
-	if raw, ok := request[NsRestore]; ok {
-		if out == nil {
-			out = map[string]string{}
+	for _, ns := range []string{NsRestore, NsCredentials} {
+		delete(out, ns)
+		if raw, ok := request[ns]; ok {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[ns] = raw
 		}
-		out[NsRestore] = raw
 	}
 	return out
 }
