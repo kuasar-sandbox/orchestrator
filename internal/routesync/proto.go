@@ -76,18 +76,26 @@ const (
 // so a proxy can serve the data plane on its own (no per-request callback). State
 // "paused"/missing makes the proxy send a Wake; "running" lets it forward.
 type RouteEntry struct {
-	SandboxID   string `json:"sid"`
-	Profile     string `json:"profile"`                // "e2b" | "bare"
-	TemplateID  string `json:"template_id,omitempty"`  // for MMDS envID (proxy-served metadata)
-	State       string `json:"state"`                  // "running" | "paused" | "dead"
-	EnvdUDS     string `json:"envd_uds,omitempty"`     // e2b control port 49983
-	CiUDS       string `json:"ci_uds,omitempty"`       // e2b code-interpreter port 49999
-	FloatingIP  string `json:"floatingip,omitempty"`   // host-reachable addr for user ports
-	AccessToken string `json:"access_token,omitempty"` // envdAccessToken; X-Access-Token must match
-	// TrafficAccessToken is the SDK compatibility token returned by create. It is
-	// reported by the node route authority and preserved by route_link, but is not
-	// used as the data-plane X-Access-Token.
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	SandboxID  string `json:"sid"`
+	Profile    string `json:"profile"`               // "e2b" | "bare"
+	TemplateID string `json:"template_id,omitempty"` // for MMDS envID (proxy-served metadata)
+	State      string `json:"state"`                 // "running" | "paused" | "dead"
+	EnvdUDS    string `json:"envd_uds,omitempty"`    // e2b control port 49983
+	CiUDS      string `json:"ci_uds,omitempty"`      // e2b code-interpreter port 49999
+	FloatingIP string `json:"floatingip,omitempty"`  // host-reachable addr for user ports
+
+	// Credential material is copied from the sandbox business record. Trusted
+	// proxy/registry subscribers use the roots and fingerprints for local request
+	// authentication; data-plane forwarding selects EnvdAccessToken for the e2b
+	// control ports and ForwardAccessToken for other forwarded ports.
+	AuthSandboxID          string `json:"auth_sandbox_id,omitempty"`
+	APISecret              string `json:"api_secret,omitempty"`
+	APISecretFingerprint   string `json:"api_secret_fingerprint,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"`
+	ServiceSecret          string `json:"service_secret,omitempty"`
+	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string `json:"forward_access_token,omitempty"`
 	// SnapshotLocation is "" for running/dead, else "local" (node-bound checkpoint
 	// bundle — blocks a node drain unless migrated) or "remote" (uploaded, portable).
 	// A subscriber (e.g. the platform agent) reads it to decide migration; the actual

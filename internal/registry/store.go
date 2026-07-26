@@ -19,6 +19,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const nodeListTombstoneRetention = time.Hour
@@ -63,24 +64,30 @@ type NodeRecord struct {
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
-	Group                string                    `json:"group"`
-	RouteKey             string                    `json:"route_key"`
-	SID                  string                    `json:"sid,omitempty"`
-	State                SandboxState              `json:"state"`
-	NodeID               string                    `json:"node_id,omitempty"`
-	SnapLoc              string                    `json:"snap_loc,omitempty"`
-	TemplateID           string                    `json:"template_id,omitempty"`
-	Profile              string                    `json:"profile,omitempty"`
-	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
-	AccessToken          string                    `json:"access_token,omitempty"`
-	TrafficAccessToken   string                    `json:"traffic_access_token,omitempty"`
-	TargetPort           int                       `json:"target_port,omitempty"`
-	LastActive           int64                     `json:"last_active,omitempty"`
-	BuildID              string                    `json:"build_id,omitempty"`
-	BuildState           BuildState                `json:"build_state,omitempty"`
-	BuildResources       *routesync.BuildResources `json:"build_resources,omitempty"`
-	BuildReason          string                    `json:"build_reason,omitempty"`
-	CreatedU             int64                     `json:"created_unix,omitempty"`
+	Group                  string                    `json:"group"`
+	RouteKey               string                    `json:"route_key"`
+	SID                    string                    `json:"sid,omitempty"`
+	State                  SandboxState              `json:"state"`
+	NodeID                 string                    `json:"node_id,omitempty"`
+	SnapLoc                string                    `json:"snap_loc,omitempty"`
+	TemplateID             string                    `json:"template_id,omitempty"`
+	Profile                string                    `json:"profile,omitempty"`
+	APISecretFingerprint   string                    `json:"api_secret_fingerprint,omitempty"`
+	ManifestKeyFingerprint string                    `json:"manifest_key_fingerprint,omitempty"`
+	CreateCredentials      *sandboxcfg.Credentials   `json:"create_credentials,omitempty"`
+	AuthSandboxID          string                    `json:"auth_sandbox_id,omitempty"`
+	APISecret              string                    `json:"api_secret,omitempty"`
+	ServiceSecret          string                    `json:"service_secret,omitempty"`
+	EnvdAccessToken        string                    `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string                    `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string                    `json:"forward_access_token,omitempty"`
+	TargetPort             int                       `json:"target_port,omitempty"`
+	LastActive             int64                     `json:"last_active,omitempty"`
+	BuildID                string                    `json:"build_id,omitempty"`
+	BuildState             BuildState                `json:"build_state,omitempty"`
+	BuildResources         *routesync.BuildResources `json:"build_resources,omitempty"`
+	BuildReason            string                    `json:"build_reason,omitempty"`
+	CreatedU               int64                     `json:"created_unix,omitempty"`
 }
 
 type WatchEventType int

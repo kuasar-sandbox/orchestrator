@@ -186,6 +186,7 @@ func (s *Stores) rangeRouteSandboxesShard(ctx context.Context, group string, fn 
 		if err := validateSandboxRecord(&route); err != nil {
 			return err
 		}
+		stripProtectedSandboxFields(&route)
 		out = append(out, route)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RouteKey < out[j].RouteKey })
@@ -278,6 +279,7 @@ func routeWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 		if err := validateSandboxRecord(&route); err != nil {
 			return WatchEvent{}, false, err
 		}
+		stripProtectedSandboxFields(&route)
 		raw, err := json.Marshal(route)
 		if err != nil {
 			return WatchEvent{}, false, err
@@ -291,6 +293,21 @@ func routeWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 	default:
 		return WatchEvent{}, false, nil
 	}
+}
+
+func stripProtectedSandboxFields(route *SandboxRecord) {
+	if route == nil {
+		return
+	}
+	route.APISecretFingerprint = ""
+	route.ManifestKeyFingerprint = ""
+	route.CreateCredentials = nil
+	route.AuthSandboxID = ""
+	route.APISecret = ""
+	route.ServiceSecret = ""
+	route.EnvdAccessToken = ""
+	route.TrafficAccessToken = ""
+	route.ForwardAccessToken = ""
 }
 
 func validateSandboxRecord(r *SandboxRecord) error {

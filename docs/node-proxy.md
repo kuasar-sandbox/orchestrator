@@ -130,6 +130,13 @@ sid hash ─► record slot ─► RouteEntry
 worker 对 missing/paused sid 写 wake pipe 给 master;master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 
+受保护 `RouteEntry` 显式携带 `AuthSandboxID`、`APISecret`、`APISecretFingerprint`、
+`ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
+`ForwardAccessToken`。
+ManifestKey 原文不进入路由。节点 proxy 转发时只按目标选择 EnvdAccessToken 或
+ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关及 e2b 数据面组件,
+不由 node 平台层消费。既有 `MmdsSecret` 独立服务于 MMDS,不充当上述任一 token。
+
 ## 5. 转发路径
 
 请求按 `Host: <port>-<sid>.<domain>` 或 `E2b-Sandbox-Id` /
@@ -145,7 +152,8 @@ unknown or not running before timeout   → 404
 普通 HTTP:
 
 1. worker 从共享表解析 route;
-2. 校验 `X-Access-Token` 或 `/files` signature;
+2. 按目标选择 EnvdAccessToken 或 ForwardAccessToken,校验 `X-Access-Token`;符合条件的
+   `/files` 请求也可使用 EnvdAccessToken 验证 signature;
 3. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
    netns 内拨号;
 4. 写入一条 HTTP 请求,流式复制响应,响应结束关闭后端连接。
@@ -160,13 +168,20 @@ CONNECT:
 proxyForwarder:
 
 - conductor 收到数据面请求但处于 external 模式时,不会自己查路由;
-- 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid、port 和 access token;
+- 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid、port,并原样携带客户端的
+  `X-Access-Token`;
 - 普通 HTTP 在该 CONNECT 隧道里发送一条请求;CONNECT 则继续隧道化到沙箱。
 
 ## 6. 数据面鉴权
 
-数据面 token 是 create 响应中的 `envdAccessToken`,请求头为 `X-Access-Token`。
-proxy 逐请求常数时间比较请求 token 与 route 中的 `access_token`。
+数据面请求头统一为 `X-Access-Token`,但期望值按转发目标选择:
+
+- e2b 49983/49999 使用 create 响应中的 `envdAccessToken`;
+- e2b/bare 的其他允许转发端口使用 `forwardAccessToken`;
+- `trafficAccessToken` 只供外部网关及 e2b 数据面组件验证,node proxy 不消费;
+- bare 的 49983/49999 不进入鉴权或转发,直接按不支持的控制端口处理。
+
+proxy 逐请求以常数时间比较请求 token 与选中的显式字段。
 
 `auth` / policy `auth_mode`:
 
@@ -176,8 +191,9 @@ proxy 逐请求常数时间比较请求 token 与 route 中的 `access_token`。
 | `log` | 记录但放行 |
 | `off` | 不校验 |
 
-`GET/POST /files` 可用 envd signature query 替代 `X-Access-Token`;如果请求同时携带
-非空但错误的 `X-Access-Token`,不回退 signature。
+e2b 49983 上的 `GET/POST /files` 在未携带 `X-Access-Token` 时,可用
+EnvdAccessToken 验证 envd signature query;proxy 先验签再转发,envd 收到原始请求后再次
+验证同一 signature。如果请求携带非空但错误的 `X-Access-Token`,不回退 signature。
 
 ## 7. MMDS
 

@@ -25,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
@@ -33,12 +34,13 @@ import (
 )
 
 const (
-	testDomain          = "cluster.stub.local"
-	testGroup           = "/cell/proj/app/g1"
-	testAPISecret       = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
-	testMK              = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	testTemplateRef     = "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	testEnvdAccessToken = "opaque-envd-access-token-from-node"
+	testDomain             = "cluster.stub.local"
+	testGroup              = "/cell/proj/app/g1"
+	testAPISecret          = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+	testMK                 = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testTemplateRef        = "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testEnvdAccessToken    = "opaque-envd-access-token-from-node"
+	testTrafficAccessToken = "opaque-traffic-access-token-from-node"
 )
 
 func fullFingerprint(t *testing.T, secretHex string) string {
@@ -54,13 +56,12 @@ type harness struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reg       *registry.Registry
-	links     *httptest.Server
-	router    *httptest.Server
-	node      *nodeStub
-	apiKey    string
-	dataHits  chan *http.Request
-	dataToken chan string
+	reg      *registry.Registry
+	links    *httptest.Server
+	router   *httptest.Server
+	node     *nodeStub
+	apiKey   string
+	dataHits chan string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -135,11 +136,9 @@ func newHarness(t *testing.T) *harness {
 	svc.Start(ctx)
 	go svc.RegisterLoop(ctx, "s1", placerSrv.URL, "placer.default")
 
-	dataHits := make(chan *http.Request, 16)
-	dataToken := make(chan string, 16)
+	dataHits := make(chan string, 16)
 	nodeHTTP := newClusterDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dataHits <- r.Clone(r.Context())
-		dataToken <- r.Header.Get(router.HeaderAccessTok)
+		dataHits <- r.Host
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
@@ -160,7 +159,7 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		ctx: ctx, cancel: cancel, reg: reg, links: links, router: routerSrv,
-		node: node, apiKey: apiKey, dataHits: dataHits, dataToken: dataToken,
+		node: node, apiKey: apiKey, dataHits: dataHits,
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -287,8 +286,9 @@ func readViewFrame(r io.Reader) (*registry.ViewEvent, error) {
 	return &ev, nil
 }
 
-func TestClusterStubReserveAndDataPlane(t *testing.T) {
+func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	h := newHarness(t)
+	const routeKey = "u1:s1"
 
 	h.waitForNodeKeyCache(t, "n1")
 	h.node.sendHeartbeat(t)
@@ -298,16 +298,43 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 		t.Fatalf("key_put did not carry the complete credential pair: %+v", keyPut)
 	}
 
-	resp := h.doDataByKey(t, "u1:s1")
+	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/sandboxes", nil)
+	req.Host = "api." + testDomain
+	req.Header.Set(router.HeaderGroup, testGroup)
+	req.Header.Set(router.HeaderRouteKey, routeKey)
+	req.Header.Set(router.HeaderAPIKey, h.apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		SandboxID          string `json:"sandboxID"`
+		RouteKey           string `json:"routeKey"`
+		EnvdAccessToken    string `json:"envdAccessToken"`
+		TrafficAccessToken string `json:"trafficAccessToken"`
+		ForwardAccessToken string `json:"forwardAccessToken"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("data by key status=%d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d, want 201", resp.StatusCode)
+	}
+	if created.SandboxID == "" || created.RouteKey != routeKey ||
+		created.EnvdAccessToken != testEnvdAccessToken ||
+		created.TrafficAccessToken != testTrafficAccessToken || created.ForwardAccessToken == "" {
+		t.Fatal("create response did not return SID and the explicit e2b/forward tokens")
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
-	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != "u1:s1" ||
+	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != routeKey ||
 		create.Cluster.AuthSandboxID != create.SID || create.Profile != "e2b" ||
 		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
+	}
+	if created.SandboxID != create.SID {
+		t.Fatalf("create response SID=%q, node command SID=%q", created.SandboxID, create.SID)
 	}
 	if _, found := create.Config[clusterstate.ObjectMetadataKey]; found {
 		t.Fatalf("create command leaked cluster context into user config: %+v", create.Config)
@@ -315,42 +342,58 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	if create.APISecretFingerprint != fullFingerprint(t, testAPISecret) {
 		t.Fatalf("create APISecretFingerprint=%q, want group API secret fingerprint", create.APISecretFingerprint)
 	}
-	reserved, err := h.reg.ReserveSandbox(h.ctx, testGroup, "u1:s1", nil)
+	reserved, err := h.reg.ReserveSandbox(h.ctx, testGroup, routeKey, nil)
 	if err != nil {
 		t.Fatalf("ready Reserve: %v", err)
 	}
-	if reserved.AccessToken != testEnvdAccessToken {
-		t.Fatalf("ready Reserve token=%q, want node-reported token", reserved.AccessToken)
+	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, create.Cluster.AuthSandboxID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, "u1:s1", create.SID)
-	if err != nil || !found || resolved.AccessToken != testEnvdAccessToken {
-		t.Fatalf("resolved route=%+v found=%v err=%v, want node-reported token", resolved, found, err)
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, create.Cluster.AuthSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserved.AuthSandboxID != create.Cluster.AuthSandboxID || reserved.APISecret != testAPISecret ||
+		reserved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
+		reserved.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
+		reserved.ServiceSecret != serviceSecret || reserved.EnvdAccessToken != testEnvdAccessToken ||
+		reserved.TrafficAccessToken != testTrafficAccessToken || reserved.ForwardAccessToken != forwardAccessToken {
+		t.Fatal("ready Reserve did not preserve explicit node-reported credentials")
+	}
+	if created.ForwardAccessToken != forwardAccessToken {
+		t.Fatal("create response ForwardAccessToken did not match the node-reported route")
+	}
+	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, create.SID)
+	if err != nil || !found || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
+		resolved.APISecret != testAPISecret || resolved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
+		resolved.ManifestKeyFingerprint != fullFingerprint(t, testMK) || resolved.ServiceSecret != serviceSecret ||
+		resolved.EnvdAccessToken != testEnvdAccessToken || resolved.TrafficAccessToken != testTrafficAccessToken ||
+		resolved.ForwardAccessToken != forwardAccessToken {
+		t.Fatalf("resolved route did not preserve explicit node-reported credentials: found=%v err=%v", found, err)
 	}
 
+	resp = h.doDataBySID(t, created.SandboxID, routeKey, created.EnvdAccessToken)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("sandbox-host data status=%d, want 204", resp.StatusCode)
+	}
 	select {
-	case req := <-h.dataHits:
-		if req.Host != "49983-"+create.SID+"."+testDomain {
-			t.Fatalf("forwarded Host=%q, want synthesized sandbox host", req.Host)
+	case host := <-h.dataHits:
+		if host != "49983-"+create.SID+"."+testDomain {
+			t.Fatalf("forwarded Host=%q, want explicit sandbox host", host)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("router never forwarded to node data endpoint")
 	}
-	select {
-	case tok := <-h.dataToken:
-		if tok != testEnvdAccessToken {
-			t.Fatalf("node saw access token %q, want node-reported %q", tok, testEnvdAccessToken)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("node did not receive access token")
-	}
 
-	resp = h.doDataByKey(t, "u1:s1")
+	resp = h.doDataBySID(t, created.SandboxID, routeKey, created.EnvdAccessToken)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("second data by key status=%d, want 204", resp.StatusCode)
+		t.Fatalf("second sandbox-host data status=%d, want 204", resp.StatusCode)
 	}
 	if got := h.node.countKind(routesync.CmdCreate); got != 1 {
-		t.Fatalf("create commands=%d, want 1 (route cache should avoid Reserve)", got)
+		t.Fatalf("create commands=%d, want exactly the explicit create", got)
 	}
 }
 
@@ -411,32 +454,18 @@ func TestClusterStubUnownedReportDoesNotDeleteNodeSandbox(t *testing.T) {
 	h.node.assertNoCommand(t, routesync.CmdDelete, "sb-orphan", 500*time.Millisecond)
 }
 
-func (h *harness) doDataByKey(t *testing.T, routeKey string) *http.Response {
+func (h *harness) doDataBySID(t *testing.T, sid, routeKey, accessToken string) *http.Response {
 	t.Helper()
-	var lastStatus int
-	var lastBody string
-	for i := 0; i < 200; i++ {
-		req, _ := http.NewRequest(http.MethodGet, h.router.URL+"/health", nil)
-		req.Host = "data." + testDomain
-		req.Header.Set(router.HeaderGroup, testGroup)
-		req.Header.Set(router.HeaderRouteKey, routeKey)
-		req.Header.Set(router.HeaderAPIKey, h.apiKey)
-		req.Header.Set("E2b-Sandbox-Port", "49983")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode == http.StatusNoContent {
-			return resp
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		lastStatus = resp.StatusCode
-		lastBody = strings.TrimSpace(string(body))
-		time.Sleep(25 * time.Millisecond)
+	req, _ := http.NewRequest(http.MethodGet, h.router.URL+"/health", nil)
+	req.Host = "49983-" + sid + "." + testDomain
+	req.Header.Set(router.HeaderGroup, testGroup)
+	req.Header.Set(router.HeaderRouteKey, routeKey)
+	req.Header.Set(router.HeaderAccessTok, accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("data by key never succeeded; last status=%d body=%s", lastStatus, lastBody)
-	return nil
+	return resp
 }
 
 type nodeStub struct {
@@ -523,16 +552,46 @@ func (n *nodeStub) readLoop() {
 		n.write(n.t, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		switch cmd.Kind {
 		case routesync.CmdCreate, routesync.CmdConnect:
-			n.sendRoute(n.t, routesync.RouteEntry{
-				SandboxID: cmd.SID, State: routesync.StateRunning,
-				AccessToken: testEnvdAccessToken, TemplateID: cmd.TemplateRef, Profile: cmd.Profile,
-			})
+			n.sendRoute(n.t, routeForCommand(n.t, &cmd))
 		case routesync.CmdBuildRegister:
 			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildEvent, Build: &routesync.BuildEvent{
 				BuildID: cmd.BuildID, State: string(registry.BuildBuilding),
 			}})
 		}
 	}
+}
+
+func routeForCommand(t *testing.T, cmd *routesync.Command) routesync.RouteEntry {
+	t.Helper()
+	authSandboxID := cmd.SID
+	if cmd.Cluster != nil && cmd.Cluster.AuthSandboxID != "" {
+		authSandboxID = cmd.Cluster.AuthSandboxID
+	}
+	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, authSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := routesync.RouteEntry{
+		SandboxID:              cmd.SID,
+		TemplateID:             cmd.TemplateRef,
+		Profile:                cmd.Profile,
+		State:                  routesync.StateRunning,
+		AuthSandboxID:          authSandboxID,
+		APISecret:              testAPISecret,
+		APISecretFingerprint:   fullFingerprint(t, testAPISecret),
+		ManifestKeyFingerprint: fullFingerprint(t, testMK),
+		ServiceSecret:          serviceSecret,
+		ForwardAccessToken:     forwardAccessToken,
+	}
+	if cmd.Profile == "e2b" {
+		entry.EnvdAccessToken = testEnvdAccessToken
+		entry.TrafficAccessToken = testTrafficAccessToken
+	}
+	return entry
 }
 
 func (n *nodeStub) waitCommand(t *testing.T, kind string) *routesync.Command {

@@ -3,6 +3,7 @@ package registry
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,43 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
+
+func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
+	ctx := context.Background()
+	reg := New(NewStores(), nil, 0, nil)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:8443"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1"})
+	want := testE2BSandboxRecord("/g", "rk", "sb-route", "n1", StateReady)
+	if _, err := reg.stores.PutSandbox(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	req := httptest.NewRequest(http.MethodGet, RouteLinkRoutePath+"?group=/g&route_key=rk&sid=sb-route", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"access_token":`)) {
+		t.Fatal("protected route retained generic access_token")
+	}
+	var got RouteResolve
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SID != want.SID || got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
+		got.AuthSandboxID != want.AuthSandboxID || got.APISecret != want.APISecret ||
+		got.APISecretFingerprint != want.APISecretFingerprint ||
+		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||
+		got.ServiceSecret != want.ServiceSecret || got.EnvdAccessToken != want.EnvdAccessToken ||
+		got.TrafficAccessToken != want.TrafficAccessToken ||
+		got.ForwardAccessToken != want.ForwardAccessToken {
+		t.Fatal("protected route omitted or changed an explicit credential field")
+	}
+}
 
 func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	mux := http.NewServeMux()
@@ -100,12 +138,15 @@ func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
 	}), 0, nil)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
-	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"unknown\":\"value\"}"}}`)
+	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"unknown\":\"credential-secret-sentinel\"}"}}`)
 	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q, want 400", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "credential-secret-sentinel") {
+		t.Fatalf("invalid credentials value leaked into error: %q", rec.Body.String())
 	}
 	if placements != 0 {
 		t.Fatalf("invalid credentials reached placement %d times", placements)
@@ -130,6 +171,9 @@ func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q, want 400", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "e2b-only") {
+		t.Fatalf("profile-invalid credentials leaked into error: %q", rec.Body.String())
 	}
 	if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
 		t.Fatalf("invalid profile credentials wrote route state: found=%v err=%v", found, err)

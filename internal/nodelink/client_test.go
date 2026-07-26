@@ -18,13 +18,16 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const (
-	testAPISecret   = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
-	testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testAPISecret          = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+	testManifestKey        = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testEnvdAccessToken    = "node-link-envd-token"
+	testTrafficAccessToken = "node-link-traffic-token"
 )
 
 func testFingerprint(secretHex string) string {
@@ -83,6 +86,7 @@ func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent   { return nil }
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+	var keyPair routesync.Command
 	switch cmd.Kind {
 	case routesync.CmdKeyPut:
 		n.mu.Lock()
@@ -91,7 +95,8 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		return ack
 	case routesync.CmdCreate:
 		n.mu.Lock()
-		_, installed := n.keyPairs[cmd.APISecretFingerprint]
+		var installed bool
+		keyPair, installed = n.keyPairs[cmd.APISecretFingerprint]
 		n.createAPIFingerprint = cmd.APISecretFingerprint
 		n.mu.Unlock()
 		if !installed {
@@ -102,10 +107,36 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	default:
 		return ack
 	}
+	authSandboxID := cmd.SID
+	if cmd.Cluster != nil && cmd.Cluster.AuthSandboxID != "" {
+		authSandboxID = cmd.Cluster.AuthSandboxID
+	}
+	serviceSecret, err := keys.DeriveServiceSecret(keyPair.APISecret, authSandboxID)
+	if err != nil {
+		ack.Status = routesync.AckRejected
+		ack.Reason = "invalid service credentials"
+		return ack
+	}
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	if err != nil {
+		ack.Status = routesync.AckRejected
+		ack.Reason = "invalid forward credentials"
+		return ack
+	}
 	e := routesync.RouteEntry{
-		SandboxID: cmd.SID,
-		Profile:   cmd.Profile,
-		State:     routesync.StateRunning,
+		SandboxID:              cmd.SID,
+		Profile:                cmd.Profile,
+		State:                  routesync.StateRunning,
+		AuthSandboxID:          authSandboxID,
+		APISecret:              keyPair.APISecret,
+		APISecretFingerprint:   keyPair.APISecretFingerprint,
+		ManifestKeyFingerprint: keyPair.ManifestKeyFingerprint,
+		ServiceSecret:          serviceSecret,
+		ForwardAccessToken:     forwardAccessToken,
+	}
+	if cmd.Profile == "e2b" {
+		e.EnvdAccessToken = testEnvdAccessToken
+		e.TrafficAccessToken = testTrafficAccessToken
 	}
 	n.mu.Lock()
 	n.routes[cmd.SID] = e
@@ -205,6 +236,14 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	}
 	if got := node.createFingerprint(); got != apiFingerprint {
 		t.Fatalf("create APISecretFingerprint=%q, placement fingerprint=%q", got, apiFingerprint)
+	}
+	if res.AuthSandboxID != res.SID || res.APISecret != testAPISecret ||
+		res.APISecretFingerprint != apiFingerprint || res.ManifestKeyFingerprint != manifestFingerprint ||
+		res.EnvdAccessToken != testEnvdAccessToken || res.TrafficAccessToken != testTrafficAccessToken {
+		t.Fatal("reserve result did not preserve explicit route credentials")
+	}
+	if err := keys.VerifyForwardAccessToken(res.ForwardAccessToken, res.ServiceSecret, res.AuthSandboxID); err != nil {
+		t.Fatalf("reserve ForwardAccessToken: %v", err)
 	}
 }
 

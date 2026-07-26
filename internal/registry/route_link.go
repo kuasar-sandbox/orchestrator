@@ -27,16 +27,22 @@ const (
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
 type RouteResolve struct {
-	SID                string `json:"sid"`
-	Group              string `json:"group"`
-	RouteKey           string `json:"route_key"`
-	NodeID             string `json:"node_id"`
-	DataEndpoint       string `json:"data_endpoint"`
-	Profile            string `json:"profile"`
-	AccessToken        string `json:"access_token"`
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
-	TargetPort         int    `json:"target_port,omitempty"`
-	State              string `json:"state"`
+	SID                    string `json:"sid"`
+	Group                  string `json:"group"`
+	RouteKey               string `json:"route_key"`
+	NodeID                 string `json:"node_id"`
+	DataEndpoint           string `json:"data_endpoint"`
+	Profile                string `json:"profile"`
+	AuthSandboxID          string `json:"auth_sandbox_id"`
+	APISecret              string `json:"api_secret"`
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ServiceSecret          string `json:"service_secret"`
+	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string `json:"forward_access_token"`
+	TargetPort             int    `json:"target_port,omitempty"`
+	State                  string `json:"state"`
 }
 
 // SandboxReserveReq is the router-to-registry create payload. Config remains a
@@ -218,11 +224,20 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	if rec.SID != sid {
 		return nil, false, nil
 	}
+	if rec.State == StateReady || rec.State == StatePaused || hasRouteCredentials(rec) {
+		if _, _, err := replacementCredentials(rec); err != nil {
+			return nil, false, err
+		}
+	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, AccessToken: rec.AccessToken,
-		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
-		State: string(rec.State),
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile,
+		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
+		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
+		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
+		TargetPort: rec.TargetPort,
+		State:      string(rec.State),
 	}, true, nil
 }
 

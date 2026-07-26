@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	nodestore "github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -152,16 +156,22 @@ type reserveCall struct {
 	createConfig    map[string]string
 }
 
-// ReserveResult is what a satisfied ReserveSandbox returns (cluster.md). The
-// router injects AccessToken and forwards to the node's DataEndpoint.
+// ReserveResult is the protected route material returned to a trusted router
+// after ReserveSandbox has converged the node-reported business record.
 type ReserveResult struct {
-	NodeID             string `json:"node_id"`
-	SID                string `json:"sid"`
-	Profile            string `json:"profile"`
-	AccessToken        string `json:"access_token"`
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
-	TargetPort         int    `json:"target_port,omitempty"`
-	DataEndpoint       string `json:"data_endpoint"`
+	NodeID                 string `json:"node_id"`
+	SID                    string `json:"sid"`
+	Profile                string `json:"profile"`
+	AuthSandboxID          string `json:"auth_sandbox_id"`
+	APISecret              string `json:"api_secret"`
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ServiceSecret          string `json:"service_secret"`
+	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string `json:"forward_access_token"`
+	TargetPort             int    `json:"target_port,omitempty"`
+	DataEndpoint           string `json:"data_endpoint"`
 }
 
 // New builds a Registry. Production callers set a placer_link placer explicitly.
@@ -440,7 +450,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
-	createConfig, err := normalizeSandboxReserveConfig(createConfig)
+	createConfig, createCredentials, err := normalizeSandboxReserveConfig(createConfig)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 	}
@@ -474,7 +484,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		r.mu.Unlock()
 	}()
 
-	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig); err != nil {
+	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials); err != nil {
 		r.finish(key, nil, err)
 		if errors.Is(err, errNodeSandboxIDConflict) {
 			r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
@@ -572,9 +582,13 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string) error {
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials) error {
 	// PAUSED: resume on the same node (no placement).
 	if found && rec.State == StatePaused && rec.NodeID != "" {
+		_, authSandboxID, err := replacementCredentials(rec)
+		if err != nil {
+			return err
+		}
 		if r.nodeOwner == nil {
 			return ErrNodeGone
 		}
@@ -598,7 +612,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID,
 			Profile: rec.Profile,
 			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, AuthSandboxID: rec.SID,
+				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
 			},
 			APISecretFingerprint: rec.APISecretFingerprint,
 		}
@@ -624,18 +638,25 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		copy := *rec
 		replaceReady = &copy
 	}
-	return r.placeAndCreate(ctx, group, routeKey, createConfig, replaceReady)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, replaceReady *SandboxRecord) error {
-	_, credentialsPresent := createConfig[sandboxcfg.NsCredentials]
-	credentials, createConfig, err := sandboxcfg.ExtractCredentials(createConfig)
-	if err != nil {
-		return fmt.Errorf("registry: invalid sandbox credentials: %w", err)
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord) error {
+	if _, found := createConfig[sandboxcfg.NsCredentials]; found {
+		return errors.New("registry: create credentials were not separated from config")
+	}
+	workflowCredentials := cloneCreateCredentials(createCredentials)
+	workflowReplacement := replaceReady
+	if replaceReady != nil {
+		var err error
+		workflowCredentials, _, err = replacementCredentials(replaceReady)
+		if err != nil {
+			return err
+		}
 	}
 	excluded := placementExclusions{}
 	casConflicts := 0
@@ -650,6 +671,25 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		}
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
+		}
+		selectedCredentials := cloneCreateCredentials(workflowCredentials)
+		selectedReplacement := workflowReplacement
+		binding := workflowReplacement
+		if curFound && cur.State == StateReserved {
+			// The first committed RESERVED row freezes the create credential
+			// selection. A retry or competing Reserve must not adopt credentials
+			// from its own request after that point.
+			binding = cur
+			if hasRouteCredentials(cur) {
+				selectedCredentials, _, err = replacementCredentials(cur)
+				if err != nil {
+					return err
+				}
+				selectedReplacement = cur
+			} else {
+				selectedCredentials = cloneCreateCredentials(cur.CreateCredentials)
+				selectedReplacement = nil
+			}
 		}
 		sid := "sb-" + newID()
 		placement, perr := r.placer.Place(ctx, PlaceRequest{
@@ -672,14 +712,14 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return fmt.Errorf("registry: invalid placement template: %w", err)
 		}
-		if replaceReady != nil && placement.APISecretFingerprint != replaceReady.APISecretFingerprint {
+		if binding != nil && placement.APISecretFingerprint != binding.APISecretFingerprint {
 			return errors.New("registry: replacement credential binding mismatch")
 		}
-		if replaceReady != nil && string(template.Profile) != replaceReady.Profile {
+		if binding != nil && string(template.Profile) != binding.Profile {
 			return errors.New("registry: replacement profile mismatch")
 		}
 		config := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
-		config, err = attachCreateCredentials(config, template.Profile, credentials, credentialsPresent)
+		config, err = attachCreateCredentials(config, template.Profile, selectedCredentials)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 		}
@@ -710,8 +750,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
 			TemplateID: placement.TemplateRef, Profile: string(template.Profile),
 			APISecretFingerprint: placement.APISecretFingerprint,
+			CreateCredentials:    cloneCreateCredentials(selectedCredentials),
 			TargetPort:           placement.TargetPort,
 		}
+		copyRouteCredentials(reserved, selectedReplacement)
 		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
 		if cerr != nil {
 			return cerr
@@ -721,6 +763,14 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 				continue
 			}
 			return ErrNoNode
+		}
+		workflowCredentials = cloneCreateCredentials(selectedCredentials)
+		if hasRouteCredentials(reserved) {
+			copy := *reserved
+			copy.CreateCredentials = cloneCreateCredentials(reserved.CreateCredentials)
+			workflowReplacement = &copy
+		} else {
+			workflowReplacement = nil
 		}
 		if err := r.stores.AddNodeSandboxRef(ctx, nodeID, ref); err != nil {
 			if errors.Is(err, errNodeSandboxIDConflict) {
@@ -735,11 +785,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return err
 		}
 
+		authSandboxID := sid
+		if selectedReplacement != nil {
+			authSandboxID = selectedReplacement.AuthSandboxID
+		}
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdCreate, SID: sid,
 			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
 			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, AuthSandboxID: sid,
+				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
 			},
 			APISecretFingerprint: placement.APISecretFingerprint,
 		}
@@ -778,35 +832,29 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 
 // normalizeSandboxReserveConfig validates request-scoped namespaces before any
 // READY fast path, placement, route mutation, or lifecycle command. Credentials
-// remain attached in canonical form for a possible create, but are ignored by an
-// already-existing sandbox and never reach the placer.
-func normalizeSandboxReserveConfig(config map[string]string) (map[string]string, error) {
+// are parsed once and removed from ordinary config at this boundary.
+func normalizeSandboxReserveConfig(config map[string]string) (map[string]string, *sandboxcfg.Credentials, error) {
 	config, err := sandboxcfg.NormalizeRestoreMetadata(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	_, present := config[sandboxcfg.NsCredentials]
 	credentials, cleaned, err := sandboxcfg.ExtractCredentials(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !present {
-		return cleaned, nil
+		return cleaned, nil, nil
 	}
-	canonical, err := json.Marshal(credentials)
-	if err != nil {
-		return nil, errors.New("registry: encode sandbox credentials")
-	}
-	cleaned[sandboxcfg.NsCredentials] = string(canonical)
-	return cleaned, nil
+	return cleaned, &credentials, nil
 }
 
-func attachCreateCredentials(config map[string]string, profile types.Profile, credentials sandboxcfg.Credentials, present bool) (map[string]string, error) {
-	if err := sandboxcfg.ValidateCredentialsForProfile(profile, credentials); err != nil {
-		return nil, err
-	}
-	if !present {
+func attachCreateCredentials(config map[string]string, profile types.Profile, credentials *sandboxcfg.Credentials) (map[string]string, error) {
+	if credentials == nil {
 		return config, nil
+	}
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, *credentials); err != nil {
+		return nil, err
 	}
 	canonical, err := json.Marshal(credentials)
 	if err != nil {
@@ -817,6 +865,48 @@ func attachCreateCredentials(config map[string]string, profile types.Profile, cr
 	}
 	config[sandboxcfg.NsCredentials] = string(canonical)
 	return config, nil
+}
+
+func cloneCreateCredentials(credentials *sandboxcfg.Credentials) *sandboxcfg.Credentials {
+	if credentials == nil {
+		return nil
+	}
+	clone := *credentials
+	return &clone
+}
+
+func replacementCredentials(record *SandboxRecord) (*sandboxcfg.Credentials, string, error) {
+	if record == nil || !hasRouteCredentials(record) {
+		return nil, "", errors.New("registry: replacement route credentials are unavailable")
+	}
+	route := &routesync.RouteEntry{
+		Profile: record.Profile, AuthSandboxID: record.AuthSandboxID,
+		APISecret: record.APISecret, APISecretFingerprint: record.APISecretFingerprint,
+		ManifestKeyFingerprint: record.ManifestKeyFingerprint,
+		ServiceSecret:          record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
+		TrafficAccessToken: record.TrafficAccessToken, ForwardAccessToken: record.ForwardAccessToken,
+	}
+	if err := validateRouteCredentials(route, record.APISecretFingerprint); err != nil {
+		return nil, "", errors.New("registry: replacement route credentials are invalid")
+	}
+	return &sandboxcfg.Credentials{
+		ServiceSecret: record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
+		TrafficAccessToken: record.TrafficAccessToken,
+	}, record.AuthSandboxID, nil
+}
+
+func copyRouteCredentials(dst, src *SandboxRecord) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.APISecretFingerprint = src.APISecretFingerprint
+	dst.ManifestKeyFingerprint = src.ManifestKeyFingerprint
+	dst.AuthSandboxID = src.AuthSandboxID
+	dst.APISecret = src.APISecret
+	dst.ServiceSecret = src.ServiceSecret
+	dst.EnvdAccessToken = src.EnvdAccessToken
+	dst.TrafficAccessToken = src.TrafficAccessToken
+	dst.ForwardAccessToken = src.ForwardAccessToken
 }
 
 // sendAndWait sends a command and blocks until the node acknowledges receipt or
@@ -892,9 +982,15 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	rec := &SandboxRecord{
 		Group: ref.Group, RouteKey: ref.RouteKey, SID: e.SandboxID, NodeID: nodeID,
 		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, Profile: ref.Profile,
-		APISecretFingerprint: ref.APISecretFingerprint, AccessToken: e.AccessToken,
-		TrafficAccessToken: e.TrafficAccessToken,
-		LastActive:         time.Now().Unix(),
+		APISecretFingerprint:   ref.APISecretFingerprint,
+		ManifestKeyFingerprint: e.ManifestKeyFingerprint,
+		AuthSandboxID:          e.AuthSandboxID,
+		APISecret:              e.APISecret,
+		ServiceSecret:          e.ServiceSecret,
+		EnvdAccessToken:        e.EnvdAccessToken,
+		TrafficAccessToken:     e.TrafficAccessToken,
+		ForwardAccessToken:     e.ForwardAccessToken,
+		LastActive:             time.Now().Unix(),
 	}
 	switch e.State {
 	case routesync.StateRunning:
@@ -906,6 +1002,62 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		return
 	}
 	r.applyLiveRoute(ctx, nodeID, e, rec)
+}
+
+func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint string) error {
+	apiSecretFingerprint, err := nodestore.APISecretHash(e.APISecret)
+	if err != nil || apiSecretFingerprint != e.APISecretFingerprint ||
+		apiSecretFingerprint != expectedAPISecretFingerprint {
+		return errors.New("registry: route API secret binding is invalid")
+	}
+	if !validFullFingerprint(e.ManifestKeyFingerprint) {
+		return errors.New("registry: route manifest key fingerprint is invalid")
+	}
+	if e.AuthSandboxID == "" || !utf8.ValidString(e.AuthSandboxID) {
+		return errors.New("registry: route authentication sandbox ID is invalid")
+	}
+	if err := keys.VerifyForwardAccessToken(e.ForwardAccessToken, e.ServiceSecret, e.AuthSandboxID); err != nil {
+		return errors.New("registry: route forward credential is invalid")
+	}
+	if !sandboxcfg.ValidE2BAccessToken(e.EnvdAccessToken) ||
+		!sandboxcfg.ValidE2BAccessToken(e.TrafficAccessToken) {
+		return errors.New("registry: route e2b credential is invalid")
+	}
+	switch types.Profile(e.Profile) {
+	case types.ProfileE2B:
+		if e.EnvdAccessToken == "" || e.TrafficAccessToken == "" {
+			return errors.New("registry: route e2b credentials are required")
+		}
+	case types.ProfileBare:
+		if e.EnvdAccessToken != "" || e.TrafficAccessToken != "" {
+			return errors.New("registry: bare route contains e2b credentials")
+		}
+	default:
+		return errors.New("registry: route profile is invalid")
+	}
+	return nil
+}
+
+func sameRouteCredentials(a, b *SandboxRecord) bool {
+	return a.APISecretFingerprint == b.APISecretFingerprint &&
+		a.ManifestKeyFingerprint == b.ManifestKeyFingerprint &&
+		a.AuthSandboxID == b.AuthSandboxID &&
+		constantTimeStringEqual(a.APISecret, b.APISecret) &&
+		constantTimeStringEqual(a.ServiceSecret, b.ServiceSecret) &&
+		constantTimeStringEqual(a.EnvdAccessToken, b.EnvdAccessToken) &&
+		constantTimeStringEqual(a.TrafficAccessToken, b.TrafficAccessToken) &&
+		constantTimeStringEqual(a.ForwardAccessToken, b.ForwardAccessToken)
+}
+
+func constantTimeStringEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func hasRouteCredentials(record *SandboxRecord) bool {
+	return record != nil && (record.ManifestKeyFingerprint != "" ||
+		record.AuthSandboxID != "" || record.APISecret != "" ||
+		record.ServiceSecret != "" || record.EnvdAccessToken != "" ||
+		record.TrafficAccessToken != "" || record.ForwardAccessToken != "")
 }
 
 func (r *Registry) lookupNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
@@ -962,14 +1114,16 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey, rec.APISecretFingerprint)
 		return true
 	}
+	if err := validateRouteCredentials(e, rec.APISecretFingerprint); err != nil {
+		r.log.Warn("registry: ignored route with invalid credentials", "node", nodeID, "sid", e.SandboxID, "err", err)
+		return true
+	}
 	if rec.TemplateID == "" {
 		rec.TemplateID = cur.TemplateID
 	}
-	if rec.AccessToken == "" {
-		rec.AccessToken = cur.AccessToken
-	}
-	if rec.TrafficAccessToken == "" {
-		rec.TrafficAccessToken = cur.TrafficAccessToken
+	if hasRouteCredentials(cur) && !sameRouteCredentials(rec, cur) {
+		r.log.Warn("registry: ignored route credential rebinding", "node", nodeID, "sid", e.SandboxID)
+		return true
 	}
 	if rec.TargetPort == 0 {
 		rec.TargetPort = cur.TargetPort
@@ -986,9 +1140,12 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	}
 	if rec.State == StateReady {
 		r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{
-			NodeID: nodeID, SID: e.SandboxID, Profile: rec.Profile, AccessToken: rec.AccessToken,
-			TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
-			DataEndpoint: r.nodeDataEndpoint(ctx, nodeID),
+			NodeID: nodeID, SID: e.SandboxID, Profile: rec.Profile,
+			AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+			APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
+			ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
+			TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
+			TargetPort: rec.TargetPort, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID),
 		}, nil)
 	}
 	return true
@@ -1152,6 +1309,9 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	if rec == nil || rec.NodeID == "" || r.nodeOwner == nil {
 		return nil, false, nil
 	}
+	if _, _, err := replacementCredentials(rec); err != nil {
+		return nil, false, err
+	}
 	node, found, err := r.nodeOwner.Runtime(ctx, rec.NodeID)
 	if errors.Is(err, ErrNodeGone) {
 		return nil, false, nil
@@ -1163,9 +1323,12 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 		return nil, false, fmt.Errorf("registry: runtime profile for connected node %q is unavailable", rec.NodeID)
 	}
 	return &ReserveResult{
-		NodeID: rec.NodeID, SID: rec.SID, Profile: rec.Profile, AccessToken: rec.AccessToken,
-		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
-		DataEndpoint: node.DataEndpoint,
+		NodeID: rec.NodeID, SID: rec.SID, Profile: rec.Profile,
+		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
+		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
+		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
+		TargetPort: rec.TargetPort, DataEndpoint: node.DataEndpoint,
 	}, true, nil
 }
 

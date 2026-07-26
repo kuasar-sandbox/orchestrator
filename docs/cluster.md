@@ -35,9 +35,10 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
                                └────────────── placer consumes one owner
 ```
 
-稳态数据面不经过 registry。只有 cold/miss/fail-fast 路径需要 registry:
+稳态数据面不经过 registry。只有显式 create、已知 route 激活和 cache miss/fail-fast 路径需要 registry:
 
-- router miss 时调用 `ReserveSandbox` / `ReserveBuild`。
+- 显式 create 或已知非 READY sandbox 的激活调用 `ReserveSandbox`;数据面 cache miss/fail-fast 先调用
+  `Resolve`,不会用未知 route 隐式创建 sandbox。显式 build register 调用 `ReserveBuild`。
 - registry 调 placer `PlaceSandbox` / `PlaceBuild`。
 - registry 经 node owner 下发 create/connect/delete/build/key 命令。
 - node 经 node_link 上报 sandbox/build 状态和低频节点目录。
@@ -65,7 +66,7 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
 | 角色 | 职责 |
 |---|---|
 | registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `placer_link` 执行态和 membership |
-| router | e2b 统一入口;按 group 定位 route owner;miss 时 Reserve;热路径复用活动连接 |
+| router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,显式 create 或已知 route 激活时 Reserve;热路径复用活动连接 |
 | placer | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
 | node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/delete/build/key 命令 |
 
@@ -674,8 +675,13 @@ node_link 重建第二条事实传播路径。
 | `node_id` | 当前承载节点 |
 | `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
 | `api_secret_fingerprint` | 当前实例创建时绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
-| `access_token` | 当前实例数据面 token |
-| `traffic_access_token` | SDK 兼容返回字段,不作为数据面强制鉴权头 |
+| `manifest_key_fingerprint` | 与 APISecret 配对的 ManifestKey 完整指纹;route 不保存或投影 ManifestKey 原文 |
+| `auth_sandbox_id` | ServiceSecret 和 KAT token 使用的稳定认证 subject |
+| `api_secret` | 当前 sandbox 已绑定的 APISecret;仅存在于受保护 route 存储和可信 router/proxy 投影 |
+| `service_secret` | 当前 sandbox 持久化的 service credential;用于签发和验证用途明确的 KAT token |
+| `envd_access_token` | e2b envd 端口使用的数据面 token |
+| `traffic_access_token` | 外部网关及 e2b 数据面组件使用的 token,cluster 平台层不消费 |
+| `forward_access_token` | bare/e2b 的其他 forward 目标使用的数据面 token |
 | `target_port` | group/provider 返回的强制数据面端口;为 0 时请求必须显式携带端口 |
 | `updated_at` | timeout/reconcile 使用 |
 
@@ -687,7 +693,8 @@ ready -> paused -> reserved -> ready
 ready/paused/reserved -> dead/tombstone
 ```
 
-整机清空、单沙箱 killed、node 重启后的缺失 sandbox 都收敛为 dead route 清理;下次 Reserve 重新放置。
+整机清空、单沙箱 killed、node 重启后的缺失 sandbox 都收敛为 dead route 清理;下次显式 create/恢复
+Reserve 才重新放置。
 
 ### 8.3 Reserve
 
@@ -710,7 +717,7 @@ node owner
   │ create/connect (system context is persisted separately)
   ▼
 node reports RUNNING/READY
-  │ with node-issued access tokens
+  │ with node-issued Envd/Traffic/Forward access tokens
   │
   ▼
 route_link CAS ready
@@ -792,10 +799,12 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 
 router 是无状态北向入口,但持本地缓存:
 
-- route resolution cache:`(group, route_key, sandbox_id)` -> node endpoint / access token / route Rev。
+- route resolution cache:`(group, route_key, sandbox_id)` -> node endpoint / profile /
+  AuthSandboxID / APISecret / 两项 root fingerprint / ServiceSecret /
+  EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / route Rev。
 - build forwarding cache:`(group, build_id)` -> node endpoint;不能只以 build_id 为键。
 - active connection cache:同一路由已有活动 HTTP/CONNECT/WebSocket 时,新请求不调用 Reserve。
-- singleflight:同一 `(group, route_key)` 并发 miss 只发起一次 Reserve。
+- singleflight:同一 `(group, route_key)` 的并发显式 create 或已知 route 激活只发起一次 Reserve。
 
 ```text
 request(group, route_key, sandbox_id)
@@ -804,26 +813,30 @@ request(group, route_key, sandbox_id)
   │
   ├─ route cache hit ──────────────► node proxy
   │
-  └─ miss/fail-fast ───────────────► route owner Reserve/Resolve
+  └─ miss/fail-fast ───────────────► route owner Resolve
                                       │
-                                      ▼
-                                    node proxy
+                                      ├─ READY ─────────────► node proxy
+                                      └─ known non-READY ───► Reserve ──► node proxy
 ```
+
+未知 route 的数据面请求在 Resolve 后返回 not found,不会触发 sandbox 创建。
 
 所有请求必须带 group。router 通过 bootstrap 拉取 `/cluster/membership`,再按 active membership 定位
 route owner。membership refresh 会尝试 bootstrap 和已知 active/next/old_grace 成员,选择 active version
 最新的结果。
 
-router 调 route owner 的 verify-key;route owner 只 failover 到 ready placer 校验。该校验由 placer 使用
-provider 的 APISecret 完成,router 与 route owner 不读取根凭据,也不使用 ManifestKey 做 API 认证。
+router 调 route owner 的 verify-key;route owner 只 failover 到 ready placer 校验。该 group 级校验仍由
+placer 使用 provider 的 APISecret 完成。sandbox READY 后,node 把该业务记录已绑定的 APISecret、ServiceSecret
+及用途明确的 access tokens 投影到受保护 route,供可信 registry/router/proxy 使用;ManifestKey 原文不进入
+该链路,也不用于 API 认证。
 
 ## 11. 密钥与鉴权
 
-group 有两个根凭据域:
+同一 group/租户范围内有两个用途分离的根凭据域:
 
 | 名称 | 持有者 | 用途 |
 |---|---|---|
-| `APISecret` | provider/placer/node | 签发并验证 API key;完整 SHA-256 指纹标识凭据对 |
+| `APISecret` | provider/placer/node/registry/router/proxy | 签发并验证 API key及后续用途明确的认证材料;完整 SHA-256 指纹标识凭据对 |
 | `ManifestKey` | provider/placer/node | 解密 manifest/镜像/快照内容,封装 pull token;router 不接触 |
 
 两者都是 32B / 64-lowercase-hex。APISecret 缺省时,placer 在物化 inline ManifestKey 时使用固定 KDF:
@@ -863,6 +876,14 @@ ServiceSecret 不是第三个 group root,而是每个 node Sandbox 业务记录�
 `kuasar-sandbox.credentials` object 显式指定。Registry 在 route/ref/command 副作用前按 placement
 Profile 校验并规范化该 object,node 再次校验、分离后把 ServiceSecret 与 Envd/Traffic/Forward token
 加密写入 Sandbox 业务行。普通 metadata、guest 配置和 node-stub 观测面均不保留 credentials object。
+
+Registry 从 node route event 物化受保护 route 时,只采纳 APISecret、两项 root fingerprint、
+AuthSandboxID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文、Exec token
+或既有 node-link wire 中供节点 proxy/MMDS 使用的 MmdsSecret。Registry 本阶段以明文结构化字段保存
+这些受保护 route 凭据,不增加额外加密层;它们只可由受保护 Reserve/Resolve 返回给可信 router,
+不得进入普通 route watch/list、公开 create/get/list 响应、日志或观测接口。创建请求中的
+`kuasar-sandbox.credentials` 在 Reserve 入口从普通 config 分离,仅随 RESERVED 记录冻结并在 CmdCreate 前临时
+编码,READY 后清除。
 
 ## 12. Build
 
@@ -926,7 +947,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 
 | 事件 | 行为 |
 |---|---|
-| router 崩溃 | 丢本地缓存;重启后 miss 重新 Reserve |
+| router 崩溃 | 丢本地缓存;重启后 cache miss 重新 Resolve |
 | placer 崩溃 | registry 对同 group failover 到下一个 ready placer;热路径不受影响 |
 | node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；node_dead_after 后清理 node profile/node_list 和关联执行态；node 重连后全量/增量重报 |
 | node 整机重启 | node 清空运行态;缺失 sandbox 经 node 上报/清理收敛为 dead route |
@@ -958,7 +979,7 @@ node,但不启动 microVM。除 microVM/应用进程外,它模拟节点控制面
 
 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/placer` 与 `node-stub-ctl`。
 `test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
-import、key 分发、Reserve、数据面转发、active cache、BuildRegister、孤儿 route 清理和节点清空收敛。
+import、key 分发、显式 create/Reserve、按 SID 数据面转发、active cache、BuildRegister、孤儿 route 清理和节点清空收敛。
 
 ## 17. See Also
 

@@ -17,7 +17,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 |---|---|---|---|
 | Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
-| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ placer(放置调度 + group provider);按 sandbox-group + route-key 把请求路由 / 按需拉起到正确节点的沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
+| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ placer(放置调度 + group provider);显式创建沙箱后按 sandbox-group + route-key + sandbox_id 路由请求,并按需激活已知的非 READY 沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
 
 **Region 级共享资源**(由各自的平台管理面运营,平台外)
 
@@ -252,7 +252,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
 (shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
+按 sandbox-group + route-key + sandbox_id 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
 放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
 时**不需要** cluster 层。
 

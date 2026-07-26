@@ -23,7 +23,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 1
+	schema uint32 = 2
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -37,6 +37,8 @@ const (
 	maxState       = 16
 	maxUDS         = 256
 	maxFloatingIP  = 64
+	maxSecret      = 64
+	maxFingerprint = 64
 	maxAccessToken = 256
 	maxSnapLoc     = 32
 	maxMmdsSecret  = 128
@@ -69,17 +71,23 @@ type mmapRecord struct {
 	SyncGen uint64
 	Rev     uint64
 
-	SandboxID          [maxSandboxID]byte
-	Profile            [maxProfile]byte
-	TemplateID         [maxTemplateID]byte
-	State              [maxState]byte
-	EnvdUDS            [maxUDS]byte
-	CiUDS              [maxUDS]byte
-	FloatingIP         [maxFloatingIP]byte
-	AccessToken        [maxAccessToken]byte
-	TrafficAccessToken [maxAccessToken]byte
-	SnapshotLocation   [maxSnapLoc]byte
-	MmdsSecret         [maxMmdsSecret]byte
+	SandboxID              [maxSandboxID]byte
+	Profile                [maxProfile]byte
+	TemplateID             [maxTemplateID]byte
+	State                  [maxState]byte
+	EnvdUDS                [maxUDS]byte
+	CiUDS                  [maxUDS]byte
+	FloatingIP             [maxFloatingIP]byte
+	AuthSandboxID          [maxSandboxID]byte
+	APISecret              [maxSecret]byte
+	APISecretFingerprint   [maxFingerprint]byte
+	ManifestKeyFingerprint [maxFingerprint]byte
+	ServiceSecret          [maxSecret]byte
+	EnvdAccessToken        [maxAccessToken]byte
+	TrafficAccessToken     [maxAccessToken]byte
+	ForwardAccessToken     [maxAccessToken]byte
+	SnapshotLocation       [maxSnapLoc]byte
+	MmdsSecret             [maxMmdsSecret]byte
 }
 
 // Table is a memory-mapped fixed-capacity route table.
@@ -273,8 +281,14 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	_ = putFixed(rec.EnvdUDS[:], in.EnvdUDS)
 	_ = putFixed(rec.CiUDS[:], in.CiUDS)
 	_ = putFixed(rec.FloatingIP[:], in.FloatingIP)
-	_ = putFixed(rec.AccessToken[:], in.AccessToken)
+	_ = putFixed(rec.AuthSandboxID[:], in.AuthSandboxID)
+	_ = putFixed(rec.APISecret[:], in.APISecret)
+	_ = putFixed(rec.APISecretFingerprint[:], in.APISecretFingerprint)
+	_ = putFixed(rec.ManifestKeyFingerprint[:], in.ManifestKeyFingerprint)
+	_ = putFixed(rec.ServiceSecret[:], in.ServiceSecret)
+	_ = putFixed(rec.EnvdAccessToken[:], in.EnvdAccessToken)
 	_ = putFixed(rec.TrafficAccessToken[:], in.TrafficAccessToken)
+	_ = putFixed(rec.ForwardAccessToken[:], in.ForwardAccessToken)
 	_ = putFixed(rec.SnapshotLocation[:], in.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], in.MmdsSecret)
 	finishWrite(rec)
@@ -305,8 +319,14 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	clearFixed(rec.EnvdUDS[:])
 	clearFixed(rec.CiUDS[:])
 	clearFixed(rec.FloatingIP[:])
-	clearFixed(rec.AccessToken[:])
+	clearFixed(rec.AuthSandboxID[:])
+	clearFixed(rec.APISecret[:])
+	clearFixed(rec.APISecretFingerprint[:])
+	clearFixed(rec.ManifestKeyFingerprint[:])
+	clearFixed(rec.ServiceSecret[:])
+	clearFixed(rec.EnvdAccessToken[:])
 	clearFixed(rec.TrafficAccessToken[:])
+	clearFixed(rec.ForwardAccessToken[:])
 	clearFixed(rec.SnapshotLocation[:])
 	clearFixed(rec.MmdsSecret[:])
 	finishWrite(rec)
@@ -366,7 +386,7 @@ func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool
 	if !ok || r.State != routesync.StateRunning {
 		return "", "", false
 	}
-	return r.TemplateID, r.AccessToken, true
+	return r.TemplateID, r.EnvdAccessToken, true
 }
 
 func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
@@ -432,17 +452,23 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 		}
 		st := atomic.LoadUint32(&rec.Status)
 		entry := routesync.RouteEntry{
-			SandboxID:          fixedString(rec.SandboxID[:]),
-			Profile:            fixedString(rec.Profile[:]),
-			TemplateID:         fixedString(rec.TemplateID[:]),
-			State:              fixedString(rec.State[:]),
-			EnvdUDS:            fixedString(rec.EnvdUDS[:]),
-			CiUDS:              fixedString(rec.CiUDS[:]),
-			FloatingIP:         fixedString(rec.FloatingIP[:]),
-			AccessToken:        fixedString(rec.AccessToken[:]),
-			TrafficAccessToken: fixedString(rec.TrafficAccessToken[:]),
-			SnapshotLocation:   fixedString(rec.SnapshotLocation[:]),
-			MmdsSecret:         fixedString(rec.MmdsSecret[:]),
+			SandboxID:              fixedString(rec.SandboxID[:]),
+			Profile:                fixedString(rec.Profile[:]),
+			TemplateID:             fixedString(rec.TemplateID[:]),
+			State:                  fixedString(rec.State[:]),
+			EnvdUDS:                fixedString(rec.EnvdUDS[:]),
+			CiUDS:                  fixedString(rec.CiUDS[:]),
+			FloatingIP:             fixedString(rec.FloatingIP[:]),
+			AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
+			APISecret:              fixedString(rec.APISecret[:]),
+			APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
+			ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
+			ServiceSecret:          fixedString(rec.ServiceSecret[:]),
+			EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
+			TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
+			ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
+			SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
+			MmdsSecret:             fixedString(rec.MmdsSecret[:]),
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
 		if seq1 == seq2 && seq2&1 == 0 {
@@ -497,8 +523,14 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"envd_uds", r.EnvdUDS, maxUDS},
 		{"ci_uds", r.CiUDS, maxUDS},
 		{"floatingip", r.FloatingIP, maxFloatingIP},
-		{"access_token", r.AccessToken, maxAccessToken},
+		{"auth_sandbox_id", r.AuthSandboxID, maxSandboxID},
+		{"api_secret", r.APISecret, maxSecret},
+		{"api_secret_fingerprint", r.APISecretFingerprint, maxFingerprint},
+		{"manifest_key_fingerprint", r.ManifestKeyFingerprint, maxFingerprint},
+		{"service_secret", r.ServiceSecret, maxSecret},
+		{"envd_access_token", r.EnvdAccessToken, maxAccessToken},
 		{"traffic_access_token", r.TrafficAccessToken, maxAccessToken},
+		{"forward_access_token", r.ForwardAccessToken, maxAccessToken},
 		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
 	}

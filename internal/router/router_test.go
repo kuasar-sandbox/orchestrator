@@ -249,7 +249,11 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
-		return textResponse(http.StatusOK, `{"node_id":"n1","sid":"s1","data_endpoint":"node:1"}`), nil
+		body, err := json.Marshal(routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return textResponse(http.StatusOK, string(body)), nil
 	})}
 	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
 		return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
@@ -265,7 +269,8 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 }
 
 func TestReserveByKeyJoinsExistingRouteFlight(t *testing.T) {
-	result := &reserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	resultValue := routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B)
+	result := &resultValue
 	flight := &reserveFlight{done: make(chan struct{}), res: result}
 	close(flight.done)
 	rt := &Router{reserveInFlight: map[string]*reserveFlight{
@@ -384,9 +389,9 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		case "/route-link/route":
 			switch r.URL.Query().Get("sid") {
 			case "sb-1":
-				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk1", DataEndpoint: node1Host, State: "ready"})
+				_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk1", node1Host, types.ProfileE2B))
 			case "sb-2":
-				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-2", Group: "/g", RouteKey: "rk2", DataEndpoint: node2Host, State: "ready"})
+				_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-2", "/g", "rk2", node2Host, types.ProfileE2B))
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}

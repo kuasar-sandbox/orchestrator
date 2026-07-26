@@ -492,7 +492,10 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
 	}
-	return proxy.RouteForTarget(string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, port), nil
+	return proxy.RouteForTarget(
+		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
+		sb.EnvdAccessToken, sb.ForwardAccessToken, port,
+	), nil
 }
 
 // resumeIfPaused (run under the per-sid single-flight) resumes sid only if it is

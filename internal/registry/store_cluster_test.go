@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
@@ -449,6 +451,72 @@ func TestRouteLinkShardSeparatesSandboxesAndBuilds(t *testing.T) {
 	}
 	if len(builds) != 1 || builds[0] != "b1" {
 		t.Fatalf("builds=%v, want [b1]", builds)
+	}
+}
+
+func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stores := NewStores()
+	watch, err := stores.WatchRouteGroup(ctx, "/g", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := &sandboxcfg.Credentials{
+		ServiceSecret:      strings.Repeat("1", 64),
+		EnvdAccessToken:    "envd-private",
+		TrafficAccessToken: "traffic-private",
+	}
+	route := testE2BSandboxRecord("/g", "rk", "sb", "n1", StateReserved)
+	route.CreateCredentials = credentials
+	if _, err := stores.PutSandbox(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, _, found, err := stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || stored.CreateCredentials == nil || *stored.CreateCredentials != *credentials ||
+		!sameRouteCredentials(stored, route) {
+		t.Fatalf("internal store read=%+v found=%v err=%v", stored, found, err)
+	}
+	if _, err := stores.PutSandbox(ctx, &SandboxRecord{
+		Profile: "e2b", Group: "/g", RouteKey: "empty", SID: "sb-empty", State: StateReserved,
+		CreateCredentials: &sandboxcfg.Credentials{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	empty, _, found, err := stores.GetSandbox(ctx, "/g", "empty")
+	if err != nil || !found || empty.CreateCredentials == nil || *empty.CreateCredentials != (sandboxcfg.Credentials{}) {
+		t.Fatalf("explicit empty credentials lost in store: route=%+v found=%v err=%v", empty, found, err)
+	}
+	if err := stores.RangeSandboxes(ctx, "/g", func(route *SandboxRecord) error {
+		if route.CreateCredentials != nil || hasRouteCredentials(route) || route.APISecretFingerprint != "" {
+			t.Fatalf("route list exposed protected credentials: %+v", route)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case event := <-watch:
+		if event.Type != WatchEventPut {
+			t.Fatalf("watch event=%+v", event)
+		}
+		var projected map[string]json.RawMessage
+		if err := json.Unmarshal(event.Value, &projected); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{
+			"api_secret_fingerprint", "manifest_key_fingerprint", "create_credentials",
+			"auth_sandbox_id", "api_secret", "service_secret", "envd_access_token",
+			"traffic_access_token", "forward_access_token",
+		} {
+			if _, found := projected[field]; found {
+				t.Fatalf("route watch exposed protected field %q: %s", field, event.Value)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route watch did not publish the stored route")
 	}
 }
 

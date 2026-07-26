@@ -324,7 +324,7 @@ filter node_list:
 P2C over candidates
   │
   ▼
-return node_id + create_spec + key intent + access_token + runtime/template hints
+return node_id + create_spec + APISecret fingerprint + runtime/template hints
 ```
 
 `node_list` 只提供低频目录,不判定 node 是否在线。route owner 在提交前向 node owner 查询当前

@@ -291,10 +291,8 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 	if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			n.publish(routesync.RouteEntry{Profile: cmd.Profile,
-				SandboxID: cmd.SID,
-				State:     routesync.StateRunning, AccessToken: "node-access-token",
-			})
+			route := testE2BRoute(cmd.SID, routesync.StateRunning)
+			n.publish(route)
 		}()
 	}
 	if cmd.Kind == routesync.CmdDelete {
@@ -440,9 +438,8 @@ func (n *relayNodeStub) readLoop(t *testing.T) {
 		}
 		_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
-			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{Profile: cmd.Profile,
-				SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: "node-access-token",
-			}})
+			route := testE2BRoute(cmd.SID, routesync.StateRunning)
+			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &route})
 		}
 	}
 }

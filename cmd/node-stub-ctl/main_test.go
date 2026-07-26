@@ -12,8 +12,10 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
@@ -91,7 +93,7 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	pair, found := node.keyPairs[apiSecretFingerprint]
 	node.mu.Unlock()
 	if !found || pair.APISecret != apiSecret || pair.ManifestKey != manifestKey || pair.ExpiresUnix != expiresUnix {
-		t.Fatalf("stored key pair = %+v, found=%v", pair, found)
+		t.Fatal("stub did not retain the installed key pair")
 	}
 
 	create := &routesync.Command{
@@ -110,15 +112,24 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	}
 	node.mu.Lock()
 	storedSandbox := node.sandboxes[create.SID]
-	accessToken := storedSandbox.AccessToken
+	serviceSecret := storedSandbox.ServiceSecret
+	envdToken := storedSandbox.EnvdAccessToken
 	trafficToken := storedSandbox.TrafficAccessToken
+	forwardToken := storedSandbox.ForwardAccessToken
 	commandMetadata := node.commands[len(node.commands)-1].Metadata
 	node.mu.Unlock()
-	if accessToken != "envd-override" || trafficToken != "traffic-override" {
-		t.Fatalf("stub access tokens = envd:%q traffic:%q", accessToken, trafficToken)
+	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, create.Cluster.AuthSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serviceSecret != wantServiceSecret || envdToken != "envd-override" || trafficToken != "traffic-override" {
+		t.Fatal("stub did not materialize the expected credential overrides")
+	}
+	if err := keys.VerifyForwardAccessToken(forwardToken, serviceSecret, create.Cluster.AuthSandboxID); err != nil {
+		t.Fatalf("stub forward access token = invalid: %v", err)
 	}
 	if storedSandbox.Profile != create.Profile || !sameStubClusterContext(storedSandbox.Cluster, create.Cluster) {
-		t.Fatalf("stub sandbox context = %+v", storedSandbox)
+		t.Fatal("stub sandbox context did not match the trusted command")
 	}
 	if _, found := storedSandbox.Metadata[clusterstate.ObjectMetadataKey]; found {
 		t.Fatalf("stub sandbox retained reserved cluster metadata: %+v", storedSandbox.Metadata)
@@ -128,6 +139,13 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	}
 	if _, found := commandMetadata[sandboxcfg.NsCredentials]; found {
 		t.Fatalf("stub command log exposed credentials metadata: %+v", commandMetadata)
+	}
+	route := storedSandbox.routeEntry()
+	if route.AuthSandboxID != create.Cluster.AuthSandboxID || route.APISecret != apiSecret ||
+		route.APISecretFingerprint != apiSecretFingerprint || route.ManifestKeyFingerprint != manifestKeyFingerprint ||
+		route.ServiceSecret != serviceSecret || route.EnvdAccessToken != envdToken ||
+		route.TrafficAccessToken != trafficToken || route.ForwardAccessToken != forwardToken {
+		t.Fatal("stub route did not project the sandbox credential record")
 	}
 
 	build := &routesync.Command{
@@ -222,19 +240,163 @@ func TestNodeSnapshotRedactsCredentialMaterial(t *testing.T) {
 		APISecretFingerprint: strings.Repeat("8", 64), APISecretType: "ref", APISecretRef: apiRef,
 		ManifestKeyFingerprint: strings.Repeat("9", 64), ManifestKeyType: "ref", ManifestKeyRef: manifestRef,
 	}
-
-	raw, err := json.Marshal(node.snapshot())
+	serviceSecret := strings.Repeat("aa", 32)
+	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, "stable-sandbox")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{apiSecret, manifestKey, apiRef, manifestRef} {
+	envdToken, trafficToken := "private-envd-token", "private-traffic-token"
+	node.sandboxes["node-sandbox"] = &stubSandbox{
+		SID:                    "node-sandbox",
+		Profile:                string(types.ProfileE2B),
+		Metadata:               map[string]string{sandboxcfg.NsCredentials: `{"service_secret":"` + serviceSecret + `"}`, "visible": "value"},
+		State:                  routesync.StateRunning,
+		AuthSandboxID:          "stable-sandbox",
+		APISecret:              apiSecret,
+		APISecretFingerprint:   testStubFingerprint(t, apiSecret),
+		ManifestKeyFingerprint: testStubFingerprint(t, manifestKey),
+		ServiceSecret:          serviceSecret,
+		EnvdAccessToken:        envdToken,
+		TrafficAccessToken:     trafficToken,
+		ForwardAccessToken:     forwardToken,
+	}
+	node.publishRoute(node.sandboxes["node-sandbox"].routeEntry())
+	svc.appendDataHit(dataHit{NodeID: node.ID, SandboxID: "node-sandbox", Path: "/health"})
+
+	raw, err := json.Marshal(struct {
+		Node     nodeSnapshot `json:"node"`
+		Events   []eventLog   `json:"events"`
+		DataHits []dataHit    `json:"data_hits"`
+	}{Node: node.snapshot(), Events: svc.events, DataHits: svc.dataHits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{apiSecret, manifestKey, apiRef, manifestRef, serviceSecret, envdToken, trafficToken, forwardToken} {
 		if strings.Contains(string(raw), secret) {
-			t.Fatalf("node snapshot leaked credential material %q: %s", secret, raw)
+			t.Fatal("stub observation leaked credential material")
 		}
 	}
 	if !strings.Contains(string(raw), testStubFingerprint(t, apiSecret)) ||
 		!strings.Contains(string(raw), testStubFingerprint(t, manifestKey)) {
-		t.Fatalf("node snapshot omitted credential fingerprints: %s", raw)
+		t.Fatal("node snapshot omitted credential fingerprints")
+	}
+}
+
+func TestStubCredentialProfilesAndPublicResponses(t *testing.T) {
+	apiSecret := strings.Repeat("ab", 32)
+	authSandboxID := "stable-sandbox"
+
+	e2b, err := materializeStubCredentials(types.ProfileE2B, apiSecret, authSandboxID, sandboxcfg.Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, authSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2b.ServiceSecret != wantServiceSecret || e2b.EnvdAccessToken == "" || e2b.TrafficAccessToken == "" ||
+		e2b.EnvdAccessToken == e2b.TrafficAccessToken {
+		t.Fatalf("e2b credential defaults were not independently materialized")
+	}
+	if err := keys.VerifyForwardAccessToken(e2b.ForwardAccessToken, e2b.ServiceSecret, authSandboxID); err != nil {
+		t.Fatalf("e2b forward access token = invalid: %v", err)
+	}
+	e2bResponse := (&stubSandbox{
+		SID: "node-sandbox", Profile: string(types.ProfileE2B), TemplateID: "e2b-img-template",
+		EnvdAccessToken: e2b.EnvdAccessToken, TrafficAccessToken: e2b.TrafficAccessToken,
+		ForwardAccessToken: e2b.ForwardAccessToken,
+	}).connectResponse()
+	for _, field := range []string{"envdAccessToken", "trafficAccessToken", "forwardAccessToken"} {
+		if e2bResponse[field] == nil {
+			t.Fatalf("e2b response omitted %s", field)
+		}
+	}
+	assertNoInternalCredentialFields(t, e2bResponse)
+
+	override := strings.Repeat("cd", 32)
+	bare, err := materializeStubCredentials(types.ProfileBare, apiSecret, authSandboxID, sandboxcfg.Credentials{ServiceSecret: override})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.ServiceSecret != override || bare.EnvdAccessToken != "" || bare.TrafficAccessToken != "" {
+		t.Fatalf("bare credentials did not preserve the profile contract")
+	}
+	if err := keys.VerifyForwardAccessToken(bare.ForwardAccessToken, bare.ServiceSecret, authSandboxID); err != nil {
+		t.Fatalf("bare forward access token = invalid: %v", err)
+	}
+	bareResponse := (&stubSandbox{
+		SID: "node-sandbox", Profile: string(types.ProfileBare), TemplateID: "bare-img-template",
+		ForwardAccessToken: bare.ForwardAccessToken,
+	}).connectResponse()
+	if len(bareResponse) != 3 || bareResponse["forwardAccessToken"] != bare.ForwardAccessToken {
+		t.Fatal("bare response did not contain exactly the public forward credential")
+	}
+	if _, ok := bareResponse["envdAccessToken"]; ok {
+		t.Fatal("bare response exposed envdAccessToken")
+	}
+	if _, ok := bareResponse["trafficAccessToken"]; ok {
+		t.Fatal("bare response exposed trafficAccessToken")
+	}
+	assertNoInternalCredentialFields(t, bareResponse)
+
+	detailResponse := (&stubSandbox{
+		SID: "node-sandbox", Profile: string(types.ProfileE2B), TemplateID: "e2b-img-template",
+		State: routesync.StateRunning, AuthSandboxID: authSandboxID,
+		APISecret: apiSecret, APISecretFingerprint: testStubFingerprint(t, apiSecret),
+		ServiceSecret: e2b.ServiceSecret, EnvdAccessToken: e2b.EnvdAccessToken,
+		TrafficAccessToken: e2b.TrafficAccessToken, ForwardAccessToken: e2b.ForwardAccessToken,
+		Cluster:  &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: authSandboxID},
+		Metadata: map[string]string{sandboxcfg.NsCredentials: `{"envd_access_token":"private"}`, "visible": "value"},
+	}).publicDetailResponse("n1")
+	if detailResponse["sandboxID"] != "node-sandbox" || detailResponse["clientID"] != "n1" {
+		t.Fatal("public detail response omitted sandbox identity")
+	}
+	if metadata, ok := detailResponse["metadata"].(map[string]string); !ok || metadata["visible"] != "value" {
+		t.Fatal("public detail response omitted visible metadata")
+	} else if _, found := metadata[sandboxcfg.NsCredentials]; found {
+		t.Fatal("public detail response exposed credentials metadata")
+	}
+	assertNoInternalCredentialFields(t, detailResponse)
+}
+
+func TestStubCreateRejectsUnavailableAPISecretMaterial(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{ID: "n1", StrictKeys: true}, svc)
+	apiFingerprint := strings.Repeat("8", 64)
+	manifestFingerprint := strings.Repeat("9", 64)
+	put := &routesync.Command{
+		CmdID: "key-ref", Kind: routesync.CmdKeyPut,
+		APISecretFingerprint: apiFingerprint, APISecretType: "ref", APISecretRef: "secret://tenant/api",
+		ManifestKeyFingerprint: manifestFingerprint, ManifestKeyType: "ref", ManifestKeyRef: "secret://tenant/manifest",
+	}
+	if got := node.HandleCommand(context.Background(), put); got.Status != routesync.AckAccepted {
+		t.Fatalf("ref key_put ack = %+v", got)
+	}
+	create := &routesync.Command{
+		CmdID: "create-ref", Kind: routesync.CmdCreate, SID: "node-sandbox",
+		TemplateRef: "bare-img-" + strings.Repeat("a", 64), Profile: string(types.ProfileBare),
+		APISecretFingerprint: apiFingerprint,
+		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "stable-sandbox"},
+	}
+	got := node.HandleCommand(context.Background(), create)
+	if got.Status != routesync.AckRejected || got.Reason != "API secret material unavailable" {
+		t.Fatalf("ref-backed create ack = %+v", got)
+	}
+	if node.getSandbox(create.SID) != nil {
+		t.Fatal("ref-backed create inserted a sandbox")
+	}
+}
+
+func assertNoInternalCredentialFields(t *testing.T, response map[string]any) {
+	t.Helper()
+	for _, field := range []string{
+		"accessToken", "apiSecret", "apiSecretFingerprint", "manifestKey", "manifestKeyFingerprint",
+		"serviceSecret", "authSandboxID", "nodeSandboxID", "execAccessToken", "cluster", "behavior",
+	} {
+		if _, ok := response[field]; ok {
+			t.Fatalf("public response exposed %s", field)
+		}
 	}
 }
 

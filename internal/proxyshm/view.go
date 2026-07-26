@@ -197,7 +197,10 @@ func (v *WorkerView) Route(ctx context.Context, sid string, port int) (proxy.Rou
 	if !ok {
 		return proxy.Route{Kind: proxy.KindNotFound}, nil
 	}
-	return proxy.RouteForTarget(r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP, r.AccessToken, port), nil
+	return proxy.RouteForTarget(
+		r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP,
+		r.EnvdAccessToken, r.ForwardAccessToken, port,
+	), nil
 }
 
 func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEntry, bool) {

@@ -2,6 +2,7 @@ package routesync
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -69,13 +70,30 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		t.Fatalf("build_register round-trip: %+v", b.Cmd)
 	}
 
-	// Sandbox routes carry runtime state only; the node-link owner supplies cluster identity.
+	// Sandbox routes project the complete trusted credential view used by proxy and
+	// registry subscribers; the manifest encryption root and exec credentials are
+	// deliberately absent.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
 		SandboxID: "s1", State: StateRunning,
-		FloatingIP: "100.100.96.5", AccessToken: "tok",
+		FloatingIP: "100.100.96.5", AuthSandboxID: "stable-s1",
+		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
+		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
+		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
 	}})
-	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning {
+	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning ||
+		r.Route.AuthSandboxID != "stable-s1" || r.Route.APISecret != strings.Repeat("1", 64) ||
+		r.Route.APISecretFingerprint != strings.Repeat("2", 64) ||
+		r.Route.ManifestKeyFingerprint != strings.Repeat("3", 64) ||
+		r.Route.ServiceSecret != strings.Repeat("4", 64) || r.Route.EnvdAccessToken != "envd" ||
+		r.Route.TrafficAccessToken != "traffic" || r.Route.ForwardAccessToken != "forward" {
 		t.Fatalf("sandbox route round-trip: %+v", r.Route)
+	}
+	wire, err := json.Marshal(r.Route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(wire, []byte(`"access_token":`)) {
+		t.Fatalf("route retained generic access_token: %s", wire)
 	}
 
 	a := roundTrip(t, &Msg{Type: TypeCmdAck, Ack: &CmdAck{CmdID: "x1", Status: AckAccepted}})
