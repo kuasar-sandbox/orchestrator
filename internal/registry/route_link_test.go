@@ -47,7 +47,7 @@ func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 	placements := 0
 	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
-		return &Placement{NodeID: "n1"}, nil
+		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 0, nil)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)

@@ -92,9 +92,9 @@ var ErrAlreadyPaused = errors.New("already paused")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
-// ErrNotAllowed is returned by Create/RegisterBuild when the api key's manifest
-// key is not in the manifest_keys allowlist (=> 403).
-var ErrNotAllowed = errors.New("manifest key not allowed to create")
+// ErrNotAllowed is returned by Create/RegisterBuild when the API key does not
+// resolve to an APISecret/ManifestKey pair in the node allowlist (=> 403).
+var ErrNotAllowed = errors.New("credential pair not allowed to create")
 
 // ErrFilesUnsupported is returned by FilesUpload / TriggerBuild when a COPY
 // step is used but builder.files_storage is unconfigured (=> 501).
@@ -163,9 +163,9 @@ type CreateReq struct {
 }
 
 // Core is the orchestrator behaviour the API needs. Every per-resource method
-// takes the raw api key; Core resolves it to the tenant manifest key (verifying
-// the MAC against the stored, encrypted key) and treats a mismatch as not-found.
-// Create/RegisterBuild additionally require the manifest key to be allowlisted.
+// takes the raw API key; Core verifies it against the encrypted APISecret saved
+// on the target resource and treats a mismatch as not-found. Create/RegisterBuild
+// additionally require the APISecret/ManifestKey pair to be allowlisted.
 type Core interface {
 	Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) // req.APIKey carries the key
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
@@ -702,7 +702,7 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):
-		writeErr(w, 403, "manifest key not allowed")
+		writeErr(w, 403, "credential pair not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
 	default:

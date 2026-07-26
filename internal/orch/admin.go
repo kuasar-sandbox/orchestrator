@@ -1,10 +1,7 @@
 package orch
 
-// Admin plane: thin manifest-key allowlist wrappers the local control socket's
-// admin plane (internal/configsock) calls. They validate the key, compute its
-// fingerprint, and delegate to the store — so the daemon is the sole writer of the
-// manifest_keys table (the manifest-key CLI is now a socket client, not a second
-// process opening the DB).
+// Admin plane: tenant APISecret/ManifestKey pair allowlist wrappers. The local
+// control socket remains the only writer of the encrypted node key table.
 
 import (
 	"context"
@@ -13,59 +10,74 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
-// AddManifestKey adds key (64-hex) to the allowlist, or refreshes it if it already
-// exists (added=false). ttlSec>0 expires it after ttlSec; <=0 = never. registryAuth
-// (a docker config.json; "" = leave) is the tenant's default registry pull creds.
-// Returns the key's 24-hex fingerprint.
-func (o *Orchestrator) AddManifestKey(ctx context.Context, key, label string, ttlSec int64, registryAuth string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+// materializeKeyPair validates a manifest key and either validates the supplied
+// APISecret or derives its default. Derivation happens only at this ingestion
+// boundary; request paths always consume a complete persisted pair.
+func materializeKeyPair(manifestKey, apiSecret string) (store.KeyPair, string, string, error) {
+	manifestFP, err := store.ManifestKeyHash(manifestKey)
 	if err != nil {
-		return false, "", err
+		return store.KeyPair{}, "", "", err
 	}
-	added, err := o.st.AddManifestKey(ctx, key, label, ttlSec, registryAuth)
-	return added, fp, err
+	if apiSecret == "" {
+		rawManifest, err := hex.DecodeString(manifestKey)
+		if err != nil {
+			return store.KeyPair{}, "", "", fmt.Errorf("manifest key must be 64 lowercase hex characters")
+		}
+		apiSecret = hex.EncodeToString(apikey.DeriveAPISecret(rawManifest))
+	}
+	apiFP, err := store.APISecretHash(apiSecret)
+	if err != nil {
+		return store.KeyPair{}, "", "", err
+	}
+	return store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, apiFP, manifestFP, nil
 }
 
-// RemoveManifestKey removes key from the allowlist; removed=false means it was absent.
-func (o *Orchestrator) RemoveManifestKey(ctx context.Context, key string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+// AddKeyPair adds or refreshes one exact tenant credential pair. An empty
+// apiSecret selects the deterministic default derived from manifestKey.
+func (o *Orchestrator) AddKeyPair(ctx context.Context, manifestKey, apiSecret, label string, ttlSec int64, registryAuth string) (bool, string, string, error) {
+	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
-	n, err := o.st.RemoveManifestKey(ctx, key)
-	return n > 0, fp, err
+	added, err := o.st.AddKeyPair(ctx, pair, label, ttlSec, registryAuth)
+	return added, apiFP, manifestFP, err
 }
 
-// HasManifestKey reports whether key is in the allowlist.
-func (o *Orchestrator) HasManifestKey(ctx context.Context, key string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+func (o *Orchestrator) RemoveKeyPair(ctx context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
+	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
-	ok, err := o.st.HasManifestKey(ctx, key)
-	return ok, fp, err
+	n, err := o.st.RemoveKeyPair(ctx, pair)
+	return n > 0, apiFP, manifestFP, err
 }
 
-// ListManifestKeys returns the allowlist as fingerprint-only entries.
-func (o *Orchestrator) ListManifestKeys(ctx context.Context) ([]configsock.AdminKeyInfo, error) {
-	infos, err := o.st.ListManifestKeys(ctx)
+func (o *Orchestrator) HasKeyPair(ctx context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
+	pair, apiFP, manifestFP, err := materializeKeyPair(manifestKey, apiSecret)
+	if err != nil {
+		return false, "", "", err
+	}
+	ok, err := o.st.HasKeyPair(ctx, pair)
+	return ok, apiFP, manifestFP, err
+}
+
+func (o *Orchestrator) ListKeyPairs(ctx context.Context) ([]configsock.AdminKeyInfo, error) {
+	infos, err := o.st.ListKeyPairs(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]configsock.AdminKeyInfo, 0, len(infos))
-	for _, mi := range infos {
-		out = append(out, configsock.AdminKeyInfo{Fingerprint: mi.Hash, Label: mi.Label, CreatedUnix: mi.CreatedUnix, ExpiresUnix: mi.ExpiresUnix})
+	for _, info := range infos {
+		out = append(out, configsock.AdminKeyInfo{
+			APISecretFingerprint:   info.APISecretHash,
+			ManifestKeyFingerprint: info.ManifestKeyHash,
+			Label:                  info.Label,
+			CreatedUnix:            info.CreatedUnix,
+			ExpiresUnix:            info.ExpiresUnix,
+		})
 	}
 	return out, nil
-}
-
-// fingerprintHex validates a 64-hex manifest key and returns its 24-hex fingerprint.
-func fingerprintHex(manifestKeyHex string) (string, error) {
-	raw, err := hex.DecodeString(manifestKeyHex)
-	if err != nil || len(raw) != 32 {
-		return "", fmt.Errorf("manifest-key: %q is not a 64-hex (32-byte) key", manifestKeyHex)
-	}
-	return hex.EncodeToString(apikey.Fingerprint(raw)), nil
 }

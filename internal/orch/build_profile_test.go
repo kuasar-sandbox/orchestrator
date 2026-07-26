@@ -2,13 +2,11 @@ package orch
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -17,15 +15,8 @@ import (
 func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKey, fingerprint string) {
 	t.Helper()
 	manifestKey = strings.Repeat("5a", 32)
-	raw, err := hex.DecodeString(manifestKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	apiKey, err = apikey.Mint(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, fingerprint, err = o.AddManifestKey(context.Background(), manifestKey, "test", 0, "")
+	_, apiKey = defaultTestCredentials(t, manifestKey)
+	_, fingerprint, _, err := o.AddKeyPair(context.Background(), manifestKey, "", "test", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,13 +100,13 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 
-	missing := &routesync.Command{BuildID: "missing-profile", TemplateRef: "transient-missing", KeyFingerprint: fingerprint}
+	missing := &routesync.Command{BuildID: "missing-profile", TemplateRef: "transient-missing", APISecretFingerprint: fingerprint}
 	if err := o.registerClusterBuild(ctx, missing); err == nil {
 		t.Fatal("build_register without profile was accepted")
 	}
 	cmd := &routesync.Command{
 		BuildID: "bare-cluster-build", TemplateRef: "transient-bare",
-		Profile: string(types.ProfileBare), KeyFingerprint: fingerprint,
+		Profile: string(types.ProfileBare), APISecretFingerprint: fingerprint,
 	}
 	if err := o.registerClusterBuild(ctx, cmd); err != nil {
 		t.Fatalf("registerClusterBuild: %v", err)

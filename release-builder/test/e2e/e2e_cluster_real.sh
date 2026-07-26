@@ -219,9 +219,9 @@ retry_data_by_key() {
             echo "$code"
             return 0
         fi
-        if grep -qiE 'no allowlisted manifest key|key not distributed' "$WORK/data-health.body" 2>/dev/null; then
-            cat "$WORK/data-health.body" >&2
-            fail "data-plane hit node before manifest-key cache was ready"
+        if grep -qiE 'credential pair (is )?not (installed|distributed)' "$WORK/data-health.body" 2>/dev/null; then
+			cat "$WORK/data-health.body" >&2
+			fail "data-plane hit node before credential-pair cache was ready"
         fi
         step "data-plane attempt $i returned $code; retrying while sandbox boot converges"
         sleep 2
@@ -384,7 +384,7 @@ write_group_record() {
 {
   "group": "$GROUP",
   "manifest_key": { "type": "inline", "value": "$MANIFEST_KEY" },
-  "auth_key": { "type": "inline", "value": "$AUTH_KEY" },
+  "api_secret": { "type": "inline", "value": "$API_SECRET" },
   "template_ref": "$TEMPLATE_REF",
   "target_port": 49983,
   "node_selectors": [{ "pool": "real" }]
@@ -594,19 +594,19 @@ EOF
     fi
 }
 
-wait_cluster_node_manifest_key() {
-    step "waiting for node_link manifest-key cache on $NODE_ID"
+wait_cluster_node_key_pair() {
+    step "waiting for node_link credential-pair cache on $NODE_ID"
     for _ in $(seq 1 120); do
         if "$BIN/node-ctl" manifest-key list --socket "$WORK/cn.sock" >"$WORK/cluster-node-keys.out" 2>&1; then
-            if grep -q "^$MANIFEST_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
-                step "node manifest-key cache ready: $MANIFEST_FP"
+            if grep -q "^api=$API_SECRET_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
+                step "node credential-pair cache ready: $API_SECRET_FP"
                 return 0
             fi
         fi
         sleep 0.5
     done
     cat "$WORK/cluster-node-keys.out" >&2 || true
-    fail "node manifest-key cache did not receive $MANIFEST_FP"
+    fail "node credential-pair cache did not receive $API_SECRET_FP"
 }
 
 run_cluster_flow() {
@@ -655,10 +655,10 @@ PY
 
 step "cluster real e2e case=$CLUSTER_REAL_CASE work=$WORK using BIN=$BIN"
 MANIFEST_KEY="$("$BIN/e2b-key-ctl" gen-key)"
-MANIFEST_FP="$("$BIN/e2b-key-ctl" fingerprint "$MANIFEST_KEY")"
-AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
-BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$MANIFEST_KEY")"
-CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MANIFEST_KEY")"
+API_SECRET_FP="$("$BIN/e2b-key-ctl" fingerprint "$API_SECRET")"
+BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
+CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ENC_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 GROUP="/e2e/cluster/real/$CLUSTER_REAL_CASE"
 ROUTE_KEY="user1/$CLUSTER_REAL_CASE"
@@ -683,7 +683,7 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     step "selected redirected node_id=$NODE_ID"
 fi
 start_cluster_node "$NODE_ID"
-wait_cluster_node_manifest_key
+wait_cluster_node_key_pair
 run_cluster_flow
 
 echo "==> PASS: e2e_cluster_real $CLUSTER_REAL_CASE"

@@ -40,7 +40,7 @@ func TestAuthRejectsBadKey(t *testing.T) {
 
 // TestSandboxDeleteUsesRouteOwnerCommand checks the cluster control plane delete
 // path: DELETE is a lifecycle command owned by route_link/node_link, not a
-// reverse proxy to the node's local e2b API. This keeps cluster auth_key
+// reverse proxy to the node's local e2b API. This keeps cluster APISecret
 // independent from the node-local manifest_key.
 func TestSandboxDeleteUsesRouteOwnerCommand(t *testing.T) {
 	var deletePath, deleteQuery string

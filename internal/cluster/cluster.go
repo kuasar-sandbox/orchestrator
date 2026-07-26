@@ -58,7 +58,7 @@ func (v MemberView) Owners(key string, n int) ([]string, error) {
 type Secret struct {
 	Type        string `json:"type"`                  // inline | ref
 	Value       string `json:"value,omitempty"`       // inline secret or provider reference
-	Fingerprint string `json:"fingerprint,omitempty"` // required for ref manifest_key key_put/precheck
+	Fingerprint string `json:"fingerprint,omitempty"` // required for referenced credentials
 }
 
 func (s *Secret) UnmarshalJSON(raw []byte) error {
@@ -108,12 +108,12 @@ type SandboxGroup struct {
 
 // SandboxGroupRecord is the importer record owned by placer/provider side. It is
 // intentionally richer than SandboxGroup: placer needs placement selectors and
-// secret material to answer Place and refresh node_link manifest-key cache.
+// secret material to answer Place and refresh the node_link credential cache.
 type SandboxGroupRecord struct {
 	Group         string              `json:"group"`
 	ProjectID     string              `json:"project_id,omitempty"`
 	ManifestKey   Secret              `json:"manifest_key,omitempty"`
-	AuthKey       Secret              `json:"auth_key,omitempty"`
+	APISecret     Secret              `json:"api_secret,omitempty"`
 	RegistryAuth  Secret              `json:"registry_auth,omitempty"`
 	Config        map[string]string   `json:"sandbox_config,omitempty"`
 	ImageRepo     string              `json:"image_repo,omitempty"`
@@ -141,8 +141,8 @@ type GroupPage struct {
 type SandboxGroupProvider interface {
 	Get(ctx context.Context, group string) (SandboxGroup, bool, error)
 	GetPlacementHint(ctx context.Context, group string) (PlacementHint, bool, error)
-	GetKey(ctx context.Context, group string) (Secret, bool, error)     // manifest-key, node-facing
-	GetAuthKey(ctx context.Context, group string) (Secret, bool, error) // auth-key, router/node-facing
+	GetKey(ctx context.Context, group string) (Secret, bool, error)       // manifest-key, node-facing
+	GetAPISecret(ctx context.Context, group string) (Secret, bool, error) // API authentication root
 }
 
 type SandboxGroupImporter interface {

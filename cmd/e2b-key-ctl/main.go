@@ -1,12 +1,12 @@
 // Command e2b-key-ctl is a pure-derivation tool for e2b credentials. It mints e2b
-// API keys from a tenant manifest key (the 64-hex root secret), generates new
-// manifest keys, and prints fingerprints — no DB, config, or orchestrator state.
-// The minted api key is what the e2b SDK uses (E2B_API_KEY); the manifest key
-// stays with the operator and is registered via `node-ctl manifest-key add`.
+// API keys from a tenant API secret, derives the default API secret associated
+// with a manifest key, and generates root secrets — no DB, config, or orchestrator
+// state. APISecret authenticates API requests; ManifestKey protects content.
 //
-//	e2b-key-ctl gen-apikey  [<MANIFEST_KEY>]   # derive an e2b API key (or MANIFEST_KEY env)
-//	e2b-key-ctl gen-key                         # random 32-byte manifest key (64-hex)
-//	e2b-key-ctl fingerprint [<MANIFEST_KEY>]   # 24-hex fingerprint (matches the allowlist)
+//	e2b-key-ctl gen-apikey        [<API_SECRET>]
+//	e2b-key-ctl derive-api-secret [<MANIFEST_KEY>]
+//	e2b-key-ctl gen-key
+//	e2b-key-ctl fingerprint       [<API_SECRET>]
 //	e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] --registry-username/-password | -token
 //	                                            # opaque registry pull token for api_headers
 //	e2b-key-ctl version
@@ -32,16 +32,18 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "gen-apikey":
-		ak, err := apikey.Mint(manifestKeyArg(os.Args[2:]))
+		ak, err := apikey.Mint(rootSecretArg(os.Args[2:], "API_SECRET"))
 		check(err)
 		fmt.Println(ak)
+	case "derive-api-secret":
+		fmt.Println(hex.EncodeToString(apikey.DeriveAPISecret(rootSecretArg(os.Args[2:], "MANIFEST_KEY"))))
 	case "gen-key":
 		raw := make([]byte, 32)
 		_, err := rand.Read(raw)
 		check(err)
 		fmt.Println(hex.EncodeToString(raw))
 	case "fingerprint":
-		fmt.Println(hex.EncodeToString(apikey.Fingerprint(manifestKeyArg(os.Args[2:]))))
+		fmt.Println(hex.EncodeToString(apikey.FullFingerprint(rootSecretArg(os.Args[2:], "API_SECRET"))))
 	case "seal-pull-token":
 		check(sealPullToken(os.Args[2:]))
 	case "version", "-v", "--version":
@@ -53,9 +55,10 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  e2b-key-ctl gen-apikey  [<MANIFEST_KEY>]   # derive an e2b API key (or MANIFEST_KEY env)
-  e2b-key-ctl gen-key                         # generate a random 32-byte manifest key (64-hex)
-  e2b-key-ctl fingerprint [<MANIFEST_KEY>]   # print the 24-hex fingerprint
+  e2b-key-ctl gen-apikey        [<API_SECRET>]   # mint an e2b API key (or API_SECRET env)
+  e2b-key-ctl derive-api-secret [<MANIFEST_KEY>] # derive the default API secret (or MANIFEST_KEY env)
+  e2b-key-ctl gen-key                             # generate a random 32-byte root secret (64-hex)
+  e2b-key-ctl fingerprint       [<API_SECRET>]   # print the full 64-hex API-secret fingerprint
   e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-password P | --registry-token T}
                                               # opaque pull token for the SDK's api_headers (X-Kuasar-Pull-Token)
   e2b-key-ctl version`)
@@ -88,19 +91,20 @@ func sealPullToken(args []string) error {
 	return nil
 }
 
-// manifestKeyArg reads the 64-hex manifest key from the first arg or MANIFEST_KEY env.
-func manifestKeyArg(args []string) []byte {
-	hexKey := os.Getenv("MANIFEST_KEY")
+// rootSecretArg reads a canonical 64-hex root secret from the first argument or
+// the named environment variable.
+func rootSecretArg(args []string, envName string) []byte {
+	hexKey := os.Getenv(envName)
 	if len(args) > 0 {
 		hexKey = args[0]
 	}
 	if hexKey == "" {
-		fmt.Fprintln(os.Stderr, "e2b-key-ctl: provide MANIFEST_KEY as an argument or env")
+		fmt.Fprintf(os.Stderr, "e2b-key-ctl: provide %s as an argument or env\n", envName)
 		os.Exit(2)
 	}
 	raw, err := hex.DecodeString(hexKey)
-	if err != nil || len(raw) != 32 {
-		fmt.Fprintln(os.Stderr, "e2b-key-ctl: MANIFEST_KEY must be 64 hex chars (32 bytes)")
+	if err != nil || len(raw) != 32 || hexKey != strings.ToLower(hexKey) {
+		fmt.Fprintf(os.Stderr, "e2b-key-ctl: %s must be 64 lowercase hex chars (32 bytes)\n", envName)
 		os.Exit(2)
 	}
 	return raw

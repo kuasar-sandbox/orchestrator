@@ -12,12 +12,12 @@ import (
 
 type NodeOwner interface {
 	Connected(ctx context.Context, nodeID string) error
-	PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error
-	DropManifestKey(ctx context.Context, nodeID, fingerprint string) error
+	PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error
+	DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error
 	AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool
 	ReleaseBuild(ctx context.Context, nodeID, buildID string)
 	Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error)
-	DeleteSandbox(ctx context.Context, nodeID, sid string) error
+	DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error
 	SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error
 	SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error)
 }
@@ -41,64 +41,56 @@ func (o *localNodeOwner) Connected(ctx context.Context, nodeID string) error {
 	return nil
 }
 
-func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	if keyType == "" {
-		keyType = clusterstate.SecretInline
-	}
-	key := clusterstate.NodeManifestKey{Fingerprint: fingerprint, Type: keyType, ExpiresUnix: expiresUnix}
-	if keyType == "ref" {
-		key.Ref = keyValue
-	} else {
-		key.Value = keyValue
-	}
-	return o.reg.stores.UpsertNodeManifestKey(ctx, nodeID, key)
+func (o *localNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	return o.reg.stores.UpsertNodeKeyPair(ctx, nodeID, pair)
 }
 
-func (o *localNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	return o.reg.stores.DropNodeManifestKey(ctx, nodeID, fingerprint)
+func (o *localNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	return o.reg.stores.DropNodeKeyPair(ctx, nodeID, apiSecretFingerprint)
 }
 
-func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string, keys []clusterstate.NodeManifestKey) {
+func (o *localNodeOwner) RefreshKeyPairs(ctx context.Context, nodeID string, pairs []clusterstate.NodeKeyPair) {
 	now := time.Now().Unix()
-	for _, key := range keys {
-		if key.Fingerprint == "" || (key.ExpiresUnix > 0 && key.ExpiresUnix <= now) {
+	for _, pair := range pairs {
+		if pair.APISecretFingerprint == "" || (pair.ExpiresUnix > 0 && pair.ExpiresUnix <= now) {
 			continue
 		}
-		if key.AckedExpiresUnix-now > int64(keyRenewBefore.Seconds()) {
+		if pair.AckedExpiresUnix-now > int64(keyRenewBefore.Seconds()) {
 			continue
 		}
 		cmd := &routesync.Command{
-			CmdID:           newID(),
-			Kind:            routesync.CmdKeyPut,
-			KeyFingerprint:  key.Fingerprint,
-			ManifestKeyType: key.Type,
-			ManifestKey:     key.Value,
-			ManifestKeyRef:  key.Ref,
-			ExpiresUnix:     key.ExpiresUnix,
-		}
-		if cmd.ManifestKeyType == "" {
-			cmd.ManifestKeyType = clusterstate.SecretInline
+			CmdID:                  newID(),
+			Kind:                   routesync.CmdKeyPut,
+			APISecretFingerprint:   pair.APISecretFingerprint,
+			APISecretType:          pair.APISecretType,
+			APISecret:              pair.APISecret,
+			APISecretRef:           pair.APISecretRef,
+			ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
+			ManifestKeyType:        pair.ManifestKeyType,
+			ManifestKey:            pair.ManifestKey,
+			ManifestKeyRef:         pair.ManifestKeyRef,
+			ExpiresUnix:            pair.ExpiresUnix,
 		}
 		ack, err := o.SendCommandAndWait(ctx, nodeID, cmd, keyAckTimeout)
 		if err != nil || ack == nil {
-			o.reg.log.Debug("node-link: manifest key acknowledgement missing",
-				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "err", err)
+			o.reg.log.Debug("node-link: key-pair acknowledgement missing",
+				"node", nodeID, "cmd_id", cmd.CmdID, "err", err)
 			return
 		}
 		if ack.Status != routesync.AckAccepted {
-			o.reg.log.Warn("node-link: manifest key rejected",
-				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "reason", ack.Reason)
+			o.reg.log.Warn("node-link: key pair rejected",
+				"node", nodeID, "cmd_id", cmd.CmdID, "reason", ack.Reason)
 			continue
 		}
-		marked, err := o.reg.stores.MarkNodeManifestKeyAcked(ctx, nodeID, key)
+		marked, err := o.reg.stores.MarkNodeKeyPairAcked(ctx, nodeID, pair)
 		if err != nil {
-			o.reg.log.Warn("node-link: record manifest key acknowledgement",
-				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "err", err)
+			o.reg.log.Warn("node-link: record key-pair acknowledgement",
+				"node", nodeID, "cmd_id", cmd.CmdID, "err", err)
 			continue
 		}
 		if !marked {
-			o.reg.log.Debug("node-link: manifest key desired lease changed before acknowledgement",
-				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID)
+			o.reg.log.Debug("node-link: key-pair desired lease changed before acknowledgement",
+				"node", nodeID, "cmd_id", cmd.CmdID)
 		}
 	}
 }
@@ -122,8 +114,11 @@ func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecor
 	return o.reg.stores.GetNodeProfile(ctx, nodeID)
 }
 
-func (o *localNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
-	return o.SendCommand(ctx, nodeID, &routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: sid})
+func (o *localNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
+	return o.SendCommand(ctx, nodeID, &routesync.Command{
+		CmdID: newID(), Kind: routesync.CmdDelete, SID: sid,
+		APISecretFingerprint: apiSecretFingerprint,
+	})
 }
 
 func (o *localNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
@@ -260,12 +255,12 @@ func (o *routingNodeOwner) Connected(ctx context.Context, nodeID string) error {
 	return ErrNodeGone
 }
 
-func (o *routingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	return o.ownerFor(ctx, nodeID).PutManifestKey(ctx, nodeID, fingerprint, keyType, keyValue, expiresUnix)
+func (o *routingNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	return o.ownerFor(ctx, nodeID).PutKeyPair(ctx, nodeID, pair)
 }
 
-func (o *routingNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	return o.ownerFor(ctx, nodeID).DropManifestKey(ctx, nodeID, fingerprint)
+func (o *routingNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	return o.ownerFor(ctx, nodeID).DropKeyPair(ctx, nodeID, apiSecretFingerprint)
 }
 
 func (o *routingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
@@ -283,8 +278,8 @@ func (o *routingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRec
 	return o.ownerFor(ctx, nodeID).Runtime(ctx, nodeID)
 }
 
-func (o *routingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
-	return o.ownerFor(ctx, nodeID).DeleteSandbox(ctx, nodeID, sid)
+func (o *routingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
+	return o.ownerFor(ctx, nodeID).DeleteSandbox(ctx, nodeID, sid, apiSecretFingerprint)
 }
 
 func (o *routingNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
@@ -301,11 +296,11 @@ func (o missingNodeOwner) err() error { return ErrNodeGone }
 
 func (o missingNodeOwner) Connected(context.Context, string) error { return o.err() }
 
-func (o missingNodeOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
+func (o missingNodeOwner) PutKeyPair(context.Context, string, clusterstate.NodeKeyPair) error {
 	return o.err()
 }
 
-func (o missingNodeOwner) DropManifestKey(context.Context, string, string) error { return o.err() }
+func (o missingNodeOwner) DropKeyPair(context.Context, string, string) error { return o.err() }
 
 func (o missingNodeOwner) AdmitBuild(context.Context, string, string, *routesync.BuildResources) bool {
 	return false
@@ -317,7 +312,9 @@ func (o missingNodeOwner) Runtime(context.Context, string) (*NodeRecord, bool, e
 	return nil, false, o.err()
 }
 
-func (o missingNodeOwner) DeleteSandbox(context.Context, string, string) error { return o.err() }
+func (o missingNodeOwner) DeleteSandbox(context.Context, string, string, string) error {
+	return o.err()
+}
 
 func (o missingNodeOwner) SendCommand(context.Context, string, *routesync.Command) error {
 	return o.err()

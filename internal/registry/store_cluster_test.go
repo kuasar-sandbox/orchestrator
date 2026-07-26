@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +39,43 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord, nodeOwners)
+}
+
+func TestNodeSandboxSnapshotsRejectInvalidCredentialFingerprint(t *testing.T) {
+	for name, fingerprint := range map[string]string{
+		"missing":   "",
+		"short":     "abcd",
+		"uppercase": strings.ToUpper(testAPIFingerprint),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			stores := NewStores()
+			const nodeID = "n1"
+			if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+				t.Fatal(err)
+			}
+			set, err := stores.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := clusterstate.NodeSandboxRef{
+				Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: fingerprint,
+			}
+			value, err := clusterstate.EncodeShardValue(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := set.CAS(ctx, clusterstate.NodeSandboxRecordKey(ref.SandboxID), 0, value); err != nil || !ok {
+				t.Fatalf("seed invalid ref ok=%v err=%v", ok, err)
+			}
+			if _, _, err := stores.GetNode(ctx, nodeID); err == nil {
+				t.Fatal("GetNode accepted invalid sandbox credential fingerprint")
+			}
+			if _, err := stores.snapshotNodeReapShard(ctx, nodeID); err == nil {
+				t.Fatal("reap snapshot accepted invalid sandbox credential fingerprint")
+			}
+		})
+	}
 }
 
 func TestStoresBuildShardKVNamespaces(t *testing.T) {
@@ -86,31 +124,34 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	if err := stores.putNodeProfileShard(ctx, node); err != nil {
 		t.Fatalf("putNodeProfileShard: %v", err)
 	}
-	if err := stores.addNodeSandboxRefShard(ctx, "n1", clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}); err != nil {
+	if err := stores.addNodeSandboxRefShard(ctx, "n1", clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
+	}); err != nil {
 		t.Fatalf("addNodeSandboxRefShard: %v", err)
 	}
 	if err := stores.addNodeBuildRefShard(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "b1"}); err != nil {
 		t.Fatalf("addNodeBuildRefShard: %v", err)
 	}
-	if err := stores.upsertNodeManifestKeyShard(ctx, "n1", clusterstate.NodeManifestKey{Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk", ExpiresUnix: 123}); err != nil {
-		t.Fatalf("upsertNodeManifestKeyShard: %v", err)
+	pair := testNodeKeyPair(strings.Repeat("a", 64), strings.Repeat("b", 64), 123)
+	if err := stores.upsertNodeKeyPairShard(ctx, "n1", pair); err != nil {
+		t.Fatalf("upsertNodeKeyPairShard: %v", err)
 	}
 	got, found, err := stores.getNodeShard(ctx, "n1")
 	if err != nil || !found {
 		t.Fatalf("getNodeShard found=%v err=%v", found, err)
 	}
-	if got.NodeID != "n1" || got.Labels["pool"] != "p" || len(got.Sandboxes) != 1 || len(got.Builds) != 1 || len(got.ManifestKeys) != 1 {
+	if got.NodeID != "n1" || got.Labels["pool"] != "p" || len(got.Sandboxes) != 1 || len(got.Builds) != 1 || len(got.KeyPairs) != 1 {
 		t.Fatalf("node view=%+v", got)
 	}
-	if err := stores.dropNodeManifestKeyShard(ctx, "n1", "fp"); err != nil {
-		t.Fatalf("dropNodeManifestKeyShard: %v", err)
+	if err := stores.dropNodeKeyPairShard(ctx, "n1", pair.APISecretFingerprint); err != nil {
+		t.Fatalf("dropNodeKeyPairShard: %v", err)
 	}
 	got, found, err = stores.getNodeShard(ctx, "n1")
 	if err != nil || !found {
 		t.Fatalf("getNodeShard after drop found=%v err=%v", found, err)
 	}
-	if len(got.ManifestKeys) != 0 {
-		t.Fatalf("manifest keys after tombstone=%+v", got.ManifestKeys)
+	if len(got.KeyPairs) != 0 {
+		t.Fatalf("manifest keys after tombstone=%+v", got.KeyPairs)
 	}
 }
 
@@ -151,7 +192,9 @@ func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
 	ctx := context.Background()
 	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 3, 1, 3)
 	const nodeID = "node-reap-wins"
-	oldRef := clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}
+	oldRef := clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
+	}
 	if err := cluster["a"].PutNode(ctx, &NodeRecord{
 		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
 		LinkOwner: "a", Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
@@ -225,16 +268,20 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	sandboxRef := clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}
+	sandboxRef := clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
+	}
 	buildRef := clusterstate.NodeBuildRef{Group: "/g", BuildID: "build"}
-	manifestKey := clusterstate.NodeManifestKey{Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "old"}
+	pair := testNodeKeyPair(strings.Repeat("a", 64), strings.Repeat("b", 64), 100)
+	replacementSandboxRef := sandboxRef
+	replacementSandboxRef.APISecretFingerprint = strings.Repeat("c", 64)
 	if err := stores.AddNodeSandboxRef(ctx, nodeID, sandboxRef); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeBuildRef(ctx, nodeID, buildRef); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.UpsertNodeManifestKey(ctx, nodeID, manifestKey); err != nil {
+	if err := stores.UpsertNodeKeyPair(ctx, nodeID, pair); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := stores.snapshotNodeReapShard(ctx, nodeID)
@@ -249,14 +296,17 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("claim=%v err=%v", claimed, err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, nodeID, sandboxRef); err != nil {
+	if err := stores.RemoveNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.AddNodeSandboxRef(ctx, nodeID, replacementSandboxRef); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeBuildRef(ctx, nodeID, buildRef); err != nil {
 		t.Fatal(err)
 	}
-	manifestKey.Value = "new"
-	if err := stores.UpsertNodeManifestKey(ctx, nodeID, manifestKey); err != nil {
+	pair.ExpiresUnix = 200
+	if err := stores.UpsertNodeKeyPair(ctx, nodeID, pair); err != nil {
 		t.Fatal(err)
 	}
 	if deleted, err := stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, sandboxRef.SandboxID, snapshot.Sandboxes[0].Revision); err != nil || deleted {
@@ -265,17 +315,18 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if deleted, err := stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, buildRef.BuildID, snapshot.Builds[0].Revision); err != nil || deleted {
 		t.Fatalf("old build cleanup deleted replacement: deleted=%v err=%v", deleted, err)
 	}
-	if deleted, err := stores.dropNodeManifestKeyShardAtRevision(ctx, nodeID, manifestKey.Fingerprint, snapshot.ManifestKeys[0].Revision); err != nil || deleted {
+	if deleted, err := stores.dropNodeKeyPairShardAtRevision(ctx, nodeID, pair.APISecretFingerprint, snapshot.KeyPairs[0].Revision); err != nil || deleted {
 		t.Fatalf("old key cleanup deleted replacement: deleted=%v err=%v", deleted, err)
 	}
-	if _, found, err := stores.GetNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil || !found {
-		t.Fatalf("replacement sandbox ref found=%v err=%v", found, err)
+	if ref, found, err := stores.GetNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil || !found ||
+		ref.APISecretFingerprint != replacementSandboxRef.APISecretFingerprint {
+		t.Fatalf("replacement sandbox ref=%+v found=%v err=%v", ref, found, err)
 	}
 	if _, found, err := stores.GetNodeBuildRef(ctx, nodeID, buildRef.BuildID); err != nil || !found {
 		t.Fatalf("replacement build ref found=%v err=%v", found, err)
 	}
-	gotKey, _, found, err := stores.getNodeManifestKeyShard(ctx, nodeID, manifestKey.Fingerprint)
-	if err != nil || !found || gotKey.Value != "new" {
+	gotKey, _, found, err := stores.getNodeKeyPairShard(ctx, nodeID, pair.APISecretFingerprint)
+	if err != nil || !found || gotKey.ExpiresUnix != 200 {
 		t.Fatalf("replacement key=%+v found=%v err=%v", gotKey, found, err)
 	}
 }
@@ -283,11 +334,15 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	n1Ref := clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g1", RouteKey: "rk1"}
+	n1Ref := clusterstate.NodeSandboxRef{
+		SandboxID: "same", Group: "/g1", RouteKey: "rk1", APISecretFingerprint: testAPIFingerprint,
+	}
 	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g2", RouteKey: "rk2"}); err != nil {
+	if err := stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{
+		SandboxID: "same", Group: "/g2", RouteKey: "rk2", APISecretFingerprint: testAPIFingerprint,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -305,7 +360,7 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 		t.Fatalf("idempotent same-node sandbox ref: %v", err)
 	}
 	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
-		SandboxID: "same", Group: "/other", RouteKey: "other",
+		SandboxID: "same", Group: "/other", RouteKey: "other", APISecretFingerprint: testAPIFingerprint,
 	}); !errors.Is(err, errNodeSandboxIDConflict) {
 		t.Fatalf("same-node ownership collision err=%v", err)
 	}
@@ -616,18 +671,19 @@ func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
 	remote := &routingNodeOwnerRecorder{allow: true}
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": remote})
 
-	if err := reg.nodeOwner.PutManifestKey(ctx, "n1", "fp", "inline", "key", 123); err != nil {
-		t.Fatalf("PutManifestKey: %v", err)
+	pair := testNodeKeyPair(strings.Repeat("a", 64), strings.Repeat("b", 64), 123)
+	if err := reg.nodeOwner.PutKeyPair(ctx, "n1", pair); err != nil {
+		t.Fatalf("PutKeyPair: %v", err)
 	}
 	if !reg.nodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1}) {
 		t.Fatal("AdmitBuild returned false")
 	}
-	if err := reg.nodeOwner.DeleteSandbox(ctx, "n1", "sb1"); err != nil {
+	if err := reg.nodeOwner.DeleteSandbox(ctx, "n1", "sb1", pair.APISecretFingerprint); err != nil {
 		t.Fatalf("DeleteSandbox: %v", err)
 	}
 	reg.nodeOwner.ReleaseBuild(ctx, "n1", "b1")
 
-	if len(remote.keys) != 1 || remote.keys[0] != "n1/fp" {
+	if len(remote.keys) != 1 || remote.keys[0] != "n1/"+pair.APISecretFingerprint {
 		t.Fatalf("remote keys=%v", remote.keys)
 	}
 	if len(remote.admitted) != 1 || remote.admitted[0] != "n1/b1" {
@@ -1493,12 +1549,12 @@ func (r *routingNodeOwnerRecorder) Connected(ctx context.Context, nodeID string)
 	return nil
 }
 
-func (r *routingNodeOwnerRecorder) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	r.keys = append(r.keys, nodeID+"/"+fingerprint)
+func (r *routingNodeOwnerRecorder) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	r.keys = append(r.keys, nodeID+"/"+pair.APISecretFingerprint)
 	return nil
 }
 
-func (r *routingNodeOwnerRecorder) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+func (r *routingNodeOwnerRecorder) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
 	return nil
 }
 
@@ -1515,7 +1571,7 @@ func (r *routingNodeOwnerRecorder) Runtime(ctx context.Context, nodeID string) (
 	return &NodeRecord{NodeID: nodeID}, true, nil
 }
 
-func (r *routingNodeOwnerRecorder) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+func (r *routingNodeOwnerRecorder) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
 	r.deleted = append(r.deleted, nodeID+"/"+sid)
 	return nil
 }

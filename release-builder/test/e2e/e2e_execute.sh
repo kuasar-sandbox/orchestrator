@@ -246,7 +246,7 @@ chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1MiB } }
 crypto: { chunk: aes, manifest: aes }
 EOF
 
-MK="$("$BIN/e2b-key-ctl" gen-key)"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
+MK="$("$BIN/e2b-key-ctl" gen-key)"; API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # Cold boot needs a pre-formatted empty ext4 to seed the writable overlay upper
 # (deployment-provided in prod; created inline here). mkfs.ext4 may live in /sbin.

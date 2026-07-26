@@ -2,6 +2,8 @@ package nodelink
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -20,29 +22,46 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+const (
+	testAPISecret   = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+	testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+)
+
+func testFingerprint(secretHex string) string {
+	raw, err := hex.DecodeString(secretHex)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
 
 type testPlacer struct{}
 
 func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
-	tok, err := clusterstate.DeriveAccessToken(testAuthKey, req.SandboxID)
-	if err != nil {
-		return nil, err
-	}
-	return &registry.Placement{NodeID: "n1", AccessToken: tok}, nil
+	return &registry.Placement{
+		NodeID:               "n1",
+		APISecretFingerprint: testFingerprint(testAPISecret),
+	}, nil
 }
 
 // fakeNode implements Node: it streams its routes and, on a create command,
 // "boots" the sandbox by adding a running route + emitting an upsert event — the
 // same path a real node takes (the registry's Reserve waits on that route).
 type fakeNode struct {
-	mu     sync.Mutex
-	routes map[string]routesync.RouteEntry
-	events chan routesync.Event
+	mu                   sync.Mutex
+	routes               map[string]routesync.RouteEntry
+	keyPairs             map[string]routesync.Command
+	createAPIFingerprint string
+	events               chan routesync.Event
 }
 
 func newFakeNode() *fakeNode {
-	return &fakeNode{routes: map[string]routesync.RouteEntry{}, events: make(chan routesync.Event, 16)}
+	return &fakeNode{
+		routes:   map[string]routesync.RouteEntry{},
+		keyPairs: map[string]routesync.Command{},
+		events:   make(chan routesync.Event, 16),
+	}
 }
 
 func (n *fakeNode) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
@@ -63,18 +82,47 @@ func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent   { return nil }
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
-	if cmd.Kind != routesync.CmdCreate {
+	switch cmd.Kind {
+	case routesync.CmdKeyPut:
+		n.mu.Lock()
+		n.keyPairs[cmd.APISecretFingerprint] = *cmd
+		n.mu.Unlock()
+		return ack
+	case routesync.CmdCreate:
+		n.mu.Lock()
+		_, installed := n.keyPairs[cmd.APISecretFingerprint]
+		n.createAPIFingerprint = cmd.APISecretFingerprint
+		n.mu.Unlock()
+		if !installed {
+			ack.Status = routesync.AckRejected
+			ack.Reason = "credential pair not installed"
+			return ack
+		}
+	default:
 		return ack
 	}
 	e := routesync.RouteEntry{
 		SandboxID: cmd.SID,
-		State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
+		State:     routesync.StateRunning,
 	}
 	n.mu.Lock()
 	n.routes[cmd.SID] = e
 	n.mu.Unlock()
 	n.events <- routesync.Event{Kind: routesync.TypeUpsert, Route: e}
 	return ack
+}
+
+func (n *fakeNode) installedKeyPair(fingerprint string) (routesync.Command, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	cmd, ok := n.keyPairs[fingerprint]
+	return cmd, ok
+}
+
+func (n *fakeNode) createFingerprint() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.createAPIFingerprint
 }
 
 func TestNodeLinkReserveRoundTrip(t *testing.T) {
@@ -109,24 +157,52 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	apiFingerprint := testFingerprint(testAPISecret)
+	manifestFingerprint := testFingerprint(testManifestKey)
+	if err := reg.Stores().UpsertNodeKeyPair(ctx, "n1", clusterstate.NodeKeyPair{
+		APISecretFingerprint:   apiFingerprint,
+		APISecretType:          clusterstate.SecretInline,
+		APISecret:              testAPISecret,
+		ManifestKeyFingerprint: manifestFingerprint,
+		ManifestKeyType:        clusterstate.SecretInline,
+		ManifestKey:            testManifestKey,
+		ExpiresUnix:            time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keyDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if keyPut, ok := node.installedKeyPair(apiFingerprint); ok {
+			if keyPut.APISecret != testAPISecret || keyPut.ManifestKey != testManifestKey ||
+				keyPut.ManifestKeyFingerprint != manifestFingerprint {
+				t.Fatalf("distributed credential pair: %+v", keyPut)
+			}
+			break
+		}
+		if time.Now().After(keyDeadline) {
+			t.Fatal("credential pair was not distributed over node-link")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	var res *registry.ReserveResult
 	var err error
+	reserveDeadline := time.Now().Add(3 * time.Second)
 	for {
 		res, err = reg.ReserveSandbox(ctx, "/cell/proj/app/g1", "u1:sess1", nil)
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(deadline) {
+		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(reserveDeadline) {
 			t.Fatalf("reserve over node-link: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	want, err := clusterstate.DeriveAccessToken(testAuthKey, res.SID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.NodeID != "n1" || res.SID == "" || res.AccessToken != want {
+	if res.NodeID != "n1" || res.SID == "" {
 		t.Fatalf("reserve result: %+v", res)
+	}
+	if got := node.createFingerprint(); got != apiFingerprint {
+		t.Fatalf("create APISecretFingerprint=%q, placement fingerprint=%q", got, apiFingerprint)
 	}
 }
 

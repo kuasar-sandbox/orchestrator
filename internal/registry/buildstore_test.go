@@ -21,15 +21,16 @@ type recordingNodeOwner struct {
 	ack          *routesync.CmdAck
 	ackErr       error
 	commands     []*routesync.Command
+	deleted      []string
 }
 
 func (a *recordingNodeOwner) Connected(context.Context, string) error { return a.connectedErr }
 
-func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+func (a *recordingNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
 	return nil
 }
 
-func (a *recordingNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+func (a *recordingNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
 	return nil
 }
 
@@ -46,7 +47,8 @@ func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeR
 	return &NodeRecord{NodeID: nodeID}, true, nil
 }
 
-func (a *recordingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+func (a *recordingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
+	a.deleted = append(a.deleted, nodeID+"/"+sid+"/"+apiSecretFingerprint)
 	return nil
 }
 
@@ -265,7 +267,7 @@ func TestReserveBuildKeepsCommittedBuildAfterAmbiguousCommandError(t *testing.T)
 	placements := 0
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
-		return &Placement{NodeID: fmt.Sprintf("n%d", placements)}, nil
+		return &Placement{NodeID: fmt.Sprintf("n%d", placements), APISecretFingerprint: testAPIFingerprint}, nil
 	}))
 	ackErr := errors.New("build acknowledgement response lost")
 	owner := &recordingNodeOwner{allow: true, ackErr: ackErr}
@@ -304,10 +306,10 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 		for _, nodeID := range req.ExcludeNodeIDs {
 			if nodeID == "stale" {
 				sawExclusion = true
-				return &Placement{NodeID: "live"}, nil
+				return &Placement{NodeID: "live", APISecretFingerprint: testAPIFingerprint}, nil
 			}
 		}
-		return &Placement{NodeID: "stale"}, nil
+		return &Placement{NodeID: "stale", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
 	for _, nodeID := range []string{"stale", "live"} {
 		if err := reg.stores.PutNode(ctx, &NodeRecord{
@@ -334,7 +336,7 @@ func TestReserveBuildDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	placements := 0
 	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
-		return &Placement{NodeID: "n1"}, nil
+		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, nil)
 	checkErr := errors.New("node owner temporarily unavailable")
 	owner := &recordingNodeOwner{allow: true, connectedErr: checkErr}

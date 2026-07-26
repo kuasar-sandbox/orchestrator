@@ -16,7 +16,7 @@ SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FI
 | 步骤 | 命令(真实 e2b Python SDK / node-ctl) | 证明 |
 |---|---|---|
 | 1 | (编排起栈) | orchestrator(TLS) + eBPF vswitch + host NAT;store/cache 经 UDS 复用 |
-| 2 | `e2b-key-ctl` + `manifest-key add` | 密钥模型:manifest_key 根密钥 → 派生 api_key → 白名单 + 租户镜像拉取凭据 |
+| 2 | `e2b-key-ctl` + `manifest-key add` | 凭据模型:ManifestKey 保护内容与拉取令牌,固定 KDF 派生缺省 APISecret,APISecret 签发 api_key,两者成对白名单入库 |
 | 3 | `Template().from_image(ref).build()` | **构建沙箱**(microVM)内拉取该镜像(租户凭据、租户网络)+ 展平为模板;**无客户端 docker** |
 | 4 | `Sandbox.create(template)` | 从模板冷启真实 cloud-hypervisor microVM,guest 内 envd 就绪 |
 | 5 | `sbx.commands.run(…)` | guest 内执行命令(默认用户 `user`,可写 `/home/user`)经 proxy→envd |

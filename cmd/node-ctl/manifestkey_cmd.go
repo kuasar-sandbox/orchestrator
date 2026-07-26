@@ -34,16 +34,17 @@ func buildRegistryAuth(file, user, pass, token string) (string, error) {
 }
 
 // manifestKeyCmd implements `node-ctl manifest-key {add|remove|check|list}`
-// — the create/build allowlist (the manifest_keys table). It is a thin client of the
+// — the tenant APISecret/ManifestKey pair allowlist. It is a thin client of the
 // running serve daemon's admin plane (the local control socket): the daemon is the
-// sole owner of the table. Keys are read from positional args or the MANIFEST_KEY
-// env; output is fingerprints only (the 24-hex SHA256[:12] prefix), never the key.
+// sole owner of the table. Manifest keys are read from positional args or the
+// MANIFEST_KEY env. APISecret is optional and otherwise derived at ingestion;
+// output contains complete fingerprints only, never either secret.
 // Admin authorization is by SO_PEERCRED (admin_pidfile allowlist, or the socket's
 // 0600 perms — same uid / root — when admin_pidfile is unset).
 //
-//	node-ctl manifest-key add    [--label L] [--socket S] <MANIFEST_KEY>...
-//	node-ctl manifest-key remove            [--socket S] <MANIFEST_KEY>...
-//	node-ctl manifest-key check             [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key add    [--api-secret S] [--label L] [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key remove [--api-secret S]             [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key check  [--api-secret S]             [--socket S] <MANIFEST_KEY>...
 //	node-ctl manifest-key list              [--socket S]
 func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	if len(args) == 0 {
@@ -52,6 +53,7 @@ func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("manifest-key "+sub, flag.ExitOnError)
 	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
+	apiSecret := fs.String("api-secret", os.Getenv("API_SECRET"), "optional APISecret; default derives from each ManifestKey")
 	label := fs.String("label", "", "optional label (add)")
 	ttl := fs.Duration("ttl", 0, "add: expire the key after this duration (e.g. 24h); 0 = never. Re-adding refreshes it.")
 	regAuthFile := fs.String("registry-auth", "", "add: tenant-default registry creds as a docker config.json file")
@@ -78,10 +80,16 @@ func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("manifest-key %s: provide MANIFEST_KEY arg(s) or env", sub)
 	}
+	if *apiSecret != "" && len(keys) != 1 {
+		return fmt.Errorf("manifest-key %s: --api-secret requires exactly one MANIFEST_KEY", sub)
+	}
 	switch sub {
 	case "add", "remove", "check":
 		for _, k := range keys {
-			req := configsock.AdminKeyRequest{Op: sub, Key: k, Label: *label, TTLSeconds: int64(ttl.Seconds()), RegistryAuth: registryAuth}
+			req := configsock.AdminKeyRequest{
+				Op: sub, ManifestKey: k, APISecret: *apiSecret, Label: *label,
+				TTLSeconds: int64(ttl.Seconds()), RegistryAuth: registryAuth,
+			}
 			code, body, err := udsDo(sock, http.MethodPost, configsock.PathAdminManifestKey, nil, req)
 			if err != nil {
 				return err
@@ -91,7 +99,7 @@ func manifestKeyCmd(args []string, _ *slog.Logger) error {
 			if code != http.StatusOK || resp.Error != "" {
 				return fmt.Errorf("manifest-key %s: %s", sub, firstNonEmpty(resp.Error, string(body)))
 			}
-			fmt.Printf("%-8s %s\n", resp.Status, resp.Fingerprint)
+			fmt.Printf("%-9s api=%s manifest=%s\n", resp.Status, resp.APISecretFingerprint, resp.ManifestKeyFingerprint)
 		}
 	default:
 		return fmt.Errorf("manifest-key: unknown subcommand %q (want add|remove|check|list)", sub)
@@ -116,7 +124,8 @@ func manifestKeyList(sock string) error {
 		if mi.ExpiresUnix > 0 {
 			exp = time.Unix(mi.ExpiresUnix, 0).UTC().Format(time.RFC3339)
 		}
-		fmt.Printf("%s  %-24s  created=%s  expires=%s\n", mi.Fingerprint, mi.Label,
+		fmt.Printf("api=%s  manifest=%s  %-24s  created=%s  expires=%s\n",
+			mi.APISecretFingerprint, mi.ManifestKeyFingerprint, mi.Label,
 			time.Unix(mi.CreatedUnix, 0).UTC().Format(time.RFC3339), exp)
 	}
 	return nil

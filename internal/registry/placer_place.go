@@ -131,9 +131,9 @@ func (p *HTTPPlacer) placeOne(ctx context.Context, peer PlacerPeer, req PlaceReq
 	}
 	return &Placement{
 		NodeID: out.NodeID, TemplateRef: out.TemplateRef, Config: out.Config,
-		TargetPort:     out.TargetPort,
-		KeyFingerprint: out.KeyFingerprint, AccessToken: out.AccessToken,
-		ImageRepo: out.ImageRepo, RegistryAuth: out.RegistryAuth,
+		TargetPort:           out.TargetPort,
+		APISecretFingerprint: out.APISecretFingerprint,
+		ImageRepo:            out.ImageRepo, RegistryAuth: out.RegistryAuth,
 	}, nil
 }
 

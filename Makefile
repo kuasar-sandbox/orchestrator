@@ -44,7 +44,7 @@ all: build
 # `build` ships the control-plane binaries.
 build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
 
-# e2b-key-ctl: pure-derivation tool to mint e2b API keys from a manifest key.
+# e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/e2b-key-ctl ./cmd/e2b-key-ctl

@@ -2,11 +2,9 @@ package orch
 
 import (
 	"context"
-	"encoding/hex"
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -16,15 +14,11 @@ func TestResolveTemplateAlias(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	mk := strings.Repeat("4", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, err := apikey.Mint(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
 	persist := "e2b-img-" + strings.Repeat("a", 64)
 	b := &types.Build{
 		BuildID: "b1", TemplateID: "transient-xyz", PersistID: persist,
-		ManifestKey: mk, Profile: types.ProfileE2B, Kind: types.KindImg,
+		APISecret: apiSecret, ManifestKey: mk, Profile: types.ProfileE2B, Kind: types.KindImg,
 		Status: types.BuildReady, Names: []string{"my-app", persist}, Aliases: []string{persist},
 		CreatedUnix: 1,
 	}
@@ -41,7 +35,7 @@ func TestResolveTemplateAlias(t *testing.T) {
 		t.Errorf(`unknown ref should be "", got %q`, got)
 	}
 	// a different tenant's key cannot resolve this build.
-	other, _ := apikey.Mint([]byte(strings.Repeat("\x05", 32)))
+	other := mintTestAPIKey(t, strings.Repeat("05", 32))
 	if got := o.resolveTemplateAlias(ctx, other, "my-app"); got != "" {
 		t.Errorf(`wrong tenant should be "", got %q`, got)
 	}

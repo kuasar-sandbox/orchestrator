@@ -2,6 +2,7 @@ package routesync
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -37,16 +38,26 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
 		CmdID: "x1", Kind: CmdCreate, SID: "s1", Config: map[string]string{"kuasar-sandbox.cluster": `{"group":"/c/p/a/g1","route_key":"u1:sess1"}`},
-		TemplateRef: "manifest://abc", KeyFingerprint: "e2b_deadbeef",
+		TemplateRef: "manifest://abc", APISecretFingerprint: strings.Repeat("a", 64),
 	}})
 	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Config["kuasar-sandbox.cluster"] == "" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
-		CmdID: "k1", Kind: CmdKeyPut, ManifestKeyType: "ref", ManifestKeyRef: "vault://tenant/key", ExpiresUnix: 123,
+		CmdID: "k1", Kind: CmdKeyPut,
+		APISecretFingerprint: strings.Repeat("a", 64), APISecretType: "ref", APISecretRef: "vault://tenant/api",
+		ManifestKeyFingerprint: strings.Repeat("b", 64), ManifestKeyType: "ref", ManifestKeyRef: "vault://tenant/manifest",
+		ExpiresUnix: 123,
 	}})
-	if k.Cmd == nil || k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/key" {
+	if k.Cmd == nil || k.Cmd.APISecretType != "ref" || k.Cmd.APISecretRef != "vault://tenant/api" ||
+		k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/manifest" {
 		t.Fatalf("key_put ref round-trip: %+v", k.Cmd)
+	}
+	d := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
+		CmdID: "k2", Kind: CmdKeyDrop, APISecretFingerprint: strings.Repeat("a", 64),
+	}})
+	if d.Cmd == nil || d.Cmd.Kind != CmdKeyDrop || d.Cmd.APISecretFingerprint != strings.Repeat("a", 64) {
+		t.Fatalf("key_drop round-trip: %+v", d.Cmd)
 	}
 	b := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
 		CmdID: "b1", Kind: CmdBuildRegister, BuildID: "build-1", TemplateRef: "transient-1", Profile: "bare",

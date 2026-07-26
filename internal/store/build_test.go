@@ -13,6 +13,7 @@ func TestSetBuildRunIDPreservesBuildingStatus(t *testing.T) {
 	ctx := context.Background()
 	b := &types.Build{
 		BuildID: "build-1", TemplateID: "transient-1",
+		APISecret:   strings.Repeat("2", 64),
 		ManifestKey: strings.Repeat("1", 64),
 		Profile:     types.ProfileE2B, Kind: types.KindImg,
 		Status: types.BuildWaiting, CreatedUnix: 1,

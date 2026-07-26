@@ -129,11 +129,11 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
 	}
-	manifestKey, err := o.resolveAllowed(ctx, req.APIKey)
+	pair, err := o.resolveAllowed(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
-	if manifestKey == "" {
+	if pair.APISecret == "" {
 		return nil, api.ErrNotAllowed
 	}
 	tmpl, err := types.ParseTemplateID(req.TemplateID)
@@ -178,7 +178,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
-		ManifestKey:        manifestKey,
+		APISecret:          pair.APISecret,
+		ManifestKey:        pair.ManifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
 		Metadata:           meta,
@@ -292,7 +293,7 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 	// hash-collision rows belonging to another tenant).
 	out := rows[:0]
 	for _, sb := range rows {
-		if verifyKey(apiKey, sb.ManifestKey) {
+		if verifyKey(apiKey, sb.APISecret) {
 			out = append(out, sb)
 		}
 	}
@@ -692,10 +693,10 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
-			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
-				o.log.Warn("reaper prune manifest keys", "err", err)
+			if n, err := o.st.PruneExpiredKeyPairs(ctx); err != nil {
+				o.log.Warn("reaper prune key pairs", "err", err)
 			} else if n > 0 {
-				o.log.Info("reaper pruned expired manifest keys", "n", n)
+				o.log.Info("reaper pruned expired key pairs", "n", n)
 			}
 		}
 	}

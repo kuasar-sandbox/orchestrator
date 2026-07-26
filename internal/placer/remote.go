@@ -334,21 +334,38 @@ func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	authSecret, ok, err := s.provider.GetAuthKey(req.Context(), req.URL.Query().Get("group"))
+	group := req.URL.Query().Get("group")
+	apiSecret, apiSecretFound, err := s.provider.GetAPISecret(req.Context(), group)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if !ok {
+	credentialFound := apiSecretFound
+	var manifestKey clusterstate.Secret
+	if apiSecret.Value == "" {
+		var manifestKeyFound bool
+		manifestKey, manifestKeyFound, err = s.provider.GetKey(req.Context(), group)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		credentialFound = credentialFound || manifestKeyFound
+	}
+	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if !credentialFound {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	authKey, err := inlineSecret("auth_key", authSecret)
+	apiSecretValue, err := inlineSecret("api_secret", apiSecret)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if authKey == "" || !verifyAPIKey(authKey, req.Header.Get("X-API-KEY")) {
+	if apiSecretValue == "" || !verifyAPIKey(apiSecretValue, req.Header.Get("X-API-KEY")) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -409,25 +426,10 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 		res.NoNode = true
 		return res
 	}
-	fp, _, _, _, err := manifestKeyPatch(req.Group, g.manifestKey)
+	apiFP, _, _, _, _, _, _, _, err := credentialPairPatch(req.Group, g.manifestKey, g.apiSecret)
 	if err != nil {
 		res.Error = err.Error()
 		return res
-	}
-	if !req.Build {
-		authKey, err := inlineSecret("auth_key", g.authKey)
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		if authKey != "" && req.SandboxID != "" {
-			tok, err := clusterstate.DeriveAccessToken(authKey, req.SandboxID)
-			if err != nil {
-				res.Error = err.Error()
-				return res
-			}
-			res.AccessToken = tok
-		}
 	}
 	p := placeParams{
 		group: req.Group, nodes: s.nodes.values(), selectors: g.hint.NodeSelectors,
@@ -446,7 +448,7 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 		res.NoNode = true
 	} else {
 		res.NodeID = node
-		res.KeyFingerprint = fp
+		res.APISecretFingerprint = apiFP
 		if req.Build {
 			res.ImageRepo = g.group.ImageRepo
 			if g.group.RegistryAuth.Value != "" {
@@ -471,7 +473,7 @@ type groupView struct {
 	group       clusterstate.SandboxGroup
 	hint        clusterstate.PlacementHint
 	manifestKey clusterstate.Secret
-	authKey     clusterstate.Secret
+	apiSecret   clusterstate.Secret
 }
 
 func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, bool, error) {
@@ -487,17 +489,22 @@ func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, b
 	if err != nil {
 		return groupView{}, false, err
 	}
-	authKey, _, err := s.provider.GetAuthKey(ctx, group)
+	apiSecret, _, err := s.provider.GetAPISecret(ctx, group)
 	if err != nil {
 		return groupView{}, false, err
 	}
-	return groupView{group: g, hint: hint, manifestKey: manifestKey, authKey: authKey}, true, nil
+	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
+	if err != nil {
+		return groupView{}, false, fmt.Errorf("placer: group %q: %w", group, err)
+	}
+	return groupView{group: g, hint: hint, manifestKey: manifestKey, apiSecret: apiSecret}, true, nil
 }
 
 type selectorPatchGroup struct {
 	group       string
 	hint        clusterstate.PlacementHint
 	manifestKey clusterstate.Secret
+	apiSecret   clusterstate.Secret
 }
 
 type selectorPatchState struct {
@@ -511,9 +518,9 @@ type importLeaseToken struct {
 }
 
 // reconcileSelectorPatches computes each imported group's shuffle-effective
-// selectors and manifest-key node set, then pushes them through placer_link. Only
+// selectors and credential-pair node set, then pushes them through placer_link. Only
 // the source lease winner runs Range for a source_id; unchanged patches are
-// refreshed so node_link manifest-key TTLs stay live.
+// refreshed so node_link credential-pair TTLs stay live.
 func (s *Service) reconcileSelectorPatches(ctx context.Context) {
 	last := map[string]selectorPatchState{} // group -> derived key + owner-set signature + last successful push
 	t := time.NewTicker(s.reconcileInterval())
@@ -686,7 +693,11 @@ func (s *Service) selectorPatchGroupsForImportPage(ctx context.Context, groups [
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, selectorPatchGroup{group: group, hint: hint, manifestKey: key})
+		apiSecret, _, err := s.provider.GetAPISecret(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, selectorPatchGroup{group: group, hint: hint, manifestKey: key, apiSecret: apiSecret})
 	}
 	return out, nil
 }
@@ -833,22 +844,28 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 	now := time.Now()
 	for _, g := range groups {
 		selectors, nodeIDs := selectorPatchTargets(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
-		fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
+		apiFP, apiType, apiValue, apiRef,
+			manifestFP, manifestType, manifestValue, manifestRef, err := credentialPairPatch(g.group, g.manifestKey, g.apiSecret)
 		if err != nil {
-			s.log.Warn("placer: manifest key", "group", g.group, "err", err)
+			s.log.Warn("placer: credential pair", "group", g.group, "err", err)
 			nodeIDs = nil
-			fp, keyType, keyValue, keyRef = "", "", "", ""
+			apiFP, apiType, apiValue, apiRef = "", "", "", ""
+			manifestFP, manifestType, manifestValue, manifestRef = "", "", "", ""
 		}
 		links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
 		linkSig := registryLinkSignature(links)
-		key := selectorPatchSignature(selectors, nodeIDs, fp, keyType, keyValue, keyRef, linkSig)
+		key := selectorPatchSignature(selectors, nodeIDs,
+			apiFP, apiType, apiValue, apiRef,
+			manifestFP, manifestType, manifestValue, manifestRef,
+			linkSig)
 		state := last[g.group]
 		if state.key == key && now.Sub(state.sentAt) < s.selectorPatchEvery {
 			continue
 		}
 		patch := &routesync.SelectorPatch{
 			Group: g.group, Selectors: selectors, NodeIDs: nodeIDs,
-			KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
+			APISecretFingerprint: apiFP, APISecretType: apiType, APISecret: apiValue, APISecretRef: apiRef,
+			ManifestKeyFingerprint: manifestFP, ManifestKeyType: manifestType, ManifestKey: manifestValue, ManifestKeyRef: manifestRef,
 			ImportSourceID: lease.sourceID, ImportOwnerID: lease.lease.OwnerID, ImportRunID: lease.lease.RunID, ImportTerm: lease.lease.Term,
 		}
 		pushed := false
@@ -903,16 +920,24 @@ func registryLinkSignature(links []RegistryLink) string {
 	return strings.Join(ids, ",")
 }
 
-func selectorPatchSignature(selectors []map[string]string, nodeIDs []string, fp, keyType, keyValue, keyRef, linkSig string) string {
+func selectorPatchSignature(selectors []map[string]string, nodeIDs []string,
+	apiFP, apiType, apiValue, apiRef,
+	manifestFP, manifestType, manifestValue, manifestRef,
+	linkSig string,
+) string {
 	nodes := append([]string(nil), nodeIDs...)
 	sort.Strings(nodes)
 	return strings.Join([]string{
 		strings.Join(canonicalSelectorStrings(selectors), ";"),
 		strings.Join(nodes, ","),
-		fp,
-		keyType,
-		keyValue,
-		keyRef,
+		apiFP,
+		apiType,
+		apiValue,
+		apiRef,
+		manifestFP,
+		manifestType,
+		manifestValue,
+		manifestRef,
 		linkSig,
 	}, "|")
 }

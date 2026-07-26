@@ -212,9 +212,9 @@ alloc_port ROUTER_PORT router
 alloc_port ADMIN_PORT node-stub-admin
 alloc_port DATA_PORT node-stub-data
 
-AUTH_KEY="$("$E2B_KEY_CTL" gen-key)"
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
-API_KEY="$("$E2B_KEY_CTL" gen-apikey "$AUTH_KEY")"
+API_SECRET="$("$E2B_KEY_CTL" derive-api-secret "$MANIFEST_KEY")"
+API_KEY="$("$E2B_KEY_CTL" gen-apikey "$API_SECRET")"
 
 OWNER_COUNT="$REGISTRIES"
 ROUTE_OWNER_COUNT="$OWNER_COUNT"
@@ -322,7 +322,7 @@ done
 
 mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
-{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
+{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","api_secret":"$API_SECRET","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
 for i in $(seq 1 "$REGISTRIES"); do
@@ -388,8 +388,8 @@ step "starting router"
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
-step "waiting for node_link manifest-key cache"
-python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
+step "waiting for node_link credential-pair cache"
+python3 - "$ADMIN" "$NODES" <<'PY' || fail "credential pairs were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
 for _ in range(300):

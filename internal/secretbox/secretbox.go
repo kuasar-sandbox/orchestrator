@@ -1,5 +1,5 @@
-// Package secretbox encrypts small secrets (the per-tenant manifest key) at rest
-// with an AES-256-GCM key set. The active key (index 0) encrypts; every key can
+// Package secretbox encrypts small secrets (including tenant API/content roots)
+// at rest with an AES-256-GCM key set. The active key (index 0) encrypts; every key can
 // decrypt, so keys rotate by prepending a new active key and keeping the old ones
 // as standby until their records are re-encrypted.
 //
@@ -108,7 +108,7 @@ func (b *Box) Decrypt(record string) ([]byte, error) {
 	return nil, errors.New("secretbox: no encryption key matches this record (rotated away?)")
 }
 
-// EncryptString / DecryptString are string conveniences for hex manifest keys.
+// EncryptString / DecryptString are string conveniences for encoded secrets.
 func (b *Box) EncryptString(s string) (string, error) { return b.Encrypt([]byte(s)) }
 func (b *Box) DecryptString(record string) (string, error) {
 	p, err := b.Decrypt(record)

@@ -348,7 +348,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 
 func (r *Registry) runNodeHeartbeatUpdates(ctx context.Context, nodeID string, ch <-chan *routesync.Heartbeat) {
 	keyRefreshCh := make(chan struct{}, 1)
-	go r.runNodeManifestKeyRefreshes(ctx, nodeID, keyRefreshCh)
+	go r.runNodeKeyPairRefreshes(ctx, nodeID, keyRefreshCh)
 	defer close(keyRefreshCh)
 	for {
 		select {
@@ -360,13 +360,13 @@ func (r *Registry) runNodeHeartbeatUpdates(ctx context.Context, nodeID string, c
 			}
 			if hb != nil {
 				r.updateHeartbeat(ctx, nodeID, hb)
-				queueNodeManifestKeyRefresh(keyRefreshCh)
+				queueNodeKeyPairRefresh(keyRefreshCh)
 			}
 		}
 	}
 }
 
-func (r *Registry) runNodeManifestKeyRefreshes(ctx context.Context, nodeID string, ch <-chan struct{}) {
+func (r *Registry) runNodeKeyPairRefreshes(ctx context.Context, nodeID string, ch <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -377,13 +377,13 @@ func (r *Registry) runNodeManifestKeyRefreshes(ctx context.Context, nodeID strin
 			}
 			rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
 			if err == nil && found {
-				r.refreshNodeManifestKeys(ctx, rec)
+				r.refreshNodeKeyPairs(ctx, rec)
 			}
 		}
 	}
 }
 
-func queueNodeManifestKeyRefresh(ch chan<- struct{}) {
+func queueNodeKeyPairRefresh(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default:

@@ -15,8 +15,9 @@ node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
 跑原版 envd(由单一 `sandbox-runtime.erofs` 内置,§11),serve 经 UDS
-反代其单端口协议(49983/Connect-RPC)。密钥模型以租户 **manifest_key** 为根:api_key
-由它派生(MAC 令牌),库内只存 AES-GCM 密文,密钥永不落明文盘(§7)。
+反代其单端口协议(49983/Connect-RPC)。租户根凭据是 **APISecret + ManifestKey**:
+APISecret 仅用于签发/验证 api_key,ManifestKey 保护 manifest 内容和镜像拉取令牌;
+APISecret 缺省时由 ManifestKey 通过固定 KDF 派生。两者成对加密存储,永不落明文盘(§7)。
 
 产物两个二进制:**`node-ctl`**(daemon + 启动器 + 资源控制器 + 管理 CLI,§2)与
 **`e2b-key-ctl`**(纯派生凭据工具,无 DB/config/编排状态,§2.8)。
@@ -145,7 +146,7 @@ registry(§10、§4.6)。
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
 | `resource` | `status`/`list`/`drain`/`grant`/`reclaim`:资源控制器只读巡检与运维(node-resource.md §2) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
-| `manifest-key` | `add`/`remove`/`check`/`list`:create/build 白名单管理(§7;集群下另由 registry 租约写入,§10) |
+| `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理(§7;集群下另由 registry 租约写入,§10) |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移(§8.1) |
 | `version` | 版本 |
 
@@ -153,19 +154,21 @@ registry(§10、§4.6)。
 
 | 子命令 | 用途 |
 |---|---|
-| `gen-key` | 生成随机 32B manifest key(64-hex) |
-| `gen-apikey [<MANIFEST_KEY>]` | 从 manifest key 派生 e2b api key(`e2b_` + hex,§7) |
-| `fingerprint [<MANIFEST_KEY>]` | 打印 24-hex 指纹(与白名单/库内索引一致) |
+| `gen-key` | 生成随机 32B 根凭据(64-hex) |
+| `derive-api-secret [<MANIFEST_KEY>]` | 用固定 KDF 派生缺省 APISecret(§7) |
+| `gen-apikey [<API_SECRET>]` | 用 APISecret 签发 e2b api key(`e2b_` + hex,§7) |
+| `fingerprint [<API_SECRET>]` | 打印 APISecret 的完整 64-hex SHA-256 指纹 |
 | `seal-pull-token [<MANIFEST_KEY>] …` | 封装不透明镜像拉取令牌(`kpt_`,§12) |
 | `version` | 版本 |
 
 接住一个新节点(独立模式)的典型顺序:
 
 ```bash
-# 1) 生成租户根密钥,登记白名单,派生 SDK 用的 api key
+# 1) 生成内容根密钥,派生缺省 APISecret,登记凭据对,签发 SDK 用的 api key
 MK=$(e2b-key-ctl gen-key)
-node-ctl manifest-key add "$MK" --label tenant-a
-export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
+API_SECRET=$(e2b-key-ctl derive-api-secret "$MK")
+node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
+export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 2) e2b SDK/CLI 直接指向本机
 export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
@@ -250,26 +253,32 @@ node-ctl config <serve|proxy> --config <file> --resolve   # 再展开 auto/派�
 
 ### 2.6 `node-ctl manifest-key`
 
-create/build 白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平面**的瘦
+create/build 凭据对白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平面**的瘦
 客户端(经本机控制 socket,§6)——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
 只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
-key 取自位置参数或 `MANIFEST_KEY` env;输出只含指纹,绝不回显 key。集群下该表另由
-registry 经 node-link 以租约项写入(§10、cluster.md),与手动项共存。
+ManifestKey 取自位置参数或 `MANIFEST_KEY` env;APISecret 可用 `--api-secret` / `API_SECRET`
+显式指定,缺省则按 §7 固定 KDF 派生。两者原子成对入库;输出只含两者的完整指纹,
+绝不回显根凭据。集群下该表另由 registry 经 node-link 以租约项写入(§10、cluster.md),
+与手动项共存。
 
 ```
-node-ctl manifest-key add    [--label L] [--ttl 24h]
+node-ctl manifest-key add    [--api-secret S] [--label L] [--ttl 24h]
                              [--registry-auth <docker.json> |
                               --registry-username U --registry-password P |
                               --registry-token T]      [--socket S] <KEY>…
-node-ctl manifest-key remove [--socket S] <KEY>…
-node-ctl manifest-key check  [--socket S] <KEY>…
+node-ctl manifest-key remove [--api-secret S] [--socket S] <KEY>…
+node-ctl manifest-key check  [--api-secret S] [--socket S] <KEY>…
 node-ctl manifest-key list   [--socket S]
 ```
 
-- `--ttl`:失效时长(`0`/缺省 = 永不);**重复 add 刷新失效时间**。过期 key 视同不在
+- `--api-secret`:显式指定与该 ManifestKey 配对的 APISecret;只接受单个 `<KEY>`。
+  缺省时派生默认值。`add/remove/check` 始终按完整凭据对操作。
+- `--ttl`:失效时长(`0`/缺省 = 永不);只有完整 pair 完全相同时,重复 add 才刷新失效时间;
+  相同 APISecret 完整指纹绑定不同凭据材料时报冲突。过期凭据对视同不在
   白名单,由 reaper 惰性清理;`list` 显示 `expires`。
 - `--registry-auth`/`--registry-*`:租户默认镜像拉取凭据,加密存白名单行
   (`registry_auth_enc`),构建拉取时按 fromImage 的 host 匹配取用(§12)。
+- `add/remove/check` 输出 `STATUS api=<64-hex> manifest=<64-hex>`;`list` 逐行输出两项完整指纹。
 - 鉴权:`SO_PEERCRED`——配置了 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠
   socket 0600 权限(同 uid / root)。
 
@@ -324,7 +333,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
-| `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
+| `encryption_key` | (必填) | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
@@ -383,12 +392,12 @@ proxy 组件)。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式
 ## 4. e2b API 契约
 
 基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
-(e2b CLI 构建面,两者同样解析)。api_key 由 manifest_key 派生(`e2b-key-ctl
+(e2b CLI 构建面,两者同样解析)。api_key 由 APISecret 签发(`e2b-key-ctl
 gen-apikey`),serve 经 MAC 校验解析出租户——无静态 api_keys 表(§7)。
 
-**归属校验**:按 id 的控制操作用 api_key 的 MAC 对该资源行的(解密)manifest_key
-校验,不符回 **404**(不泄露他租户存在性);create / build / import 另需 manifest_key
-在白名单,否则 **403**。
+**归属校验**:按 id 的控制操作用 api_key 的 MAC 对该资源行的(解密)APISecret
+校验,不符回 **404**(不泄露他租户存在性);create / build / import 另需对应的
+APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 ### 4.1 控制面:沙箱生命周期
 
@@ -676,10 +685,12 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
 
 **② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
-{op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
-管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
-0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 心跳维系收到的 `key_put` 写 / 重发续租
-租约项;未续租 key 按 TTL 淘汰,`key_drop` 只作为 best-effort 清理命令(§10)。
+{op: add|remove|check, manifest_key, api_secret?, label, ttl_seconds, registry_auth}`):
+APISecret+ManifestKey 凭据对白名单管理(§7);响应和 list 只返回两者的完整指纹。
+鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
+0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 心跳维系收到的原子
+凭据对 `key_put` 写入 / 重发续租;未续租条目按 TTL 淘汰,`key_drop` 只作为
+best-effort 清理命令(§10)。
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
@@ -697,41 +708,52 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 
 **信任模型**:host root / daemon uid 可信;租户代码在 guest 内,够不到 host UDS。
 
-## 7. 密钥与归属模型(manifest_key 根密钥,加密存 sqlite)
+## 7. 密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)
 
-- **manifest_key 是每租户根密钥**(32B / 64-hex),同时就是 manifest 内容键
-  (`MANIFEST_KEY` env / `manifest.key`)。**api_key 由它派生**(`e2b-key-ctl
-  gen-apikey`):
+- **根凭据分工**:APISecret 与 ManifestKey 都是 32B / 64-lowercase-hex。
+  APISecret 只用于 API 请求认证;ManifestKey 是 manifest 内容键(`MANIFEST_KEY` env /
+  `manifest.key`),也用于封装镜像拉取令牌。创建凭据对时可显式给出 APISecret;
+  缺省值采用固定、域隔离的 KDF:
+
+  ```
+  APISecret = HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")
+  ```
+
+  **api_key 只由 APISecret 签发和验证**(`e2b-key-ctl gen-apikey`):
 
   ```
   api_key = "e2b_" + hex( fp(12) ‖ ts(4) ‖ nonce(4) ‖ mac(16) )      # 76 字符
-  fp  = SHA256(manifest_key)[:12]                                    # O(1) 库内匹配
-  mac = HMAC-SHA256(manifest_key, fp‖ts‖nonce)[:16]                  # 无 key 不可伪造
+  fp  = SHA256(APISecret)[:12]                                       # 候选预筛,不是唯一身份
+  mac = HMAC-SHA256(APISecret, fp‖ts‖nonce)[:16]                     # 无 APISecret 不可伪造
   ```
 
   e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验 api_key 格式(故用 hex 编码);serve 另
-  自校验 MAC(`internal/apikey`)。manifest_key 本身永不发给 SDK。
-- **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表的 manifest_key 字段
-  AES-256-GCM 加密(`internal/secretbox`:记录 = `keytag(4)‖nonce(12)‖ct+tag`,
-  keytag 选解密钥),另存 `manifest_key_hash = hex(fp)` 非唯一索引(快速匹配/排除)。
+  自校验 MAC(`internal/apikey`)。APISecret 与 ManifestKey 本身都不发给 SDK。
+- **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表均保存完整凭据对;
+  `api_secret_enc`、`manifest_key_enc` 使用 AES-256-GCM(`internal/secretbox`:
+  记录 = `keytag(4)‖nonce(12)‖ct+tag`,keytag 选解密钥)。两者各存完整 64-hex
+  SHA-256 指纹;API key 内的 24-hex 短指纹只作候选预筛,不作唯一身份。
   加密密钥经 `encryption_key` / `NODE_CONFIG_ENCRYPTION_KEY`(`:` 分隔多键,[0]
   活动、其余备用解旧记录,支持轮换)。
-- **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 `fp` 命中行/白名单 →
-  解密 manifest_key → 重算 HMAC 比对:
-  - **create / build / import**:manifest_key 须在 `manifest_keys` 白名单
+- **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 APISecret 候选指纹
+  命中行/白名单 → 解密 APISecret → 重算 HMAC 比对:
+  - **create / build / import**:APISecret+ManifestKey 凭据对须在 `manifest_keys` 白名单
     (`node-ctl manifest-key`,§2.6;daemon 是该表唯一写者;集群下 registry 经
     node-link 租约写入,§10),否则 **403**。
-  - **其他按 id / list 操作**:只对资源行自身的 manifest_key 校验,不查白名单——即
+  - **其他按 id / list 操作**:只对资源行自身的 APISecret 校验,不查白名单——即
     清空白名单,存量 sandbox/build 仍可正常操作直至生命周期结束。
   - list 的 hash 预筛非唯一,逐行再验 MAC,杜绝 hash 碰撞串租户。
+- **业务记录复制**:create/build/import 插入时把完整 pair 复制进 sandbox/build 行。
+  后续 allowlist add/drop/TTL 或 provider 凭据更新只影响新插入记录,不重绑既有业务记录。
 - **与收敛加密的关系**:manifest_key 只封 manifest 的密钥表;chunk 加密密钥派生自
   `SHA256(salt‖明文)`、与租户 key 无关 ⇒ chunk 去重仍跨租户;租户之间不共享 key 与
   模板。
-- **key 不落明文**:sqlite 内加密;运行期只在 serve 内存、LaunchSpec env 帧、
-  子进程 env(`MANIFEST_KEY`)中;`<sid>.yaml` 非密不含 key。auto-resume 从加密存储
-  解出 key 解封快照(数据面唤醒无 api_key 可用)。集群下经 node-link 下行的 manifest_key
-  同样仅入加密存储 + 运行期内存(§10)。
-- 数据面另有 token 与会话密钥,皆系于此根:`envdAccessToken`/`trafficAccessToken`
+- **根凭据不落明文**:sqlite 内加密;运行期只在 serve 内存和必要的进程 env 中。
+  ManifestKey 经 LaunchSpec/BuildSpec 注入需要内容访问的宿主进程;`<sid>.yaml` 非密不含根凭据。
+  APISecret 留在 serve 内用于认证,不下发给子进程。auto-resume 从资源行解密 ManifestKey
+  访问快照。集群下 node-link 原子下发完整凭据对,
+  两者同样仅入加密存储 + 运行期内存(§10)。
+- 数据面凭据独立于 APISecret:`envdAccessToken`/`trafficAccessToken`
   (create 时铸造的随机 token、随行存库,数据面鉴权语义见 node-proxy.md §7);`MmdsSecret =
   HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
   密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md §8)。
@@ -793,12 +815,14 @@ e2b API/CLI 零改动。
 
 - **晋升 / 转模板**(`--to-template`,须 paused):确保远程后,组装并打印自描述持久
   id `<profile>-snp-<key>`(不写 builds 表)。之后 `e2b sandbox create <id>` 即从该
-  快照扇出新沙箱(新 sid);create 解密用的租户 key 仍由 api_key→白名单解析。
+  快照扇出新沙箱(新 sid);create 由 api_key→白名单解析完整凭据对,再以 ManifestKey
+  访问快照内容。
 - **迁移(新 sid 跨机)**:`export-sandbox <sid>` 确保远程后导出**单行 base64 token**
-  = 沙箱行(env/metadata/deadline/数据面 token + runtime erofs 摘要;manifest_key
-  仅指纹、不含密钥);默认回收源行(move,`--keep-source` = copy)。目标机
-  `import-sandbox <token>`:api_key → 白名单解析租户 key(须先 `manifest-key add`,
-  与 create 同前置)、校验 token 指纹与本机 runtime 摘要一致,分配新 UUIDv7 并插入
+  = 沙箱行(env/metadata/deadline + runtime erofs 摘要;APISecret 与 ManifestKey
+  均只携带完整指纹、不含根凭据);默认回收源行(move,`--keep-source` = copy)。目标机
+  `import-sandbox <token>`:api_key → 白名单解析凭据对(须先 `manifest-key add`,
+  与 create 同前置)、同时校验凭据对的 APISecret/ManifestKey 完整指纹,并校验本机 runtime 摘要一致,
+  分配新 UUIDv7 并插入
   paused 行;随后对新 sid 执行 `connect`。源 sid 不在目标机复用。目标机须共享同一
   `manifest_config`(远程 store)。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
@@ -947,11 +971,11 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, key_fp, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
-  | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
-  | `delete{cmd_id, sid}` | 销毁沙箱(§5 kill) |
-  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
+  | `create{cmd_id, sid, template_ref, api_secret_fingerprint, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
+  | `connect{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后恢复本机 PAUSED 沙箱(§8 auto-resume) |
+  | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
+  | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
+  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按完整 APISecret 指纹解析凭据对、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。
@@ -961,7 +985,7 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
 断线后节点指数退避重连并重注册,带 `resume_from=<rev>` 请求增量重放。registry/node 留存窗口内只补增量,
 否则逐条全量 + bookmark。registry 重启亦然。
 
-node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 `manifest_key` 只进入加密存储和运行期内存;上行
+node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 APISecret+ManifestKey 凭据对只进入加密存储和运行期内存;上行
 `access_token` 属沙箱级敏感,在 mTLS 内传输。
 
 接入集群与本机 plugin 平面使用同一 routesync 引擎和线格式,仅订阅者 kind 不同。router 不订阅节点
@@ -1139,7 +1163,7 @@ vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 tri
    `e2b-key-ctl seal-pull-token` 用租户 manifest_key 派生密钥封装的 `kpt_` 令牌,
    serve 以该租户存量 key 解封;
 2. **SDK 明文**:trigger body `fromImageRegistry{username, password}`;
-3. **租户默认**:`manifest_keys.registry_auth_enc`(docker config.json;
+3. **租户默认**:`manifest_keys.registry_auth_enc`(与完整凭据对绑定的 docker config.json;
    `manifest-key add --registry-auth` 或 `--registry-username/--password/--token`
    自动组装 catch-all `*` 条目;按 fromImage host → `*` 匹配取条)。
 
@@ -1186,19 +1210,21 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 ```
 sandboxes      id(uuidv7) PK, template_id, state(running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
-               inner_ip, port_mac, manifest_key_hash, manifest_key_enc, snapshot_ref,
+               inner_ip, port_mac, api_secret_hash, api_secret_enc,
+               manifest_key_hash, manifest_key_enc, snapshot_ref,
                envd_access_token, traffic_access_token, metadata_json, env_json,
                created_unix
 builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<key>),
-               manifest_key_hash, manifest_key_enc, profile, kind, from_image,
+               api_secret_hash, api_secret_enc, manifest_key_hash, manifest_key_enc,
+               profile, kind, from_image,
                start_cmd, status(registered|waiting|building|ready|error), reason,
                names_json, aliases_json, registry_auth_enc, created_unix
-manifest_keys  key_hash(索引), key_enc, label, created_unix, expires_unix,
-               registry_auth_enc
+manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
+               manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
 
-`builds` 兼任模板登记(§4.4);`*_key_enc` 均 AES-256-GCM、`*_hash` 为
-`SHA256(mk)[:12]` 非唯一索引(§7)。
+`builds` 兼任模板登记(§4.4);`*_enc` 根凭据均 AES-256-GCM、两项 `*_hash` 均为
+完整 SHA-256。`substr(api_secret_hash,1,24)` 仅建候选预筛索引(§7)。
 
 ### 15.2 重启对账
 

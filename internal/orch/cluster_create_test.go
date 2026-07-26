@@ -29,7 +29,11 @@ func TestClaimClusterCreateRejectsInflightAndStoredSandboxIDs(t *testing.T) {
 	}
 	o.releaseClusterCreate("inflight")
 
-	if err := o.st.Put(ctx, &types.Sandbox{ID: "stored", State: types.StateRunning}); err != nil {
+	manifestKey := strings.Repeat("b", 64)
+	if err := o.st.Put(ctx, &types.Sandbox{
+		ID: "stored", State: types.StateRunning,
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.claimClusterCreate(ctx, "stored"); err == nil {
@@ -44,8 +48,8 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := &routesync.Command{
-		TemplateRef:    "bare-img-" + strings.Repeat("a", 64),
-		KeyFingerprint: fingerprint,
+		TemplateRef:          "bare-img-" + strings.Repeat("a", 64),
+		APISecretFingerprint: fingerprint,
 		Config: map[string]string{
 			sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
 		},

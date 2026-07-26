@@ -33,11 +33,21 @@ import (
 )
 
 const (
-	testDomain  = "cluster.stub.local"
-	testGroup   = "/cell/proj/app/g1"
-	testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
-	testMK      = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testDomain          = "cluster.stub.local"
+	testGroup           = "/cell/proj/app/g1"
+	testAPISecret       = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+	testMK              = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	testEnvdAccessToken = "opaque-envd-access-token-from-node"
 )
+
+func fullFingerprint(t *testing.T, secretHex string) string {
+	t.Helper()
+	raw, err := hex.DecodeString(secretHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(apikey.FullFingerprint(raw))
+}
 
 type harness struct {
 	ctx    context.Context
@@ -138,11 +148,11 @@ func newHarness(t *testing.T) *harness {
 	rt.SetDataPlaneAuth("off")
 	routerSrv := httptest.NewServer(rt.Handler())
 
-	rawAuth, err := hex.DecodeString(testAuthKey)
+	rawAPISecret, err := hex.DecodeString(testAPISecret)
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiKey, err := apikey.Mint(rawAuth)
+	apiKey, err := apikey.Mint(rawAPISecret)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +213,7 @@ func writeStubGroup(t *testing.T, dir string) {
 	t.Helper()
 	raw, err := json.Marshal(clusterstate.SandboxGroupRecord{
 		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
-		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		APISecret:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
 		TemplateRef:   "tmpl-1",
 		NodeSelectors: []map[string]string{{"pool": "stub"}},
 		Config:        map[string]string{"from_group": "yes"},
@@ -281,7 +291,11 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 
 	h.waitForNodeKeyCache(t, "n1")
 	h.node.sendHeartbeat(t)
-	h.node.waitCommand(t, routesync.CmdKeyPut)
+	keyPut := h.node.waitCommand(t, routesync.CmdKeyPut)
+	if keyPut.APISecretFingerprint != fullFingerprint(t, testAPISecret) || keyPut.APISecret != testAPISecret ||
+		keyPut.ManifestKeyFingerprint != fullFingerprint(t, testMK) || keyPut.ManifestKey != testMK {
+		t.Fatalf("key_put did not carry the complete credential pair: %+v", keyPut)
+	}
 
 	resp := h.doDataByKey(t, "u1:s1")
 	resp.Body.Close()
@@ -296,8 +310,19 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	if location.Group != testGroup || location.RouteKey != "u1:s1" || create.TemplateRef != "tmpl-1" || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
 	}
-	if create.KeyFingerprint == "" || create.AccessToken == "" {
-		t.Fatalf("create missing key fingerprint or access token: %+v", create)
+	if create.APISecretFingerprint != fullFingerprint(t, testAPISecret) {
+		t.Fatalf("create APISecretFingerprint=%q, want group API secret fingerprint", create.APISecretFingerprint)
+	}
+	reserved, err := h.reg.ReserveSandbox(h.ctx, testGroup, "u1:s1", nil)
+	if err != nil {
+		t.Fatalf("ready Reserve: %v", err)
+	}
+	if reserved.AccessToken != testEnvdAccessToken {
+		t.Fatalf("ready Reserve token=%q, want node-reported token", reserved.AccessToken)
+	}
+	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, "u1:s1", create.SID)
+	if err != nil || !found || resolved.AccessToken != testEnvdAccessToken {
+		t.Fatalf("resolved route=%+v found=%v err=%v, want node-reported token", resolved, found, err)
 	}
 
 	select {
@@ -310,8 +335,8 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	}
 	select {
 	case tok := <-h.dataToken:
-		if tok != create.AccessToken {
-			t.Fatalf("node saw access token %q, want %q", tok, create.AccessToken)
+		if tok != testEnvdAccessToken {
+			t.Fatalf("node saw access token %q, want node-reported %q", tok, testEnvdAccessToken)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("node did not receive access token")
@@ -331,12 +356,16 @@ func (h *harness) waitForNodeKeyCache(t *testing.T, nodeID string) {
 	t.Helper()
 	for i := 0; i < 1000; i++ {
 		node, found, err := h.reg.Stores().GetNode(h.ctx, nodeID)
-		if err == nil && found && len(node.ManifestKeys) > 0 {
+		if err == nil && found && len(node.KeyPairs) == 1 &&
+			node.KeyPairs[0].APISecretFingerprint == fullFingerprint(t, testAPISecret) &&
+			node.KeyPairs[0].APISecret == testAPISecret &&
+			node.KeyPairs[0].ManifestKeyFingerprint == fullFingerprint(t, testMK) &&
+			node.KeyPairs[0].ManifestKey == testMK {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("node %s did not receive manifest key cache", nodeID)
+	t.Fatalf("node %s did not receive the complete credential pair cache", nodeID)
 }
 
 func TestClusterStubBuildRegister(t *testing.T) {
@@ -367,7 +396,8 @@ func TestClusterStubBuildRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build command metadata: %v", err)
 	}
-	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" || cmd.KeyFingerprint == "" || cmd.Profile != "bare" {
+	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" ||
+		cmd.APISecretFingerprint != fullFingerprint(t, testAPISecret) || cmd.Profile != "bare" {
 		t.Fatalf("build_register command = %+v", cmd)
 	}
 }
@@ -493,7 +523,7 @@ func (n *nodeStub) readLoop() {
 		case routesync.CmdCreate, routesync.CmdConnect:
 			n.sendRoute(n.t, routesync.RouteEntry{
 				SandboxID: cmd.SID, State: routesync.StateRunning,
-				AccessToken: cmd.AccessToken, TemplateID: cmd.TemplateRef,
+				AccessToken: testEnvdAccessToken, TemplateID: cmd.TemplateRef,
 			})
 		case routesync.CmdBuildRegister:
 			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildEvent, Build: &routesync.BuildEvent{

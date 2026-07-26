@@ -209,13 +209,14 @@ ok "orchestrator serving https://api.$DOMAIN"
 pause
 
 # ===========================================================================
-banner "Onboard a tenant (manifest key → allowlist + registry creds → e2b API key)"
+banner "Onboard a tenant (ManifestKey + derived APISecret → allowlist + API key)"
 # ---------------------------------------------------------------------------
 REG_FLAGS=(); [ -n "${REGISTRY_USER:-}" ] && REG_FLAGS=(--registry-username "$REGISTRY_USER" --registry-password "${REGISTRY_PASS:-}")
 say "allowlist the tenant manifest key + its default registry pull creds (so the node can pull $REGISTRY):"
 echo "${c_cmd}  \$ node-ctl manifest-key add ${REG_FLAGS:+--registry-username … } \$MANIFEST_KEY${c_off}"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "${REG_FLAGS[@]}" "$MK" >/dev/null || die "manifest-key add"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ok "tenant ready — e2b API key ${AK:0:16}…  (format e2b_<hex>)"
 # world-readable env for another terminal to drive the Python SDK against this node
 cat > "$CLI_ENV_FILE" <<EOF

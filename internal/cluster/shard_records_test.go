@@ -18,7 +18,7 @@ func TestShardRecordKeys(t *testing.T) {
 	if !ok || buildID != "b1" {
 		t.Fatalf("node build parse=%q ok=%v", buildID, ok)
 	}
-	fp, ok := ParseNodeManifestKeyRecordKey(NodeManifestKeyRecordKey("fp1"))
+	fp, ok := ParseNodeKeyPairRecordKey(NodeKeyPairRecordKey("fp1"))
 	if !ok || fp != "fp1" {
 		t.Fatalf("manifest key parse fp=%q ok=%v", fp, ok)
 	}

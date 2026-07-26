@@ -59,33 +59,45 @@ func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, 
 	return os.ErrNotExist
 }
 
-type stubAdmin struct{ keys map[string]string }
+type stubAdmin struct{ pairs map[string]AdminKeyInfo }
 
-func (a *stubAdmin) AddManifestKey(_ context.Context, key, label string, _ int64, _ string) (bool, string, error) {
-	if _, ok := a.keys[key]; ok {
-		return false, "fp-" + key, nil
+func stubKeyPair(manifestKey, apiSecret string) (string, string, string) {
+	if apiSecret == "" {
+		apiSecret = "derived-" + manifestKey
 	}
-	a.keys[key] = label
-	return true, "fp-" + key, nil
+	apiFP := "api-fp-" + apiSecret
+	manifestFP := "manifest-fp-" + manifestKey
+	return apiFP + "\x00" + manifestFP, apiFP, manifestFP
 }
 
-func (a *stubAdmin) RemoveManifestKey(_ context.Context, key string) (bool, string, error) {
-	if _, ok := a.keys[key]; ok {
-		delete(a.keys, key)
-		return true, "fp-" + key, nil
+func (a *stubAdmin) AddKeyPair(_ context.Context, manifestKey, apiSecret, label string, _ int64, _ string) (bool, string, string, error) {
+	key, apiFP, manifestFP := stubKeyPair(manifestKey, apiSecret)
+	if _, ok := a.pairs[key]; ok {
+		return false, apiFP, manifestFP, nil
 	}
-	return false, "fp-" + key, nil
+	a.pairs[key] = AdminKeyInfo{APISecretFingerprint: apiFP, ManifestKeyFingerprint: manifestFP, Label: label}
+	return true, apiFP, manifestFP, nil
 }
 
-func (a *stubAdmin) HasManifestKey(_ context.Context, key string) (bool, string, error) {
-	_, ok := a.keys[key]
-	return ok, "fp-" + key, nil
+func (a *stubAdmin) RemoveKeyPair(_ context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
+	key, apiFP, manifestFP := stubKeyPair(manifestKey, apiSecret)
+	if _, ok := a.pairs[key]; ok {
+		delete(a.pairs, key)
+		return true, apiFP, manifestFP, nil
+	}
+	return false, apiFP, manifestFP, nil
 }
 
-func (a *stubAdmin) ListManifestKeys(_ context.Context) ([]AdminKeyInfo, error) {
-	out := make([]AdminKeyInfo, 0, len(a.keys))
-	for k, label := range a.keys {
-		out = append(out, AdminKeyInfo{Fingerprint: "fp-" + k, Label: label})
+func (a *stubAdmin) HasKeyPair(_ context.Context, manifestKey, apiSecret string) (bool, string, string, error) {
+	key, apiFP, manifestFP := stubKeyPair(manifestKey, apiSecret)
+	_, ok := a.pairs[key]
+	return ok, apiFP, manifestFP, nil
+}
+
+func (a *stubAdmin) ListKeyPairs(_ context.Context) ([]AdminKeyInfo, error) {
+	out := make([]AdminKeyInfo, 0, len(a.pairs))
+	for _, pair := range a.pairs {
+		out = append(out, pair)
 	}
 	return out, nil
 }
@@ -189,24 +201,25 @@ func TestRunPlane(t *testing.T) {
 // TestAdminPlane: with admin_pidfile unset, the admin plane is reachable (socket
 // perms gate) and add/check/list/remove round-trip.
 func TestAdminPlane(t *testing.T) {
-	adm := &stubAdmin{keys: map[string]string{}}
+	adm := &stubAdmin{pairs: map[string]AdminKeyInfo{}}
 	_, client := startTestServer(t, Deps{Admin: adm})
 
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1", Label: "L"}); r.Status != "added" || r.Fingerprint != "fp-k1" {
+	req := AdminKeyRequest{ManifestKey: "k1", APISecret: "a1"}
+	if r := adminPost(t, client, AdminKeyRequest{Op: "add", ManifestKey: req.ManifestKey, APISecret: req.APISecret, Label: "L"}); r.Status != "added" || r.APISecretFingerprint != "api-fp-a1" || r.ManifestKeyFingerprint != "manifest-fp-k1" {
 		t.Fatalf("add: %+v", r)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1"}); r.Status != "refreshed" {
+	if r := adminPost(t, client, AdminKeyRequest{Op: "add", ManifestKey: req.ManifestKey, APISecret: req.APISecret}); r.Status != "refreshed" {
 		t.Fatalf("re-add: %+v", r)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "check", Key: "k1"}); r.Status != "present" {
+	if r := adminPost(t, client, AdminKeyRequest{Op: "check", ManifestKey: req.ManifestKey, APISecret: req.APISecret}); r.Status != "present" {
 		t.Fatalf("check: %+v", r)
 	}
 	_, body := rawGet(t, client, PathAdminManifestKey)
 	var infos []AdminKeyInfo
-	if err := json.Unmarshal(body, &infos); err != nil || len(infos) != 1 || infos[0].Fingerprint != "fp-k1" {
+	if err := json.Unmarshal(body, &infos); err != nil || len(infos) != 1 || infos[0].APISecretFingerprint != "api-fp-a1" || infos[0].ManifestKeyFingerprint != "manifest-fp-k1" {
 		t.Fatalf("list: %s (err %v)", body, err)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "remove", Key: "k1"}); r.Status != "removed" {
+	if r := adminPost(t, client, AdminKeyRequest{Op: "remove", ManifestKey: req.ManifestKey, APISecret: req.APISecret}); r.Status != "removed" {
 		t.Fatalf("remove: %+v", r)
 	}
 }
@@ -216,14 +229,14 @@ func TestAdminPlane(t *testing.T) {
 func TestAdminPidfileGate(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "admin.pids")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1)+"\n# a comment\n")
-	adm := &stubAdmin{keys: map[string]string{}}
+	adm := &stubAdmin{pairs: map[string]AdminKeyInfo{}}
 	_, client := startTestServer(t, Deps{Admin: adm, AdminPidfile: pf})
 
-	if code, _ := rawPost(t, client, PathAdminManifestKey, AdminKeyRequest{Op: "add", Key: "k1"}); code != http.StatusForbidden {
+	if code, _ := rawPost(t, client, PathAdminManifestKey, AdminKeyRequest{Op: "add", ManifestKey: "k1"}); code != http.StatusForbidden {
 		t.Fatalf("excluded pid should be 403, got %d", code)
 	}
 	mustWrite(t, pf, strconv.Itoa(os.Getpid())+"\n")
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1"}); r.Status != "added" {
+	if r := adminPost(t, client, AdminKeyRequest{Op: "add", ManifestKey: "k1"}); r.Status != "added" {
 		t.Fatalf("allowlisted pid should add: %+v", r)
 	}
 }

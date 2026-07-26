@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -18,6 +20,34 @@ import (
 )
 
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }
+
+func deriveTestAPISecret(t *testing.T, manifestKey string) string {
+	t.Helper()
+	raw, err := hex.DecodeString(manifestKey)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("invalid test ManifestKey %q: %v", manifestKey, err)
+	}
+	return hex.EncodeToString(apikey.DeriveAPISecret(raw))
+}
+
+func mintTestAPIKey(t *testing.T, apiSecret string) string {
+	t.Helper()
+	raw, err := hex.DecodeString(apiSecret)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("invalid test APISecret %q: %v", apiSecret, err)
+	}
+	apiKey, err := apikey.Mint(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return apiKey
+}
+
+func defaultTestCredentials(t *testing.T, manifestKey string) (apiSecret, apiKey string) {
+	t.Helper()
+	apiSecret = deriveTestAPISecret(t, manifestKey)
+	return apiSecret, mintTestAPIKey(t, apiSecret)
+}
 
 func testOrchCfg(t *testing.T, cfg *config.Config) *Orchestrator {
 	return testOrchCfgAt(t, cfg, filepath.Join(t.TempDir(), "t.db"))
@@ -38,12 +68,13 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 }
 
 // TestResolveBuildCreds verifies the precedence: pull token > fromImageRegistry
-// (cleartext) > tenant default (manifest_keys) > anonymous.
+// (cleartext) > tenant default (credential pair) > anonymous.
 func TestResolveBuildCreds(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	mk := strings.Repeat("3", 64)
-	b := &types.Build{ManifestKey: mk, FromImage: "reg.example.com/app:tag"}
+	apiSecret := deriveTestAPISecret(t, mk)
+	b := &types.Build{APISecret: apiSecret, ManifestKey: mk, FromImage: "reg.example.com/app:tag"}
 
 	user := func(js string) string {
 		var c regcreds.Creds
@@ -59,9 +90,9 @@ func TestResolveBuildCreds(t *testing.T) {
 	if js, err := o.resolveBuildCreds(ctx, b, "", "fu", "fp"); err != nil || user(js) != "fu" {
 		t.Fatalf("fromImageRegistry: %q %v", js, err)
 	}
-	// tenant default (stored on the manifest key) when nothing per-build is given.
+	// tenant default (stored on the credential pair) when nothing per-build is given.
 	auth, _ := regcreds.AssembleDockerAuth(regcreds.Creds{Username: "tu", Password: "tp"})
-	if _, err := o.st.AddManifestKey(ctx, mk, "", 0, auth); err != nil {
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, auth); err != nil {
 		t.Fatal(err)
 	}
 	if js, err := o.resolveBuildCreds(ctx, b, "", "", ""); err != nil || user(js) != "tu" {

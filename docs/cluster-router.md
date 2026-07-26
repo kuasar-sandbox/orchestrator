@@ -32,7 +32,7 @@ node owner / placer / node
 4. **fail-fast 失效**:node 返回 sandbox 不存在、token 不匹配、连接失败时,router 淘汰本地缓存并重新 Reserve。
 5. **数据面字节不进 registry**:registry 只参与 cold/miss/fail-fast 控制面。
 6. **鉴权材料来自 placer/provider 侧**:router 调 route owner 的 verify-key;registry failover 到 ready placer,
-   不读取 auth_key;router 不接触 manifest_key。
+   由 placer 使用 provider 的 APISecret 验证。router 与 route owner 不读取根凭据,也不接触 ManifestKey。
 
 ## 2. 命令行
 
@@ -184,7 +184,7 @@ Reserve。迁移/恢复时允许首个请求付出一次 fail-fast 代价,不为
 ## 7. 控制面
 
 router 校验 API key 与 group 关系时调用 route owner `verify-key`;route owner failover 到 ready placer,
-实际校验使用 placer/provider 侧 `auth_key` 或等价 verify 能力。router 不接触 `manifest_key`。
+实际校验由 placer 使用 provider 侧 APISecret 完成。ManifestKey 只用于内容路径,不参与该校验。
 
 | 操作 | 行为 |
 |---|---|

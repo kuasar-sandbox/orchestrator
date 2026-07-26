@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"encoding/hex"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -94,14 +92,11 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	// bare-img with no snapshot ref → launch reaches lc.Start without the e2b
 	// readiness wait or the snapshot-probe exec (RestoreRefFor returns "").
 	mk := strings.Repeat("a", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, err := apikey.Mint(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
 		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
+		APISecret:   apiSecret,
 		ManifestKey: mk,
 		RunDir:      cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:     cfg.Paths.BaseRoot + "/" + sid,

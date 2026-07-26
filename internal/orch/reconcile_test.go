@@ -56,12 +56,13 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	knownUnit := "sandbox-runner@" + knownRun + ".service"
 	orphanUnit := "sandbox-runner@sr-00000000-0000-7000-8000-000000000002.service"
 	failedUnit := "sandbox-runner@sr-00000000-0000-7000-8000-000000000003.service"
+	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID: "sandbox-1", TemplateID: "bare-img-" + strings.Repeat("b", 64),
 		State: types.StateRunning, RunID: knownRun,
-		RunDir:      filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
-		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
-		ManifestKey: strings.Repeat("a", 64), CreatedUnix: 1,
+		RunDir:    filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
+		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1,
 	}
 	if err := st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)

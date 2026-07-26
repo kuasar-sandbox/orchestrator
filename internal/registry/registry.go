@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -57,17 +57,15 @@ type PlaceRequest struct {
 }
 
 // Placement is a placer answer plus the group-derived material the registry must
-// place on node commands. Registry route owners persist AccessToken in route_link
-// and never call a sandbox-group provider on the hot/read path.
+// place on node commands.
 type Placement struct {
-	NodeID         string
-	TemplateRef    string
-	TargetPort     int
-	Config         map[string]string
-	KeyFingerprint string
-	AccessToken    string
-	ImageRepo      string
-	RegistryAuth   string
+	NodeID               string
+	TemplateRef          string
+	TargetPort           int
+	Config               map[string]string
+	APISecretFingerprint string
+	ImageRepo            string
+	RegistryAuth         string
 }
 
 // Placer suggests a node and group-derived create/build material. Production
@@ -192,7 +190,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	return r
 }
 
-// applySelectorPatch renews the placer-selected node manifest-key cache. The
+// applySelectorPatch renews the placer-selected node credential-pair cache. The
 // placer owns selector/shuffle decisions; registry only writes the current key
 // lease into node_link for the explicit nodes in the patch. Old keys are not
 // actively deleted: node_link and node side TTLs expire entries that stop being
@@ -201,24 +199,37 @@ func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.Selector
 	if err := r.checkSelectorPatchLease(ctx, p); err != nil {
 		return err
 	}
-	if p.KeyFingerprint == "" || len(p.NodeIDs) == 0 {
+	pair := clusterstate.NodeKeyPair{
+		APISecretFingerprint:   p.APISecretFingerprint,
+		APISecretType:          p.APISecretType,
+		APISecret:              p.APISecret,
+		APISecretRef:           p.APISecretRef,
+		ManifestKeyFingerprint: p.ManifestKeyFingerprint,
+		ManifestKeyType:        p.ManifestKeyType,
+		ManifestKey:            p.ManifestKey,
+		ManifestKeyRef:         p.ManifestKeyRef,
+	}
+	if selectorPatchPairEmpty(pair) {
 		return nil
 	}
-	keyType, keyValue := p.ManifestKeyType, p.ManifestKey
-	if keyType == clusterstate.SecretRef {
-		keyValue = p.ManifestKeyRef
+	var err error
+	pair, err = normalizeNodeKeyPair(pair)
+	if err != nil {
+		return err
 	}
-	if keyType == "" && keyValue != "" {
-		keyType = clusterstate.SecretInline
-	}
-	if keyValue == "" {
+	if len(p.NodeIDs) == 0 {
 		return nil
 	}
-	expiresUnix := time.Now().Add(keyLeaseTTL).Unix()
-	return r.putManifestKeyTargets(ctx, p.NodeIDs, p.KeyFingerprint, keyType, keyValue, expiresUnix)
+	pair.ExpiresUnix = time.Now().Add(keyLeaseTTL).Unix()
+	return r.putKeyPairTargets(ctx, p.NodeIDs, pair)
 }
 
-func (r *Registry) putManifestKeyTargets(ctx context.Context, nodeIDs []string, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+func selectorPatchPairEmpty(pair clusterstate.NodeKeyPair) bool {
+	return pair.APISecretFingerprint == "" && pair.APISecretType == "" && pair.APISecret == "" && pair.APISecretRef == "" &&
+		pair.ManifestKeyFingerprint == "" && pair.ManifestKeyType == "" && pair.ManifestKey == "" && pair.ManifestKeyRef == ""
+}
+
+func (r *Registry) putKeyPairTargets(ctx context.Context, nodeIDs []string, pair clusterstate.NodeKeyPair) error {
 	if r.nodeOwner == nil || len(nodeIDs) == 0 {
 		return nil
 	}
@@ -243,7 +254,7 @@ func (r *Registry) putManifestKeyTargets(ctx context.Context, nodeIDs []string, 
 					if !ok {
 						return
 					}
-					err := r.nodeOwner.PutManifestKey(workCtx, nodeID, fingerprint, keyType, keyValue, expiresUnix)
+					err := r.nodeOwner.PutKeyPair(workCtx, nodeID, pair)
 					if err == nil || errors.Is(err, ErrNodeGone) {
 						continue
 					}
@@ -530,12 +541,13 @@ func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeK
 		if _, ok, err := r.stores.CASSandbox(ctx, orig, rev); err != nil || !ok {
 			return false
 		}
-		if dropCurrentRef && cur.NodeID != "" && (cur.NodeID != orig.NodeID || cur.SID != orig.SID) {
+		if dropCurrentRef && cur.NodeID != "" && !sameSandboxGeneration(cur, orig) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
 		}
 		if orig.NodeID != "" {
 			_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
 				Group: group, RouteKey: routeKey, SandboxID: orig.SID,
+				APISecretFingerprint: orig.APISecretFingerprint,
 			})
 		}
 		return true
@@ -568,7 +580,10 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		if _, ok, err := r.stores.CASSandbox(ctx, &reserved, rev); err != nil || !ok {
 			return cas(err, ok)
 		}
-		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: rec.SID}); err != nil {
+		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{
+			Group: group, RouteKey: routeKey, SandboxID: rec.SID,
+			APISecretFingerprint: rec.APISecretFingerprint,
+		}); err != nil {
 			if errors.Is(err, errNodeSandboxIDConflict) {
 				r.rollbackReserveRetainingOwnership(group, routeKey, rec, true)
 			} else {
@@ -576,7 +591,10 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			}
 			return err
 		}
-		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
+		ccmd := &routesync.Command{
+			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID,
+			APISecretFingerprint: rec.APISecretFingerprint,
+		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, ccmd, lifecycleAckTimeout)
 		if err != nil {
 			r.rollbackReserve(group, routeKey, rec, true)
@@ -635,6 +653,12 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if placement == nil || placement.NodeID == "" {
 			return ErrNoNode
 		}
+		if !validFullFingerprint(placement.APISecretFingerprint) {
+			return errors.New("registry: placement is missing a valid API secret fingerprint")
+		}
+		if replaceReady != nil && placement.APISecretFingerprint != replaceReady.APISecretFingerprint {
+			return errors.New("registry: replacement credential binding mismatch")
+		}
 		config := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
 		metadata, err := clusterstate.WithObjectLocation(config, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
 		if err != nil {
@@ -644,6 +668,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return err
 		}
+		ref.APISecretFingerprint = placement.APISecretFingerprint
 		nodeID := placement.NodeID
 		if excluded.has(nodeID) {
 			if lastFailure != nil {
@@ -665,7 +690,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		}
 		reserved := &SandboxRecord{
 			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
-			TemplateID: placement.TemplateRef, AccessToken: placement.AccessToken,
+			TemplateID: placement.TemplateRef, APISecretFingerprint: placement.APISecretFingerprint,
 			TargetPort: placement.TargetPort,
 		}
 		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
@@ -694,7 +719,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdCreate, SID: sid,
 			TemplateRef: placement.TemplateRef, Config: metadata,
-			KeyFingerprint: placement.KeyFingerprint, AccessToken: placement.AccessToken,
+			APISecretFingerprint: placement.APISecretFingerprint,
 		}
 		if r.nodeOwner == nil {
 			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
@@ -789,14 +814,15 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		return
 	}
 	if e.State == routesync.StateDead {
-		if r.applyDelete(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey) {
+		if r.applyDelete(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.SandboxID)
 		}
 		return
 	}
 	rec := &SandboxRecord{
 		Group: ref.Group, RouteKey: ref.RouteKey, SID: e.SandboxID, NodeID: nodeID,
-		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, AccessToken: e.AccessToken,
+		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID,
+		APISecretFingerprint: ref.APISecretFingerprint, AccessToken: e.AccessToken,
 		TrafficAccessToken: e.TrafficAccessToken,
 		LastActive:         time.Now().Unix(),
 	}
@@ -860,8 +886,9 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		r.log.Warn("registry: read sandbox route", "group", rec.Group, "err", err)
 		return true
 	}
-	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) {
-		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey)
+	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) ||
+		cur.APISecretFingerprint != rec.APISecretFingerprint {
+		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey, rec.APISecretFingerprint)
 		return true
 	}
 	if rec.TemplateID == "" {
@@ -896,11 +923,11 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	return true
 }
 
-func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, routeKey string) {
+func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, routeKey, apiSecretFingerprint string) {
 	if r.nodeOwner == nil || sid == "" {
 		return
 	}
-	if err := r.nodeOwner.DeleteSandbox(ctx, nodeID, sid); err != nil && !errors.Is(err, ErrNodeGone) {
+	if err := r.nodeOwner.DeleteSandbox(ctx, nodeID, sid, apiSecretFingerprint); err != nil && !errors.Is(err, ErrNodeGone) {
 		r.log.Warn("registry: delete orphan sandbox", "node", nodeID, "sid", sid, "group", group, "route_key", routeKey, "err", err)
 	}
 }
@@ -908,8 +935,9 @@ func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, 
 // applyDelete converges a removed route only while it still names the reporting
 // node and sandbox. A late DEAD from a replaced instance must not delete its
 // successor's route.
-func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey string) bool {
-	if nodeID == "" || sandboxID == "" || group == "" || routeKey == "" {
+func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey, apiSecretFingerprint string) bool {
+	if nodeID == "" || sandboxID == "" || group == "" || routeKey == "" ||
+		!validFullFingerprint(apiSecretFingerprint) {
 		return false
 	}
 	const attempts = 5
@@ -921,7 +949,7 @@ func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, ro
 			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
 			}
 		}
-		if r.tryApplyDelete(ctx, nodeID, sandboxID, group, routeKey) {
+		if r.tryApplyDelete(ctx, nodeID, sandboxID, group, routeKey, apiSecretFingerprint) {
 			return true
 		}
 	}
@@ -929,7 +957,7 @@ func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, ro
 	return false
 }
 
-func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey string) bool {
+func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey, apiSecretFingerprint string) bool {
 	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil {
 		return false
@@ -937,7 +965,7 @@ func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, sandboxID, group,
 	if !found {
 		return true
 	}
-	if rec.NodeID != nodeID || rec.SID != sandboxID {
+	if rec.NodeID != nodeID || rec.SID != sandboxID || rec.APISecretFingerprint != apiSecretFingerprint {
 		return true
 	}
 	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
@@ -952,17 +980,19 @@ func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, exp
 		return
 	}
 	for _, ref := range expected {
-		if ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" {
+		if ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+			!validFullFingerprint(ref.APISecretFingerprint) {
 			continue
 		}
 		if _, ok := seen[ref.SandboxID]; ok {
 			continue
 		}
 		current, found, err := r.stores.GetNodeSandboxRef(ctx, nodeID, ref.SandboxID)
-		if err != nil || !found || current.Group != ref.Group || current.RouteKey != ref.RouteKey {
+		if err != nil || !found || current.Group != ref.Group || current.RouteKey != ref.RouteKey ||
+			current.APISecretFingerprint != ref.APISecretFingerprint {
 			continue
 		}
-		if r.applyDelete(ctx, nodeID, ref.SandboxID, ref.Group, ref.RouteKey) {
+		if r.applyDelete(ctx, nodeID, ref.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, ref.SandboxID)
 		}
 	}
@@ -975,7 +1005,7 @@ func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, sid string) {
 	if err != nil || !found {
 		return
 	}
-	if r.applyDelete(ctx, nodeID, sid, ref.Group, ref.RouteKey) {
+	if r.applyDelete(ctx, nodeID, sid, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
 		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, sid)
 	}
 }
@@ -1085,7 +1115,7 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sid 
 	if r.nodeOwner == nil || rec.NodeID == "" {
 		return r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
 	}
-	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, sid); err != nil {
+	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, sid, rec.APISecretFingerprint); err != nil {
 		if !errors.Is(err, ErrNodeGone) {
 			return false, err
 		}
@@ -1376,14 +1406,14 @@ func isNodeListProjectionRetryable(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-func (r *Registry) refreshNodeManifestKeys(ctx context.Context, rec *NodeRecord) {
-	if rec == nil || rec.NodeID == "" || len(rec.ManifestKeys) == 0 {
+func (r *Registry) refreshNodeKeyPairs(ctx context.Context, rec *NodeRecord) {
+	if rec == nil || rec.NodeID == "" || len(rec.KeyPairs) == 0 {
 		return
 	}
 	if owner, ok := r.localNodeOwner.(*localNodeOwner); ok {
-		owner.RefreshManifestKeys(ctx, rec.NodeID, rec.ManifestKeys)
+		owner.RefreshKeyPairs(ctx, rec.NodeID, rec.KeyPairs)
 	}
-	_ = r.stores.PruneExpiredNodeManifestKeys(ctx, rec.NodeID, time.Now().Unix())
+	_ = r.stores.PruneExpiredNodeKeyPairs(ctx, rec.NodeID, time.Now().Unix())
 }
 
 func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {
@@ -1551,7 +1581,8 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			return
 		}
 		plan := sandboxReapPlan{ref: child}
-		if !routeFound || s.NodeID != nodeID || s.SID != ref.SandboxID {
+		if !routeFound || s.NodeID != nodeID || s.SID != ref.SandboxID ||
+			s.APISecretFingerprint != ref.APISecretFingerprint {
 			sandboxPlans = append(sandboxPlans, plan)
 			continue
 		}
@@ -1624,9 +1655,9 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			r.log.Warn("registry: remove reaped build ownership", "node", nodeID, "build", plan.ref.Ref.BuildID, "err", err)
 		}
 	}
-	for _, key := range snapshot.ManifestKeys {
-		if _, err := r.stores.dropNodeManifestKeyShardAtRevision(ctx, nodeID, key.Fingerprint, key.Revision); err != nil {
-			r.log.Warn("registry: remove reaped manifest key", "node", nodeID, "fingerprint", key.Fingerprint, "err", err)
+	for _, pair := range snapshot.KeyPairs {
+		if _, err := r.stores.dropNodeKeyPairShardAtRevision(ctx, nodeID, pair.APISecretFingerprint, pair.Revision); err != nil {
+			r.log.Warn("registry: remove reaped key pair", "node", nodeID, "err", err)
 		}
 	}
 	r.log.Warn("registry: swept dead node", "node", nodeID, "sandboxes_reset", reset, "builds_errored", deadBuilds)
@@ -1671,12 +1702,13 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// keyFingerprint is the fingerprint the node matches against its manifest-key
-// allowlist (= store.ManifestKeyHash: hex(apikey.Fingerprint(rawKey))).
-func keyFingerprint(manifestKeyHex string) string {
-	raw, err := hex.DecodeString(manifestKeyHex)
+// fullFingerprint is the lowercase full SHA-256 fingerprint used by node_link
+// key-pair records and lifecycle commands.
+func fullFingerprint(secretHex string) string {
+	raw, err := hex.DecodeString(secretHex)
 	if err != nil {
 		return ""
 	}
-	return hex.EncodeToString(apikey.Fingerprint(raw))
+	h := sha256.Sum256(raw)
+	return hex.EncodeToString(h[:])
 }

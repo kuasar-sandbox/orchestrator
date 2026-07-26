@@ -1,6 +1,6 @@
-// Package keys mints sandbox access tokens. (Tenant identity is the manifest key
-// — see internal/apikey for api-key derivation/verification and internal/secretbox
-// for at-rest encryption.)
+// Package keys mints sandbox access tokens and derives sandbox-scoped MMDS
+// material. Tenant API authentication lives in internal/apikey; persisted root
+// secrets are protected by internal/secretbox.
 package keys
 
 import (
@@ -34,8 +34,7 @@ const mmdsSecretInfo = "kuasar-mmds-v1:"
 // treats that as "no secret available").
 //
 // HMAC-SHA256 is used directly as the KDF (no HKDF-Extract): the manifest key is
-// already a uniformly-random 32-byte value (SHA256 of the api key), so expand alone
-// is sound.
+// already a uniformly random 32-byte root, so expand alone is sound.
 func MmdsSecret(manifestKeyHex, sandboxID string) []byte {
 	mk, err := hex.DecodeString(manifestKeyHex)
 	if err != nil || len(mk) == 0 {

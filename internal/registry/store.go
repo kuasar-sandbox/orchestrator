@@ -6,9 +6,13 @@ package registry
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,33 +52,34 @@ type NodeRecord struct {
 	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
 	// dead-node sweep resets a disconnected node whose last beat predates
 	// node_dead_after.
-	LastHeartbeatUnix int64                          `json:"last_heartbeat_unix,omitempty"`
-	ResumeToken       string                         `json:"resume_token,omitempty"`
-	LinkOwner         string                         `json:"link_owner,omitempty"`
-	ManifestKeys      []clusterstate.NodeManifestKey `json:"manifest_keys,omitempty"`
-	Sandboxes         []clusterstate.NodeSandboxRef  `json:"sandboxes,omitempty"`
-	Builds            []clusterstate.NodeBuildRef    `json:"builds,omitempty"`
+	LastHeartbeatUnix int64                         `json:"last_heartbeat_unix,omitempty"`
+	ResumeToken       string                        `json:"resume_token,omitempty"`
+	LinkOwner         string                        `json:"link_owner,omitempty"`
+	KeyPairs          []clusterstate.NodeKeyPair    `json:"key_pairs,omitempty"`
+	Sandboxes         []clusterstate.NodeSandboxRef `json:"sandboxes,omitempty"`
+	Builds            []clusterstate.NodeBuildRef   `json:"builds,omitempty"`
 }
 
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
-	Group              string                    `json:"group"`
-	RouteKey           string                    `json:"route_key"`
-	SID                string                    `json:"sid,omitempty"`
-	State              SandboxState              `json:"state"`
-	NodeID             string                    `json:"node_id,omitempty"`
-	SnapLoc            string                    `json:"snap_loc,omitempty"`
-	TemplateID         string                    `json:"template_id,omitempty"`
-	AccessToken        string                    `json:"access_token,omitempty"`
-	TrafficAccessToken string                    `json:"traffic_access_token,omitempty"`
-	TargetPort         int                       `json:"target_port,omitempty"`
-	LastActive         int64                     `json:"last_active,omitempty"`
-	BuildID            string                    `json:"build_id,omitempty"`
-	BuildState         BuildState                `json:"build_state,omitempty"`
-	BuildResources     *routesync.BuildResources `json:"build_resources,omitempty"`
-	BuildReason        string                    `json:"build_reason,omitempty"`
-	CreatedU           int64                     `json:"created_unix,omitempty"`
+	Group                string                    `json:"group"`
+	RouteKey             string                    `json:"route_key"`
+	SID                  string                    `json:"sid,omitempty"`
+	State                SandboxState              `json:"state"`
+	NodeID               string                    `json:"node_id,omitempty"`
+	SnapLoc              string                    `json:"snap_loc,omitempty"`
+	TemplateID           string                    `json:"template_id,omitempty"`
+	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
+	AccessToken          string                    `json:"access_token,omitempty"`
+	TrafficAccessToken   string                    `json:"traffic_access_token,omitempty"`
+	TargetPort           int                       `json:"target_port,omitempty"`
+	LastActive           int64                     `json:"last_active,omitempty"`
+	BuildID              string                    `json:"build_id,omitempty"`
+	BuildState           BuildState                `json:"build_state,omitempty"`
+	BuildResources       *routesync.BuildResources `json:"build_resources,omitempty"`
+	BuildReason          string                    `json:"build_reason,omitempty"`
+	CreatedU             int64                     `json:"created_unix,omitempty"`
 }
 
 type WatchEventType int
@@ -466,8 +471,9 @@ func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
 }
 
 func (s *Stores) AddNodeSandboxRef(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" {
-		return errors.New("registry: node sandbox ref requires node_id, sandbox_id, group, and route_key")
+	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+		!validFullFingerprint(ref.APISecretFingerprint) {
+		return errors.New("registry: node sandbox ref requires node_id, sandbox_id, group, route_key, and API secret fingerprint")
 	}
 	return s.addNodeSandboxRefShard(ctx, nodeID, ref)
 }
@@ -495,38 +501,36 @@ func (s *Stores) RemoveNodeBuildRef(ctx context.Context, nodeID, buildID string)
 	return s.removeNodeBuildRefShard(ctx, nodeID, buildID)
 }
 
-func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
-	if nodeID == "" || key.Fingerprint == "" {
+func (s *Stores) UpsertNodeKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	if nodeID == "" {
 		return nil
 	}
-	if key.Type == "" {
-		key.Type = clusterstate.SecretInline
-	}
-	cur, _, found, err := s.getNodeManifestKeyShard(ctx, nodeID, key.Fingerprint)
+	var err error
+	pair, err = normalizeNodeKeyPair(pair)
 	if err != nil {
 		return err
 	}
-	if found && sameNodeManifestKeyMaterial(cur, key) && key.AckedExpiresUnix == 0 {
-		key.AckedExpiresUnix = cur.AckedExpiresUnix
-	}
-	return s.upsertNodeManifestKeyShard(ctx, nodeID, key)
+	return s.upsertNodeKeyPairShard(ctx, nodeID, pair)
 }
 
-func (s *Stores) MarkNodeManifestKeyAcked(ctx context.Context, nodeID string, expected clusterstate.NodeManifestKey) (bool, error) {
-	if nodeID == "" || expected.Fingerprint == "" || expected.ExpiresUnix <= 0 {
+func (s *Stores) MarkNodeKeyPairAcked(ctx context.Context, nodeID string, expected clusterstate.NodeKeyPair) (bool, error) {
+	if nodeID == "" || expected.APISecretFingerprint == "" || expected.ExpiresUnix <= 0 {
 		return false, nil
 	}
-	return s.markNodeManifestKeyAckedShard(ctx, nodeID, expected)
+	return s.markNodeKeyPairAckedShard(ctx, nodeID, expected)
 }
 
-func (s *Stores) DropNodeManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	if nodeID == "" || fingerprint == "" {
+func (s *Stores) DropNodeKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	if nodeID == "" || apiSecretFingerprint == "" {
 		return nil
 	}
-	return s.dropNodeManifestKeyShard(ctx, nodeID, fingerprint)
+	if !validFullFingerprint(apiSecretFingerprint) {
+		return errors.New("registry: API secret fingerprint must be 64 lowercase hex characters")
+	}
+	return s.dropNodeKeyPairShard(ctx, nodeID, apiSecretFingerprint)
 }
 
-func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string, nowUnix int64) error {
+func (s *Stores) PruneExpiredNodeKeyPairs(ctx context.Context, nodeID string, nowUnix int64) error {
 	if nodeID == "" || nowUnix <= 0 {
 		return nil
 	}
@@ -534,9 +538,9 @@ func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string
 	if err != nil || !found {
 		return err
 	}
-	for _, key := range rec.ManifestKeys {
-		if key.ExpiresUnix > 0 && key.ExpiresUnix <= nowUnix {
-			if err := s.dropNodeManifestKeyShard(ctx, nodeID, key.Fingerprint); err != nil {
+	for _, pair := range rec.KeyPairs {
+		if pair.ExpiresUnix > 0 && pair.ExpiresUnix <= nowUnix {
+			if err := s.dropNodeKeyPairShard(ctx, nodeID, pair.APISecretFingerprint); err != nil {
 				return err
 			}
 		}
@@ -544,12 +548,83 @@ func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string
 	return nil
 }
 
-func sortNodeManifestKeys(keys []clusterstate.NodeManifestKey) {
-	sort.Slice(keys, func(i, j int) bool { return keys[i].Fingerprint < keys[j].Fingerprint })
+func sortNodeKeyPairs(pairs []clusterstate.NodeKeyPair) {
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].APISecretFingerprint < pairs[j].APISecretFingerprint
+	})
 }
 
-func sameNodeManifestKeyMaterial(a, b clusterstate.NodeManifestKey) bool {
-	return a.Type == b.Type && a.Value == b.Value && a.Ref == b.Ref
+func sameNodeKeyPairMaterial(a, b clusterstate.NodeKeyPair) bool {
+	apiSecretEqual := hmac.Equal([]byte(a.APISecret), []byte(b.APISecret))
+	apiRefEqual := hmac.Equal([]byte(a.APISecretRef), []byte(b.APISecretRef))
+	manifestKeyEqual := hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
+	manifestRefEqual := hmac.Equal([]byte(a.ManifestKeyRef), []byte(b.ManifestKeyRef))
+	return a.APISecretFingerprint == b.APISecretFingerprint &&
+		a.APISecretType == b.APISecretType && apiSecretEqual && apiRefEqual &&
+		a.ManifestKeyFingerprint == b.ManifestKeyFingerprint &&
+		a.ManifestKeyType == b.ManifestKeyType && manifestKeyEqual && manifestRefEqual
+}
+
+func normalizeNodeKeyPair(pair clusterstate.NodeKeyPair) (clusterstate.NodeKeyPair, error) {
+	if !validFullFingerprint(pair.APISecretFingerprint) {
+		return clusterstate.NodeKeyPair{}, errors.New("registry: API secret fingerprint must be 64 lowercase hex characters")
+	}
+	if !validFullFingerprint(pair.ManifestKeyFingerprint) {
+		return clusterstate.NodeKeyPair{}, errors.New("registry: manifest key fingerprint must be 64 lowercase hex characters")
+	}
+	var err error
+	pair.APISecretType, err = normalizePairSecret(
+		"API secret", pair.APISecretType, pair.APISecret, pair.APISecretRef, pair.APISecretFingerprint,
+	)
+	if err != nil {
+		return clusterstate.NodeKeyPair{}, err
+	}
+	pair.ManifestKeyType, err = normalizePairSecret(
+		"manifest key", pair.ManifestKeyType, pair.ManifestKey, pair.ManifestKeyRef, pair.ManifestKeyFingerprint,
+	)
+	if err != nil {
+		return clusterstate.NodeKeyPair{}, err
+	}
+	return pair, nil
+}
+
+func normalizePairSecret(name, typ, value, ref, fingerprint string) (string, error) {
+	if typ == "" && value != "" && ref == "" {
+		typ = clusterstate.SecretInline
+	}
+	switch typ {
+	case clusterstate.SecretInline:
+		if value == "" || ref != "" {
+			return "", fmt.Errorf("registry: %s inline carrier is incomplete", name)
+		}
+		if !validSecretValue(value) {
+			return "", fmt.Errorf("registry: %s must be 64 lowercase hex characters", name)
+		}
+		raw, _ := hex.DecodeString(value)
+		h := sha256.Sum256(raw)
+		if hex.EncodeToString(h[:]) != fingerprint {
+			return "", fmt.Errorf("registry: %s fingerprint does not match inline material", name)
+		}
+	case clusterstate.SecretRef:
+		if ref == "" || value != "" {
+			return "", fmt.Errorf("registry: %s ref carrier is incomplete", name)
+		}
+	default:
+		return "", fmt.Errorf("registry: unsupported %s carrier type %q", name, typ)
+	}
+	return typ, nil
+}
+
+func validSecretValue(value string) bool {
+	if len(value) != sha256.Size*2 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validFullFingerprint(fingerprint string) bool {
+	return validSecretValue(fingerprint)
 }
 
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
@@ -952,7 +1027,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
 		LinkOwner:         n.LinkOwner,
-		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
+		KeyPairs:          cloneNodeKeyPairs(n.KeyPairs),
 		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
 		Builds:            cloneNodeBuildRefs(n.Builds),
 	}
@@ -979,7 +1054,7 @@ func cloneNodeRecord(n *NodeRecord) *NodeRecord {
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
 		LinkOwner:         n.LinkOwner,
-		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
+		KeyPairs:          cloneNodeKeyPairs(n.KeyPairs),
 		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
 		Builds:            cloneNodeBuildRefs(n.Builds),
 	}
@@ -996,11 +1071,11 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func cloneNodeManifestKeys(in []clusterstate.NodeManifestKey) []clusterstate.NodeManifestKey {
+func cloneNodeKeyPairs(in []clusterstate.NodeKeyPair) []clusterstate.NodeKeyPair {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]clusterstate.NodeManifestKey, len(in))
+	out := make([]clusterstate.NodeKeyPair, len(in))
 	copy(out, in)
 	return out
 }

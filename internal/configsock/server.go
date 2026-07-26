@@ -222,38 +222,40 @@ type BuildTimeouts struct {
 	TotalSec int `json:"total_sec"`
 }
 
-// AdminKeyInfo is one manifest-key allowlist entry (fingerprint only — never the key).
+// AdminKeyInfo is one tenant key-pair allowlist entry. Only complete
+// fingerprints are returned; secret material never leaves the daemon.
 type AdminKeyInfo struct {
-	Fingerprint string `json:"fingerprint"`
-	Label       string `json:"label"`
-	CreatedUnix int64  `json:"created_unix"`
-	ExpiresUnix int64  `json:"expires_unix"` // 0 = never expires
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	Label                  string `json:"label"`
+	CreatedUnix            int64  `json:"created_unix"`
+	ExpiresUnix            int64  `json:"expires_unix"` // 0 = never expires
 }
 
-// Admin is the manifest-key allowlist management the admin plane exposes. Every
-// method returns the key's fingerprint (24-hex) so the daemon never echoes key
-// material back to the client.
+// Admin is the tenant key-pair allowlist management exposed by the admin plane.
 type Admin interface {
-	AddManifestKey(ctx context.Context, key, label string, ttlSec int64, registryAuth string) (added bool, fp string, err error)
-	RemoveManifestKey(ctx context.Context, key string) (removed bool, fp string, err error)
-	HasManifestKey(ctx context.Context, key string) (present bool, fp string, err error)
-	ListManifestKeys(ctx context.Context) ([]AdminKeyInfo, error)
+	AddKeyPair(ctx context.Context, manifestKey, apiSecret, label string, ttlSec int64, registryAuth string) (added bool, apiFP, manifestFP string, err error)
+	RemoveKeyPair(ctx context.Context, manifestKey, apiSecret string) (removed bool, apiFP, manifestFP string, err error)
+	HasKeyPair(ctx context.Context, manifestKey, apiSecret string) (present bool, apiFP, manifestFP string, err error)
+	ListKeyPairs(ctx context.Context) ([]AdminKeyInfo, error)
 }
 
 // AdminKeyRequest / AdminKeyResponse are the admin-plane add/remove/check messages.
 type AdminKeyRequest struct {
 	Op           string `json:"op"` // add | remove | check
-	Key          string `json:"key"`
+	ManifestKey  string `json:"manifest_key"`
+	APISecret    string `json:"api_secret,omitempty"`
 	Label        string `json:"label,omitempty"`
 	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`   // add: 0 = never expires
 	RegistryAuth string `json:"registry_auth,omitempty"` // add: tenant-default docker config.json
 }
 
 type AdminKeyResponse struct {
-	Op          string `json:"op"`
-	Fingerprint string `json:"fingerprint"`
-	Status      string `json:"status"` // added | exists | removed | absent | present
-	Error       string `json:"error,omitempty"`
+	Op                     string `json:"op"`
+	APISecretFingerprint   string `json:"api_secret_fingerprint,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"`
+	Status                 string `json:"status"` // added | refreshed | removed | absent | present
+	Error                  string `json:"error,omitempty"`
 }
 
 // Deps wires the planes for New.
@@ -493,7 +495,7 @@ func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		infos, err := s.deps.Admin.ListManifestKeys(r.Context())
+		infos, err := s.deps.Admin.ListKeyPairs(r.Context())
 		if err != nil {
 			s.log.Warn("configsock admin list", "err", err)
 			writeJSON(w, http.StatusInternalServerError, &AdminKeyResponse{Error: "internal error"})
@@ -502,8 +504,8 @@ func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, infos)
 	case http.MethodPost:
 		var req AdminKeyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
-			writeJSON(w, http.StatusBadRequest, &AdminKeyResponse{Op: req.Op, Error: "key required"})
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ManifestKey == "" {
+			writeJSON(w, http.StatusBadRequest, &AdminKeyResponse{Op: req.Op, Error: "manifest_key required"})
 			return
 		}
 		resp := s.adminOp(r.Context(), req)
@@ -521,26 +523,29 @@ func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResp
 	out := &AdminKeyResponse{Op: req.Op}
 	switch req.Op {
 	case "add":
-		added, fp, err := s.deps.Admin.AddManifestKey(ctx, req.Key, req.Label, req.TTLSeconds, req.RegistryAuth)
+		added, apiFP, manifestFP, err := s.deps.Admin.AddKeyPair(ctx, req.ManifestKey, req.APISecret, req.Label, req.TTLSeconds, req.RegistryAuth)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(added, "added", "refreshed")
+		out.APISecretFingerprint, out.ManifestKeyFingerprint = apiFP, manifestFP
+		out.Status = statusWord(added, "added", "refreshed")
 	case "remove":
-		removed, fp, err := s.deps.Admin.RemoveManifestKey(ctx, req.Key)
+		removed, apiFP, manifestFP, err := s.deps.Admin.RemoveKeyPair(ctx, req.ManifestKey, req.APISecret)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(removed, "removed", "absent")
+		out.APISecretFingerprint, out.ManifestKeyFingerprint = apiFP, manifestFP
+		out.Status = statusWord(removed, "removed", "absent")
 	case "check":
-		present, fp, err := s.deps.Admin.HasManifestKey(ctx, req.Key)
+		present, apiFP, manifestFP, err := s.deps.Admin.HasKeyPair(ctx, req.ManifestKey, req.APISecret)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(present, "present", "absent")
+		out.APISecretFingerprint, out.ManifestKeyFingerprint = apiFP, manifestFP
+		out.Status = statusWord(present, "present", "absent")
 	default:
 		out.Error = "unknown op (want add|remove|check)"
 	}

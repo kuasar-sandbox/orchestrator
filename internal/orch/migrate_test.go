@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,15 +12,15 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // TestExportImportRoundTrip exercises the migration core that connect's auto-import
 // builds on: export (move) mints a token and relinquishes the source; import on a
-// node with the tenant key + matching runtime inserts a paused row with a fresh
+// node with the tenant key pair + matching runtime inserts a paused row with a fresh
 // globally unique id.
 func TestExportImportRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -36,16 +35,15 @@ func TestExportImportRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	mk := strings.Repeat("6", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, _ := apikey.Mint(raw)
-	if _, err := o.st.AddManifestKey(ctx, mk, "", 0, ""); err != nil { // import precondition: key allowlisted
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil { // import precondition: pair allowlisted
 		t.Fatal(err)
 	}
 
 	sid := "sbx-mig-1"
 	sb := &types.Sandbox{
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
-		ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
+		APISecret: apiSecret, ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
 		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
 			"k": "v", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
@@ -117,19 +115,44 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestImportRejectsSameManifestKeyWithDifferentAPISecret(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "rt-e2b.erofs")
+	if err := os.WriteFile(runtimePath, []byte("fake-runtime-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
+	o := testOrchCfg(t, cfg)
+	ctx := context.Background()
+
+	mk := strings.Repeat("6", 64)
+	source := migrationSandbox(t, dir, "source", mk, "manifest://"+strings.Repeat("b", 64))
+	source.APISecret = strings.Repeat("1", 64)
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPair := store.KeyPair{APISecret: strings.Repeat("2", 64), ManifestKey: mk}
+	if _, err := o.importSandboxWithKey(ctx, targetPair, token); err == nil ||
+		!strings.Contains(err.Error(), "different tenant") {
+		t.Fatalf("import error = %v; want API-secret binding mismatch", err)
+	}
+}
+
 func TestExportPromotesLocalSnapshotState(t *testing.T) {
 	dir := t.TempDir()
 	o := testOrch(t)
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, _ := apikey.Mint(raw)
+	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-promote-ok"
 	localRef := makeLocalSnapshot(t, dir, sid)
 	mref := "manifest://" + strings.Repeat("c", 64)
 	installPromoteStub(t, mref)
 
-	sb := migrationSandbox(dir, sid, mk, localRef)
+	sb := migrationSandbox(t, dir, sid, mk, localRef)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -166,13 +189,12 @@ func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 	o := testOrchCfgAt(t, &config.Config{}, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("8", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, _ := apikey.Mint(raw)
+	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-promote-fail"
 	localRef := makeLocalSnapshot(t, dir, sid)
 	installPromoteStub(t, "manifest://"+strings.Repeat("d", 64))
 
-	sb := migrationSandbox(dir, sid, mk, localRef)
+	sb := migrationSandbox(t, dir, sid, mk, localRef)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -213,11 +235,10 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	o := testOrchCfgAt(t, cfg, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("9", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, _ := apikey.Mint(raw)
+	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-delete-fail"
 	mref := "manifest://" + strings.Repeat("e", 64)
-	sb := migrationSandbox(dir, sid, mk, mref)
+	sb := migrationSandbox(t, dir, sid, mk, mref)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -244,10 +265,11 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	}
 }
 
-func migrationSandbox(dir, sid, mk, ref string) *types.Sandbox {
+func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
+	t.Helper()
 	return &types.Sandbox{
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
-		ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
+		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
 	}
 }

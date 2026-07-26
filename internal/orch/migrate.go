@@ -6,8 +6,9 @@ package orch
 // node. Both ride existing sandbox-ctl primitives (snapshot --upload /
 // upload-snapshot / run --restore) + the e2b CLI (create / resume); nothing about
 // the e2b API/CLI changes. The token carries the sandbox row minus system
-// secrets: the tenant manifest_key appears only as a fingerprint — the target
-// resolves the real key from its own whitelist (= the create/build precondition).
+// secrets: tenant APISecret and ManifestKey appear only as complete fingerprints;
+// the target resolves the real pair from its own allowlist (= the create/build
+// precondition).
 
 import (
 	"context"
@@ -24,8 +25,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -33,17 +34,18 @@ const sandboxTokenVersion = 1
 
 // SandboxToken is the portable, base64-encoded migration handle from export-sandbox.
 // It carries portable snapshot state but no sandbox identity or data-plane
-// credentials. manifest_key is represented by a fingerprint only.
+// credentials. Tenant roots are represented by complete fingerprints only.
 type SandboxToken struct {
-	V             int               `json:"v"`
-	TemplateID    string            `json:"template_id"`
-	SnapshotRef   string            `json:"snapshot_ref"` // manifest://<key> (always remote)
-	Profile       string            `json:"profile"`
-	Env           map[string]string `json:"env,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
-	DeadlineUnix  int64             `json:"deadline_unix,omitempty"`
-	MKFingerprint string            `json:"mk_fingerprint"` // hex SHA256(manifest_key)[:12]; NOT the key
-	RuntimeDigest string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
+	V                      int               `json:"v"`
+	TemplateID             string            `json:"template_id"`
+	SnapshotRef            string            `json:"snapshot_ref"` // manifest://<key> (always remote)
+	Profile                string            `json:"profile"`
+	Env                    map[string]string `json:"env,omitempty"`
+	Metadata               map[string]string `json:"metadata,omitempty"`
+	DeadlineUnix           int64             `json:"deadline_unix,omitempty"`
+	APISecretFingerprint   string            `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string            `json:"manifest_key_fingerprint"`
+	RuntimeDigest          string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
 }
 
 // ExportSandbox authorizes apiKey against the paused sandbox, ensures its snapshot
@@ -121,12 +123,21 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("mint token: hash runtime: %w", err)
 	}
-	rawMK, _ := hex.DecodeString(sb.ManifestKey)
+	apiFingerprint, err := store.APISecretHash(sb.APISecret)
+	if err != nil {
+		return "", err
+	}
+	manifestFingerprint, err := store.ManifestKeyHash(sb.ManifestKey)
+	if err != nil {
+		return "", err
+	}
 	b, err := json.Marshal(SandboxToken{
 		V: sandboxTokenVersion, TemplateID: sb.TemplateID, SnapshotRef: ref,
 		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: sb.Metadata,
-		DeadlineUnix:  sb.DeadlineUnix,
-		MKFingerprint: hex.EncodeToString(apikey.Fingerprint(rawMK)), RuntimeDigest: dig,
+		DeadlineUnix:           sb.DeadlineUnix,
+		APISecretFingerprint:   apiFingerprint,
+		ManifestKeyFingerprint: manifestFingerprint,
+		RuntimeDigest:          dig,
 	})
 	if err != nil {
 		return "", err
@@ -144,21 +155,21 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 	}
 	// The tenant key must be on this node (manifest-key add) — same precondition as
 	// create — and the api key must resolve to it.
-	mk, err := o.resolveAllowed(ctx, apiKey)
+	pair, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return "", err
 	}
-	if mk == "" {
+	if pair.APISecret == "" {
 		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
 	}
-	return o.importSandboxWithKey(ctx, mk, token)
+	return o.importSandboxWithKey(ctx, pair, token)
 }
 
 // importSandboxWithKey decodes a migration token, checks its fingerprint against
 // the resolved tenant key mk + that this node's guest runtime matches the
 // snapshot's, then inserts the paused row (the caller resumes). The cluster create
 // path supplies mk from the predistributed key; the SDK path from the api key.
-func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token string) (string, error) {
+func (o *Orchestrator) importSandboxWithKey(ctx context.Context, pair store.KeyPair, token string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
 	if err != nil {
 		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
@@ -167,8 +178,15 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
 		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
 	}
-	rawMK, _ := hex.DecodeString(mk)
-	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {
+	apiFingerprint, err := store.APISecretHash(pair.APISecret)
+	if err != nil {
+		return "", err
+	}
+	manifestFingerprint, err := store.ManifestKeyHash(pair.ManifestKey)
+	if err != nil {
+		return "", err
+	}
+	if apiFingerprint != tok.APISecretFingerprint || manifestFingerprint != tok.ManifestKeyFingerprint {
 		return "", fmt.Errorf("import-sandbox: token is for a different tenant")
 	}
 	// The snapshot is bound to the guest runtime it was captured under; a different
@@ -200,7 +218,7 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 		ID: sid, TemplateID: tok.TemplateID, State: types.StatePaused,
 		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: time.Now().Unix(),
 		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
-		ManifestKey: mk, SnapshotRef: tok.SnapshotRef,
+		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, SnapshotRef: tok.SnapshotRef,
 		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
 		Metadata: tok.Metadata, Env: tok.Env,
 	}

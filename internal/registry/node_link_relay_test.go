@@ -293,7 +293,7 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 			time.Sleep(10 * time.Millisecond)
 			n.publish(routesync.RouteEntry{
 				SandboxID: cmd.SID,
-				State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
+				State:     routesync.StateRunning, AccessToken: "node-access-token",
 			})
 		}()
 	}
@@ -441,7 +441,7 @@ func (n *relayNodeStub) readLoop(t *testing.T) {
 		_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
 			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
-				SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+				SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: "node-access-token",
 			}})
 		}
 	}

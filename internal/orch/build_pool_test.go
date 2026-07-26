@@ -11,10 +11,12 @@ import (
 func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
+	manifestKey := strings.Repeat("a", 64)
 	b := &types.Build{
 		BuildID:     "build-admission-test",
 		TemplateID:  "transient-build-admission-test",
-		ManifestKey: strings.Repeat("a", 64),
+		APISecret:   deriveTestAPISecret(t, manifestKey),
+		ManifestKey: manifestKey,
 		Profile:     types.ProfileE2B,
 		Kind:        types.KindImg,
 		Status:      types.BuildWaiting,

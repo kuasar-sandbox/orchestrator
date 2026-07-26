@@ -133,8 +133,9 @@ per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-c
 
 - **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;node-ctl 经**共享**
   `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
-  `MANIFEST_KEY` 为该租户 manifest 根密钥——node-ctl 从加密存储解出;**api_key 由它
-  派生**,见 `orchestrator/docs/node.md` §7)。外部管理面若选择直接对接单机
+  `MANIFEST_KEY` 为该租户内容根密钥——node-ctl 从加密的 APISecret+ManifestKey
+  凭据对中解出;**api_key 由 APISecret 签发**,见 `orchestrator/docs/node.md` §7)。
+  外部管理面若选择直接对接单机
   `node-ctl`,也必须按同一 per-sandbox 生命周期落地 manifest 配置
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
@@ -295,9 +296,9 @@ cluster-ctl placer
   `route_link` owner 下发 create/connect/delete/build/key 命令时,通过 node-owner RPC 转给当前
   `link_owner`。
 - **平台管理面(平台外)**:向 placer/provider 侧导入 sandbox-group 配置(租户 `manifest_key`、
-  `auth_key`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
-  只在 Reserve/Place 冷路径把请求转给 ready placer。密钥分发是 create/build 前置条件,drop 或租约过期
-  不影响已经运行的 sandbox。
+  `api_secret`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
+  只在 Reserve/Place 冷路径把请求转给 ready placer。凭据对分发是 create/build 前置条件;
+  drop 或租约过期不修改已经复制到现有 sandbox/build 记录的凭据对。
 - **成员关系**:registry 成员表由版本化配置分发,通过信号或 API reload。`memberlist` 复用 HTTP 控制面,
   只做 failure detection 和 meta 传播,不维护成员清单,不参与 `LocateN` 分片计算。
 - **成员变更**:registry 可同时持有 active / next membership。受影响的 group/node 逻辑 owner set 为

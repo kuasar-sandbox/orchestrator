@@ -88,6 +88,15 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	return string(b), err
 }
 
+func parseKeyPairStatus(t *testing.T, out, wantStatus string) (string, string) {
+	t.Helper()
+	fields := strings.Fields(out)
+	if len(fields) != 3 || fields[0] != wantStatus || !strings.HasPrefix(fields[1], "api=") || !strings.HasPrefix(fields[2], "manifest=") {
+		t.Fatalf("manifest-key output=%q, want %s api=<fingerprint> manifest=<fingerprint>", out, wantStatus)
+	}
+	return strings.TrimPrefix(fields[1], "api="), strings.TrimPrefix(fields[2], "manifest=")
+}
+
 // TestManifestKeyCmdAdminPlane drives the real manifest-key CLI against a real
 // store-backed admin plane over the control socket.
 func TestManifestKeyCmdAdminPlane(t *testing.T) {
@@ -98,30 +107,41 @@ func TestManifestKeyCmdAdminPlane(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return manifestKeyCmd([]string{"add", "--label", "dev", "--socket", sock, mk}, log)
 	})
-	if err != nil || !strings.HasPrefix(out, "added ") {
+	if err != nil {
 		t.Fatalf("add: out=%q err=%v", out, err)
 	}
-	fp := strings.TrimSpace(strings.TrimPrefix(out, "added "))
+	apiFP, manifestFP := parseKeyPairStatus(t, out, "added")
+	if len(apiFP) != 64 || len(manifestFP) != 64 {
+		t.Fatalf("add fingerprints api=%q manifest=%q, want full SHA-256 hex", apiFP, manifestFP)
+	}
 
 	out, err = captureStdout(t, func() error {
 		return manifestKeyCmd([]string{"add", "--socket", sock, mk}, log)
 	})
-	if err != nil || !strings.HasPrefix(out, "refreshed ") {
+	if err != nil {
 		t.Fatalf("re-add: out=%q err=%v", out, err)
+	}
+	refreshedAPI, refreshedManifest := parseKeyPairStatus(t, out, "refreshed")
+	if refreshedAPI != apiFP || refreshedManifest != manifestFP {
+		t.Fatalf("re-add fingerprints api=%q manifest=%q, want api=%q manifest=%q", refreshedAPI, refreshedManifest, apiFP, manifestFP)
 	}
 
 	out, err = captureStdout(t, func() error {
 		return manifestKeyCmd([]string{"check", "--socket", sock, mk}, log)
 	})
-	if err != nil || !strings.HasPrefix(out, "present ") {
+	if err != nil {
 		t.Fatalf("check: out=%q err=%v", out, err)
+	}
+	checkedAPI, checkedManifest := parseKeyPairStatus(t, out, "present")
+	if checkedAPI != apiFP || checkedManifest != manifestFP {
+		t.Fatalf("check fingerprints api=%q manifest=%q, want api=%q manifest=%q", checkedAPI, checkedManifest, apiFP, manifestFP)
 	}
 
 	out, err = captureStdout(t, func() error {
 		return manifestKeyCmd([]string{"list", "--socket", sock}, log)
 	})
-	if err != nil || !strings.Contains(out, fp) {
-		t.Fatalf("list: out=%q err=%v (want fp %s)", out, err, fp)
+	if err != nil || !strings.Contains(out, "api="+apiFP) || !strings.Contains(out, "manifest="+manifestFP) {
+		t.Fatalf("list: out=%q err=%v (want api=%s manifest=%s)", out, err, apiFP, manifestFP)
 	}
 
 	// Bad key is validated daemon-side (the CLI never sees key material logic).
