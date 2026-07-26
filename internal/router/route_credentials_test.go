@@ -38,7 +38,8 @@ func routerTestReserveResult(t *testing.T, sid, endpoint string, profile types.P
 	}
 	result := reserveResult{
 		NodeID:                 "n1",
-		SID:                    sid,
+		SandboxID:              sid,
+		NodeSandboxID:          sid + "-g0",
 		Profile:                string(profile),
 		AuthSandboxID:          sid,
 		APISecret:              routerTestAPISecret,
@@ -59,7 +60,8 @@ func routerTestRouteResolve(t *testing.T, sid, group, routeKey, endpoint string,
 	t.Helper()
 	reserved := routerTestReserveResult(t, sid, endpoint, profile)
 	return routeResolve{
-		SID:                    reserved.SID,
+		SandboxID:              reserved.SandboxID,
+		NodeSandboxID:          reserved.NodeSandboxID,
 		Group:                  group,
 		RouteKey:               routeKey,
 		NodeID:                 reserved.NodeID,

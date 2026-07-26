@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -132,7 +133,7 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 		if out["routeKey"] == "" {
 			t.Fatalf("create %d omitted generated routeKey in response", i)
 		}
-		if out["sandboxID"] != results[i].SID || out["clientID"] != results[i].NodeID ||
+		if out["sandboxID"] != results[i].SandboxID || out["clientID"] != results[i].NodeID ||
 			out["forwardAccessToken"] != results[i].ForwardAccessToken || out["domain"] != "test.local" {
 			t.Fatalf("create %d public response did not preserve public identifiers and forward token", i)
 		}
@@ -165,9 +166,13 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	var reserveHits int
 	var routeHits int
-	var gotHost string
-	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHost = r.Host
+	var outerSandboxID, innerSandboxID, innerHost, innerMarker string
+	node := newObservedDataTunnelServer(t, func(r *http.Request) {
+		outerSandboxID = r.Header.Get(proxypkg.HeaderSandboxID)
+	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		innerSandboxID = r.Header.Get(proxypkg.HeaderSandboxID)
+		innerHost = r.Host
+		innerMarker = r.Header.Get("X-Test-Marker")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
@@ -194,6 +199,8 @@ func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	req.Host = "49983-sb-1.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(proxypkg.HeaderSandboxID, "sb-1")
+	req.Header.Set("X-Test-Marker", "unchanged")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -205,8 +212,14 @@ func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	if routeHits != 1 || reserveHits != 0 {
 		t.Fatalf("routeHits=%d reserveHits=%d, want route only", routeHits, reserveHits)
 	}
-	if gotHost != "49983-sb-1.test.local" {
-		t.Fatalf("node saw Host=%q, want original sid host", gotHost)
+	if outerSandboxID != "sb-1-g0" {
+		t.Fatalf("outer CONNECT sandbox ID=%q, want node identity", outerSandboxID)
+	}
+	if innerHost != "49983-sb-1-g0.test.local" || innerSandboxID != "sb-1-g0" {
+		t.Fatalf("inner identity Host=%q header=%q, want node identity", innerHost, innerSandboxID)
+	}
+	if innerMarker != "unchanged" {
+		t.Fatalf("ordinary end-to-end header=%q, want unchanged", innerMarker)
 	}
 }
 
@@ -393,6 +406,56 @@ func TestServeDataRejectsInvalidSignedFileBeforeReserve(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&reserveHits); got != 0 {
 		t.Fatalf("reserve hits=%d, want 0", got)
+	}
+}
+
+func TestServeDataRejectsReserveIdentityChange(t *testing.T) {
+	var reserveHits int32
+	var nodeHits int32
+	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&nodeHits, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	paused := routerTestRouteResolve(t, "sb-1", "/g", "rk", "", types.ProfileBare)
+	paused.State = "paused"
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(paused)
+		case "/route-link/reserve":
+			atomic.AddInt32(&reserveHits, 1)
+			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "sb-recreated", nodeHost, types.ProfileBare))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	rt.SetDataPlaneAuth("enforce")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+	req.Host = "8080-sb-1.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAccessTok, paused.ForwardAccessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 1 {
+		t.Fatalf("reserve hits=%d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 0 {
+		t.Fatalf("identity-changing reserve reached node %d times", got)
 	}
 }
 

@@ -368,18 +368,18 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	var node1Hits, node2Hits int
 	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		node1Hits++
-		if r.URL.Path != "/sandboxes/sb-1" {
+		if r.URL.Path != "/sandboxes/sb-1-g0" {
 			t.Fatalf("node1 saw path %q", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": "sb-1-g0", "opaque": "sb-1-g0"})
 	}))
 	defer node1.Close()
 	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		node2Hits++
-		if r.URL.Path != "/sandboxes/sb-2" {
+		if r.URL.Path != "/sandboxes/sb-2-g0" {
 			t.Fatalf("node2 saw path %q", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": "sb-2-g0", "opaque": "sb-2-g0"})
 	}))
 	defer node2.Close()
 	node1Host := strings.TrimPrefix(node1.URL, "http://")
@@ -418,13 +418,65 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var body map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s status=%d, want 204", tc.sid, resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%d, want 200", tc.sid, resp.StatusCode)
+		}
+		if body["sandboxID"] != tc.sid || body["opaque"] != tc.sid+"-g0" {
+			t.Fatalf("%s adapted response=%v", tc.sid, body)
 		}
 	}
 	if node1Hits != 1 || node2Hits != 1 {
 		t.Fatalf("node hits node1=%d node2=%d, want one hit each", node1Hits, node2Hits)
+	}
+}
+
+func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
+	var nodeHits int
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nodeHits++
+		if r.URL.Path != "/v2/sandboxes/sb-1-g0/pause" || r.URL.RawQuery != "reason=sb-1" {
+			t.Fatalf("node request path=%q query=%q", r.URL.Path, r.URL.RawQuery)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != `{"opaque":"sb-1"}` {
+			t.Fatalf("node body=%q, want unchanged", body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/route" || r.URL.Query().Get("sid") != "sb-1" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+`/v2/sandboxes/sb-1/pause?reason=sb-1`, strings.NewReader(`{"opaque":"sb-1"}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent || nodeHits != 1 {
+		t.Fatalf("control forward status=%d nodeHits=%d", resp.StatusCode, nodeHits)
 	}
 }
 

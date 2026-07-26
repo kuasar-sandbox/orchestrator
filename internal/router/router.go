@@ -49,7 +49,8 @@ const (
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
 	NodeID                 string `json:"node_id"`
-	SID                    string `json:"sid"`
+	SandboxID              string `json:"sandbox_id"`
+	NodeSandboxID          string `json:"node_sandbox_id"`
 	Profile                string `json:"profile"`
 	AuthSandboxID          string `json:"auth_sandbox_id"`
 	APISecret              string `json:"api_secret"`
@@ -63,7 +64,8 @@ type reserveResult struct {
 	DataEndpoint           string `json:"data_endpoint"`
 }
 type routeResolve struct {
-	SID                    string `json:"sid"`
+	SandboxID              string `json:"sandbox_id"`
+	NodeSandboxID          string `json:"node_sandbox_id"`
 	Group                  string `json:"group"`
 	RouteKey               string `json:"route_key"`
 	NodeID                 string `json:"node_id"`
@@ -113,8 +115,8 @@ type Router struct {
 	builds   map[string]buildEntry // group\x00build_id -> node; TTL-evicted
 
 	cacheMu sync.RWMutex
-	cache   map[string]*routeResolve // group\x00route_key\x00sid -> resolved data-plane target
-	active  map[string]*activeRoute  // active group/route or sid forwards; survives normal route-cache churn
+	cache   map[string]*routeResolve // group\x00route_key\x00stable_sid -> current data-plane target
+	active  map[string]*activeRoute  // in-flight bookkeeping only; never resolves a new request
 
 	reserveMu       sync.Mutex
 	reserveInFlight map[string]*reserveFlight // single-flight Reserve per (group,route_key)
@@ -197,8 +199,8 @@ func NewWithRegistry(reg *clusterclient.Registry, domain string, authTTL time.Du
 func (rt *Router) SetDataPlaneAuth(mode string) { rt.dataPlaneAuth = mode }
 
 // SetRouteCache configures local route resolution cache retention. Non-positive
-// values disable that particular age check; active requests remain protected by
-// the active-route map while they are in flight.
+// values disable that particular age check. In-flight requests retain their own
+// route copy and never depend on the cache entry after forwarding starts.
 func (rt *Router) SetRouteCache(routeTTL, idleTimeout time.Duration) {
 	rt.cacheMu.Lock()
 	defer rt.cacheMu.Unlock()
@@ -313,7 +315,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	out := map[string]any{
-		"sandboxID":          res.SID,
+		"sandboxID":          res.SandboxID,
 		"routeKey":           routeKey,
 		"clientID":           res.NodeID,
 		"forwardAccessToken": res.ForwardAccessToken,
@@ -594,7 +596,12 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	rt.forwardToNode(w, r, rr.DataEndpoint)
+	nodePath, ok := rewriteSandboxPath(r.URL.Path, sid, rr.NodeSandboxID)
+	if !ok {
+		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
+		return
+	}
+	rt.forwardToNode(w, r, rr, nodePath, r.Method == http.MethodGet && isSandboxResourcePath(r.URL.Path))
 }
 
 // handleList returns the group's sandbox shard (cluster-router.md: list is
@@ -629,13 +636,13 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 
 // resolveRoute returns a sandbox's resolved route via the local cache, falling
 // back to the control API; nil if unknown.
-func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sid string) *routeResolve {
-	if rr := rt.cachedRoute(group, routeKey, sid); rr != nil && routeMatchesIdentity(rr, group, routeKey) {
+func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sandboxID string) *routeResolve {
+	if rr := rt.cachedRoute(group, routeKey, sandboxID); rr != nil && routeMatchesIdentity(rr, group, routeKey, sandboxID) {
 		return rr
 	}
-	if rr, err := rt.routeLinkRoute(ctx, group, routeKey, sid); err == nil {
-		if !routeMatchesIdentity(rr, group, routeKey) {
-			rt.evictRoute(group, routeKey, sid)
+	if rr, err := rt.routeLinkRoute(ctx, group, routeKey, sandboxID); err == nil {
+		if !routeMatchesIdentity(rr, group, routeKey, sandboxID) {
+			rt.evictRoute(group, routeKey, sandboxID)
 			return nil
 		}
 		rt.rememberRoute(rr)
@@ -646,19 +653,26 @@ func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sid string)
 
 // forwardToNode proxies a control request to a node's e2b control plane (Host
 // api.<domain>; the client's X-API-KEY passes through for the node's auth).
-func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, dataEndpoint string) {
-	target := &url.URL{Scheme: "http", Host: dataEndpoint}
+func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, rr *routeResolve, nodePath string, adaptSandboxIdentity bool) {
+	target := &url.URL{Scheme: "http", Host: rr.DataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = rt.fwdTransport
 	apiHost := "api." + rt.domain
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "http"
-		req.URL.Host = dataEndpoint
+		req.URL.Host = rr.DataEndpoint
+		req.URL.Path = nodePath
+		req.URL.RawPath = ""
 		req.Host = apiHost
 		req.Header.Del(HeaderAccessTok) // control verbs authorize via X-API-KEY, not a client token
 	}
+	if adaptSandboxIdentity {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			return rewriteSandboxIdentityResponse(resp, rr.SandboxID, rr.NodeSandboxID)
+		}
+	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
-		rt.log.Warn("router: control forward", "node", dataEndpoint, "err", e)
+		rt.log.Warn("router: control forward", "node", rr.DataEndpoint, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, r)
@@ -676,6 +690,60 @@ func extractSandboxID(path string) string {
 		return rest[:j]
 	}
 	return rest
+}
+
+func rewriteSandboxPath(path, sandboxID, nodeSandboxID string) (string, bool) {
+	i := strings.Index(path, "/sandboxes/")
+	if i < 0 || sandboxID == "" || nodeSandboxID == "" {
+		return path, false
+	}
+	start := i + len("/sandboxes/")
+	end := len(path)
+	if j := strings.IndexByte(path[start:], '/'); j >= 0 {
+		end = start + j
+	}
+	if path[start:end] != sandboxID {
+		return path, false
+	}
+	return path[:start] + nodeSandboxID + path[end:], true
+}
+
+func isSandboxResourcePath(path string) bool {
+	i := strings.Index(path, "/sandboxes/")
+	if i < 0 {
+		return false
+	}
+	rest := path[i+len("/sandboxes/"):]
+	return rest != "" && !strings.ContainsRune(rest, '/')
+}
+
+func rewriteSandboxIdentityResponse(resp *http.Response, sandboxID, nodeSandboxID string) error {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read sandbox response: %w", err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return fmt.Errorf("decode sandbox response: %w", err)
+	}
+	var returnedID string
+	rawID, found := envelope["sandboxID"]
+	if !found || json.Unmarshal(rawID, &returnedID) != nil || returnedID != nodeSandboxID {
+		return errors.New("node returned an unexpected sandbox identity")
+	}
+	envelope["sandboxID"], _ = json.Marshal(sandboxID)
+	body, err = json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("encode sandbox response: %w", err)
+	}
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return nil
 }
 
 // --- data plane ---
@@ -716,7 +784,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
 	// miss (cache lagging / cold), fall back to route_link.
 	rr := rt.cachedRoute(group, routeKey, sid)
-	if rr != nil && !routeMatchesIdentity(rr, group, routeKey) {
+	if rr != nil && !routeMatchesIdentity(rr, group, routeKey, sid) {
 		rr = nil
 	}
 	if rr == nil {
@@ -730,7 +798,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		if !routeMatchesIdentity(rr, group, routeKey) {
+		if !routeMatchesIdentity(rr, group, routeKey, sid) {
 			rt.evictRoute(group, routeKey, sid)
 			http.Error(w, "sandbox not found", http.StatusNotFound)
 			return
@@ -770,14 +838,17 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// then forwards to the resumed node.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
 		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey, nil); err == nil && res.DataEndpoint != "" {
-			rr = routeFromReserve(res, rr.Group, rr.RouteKey)
+			resumed := routeFromReserve(res, rr.Group, rr.RouteKey)
+			if routeMatchesIdentity(resumed, rr.Group, rr.RouteKey, sid) {
+				rr = resumed
+			}
 		}
 	}
 	if rr.State != "ready" || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
 	}
-	rt.forwardSandboxData(w, r, rr, r.Host, sid, effectivePort, connectToken)
+	rt.forwardSandboxData(w, r, rr, sid, effectivePort, connectToken)
 }
 
 func expectedDataAccessToken(route *routeResolve, port int) string {
@@ -792,26 +863,27 @@ func expectedDataAccessToken(route *routeResolve, port int) string {
 }
 
 // forwardSandboxData two-hop forwards a data-plane request to the sandbox's node:
-// sandboxHost is the original <port>-<sid>.<domain> authority. connectToken is
+// sandboxID is the stable public identity used to address the route. connectToken is
 // used only for the outer node CONNECT. Every ordinary HTTP request is written
-// unchanged inside that one-shot tunnel, apart from preserving its Host.
-func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string, port int, connectToken string) {
-	r.Host = sandboxHost
+// unchanged inside that one-shot tunnel, apart from rewriting known identity carriers
+// to the current node-local identity.
+func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, port int, connectToken string) {
+	nodeSandboxHost := fmt.Sprintf("%d-%s.%s", port, rr.NodeSandboxID, rt.domain)
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
-	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, sid, port, connectToken)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, port, connectToken)
 	if err != nil {
-		rt.evictRoute(rr.Group, rr.RouteKey, sid)
+		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
-		rt.log.Warn("router: data connect", "sid", sid, "node", rr.NodeID, "err", err)
+		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		backend.Close()
 		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
-			rt.evictRoute(rr.Group, rr.RouteKey, sid)
+			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
 		}
 		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
 		http.Error(w, "connect refused by node", resp.StatusCode)
@@ -823,11 +895,15 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	}
 	defer backend.Close()
 	resp, err = proxypkg.ForwardHTTPOnce(r, backend, br, func(req *http.Request) {
-		req.Host = sandboxHost
+		req.Host = nodeSandboxHost
+		req.URL.Host = nodeSandboxHost
+		if _, present := req.Header[http.CanonicalHeaderKey(proxypkg.HeaderSandboxID)]; present {
+			req.Header.Set(proxypkg.HeaderSandboxID, rr.NodeSandboxID)
+		}
 	})
 	if err != nil {
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
-		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", err)
+		rt.log.Warn("router: data forward", "sid", sandboxID, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -913,6 +989,21 @@ func effectiveDataPort(explicit int, hasExplicit bool, targetPort int) (int, err
 
 func (rt *Router) evictRoute(group, routeKey, sid string) {
 	rt.cacheMu.Lock()
+	rt.evictRouteLocked(group, routeKey, sid)
+	rt.cacheMu.Unlock()
+}
+
+func (rt *Router) evictRouteIfCurrent(group, routeKey, sandboxID, nodeSandboxID string) {
+	rt.cacheMu.Lock()
+	if rr := rt.cache[routeCacheID(group, routeKey, sandboxID)]; rr != nil && rr.NodeSandboxID != nodeSandboxID {
+		rt.cacheMu.Unlock()
+		return
+	}
+	rt.evictRouteLocked(group, routeKey, sandboxID)
+	rt.cacheMu.Unlock()
+}
+
+func (rt *Router) evictRouteLocked(group, routeKey, sid string) {
 	key := routeCacheID(group, routeKey, sid)
 	if rr := rt.cache[key]; rr != nil {
 		for _, key := range activeRouteKeys(rr) {
@@ -921,7 +1012,6 @@ func (rt *Router) evictRoute(group, routeKey, sid string) {
 	}
 	delete(rt.active, activeSIDKey(group, routeKey, sid))
 	delete(rt.cache, key)
-	rt.cacheMu.Unlock()
 }
 
 func routeCacheKey(group, routeKey string) string { return group + "\x00" + routeKey }
@@ -937,8 +1027,8 @@ func activeRouteKeys(rr *routeResolve) []string {
 		return nil
 	}
 	keys := make([]string, 0, 1)
-	if rr.Group != "" && rr.RouteKey != "" && rr.SID != "" {
-		keys = append(keys, activeSIDKey(rr.Group, rr.RouteKey, rr.SID))
+	if rr.Group != "" && rr.RouteKey != "" && rr.SandboxID != "" {
+		keys = append(keys, activeSIDKey(rr.Group, rr.RouteKey, rr.SandboxID))
 	}
 	return keys
 }
@@ -975,14 +1065,14 @@ func (rt *Router) beginActiveRoute(rr *routeResolve) func() {
 }
 
 func (rt *Router) rememberRoute(rr *routeResolve) {
-	if rr == nil || rr.Group == "" || rr.RouteKey == "" || rr.SID == "" {
+	if rr == nil || rr.Group == "" || rr.RouteKey == "" || rr.SandboxID == "" || rr.NodeSandboxID == "" {
 		return
 	}
 	cp := *rr
 	now := time.Now()
 	cp.cachedAt = now
 	cp.lastUsed = now
-	key := routeCacheID(cp.Group, cp.RouteKey, cp.SID)
+	key := routeCacheID(cp.Group, cp.RouteKey, cp.SandboxID)
 	rt.cacheMu.Lock()
 	rt.cache[key] = &cp
 	rt.cacheMu.Unlock()
@@ -992,8 +1082,9 @@ func routeBelongsToGroup(rr *routeResolve, group string) bool {
 	return rr != nil && group != "" && rr.Group == group
 }
 
-func routeMatchesIdentity(rr *routeResolve, group, routeKey string) bool {
-	return routeBelongsToGroup(rr, group) && routeKey != "" && rr.RouteKey == routeKey
+func routeMatchesIdentity(rr *routeResolve, group, routeKey, sandboxID string) bool {
+	return routeBelongsToGroup(rr, group) && routeKey != "" && rr.RouteKey == routeKey &&
+		sandboxID != "" && rr.SandboxID == sandboxID && rr.NodeSandboxID != ""
 }
 
 func newRouteKey() string {
@@ -1053,7 +1144,8 @@ func routeFromReserve(res *reserveResult, group, routeKey string) *routeResolve 
 		return nil
 	}
 	return &routeResolve{
-		SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID,
+		SandboxID: res.SandboxID, NodeSandboxID: res.NodeSandboxID,
+		Group: group, RouteKey: routeKey, NodeID: res.NodeID,
 		DataEndpoint: res.DataEndpoint, Profile: res.Profile,
 		AuthSandboxID: res.AuthSandboxID, APISecret: res.APISecret,
 		APISecretFingerprint: res.APISecretFingerprint, ManifestKeyFingerprint: res.ManifestKeyFingerprint,
@@ -1203,10 +1295,6 @@ func (rt *Router) cachedRoute(group, routeKey, sid string) *routeResolve {
 	cacheKey := routeCacheID(group, routeKey, sid)
 	rt.cacheMu.Lock()
 	defer rt.cacheMu.Unlock()
-	if ar := rt.active[activeSIDKey(group, routeKey, sid)]; ar != nil && ar.rr != nil {
-		cp := *ar.rr
-		return &cp
-	}
 	return rt.cacheRouteLocked(cacheKey, time.Now())
 }
 

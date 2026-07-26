@@ -9,6 +9,31 @@ import (
 	"testing"
 )
 
+func TestStableSandboxCacheDoesNotPinOrEvictNewNodeIdentity(t *testing.T) {
+	rt := &Router{
+		cache:  map[string]*routeResolve{},
+		active: map[string]*activeRoute{},
+	}
+	g0 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g0"}
+	g1 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g1"}
+	rt.rememberRoute(g0)
+	done := rt.beginActiveRoute(g0)
+	defer done()
+	rt.rememberRoute(g1)
+
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("cached route after cutover=%+v, want g1", got)
+	}
+	rt.evictRouteIfCurrent("/g", "rk", "sb-1", "sb-1-g0")
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("old generation evicted current route: %+v", got)
+	}
+	rt.evictRouteIfCurrent("/g", "rk", "sb-1", "sb-1-g1")
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("current generation remained cached: %+v", got)
+	}
+}
+
 // TestAuthRejectsBadKey checks the Phase 7g router auth: a create whose api key
 // the registry rejects is 403'd at the router, before any reserve.
 func TestAuthRejectsBadKey(t *testing.T) {
