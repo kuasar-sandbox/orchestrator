@@ -231,13 +231,14 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if res.NodeID != "n1" || res.SID == "" {
+	if res.NodeID != "n1" || res.SandboxID == "" ||
+		res.NodeSandboxID != registry.EncodeNodeSandboxID(res.SandboxID, 0) {
 		t.Fatalf("reserve result: %+v", res)
 	}
 	if got := node.createFingerprint(); got != apiFingerprint {
 		t.Fatalf("create APISecretFingerprint=%q, placement fingerprint=%q", got, apiFingerprint)
 	}
-	if res.AuthSandboxID != res.SID || res.APISecret != testAPISecret ||
+	if res.AuthSandboxID != res.SandboxID || res.APISecret != testAPISecret ||
 		res.APISecretFingerprint != apiFingerprint || res.ManifestKeyFingerprint != manifestFingerprint ||
 		res.EnvdAccessToken != testEnvdAccessToken || res.TrafficAccessToken != testTrafficAccessToken {
 		t.Fatal("reserve result did not preserve explicit route credentials")

@@ -329,12 +329,13 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
 	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != routeKey ||
-		create.Cluster.AuthSandboxID != create.SID || create.Profile != "e2b" ||
+		create.Cluster.AuthSandboxID != created.SandboxID ||
+		create.SID != registry.EncodeNodeSandboxID(created.SandboxID, 0) || create.Profile != "e2b" ||
 		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
 	}
-	if created.SandboxID != create.SID {
-		t.Fatalf("create response SID=%q, node command SID=%q", created.SandboxID, create.SID)
+	if created.SandboxID == create.SID {
+		t.Fatalf("create exposed node command SID=%q as the stable public ID", create.SID)
 	}
 	if _, found := create.Config[clusterstate.ObjectMetadataKey]; found {
 		t.Fatalf("create command leaked cluster context into user config: %+v", create.Config)
@@ -354,7 +355,8 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserved.AuthSandboxID != create.Cluster.AuthSandboxID || reserved.APISecret != testAPISecret ||
+	if reserved.SandboxID != created.SandboxID || reserved.NodeSandboxID != create.SID ||
+		reserved.AuthSandboxID != create.Cluster.AuthSandboxID || reserved.APISecret != testAPISecret ||
 		reserved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		reserved.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
 		reserved.ServiceSecret != serviceSecret || reserved.EnvdAccessToken != testEnvdAccessToken ||
@@ -364,8 +366,9 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if created.ForwardAccessToken != forwardAccessToken {
 		t.Fatal("create response ForwardAccessToken did not match the node-reported route")
 	}
-	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, create.SID)
-	if err != nil || !found || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
+	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, created.SandboxID)
+	if err != nil || !found || resolved.SandboxID != created.SandboxID ||
+		resolved.NodeSandboxID != create.SID || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
 		resolved.APISecret != testAPISecret || resolved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		resolved.ManifestKeyFingerprint != fullFingerprint(t, testMK) || resolved.ServiceSecret != serviceSecret ||
 		resolved.EnvdAccessToken != testEnvdAccessToken || resolved.TrafficAccessToken != testTrafficAccessToken ||
