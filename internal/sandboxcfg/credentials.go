@@ -3,9 +3,13 @@ package sandboxcfg
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // Credentials is the creation-time override carried by NsCredentials. Empty
@@ -14,6 +18,33 @@ type Credentials struct {
 	ServiceSecret      string `json:"service_secret,omitempty"`
 	EnvdAccessToken    string `json:"envd_access_token,omitempty"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+}
+
+const maxE2BAccessTokenBytes = 256
+
+// ValidE2BAccessToken reports whether token is a valid optional e2b service
+// credential. Empty means unspecified; a supplied token must be valid UTF-8 and
+// no longer than 256 bytes.
+func ValidE2BAccessToken(token string) bool {
+	return utf8.ValidString(token) && len(token) <= maxE2BAccessTokenBytes
+}
+
+// ValidateCredentialsForProfile applies the fixed profile contract after the
+// credentials object has been parsed and before lifecycle side effects begin.
+func ValidateCredentialsForProfile(profile types.Profile, credentials Credentials) error {
+	if !profile.Valid() {
+		return fmt.Errorf("sandboxcfg: unknown sandbox profile %q", profile)
+	}
+	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
+		return errors.New("sandboxcfg: envd_access_token must be valid UTF-8 and at most 256 bytes")
+	}
+	if !ValidE2BAccessToken(credentials.TrafficAccessToken) {
+		return errors.New("sandboxcfg: traffic_access_token must be valid UTF-8 and at most 256 bytes")
+	}
+	if profile == types.ProfileBare && (credentials.EnvdAccessToken != "" || credentials.TrafficAccessToken != "") {
+		return errors.New("sandboxcfg: envd_access_token and traffic_access_token are not valid for bare sandboxes")
+	}
+	return nil
 }
 
 // ExtractCredentials strictly parses and removes the credentials namespace from
@@ -106,12 +137,21 @@ func parseCredentials(raw string) (Credentials, error) {
 			return Credentials{}, credentialsError("service_secret must be 64 lowercase hex characters")
 		}
 	}
+	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
+		return Credentials{}, credentialsError("envd_access_token must be valid UTF-8 and at most 256 bytes")
+	}
+	if !ValidE2BAccessToken(credentials.TrafficAccessToken) {
+		return Credentials{}, credentialsError("traffic_access_token must be valid UTF-8 and at most 256 bytes")
+	}
 	return credentials, nil
 }
 
 func parseCredentialString(field string, raw json.RawMessage) (string, error) {
 	if strings.TrimSpace(string(raw)) == "null" {
 		return "", credentialsError(fmt.Sprintf("%s must not be null", field))
+	}
+	if !utf8.Valid(raw) {
+		return "", credentialsError(fmt.Sprintf("%s must contain valid UTF-8", field))
 	}
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil {

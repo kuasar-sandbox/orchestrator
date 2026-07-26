@@ -64,6 +64,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}

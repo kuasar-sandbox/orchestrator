@@ -31,6 +31,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
 		APISecret:   deriveTestAPISecret(t, manifestKey),
 		ManifestKey: manifestKey,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +69,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T
 		APISecret:   deriveTestAPISecret(t, manifestKey),
 		ManifestKey: manifestKey,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}

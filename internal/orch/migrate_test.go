@@ -3,188 +3,322 @@ package orch
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
-
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// TestExportImportRoundTrip exercises the migration core that connect's auto-import
-// builds on: export (move) mints a token and relinquishes the source; import on a
-// node with the tenant key pair + matching runtime inserts a paused row with a fresh
-// globally unique id.
-func TestExportImportRoundTrip(t *testing.T) {
+func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testing.T) {
 	dir := t.TempDir()
-	rt := filepath.Join(dir, "rt-e2b.erofs")
-	if err := os.WriteFile(rt, []byte("fake-runtime-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Config{}
-	cfg.Sandbox.Boot.Runtime = rt
-	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
-	o := testOrchCfg(t, cfg)
+	o := migrationOrchestrator(t, dir, []byte("fake-runtime-bytes"))
 	ctx := context.Background()
 
 	mk := strings.Repeat("6", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, mk)
-	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil { // import precondition: pair allowlisted
+	pair := store.KeyPair{APISecret: apiSecret, ManifestKey: mk}
+	if _, err := o.st.AddKeyPair(ctx, pair, "", 0, ""); err != nil {
 		t.Fatal(err)
 	}
 
-	sid := "sbx-mig-1"
-	sb := &types.Sandbox{
-		ID: sid, Profile: types.ProfileE2B, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
-		APISecret: apiSecret, ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
-		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
-		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
-			"k": "v", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
-		},
-		CreatedUnix: 1, EnvdAccessToken: "source-envd-token", TrafficAccessToken: "source-traffic-token",
+	sid := "stable-sandbox-g0"
+	sb := migrationSandbox(t, dir, sid, mk, "manifest://"+strings.Repeat("b", 64))
+	sb.AuthSandboxIDValue = "stable-sandbox"
+	sb.DeadlineUnix = 1_900_000_000
+	sb.Env = map[string]string{"FOO": "bar"}
+	sb.Metadata = map[string]string{
+		"k": "v", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	}
+	sb.EnvdAccessToken = "source-envd-token"
+	sb.TrafficAccessToken = "source-traffic-token"
+	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{
+		EnvdAccessToken: sb.EnvdAccessToken, TrafficAccessToken: sb.TrafficAccessToken,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 	o.cache(sb)
 
-	// export (move): mints a token, deletes the source row, and removes any
-	// cached source so an immediate connect+import cannot resume stale local state.
 	tok, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
+	if !strings.HasPrefix(tok, "kmt1.") {
+		t.Fatal("exported token does not have the kmt1 prefix")
+	}
+	payload, err := migrationtoken.Open(migrationtoken.KeyMaterial{
+		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
+	}, tok)
+	if err != nil {
+		t.Fatalf("open exported token: %v", err)
+	}
+	if payload.NodeSandboxID != sid || payload.AuthSandboxID != sb.AuthSandboxID() ||
+		payload.TemplateID != sb.TemplateID || payload.Profile != string(sb.Profile) ||
+		payload.SnapshotRef != sb.SnapshotRef || payload.CreatedUnix != sb.CreatedUnix ||
+		payload.DeadlineUnix != sb.DeadlineUnix {
+		t.Fatal("exported payload lost one or more portable sandbox fields")
+	}
+	assertMigrationCredentialsEqual(t, payloadCredentials(payload), sandboxCredentials(sb))
+
 	if s, _ := o.st.Get(ctx, sid); s != nil {
 		t.Fatal("move export should delete the source row")
 	}
 	if s := o.lookup(sid); s != nil {
-		t.Fatalf("move export should uncache the source row: %+v", s)
+		t.Fatal("move export should uncache the source row")
 	}
-	rawToken, err := base64.StdEncoding.DecodeString(tok)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var tokenFields map[string]json.RawMessage
-	if err := json.Unmarshal(rawToken, &tokenFields); err != nil {
-		t.Fatal(err)
-	}
-	for _, field := range []string{"id", "created_unix", "envd_access_token", "traffic_access_token"} {
-		if _, found := tokenFields[field]; found {
-			t.Fatalf("migration token retained identity field %q", field)
-		}
-	}
-
-	// Import allocates a fresh UUIDv7 while preserving the portable snapshot state.
-	imported, err := o.ImportSandbox(ctx, apiKey, tok)
-	if err != nil || imported == sid {
+	// Standalone import defaults to the source NodeSandboxID after a move.
+	imported, err := o.ImportSandbox(ctx, apiKey, tok, "")
+	if err != nil || imported != sid {
 		t.Fatalf("import: imported=%q err=%v", imported, err)
 	}
-	parsed, err := uuid.Parse(imported)
-	if err != nil || parsed.Version() != 7 {
-		t.Fatalf("imported id=%q, want UUIDv7: %v", imported, err)
-	}
 	got, _ := o.st.Get(ctx, imported)
-	if got == nil || got.State != types.StatePaused || got.Env["FOO"] != "bar" || got.SnapshotRef != sb.SnapshotRef ||
-		got.Metadata[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
-		t.Fatalf("imported row wrong: %+v", got)
+	if got == nil || got.ID != sid || got.AuthSandboxID() != sb.AuthSandboxID() || got.Cluster != nil ||
+		got.State != types.StatePaused || got.Profile != sb.Profile || got.TemplateID != sb.TemplateID ||
+		got.SnapshotRef != sb.SnapshotRef || got.CreatedUnix != sb.CreatedUnix ||
+		got.DeadlineUnix != sb.DeadlineUnix || !reflect.DeepEqual(got.Env, sb.Env) ||
+		!reflect.DeepEqual(got.Metadata, sb.Metadata) {
+		t.Fatal("imported row lost one or more portable sandbox fields")
 	}
-	if got.EnvdAccessToken == "" || got.TrafficAccessToken == "" ||
-		got.EnvdAccessToken == sb.EnvdAccessToken || got.TrafficAccessToken == sb.TrafficAccessToken {
-		t.Fatalf("import reused source data-plane credentials: %+v", got)
-	}
-	if got.CreatedUnix == sb.CreatedUnix {
-		t.Fatalf("import preserved source creation identity: got %d", got.CreatedUnix)
-	}
-
-	// Reusing a portable token creates another independently addressable sandbox;
-	// neither import reuses the source id or collides with the other.
-	importedAgain, err := o.ImportSandbox(ctx, apiKey, tok)
-	if err != nil || importedAgain == sid || importedAgain == imported {
-		t.Fatalf("second import=%q first=%q source=%q err=%v", importedAgain, imported, sid, err)
-	}
-	gotAgain, _ := o.st.Get(ctx, importedAgain)
-	if gotAgain == nil || gotAgain.EnvdAccessToken == got.EnvdAccessToken || gotAgain.TrafficAccessToken == got.TrafficAccessToken {
-		t.Fatalf("second import did not mint independent credentials: first=%+v second=%+v", got, gotAgain)
-	}
+	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(sb))
 }
 
-func TestImportRejectsSameManifestKeyWithDifferentAPISecret(t *testing.T) {
+func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	dir := t.TempDir()
-	runtimePath := filepath.Join(dir, "rt-e2b.erofs")
-	if err := os.WriteFile(runtimePath, []byte("fake-runtime-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Config{}
-	cfg.Sandbox.Boot.Runtime = runtimePath
-	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
-	o := testOrchCfg(t, cfg)
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	ctx := context.Background()
-
 	mk := strings.Repeat("6", 64)
-	source := migrationSandbox(t, dir, "source", mk, "manifest://"+strings.Repeat("b", 64))
-	source.APISecret = strings.Repeat("1", 64)
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
-	if err != nil {
+	_, apiKey := defaultTestCredentials(t, mk)
+
+	if _, err := o.ExportSandbox(ctx, apiKey, "missing", false, true); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("missing export error = %v, want ErrNotFound", err)
+	}
+
+	sb := migrationSandbox(t, dir, "running", mk, "manifest://"+strings.Repeat("b", 64))
+	sb.State = types.StateRunning
+	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	targetPair := store.KeyPair{APISecret: strings.Repeat("2", 64), ManifestKey: mk}
-	if _, err := o.importSandboxWithKey(ctx, targetPair, token); err == nil ||
-		!strings.Contains(err.Error(), "different tenant") {
-		t.Fatalf("import error = %v; want API-secret binding mismatch", err)
+	if _, err := o.ExportSandbox(ctx, "wrong-api-key", sb.ID, false, true); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("non-owner export error = %v, want ErrNotFound", err)
+	}
+	if _, err := o.ExportSandbox(ctx, apiKey, sb.ID, false, true); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("running export error = %v, want ErrBadRequest", err)
 	}
 }
 
-func TestImportRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
+func TestImportExplicitTargetPreservesAuthSubjectAndCredentials(t *testing.T) {
 	dir := t.TempDir()
-	runtimePath := filepath.Join(dir, "runtime.erofs")
-	if err := os.WriteFile(runtimePath, []byte("fake-runtime-bytes"), 0o644); err != nil {
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{}
-	cfg.Sandbox.Boot.Runtime = runtimePath
-	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
-	o := testOrchCfg(t, cfg)
+	source := migrationSandbox(t, dir, "logical-g0", mk, "manifest://"+strings.Repeat("b", 64))
+	source.AuthSandboxIDValue = "logical"
+	source.Metadata = map[string]string{
+		"ordinary":               "preserved",
+		sandboxcfg.NsCredentials: `{"service_secret":"must-not-reenter"}`,
+	}
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	targetID := "logical-g1"
+	gotID, err := o.ImportSandbox(ctx, apiKey, token, targetID)
+	if err != nil || gotID != targetID {
+		t.Fatalf("explicit import = %q, %v", gotID, err)
+	}
+	got, err := o.st.Get(ctx, targetID)
+	if err != nil || got == nil {
+		t.Fatalf("get explicit target: %v", err)
+	}
+	if got.AuthSandboxID() != source.AuthSandboxID() || got.ID == source.ID {
+		t.Fatal("explicit target changed the authentication subject or retained the source node ID")
+	}
+	if got.Metadata["ordinary"] != "preserved" {
+		t.Fatal("standalone import lost ordinary metadata")
+	}
+	if _, found := got.Metadata[sandboxcfg.NsCredentials]; found {
+		t.Fatal("credentials namespace re-entered standalone sandbox metadata")
+	}
+	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(source))
+	if retained, err := o.st.Get(ctx, source.ID); err != nil || retained == nil {
+		t.Fatalf("copy export removed source: %v", err)
+	}
+}
+
+func TestImportIsInsertOnlyAndMapsDuplicateToAlreadyExists(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
 	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
 	source := migrationSandbox(t, dir, "source", mk, "manifest://"+strings.Repeat("b", 64))
 	token, err := o.mintSandboxToken(source, source.SnapshotRef)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := base64.StdEncoding.DecodeString(token)
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "target"); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	before, err := o.st.Get(ctx, "target")
+	if err != nil || before == nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "target"); !errors.Is(err, api.ErrAlreadyExists) {
+		t.Fatalf("second import error = %v, want ErrAlreadyExists", err)
+	}
+	after, err := o.st.Get(ctx, "target")
+	if err != nil || !reflect.DeepEqual(after, before) {
+		t.Fatalf("duplicate import changed existing row: %v", err)
+	}
+}
+
+func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	source := migrationSandbox(t, dir, "logical-g0", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	source.AuthSandboxIDValue = "logical"
+	source.Metadata = map[string]string{
+		"ordinary":                     "preserved",
+		clusterstate.ObjectMetadataKey: "untrusted-binding",
+		sandboxcfg.NsCredentials:       `{"service_secret":"must-not-reenter"}`,
+	}
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload SandboxToken
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		t.Fatal(err)
-	}
-	payload.Profile = string(types.ProfileBare)
-	raw, err = json.Marshal(payload)
+	digest, err := sha256File(o.runtimeFileFor(source.Profile))
 	if err != nil {
 		t.Fatal(err)
+	}
+	cluster := &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-1"}
+	imported, err := o.importSandboxWithKey(context.Background(), store.KeyPair{
+		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
+	}, token, "logical-g1", migrationtoken.Expectations{
+		AuthSandboxID: source.AuthSandboxID(),
+		TemplateID:    source.TemplateID,
+		Profile:       source.Profile,
+		RuntimeDigest: digest,
+		SnapshotRef:   source.SnapshotRef,
+	}, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.Group = "/mutated"
+	if imported.ID != "logical-g1" || imported.AuthSandboxID() != "logical" || imported.Cluster == nil ||
+		imported.Cluster.Group != "/tenant/workloads" || imported.Cluster.RouteKey != "route-1" {
+		t.Fatal("trusted import context was not preserved")
+	}
+	if imported.Metadata["ordinary"] != "preserved" {
+		t.Fatal("ordinary migration metadata was not preserved")
+	}
+	if _, found := imported.Metadata[clusterstate.ObjectMetadataKey]; found {
+		t.Fatal("untrusted execution binding metadata entered cluster import")
+	}
+	if _, found := imported.Metadata[sandboxcfg.NsCredentials]; found {
+		t.Fatal("credentials namespace re-entered cluster sandbox metadata")
+	}
+}
+
+func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime-a"))
+	source := migrationSandbox(t, dir, "source", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair := store.KeyPair{APISecret: source.APISecret, ManifestKey: source.ManifestKey}
+
+	t.Run("API secret", func(t *testing.T) {
+		wrong := pair
+		wrong.APISecret = strings.Repeat("1", 64)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "api-mismatch", migrationtoken.Expectations{}, nil)
+		if !errors.Is(err, migrationtoken.ErrCredentialMismatch) {
+			t.Fatalf("error = %v, want credential mismatch", err)
+		}
+	})
+	t.Run("manifest key", func(t *testing.T) {
+		wrong := pair
+		wrong.ManifestKey = strings.Repeat("2", 64)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "manifest-mismatch", migrationtoken.Expectations{}, nil)
+		if !errors.Is(err, migrationtoken.ErrAuthentication) {
+			t.Fatalf("error = %v, want authentication failure", err)
+		}
+	})
+
+	for name, expected := range map[string]migrationtoken.Expectations{
+		"subject":  {AuthSandboxID: "different-subject"},
+		"template": {TemplateID: "e2b-snp-" + strings.Repeat("c", 64)},
+		"profile":  {Profile: types.ProfileBare},
+		"snapshot": {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil)
+			if !errors.Is(err, migrationtoken.ErrIncompatible) {
+				t.Fatalf("error = %v, want incompatible target", err)
+			}
+		})
 	}
 
-	_, err = o.importSandboxWithKey(context.Background(), store.KeyPair{
-		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
-	}, base64.StdEncoding.EncodeToString(raw))
-	if err == nil || !strings.Contains(err.Error(), "does not match template profile") {
-		t.Fatalf("profile/template mismatch error = %v", err)
+	if err := os.WriteFile(o.runtimeFileFor(source.Profile), []byte("runtime-b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.importSandboxWithKey(context.Background(), pair, token, "runtime-mismatch", migrationtoken.Expectations{}, nil); !errors.Is(err, migrationtoken.ErrIncompatible) {
+		t.Fatalf("runtime mismatch error = %v, want incompatible target", err)
+	}
+}
+
+func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	source := migrationSandbox(t, dir, "source", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair := store.KeyPair{APISecret: source.APISecret, ManifestKey: source.ManifestKey}
+	for _, target := range []string{"UPPER", "has/slash", "-prefix", "suffix-", strings.Repeat("a", 58)} {
+		t.Run(target, func(t *testing.T) {
+			if _, err := o.importSandboxWithKey(context.Background(), pair, token, target, migrationtoken.Expectations{}, nil); err == nil ||
+				!strings.Contains(err.Error(), "invalid target sandbox ID") {
+				t.Fatalf("target %q error = %v", target, err)
+			}
+		})
 	}
 }
 
 func TestMintSandboxTokenRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
 	o := testOrch(t)
-	sb := &types.Sandbox{
-		Profile: types.ProfileBare, TemplateID: "e2b-snp-" + strings.Repeat("a", 64),
-	}
+	sb := &types.Sandbox{Profile: types.ProfileBare, TemplateID: "e2b-snp-" + strings.Repeat("a", 64)}
 	if _, err := o.mintSandboxToken(sb, "manifest://"+strings.Repeat("b", 64)); err == nil ||
 		!strings.Contains(err.Error(), "does not match template profile") {
 		t.Fatalf("mint mismatch error = %v", err)
@@ -215,15 +349,15 @@ func TestExportPromotesLocalSnapshotState(t *testing.T) {
 	}
 	stored, err := o.st.Get(ctx, sid)
 	if err != nil || stored == nil || stored.SnapshotRef != mref {
-		t.Fatalf("stored snapshot ref = %+v, err=%v", stored, err)
+		t.Fatalf("stored snapshot ref was not promoted: %v", err)
 	}
 	if cached := o.lookup(sid); cached == nil || cached.SnapshotRef != mref {
-		t.Fatalf("cached snapshot ref = %+v", cached)
+		t.Fatal("cached snapshot ref was not promoted")
 	}
 	select {
 	case ev := <-events:
 		if ev.Kind != "upsert" || ev.Route.SnapshotLocation != "remote" {
-			t.Fatalf("route event = %+v", ev)
+			t.Fatal("promote published the wrong route event")
 		}
 	default:
 		t.Fatal("promote did not publish a remote upsert")
@@ -258,17 +392,17 @@ func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 	}
 	stored, err := o.st.Get(ctx, sid)
 	if err != nil || stored == nil || stored.SnapshotRef != localRef {
-		t.Fatalf("stored snapshot changed after failure: %+v, err=%v", stored, err)
+		t.Fatalf("stored snapshot changed after failure: %v", err)
 	}
 	if cached := o.lookup(sid); cached == nil || cached.SnapshotRef != localRef {
-		t.Fatalf("cached snapshot changed after failure: %+v", cached)
+		t.Fatal("cached snapshot changed after failure")
 	}
 	if _, err := os.Stat(localRef); err != nil {
 		t.Fatalf("local snapshot removed after failed store update: %v", err)
 	}
 	select {
-	case ev := <-events:
-		t.Fatalf("unexpected route event after failed store update: %+v", ev)
+	case <-events:
+		t.Fatal("unexpected route event after failed store update")
 	default:
 	}
 }
@@ -299,28 +433,77 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 
 	tok, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
 	if err == nil || !strings.Contains(err.Error(), "delete source") || tok != "" {
-		t.Fatalf("move export = token %q, err=%v; want empty token and delete error", tok, err)
+		t.Fatalf("move export returned the wrong token/error state: %v", err)
 	}
 	stored, getErr := o.st.Get(ctx, sid)
 	if getErr != nil || stored == nil {
-		t.Fatalf("source row lost after failed delete: %+v, err=%v", stored, getErr)
+		t.Fatalf("source row lost after failed delete: %v", getErr)
 	}
 	if cached := o.lookup(sid); cached == nil {
 		t.Fatal("source cache removed after failed delete")
 	}
 	select {
-	case ev := <-events:
-		t.Fatalf("unexpected route event after failed delete: %+v", ev)
+	case <-events:
+		t.Fatal("unexpected route event after failed delete")
 	default:
 	}
 }
 
 func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 	t.Helper()
-	return &types.Sandbox{
+	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileE2B, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
 		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
+	}
+	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	return sb
+}
+
+func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrator {
+	t.Helper()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, runtime, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
+	return testOrchCfg(t, cfg)
+}
+
+type migrationCredentials struct {
+	service string
+	envd    string
+	traffic string
+	forward string
+}
+
+func sandboxCredentials(sb *types.Sandbox) migrationCredentials {
+	return migrationCredentials{
+		service: sb.ServiceSecret,
+		envd:    sb.EnvdAccessToken,
+		traffic: sb.TrafficAccessToken,
+		forward: sb.ForwardAccessToken,
+	}
+}
+
+func payloadCredentials(payload migrationtoken.MigrationTokenPayloadV1) migrationCredentials {
+	return migrationCredentials{
+		service: payload.ServiceSecret,
+		envd:    payload.EnvdAccessToken,
+		traffic: payload.TrafficAccessToken,
+		forward: payload.ForwardAccessToken,
+	}
+}
+
+func assertMigrationCredentialsEqual(t *testing.T, got, want migrationCredentials) {
+	t.Helper()
+	if got != want {
+		t.Fatal("migration changed one or more persisted service credentials")
 	}
 }
 

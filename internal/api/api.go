@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -33,8 +35,9 @@ var configHeaderNs = []struct{ header, metaKey string }{
 }
 
 const (
-	builderHeader = "X-Kuasar-Sandbox-Builder"
-	restoreHeader = "X-Kuasar-Sandbox-Restore"
+	builderHeader     = "X-Kuasar-Sandbox-Builder"
+	restoreHeader     = "X-Kuasar-Sandbox-Restore"
+	credentialsHeader = "X-Kuasar-Sandbox-Credentials"
 )
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
@@ -64,14 +67,18 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string
 
 func mergeCreateConfigHeaders(meta map[string]string, h http.Header) map[string]string {
 	meta = mergeConfigHeaders(meta, h)
-	_, present := h[http.CanonicalHeaderKey(restoreHeader)]
-	if !present {
-		return meta
+	for _, item := range []struct{ header, metaKey string }{
+		{restoreHeader, sandboxcfg.NsRestore},
+		{credentialsHeader, sandboxcfg.NsCredentials},
+	} {
+		if _, present := h[http.CanonicalHeaderKey(item.header)]; !present {
+			continue
+		}
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[item.metaKey] = h.Get(item.header)
 	}
-	if meta == nil {
-		meta = map[string]string{}
-	}
-	meta[sandboxcfg.NsRestore] = h.Get(restoreHeader)
 	return meta
 }
 
@@ -103,6 +110,9 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // ErrBadRequest maps a Core-side validation failure (e.g. a COPY referencing
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
+
+// ErrAlreadyExists is returned when a sandbox migration import target exists.
+var ErrAlreadyExists = errors.New("sandbox already exists")
 
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
 const PullTokenHeader = "X-Kuasar-Pull-Token"
@@ -194,9 +204,9 @@ type Core interface {
 
 	// Sandbox export/import (orchestrator extension to the e2b surface). Export turns
 	// a paused sandbox's remote snapshot into a reusable template (toTemplate) or a
-	// one-line base64 migration token; import recreates a paused sandbox from a token.
+	// one-line opaque kmt1 migration token; import restores a paused logical sandbox.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
-	ImportSandbox(ctx context.Context, apiKey, token string) (string, error)
+	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
 
 // Resources are the node-uniform VM resources surfaced in e2b list/get responses.
@@ -333,11 +343,15 @@ func (a *API) kill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) connect(w http.ResponseWriter, r *http.Request) {
+	migrationToken := r.Header.Get(MigrationTokenHeader)
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+		return
+	}
 	var body struct {
 		Timeout int `json:"timeout"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	migrationToken := r.Header.Get(MigrationTokenHeader)
 	sb, err := a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout)
 	if err != nil {
 		if migrationToken != "" {
@@ -593,6 +607,12 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 
 // --- sandbox export / import (orchestrator extension) ---
 
+const (
+	// The token and target ID use JSON-safe alphabets, so the compact object plus
+	// one trailing newline is the complete request envelope accepted here.
+	maxImportRequestBytes = migrationtoken.MaxWireSize + types.MaxLocalSandboxIDBytes + len(`{"token":"","sandboxID":""}`) + 1
+)
+
 func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ToTemplate bool `json:"toTemplate"`
@@ -608,33 +628,74 @@ func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxImportRequestBytes))
 	var body struct {
-		Token string `json:"token"`
+		Token     string `json:"token"`
+		SandboxID string `json:"sandboxID"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&body)
+	if err == nil {
+		var extra any
+		if trailingErr := decoder.Decode(&extra); trailingErr != io.EOF {
+			if trailingErr == nil {
+				err = ErrBadRequest
+			} else {
+				err = trailingErr
+			}
+		}
+	}
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+			return
+		}
 		writeErr(w, 400, "token required")
 		return
 	}
-	id, err := a.core.ImportSandbox(r.Context(), apiKeyFrom(r.Context()), body.Token)
+	if body.Token == "" {
+		writeErr(w, 400, "token required")
+		return
+	}
+	if len(body.Token) > migrationtoken.MaxWireSize {
+		writeErr(w, http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+		return
+	}
+	id, err := a.core.ImportSandbox(r.Context(), apiKeyFrom(r.Context()), body.Token, body.SandboxID)
 	if err != nil {
+		if errors.Is(err, migrationtoken.ErrTokenTooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
 		a.failMigrate(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"sandboxID": id})
 }
 
-// failMigrate surfaces export/import errors: these are operator/tenant tools, so the
-// concrete message (e.g. "pause X first", "runtime mismatch", "tenant key not on
-// this node") is returned rather than collapsed to a generic 500.
+// failMigrate maps typed migration failures without returning storage paths,
+// credential material, token fragments, or other internal diagnostics.
 func (a *API) failMigrate(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrAlreadyExists):
+		writeErr(w, http.StatusConflict, "target sandbox already exists")
+	case errors.Is(err, migrationtoken.ErrIncompatible):
+		writeErr(w, http.StatusConflict, "target environment incompatible")
+	case errors.Is(err, migrationtoken.ErrAuthentication),
+		errors.Is(err, migrationtoken.ErrCredentialMismatch),
+		errors.Is(err, ErrNotAllowed):
+		writeErr(w, http.StatusForbidden, "migration credential not allowed")
+	case errors.Is(err, migrationtoken.ErrMalformedToken),
+		errors.Is(err, migrationtoken.ErrInvalidPayload):
+		writeErr(w, http.StatusBadRequest, "invalid migration token")
+	case errors.Is(err, ErrBadRequest):
+		writeErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrNotFound):
-		writeErr(w, 404, err.Error())
-	case errors.Is(err, ErrNotAllowed):
-		writeErr(w, 403, err.Error())
+		writeErr(w, http.StatusNotFound, "not found")
 	default:
 		a.log.Warn("migrate error", "err", err)
-		writeErr(w, 400, err.Error())
+		writeErr(w, http.StatusInternalServerError, "internal error")
 	}
 }
 
@@ -648,20 +709,28 @@ func (a *API) envdVersion(sb *types.Sandbox) string {
 }
 
 func (a *API) sandboxResp(sb *types.Sandbox) map[string]any {
+	response := a.sandboxBaseResp(sb)
+	response["forwardAccessToken"] = sb.ForwardAccessToken
+	if sb.Profile == types.ProfileE2B {
+		response["envdAccessToken"] = sb.EnvdAccessToken
+		response["trafficAccessToken"] = sb.TrafficAccessToken
+	}
+	return response
+}
+
+func (a *API) sandboxBaseResp(sb *types.Sandbox) map[string]any {
 	return map[string]any{
-		"sandboxID":          sb.ID,
-		"templateID":         sb.TemplateID,
-		"clientID":           "orchestrator",
-		"domain":             a.domain,
-		"envdVersion":        a.envdVersion(sb),
-		"envdAccessToken":    sb.EnvdAccessToken,
-		"trafficAccessToken": sb.TrafficAccessToken,
-		"alias":              "",
+		"sandboxID":   sb.ID,
+		"templateID":  sb.TemplateID,
+		"clientID":    "orchestrator",
+		"domain":      a.domain,
+		"envdVersion": a.envdVersion(sb),
+		"alias":       "",
 	}
 }
 
 func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
-	d := a.sandboxResp(sb)
+	d := a.sandboxBaseResp(sb)
 	d["state"] = string(sb.State)
 	d["startedAt"] = sb.CreatedUnix
 	d["endAt"] = sb.DeadlineUnix

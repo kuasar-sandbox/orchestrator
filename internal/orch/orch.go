@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -163,30 +164,36 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	credentials, meta, err := sandboxcfg.ExtractCredentials(meta)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("orch: new id: %w", err)
 	}
 	sid := id.String()
-	envdTok, _ := keys.MintToken()
-	trafTok, _ := keys.MintToken()
 
 	sb := &types.Sandbox{
-		ID:                 sid,
-		Profile:            tmpl.Profile,
-		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
-		State:              types.StateRunning,
-		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
-		APISecret:          pair.APISecret,
-		ManifestKey:        pair.ManifestKey,
-		EnvdAccessToken:    envdTok,
-		TrafficAccessToken: trafTok,
-		Metadata:           meta,
-		Env:                req.EnvVars,
-		CreatedUnix:        time.Now().Unix(),
-		DeadlineUnix:       time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
+		ID:           sid,
+		Profile:      tmpl.Profile,
+		TemplateID:   tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
+		State:        types.StateRunning,
+		RunDir:       o.cfg.Paths.RunRoot + "/" + sid,
+		BaseDir:      o.cfg.Paths.BaseRoot + "/" + sid,
+		APISecret:    pair.APISecret,
+		ManifestKey:  pair.ManifestKey,
+		Metadata:     meta,
+		Env:          req.EnvVars,
+		CreatedUnix:  time.Now().Unix(),
+		DeadlineUnix: time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
+	}
+	if err := materializeSandboxCredentials(sb, credentials); err != nil {
+		return nil, fmt.Errorf("orch: create credentials: %w", err)
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
@@ -358,14 +365,21 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 	}
 	// Auto-migrate: connecting to a sandbox absent on this node with a migration
 	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
-	// resumes — one SDK call does export's counterpart. ImportSandbox checks the
-	// tenant key + token fingerprint + runtime digest.
+	// schedules an asynchronous resume. ImportSandbox checks the tenant key,
+	// token fingerprints, runtime digest, and exact caller-selected target ID.
+	// An existing target ignores the token completely, including malformed input.
 	if sb == nil && migrationToken != "" {
-		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken)
+		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id)
 		if ierr != nil {
-			return nil, ierr
+			if !errors.Is(ierr, api.ErrAlreadyExists) {
+				return nil, ierr
+			}
+			// Another Connect may have won the insert-only import race. Treat the
+			// winner as an existing target, then apply the normal ownership check
+			// below. Never overwrite or merge the row that won.
+		} else if imported != id {
+			return nil, fmt.Errorf("connect: imported sandbox ID mismatch")
 		}
-		id = imported
 		if sb, err = o.st.Get(ctx, id); err != nil {
 			return nil, err
 		}
@@ -373,33 +387,41 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 	if !ownsSandbox(sb, apiKey) {
 		return nil, api.ErrNotFound
 	}
-	if sb.State == types.StatePaused {
-		// Route the resume through the same per-sid single-flight the data plane
-		// uses, so a /connect racing data-plane traffic (or another /connect)
-		// collapses to one resume+launch instead of double-allocating the port or
-		// starting the unit twice. resumeIfPaused re-checks "still paused?" inside
-		// the flight, so the losers are no-ops.
-		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
-			return nil, err
-		}
-		// Re-read the now-running snapshot the flight published; never mutate the
-		// cached pointer in place.
-		if r := o.lookup(id); r != nil {
-			sb = r
-		} else if sb, err = o.st.Get(ctx, id); err != nil || sb == nil {
-			return nil, api.ErrNotFound
-		}
-	}
+	var requestedDeadline int64
 	if timeoutSec > 0 {
-		dl := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = dl }); s != nil {
+		requestedDeadline = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline }); s != nil {
 			sb = s // cached: published a fresh snapshot with the new deadline
 		} else {
-			sb.DeadlineUnix = dl // not cached (fresh, unpublished) — safe in place
+			sb.DeadlineUnix = requestedDeadline // not cached (fresh, unpublished) — safe in place
 		}
-		_ = o.st.SetDeadline(ctx, id, dl)
+		_ = o.st.SetDeadline(ctx, id, requestedDeadline)
+	}
+	if sb.State == types.StatePaused {
+		// Import and credential lookup are complete before this point. Resume is
+		// deliberately asynchronous, but still shares the per-sandbox flight with
+		// data-plane wakes and other Connect calls.
+		o.scheduleResume(id, requestedDeadline)
 	}
 	return sb, nil
+}
+
+func (o *Orchestrator) scheduleResume(id string, requestedDeadline int64) {
+	go func() {
+		ctx := o.asyncCtx()
+		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
+			o.log.Error("sandbox connect resume", "sid", id, "err", err)
+			return
+		}
+		// resume applies the node default TTL. A timeout explicitly supplied by
+		// this Connect remains authoritative and is restored after the flight.
+		if requestedDeadline > 0 {
+			o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline })
+			if err := o.st.SetDeadline(ctx, id, requestedDeadline); err != nil {
+				o.log.Error("sandbox connect deadline", "sid", id, "err", err)
+			}
+		}
+	}()
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {

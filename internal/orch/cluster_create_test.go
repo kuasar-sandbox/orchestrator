@@ -31,10 +31,12 @@ func TestClaimClusterCreateRejectsInflightAndStoredSandboxIDs(t *testing.T) {
 	o.releaseClusterCreate("inflight")
 
 	manifestKey := strings.Repeat("b", 64)
-	if err := o.st.Put(ctx, &types.Sandbox{
+	stored := &types.Sandbox{
 		ID: "stored", Profile: types.ProfileBare, State: types.StateRunning,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-	}); err != nil {
+	}
+	materializeTestSandboxCredentials(t, stored)
+	if err := o.st.Put(ctx, stored); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.claimClusterCreate(ctx, "stored"); err == nil {
@@ -57,7 +59,7 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 			sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
 		},
 	}
-	if _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
+	if _, _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
 		t.Fatal("cluster create accepted invalid restore policy")
 	}
 }
@@ -76,7 +78,7 @@ func TestPrecheckClusterRequiresConsistentProfileAndContext(t *testing.T) {
 		}
 	}
 
-	if _, tmpl, err := o.precheckCluster(context.Background(), valid()); err != nil {
+	if _, tmpl, _, err := o.precheckCluster(context.Background(), valid()); err != nil {
 		t.Fatalf("valid cluster create rejected: %v", err)
 	} else if tmpl.Profile != types.ProfileBare {
 		t.Fatalf("template profile = %q, want bare", tmpl.Profile)
@@ -96,12 +98,12 @@ func TestPrecheckClusterRequiresConsistentProfileAndContext(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cmd := valid()
 			mutate(cmd)
-			if _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
+			if _, _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
 				t.Fatal("invalid cluster create was accepted")
 			}
 		})
 	}
-	if _, _, err := o.precheckCluster(context.Background(), nil); err == nil {
+	if _, _, _, err := o.precheckCluster(context.Background(), nil); err == nil {
 		t.Fatal("nil cluster create command was accepted")
 	}
 }
@@ -110,6 +112,7 @@ func TestClusterSandboxMetadataExcludesLegacyClusterIdentity(t *testing.T) {
 	input := map[string]string{
 		"user-key":                     "user-value",
 		clusterstate.ObjectMetadataKey: `{"group":"legacy","route_key":"legacy"}`,
+		sandboxcfg.NsCredentials:       `{"service_secret":"` + strings.Repeat("1", 64) + `"}`,
 	}
 	metadata := clusterSandboxMetadata(input)
 	if metadata["user-key"] != "user-value" {
@@ -118,8 +121,36 @@ func TestClusterSandboxMetadataExcludesLegacyClusterIdentity(t *testing.T) {
 	if _, found := metadata[clusterstate.ObjectMetadataKey]; found {
 		t.Fatal("legacy cluster identity remained in sandbox metadata")
 	}
+	if _, found := metadata[sandboxcfg.NsCredentials]; found {
+		t.Fatal("sandbox credentials remained in user metadata")
+	}
 	if _, found := input[clusterstate.ObjectMetadataKey]; !found {
 		t.Fatal("metadata filtering mutated the command config")
+	}
+}
+
+func TestPrecheckClusterExtractsCredentials(t *testing.T) {
+	o := testOrch(t)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	secret := strings.Repeat("1", 64)
+	cmd := &routesync.Command{
+		SID: "stable-g0", TemplateRef: "e2b-img-" + strings.Repeat("a", 64), Profile: "e2b",
+		APISecretFingerprint: fingerprint,
+		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+		Config: map[string]string{
+			sandboxcfg.NsCredentials: `{"service_secret":"` + secret + `","envd_access_token":"envd","traffic_access_token":"traffic"}`,
+			"keep":                   "value",
+		},
+	}
+	_, _, credentials, err := o.precheckCluster(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials.ServiceSecret != secret || credentials.EnvdAccessToken != "envd" || credentials.TrafficAccessToken != "traffic" {
+		t.Fatalf("cluster credentials = %+v", credentials)
+	}
+	if _, found := cmd.Config[sandboxcfg.NsCredentials]; found || cmd.Config["keep"] != "value" {
+		t.Fatalf("cluster command config was not separated: %+v", cmd.Config)
 	}
 }
 
@@ -176,6 +207,7 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 		APISecret:          deriveTestAPISecret(t, manifestKey),
 		ManifestKey:        manifestKey,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}

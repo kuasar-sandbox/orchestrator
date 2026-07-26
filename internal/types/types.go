@@ -44,6 +44,18 @@ const (
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
+const MaxLocalSandboxIDBytes = 57
+
+var localSandboxIDRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`)
+
+// ValidLocalSandboxID reports whether id is an opaque node-local sandbox ID.
+// The contract is the 1..57-byte lowercase DNS-label subset
+// ^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$.
+func ValidLocalSandboxID(id string) bool {
+	return localSandboxIDRe.MatchString(id)
+}
+
 // TemplateID is the e2b templateID, self-describing as <profile>-<kind>-<key>.
 // key is the 64-hex manifest content key. There is no separate template registry.
 type TemplateID struct {
@@ -101,8 +113,10 @@ type Sandbox struct {
 	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
 	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
 	SnapshotRef        string // latest snapshot manifest key (for resume); empty if never paused
+	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
 	EnvdAccessToken    string
 	TrafficAccessToken string
+	ForwardAccessToken string
 	Metadata           map[string]string
 	Env                map[string]string
 	CreatedUnix        int64

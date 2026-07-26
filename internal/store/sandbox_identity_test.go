@@ -20,6 +20,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 		State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
+	setTestSandboxServiceCredentials(cluster)
 	if err := st.Put(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
@@ -38,6 +39,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 		TemplateID: "e2b-snp-" + strings.Repeat("b", 64), State: types.StatePaused,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 2,
 	}
+	setTestSandboxServiceCredentials(standalone)
 	if err := st.Put(ctx, standalone); err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +63,7 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 		State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
+	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +72,7 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 	sb.Cluster = &types.ClusterSandboxContext{Group: "/replacement", RouteKey: "other"}
 	sb.AuthSandboxIDValue = "replacement"
 	sb.State = types.StatePaused
+	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +97,7 @@ func TestSandboxIdentityValidation(t *testing.T) {
 		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StateRunning,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
 	}
+	setTestSandboxServiceCredentials(&base)
 
 	for name, mutate := range map[string]func(*types.Sandbox){
 		"empty profile":   func(sb *types.Sandbox) { sb.Profile = "" },

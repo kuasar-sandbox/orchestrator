@@ -1,8 +1,9 @@
 // Package store persists sandbox/build records in a node-local sqlite database.
-// modernc.org/sqlite is a pure-Go driver (CGO_ENABLED=0). Tenant API and manifest
-// secrets are stored AES-256-GCM-encrypted (secretbox). Their complete SHA-256
-// fingerprints are indexed; the API-secret fingerprint prefix embedded in an
-// API key is only a candidate selector, and callers must still verify the MAC.
+// modernc.org/sqlite is a pure-Go driver (CGO_ENABLED=0). Tenant API, manifest,
+// and sandbox service credentials are stored AES-256-GCM-encrypted (secretbox).
+// Tenant-root complete SHA-256 fingerprints are indexed; the API-secret
+// fingerprint prefix embedded in an API key is only a candidate selector, and
+// callers must still verify the MAC.
 package store
 
 import (
@@ -17,6 +18,8 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	_ "modernc.org/sqlite"
@@ -51,8 +54,10 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   manifest_key_hash    TEXT NOT NULL,
   manifest_key_enc     TEXT NOT NULL,
   snapshot_ref         TEXT NOT NULL DEFAULT '',
-  envd_access_token    TEXT NOT NULL DEFAULT '',
-  traffic_access_token TEXT NOT NULL DEFAULT '',
+  service_secret_enc       TEXT NOT NULL,
+  envd_access_token_enc    TEXT NOT NULL,
+  traffic_access_token_enc TEXT NOT NULL,
+  forward_access_token_enc TEXT NOT NULL,
   metadata_json        TEXT NOT NULL DEFAULT '{}',
   env_json             TEXT NOT NULL DEFAULT '{}',
   created_unix         INTEGER NOT NULL
@@ -107,7 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_ke
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
-// for credential pairs at rest. The file should be 0600.
+// for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
@@ -131,6 +136,10 @@ const (
 var (
 	hexSecretRE        = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	hexCandidateHashRE = regexp.MustCompile(`^[0-9a-f]{24}$`)
+
+	// ErrSandboxExists means an insert-only sandbox write found an existing
+	// record with the same ID. The existing row is retained unchanged.
+	ErrSandboxExists = errors.New("store: sandbox already exists")
 
 	// ErrKeyPairConflict means an API-secret fingerprint is already bound to
 	// different API-secret or manifest-key material. The existing row is retained.
@@ -244,59 +253,127 @@ func ub(s string) types.BuildOptions {
 
 // --- sandboxes ---
 
-// Put upserts a sandbox record. Profile, cluster identity, credential subject,
-// and tenant credential pair are written only by the initial insert; later
-// lifecycle updates cannot rebind an existing sandbox.
-func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
-	if sb == nil {
-		return errors.New("store: put: sandbox is required")
-	}
-	clusterGroup, clusterRouteKey, err := sandboxIdentityColumns(sb)
-	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
-	}
-	apiHash, apiEnc, err := s.encSecret("API secret", sb.APISecret)
-	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
-	}
-	manifestHash, manifestEnc, err := s.encSecret("manifest key", sb.ManifestKey)
-	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
-	}
-	_, err = s.db.ExecContext(ctx, `
+const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
-	  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
   template_id=excluded.template_id, state=excluded.state, deadline_unix=excluded.deadline_unix,
   run_dir=excluded.run_dir, base_dir=excluded.base_dir, run_id=excluded.run_id, envd_uds=excluded.envd_uds,
   ci_uds=excluded.ci_uds, floatingip=excluded.floatingip, vswitch_port=excluded.vswitch_port,
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
-  snapshot_ref=excluded.snapshot_ref, envd_access_token=excluded.envd_access_token,
-  traffic_access_token=excluded.traffic_access_token,
-  metadata_json=excluded.metadata_json, env_json=excluded.env_json`,
+  snapshot_ref=excluded.snapshot_ref,
+  metadata_json=excluded.metadata_json, env_json=excluded.env_json`
+
+const sandboxInsertOnlySQL = sandboxInsertSQL + `
+ON CONFLICT(id) DO NOTHING`
+
+func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
+	if sb == nil {
+		return nil, errors.New("sandbox is required")
+	}
+	if !types.ValidLocalSandboxID(sb.ID) {
+		return nil, errors.New("invalid sandbox id")
+	}
+	clusterGroup, clusterRouteKey, err := sandboxIdentityColumns(sb)
+	if err != nil {
+		return nil, err
+	}
+	apiHash, apiEnc, err := s.encSecret("API secret", sb.APISecret)
+	if err != nil {
+		return nil, err
+	}
+	manifestHash, manifestEnc, err := s.encSecret("manifest key", sb.ManifestKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSandboxServiceCredentials(sb); err != nil {
+		return nil, err
+	}
+	serviceSecretEnc, err := s.box.EncryptString(sb.ServiceSecret)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt service secret: %w", err)
+	}
+	envdAccessTokenEnc, err := s.box.EncryptString(sb.EnvdAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt envd access token: %w", err)
+	}
+	trafficAccessTokenEnc, err := s.box.EncryptString(sb.TrafficAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt traffic access token: %w", err)
+	}
+	forwardAccessTokenEnc, err := s.box.EncryptString(sb.ForwardAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt forward access token: %w", err)
+	}
+	return []any{
 		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.AuthSandboxIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef,
-		sb.EnvdAccessToken, sb.TrafficAccessToken, mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix)
+		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
+		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix,
+	}, nil
+}
+
+func sandboxWriteError(operation string, sb *types.Sandbox, err error) error {
+	if sb == nil {
+		return fmt.Errorf("store: %s: %w", operation, err)
+	}
+	return fmt.Errorf("store: %s %s: %w", operation, sb.ID, err)
+}
+
+// Put upserts a sandbox record. Profile, cluster identity, credential subject,
+// tenant credential pair, and sandbox service credentials are written only by
+// the initial insert; later lifecycle updates cannot rebind an existing sandbox.
+func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
+	args, err := s.prepareSandboxInsert(sb)
 	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
+		return sandboxWriteError("put", sb, err)
+	}
+	_, err = s.db.ExecContext(ctx, sandboxUpsertSQL, args...)
+	if err != nil {
+		return sandboxWriteError("put", sb, err)
+	}
+	return nil
+}
+
+// InsertSandbox writes a new sandbox record and returns ErrSandboxExists when
+// the ID is already present. It never changes an existing row.
+func (s *Store) InsertSandbox(ctx context.Context, sb *types.Sandbox) error {
+	args, err := s.prepareSandboxInsert(sb)
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	result, err := s.db.ExecContext(ctx, sandboxInsertOnlySQL, args...)
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	if inserted == 0 {
+		return sandboxWriteError("insert sandbox", sb, ErrSandboxExists)
 	}
 	return nil
 }
 
 var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
-  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix`
+  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
 	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
+	var serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc string
 	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.AuthSandboxIDValue,
 		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
-		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef, &sb.EnvdAccessToken, &sb.TrafficAccessToken,
+		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef,
+		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix); err != nil {
 		return nil, err
 	}
@@ -306,6 +383,21 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	}
 	sb.APISecret = pair.APISecret
 	sb.ManifestKey = pair.ManifestKey
+	for name, encrypted := range map[string]struct {
+		ciphertext string
+		dest       *string
+	}{
+		"service secret":       {serviceSecretEnc, &sb.ServiceSecret},
+		"envd access token":    {envdAccessTokenEnc, &sb.EnvdAccessToken},
+		"traffic access token": {trafficAccessTokenEnc, &sb.TrafficAccessToken},
+		"forward access token": {forwardAccessTokenEnc, &sb.ForwardAccessToken},
+	} {
+		plaintext, err := s.box.DecryptString(encrypted.ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("store: decrypt %s for sandbox %s: %w", name, sb.ID, err)
+		}
+		*encrypted.dest = plaintext
+	}
 	sb.Profile, sb.State = types.Profile(profile), types.State(st)
 	if !sb.Profile.Valid() {
 		return nil, fmt.Errorf("store: sandbox %s has invalid profile %q", sb.ID, profile)
@@ -318,8 +410,43 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	default:
 		sb.Cluster = &types.ClusterSandboxContext{Group: clusterGroup, RouteKey: clusterRouteKey}
 	}
+	if err := validateSandboxServiceCredentials(&sb); err != nil {
+		return nil, fmt.Errorf("store: sandbox %s has corrupt service credentials: %w", sb.ID, err)
+	}
 	sb.Metadata, sb.Env = uj(meta), uj(env)
 	return &sb, nil
+}
+
+func validateSandboxServiceCredentials(sb *types.Sandbox) error {
+	if _, err := secretHash("service secret", sb.ServiceSecret); err != nil {
+		return err
+	}
+	if sb.ForwardAccessToken == "" {
+		return errors.New("forward access token is required")
+	}
+	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, sb.ServiceSecret, sb.AuthSandboxID()); err != nil {
+		return errors.New("forward access token is invalid")
+	}
+	switch sb.Profile {
+	case types.ProfileE2B:
+		if !sandboxcfg.ValidE2BAccessToken(sb.EnvdAccessToken) ||
+			!sandboxcfg.ValidE2BAccessToken(sb.TrafficAccessToken) {
+			return errors.New("envd and traffic access tokens must be valid UTF-8 and at most 256 bytes")
+		}
+		if sb.EnvdAccessToken == "" {
+			return errors.New("envd access token is required for e2b profile")
+		}
+		if sb.TrafficAccessToken == "" {
+			return errors.New("traffic access token is required for e2b profile")
+		}
+	case types.ProfileBare:
+		if sb.EnvdAccessToken != "" || sb.TrafficAccessToken != "" {
+			return errors.New("envd and traffic access tokens must be empty for bare profile")
+		}
+	default:
+		return fmt.Errorf("invalid sandbox profile %q", sb.Profile)
+	}
+	return nil
 }
 
 func sandboxIdentityColumns(sb *types.Sandbox) (group, routeKey string, err error) {

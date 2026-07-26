@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -30,6 +31,19 @@ func testKeyPair(apiDigit, manifestDigit string) KeyPair {
 	return KeyPair{
 		APISecret:   strings.Repeat(apiDigit, 64),
 		ManifestKey: strings.Repeat(manifestDigit, 64),
+	}
+}
+
+func setTestSandboxServiceCredentials(sb *types.Sandbox) {
+	sb.ServiceSecret = strings.Repeat("7", 64)
+	forwardToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.AuthSandboxID())
+	if err != nil {
+		panic(err)
+	}
+	sb.ForwardAccessToken = forwardToken
+	if sb.Profile == types.ProfileE2B {
+		sb.EnvdAccessToken = "test-envd-access-token"
+		sb.TrafficAccessToken = "test-traffic-access-token"
 	}
 }
 
@@ -172,6 +186,7 @@ func TestRemoveKeyPairByAPISecretFingerprintDeletesExpiredKeyTableOnly(t *testin
 		Profile: types.ProfileBare, State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
+	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -247,6 +262,7 @@ func TestBusinessCredentialsAreEncryptedImmutableAndIndependentOfAllowlist(t *te
 		Profile: types.ProfileBare, State: types.StateRunning, APISecret: initial.APISecret, ManifestKey: initial.ManifestKey,
 		CreatedUnix: 1,
 	}
+	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -314,10 +330,12 @@ func TestSandboxListUsesAPISecretCandidateHash(t *testing.T) {
 	first := testKeyPair("c", "d")
 	second := testKeyPair("e", "f")
 	for id, pair := range map[string]KeyPair{"sandbox-1": first, "sandbox-2": second} {
-		if err := st.Put(ctx, &types.Sandbox{
+		sb := &types.Sandbox{
 			ID: id, Profile: types.ProfileBare, TemplateID: "bare-img-" + strings.Repeat("1", 64), State: types.StateRunning,
 			APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
-		}); err != nil {
+		}
+		setTestSandboxServiceCredentials(sb)
+		if err := st.Put(ctx, sb); err != nil {
 			t.Fatal(err)
 		}
 	}

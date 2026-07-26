@@ -31,6 +31,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 )
 
 // Version is the protocol version exchanged in Hello/Register.
@@ -190,6 +192,9 @@ const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake fra
 
 // WriteMsg writes a length-prefixed JSON frame ([4B LE len][json]).
 func WriteMsg(w io.Writer, m *Msg) error {
+	if err := validateMessageLimits(m); err != nil {
+		return err
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -224,5 +229,15 @@ func ReadMsg(r io.Reader) (*Msg, error) {
 	if err := json.Unmarshal(buf, &m); err != nil {
 		return nil, err
 	}
+	if err := validateMessageLimits(&m); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+func validateMessageLimits(m *Msg) error {
+	if m != nil && m.Cmd != nil && len(m.Cmd.MigrationToken) > migrationtoken.MaxWireSize {
+		return migrationtoken.ErrTokenTooLarge
+	}
+	return nil
 }

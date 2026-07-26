@@ -1,6 +1,9 @@
 package types
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseProfile(t *testing.T) {
 	for _, tt := range []struct {
@@ -19,6 +22,33 @@ func TestParseProfile(t *testing.T) {
 				t.Fatalf("ParseProfile(%q) = %q, %v; want %q, error=%t", tt.raw, got, err, tt.want, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidLocalSandboxID(t *testing.T) {
+	for _, tt := range []struct {
+		id   string
+		want bool
+	}{
+		{id: "a", want: true},
+		{id: "0", want: true},
+		{id: "a0", want: true},
+		{id: "sandbox-01-g7", want: true},
+		{id: "a-z", want: true},
+		{id: "a" + strings.Repeat("-", 55) + "z", want: true},
+		{id: "", want: false},
+		{id: strings.Repeat("a", 58), want: false},
+		{id: "-sandbox", want: false},
+		{id: "sandbox-", want: false},
+		{id: "Sandbox", want: false},
+		{id: "sandbox_id", want: false},
+		{id: "sandbox.id", want: false},
+		{id: "sandbox/id", want: false},
+		{id: "sandébox", want: false},
+	} {
+		if got := ValidLocalSandboxID(tt.id); got != tt.want {
+			t.Errorf("ValidLocalSandboxID(%q) = %t, want %t", tt.id, got, tt.want)
+		}
 	}
 }
 

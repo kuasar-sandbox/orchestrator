@@ -13,9 +13,9 @@ import (
 // the running serve daemon's api plane (POST /sandboxes/{id}/export over the local
 // control socket). With --to-template it promotes the paused sandbox's snapshot to a
 // remote manifest and prints the persist template id (fork; usable via `e2b sandbox
-// create`). Otherwise it prints a one-line base64 migration token for `import-sandbox`
-// on another node (the import allocates a fresh sandbox id). Auth: E2B_API_KEY env
-// (must own the sandbox).
+// create`). Otherwise it prints a one-line opaque kmt1 migration token for
+// `import-sandbox` on another node (the import reuses the source node-local id by
+// default). Auth: E2B_API_KEY env (must own the sandbox).
 func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	sid, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)

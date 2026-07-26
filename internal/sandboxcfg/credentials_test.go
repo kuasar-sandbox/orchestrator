@@ -1,10 +1,66 @@
 package sandboxcfg
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestValidE2BAccessTokenBoundaries(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		token string
+		want  bool
+	}{
+		{name: "unspecified", token: "", want: true},
+		{name: "256 ASCII bytes", token: strings.Repeat("a", 256), want: true},
+		{name: "257 ASCII bytes", token: strings.Repeat("a", 257), want: false},
+		{name: "256 multibyte UTF-8 bytes", token: strings.Repeat("界", 85) + "a", want: true},
+		{name: "257 multibyte UTF-8 bytes", token: strings.Repeat("界", 85) + "ab", want: false},
+		{name: "invalid UTF-8", token: string([]byte{0xff}), want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ValidE2BAccessToken(tt.token); got != tt.want {
+				t.Fatalf("ValidE2BAccessToken() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractCredentialsEnforcesE2BAccessTokenBoundaries(t *testing.T) {
+	for _, field := range []string{"envd_access_token", "traffic_access_token"} {
+		t.Run(field, func(t *testing.T) {
+			for _, tt := range []struct {
+				name    string
+				token   string
+				wantErr bool
+			}{
+				{name: "256 bytes", token: strings.Repeat("界", 85) + "a"},
+				{name: "257 bytes", token: strings.Repeat("界", 85) + "ab", wantErr: true},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					raw, err := json.Marshal(map[string]string{field: tt.token})
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _, err = ExtractCredentials(map[string]string{NsCredentials: string(raw)})
+					if (err != nil) != tt.wantErr {
+						t.Fatalf("ExtractCredentials() error = %v, want error=%t", err, tt.wantErr)
+					}
+				})
+			}
+		})
+	}
+
+	invalidUTF8 := append([]byte(`{"envd_access_token":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	if _, _, err := ExtractCredentials(map[string]string{NsCredentials: string(invalidUTF8)}); err == nil {
+		t.Fatal("ExtractCredentials accepted an invalid UTF-8 token")
+	}
+}
 
 func TestExtractCredentials(t *testing.T) {
 	secret := strings.Repeat("ab", 32)
@@ -33,6 +89,25 @@ func TestExtractCredentials(t *testing.T) {
 	cleaned["keep"] = "changed"
 	if original["keep"] != "value" {
 		t.Fatal("cleaned metadata aliases the input map")
+	}
+}
+
+func TestValidateCredentialsForProfile(t *testing.T) {
+	if err := ValidateCredentialsForProfile(types.ProfileE2B, Credentials{
+		EnvdAccessToken: "envd", TrafficAccessToken: "traffic",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCredentialsForProfile(types.ProfileBare, Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credentials := range []Credentials{{EnvdAccessToken: "envd"}, {TrafficAccessToken: "traffic"}} {
+		if err := ValidateCredentialsForProfile(types.ProfileBare, credentials); err == nil {
+			t.Fatalf("bare credentials accepted: %+v", credentials)
+		}
+	}
+	if err := ValidateCredentialsForProfile(types.Profile("other"), Credentials{}); err == nil {
+		t.Fatal("invalid profile was accepted")
 	}
 }
 

@@ -169,6 +169,7 @@ type Command struct {
 	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
 	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
 	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
+	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect/exec-session import when the exact target is absent
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put

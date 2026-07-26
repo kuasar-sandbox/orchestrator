@@ -1,71 +1,47 @@
 package orch
 
-// Sandbox export/import: turn a paused sandbox's remote (portable) snapshot into
-// either a reusable template (--to-template; fork/fan-out) or a one-line
-// migration token that restores the snapshot under a fresh sandbox id on another
-// node. Both ride existing sandbox-ctl primitives (snapshot --upload /
-// upload-snapshot / run --restore) + the e2b CLI (create / resume); nothing about
-// the e2b API/CLI changes. The token carries the sandbox row minus system
-// secrets: tenant APISecret and ManifestKey appear only as complete fingerprints;
-// the target resolves the real pair from its own allowlist (= the create/build
-// precondition).
+// Sandbox export/import turns a paused sandbox's portable snapshot into either a
+// reusable template or an opaque kmt1 migration token. The token preserves the
+// logical sandbox state and service credentials while carrying only fingerprints
+// of tenant API and manifest roots. The target obtains those roots from its own
+// trusted key store before it can authenticate and decrypt the token.
 
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/google/uuid"
-
-	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-const sandboxTokenVersion = 1
-
-// SandboxToken is the portable, base64-encoded migration handle from export-sandbox.
-// It carries portable snapshot state but no sandbox identity or data-plane
-// credentials. Tenant roots are represented by complete fingerprints only.
-type SandboxToken struct {
-	V                      int               `json:"v"`
-	TemplateID             string            `json:"template_id"`
-	SnapshotRef            string            `json:"snapshot_ref"` // manifest://<key> (always remote)
-	Profile                string            `json:"profile"`
-	Env                    map[string]string `json:"env,omitempty"`
-	Metadata               map[string]string `json:"metadata,omitempty"`
-	DeadlineUnix           int64             `json:"deadline_unix,omitempty"`
-	APISecretFingerprint   string            `json:"api_secret_fingerprint"`
-	ManifestKeyFingerprint string            `json:"manifest_key_fingerprint"`
-	RuntimeDigest          string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
-}
-
 // ExportSandbox authorizes apiKey against the paused sandbox, ensures its snapshot
 // is remote (promoting a local checkpoint if needed), then either returns the
-// derived persist template id (toTemplate; fork) or a one-line base64 migration
+// derived persist template id (toTemplate; fork) or a one-line opaque kmt1
 // token (default). A move relinquishes the source row unless
 // keepSource (copy) — the remote snapshot persists either way.
 func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
 	if apiKey == "" {
-		return "", fmt.Errorf("export-sandbox: E2B_API_KEY is required")
+		return "", fmt.Errorf("export-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
 	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
 		return "", err
 	}
 	if !ownsSandbox(sb, apiKey) {
-		return "", fmt.Errorf("export-sandbox: api key does not own sandbox %s", sid)
+		return "", api.ErrNotFound
 	}
 	if sb.State != types.StatePaused || sb.SnapshotRef == "" {
-		return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s)", sid, sid)
+		return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 	}
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
@@ -115,49 +91,61 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	return tok, nil
 }
 
-// mintSandboxToken marshals a sandbox + its remote snapshot ref into a base64
-// migration token. No api-key gating; callers authorize upstream.
+// mintSandboxToken seals a complete portable sandbox record. There is no API-key
+// gate here; ExportSandbox performs object authorization before calling it.
 func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, error) {
+	if sb == nil {
+		return "", fmt.Errorf("mint migration token: sandbox is required")
+	}
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("mint migration token: template: %w", err)
 	}
 	if sb.Profile != tmpl.Profile {
-		return "", fmt.Errorf("mint token: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
+		return "", fmt.Errorf("mint migration token: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 	}
 	dig, err := sha256File(o.runtimeFileFor(tmpl.Profile))
 	if err != nil {
-		return "", fmt.Errorf("mint token: hash runtime: %w", err)
+		return "", fmt.Errorf("mint migration token: hash runtime: %w", err)
 	}
 	apiFingerprint, err := store.APISecretHash(sb.APISecret)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("mint migration token: API secret fingerprint: %w", err)
 	}
 	manifestFingerprint, err := store.ManifestKeyHash(sb.ManifestKey)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("mint migration token: manifest key fingerprint: %w", err)
 	}
-	b, err := json.Marshal(SandboxToken{
-		V: sandboxTokenVersion, TemplateID: sb.TemplateID, SnapshotRef: ref,
-		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: sb.Metadata,
-		DeadlineUnix:           sb.DeadlineUnix,
-		APISecretFingerprint:   apiFingerprint,
-		ManifestKeyFingerprint: manifestFingerprint,
-		RuntimeDigest:          dig,
-	})
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b), nil
+	return migrationtoken.Seal(
+		migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey},
+		migrationtoken.MigrationTokenPayloadV1{
+			Version:                1,
+			NodeSandboxID:          sb.ID,
+			AuthSandboxID:          sb.AuthSandboxID(),
+			APISecretFingerprint:   apiFingerprint,
+			ManifestKeyFingerprint: manifestFingerprint,
+			TemplateID:             sb.TemplateID,
+			Profile:                string(sb.Profile),
+			RuntimeDigest:          dig,
+			SnapshotRef:            ref,
+			Env:                    sb.Env,
+			Metadata:               sb.Metadata,
+			CreatedUnix:            sb.CreatedUnix,
+			DeadlineUnix:           sb.DeadlineUnix,
+			ServiceSecret:          sb.ServiceSecret,
+			EnvdAccessToken:        sb.EnvdAccessToken,
+			TrafficAccessToken:     sb.TrafficAccessToken,
+			ForwardAccessToken:     sb.ForwardAccessToken,
+		},
+	)
 }
 
-// ImportSandbox decodes a migration token, requires the tenant manifest_key to be
-// whitelisted here (= the create precondition), checks the token fingerprint + that
-// this node's guest runtime matches the snapshot's, then inserts the paused row.
-// `e2b sandbox resume <id>` then restores it on this node.
-func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) (string, error) {
+// ImportSandbox authenticates the caller's paired tenant roots and inserts the
+// token as a paused standalone sandbox. An empty targetID reuses the source
+// NodeSandboxID; a non-empty targetID replaces only the node-local identity.
+func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
 	if apiKey == "" {
-		return "", fmt.Errorf("import-sandbox: E2B_API_KEY is required")
+		return "", fmt.Errorf("import-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
 	// The tenant key must be on this node (manifest-key add) — same precondition as
 	// create — and the api key must resolve to it.
@@ -166,91 +154,116 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 		return "", err
 	}
 	if pair.APISecret == "" {
-		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
+		return "", fmt.Errorf("import-sandbox: credential pair is not installed: %w", api.ErrNotAllowed)
 	}
-	return o.importSandboxWithKey(ctx, pair, token)
-}
-
-// importSandboxWithKey decodes a migration token, checks its fingerprint against
-// the resolved tenant key mk + that this node's guest runtime matches the
-// snapshot's, then inserts the paused row (the caller resumes). The cluster create
-// path supplies mk from the predistributed key; the SDK path from the api key.
-func (o *Orchestrator) importSandboxWithKey(ctx context.Context, pair store.KeyPair, token string) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
+	sb, err := o.importSandboxWithKey(ctx, pair, token, targetID, migrationtoken.Expectations{}, nil)
 	if err != nil {
-		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
-	}
-	var tok SandboxToken
-	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
-		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
-	}
-	profile, err := types.ParseProfile(tok.Profile)
-	if err != nil {
-		return "", fmt.Errorf("import-sandbox: bad token profile: %w", err)
-	}
-	template, err := types.ParseTemplateID(tok.TemplateID)
-	if err != nil {
-		return "", fmt.Errorf("import-sandbox: bad token template: %w", err)
-	}
-	if template.Profile != profile {
-		return "", fmt.Errorf("import-sandbox: token profile %q does not match template profile %q", profile, template.Profile)
-	}
-	apiFingerprint, err := store.APISecretHash(pair.APISecret)
-	if err != nil {
-		return "", err
-	}
-	manifestFingerprint, err := store.ManifestKeyHash(pair.ManifestKey)
-	if err != nil {
-		return "", err
-	}
-	if apiFingerprint != tok.APISecretFingerprint || manifestFingerprint != tok.ManifestKeyFingerprint {
-		return "", fmt.Errorf("import-sandbox: token is for a different tenant")
-	}
-	// The snapshot is bound to the guest runtime it was captured under; a different
-	// runtime here would fail restore — reject early with a clear message.
-	if tok.RuntimeDigest != "" {
-		dig, err := sha256File(o.runtimeFileFor(profile))
-		if err != nil {
-			return "", fmt.Errorf("import-sandbox: hash runtime: %w", err)
-		}
-		if dig != tok.RuntimeDigest {
-			return "", fmt.Errorf("import-sandbox: runtime mismatch — this node's %s runtime is %s…, snapshot needs %s…",
-				tok.Profile, short(dig), short(tok.RuntimeDigest))
-		}
-	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return "", fmt.Errorf("import-sandbox: new id: %w", err)
-	}
-	sid := id.String()
-	envdToken, err := keys.MintToken()
-	if err != nil {
-		return "", fmt.Errorf("import-sandbox: mint envd token: %w", err)
-	}
-	trafficToken, err := keys.MintToken()
-	if err != nil {
-		return "", fmt.Errorf("import-sandbox: mint traffic token: %w", err)
-	}
-	sb := &types.Sandbox{
-		ID: sid, Profile: profile, TemplateID: tok.TemplateID, State: types.StatePaused,
-		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: time.Now().Unix(),
-		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
-		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, SnapshotRef: tok.SnapshotRef,
-		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
-		Metadata: tok.Metadata, Env: tok.Env,
-	}
-	if profile == types.ProfileE2B {
-		sb.EnvdUDS = sb.RunDir + "/envd.sock"
-		sb.CiUDS = sb.RunDir + "/ci.sock"
-	}
-	if err := o.st.Put(ctx, sb); err != nil {
 		return "", err
 	}
 	return sb.ID, nil
 }
 
+// importSandboxWithKey is the shared synchronous KMT import core. expected and
+// cluster are trusted caller inputs: standalone import passes zero values, while
+// cluster commands can constrain the token subject/profile/runtime and attach
+// system-owned Group/RouteKey state. The token never supplies that context.
+func (o *Orchestrator) importSandboxWithKey(
+	ctx context.Context,
+	pair store.KeyPair,
+	token, targetID string,
+	expected migrationtoken.Expectations,
+	cluster *types.ClusterSandboxContext,
+) (*types.Sandbox, error) {
+	if targetID != "" && !types.ValidLocalSandboxID(targetID) {
+		return nil, fmt.Errorf("import-sandbox: invalid target sandbox ID: %w", api.ErrBadRequest)
+	}
+	payload, err := migrationtoken.Open(
+		migrationtoken.KeyMaterial{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey},
+		token,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: open migration token: %w", err)
+	}
+	if err := migrationtoken.ValidateExpectations(payload, expected); err != nil {
+		return nil, fmt.Errorf("import-sandbox: validate target: %w", err)
+	}
+	profile, err := types.ParseProfile(payload.Profile)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: profile: %w", err)
+	}
+	runtimeDigest, err := sha256File(o.runtimeFileFor(profile))
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: hash runtime: %w", err)
+	}
+	if runtimeDigest != payload.RuntimeDigest {
+		return nil, fmt.Errorf("import-sandbox: %w: runtime", migrationtoken.ErrIncompatible)
+	}
+	if targetID == "" {
+		targetID = payload.NodeSandboxID
+	}
+	if !types.ValidLocalSandboxID(targetID) {
+		return nil, fmt.Errorf("import-sandbox: invalid target sandbox ID: %w", api.ErrBadRequest)
+	}
+
+	var trustedCluster *types.ClusterSandboxContext
+	metadata := migrationSandboxMetadata(payload.Metadata)
+	if cluster != nil {
+		trustedCluster = &types.ClusterSandboxContext{Group: cluster.Group, RouteKey: cluster.RouteKey}
+		metadata = clusterSandboxMetadata(metadata)
+	}
+	sb := &types.Sandbox{
+		ID:                 targetID,
+		Profile:            profile,
+		Cluster:            trustedCluster,
+		AuthSandboxIDValue: payload.AuthSandboxID,
+		TemplateID:         payload.TemplateID,
+		State:              types.StatePaused,
+		DeadlineUnix:       payload.DeadlineUnix,
+		CreatedUnix:        payload.CreatedUnix,
+		RunDir:             filepath.Join(o.cfg.Paths.RunRoot, targetID),
+		BaseDir:            filepath.Join(o.cfg.Paths.BaseRoot, targetID),
+		APISecret:          pair.APISecret,
+		ManifestKey:        pair.ManifestKey,
+		SnapshotRef:        payload.SnapshotRef,
+		ServiceSecret:      payload.ServiceSecret,
+		EnvdAccessToken:    payload.EnvdAccessToken,
+		TrafficAccessToken: payload.TrafficAccessToken,
+		ForwardAccessToken: payload.ForwardAccessToken,
+		Metadata:           metadata,
+		Env:                payload.Env,
+	}
+	if profile == types.ProfileE2B {
+		sb.EnvdUDS = sb.RunDir + "/envd.sock"
+		sb.CiUDS = sb.RunDir + "/ci.sock"
+	}
+	if err := o.st.InsertSandbox(ctx, sb); err != nil {
+		if errors.Is(err, store.ErrSandboxExists) {
+			return nil, fmt.Errorf("import-sandbox: %w", api.ErrAlreadyExists)
+		}
+		return nil, fmt.Errorf("import-sandbox: insert target %s: %w", targetID, err)
+	}
+	return sb, nil
+}
+
+// migrationSandboxMetadata preserves ordinary portable metadata while ensuring
+// the request-only credentials carrier can never re-enter metadata_json. The
+// service credentials restored from KMT1 come only from their typed payload
+// fields and are validated separately.
+func migrationSandboxMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+	cleaned := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if key != sandboxcfg.NsCredentials {
+			cleaned[key] = value
+		}
+	}
+	return cleaned
+}
+
 // runtimeFileFor returns the guest runtime erofs path.
-func (o *Orchestrator) runtimeFileFor(p types.Profile) string {
+func (o *Orchestrator) runtimeFileFor(_ types.Profile) string {
 	return o.cfg.Sandbox.Boot.Runtime
 }
 
@@ -265,11 +278,4 @@ func sha256File(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func short(s string) string {
-	if len(s) > 12 {
-		return s[:12]
-	}
-	return s
 }
