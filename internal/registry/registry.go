@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,6 +29,7 @@ var ErrNodeGone = errors.New("registry: node owner cannot reach node")
 
 var (
 	errMissingImportSourceLease = errors.New("registry: import source lease fields are required")
+	errInvalidSandboxConfig     = errors.New("registry: invalid sandbox config")
 	errStaleImportSourceLease   = errors.New("registry: stale import source lease")
 )
 
@@ -438,10 +440,9 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
-	var err error
-	createConfig, err = sandboxcfg.NormalizeRestoreMetadata(createConfig)
+	createConfig, err := normalizeSandboxReserveConfig(createConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 	}
 	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
 	if err != nil {
@@ -631,6 +632,11 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
 func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, replaceReady *SandboxRecord) error {
+	_, credentialsPresent := createConfig[sandboxcfg.NsCredentials]
+	credentials, createConfig, err := sandboxcfg.ExtractCredentials(createConfig)
+	if err != nil {
+		return fmt.Errorf("registry: invalid sandbox credentials: %w", err)
+	}
 	excluded := placementExclusions{}
 	casConflicts := 0
 	var lastFailure error
@@ -673,6 +679,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return errors.New("registry: replacement profile mismatch")
 		}
 		config := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
+		config, err = attachCreateCredentials(config, template.Profile, credentials, credentialsPresent)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
 		ref := clusterstate.NodeSandboxRef{
 			Group: group, RouteKey: routeKey, SandboxID: sid, Profile: string(template.Profile),
 			APISecretFingerprint: placement.APISecretFingerprint,
@@ -764,6 +774,49 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		}
 		return nil
 	}
+}
+
+// normalizeSandboxReserveConfig validates request-scoped namespaces before any
+// READY fast path, placement, route mutation, or lifecycle command. Credentials
+// remain attached in canonical form for a possible create, but are ignored by an
+// already-existing sandbox and never reach the placer.
+func normalizeSandboxReserveConfig(config map[string]string) (map[string]string, error) {
+	config, err := sandboxcfg.NormalizeRestoreMetadata(config)
+	if err != nil {
+		return nil, err
+	}
+	_, present := config[sandboxcfg.NsCredentials]
+	credentials, cleaned, err := sandboxcfg.ExtractCredentials(config)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return cleaned, nil
+	}
+	canonical, err := json.Marshal(credentials)
+	if err != nil {
+		return nil, errors.New("registry: encode sandbox credentials")
+	}
+	cleaned[sandboxcfg.NsCredentials] = string(canonical)
+	return cleaned, nil
+}
+
+func attachCreateCredentials(config map[string]string, profile types.Profile, credentials sandboxcfg.Credentials, present bool) (map[string]string, error) {
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, credentials); err != nil {
+		return nil, err
+	}
+	if !present {
+		return config, nil
+	}
+	canonical, err := json.Marshal(credentials)
+	if err != nil {
+		return nil, errors.New("registry: encode sandbox credentials")
+	}
+	if config == nil {
+		config = map[string]string{}
+	}
+	config[sandboxcfg.NsCredentials] = string(canonical)
+	return config, nil
 }
 
 // sendAndWait sends a command and blocks until the node acknowledges receipt or

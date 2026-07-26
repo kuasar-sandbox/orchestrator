@@ -26,6 +26,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
@@ -1233,6 +1234,29 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	}
 }
 
+func TestReserveSandboxRejectsInvalidCredentialsBeforeReadyFastPath(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	original := &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1",
+		Profile: "e2b", APISecretFingerprint: testAPIFingerprint,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsCredentials: `{"service_secret":"not-hex"}`,
+	})
+	if !errors.Is(err, errInvalidSandboxConfig) {
+		t.Fatalf("ReserveSandbox error=%v, want invalid sandbox config", err)
+	}
+	stored, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if getErr != nil || !found || stored.SID != original.SID || stored.State != original.State {
+		t.Fatalf("invalid credentials changed READY route: stored=%+v found=%v err=%v", stored, found, getErr)
+	}
+}
+
 func TestReserveSandboxRejectsInvalidPlacementTemplate(t *testing.T) {
 	reg := testReg(t)
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
@@ -1993,6 +2017,51 @@ func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 	stored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || stored.SID != orig.SID || stored.Profile != orig.Profile {
 		t.Fatalf("original route=%+v found=%v err=%v", stored, found, err)
+	}
+}
+
+func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		if _, found := req.Config[sandboxcfg.NsCredentials]; found {
+			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
+		}
+		return &Placement{
+			NodeID: "candidate", TemplateRef: "bare-img-" + strings.Repeat("b", 64),
+			APISecretFingerprint: testAPIFingerprint,
+		}, nil
+	}))
+	err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsCredentials: `{"envd_access_token":"envd"}`,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not valid for bare") {
+		t.Fatalf("placeAndCreate error = %v", err)
+	}
+	if route, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk"); getErr != nil || found {
+		t.Fatalf("invalid credentials mutated route: route=%+v found=%v err=%v", route, found, getErr)
+	}
+}
+
+func TestAttachCreateCredentialsCanonicalizesAndPreservesOrdinaryConfig(t *testing.T) {
+	secret := strings.Repeat("1", 64)
+	original := map[string]string{
+		sandboxcfg.NsCredentials: ` { "traffic_access_token": "traffic", "service_secret": "` + secret + `" } `,
+		"keep":                   "value",
+	}
+	credentials, cleaned, err := sandboxcfg.ExtractCredentials(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := attachCreateCredentials(cleaned, types.ProfileE2B, credentials, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[sandboxcfg.NsCredentials] != `{"service_secret":"`+secret+`","traffic_access_token":"traffic"}` || got["keep"] != "value" {
+		t.Fatalf("normalized create config = %+v", got)
+	}
+	if original[sandboxcfg.NsCredentials] == got[sandboxcfg.NsCredentials] {
+		t.Fatal("normalization mutated or aliased the original credentials value")
 	}
 }
 

@@ -36,11 +36,12 @@ import (
 
 // Headers the cluster ingress reads (cluster.md).
 const (
-	HeaderGroup     = "X-Kuasar-Sandbox-Group"
-	HeaderRouteKey  = "X-Kuasar-Route-Key"
-	HeaderRestore   = "X-Kuasar-Sandbox-Restore"
-	HeaderAPIKey    = "X-API-KEY"
-	HeaderAccessTok = "X-Access-Token"
+	HeaderGroup       = "X-Kuasar-Sandbox-Group"
+	HeaderRouteKey    = "X-Kuasar-Route-Key"
+	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
+	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
+	HeaderAPIKey      = "X-API-KEY"
+	HeaderAccessTok   = "X-Access-Token"
 
 	maxClusterCreateBodyBytes int64 = 16 << 20
 )
@@ -276,7 +277,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	restore, err := createRestoreMetadata(w, r)
+	createConfig, err := createSandboxMetadata(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesErr *http.MaxBytesError
@@ -286,7 +287,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
-	res, err := rt.reserveByKey(r.Context(), group, routeKey, restore)
+	res, err := rt.reserveByKey(r.Context(), group, routeKey, createConfig)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
 		status := http.StatusServiceUnavailable
@@ -312,17 +313,17 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// createRestoreMetadata narrows cluster create input to the one supported
-// sandbox policy. The dedicated header is a no-body-read fast path; without it,
-// body metadata is inspected within the cluster create body limit.
-func createRestoreMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
-	if raw, present := restoreHeaderValue(r.Header); present {
-		return sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
-	}
+// createSandboxMetadata selects request-scoped restore and credential objects
+// from the cluster create request. Each dedicated header replaces the matching
+// metadata object. The body is skipped only when both objects are supplied by
+// headers; otherwise it is read within the cluster create limit.
+func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
+	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
 	var body struct {
 		Metadata map[string]string `json:"metadata"`
 	}
-	if r.Body != nil {
+	if (!restoreHeader || !credentialsHeader) && r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
 			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
 		}
@@ -338,16 +339,46 @@ func createRestoreMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 			return nil, fmt.Errorf("bad create body: %w", err)
 		}
 	}
-	var restore map[string]string
+	selected := map[string]string{}
 	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
-		restore = map[string]string{sandboxcfg.NsRestore: raw}
+		selected[sandboxcfg.NsRestore] = raw
 	}
-	return sandboxcfg.NormalizeRestoreMetadata(restore)
+	if raw, ok := body.Metadata[sandboxcfg.NsCredentials]; ok {
+		selected[sandboxcfg.NsCredentials] = raw
+	}
+	if restoreHeader {
+		selected[sandboxcfg.NsRestore] = restoreRaw
+	}
+	if credentialsHeader {
+		selected[sandboxcfg.NsCredentials] = credentialsRaw
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	selected, err := sandboxcfg.NormalizeRestoreMetadata(selected)
+	if err != nil {
+		return nil, err
+	}
+	credentials, cleaned, err := sandboxcfg.ExtractCredentials(selected)
+	if err != nil {
+		return nil, err
+	}
+	if _, present := selected[sandboxcfg.NsCredentials]; present {
+		canonical, err := json.Marshal(credentials)
+		if err != nil {
+			return nil, fmt.Errorf("encode credentials: %w", err)
+		}
+		if cleaned == nil {
+			cleaned = map[string]string{}
+		}
+		cleaned[sandboxcfg.NsCredentials] = string(canonical)
+	}
+	return cleaned, nil
 }
 
-func restoreHeaderValue(header http.Header) (string, bool) {
-	_, present := header[http.CanonicalHeaderKey(HeaderRestore)]
-	return header.Get(HeaderRestore), present
+func createHeaderValue(header http.Header, name string) (string, bool) {
+	_, present := header[http.CanonicalHeaderKey(name)]
+	return header.Get(name), present
 }
 
 // --- build control plane ---

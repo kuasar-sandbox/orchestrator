@@ -13,6 +13,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
@@ -95,12 +96,13 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 
 	create := &routesync.Command{
 		CmdID: "create-1", Kind: routesync.CmdCreate, SID: "sb1",
-		TemplateRef: "bare-img-" + strings.Repeat("b", 64), Profile: "bare",
+		TemplateRef: "e2b-img-" + strings.Repeat("b", 64), Profile: "e2b",
 		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "sb1"},
 		APISecretFingerprint: apiSecretFingerprint,
 		Config: map[string]string{
 			"stub.create_result":           "timeout",
 			clusterstate.ObjectMetadataKey: `{"group":"forged","route_key":"forged"}`,
+			sandboxcfg.NsCredentials:       `{"envd_access_token":"envd-override","traffic_access_token":"traffic-override"}`,
 		},
 	}
 	if got := node.HandleCommand(context.Background(), create); got.Status != routesync.AckAccepted {
@@ -109,15 +111,23 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	node.mu.Lock()
 	storedSandbox := node.sandboxes[create.SID]
 	accessToken := storedSandbox.AccessToken
+	trafficToken := storedSandbox.TrafficAccessToken
+	commandMetadata := node.commands[len(node.commands)-1].Metadata
 	node.mu.Unlock()
-	if accessToken != "stub-access-"+create.SID {
-		t.Fatalf("stub access token = %q", accessToken)
+	if accessToken != "envd-override" || trafficToken != "traffic-override" {
+		t.Fatalf("stub access tokens = envd:%q traffic:%q", accessToken, trafficToken)
 	}
 	if storedSandbox.Profile != create.Profile || !sameStubClusterContext(storedSandbox.Cluster, create.Cluster) {
 		t.Fatalf("stub sandbox context = %+v", storedSandbox)
 	}
 	if _, found := storedSandbox.Metadata[clusterstate.ObjectMetadataKey]; found {
 		t.Fatalf("stub sandbox retained reserved cluster metadata: %+v", storedSandbox.Metadata)
+	}
+	if _, found := storedSandbox.Metadata[sandboxcfg.NsCredentials]; found {
+		t.Fatalf("stub sandbox retained credentials metadata: %+v", storedSandbox.Metadata)
+	}
+	if _, found := commandMetadata[sandboxcfg.NsCredentials]; found {
+		t.Fatalf("stub command log exposed credentials metadata: %+v", commandMetadata)
 	}
 
 	build := &routesync.Command{

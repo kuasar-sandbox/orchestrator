@@ -858,6 +858,12 @@ node encrypted local key store
 凭据分发是 create/build 前置条件;drop、TTL 或 provider 更新都不修改已复制进现有 sandbox/build
 业务记录的凭据对。
 
+ServiceSecret 不是第三个 group root,而是每个 node Sandbox 业务记录的独立 service credential。缺省值由
+该 Sandbox 已绑定的 APISecret 和 `AuthSandboxID()` 以固定 domain 派生;也可由本次 create 的
+`kuasar-sandbox.credentials` object 显式指定。Registry 在 route/ref/command 副作用前按 placement
+Profile 校验并规范化该 object,node 再次校验、分离后把 ServiceSecret 与 Envd/Traffic/Forward token
+加密写入 Sandbox 业务行。普通 metadata、guest 配置和 node-stub 观测面均不保留 credentials object。
+
 ## 12. Build
 
 Build 记录按 group 存在 `route_link` 的 `build` recordSet;执行态和实时预算归 node owner。

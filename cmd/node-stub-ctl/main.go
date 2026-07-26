@@ -29,6 +29,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -852,20 +853,38 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 	if err != nil || tmpl.Profile != profile {
 		return ack(cmd, routesync.AckRejected, "template and command profile must match")
 	}
+	credentials, metadata, err := sandboxcfg.ExtractCredentials(cmd.Config)
+	if err != nil {
+		return ack(cmd, routesync.AckRejected, "invalid sandbox credentials")
+	}
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, credentials); err != nil {
+		return ack(cmd, routesync.AckRejected, "sandbox credentials do not match profile")
+	}
 	if n.StrictKeys && !n.hasKeyPair(cmd.APISecretFingerprint) {
 		return ack(cmd, routesync.AckRejected, "credential pair not installed")
 	}
-	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
+	beh := behaviorFromConfig(metadata, n.CreateDelay, n.BuildDelay)
 	if beh.CreateResult == "reject" {
 		return ack(cmd, routesync.AckRejected, "stub create rejected")
 	}
-	metadata := cloneStringMap(cmd.Config)
+	metadata = cloneStringMap(metadata)
 	delete(metadata, clusterstate.ObjectMetadataKey)
+	envdToken, trafficToken := "", ""
+	if profile == types.ProfileE2B {
+		envdToken = credentials.EnvdAccessToken
+		if envdToken == "" {
+			envdToken = "stub-access-" + cmd.SID
+		}
+		trafficToken = credentials.TrafficAccessToken
+		if trafficToken == "" {
+			trafficToken = "traffic-" + cmd.SID
+		}
+	}
 	clusterContext := *cmd.Cluster
 	sb := &stubSandbox{
 		SID: cmd.SID, Profile: string(profile), Metadata: metadata, State: "creating",
-		TemplateID: cmd.TemplateRef, AccessToken: "stub-access-" + cmd.SID,
-		TrafficAccessToken:   "traffic-" + cmd.SID,
+		TemplateID: cmd.TemplateRef, AccessToken: envdToken,
+		TrafficAccessToken:   trafficToken,
 		APISecretFingerprint: cmd.APISecretFingerprint,
 		Cluster:              &clusterContext,
 		Behavior:             beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -1045,11 +1064,13 @@ func (n *stubNode) hasKeyPair(apiSecretFingerprint string) bool {
 }
 
 func (n *stubNode) recordCommand(cmd *routesync.Command) {
+	metadata := cloneStringMap(cmd.Config)
+	delete(metadata, sandboxcfg.NsCredentials)
 	n.mu.Lock()
 	n.cmdSeq++
 	log := commandLog{
 		Seq: n.cmdSeq, Time: time.Now().UTC().Format(time.RFC3339Nano), NodeID: n.ID,
-		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: cloneStringMap(cmd.Config),
+		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: metadata,
 		BuildID: cmd.BuildID, Profile: cmd.Profile, Cluster: cloneStubClusterContext(cmd.Cluster),
 		APISecretFingerprint: cmd.APISecretFingerprint,
 	}
