@@ -608,9 +608,11 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 // --- sandbox export / import (orchestrator extension) ---
 
 const (
-	// The token and target ID use JSON-safe alphabets, so the compact object plus
-	// one trailing newline is the complete request envelope accepted here.
-	maxImportRequestBytes = migrationtoken.MaxWireSize + types.MaxLocalSandboxIDBytes + len(`{"token":"","sandboxID":""}`) + 1
+	// Token and target ID retain their independent field limits. Allow a small,
+	// bounded JSON envelope budget so ordinary serializers may add whitespace
+	// without making a maximum-size valid pair depend on compact encoding.
+	maxImportJSONEnvelopeBytes = 256
+	maxImportRequestBytes      = migrationtoken.MaxWireSize + types.MaxLocalSandboxIDBytes + len(`{"token":"","sandboxID":""}`) + maxImportJSONEnvelopeBytes
 )
 
 func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
@@ -689,6 +691,8 @@ func (a *API) failMigrate(w http.ResponseWriter, err error) {
 	case errors.Is(err, migrationtoken.ErrMalformedToken),
 		errors.Is(err, migrationtoken.ErrInvalidPayload):
 		writeErr(w, http.StatusBadRequest, "invalid migration token")
+	case errors.Is(err, migrationtoken.ErrTokenTooLarge):
+		writeErr(w, http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error())
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrNotFound):

@@ -186,13 +186,9 @@ func TestImportSandboxPassesOptionalTargetID(t *testing.T) {
 func TestImportSandboxAcceptsMaximumTokenAndTarget(t *testing.T) {
 	token := strings.Repeat("a", migrationtoken.MaxWireSize)
 	targetID := strings.Repeat("a", types.MaxLocalSandboxIDBytes)
-	payload, err := json.Marshal(struct {
-		Token     string `json:"token"`
-		SandboxID string `json:"sandboxID"`
-	}{Token: token, SandboxID: targetID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Match common serializer output rather than relying on compact JSON: spaces
+	// around separators must not reduce either field's documented maximum.
+	payload := []byte(fmt.Sprintf(`{"token": %q, "sandboxID": %q}`, token, targetID))
 	if len(payload) > maxImportRequestBytes {
 		t.Fatalf("maximum contract request is %d bytes, handler limit is %d", len(payload), maxImportRequestBytes)
 	}
@@ -212,6 +208,20 @@ func TestImportSandboxAcceptsMaximumTokenAndTarget(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("ImportSandbox was not called")
+	}
+}
+
+func TestExportSandboxMapsTokenTooLarge(t *testing.T) {
+	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (string, error) {
+		return "", fmt.Errorf("private export detail: %w", migrationtoken.ErrTokenTooLarge)
+	}}
+	h, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/export", strings.NewReader(`{}`), nil)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusRequestEntityTooLarge, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "private export detail") {
+		t.Fatalf("response exposed internal detail: %s", response.Body.String())
 	}
 }
 
@@ -347,11 +357,16 @@ func TestConnectRejectsOversizedMigrationTokenHeader(t *testing.T) {
 type migrationCoreStub struct {
 	Core
 	importSandbox func(context.Context, string, string, string) (string, error)
+	exportSandbox func(context.Context, string, string, bool, bool) (string, error)
 	connect       func(context.Context, string, string, string, int) (*types.Sandbox, error)
 }
 
 func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
 	return c.importSandbox(ctx, apiKey, token, targetID)
+}
+
+func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
+	return c.exportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
 }
 
 func (c *migrationCoreStub) Connect(ctx context.Context, id, apiKey, token string, timeout int) (*types.Sandbox, error) {
