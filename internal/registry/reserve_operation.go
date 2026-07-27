@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -300,8 +301,8 @@ func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveReq
 		if err := authenticateRecordAPIKey(rec, req.APIKey); err != nil {
 			return nil, err
 		}
-		if req.TTLSeconds > math.MaxInt64-time.Now().Unix() {
-			return nil, fmt.Errorf("%w: ttl_seconds overflows Unix time", ErrReserveBadRequest)
+		if _, err := execsession.ExpiryUnix(time.Now().Unix(), req.TTLSeconds); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
 		}
 		if _, _, err := replacementCredentials(rec); err != nil {
 			return nil, err

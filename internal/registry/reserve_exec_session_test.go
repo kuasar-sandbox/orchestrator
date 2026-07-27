@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -146,6 +148,43 @@ func TestReserveExecSessionRejectsTTLOverflowBeforeStateOrCommand(t *testing.T) 
 	if err != nil || !found || revision != initialRevision || stored.State != StatePaused ||
 		stored.NodeID != record.NodeID || stored.NodeSandboxID != record.NodeSandboxID || commands != 0 {
 		t.Fatalf("TTL overflow side effects: stored=%+v revision=%d commands=%d found=%v err=%v",
+			stored, revision, commands, found, err)
+	}
+}
+
+func TestReserveExecSessionRejectsTTLOutsideTimeRepresentationBeforeStateOrCommand(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	record := testE2BSandboxRecord("/g", "rk", "stable", "n1", StatePaused)
+	initialRevision, err := reg.stores.PutSandbox(ctx, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+		t.Fatal(err)
+	}
+	commands := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commands++ }})
+
+	// This TTL fits int64 when added to the current Unix timestamp, but the
+	// resulting instant exceeds time.Time's internal second representation.
+	const unixToInternal = int64(62_135_596_800)
+	ttlSeconds := int64(math.MaxInt64) - unixToInternal
+	request := httptest.NewRequest(http.MethodPost,
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable&ttl_seconds="+
+			strconv.FormatInt(ttlSeconds, 10), nil)
+	request.Header.Set("X-API-KEY", testAPIKeyValue())
+	response := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %q", response.Code, response.Body.String())
+	}
+	stored, revision, found, err := reg.stores.GetSandbox(ctx, record.Group, record.RouteKey)
+	if err != nil || !found || revision != initialRevision || stored.State != StatePaused ||
+		stored.NodeID != record.NodeID || stored.NodeSandboxID != record.NodeSandboxID || commands != 0 {
+		t.Fatalf("TTL representation overflow side effects: stored=%+v revision=%d commands=%d found=%v err=%v",
 			stored, revision, commands, found, err)
 	}
 }
