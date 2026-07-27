@@ -59,11 +59,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if err != nil {
 			return reject(cmd, err)
 		}
-		go func() {
-			if err := o.connectCluster(o.asyncCtx(), sb.ID); err != nil {
-				o.log.Error("cluster connect", "sid", cmd.SID, "err", err)
-			}
-		}()
+		o.scheduleResume(sb.ID)
 		return accept(cmd)
 	case routesync.CmdDelete:
 		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
@@ -575,14 +571,10 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 	return sb, nil
 }
 
-// connectCluster resumes an already-authorized node-local sandbox.
-func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
-	return o.resumeSandbox(ctx, sid)
-}
-
 func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
+	o.cancelResumeRequests(sb.ID)
 
 	current, err := o.st.Get(ctx, sb.ID)
 	if err != nil {

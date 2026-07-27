@@ -338,6 +338,43 @@ func TestKillWaitsForAsyncResumeAndDoesNotResurrectSandbox(t *testing.T) {
 	}
 }
 
+func TestPauseFencesQueuedAsyncResumeButAllowsLaterWake(t *testing.T) {
+	f := newBlockedResumeFixture(t)
+
+	// scheduleResume registers its request before returning to the caller. Model
+	// the interval before its goroutine starts, then let Pause linearize first.
+	queued := f.o.newResumeRequest(f.sb.ID)
+	defer f.o.releaseResumeRequest(queued)
+	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey); !errors.Is(err, api.ErrAlreadyPaused) {
+		t.Fatalf("Pause already-paused sandbox = %v, want ErrAlreadyPaused", err)
+	}
+
+	close(f.startGate)
+	if err := f.o.resumeSandboxRequest(f.ctx, queued); err != nil {
+		t.Fatalf("fenced resume request = %v", err)
+	}
+	select {
+	case <-f.started:
+		t.Fatal("resume request queued before Pause started the sandbox")
+	default:
+	}
+	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("sandbox after fenced resume = %+v, %v; want paused", stored, err)
+	}
+
+	// Pause is a fence, not a permanent block: a later data-plane wake remains
+	// eligible to resume the sandbox.
+	if err := f.o.resumeSandbox(f.ctx, f.sb.ID); err != nil {
+		t.Fatalf("resume request registered after Pause = %v", err)
+	}
+	waitForLauncherStart(t, f.started)
+	stored, err = f.o.st.Get(f.ctx, f.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after later wake = %+v, %v; want running", stored, err)
+	}
+}
+
 func TestSetTimeoutAfterAsyncConnectWins(t *testing.T) {
 	f := newBlockedResumeFixture(t)
 	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 37); err != nil {

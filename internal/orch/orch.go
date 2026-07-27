@@ -60,6 +60,8 @@ type Orchestrator struct {
 
 	deadlineIntentMu sync.Mutex
 	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
+	resumeRequestMu  sync.Mutex
+	resumeRequests   map[string]*resumeRequestState // outstanding requests and the latest Pause/Delete fence
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -324,6 +326,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	o.cancelResumeRequests(id)
 	o.teardown(ctx, sb)
 	if err := o.st.Delete(ctx, id); err != nil {
 		return false, err
@@ -335,6 +338,9 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return err
@@ -342,12 +348,28 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
-	return o.pauseSandbox(ctx, sb)
+	o.cancelResumeRequests(id)
+	return o.pauseSandboxLocked(ctx, sb)
 }
 
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
 // and the reaper's auto-suspend (no api key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	o.cancelResumeRequests(sb.ID)
+
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return api.ErrNotFound
+	}
+	return o.pauseSandboxLocked(ctx, current)
+}
+
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
 	}
@@ -443,9 +465,11 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 }
 
 func (o *Orchestrator) scheduleResume(id string) {
+	request := o.newResumeRequest(id)
 	go func() {
+		defer o.releaseResumeRequest(request)
 		ctx := o.asyncCtx()
-		if err := o.resumeSandbox(ctx, id); err != nil {
+		if err := o.resumeSandboxRequest(ctx, request); err != nil {
 			o.log.Error("sandbox connect resume", "sid", id, "err", err)
 		}
 	}()
