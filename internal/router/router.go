@@ -104,7 +104,6 @@ const buildTTL = time.Hour
 // group-scoped control request to a route owner, then forwards data to nodes.
 type Router struct {
 	domain        string
-	authMode      string // off | log | enforce — caller api_key auth (§8); default enforce
 	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
 	mx            *metrics.M
 	routeLinkBase string       // static base used by New in tests / size-1 local mode
@@ -155,7 +154,7 @@ func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, 
 		authTTL = 60 * time.Second
 	}
 	rt := &Router{
-		domain: domain, log: log, authTTL: authTTL, authMode: "enforce", mx: metrics.New(),
+		domain: domain, log: log, authTTL: authTTL, mx: metrics.New(),
 		builds:           map[string]buildEntry{},
 		cache:            map[string]*routeResolve{},
 		active:           map[string]*activeRoute{},
@@ -197,14 +196,6 @@ func (rt *Router) SetRouteCache(routeTTL, idleTimeout time.Duration) {
 	defer rt.cacheMu.Unlock()
 	rt.routeTTL = routeTTL
 	rt.routeIdleTimeout = idleTimeout
-}
-
-// SetAuthMode sets the caller api_key auth mode (off | log | enforce, §8): off
-// skips it when a front auth layer enforces mTLS/JWT, log warns but allows.
-func (rt *Router) SetAuthMode(mode string) {
-	if mode != "" {
-		rt.authMode = mode
-	}
 }
 
 // Metrics returns the router's metric registry (Prometheus text); cluster-ctl
@@ -1466,23 +1457,12 @@ func apiKeyFromRequest(r *http.Request) string {
 // when the control API is unreachable (don't 403-storm on a transient blip), 403
 // when the key is rejected. Returns false on failure.
 func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, apiKey string) bool {
-	if rt.authMode == "off" {
-		return true // caller auth delegated to a front auth layer (§8)
-	}
 	ok, err := rt.verifyAuth(ctx, group, apiKey)
 	if err != nil {
-		if rt.authMode == "log" {
-			rt.log.Warn("router: caller-auth route_link unreachable (log mode, allowing)", "group", group)
-			return true
-		}
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)
 		return false
 	}
 	if !ok {
-		if rt.authMode == "log" {
-			rt.log.Warn("router: caller-auth reject (log mode, allowing)", "group", group)
-			return true
-		}
 		rt.mx.Inc(`router_requests_total{result="auth_reject"}`)
 		http.Error(w, "invalid api key for group", http.StatusForbidden)
 		return false

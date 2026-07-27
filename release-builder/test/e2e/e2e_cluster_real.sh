@@ -519,7 +519,6 @@ registry:
 ingress:
   listen: "127.0.0.1:$ROUTER_PORT"
 auth:
-  api_key: "enforce"
   data_plane: "enforce"
   cache_ttl: "500ms"
 cache:

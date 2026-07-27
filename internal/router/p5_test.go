@@ -63,19 +63,22 @@ func newObservedDataTunnelServer(t *testing.T, onConnect func(*http.Request), h 
 	return srv
 }
 
-// TestAuthModeOffSkipsVerifyForList keeps the front-auth mode coverage on an
-// operation that does not authenticate as part of Reserve.
-func TestAuthModeOffSkipsVerifyForList(t *testing.T) {
+func TestListAlwaysEnforcesAPIKey(t *testing.T) {
+	var verifyHits, listHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/list" {
+		switch r.URL.Path {
+		case "/route-link/verify-key":
+			verifyHits++
+			w.WriteHeader(http.StatusForbidden)
+		case "/route-link/list":
+			listHits++
 			_, _ = io.WriteString(w, "[]")
-			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusForbidden) // verify-key would reject
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -88,8 +91,8 @@ func TestAuthModeOffSkipsVerifyForList(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("auth=off list status=%d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden || verifyHits != 1 || listHits != 0 {
+		t.Fatalf("list status=%d verify=%d list=%d, want 403/1/0", resp.StatusCode, verifyHits, listHits)
 	}
 }
 
@@ -407,7 +410,6 @@ func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -462,7 +464,6 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -548,7 +549,6 @@ func TestServeDataForwardTokenByProfile(t *testing.T) {
 			defer control.Close()
 
 			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			rt.SetAuthMode("off")
 			rt.SetDataPlaneAuth("enforce")
 			srv := httptest.NewServer(rt.Handler())
 			defer srv.Close()
@@ -604,7 +604,6 @@ func TestServeDataRejectsInvalidSignedFileBeforeReserve(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -649,7 +648,6 @@ func TestServeDataSignedFileExplicitBadTokenNeverFallsBackWhenAuthOff(t *testing
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -718,7 +716,6 @@ func TestServeDataPausedUsesOperationAwareReserve(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -776,7 +773,6 @@ func TestServeDataPausedSignedFileUsesEnvdTokenOnlyOutside(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -826,7 +822,6 @@ func TestServeDataDoesNotForwardNonReadyReserveRoute(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -873,7 +868,6 @@ func TestServeDataRejectsReserveIdentityChange(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	rt.SetDataPlaneAuth("enforce")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -949,7 +943,6 @@ func TestServeDataUnknownSandboxReturnsNotFoundWithoutReserve(t *testing.T) {
 	defer control.Close()
 
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -983,6 +976,10 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/route-link/verify-key" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path != "/route-link/route" {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -991,7 +988,6 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -999,6 +995,7 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

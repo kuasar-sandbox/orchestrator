@@ -845,10 +845,11 @@ NodeSandboxID 覆盖当前值。旧代际在途请求失败时,仅在 cache 仍�
 route owner。membership refresh 会尝试 bootstrap 和已知 active/next/old_grace 成员,选择 active version
 最新的结果。
 
-router 调 route owner 的 verify-key;route owner 只 failover 到 ready placer 校验。该 group 级校验仍由
-placer 使用 provider 的 APISecret 完成。sandbox READY 后,node 把该业务记录已绑定的 APISecret、ServiceSecret
-及用途明确的 access tokens 投影到受保护 route,供可信 registry/router/proxy 使用;ManifestKey 原文不进入
-该链路,也不用于 API 认证。
+create/connect 由 Reserve 强制验证客户端原始 API key;其它控制操作由 router 调 route owner 的
+verify-key,route owner 只 failover 到 ready placer 校验。该 group 级校验仍由 placer 使用 provider 的
+APISecret 完成。sandbox READY 后,node 把该业务记录已绑定的 APISecret、ServiceSecret 及用途明确的
+access tokens 投影到受保护 route,供可信 registry/router/proxy 使用;ManifestKey 原文不进入该链路,
+也不用于 API 认证。
 
 ## 11. 密钥与鉴权
 

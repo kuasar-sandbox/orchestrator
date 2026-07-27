@@ -37,9 +37,10 @@ node owner / placer / node
    只有已存在但非 READY 的 route 才继续 Reserve。
 5. **数据面字节不进 registry**:registry 只参与显式 create/connect、已知 route 激活和
    miss/fail-fast Resolve。
-6. **根凭据用途分离**:router 调 route owner 的 verify-key,registry failover 到 ready placer,由 placer 使用
-   provider 的 APISecret 验证。READY route 的受保护返回同时投影该 sandbox 已绑定的 APISecret、ServiceSecret
-   和用途明确的 access tokens 给可信 router;ManifestKey 原文不进入 registry/router 路由链路。
+6. **根凭据用途分离**:create/connect 由 Reserve 强制验证原始 API key;其它控制操作由 router 调
+   route owner 的 verify-key,registry failover 到 ready placer,由 placer 使用 provider 的 APISecret 验证。
+   READY route 的受保护返回同时投影该 sandbox 已绑定的 APISecret、ServiceSecret 和用途明确的 access tokens
+   给可信 router;ManifestKey 原文不进入 registry/router 路由链路。
 
 ## 2. 命令行
 
@@ -59,7 +60,6 @@ ingress:
   listen: ":443"
 
 auth:
-  api_key: enforce
   data_plane: enforce
   cache_ttl: 60s
 
@@ -75,7 +75,6 @@ cache:
 | `ingress.tls` | 通配证书 |
 | `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
 | `registry.tls` | 到 registry 控制面的 mTLS |
-| `auth.api_key` | `enforce` / `log` / `off` |
 | `auth.data_plane` | 数据面凭证校验:`enforce` / `log` / `off` |
 | `auth.cache_ttl` | API key 校验缓存 |
 | `cache.route_ttl` | 路由解析缓存 TTL |
@@ -220,7 +219,8 @@ fail-fast 代价,不为此维护 router route 订阅。
 
 ## 7. 控制面
 
-router 校验 API key 与 group 关系时调用 route owner `verify-key`;route owner failover 到 ready placer,
+API key 鉴权不可关闭。create/connect 把客户端原始 API key 交给 Reserve,由 Registry 在任何生命周期
+副作用前完成验证;其它控制操作由 router 调 route owner `verify-key`,route owner failover 到 ready placer,
 实际校验由 placer 使用 provider 侧 APISecret 完成。ManifestKey 只用于内容路径,不参与该校验。
 
 | 操作 | 行为 |

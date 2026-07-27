@@ -152,7 +152,7 @@ func TestHandleCreateRejectsBodyPast16MiBWithoutHeader(t *testing.T) {
 	req.Header.Set(HeaderGroup, "/g")
 	rec := httptest.NewRecorder()
 
-	(&Router{authMode: "off"}).handleCreate(rec, req)
+	(&Router{}).handleCreate(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
@@ -183,7 +183,7 @@ func TestHandleCreateRejectsChunkedBodyPast16MiBWithoutHeader(t *testing.T) {
 	req.Header.Set(HeaderGroup, "/g")
 	rec := httptest.NewRecorder()
 
-	(&Router{authMode: "off"}).handleCreate(rec, req)
+	(&Router{}).handleCreate(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
@@ -445,6 +445,8 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	node2Host := strings.TrimPrefix(node2.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/route-link/verify-key":
+			w.WriteHeader(http.StatusOK)
 		case "/route-link/route":
 			switch r.URL.Query().Get("sid") {
 			case "sb-1":
@@ -460,7 +462,6 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -473,6 +474,7 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		req.Host = "api.test.local"
 		req.Header.Set(HeaderGroup, "/g")
 		req.Header.Set(HeaderRouteKey, tc.routeKey)
+		req.Header.Set(HeaderAPIKey, "e2b_test")
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -513,6 +515,10 @@ func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/route-link/verify-key" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path != "/route-link/route" || r.URL.Query().Get("sid") != "sb-1" {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -521,7 +527,6 @@ func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -529,6 +534,7 @@ func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

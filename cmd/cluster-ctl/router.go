@@ -49,7 +49,6 @@ func runRouter(args []string, log *slog.Logger) error {
 	}
 	rt := router.NewWithRegistry(regClient, cfg.Domain, cfg.AuthCacheDur(), log)
 	rt.SetDataPlaneAuth(cfg.Auth.DataPlane)
-	rt.SetAuthMode(cfg.Auth.APIKey)
 	rt.SetRouteCache(cfg.RouteCacheDur(), cfg.RouteIdleDur())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

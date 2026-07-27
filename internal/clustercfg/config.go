@@ -111,7 +111,6 @@ type IngressConfig struct {
 
 // RouterAuth groups the router's auth policy.
 type RouterAuth struct {
-	APIKey    string `yaml:"api_key"`    // caller api_key auth: off | log | enforce (default); §8
 	DataPlane string `yaml:"data_plane"` // data-plane access-token check: off | log | enforce (default)
 	CacheTTL  string `yaml:"cache_ttl"`  // api_key↔group verification cache; default 60s
 }
@@ -720,7 +719,7 @@ func DefaultRouter() RouterConfig {
 	return RouterConfig{
 		Registry: RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		Ingress:  IngressConfig{Listen: ":443"},
-		Auth:     RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		Auth:     RouterAuth{DataPlane: "enforce", CacheTTL: "60s"},
 		Cache:    RouterCache{RouteTTL: "5m", IdleTimeout: "2m"},
 	}
 }
@@ -752,9 +751,6 @@ func (c *RouterConfig) applyDefaults() {
 	if c.Ingress.Listen == "" {
 		c.Ingress.Listen = d.Ingress.Listen
 	}
-	if c.Auth.APIKey == "" {
-		c.Auth.APIKey = d.Auth.APIKey
-	}
 	if c.Auth.DataPlane == "" {
 		c.Auth.DataPlane = d.Auth.DataPlane
 	}
@@ -775,11 +771,6 @@ func (c *RouterConfig) Validate() error {
 	}
 	if c.Registry.Bootstrap == "" {
 		return fmt.Errorf("clustercfg: registry.bootstrap is required")
-	}
-	switch c.Auth.APIKey {
-	case "", "off", "log", "enforce":
-	default:
-		return fmt.Errorf("clustercfg: auth.api_key %q invalid (off|log|enforce)", c.Auth.APIKey)
 	}
 	switch c.Auth.DataPlane {
 	case "off", "log", "enforce":
