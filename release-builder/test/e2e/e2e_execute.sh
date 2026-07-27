@@ -15,7 +15,10 @@
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
 #                                in the guest below (§4.6 config passing chain).
-#   exec                       -> run a command in the guest via envd (incl. hostname).
+#   exec-session + CONNECT     -> issue an explicit exec capability, bridge a local
+#                                ctl.sock through service=exec, and run sandbox-ctl
+#                                against the real guest (including guest exit status).
+#   envd exec                  -> run a command in the guest via envd (incl. hostname).
 #   DELETE                     -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
@@ -26,6 +29,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+EXEC_CONNECT_BRIDGE="$REPO_ROOT/release-builder/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
@@ -49,6 +53,7 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
+[ -f "$EXEC_CONNECT_BRIDGE" ] || skip "missing $EXEC_CONNECT_BRIDGE"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -134,6 +139,80 @@ req() {
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
+assert_no_default_exec_token() {
+    python3 - "$1" <<'PY'
+import json, sys
+created = json.load(open(sys.argv[1]))
+if "execAccessToken" in created:
+    raise SystemExit("create response unexpectedly contains execAccessToken")
+PY
+}
+issue_exec_session() {
+    local sid="$1" key="$2" code
+    code="$(curl -sS --noproxy '*' --max-time 30 \
+        -D "$WORK/exec-session.headers" \
+        -o "$WORK/exec-session.secret" \
+        -w '%{http_code}' \
+        -X POST \
+        -H "Host: api.$DOMAIN" \
+        -H "X-API-KEY: $key" \
+        -H 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:$PORT/sandboxes/$sid/exec-sessions")"
+    [ "$code" = "201" ] || fail "exec-session=$code (want 201)"
+    python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
+import json, sys
+headers = [line.strip().lower() for line in open(sys.argv[1], "rb").read().splitlines()]
+if b"cache-control: no-store" not in headers:
+    raise SystemExit("exec-session response omitted Cache-Control: no-store")
+payload = json.load(open(sys.argv[2]))
+if not isinstance(payload, dict) or set(payload) != {"execAccessToken"}:
+    raise SystemExit("exec-session response must contain only execAccessToken")
+token = payload["execAccessToken"]
+if not isinstance(token, str) or not token.startswith("kat1.") or len(token.split(".")) != 3:
+    raise SystemExit("exec-session response contains an invalid KAT token")
+print(token)
+PY
+}
+exec_through_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local bridge_root="$WORK/exec-connect-run"
+    local ready_file="$WORK/exec-connect.ready"
+    local bridge_log="$WORK/exec-connect-bridge.log"
+    local output="$WORK/native-exec.out"
+    local bridge_pid status
+
+    mkdir -p "$bridge_root/$sid"
+    EXEC_CONNECT_TOKEN="$token" python3 "$EXEC_CONNECT_BRIDGE" \
+        --listen "$bridge_root/$sid/ctl.sock" \
+        --ready-file "$ready_file" \
+        --upstream "127.0.0.1:$PORT" \
+        --sandbox-id "$sid" \
+        >"$bridge_log" 2>&1 &
+    bridge_pid=$!
+    PIDS+=("$bridge_pid")
+    for _ in $(seq 1 100); do
+        [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] && break
+        kill -0 "$bridge_pid" 2>/dev/null || { cat "$bridge_log"; fail "exec CONNECT bridge exited before readiness"; }
+        sleep 0.05
+    done
+    [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] \
+        || { cat "$bridge_log"; fail "exec CONNECT bridge did not become ready"; }
+
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --sandbox-id "$sid" --run-root "$bridge_root" -- \
+        /bin/sh -c "printf '%s\\n' '$marker'; exit 47" >"$output" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    if ! wait "$bridge_pid"; then
+        cat "$bridge_log"
+        fail "exec CONNECT bridge failed"
+    fi
+    grep -Fxq "$marker" "$output" || { sed 's/^/  guest| /' "$output"; fail "native exec output missing $marker"; }
+    [ "$status" = "47" ] || { sed 's/^/  guest| /' "$output"; fail "native exec exit=$status (want guest status 47)"; }
 }
 dp() {
     local port_sid="$1" path="$2" token="${3:-}"
@@ -330,12 +409,22 @@ fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
+assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
 echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
 grep -q "$SID" "$WORK/resp.body" || fail "sandbox $SID not listed"
 echo "==> PASS: sandbox listed"
+
+# ---- native exec capability -> CONNECT -> sandbox-ctl -> real guest -------
+echo "==> issue an explicit native exec capability (create has no default token)"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capability"
+rm -f "$WORK/exec-session.secret"
+NATIVE_MARK="NATIVE_EXEC_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
+unset EXEC_TOKEN
+echo "==> PASS: service=exec CONNECT reached the real guest (marker=$NATIVE_MARK, exit=47)"
 
 # ---- execute a command in the guest via envd (Connect-RPC over envd.sock) --
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
