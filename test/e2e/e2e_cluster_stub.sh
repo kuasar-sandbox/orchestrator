@@ -454,6 +454,42 @@ code="$(create_sandbox "user1/session1" "$WORK/create-session1.body" || true)"
 IFS=$'\t' read -r SESSION1_SID SESSION1_ENVD_TOKEN \
     < <(sandbox_credentials "$WORK/create-session1.body" "user1/session1") || fail "invalid create response for user1/session1"
 
+step "checking stable SID connect through Registry CmdConnect"
+code="$(http_code "$WORK/connect-session1.body" -X POST \
+    -H "Host: api.$DOMAIN" \
+    -H "X-Kuasar-Sandbox-Group: $GROUP" \
+    -H "X-Kuasar-Route-Key: user1/session1" \
+    -H "X-API-KEY: $API_KEY" \
+    -H "Content-Type: application/json" \
+    --data '{"timeout":37}' \
+    "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID/connect" || true)"
+[ "$code" = "200" ] || fail "connect user1/session1 returned $code: $(cat "$WORK/connect-session1.body")"
+
+python3 - "$WORK/create-session1.body" "$WORK/connect-session1.body" <<'PY' || fail "connect response changed stable identity or credentials"
+import json, sys
+created = json.load(open(sys.argv[1]))
+connected = json.load(open(sys.argv[2]))
+for key in ("sandboxID", "envdAccessToken", "trafficAccessToken", "forwardAccessToken"):
+    assert connected.get(key) == created.get(key), (key, created, connected)
+assert isinstance(connected.get("templateID"), str) and connected["templateID"], connected
+PY
+
+python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "CmdConnect did not preserve the node identity and cluster context"
+import json, sys, urllib.request
+admin, group, stable_sid = sys.argv[1:]
+commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
+creates = [c for c in commands if c.get("kind") == "create" and c.get("cluster", {}).get("route_key") == "user1/session1"]
+connects = [c for c in commands if c.get("kind") == "connect" and c.get("cluster", {}).get("route_key") == "user1/session1"]
+assert len(creates) == 1, creates
+assert len(connects) == 1, connects
+created, connected = creates[0], connects[0]
+assert connected.get("sid") == created.get("sid") == stable_sid + "-g0", (created, connected)
+cluster = connected.get("cluster", {})
+assert cluster.get("group") == group, connected
+assert cluster.get("route_key") == "user1/session1", connected
+assert cluster.get("auth_sandbox_id") == stable_sid, connected
+PY
+
 code="$(retry_code 204 "$WORK/data1.body" \
     -H "Host: 49983-$SESSION1_SID.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
