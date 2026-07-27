@@ -241,7 +241,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
-	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.auth(a.execSession))
+	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.authAPIKey(a.execSession))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", a.auth(a.pause))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", a.auth(a.timeout))
 	// Template build (e2b v3). The CLI authenticates with a Bearer access token;
@@ -277,6 +277,20 @@ func (a *API) auth(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		h(w, r.WithContext(context.WithValue(r.Context(), apiKeyCtxKey{}, k)))
+	}
+}
+
+// authAPIKey is the capability-issuance authentication adapter. Unlike the e2b
+// template/account compatibility surface, exec-session creation accepts only
+// the explicit X-API-KEY carrier.
+func (a *API) authAPIKey(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-KEY")
+		if _, err := apikey.Parse(key); err != nil {
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		h(w, r.WithContext(context.WithValue(r.Context(), apiKeyCtxKey{}, key)))
 	}
 }
 

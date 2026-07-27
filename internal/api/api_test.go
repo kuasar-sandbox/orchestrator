@@ -446,6 +446,25 @@ func TestCreateExecSessionRejectsOversizedMigrationTokenBeforeCore(t *testing.T)
 	}
 }
 
+func TestCreateExecSessionRequiresExplicitAPIKeyHeader(t *testing.T) {
+	called := false
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+		called = true
+		return "kat1.exec", nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader("{}"))
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("Bearer-only status = %d, want 401; body=%s", response.Code, response.Body.String())
+	}
+	if called {
+		t.Fatal("Bearer-only exec-session request reached Core")
+	}
+}
+
 type execSessionCoreStub struct {
 	Core
 	execSession func(context.Context, string, string, string, int64) (string, error)
