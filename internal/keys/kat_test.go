@@ -283,6 +283,7 @@ func TestExecAccessTokenRequiresCanonicalClaims(t *testing.T) {
 		"wrong SID":       `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-02","aud":"exec"}`,
 		"wrong audience":  `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"forward"}`,
 		"UUIDv4":          `{"v":1,"session_id":"550e8400-e29b-41d4-a716-446655440000","sid":"sandbox-01","aud":"exec"}`,
+		"UUIDv7 variant":  `{"v":1,"session_id":"01890f35-7b2c-7cc6-18c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}`,
 		"upper UUID":      `{"v":1,"session_id":"01890F35-7B2C-7CC6-98C4-DC0C0C07398F","sid":"sandbox-01","aud":"exec"}`,
 		"zero expiry":     `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec","exp":0}`,
 		"trailing value":  `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}{}`,

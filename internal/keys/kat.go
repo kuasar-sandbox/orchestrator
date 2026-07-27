@@ -208,7 +208,7 @@ func mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID string, expi
 
 func validUUIDv7(value string) bool {
 	id, err := uuid.Parse(value)
-	return err == nil && id.Version() == 7 && id.String() == value
+	return err == nil && id.Version() == 7 && id.Variant() == uuid.RFC4122 && id.String() == value
 }
 
 func canonicalForwardPayload(authSandboxID string) ([]byte, error) {
