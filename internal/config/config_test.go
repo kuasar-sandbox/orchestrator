@@ -312,7 +312,7 @@ sandbox:
 
 func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxy.yaml")
-	if err := os.WriteFile(path, []byte("proxy_netns: sw0_mgmt\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("run_root: /run/sandbox\nproxy_netns: sw0_mgmt\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -322,6 +322,24 @@ func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	}
 	if got := cfg.ProxyNetNS; got != "sw0_mgmt" {
 		t.Fatalf("proxy_netns = %q", got)
+	}
+	if got := cfg.RunRoot; got != "/run/sandbox" {
+		t.Fatalf("run_root = %q", got)
+	}
+}
+
+func TestLoadProxyRequiresRunRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("proxy_netns: sw0_mgmt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadProxy(path)
+	if err == nil {
+		t.Fatal("LoadProxy succeeded without run_root")
+	}
+	if !strings.Contains(err.Error(), "run_root is required") {
+		t.Fatalf("error %q does not report required run_root", err)
 	}
 }
 

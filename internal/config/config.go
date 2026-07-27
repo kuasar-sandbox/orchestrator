@@ -716,6 +716,7 @@ func (c *Config) validateProxy() error {
 // local values are bootstrap fallbacks until that handshake completes.
 type ProxyFileConfig struct {
 	ConfigSocket  string    `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
+	RunRoot       string    `yaml:"run_root"`       // sandbox runtime root containing <sid>/ctl.sock; required
 	DataListen    string    `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
 	ProxyNetNS    string    `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
 	ProxySocket   string    `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
@@ -768,6 +769,9 @@ func (p *ProxyFileConfig) applyDefaults() {
 }
 
 func (p *ProxyFileConfig) validate() error {
+	if p.RunRoot == "" {
+		return fmt.Errorf("proxy config: run_root is required")
+	}
 	switch p.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
 	default:
