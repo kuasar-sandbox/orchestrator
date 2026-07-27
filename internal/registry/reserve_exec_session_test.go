@@ -257,6 +257,53 @@ func TestReserveExecSessionIssuesEveryRequestWithoutWaitingForReady(t *testing.T
 	}
 }
 
+func TestReserveExecSessionDoesNotMutateExistingReadyOrReservedWorkflow(t *testing.T) {
+	for _, state := range []SandboxState{StateReady, StateReserved} {
+		for _, accepted := range []bool{true, false} {
+			t.Run(string(state)+"/accepted="+strconv.FormatBool(accepted), func(t *testing.T) {
+				ctx := context.Background()
+				reg := testReg(t)
+				record := testE2BSandboxRecord("/g", "rk", "stable", "n1", state)
+				initialRevision, err := reg.stores.PutSandbox(ctx, record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+					t.Fatal(err)
+				}
+				commands := 0
+				reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+					commands++
+					ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "refused"}
+					if accepted {
+						ack.Status = routesync.AckAccepted
+						ack.ExecSession = &routesync.ExecSessionResult{ExecAccessToken: "kat1.exec"}
+					}
+					go reg.ackCommand(ack)
+				}})
+
+				result, reserveErr := reg.ReserveSandbox(ctx, testExecSessionReserve(record))
+				if accepted {
+					if reserveErr != nil || result == nil || result.ExecSession == nil ||
+						result.ExecSession.ExecAccessToken != "kat1.exec" {
+						t.Fatalf("result = %+v, error = %v", result, reserveErr)
+					}
+				} else if reserveErr == nil || result != nil {
+					t.Fatalf("result = %+v, error = %v, want rejection", result, reserveErr)
+				}
+
+				stored, revision, found, err := reg.stores.GetSandbox(ctx, record.Group, record.RouteKey)
+				if err != nil || !found || revision != initialRevision || commands != 1 ||
+					stored.State != state || stored.NodeID != record.NodeID ||
+					stored.NodeSandboxID != record.NodeSandboxID || stored.SandboxGeneration != record.SandboxGeneration {
+					t.Fatalf("exec-session disturbed existing workflow: stored=%+v revision=%d initial=%d commands=%d found=%v err=%v",
+						stored, revision, initialRevision, commands, found, err)
+				}
+			})
+		}
+	}
+}
+
 func TestReserveExecSessionRejectsInvalidTypedResultAndRollsBack(t *testing.T) {
 	for _, test := range []struct {
 		name string

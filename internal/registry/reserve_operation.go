@@ -340,31 +340,40 @@ func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveReq
 func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev int64) (*ReserveResult, bool, error) {
 	before := *rec
 	current := *rec
+	currentRev := rev
+	transitioned := false
 	if current.State == StatePaused {
 		current.State = StateReserved
-	}
-	currentRev, ok, err := r.stores.CASSandbox(ctx, &current, rev)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		return nil, true, nil
-	}
-	if err := r.stores.AddNodeSandboxRef(ctx, current.NodeID, clusterstate.NodeSandboxRef{
-		Group: current.Group, RouteKey: current.RouteKey, SandboxID: current.SandboxID,
-		SandboxGeneration: current.SandboxGeneration, NodeSandboxID: current.NodeSandboxID,
-		Profile: current.Profile, APISecretFingerprint: current.APISecretFingerprint,
-	}); err != nil {
-		r.rollbackConnect(&current, currentRev, &before, true)
-		return nil, false, err
+		var ok bool
+		var err error
+		currentRev, ok, err = r.stores.CASSandbox(ctx, &current, rev)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return nil, true, nil
+		}
+		transitioned = true
+		if err := r.stores.AddNodeSandboxRef(ctx, current.NodeID, clusterstate.NodeSandboxRef{
+			Group: current.Group, RouteKey: current.RouteKey, SandboxID: current.SandboxID,
+			SandboxGeneration: current.SandboxGeneration, NodeSandboxID: current.NodeSandboxID,
+			Profile: current.Profile, APISecretFingerprint: current.APISecretFingerprint,
+		}); err != nil {
+			r.rollbackConnect(&current, currentRev, &before, true)
+			return nil, false, err
+		}
 	}
 	ack, err := r.nodeOwner.SendCommandAndWait(ctx, current.NodeID, execSessionCommand(req, &current), lifecycleAckTimeout)
 	if err != nil {
-		r.rollbackConnect(&current, currentRev, &before, !errors.Is(err, ErrNodeGone))
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, !errors.Is(err, ErrNodeGone))
+		}
 		return nil, false, err
 	}
 	if ack == nil || ack.Status != routesync.AckAccepted {
-		r.rollbackConnect(&current, currentRev, &before, false)
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, false)
+		}
 		reason := ""
 		if ack != nil {
 			reason = ack.Reason
@@ -372,7 +381,9 @@ func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveReq
 		return nil, false, fmt.Errorf("registry: exec session rejected: %s", reason)
 	}
 	if err := validateExecSessionResult(ack.ExecSession); err != nil {
-		r.rollbackConnect(&current, currentRev, &before, true)
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, true)
+		}
 		return nil, false, err
 	}
 	route, err := r.currentExecSessionRoute(ctx, req)
