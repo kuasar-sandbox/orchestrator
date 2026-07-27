@@ -28,6 +28,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -219,6 +220,15 @@ func (rt *Router) Handler() http.Handler {
 		}
 		if host == "api."+rt.domain {
 			rt.serveControl(w, r)
+			return
+		}
+		if r.Header.Get(proxypkg.HeaderSandboxService) == string(proxypkg.ConnectServiceExec) {
+			if r.Method != http.MethodConnect {
+				w.Header().Set("Allow", http.MethodConnect)
+				http.Error(w, "exec requires CONNECT", http.StatusMethodNotAllowed)
+				return
+			}
+			rt.serveExecData(w, r)
 			return
 		}
 		rt.serveData(w, r, host)
@@ -935,6 +945,83 @@ func rewriteSandboxIdentityResponse(resp *http.Response, sandboxID, nodeSandboxI
 
 // --- data plane ---
 
+// serveExecData handles the cluster-facing logical exec service. Route lookup is
+// read-only; a KAT must validate against the stable route identity before the
+// Router is allowed to call Reserve(data). The final node receives the same
+// service, optional port, and token with only the sandbox ID rewritten.
+func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
+	sid, target, ok := proxypkg.ParseConnect(r)
+	if !ok || target.Service != proxypkg.ConnectServiceExec {
+		http.Error(w, "bad connect target", http.StatusBadRequest)
+		return
+	}
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
+
+	rr := rt.cachedRoute(group, routeKey, sid)
+	if rr != nil && !routeMatchesIdentity(rr, group, routeKey, sid) {
+		rr = nil
+	}
+	if rr == nil {
+		var err error
+		if rr, err = rt.routeLinkRoute(r.Context(), group, routeKey, sid); err != nil {
+			var routeErr *routeLinkCallError
+			if errors.As(err, &routeErr) && routeErr.status == http.StatusNotFound {
+				http.Error(w, "sandbox not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if !routeMatchesIdentity(rr, group, routeKey, sid) {
+			rt.evictRoute(group, routeKey, sid)
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+			return
+		}
+		rt.rememberRoute(rr)
+	}
+
+	token := r.Header.Get(HeaderAccessTok)
+	if err := keys.VerifyExecAccessToken(token, rr.ServiceSecret, rr.AuthSandboxID, time.Now()); err != nil {
+		http.Error(w, "invalid access token", http.StatusUnauthorized)
+		return
+	}
+
+	if rr.State != "ready" || rr.DataEndpoint == "" {
+		res, err := rt.routeLinkReserve(
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
+			map[string]string{
+				HeaderAccessTok:               token,
+				proxypkg.HeaderSandboxService: string(target.Service),
+			},
+		)
+		if err != nil {
+			writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+			return
+		}
+		current := &res.Route
+		if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) {
+			http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+			return
+		}
+		rt.rememberRoute(current)
+		rr = current
+	}
+	if rr.State != "ready" || rr.DataEndpoint == "" {
+		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	rt.forwardSandboxConnect(w, r, rr, sid, target, token)
+}
+
 func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string) {
 	sub := strings.TrimSuffix(host, "."+rt.domain)
 	if sub == host { // not under our domain
@@ -1055,6 +1142,32 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		return
 	}
 	rt.forwardSandboxData(w, r, rr, sid, effectivePort, connectToken)
+}
+
+func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, target proxypkg.ConnectTarget, token string) {
+	doneActive := rt.beginActiveRoute(rr)
+	defer doneActive()
+	rt.mx.Inc(`router_requests_total{plane="data"}`)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(
+		r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, target, token,
+	)
+	if err != nil {
+		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
+		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		backend.Close()
+		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
+			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+		}
+		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
+		http.Error(w, "connect refused by node", resp.StatusCode)
+		return
+	}
+	proxypkg.TunnelBuffered(w, r, backend, br)
 }
 
 func expectedDataAccessToken(route *routeResolve, port int) string {

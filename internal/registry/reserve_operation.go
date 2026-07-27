@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -25,6 +26,8 @@ const (
 	ReserveConnect     ReserveOperation = "connect"
 	ReserveExecSession ReserveOperation = "exec-session"
 	ReserveData        ReserveOperation = "data"
+
+	reserveDataServiceExec = "exec"
 )
 
 func (op ReserveOperation) Valid() bool {
@@ -44,6 +47,7 @@ type SandboxReserveRequest struct {
 	TTLSeconds        int64
 	APIKey            string
 	AccessToken       string
+	Service           string
 	MigrationToken    string
 	Config            map[string]string
 }
@@ -62,7 +66,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 	switch req.Operation {
 	case ReserveCreate:
 		if req.ExpectedSandboxID != "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
-			req.TTLSeconds != 0 || req.AccessToken != "" || req.MigrationToken != "" {
+			req.TTLSeconds != 0 || req.AccessToken != "" || req.Service != "" || req.MigrationToken != "" {
 			return nil, fmt.Errorf("%w: create contains fields for another operation", ErrReserveBadRequest)
 		}
 		if err := r.authenticateCreate(ctx, req.Group, req.APIKey); err != nil {
@@ -71,19 +75,20 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config)
 	case ReserveConnect:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TTLSeconds != 0 ||
-			req.AccessToken != "" || len(req.Config) != 0 {
+			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
 			return nil, fmt.Errorf("%w: connect contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveConnect(ctx, req)
 	case ReserveExecSession:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
-			req.AccessToken != "" || len(req.Config) != 0 {
+			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
 			return nil, fmt.Errorf("%w: exec-session contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveExecSession(ctx, req)
 	case ReserveData:
 		if req.ExpectedSandboxID == "" || req.TimeoutSeconds != 0 || req.APIKey != "" ||
-			req.TTLSeconds != 0 || req.MigrationToken != "" || len(req.Config) != 0 {
+			req.TTLSeconds != 0 || req.MigrationToken != "" || len(req.Config) != 0 ||
+			(req.Service != "" && req.Service != reserveDataServiceExec) {
 			return nil, fmt.Errorf("%w: data contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveData(ctx, req)
@@ -122,12 +127,18 @@ func authenticateRecordAPIKey(rec *SandboxRecord, apiKey string) error {
 	return nil
 }
 
-func authenticateRecordAccessToken(rec *SandboxRecord, requestedPort int, accessToken string) error {
+func authenticateRecordAccessToken(rec *SandboxRecord, requestedPort int, service, accessToken string, now time.Time) error {
 	if accessToken == "" {
 		return ErrReserveUnauthorized
 	}
 	if rec == nil {
 		return ErrSandboxNotFound
+	}
+	if service == reserveDataServiceExec {
+		if err := keys.VerifyExecAccessToken(accessToken, rec.ServiceSecret, rec.AuthSandboxID, now); err != nil {
+			return ErrReserveUnauthorized
+		}
+		return nil
 	}
 	port, err := reserveDataPort(rec, requestedPort)
 	if err != nil {
@@ -709,7 +720,7 @@ func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveReq
 	if _, _, err := replacementCredentials(rec); err != nil {
 		return nil, err
 	}
-	if err := authenticateRecordAccessToken(rec, req.Port, req.AccessToken); err != nil {
+	if err := authenticateRecordAccessToken(rec, req.Port, req.Service, req.AccessToken, time.Now()); err != nil {
 		return nil, err
 	}
 	switch rec.State {

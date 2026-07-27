@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -62,6 +63,8 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 	req.Header.Set(HeaderRouteKey, "rk")
 	req.Header.Set(HeaderAPIKey, "api-key")
 	req.Header.Set(HeaderMigration, "kmt1.opaque")
+	// Data-plane service headers do not override api.<domain> control routing.
+	req.Header.Set(proxypkg.HeaderSandboxService, string(proxypkg.ConnectServiceExec))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

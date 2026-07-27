@@ -215,6 +215,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		TTLSeconds:        ttlSeconds,
 		APIKey:            req.Header.Get("X-API-KEY"),
 		AccessToken:       req.Header.Get("X-Access-Token"),
+		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
 		Config:            body.Config,
 	})

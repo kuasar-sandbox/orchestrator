@@ -1,13 +1,10 @@
 package proxy
 
 import (
-	"bufio"
 	"context"
 	"io"
-	"net"
 	"net/http"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -96,7 +93,7 @@ func (p *Proxy) serveExecH1(w http.ResponseWriter, r *http.Request, ctlConn io.R
 		_ = ctlConn.Close()
 		return
 	}
-	downstream := &h1ExecDownstream{Conn: client, reader: rw.Reader}
+	downstream := &h1ConnectStream{Conn: client, reader: rw.Reader}
 	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		_ = downstream.Close()
 		_ = ctlConn.Close()
@@ -134,7 +131,7 @@ func (p *Proxy) serveExecH2(w http.ResponseWriter, r *http.Request, ctlConn io.R
 	if body == nil {
 		body = http.NoBody
 	}
-	downstream := &h2ExecDownstream{reader: body, writer: w, flusher: flusher}
+	downstream := &h2ConnectStream{reader: body, writer: w, flusher: flusher}
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	p.mx.Inc(`data_requests_total{result="ok"}`)
@@ -153,53 +150,3 @@ func (p *Proxy) logExecRelayError(ctx context.Context, err error) {
 	}
 	p.log.Debug("exec tunnel relay ended", "err", err)
 }
-
-// h1ExecDownstream keeps net/http's buffered reader in front of the hijacked
-// connection so a ctl first frame or MUX tail pre-read with the CONNECT headers
-// is not lost. Writes and half-close operate on the raw connection after the 200
-// response has been flushed.
-type h1ExecDownstream struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (s *h1ExecDownstream) Read(p []byte) (int, error) { return s.reader.Read(p) }
-
-func (s *h1ExecDownstream) CloseWrite() error {
-	if closer, ok := s.Conn.(interface{ CloseWrite() error }); ok {
-		return closer.CloseWrite()
-	}
-	return nil
-}
-
-// h2ExecDownstream maps an HTTP/2 CONNECT stream to io.ReadWriteCloser. Closing
-// the response direction closes the request body so a blocked client-to-ctl copy
-// can finish after ctl EOF; handler return then ends the response stream.
-type h2ExecDownstream struct {
-	reader    io.ReadCloser
-	writer    io.Writer
-	flusher   http.Flusher
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func (s *h2ExecDownstream) Read(p []byte) (int, error) { return s.reader.Read(p) }
-
-func (s *h2ExecDownstream) Write(p []byte) (int, error) {
-	n, err := s.writer.Write(p)
-	s.flusher.Flush()
-	return n, err
-}
-
-func (s *h2ExecDownstream) CloseWrite() error { return s.closeReader() }
-func (s *h2ExecDownstream) Close() error      { return s.closeReader() }
-
-func (s *h2ExecDownstream) closeReader() error {
-	s.closeOnce.Do(func() { s.closeErr = s.reader.Close() })
-	return s.closeErr
-}
-
-var _ io.ReadWriteCloser = (*h1ExecDownstream)(nil)
-var _ interface{ CloseWrite() error } = (*h1ExecDownstream)(nil)
-var _ io.ReadWriteCloser = (*h2ExecDownstream)(nil)
-var _ interface{ CloseWrite() error } = (*h2ExecDownstream)(nil)
