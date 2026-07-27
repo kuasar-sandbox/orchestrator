@@ -234,7 +234,8 @@ fi
 
 # ---- tenant credentials + orchestrator --------------------------------------
 MK="$("$BIN/e2b-key-ctl" gen-key)"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 PORT="$(free_port)"
 

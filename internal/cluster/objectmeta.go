@@ -6,13 +6,12 @@ import (
 	"fmt"
 )
 
-// ObjectMetadataKey carries cluster routing identity in sandbox/build metadata.
-// Nodes persist this value opaquely; only cluster components interpret it.
+// ObjectMetadataKey carries cluster build ownership in build metadata. Sandbox
+// ownership uses the typed node-link ClusterSandboxContext instead.
 const ObjectMetadataKey = "kuasar-sandbox.cluster"
 
 type ObjectLocation struct {
-	Group    string `json:"group"`
-	RouteKey string `json:"route_key,omitempty"`
+	Group string `json:"group"`
 }
 
 func WithObjectLocation(metadata map[string]string, location ObjectLocation) (map[string]string, error) {
@@ -44,20 +43,6 @@ func ObjectLocationFromMetadata(metadata map[string]string) (ObjectLocation, err
 		return ObjectLocation{}, errors.New("cluster: object metadata group is required")
 	}
 	return location, nil
-}
-
-func NodeSandboxRefFromMetadata(sandboxID string, metadata map[string]string) (NodeSandboxRef, error) {
-	if sandboxID == "" {
-		return NodeSandboxRef{}, errors.New("cluster: sandbox id is required")
-	}
-	location, err := ObjectLocationFromMetadata(metadata)
-	if err != nil {
-		return NodeSandboxRef{}, err
-	}
-	if location.RouteKey == "" {
-		return NodeSandboxRef{}, errors.New("cluster: sandbox route key is required")
-	}
-	return NodeSandboxRef{SandboxID: sandboxID, Group: location.Group, RouteKey: location.RouteKey}, nil
 }
 
 func NodeBuildRefFromMetadata(buildID string, metadata map[string]string) (NodeBuildRef, error) {

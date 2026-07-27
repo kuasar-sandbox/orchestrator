@@ -8,6 +8,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -27,18 +28,26 @@ type routeLogEntry struct {
 // MMDS secret is derived deterministically (so every proxy worker agrees) and is
 // carried on every entry — subscribers that don't serve MMDS simply ignore it.
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
+	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
+	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
-		SandboxID:          sb.ID,
-		Profile:            string(sb.Profile()),
-		TemplateID:         sb.TemplateID,
-		State:              string(sb.State),
-		EnvdUDS:            sb.EnvdUDS,
-		CiUDS:              sb.CiUDS,
-		FloatingIP:         sb.FloatingIP,
-		AccessToken:        sb.EnvdAccessToken,
-		TrafficAccessToken: sb.TrafficAccessToken,
-		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
-		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+		SandboxID:              sb.ID,
+		Profile:                string(sb.Profile),
+		TemplateID:             sb.TemplateID,
+		State:                  string(sb.State),
+		EnvdUDS:                sb.EnvdUDS,
+		CiUDS:                  sb.CiUDS,
+		FloatingIP:             sb.FloatingIP,
+		AuthSandboxID:          sb.AuthSandboxID(),
+		APISecret:              sb.APISecret,
+		APISecretFingerprint:   apiSecretFingerprint,
+		ManifestKeyFingerprint: manifestKeyFingerprint,
+		ServiceSecret:          sb.ServiceSecret,
+		EnvdAccessToken:        sb.EnvdAccessToken,
+		TrafficAccessToken:     sb.TrafficAccessToken,
+		ForwardAccessToken:     sb.ForwardAccessToken,
+		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
+		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 	}
 	return e
 }
@@ -110,7 +119,7 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 	case types.StateRunning:
 		o.publishUpsert(sb) // already up; re-announce so the proxy unparks
 	case types.StatePaused:
-		if err := o.sf.Do(sid, func() error { return o.resumeIfPaused(ctx, sid) }); err != nil {
+		if err := o.resumeSandbox(ctx, sid); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 			// stays paused; the proxy's park times out -> 404.
 		}

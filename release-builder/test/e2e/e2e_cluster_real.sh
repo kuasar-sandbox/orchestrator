@@ -4,8 +4,8 @@
 #
 #   Phase 1 / registry-n1:
 #     registry + placer + router + one real node-ctl conductor serve.
-#     A data-plane request by (group, route_key) drives Reserve -> node-link
-#     create -> real microVM boot -> envd /health through router -> delete.
+#     An explicit create drives Reserve -> node-link create -> real microVM
+#     boot, then envd /health is reached by sandbox ID through router -> delete.
 #
 #   Phase 2 / registry-redirect:
 #     three registries, node_link owner_count=1. The node first connects to the
@@ -122,6 +122,7 @@ SW_STARTED=""
 
 cleanup() {
     set +e
+    rm -f "$WORK/create.credentials"
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         p="${PIDS[$i]}"
@@ -200,28 +201,75 @@ router_req() {
     curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
 }
 
-data_by_key_code() {
+create_sandbox() {
     local out="$1"
     http_code "$out" \
-        -H "Host: data.$DOMAIN" \
+        -X POST \
+        -H "Host: api.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
         -H "X-Kuasar-Route-Key: $ROUTE_KEY" \
         -H "X-API-KEY: $CLUSTER_API_KEY" \
+        -H 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:$ROUTER_PORT/sandboxes"
+}
+
+retry_create_sandbox() {
+    local out="$1" code="000"
+    for attempt in $(seq 1 12); do
+        code="$(create_sandbox "$out" || true)"
+        if [ "$code" = "201" ]; then
+            echo "$code"
+            return 0
+        fi
+        if [ "$code" != "503" ] || [ "$attempt" = "12" ]; then
+            echo "$code"
+            return 1
+        fi
+        step "sandbox create attempt $attempt returned 503; waiting for placement convergence"
+        sleep 2
+    done
+}
+
+sandbox_route() {
+    python3 - "$1" "$ROUTE_KEY" <<'PY'
+import json, sys
+path, expected_route_key = sys.argv[1:]
+created = json.load(open(path))
+if created.get("routeKey") != expected_route_key:
+    raise SystemExit("create response routeKey mismatch")
+fields = [created.get(name) for name in (
+    "sandboxID", "envdAccessToken", "trafficAccessToken", "forwardAccessToken"
+)]
+if not all(isinstance(value, str) and value for value in fields):
+    raise SystemExit("create response omitted e2b sandbox credentials")
+print("\t".join(fields[:2]))
+PY
+}
+
+data_by_sid_code() {
+    local out="$1" sid="$2" envd_token="$3"
+    http_code "$out" \
+        -H "Host: 49983-$sid.$DOMAIN" \
+        -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        -H "X-Access-Token: $envd_token" \
         "http://127.0.0.1:$ROUTER_PORT/health"
 }
 
-retry_data_by_key() {
+retry_data_by_sid() {
+    local sid="$1" envd_token="$2"
     local code="000"
     for i in $(seq 1 12); do
-        step "data-plane attempt $i: router -> registry Reserve -> node -> real envd"
-        code="$(data_by_key_code "$WORK/data-health.body" 2>/dev/null || echo 000)"
+        step "data-plane attempt $i: router -> route resolve -> node -> real envd"
+        code="$(data_by_sid_code "$WORK/data-health.body" "$sid" "$envd_token" 2>/dev/null || echo 000)"
         if [ "$code" = "204" ] || [ "$code" = "200" ]; then
             echo "$code"
             return 0
         fi
-        if grep -qiE 'no allowlisted manifest key|key not distributed' "$WORK/data-health.body" 2>/dev/null; then
-            cat "$WORK/data-health.body" >&2
-            fail "data-plane hit node before manifest-key cache was ready"
+        if grep -qiE 'credential pair (is )?not (installed|distributed)' "$WORK/data-health.body" 2>/dev/null; then
+			cat "$WORK/data-health.body" >&2
+			fail "data-plane hit node before credential-pair cache was ready"
         fi
         step "data-plane attempt $i returned $code; retrying while sandbox boot converges"
         sleep 2
@@ -384,7 +432,7 @@ write_group_record() {
 {
   "group": "$GROUP",
   "manifest_key": { "type": "inline", "value": "$MANIFEST_KEY" },
-  "auth_key": { "type": "inline", "value": "$AUTH_KEY" },
+  "api_secret": { "type": "inline", "value": "$API_SECRET" },
   "template_ref": "$TEMPLATE_REF",
   "target_port": 49983,
   "node_selectors": [{ "pool": "real" }]
@@ -594,42 +642,51 @@ EOF
     fi
 }
 
-wait_cluster_node_manifest_key() {
-    step "waiting for node_link manifest-key cache on $NODE_ID"
+wait_cluster_node_key_pair() {
+    step "waiting for node_link credential-pair cache on $NODE_ID"
     for _ in $(seq 1 120); do
         if "$BIN/node-ctl" manifest-key list --socket "$WORK/cn.sock" >"$WORK/cluster-node-keys.out" 2>&1; then
-            if grep -q "^$MANIFEST_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
-                step "node manifest-key cache ready: $MANIFEST_FP"
+            if grep -q "^api=$API_SECRET_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
+                step "node credential-pair cache ready: $API_SECRET_FP"
                 return 0
             fi
         fi
         sleep 0.5
     done
     cat "$WORK/cluster-node-keys.out" >&2 || true
-    fail "node manifest-key cache did not receive $MANIFEST_FP"
+    fail "node credential-pair cache did not receive $API_SECRET_FP"
 }
 
 run_cluster_flow() {
-    local code sid
-    step "checking by-key data request uses group target_port (no E2b-Sandbox-Port header)"
-    code="$(retry_data_by_key || true)"
+    local code sid envd_token create_response="$WORK/create.credentials"
+    step "creating sandbox explicitly through router"
+    code="$(retry_create_sandbox "$create_response" || true)"
+    if [ "$code" != "201" ]; then
+        [ -s "$create_response" ] && { step "sandbox create response:"; sed 's/^/  create| /' "$create_response" >&2; }
+        fail "sandbox create returned $code"
+    fi
+    if ! IFS=$'\t' read -r sid envd_token < <(sandbox_route "$create_response"); then
+        rm -f "$create_response"
+        fail "sandbox create returned an invalid e2b response"
+    fi
+    rm -f "$create_response"
+    step "created sandbox: $sid"
+
+    step "checking SID-addressed envd data request with X-Access-Token"
+    code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
+    unset envd_token
     [ "$code" = "204" ] || [ "$code" = "200" ] || fail "data-plane /health returned $code"
-    step "PASS: router -> registry Reserve -> node-link create -> real envd /health ($code)"
+    step "PASS: explicit create -> SID route -> real envd /health ($code)"
 
     step "checking group-local sandbox list through router"
     code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"
     [ "$code" = "200" ] || { cat "$WORK/router-resp.body"; fail "list returned $code"; }
-    sid="$(python3 - "$WORK/router-resp.body" <<'PY'
+    python3 - "$WORK/router-resp.body" "$sid" <<'PY' || fail "sandbox list did not contain created sandbox $sid"
 import json, sys
 rows = json.load(open(sys.argv[1]))
-for row in rows:
-    sid = row.get("sandboxID")
-    if sid:
-        print(sid)
-        raise SystemExit(0)
-raise SystemExit(1)
+expected = sys.argv[2]
+raise SystemExit(0 if any(row.get("sandboxID") == expected for row in rows) else 1)
 PY
-)" || fail "sandbox list did not contain a sandboxID"
     step "listed sandbox: $sid"
 
     step "checking router control DELETE forwards to the real node"
@@ -655,10 +712,10 @@ PY
 
 step "cluster real e2e case=$CLUSTER_REAL_CASE work=$WORK using BIN=$BIN"
 MANIFEST_KEY="$("$BIN/e2b-key-ctl" gen-key)"
-MANIFEST_FP="$("$BIN/e2b-key-ctl" fingerprint "$MANIFEST_KEY")"
-AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
-BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$MANIFEST_KEY")"
-CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MANIFEST_KEY")"
+API_SECRET_FP="$("$BIN/e2b-key-ctl" fingerprint "$API_SECRET")"
+BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
+CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ENC_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 GROUP="/e2e/cluster/real/$CLUSTER_REAL_CASE"
 ROUTE_KEY="user1/$CLUSTER_REAL_CASE"
@@ -683,7 +740,7 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     step "selected redirected node_id=$NODE_ID"
 fi
 start_cluster_node "$NODE_ID"
-wait_cluster_node_manifest_key
+wait_cluster_node_key_pair
 run_cluster_flow
 
 echo "==> PASS: e2e_cluster_real $CLUSTER_REAL_CASE"

@@ -348,9 +348,9 @@ func TestPlacerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	seedNodeListView(t, svc, "n1")
 	svc.Start(ctx)
 
-	waitForNodeKey(t, ctx, reg, "n1", true)
+	waitForNodeKeyPair(t, ctx, reg, "n1", true)
 	time.Sleep(180 * time.Millisecond)
-	waitForNodeKey(t, ctx, reg, "n1", true)
+	waitForNodeKeyPair(t, ctx, reg, "n1", true)
 	if calls := src.rangeCalls.Load(); calls < 2 {
 		t.Fatalf("Range calls=%d, want repeated refresh cycles", calls)
 	}
@@ -566,8 +566,10 @@ func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testin
 
 func TestSelectorPatchSignatureCanonicalizesSelectors(t *testing.T) {
 	links := []RegistryLink{{Name: "r2", BaseURL: "http://r2"}, {Name: "r1", BaseURL: "http://r1"}}
-	a := selectorPatchSignature([]map[string]string{{"b": "2", "a": "1"}, {"zone": "east"}}, []string{"n2", "n1"}, "fp", "inline", "mk", "", registryLinkSignature(links))
-	b := selectorPatchSignature([]map[string]string{{"a": "1", "b": "2"}, {"zone": "east"}}, []string{"n1", "n2"}, "fp", "inline", "mk", "", registryLinkSignature(links))
+	a := selectorPatchSignature([]map[string]string{{"b": "2", "a": "1"}, {"zone": "east"}}, []string{"n2", "n1"},
+		"api-fp", "inline", "api", "", "manifest-fp", "inline", "mk", "", registryLinkSignature(links))
+	b := selectorPatchSignature([]map[string]string{{"a": "1", "b": "2"}, {"zone": "east"}}, []string{"n1", "n2"},
+		"api-fp", "inline", "api", "", "manifest-fp", "inline", "mk", "", registryLinkSignature(links))
 	if a != b {
 		t.Fatalf("canonical signatures differ:\n%s\n%s", a, b)
 	}
@@ -713,17 +715,17 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 	sink.bookmark()
 }
 
-func waitForNodeKey(t *testing.T, ctx context.Context, reg *registry.Registry, nodeID string, want bool) {
+func waitForNodeKeyPair(t *testing.T, ctx context.Context, reg *registry.Registry, nodeID string, want bool) {
 	t.Helper()
 	for i := 0; i < 200; i++ {
 		node, found, err := reg.Stores().GetNode(ctx, nodeID)
-		if err == nil && found && (len(node.ManifestKeys) > 0) == want {
+		if err == nil && found && (len(node.KeyPairs) > 0) == want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	node, found, err := reg.Stores().GetNode(ctx, nodeID)
-	t.Fatalf("node key presence=%v found=%v err=%v keys=%+v, want %v", len(node.ManifestKeys) > 0, found, err, node.ManifestKeys, want)
+	t.Fatalf("node key-pair presence=%v found=%v err=%v pairs=%+v, want %v", len(node.KeyPairs) > 0, found, err, node.KeyPairs, want)
 }
 
 type countingGroupSource struct {
@@ -751,8 +753,8 @@ func (s *pagedFailingGroupSource) GetKey(context.Context, string) (clusterstate.
 	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
 }
 
-func (s *pagedFailingGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+func (s *pagedFailingGroupSource) GetAPISecret(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret}, true, nil
 }
 
 func (s *pagedFailingGroupSource) Range(_ context.Context, cursor string, _ int) (clusterstate.GroupPage, error) {
@@ -779,8 +781,8 @@ func (s *countingGroupSource) GetKey(context.Context, string) (clusterstate.Secr
 	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
 }
 
-func (s *countingGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+func (s *countingGroupSource) GetAPISecret(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret}, true, nil
 }
 
 func (s *countingGroupSource) Range(context.Context, string, int) (clusterstate.GroupPage, error) {

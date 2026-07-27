@@ -20,14 +20,18 @@ func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
 
 	sid := "sbx-trust"
 	key := strings.Repeat("b", 64)
+	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID:          sid,
+		Profile:     types.ProfileBare,
 		TemplateID:  "bare-snp-" + key,
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,
-		ManifestKey: strings.Repeat("a", 64),
+		APISecret:   deriveTestAPISecret(t, manifestKey),
+		ManifestKey: manifestKey,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
@@ -54,14 +58,18 @@ func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T
 	o.vs = stubVS{}
 
 	sid := "sbx-cold"
+	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
 		ID:          sid,
+		Profile:     types.ProfileBare,
 		TemplateID:  "bare-img-" + strings.Repeat("b", 64),
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,
-		ManifestKey: strings.Repeat("a", 64),
+		APISecret:   deriveTestAPISecret(t, manifestKey),
+		ManifestKey: manifestKey,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}

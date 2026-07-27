@@ -116,7 +116,7 @@ proxy:                                           # data-plane policy (<port>-<si
   # proxy_netns: sw0_mgmt                         # internal-mode forwarding netns for floatingip dials + MMDS listen.
   # park_timeout: 30s
   # metrics_listen: ":9900"                       # serve's own Prometheus text endpoint
-# AES-256 keys for manifest keys at rest (":"-separated, first active). Prefer the
+# AES-256 keys for tenant credentials at rest (":"-separated, first active). Prefer the
 # NODE_CONFIG_ENCRYPTION_KEY env (overrides). Generate: e2b-key-ctl gen-key.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 # Shared remote manifest store (manifest.key empty; the tenant key arrives via env).

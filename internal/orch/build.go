@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
@@ -41,11 +42,11 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
-	manifestKey, err := o.resolveAllowed(ctx, apiKey)
+	pair, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
 	}
-	if manifestKey == "" {
+	if pair.APISecret == "" {
 		return nil, api.ErrNotAllowed
 	}
 	bid, err := uuid.NewV7()
@@ -60,7 +61,8 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	b := &types.Build{
 		BuildID:     bid.String(),
 		TemplateID:  templateID,
-		ManifestKey: manifestKey,
+		APISecret:   pair.APISecret,
+		ManifestKey: pair.ManifestKey,
 		Profile:     spec.Profile,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
@@ -264,7 +266,9 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 		// not the node's stored registry_auth_enc.
 		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
 	default:
-		authJSON, err := o.st.RegistryAuthForKey(ctx, b.ManifestKey)
+		authJSON, err := o.st.RegistryAuthForKeyPair(ctx, store.KeyPair{
+			APISecret: b.APISecret, ManifestKey: b.ManifestKey,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -297,7 +301,7 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 	}
 	out := all[:0]
 	for _, b := range all {
-		if verifyKey(apiKey, b.ManifestKey) {
+		if verifyKey(apiKey, b.APISecret) {
 			out = append(out, b)
 		}
 	}
@@ -516,9 +520,9 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	// (FC-mode envd resolves {id, token-hash} by its floating IP).
 	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
 		row := &types.Sandbox{
-			ID: "build-" + b.BuildID, TemplateID: b.TemplateID,
+			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
 			State: types.StateRunning, FloatingIP: port.FloatingIP,
-			EnvdAccessToken: envdTok, ManifestKey: b.ManifestKey,
+			EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
 			CreatedUnix: time.Now().Unix(),
 		}
 		o.cache(row)

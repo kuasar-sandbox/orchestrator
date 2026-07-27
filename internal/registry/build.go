@@ -111,6 +111,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if placement == nil || placement.NodeID == "" {
 			return nil, ErrNoNode
 		}
+		if !validFullFingerprint(placement.APISecretFingerprint) {
+			return nil, errors.New("registry: build placement is missing a valid API secret fingerprint")
+		}
 		id := placement.NodeID
 		if excluded.has(id) {
 			if lastFailure != nil {
@@ -131,7 +134,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
-		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile, Resources: resources, State: BuildRegistered, TemplateID: templateID}
+		rec := &BuildRecord{
+			Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile,
+			APISecretFingerprint: placement.APISecretFingerprint,
+			Resources:            resources, State: BuildRegistered, TemplateID: templateID,
+		}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			r.releaseBuildAdmission(id, req.Group, buildID)
 			return nil, err
@@ -149,7 +156,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdBuildRegister,
 			BuildID: buildID, TemplateRef: templateID, Profile: string(req.Profile), BuildResources: resources, Config: req.Metadata,
-			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
+			APISecretFingerprint: placement.APISecretFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
 		if r.nodeOwner == nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)

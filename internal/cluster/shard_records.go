@@ -10,14 +10,14 @@ import (
 )
 
 const (
-	RecordSetRouteSandbox    shardkv.RecordSetName = "sandbox"
-	RecordSetRouteBuild      shardkv.RecordSetName = "build"
-	RecordSetNodeProfile     shardkv.RecordSetName = "profile"
-	RecordSetNodeSandbox     shardkv.RecordSetName = "sandbox"
-	RecordSetNodeBuild       shardkv.RecordSetName = "build"
-	RecordSetNodeManifestKey shardkv.RecordSetName = "manifest_key"
-	RecordSetNodeListNodes   shardkv.RecordSetName = "nodes"
-	RecordSetPlacerImport    shardkv.RecordSetName = "import"
+	RecordSetRouteSandbox  shardkv.RecordSetName = "sandbox"
+	RecordSetRouteBuild    shardkv.RecordSetName = "build"
+	RecordSetNodeProfile   shardkv.RecordSetName = "profile"
+	RecordSetNodeSandbox   shardkv.RecordSetName = "sandbox"
+	RecordSetNodeBuild     shardkv.RecordSetName = "build"
+	RecordSetNodeKeyPair   shardkv.RecordSetName = "key_pair"
+	RecordSetNodeListNodes shardkv.RecordSetName = "nodes"
+	RecordSetPlacerImport  shardkv.RecordSetName = "import"
 
 	NodeLinkProfileRecord  shardkv.RecordKey = "profile"
 	RouteLinkProfileRecord shardkv.RecordKey = "profile"
@@ -37,8 +37,8 @@ func NodeBuildRecordKey(buildID string) shardkv.RecordKey {
 	return shardkv.RecordKey(buildID)
 }
 
-func NodeManifestKeyRecordKey(fingerprint string) shardkv.RecordKey {
-	return shardkv.RecordKey(fingerprint)
+func NodeKeyPairRecordKey(apiSecretFingerprint string) shardkv.RecordKey {
+	return shardkv.RecordKey(apiSecretFingerprint)
 }
 
 func RouteLinkShard(group string) shardkv.ShardKey {
@@ -69,7 +69,7 @@ func ParseNodeBuildRecordKey(key shardkv.RecordKey) (buildID string, ok bool) {
 	return string(key), key != ""
 }
 
-func ParseNodeManifestKeyRecordKey(key shardkv.RecordKey) (fingerprint string, ok bool) {
+func ParseNodeKeyPairRecordKey(key shardkv.RecordKey) (apiSecretFingerprint string, ok bool) {
 	return string(key), key != ""
 }
 
@@ -87,7 +87,7 @@ func ParsePlacerImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok b
 }
 
 // NodeProfileRecord is the node_link profile record. Per-node sandboxes, builds,
-// and manifest keys are stored as separate node_link records in the same shard.
+// and credential pairs are stored as separate node_link records in the same shard.
 type NodeProfileRecord struct {
 	NodeID            string                    `json:"node_id"`
 	State             NodeState                 `json:"state"`

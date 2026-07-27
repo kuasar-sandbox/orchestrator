@@ -35,34 +35,39 @@ type PlaceReq struct {
 
 // PlaceResult is the placer's answer (NodeID set, or NoNode when nothing eligible).
 type PlaceResult struct {
-	ReqID          string            `json:"req_id"`
-	NodeID         string            `json:"node_id,omitempty"`
-	NoNode         bool              `json:"no_node,omitempty"`
-	Error          string            `json:"error,omitempty"`
-	TemplateRef    string            `json:"template_ref,omitempty"`
-	TargetPort     int               `json:"target_port,omitempty"`
-	Config         map[string]string `json:"config,omitempty"`
-	KeyFingerprint string            `json:"key_fp,omitempty"`
-	AccessToken    string            `json:"access_token,omitempty"`
-	ImageRepo      string            `json:"image_repo,omitempty"`
-	RegistryAuth   string            `json:"registry_auth,omitempty"`
+	ReqID                string            `json:"req_id"`
+	NodeID               string            `json:"node_id,omitempty"`
+	NoNode               bool              `json:"no_node,omitempty"`
+	Error                string            `json:"error,omitempty"`
+	TemplateRef          string            `json:"template_ref,omitempty"`
+	TargetPort           int               `json:"target_port,omitempty"`
+	Config               map[string]string `json:"config,omitempty"`
+	APISecretFingerprint string            `json:"api_secret_fingerprint,omitempty"`
+	ImageRepo            string            `json:"image_repo,omitempty"`
+	RegistryAuth         string            `json:"registry_auth,omitempty"`
 }
 
 // SelectorPatch is the placer's placement projection for a group. NodeIDs is the
-// explicit node set that should hold the group's manifest key; Selectors carries
-// the shuffle-effective selector projection.
+// explicit node set that should hold the group's API/manifest credential pair;
+// Selectors carries the shuffle-effective selector projection. The pair is one
+// atomic unit: both fingerprints and both typed secret carriers are present, or
+// all credential fields are absent.
 type SelectorPatch struct {
-	Group           string              `json:"group"`
-	Selectors       []map[string]string `json:"selectors"`
-	NodeIDs         []string            `json:"node_ids,omitempty"`
-	KeyFingerprint  string              `json:"key_fp,omitempty"`
-	ManifestKeyType string              `json:"manifest_key_type,omitempty"`
-	ManifestKey     string              `json:"manifest_key,omitempty"`
-	ManifestKeyRef  string              `json:"manifest_key_ref,omitempty"`
-	ImportSourceID  string              `json:"import_source_id,omitempty"`
-	ImportOwnerID   string              `json:"import_owner_id,omitempty"`
-	ImportRunID     string              `json:"import_run_id,omitempty"`
-	ImportTerm      uint64              `json:"import_term,omitempty"`
+	Group                  string              `json:"group"`
+	Selectors              []map[string]string `json:"selectors"`
+	NodeIDs                []string            `json:"node_ids,omitempty"`
+	APISecretFingerprint   string              `json:"api_secret_fingerprint,omitempty"`
+	APISecretType          string              `json:"api_secret_type,omitempty"`
+	APISecret              string              `json:"api_secret,omitempty"`
+	APISecretRef           string              `json:"api_secret_ref,omitempty"`
+	ManifestKeyFingerprint string              `json:"manifest_key_fingerprint,omitempty"`
+	ManifestKeyType        string              `json:"manifest_key_type,omitempty"`
+	ManifestKey            string              `json:"manifest_key,omitempty"`
+	ManifestKeyRef         string              `json:"manifest_key_ref,omitempty"`
+	ImportSourceID         string              `json:"import_source_id,omitempty"`
+	ImportOwnerID          string              `json:"import_owner_id,omitempty"`
+	ImportRunID            string              `json:"import_run_id,omitempty"`
+	ImportTerm             uint64              `json:"import_term,omitempty"`
 }
 
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
@@ -74,7 +79,7 @@ const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
 	CmdDelete        = "delete"         // destroy a sandbox
-	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md)
+	CmdKeyPut        = "key_put"        // install / renew an API/manifest key-pair lease
 	CmdKeyDrop       = "key_drop"       // drop a key lease
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )
@@ -91,6 +96,16 @@ type BuildEvent struct {
 	State      string `json:"state"`
 	TemplateID string `json:"template_id,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+}
+
+// ClusterSandboxContext carries Registry-owned sandbox identity to a node. The
+// node persists Group and RouteKey separately from user metadata, and stores the
+// optional AuthSandboxID as the stable credential subject. It never derives any
+// of these values from Command.SID.
+type ClusterSandboxContext struct {
+	Group         string `json:"group"`
+	RouteKey      string `json:"route_key"`
+	AuthSandboxID string `json:"auth_sandbox_id,omitempty"`
 }
 
 // CmdAck statuses.
@@ -148,21 +163,26 @@ type Command struct {
 	CmdID string `json:"cmd_id"`
 	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
 	SID   string `json:"sid,omitempty"`
-	// create
-	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
-	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold
-	Config         map[string]string `json:"config,omitempty"`       // merged sandbox config (node default ⊕ group ⊕ create)
-	AccessToken    string            `json:"access_token,omitempty"` // MAC(auth_key,sid), supplied by registry
+	// create and lifecycle credential binding
+	TemplateRef          string                 `json:"template_ref,omitempty"`           // snapshot template ref (cold start = fast restore)
+	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register
+	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
+	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
+	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
+	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect/exec-session import when the exact target is absent
 	// key_put / key_drop
-	ManifestKeyType string `json:"manifest_key_type,omitempty"` // inline | ref
-	ManifestKey     string `json:"manifest_key,omitempty"`      // hex; only on inline key_put
-	ManifestKeyRef  string `json:"manifest_key_ref,omitempty"`  // provider ref; resolved out-of-band by node owner
-	ExpiresUnix     int64  `json:"expires_unix,omitempty"`      // lease expiry (key_put)
+	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
+	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put
+	APISecretRef           string `json:"api_secret_ref,omitempty"`           // provider ref
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"` // full fingerprint of manifest content key
+	ManifestKeyType        string `json:"manifest_key_type,omitempty"`        // inline | ref
+	ManifestKey            string `json:"manifest_key,omitempty"`             // hex; only on inline key_put
+	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`         // provider ref
+	ExpiresUnix            int64  `json:"expires_unix,omitempty"`             // lease expiry (key_put)
 	// build_register (§7.5): pre-provision a build with registry-assigned ids +
 	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
 	// delivered WITH the build task and used transiently (never persisted on the node).
 	BuildID        string          `json:"build_id,omitempty"`
-	Profile        string          `json:"profile,omitempty"`
 	BuildResources *BuildResources `json:"build_resources,omitempty"`
 	ImageRepo      string          `json:"image_repo,omitempty"`
 	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient

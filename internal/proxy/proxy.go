@@ -39,7 +39,7 @@ type Route struct {
 	Kind        Kind
 	UDS         string // KindUDS
 	Addr        string // KindTCP, host:port
-	AccessToken string // expected envd access token ("" = no data-plane auth, e.g. bare)
+	AccessToken string // expected token selected for this forwarding target
 }
 
 const (
@@ -78,19 +78,19 @@ type RouteDialer func(context.Context, Route) (net.Conn, error)
 // RouteForTarget builds the forwarding decision for a resolved, running sandbox
 // from its targets + the requested port. Shared by the internal router (orch) and
 // the external route table so both classify ports identically.
-func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, accessToken string, port int) Route {
+func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwardAccessToken string, port int) Route {
 	control := port == 49983 || port == 49999
 	if profile == string(types.ProfileE2B) && control {
 		uds := envdUDS
 		if port == 49999 {
 			uds = ciUDS
 		}
-		return Route{Kind: KindUDS, UDS: uds, AccessToken: accessToken}
+		return Route{Kind: KindUDS, UDS: uds, AccessToken: envdAccessToken}
 	}
 	if profile == string(types.ProfileBare) && control {
 		return Route{Kind: KindDeny}
 	}
-	return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, port), AccessToken: accessToken}
+	return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, port), AccessToken: forwardAccessToken}
 }
 
 type Proxy struct {

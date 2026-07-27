@@ -9,24 +9,22 @@ import (
 	"strings"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const NodeOwnerRPCPath = "/internal/node-owner"
 
 type nodeOwnerRequest struct {
-	Op              string                    `json:"op"`
-	NodeID          string                    `json:"node_id,omitempty"`
-	Fingerprint     string                    `json:"fingerprint,omitempty"`
-	ManifestKeyType string                    `json:"manifest_key_type,omitempty"`
-	ManifestKey     string                    `json:"manifest_key,omitempty"`
-	ManifestKeyRef  string                    `json:"manifest_key_ref,omitempty"`
-	ExpiresUnix     int64                     `json:"expires_unix,omitempty"`
-	BuildID         string                    `json:"build_id,omitempty"`
-	Resources       *routesync.BuildResources `json:"resources,omitempty"`
-	SID             string                    `json:"sid,omitempty"`
-	Command         *routesync.Command        `json:"command,omitempty"`
-	TimeoutMS       int64                     `json:"timeout_ms,omitempty"`
+	Op                   string                    `json:"op"`
+	NodeID               string                    `json:"node_id,omitempty"`
+	KeyPair              *clusterstate.NodeKeyPair `json:"key_pair,omitempty"`
+	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
+	BuildID              string                    `json:"build_id,omitempty"`
+	Resources            *routesync.BuildResources `json:"resources,omitempty"`
+	SID                  string                    `json:"sid,omitempty"`
+	Command              *routesync.Command        `json:"command,omitempty"`
+	TimeoutMS            int64                     `json:"timeout_ms,omitempty"`
 }
 
 type nodeOwnerResponse struct {
@@ -53,15 +51,15 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	case "connected":
 		err = owner.Connected(req.Context(), in.NodeID)
 		out.OK = err == nil
-	case "put_manifest_key":
-		keyType, keyValue := in.ManifestKeyType, in.ManifestKey
-		if keyType == "ref" {
-			keyValue = in.ManifestKeyRef
+	case "put_key_pair":
+		if in.KeyPair == nil {
+			err = fmt.Errorf("registry: key pair is required")
+		} else {
+			err = owner.PutKeyPair(req.Context(), in.NodeID, *in.KeyPair)
 		}
-		err = owner.PutManifestKey(req.Context(), in.NodeID, in.Fingerprint, keyType, keyValue, in.ExpiresUnix)
 		out.OK = err == nil
-	case "drop_manifest_key":
-		err = owner.DropManifestKey(req.Context(), in.NodeID, in.Fingerprint)
+	case "drop_key_pair":
+		err = owner.DropKeyPair(req.Context(), in.NodeID, in.APISecretFingerprint)
 		out.OK = err == nil
 	case "admit_build":
 		out.OK = owner.AdmitBuild(req.Context(), in.NodeID, in.BuildID, in.Resources)
@@ -72,7 +70,7 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 		out.Node, out.Found, err = owner.Runtime(req.Context(), in.NodeID)
 		out.OK = err == nil
 	case "delete_sandbox":
-		err = owner.DeleteSandbox(req.Context(), in.NodeID, in.SID)
+		err = owner.DeleteSandbox(req.Context(), in.NodeID, in.SID, in.APISecretFingerprint)
 		out.OK = err == nil
 	case "send_command":
 		err = owner.SendCommand(req.Context(), in.NodeID, in.Command)
@@ -113,19 +111,13 @@ func (o *HTTPNodeOwner) Connected(ctx context.Context, nodeID string) error {
 	return err
 }
 
-func (o *HTTPNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	req := nodeOwnerRequest{Op: "put_manifest_key", NodeID: nodeID, Fingerprint: fingerprint, ManifestKeyType: keyType, ExpiresUnix: expiresUnix}
-	if keyType == "ref" {
-		req.ManifestKeyRef = keyValue
-	} else {
-		req.ManifestKey = keyValue
-	}
-	_, err := o.call(ctx, req)
+func (o *HTTPNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	_, err := o.call(ctx, nodeOwnerRequest{Op: "put_key_pair", NodeID: nodeID, KeyPair: &pair})
 	return err
 }
 
-func (o *HTTPNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	_, err := o.call(ctx, nodeOwnerRequest{Op: "drop_manifest_key", NodeID: nodeID, Fingerprint: fingerprint})
+func (o *HTTPNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	_, err := o.call(ctx, nodeOwnerRequest{Op: "drop_key_pair", NodeID: nodeID, APISecretFingerprint: apiSecretFingerprint})
 	return err
 }
 
@@ -143,8 +135,11 @@ func (o *HTTPNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord
 	return out.Node, out.Found, err
 }
 
-func (o *HTTPNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
-	_, err := o.call(ctx, nodeOwnerRequest{Op: "delete_sandbox", NodeID: nodeID, SID: sid})
+func (o *HTTPNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
+	_, err := o.call(ctx, nodeOwnerRequest{
+		Op: "delete_sandbox", NodeID: nodeID, SID: sid,
+		APISecretFingerprint: apiSecretFingerprint,
+	})
 	return err
 }
 

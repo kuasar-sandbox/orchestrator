@@ -246,7 +246,7 @@ chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1MiB } }
 crypto: { chunk: aes, manifest: aes }
 EOF
 
-MK="$("$BIN/e2b-key-ctl" gen-key)"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
+MK="$("$BIN/e2b-key-ctl" gen-key)"; API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # Cold boot needs a pre-formatted empty ext4 to seed the writable overlay upper
 # (deployment-provided in prod; created inline here). mkfs.ext4 may live in /sbin.
@@ -329,6 +329,7 @@ if [ "$code" != "201" ]; then
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
 
 # ---- list -----------------------------------------------------------------
@@ -394,7 +395,7 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
 grep -q 'EXIT_CODE 0' "$WORK/start-user-port.out" || { sed 's/^/  envd| /' "$WORK/start-user-port.out"; fail "start guest user-port server"; }
 ok=""
 for _ in $(seq 1 30); do
-    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$ENVD_TOKEN" || true)
+    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$FORWARD_TOKEN" || true)
     grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
     sleep 0.5
 done
@@ -417,7 +418,17 @@ if [ "$code" = "204" ]; then
     echo "==> resume via connect"
     code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
     [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
-    for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.3; done
+    # Connect acknowledges after import and schedules resume asynchronously. The
+    # old UDS path can survive pause, so its mere existence is not a readiness
+    # signal; probe the service until the restored envd is accepting requests.
+    resumed=""
+    for _ in $(seq 1 90); do
+        code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
+            -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
+        case "$code" in 200|204) resumed=1; break ;; esac
+        sleep 0.5
+    done
+    [ -n "$resumed" ] || fail "envd did not become ready after asynchronous resume"
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
     grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"

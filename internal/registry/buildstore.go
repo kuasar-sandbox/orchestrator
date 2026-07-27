@@ -25,15 +25,16 @@ const (
 
 // BuildRecord is the registry's view of a build (the node runs it + reports state).
 type BuildRecord struct {
-	Group      string                    `json:"group"`
-	BuildID    string                    `json:"build_id"`
-	NodeID     string                    `json:"node_id"`
-	Profile    types.Profile             `json:"profile"`
-	Resources  *routesync.BuildResources `json:"resources,omitempty"`
-	State      BuildState                `json:"state"`
-	TemplateID string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
-	Reason     string                    `json:"reason,omitempty"`
-	CreatedU   int64                     `json:"created_unix,omitempty"`
+	Group                string                    `json:"group"`
+	BuildID              string                    `json:"build_id"`
+	NodeID               string                    `json:"node_id"`
+	Profile              types.Profile             `json:"profile"`
+	APISecretFingerprint string                    `json:"api_secret_fingerprint"`
+	Resources            *routesync.BuildResources `json:"resources,omitempty"`
+	State                BuildState                `json:"state"`
+	TemplateID           string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	Reason               string                    `json:"reason,omitempty"`
+	CreatedU             int64                     `json:"created_unix,omitempty"`
 }
 
 // occupies reports whether the build still holds its reserved build resources

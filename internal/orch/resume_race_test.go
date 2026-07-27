@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"encoding/hex"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -10,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -22,12 +21,27 @@ import (
 
 // countingLauncher records how many times a unit was started — the launch count.
 type countingLauncher struct {
-	starts atomic.Int64
-	orch   *Orchestrator
+	starts    atomic.Int64
+	orch      *Orchestrator
+	started   chan<- struct{}
+	startGate <-chan struct{}
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 	l.starts.Add(1)
+	if l.started != nil {
+		select {
+		case l.started <- struct{}{}:
+		default:
+		}
+	}
+	if l.startGate != nil {
+		select {
+		case <-l.startGate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if l.orch != nil {
 		prefix := strings.TrimSuffix(l.orch.cfg.Units.Runner, ".service")
 		if strings.HasPrefix(unit, prefix) {
@@ -57,15 +71,8 @@ func (stubVS) Detach(context.Context, string) error { return nil }
 func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
 
 // TestResumeRace_ConnectAndRouteSingleLaunch is the regression guard for the
-// control-plane resume race: a paused sandbox hit concurrently by /connect
-// (control plane) and proxy traffic (data plane) must resume exactly once.
-//
-// Before the fix, Connect called resume directly while Route/OnWake went through
-// the per-sid single-flight, so the two paths could both launch — double port
-// attach + double unit start — and they mutated the shared cached *Sandbox
-// without synchronization (a data race). With Connect routed through the same
-// single-flight and resume publishing an immutable copy, this is one launch and
-// `go test -race` is clean.
+// control-plane resume race: an asynchronous /connect resume held inside its
+// flight and concurrent data-plane Route calls must still launch exactly once.
 func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
@@ -82,11 +89,14 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // allocInnerIP needs a valid CIDR
 
-	lc := &countingLauncher{}
+	started := make(chan struct{}, 4)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
 	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	o.SetClusterContext(ctx)
 	if err := o.StartRunPools(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -94,39 +104,78 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	// bare-img with no snapshot ref → launch reaches lc.Start without the e2b
 	// readiness wait or the snapshot-probe exec (RestoreRefFor returns "").
 	mk := strings.Repeat("a", 64)
-	raw, _ := hex.DecodeString(mk)
-	apiKey, err := apikey.Mint(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
-		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
+		ID: sid, Profile: types.ProfileBare, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
+		APISecret:   apiSecret,
 		ManifestKey: mk,
 		RunDir:      cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:     cfg.Paths.BaseRoot + "/" + sid,
 		CreatedUnix: 1,
 	}
+	materializeTestSandboxCredentials(t, sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 
-	// Fire /connect, several data-plane Route calls, and a couple of read-only
-	// MMDS lookups at the same paused sandbox simultaneously (released together
-	// for maximal contention on the cached pointer).
-	var wg sync.WaitGroup
-	release := make(chan struct{})
-	launchG := func(fn func()) { wg.Add(1); go func() { defer wg.Done(); <-release; fn() }() }
+	// Connect returns while its asynchronous resume is blocked in launcher.Start.
+	// That guarantees the Route calls below enter the same still-active flight.
+	connected, err := o.Connect(ctx, sid, apiKey, "", 60)
+	if err != nil || connected == nil || connected.State != types.StatePaused {
+		t.Fatalf("Connect = %+v, %v; want paused result and async resume", connected, err)
+	}
+	waitForLauncherStart(t, started)
+	o.sf.mu.Lock()
+	activeFlight := o.sf.m[sid]
+	o.sf.mu.Unlock()
+	if activeFlight == nil {
+		t.Fatal("asynchronous Connect resume did not register an active flight")
+	}
 
-	launchG(func() { _, _ = o.Connect(ctx, sid, apiKey, "", 60) })
-	for i := 0; i < 8; i++ {
-		launchG(func() { _, _ = o.Route(ctx, sid, 49983) })
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 7; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := o.Route(ctx, sid, 49983)
+			errs <- err
+		}()
 	}
-	for i := 0; i < 4; i++ {
-		launchG(func() { _, _ = o.ByFloatingIP("169.254.1.2"); _, _, _ = o.SandboxInfo(sid) })
+	// Execute one Route in this goroutine while the Connect flight is known to
+	// be active. The timer channel releases launcher.Start; until then Route must
+	// be waiting on that same flight rather than starting a second resume.
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStart := func() {
+		releaseOnce.Do(func() {
+			close(startGate)
+			close(released)
+		})
 	}
-	close(release)
+	timer := time.AfterFunc(100*time.Millisecond, releaseStart)
+	_, routeErr := o.Route(ctx, sid, 49983)
+	returnedBeforeRelease := timer.Stop()
+	if returnedBeforeRelease {
+		releaseStart()
+	} else {
+		<-released
+	}
+	errs <- routeErr
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Route during Connect resume: %v", err)
+		}
+	}
+	if returnedBeforeRelease {
+		t.Fatal("Route returned while the asynchronous Connect resume was still blocked")
+	}
+	waitForSandbox(t, o, ctx, sid, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateRunning
+	}, "running after Connect/Route resume")
 
 	if got := lc.starts.Load(); got != 1 {
 		t.Fatalf("launch (lc.Start) called %d times; want exactly 1 — concurrent connect+route must collapse to one resume", got)

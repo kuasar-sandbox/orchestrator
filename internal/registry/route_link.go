@@ -27,20 +27,27 @@ const (
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
 type RouteResolve struct {
-	SID                string `json:"sid"`
-	Group              string `json:"group"`
-	RouteKey           string `json:"route_key"`
-	NodeID             string `json:"node_id"`
-	DataEndpoint       string `json:"data_endpoint"`
-	AccessToken        string `json:"access_token"`
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
-	TargetPort         int    `json:"target_port,omitempty"`
-	State              string `json:"state"`
+	SID                    string `json:"sid"`
+	Group                  string `json:"group"`
+	RouteKey               string `json:"route_key"`
+	NodeID                 string `json:"node_id"`
+	DataEndpoint           string `json:"data_endpoint"`
+	Profile                string `json:"profile"`
+	AuthSandboxID          string `json:"auth_sandbox_id"`
+	APISecret              string `json:"api_secret"`
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ServiceSecret          string `json:"service_secret"`
+	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken     string `json:"forward_access_token"`
+	TargetPort             int    `json:"target_port,omitempty"`
+	State                  string `json:"state"`
 }
 
 // SandboxReserveReq is the router-to-registry create payload. Config remains a
-// map because it follows the existing placement command carrier, but cluster
-// ingress currently admits only the restore namespace into it.
+// map because it follows the existing placement command carrier. Cluster ingress
+// admits only the request-scoped restore and credentials namespaces into it.
 type SandboxReserveReq struct {
 	Config map[string]string `json:"config,omitempty"`
 }
@@ -57,7 +64,7 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 }
 
 // serveVerifyKey verifies an api key through the placer-owned group provider
-// view. Registry route owners do not read auth_key; they only fail over across
+// view. Registry route owners do not consult the group provider; they only fail over across
 // ready placers. A 403 hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
@@ -154,19 +161,18 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	for key := range body.Config {
-		if key != sandboxcfg.NsRestore {
+		if key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials {
 			http.Error(w, fmt.Sprintf("unsupported sandbox reserve config %q", key), http.StatusBadRequest)
 			return
 		}
 	}
-	config, err := sandboxcfg.NormalizeRestoreMetadata(body.Config)
+	res, err := r.ReserveSandbox(req.Context(), group, routeKey, body.Config)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	res, err := r.ReserveSandbox(req.Context(), group, routeKey, config)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errInvalidSandboxConfig) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	writeJSON(w, res)
@@ -218,11 +224,20 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	if rec.SID != sid {
 		return nil, false, nil
 	}
+	if rec.State == StateReady || rec.State == StatePaused || hasRouteCredentials(rec) {
+		if _, _, err := replacementCredentials(rec); err != nil {
+			return nil, false, err
+		}
+	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
-		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
-		State: string(rec.State),
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile,
+		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
+		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
+		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
+		TargetPort: rec.TargetPort,
+		State:      string(rec.State),
 	}, true, nil
 }
 

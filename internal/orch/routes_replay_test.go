@@ -2,12 +2,93 @@ package orch
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
+	apiSecret := strings.Repeat("1", 64)
+	manifestKey := strings.Repeat("2", 64)
+	sb := &types.Sandbox{
+		ID: "node-s1", AuthSandboxIDValue: "stable-s1", Profile: types.ProfileE2B,
+		TemplateID: "template", State: types.StateRunning,
+		EnvdUDS: "/run/s1/envd.sock", CiUDS: "/run/s1/ci.sock", FloatingIP: "100.100.0.2",
+		APISecret: apiSecret, ManifestKey: manifestKey, ServiceSecret: strings.Repeat("3", 64),
+		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
+		SnapshotRef: "manifest://snapshot",
+	}
+	apiFingerprint, err := store.APISecretHash(apiSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestFingerprint, err := store.ManifestKeyHash(manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := (&Orchestrator{}).routeEntry(sb)
+	if got.SandboxID != sb.ID || got.AuthSandboxID != "stable-s1" ||
+		got.APISecret != apiSecret || got.APISecretFingerprint != apiFingerprint ||
+		got.ManifestKeyFingerprint != manifestFingerprint || got.ServiceSecret != sb.ServiceSecret ||
+		got.EnvdAccessToken != "envd" || got.TrafficAccessToken != "traffic" ||
+		got.ForwardAccessToken != "forward" || got.SnapshotLocation != "remote" ||
+		got.MmdsSecret != hex.EncodeToString(keys.MmdsSecret(manifestKey, sb.ID)) {
+		t.Fatalf("route entry = %+v", got)
+	}
+	wire, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), manifestKey) {
+		t.Fatal("route entry exposed manifest encryption key")
+	}
+}
+
+func TestInternalRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
+	o := &Orchestrator{reg: map[string]*types.Sandbox{
+		"e2b": {
+			ID: "e2b", Profile: types.ProfileE2B, State: types.StateRunning,
+			EnvdUDS: "/run/e2b/envd.sock", CiUDS: "/run/e2b/ci.sock", FloatingIP: "100.100.0.2",
+			EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
+		},
+		"bare": {
+			ID: "bare", Profile: types.ProfileBare, State: types.StateRunning, FloatingIP: "100.100.0.3",
+			EnvdAccessToken: "unused-envd", TrafficAccessToken: "unused-traffic", ForwardAccessToken: "bare-forward",
+		},
+	}}
+	tests := []struct {
+		sid       string
+		port      int
+		wantKind  proxy.Kind
+		wantToken string
+	}{
+		{"e2b", 49983, proxy.KindUDS, "envd"},
+		{"e2b", 49999, proxy.KindUDS, "envd"},
+		{"e2b", 8080, proxy.KindTCP, "forward"},
+		{"bare", 49983, proxy.KindDeny, ""},
+		{"bare", 49999, proxy.KindDeny, ""},
+		{"bare", 8080, proxy.KindTCP, "bare-forward"},
+	}
+	for _, tc := range tests {
+		route, err := o.Route(context.Background(), tc.sid, tc.port)
+		if err != nil {
+			t.Fatalf("Route(%s, %d): %v", tc.sid, tc.port, err)
+		}
+		if route.Kind != tc.wantKind || route.AccessToken != tc.wantToken {
+			t.Fatalf("Route(%s, %d) = %+v, want kind=%v token=%q", tc.sid, tc.port, route, tc.wantKind, tc.wantToken)
+		}
+	}
+}
 
 func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	o := &Orchestrator{

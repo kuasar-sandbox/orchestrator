@@ -39,8 +39,9 @@ proxy:
 # encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
 # standby (decrypt during rotation). Prefer the NODE_CONFIG_ENCRYPTION_KEY env
 # (overrides this). Generate one: `openssl rand -hex 32`. Which manifest keys may
-# create/build/import is the manifest_keys table (node-ctl manifest-key …);
-# e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
+# create/build/import uses APISecret+ManifestKey pairs in the manifest_keys table
+# (node-ctl manifest-key …). If APISecret is omitted it is derived with the fixed
+# KDF (`e2b-key-ctl derive-api-secret`); API keys are minted from APISecret.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
 # Shared remote manifest store (manifest.key left empty; the tenant key arrives via

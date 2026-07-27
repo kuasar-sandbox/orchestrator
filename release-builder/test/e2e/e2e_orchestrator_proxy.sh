@@ -257,7 +257,7 @@ chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1MiB } }
 crypto: { chunk: aes, manifest: aes }
 EOF
 
-MK="$("$BIN/e2b-key-ctl" gen-key)"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
+MK="$("$BIN/e2b-key-ctl" gen-key)"; API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # Cold boot needs a pre-formatted empty ext4 to seed the writable overlay upper.
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
@@ -359,8 +359,10 @@ if [ "$code" != "201" ]; then
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-[ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] || fail "missing sandboxID/envdAccessToken in create response"
-echo "==> PASS: sandbox $SID running (envd token captured)"
+FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
+[ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
+    || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
+echo "==> PASS: sandbox $SID running (envd and forward tokens captured)"
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
@@ -441,7 +443,7 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
 grep -q 'EXIT_CODE 0' "$WORK/start-user-port.out" || { sed 's/^/  envd| /' "$WORK/start-user-port.out"; fail "start guest user-port server"; }
 ok=""
 for _ in $(seq 1 30); do
-    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$ENVD_TOKEN" || true)
+    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$FORWARD_TOKEN" || true)
     grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
     sleep 0.5
 done

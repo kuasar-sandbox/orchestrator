@@ -62,13 +62,14 @@ trap cleanup EXIT
 
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-# Derive tenant credentials. MK is the allowlisted tenant (its api key AK may
-# create/build); MK_OTHER is a valid but NOT-allowlisted other tenant. ENC is the
-# orchestrator's at-rest encryption key.
+# Derive tenant credential pairs. ManifestKey protects content; the fixed KDF
+# yields APISecret, which alone mints API keys. MK_OTHER remains unallowlisted.
 MK="$("$BIN/e2b-key-ctl" gen-key)"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 MK_OTHER="$("$BIN/e2b-key-ctl" gen-key)"
-AK_OTHER="$("$BIN/e2b-key-ctl" gen-apikey "$MK_OTHER")"
+API_SECRET_OTHER="$("$BIN/e2b-key-ctl" derive-api-secret "$MK_OTHER")"
+AK_OTHER="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET_OTHER")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # curl helper: $1=method $2=path $3=api-key $4=body(optional). Prints "<code>\n<body>".
@@ -117,7 +118,7 @@ for i in $(seq 1 30); do
 done
 
 # Allowlist MK so it may create/build — now via serve's admin plane on the control
-# socket (the daemon owns the manifest_keys table), so it runs AFTER serve is up.
+# socket (the daemon owns the manifest_keys credential-pair table), so it runs AFTER serve is up.
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add failed"
 
 # ---- 1. assert unit auto-install ------------------------------------------
@@ -140,11 +141,11 @@ code=$(req POST /sandboxes "e2b_deadbeef_not_a_real_token" '{"templateID":"x"}')
 [ "$code" = "401" ] || fail "POST /sandboxes with malformed key = $code (want 401)"
 echo "==> PASS: control plane up; auth rejects missing/malformed keys (401)"
 
-# A valid api key whose manifest key is NOT allowlisted: passes the format check
+# A valid api key whose APISecret+ManifestKey pair is NOT allowlisted: passes the format check
 # (not 401) but create/register is refused with 403.
 code=$(req POST /v3/templates "$AK_OTHER" '{"name":"denied"}')
 [ "$code" = "403" ] || fail "register with non-allowlisted key = $code (want 403)"
-echo "==> PASS: non-allowlisted manifest key refused (403)"
+echo "==> PASS: non-allowlisted credential pair refused (403)"
 
 # ---- 3. build API (e2b v3) + ownership ------------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"]}')

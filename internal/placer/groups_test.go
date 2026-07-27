@@ -2,26 +2,30 @@ package placer
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+const testAPISecret = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 const testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 
 func TestFileGroupSourceProviderMethods(t *testing.T) {
 	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
-		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		APISecret:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
 		TemplateRef:   "tmpl",
 		NodeSelectors: []map[string]string{{"pool": "p"}},
 	})
@@ -42,9 +46,9 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 	if err != nil || !found || key.Value != testManifestKey {
 		t.Fatalf("key=%+v found=%v err=%v", key, found, err)
 	}
-	authKey, found, err := src.GetAuthKey(ctx, "/g")
-	if err != nil || !found || authKey.Value != testAuthKey {
-		t.Fatalf("auth=%+v found=%v err=%v", authKey, found, err)
+	apiSecret, found, err := src.GetAPISecret(ctx, "/g")
+	if err != nil || !found || apiSecret.Value != testAPISecret {
+		t.Fatalf("api secret=%+v found=%v err=%v", apiSecret, found, err)
 	}
 	page, err := src.Range(ctx, "", 10)
 	if err != nil || len(page.Groups) != 1 || page.Groups[0] != "/g" {
@@ -54,7 +58,7 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 
 func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	dir := t.TempDir()
-	raw := `{"group":"/g","manifest_key":"` + testManifestKey + `","auth_key":"` + testAuthKey + `","node_selectors":[{"pool":"p"}]}`
+	raw := `{"group":"/g","manifest_key":"` + testManifestKey + `","api_secret":"` + testAPISecret + `","node_selectors":[{"pool":"p"}]}`
 	if err := os.WriteFile(filepath.Join(dir, "g.json"), []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -68,10 +72,189 @@ func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	}
 }
 
+func TestFileGroupSourceDerivesMissingAPISecret(t *testing.T) {
+	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
+		Group:       "/g",
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+	})
+
+	got, found, err := src.GetAPISecret(context.Background(), "/g")
+	if err != nil || !found {
+		t.Fatalf("GetAPISecret found=%v err=%v", found, err)
+	}
+	manifestKey, err := hex.DecodeString(testManifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := hex.EncodeToString(apikey.DeriveAPISecret(manifestKey))
+	if got.Type != clusterstate.SecretInline || got.Value != want {
+		t.Fatalf("GetAPISecret=%+v, want inline %q", got, want)
+	}
+}
+
+func TestFileGroupSourceExplicitAPISecretWins(t *testing.T) {
+	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
+		Group:       "/g",
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		APISecret:   clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
+	})
+
+	got, found, err := src.GetAPISecret(context.Background(), "/g")
+	if err != nil || !found || got.Value != testAPISecret {
+		t.Fatalf("GetAPISecret=%+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestCredentialRootsRequireLowercaseHex32(t *testing.T) {
+	badValues := []string{
+		testManifestKey[:62],
+		strings.ToUpper(testManifestKey),
+		testManifestKey[:63] + "g",
+	}
+	for _, value := range badValues {
+		if _, err := normalizeManifestKey(clusterstate.Secret{Type: clusterstate.SecretInline, Value: value}); err == nil {
+			t.Fatalf("normalizeManifestKey(%q) unexpectedly succeeded", value)
+		}
+		if _, err := materializeAPISecret(clusterstate.Secret{}, clusterstate.Secret{Type: clusterstate.SecretInline, Value: value}); err == nil {
+			t.Fatalf("materializeAPISecret(%q) unexpectedly succeeded", value)
+		}
+	}
+}
+
+func TestVerifyAPIKeyUsesAPISecret(t *testing.T) {
+	apiSecret, err := hex.DecodeString(testAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := apikey.Mint(apiSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifyAPIKey(testAPISecret, encoded) {
+		t.Fatal("API key signed by APISecret was rejected")
+	}
+	if verifyAPIKey(testManifestKey, encoded) {
+		t.Fatal("ManifestKey must not authenticate an API key")
+	}
+}
+
+func TestCredentialPatchesUseFullFingerprints(t *testing.T) {
+	manifestFP, _, _, _, err := manifestKeyPatch("/g", clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiFP, _, _, _, err := apiSecretPatch("/g", clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifestFP) != 64 || len(apiFP) != 64 {
+		t.Fatalf("fingerprint lengths manifest=%d api=%d, want 64", len(manifestFP), len(apiFP))
+	}
+}
+
+func TestCredentialPairPatchDerivesMissingAPISecret(t *testing.T) {
+	apiFP, apiType, apiValue, _, manifestFP, manifestType, manifestValue, _, err := credentialPairPatch(
+		"/g",
+		clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		clusterstate.Secret{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestKey, err := hex.DecodeString(testManifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAPISecret := hex.EncodeToString(apikey.DeriveAPISecret(manifestKey))
+	if apiFP == "" || manifestFP == "" || apiType != clusterstate.SecretInline || manifestType != clusterstate.SecretInline || apiValue != wantAPISecret || manifestValue != testManifestKey {
+		t.Fatalf("credential pair mismatch: api=(%q,%q,%q) manifest=(%q,%q,%q)", apiFP, apiType, apiValue, manifestFP, manifestType, manifestValue)
+	}
+}
+
+func TestCredentialPairPatchRejectsHalfPair(t *testing.T) {
+	_, _, _, _, _, _, _, _, err := credentialPairPatch(
+		"/g",
+		clusterstate.Secret{},
+		clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
+	)
+	if err == nil {
+		t.Fatal("APISecret without ManifestKey unexpectedly formed a credential pair")
+	}
+}
+
+func TestCredentialPairPatchRejectsIncompleteExplicitCarriers(t *testing.T) {
+	fullFingerprint := strings.Repeat("a", 64)
+	tests := []struct {
+		name        string
+		manifestKey clusterstate.Secret
+		apiSecret   clusterstate.Secret
+	}{
+		{
+			name:        "APISecret ref without value",
+			manifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+			apiSecret:   clusterstate.Secret{Type: clusterstate.SecretRef, Fingerprint: fullFingerprint},
+		},
+		{
+			name:        "ManifestKey ref without value",
+			manifestKey: clusterstate.Secret{Type: clusterstate.SecretRef, Fingerprint: fullFingerprint},
+		},
+		{
+			name:        "APISecret inline without value",
+			manifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+			apiSecret:   clusterstate.Secret{Type: clusterstate.SecretInline},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, _, _, _, _, _, _, err := credentialPairPatch("/g", tt.manifestKey, tt.apiSecret); err == nil {
+				t.Fatal("incomplete explicit carrier unexpectedly formed a credential pair")
+			}
+		})
+	}
+}
+
+func TestVerifyKeyDerivesMissingAPISecretFromManifestKey(t *testing.T) {
+	manifestKey, err := hex.DecodeString(testManifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := apikey.Mint(apikey.DeriveAPISecret(manifestKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewRemoteLinksWithGroups(nil, derivingAPISecretProvider{}, nil, clustercfg.PlacementConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	req := httptest.NewRequest(http.MethodGet, "/verify?group=/g", nil)
+	req.Header.Set("X-API-KEY", encoded)
+	rec := httptest.NewRecorder()
+
+	svc.serveVerifyKey(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("serveVerifyKey status=%d body=%q, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+type derivingAPISecretProvider struct{}
+
+func (derivingAPISecretProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+	return clusterstate.SandboxGroup{Group: "/g"}, true, nil
+}
+
+func (derivingAPISecretProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+	return clusterstate.PlacementHint{}, true, nil
+}
+
+func (derivingAPISecretProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
+}
+
+func (derivingAPISecretProvider) GetAPISecret(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{}, false, nil
+}
+
 func TestAnswerIncludesGroupMaterial(t *testing.T) {
 	svc := testServiceWithGroups(t, clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
-		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		APISecret:   clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
 		TemplateRef: "tmpl", Config: map[string]string{"a": "1"}, NodeSelectors: []map[string]string{{"pool": "p"}},
 	})
 	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}})
@@ -83,12 +266,8 @@ func TestAnswerIncludesGroupMaterial(t *testing.T) {
 	if res.NodeID != "n1" || res.TemplateRef != "tmpl" || res.Config["a"] != "1" || res.Config["b"] != "2" {
 		t.Fatalf("placement material mismatch: %+v", res)
 	}
-	want, err := clusterstate.DeriveAccessToken(testAuthKey, "sb-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.AccessToken != want || res.KeyFingerprint == "" {
-		t.Fatalf("token/key mismatch: %+v want token %q", res, want)
+	if res.APISecretFingerprint == "" {
+		t.Fatalf("placement omitted the full APISecret fingerprint: %+v", res)
 	}
 }
 
@@ -96,7 +275,7 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 	dir := t.TempDir()
 	writeGroupFile(t, dir, "g.json", clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
-		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		APISecret:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
 		TemplateRef:   "tmpl",
 		NodeSelectors: []map[string]string{{"pool": "p"}},
 	})

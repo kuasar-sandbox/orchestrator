@@ -2,6 +2,7 @@ package placer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -81,7 +82,7 @@ func (emptyGroupProvider) GetKey(context.Context, string) (clusterstate.Secret, 
 	return clusterstate.Secret{}, false, nil
 }
 
-func (emptyGroupProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (emptyGroupProvider) GetAPISecret(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{}, false, nil
 }
 
@@ -149,11 +150,11 @@ func (m multiGroupProvider) GetKey(ctx context.Context, group string) (clusterst
 	return out, foundOne != "", nil
 }
 
-func (m multiGroupProvider) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+func (m multiGroupProvider) GetAPISecret(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
 	var out clusterstate.Secret
 	foundOne := ""
 	for _, source := range m.sources {
-		key, found, err := source.GetAuthKey(ctx, group)
+		key, found, err := source.GetAPISecret(ctx, group)
 		if err != nil {
 			return clusterstate.Secret{}, false, err
 		}
@@ -199,15 +200,23 @@ func (s *fileGroupSource) GetKey(ctx context.Context, group string) (clusterstat
 	if err != nil || !found {
 		return clusterstate.Secret{}, false, err
 	}
-	return rec.ManifestKey, true, nil
+	key, err := normalizeManifestKey(rec.ManifestKey)
+	if err != nil {
+		return clusterstate.Secret{}, false, fmt.Errorf("placer: group %q: %w", group, err)
+	}
+	return key, true, nil
 }
 
-func (s *fileGroupSource) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+func (s *fileGroupSource) GetAPISecret(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
 	rec, found, err := s.find(ctx, group)
 	if err != nil || !found {
 		return clusterstate.Secret{}, false, err
 	}
-	return rec.AuthKey, true, nil
+	apiSecret, err := materializeAPISecret(rec.ManifestKey, rec.APISecret)
+	if err != nil {
+		return clusterstate.Secret{}, false, fmt.Errorf("placer: group %q: %w", group, err)
+	}
+	return apiSecret, true, nil
 }
 
 func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
@@ -342,45 +351,209 @@ func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
 	return s.Value, nil
 }
 
-func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyValue, keyRef string, err error) {
-	if key.Value == "" {
-		return "", "", "", "", nil
+func secretAbsent(secret clusterstate.Secret) bool {
+	return secret.Type == "" && secret.Value == "" && secret.Fingerprint == ""
+}
+
+func decodeRoot(kind, value string) ([]byte, error) {
+	if len(value) != 64 {
+		return nil, fmt.Errorf("%s must be 64 lowercase hexadecimal characters", kind)
 	}
-	keyType = key.Type
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return nil, fmt.Errorf("%s must be 64 lowercase hexadecimal characters", kind)
+		}
+	}
+	raw, err := hex.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be 64 lowercase hexadecimal characters", kind)
+	}
+	return raw, nil
+}
+
+func normalizeManifestKey(key clusterstate.Secret) (clusterstate.Secret, error) {
+	if secretAbsent(key) {
+		return clusterstate.Secret{}, nil
+	}
+	keyType := key.Type
 	if keyType == "" {
 		keyType = clusterstate.SecretInline
 	}
 	switch keyType {
 	case clusterstate.SecretInline:
-		fp = manifestKeyFingerprint(key.Value)
-		if fp == "" {
-			return "", "", "", "", fmt.Errorf("placer: invalid manifest_key for group %q", group)
+		if key.Value == "" {
+			return clusterstate.Secret{}, fmt.Errorf("manifest_key inline value is required")
+		}
+		if _, err := decodeRoot("manifest_key", key.Value); err != nil {
+			return clusterstate.Secret{}, err
+		}
+		return clusterstate.Secret{Type: keyType, Value: key.Value}, nil
+	case clusterstate.SecretRef:
+		if key.Value == "" {
+			return clusterstate.Secret{}, fmt.Errorf("manifest_key ref value is required")
+		}
+		if !isLowerHex64(key.Fingerprint) {
+			return clusterstate.Secret{}, fmt.Errorf("manifest_key ref requires a 64-character lowercase hexadecimal fingerprint")
+		}
+		return clusterstate.Secret{Type: keyType, Value: key.Value, Fingerprint: key.Fingerprint}, nil
+	default:
+		return clusterstate.Secret{}, fmt.Errorf("unknown manifest_key type %q", keyType)
+	}
+}
+
+func normalizeAPISecret(apiSecret clusterstate.Secret) (clusterstate.Secret, error) {
+	if secretAbsent(apiSecret) {
+		return clusterstate.Secret{}, nil
+	}
+	secretType := apiSecret.Type
+	if secretType == "" {
+		secretType = clusterstate.SecretInline
+	}
+	switch secretType {
+	case clusterstate.SecretInline:
+		if apiSecret.Value == "" {
+			return clusterstate.Secret{}, fmt.Errorf("api_secret inline value is required")
+		}
+		if _, err := decodeRoot("api_secret", apiSecret.Value); err != nil {
+			return clusterstate.Secret{}, err
+		}
+		return clusterstate.Secret{Type: secretType, Value: apiSecret.Value}, nil
+	case clusterstate.SecretRef:
+		if apiSecret.Value == "" {
+			return clusterstate.Secret{}, fmt.Errorf("api_secret ref value is required")
+		}
+		if !isLowerHex64(apiSecret.Fingerprint) {
+			return clusterstate.Secret{}, fmt.Errorf("api_secret ref requires a 64-character lowercase hexadecimal fingerprint")
+		}
+		return clusterstate.Secret{Type: secretType, Value: apiSecret.Value, Fingerprint: apiSecret.Fingerprint}, nil
+	default:
+		return clusterstate.Secret{}, fmt.Errorf("unknown api_secret type %q", secretType)
+	}
+}
+
+func materializeAPISecret(manifestKey, apiSecret clusterstate.Secret) (clusterstate.Secret, error) {
+	if !secretAbsent(apiSecret) {
+		return normalizeAPISecret(apiSecret)
+	}
+	if secretAbsent(manifestKey) {
+		return clusterstate.Secret{}, nil
+	}
+	manifestKey, err := normalizeManifestKey(manifestKey)
+	if err != nil {
+		return clusterstate.Secret{}, err
+	}
+	if manifestKey.Type != clusterstate.SecretInline {
+		return clusterstate.Secret{}, fmt.Errorf("api_secret is required when manifest_key is not inline")
+	}
+	raw, err := hex.DecodeString(manifestKey.Value)
+	if err != nil {
+		return clusterstate.Secret{}, fmt.Errorf("manifest_key must be 64 lowercase hexadecimal characters")
+	}
+	return clusterstate.Secret{
+		Type:  clusterstate.SecretInline,
+		Value: hex.EncodeToString(apikey.DeriveAPISecret(raw)),
+	}, nil
+}
+
+func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyValue, keyRef string, err error) {
+	key, err = normalizeManifestKey(key)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
+	}
+	if key.Value == "" {
+		return "", "", "", "", nil
+	}
+	keyType = key.Type
+	switch keyType {
+	case clusterstate.SecretInline:
+		fp, err = manifestKeyFingerprint(key.Value)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
 		}
 		return fp, keyType, key.Value, "", nil
 	case clusterstate.SecretRef:
-		if key.Fingerprint == "" {
-			return "", "", "", "", fmt.Errorf("placer: manifest_key ref for group %q missing fingerprint", group)
-		}
 		return key.Fingerprint, keyType, "", key.Value, nil
 	default:
-		return "", "", "", "", fmt.Errorf("placer: unknown manifest_key type %q", keyType)
+		return "", "", "", "", fmt.Errorf("placer: group %q: unknown manifest_key type %q", group, keyType)
 	}
 }
 
-func manifestKeyFingerprint(manifestKeyHex string) string {
-	raw, err := hex.DecodeString(manifestKeyHex)
+func apiSecretPatch(group string, apiSecret clusterstate.Secret) (fp, secretType, secretValue, secretRef string, err error) {
+	apiSecret, err = normalizeAPISecret(apiSecret)
 	if err != nil {
-		return ""
+		return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
 	}
-	return hex.EncodeToString(apikey.Fingerprint(raw))
+	if apiSecret.Value == "" {
+		return "", "", "", "", nil
+	}
+	secretType = apiSecret.Type
+	switch secretType {
+	case clusterstate.SecretInline:
+		fp, err = apiSecretFingerprint(apiSecret.Value)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
+		}
+		return fp, secretType, apiSecret.Value, "", nil
+	case clusterstate.SecretRef:
+		return apiSecret.Fingerprint, secretType, "", apiSecret.Value, nil
+	default:
+		return "", "", "", "", fmt.Errorf("placer: group %q: unknown api_secret type %q", group, secretType)
+	}
 }
 
-func verifyAPIKey(authKeyHex, encoded string) bool {
+func credentialPairPatch(group string, manifestKey, apiSecret clusterstate.Secret) (
+	apiFP, apiType, apiValue, apiRef,
+	manifestFP, manifestType, manifestValue, manifestRef string,
+	err error,
+) {
+	apiSecret, err = materializeAPISecret(manifestKey, apiSecret)
+	if err != nil {
+		return "", "", "", "", "", "", "", "", fmt.Errorf("placer: group %q: %w", group, err)
+	}
+	manifestFP, manifestType, manifestValue, manifestRef, err = manifestKeyPatch(group, manifestKey)
+	if err != nil {
+		return "", "", "", "", "", "", "", "", err
+	}
+	apiFP, apiType, apiValue, apiRef, err = apiSecretPatch(group, apiSecret)
+	if err != nil {
+		return "", "", "", "", "", "", "", "", err
+	}
+	if (apiFP == "") != (manifestFP == "") {
+		return "", "", "", "", "", "", "", "", fmt.Errorf("placer: group %q: api_secret and manifest_key must be configured as one pair", group)
+	}
+	return apiFP, apiType, apiValue, apiRef,
+		manifestFP, manifestType, manifestValue, manifestRef, nil
+}
+
+func manifestKeyFingerprint(manifestKeyHex string) (string, error) {
+	raw, err := decodeRoot("manifest_key", manifestKeyHex)
+	if err != nil {
+		return "", err
+	}
+	fp := sha256.Sum256(raw)
+	return hex.EncodeToString(fp[:]), nil
+}
+
+func apiSecretFingerprint(apiSecretHex string) (string, error) {
+	raw, err := decodeRoot("api_secret", apiSecretHex)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(apikey.FullFingerprint(raw)), nil
+}
+
+func isLowerHex64(value string) bool {
+	_, err := decodeRoot("fingerprint", value)
+	return err == nil
+}
+
+func verifyAPIKey(apiSecretHex, encoded string) bool {
 	p, err := apikey.Parse(encoded)
 	if err != nil {
 		return false
 	}
-	raw, err := hex.DecodeString(authKeyHex)
+	raw, err := decodeRoot("api_secret", apiSecretHex)
 	if err != nil {
 		return false
 	}

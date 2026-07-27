@@ -14,13 +14,20 @@ import (
 // (defense in depth, and the only check for ports envd does not front: the
 // code-interpreter port and user floatingip ports).
 //
-// Exemptions: auth off, a route with no token (bare), and envd pre-signed
-// /files URLs. The proxy verifies those signatures before forwarding; envd then
-// verifies the same URL again in-guest.
+// Exemptions: auth off and envd pre-signed /files URLs. The proxy verifies those
+// signatures before forwarding; envd then verifies the same URL again in-guest.
 func (p *Proxy) authorized(r *http.Request, route Route, port int) bool {
 	mode := p.authMode()
-	if mode == config.AuthOff || route.AccessToken == "" {
+	if mode == config.AuthOff {
 		return true
+	}
+	if route.AccessToken == "" {
+		if mode == config.AuthLog {
+			p.log.Warn("data-plane route has no expected access token (log mode; forwarding anyway)",
+				"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path)
+			return true
+		}
+		return false
 	}
 	res := envdsign.CheckDataPlaneAuth(r, port, route.AccessToken, time.Now())
 	if res.OK {

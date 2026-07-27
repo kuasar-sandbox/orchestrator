@@ -30,6 +30,12 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	if _, err := Seal(mk, Creds{}); err == nil {
 		t.Fatal("sealing empty creds should error")
 	}
+	if _, err := Seal(strings.ToUpper(mk), c); err == nil {
+		t.Fatal("uppercase manifest key should be rejected")
+	}
+	if _, err := Open(strings.ToUpper(mk), tok); err == nil {
+		t.Fatal("opening with a non-canonical manifest key should be rejected")
+	}
 }
 
 func TestDockerAuth(t *testing.T) {

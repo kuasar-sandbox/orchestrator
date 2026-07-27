@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -37,7 +38,7 @@ func TestCreateRestoreMetadataHeaderWinsAndNarrows(t *testing.T) {
 	))
 	req.Header.Set(HeaderRestore, ` { "prefetch": "off" } `)
 
-	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +51,7 @@ func TestCreateRestoreMetadataRejectsInvalidPolicy(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
 		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`,
 	))
-	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
 		t.Fatal("invalid restore prefetch should be rejected")
 	}
 }
@@ -60,8 +61,35 @@ func TestCreateRestoreMetadataEmptyHeaderOverridesBodyAndRejects(t *testing.T) {
 		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`,
 	))
 	req.Header.Set(HeaderRestore, "")
-	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
 		t.Fatal("an explicitly empty restore header should override body metadata and be rejected")
+	}
+}
+
+func TestCreateSandboxMetadataCredentialsHeaderWinsAsWholeObject(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}","kuasar-sandbox.credentials":"{\"envd_access_token\":\"body\"}"}}`,
+	))
+	req.Header.Set(HeaderCredentials, ` { "traffic_access_token": "header" } `)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` ||
+		got[sandboxcfg.NsCredentials] != `{"traffic_access_token":"header"}` {
+		t.Fatalf("create metadata = %+v", got)
+	}
+	if strings.Contains(got[sandboxcfg.NsCredentials], "body") {
+		t.Fatalf("credentials objects were field-merged: %+v", got)
+	}
+}
+
+func TestCreateSandboxMetadataRejectsInvalidCredentials(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
+	req.Header.Set(HeaderCredentials, `{"forward_access_token":"forbidden"}`)
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("forbidden credentials field was accepted")
 	}
 }
 
@@ -72,7 +100,7 @@ func TestCreateRestoreMetadataAcceptsBodyPastOneMiB(t *testing.T) {
 		t.Fatal("test body must be valid JSON with restore metadata after 1 MiB")
 	}
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
-	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,21 +125,22 @@ func (r fillReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestCreateRestoreMetadataHeaderBypassesBody(t *testing.T) {
+func TestCreateSandboxMetadataHeadersBypassBody(t *testing.T) {
 	body := &failOnRead{}
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
 	req.Body = io.NopCloser(body)
 	req.ContentLength = maxClusterCreateBodyBytes + 1
 	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
+	req.Header.Set(HeaderCredentials, `{}`)
 
-	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if body.read {
 		t.Fatal("restore header path read the create body")
 	}
-	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
+	if len(got) != 2 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` || got[sandboxcfg.NsCredentials] != `{}` {
 		t.Fatalf("restore metadata=%v", got)
 	}
 }
@@ -141,7 +170,7 @@ func TestCreateRestoreMetadataAcceptsExact16MiBChunkedBody(t *testing.T) {
 	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes))
 	req.ContentLength = -1
 
-	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err != nil {
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err != nil {
 		t.Fatalf("exact-limit body rejected: %v", err)
 	}
 }
@@ -220,7 +249,11 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
-		return textResponse(http.StatusOK, `{"node_id":"n1","sid":"s1","data_endpoint":"node:1"}`), nil
+		body, err := json.Marshal(routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return textResponse(http.StatusOK, string(body)), nil
 	})}
 	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
 		return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
@@ -236,7 +269,8 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 }
 
 func TestReserveByKeyJoinsExistingRouteFlight(t *testing.T) {
-	result := &reserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	resultValue := routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B)
+	result := &resultValue
 	flight := &reserveFlight{done: make(chan struct{}), res: result}
 	close(flight.done)
 	rt := &Router{reserveInFlight: map[string]*reserveFlight{
@@ -355,9 +389,9 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		case "/route-link/route":
 			switch r.URL.Query().Get("sid") {
 			case "sb-1":
-				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk1", DataEndpoint: node1Host, State: "ready"})
+				_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk1", node1Host, types.ProfileE2B))
 			case "sb-2":
-				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-2", Group: "/g", RouteKey: "rk2", DataEndpoint: node2Host, State: "ready"})
+				_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-2", "/g", "rk2", node2Host, types.ProfileE2B))
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}

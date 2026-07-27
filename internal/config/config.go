@@ -77,7 +77,7 @@ type Config struct {
 	// (node.md §10); empty = standalone single-node.
 	Cluster ClusterConfig `yaml:"cluster"`
 	// Singular top-level references.
-	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or NODE_CONFIG_ENCRYPTION_KEY env
+	EncryptionKey  string `yaml:"encryption_key"`  // credential at-rest AES-256 (":"-sep, first active); or NODE_CONFIG_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
 
 	execDir string // auto: dir of os.Executable(); used by Bin (not a YAML field)

@@ -36,38 +36,6 @@ type RecordMeta struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type RouteState string
-
-const (
-	RouteNone     RouteState = "none"
-	RouteReserved RouteState = "reserved"
-	RouteReady    RouteState = "ready"
-	RoutePaused   RouteState = "paused"
-	RouteDead     RouteState = "dead"
-)
-
-// RouteRecord is the group-sharded route_link value. AccessToken is the
-// placer-derived data-plane token for the current SandboxID generation; registry
-// route owners return it without consulting sandbox-group providers.
-type RouteRecord struct {
-	Meta           RecordMeta                `json:"meta"`
-	Group          string                    `json:"group"`
-	RouteKey       string                    `json:"route_key"`
-	SandboxID      string                    `json:"sandbox_id,omitempty"`
-	State          RouteState                `json:"state"`
-	NodeID         string                    `json:"node_id,omitempty"`
-	TemplateID     string                    `json:"template_id,omitempty"`
-	Config         map[string]string         `json:"config,omitempty"`
-	AccessToken    string                    `json:"access_token,omitempty"`
-	BuildID        string                    `json:"build_id,omitempty"`
-	BuildState     string                    `json:"build_state,omitempty"`
-	BuildResources *routesync.BuildResources `json:"build_resources,omitempty"`
-	BuildReason    string                    `json:"build_reason,omitempty"`
-	CreatedUnix    int64                     `json:"created_unix,omitempty"`
-}
-
-func RouteKey(group, routeKey string) string { return group + "\x00" + routeKey }
-
 type NodeState string
 
 const (
@@ -95,24 +63,33 @@ type NodeRecord struct {
 	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string                    `json:"resume_token,omitempty"`
 	LinkOwner         string                    `json:"link_owner,omitempty"`
-	ManifestKeys      []NodeManifestKey         `json:"manifest_keys,omitempty"`
+	KeyPairs          []NodeKeyPair             `json:"key_pairs,omitempty"`
 	Sandboxes         []NodeSandboxRef          `json:"sandboxes,omitempty"`
 	Builds            []NodeBuildRef            `json:"builds,omitempty"`
 }
 
-type NodeManifestKey struct {
-	Fingerprint      string `json:"fingerprint"`
-	Type             string `json:"type,omitempty"`
-	Value            string `json:"value,omitempty"`
-	Ref              string `json:"ref,omitempty"`
-	ExpiresUnix      int64  `json:"expires_unix,omitempty"`
-	AckedExpiresUnix int64  `json:"acked_expires_unix,omitempty"`
+// NodeKeyPair is the node_link desired lease for one tenant credential pair.
+// APISecretFingerprint is the record identity and lifecycle-command lookup key.
+// APISecret and ManifestKey are installed and acknowledged atomically.
+type NodeKeyPair struct {
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	APISecretType          string `json:"api_secret_type,omitempty"`
+	APISecret              string `json:"api_secret,omitempty"`
+	APISecretRef           string `json:"api_secret_ref,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ManifestKeyType        string `json:"manifest_key_type,omitempty"`
+	ManifestKey            string `json:"manifest_key,omitempty"`
+	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`
+	ExpiresUnix            int64  `json:"expires_unix,omitempty"`
+	AckedExpiresUnix       int64  `json:"acked_expires_unix,omitempty"`
 }
 
 type NodeSandboxRef struct {
-	Group     string `json:"group"`
-	RouteKey  string `json:"route_key"`
-	SandboxID string `json:"sandbox_id"`
+	Group                string `json:"group"`
+	RouteKey             string `json:"route_key"`
+	SandboxID            string `json:"sandbox_id"`
+	Profile              string `json:"profile"`
+	APISecretFingerprint string `json:"api_secret_fingerprint"`
 }
 
 type NodeBuildRef struct {

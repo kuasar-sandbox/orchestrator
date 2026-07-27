@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -25,13 +27,13 @@ func (o *rpcNodeOwner) Connected(ctx context.Context, nodeID string) error {
 	return o.connectedErr
 }
 
-func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	o.ops = append(o.ops, "put:"+nodeID+":"+fingerprint+":"+keyType+":"+keyValue)
+func (o *rpcNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	o.ops = append(o.ops, "put:"+nodeID+":"+pair.APISecretFingerprint)
 	return nil
 }
 
-func (o *rpcNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	o.ops = append(o.ops, "drop:"+nodeID+":"+fingerprint)
+func (o *rpcNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	o.ops = append(o.ops, "drop:"+nodeID+":"+apiSecretFingerprint)
 	return nil
 }
 
@@ -51,8 +53,8 @@ func (o *rpcNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord,
 	return &NodeRecord{NodeID: nodeID, DataEndpoint: "10.0.0.1:8443"}, true, nil
 }
 
-func (o *rpcNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
-	o.ops = append(o.ops, "delete:"+nodeID+":"+sid)
+func (o *rpcNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
+	o.ops = append(o.ops, "delete:"+nodeID+":"+sid+":"+apiSecretFingerprint)
 	return nil
 }
 
@@ -78,13 +80,19 @@ func TestHTTPNodeOwner(t *testing.T) {
 	defer srv.Close()
 
 	client := NewHTTPNodeOwner(srv.URL, srv.Client())
+	apiFP := strings.Repeat("a", 64)
+	pair := clusterstate.NodeKeyPair{
+		APISecretFingerprint: apiFP, APISecretType: clusterstate.SecretRef, APISecretRef: "vault://tenant/api",
+		ManifestKeyFingerprint: strings.Repeat("b", 64), ManifestKeyType: clusterstate.SecretRef, ManifestKeyRef: "vault://tenant/manifest",
+		ExpiresUnix: 123,
+	}
 	if err := client.Connected(ctx, "n1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.PutManifestKey(ctx, "n1", "fp", "inline", "mk", 123); err != nil {
+	if err := client.PutKeyPair(ctx, "n1", pair); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.DropManifestKey(ctx, "n1", "fp"); err != nil {
+	if err := client.DropKeyPair(ctx, "n1", apiFP); err != nil {
 		t.Fatal(err)
 	}
 	if !client.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
@@ -95,7 +103,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err != nil || !found || node.DataEndpoint == "" {
 		t.Fatalf("runtime node=%+v found=%v err=%v", node, found, err)
 	}
-	if err := client.DeleteSandbox(ctx, "n1", "sb1"); err != nil {
+	if err := client.DeleteSandbox(ctx, "n1", "sb1", strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.SendCommand(ctx, "n1", &routesync.Command{CmdID: "c1", Kind: routesync.CmdDelete, SID: "sb2"}); err != nil {
@@ -105,7 +113,10 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
 		t.Fatalf("send wait ack=%+v err=%v", ack, err)
 	}
-	wantOps := []string{"connected:n1", "put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1", "send:n1:delete", "wait:n1:create"}
+	wantOps := []string{
+		"connected:n1", "put:n1:" + apiFP, "drop:n1:" + apiFP, "admit:n1:b1",
+		"delete:n1:sb1:" + strings.Repeat("a", 64), "send:n1:delete", "wait:n1:create",
+	}
 	if len(owner.ops) != len(wantOps) {
 		t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 	}

@@ -180,6 +180,34 @@ retry_code() {
     return 1
 }
 
+create_sandbox() {
+    local route_key="$1" out="$2"
+    retry_code 201 "$out" -X POST \
+        -H "Host: api.$DOMAIN" \
+        -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: $route_key" \
+        -H "X-API-KEY: $API_KEY" \
+        -H "Content-Type: application/json" \
+        --data '{}' \
+        "http://127.0.0.1:$ROUTER_PORT/sandboxes"
+}
+
+sandbox_credentials() {
+    local response="$1" expected_route_key="$2"
+    python3 - "$response" "$expected_route_key" <<'PY'
+import json, sys
+response, expected_route_key = sys.argv[1:]
+created = json.load(open(response))
+assert created.get("routeKey") == expected_route_key, created
+sid = created.get("sandboxID")
+envd = created.get("envdAccessToken")
+traffic = created.get("trafficAccessToken")
+forward = created.get("forwardAccessToken")
+assert all(isinstance(value, str) and value for value in (sid, envd, traffic, forward)), created
+print("\t".join((sid, envd)))
+PY
+}
+
 WORK="$(mktemp -d)"
 step "work dir: $WORK"
 PIDS=()
@@ -212,9 +240,9 @@ alloc_port ROUTER_PORT router
 alloc_port ADMIN_PORT node-stub-admin
 alloc_port DATA_PORT node-stub-data
 
-AUTH_KEY="$("$E2B_KEY_CTL" gen-key)"
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
-API_KEY="$("$E2B_KEY_CTL" gen-apikey "$AUTH_KEY")"
+API_SECRET="$("$E2B_KEY_CTL" derive-api-secret "$MANIFEST_KEY")"
+API_KEY="$("$E2B_KEY_CTL" gen-apikey "$API_SECRET")"
 
 OWNER_COUNT="$REGISTRIES"
 ROUTE_OWNER_COUNT="$OWNER_COUNT"
@@ -322,7 +350,7 @@ done
 
 mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
-{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
+{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","api_secret":"$API_SECRET","template_ref":"e2b-snp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
 for i in $(seq 1 "$REGISTRIES"); do
@@ -388,8 +416,8 @@ step "starting router"
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
-step "waiting for node_link manifest-key cache"
-python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
+step "waiting for node_link credential-pair cache"
+python3 - "$ADMIN" "$NODES" <<'PY' || fail "credential pairs were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
 for _ in range(300):
@@ -420,37 +448,44 @@ raise SystemExit("nodes=%r" % last)
 PY
 fi
 
-step "checking Reserve -> READY -> data forward"
+step "checking explicit create -> READY -> data forward"
+code="$(create_sandbox "user1/session1" "$WORK/create-session1.body" || true)"
+[ "$code" = "201" ] || fail "create user1/session1 returned $code: $(cat "$WORK/create-session1.body")"
+IFS=$'\t' read -r SESSION1_SID SESSION1_ENVD_TOKEN \
+    < <(sandbox_credentials "$WORK/create-session1.body" "user1/session1") || fail "invalid create response for user1/session1"
+
 code="$(retry_code 204 "$WORK/data1.body" \
-    -H "Host: data.$DOMAIN" \
+    -H "Host: 49983-$SESSION1_SID.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
     -H "X-Kuasar-Route-Key: user1/session1" \
-    -H "X-API-KEY: $API_KEY" \
-    -H "E2b-Sandbox-Port: 49983" \
+    -H "X-Access-Token: $SESSION1_ENVD_TOKEN" \
     "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-[ "$code" = "204" ] || fail "data by group/route_key returned $code"
+[ "$code" = "204" ] || fail "data for user1/session1 returned $code"
 
 python3 - "$ADMIN" "$GROUP" <<'PY' || fail "first data hit was not recorded with the expected group"
 import json, sys, urllib.request
 hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
 assert hits, "no data hits"
 last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
+location = last.get("cluster", {})
 assert location["group"] == sys.argv[2], last
 assert location["route_key"] == "user1/session1", last
-assert last.get("access_token", "").startswith("sat_"), last
 PY
 
 if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ]; then
     step "checking placer failover after one placer exits"
     kill "${SCALER_PIDS[0]}" 2>/dev/null || true
     wait "${SCALER_PIDS[0]}" 2>/dev/null || true
+    code="$(create_sandbox "user1/session-placer-failover" "$WORK/create-placer-ha.body" || true)"
+    [ "$code" = "201" ] || fail "create after placer failure returned $code: $(cat "$WORK/create-placer-ha.body")"
+    IFS=$'\t' read -r PLACER_HA_SID PLACER_HA_ENVD_TOKEN \
+        < <(sandbox_credentials "$WORK/create-placer-ha.body" "user1/session-placer-failover") || \
+        fail "invalid create response after placer failure"
     code="$(retry_code 204 "$WORK/data-placer-ha.body" \
-        -H "Host: data.$DOMAIN" \
+        -H "Host: 49983-$PLACER_HA_SID.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
         -H "X-Kuasar-Route-Key: user1/session-placer-failover" \
-        -H "X-API-KEY: $API_KEY" \
-        -H "E2b-Sandbox-Port: 49983" \
+        -H "X-Access-Token: $PLACER_HA_ENVD_TOKEN" \
         "http://127.0.0.1:$ROUTER_PORT/health" || true)"
     [ "$code" = "204" ] || fail "data after placer failure returned $code"
 fi
@@ -509,12 +544,16 @@ PY
     done
 
     step "checking router/placer refresh through known members after cutover"
+    code="$(create_sandbox "user1/session-cutover" "$WORK/create-cutover.body" || true)"
+    [ "$code" = "201" ] || fail "create after registry cutover returned $code: $(cat "$WORK/create-cutover.body")"
+    IFS=$'\t' read -r CUTOVER_SID CUTOVER_ENVD_TOKEN \
+        < <(sandbox_credentials "$WORK/create-cutover.body" "user1/session-cutover") || \
+        fail "invalid create response after registry cutover"
     code="$(retry_code 204 "$WORK/data-cutover.body" \
-        -H "Host: data.$DOMAIN" \
+        -H "Host: 49983-$CUTOVER_SID.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
         -H "X-Kuasar-Route-Key: user1/session-cutover" \
-        -H "X-API-KEY: $API_KEY" \
-        -H "E2b-Sandbox-Port: 49983" \
+        -H "X-Access-Token: $CUTOVER_ENVD_TOKEN" \
         "http://127.0.0.1:$ROUTER_PORT/health" || true)"
     [ "$code" = "204" ] || fail "data after registry cutover returned $code"
 
@@ -523,7 +562,7 @@ import json, sys, urllib.request
 hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
 assert hits, "no data hits"
 last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
+location = last.get("cluster", {})
 assert location["group"] == sys.argv[2], last
 assert location["route_key"] == "user1/session-cutover", last
 PY
@@ -533,8 +572,7 @@ create_count_before="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
 def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
+    return c.get("cluster", {}).get("route_key")
 print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
 PY
 )"
@@ -542,20 +580,18 @@ PY
 
 step "checking active route cache"
 code="$(retry_code 204 "$WORK/data2.body" \
-    -H "Host: data.$DOMAIN" \
+    -H "Host: 49983-$SESSION1_SID.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
     -H "X-Kuasar-Route-Key: user1/session1" \
-    -H "X-API-KEY: $API_KEY" \
-    -H "E2b-Sandbox-Port: 49983" \
+    -H "X-Access-Token: $SESSION1_ENVD_TOKEN" \
     "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-[ "$code" = "204" ] || fail "second data by group/route_key returned $code"
+[ "$code" = "204" ] || fail "second data request for user1/session1 returned $code"
 
 create_count_after="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
 def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
+    return c.get("cluster", {}).get("route_key")
 print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
 PY
 )"
@@ -593,8 +629,7 @@ import json, shlex, sys, urllib.request
 nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
 for n in nodes:
     for s in n.get("sandboxes", []):
-        raw = s.get("metadata", {}).get("kuasar-sandbox.cluster")
-        location = json.loads(raw) if raw else {}
+        location = s.get("cluster", {})
         if location.get("route_key") == "user1/session1":
             open(sys.argv[2], "w").write("NODE=%s\nSID=%s\n" % (shlex.quote(n["node_id"]), shlex.quote(s["sid"])))
             sys.exit(0)

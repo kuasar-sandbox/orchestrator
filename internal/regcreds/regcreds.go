@@ -144,8 +144,11 @@ const tokenPrefix = "kpt_"
 // key. The tenant holds the manifest key (their root secret) and the orchestrator
 // holds it encrypted at rest, so both can seal/open without sharing an operator key.
 func sealKey(manifestKeyHex string) ([]byte, error) {
+	if len(manifestKeyHex) != 64 || manifestKeyHex != strings.ToLower(manifestKeyHex) {
+		return nil, fmt.Errorf("regcreds: manifest key must be 64 lowercase hex characters")
+	}
 	if raw, err := hex.DecodeString(manifestKeyHex); err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("regcreds: manifest key must be 64-hex")
+		return nil, fmt.Errorf("regcreds: manifest key must be 64 lowercase hex characters")
 	}
 	k := sha256.Sum256([]byte("kuasar-pull-token-v1:" + manifestKeyHex))
 	return k[:], nil

@@ -25,7 +25,7 @@ placer 负责:
 
 - group provider/importer 接入。
 - `node_list` WATCH_LIST 消费。
-- selector patch 与 manifest key cache refresh。
+- selector patch 与 APISecret/ManifestKey pair cache refresh。
 - shuffle-sharding、静态 selector、runtime match、P2C。
 - `PlaceSandbox` / `PlaceBuild` 建议。
 - API key verify 的 provider 侧校验。
@@ -44,7 +44,8 @@ placer 不负责:
 3. **高频负载不走 WATCH_LIST**:WATCH_LIST 只承载低频目录字段;最终资源确认由 node owner admission 完成。
 4. **source_id 是 import 执行单元**:多个 placer 配置相同 `source_id` 时,竞争同一条 source lease。
 5. **shuffle 只影响新建**:不迁移正在运行的 sandbox。
-6. **key 分发只影响 create/build 前置条件**:key drop 或租约过期不影响已经运行的 sandbox。
+6. **凭据对分发只影响 create/build 前置条件**:drop、租约过期或 provider 更新不修改已经复制到
+   现有 sandbox/build 记录的凭据对。
 
 ## 2. 命令行
 
@@ -111,7 +112,7 @@ SandboxGroupProvider:
   Get(group)
   GetPlacementHint(group)
   GetKey(group)       # typed manifest_key
-  GetAuthKey(group)   # auth_key or verification material
+  GetAPISecret(group) # typed APISecret
 
 SandboxGroupImporter:
   Range(cursor, limit)
@@ -127,7 +128,7 @@ import_groups:
 ```
 
 该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
-`Get/GetPlacementHint/GetKey/GetAuthKey` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
+`Get/GetPlacementHint/GetKey/GetAPISecret` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
 
 示例:
 
@@ -136,11 +137,16 @@ import_groups:
   "group": "/cell/project/app/group",
   "template_ref": "tmpl-1",
   "target_port": 49983,
-  "auth_key": {"type": "inline", "value": "<hex>"},
-  "manifest_key": {"type": "inline", "value": "<hex>"},
+  "api_secret": {"type": "inline", "value": "<64-lowercase-hex>"},
+  "manifest_key": {"type": "inline", "value": "<64-lowercase-hex>"},
   "node_selectors": [{"pool": "default"}]
 }
 ```
+
+显式 `api_secret` 优先。inline `manifest_key` 缺省 `api_secret` 时,placer 按
+`HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")` 派生默认值;
+ref ManifestKey 无法在 placer 本地物化,必须显式提供 APISecret。两项 root 及 ref 的完整指纹
+都必须是 64-lowercase-hex。
 
 `target_port` 是数据面强制端口,随 Place 结果返回给 route_link/router。它不参与节点筛选;
 节点筛选仍只由 `node_selectors` 与 shuffle-sharding 配置决定。
@@ -151,8 +157,8 @@ import_groups:
 - Importer Range 按 `source_id` 独立执行,不把多个 source 合并成一个 Range 视图。
 - 每个 `source_id` 的 cursor/lease 独立维护。
 
-group 从 provider 消失后,新的 Place/verify-key 返回不可用。已经写入 node_link 的 manifest key cache
-不主动删除,由 registry/node 侧 TTL 淘汰。
+group 从 provider 消失后,新的 Place/verify-key 返回不可用。已经写入 node_link 的凭据对 cache
+不主动删除,由 registry/node 侧 TTL 淘汰;现有 sandbox/build 的持久凭据副本保持不变。
 
 ## 5. node_list WATCH_LIST
 
@@ -254,13 +260,13 @@ lease winner
 groups in page
   │ for each group:
   │   GetPlacementHint
-  │   GetKey / GetAuthKey
+  │   GetKey / GetAPISecret
   │   calculate effective selectors
   ▼
 selector patch with fencing
   │
   ▼
-registry refreshes node_link manifest key cache
+registry refreshes node_link credential-pair cache
   │
   ▼
 cursor checkpoint after whole page succeeds
@@ -275,7 +281,7 @@ owner 从上次成功 cursor 继续或重放同一页。
 ### 7.3 selector patch refresh
 
 placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
-manifest key cache。group 从 provider 消失时不主动删除 node_link key cache;TTL 到期后自动淘汰。
+credential-pair cache。group 从 provider 消失时不主动删除 cache;TTL 到期后自动淘汰。
 
 ## 8. Placement
 
@@ -318,7 +324,7 @@ filter node_list:
 P2C over candidates
   │
   ▼
-return node_id + create_spec + key intent + access_token + runtime/template hints
+return node_id + create_spec + APISecret fingerprint + runtime/template hints
 ```
 
 `node_list` 只提供低频目录,不判定 node 是否在线。route owner 在提交前向 node owner 查询当前
@@ -343,18 +349,21 @@ Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算
 
 ## 9. Key Distribution
 
-placer 主管 selector patch 和 manifest key cache refresh:
+placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 
-1. 获取 group 的 typed `manifest_key` 和 `auth_key`。
+1. 获取 group 的 typed `manifest_key` 和 `api_secret`;缺省 APISecret 只可由 inline ManifestKey 固定派生。
 2. 根据 placement selectors 和 shuffle 结果得到目标 node set。
-3. 将目标 node set 与 key material/ref 作为 selector patch 推给 registry。
-4. registry/node owner 把每个 node 的 desired key list 写入 node_link `manifest_key` recordSet,并在 owner set
-   内 CAS 复制。
-5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行 `key_put`；只有匹配当前
-   desired lease 的 ACK 才推进已交付状态。
-6. 未续租 key 由节点 TTL 淘汰,`key_drop` 不作为正确性依赖。
+3. selector patch 要么携带完整 pair,要么完全不携带凭据字段。两项各带 typed carrier 和完整
+   64-hex SHA-256 指纹;半对拒绝。
+4. registry/node owner 以完整 `APISecretFingerprint` 为 record key,把 desired pair 写入 node_link
+   `key_pair` recordSet,并在 owner set 内 CAS 复制。
+5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行原子 `key_put`;只有匹配
+   当前完整 desired pair 和 lease 的 ACK 才推进已交付状态。
+6. 同一 APISecret 完整指纹只能绑定完全相同的 pair material;冲突不得覆盖。
+7. 未续租 pair 由节点 TTL 淘汰,`key_drop` 以完整 APISecret 指纹定位,不作为正确性依赖。
 
-密钥是 create/build 前置条件。key cache 删除、key_drop 或租约过期不影响已经运行的 sandbox。
+凭据对是 create/build 前置条件。cache 删除、key_drop、租约过期或后续 provider 更新不影响已经复制
+到现有 sandbox/build 业务记录的凭据对。
 
 ## 10. 可靠性
 

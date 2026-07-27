@@ -16,18 +16,16 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-func commandLocation(t *testing.T, cmd *routesync.Command) clusterstate.ObjectLocation {
+func commandClusterContext(t *testing.T, cmd *routesync.Command) *routesync.ClusterSandboxContext {
 	t.Helper()
-	location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
-	if err != nil {
-		t.Fatalf("command metadata: %v", err)
+	if cmd.Cluster == nil {
+		t.Fatal("command cluster context is nil")
 	}
-	return location
+	return cmd.Cluster
 }
 
 func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
@@ -70,8 +68,9 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 		t.Fatalf("reserve result=%+v, want node %s", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
-	location := commandLocation(t, cmd)
-	if location.Group != "/g" || location.RouteKey != "rk" || cmd.SID != res.SID {
+	clusterContext := commandClusterContext(t, cmd)
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.SID ||
+		cmd.SID != res.SID || cmd.Profile != "e2b" {
 		t.Fatalf("relayed command=%+v, reserve=%+v", cmd, res)
 	}
 }
@@ -199,8 +198,9 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 		t.Fatalf("reserve result=%+v, want node %s endpoint 127.0.0.1:19191", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
-	location := commandLocation(t, cmd)
-	if location.Group != "/g" || location.RouteKey != "rk" || cmd.SID != res.SID {
+	clusterContext := commandClusterContext(t, cmd)
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.SID ||
+		cmd.SID != res.SID || cmd.Profile != "e2b" {
 		t.Fatalf("redirected command=%+v, reserve=%+v", cmd, res)
 	}
 }
@@ -291,10 +291,8 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 	if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			n.publish(routesync.RouteEntry{
-				SandboxID: cmd.SID,
-				State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
-			})
+			route := testE2BRoute(cmd.SID, routesync.StateRunning)
+			n.publish(route)
 		}()
 	}
 	if cmd.Kind == routesync.CmdDelete {
@@ -440,9 +438,8 @@ func (n *relayNodeStub) readLoop(t *testing.T) {
 		}
 		_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
-			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
-				SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
-			}})
+			route := testE2BRoute(cmd.SID, routesync.StateRunning)
+			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &route})
 		}
 	}
 }

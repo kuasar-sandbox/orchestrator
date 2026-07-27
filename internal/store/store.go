@@ -1,19 +1,25 @@
 // Package store persists sandbox/build records in a node-local sqlite database.
-// modernc.org/sqlite is a pure-Go driver (CGO_ENABLED=0). Per-tenant manifest
-// keys are stored AES-256-GCM-encrypted (secretbox); a non-unique
-// manifest_key_hash index (= apikey.Fingerprint) enables O(1) matching, with the
-// full key recovered by decrypt for HMAC verification.
+// modernc.org/sqlite is a pure-Go driver (CGO_ENABLED=0). Tenant API, manifest,
+// and sandbox service credentials are stored AES-256-GCM-encrypted (secretbox).
+// Tenant-root complete SHA-256 fingerprints are indexed; the API-secret
+// fingerprint prefix embedded in an API key is only a candidate selector, and
+// callers must still verify the MAC.
 package store
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	_ "modernc.org/sqlite"
@@ -27,6 +33,10 @@ type Store struct {
 const schema = `
 CREATE TABLE IF NOT EXISTS sandboxes (
   id                   TEXT PRIMARY KEY,
+  profile              TEXT NOT NULL,
+  cluster_group        TEXT NOT NULL DEFAULT '',
+  cluster_route_key    TEXT NOT NULL DEFAULT '',
+  auth_sandbox_id      TEXT NOT NULL DEFAULT '',
   template_id          TEXT NOT NULL,
   state                TEXT NOT NULL,
   deadline_unix        INTEGER NOT NULL DEFAULT 0,
@@ -39,22 +49,30 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   vswitch_port         TEXT NOT NULL DEFAULT '',
   inner_ip             TEXT NOT NULL DEFAULT '',
   port_mac             TEXT NOT NULL DEFAULT '',
+  api_secret_hash      TEXT NOT NULL,
+  api_secret_enc       TEXT NOT NULL,
   manifest_key_hash    TEXT NOT NULL,
   manifest_key_enc     TEXT NOT NULL,
   snapshot_ref         TEXT NOT NULL DEFAULT '',
-  envd_access_token    TEXT NOT NULL DEFAULT '',
-  traffic_access_token TEXT NOT NULL DEFAULT '',
+  service_secret_enc       TEXT NOT NULL,
+  envd_access_token_enc    TEXT NOT NULL,
+  traffic_access_token_enc TEXT NOT NULL,
+  forward_access_token_enc TEXT NOT NULL,
   metadata_json        TEXT NOT NULL DEFAULT '{}',
   env_json             TEXT NOT NULL DEFAULT '{}',
   created_unix         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
+CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
+CREATE INDEX IF NOT EXISTS idx_sandboxes_ascandidate ON sandboxes(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_sandboxes_mkhash ON sandboxes(manifest_key_hash);
 
 CREATE TABLE IF NOT EXISTS builds (
   build_id          TEXT PRIMARY KEY,
   template_id       TEXT NOT NULL,
   persist_id        TEXT NOT NULL DEFAULT '',
+  api_secret_hash   TEXT NOT NULL,
+  api_secret_enc    TEXT NOT NULL,
   manifest_key_hash TEXT NOT NULL,
   manifest_key_enc  TEXT NOT NULL,
   profile           TEXT NOT NULL,
@@ -69,27 +87,32 @@ CREATE TABLE IF NOT EXISTS builds (
   run_id            TEXT NOT NULL DEFAULT '',
   names_json        TEXT NOT NULL DEFAULT '[]',
   aliases_json      TEXT NOT NULL DEFAULT '[]',
-	  created_unix      INTEGER NOT NULL,
-	  registry_auth_enc TEXT NOT NULL DEFAULT '',
-	  metadata_json     TEXT NOT NULL DEFAULT '{}',
-	  builder_json      TEXT NOT NULL DEFAULT '{}'
-	);
+  created_unix      INTEGER NOT NULL,
+  registry_auth_enc TEXT NOT NULL DEFAULT '',
+  metadata_json     TEXT NOT NULL DEFAULT '{}',
+  builder_json      TEXT NOT NULL DEFAULT '{}'
+);
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
+CREATE INDEX IF NOT EXISTS idx_builds_ashash ON builds(api_secret_hash);
+CREATE INDEX IF NOT EXISTS idx_builds_ascandidate ON builds(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_builds_mkhash ON builds(manifest_key_hash);
 
 CREATE TABLE IF NOT EXISTS manifest_keys (
-  key_hash          TEXT NOT NULL,
-  key_enc           TEXT NOT NULL,
+  api_secret_hash   TEXT PRIMARY KEY,
+  api_secret_enc    TEXT NOT NULL,
+  manifest_key_hash TEXT NOT NULL,
+  manifest_key_enc  TEXT NOT NULL,
   label             TEXT NOT NULL DEFAULT '',
   created_unix      INTEGER NOT NULL,
   expires_unix      INTEGER NOT NULL DEFAULT 0,
   registry_auth_enc TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_manifest_keys_hash ON manifest_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_manifest_keys_ascandidate ON manifest_keys(substr(api_secret_hash,1,24));
+CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_key_hash);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
-// for manifest keys at rest. The file should be 0600.
+// for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
@@ -100,65 +123,90 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
-	if err := ensureColumn(ctx, db, "builds", "builder_json", `TEXT NOT NULL DEFAULT '{}'`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: init schema: %w", err)
-	}
-	if err := ensureColumn(ctx, db, "sandboxes", "run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: init schema: %w", err)
-	}
-	if err := ensureColumn(ctx, db, "builds", "run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: init schema: %w", err)
-	}
 	return &Store{db: db, box: box}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func ensureColumn(ctx context.Context, db *sql.DB, table, name, spec string) error {
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var col, typ string
-		var def sql.NullString
-		if err := rows.Scan(&cid, &col, &typ, &notNull, &def, &pk); err != nil {
-			return err
-		}
-		if col == name {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+name+" "+spec)
-	return err
+const (
+	secretHexLen              = sha256.Size * 2
+	apiSecretCandidateHashLen = 12 * 2
+)
+
+var (
+	hexSecretRE        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	hexCandidateHashRE = regexp.MustCompile(`^[0-9a-f]{24}$`)
+
+	// ErrSandboxExists means an insert-only sandbox write found an existing
+	// record with the same ID. The existing row is retained unchanged.
+	ErrSandboxExists = errors.New("store: sandbox already exists")
+
+	// ErrKeyPairConflict means an API-secret fingerprint is already bound to
+	// different API-secret or manifest-key material. The existing row is retained.
+	ErrKeyPairConflict = errors.New("store: API secret fingerprint is already bound to a different key pair")
+)
+
+// KeyPair is the tenant credential pair copied into newly created durable
+// business records. APISecret authenticates API requests; ManifestKey protects
+// manifest content. Neither field is a fingerprint.
+type KeyPair struct {
+	APISecret   string
+	ManifestKey string
 }
 
-// ManifestKeyHash is hex(apikey.Fingerprint(rawKey)) — the non-unique match index
-// equal to the fingerprint embedded in api keys. Exported so callers can derive a
-// match key from an api key's fp without re-deriving the hash scheme.
+func secretHash(name, secretHex string) (string, error) {
+	if len(secretHex) != secretHexLen || !hexSecretRE.MatchString(secretHex) {
+		return "", fmt.Errorf("store: %s must be 64 lowercase hex characters", name)
+	}
+	raw, err := hex.DecodeString(secretHex)
+	if err != nil {
+		return "", fmt.Errorf("store: %s not hex: %w", name, err)
+	}
+	h := sha256.Sum256(raw)
+	return hex.EncodeToString(h[:]), nil
+}
+
+// APISecretHash returns the complete SHA-256 fingerprint of a hex API secret.
+func APISecretHash(apiSecretHex string) (string, error) {
+	return secretHash("API secret", apiSecretHex)
+}
+
+// ManifestKeyHash returns the complete SHA-256 fingerprint of a hex manifest key.
 func ManifestKeyHash(manifestKeyHex string) (string, error) {
-	raw, err := hex.DecodeString(manifestKeyHex)
-	if err != nil {
-		return "", fmt.Errorf("store: manifest key not hex: %w", err)
-	}
-	return hex.EncodeToString(apikey.Fingerprint(raw)), nil
+	return secretHash("manifest key", manifestKeyHex)
 }
 
-// encField returns the (hash, ciphertext) for a manifest key (hex) at rest.
-func (s *Store) encField(manifestKeyHex string) (hash, enc string, err error) {
-	if hash, err = ManifestKeyHash(manifestKeyHex); err != nil {
+func keyPairHashes(pair KeyPair) (apiHash, manifestHash string, err error) {
+	apiHash, err = APISecretHash(pair.APISecret)
+	if err != nil {
 		return "", "", err
 	}
-	enc, err = s.box.EncryptString(manifestKeyHex)
+	manifestHash, err = ManifestKeyHash(pair.ManifestKey)
+	if err != nil {
+		return "", "", err
+	}
+	return apiHash, manifestHash, nil
+}
+
+// encSecret returns the complete fingerprint and ciphertext for a hex secret.
+func (s *Store) encSecret(name, secretHex string) (hash, enc string, err error) {
+	if hash, err = secretHash(name, secretHex); err != nil {
+		return "", "", err
+	}
+	enc, err = s.box.EncryptString(secretHex)
 	return hash, enc, err
+}
+
+func equalSecretHex(a, b string) bool {
+	aRaw, aErr := hex.DecodeString(a)
+	bRaw, bErr := hex.DecodeString(b)
+	return aErr == nil && bErr == nil && len(aRaw) == sha256.Size && len(bRaw) == sha256.Size && hmac.Equal(aRaw, bRaw)
+}
+
+func equalKeyPair(a, b KeyPair) bool {
+	apiEqual := equalSecretHex(a.APISecret, b.APISecret)
+	manifestEqual := equalSecretHex(a.ManifestKey, b.ManifestKey)
+	return apiEqual && manifestEqual
 }
 
 func mj(m map[string]string) string {
@@ -205,56 +253,213 @@ func ub(s string) types.BuildOptions {
 
 // --- sandboxes ---
 
-// Put upserts a sandbox record (manifest key encrypted + hashed).
-func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
-	hash, enc, err := s.encField(sb.ManifestKey)
-	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
-	}
-	_, err = s.db.ExecContext(ctx, `
-INSERT INTO sandboxes (id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
-  floatingip,vswitch_port,inner_ip,port_mac,manifest_key_hash,manifest_key_enc,snapshot_ref,
-  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+const sandboxInsertSQL = `
+	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
+	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
+	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
   template_id=excluded.template_id, state=excluded.state, deadline_unix=excluded.deadline_unix,
   run_dir=excluded.run_dir, base_dir=excluded.base_dir, run_id=excluded.run_id, envd_uds=excluded.envd_uds,
   ci_uds=excluded.ci_uds, floatingip=excluded.floatingip, vswitch_port=excluded.vswitch_port,
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
-  manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
-  snapshot_ref=excluded.snapshot_ref, envd_access_token=excluded.envd_access_token,
-  traffic_access_token=excluded.traffic_access_token,
-  metadata_json=excluded.metadata_json, env_json=excluded.env_json`,
-		sb.ID, sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
-		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, hash, enc, sb.SnapshotRef,
-		sb.EnvdAccessToken, sb.TrafficAccessToken, mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix)
+  snapshot_ref=excluded.snapshot_ref,
+  metadata_json=excluded.metadata_json, env_json=excluded.env_json`
+
+const sandboxInsertOnlySQL = sandboxInsertSQL + `
+ON CONFLICT(id) DO NOTHING`
+
+func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
+	if sb == nil {
+		return nil, errors.New("sandbox is required")
+	}
+	if !types.ValidLocalSandboxID(sb.ID) {
+		return nil, errors.New("invalid sandbox id")
+	}
+	clusterGroup, clusterRouteKey, err := sandboxIdentityColumns(sb)
 	if err != nil {
-		return fmt.Errorf("store: put %s: %w", sb.ID, err)
+		return nil, err
+	}
+	apiHash, apiEnc, err := s.encSecret("API secret", sb.APISecret)
+	if err != nil {
+		return nil, err
+	}
+	manifestHash, manifestEnc, err := s.encSecret("manifest key", sb.ManifestKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSandboxServiceCredentials(sb); err != nil {
+		return nil, err
+	}
+	serviceSecretEnc, err := s.box.EncryptString(sb.ServiceSecret)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt service secret: %w", err)
+	}
+	envdAccessTokenEnc, err := s.box.EncryptString(sb.EnvdAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt envd access token: %w", err)
+	}
+	trafficAccessTokenEnc, err := s.box.EncryptString(sb.TrafficAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt traffic access token: %w", err)
+	}
+	forwardAccessTokenEnc, err := s.box.EncryptString(sb.ForwardAccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt forward access token: %w", err)
+	}
+	return []any{
+		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.AuthSandboxIDValue,
+		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
+		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef,
+		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
+		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix,
+	}, nil
+}
+
+func sandboxWriteError(operation string, sb *types.Sandbox, err error) error {
+	if sb == nil {
+		return fmt.Errorf("store: %s: %w", operation, err)
+	}
+	return fmt.Errorf("store: %s %s: %w", operation, sb.ID, err)
+}
+
+// Put upserts a sandbox record. Profile, cluster identity, credential subject,
+// tenant credential pair, and sandbox service credentials are written only by
+// the initial insert; later lifecycle updates cannot rebind an existing sandbox.
+func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
+	args, err := s.prepareSandboxInsert(sb)
+	if err != nil {
+		return sandboxWriteError("put", sb, err)
+	}
+	_, err = s.db.ExecContext(ctx, sandboxUpsertSQL, args...)
+	if err != nil {
+		return sandboxWriteError("put", sb, err)
 	}
 	return nil
 }
 
-var cols = `id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
-  vswitch_port,inner_ip,port_mac,manifest_key_hash,manifest_key_enc,snapshot_ref,
-  envd_access_token,traffic_access_token,metadata_json,env_json,created_unix`
+// InsertSandbox writes a new sandbox record and returns ErrSandboxExists when
+// the ID is already present. It never changes an existing row.
+func (s *Store) InsertSandbox(ctx context.Context, sb *types.Sandbox) error {
+	args, err := s.prepareSandboxInsert(sb)
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	result, err := s.db.ExecContext(ctx, sandboxInsertOnlySQL, args...)
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return sandboxWriteError("insert sandbox", sb, err)
+	}
+	if inserted == 0 {
+		return sandboxWriteError("insert sandbox", sb, ErrSandboxExists)
+	}
+	return nil
+}
+
+var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
+  vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
+  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
-	var st, meta, env, mkHash, mkEnc string
-	if err := row.Scan(&sb.ID, &sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
+	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
+	var serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc string
+	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.AuthSandboxIDValue,
+		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
-		&mkHash, &mkEnc, &sb.SnapshotRef, &sb.EnvdAccessToken, &sb.TrafficAccessToken,
+		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef,
+		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix); err != nil {
 		return nil, err
 	}
-	mk, err := s.box.DecryptString(mkEnc)
+	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
 	if err != nil {
-		return nil, fmt.Errorf("store: decrypt manifest key for %s: %w", sb.ID, err)
+		return nil, fmt.Errorf("store: read credential pair for %s: %w", sb.ID, err)
 	}
-	sb.ManifestKey = mk
-	sb.State = types.State(st)
+	sb.APISecret = pair.APISecret
+	sb.ManifestKey = pair.ManifestKey
+	for name, encrypted := range map[string]struct {
+		ciphertext string
+		dest       *string
+	}{
+		"service secret":       {serviceSecretEnc, &sb.ServiceSecret},
+		"envd access token":    {envdAccessTokenEnc, &sb.EnvdAccessToken},
+		"traffic access token": {trafficAccessTokenEnc, &sb.TrafficAccessToken},
+		"forward access token": {forwardAccessTokenEnc, &sb.ForwardAccessToken},
+	} {
+		plaintext, err := s.box.DecryptString(encrypted.ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("store: decrypt %s for sandbox %s: %w", name, sb.ID, err)
+		}
+		*encrypted.dest = plaintext
+	}
+	sb.Profile, sb.State = types.Profile(profile), types.State(st)
+	if !sb.Profile.Valid() {
+		return nil, fmt.Errorf("store: sandbox %s has invalid profile %q", sb.ID, profile)
+	}
+	switch {
+	case clusterGroup == "" && clusterRouteKey == "":
+		sb.Cluster = nil
+	case clusterGroup == "" || clusterRouteKey == "":
+		return nil, fmt.Errorf("store: sandbox %s has incomplete cluster context", sb.ID)
+	default:
+		sb.Cluster = &types.ClusterSandboxContext{Group: clusterGroup, RouteKey: clusterRouteKey}
+	}
+	if err := validateSandboxServiceCredentials(&sb); err != nil {
+		return nil, fmt.Errorf("store: sandbox %s has corrupt service credentials: %w", sb.ID, err)
+	}
 	sb.Metadata, sb.Env = uj(meta), uj(env)
 	return &sb, nil
+}
+
+func validateSandboxServiceCredentials(sb *types.Sandbox) error {
+	if _, err := secretHash("service secret", sb.ServiceSecret); err != nil {
+		return err
+	}
+	if sb.ForwardAccessToken == "" {
+		return errors.New("forward access token is required")
+	}
+	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, sb.ServiceSecret, sb.AuthSandboxID()); err != nil {
+		return errors.New("forward access token is invalid")
+	}
+	switch sb.Profile {
+	case types.ProfileE2B:
+		if !sandboxcfg.ValidE2BAccessToken(sb.EnvdAccessToken) ||
+			!sandboxcfg.ValidE2BAccessToken(sb.TrafficAccessToken) {
+			return errors.New("envd and traffic access tokens must be valid UTF-8 and at most 256 bytes")
+		}
+		if sb.EnvdAccessToken == "" {
+			return errors.New("envd access token is required for e2b profile")
+		}
+		if sb.TrafficAccessToken == "" {
+			return errors.New("traffic access token is required for e2b profile")
+		}
+	case types.ProfileBare:
+		if sb.EnvdAccessToken != "" || sb.TrafficAccessToken != "" {
+			return errors.New("envd and traffic access tokens must be empty for bare profile")
+		}
+	default:
+		return fmt.Errorf("invalid sandbox profile %q", sb.Profile)
+	}
+	return nil
+}
+
+func sandboxIdentityColumns(sb *types.Sandbox) (group, routeKey string, err error) {
+	if !sb.Profile.Valid() {
+		return "", "", fmt.Errorf("invalid sandbox profile %q", sb.Profile)
+	}
+	if sb.Cluster == nil {
+		return "", "", nil
+	}
+	if sb.Cluster.Group == "" || sb.Cluster.RouteKey == "" {
+		return "", "", errors.New("cluster group and route key are both required")
+	}
+	return sb.Cluster.Group, sb.Cluster.RouteKey, nil
 }
 
 // Get returns the sandbox or (nil, nil) if not found.
@@ -270,10 +475,11 @@ func (s *Store) Get(ctx context.Context, id string) (*types.Sandbox, error) {
 	return sb, nil
 }
 
-// List returns sandboxes ordered by id (cursor pagination). ownerHash != "" scopes
-// the result to a manifest_key_hash (a fast, non-unique pre-filter — the caller
-// still verifies the api key per row); "" returns all (internal callers).
-func (s *Store) List(ctx context.Context, state, ownerHash string, limit int, cursor string) ([]*types.Sandbox, string, error) {
+// List returns sandboxes ordered by id (cursor pagination). ownerCandidateHash
+// is the 24-hex API-secret fingerprint prefix embedded in an API key. It is only
+// a pre-filter; the caller must verify the API-key MAC against every candidate.
+// An empty ownerCandidateHash returns all records for internal callers.
+func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limit int, cursor string) ([]*types.Sandbox, string, error) {
 	if limit <= 0 {
 		limit = 100 // default page
 	}
@@ -287,9 +493,9 @@ func (s *Store) List(ctx context.Context, state, ownerHash string, limit int, cu
 		conds = append(conds, "state=?")
 		args = append(args, state)
 	}
-	if ownerHash != "" {
-		conds = append(conds, "manifest_key_hash=?")
-		args = append(args, ownerHash)
+	if ownerCandidateHash != "" {
+		conds = append(conds, "substr(api_secret_hash,1,24)=?")
+		args = append(args, ownerCandidateHash)
 	}
 	if cursor != "" {
 		conds = append(conds, "id > ?")
@@ -374,13 +580,13 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 
 // --- builds (also the template registry) ---
 
-var buildCols = `build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
+var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
   from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
-	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc, steps, meta, builder string
-	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &mkHash, &mkEnc, &profile, &kind,
+	var profile, kind, status, names, aliases, apiHash, apiEnc, manifestHash, manifestEnc, raEnc, steps, meta, builder string
+	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &apiHash, &apiEnc, &manifestHash, &manifestEnc, &profile, &kind,
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder); err != nil {
 		return nil, err
 	}
@@ -391,11 +597,12 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 			return nil, fmt.Errorf("store: build %s steps: %w", b.BuildID, err)
 		}
 	}
-	mk, err := s.box.DecryptString(mkEnc)
+	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
 	if err != nil {
-		return nil, fmt.Errorf("store: decrypt manifest key for build %s: %w", b.BuildID, err)
+		return nil, fmt.Errorf("store: read credential pair for build %s: %w", b.BuildID, err)
 	}
-	b.ManifestKey = mk
+	b.APISecret = pair.APISecret
+	b.ManifestKey = pair.ManifestKey
 	if raEnc != "" {
 		if b.RegistryAuth, err = s.box.DecryptString(raEnc); err != nil {
 			return nil, fmt.Errorf("store: decrypt registry auth for build %s: %w", b.BuildID, err)
@@ -406,9 +613,14 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	return &b, nil
 }
 
-// PutBuild upserts a build record (manifest key + registry auth encrypted at rest).
+// PutBuild upserts a build record. The credential pair is written only by the
+// initial insert; later build-state updates cannot rebind an existing build.
 func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
-	hash, enc, err := s.encField(b.ManifestKey)
+	apiHash, apiEnc, err := s.encSecret("API secret", b.APISecret)
+	if err != nil {
+		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
+	}
+	manifestHash, manifestEnc, err := s.encSecret("manifest key", b.ManifestKey)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
@@ -427,12 +639,11 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 		stepsJSON = string(sj)
 	}
 	_, err = s.db.ExecContext(ctx, `
-	INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
+	INSERT INTO builds (build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(build_id) DO UPDATE SET
 	  template_id=excluded.template_id, persist_id=excluded.persist_id,
-	  manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
 	  profile=excluded.profile, kind=excluded.kind, from_image=excluded.from_image,
 	  from_template=excluded.from_template, start_cmd=excluded.start_cmd,
 	  ready_cmd=excluded.ready_cmd, steps_json=excluded.steps_json,
@@ -440,7 +651,7 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
 	  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
 	  builder_json=excluded.builder_json`,
-		b.BuildID, b.TemplateID, b.PersistID, hash, enc, string(b.Profile), string(b.Kind),
+		b.BuildID, b.TemplateID, b.PersistID, apiHash, apiEnc, manifestHash, manifestEnc, string(b.Profile), string(b.Kind),
 		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder))
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
@@ -521,24 +732,29 @@ func (s *Store) CASBuildStatus(ctx context.Context, buildID string, from, to typ
 	return n == 1, nil
 }
 
-// --- manifest_keys (the create/build allowlist) ---
+// --- key pairs (the create/build allowlist, stored in manifest_keys) ---
 
-// ManifestKeyInfo is a non-secret view of a manifest_keys row (no key material).
-type ManifestKeyInfo struct {
-	Hash        string // hex fingerprint (24 chars)
-	Label       string
-	CreatedUnix int64
-	ExpiresUnix int64 // 0 = never expires
+// KeyPairInfo is a non-secret view of an allowlist row.
+type KeyPairInfo struct {
+	APISecretHash   string // complete SHA-256 fingerprint (64 lowercase hex)
+	ManifestKeyHash string // complete SHA-256 fingerprint (64 lowercase hex)
+	Label           string
+	CreatedUnix     int64
+	ExpiresUnix     int64 // 0 = never expires
 }
 
-// AddManifestKey inserts a manifest key (hex) into the allowlist, or refreshes it if
-// already present (dedup by decrypt-compare, since the short hash is non-unique).
-// ttlSec>0 sets expiry to now+ttlSec; ttlSec<=0 means never expires. registryAuthJSON
-// (a docker config.json; "" = leave) is the tenant's default pull credentials, stored
-// encrypted. Re-adding refreshes the expiry (and the label / registry auth if newly
-// given). Returns whether a NEW row was inserted (false = refreshed an existing one).
-func (s *Store) AddManifestKey(ctx context.Context, manifestKeyHex, label string, ttlSec int64, registryAuthJSON string) (bool, error) {
-	hash, enc, err := s.encField(manifestKeyHex)
+// AddKeyPair atomically inserts a credential pair or refreshes an exact existing
+// pair. A complete API-secret fingerprint binds exactly one pair: attempting to
+// reuse it with different secret material returns ErrKeyPairConflict and leaves
+// the existing row unchanged. ttlSec>0 sets expiry to now+ttlSec; ttlSec<=0 means
+// never expires. Empty label or registryAuthJSON retains the existing value on a
+// refresh. It returns true only when a new row was inserted.
+func (s *Store) AddKeyPair(ctx context.Context, pair KeyPair, label string, ttlSec int64, registryAuthJSON string) (bool, error) {
+	apiHash, apiEnc, err := s.encSecret("API secret", pair.APISecret)
+	if err != nil {
+		return false, err
+	}
+	manifestHash, manifestEnc, err := s.encSecret("manifest key", pair.ManifestKey)
 	if err != nil {
 		return false, err
 	}
@@ -546,180 +762,296 @@ func (s *Store) AddManifestKey(ctx context.Context, manifestKeyHex, label string
 	if ttlSec > 0 {
 		expires = time.Now().Unix() + ttlSec
 	}
-	var raEnc string
+	var registryAuthEnc string
 	if registryAuthJSON != "" {
-		if raEnc, err = s.box.EncryptString(registryAuthJSON); err != nil {
+		registryAuthEnc, err = s.box.EncryptString(registryAuthJSON)
+		if err != nil {
 			return false, err
 		}
 	}
-	rid, found, err := s.findManifestKeyRow(ctx, manifestKeyHex, hash)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	if found { // re-add: always refresh expiry; update label / registry auth only if given
-		if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET expires_unix=? WHERE rowid=?`, expires, rid); err != nil {
-			return false, err
-		}
-		if label != "" {
-			if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET label=? WHERE rowid=?`, label, rid); err != nil {
-				return false, err
-			}
-		}
-		if registryAuthJSON != "" {
-			if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET registry_auth_enc=? WHERE rowid=?`, raEnc, rid); err != nil {
-				return false, err
-			}
-		}
-		return false, nil
-	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO manifest_keys (key_hash,key_enc,label,created_unix,expires_unix,registry_auth_enc) VALUES (?,?,?,?,?,?)`,
-		hash, enc, label, time.Now().Unix(), expires, raEnc); err != nil {
-		return false, fmt.Errorf("store: add manifest key: %w", err)
-	}
-	return true, nil
-}
+	defer tx.Rollback()
 
-// RegistryAuthForKey returns the tenant's stored registry auth (docker config.json),
-// or "" if none. Matched by decrypt-compare (the hash is non-unique).
-func (s *Store) RegistryAuthForKey(ctx context.Context, manifestKeyHex string) (string, error) {
-	hash, err := ManifestKeyHash(manifestKeyHex)
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO manifest_keys
+  (api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,label,created_unix,expires_unix,registry_auth_enc)
+VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT(api_secret_hash) DO NOTHING`,
+		apiHash, apiEnc, manifestHash, manifestEnc, label, time.Now().Unix(), expires, registryAuthEnc)
 	if err != nil {
-		return "", err
+		return false, fmt.Errorf("store: add key pair: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT key_enc,registry_auth_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	inserted, err := res.RowsAffected()
 	if err != nil {
-		return "", err
+		return false, fmt.Errorf("store: add key pair rows affected: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var keyEnc, raEnc string
-		if err := rows.Scan(&keyEnc, &raEnc); err != nil {
-			return "", err
+	if inserted == 1 {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("store: add key pair commit: %w", err)
 		}
-		if mk, err := s.box.DecryptString(keyEnc); err == nil && mk == manifestKeyHex {
-			if raEnc == "" {
-				return "", nil
-			}
-			return s.box.DecryptString(raEnc)
-		}
+		return true, nil
 	}
-	return "", rows.Err()
-}
 
-// findManifestKeyRow returns the rowid of the manifest_keys row whose decrypted key
-// equals manifestKeyHex (the hash is non-unique, so decrypt-compare is authoritative).
-func (s *Store) findManifestKeyRow(ctx context.Context, manifestKeyHex, hash string) (int64, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid,key_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	var existingAPIHash, existingAPIEnc, existingManifestHash, existingManifestEnc string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys WHERE api_secret_hash=?`, apiHash,
+	).Scan(&existingAPIHash, &existingAPIEnc, &existingManifestHash, &existingManifestEnc); err != nil {
+		return false, fmt.Errorf("store: read existing key pair: %w", err)
+	}
+	existing, err := s.decryptVerifiedKeyPair(existingAPIHash, existingAPIEnc, existingManifestHash, existingManifestEnc)
 	if err != nil {
-		return 0, false, err
+		return false, fmt.Errorf("store: read existing key pair: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var rid int64
-		var enc string
-		if err := rows.Scan(&rid, &enc); err != nil {
-			return 0, false, err
-		}
-		if mk, err := s.box.DecryptString(enc); err == nil && mk == manifestKeyHex {
-			return rid, true, nil
-		}
+	if !equalKeyPair(existing, pair) {
+		return false, ErrKeyPairConflict
 	}
-	return 0, false, rows.Err()
-}
 
-// HasManifestKey reports whether the manifest key (hex) is in the allowlist.
-func (s *Store) HasManifestKey(ctx context.Context, manifestKeyHex string) (bool, error) {
-	keys, err := s.AllowedManifestKeysByHash(ctx, mustHash(manifestKeyHex))
-	if err != nil {
-		return false, err
+	if _, err := tx.ExecContext(ctx, `
+UPDATE manifest_keys SET
+  expires_unix=?,
+  label=CASE WHEN ?='' THEN label ELSE ? END,
+  registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END
+WHERE api_secret_hash=?`,
+		expires, label, label, registryAuthJSON, registryAuthEnc, apiHash); err != nil {
+		return false, fmt.Errorf("store: refresh key pair: %w", err)
 	}
-	for _, k := range keys {
-		if k == manifestKeyHex {
-			return true, nil
-		}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: refresh key pair commit: %w", err)
 	}
 	return false, nil
 }
 
-// RemoveManifestKey deletes matching manifest-key rows; returns the count removed.
-func (s *Store) RemoveManifestKey(ctx context.Context, manifestKeyHex string) (int, error) {
-	hash, err := ManifestKeyHash(manifestKeyHex)
+// RegistryAuthForKeyPair returns the registry credentials stored with an exact
+// pair, or "" when the pair is absent or has no credentials.
+func (s *Store) RegistryAuthForKeyPair(ctx context.Context, pair KeyPair) (string, error) {
+	apiHash, _, err := keyPairHashes(pair)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid,key_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	var storedAPIHash, apiEnc, storedManifestHash, manifestEnc, registryAuthEnc string
+	err = s.db.QueryRowContext(ctx, `
+SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,registry_auth_enc
+FROM manifest_keys WHERE api_secret_hash=?`, apiHash).Scan(
+		&storedAPIHash, &apiEnc, &storedManifestHash, &manifestEnc, &registryAuthEnc,
+	)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	var victims []int64
-	for rows.Next() {
-		var rid int64
-		var enc string
-		if err := rows.Scan(&rid, &enc); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		if mk, err := s.box.DecryptString(enc); err == nil && mk == manifestKeyHex {
-			victims = append(victims, rid)
-		}
+	stored, err := s.decryptVerifiedKeyPair(storedAPIHash, apiEnc, storedManifestHash, manifestEnc)
+	if err != nil {
+		return "", err
 	}
-	rows.Close()
-	for _, rid := range victims {
-		if _, err := s.db.ExecContext(ctx, `DELETE FROM manifest_keys WHERE rowid=?`, rid); err != nil {
-			return 0, err
-		}
+	if !equalKeyPair(stored, pair) || registryAuthEnc == "" {
+		return "", nil
 	}
-	return len(victims), nil
+	return s.box.DecryptString(registryAuthEnc)
 }
 
-// ListManifestKeys returns the allowlist as non-secret fingerprints + labels.
-func (s *Store) ListManifestKeys(ctx context.Context) ([]ManifestKeyInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT key_hash,label,created_unix,expires_unix FROM manifest_keys ORDER BY created_unix ASC`)
+func (s *Store) decryptKeyPair(apiEnc, manifestEnc string) (KeyPair, error) {
+	apiSecret, err := s.box.DecryptString(apiEnc)
+	if err != nil {
+		return KeyPair{}, fmt.Errorf("store: decrypt API secret: %w", err)
+	}
+	manifestKey, err := s.box.DecryptString(manifestEnc)
+	if err != nil {
+		return KeyPair{}, fmt.Errorf("store: decrypt manifest key: %w", err)
+	}
+	return KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, nil
+}
+
+func (s *Store) decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc string) (KeyPair, error) {
+	pair, err := s.decryptKeyPair(apiEnc, manifestEnc)
+	if err != nil {
+		return KeyPair{}, err
+	}
+	actualAPIHash, err := APISecretHash(pair.APISecret)
+	if err != nil {
+		return KeyPair{}, fmt.Errorf("store: invalid stored API secret: %w", err)
+	}
+	actualManifestHash, err := ManifestKeyHash(pair.ManifestKey)
+	if err != nil {
+		return KeyPair{}, fmt.Errorf("store: invalid stored manifest key: %w", err)
+	}
+	if actualAPIHash != apiHash || actualManifestHash != manifestHash {
+		return KeyPair{}, fmt.Errorf("store: key pair fingerprint mismatch")
+	}
+	return pair, nil
+}
+
+// HasKeyPair reports whether an exact, non-expired pair is in the allowlist.
+func (s *Store) HasKeyPair(ctx context.Context, pair KeyPair) (bool, error) {
+	apiHash, _, err := keyPairHashes(pair)
+	if err != nil {
+		return false, err
+	}
+	var storedAPIHash, apiEnc, storedManifestHash, manifestEnc string
+	err = s.db.QueryRowContext(ctx, `
+SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys
+WHERE api_secret_hash=? AND (expires_unix=0 OR expires_unix>?)`,
+		apiHash, time.Now().Unix()).Scan(&storedAPIHash, &apiEnc, &storedManifestHash, &manifestEnc)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	stored, err := s.decryptVerifiedKeyPair(storedAPIHash, apiEnc, storedManifestHash, manifestEnc)
+	return equalKeyPair(stored, pair), err
+}
+
+// RemoveKeyPair deletes an exact allowlist pair and returns the number removed.
+func (s *Store) RemoveKeyPair(ctx context.Context, pair KeyPair) (int, error) {
+	apiHash, _, err := keyPairHashes(pair)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var storedAPIHash, apiEnc, storedManifestHash, manifestEnc string
+	err = tx.QueryRowContext(ctx,
+		`SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys WHERE api_secret_hash=?`, apiHash,
+	).Scan(&storedAPIHash, &apiEnc, &storedManifestHash, &manifestEnc)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	stored, err := s.decryptVerifiedKeyPair(storedAPIHash, apiEnc, storedManifestHash, manifestEnc)
+	if err != nil {
+		return 0, err
+	}
+	if !equalKeyPair(stored, pair) {
+		return 0, nil
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM manifest_keys WHERE api_secret_hash=?`, apiHash)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(removed), nil
+}
+
+// RemoveKeyPairByAPISecretFingerprint deletes key-table material identified by
+// a complete API-secret fingerprint. Expiry does not protect the allowlist row
+// from deletion. Durable sandbox and build credential copies are not touched.
+func (s *Store) RemoveKeyPairByAPISecretFingerprint(ctx context.Context, fingerprint string) (int, error) {
+	if err := validateAPISecretFingerprint(fingerprint); err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM manifest_keys WHERE api_secret_hash=?`, fingerprint)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(removed), nil
+}
+
+// ListKeyPairs returns the allowlist as non-secret fingerprints and labels.
+func (s *Store) ListKeyPairs(ctx context.Context) ([]KeyPairInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT api_secret_hash,manifest_key_hash,label,created_unix,expires_unix
+FROM manifest_keys ORDER BY created_unix ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ManifestKeyInfo
+	var out []KeyPairInfo
 	for rows.Next() {
-		var mi ManifestKeyInfo
-		if err := rows.Scan(&mi.Hash, &mi.Label, &mi.CreatedUnix, &mi.ExpiresUnix); err != nil {
+		var info KeyPairInfo
+		if err := rows.Scan(&info.APISecretHash, &info.ManifestKeyHash, &info.Label, &info.CreatedUnix, &info.ExpiresUnix); err != nil {
 			return nil, err
 		}
-		out = append(out, mi)
+		out = append(out, info)
 	}
 	return out, rows.Err()
 }
 
-// AllowedManifestKeysByHash returns the decrypted, NON-EXPIRED manifest keys (hex) in
-// the allowlist whose hash matches — the candidate set the caller verifies an api key
-// against for create/build authorization. Expired rows (expires_unix>0 && <now) are
-// excluded (treated as not allowlisted); they linger until PruneExpiredManifestKeys.
-func (s *Store) AllowedManifestKeysByHash(ctx context.Context, hash string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT key_enc FROM manifest_keys WHERE key_hash=? AND (expires_unix=0 OR expires_unix>?)`,
-		hash, time.Now().Unix())
+// AllowedKeyPairByAPISecretFingerprint returns the unique non-expired pair
+// identified by a complete API-secret fingerprint. The decrypted pair is
+// checked against both fingerprints stored in the row before it is returned.
+func (s *Store) AllowedKeyPairByAPISecretFingerprint(ctx context.Context, fingerprint string) (KeyPair, bool, error) {
+	if err := validateAPISecretFingerprint(fingerprint); err != nil {
+		return KeyPair{}, false, err
+	}
+	var apiHash, apiEnc, manifestHash, manifestEnc string
+	err := s.db.QueryRowContext(ctx, `
+SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc
+FROM manifest_keys
+WHERE api_secret_hash=? AND (expires_unix=0 OR expires_unix>?)`,
+		fingerprint, time.Now().Unix()).Scan(&apiHash, &apiEnc, &manifestHash, &manifestEnc)
+	if err == sql.ErrNoRows {
+		return KeyPair{}, false, nil
+	}
+	if err != nil {
+		return KeyPair{}, false, err
+	}
+	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
+	if err != nil {
+		return KeyPair{}, false, err
+	}
+	return pair, true, nil
+}
+
+func validateAPISecretFingerprint(fingerprint string) error {
+	if len(fingerprint) != secretHexLen || !hexSecretRE.MatchString(fingerprint) {
+		return fmt.Errorf("store: API secret fingerprint must be 64 lowercase hex characters")
+	}
+	return nil
+}
+
+// AllowedKeyPairsByAPISecretHashPrefix returns non-expired candidate pairs for
+// the 24-hex prefix carried in an API key. A prefix is not authoritative: the
+// caller must verify the API-key MAC against every returned APISecret.
+func (s *Store) AllowedKeyPairsByAPISecretHashPrefix(ctx context.Context, prefix string) ([]KeyPair, error) {
+	if len(prefix) != apiSecretCandidateHashLen || !hexCandidateHashRE.MatchString(prefix) {
+		return nil, fmt.Errorf("store: API secret hash prefix must be 24 lowercase hex characters")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys
+WHERE substr(api_secret_hash,1,24)=? AND (expires_unix=0 OR expires_unix>?)`,
+		prefix, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var out []KeyPair
 	for rows.Next() {
-		var enc string
-		if err := rows.Scan(&enc); err != nil {
+		var apiHash, apiEnc, manifestHash, manifestEnc string
+		if err := rows.Scan(&apiHash, &apiEnc, &manifestHash, &manifestEnc); err != nil {
 			return nil, err
 		}
-		if mk, err := s.box.DecryptString(enc); err == nil {
-			out = append(out, mk)
+		pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, pair)
 	}
 	return out, rows.Err()
 }
 
-// PruneExpiredManifestKeys deletes expired allowlist rows (expires_unix>0 && <now).
-// Lazy cleanup called opportunistically by the reaper; expired keys are already
-// excluded from authorization by AllowedManifestKeysByHash.
-func (s *Store) PruneExpiredManifestKeys(ctx context.Context) (int64, error) {
+// PruneExpiredKeyPairs deletes expired allowlist rows. Expiry and pruning never
+// touch credential copies already held by sandbox or build rows.
+func (s *Store) PruneExpiredKeyPairs(ctx context.Context) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM manifest_keys WHERE expires_unix>0 AND expires_unix<?`, time.Now().Unix())
 	if err != nil {
@@ -727,14 +1059,4 @@ func (s *Store) PruneExpiredManifestKeys(ctx context.Context) (int64, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
-}
-
-// mustHash is HasManifestKey's helper; an invalid hex key yields a hash that
-// matches nothing (callers re-validate the key elsewhere).
-func mustHash(manifestKeyHex string) string {
-	h, err := ManifestKeyHash(manifestKeyHex)
-	if err != nil {
-		return ""
-	}
-	return h
 }

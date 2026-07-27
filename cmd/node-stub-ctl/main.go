@@ -6,7 +6,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -24,8 +26,11 @@ import (
 	"syscall"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -34,7 +39,6 @@ var version = "0.1.0-dev"
 const (
 	defaultCreateDelay = 10 * time.Millisecond
 	defaultBuildDelay  = 10 * time.Millisecond
-	headerAccessToken  = "X-Access-Token"
 )
 
 func main() {
@@ -106,7 +110,7 @@ func runServe(args []string, log *slog.Logger) error {
 	buildStorage := fs.Int64("build-storage-bytes", 0, "build storage capacity in bytes")
 	heartbeat := fs.Duration("heartbeat", time.Second, "node heartbeat interval")
 	runtimeDigest := fs.String("runtime-digest", "runtime-stub", "runtime digest reported by each node")
-	strictKeys := fs.Bool("strict-keys", true, "reject create/build when the referenced key is not installed")
+	strictKeys := fs.Bool("strict-keys", true, "reject builds when the referenced key is not installed; creates always require inline API secret material")
 	createDelay := fs.Duration("create-delay", defaultCreateDelay, "default create-to-running delay")
 	buildDelay := fs.Duration("build-delay", defaultBuildDelay, "default build event delay")
 	var labels multiFlag
@@ -390,6 +394,7 @@ func (s *service) serveRoutes(w http.ResponseWriter, r *http.Request, n *stubNod
 			http.Error(w, "sid is required", http.StatusBadRequest)
 			return
 		}
+		req.Metadata = observableSandboxMetadata(req.Metadata)
 		n.publishRoute(routesync.RouteEntry{SandboxID: req.SID, State: routesync.StateRunning})
 		s.logEvent(n.ID, "orphan_route", req)
 		s.writeJSON(w, map[string]any{"ok": true})
@@ -505,8 +510,8 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	}
 	status, body := sb.response()
 	s.appendDataHit(dataHit{
-		NodeID: n.ID, SandboxID: sb.SID, Metadata: cloneStringMap(sb.Metadata),
-		Host: r.Host, Path: r.URL.Path, Method: r.Method, AccessToken: r.Header.Get(headerAccessToken),
+		NodeID: n.ID, SandboxID: sb.SID, Cluster: cloneStubClusterContext(sb.Cluster), Metadata: observableSandboxMetadata(sb.Metadata),
+		Host: r.Host, Path: r.URL.Path, Method: r.Method,
 	})
 	if status == 0 {
 		status = http.StatusNoContent
@@ -545,8 +550,8 @@ func (s *service) serveDataConnect(w http.ResponseWriter, r *http.Request, n *st
 		status = http.StatusNoContent
 	}
 	s.appendDataHit(dataHit{
-		NodeID: n.ID, SandboxID: sb.SID, Metadata: cloneStringMap(sb.Metadata),
-		Host: inner.Host, Path: inner.URL.Path, Method: inner.Method, AccessToken: inner.Header.Get(headerAccessToken),
+		NodeID: n.ID, SandboxID: sb.SID, Cluster: cloneStubClusterContext(sb.Cluster), Metadata: observableSandboxMetadata(sb.Metadata),
+		Host: inner.Host, Path: inner.URL.Path, Method: inner.Method,
 	})
 	resp := &http.Response{
 		StatusCode:    status,
@@ -586,7 +591,11 @@ func (s *service) serveControlStub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sb)
+		if strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/connect") {
+			_ = json.NewEncoder(w).Encode(sb.connectResponse())
+		} else {
+			_ = json.NewEncoder(w).Encode(sb.publicDetailResponse(n.ID))
+		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -629,7 +638,7 @@ type stubNode struct {
 	redirectTo   routesync.NodeLinkTarget
 	sandboxes    map[string]*stubSandbox
 	builds       map[string]*stubBuild
-	keys         map[string]stubKey
+	keyPairs     map[string]stubKeyPair
 	commands     []commandLog
 	cmdSeq       int64
 	subs         map[int]chan routesync.Event
@@ -653,7 +662,7 @@ func newStubNode(opts stubNodeOptions, svc *service) *stubNode {
 		log:             svc.log.With("node", opts.ID),
 		sandboxes:       map[string]*stubSandbox{},
 		builds:          map[string]*stubBuild{},
-		keys:            map[string]stubKey{},
+		keyPairs:        map[string]stubKeyPair{},
 		subs:            map[int]chan routesync.Event{},
 		buildEvents:     make(chan *routesync.BuildEvent, 256),
 	}
@@ -715,11 +724,11 @@ func (n *stubNode) rebootEmpty() {
 	n.mu.Lock()
 	var old []routesync.RouteEntry
 	for _, sb := range n.sandboxes {
-		old = append(old, routesync.RouteEntry{SandboxID: sb.SID, State: routesync.StateDead})
+		old = append(old, routesync.RouteEntry{SandboxID: sb.SID, Profile: sb.Profile, State: routesync.StateDead})
 	}
 	n.sandboxes = map[string]*stubSandbox{}
 	n.builds = map[string]*stubBuild{}
-	n.keys = map[string]stubKey{}
+	n.keyPairs = map[string]stubKeyPair{}
 	n.mu.Unlock()
 	for _, r := range old {
 		n.publishRoute(r)
@@ -801,13 +810,24 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	n.recordCommand(cmd)
 	switch cmd.Kind {
 	case routesync.CmdKeyPut:
+		pair, err := stubKeyPairFromCommand(cmd)
+		if err != nil {
+			return ack(cmd, routesync.AckRejected, err.Error())
+		}
 		n.mu.Lock()
-		n.keys[cmd.KeyFingerprint] = stubKey{Fingerprint: cmd.KeyFingerprint, Type: cmd.ManifestKeyType, Value: cmd.ManifestKey, Ref: cmd.ManifestKeyRef, ExpiresUnix: cmd.ExpiresUnix}
+		if existing, found := n.keyPairs[pair.APISecretFingerprint]; found && !sameStubKeyPair(existing, pair) {
+			n.mu.Unlock()
+			return ack(cmd, routesync.AckRejected, "API secret fingerprint is already bound to a different key pair")
+		}
+		n.keyPairs[pair.APISecretFingerprint] = pair
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckAccepted, "")
 	case routesync.CmdKeyDrop:
+		if !validStubFingerprint(cmd.APISecretFingerprint) {
+			return ack(cmd, routesync.AckRejected, "API secret fingerprint must be 64 lowercase hex characters")
+		}
 		n.mu.Lock()
-		delete(n.keys, cmd.KeyFingerprint)
+		delete(n.keyPairs, cmd.APISecretFingerprint)
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckAccepted, "")
 	case routesync.CmdCreate:
@@ -815,8 +835,7 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	case routesync.CmdConnect:
 		return n.handleConnect(cmd)
 	case routesync.CmdDelete:
-		n.deleteSandbox(cmd.SID, true)
-		return ack(cmd, routesync.AckAccepted, "")
+		return n.handleDelete(cmd)
 	case routesync.CmdBuildRegister:
 		return n.handleBuildRegister(cmd)
 	default:
@@ -828,18 +847,59 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 	if cmd.SID == "" {
 		return ack(cmd, routesync.AckRejected, "sid is required")
 	}
-	if n.StrictKeys && cmd.KeyFingerprint != "" && !n.hasKey(cmd.KeyFingerprint) {
-		return ack(cmd, routesync.AckRejected, "manifest key not installed")
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return ack(cmd, routesync.AckRejected, "valid profile is required")
 	}
-	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return ack(cmd, routesync.AckRejected, "complete cluster sandbox context is required")
+	}
+	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
+	if err != nil || tmpl.Profile != profile {
+		return ack(cmd, routesync.AckRejected, "template and command profile must match")
+	}
+	credentials, metadata, err := sandboxcfg.ExtractCredentials(cmd.Config)
+	if err != nil {
+		return ack(cmd, routesync.AckRejected, "invalid sandbox credentials")
+	}
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, credentials); err != nil {
+		return ack(cmd, routesync.AckRejected, "sandbox credentials do not match profile")
+	}
+	pair, found := n.keyPair(cmd.APISecretFingerprint)
+	if !found {
+		return ack(cmd, routesync.AckRejected, "credential pair not installed")
+	}
+	if pair.APISecretType != "inline" || pair.APISecret == "" {
+		return ack(cmd, routesync.AckRejected, "API secret material unavailable")
+	}
+	beh := behaviorFromConfig(metadata, n.CreateDelay, n.BuildDelay)
 	if beh.CreateResult == "reject" {
 		return ack(cmd, routesync.AckRejected, "stub create rejected")
 	}
+	metadata = cloneStringMap(metadata)
+	delete(metadata, clusterstate.ObjectMetadataKey)
+	authSandboxID := cmd.Cluster.AuthSandboxID
+	if authSandboxID == "" {
+		authSandboxID = cmd.SID
+	}
+	materialized, err := materializeStubCredentials(profile, pair.APISecret, authSandboxID, credentials)
+	if err != nil {
+		return ack(cmd, routesync.AckRejected, "sandbox credential materialization failed")
+	}
+	clusterContext := *cmd.Cluster
 	sb := &stubSandbox{
-		SID: cmd.SID, Metadata: cloneStringMap(cmd.Config), State: "creating",
-		TemplateID: cmd.TemplateRef, AccessToken: cmd.AccessToken,
-		TrafficAccessToken: "traffic-" + cmd.SID,
-		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		SID: cmd.SID, Profile: string(profile), Metadata: metadata, State: "creating",
+		TemplateID:             cmd.TemplateRef,
+		AuthSandboxID:          authSandboxID,
+		APISecret:              pair.APISecret,
+		APISecretFingerprint:   pair.APISecretFingerprint,
+		ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
+		ServiceSecret:          materialized.ServiceSecret,
+		EnvdAccessToken:        materialized.EnvdAccessToken,
+		TrafficAccessToken:     materialized.TrafficAccessToken,
+		ForwardAccessToken:     materialized.ForwardAccessToken,
+		Cluster:                &clusterContext,
+		Behavior:               beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	n.mu.Lock()
 	n.sandboxes[sb.SID] = sb
@@ -875,10 +935,36 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "sandbox not found")
 	}
+	if cmd.APISecretFingerprint != sb.APISecretFingerprint {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox credential binding mismatch")
+	}
+	if cmd.Profile != sb.Profile || !sameStubClusterContext(cmd.Cluster, sb.Cluster) {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox context binding mismatch")
+	}
 	sb.State = routesync.StateRunning
 	entry := sb.routeEntry()
 	n.mu.Unlock()
 	n.publishRoute(entry)
+	return ack(cmd, routesync.AckAccepted, "")
+}
+
+func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
+	n.mu.Lock()
+	sb := n.sandboxes[cmd.SID]
+	if sb == nil {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox not found")
+	}
+	if cmd.APISecretFingerprint != sb.APISecretFingerprint {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox credential binding mismatch")
+	}
+	delete(n.sandboxes, cmd.SID)
+	n.mu.Unlock()
+	n.publishDelete(cmd.SID)
+	n.svc.logEvent(n.ID, "sandbox_delete", map[string]any{"sid": cmd.SID, "found": true})
 	return ack(cmd, routesync.AckAccepted, "")
 }
 
@@ -889,21 +975,21 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 	if !types.Profile(cmd.Profile).Valid() {
 		return ack(cmd, routesync.AckRejected, "valid profile is required")
 	}
-	if n.StrictKeys && cmd.KeyFingerprint != "" && !n.hasKey(cmd.KeyFingerprint) {
-		return ack(cmd, routesync.AckRejected, "manifest key not installed")
+	if n.StrictKeys && !n.hasKeyPair(cmd.APISecretFingerprint) {
+		return ack(cmd, routesync.AckRejected, "credential pair not installed")
 	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
 	if beh.BuildResult == "reject" {
 		return ack(cmd, routesync.AckRejected, "stub build rejected")
 	}
 	b := &stubBuild{
-		BuildID: cmd.BuildID, Profile: cmd.Profile, KeyFingerprint: cmd.KeyFingerprint,
+		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
-		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.KeyFingerprint != b.KeyFingerprint
+		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.APISecretFingerprint != b.APISecretFingerprint
 		n.mu.Unlock()
 		if conflict {
 			return ack(cmd, routesync.AckRejected, "build identity conflicts with existing build")
@@ -954,7 +1040,7 @@ func (n *stubNode) publishRoute(entry routesync.RouteEntry) {
 	}
 	ev := routesync.Event{Kind: routesync.TypeUpsert, Route: entry}
 	n.publish(ev)
-	n.svc.logEvent(n.ID, "route_upsert", entry)
+	n.svc.logEvent(n.ID, "route_upsert", routeObservation(entry))
 }
 
 func (n *stubNode) publishDelete(sid string) {
@@ -975,20 +1061,34 @@ func (n *stubNode) publish(ev routesync.Event) {
 	}
 }
 
-func (n *stubNode) hasKey(fp string) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	_, ok := n.keys[fp]
+func (n *stubNode) hasKeyPair(apiSecretFingerprint string) bool {
+	_, ok := n.keyPair(apiSecretFingerprint)
 	return ok
 }
 
+func (n *stubNode) keyPair(apiSecretFingerprint string) (stubKeyPair, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	pair, ok := n.keyPairs[apiSecretFingerprint]
+	if !ok {
+		return stubKeyPair{}, false
+	}
+	if pair.ExpiresUnix > 0 && pair.ExpiresUnix <= time.Now().Unix() {
+		delete(n.keyPairs, apiSecretFingerprint)
+		return stubKeyPair{}, false
+	}
+	return pair, true
+}
+
 func (n *stubNode) recordCommand(cmd *routesync.Command) {
+	metadata := observableSandboxMetadata(cmd.Config)
 	n.mu.Lock()
 	n.cmdSeq++
 	log := commandLog{
 		Seq: n.cmdSeq, Time: time.Now().UTC().Format(time.RFC3339Nano), NodeID: n.ID,
-		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: cloneStringMap(cmd.Config),
-		BuildID: cmd.BuildID, Profile: cmd.Profile, KeyFingerprint: cmd.KeyFingerprint,
+		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: metadata,
+		BuildID: cmd.BuildID, Profile: cmd.Profile, Cluster: cloneStubClusterContext(cmd.Cluster),
+		APISecretFingerprint: cmd.APISecretFingerprint,
 	}
 	n.commands = append(n.commands, log)
 	n.mu.Unlock()
@@ -1005,10 +1105,9 @@ func (n *stubNode) createAdminSandbox(req sandboxAdminRequest) (*sandboxSnapshot
 	}
 	beh := behaviorFromMap(req.Behavior, n.CreateDelay, n.BuildDelay)
 	sb := &stubSandbox{
-		SID: req.SID, Metadata: cloneStringMap(req.Metadata), State: state,
-		TemplateID: req.TemplateID, AccessToken: req.AccessToken,
-		TrafficAccessToken: "traffic-" + req.SID,
-		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		SID: req.SID, Metadata: observableSandboxMetadata(req.Metadata), State: state,
+		TemplateID: req.TemplateID,
+		Behavior:   beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	n.mu.Lock()
 	n.sandboxes[sb.SID] = sb
@@ -1066,6 +1165,7 @@ func (n *stubNode) getSandbox(sid string) *stubSandbox {
 	if sb := n.sandboxes[sid]; sb != nil {
 		cp := *sb
 		cp.Metadata = cloneStringMap(sb.Metadata)
+		cp.Cluster = cloneStubClusterContext(sb.Cluster)
 		return &cp
 	}
 	return nil
@@ -1090,7 +1190,7 @@ func (n *stubNode) snapshot() nodeSnapshot {
 		NodeID: n.ID, Online: n.online, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.draining,
 		LinkEndpoint: n.linkEndpoint, RedirectMemberID: n.redirectTo.MemberID, RedirectEndpoint: n.redirectTo.Endpoint,
-		Sandboxes: n.sandboxSnapshotsLocked(), Builds: n.buildSnapshotsLocked(), Keys: n.keySnapshotsLocked(),
+		Sandboxes: n.sandboxSnapshotsLocked(), Builds: n.buildSnapshotsLocked(), KeyPairs: n.keyPairSnapshotsLocked(),
 		CommandCounts: n.commandCountsLocked(),
 	}
 }
@@ -1132,12 +1232,20 @@ func (n *stubNode) buildSnapshotsLocked() []buildSnapshot {
 	return out
 }
 
-func (n *stubNode) keySnapshotsLocked() []stubKey {
-	out := make([]stubKey, 0, len(n.keys))
-	for _, k := range n.keys {
-		out = append(out, k)
+func (n *stubNode) keyPairSnapshotsLocked() []stubKeyPairSnapshot {
+	out := make([]stubKeyPairSnapshot, 0, len(n.keyPairs))
+	for _, pair := range n.keyPairs {
+		out = append(out, stubKeyPairSnapshot{
+			APISecretFingerprint:   pair.APISecretFingerprint,
+			APISecretType:          pair.APISecretType,
+			ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
+			ManifestKeyType:        pair.ManifestKeyType,
+			ExpiresUnix:            pair.ExpiresUnix,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Fingerprint < out[j].Fingerprint })
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].APISecretFingerprint < out[j].APISecretFingerprint
+	})
 	return out
 }
 
@@ -1150,30 +1258,159 @@ func (n *stubNode) commandCountsLocked() map[string]int {
 }
 
 type stubSandbox struct {
-	SID                string            `json:"sid"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
-	State              string            `json:"state"`
-	TemplateID         string            `json:"template_id,omitempty"`
-	AccessToken        string            `json:"access_token,omitempty"`
-	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
-	Behavior           stubBehavior      `json:"behavior,omitempty"`
-	CreatedAt          string            `json:"created_at,omitempty"`
+	SID                    string
+	Profile                string
+	Metadata               map[string]string
+	State                  string
+	TemplateID             string
+	AuthSandboxID          string
+	APISecret              string `json:"-"`
+	APISecretFingerprint   string
+	ManifestKeyFingerprint string
+	ServiceSecret          string `json:"-"`
+	EnvdAccessToken        string `json:"-"`
+	TrafficAccessToken     string `json:"-"`
+	ForwardAccessToken     string `json:"-"`
+	Cluster                *routesync.ClusterSandboxContext
+	Behavior               stubBehavior
+	CreatedAt              string
 }
 
 func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID: s.SID, State: s.State,
-		TemplateID: s.TemplateID, AccessToken: s.AccessToken,
-		TrafficAccessToken: s.TrafficAccessToken, Profile: "e2b",
+		TemplateID:             s.TemplateID,
+		Profile:                s.Profile,
+		AuthSandboxID:          s.AuthSandboxID,
+		APISecret:              s.APISecret,
+		APISecretFingerprint:   s.APISecretFingerprint,
+		ManifestKeyFingerprint: s.ManifestKeyFingerprint,
+		ServiceSecret:          s.ServiceSecret,
+		EnvdAccessToken:        s.EnvdAccessToken,
+		TrafficAccessToken:     s.TrafficAccessToken,
+		ForwardAccessToken:     s.ForwardAccessToken,
 	}
+}
+
+func (s *stubSandbox) connectResponse() map[string]any {
+	response := map[string]any{
+		"sandboxID":  s.SID,
+		"templateID": s.TemplateID,
+	}
+	if s.ForwardAccessToken != "" {
+		response["forwardAccessToken"] = s.ForwardAccessToken
+	}
+	if types.Profile(s.Profile) == types.ProfileE2B {
+		response["envdAccessToken"] = s.EnvdAccessToken
+		response["trafficAccessToken"] = s.TrafficAccessToken
+	}
+	return response
+}
+
+func (s *stubSandbox) publicDetailResponse(nodeID string) map[string]any {
+	return map[string]any{
+		"sandboxID":  s.SID,
+		"templateID": s.TemplateID,
+		"clientID":   nodeID,
+		"state":      s.State,
+		"metadata":   observableSandboxMetadata(s.Metadata),
+	}
+}
+
+type sandboxRouteObservation struct {
+	SID              string `json:"sid"`
+	Profile          string `json:"profile,omitempty"`
+	TemplateID       string `json:"template_id,omitempty"`
+	State            string `json:"state,omitempty"`
+	SnapshotLocation string `json:"snap_loc,omitempty"`
+}
+
+func routeObservation(entry routesync.RouteEntry) sandboxRouteObservation {
+	return sandboxRouteObservation{
+		SID:              entry.SandboxID,
+		Profile:          entry.Profile,
+		TemplateID:       entry.TemplateID,
+		State:            entry.State,
+		SnapshotLocation: entry.SnapshotLocation,
+	}
+}
+
+type stubCredentials struct {
+	ServiceSecret      string
+	EnvdAccessToken    string
+	TrafficAccessToken string
+	ForwardAccessToken string
+}
+
+func materializeStubCredentials(profile types.Profile, apiSecret, authSandboxID string, overrides sandboxcfg.Credentials) (stubCredentials, error) {
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, overrides); err != nil {
+		return stubCredentials{}, err
+	}
+	serviceSecret := overrides.ServiceSecret
+	var err error
+	if serviceSecret == "" {
+		serviceSecret, err = keys.DeriveServiceSecret(apiSecret, authSandboxID)
+		if err != nil {
+			return stubCredentials{}, err
+		}
+	}
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	if err != nil {
+		return stubCredentials{}, err
+	}
+	credentials := stubCredentials{
+		ServiceSecret:      serviceSecret,
+		ForwardAccessToken: forwardAccessToken,
+	}
+	if profile == types.ProfileBare {
+		return credentials, nil
+	}
+	credentials.EnvdAccessToken = overrides.EnvdAccessToken
+	if credentials.EnvdAccessToken == "" {
+		credentials.EnvdAccessToken, err = keys.MintToken()
+		if err != nil {
+			return stubCredentials{}, err
+		}
+	}
+	credentials.TrafficAccessToken = overrides.TrafficAccessToken
+	if credentials.TrafficAccessToken == "" {
+		credentials.TrafficAccessToken, err = keys.MintToken()
+		if err != nil {
+			return stubCredentials{}, err
+		}
+	}
+	return credentials, nil
+}
+
+func sameStubClusterContext(a, b *routesync.ClusterSandboxContext) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Group == b.Group && a.RouteKey == b.RouteKey && a.AuthSandboxID == b.AuthSandboxID
 }
 
 func (s *stubSandbox) snapshot(nodeID string) sandboxSnapshot {
 	return sandboxSnapshot{
-		NodeID: nodeID, SID: s.SID, Metadata: cloneStringMap(s.Metadata), State: s.State,
-		TemplateID: s.TemplateID, AccessToken: s.AccessToken, TrafficAccessToken: s.TrafficAccessToken,
-		Behavior: s.Behavior, CreatedAt: s.CreatedAt,
+		NodeID: nodeID, SID: s.SID, Profile: s.Profile, Cluster: cloneStubClusterContext(s.Cluster),
+		Metadata: observableSandboxMetadata(s.Metadata), State: s.State,
+		TemplateID:           s.TemplateID,
+		APISecretFingerprint: s.APISecretFingerprint,
+		Behavior:             s.Behavior, CreatedAt: s.CreatedAt,
 	}
+}
+
+func observableSandboxMetadata(metadata map[string]string) map[string]string {
+	out := cloneStringMap(metadata)
+	delete(out, sandboxcfg.NsCredentials)
+	return out
+}
+
+func cloneStubClusterContext(in *routesync.ClusterSandboxContext) *routesync.ClusterSandboxContext {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func (s *stubSandbox) response() (int, string) {
@@ -1185,16 +1422,16 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
-	BuildID        string                    `json:"build_id"`
-	Profile        string                    `json:"profile"`
-	KeyFingerprint string                    `json:"-"`
-	Metadata       map[string]string         `json:"metadata,omitempty"`
-	State          string                    `json:"state"`
-	TemplateID     string                    `json:"template_id,omitempty"`
-	Reason         string                    `json:"reason,omitempty"`
-	Resources      *routesync.BuildResources `json:"resources,omitempty"`
-	Behavior       stubBehavior              `json:"behavior,omitempty"`
-	CreatedAt      string                    `json:"created_at,omitempty"`
+	BuildID              string                    `json:"build_id"`
+	Profile              string                    `json:"profile"`
+	APISecretFingerprint string                    `json:"-"`
+	Metadata             map[string]string         `json:"metadata,omitempty"`
+	State                string                    `json:"state"`
+	TemplateID           string                    `json:"template_id,omitempty"`
+	Reason               string                    `json:"reason,omitempty"`
+	Resources            *routesync.BuildResources `json:"resources,omitempty"`
+	Behavior             stubBehavior              `json:"behavior,omitempty"`
+	CreatedAt            string                    `json:"created_at,omitempty"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
@@ -1255,12 +1492,111 @@ func behaviorFromMap(cfg map[string]string, createDelay, buildDelay time.Duratio
 	return b
 }
 
-type stubKey struct {
-	Fingerprint string `json:"fingerprint"`
-	Type        string `json:"type,omitempty"`
-	Value       string `json:"value,omitempty"`
-	Ref         string `json:"ref,omitempty"`
-	ExpiresUnix int64  `json:"expires_unix,omitempty"`
+type stubKeyPair struct {
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	APISecretType          string `json:"api_secret_type,omitempty"`
+	APISecret              string `json:"api_secret,omitempty"`
+	APISecretRef           string `json:"api_secret_ref,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ManifestKeyType        string `json:"manifest_key_type,omitempty"`
+	ManifestKey            string `json:"manifest_key,omitempty"`
+	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`
+	ExpiresUnix            int64  `json:"expires_unix,omitempty"`
+}
+
+// stubKeyPairSnapshot intentionally excludes inline material and secret-provider
+// references. The stub admin endpoint is observability-only and may listen beyond
+// loopback, so it exposes only non-secret identity and lease metadata.
+type stubKeyPairSnapshot struct {
+	APISecretFingerprint   string `json:"api_secret_fingerprint"`
+	APISecretType          string `json:"api_secret_type,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	ManifestKeyType        string `json:"manifest_key_type,omitempty"`
+	ExpiresUnix            int64  `json:"expires_unix,omitempty"`
+}
+
+func stubKeyPairFromCommand(cmd *routesync.Command) (stubKeyPair, error) {
+	pair := stubKeyPair{
+		APISecretFingerprint:   cmd.APISecretFingerprint,
+		APISecretType:          cmd.APISecretType,
+		APISecret:              cmd.APISecret,
+		APISecretRef:           cmd.APISecretRef,
+		ManifestKeyFingerprint: cmd.ManifestKeyFingerprint,
+		ManifestKeyType:        cmd.ManifestKeyType,
+		ManifestKey:            cmd.ManifestKey,
+		ManifestKeyRef:         cmd.ManifestKeyRef,
+		ExpiresUnix:            cmd.ExpiresUnix,
+	}
+	if !validStubFingerprint(pair.APISecretFingerprint) {
+		return stubKeyPair{}, fmt.Errorf("API secret fingerprint must be 64 lowercase hex characters")
+	}
+	if !validStubFingerprint(pair.ManifestKeyFingerprint) {
+		return stubKeyPair{}, fmt.Errorf("manifest key fingerprint must be 64 lowercase hex characters")
+	}
+	var err error
+	pair.APISecretType, err = normalizeStubSecret(
+		"API secret", pair.APISecretType, pair.APISecret, pair.APISecretRef, pair.APISecretFingerprint,
+	)
+	if err != nil {
+		return stubKeyPair{}, err
+	}
+	pair.ManifestKeyType, err = normalizeStubSecret(
+		"manifest key", pair.ManifestKeyType, pair.ManifestKey, pair.ManifestKeyRef, pair.ManifestKeyFingerprint,
+	)
+	if err != nil {
+		return stubKeyPair{}, err
+	}
+	return pair, nil
+}
+
+func normalizeStubSecret(name, typ, value, ref, fingerprint string) (string, error) {
+	if typ == "" && value != "" && ref == "" {
+		typ = "inline"
+	}
+	switch typ {
+	case "inline":
+		if value == "" || ref != "" {
+			return "", fmt.Errorf("%s inline carrier is incomplete", name)
+		}
+		if !validStubSecret(value) {
+			return "", fmt.Errorf("%s must be 64 lowercase hex characters", name)
+		}
+		raw, _ := hex.DecodeString(value)
+		sum := sha256.Sum256(raw)
+		if hex.EncodeToString(sum[:]) != fingerprint {
+			return "", fmt.Errorf("%s fingerprint does not match inline material", name)
+		}
+	case "ref":
+		if ref == "" || value != "" {
+			return "", fmt.Errorf("%s ref carrier is incomplete", name)
+		}
+	default:
+		return "", fmt.Errorf("unsupported %s carrier type %q", name, typ)
+	}
+	return typ, nil
+}
+
+func validStubSecret(value string) bool {
+	if len(value) != sha256.Size*2 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validStubFingerprint(fingerprint string) bool {
+	return validStubSecret(fingerprint)
+}
+
+func sameStubKeyPair(a, b stubKeyPair) bool {
+	apiSecretEqual := hmac.Equal([]byte(a.APISecret), []byte(b.APISecret))
+	apiRefEqual := hmac.Equal([]byte(a.APISecretRef), []byte(b.APISecretRef))
+	manifestKeyEqual := hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
+	manifestRefEqual := hmac.Equal([]byte(a.ManifestKeyRef), []byte(b.ManifestKeyRef))
+	return a.APISecretFingerprint == b.APISecretFingerprint &&
+		a.APISecretType == b.APISecretType && apiSecretEqual && apiRefEqual &&
+		a.ManifestKeyFingerprint == b.ManifestKeyFingerprint &&
+		a.ManifestKeyType == b.ManifestKeyType && manifestKeyEqual && manifestRefEqual
 }
 
 type eventLog struct {
@@ -1272,57 +1608,59 @@ type eventLog struct {
 }
 
 type commandLog struct {
-	Seq            int64             `json:"seq"`
-	Time           string            `json:"time"`
-	NodeID         string            `json:"node_id"`
-	CmdID          string            `json:"cmd_id"`
-	Kind           string            `json:"kind"`
-	SID            string            `json:"sid,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
-	BuildID        string            `json:"build_id,omitempty"`
-	Profile        string            `json:"profile,omitempty"`
-	KeyFingerprint string            `json:"key_fp,omitempty"`
+	Seq                  int64                            `json:"seq"`
+	Time                 string                           `json:"time"`
+	NodeID               string                           `json:"node_id"`
+	CmdID                string                           `json:"cmd_id"`
+	Kind                 string                           `json:"kind"`
+	SID                  string                           `json:"sid,omitempty"`
+	Metadata             map[string]string                `json:"metadata,omitempty"`
+	BuildID              string                           `json:"build_id,omitempty"`
+	Profile              string                           `json:"profile,omitempty"`
+	Cluster              *routesync.ClusterSandboxContext `json:"cluster,omitempty"`
+	APISecretFingerprint string                           `json:"api_secret_fingerprint,omitempty"`
 }
 
 type dataHit struct {
-	Seq         int64             `json:"seq"`
-	Time        string            `json:"time"`
-	NodeID      string            `json:"node_id"`
-	SandboxID   string            `json:"sid"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	Host        string            `json:"host"`
-	Path        string            `json:"path"`
-	Method      string            `json:"method"`
-	AccessToken string            `json:"access_token,omitempty"`
+	Seq       int64                            `json:"seq"`
+	Time      string                           `json:"time"`
+	NodeID    string                           `json:"node_id"`
+	SandboxID string                           `json:"sid"`
+	Cluster   *routesync.ClusterSandboxContext `json:"cluster,omitempty"`
+	Metadata  map[string]string                `json:"metadata,omitempty"`
+	Host      string                           `json:"host"`
+	Path      string                           `json:"path"`
+	Method    string                           `json:"method"`
 }
 
 type nodeSnapshot struct {
-	NodeID           string            `json:"node_id"`
-	Online           bool              `json:"online"`
-	Labels           map[string]string `json:"labels,omitempty"`
-	Capacity         int               `json:"capacity,omitempty"`
-	DataEndpoint     string            `json:"data_endpoint,omitempty"`
-	RuntimeDigest    string            `json:"runtime_digest,omitempty"`
-	Draining         bool              `json:"draining,omitempty"`
-	LinkEndpoint     string            `json:"link_endpoint,omitempty"`
-	RedirectMemberID string            `json:"redirect_member_id,omitempty"`
-	RedirectEndpoint string            `json:"redirect_endpoint,omitempty"`
-	Sandboxes        []sandboxSnapshot `json:"sandboxes,omitempty"`
-	Builds           []buildSnapshot   `json:"builds,omitempty"`
-	Keys             []stubKey         `json:"keys,omitempty"`
-	CommandCounts    map[string]int    `json:"command_counts,omitempty"`
+	NodeID           string                `json:"node_id"`
+	Online           bool                  `json:"online"`
+	Labels           map[string]string     `json:"labels,omitempty"`
+	Capacity         int                   `json:"capacity,omitempty"`
+	DataEndpoint     string                `json:"data_endpoint,omitempty"`
+	RuntimeDigest    string                `json:"runtime_digest,omitempty"`
+	Draining         bool                  `json:"draining,omitempty"`
+	LinkEndpoint     string                `json:"link_endpoint,omitempty"`
+	RedirectMemberID string                `json:"redirect_member_id,omitempty"`
+	RedirectEndpoint string                `json:"redirect_endpoint,omitempty"`
+	Sandboxes        []sandboxSnapshot     `json:"sandboxes,omitempty"`
+	Builds           []buildSnapshot       `json:"builds,omitempty"`
+	KeyPairs         []stubKeyPairSnapshot `json:"keys,omitempty"`
+	CommandCounts    map[string]int        `json:"command_counts,omitempty"`
 }
 
 type sandboxSnapshot struct {
-	NodeID             string            `json:"node_id,omitempty"`
-	SID                string            `json:"sid"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
-	State              string            `json:"state"`
-	TemplateID         string            `json:"template_id,omitempty"`
-	AccessToken        string            `json:"access_token,omitempty"`
-	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
-	Behavior           stubBehavior      `json:"behavior,omitempty"`
-	CreatedAt          string            `json:"created_at,omitempty"`
+	NodeID               string                           `json:"node_id,omitempty"`
+	SID                  string                           `json:"sid"`
+	Profile              string                           `json:"profile"`
+	Cluster              *routesync.ClusterSandboxContext `json:"cluster,omitempty"`
+	Metadata             map[string]string                `json:"metadata,omitempty"`
+	State                string                           `json:"state"`
+	TemplateID           string                           `json:"template_id,omitempty"`
+	APISecretFingerprint string                           `json:"api_secret_fingerprint,omitempty"`
+	Behavior             stubBehavior                     `json:"behavior,omitempty"`
+	CreatedAt            string                           `json:"created_at,omitempty"`
 }
 
 type buildSnapshot struct {
@@ -1339,12 +1677,11 @@ type buildSnapshot struct {
 }
 
 type sandboxAdminRequest struct {
-	SID         string            `json:"sid"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	State       string            `json:"state,omitempty"`
-	TemplateID  string            `json:"template_id,omitempty"`
-	AccessToken string            `json:"access_token,omitempty"`
-	Behavior    map[string]string `json:"behavior,omitempty"`
+	SID        string            `json:"sid"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	State      string            `json:"state,omitempty"`
+	TemplateID string            `json:"template_id,omitempty"`
+	Behavior   map[string]string `json:"behavior,omitempty"`
 }
 
 func ack(cmd *routesync.Command, status, reason string) *routesync.CmdAck {

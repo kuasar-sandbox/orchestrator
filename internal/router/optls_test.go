@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // TestRouteLinkClientTLS verifies the router dials a TLS route_link endpoint over https/h2 when
@@ -19,7 +21,7 @@ import (
 func TestRouteLinkClientTLS(t *testing.T) {
 	routeLink := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/route-link/route" {
-			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", DataEndpoint: "10.0.0.1:1", State: "ready"})
+			_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", "10.0.0.1:1", types.ProfileE2B))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -54,7 +55,13 @@ type Orchestrator struct {
 	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
 
-	sf flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	sf        flightGroup    // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	lifecycle keyedLockGroup // serialize resume against destructive/deadline mutations for one sid
+
+	deadlineIntentMu sync.Mutex
+	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
+	resumeRequestMu  sync.Mutex
+	resumeRequests   map[string]*resumeRequestState // outstanding requests and the latest Pause/Delete fence
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -91,13 +98,14 @@ type clusterBuild struct {
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:            map[string]*types.Sandbox{},
-		clusterCreates: map[string]struct{}{},
-		subs:           map[int]chan routesync.Event{},
-		routeFP:        uuid.NewString(),
-		pend:           map[string]*pendingBuild{},
-		clusterBuilds:  map[string]*clusterBuild{},
-		buildEvents:    make(chan *routesync.BuildEvent, 64),
+		reg:             map[string]*types.Sandbox{},
+		clusterCreates:  map[string]struct{}{},
+		deadlineIntents: map[string]struct{}{},
+		subs:            map[int]chan routesync.Event{},
+		routeFP:         uuid.NewString(),
+		pend:            map[string]*pendingBuild{},
+		clusterBuilds:   map[string]*clusterBuild{},
+		buildEvents:     make(chan *routesync.BuildEvent, 64),
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -129,11 +137,11 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
 	}
-	manifestKey, err := o.resolveAllowed(ctx, req.APIKey)
+	pair, err := o.resolveAllowed(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
-	if manifestKey == "" {
+	if pair.APISecret == "" {
 		return nil, api.ErrNotAllowed
 	}
 	tmpl, err := types.ParseTemplateID(req.TemplateID)
@@ -163,28 +171,36 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	credentials, meta, err := sandboxcfg.ExtractCredentials(meta)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("orch: new id: %w", err)
 	}
 	sid := id.String()
-	envdTok, _ := keys.MintToken()
-	trafTok, _ := keys.MintToken()
 
 	sb := &types.Sandbox{
-		ID:                 sid,
-		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
-		State:              types.StateRunning,
-		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
-		ManifestKey:        manifestKey,
-		EnvdAccessToken:    envdTok,
-		TrafficAccessToken: trafTok,
-		Metadata:           meta,
-		Env:                req.EnvVars,
-		CreatedUnix:        time.Now().Unix(),
-		DeadlineUnix:       time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
+		ID:           sid,
+		Profile:      tmpl.Profile,
+		TemplateID:   tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
+		State:        types.StateRunning,
+		RunDir:       o.cfg.Paths.RunRoot + "/" + sid,
+		BaseDir:      o.cfg.Paths.BaseRoot + "/" + sid,
+		APISecret:    pair.APISecret,
+		ManifestKey:  pair.ManifestKey,
+		Metadata:     meta,
+		Env:          req.EnvVars,
+		CreatedUnix:  time.Now().Unix(),
+		DeadlineUnix: time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
+	}
+	if err := materializeSandboxCredentials(sb, credentials); err != nil {
+		return nil, fmt.Errorf("orch: create credentials: %w", err)
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
@@ -292,7 +308,7 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 	// hash-collision rows belonging to another tenant).
 	out := rows[:0]
 	for _, sb := range rows {
-		if verifyKey(apiKey, sb.ManifestKey) {
+		if verifyKey(apiKey, sb.APISecret) {
 			out = append(out, sb)
 		}
 	}
@@ -300,6 +316,9 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 }
 
 func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error) {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return false, err
@@ -307,14 +326,21 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	o.cancelResumeRequests(id)
 	o.teardown(ctx, sb)
-	_ = o.st.Delete(ctx, id)
+	if err := o.st.Delete(ctx, id); err != nil {
+		return false, err
+	}
+	o.clearDeadlineIntent(id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
 	return true, nil
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return err
@@ -322,12 +348,28 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
-	return o.pauseSandbox(ctx, sb)
+	o.cancelResumeRequests(id)
+	return o.pauseSandboxLocked(ctx, sb)
 }
 
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
 // and the reaper's auto-suspend (no api key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	o.cancelResumeRequests(sb.ID)
+
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return api.ErrNotFound
+	}
+	return o.pauseSandboxLocked(ctx, current)
+}
+
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
 	}
@@ -356,51 +398,87 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 	}
 	// Auto-migrate: connecting to a sandbox absent on this node with a migration
 	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
-	// resumes — one SDK call does export's counterpart. ImportSandbox checks the
-	// tenant key + token fingerprint + runtime digest.
+	// schedules an asynchronous resume. ImportSandbox checks the tenant key,
+	// token fingerprints, runtime digest, and exact caller-selected target ID.
+	// An existing target ignores the token completely, including malformed input.
 	if sb == nil && migrationToken != "" {
-		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken)
+		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id)
 		if ierr != nil {
-			return nil, ierr
+			if !errors.Is(ierr, api.ErrAlreadyExists) {
+				return nil, ierr
+			}
+			// Another Connect may have won the insert-only import race. Treat the
+			// winner as an existing target, then apply the normal ownership check
+			// below. Never overwrite or merge the row that won.
+		} else if imported != id {
+			return nil, fmt.Errorf("connect: imported sandbox ID mismatch")
 		}
-		id = imported
 		if sb, err = o.st.Get(ctx, id); err != nil {
 			return nil, err
 		}
 	}
-	if !ownsSandbox(sb, apiKey) {
-		return nil, api.ErrNotFound
-	}
-	if sb.State == types.StatePaused {
-		// Route the resume through the same per-sid single-flight the data plane
-		// uses, so a /connect racing data-plane traffic (or another /connect)
-		// collapses to one resume+launch instead of double-allocating the port or
-		// starting the unit twice. resumeIfPaused re-checks "still paused?" inside
-		// the flight, so the losers are no-ops.
-		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
-			return nil, err
-		}
-		// Re-read the now-running snapshot the flight published; never mutate the
-		// cached pointer in place.
-		if r := o.lookup(id); r != nil {
-			sb = r
-		} else if sb, err = o.st.Get(ctx, id); err != nil || sb == nil {
+	if timeoutSec <= 0 {
+		if !ownsSandbox(sb, apiKey) {
 			return nil, api.ErrNotFound
 		}
-	}
-	if timeoutSec > 0 {
-		dl := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = dl }); s != nil {
-			sb = s // cached: published a fresh snapshot with the new deadline
-		} else {
-			sb.DeadlineUnix = dl // not cached (fresh, unpublished) — safe in place
+		if sb.State == types.StatePaused {
+			// A credential-only Connect remains non-blocking even when another
+			// caller already owns the asynchronous resume flight.
+			o.scheduleResume(id)
 		}
-		_ = o.st.SetDeadline(ctx, id, dl)
+		return sb, nil
+	}
+
+	unlock := o.lifecycle.Lock(id)
+	// Re-read under the per-sandbox lifecycle boundary: an asynchronous resume or
+	// delete may have completed since the initial existence/import decision.
+	if sb, err = o.st.Get(ctx, id); err != nil {
+		unlock()
+		return nil, err
+	}
+	if !ownsSandbox(sb, apiKey) {
+		unlock()
+		return nil, api.ErrNotFound
+	}
+	requestedDeadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline }); s != nil {
+		sb = s // cached: published a fresh snapshot with the new deadline
+	} else {
+		sb.DeadlineUnix = requestedDeadline // not cached (fresh, unpublished) — safe in place
+	}
+	if err := o.st.SetDeadline(ctx, id, requestedDeadline); err != nil {
+		unlock()
+		return nil, err
+	}
+	if sb.State == types.StatePaused {
+		o.markDeadlineIntent(id)
+	}
+	shouldResume := sb.State == types.StatePaused
+	unlock()
+	if shouldResume {
+		// Import and credential lookup are complete before this point. Resume is
+		// deliberately asynchronous, but still shares the per-sandbox flight with
+		// data-plane wakes and other Connect calls.
+		o.scheduleResume(id)
 	}
 	return sb, nil
 }
 
+func (o *Orchestrator) scheduleResume(id string) {
+	request := o.newResumeRequest(id)
+	go func() {
+		defer o.releaseResumeRequest(request)
+		ctx := o.asyncCtx()
+		if err := o.resumeSandboxRequest(ctx, request); err != nil {
+			o.log.Error("sandbox connect resume", "sid", id, "err", err)
+		}
+	}()
+}
+
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return false, err
@@ -408,13 +486,24 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
-	sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	return true, o.st.SetDeadline(ctx, id, sb.DeadlineUnix)
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if cached := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline }); cached != nil {
+		sb = cached
+	} else {
+		sb.DeadlineUnix = deadline
+	}
+	if err := o.st.SetDeadline(ctx, id, deadline); err != nil {
+		return false, err
+	}
+	if sb.State == types.StatePaused {
+		o.markDeadlineIntent(id)
+	}
+	return true, nil
 }
 
 // resume restarts a paused sandbox from its snapshot (no api_key needed: the
 // manifest key comes from the store via the config-socket).
-func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDeadline bool) error {
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
 		return err
@@ -428,7 +517,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
 	// deadline is from before the pause (already passed), so without this the reaper
 	// would immediately re-suspend it.
-	if o.cfg.Sandbox.TimeoutSec > 0 {
+	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
 	}
 	if err := o.launch(ctx, &nb, tmpl); err != nil {
@@ -437,7 +526,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
 		return err
 	}
-	if o.cfg.Sandbox.TimeoutSec > 0 {
+	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
 	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
@@ -461,19 +550,22 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 		o.cache(sb)
 	}
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
-		if err := o.sf.Do(sandboxID, func() error { return o.resumeIfPaused(ctx, sandboxID) }); err != nil {
+		if err := o.resumeSandbox(ctx, sandboxID); err != nil {
 			return proxy.Route{}, err
 		}
 		if sb = o.lookup(sandboxID); sb == nil {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
 	}
-	return proxy.RouteForTarget(string(sb.Profile()), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, port), nil
+	return proxy.RouteForTarget(
+		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
+		sb.EnvdAccessToken, sb.ForwardAccessToken, port,
+	), nil
 }
 
-// resumeIfPaused (run under the per-sid single-flight) resumes sid only if it is
-// still paused — a loser of the race finds it already running and returns.
-func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
+// resumeIfPaused (run under the per-sid single-flight and lifecycle lock) resumes
+// sid only if it is still paused — a loser of the race finds it already running.
+func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, preserveDeadline bool) error {
 	sb := o.lookup(sid)
 	if sb == nil {
 		s, _ := o.st.Get(ctx, sid)
@@ -486,7 +578,7 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
 	if sb.State != types.StatePaused {
 		return nil
 	}
-	return o.resume(ctx, sb)
+	return o.resume(ctx, sb, preserveDeadline)
 }
 
 // snapInfo is the config the orchestrator inherits from a restore snapshot: the
@@ -692,10 +784,10 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
-			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
-				o.log.Warn("reaper prune manifest keys", "err", err)
+			if n, err := o.st.PruneExpiredKeyPairs(ctx); err != nil {
+				o.log.Warn("reaper prune key pairs", "err", err)
 			} else if n > 0 {
-				o.log.Info("reaper pruned expired manifest keys", "n", n)
+				o.log.Info("reaper pruned expired key pairs", "n", n)
 			}
 		}
 	}

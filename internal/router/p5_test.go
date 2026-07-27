@@ -14,14 +14,23 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func newDataTunnelServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	return newObservedDataTunnelServer(t, nil, h)
+}
+
+func newObservedDataTunnelServer(t *testing.T, onConnect func(*http.Request), h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
 			h(w, r)
 			return
+		}
+		if onConnect != nil {
+			onConnect(r.Clone(r.Context()))
 		}
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -57,7 +66,7 @@ func newDataTunnelServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 func TestAuthModeOff(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/route-link/reserve" {
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-1", AccessToken: "t", DataEndpoint: "10.0.0.1:1"})
+			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "sb-1", "10.0.0.1:1", types.ProfileE2B))
 			return
 		}
 		w.WriteHeader(http.StatusForbidden) // verify-key would reject
@@ -84,6 +93,7 @@ func TestAuthModeOff(t *testing.T) {
 
 func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 	var routeKeys []string
+	var results []reserveResult
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/route-link/reserve" {
 			w.WriteHeader(http.StatusNotFound)
@@ -91,10 +101,13 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 		}
 		rk := r.URL.Query().Get("route_key")
 		routeKeys = append(routeKeys, rk)
-		_ = json.NewEncoder(w).Encode(reserveResult{
-			NodeID: "n1", SID: fmt.Sprintf("sb-%d", len(routeKeys)), AccessToken: "envd-tok",
-			TrafficAccessToken: "traffic-tok", DataEndpoint: "10.0.0.1:1",
-		})
+		profile := types.ProfileE2B
+		if len(routeKeys) == 2 {
+			profile = types.ProfileBare
+		}
+		result := routerTestReserveResult(t, fmt.Sprintf("sb-%d", len(routeKeys)), "10.0.0.1:1", profile)
+		results = append(results, result)
+		_ = json.NewEncoder(w).Encode(result)
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -110,21 +123,38 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var out struct {
-			RouteKey           string `json:"routeKey"`
-			EnvdAccessToken    string `json:"envdAccessToken"`
-			TrafficAccessToken string `json:"trafficAccessToken"`
-		}
+		var out map[string]string
 		_ = json.NewDecoder(resp.Body).Decode(&out)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create %d status=%d, want 201", i, resp.StatusCode)
 		}
-		if out.RouteKey == "" {
+		if out["routeKey"] == "" {
 			t.Fatalf("create %d omitted generated routeKey in response", i)
 		}
-		if out.EnvdAccessToken != "envd-tok" || out.TrafficAccessToken != "traffic-tok" {
-			t.Fatalf("create %d tokens envd=%q traffic=%q", i, out.EnvdAccessToken, out.TrafficAccessToken)
+		if out["sandboxID"] != results[i].SID || out["clientID"] != results[i].NodeID ||
+			out["forwardAccessToken"] != results[i].ForwardAccessToken || out["domain"] != "test.local" {
+			t.Fatalf("create %d public response did not preserve public identifiers and forward token", i)
+		}
+		allowed := map[string]bool{
+			"sandboxID": true, "routeKey": true, "clientID": true,
+			"forwardAccessToken": true, "domain": true,
+		}
+		if results[i].Profile == string(types.ProfileE2B) {
+			allowed["envdAccessToken"] = true
+			allowed["trafficAccessToken"] = true
+			if out["envdAccessToken"] != results[i].EnvdAccessToken ||
+				out["trafficAccessToken"] != results[i].TrafficAccessToken {
+				t.Fatalf("create %d omitted e2b tokens", i)
+			}
+		}
+		if len(out) != len(allowed) {
+			t.Fatalf("create %d response field count=%d, want %d", i, len(out), len(allowed))
+		}
+		for key := range out {
+			if !allowed[key] {
+				t.Fatalf("create %d exposed unexpected field %q", i, key)
+			}
 		}
 	}
 	if len(routeKeys) != 2 || routeKeys[0] == "" || routeKeys[1] == "" || routeKeys[0] == routeKeys[1] {
@@ -132,7 +162,7 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 	}
 }
 
-func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
+func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	var reserveHits int
 	var routeHits int
 	var gotHost string
@@ -145,10 +175,10 @@ func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
 		switch r.URL.Path {
 		case "/route-link/reserve":
 			reserveHits++
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "wrong", AccessToken: "tok", DataEndpoint: nodeHost})
+			_ = json.NewEncoder(w).Encode(routerTestReserveResult(t, "wrong", nodeHost, types.ProfileE2B))
 		case "/route-link/route":
 			routeHits++
-			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready"})
+			_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -182,10 +212,13 @@ func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
 
 func TestServeDataSignedFileURLAuth(t *testing.T) {
 	var nodeHits int32
-	var gotTokens []string
-	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var outerTokens []string
+	var innerTokens []string
+	node := newObservedDataTunnelServer(t, func(r *http.Request) {
+		outerTokens = append(outerTokens, r.Header.Get(HeaderAccessTok))
+	}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nodeHits, 1)
-		gotTokens = append(gotTokens, r.Header.Get(HeaderAccessTok))
+		innerTokens = append(innerTokens, r.Header.Get(HeaderAccessTok))
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
@@ -194,7 +227,7 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready"})
+		_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
 	}))
 	defer control.Close()
 
@@ -207,7 +240,7 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 	signedQuery := func(signature string) string {
 		return "?path=" + url.QueryEscape("/tmp/a.txt") + "&signature=" + url.QueryEscape(signature)
 	}
-	sig := envdsign.Signature("/tmp/a.txt", "", envdsign.OperationRead, "tok", nil)
+	sig := envdsign.Signature("/tmp/a.txt", "", envdsign.OperationRead, routerTestEnvdAccessToken, nil)
 	do := func(host, path, query, token string) int {
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+path+query, nil)
 		req.Host = host
@@ -227,8 +260,11 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 	if code := do("49983-sb-1.test.local", "/files", signedQuery(sig), ""); code != http.StatusNoContent {
 		t.Fatalf("valid signed file status=%d, want 204", code)
 	}
-	if got := gotTokens[len(gotTokens)-1]; got != "" {
-		t.Fatalf("signed file forwarded X-Access-Token=%q, want empty", got)
+	if got := outerTokens[len(outerTokens)-1]; got != routerTestEnvdAccessToken {
+		t.Fatal("signed file outer CONNECT did not use EnvdAccessToken")
+	}
+	if got := innerTokens[len(innerTokens)-1]; got != "" {
+		t.Fatalf("signed file inner HTTP X-Access-Token=%q, want empty", got)
 	}
 
 	if code := do("49983-sb-1.test.local", "/files", signedQuery("bad"), ""); code != http.StatusUnauthorized {
@@ -244,165 +280,132 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 		t.Fatalf("node hits after rejected signed requests=%d, want 1", got)
 	}
 
-	if code := do("49983-sb-1.test.local", "/health", "", "tok"); code != http.StatusNoContent {
+	if code := do("49983-sb-1.test.local", "/health", "", routerTestEnvdAccessToken); code != http.StatusNoContent {
 		t.Fatalf("valid token status=%d, want 204", code)
 	}
-	if got := gotTokens[len(gotTokens)-1]; got != "tok" {
-		t.Fatalf("token-auth forward X-Access-Token=%q, want tok", got)
+	if got := outerTokens[len(outerTokens)-1]; got != routerTestEnvdAccessToken {
+		t.Fatal("ordinary request outer CONNECT changed the client token")
+	}
+	if got := innerTokens[len(innerTokens)-1]; got != routerTestEnvdAccessToken {
+		t.Fatal("ordinary request inner HTTP changed the client token")
 	}
 }
 
-// TestServeDataByKey: a data-plane request carrying group + route-key headers (no
-// prior create) Reserves and forwards to the node (cluster-router.md).
-func TestServeDataByKey(t *testing.T) {
-	var gotHost string
+func TestServeDataForwardTokenByProfile(t *testing.T) {
+	for _, profile := range []types.Profile{types.ProfileE2B, types.ProfileBare} {
+		t.Run(string(profile), func(t *testing.T) {
+			var connectHits int32
+			var innerHits int32
+			var outerToken string
+			var innerToken string
+			node := newObservedDataTunnelServer(t, func(r *http.Request) {
+				atomic.AddInt32(&connectHits, 1)
+				outerToken = r.Header.Get(HeaderAccessTok)
+			}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&innerHits, 1)
+				innerToken = r.Header.Get(HeaderAccessTok)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			nodeHost := strings.TrimPrefix(node.URL, "http://")
+			route := routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, profile)
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/route-link/route" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(route)
+			}))
+			defer control.Close()
+
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			rt.SetAuthMode("off")
+			rt.SetDataPlaneAuth("enforce")
+			srv := httptest.NewServer(rt.Handler())
+			defer srv.Close()
+
+			do := func(token string) int {
+				req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+				req.Host = "8080-sb-1.test.local"
+				req.Header.Set(HeaderGroup, "/g")
+				req.Header.Set(HeaderRouteKey, "rk")
+				req.Header.Set(HeaderAccessTok, token)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				return resp.StatusCode
+			}
+
+			if code := do(route.ForwardAccessToken); code != http.StatusNoContent {
+				t.Fatalf("valid forward token status=%d, want 204", code)
+			}
+			if outerToken != route.ForwardAccessToken || innerToken != route.ForwardAccessToken {
+				t.Fatalf("forward token changed across hops: outer=%q inner=%q", outerToken, innerToken)
+			}
+			if code := do("wrong"); code != http.StatusUnauthorized {
+				t.Fatalf("wrong forward token status=%d, want 401", code)
+			}
+			if got := atomic.LoadInt32(&connectHits); got != 1 {
+				t.Fatalf("CONNECT hits=%d after rejected token, want 1", got)
+			}
+			if got := atomic.LoadInt32(&innerHits); got != 1 {
+				t.Fatalf("inner hits=%d after rejected token, want 1", got)
+			}
+		})
+	}
+}
+
+func TestServeDataRejectsInvalidSignedFileBeforeReserve(t *testing.T) {
+	var reserveHits int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			route := routerTestRouteResolve(t, "sb-1", "/g", "rk", "", types.ProfileE2B)
+			route.State = "paused"
+			_ = json.NewEncoder(w).Encode(route)
+		case "/route-link/reserve":
+			atomic.AddInt32(&reserveHits, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	rt.SetDataPlaneAuth("enforce")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/files?path=%2Ftmp%2Fa.txt&signature=bad", nil)
+	req.Host = "49983-sb-1.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 0 {
+		t.Fatalf("reserve hits=%d, want 0", got)
+	}
+}
+
+func TestServeDataNonSandboxHostDoesNotReserve(t *testing.T) {
 	var reserveHits int
-	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHost = r.Host
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/route-link/reserve":
+		if r.URL.Path == "/route-link/reserve" {
 			reserveHits++
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", DataEndpoint: nodeHost})
-		case "/route-link/verify-key":
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
 		}
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetDataPlaneAuth("off")
-	srv := httptest.NewServer(rt.Handler())
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req.Host = "data.test.local" // not api.<domain> → data plane; no <port>-<sid>
-	req.Header.Set(HeaderGroup, "/g")
-	req.Header.Set(HeaderRouteKey, "u1:s1")
-	req.Header.Set(HeaderAPIKey, "e2b_ok")
-	req.Header.Set("E2b-Sandbox-Port", "49983")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("by-key forward status=%d, want 204", resp.StatusCode)
-	}
-	if gotHost != "49983-sb-9.test.local" {
-		t.Fatalf("node saw Host=%q, want 49983-sb-9.test.local (synthesized <port>-<sid>)", gotHost)
-	}
-
-	req2, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req2.Host = "data.test.local"
-	req2.Header.Set(HeaderGroup, "/g")
-	req2.Header.Set(HeaderRouteKey, "u1:s1")
-	req2.Header.Set(HeaderAPIKey, "e2b_ok")
-	req2.Header.Set("E2b-Sandbox-Port", "49983")
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNoContent {
-		t.Fatalf("second by-key forward status=%d, want 204", resp2.StatusCode)
-	}
-	if reserveHits != 1 {
-		t.Fatalf("reserve hits=%d, want 1 (second request should use route cache)", reserveHits)
-	}
-}
-
-func TestServeDataByKeyRequiresPortWithoutTargetPort(t *testing.T) {
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/route-link/reserve":
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", DataEndpoint: "127.0.0.1:1"})
-		case "/route-link/verify-key":
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer control.Close()
-	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetDataPlaneAuth("off")
-	srv := httptest.NewServer(rt.Handler())
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req.Host = "data.test.local"
-	req.Header.Set(HeaderGroup, "/g")
-	req.Header.Set(HeaderRouteKey, "u1:s1")
-	req.Header.Set(HeaderAPIKey, "e2b_ok")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status=%d, want 400 when neither request nor route supplies target port", resp.StatusCode)
-	}
-}
-
-func TestServeDataByKeyUsesTargetPort(t *testing.T) {
-	var gotHost string
-	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHost = r.Host
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	nodeHost := strings.TrimPrefix(node.URL, "http://")
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/route-link/reserve":
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", TargetPort: 7000, DataEndpoint: nodeHost})
-		case "/route-link/verify-key":
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer control.Close()
-	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetDataPlaneAuth("off")
-	srv := httptest.NewServer(rt.Handler())
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req.Host = "data.test.local"
-	req.Header.Set(HeaderGroup, "/g")
-	req.Header.Set(HeaderRouteKey, "u1:s1")
-	req.Header.Set(HeaderAPIKey, "e2b_ok")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("status=%d, want 204", resp.StatusCode)
-	}
-	if gotHost != "7000-sb-9.test.local" {
-		t.Fatalf("node saw Host=%q, want target_port sandbox host", gotHost)
-	}
-}
-
-func TestServeDataRejectsTargetPortMismatch(t *testing.T) {
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/route-link/reserve":
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", TargetPort: 7000, DataEndpoint: "127.0.0.1:1"})
-		case "/route-link/verify-key":
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer control.Close()
-	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetDataPlaneAuth("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -418,7 +421,53 @@ func TestServeDataRejectsTargetPortMismatch(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status=%d, want 400 for target_port mismatch", resp.StatusCode)
+		t.Fatalf("non-sandbox data host status=%d, want 400", resp.StatusCode)
+	}
+	if reserveHits != 0 {
+		t.Fatalf("non-sandbox data host triggered %d Reserve calls, want 0", reserveHits)
+	}
+}
+
+func TestServeDataUnknownSandboxReturnsNotFoundWithoutReserve(t *testing.T) {
+	var routeHits int32
+	var reserveHits int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			atomic.AddInt32(&routeHits, 1)
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+		case "/route-link/reserve":
+			atomic.AddInt32(&reserveHits, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+	req.Host = "8080-missing.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAccessTok, "unused")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&routeHits); got != 1 {
+		t.Fatalf("route hits=%d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 0 {
+		t.Fatalf("reserve hits=%d, want 0", got)
 	}
 }
 
@@ -435,9 +484,7 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(routeResolve{
-			SID: "sb-1", Group: "/other", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready",
-		})
+		_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/other", "rk", nodeHost, types.ProfileE2B))
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -459,85 +506,5 @@ func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&nodeHits); got != 0 {
 		t.Fatalf("node hits=%d, want 0", got)
-	}
-}
-
-func TestServeDataByKeyUsesActiveRouteWhenRouteCacheEvicted(t *testing.T) {
-	var reserveHits int32
-	var nodeHits int32
-	started := make(chan struct{})
-	release := make(chan struct{})
-	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&nodeHits, 1) == 1 {
-			close(started)
-			<-release
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	nodeHost := strings.TrimPrefix(node.URL, "http://")
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/route-link/reserve" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		atomic.AddInt32(&reserveHits, 1)
-		_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", DataEndpoint: nodeHost})
-	}))
-	defer control.Close()
-	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
-	rt.SetDataPlaneAuth("off")
-	srv := httptest.NewServer(rt.Handler())
-	defer srv.Close()
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	firstDone := make(chan error, 1)
-	go func() {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-		req.Host = "data.test.local"
-		req.Header.Set(HeaderGroup, "/g")
-		req.Header.Set(HeaderRouteKey, "u1:s1")
-		req.Header.Set("E2b-Sandbox-Port", "49983")
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusNoContent {
-				err = fmt.Errorf("first status=%d", resp.StatusCode)
-			}
-		}
-		firstDone <- err
-	}()
-	select {
-	case <-started:
-	case <-time.After(3 * time.Second):
-		t.Fatal("first request did not reach node")
-	}
-
-	// Simulate ordinary route-cache churn while the first data-plane request is
-	// still active. The active-route map must still carry this route.
-	rt.cacheMu.Lock()
-	delete(rt.cache, "sb-9")
-	delete(rt.byKey, routeCacheKey("/g", "u1:s1"))
-	rt.cacheMu.Unlock()
-
-	req2, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req2.Host = "data.test.local"
-	req2.Header.Set(HeaderGroup, "/g")
-	req2.Header.Set(HeaderRouteKey, "u1:s1")
-	req2.Header.Set("E2b-Sandbox-Port", "49983")
-	resp2, err := client.Do(req2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNoContent {
-		t.Fatalf("second status=%d, want 204", resp2.StatusCode)
-	}
-	if got := atomic.LoadInt32(&reserveHits); got != 1 {
-		t.Fatalf("reserve hits=%d, want 1 (second request should use active route)", got)
-	}
-	close(release)
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
 	}
 }

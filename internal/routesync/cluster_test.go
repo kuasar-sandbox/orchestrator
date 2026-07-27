@@ -2,6 +2,8 @@ package routesync
 
 import (
 	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -36,17 +38,30 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
-		CmdID: "x1", Kind: CmdCreate, SID: "s1", Config: map[string]string{"kuasar-sandbox.cluster": `{"group":"/c/p/a/g1","route_key":"u1:sess1"}`},
-		TemplateRef: "manifest://abc", KeyFingerprint: "e2b_deadbeef",
+		CmdID: "x1", Kind: CmdCreate, SID: "stable-g0", Profile: "bare",
+		Cluster:     &ClusterSandboxContext{Group: "/c/p/a/g1", RouteKey: "u1:sess1", AuthSandboxID: "stable"},
+		TemplateRef: "bare-img-" + strings.Repeat("b", 64), APISecretFingerprint: strings.Repeat("a", 64),
 	}})
-	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Config["kuasar-sandbox.cluster"] == "" || c.Rev != 42 {
+	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.SID != "stable-g0" || c.Cmd.Profile != "bare" ||
+		c.Cmd.Cluster == nil || c.Cmd.Cluster.Group != "/c/p/a/g1" || c.Cmd.Cluster.RouteKey != "u1:sess1" ||
+		c.Cmd.Cluster.AuthSandboxID != "stable" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
-		CmdID: "k1", Kind: CmdKeyPut, ManifestKeyType: "ref", ManifestKeyRef: "vault://tenant/key", ExpiresUnix: 123,
+		CmdID: "k1", Kind: CmdKeyPut,
+		APISecretFingerprint: strings.Repeat("a", 64), APISecretType: "ref", APISecretRef: "vault://tenant/api",
+		ManifestKeyFingerprint: strings.Repeat("b", 64), ManifestKeyType: "ref", ManifestKeyRef: "vault://tenant/manifest",
+		ExpiresUnix: 123,
 	}})
-	if k.Cmd == nil || k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/key" {
+	if k.Cmd == nil || k.Cmd.APISecretType != "ref" || k.Cmd.APISecretRef != "vault://tenant/api" ||
+		k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/manifest" {
 		t.Fatalf("key_put ref round-trip: %+v", k.Cmd)
+	}
+	d := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
+		CmdID: "k2", Kind: CmdKeyDrop, APISecretFingerprint: strings.Repeat("a", 64),
+	}})
+	if d.Cmd == nil || d.Cmd.Kind != CmdKeyDrop || d.Cmd.APISecretFingerprint != strings.Repeat("a", 64) {
+		t.Fatalf("key_drop round-trip: %+v", d.Cmd)
 	}
 	b := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
 		CmdID: "b1", Kind: CmdBuildRegister, BuildID: "build-1", TemplateRef: "transient-1", Profile: "bare",
@@ -55,13 +70,30 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		t.Fatalf("build_register round-trip: %+v", b.Cmd)
 	}
 
-	// Sandbox routes carry runtime state only; the node-link owner supplies cluster identity.
+	// Sandbox routes project the complete trusted credential view used by proxy and
+	// registry subscribers; the manifest encryption root and exec credentials are
+	// deliberately absent.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
 		SandboxID: "s1", State: StateRunning,
-		FloatingIP: "100.100.96.5", AccessToken: "tok",
+		FloatingIP: "100.100.96.5", AuthSandboxID: "stable-s1",
+		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
+		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
+		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
 	}})
-	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning {
+	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning ||
+		r.Route.AuthSandboxID != "stable-s1" || r.Route.APISecret != strings.Repeat("1", 64) ||
+		r.Route.APISecretFingerprint != strings.Repeat("2", 64) ||
+		r.Route.ManifestKeyFingerprint != strings.Repeat("3", 64) ||
+		r.Route.ServiceSecret != strings.Repeat("4", 64) || r.Route.EnvdAccessToken != "envd" ||
+		r.Route.TrafficAccessToken != "traffic" || r.Route.ForwardAccessToken != "forward" {
 		t.Fatalf("sandbox route round-trip: %+v", r.Route)
+	}
+	wire, err := json.Marshal(r.Route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(wire, []byte(`"access_token":`)) {
+		t.Fatalf("route retained generic access_token: %s", wire)
 	}
 
 	a := roundTrip(t, &Msg{Type: TypeCmdAck, Ack: &CmdAck{CmdID: "x1", Status: AckAccepted}})

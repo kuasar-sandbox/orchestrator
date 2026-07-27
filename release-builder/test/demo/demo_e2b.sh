@@ -209,13 +209,14 @@ ok "orchestrator serving https://api.$DOMAIN"
 pause
 
 # ===========================================================================
-banner "Onboard a tenant (manifest key → allowlist + registry creds → e2b API key)"
+banner "Onboard a tenant (ManifestKey + derived APISecret → allowlist + API key)"
 # ---------------------------------------------------------------------------
 REG_FLAGS=(); [ -n "${REGISTRY_USER:-}" ] && REG_FLAGS=(--registry-username "$REGISTRY_USER" --registry-password "${REGISTRY_PASS:-}")
 say "allowlist the tenant manifest key + its default registry pull creds (so the node can pull $REGISTRY):"
 echo "${c_cmd}  \$ node-ctl manifest-key add ${REG_FLAGS:+--registry-username … } \$MANIFEST_KEY${c_off}"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "${REG_FLAGS[@]}" "$MK" >/dev/null || die "manifest-key add"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ok "tenant ready — e2b API key ${AK:0:16}…  (format e2b_<hex>)"
 # world-readable env for another terminal to drive the Python SDK against this node
 cat > "$CLI_ENV_FILE" <<EOF
@@ -353,7 +354,13 @@ case "$out" in
   *"$BUILT_MARKER"*) ok "host→沙箱 floatingip:8000 直连成功，且页面即构建产物 (start_cmd 经快照→恢复仍在服务)";;
   *) [ -n "${DEMO_NETDIAG:-}" ] && say "直连失败 (NETDIAG, 继续)" || die "直连 floatingip 失败或页面非构建产物: ${out:-<empty>}";;
 esac
-TOK="$(curl -sk --max-time 8 --noproxy '*' -H "X-API-KEY: $AK" "https://api.$DOMAIN/sandboxes/$SID" 2>/dev/null | grep -o '"envdAccessToken":"[^"]*"' | cut -d'"' -f4)"
+TOKEN_RESPONSE="$WORK/connect-token.json"
+code="$(curl -sk --max-time 8 --noproxy '*' -o "$TOKEN_RESPONSE" -w '%{http_code}' \
+    -X POST -H "X-API-KEY: $AK" -H 'Content-Type: application/json' -d '{}' \
+    "https://api.$DOMAIN/sandboxes/$SID/connect" 2>/dev/null || true)"
+[ "$code" = "200" ] || die "connect did not return sandbox credentials (HTTP ${code:-000})"
+TOK="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["forwardAccessToken"])' "$TOKEN_RESPONSE" 2>/dev/null || true)"
+[ -n "$TOK" ] || die "connect response did not contain forwardAccessToken"
 hosts_add "8000-$SID.$DOMAIN"
 out="$(curl -sk --max-time 8 --noproxy '*' -H "X-Access-Token: $TOK" "https://8000-$SID.$DOMAIN/" 2>&1)" || true
 case "$out" in

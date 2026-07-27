@@ -44,6 +44,18 @@ const (
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
+const MaxLocalSandboxIDBytes = 57
+
+var localSandboxIDRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`)
+
+// ValidLocalSandboxID reports whether id is an opaque node-local sandbox ID.
+// The contract is the 1..57-byte lowercase DNS-label subset
+// ^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$.
+func ValidLocalSandboxID(id string) bool {
+	return localSandboxIDRe.MatchString(id)
+}
+
 // TemplateID is the e2b templateID, self-describing as <profile>-<kind>-<key>.
 // key is the 64-hex manifest content key. There is no separate template registry.
 type TemplateID struct {
@@ -83,6 +95,9 @@ func (t TemplateID) ManifestRef() string { return "manifest://" + t.Key }
 // Sandbox is one managed sandbox instance.
 type Sandbox struct {
 	ID                 string
+	Profile            Profile
+	Cluster            *ClusterSandboxContext
+	AuthSandboxIDValue string // optional stable credential subject; empty falls back to ID
 	TemplateID         string
 	State              State
 	DeadlineUnix       int64 // 0 = no deadline
@@ -95,21 +110,38 @@ type Sandbox struct {
 	VswitchPort        string // vswitch port handle (1-based; slot is vswitch-internal)
 	InnerIP            string // guest inner IP (CIDR), passed to vswitch attach + Network.IP
 	PortMAC            string // per-port MAC from attach -> Network.MAC
-	ManifestKey        string // SHA256(api_key), hex; never written to env/yaml
+	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
+	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
 	SnapshotRef        string // latest snapshot manifest key (for resume); empty if never paused
+	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
 	EnvdAccessToken    string
 	TrafficAccessToken string
+	ForwardAccessToken string
 	Metadata           map[string]string
 	Env                map[string]string
 	CreatedUnix        int64
 }
 
-func (s *Sandbox) Profile() Profile {
-	t, err := ParseTemplateID(s.TemplateID)
-	if err != nil {
+// ClusterSandboxContext is trusted node-local ownership state supplied by the
+// cluster control plane. It is persisted separately from user metadata. A nil
+// context identifies a standalone sandbox.
+type ClusterSandboxContext struct {
+	Group    string
+	RouteKey string
+}
+
+// AuthSandboxID returns the stable subject used by sandbox service credentials.
+// Standalone sandboxes normally leave AuthSandboxIDValue empty and therefore use
+// their local ID. Imports may preserve a non-local subject without becoming
+// cluster-owned.
+func (s *Sandbox) AuthSandboxID() string {
+	if s == nil {
 		return ""
 	}
-	return t.Profile
+	if s.AuthSandboxIDValue != "" {
+		return s.AuthSandboxIDValue
+	}
+	return s.ID
 }
 
 // PidFile is where sandbox-ctl writes its pid (config-socket auth reads it).

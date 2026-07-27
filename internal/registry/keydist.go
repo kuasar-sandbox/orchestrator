@@ -2,7 +2,7 @@ package registry
 
 import "time"
 
-// Manifest-key leases are written to node_link by shuffle-sharding selector
+// APISecret/ManifestKey pair leases are written to node_link by shuffle-sharding selector
 // patches and refreshed to connected nodes by heartbeat maintenance.
 
 const (

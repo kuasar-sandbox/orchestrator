@@ -17,7 +17,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 |---|---|---|---|
 | Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
-| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ placer(放置调度 + group provider);按 sandbox-group + route-key 把请求路由 / 按需拉起到正确节点的沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
+| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ placer(放置调度 + group provider);显式创建沙箱后按 sandbox-group + route-key + sandbox_id 路由请求,并按需激活已知的非 READY 沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
 
 **Region 级共享资源**(由各自的平台管理面运营,平台外)
 
@@ -133,8 +133,9 @@ per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-c
 
 - **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;node-ctl 经**共享**
   `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
-  `MANIFEST_KEY` 为该租户 manifest 根密钥——node-ctl 从加密存储解出;**api_key 由它
-  派生**,见 `orchestrator/docs/node.md` §7)。外部管理面若选择直接对接单机
+  `MANIFEST_KEY` 为该租户内容根密钥——node-ctl 从加密的 APISecret+ManifestKey
+  凭据对中解出;**api_key 由 APISecret 签发**,见 `orchestrator/docs/node.md` §7)。
+  外部管理面若选择直接对接单机
   `node-ctl`,也必须按同一 per-sandbox 生命周期落地 manifest 配置
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
@@ -251,7 +252,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
 (shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
+按 sandbox-group + route-key + sandbox_id 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
 放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
 时**不需要** cluster 层。
 
@@ -295,9 +296,9 @@ cluster-ctl placer
   `route_link` owner 下发 create/connect/delete/build/key 命令时,通过 node-owner RPC 转给当前
   `link_owner`。
 - **平台管理面(平台外)**:向 placer/provider 侧导入 sandbox-group 配置(租户 `manifest_key`、
-  `auth_key`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
-  只在 Reserve/Place 冷路径把请求转给 ready placer。密钥分发是 create/build 前置条件,drop 或租约过期
-  不影响已经运行的 sandbox。
+  `api_secret`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
+  只在 Reserve/Place 冷路径把请求转给 ready placer。凭据对分发是 create/build 前置条件;
+  drop 或租约过期不修改已经复制到现有 sandbox/build 记录的凭据对。
 - **成员关系**:registry 成员表由版本化配置分发,通过信号或 API reload。`memberlist` 复用 HTTP 控制面,
   只做 failure detection 和 meta 传播,不维护成员清单,不参与 `LocateN` 分片计算。
 - **成员变更**:registry 可同时持有 active / next membership。受影响的 group/node 逻辑 owner set 为

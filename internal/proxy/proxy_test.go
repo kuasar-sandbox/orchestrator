@@ -39,19 +39,19 @@ func (l *countingListener) Accept() (net.Conn, error) {
 }
 
 func TestRouteForTarget(t *testing.T) {
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "tok", 49983); r.Kind != proxy.KindUDS || r.UDS != "/e.sock" || r.AccessToken != "tok" {
+	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 49983); r.Kind != proxy.KindUDS || r.UDS != "/e.sock" || r.AccessToken != "envd" {
 		t.Fatalf("envd port: %+v", r)
 	}
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "tok", 49999); r.Kind != proxy.KindUDS || r.UDS != "/c.sock" {
+	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 49999); r.Kind != proxy.KindUDS || r.UDS != "/c.sock" || r.AccessToken != "envd" {
 		t.Fatalf("ci port: %+v", r)
 	}
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "tok", 8080); r.Kind != proxy.KindTCP || r.Addr != "10.0.0.5:8080" {
+	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 8080); r.Kind != proxy.KindTCP || r.Addr != "10.0.0.5:8080" || r.AccessToken != "forward" {
 		t.Fatalf("user port: %+v", r)
 	}
-	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "", 49983); r.Kind != proxy.KindDeny {
+	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "envd", "forward", 49983); r.Kind != proxy.KindDeny {
 		t.Fatalf("bare control: %+v", r)
 	}
-	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "", 8080); r.Kind != proxy.KindTCP {
+	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "envd", "forward", 8080); r.Kind != proxy.KindTCP || r.AccessToken != "forward" {
 		t.Fatalf("bare user: %+v", r)
 	}
 }
@@ -150,6 +150,51 @@ func TestProxyForwardAndAuth(t *testing.T) {
 	mode = "log"
 	if code, body := do("wrong", "/echo", "", ""); code != 200 || body != "hello from envd" {
 		t.Fatalf("auth log forwards: code=%d body=%q", code, body)
+	}
+}
+
+func TestProxyMissingExpectedTokenHonorsAuthMode(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	upSock := filepath.Join(t.TempDir(), "up.sock")
+	upLn, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	up := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	})}
+	go up.Serve(upLn)
+	defer up.Close()
+
+	mode := "enforce"
+	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindUDS, UDS: upSock}},
+		func() string { return mode }, log, nil)
+	ts := httptest.NewServer(px)
+	defer ts.Close()
+
+	request := func() int {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/echo", nil)
+		req.Header.Set(proxy.HeaderSandboxID, "s1")
+		req.Header.Set(proxy.HeaderSandboxPort, "49983")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := request(); code != http.StatusUnauthorized {
+		t.Fatalf("missing expected token in enforce mode: code=%d, want 401", code)
+	}
+	mode = "log"
+	if code := request(); code != http.StatusOK {
+		t.Fatalf("missing expected token in log mode: code=%d, want 200", code)
+	}
+	mode = "off"
+	if code := request(); code != http.StatusOK {
+		t.Fatalf("missing expected token with auth off: code=%d, want 200", code)
 	}
 }
 

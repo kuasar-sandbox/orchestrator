@@ -2,23 +2,27 @@ package orch
 
 import (
 	"context"
-	"encoding/hex"
+	"crypto/hmac"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
-	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // This file makes the orchestrator the node side of the cluster node-link
 // (nodelink.Node): it executes the registry's lifecycle commands and reports the
-// terminal state by sandbox/build ID. Cluster routing metadata is stored opaquely
-// on the object; the nodelink owner resolves it from its per-node ownership table.
+// terminal state by sandbox/build ID. Registry-owned sandbox context is persisted
+// separately from user metadata; the nodelink owner resolves cluster identity
+// from its per-node ownership table.
 
 // HandleCommand executes a registry node-link command and returns a receipt ack
 // (cluster.md): accepted once the synchronous preconditions hold (key
@@ -27,9 +31,14 @@ import (
 // isn't blocked; the terminal sandbox state is reported on the route stream,
 // which a Reserve waits on.
 func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
+	// The node-link wire enforces the same complete-token bound, but keep the
+	// command entry defensive for direct callers and tests that bypass framing.
+	if cmd != nil && len(cmd.MigrationToken) > migrationtoken.MaxWireSize {
+		return reject(cmd, migrationtoken.ErrTokenTooLarge)
+	}
 	switch cmd.Kind {
 	case routesync.CmdCreate:
-		manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
+		pair, tmpl, credentials, err := o.precheckCluster(ctx, cmd)
 		if err != nil {
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
@@ -40,46 +49,36 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		go func() {
 			defer o.releaseClusterCreate(cmd.SID)
-			if _, err := o.bootCluster(o.asyncCtx(), cmd, manifestKey, tmpl); err != nil {
+			if _, err := o.bootCluster(o.asyncCtx(), cmd, pair, tmpl, credentials); err != nil {
 				o.log.Error("cluster create", "sid", cmd.SID, "err", err)
 			}
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
-		go func() {
-			if err := o.connectCluster(o.asyncCtx(), cmd.SID); err != nil {
-				o.log.Error("cluster connect", "sid", cmd.SID, "err", err)
-			}
-		}()
+		sb, err := o.prepareClusterConnect(ctx, cmd)
+		if err != nil {
+			return reject(cmd, err)
+		}
+		o.scheduleResume(sb.ID)
 		return accept(cmd)
 	case routesync.CmdDelete:
+		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
+		if err != nil {
+			return reject(cmd, err)
+		}
 		go func() {
-			if err := o.deleteCluster(o.asyncCtx(), cmd.SID); err != nil {
+			if err := o.deleteCluster(o.asyncCtx(), sb); err != nil {
 				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
 			}
 		}()
 		return accept(cmd)
 	case routesync.CmdKeyPut:
-		// Key distribution (cluster.md): refresh the manifest-key allowlist
-		// lease so create/build can resolve it by fingerprint. The registry sends
-		// this from node_link heartbeat maintenance, not on the Place path.
-		if cmd.ManifestKeyType == "ref" || cmd.ManifestKeyRef != "" {
-			return reject(cmd, fmt.Errorf("manifest_key ref delivery is not configured"))
-		}
-		if cmd.ManifestKey != "" {
-			var ttl int64
-			if cmd.ExpiresUnix > 0 {
-				if ttl = cmd.ExpiresUnix - time.Now().Unix(); ttl <= 0 {
-					ttl = 1
-				}
-			}
-			if _, err := o.st.AddManifestKey(ctx, cmd.ManifestKey, "cluster", ttl, ""); err != nil {
-				return reject(cmd, err)
-			}
+		if err := o.putClusterKeyPair(ctx, cmd); err != nil {
+			return reject(cmd, err)
 		}
 		return accept(cmd)
 	case routesync.CmdKeyDrop:
-		if err := o.dropClusterKey(ctx, cmd.KeyFingerprint); err != nil {
+		if err := o.dropClusterKey(ctx, cmd.APISecretFingerprint); err != nil {
 			return reject(cmd, err)
 		}
 		return accept(cmd)
@@ -98,8 +97,8 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 }
 
 func (o *Orchestrator) claimClusterCreate(ctx context.Context, sid string) error {
-	if sid == "" {
-		return fmt.Errorf("cluster create: sandbox id is required")
+	if !types.ValidLocalSandboxID(sid) {
+		return fmt.Errorf("cluster create: invalid sandbox id")
 	}
 	o.mu.Lock()
 	if o.reg[sid] != nil {
@@ -157,7 +156,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return fmt.Errorf("build_register: %w", err)
 	}
-	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
+	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
 	if err != nil {
 		return err
 	}
@@ -173,7 +172,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		return err
 	}
 	if existing != nil {
-		if existing.TemplateID != cmd.TemplateRef || existing.Profile != profile || existing.ManifestKey != manifestKey {
+		if existing.TemplateID != cmd.TemplateRef || existing.Profile != profile ||
+			!sameRootPair(existing.APISecret, existing.ManifestKey, pair) {
 			return fmt.Errorf("build_register: build %s conflicts with existing identity", cmd.BuildID)
 		}
 		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
@@ -186,7 +186,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	b := &types.Build{
 		BuildID:     cmd.BuildID,
 		TemplateID:  cmd.TemplateRef,
-		ManifestKey: manifestKey,
+		APISecret:   pair.APISecret,
+		ManifestKey: pair.ManifestKey,
 		Profile:     profile,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
@@ -203,6 +204,12 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	o.clusterBuildMu.Unlock()
 	o.publishBuildState(cmd.BuildID, "registered", "", "")
 	return nil
+}
+
+func sameRootPair(apiSecret, manifestKey string, pair store.KeyPair) bool {
+	apiEqual := hmac.Equal([]byte(apiSecret), []byte(pair.APISecret))
+	manifestEqual := hmac.Equal([]byte(manifestKey), []byte(pair.ManifestKey))
+	return apiEqual && manifestEqual
 }
 
 // BuildEvents is the node-link client's source of build state transitions
@@ -333,60 +340,79 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 // async path (HandleCommand) splits it so the ack is prompt; callers/tests that
 // want the result synchronously use this.
 func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
-	manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
+	pair, tmpl, credentials, err := o.precheckCluster(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
-	return o.bootCluster(ctx, cmd, manifestKey, tmpl)
+	return o.bootCluster(ctx, cmd, pair, tmpl, credentials)
 }
 
 // precheckCluster resolves the manifest key (by the fingerprint the registry
 // predistributed) and the snapshot template — the fast, synchronous preconditions
 // whose failure is a rejected ack (rather than a slow create that fails only by
 // Reserve timeout).
-func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (string, types.TemplateID, error) {
-	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
+func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (store.KeyPair, types.TemplateID, sandboxcfg.Credentials, error) {
+	if cmd == nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: command is required")
+	}
+	if !types.ValidLocalSandboxID(cmd.SID) {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: invalid sandbox id")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
 	if err != nil {
-		return "", types.TemplateID{}, err
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: group and route key are required")
+	}
+	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, err
 	}
 	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
 	if err != nil {
-		return "", types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
+	}
+	if tmpl.Profile != profile {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: profile %q does not match template profile %q", profile, tmpl.Profile)
 	}
 	config, err := sandboxcfg.NormalizeRestoreMetadata(cmd.Config)
 	if err != nil {
-		return "", types.TemplateID{}, fmt.Errorf("cluster create: %w", err)
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	credentials, config, err := sandboxcfg.ExtractCredentials(config)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
 	cmd.Config = config
-	return manifestKey, tmpl, nil
+	return pair, tmpl, credentials, nil
 }
 
 // bootCluster builds + launches the sandbox from the registry-supplied metadata
 // and publishes its route, which satisfies the registry's Reserve.
-func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, manifestKey string, tmpl types.TemplateID) (*types.Sandbox, error) {
-	envdTok := cmd.AccessToken
-	if envdTok == "" {
-		return nil, fmt.Errorf("cluster create: access_token required")
-	}
-	trafTok, _ := keys.MintToken()
-
-	meta := make(map[string]string, len(cmd.Config))
-	for k, v := range cmd.Config {
-		meta[k] = v
-	}
+func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, credentials sandboxcfg.Credentials) (*types.Sandbox, error) {
+	meta := clusterSandboxMetadata(cmd.Config)
 
 	sb := &types.Sandbox{
 		ID:                 cmd.SID,
+		Profile:            tmpl.Profile,
+		Cluster:            &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		AuthSandboxIDValue: cmd.Cluster.AuthSandboxID,
 		TemplateID:         tmpl.String(),
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + cmd.SID,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + cmd.SID,
-		ManifestKey:        manifestKey,
-		EnvdAccessToken:    envdTok,
-		TrafficAccessToken: trafTok,
+		APISecret:          pair.APISecret,
+		ManifestKey:        pair.ManifestKey,
 		Metadata:           meta,
 		CreatedUnix:        time.Now().Unix(),
 		DeadlineUnix:       time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix(),
+	}
+	if err := materializeSandboxCredentials(sb, credentials); err != nil {
+		return nil, fmt.Errorf("cluster create: %w", err)
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
@@ -400,72 +426,211 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	return sb, nil
 }
 
-func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (string, error) {
+func clusterSandboxMetadata(config map[string]string) map[string]string {
+	metadata := make(map[string]string, len(config))
+	for k, v := range config {
+		if k != clusterstate.ObjectMetadataKey && k != sandboxcfg.NsCredentials {
+			metadata[k] = v
+		}
+	}
+	return metadata
+}
+
+func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (store.KeyPair, error) {
 	if fp == "" {
-		return "", fmt.Errorf("cluster create: empty key fingerprint")
+		return store.KeyPair{}, fmt.Errorf("cluster: empty API secret fingerprint")
 	}
-	candidates, err := o.st.AllowedManifestKeysByHash(ctx, fp)
+	pair, found, err := o.st.AllowedKeyPairByAPISecretFingerprint(ctx, fp)
 	if err != nil {
-		return "", err
+		return store.KeyPair{}, err
 	}
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("cluster: no allowlisted manifest key for fingerprint %s (key not distributed?)", fp)
+	if !found {
+		return store.KeyPair{}, fmt.Errorf("cluster: credential pair is not installed")
 	}
-	return candidates[0], nil
+	return pair, nil
 }
 
-// connectCluster resumes a node-local PAUSED sandbox by sid, reusing the
-// api-key-gated Connect with a key derived from the sandbox's own manifest key.
-func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
-	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
-	if err != nil {
-		return err
+// clusterSandbox verifies that a trusted lifecycle command is bound to the
+// existing sandbox's APISecret without carrying the original API key to node.
+func (o *Orchestrator) clusterSandbox(ctx context.Context, sid, apiSecretFingerprint string) (*types.Sandbox, error) {
+	if !types.ValidLocalSandboxID(sid) || apiSecretFingerprint == "" {
+		return nil, fmt.Errorf("cluster: sandbox id and API secret fingerprint are required")
 	}
-	_, err = o.Connect(ctx, sid, apiKey, "", 0)
-	return err
-}
-
-func (o *Orchestrator) deleteCluster(ctx context.Context, sid string) error {
-	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
-	if err != nil {
-		return err
-	}
-	ok, err := o.Kill(ctx, sid, apiKey)
-	o.log.Info("cluster delete", "sid", sid, "killed", ok, "err", err)
-	return err
-}
-
-// deriveSandboxAPIKey mints the api key for a sandbox's own manifest key so the
-// cluster command can reuse the api-key-gated Connect/Kill (the node already
-// trusts the registry's command; this just satisfies the local auth path).
-func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (string, error) {
 	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if sb == nil {
-		return "", fmt.Errorf("cluster: sandbox %s not found", sid)
+		return nil, fmt.Errorf("cluster: sandbox not found")
 	}
-	raw, err := hex.DecodeString(sb.ManifestKey)
-	if err != nil {
-		return "", err
+	if err := validateClusterSandboxCredentialBinding(sb, apiSecretFingerprint); err != nil {
+		return nil, err
 	}
-	return apikey.Mint(raw)
+	return sb, nil
 }
 
-// dropClusterKey removes a manifest key from the node's allowlist by fingerprint.
+func validateClusterSandboxCredentialBinding(sb *types.Sandbox, apiSecretFingerprint string) error {
+	if sb == nil || apiSecretFingerprint == "" {
+		return fmt.Errorf("cluster: sandbox and API secret fingerprint are required")
+	}
+	fingerprint, err := store.APISecretHash(sb.APISecret)
+	if err != nil {
+		return err
+	}
+	if fingerprint != apiSecretFingerprint {
+		return fmt.Errorf("cluster: sandbox credential binding mismatch")
+	}
+	return nil
+}
+
+func validateClusterSandboxContext(sb *types.Sandbox, cmd *routesync.Command) error {
+	if sb == nil || cmd == nil {
+		return fmt.Errorf("cluster connect: sandbox and command are required")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return fmt.Errorf("cluster connect: %w", err)
+	}
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return fmt.Errorf("cluster connect: group and route key are required")
+	}
+	authSandboxID := cmd.Cluster.AuthSandboxID
+	if authSandboxID == "" {
+		authSandboxID = cmd.SID
+	}
+	if sb.Profile != profile || sb.Cluster == nil ||
+		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
+		sb.AuthSandboxID() != authSandboxID {
+		return fmt.Errorf("cluster connect: sandbox context mismatch")
+	}
+	return nil
+}
+
+// prepareClusterConnect validates an existing exact target without touching the
+// optional token. If the target is absent, it synchronously authenticates and
+// imports KMT1 under the Registry-selected NodeSandboxID before the Ack is sent.
+func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
+	if cmd == nil || !types.ValidLocalSandboxID(cmd.SID) || cmd.APISecretFingerprint == "" {
+		return nil, fmt.Errorf("cluster connect: valid sandbox id and API secret fingerprint are required")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return nil, fmt.Errorf("cluster connect: %w", err)
+	}
+	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		return nil, fmt.Errorf("cluster connect: group and route key are required")
+	}
+
+	sb, err := o.st.Get(ctx, cmd.SID)
+	if err != nil {
+		return nil, err
+	}
+	if sb != nil {
+		if err := validateClusterSandboxCredentialBinding(sb, cmd.APISecretFingerprint); err != nil {
+			return nil, err
+		}
+		if err := validateClusterSandboxContext(sb, cmd); err != nil {
+			return nil, err
+		}
+		return sb, nil // an existing exact target ignores MigrationToken completely
+	}
+	if cmd.MigrationToken == "" {
+		return nil, fmt.Errorf("cluster: sandbox not found")
+	}
+
+	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	authSandboxID := cmd.Cluster.AuthSandboxID
+	if authSandboxID == "" {
+		authSandboxID = cmd.SID
+	}
+	sb, err = o.importSandboxWithKey(
+		ctx,
+		pair,
+		cmd.MigrationToken,
+		cmd.SID,
+		migrationtoken.Expectations{AuthSandboxID: authSandboxID, Profile: profile},
+		&types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+	)
+	if err != nil {
+		if !errors.Is(err, api.ErrAlreadyExists) {
+			return nil, err
+		}
+		// A concurrent command inserted the exact target. Re-read and validate it
+		// under the normal existing-target contract; never overwrite or merge it.
+		sb, err = o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateClusterSandboxContext(sb, cmd); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	o.cancelResumeRequests(sb.ID)
+
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return nil
+	}
+	o.teardown(ctx, current)
+	if err := o.st.Delete(ctx, current.ID); err != nil {
+		return err
+	}
+	o.clearDeadlineIntent(current.ID)
+	o.uncache(current.ID)
+	o.publishDelete(current.ID)
+	return nil
+}
+
+// putClusterKeyPair validates and atomically installs one inline tenant pair.
+func (o *Orchestrator) putClusterKeyPair(ctx context.Context, cmd *routesync.Command) error {
+	if cmd.APISecretType == clusterstate.SecretRef || cmd.APISecretRef != "" ||
+		cmd.ManifestKeyType == clusterstate.SecretRef || cmd.ManifestKeyRef != "" {
+		return fmt.Errorf("cluster: secret ref delivery is not configured")
+	}
+	if cmd.APISecret == "" || cmd.ManifestKey == "" ||
+		cmd.APISecretFingerprint == "" || cmd.ManifestKeyFingerprint == "" {
+		return fmt.Errorf("cluster: complete credential pair is required")
+	}
+	apiFP, err := store.APISecretHash(cmd.APISecret)
+	if err != nil {
+		return err
+	}
+	manifestFP, err := store.ManifestKeyHash(cmd.ManifestKey)
+	if err != nil {
+		return err
+	}
+	if apiFP != cmd.APISecretFingerprint || manifestFP != cmd.ManifestKeyFingerprint {
+		return fmt.Errorf("cluster: credential pair fingerprint mismatch")
+	}
+	var ttl int64
+	if cmd.ExpiresUnix > 0 {
+		if ttl = cmd.ExpiresUnix - time.Now().Unix(); ttl <= 0 {
+			ttl = 1
+		}
+	}
+	_, err = o.st.AddKeyPair(ctx, store.KeyPair{
+		APISecret: cmd.APISecret, ManifestKey: cmd.ManifestKey,
+	}, "cluster", ttl, "")
+	return err
+}
+
+// dropClusterKey removes a tenant pair from the node allowlist by its complete
+// APISecret fingerprint. Existing sandbox/build credential copies are untouched.
 // It is best-effort; normal withdrawal relies on TTL expiry when heartbeat
 // refresh stops (cluster.md).
 func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) error {
-	keys, err := o.st.AllowedManifestKeysByHash(ctx, fingerprint)
-	if err != nil {
-		return err
-	}
-	for _, k := range keys {
-		if _, err := o.st.RemoveManifestKey(ctx, k); err != nil {
-			return err
-		}
-	}
-	o.log.Debug("cluster key_drop", "fp", fingerprint, "removed", len(keys))
-	return nil
+	_, err := o.st.RemoveKeyPairByAPISecretFingerprint(ctx, fingerprint)
+	return err
 }

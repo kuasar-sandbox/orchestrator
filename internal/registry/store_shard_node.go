@@ -7,6 +7,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 var errNodeSandboxIDConflict = errors.New("registry: sandbox id is already owned by another route on this node")
@@ -21,15 +22,15 @@ type nodeReapBuildRef struct {
 	Revision uint64
 }
 
-type nodeReapManifestKey struct {
-	Fingerprint string
-	Revision    uint64
+type nodeReapKeyPair struct {
+	APISecretFingerprint string
+	Revision             uint64
 }
 
 type nodeReapSnapshot struct {
-	Sandboxes    []nodeReapSandboxRef
-	Builds       []nodeReapBuildRef
-	ManifestKeys []nodeReapManifestKey
+	Sandboxes []nodeReapSandboxRef
+	Builds    []nodeReapBuildRef
+	KeyPairs  []nodeReapKeyPair
 }
 
 func (s *Stores) putNodeProfileShard(ctx context.Context, n *NodeRecord) error {
@@ -95,8 +96,8 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 			return 0, err
 		}
 	}
-	for _, key := range n.ManifestKeys {
-		if err := s.upsertNodeManifestKeyShard(ctx, n.NodeID, key); err != nil {
+	for _, pair := range n.KeyPairs {
+		if err := s.UpsertNodeKeyPair(ctx, n.NodeID, pair); err != nil {
 			return 0, err
 		}
 	}
@@ -104,7 +105,8 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 }
 
 func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" {
+	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return errors.New("registry: invalid node sandbox ref")
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
@@ -126,10 +128,12 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 			if err != nil {
 				return err
 			}
-			if existing.SandboxID != ref.SandboxID || existing.Group == "" || existing.RouteKey == "" {
+			if existing.SandboxID != ref.SandboxID || existing.Group == "" || existing.RouteKey == "" ||
+				!validFullFingerprint(existing.APISecretFingerprint) || !types.Profile(existing.Profile).Valid() {
 				return errors.New("registry: invalid node sandbox ref")
 			}
-			if existing.Group != ref.Group || existing.RouteKey != ref.RouteKey {
+			if existing.Group != ref.Group || existing.RouteKey != ref.RouteKey ||
+				existing.Profile != ref.Profile || existing.APISecretFingerprint != ref.APISecretFingerprint {
 				return errNodeSandboxIDConflict
 			}
 			if _, ok, err := sh.CAS(ctx, key, cur.Meta.Rev, value); err != nil {
@@ -164,7 +168,8 @@ func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID s
 	if err != nil {
 		return clusterstate.NodeSandboxRef{}, false, err
 	}
-	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return clusterstate.NodeSandboxRef{}, false, errors.New("registry: invalid node sandbox ref")
 	}
 	return ref, true, nil
@@ -283,79 +288,106 @@ func (s *Stores) removeNodeBuildRefShardAtRevision(ctx context.Context, nodeID, 
 	return ok, err
 }
 
-func (s *Stores) upsertNodeManifestKeyShard(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
-	if nodeID == "" || key.Fingerprint == "" {
+func (s *Stores) upsertNodeKeyPairShard(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error {
+	if nodeID == "" || pair.APISecretFingerprint == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return err
 	}
-	value, err := clusterstate.EncodeShardValue(key)
-	if err != nil {
-		return err
+	key := clusterstate.NodeKeyPairRecordKey(pair.APISecretFingerprint)
+	for attempt := 0; attempt < 5; attempt++ {
+		currentPair := pair
+		current, found, err := sh.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		expect := uint64(0)
+		if found {
+			existing, err := clusterstate.DecodeShardValue[clusterstate.NodeKeyPair](current.Value)
+			if err != nil {
+				return err
+			}
+			if !sameNodeKeyPairMaterial(existing, pair) {
+				return errors.New("registry: API secret fingerprint is already bound to a different key pair")
+			}
+			if currentPair.AckedExpiresUnix == 0 {
+				currentPair.AckedExpiresUnix = existing.AckedExpiresUnix
+			}
+			expect = current.Meta.Rev
+		}
+		value, err := clusterstate.EncodeShardValue(currentPair)
+		if err != nil {
+			return err
+		}
+		if _, ok, err := sh.CAS(ctx, key, expect, value); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
 	}
-	return shardUpsert(ctx, sh, clusterstate.NodeManifestKeyRecordKey(key.Fingerprint), value)
+	return shardkv.ErrConflict
 }
 
-func (s *Stores) dropNodeManifestKeyShard(ctx context.Context, nodeID, fingerprint string) error {
-	if nodeID == "" || fingerprint == "" {
+func (s *Stores) dropNodeKeyPairShard(ctx context.Context, nodeID, apiSecretFingerprint string) error {
+	if nodeID == "" || apiSecretFingerprint == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return err
 	}
-	return shardDeleteIfFound(ctx, sh, clusterstate.NodeManifestKeyRecordKey(fingerprint))
+	return shardDeleteIfFound(ctx, sh, clusterstate.NodeKeyPairRecordKey(apiSecretFingerprint))
 }
 
-func (s *Stores) dropNodeManifestKeyShardAtRevision(ctx context.Context, nodeID, fingerprint string, expectRev uint64) (bool, error) {
-	if nodeID == "" || fingerprint == "" || expectRev == 0 {
+func (s *Stores) dropNodeKeyPairShardAtRevision(ctx context.Context, nodeID, apiSecretFingerprint string, expectRev uint64) (bool, error) {
+	if nodeID == "" || apiSecretFingerprint == "" || expectRev == 0 {
 		return false, nil
 	}
-	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return false, err
 	}
-	_, ok, err := sh.Delete(ctx, clusterstate.NodeManifestKeyRecordKey(fingerprint), expectRev)
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeKeyPairRecordKey(apiSecretFingerprint), expectRev)
 	return ok, err
 }
 
-func (s *Stores) getNodeManifestKeyShard(ctx context.Context, nodeID, fingerprint string) (clusterstate.NodeManifestKey, uint64, bool, error) {
-	if nodeID == "" || fingerprint == "" {
-		return clusterstate.NodeManifestKey{}, 0, false, nil
+func (s *Stores) getNodeKeyPairShard(ctx context.Context, nodeID, apiSecretFingerprint string) (clusterstate.NodeKeyPair, uint64, bool, error) {
+	if nodeID == "" || apiSecretFingerprint == "" {
+		return clusterstate.NodeKeyPair{}, 0, false, nil
 	}
-	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
-		return clusterstate.NodeManifestKey{}, 0, false, err
+		return clusterstate.NodeKeyPair{}, 0, false, err
 	}
-	rec, found, err := sh.Get(ctx, clusterstate.NodeManifestKeyRecordKey(fingerprint))
+	rec, found, err := sh.Get(ctx, clusterstate.NodeKeyPairRecordKey(apiSecretFingerprint))
 	if err != nil || !found {
-		return clusterstate.NodeManifestKey{}, 0, found, err
+		return clusterstate.NodeKeyPair{}, 0, found, err
 	}
-	key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+	pair, err := clusterstate.DecodeShardValue[clusterstate.NodeKeyPair](rec.Value)
 	if err != nil {
-		return clusterstate.NodeManifestKey{}, 0, false, err
+		return clusterstate.NodeKeyPair{}, 0, false, err
 	}
-	return key, rec.Meta.Rev, true, nil
+	return pair, rec.Meta.Rev, true, nil
 }
 
-func (s *Stores) markNodeManifestKeyAckedShard(ctx context.Context, nodeID string, expected clusterstate.NodeManifestKey) (bool, error) {
-	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+func (s *Stores) markNodeKeyPairAckedShard(ctx context.Context, nodeID string, expected clusterstate.NodeKeyPair) (bool, error) {
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return false, err
 	}
-	recordKey := clusterstate.NodeManifestKeyRecordKey(expected.Fingerprint)
+	recordKey := clusterstate.NodeKeyPairRecordKey(expected.APISecretFingerprint)
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, found, err := sh.Get(ctx, recordKey)
 		if err != nil || !found {
 			return false, err
 		}
-		current, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		current, err := clusterstate.DecodeShardValue[clusterstate.NodeKeyPair](rec.Value)
 		if err != nil {
 			return false, err
 		}
-		if current.ExpiresUnix != expected.ExpiresUnix || !sameNodeManifestKeyMaterial(current, expected) {
+		if current.ExpiresUnix != expected.ExpiresUnix || !sameNodeKeyPairMaterial(current, expected) {
 			return false, nil
 		}
 		if current.AckedExpiresUnix >= expected.ExpiresUnix {
@@ -394,7 +426,8 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 			return nil, err
 		}
 		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
-		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, errors.New("registry: invalid node sandbox ref")
 		}
 		out.Sandboxes = append(out.Sandboxes, nodeReapSandboxRef{Ref: ref, Revision: rec.Meta.Rev})
@@ -418,7 +451,7 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 		}
 		out.Builds = append(out.Builds, nodeReapBuildRef{Ref: ref, Revision: rec.Meta.Rev})
 	}
-	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return nil, err
 	}
@@ -427,19 +460,21 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 		return nil, err
 	}
 	for _, rec := range keySnap.Records {
-		key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		pair, err := clusterstate.DecodeShardValue[clusterstate.NodeKeyPair](rec.Value)
 		if err != nil {
 			return nil, err
 		}
-		fingerprint, ok := clusterstate.ParseNodeManifestKeyRecordKey(rec.Key)
-		if !ok || key.Fingerprint != fingerprint {
-			return nil, errors.New("registry: invalid node manifest key")
+		fingerprint, ok := clusterstate.ParseNodeKeyPairRecordKey(rec.Key)
+		if !ok || pair.APISecretFingerprint != fingerprint {
+			return nil, errors.New("registry: invalid node key pair")
 		}
-		out.ManifestKeys = append(out.ManifestKeys, nodeReapManifestKey{Fingerprint: fingerprint, Revision: rec.Meta.Rev})
+		out.KeyPairs = append(out.KeyPairs, nodeReapKeyPair{APISecretFingerprint: fingerprint, Revision: rec.Meta.Rev})
 	}
 	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].Ref.SandboxID < out.Sandboxes[j].Ref.SandboxID })
 	sort.Slice(out.Builds, func(i, j int) bool { return out.Builds[i].Ref.BuildID < out.Builds[j].Ref.BuildID })
-	sort.Slice(out.ManifestKeys, func(i, j int) bool { return out.ManifestKeys[i].Fingerprint < out.ManifestKeys[j].Fingerprint })
+	sort.Slice(out.KeyPairs, func(i, j int) bool {
+		return out.KeyPairs[i].APISecretFingerprint < out.KeyPairs[j].APISecretFingerprint
+	})
 	return out, nil
 }
 
@@ -477,7 +512,8 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 			return nil, false, err
 		}
 		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
-		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, false, errors.New("registry: invalid node sandbox ref")
 		}
 		out.Sandboxes = append(out.Sandboxes, ref)
@@ -501,7 +537,7 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		}
 		out.Builds = append(out.Builds, ref)
 	}
-	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeKeyPair)
 	if err != nil {
 		return nil, false, err
 	}
@@ -510,17 +546,17 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		return nil, false, err
 	}
 	for _, rec := range keySnap.Records {
-		key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		pair, err := clusterstate.DecodeShardValue[clusterstate.NodeKeyPair](rec.Value)
 		if err != nil {
 			return nil, false, err
 		}
-		out.ManifestKeys = append(out.ManifestKeys, key)
+		out.KeyPairs = append(out.KeyPairs, pair)
 	}
 	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].SandboxID < out.Sandboxes[j].SandboxID })
 	sort.Slice(out.Builds, func(i, j int) bool {
 		return out.Builds[i].BuildID < out.Builds[j].BuildID
 	})
-	sortNodeManifestKeys(out.ManifestKeys)
+	sortNodeKeyPairs(out.KeyPairs)
 	return out, true, nil
 }
 
@@ -636,7 +672,7 @@ func isNodeBuildRecord(key shardkv.RecordKey) bool {
 	return ok
 }
 
-func isNodeManifestKeyRecord(key shardkv.RecordKey) bool {
-	_, ok := clusterstate.ParseNodeManifestKeyRecordKey(key)
+func isNodeKeyPairRecord(key shardkv.RecordKey) bool {
+	_, ok := clusterstate.ParseNodeKeyPairRecordKey(key)
 	return ok
 }
