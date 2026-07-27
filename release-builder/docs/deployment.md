@@ -33,7 +33,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
+| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip及经显式 capability 授权的 native exec)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 node-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
 | `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<run-id>` 单元(`run-sandbox`)assignment 后启动 | 平台内,`docs/sandbox.md` |
@@ -51,7 +51,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | `cache-ctl tiered` | `127.0.0.1:7071` | gRPC | health / `ping` / `info` |
 | `node-ctl conductor serve(resource_listen)` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
-| `node-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`;转发层设计见 `orchestrator/docs/node-proxy.md`)|
+| `node-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`及 service-addressed CONNECT);native exec 先调用 `POST /sandboxes/{sid}/exec-sessions`,再以 `service=exec` + `X-Access-Token` CONNECT;转发层设计见 `orchestrator/docs/node-proxy.md` |
 | `node-ctl` | `/run/sandbox/node-ctl.socket` | UDS,framed JSON | config-socket(task/admin/plugin/api 四平面):`run-sandbox`/`run-builder` 取 LaunchSpec / BuildSpec(密钥经 env);external proxy / 平台 agent 经 plugin 平面注册并同步路由(SO_PEERCRED + `<id>.pid` / pidfile 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
@@ -65,9 +65,11 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 `orchestrator/docs/node.md` §5/§12。
 
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
---sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
-沙箱排障(命令跑在应用的命名空间内,如 `docker exec`)。完整规格见
-`sandboxer/docs/sandbox.md` §2.4(发布包平铺名:`docs/sandbox.md`)。
+--sandbox-id <sid> -- CMD` 的本机入口。远程调用不会直接暴露该 UDS:客户端先以
+`X-API-KEY` 显式申请绑定 AuthSandboxID 的 `kat1` ExecAccessToken,再通过
+`service=exec` CONNECT;最终 node proxy 验证 token 后拨现有 `ctl.sock`,并由
+`pkg/ctl.ProxyExec` 限制首帧只能是 `exec_request`。完整规格见
+`sandboxer/docs/sandbox.md` 和 `orchestrator/docs/node-proxy.md`。
 
 ### 2.3 持久化与运行时目录
 
@@ -252,7 +254,10 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
 (shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key + 稳定 sandbox_id 路由,在 node 边界使用 NodeSandboxID)、**placer**(group provider/importer、WATCH_LIST 消费方与
+按 sandbox-group + route-key + 稳定 sandbox_id 路由,在 node 边界使用 NodeSandboxID;
+Exec Session 通过 `Reserve(op=exec-session)` + `CmdExecSession` 由 node 签发,数据面由
+Router 与 node 验证同一 KAT;非 READY route 进入 data Reserve 时,Registry 在触发生命周期
+动作前再次验证)、**placer**(group provider/importer、WATCH_LIST 消费方与
 放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
 时**不需要** cluster 层。
 
@@ -275,7 +280,7 @@ cluster-ctl placer
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
 | `cluster-ctl registry` | registry 自聚簇成员;复制 `route_link` / `node_link` / `node_list` / `placer_link` 执行态,承载 node 长连接和 route/node owner RPC | 1 或 N 副本;每个 group/node 由 LocateN 选 owner set | systemd | 平台内,`cluster.md` |
-| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持近期 route cache;数据面 miss 时 Resolve 并对已知非 READY route 做 data Reserve,create/connect 使用对应 Reserve operation | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
+| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持近期 route cache;数据面 miss 时 Resolve 并对已知非 READY route 做 data Reserve,create/connect/exec-session 使用对应 Reserve operation;Exec CONNECT 仅替换 stable SID 为 current NodeSandboxID,保持 service/port/token | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
 | `cluster-ctl placer` | group provider/importer、WATCH_LIST 消费方与放置调度器;向 registry 提供 PlaceSandbox / PlaceBuild / verify-key | N 副本;按 placer memberlist ready 视图和 group 确定性 failover | systemd | 平台内,`cluster-placer.md` |
 
 小规模可三角色同机共置;大规模按 registry 成员表、router 入口副本和 placer 副本分别扩展。
