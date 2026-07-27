@@ -27,6 +27,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -51,8 +52,9 @@ const (
 
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
-	Route   routeResolve   `json:"route"`
-	Connect *connectResult `json:"connect,omitempty"`
+	Route       routeResolve       `json:"route"`
+	Connect     *connectResult     `json:"connect,omitempty"`
+	ExecSession *execSessionResult `json:"exec_session,omitempty"`
 }
 
 type connectResult struct {
@@ -62,6 +64,10 @@ type connectResult struct {
 	EnvdAccessToken    string `json:"envd_access_token,omitempty"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	ForwardAccessToken string `json:"forward_access_token"`
+}
+
+type execSessionResult struct {
+	ExecAccessToken string `json:"exec_access_token"`
 }
 type routeResolve struct {
 	SandboxID              string `json:"sandbox_id"`
@@ -244,6 +250,14 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 		// the exact node-local target synchronously and the node resumes it
 		// asynchronously.
 		rt.handleConnect(w, r)
+	case isSandboxExecSessionPath(path):
+		// Exec capability issuance is a Registry operation over the current
+		// node-local instance; the public request is never forwarded to a node.
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rt.handleExecSession(w, r)
 	case isSandboxVerbPath(path):
 		// get / kill / pause / timeout / export: forward to the node by sid.
 		rt.handleSandboxVerb(w, r)
@@ -270,6 +284,14 @@ func isSandboxConnectPath(path string) bool {
 	}
 	sid := extractSandboxID(path)
 	return sid != "" && sid != "import" && path == sandboxPathPrefix(path)+sid+"/connect"
+}
+
+func isSandboxExecSessionPath(path string) bool {
+	if !strings.HasPrefix(path, "/sandboxes/") || !strings.HasSuffix(path, "/exec-sessions") {
+		return false
+	}
+	sid := extractSandboxID(path)
+	return sid != "" && sid != "import" && path == "/sandboxes/"+sid+"/exec-sessions"
 }
 
 func sandboxPathPrefix(path string) string {
@@ -303,7 +325,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "create", group, routeKey, "", 0, 0, createConfig,
+		r.Context(), "create", group, routeKey, "", 0, 0, 0, createConfig,
 		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
 	)
 	if err != nil {
@@ -611,7 +633,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, headers,
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, 0, nil, headers,
 	)
 	if err != nil {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -646,6 +668,67 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
+	sandboxID := extractSandboxID(r.URL.Path)
+	if sandboxID == "" || sandboxID == "import" {
+		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
+		return
+	}
+	apiKey := r.Header.Get(HeaderAPIKey)
+	if apiKey == "" {
+		http.Error(w, HeaderAPIKey+" required", http.StatusUnauthorized)
+		return
+	}
+	migrationToken := r.Header.Get(HeaderMigration)
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		http.Error(w, migrationtoken.ErrTokenTooLarge.Error(), http.StatusRequestHeaderFieldsTooLarge)
+		return
+	}
+	request, err := execsession.DecodeRequest(r.Body, r.ContentLength)
+	if err != nil {
+		if errors.Is(err, execsession.ErrRequestTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, execsession.ErrInvalidRequest.Error(), http.StatusBadRequest)
+		return
+	}
+	headers := map[string]string{HeaderAPIKey: apiKey}
+	if migrationToken != "" {
+		headers[HeaderMigration] = migrationToken
+	}
+	res, err := rt.routeLinkReserve(
+		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, request.TTLSeconds, nil, headers,
+	)
+	if err != nil {
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+		return
+	}
+	route := &res.Route
+	result := res.ExecSession
+	if !routeMatchesIdentity(route, group, routeKey, sandboxID) || result == nil || result.ExecAccessToken == "" {
+		http.Error(w, "registry returned an invalid exec session result", http.StatusBadGateway)
+		return
+	}
+	rt.rememberRoute(route)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(struct {
+		ExecAccessToken string `json:"execAccessToken"`
+	}{ExecAccessToken: result.ExecAccessToken})
 }
 
 // handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
@@ -954,7 +1037,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// unchanged.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil,
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
 			map[string]string{HeaderAccessTok: connectToken},
 		)
 		if err != nil {
@@ -1230,7 +1313,7 @@ func randomHexID() string {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, config map[string]string, headers map[string]string) (*reserveResult, error) {
+func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, ttlSeconds int64, config map[string]string, headers map[string]string) (*reserveResult, error) {
 	query := url.Values{
 		"operation": []string{operation},
 		"group":     []string{group},
@@ -1244,6 +1327,9 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	}
 	if timeout != 0 {
 		query.Set("timeout", strconv.Itoa(timeout))
+	}
+	if ttlSeconds > 0 {
+		query.Set("ttl_seconds", strconv.FormatInt(ttlSeconds, 10))
 	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte

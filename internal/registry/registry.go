@@ -180,11 +180,12 @@ func (f reserveRollbackFence) matches(rec *SandboxRecord, revision int64) bool {
 }
 
 // ReserveResult is the operation result returned to a trusted router. Route is
-// always the complete authoritative forwarding record; Connect is present only
-// after an accepted CmdConnect.
+// always the complete authoritative forwarding record; operation-specific
+// results are present only after their matching node command is accepted.
 type ReserveResult struct {
-	Route   RouteResolve             `json:"route"`
-	Connect *routesync.ConnectResult `json:"connect,omitempty"`
+	Route       RouteResolve                 `json:"route"`
+	Connect     *routesync.ConnectResult     `json:"connect,omitempty"`
+	ExecSession *routesync.ExecSessionResult `json:"exec_session,omitempty"`
 }
 
 // New builds a Registry. Production callers set a placer_link placer explicitly.
