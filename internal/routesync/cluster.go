@@ -78,6 +78,7 @@ type SelectorPatch struct {
 const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
+	CmdExecSession   = "exec_session"   // mint an exec capability and asynchronously resume
 	CmdDelete        = "delete"         // destroy a sandbox
 	CmdKeyPut        = "key_put"        // install / renew an API/manifest key-pair lease
 	CmdKeyDrop       = "key_drop"       // drop a key lease
@@ -165,7 +166,7 @@ type Heartbeat struct {
 // idempotent by SID. Fields are populated per Kind.
 type Command struct {
 	CmdID string `json:"cmd_id"`
-	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
+	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
 	SID   string `json:"sid,omitempty"`
 	// create and lifecycle credential binding
 	TemplateRef          string                 `json:"template_ref,omitempty"`           // snapshot template ref (cold start = fast restore)
@@ -175,6 +176,7 @@ type Command struct {
 	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
 	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
+	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put
@@ -205,13 +207,20 @@ type ConnectResult struct {
 	ForwardAccessToken string `json:"forward_access_token"`
 }
 
-// CmdAck acknowledges a Command's receipt. CmdConnect additionally returns its
-// synchronously prepared result; asynchronous resume completion still arrives
-// through the route stream.
+// ExecSessionResult is the complete public result of an accepted
+// CmdExecSession. Session identifiers and credential roots remain node-local.
+type ExecSessionResult struct {
+	ExecAccessToken string `json:"exec_access_token"`
+}
+
+// CmdAck acknowledges a Command's receipt. CmdConnect and CmdExecSession
+// additionally return their synchronously prepared result; asynchronous resume
+// completion still arrives through the route stream.
 type CmdAck struct {
-	CmdID      string         `json:"cmd_id"`
-	Status     string         `json:"status"` // AckAccepted | AckRejected
-	Reason     string         `json:"reason,omitempty"`
-	HTTPStatus int            `json:"http_status,omitempty"`
-	Connect    *ConnectResult `json:"connect,omitempty"`
+	CmdID       string             `json:"cmd_id"`
+	Status      string             `json:"status"` // AckAccepted | AckRejected
+	Reason      string             `json:"reason,omitempty"`
+	HTTPStatus  int                `json:"http_status,omitempty"`
+	Connect     *ConnectResult     `json:"connect,omitempty"`
+	ExecSession *ExecSessionResult `json:"exec_session,omitempty"`
 }

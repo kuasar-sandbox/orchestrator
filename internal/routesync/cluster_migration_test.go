@@ -56,6 +56,56 @@ func TestNodeLinkRejectedAckRoundTripPreservesHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestNodeLinkExecSessionCommandAndAckRoundTrip(t *testing.T) {
+	command := &Command{
+		CmdID: "exec-1", Kind: CmdExecSession, SID: "stable-g2", Profile: "bare",
+		APISecretFingerprint: "api-secret-fingerprint",
+		Cluster: &ClusterSandboxContext{
+			Group: "/tenant/workloads", RouteKey: "route-stable", AuthSandboxID: "stable",
+		},
+		MigrationToken: "kmt1.opaque-migration-token",
+		TTLSeconds:     37,
+	}
+	got := roundTrip(t, &Msg{Type: TypeCommand, Rev: 11, Cmd: command})
+	if got.Cmd == nil || got.Cmd.Kind != CmdExecSession || got.Cmd.SID != command.SID ||
+		got.Cmd.Profile != command.Profile || got.Cmd.APISecretFingerprint != command.APISecretFingerprint ||
+		got.Cmd.MigrationToken != command.MigrationToken || got.Cmd.TTLSeconds != command.TTLSeconds ||
+		got.Cmd.Cluster == nil || *got.Cmd.Cluster != *command.Cluster || got.Rev != 11 {
+		t.Fatalf("exec-session command round-trip: %+v rev=%d", got.Cmd, got.Rev)
+	}
+
+	ack := &CmdAck{
+		CmdID: "exec-1", Status: AckAccepted,
+		ExecSession: &ExecSessionResult{ExecAccessToken: "kat1.exec"},
+	}
+	got = roundTrip(t, &Msg{Type: TypeCmdAck, Ack: ack})
+	if got.Ack == nil || got.Ack.ExecSession == nil || *got.Ack.ExecSession != *ack.ExecSession ||
+		got.Ack.CmdID != ack.CmdID || got.Ack.Status != ack.Status || got.Ack.Connect != nil {
+		t.Fatalf("exec-session ack round-trip: %+v", got.Ack)
+	}
+}
+
+func TestNodeLinkExecSessionWireOmitsCredentialRoots(t *testing.T) {
+	payload, err := json.Marshal(&Msg{
+		Type: TypeCmdAck,
+		Ack: &CmdAck{
+			CmdID: "exec-1", Status: AckAccepted,
+			ExecSession: &ExecSessionResult{ExecAccessToken: "kat1.exec"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"api_secret", "service_secret", "session_id"} {
+		if bytes.Contains(payload, []byte(forbidden)) {
+			t.Fatalf("exec-session ack leaks %q: %s", forbidden, payload)
+		}
+	}
+	if !bytes.Contains(payload, []byte(`"exec_session":{"exec_access_token":"kat1.exec"}`)) {
+		t.Fatalf("exec-session ack wire = %s", payload)
+	}
+}
+
 func TestNodeLinkMigrationTokenWireSizeLimit(t *testing.T) {
 	exact := &Msg{
 		Type: TypeCommand,
