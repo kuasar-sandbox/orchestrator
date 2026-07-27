@@ -15,6 +15,8 @@
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
 #   GET <proxy> for an unknown sandbox -> wake -> 404 (orchestrator says gone)
+#   POST /sandboxes/<sid>/exec-sessions -> KAT; service=exec CONNECT through the
+#                                          external proxy -> real guest exec
 #   pause -> GET <proxy> -> wake -> auto-resume -> forwarded
 #   /metrics on the proxy master reports worker data-plane counters
 #
@@ -26,6 +28,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+EXEC_CONNECT_BRIDGE="$REPO_ROOT/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-3443}"
@@ -51,6 +54,7 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
+[ -f "$EXEC_CONNECT_BRIDGE" ] || skip "missing $EXEC_CONNECT_BRIDGE"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -161,6 +165,80 @@ req() {
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
+assert_no_default_exec_token() {
+    python3 - "$1" <<'PY'
+import json, sys
+created = json.load(open(sys.argv[1]))
+if "execAccessToken" in created:
+    raise SystemExit("create response unexpectedly contains execAccessToken")
+PY
+}
+issue_exec_session() {
+    local sid="$1" key="$2" code
+    code="$(curl -sS --noproxy '*' --max-time 30 \
+        -D "$WORK/exec-session.headers" \
+        -o "$WORK/exec-session.secret" \
+        -w '%{http_code}' \
+        -X POST \
+        -H "Host: api.$DOMAIN" \
+        -H "X-API-KEY: $key" \
+        -H 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:$PORT/sandboxes/$sid/exec-sessions")"
+    [ "$code" = "201" ] || fail "exec-session=$code (want 201)"
+    python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
+import json, sys
+headers = [line.strip().lower() for line in open(sys.argv[1], "rb").read().splitlines()]
+if b"cache-control: no-store" not in headers:
+    raise SystemExit("exec-session response omitted Cache-Control: no-store")
+payload = json.load(open(sys.argv[2]))
+if not isinstance(payload, dict) or set(payload) != {"execAccessToken"}:
+    raise SystemExit("exec-session response must contain only execAccessToken")
+token = payload["execAccessToken"]
+if not isinstance(token, str) or not token.startswith("kat1.") or len(token.split(".")) != 3:
+    raise SystemExit("exec-session response contains an invalid KAT token")
+print(token)
+PY
+}
+exec_through_proxy_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local bridge_root="$WORK/exec-connect-run"
+    local ready_file="$WORK/exec-connect.ready"
+    local bridge_log="$WORK/exec-connect-bridge.log"
+    local output="$WORK/native-exec.out"
+    local bridge_pid status
+
+    mkdir -p "$bridge_root/$sid"
+    EXEC_CONNECT_TOKEN="$token" timeout -k 5s 75 python3 "$EXEC_CONNECT_BRIDGE" \
+        --listen "$bridge_root/$sid/ctl.sock" \
+        --ready-file "$ready_file" \
+        --upstream "127.0.0.1:$PROXY_PORT" \
+        --sandbox-id "$sid" \
+        >"$bridge_log" 2>&1 &
+    bridge_pid=$!
+    PIDS+=("$bridge_pid")
+    for _ in $(seq 1 100); do
+        [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] && break
+        kill -0 "$bridge_pid" 2>/dev/null || { cat "$bridge_log"; fail "exec CONNECT bridge exited before readiness"; }
+        sleep 0.05
+    done
+    [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] \
+        || { cat "$bridge_log"; fail "exec CONNECT bridge did not become ready"; }
+
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --sandbox-id "$sid" --run-root "$bridge_root" -- \
+        /bin/sh -c "printf '%s\\n' '$marker'; exit 47" >"$output" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    if ! wait "$bridge_pid"; then
+        cat "$bridge_log"
+        fail "exec CONNECT bridge failed"
+    fi
+    grep -Fxq "$marker" "$output" || { sed 's/^/  guest| /' "$output"; fail "native exec output missing $marker"; }
+    [ "$status" = "47" ] || { sed 's/^/  guest| /' "$output"; fail "native exec exit=$status (want guest status 47)"; }
 }
 # data-plane request through the PROXY (:PROXY_PORT), Host <port>-<sid>.<domain>
 dp() {
@@ -363,7 +441,8 @@ ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
     || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
-echo "==> PASS: sandbox $SID running (envd and forward tokens captured)"
+assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
+echo "==> PASS: sandbox $SID running (envd and forward tokens captured; no default exec token)"
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
@@ -505,7 +584,16 @@ else
     fail "CONNECT tunnel through proxy failed: $cc"
 fi
 
-# ---- (4) auto-resume THROUGH the proxy ------------------------------------
+# ---- (4) native exec capability THROUGH the external proxy ----------------
+echo "==> issue an explicit native exec capability through the direct control API"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capability"
+rm -f "$WORK/exec-session.secret"
+NATIVE_MARK="EXTERNAL_PROXY_NATIVE_EXEC_$RANDOM"
+exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
+unset EXEC_TOKEN
+echo "==> PASS: service=exec CONNECT through the external proxy reached the real guest (marker=$NATIVE_MARK, exit=47)"
+
+# ---- (5) auto-resume THROUGH the proxy ------------------------------------
 echo "==> pause $SID, then drive the proxy to trigger wake -> auto-resume"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
