@@ -211,14 +211,17 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 	waitForLauncherStart(t, started)
 
 	done := make(chan *routesync.CmdAck, 1)
-	before := time.Now().Unix()
-	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 91)) }()
+	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 1)) }()
 	select {
 	case ack := <-done:
 		t.Fatalf("later cluster Connect returned before the in-flight resume completed: %+v", ack)
 	case <-time.After(100 * time.Millisecond):
 	}
 
+	// Keep the later Connect behind the lifecycle boundary for longer than its
+	// requested lifetime. Its timeout must start after the wait, not before it.
+	time.Sleep(1100 * time.Millisecond)
+	releasedAt := time.Now().Unix()
 	close(startGate)
 	var ack *routesync.CmdAck
 	select {
@@ -233,8 +236,8 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 	if err != nil || stored == nil || stored.State != types.StateRunning {
 		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
 	}
-	if stored.DeadlineUnix < before+90 || stored.DeadlineUnix > time.Now().Unix()+92 {
-		t.Fatalf("deadline = %d, want the later cluster Connect timeout", stored.DeadlineUnix)
+	if stored.DeadlineUnix <= releasedAt {
+		t.Fatalf("deadline = %d, want a timeout starting after lifecycle release at %d", stored.DeadlineUnix, releasedAt)
 	}
 	if cached := o.lookup(sb.ID); cached == nil || cached.DeadlineUnix != stored.DeadlineUnix {
 		t.Fatalf("cache deadline differs from stored sandbox: cached=%+v stored=%+v", cached, stored)

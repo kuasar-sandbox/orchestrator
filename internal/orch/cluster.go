@@ -55,11 +55,11 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
-		requestedDeadline := clusterConnectDeadline(cmd.TimeoutSeconds)
-		if requestedDeadline > 0 {
+		if cmd.TimeoutSeconds > 0 {
 			unlock := o.lifecycle.Lock(cmd.SID)
 			defer unlock()
 		}
+		requestedDeadline := clusterConnectDeadline(cmd.TimeoutSeconds)
 		sb, err := o.prepareClusterConnect(ctx, cmd, requestedDeadline)
 		if err != nil {
 			return reject(cmd, err)
