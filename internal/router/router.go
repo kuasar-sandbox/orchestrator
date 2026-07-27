@@ -973,12 +973,7 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 	if rr == nil {
 		var err error
 		if rr, err = rt.routeLinkRoute(r.Context(), group, routeKey, sid); err != nil {
-			var routeErr *routeLinkCallError
-			if errors.As(err, &routeErr) && routeErr.status == http.StatusNotFound {
-				http.Error(w, "sandbox not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeExecDataRouteError(w, err)
 			return
 		}
 		if !routeMatchesIdentity(rr, group, routeKey, sid) {
@@ -1004,7 +999,7 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 			},
 		)
 		if err != nil {
-			writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+			writeExecDataReserveError(w, err)
 			return
 		}
 		current := &res.Route
@@ -1574,6 +1569,30 @@ func writeExecSessionRouteLinkError(w http.ResponseWriter, err error) {
 		}
 	}
 	http.Error(w, message, status)
+}
+
+func writeExecDataRouteError(w http.ResponseWriter, err error) {
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) && routeErr.status == http.StatusNotFound {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, "routing unavailable", http.StatusServiceUnavailable)
+}
+
+func writeExecDataReserveError(w http.ResponseWriter, err error) {
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) {
+		switch routeErr.status {
+		case http.StatusUnauthorized:
+			http.Error(w, "invalid access token", http.StatusUnauthorized)
+			return
+		case http.StatusNotFound:
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+			return
+		}
+	}
+	http.Error(w, "sandbox activation failed", http.StatusServiceUnavailable)
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {

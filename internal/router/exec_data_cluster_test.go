@@ -104,6 +104,75 @@ func TestClusterExecRejectsInvalidKATBeforeReserve(t *testing.T) {
 	}
 }
 
+func TestClusterExecSanitizesRouteLookupFailure(t *testing.T) {
+	const internalDetail = "registry sqlite failed at /private/registry.db"
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/route" {
+			t.Fatalf("route-link path = %q", r.URL.Path)
+		}
+		http.Error(w, internalDetail, http.StatusInternalServerError)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+
+	resp := httptest.NewRecorder()
+	rt.Handler().ServeHTTP(resp, clusterExecRequest("unparsed-before-route", 0))
+	if resp.Code != http.StatusServiceUnavailable || resp.Body.String() != "routing unavailable\n" {
+		t.Fatalf("status = %d, body = %q", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), internalDetail) || strings.Contains(resp.Body.String(), "/private/") {
+		t.Fatalf("public route error leaked internal detail: %q", resp.Body.String())
+	}
+}
+
+func TestClusterExecSanitizesReserveFailure(t *testing.T) {
+	paused := routerTestRouteResolve(t, "stable", "/g", "rk", "", types.ProfileBare)
+	paused.State = "paused"
+	token, err := keys.MintExecAccessToken(paused.ServiceSecret, paused.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const internalDetail = "node stable-g7 rejected ctl path /private/run/ctl.sock"
+	for _, test := range []struct {
+		name       string
+		upstream   int
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "stale token", upstream: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized, wantBody: "invalid access token\n"},
+		{name: "route disappeared", upstream: http.StatusNotFound, wantStatus: http.StatusNotFound, wantBody: "sandbox not found\n"},
+		{name: "activation failed", upstream: http.StatusInternalServerError, wantStatus: http.StatusServiceUnavailable, wantBody: "sandbox activation failed\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var reserveHits atomic.Int32
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/route-link/route":
+					_ = json.NewEncoder(w).Encode(paused)
+				case "/route-link/reserve":
+					reserveHits.Add(1)
+					http.Error(w, internalDetail, test.upstream)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer control.Close()
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+
+			resp := httptest.NewRecorder()
+			rt.Handler().ServeHTTP(resp, clusterExecRequest(token, 0))
+			if resp.Code != test.wantStatus || resp.Body.String() != test.wantBody || reserveHits.Load() == 0 {
+				t.Fatalf("status = %d, body = %q, reserve hits = %d; want %d, %q and at least one Reserve attempt",
+					resp.Code, resp.Body.String(), reserveHits.Load(), test.wantStatus, test.wantBody)
+			}
+			if strings.Contains(resp.Body.String(), internalDetail) ||
+				strings.Contains(resp.Body.String(), "stable-g7") || strings.Contains(resp.Body.String(), "/private/") {
+				t.Fatalf("public reserve error leaked internal detail: %q", resp.Body.String())
+			}
+		})
+	}
+}
+
 func TestClusterExecReadyCacheRewritesOnlySIDAndPreservesTunnel(t *testing.T) {
 	node, observed, backendInput := newExecTunnelNode(t, "node-prefetched/", "node-tail")
 	defer node.Close()
