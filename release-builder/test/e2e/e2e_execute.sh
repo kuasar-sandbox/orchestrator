@@ -418,7 +418,17 @@ if [ "$code" = "204" ]; then
     echo "==> resume via connect"
     code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
     [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
-    for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.3; done
+    # Connect acknowledges after import and schedules resume asynchronously. The
+    # old UDS path can survive pause, so its mere existence is not a readiness
+    # signal; probe the service until the restored envd is accepting requests.
+    resumed=""
+    for _ in $(seq 1 90); do
+        code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
+            -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
+        case "$code" in 200|204) resumed=1; break ;; esac
+        sleep 0.5
+    done
+    [ -n "$resumed" ] || fail "envd did not become ready after asynchronous resume"
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
     grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
