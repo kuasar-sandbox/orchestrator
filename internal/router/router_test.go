@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,13 +244,17 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 		Config map[string]string `json:"config"`
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
+		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("operation") != "create" ||
+			req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
 			t.Fatalf("reserve request path=%q query=%q", req.URL.Path, req.URL.RawQuery)
+		}
+		if req.Header.Get(HeaderAPIKey) != "api-key" {
+			t.Fatalf("reserve X-API-KEY=%q", req.Header.Get(HeaderAPIKey))
 		}
 		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
-		body, err := json.Marshal(routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B))
+		body, err := json.Marshal(routerTestReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileE2B))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -260,7 +265,7 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	})}
 
 	config := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
-	if _, err := rt.routeLinkReserve(context.Background(), "/g", "rk", config); err != nil {
+	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
 		t.Fatal(err)
 	}
 	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
@@ -268,20 +273,74 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	}
 }
 
-func TestReserveByKeyJoinsExistingRouteFlight(t *testing.T) {
-	resultValue := routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B)
-	result := &resultValue
-	flight := &reserveFlight{done: make(chan struct{}), res: result}
-	close(flight.done)
-	rt := &Router{reserveInFlight: map[string]*reserveFlight{
-		routeCacheKey("/g", "rk"): flight,
-	}}
-
-	got, err := rt.reserveByKey(context.Background(), "/g", "rk", map[string]string{
-		"kuasar-sandbox.restore": `{"prefetch":"memory"}`,
-	})
-	if err != nil || got != result {
-		t.Fatalf("existing route flight result=%+v err=%v", got, err)
+func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		operation string
+		port      int
+		timeout   int
+		headers   map[string]string
+	}{
+		{
+			name: "connect", operation: "connect", timeout: 37,
+			headers: map[string]string{HeaderAPIKey: "api-key", HeaderMigration: "kmt1.token"},
+		},
+		{
+			name: "data", operation: "data", port: 8080,
+			headers: map[string]string{HeaderAccessTok: "access-token"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				query := req.URL.Query()
+				if req.URL.Path != "/route-link/reserve" || query.Get("operation") != tc.operation ||
+					query.Get("group") != "/g" || query.Get("route_key") != "rk" || query.Get("sid") != "s1" {
+					t.Fatalf("reserve path=%q query=%q", req.URL.Path, req.URL.RawQuery)
+				}
+				wantPort := ""
+				if tc.port > 0 {
+					wantPort = strconv.Itoa(tc.port)
+				}
+				if query.Get("port") != wantPort {
+					t.Fatalf("reserve port=%q, want %q", query.Get("port"), wantPort)
+				}
+				wantTimeout := ""
+				if tc.timeout > 0 {
+					wantTimeout = strconv.Itoa(tc.timeout)
+				}
+				if query.Get("timeout") != wantTimeout {
+					t.Fatalf("reserve timeout=%q, want %q", query.Get("timeout"), wantTimeout)
+				}
+				if body, err := io.ReadAll(req.Body); err != nil || len(body) != 0 {
+					t.Fatalf("reserve body=%q err=%v, want empty", body, err)
+				}
+				if contentType := req.Header.Get("Content-Type"); contentType != "" {
+					t.Fatalf("reserve Content-Type=%q, want empty", contentType)
+				}
+				for name, want := range tc.headers {
+					if got := req.Header.Get(name); got != want {
+						t.Fatalf("reserve %s=%q, want %q", name, got, want)
+					}
+				}
+				result := routerTestReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				if tc.operation == "connect" {
+					result = routerTestConnectReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				}
+				body, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return textResponse(http.StatusOK, string(body)), nil
+			})}
+			rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+				return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
+			})}
+			if _, err := rt.routeLinkReserve(
+				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, tc.headers,
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

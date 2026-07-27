@@ -28,6 +28,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -42,35 +43,35 @@ const (
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
 	HeaderAPIKey      = "X-API-KEY"
 	HeaderAccessTok   = "X-Access-Token"
+	HeaderMigration   = "X-Kuasar-Migration-Token"
 
 	maxClusterCreateBodyBytes int64 = 16 << 20
 )
 
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
-	NodeID                 string `json:"node_id"`
-	SandboxID              string `json:"sandbox_id"`
-	NodeSandboxID          string `json:"node_sandbox_id"`
-	Profile                string `json:"profile"`
-	AuthSandboxID          string `json:"auth_sandbox_id"`
-	APISecret              string `json:"api_secret"`
-	APISecretFingerprint   string `json:"api_secret_fingerprint"`
-	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
-	ServiceSecret          string `json:"service_secret"`
-	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
-	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
-	ForwardAccessToken     string `json:"forward_access_token"`
-	TargetPort             int    `json:"target_port,omitempty"`
-	DataEndpoint           string `json:"data_endpoint"`
+	Route   routeResolve   `json:"route"`
+	Connect *connectResult `json:"connect,omitempty"`
+}
+
+type connectResult struct {
+	NodeSandboxID      string `json:"node_sandbox_id"`
+	TemplateID         string `json:"template_id"`
+	Profile            string `json:"profile"`
+	EnvdAccessToken    string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken string `json:"forward_access_token"`
 }
 type routeResolve struct {
 	SandboxID              string `json:"sandbox_id"`
 	NodeSandboxID          string `json:"node_sandbox_id"`
+	RouteRevision          int64  `json:"route_revision"`
 	Group                  string `json:"group"`
 	RouteKey               string `json:"route_key"`
 	NodeID                 string `json:"node_id"`
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
+	TemplateID             string `json:"template_id"`
 	AuthSandboxID          string `json:"auth_sandbox_id"`
 	APISecret              string `json:"api_secret"`
 	APISecretFingerprint   string `json:"api_secret_fingerprint"`
@@ -118,9 +119,6 @@ type Router struct {
 	cache   map[string]*routeResolve // group\x00route_key\x00stable_sid -> current data-plane target
 	active  map[string]*activeRoute  // in-flight bookkeeping only; never resolves a new request
 
-	reserveMu       sync.Mutex
-	reserveInFlight map[string]*reserveFlight // single-flight Reserve per (group,route_key)
-
 	authTTL time.Duration
 	authMu  sync.Mutex
 	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
@@ -130,12 +128,6 @@ type Router struct {
 
 	fwdTransport *http.Transport // pooled transport for node control/build forwards
 
-}
-
-type reserveFlight struct {
-	done chan struct{}
-	res  *reserveResult
-	err  error
 }
 
 type routeRegistry interface {
@@ -167,7 +159,6 @@ func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, 
 		builds:           map[string]buildEntry{},
 		cache:            map[string]*routeResolve{},
 		active:           map[string]*activeRoute{},
-		reserveInFlight:  map[string]*reserveFlight{},
 		authOK:           map[string]time.Time{},
 		routeTTL:         5 * time.Minute,
 		routeIdleTimeout: 2 * time.Minute,
@@ -256,8 +247,13 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && isSandboxCollectionPath(path):
 		// list: the group's sandbox shard (no cross-group).
 		rt.handleList(w, r)
+	case r.Method == http.MethodPost && isSandboxConnectPath(path):
+		// connect is completed by operation-aware Reserve: the registry prepares
+		// the exact node-local target synchronously and the node resumes it
+		// asynchronously.
+		rt.handleConnect(w, r)
 	case isSandboxVerbPath(path):
-		// get / kill / pause / timeout / connect / export: forward to the node by sid.
+		// get / kill / pause / timeout / export: forward to the node by sid.
 		rt.handleSandboxVerb(w, r)
 	default:
 		http.Error(w, "cluster router: control verb not supported", http.StatusNotImplemented)
@@ -276,13 +272,28 @@ func isSandboxVerbPath(path string) bool {
 	return strings.HasPrefix(path, "/sandboxes/") || strings.HasPrefix(path, "/v2/sandboxes/")
 }
 
+func isSandboxConnectPath(path string) bool {
+	if !strings.HasSuffix(path, "/connect") {
+		return false
+	}
+	sid := extractSandboxID(path)
+	return sid != "" && sid != "import" && path == sandboxPathPrefix(path)+sid+"/connect"
+}
+
+func sandboxPathPrefix(path string) string {
+	if strings.HasPrefix(path, "/v2/sandboxes/") {
+		return "/v2/sandboxes/"
+	}
+	if strings.HasPrefix(path, "/sandboxes/") {
+		return "/sandboxes/"
+	}
+	return ""
+}
+
 func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
-		return
-	}
-	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	routeKey := r.Header.Get(HeaderRouteKey)
@@ -299,31 +310,35 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
-	res, err := rt.reserveByKey(r.Context(), group, routeKey, createConfig)
+	res, err := rt.routeLinkReserve(
+		r.Context(), "create", group, routeKey, "", 0, 0, createConfig,
+		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
+	)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
-		status := http.StatusServiceUnavailable
-		var routeErr *routeLinkCallError
-		if errors.As(err, &routeErr) && routeErr.status == http.StatusBadRequest {
-			status = http.StatusBadRequest
-		}
-		http.Error(w, err.Error(), status)
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
 		return
 	}
+	route := &res.Route
+	if route.Group != group || route.RouteKey != routeKey || route.SandboxID == "" || route.NodeSandboxID == "" {
+		http.Error(w, "registry returned an invalid sandbox route", http.StatusBadGateway)
+		return
+	}
+	rt.rememberRoute(route)
 	// Public create responses expose only the profile-specific sandbox tokens.
 	// Tenant and sandbox credential roots remain inside the protected route link.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	out := map[string]any{
-		"sandboxID":          res.SandboxID,
+		"sandboxID":          route.SandboxID,
 		"routeKey":           routeKey,
-		"clientID":           res.NodeID,
-		"forwardAccessToken": res.ForwardAccessToken,
+		"clientID":           route.NodeID,
+		"forwardAccessToken": route.ForwardAccessToken,
 		"domain":             rt.domain,
 	}
-	if res.Profile == string(types.ProfileE2B) {
-		out["envdAccessToken"] = res.EnvdAccessToken
-		out["trafficAccessToken"] = res.TrafficAccessToken
+	if route.Profile == string(types.ProfileE2B) {
+		out["envdAccessToken"] = route.EnvdAccessToken
+		out["trafficAccessToken"] = route.TrafficAccessToken
 	}
 	_ = json.NewEncoder(w).Encode(out)
 }
@@ -549,8 +564,77 @@ func extractBuildID(path string) string {
 
 // --- sandbox control verbs (forward by sid / group shard) ---
 
+func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
+	sandboxID := extractSandboxID(r.URL.Path)
+	if sandboxID == "" || sandboxID == "import" {
+		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
+		return
+	}
+	migrationToken := r.Header.Get(HeaderMigration)
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		http.Error(w, migrationtoken.ErrTokenTooLarge.Error(), http.StatusRequestHeaderFieldsTooLarge)
+		return
+	}
+	var body struct {
+		Timeout int `json:"timeout"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	headers := map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}
+	if migrationToken != "" {
+		headers[HeaderMigration] = migrationToken
+	}
+	res, err := rt.routeLinkReserve(
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, headers,
+	)
+	if err != nil {
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+		return
+	}
+	route := &res.Route
+	connected := res.Connect
+	if !routeMatchesIdentity(route, group, routeKey, sandboxID) || connected == nil ||
+		connected.NodeSandboxID == "" || connected.NodeSandboxID != route.NodeSandboxID ||
+		connected.TemplateID == "" || connected.TemplateID != route.TemplateID ||
+		connected.Profile == "" || connected.Profile != route.Profile ||
+		connected.EnvdAccessToken != route.EnvdAccessToken ||
+		connected.TrafficAccessToken != route.TrafficAccessToken ||
+		connected.ForwardAccessToken != route.ForwardAccessToken {
+		http.Error(w, "registry returned an invalid connect result", http.StatusBadGateway)
+		return
+	}
+	rt.rememberRoute(route)
+	out := map[string]any{
+		"sandboxID":          sandboxID,
+		"templateID":         connected.TemplateID,
+		"clientID":           "orchestrator",
+		"domain":             rt.domain,
+		"envdVersion":        "0.1.0",
+		"alias":              "",
+		"forwardAccessToken": connected.ForwardAccessToken,
+	}
+	if connected.Profile == string(types.ProfileE2B) {
+		out["envdVersion"] = "0.6.1"
+		out["envdAccessToken"] = connected.EnvdAccessToken
+		out["trafficAccessToken"] = connected.TrafficAccessToken
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 // handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
-// connect/export) to the node holding the sandbox (cluster-router.md); kill's
+// export) to the node holding the sandbox (cluster-router.md); kill's
 // teardown propagates back as a route delete, converging the registry.
 func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
@@ -817,13 +901,22 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// verifies the same signature independently. Other requests reuse the client's
 	// token on both hops; the node proxy performs the final target-specific check.
 	connectToken := r.Header.Get(HeaderAccessTok)
-	if connectToken == "" && envdsign.IsFileSignatureCandidate(r.Method, r.URL.Path, effectivePort) {
-		if rr.Profile != string(types.ProfileE2B) || rr.EnvdAccessToken == "" ||
-			envdsign.ValidateFileRequest(r, rr.EnvdAccessToken, time.Now()) != nil {
-			http.Error(w, "invalid file signature", http.StatusUnauthorized)
-			return
+	if envdsign.IsFileSignatureCandidate(r.Method, r.URL.Path, effectivePort) {
+		if connectToken != "" {
+			// An explicit token selects token authentication in every router auth
+			// mode. A bad token must not fall back to an otherwise valid signed URL.
+			if auth := envdsign.CheckDataPlaneAuth(r, effectivePort, expectedDataAccessToken(rr, effectivePort), time.Now()); !auth.OK {
+				http.Error(w, "invalid access token", http.StatusUnauthorized)
+				return
+			}
+		} else {
+			if rr.Profile != string(types.ProfileE2B) || rr.EnvdAccessToken == "" ||
+				envdsign.ValidateFileRequest(r, rr.EnvdAccessToken, time.Now()) != nil {
+				http.Error(w, "invalid file signature", http.StatusUnauthorized)
+				return
+			}
+			connectToken = rr.EnvdAccessToken
 		}
-		connectToken = rr.EnvdAccessToken
 	} else if rt.dataPlaneAuth == "enforce" || rt.dataPlaneAuth == "log" {
 		auth := envdsign.CheckDataPlaneAuth(r, effectivePort, expectedDataAccessToken(rr, effectivePort), time.Now())
 		if !auth.OK {
@@ -834,14 +927,24 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			rt.log.Warn("router: data-plane auth mismatch (log mode)", "sid", sid, "err", auth.Err)
 		}
 	}
-	// Not ready (paused / lagging): data-plane traffic wakes it via Reserve (§1.4),
-	// then forwards to the resumed node.
+	// Not ready (paused / lagging): operation-aware Reserve authenticates this
+	// exact stable sandbox and prepares its current node route. A signed /files
+	// request has already been verified above, so its protected EnvdAccessToken is
+	// used only for Reserve and the outer CONNECT; the inner HTTP request remains
+	// unchanged.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
-		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey, nil); err == nil && res.DataEndpoint != "" {
-			resumed := routeFromReserve(res, rr.Group, rr.RouteKey)
-			if routeMatchesIdentity(resumed, rr.Group, rr.RouteKey, sid) {
-				rr = resumed
-			}
+		res, err := rt.routeLinkReserve(
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil,
+			map[string]string{HeaderAccessTok: connectToken},
+		)
+		if err != nil {
+			writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+			return
+		}
+		resumed := &res.Route
+		if routeMatchesIdentity(resumed, rr.Group, rr.RouteKey, sid) {
+			rt.rememberRoute(resumed)
+			rr = resumed
 		}
 	}
 	if rr.State != "ready" || rr.DataEndpoint == "" {
@@ -1014,7 +1117,6 @@ func (rt *Router) evictRouteLocked(group, routeKey, sid string) {
 	delete(rt.cache, key)
 }
 
-func routeCacheKey(group, routeKey string) string { return group + "\x00" + routeKey }
 func routeCacheID(group, routeKey, sid string) string {
 	return group + "\x00" + routeKey + "\x00" + sid
 }
@@ -1074,6 +1176,13 @@ func (rt *Router) rememberRoute(rr *routeResolve) {
 	cp.lastUsed = now
 	key := routeCacheID(cp.Group, cp.RouteKey, cp.SandboxID)
 	rt.cacheMu.Lock()
+	if current := rt.cache[key]; current != nil {
+		if cp.RouteRevision < current.RouteRevision ||
+			(cp.RouteRevision == current.RouteRevision && cp.NodeSandboxID != current.NodeSandboxID) {
+			rt.cacheMu.Unlock()
+			return
+		}
+	}
 	rt.cache[key] = &cp
 	rt.cacheMu.Unlock()
 }
@@ -1101,58 +1210,35 @@ func randomHexID() string {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
-	path := fmt.Sprintf("%s?group=%s&route_key=%s", registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
-	body, _ := json.Marshal(registry.SandboxReserveReq{Config: config})
+func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, config map[string]string, headers map[string]string) (*reserveResult, error) {
+	query := url.Values{
+		"operation": []string{operation},
+		"group":     []string{group},
+		"route_key": []string{routeKey},
+	}
+	if sandboxID != "" {
+		query.Set("sid", sandboxID)
+	}
+	if port > 0 {
+		query.Set("port", strconv.Itoa(port))
+	}
+	if timeout > 0 {
+		query.Set("timeout", strconv.Itoa(timeout))
+	}
+	path := registry.RouteLinkReservePath + "?" + query.Encode()
+	var body []byte
+	if operation == "create" {
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config})
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		headers["Content-Type"] = "application/json"
+	}
 	var res reserveResult
-	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, body, map[string]string{"Content-Type": "application/json"}, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, body, headers, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
-}
-
-func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
-	key := routeCacheKey(group, routeKey)
-	rt.reserveMu.Lock()
-	if f := rt.reserveInFlight[key]; f != nil {
-		rt.reserveMu.Unlock()
-		select {
-		case <-f.done:
-			return f.res, f.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	f := &reserveFlight{done: make(chan struct{})}
-	rt.reserveInFlight[key] = f
-	rt.reserveMu.Unlock()
-
-	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey, config)
-	if f.err == nil && f.res != nil {
-		rt.rememberRoute(routeFromReserve(f.res, group, routeKey))
-	}
-	close(f.done)
-
-	rt.reserveMu.Lock()
-	delete(rt.reserveInFlight, key)
-	rt.reserveMu.Unlock()
-	return f.res, f.err
-}
-
-func routeFromReserve(res *reserveResult, group, routeKey string) *routeResolve {
-	if res == nil {
-		return nil
-	}
-	return &routeResolve{
-		SandboxID: res.SandboxID, NodeSandboxID: res.NodeSandboxID,
-		Group: group, RouteKey: routeKey, NodeID: res.NodeID,
-		DataEndpoint: res.DataEndpoint, Profile: res.Profile,
-		AuthSandboxID: res.AuthSandboxID, APISecret: res.APISecret,
-		APISecretFingerprint: res.APISecretFingerprint, ManifestKeyFingerprint: res.ManifestKeyFingerprint,
-		ServiceSecret: res.ServiceSecret, EnvdAccessToken: res.EnvdAccessToken,
-		TrafficAccessToken: res.TrafficAccessToken, ForwardAccessToken: res.ForwardAccessToken,
-		TargetPort: res.TargetPort, State: "ready",
-	}
 }
 
 func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
@@ -1226,6 +1312,20 @@ type routeLinkCallError struct {
 
 func (e *routeLinkCallError) Error() string {
 	return fmt.Sprintf("route_link %s: %s: %s", e.path, e.response, e.body)
+}
+
+func writeRouteLinkError(w http.ResponseWriter, err error, fallbackStatus int) {
+	status := fallbackStatus
+	message := err.Error()
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) {
+		status = routeErr.status
+		message = routeErr.body
+		if message == "" {
+			message = http.StatusText(status)
+		}
+	}
+	http.Error(w, message, status)
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
