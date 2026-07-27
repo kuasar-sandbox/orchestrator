@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -66,7 +68,7 @@ func testE2BSandboxRecord(group, routeKey, sid, nodeID string, state SandboxStat
 	return &SandboxRecord{
 		Group: group, RouteKey: routeKey, SandboxID: sid, NodeSandboxID: route.SandboxID,
 		SandboxGeneration: 0, NextSandboxGeneration: 1,
-		NodeID: nodeID, State: state, Profile: route.Profile,
+		NodeID: nodeID, State: state, Profile: route.Profile, TemplateID: testTemplateRef,
 		AuthSandboxID: route.AuthSandboxID, APISecret: route.APISecret,
 		APISecretFingerprint: route.APISecretFingerprint, ManifestKeyFingerprint: route.ManifestKeyFingerprint,
 		ServiceSecret: route.ServiceSecret, EnvdAccessToken: route.EnvdAccessToken,
@@ -779,7 +781,48 @@ func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 func testReg(t *testing.T) *Registry {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(NewStores(), nil, 5*time.Second, log)
+	reg := New(NewStores(), nil, 5*time.Second, log)
+	enableTestCreateAuth(t, reg)
+	return reg
+}
+
+func testCreateReserve(group, routeKey string, config map[string]string) SandboxReserveRequest {
+	return SandboxReserveRequest{
+		Operation: ReserveCreate, Group: group, RouteKey: routeKey,
+		APIKey: testAPIKeyValue(), Config: config,
+	}
+}
+
+func testAPIKeyValue() string {
+	secret, err := hex.DecodeString(testAPISecret)
+	if err != nil {
+		panic(err)
+	}
+	apiKey, err := apikey.Mint(secret)
+	if err != nil {
+		panic(err)
+	}
+	return apiKey
+}
+
+func enableTestCreateAuth(t *testing.T, reg *Registry) {
+	t.Helper()
+	secret, err := hex.DecodeString(testAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		parsed, parseErr := apikey.Parse(req.Header.Get("X-API-KEY"))
+		if parseErr != nil || !apikey.Verify(parsed, secret) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	reg.SetPlacerPeerSource(func(string) []PlacerPeer {
+		return []PlacerPeer{{ID: "test-placer", Advertise: server.URL}}
+	})
 }
 
 func pushSelectorPatch(reg *Registry, group string, nodes []string, manifestKey string) error {
@@ -1007,22 +1050,22 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	res, err := reg.ReserveSandbox(ctx, "/c/p/a/g1", "u1:s1", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/c/p/a/g1", "u1:s1", nil))
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	want := testEnvdAccessToken
-	if res.NodeID != "n1" || res.SandboxID == "" || res.NodeSandboxID != EncodeNodeSandboxID(res.SandboxID, 0) || res.EnvdAccessToken != want {
+	if res.Route.NodeID != "n1" || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) || res.Route.EnvdAccessToken != want {
 		t.Fatalf("reserve result: %+v", res)
 	}
 
 	// The sandbox is now READY; a second reserve for the same key returns it
 	// directly (session affinity) without re-placing.
-	res2, err := reg.ReserveSandbox(ctx, "/c/p/a/g1", "u1:s1", nil)
+	res2, err := reg.ReserveSandbox(ctx, testCreateReserve("/c/p/a/g1", "u1:s1", nil))
 	if err != nil {
 		t.Fatalf("re-reserve: %v", err)
 	}
-	if res2.SandboxID != res.SandboxID || res2.NodeSandboxID != res.NodeSandboxID || res2.NodeID != "n1" {
+	if res2.Route.SandboxID != res.Route.SandboxID || res2.Route.NodeSandboxID != res.Route.NodeSandboxID || res2.Route.NodeID != "n1" {
 		t.Fatalf("re-reserve mismatch: %+v vs %+v", res2, res)
 	}
 
@@ -1067,7 +1110,7 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	}
 	leader := make(chan reserveOut, 1)
 	go func() {
-		res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+		res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 		leader <- reserveOut{res: res, err: err}
 	}()
 
@@ -1081,7 +1124,7 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	defer cancel()
 	joiner := make(chan reserveOut, 1)
 	go func() {
-		res, err := reg.ReserveSandbox(joinCtx, "/g", "rk", nil)
+		res, err := reg.ReserveSandbox(joinCtx, testCreateReserve("/g", "rk", nil))
 		joiner <- reserveOut{res: res, err: err}
 	}()
 	time.Sleep(25 * time.Millisecond)
@@ -1093,12 +1136,12 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("leader reserve did not complete")
 	}
-	if lout.err != nil || lout.res == nil || lout.res.SandboxID == "" || lout.res.NodeSandboxID == "" {
+	if lout.err != nil || lout.res == nil || lout.res.Route.SandboxID == "" || lout.res.Route.NodeSandboxID == "" {
 		t.Fatalf("leader reserve = %+v err=%v", lout.res, lout.err)
 	}
 	select {
 	case jout := <-joiner:
-		if jout.err != nil || jout.res == nil || jout.res.SandboxID != lout.res.SandboxID || jout.res.NodeSandboxID != lout.res.NodeSandboxID {
+		if jout.err != nil || jout.res == nil || jout.res.Route.SandboxID != lout.res.Route.SandboxID || jout.res.Route.NodeSandboxID != lout.res.Route.NodeSandboxID {
 			t.Fatalf("joiner reserve = %+v err=%v, leader=%+v", jout.res, jout.err, lout.res)
 		}
 	case <-time.After(time.Second):
@@ -1112,6 +1155,7 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 	nodeID := "node-remote"
 	waiter := New(cluster["a"], placementWithToken(nodeID), 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reporter := New(cluster["b"], nil, 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, waiter)
 	owner := &remoteRouteWriteOwner{
 		node: &NodeRecord{NodeID: nodeID, DataEndpoint: "127.0.0.1:12345"},
 		onCreate: func(cmd *routesync.Command) {
@@ -1125,15 +1169,15 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 	}
 	waiter.SetNodeOwner(owner)
 
-	res, err := waiter.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := waiter.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("ReserveSandbox: %v", err)
 	}
-	if res.NodeID != nodeID || res.SandboxID == "" || res.NodeSandboxID != EncodeNodeSandboxID(res.SandboxID, 0) || res.DataEndpoint != "127.0.0.1:12345" {
+	if res.Route.NodeID != nodeID || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) || res.Route.DataEndpoint != "127.0.0.1:12345" {
 		t.Fatalf("reserve result=%+v", res)
 	}
 	rec, _, found, err := cluster["c"].GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || rec.State != StateReady || rec.SandboxID != res.SandboxID || rec.NodeSandboxID != res.NodeSandboxID {
+	if err != nil || !found || rec.State != StateReady || rec.SandboxID != res.Route.SandboxID || rec.NodeSandboxID != res.Route.NodeSandboxID {
 		t.Fatalf("replicated ready route=%+v found=%v err=%v", rec, found, err)
 	}
 }
@@ -1157,16 +1201,16 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "u1:s1", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "u1:s1", nil))
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	want := testEnvdAccessToken
-	if res.EnvdAccessToken != want || res.TrafficAccessToken != testTrafficAccessToken || res.ForwardAccessToken == "" {
+	if res.Route.EnvdAccessToken != want || res.Route.TrafficAccessToken != testTrafficAccessToken || res.Route.ForwardAccessToken == "" {
 		t.Fatalf("route credentials mismatch result=%+v", res)
 	}
-	if res.Profile != "e2b" {
-		t.Fatalf("reserve profile=%q, want e2b", res.Profile)
+	if res.Route.Profile != "e2b" {
+		t.Fatalf("reserve profile=%q, want e2b", res.Route.Profile)
 	}
 }
 
@@ -1178,11 +1222,11 @@ func TestReadyRoutePreservesCredentials(t *testing.T) {
 	want := testEnvdAccessToken
 	reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-ready", "n1", StateReady))
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.SandboxID != "sb-ready" || res.NodeSandboxID != EncodeNodeSandboxID("sb-ready", 0) || res.EnvdAccessToken != want || res.Profile != "e2b" {
+	if res.Route.SandboxID != "sb-ready" || res.Route.NodeSandboxID != EncodeNodeSandboxID("sb-ready", 0) || res.Route.EnvdAccessToken != want || res.Route.Profile != "e2b" {
 		t.Fatalf("ready reserve result=%+v, want e2b profile and node-reported token %q", res, want)
 	}
 	rr, found, err := reg.ResolveSID(ctx, "/g", "rk", "sb-ready")
@@ -1211,7 +1255,7 @@ func TestMaterializedRouteReadsRejectCorruptCredentials(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); err == nil {
+			if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); err == nil {
 				t.Fatal("Reserve accepted a corrupt materialized route")
 			}
 			if _, found, err := reg.ResolveSID(ctx, "/g", "rk", "sb-corrupt"); err == nil || found {
@@ -1250,7 +1294,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{"b": "2"}); err != nil {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{"b": "2"})); err != nil {
 		t.Fatal(err)
 	}
 	if got == nil {
@@ -1275,9 +1319,9 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 
 	for _, mode := range []string{"off", "memory"} {
 		got = nil
-		if _, err := reg.ReserveSandbox(ctx, "/g", "rk-"+mode, map[string]string{
+		if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-"+mode, map[string]string{
 			sandboxcfg.NsRestore: `{"prefetch":"` + mode + `"}`,
-		}); err != nil {
+		})); err != nil {
 			t.Fatal(err)
 		}
 		if got == nil || got.Config[sandboxcfg.NsRestore] != `{"prefetch":"`+mode+`"}` {
@@ -1294,9 +1338,9 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
 
-	_, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
-	})
+	}))
 	if err == nil {
 		t.Fatal("invalid restore should be rejected")
 	}
@@ -1316,9 +1360,9 @@ func TestReserveSandboxRejectsInvalidCredentialsBeforeReadyFastPath(t *testing.T
 		t.Fatal(err)
 	}
 
-	_, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"service_secret":"not-hex"}`,
-	})
+	}))
 	if !errors.Is(err, errInvalidSandboxConfig) {
 		t.Fatalf("ReserveSandbox error=%v, want invalid sandbox config", err)
 	}
@@ -1336,7 +1380,7 @@ func TestReserveSandboxRejectsInvalidPlacementTemplate(t *testing.T) {
 		}, nil
 	}))
 
-	if _, err := reg.ReserveSandbox(context.Background(), "/g", "rk", nil); err == nil ||
+	if _, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", nil)); err == nil ||
 		!strings.Contains(err.Error(), "invalid placement template") {
 		t.Fatalf("ReserveSandbox error=%v, want invalid placement template", err)
 	}
@@ -1346,15 +1390,15 @@ func TestReserveSandboxRejectsInvalidPlacementTemplate(t *testing.T) {
 }
 
 func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
-	result := &ReserveResult{SandboxID: "s1", NodeSandboxID: EncodeNodeSandboxID("s1", 0), NodeID: "n1", DataEndpoint: "node:1"}
+	result := &ReserveResult{Route: RouteResolve{SandboxID: "s1", NodeSandboxID: EncodeNodeSandboxID("s1", 0), NodeID: "n1", DataEndpoint: "node:1"}}
 	call := &reserveCall{done: make(chan struct{}), result: result}
 	close(call.done)
 	reg := testReg(t)
 	reg.inflight[flightKey("/g", "rk")] = call
 
-	got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+	got, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
-	})
+	}))
 	if err != nil || got != result {
 		t.Fatalf("existing route flight result=%+v err=%v", got, err)
 	}
@@ -1363,17 +1407,18 @@ func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
 func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 	ctx := context.Background()
 	reg := New(NewStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
 	owner := &remoteLifecycleOwner{reg: reg}
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("reserve via remote owner: %v", err)
 	}
-	if res.NodeID != "n-remote" || res.DataEndpoint != "10.0.0.2:8443" || owner.commands != 1 {
+	if res.Route.NodeID != "n-remote" || res.Route.DataEndpoint != "10.0.0.2:8443" || owner.commands != 1 {
 		t.Fatalf("res=%+v commands=%d", res, owner.commands)
 	}
 }
@@ -1384,6 +1429,7 @@ func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 		t.Fatal("ready route should not call placer")
 		return nil, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1391,11 +1437,11 @@ func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
 	_, _ = reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-ready", "n-remote", StateReady))
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("reserve ready via remote owner: %v", err)
 	}
-	if res.NodeID != "n-remote" || res.DataEndpoint != "10.0.0.2:8443" || owner.commands != 0 {
+	if res.Route.NodeID != "n-remote" || res.Route.DataEndpoint != "10.0.0.2:8443" || owner.commands != 0 {
 		t.Fatalf("res=%+v commands=%d", res, owner.commands)
 	}
 }
@@ -1407,6 +1453,7 @@ func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "replacement", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	if _, err := reg.stores.PutSandbox(ctx, testE2BSandboxRecord("/g", "rk", "sb-ready", "n1", StateReady)); err != nil {
 		t.Fatal(err)
 	}
@@ -1414,7 +1461,7 @@ func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 	owner := &remoteRouteWriteOwner{node: &NodeRecord{NodeID: "n1"}, runtimeErr: runtimeErr}
 	reg.SetNodeOwner(owner)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, runtimeErr) {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, runtimeErr) {
 		t.Fatalf("ReserveSandbox err=%v, want runtime error", err)
 	}
 	if placements != 0 || owner.commands != 0 {
@@ -1428,7 +1475,7 @@ func TestReserveSandboxDoesNotReplaceReadyRouteOnRuntimeError(t *testing.T) {
 
 func TestReserveSandboxNoNode(t *testing.T) {
 	reg := testReg(t)
-	if _, err := reg.ReserveSandbox(context.Background(), "/c/p/a/g1", "u1:s1", nil); err == nil {
+	if _, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/c/p/a/g1", "u1:s1", nil)); err == nil {
 		t.Fatal("expected error with no nodes")
 	}
 }
@@ -1467,7 +1514,7 @@ func TestCreateRejectFastFails(t *testing.T) {
 	reg.addNode(conn)
 
 	start := time.Now()
-	_, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err == nil {
 		t.Fatal("expected reserve to fail on a rejected create")
 	}
@@ -1490,7 +1537,7 @@ func TestCreateRejectRestoresPreexistingRoute(t *testing.T) {
 		}
 	}})
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); err == nil {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); err == nil {
 		t.Fatal("expected reserve to fail on rejected replacement")
 	}
 	got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -1765,20 +1812,20 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 		}()
 	}})
 
-	res, err := reg.ReserveSandbox(ctx, "/new", "rk-new", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/new", "rk-new", nil))
 	if err != nil {
 		t.Fatalf("ReserveSandbox: %v", err)
 	}
-	if placeCalls != 2 || firstSID == "" || res.SandboxID != firstSID || res.NodeSandboxID == EncodeNodeSandboxID(firstSID, 0) {
+	if placeCalls != 2 || firstSID == "" || res.Route.SandboxID != firstSID || res.Route.NodeSandboxID == EncodeNodeSandboxID(firstSID, 0) {
 		t.Fatalf("placeCalls=%d firstSID=%q result=%+v", placeCalls, firstSID, res)
 	}
-	if len(createSIDs) != 1 || createSIDs[0] != res.NodeSandboxID {
+	if len(createSIDs) != 1 || createSIDs[0] != res.Route.NodeSandboxID {
 		t.Fatalf("create commands=%v result=%+v", createSIDs, res)
 	}
 	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", EncodeNodeSandboxID(firstSID, 0)); err != nil || !found || ref.Group != "/existing" || ref.RouteKey != "rk-existing" {
 		t.Fatalf("original ownership=%+v found=%v err=%v", ref, found, err)
 	}
-	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", res.NodeSandboxID); err != nil || !found || ref.Group != "/new" || ref.RouteKey != "rk-new" || ref.SandboxID != res.SandboxID || ref.SandboxGeneration != 1 {
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", res.Route.NodeSandboxID); err != nil || !found || ref.Group != "/new" || ref.RouteKey != "rk-new" || ref.SandboxID != res.Route.SandboxID || ref.SandboxGeneration != 1 {
 		t.Fatalf("replacement ownership=%+v found=%v err=%v", ref, found, err)
 	}
 }
@@ -1786,6 +1833,7 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
 	reg := New(NewStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	var sid string
@@ -1802,7 +1850,7 @@ func TestParkTimeoutRollback(t *testing.T) {
 		}
 	}}) // accepts create but never reports running
 
-	_, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err == nil {
 		t.Fatal("expected park timeout error")
 	}
@@ -1837,7 +1885,8 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	reserved.SandboxGeneration = 1
 	reserved.NodeSandboxID = EncodeNodeSandboxID(orig.SandboxID, 1)
 	reserved.NextSandboxGeneration = 2
-	if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+	reservedRev, err := reg.stores.PutSandbox(ctx, reserved)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "new"}); err != nil {
@@ -1849,7 +1898,9 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.rollbackReserve("/g", "rk", orig, true)
+	if !reg.rollbackReservedAtRevision(ctx, "/g", "rk", reserved, reservedRev, orig, true, true) {
+		t.Fatal("rollback did not restore original route")
+	}
 	got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || got.SandboxID != "sb-old" || got.NodeSandboxID != orig.NodeSandboxID || got.NodeID != "old" {
 		t.Fatalf("restored route=%+v found=%v err=%v", got, found, err)
@@ -1871,7 +1922,8 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	reserved.SandboxGeneration = 1
 	reserved.NodeSandboxID = EncodeNodeSandboxID(orig.SandboxID, 1)
 	reserved.NextSandboxGeneration = 2
-	if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+	reservedRev, err := reg.stores.PutSandbox(ctx, reserved)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
@@ -1883,7 +1935,9 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.rollbackReserve("/g", "rk", orig, true)
+	if !reg.rollbackReservedAtRevision(ctx, "/g", "rk", reserved, reservedRev, orig, true, true) {
+		t.Fatal("rollback did not restore original route")
+	}
 	node, found, err := reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found {
 		t.Fatalf("node=%+v found=%v err=%v", node, found, err)
@@ -1902,7 +1956,8 @@ func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 	reserved.NodeSandboxID = EncodeNodeSandboxID(orig.SandboxID, 1)
 	reserved.NextSandboxGeneration = 2
 	reserved.APISecretFingerprint = strings.Repeat("b", 64)
-	if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+	reservedRev, err := reg.stores.PutSandbox(ctx, reserved)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
@@ -1914,7 +1969,9 @@ func TestRollbackReserveRestoresOriginalCredentialBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg.rollbackReserve("/g", "rk", orig, true)
+	if !reg.rollbackReservedAtRevision(ctx, "/g", "rk", reserved, reservedRev, orig, true, true) {
+		t.Fatal("rollback did not restore original credential binding")
+	}
 
 	route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || route.APISecretFingerprint != orig.APISecretFingerprint {
@@ -1974,7 +2031,7 @@ func TestReserveFinishIsSingleAssignment(t *testing.T) {
 			defer wg.Done()
 			<-start
 			sandboxID := fmt.Sprintf("sb-%d", i)
-			reg.finish("/g\x00rk", &ReserveResult{SandboxID: sandboxID, NodeSandboxID: EncodeNodeSandboxID(sandboxID, 0)}, nil)
+			reg.finish("/g\x00rk", &ReserveResult{Route: RouteResolve{SandboxID: sandboxID, NodeSandboxID: EncodeNodeSandboxID(sandboxID, 0)}}, nil)
 		}(i)
 	}
 	close(start)
@@ -1984,7 +2041,7 @@ func TestReserveFinishIsSingleAssignment(t *testing.T) {
 	default:
 		t.Fatal("reserve call was not completed")
 	}
-	if call.result == nil || call.result.SandboxID == "" || call.result.NodeSandboxID == "" {
+	if call.result == nil || call.result.Route.SandboxID == "" || call.result.Route.NodeSandboxID == "" {
 		t.Fatalf("reserve result=%+v", call.result)
 	}
 }
@@ -2014,7 +2071,7 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 	}
 	reg.addNode(&fakeConn{nodeID: "candidate", err: ErrNodeGone})
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, ErrNodeGone) {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, ErrNodeGone) {
 		t.Fatalf("ReserveSandbox err=%v, want ErrNodeGone", err)
 	}
 	if placements != 2 {
@@ -2135,9 +2192,9 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	}})
 
 	requestOverride := strings.Repeat("2", 64)
-	result, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+	result, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"service_secret":"` + requestOverride + `","envd_access_token":"new-envd","traffic_access_token":"new-traffic"}`,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2157,10 +2214,10 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		!sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement RESERVED row did not retain materialized credentials")
 	}
-	if result.SandboxID != original.SandboxID || result.NodeSandboxID == original.NodeSandboxID || result.AuthSandboxID != original.AuthSandboxID ||
-		result.ServiceSecret != original.ServiceSecret || result.EnvdAccessToken != original.EnvdAccessToken ||
-		result.TrafficAccessToken != original.TrafficAccessToken ||
-		result.ForwardAccessToken != original.ForwardAccessToken {
+	if result.Route.SandboxID != original.SandboxID || result.Route.NodeSandboxID == original.NodeSandboxID || result.Route.AuthSandboxID != original.AuthSandboxID ||
+		result.Route.ServiceSecret != original.ServiceSecret || result.Route.EnvdAccessToken != original.EnvdAccessToken ||
+		result.Route.TrafficAccessToken != original.TrafficAccessToken ||
+		result.Route.ForwardAccessToken != original.ForwardAccessToken {
 		t.Fatal("replacement READY result changed materialized credentials")
 	}
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -2677,7 +2734,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig); err != nil {
 		t.Fatalf("placeAndCreate: %v", err)
 	}
-	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	reserved, reservedRev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || reserved.State != StateReserved || reserved.SandboxID != orig.SandboxID || reserved.NodeSandboxID != replacementSID || reserved.SandboxGeneration != 1 || reserved.NextSandboxGeneration != 2 {
 		t.Fatalf("replacement route=%+v found=%v err=%v", reserved, found, err)
 	}
@@ -2690,7 +2747,9 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 		t.Fatalf("new node after replacement=%+v found=%v err=%v", newNode, found, err)
 	}
 
-	reg.rollbackReserve("/g", "rk", orig, true)
+	if !reg.rollbackReservedAtRevision(ctx, "/g", "rk", reserved, reservedRev, orig, true, true) {
+		t.Fatal("rollback did not restore ready replacement")
+	}
 	restored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || restored.SandboxID != "sb-old" || restored.NodeSandboxID != orig.NodeSandboxID || restored.NodeID != "old" || restored.NextSandboxGeneration != 2 {
 		t.Fatalf("restored route=%+v found=%v err=%v", restored, found, err)
@@ -2837,13 +2896,13 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 		go reg.applyRoute(context.Background(), "n2", &route)
 	}})
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: credentialsJSON,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("reserve should succeed after excluding the rejected node: %v", err)
 	}
-	if res.NodeID != "n2" || creates != 2 {
+	if res.Route.NodeID != "n2" || creates != 2 {
 		t.Fatalf("expected n1 reject then n2 success; got %d creates, res=%+v", creates, res)
 	}
 	if len(createCredentials) != 2 || createCredentials[0] != credentialsJSON || createCredentials[1] != credentialsJSON {
@@ -2883,11 +2942,11 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 		go reg.applyRoute(context.Background(), "live", &route)
 	}})
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("ReserveSandbox: %v", err)
 	}
-	if res.NodeID != "live" || !sawExclusion {
+	if res.Route.NodeID != "live" || !sawExclusion {
 		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
 	}
 }
@@ -2899,13 +2958,14 @@ func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	checkErr := errors.New("node owner temporarily unavailable")
 	owner := &remoteRouteWriteOwner{
 		node: &NodeRecord{NodeID: "n1"}, connectedErr: checkErr,
 	}
 	reg.SetNodeOwner(owner)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, checkErr) {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, checkErr) {
 		t.Fatalf("ReserveSandbox err=%v, want connection check error", err)
 	}
 	if placements != 1 || owner.commands != 0 {
@@ -2920,13 +2980,14 @@ func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
 		ackErr: context.DeadlineExceeded,
 	}
 	reg.SetNodeOwner(owner)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ReserveSandbox err=%v, want park timeout", err)
 	}
 	if placements != 1 || owner.commands != 1 {
@@ -2941,13 +3002,14 @@ func TestReserveSandboxParksAfterAmbiguousCommandError(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enableTestCreateAuth(t, reg)
 	owner := &remoteRouteWriteOwner{
 		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
 		ackErr: errors.New("node-owner response lost"),
 	}
 	reg.SetNodeOwner(owner)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ReserveSandbox err=%v, want park timeout after ambiguous delivery", err)
 	}
 	if placements != 1 || owner.commands != 1 {
@@ -2986,14 +3048,14 @@ func TestReservePausedResume(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"service_secret":"` + strings.Repeat("3", 64) + `"}`,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
 	}
-	if res.SandboxID != original.SandboxID || res.NodeSandboxID != original.NodeSandboxID || res.Profile != "e2b" || res.AuthSandboxID != original.AuthSandboxID ||
-		res.EnvdAccessToken != want || !constantTimeStringEqual(res.ForwardAccessToken, original.ForwardAccessToken) {
+	if res.Route.SandboxID != original.SandboxID || res.Route.NodeSandboxID != original.NodeSandboxID || res.Route.Profile != "e2b" || res.Route.AuthSandboxID != original.AuthSandboxID ||
+		res.Route.EnvdAccessToken != want || !constantTimeStringEqual(res.Route.ForwardAccessToken, original.ForwardAccessToken) {
 		t.Fatalf("resume result: %+v", res)
 	}
 }

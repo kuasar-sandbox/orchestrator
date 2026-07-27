@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
@@ -40,6 +43,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	}
 	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
 		got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
+		got.RouteRevision <= 0 ||
 		got.AuthSandboxID != want.AuthSandboxID || got.APISecret != want.APISecret ||
 		got.APISecretFingerprint != want.APISecretFingerprint ||
 		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||
@@ -75,9 +79,12 @@ func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 
 func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 	mux := http.NewServeMux()
-	New(NewStores(), nil, 0, nil).ServeRouteLink(mux)
+	reg := New(NewStores(), nil, 0, nil)
+	enableTestCreateAuth(t, reg)
+	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -91,10 +98,12 @@ func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 		placements++
 		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
 	}), 0, nil)
+	enableTestCreateAuth(t, reg)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}","kuasar-sandbox.network":"{}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -117,10 +126,12 @@ func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) 
 		}
 		return nil, ErrNoNode
 	}), 0, nil)
+	enableTestCreateAuth(t, reg)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"service_secret\":\"` + strings.Repeat("1", 64) + `\"}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -137,10 +148,12 @@ func TestServeReserveRejectsInvalidCredentialsBeforePlacement(t *testing.T) {
 		placements++
 		return nil, ErrNoNode
 	}), 0, nil)
+	enableTestCreateAuth(t, reg)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"unknown\":\"credential-secret-sentinel\"}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -164,10 +177,12 @@ func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
 			APISecretFingerprint: testAPIFingerprint,
 		}, nil
 	}), 0, nil)
+	enableTestCreateAuth(t, reg)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	body := []byte(`{"config":{"kuasar-sandbox.credentials":"{\"envd_access_token\":\"e2b-only\"}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -178,5 +193,93 @@ func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
 	}
 	if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
 		t.Fatalf("invalid profile credentials wrote route state: found=%v err=%v", found, err)
+	}
+}
+
+func TestServeReserveMapsOperationErrorsWithoutLifecycleSideEffects(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	record := testE2BSandboxRecord("/g", "rk", "sb-route", "n1", StatePaused)
+	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		apiKey     string
+		access     string
+		migration  string
+		wantStatus int
+	}{
+		{name: "missing operation", path: "?group=/g&route_key=rk", wantStatus: http.StatusBadRequest},
+		{name: "missing create credential", path: "?group=/g&route_key=new&operation=create", wantStatus: http.StatusUnauthorized},
+		{name: "wrong create credential", path: "?group=/g&route_key=new&operation=create", apiKey: "e2b_bad", wantStatus: http.StatusForbidden},
+		{name: "expected identity mismatch", path: "?group=/g&route_key=rk&operation=connect&sid=sb-other", apiKey: testAPIKeyValue(), wantStatus: http.StatusNotFound},
+		{name: "connected node unavailable", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), wantStatus: http.StatusServiceUnavailable},
+		{name: "wrong data credential", path: "?group=/g&route_key=rk&operation=data&sid=sb-route&port=8080", access: "wrong", wantStatus: http.StatusUnauthorized},
+		{name: "connect body", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
+		{name: "oversized migration token", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), migration: strings.Repeat("x", migrationtoken.MaxWireSize+1), wantStatus: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+tc.path, body)
+			req.Header.Set("X-API-KEY", tc.apiKey)
+			req.Header.Set("X-Access-Token", tc.access)
+			req.Header.Set("X-Kuasar-Migration-Token", tc.migration)
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%q, want %d", resp.Code, resp.Body.String(), tc.wantStatus)
+			}
+		})
+	}
+	stored, _, found, err := reg.stores.GetSandbox(ctx, record.Group, record.RouteKey)
+	if err != nil || !found || stored.State != StatePaused || stored.NodeSandboxID != record.NodeSandboxID {
+		t.Fatalf("failed route-link operations changed route: stored=%+v found=%v err=%v", stored, found, err)
+	}
+}
+
+func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	record := testE2BSandboxRecord("/g", "rk", "sb-route", "n1", StateReserved)
+	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:9443"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+			Connect: testConnectResult(record, cmd.SID),
+		})
+	}})
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	req := httptest.NewRequest(http.MethodPost,
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=37", nil)
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", resp.Code, resp.Body.String())
+	}
+	var result ReserveResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Connect == nil || result.Connect.NodeSandboxID != record.NodeSandboxID ||
+		result.Route.SandboxID != record.SandboxID || result.Route.NodeSandboxID != record.NodeSandboxID ||
+		result.Route.RouteRevision <= 0 {
+		t.Fatalf("reserve result=%+v", result)
 	}
 }

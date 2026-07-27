@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -15,7 +16,7 @@ import (
 // route_link paths. Routers dial this link for group-scoped route/build
 // operations and API-key verification.
 const (
-	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
+	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key=&operation=... -> ReserveResult
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
 	RouteLinkDeletePath       = "/route-link/delete"        // DELETE ?group=&route_key=&sid= -> node-link CmdDelete
 	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,profile,resources,metadata} -> BuildReserveResult
@@ -34,6 +35,7 @@ type RouteResolve struct {
 	NodeID                 string `json:"node_id"`
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
+	TemplateID             string `json:"template_id"`
 	AuthSandboxID          string `json:"auth_sandbox_id"`
 	APISecret              string `json:"api_secret"`
 	APISecretFingerprint   string `json:"api_secret_fingerprint"`
@@ -44,6 +46,7 @@ type RouteResolve struct {
 	ForwardAccessToken     string `json:"forward_access_token"`
 	TargetPort             int    `json:"target_port,omitempty"`
 	State                  string `json:"state"`
+	RouteRevision          int64  `json:"route_revision"`
 }
 
 // SandboxReserveReq is the router-to-registry create payload. Config remains a
@@ -147,17 +150,46 @@ func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	q := req.URL.Query()
 	group, routeKey := q.Get("group"), q.Get("route_key")
 	if group == "" || routeKey == "" {
 		http.Error(w, "group and route_key are required", http.StatusBadRequest)
 		return
 	}
+	operation := ReserveOperation(q.Get("operation"))
+	if !operation.Valid() {
+		http.Error(w, "operation must be create, connect, or data", http.StatusBadRequest)
+		return
+	}
+	port, err := reserveQueryInt(q.Get("port"), "port")
+	if err != nil || port > 65535 {
+		http.Error(w, "port must be an integer between 0 and 65535", http.StatusBadRequest)
+		return
+	}
+	timeoutSeconds, err := reserveQueryInt(q.Get("timeout"), "timeout")
+	if err != nil {
+		http.Error(w, "timeout must be a non-negative integer", http.StatusBadRequest)
+		return
+	}
 	var body SandboxReserveReq
-	if req.Body != nil {
-		err := json.NewDecoder(req.Body).Decode(&body)
+	if operation == ReserveCreate && req.Body != nil {
+		err = json.NewDecoder(req.Body).Decode(&body)
 		if err != nil && !errors.Is(err, io.EOF) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else if req.Body != nil {
+		content, readErr := io.ReadAll(io.LimitReader(req.Body, 1))
+		if readErr != nil {
+			http.Error(w, readErr.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(content) != 0 {
+			http.Error(w, "reserve body is only valid for create", http.StatusBadRequest)
 			return
 		}
 	}
@@ -167,16 +199,34 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	res, err := r.ReserveSandbox(req.Context(), group, routeKey, body.Config)
+	res, err := r.ReserveSandbox(req.Context(), SandboxReserveRequest{
+		Operation:         operation,
+		Group:             group,
+		RouteKey:          routeKey,
+		ExpectedSandboxID: q.Get("sid"),
+		Port:              port,
+		TimeoutSeconds:    timeoutSeconds,
+		APIKey:            req.Header.Get("X-API-KEY"),
+		AccessToken:       req.Header.Get("X-Access-Token"),
+		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
+		Config:            body.Config,
+	})
 	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, errInvalidSandboxConfig) {
-			status = http.StatusBadRequest
-		}
-		http.Error(w, err.Error(), status)
+		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 	writeJSON(w, res)
+}
+
+func reserveQueryInt(value, field string) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("registry: invalid %s", field)
+	}
+	return n, nil
 }
 
 func (r *Registry) serveRoute(w http.ResponseWriter, req *http.Request) {
@@ -218,7 +268,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	if group == "" || routeKey == "" || sid == "" {
 		return nil, false, nil
 	}
-	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil || !found {
 		return nil, found, err
 	}
@@ -233,13 +283,13 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	return &RouteResolve{
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile,
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, TemplateID: rec.TemplateID,
 		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
 		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
 		TargetPort: rec.TargetPort,
-		State:      string(rec.State),
+		State:      string(rec.State), RouteRevision: rev,
 	}, true, nil
 }
 
@@ -250,9 +300,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func routeLinkStatus(err error) int {
 	switch {
+	case errors.Is(err, ErrReserveBadRequest), errors.Is(err, errInvalidSandboxConfig):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrReserveUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrReserveForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, ErrSandboxNotFound):
+		return http.StatusNotFound
 	case errors.Is(err, clusterstate.ErrQuorum):
 		return http.StatusServiceUnavailable
 	default:
-		return http.StatusBadRequest
+		return http.StatusServiceUnavailable
 	}
 }

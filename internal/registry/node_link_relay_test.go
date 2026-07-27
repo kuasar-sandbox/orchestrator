@@ -36,6 +36,7 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
 	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
+	enableTestCreateAuth(t, ingress)
 	ingress.SetRemoteNodeOwners(map[string]NodeOwner{"owner": owner.LocalNodeOwner()})
 
 	ownerMux := http.NewServeMux()
@@ -60,17 +61,17 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 		t.Fatal("owner member does not hold the relayed node_link stream")
 	}
 
-	res, err := ingress.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := ingress.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("reserve through ingress: %v", err)
 	}
-	if res.NodeID != nodeID || res.SandboxID == "" || res.NodeSandboxID != EncodeNodeSandboxID(res.SandboxID, 0) {
+	if res.Route.NodeID != nodeID || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) {
 		t.Fatalf("reserve result=%+v, want node %s", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
 	clusterContext := commandClusterContext(t, cmd)
-	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.SandboxID ||
-		cmd.SID != res.NodeSandboxID || cmd.Profile != "e2b" {
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.Route.SandboxID ||
+		cmd.SID != res.Route.NodeSandboxID || cmd.Profile != "e2b" {
 		t.Fatalf("relayed command=%+v, reserve=%+v", cmd, res)
 	}
 }
@@ -83,6 +84,7 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
 	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
+	enableTestCreateAuth(t, ingress)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(NodeLinkRelayPath, owner.ServeNodeLinkRelay)
@@ -159,6 +161,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
 	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
+	enableTestCreateAuth(t, ingress)
 
 	ownerMux := http.NewServeMux()
 	ownerMux.HandleFunc(routesync.NodeLinkPath, owner.ServeNodeLink)
@@ -190,17 +193,17 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	}
 	waitRegistryNodeLive(t, owner, nodeID)
 
-	res, err := ingress.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := ingress.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
 	if err != nil {
 		t.Fatalf("reserve through redirected node-link: %v", err)
 	}
-	if res.NodeID != nodeID || res.SandboxID == "" || res.NodeSandboxID != EncodeNodeSandboxID(res.SandboxID, 0) || res.DataEndpoint != "127.0.0.1:19191" {
+	if res.Route.NodeID != nodeID || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) || res.Route.DataEndpoint != "127.0.0.1:19191" {
 		t.Fatalf("reserve result=%+v, want node %s endpoint 127.0.0.1:19191", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
 	clusterContext := commandClusterContext(t, cmd)
-	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.SandboxID ||
-		cmd.SID != res.NodeSandboxID || cmd.Profile != "e2b" {
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.Route.SandboxID ||
+		cmd.SID != res.Route.NodeSandboxID || cmd.Profile != "e2b" {
 		t.Fatalf("redirected command=%+v, reserve=%+v", cmd, res)
 	}
 }
