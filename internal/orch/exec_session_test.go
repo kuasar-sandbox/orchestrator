@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -93,6 +96,87 @@ func TestExecSessionTTLStartsAtSigningAfterTargetPreparation(t *testing.T) {
 	}
 	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_137, 0)); err == nil {
 		t.Fatal("token accepted at signing time + TTL")
+	}
+}
+
+func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the migration snapshot probe local and deterministic.
+	t.Setenv("PATH", t.TempDir())
+
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	started := make(chan struct{}, 1)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+
+	manifestKey := strings.Repeat("c", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{
+		APISecret: apiSecret, ManifestKey: manifestKey,
+	}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	source := &types.Sandbox{
+		ID: "exec-portable-source", Profile: types.ProfileBare,
+		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StatePaused,
+		SnapshotRef: "manifest://" + strings.Repeat("e", 64),
+		APISecret:   apiSecret, ManifestKey: manifestKey,
+		CreatedUnix: 1, DeadlineUnix: 100,
+	}
+	materializeTestSandboxCredentials(t, source)
+	migrationToken, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetID := "exec-portable-target"
+	type result struct {
+		token string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		token, err := o.ExecSession(ctx, targetID, apiKey, migrationToken, 37)
+		done <- result{token: token, err: err}
+	}()
+
+	var issued result
+	select {
+	case issued = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ExecSession waited for the blocked asynchronous resume")
+	}
+	if issued.err != nil || issued.token == "" {
+		t.Fatalf("ExecSession token = %q, error = %v", issued.token, issued.err)
+	}
+	imported, err := o.st.Get(ctx, targetID)
+	if err != nil || imported == nil || imported.State != types.StatePaused {
+		t.Fatalf("synchronously imported target = %+v, %v", imported, err)
+	}
+	assertMigrationCredentialsEqual(t, sandboxCredentials(imported), sandboxCredentials(source))
+	if err := keys.VerifyExecAccessToken(
+		issued.token, imported.ServiceSecret, imported.AuthSandboxID(), time.Now(),
+	); err != nil {
+		t.Fatalf("imported target token: %v", err)
+	}
+
+	waitForLauncherStart(t, started)
+	blocked, err := o.st.Get(ctx, targetID)
+	if err != nil || blocked == nil || blocked.State != types.StatePaused {
+		t.Fatalf("imported row before launcher release = %+v, %v; want paused", blocked, err)
+	}
+	close(startGate)
+	waitForSandbox(t, o, ctx, targetID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StateRunning
+	}, "running after asynchronous exec-session resume")
+	if got := lc.starts.Load(); got != 1 {
+		t.Fatalf("launcher starts = %d, want 1", got)
 	}
 }
 
