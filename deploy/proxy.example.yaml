@@ -11,7 +11,8 @@ config_socket: /run/sandbox/node-ctl.socket
 
 # Sandbox runtime root. Workers use <run_root>/<sid>/ctl.sock for native exec.
 # Configure this locally on the proxy; it is not projected over route sync.
-run_root: /run/sandbox
+paths:
+  run_root: /run/sandbox
 
 # Data-plane ingress. The master binds once and passes the same listener fd to all
 # workers. "" = serve only proxy-forwards over proxy_socket.

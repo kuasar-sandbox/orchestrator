@@ -387,7 +387,8 @@ echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_
 # workers run inside that netns, so floatingip TCP dials need its route table.
 cat > "$WORK/proxy.yaml" <<EOF
 config_socket: $WORK/node-ctl.socket
-run_root: $WORK/run
+paths:
+  run_root: $WORK/run
 data_listen: 127.0.0.1:$PROXY_PORT
 proxy_netns: $PROXY_NETNS
 proxy_socket: $PROXY_SOCK

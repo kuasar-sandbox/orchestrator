@@ -340,7 +340,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
 | `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §3) |
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
-| `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段,external native exec 另要求 `proxy.yaml` 必填 `run_root` |
+| `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段,external native exec 另要求 `proxy.yaml` 必填 `paths.run_root` |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §4) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §6) |
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
@@ -959,7 +959,7 @@ internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改�
 接受 proxy master 注册并向其广播路由(§9.2),数据面字节流不经 serve.#63 的
 legacy/explicit forward,envd 和 CI 转发判定由两模式共用.native exec 也在最终
 node proxy 执行 KAT 校验和 `ctl.ProxyExec` gate:internal 使用 conductor `paths.run_root`,
-external worker 使用自身 `proxy.yaml` 必填且与 conductor 一致的 `run_root` 本地构造
+external worker 使用自身 `proxy.yaml` 必填且与 conductor 一致的 `paths.run_root` 本地构造
 `<run_root>/<NodeSandboxID>/ctl.sock`.该路径不通过 routesync `Policy` 或共享路由视图传递.
 部署拓扑见 node-proxy.md §3,共享内存路由视图见 §4,转发判定与隧道详细见 §5.集群下,
 cluster-ctl router 把数据面转发进本节点的
@@ -1322,7 +1322,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、§12) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
-| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点,运维带外起;proxy master 注册一次,worker 共享继承 listener fd + shm 路由视图;`proxy.yaml` 必填 `run_root` 以供 worker 本地定位 native exec `ctl.sock`(node-proxy.md §3/§4) |
+| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点,运维带外起;proxy master 注册一次,worker 共享继承 listener fd + shm 路由视图;`proxy.yaml` 必填 `paths.run_root` 以供 worker 本地定位 native exec `ctl.sock`(node-proxy.md §3/§4) |
 
 不新增导出包;`CGO_ENABLED=0`;依赖层级 = 叶子。
 

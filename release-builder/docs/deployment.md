@@ -60,7 +60,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 端口(详见 §3)。internal 模式下,conductor 进程内 proxy 与控制面共用 handler;
 external 模式下,`node-ctl proxy serve` 启动 1 个 master 和配置数量的 workers,正常数据面流量进入
 `proxy.yaml.data_listen`,而控制面仍由 conductor 的 `api.listen` 承载。external worker 使用自身
-`proxy.yaml` 中必填的 `run_root` 定位 `<run_root>/<NodeSandboxID>/ctl.sock`;该值是节点本地部署配置,
+`proxy.yaml` 中必填的 `paths.run_root` 定位 `<run_root>/<NodeSandboxID>/ctl.sock`;该值是节点本地部署配置,
 不经 routesync `Policy` 或共享内存路由视图传递。其余本机进程均使用 loopback/UDS。
 `sandbox-ctl` 由 `node-ctl` 经 systemd **模板单元 `sandbox-runner@<run-id>.service`** 拉起
 (`StartUnit`/预启动 → 单元内 `run-sandbox` WaitAssignment 后 `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建

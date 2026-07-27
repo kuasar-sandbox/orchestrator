@@ -60,7 +60,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
-| `run_root` | (必填) | 本机 sandbox 运行目录根;external worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
+| `paths.run_root` | (必填) | 本机 sandbox 运行目录根;external worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,`mmds_listen` 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
@@ -205,7 +205,7 @@ resume paused sandbox;恢复后重读 NodeSandboxID 和 credential identity,二�
 的所有权交给 `sandboxer/pkg/ctl.ProxyExec`.
 
 internal 模式的 `run_root` 取自 conductor `paths.run_root`;external 模式的
-worker 直接读取自身 `proxy.yaml` 必填的 `run_root`.该值应与同节点
+worker 直接读取自身 `proxy.yaml` 必填的 `paths.run_root`.该值应与同节点
 conductor 的 `paths.run_root` 一致.routesync `Policy` 和共享路由视图只提供
 路由,凭据及鉴权策略,不投影 `ctl.sock` 路径.
 
@@ -219,7 +219,7 @@ KAT 只在 CONNECT admission 时校验;过期不强制断开已建立 tunnel,有
 可以建立多条独立 CONNECT.每条 tunnel 只承载一个 ctl exec session,不复用 backend 连接;
 新 CONNECT 在 route 切换后自动进入当前 NodeSandboxID,已建立 tunnel 不迁移.
 
-external worker 同样在本进程完成 KAT gate,用 `proxy.yaml` 的 `run_root`
+external worker 同样在本进程完成 KAT gate,用 `proxy.yaml` 的 `paths.run_root`
 构造 `ctl.sock` 路径并进入 `ProxyExec`.路径不经 routesync `Policy`,SHM 记录或
 conductor proxyForwarder 投影;proxyForwarder 仅透传同一 exec target 和客户端 KAT.
 
