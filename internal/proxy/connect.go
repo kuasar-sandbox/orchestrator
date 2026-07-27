@@ -43,6 +43,10 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad connect target", ProxyErrorBadRequest)
 		return
 	}
+	if target.Service == ConnectServiceExec {
+		p.serveExecConnect(w, r, sid)
+		return
+	}
 	route, err := p.router.Route(r.Context(), sid, target)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)

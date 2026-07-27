@@ -448,7 +448,7 @@ func TestProxyUsesCustomDialerForHTTP(t *testing.T) {
 				return nil, fmt.Errorf("dial route kind = %v, want KindTCP", r.Kind)
 			}
 			return (&net.Dialer{}).DialContext(ctx, "tcp", r.Addr)
-		})
+		}, "")
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 
@@ -501,7 +501,7 @@ func TestConnectTunnel(t *testing.T) {
 				return nil, fmt.Errorf("dial route kind = %v, want KindTCP", r.Kind)
 			}
 			return (&net.Dialer{}).DialContext(ctx, "tcp", r.Addr)
-		})
+		}, "")
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 	_, bport, _ := net.SplitHostPort(backLn.Addr().String())
