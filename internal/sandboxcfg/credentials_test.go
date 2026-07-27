@@ -21,6 +21,7 @@ func TestValidE2BAccessTokenBoundaries(t *testing.T) {
 		{name: "256 multibyte UTF-8 bytes", token: strings.Repeat("界", 85) + "a", want: true},
 		{name: "257 multibyte UTF-8 bytes", token: strings.Repeat("界", 85) + "ab", want: false},
 		{name: "invalid UTF-8", token: string([]byte{0xff}), want: false},
+		{name: "embedded NUL", token: "prefix\x00suffix", want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := ValidE2BAccessToken(tt.token); got != tt.want {
@@ -40,6 +41,7 @@ func TestExtractCredentialsEnforcesE2BAccessTokenBoundaries(t *testing.T) {
 			}{
 				{name: "256 bytes", token: strings.Repeat("界", 85) + "a"},
 				{name: "257 bytes", token: strings.Repeat("界", 85) + "ab", wantErr: true},
+				{name: "embedded NUL", token: "prefix\x00suffix", wantErr: true},
 			} {
 				t.Run(tt.name, func(t *testing.T) {
 					raw, err := json.Marshal(map[string]string{field: tt.token})

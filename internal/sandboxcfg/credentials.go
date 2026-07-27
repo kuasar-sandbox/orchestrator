@@ -23,10 +23,11 @@ type Credentials struct {
 const maxE2BAccessTokenBytes = 256
 
 // ValidE2BAccessToken reports whether token is a valid optional e2b service
-// credential. Empty means unspecified; a supplied token must be valid UTF-8 and
-// no longer than 256 bytes.
+// credential. Empty means unspecified; a supplied token must be valid UTF-8,
+// contain no NUL byte, and be no longer than 256 bytes so every persisted and
+// shared-memory representation preserves it exactly.
 func ValidE2BAccessToken(token string) bool {
-	return utf8.ValidString(token) && len(token) <= maxE2BAccessTokenBytes
+	return utf8.ValidString(token) && !strings.ContainsRune(token, '\x00') && len(token) <= maxE2BAccessTokenBytes
 }
 
 // ValidateCredentialsForProfile applies the fixed profile contract after the
@@ -36,10 +37,10 @@ func ValidateCredentialsForProfile(profile types.Profile, credentials Credential
 		return fmt.Errorf("sandboxcfg: unknown sandbox profile %q", profile)
 	}
 	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
-		return errors.New("sandboxcfg: envd_access_token must be valid UTF-8 and at most 256 bytes")
+		return errors.New("sandboxcfg: envd_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
 	}
 	if !ValidE2BAccessToken(credentials.TrafficAccessToken) {
-		return errors.New("sandboxcfg: traffic_access_token must be valid UTF-8 and at most 256 bytes")
+		return errors.New("sandboxcfg: traffic_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
 	}
 	if profile == types.ProfileBare && (credentials.EnvdAccessToken != "" || credentials.TrafficAccessToken != "") {
 		return errors.New("sandboxcfg: envd_access_token and traffic_access_token are not valid for bare sandboxes")
@@ -138,10 +139,10 @@ func parseCredentials(raw string) (Credentials, error) {
 		}
 	}
 	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
-		return Credentials{}, credentialsError("envd_access_token must be valid UTF-8 and at most 256 bytes")
+		return Credentials{}, credentialsError("envd_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
 	}
 	if !ValidE2BAccessToken(credentials.TrafficAccessToken) {
-		return Credentials{}, credentialsError("traffic_access_token must be valid UTF-8 and at most 256 bytes")
+		return Credentials{}, credentialsError("traffic_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
 	}
 	return credentials, nil
 }
