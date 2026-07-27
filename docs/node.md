@@ -862,7 +862,7 @@ e2b API/CLI 零改动。
 - **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`AuthSandboxID()`、Profile、
   template/snapshot/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
   以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
-  Group/RouteKey、generation、Exec token 或 session。目标 node 从本地 key 表取得完整 pair,
+  Group/RouteKey 或 generation。目标 node 从本地 key 表取得完整 pair,
   校验 fingerprints/runtime/Profile/Forward KAT 后原样落库,不重新派生或生成 service credential。
 - **target 与冲突**:standalone import 省略 `sandboxID` 时复用 source NodeSandboxID;显式 target
   只替换本地 ID,保留 AuthSandboxID 与全部 credential。ID 使用 1..57 bytes 的 lowercase

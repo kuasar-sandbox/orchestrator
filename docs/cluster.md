@@ -898,8 +898,8 @@ Profile 校验并规范化该 object,node 再次校验、分离后把 ServiceSec
 加密写入 Sandbox 业务行。普通 metadata、guest 配置和 node-stub 观测面均不保留 credentials object。
 
 Registry 从 node route event 物化受保护 route 时,只采纳 APISecret、两项 root fingerprint、
-AuthSandboxID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文、Exec token
-或既有 node-link wire 中供节点 proxy/MMDS 使用的 MmdsSecret。Registry 本阶段以明文结构化字段保存
+AuthSandboxID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文或既有
+node-link wire 中供节点 proxy/MMDS 使用的 MmdsSecret。Registry 本阶段以明文结构化字段保存
 这些受保护 route 凭据,不增加额外加密层;它们只可由受保护 Reserve/Resolve 返回给可信 router,
 不得进入普通 route watch/list、公开 create/get/list 响应、日志或观测接口。创建请求中的
 `kuasar-sandbox.credentials` 在 Reserve 入口从普通 config 分离,仅随 RESERVED 记录冻结并在 CmdCreate 前临时
