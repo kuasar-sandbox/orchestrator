@@ -19,12 +19,28 @@ func TestNodeLinkConnectCommandRoundTripPreservesMigrationToken(t *testing.T) {
 			Group: "/tenant/workloads", RouteKey: "route-stable", AuthSandboxID: "stable",
 		},
 		MigrationToken: "kmt1.opaque-migration-token",
+		TimeoutSeconds: 37,
 	}
 	got := roundTrip(t, &Msg{Type: TypeCommand, Rev: 9, Cmd: want})
 	if got.Cmd == nil || got.Cmd.Kind != CmdConnect || got.Cmd.SID != want.SID ||
-		got.Cmd.MigrationToken != want.MigrationToken || got.Cmd.Cluster == nil ||
+		got.Cmd.MigrationToken != want.MigrationToken || got.Cmd.TimeoutSeconds != want.TimeoutSeconds || got.Cmd.Cluster == nil ||
 		got.Cmd.Cluster.AuthSandboxID != want.Cluster.AuthSandboxID || got.Rev != 9 {
 		t.Fatalf("connect command round-trip: %+v rev=%d", got.Cmd, got.Rev)
+	}
+}
+
+func TestNodeLinkConnectAckRoundTripPreservesTypedResult(t *testing.T) {
+	want := &CmdAck{
+		CmdID: "connect-1", Status: AckAccepted,
+		Connect: &ConnectResult{
+			NodeSandboxID: "stable-g1", TemplateID: "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Profile: "e2b", EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "kat1.forward",
+		},
+	}
+	got := roundTrip(t, &Msg{Type: TypeCmdAck, Ack: want})
+	if got.Ack == nil || got.Ack.Connect == nil || *got.Ack.Connect != *want.Connect ||
+		got.Ack.CmdID != want.CmdID || got.Ack.Status != want.Status {
+		t.Fatalf("connect ack round-trip: %+v", got.Ack)
 	}
 }
 

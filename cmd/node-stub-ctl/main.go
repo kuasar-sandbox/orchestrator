@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -943,11 +944,21 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "sandbox context binding mismatch")
 	}
+	result, err := stubConnectResult(sb)
+	if err != nil {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, err.Error())
+	}
+	if cmd.TimeoutSeconds > 0 {
+		sb.DeadlineUnix = time.Now().Add(time.Duration(cmd.TimeoutSeconds) * time.Second).Unix()
+	}
 	sb.State = routesync.StateRunning
 	entry := sb.routeEntry()
 	n.mu.Unlock()
 	n.publishRoute(entry)
-	return ack(cmd, routesync.AckAccepted, "")
+	accepted := ack(cmd, routesync.AckAccepted, "")
+	accepted.Connect = result
+	return accepted
 }
 
 func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
@@ -1271,9 +1282,41 @@ type stubSandbox struct {
 	EnvdAccessToken        string `json:"-"`
 	TrafficAccessToken     string `json:"-"`
 	ForwardAccessToken     string `json:"-"`
+	DeadlineUnix           int64
 	Cluster                *routesync.ClusterSandboxContext
 	Behavior               stubBehavior
 	CreatedAt              string
+}
+
+func stubConnectResult(s *stubSandbox) (*routesync.ConnectResult, error) {
+	if s == nil || s.SID == "" || s.TemplateID == "" || s.ForwardAccessToken == "" {
+		return nil, errors.New("sandbox connect result is incomplete")
+	}
+	template, err := types.ParseTemplateID(s.TemplateID)
+	if err != nil || string(template.Profile) != s.Profile {
+		return nil, errors.New("sandbox template and profile are inconsistent")
+	}
+	result := &routesync.ConnectResult{
+		NodeSandboxID:      s.SID,
+		TemplateID:         s.TemplateID,
+		Profile:            s.Profile,
+		ForwardAccessToken: s.ForwardAccessToken,
+	}
+	switch types.Profile(s.Profile) {
+	case types.ProfileBare:
+		if s.EnvdAccessToken != "" || s.TrafficAccessToken != "" {
+			return nil, errors.New("bare sandbox contains e2b access tokens")
+		}
+	case types.ProfileE2B:
+		if s.EnvdAccessToken == "" || s.TrafficAccessToken == "" {
+			return nil, errors.New("e2b sandbox access tokens are required")
+		}
+		result.EnvdAccessToken = s.EnvdAccessToken
+		result.TrafficAccessToken = s.TrafficAccessToken
+	default:
+		return nil, errors.New("sandbox profile is invalid")
+	}
+	return result, nil
 }
 
 func (s *stubSandbox) routeEntry() routesync.RouteEntry {

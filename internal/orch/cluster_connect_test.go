@@ -34,6 +34,7 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		AuthSandboxIDValue: "stable",
 		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
 		State:              types.StateRunning,
+		DeadlineUnix:       1_900_000_000,
 		APISecret:          apiSecret,
 		ManifestKey:        manifestKey,
 		CreatedUnix:        1,
@@ -62,7 +63,19 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 			if ack.Status != routesync.AckAccepted {
 				t.Fatalf("existing-target connect ack = %+v", ack)
 			}
+			if ack.Connect == nil || ack.Connect.NodeSandboxID != sb.ID ||
+				ack.Connect.TemplateID != sb.TemplateID || ack.Connect.Profile != string(sb.Profile) ||
+				ack.Connect.ForwardAccessToken != sb.ForwardAccessToken {
+				t.Fatalf("existing-target connect result = %+v, sandbox = %+v", ack.Connect, sb)
+			}
+			if ack.Connect.EnvdAccessToken != "" || ack.Connect.TrafficAccessToken != "" {
+				t.Fatalf("bare connect result exposed e2b tokens: %+v", ack.Connect)
+			}
 		})
+	}
+	preserved, err := o.st.Get(ctx, sb.ID)
+	if err != nil || preserved == nil || preserved.DeadlineUnix != sb.DeadlineUnix {
+		t.Fatalf("connect without timeout changed deadline: sandbox=%+v err=%v", preserved, err)
 	}
 
 	ack := o.HandleCommand(ctx, &routesync.Command{
@@ -114,9 +127,18 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	})
 
 	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.TimeoutSeconds = 37
+	deadlineFloor := time.Now().Add(36 * time.Second).Unix()
 	ack := fixture.o.HandleCommand(context.Background(), cmd)
 	if ack.Status != routesync.AckAccepted {
 		t.Fatalf("cluster migration connect ack = %+v", ack)
+	}
+	if ack.Connect == nil || ack.Connect.NodeSandboxID != cmd.SID ||
+		ack.Connect.TemplateID != fixture.source.TemplateID || ack.Connect.Profile != string(fixture.source.Profile) ||
+		ack.Connect.EnvdAccessToken != fixture.source.EnvdAccessToken ||
+		ack.Connect.TrafficAccessToken != fixture.source.TrafficAccessToken ||
+		ack.Connect.ForwardAccessToken != fixture.source.ForwardAccessToken {
+		t.Fatalf("cluster migration connect result = %+v", ack.Connect)
 	}
 
 	// HandleCommand may return Accepted only after KMT authentication and the
@@ -129,6 +151,9 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	if got.ID != "stable-g1" || got.State != types.StatePaused || got.Profile != fixture.source.Profile ||
 		got.AuthSandboxID() != fixture.source.AuthSandboxID() || got.CreatedUnix != fixture.source.CreatedUnix {
 		t.Fatalf("imported identity/state = %+v", got)
+	}
+	if got.DeadlineUnix < deadlineFloor || got.DeadlineUnix > time.Now().Add(38*time.Second).Unix() {
+		t.Fatalf("persisted connect deadline = %d, want approximately now+37s", got.DeadlineUnix)
 	}
 	if got.Cluster == nil || got.Cluster.Group != cmd.Cluster.Group || got.Cluster.RouteKey != cmd.Cluster.RouteKey {
 		t.Fatalf("imported cluster context = %+v, command = %+v", got.Cluster, cmd.Cluster)
@@ -150,6 +175,41 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	case <-blocker.returned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("asynchronous cluster resume did not observe cancellation")
+	}
+}
+
+func TestClusterConnectResultEnforcesProfileCredentialShape(t *testing.T) {
+	base := &types.Sandbox{
+		ID: "stable-g1", Profile: types.ProfileBare,
+		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
+		ForwardAccessToken: "kat1.forward",
+	}
+	result, err := clusterConnectResult(base)
+	if err != nil {
+		t.Fatalf("bare result: %v", err)
+	}
+	if result.EnvdAccessToken != "" || result.TrafficAccessToken != "" {
+		t.Fatalf("bare result = %+v", result)
+	}
+
+	e2b := *base
+	e2b.Profile = types.ProfileE2B
+	e2b.TemplateID = "e2b-img-" + strings.Repeat("b", 64)
+	if _, err := clusterConnectResult(&e2b); err == nil {
+		t.Fatal("e2b result accepted missing e2b access tokens")
+	}
+	e2b.EnvdAccessToken = "envd"
+	e2b.TrafficAccessToken = "traffic"
+	if result, err = clusterConnectResult(&e2b); err != nil {
+		t.Fatalf("e2b result: %v", err)
+	} else if result.EnvdAccessToken != "envd" || result.TrafficAccessToken != "traffic" {
+		t.Fatalf("e2b result = %+v", result)
+	}
+
+	bareWithE2BTokens := *base
+	bareWithE2BTokens.EnvdAccessToken = "envd"
+	if _, err := clusterConnectResult(&bareWithE2BTokens); err == nil {
+		t.Fatal("bare result accepted an e2b access token")
 	}
 }
 
