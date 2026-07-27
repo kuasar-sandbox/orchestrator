@@ -489,6 +489,158 @@ assert cluster.get("route_key") == "user1/session1", connected
 assert cluster.get("auth_sandbox_id") == stable_sid, connected
 PY
 
+step "checking cluster exec-session issuance through Registry CmdExecSession"
+code="$(http_code "$WORK/exec-session1.response" -D "$WORK/exec-session1.headers" -X POST \
+    -H "Host: api.$DOMAIN" \
+    -H "X-Kuasar-Sandbox-Group: $GROUP" \
+    -H "X-Kuasar-Route-Key: user1/session1" \
+    -H "X-API-KEY: $API_KEY" \
+    -H "Content-Type: application/json" \
+    --data '{"ttlSeconds":60}' \
+    "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID/exec-sessions" || true)"
+[ "$code" = "201" ] || fail "exec-session user1/session1 returned $code"
+
+python3 - "$WORK/exec-session1.response" "$WORK/exec-session1.headers" <<'PY' || fail "invalid exec-session response contract"
+import json, sys
+response_path, headers_path = sys.argv[1:]
+response = json.load(open(response_path))
+assert set(response) == {"execAccessToken"}, response
+assert isinstance(response["execAccessToken"], str) and response["execAccessToken"], response
+headers = {}
+for line in open(headers_path):
+    if ":" not in line:
+        continue
+    name, value = line.split(":", 1)
+    headers.setdefault(name.strip().lower(), []).append(value.strip())
+assert headers.get("cache-control") == ["no-store"], headers
+PY
+
+python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$WORK" <<'PY' || \
+    fail "CmdExecSession did not preserve identity or exposed its token"
+import json, pathlib, sys, urllib.request
+admin, group, stable_sid, response_path, work_dir = sys.argv[1:]
+token = json.load(open(response_path))["execAccessToken"]
+commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
+events = json.load(urllib.request.urlopen(admin + "/v1/events", timeout=2))
+exec_commands = [
+    command for command in commands
+    if command.get("kind") == "exec_session" and
+       command.get("cluster", {}).get("route_key") == "user1/session1"
+]
+assert len(exec_commands) == 1, exec_commands
+command = exec_commands[0]
+assert command.get("sid") == stable_sid + "-g0", command
+assert command.get("profile") == "e2b", command
+cluster = command.get("cluster", {})
+assert cluster.get("group") == group, command
+assert cluster.get("route_key") == "user1/session1", command
+assert cluster.get("auth_sandbox_id") == stable_sid, command
+observed = json.dumps({"commands": commands, "events": events}, separators=(",", ":"))
+observed += "".join(path.read_text() for path in pathlib.Path(work_dir).glob("*.log"))
+assert token not in observed, "exec access token appeared in node-stub observations"
+PY
+
+step "checking invalid exec KAT rejection at Router and node data endpoint"
+python3 - "$ROUTER_PORT" "$DATA_PORT" "$GROUP" "$ADMIN" "$SESSION1_SID" <<'PY' || \
+    fail "invalid exec KAT reached lifecycle or data-plane handling"
+import json, socket, sys, urllib.request
+router_port, node_port, group, admin, stable_sid = sys.argv[1:]
+
+def observations():
+    commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2)) or []
+    hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)) or []
+    return len(commands), len(hits)
+
+def rejected_connect(port, sandbox_id, include_cluster):
+    headers = [
+        "CONNECT sandbox:443 HTTP/1.1",
+        "Host: sandbox:443",
+        "E2b-Sandbox-Id: " + sandbox_id,
+        "E2b-Sandbox-Service: exec",
+        "E2b-Sandbox-Port: 8123",
+        "X-Access-Token: not-a-kat",
+    ]
+    if include_cluster:
+        headers.extend([
+            "X-Kuasar-Sandbox-Group: " + group,
+            "X-Kuasar-Route-Key: user1/session1",
+        ])
+    request = ("\r\n".join(headers) + "\r\n\r\n").encode()
+    with socket.create_connection(("127.0.0.1", int(port)), timeout=5) as conn:
+        conn.settimeout(5)
+        conn.sendall(request)
+        stream = conn.makefile("rb")
+        status = stream.readline().decode("ascii", "strict").rstrip("\r\n")
+        assert status.startswith("HTTP/1.1 401 "), status
+
+before = observations()
+rejected_connect(router_port, stable_sid, True)
+rejected_connect(node_port, stable_sid + "-g0", False)
+after = observations()
+assert after == before, (before, after)
+PY
+
+step "checking service=exec CONNECT rewrite and buffered tunnel relay"
+python3 - "$ROUTER_PORT" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" <<'PY' || \
+    fail "cluster exec CONNECT did not preserve the tunnel"
+import json, socket, sys
+router_port, group, stable_sid, response_path = sys.argv[1:]
+token = json.load(open(response_path))["execAccessToken"]
+headers = [
+    "CONNECT sandbox:443 HTTP/1.1",
+    "Host: sandbox:443",
+    "E2b-Sandbox-Id: " + stable_sid,
+    "E2b-Sandbox-Service: exec",
+    "E2b-Sandbox-Port: 8123",
+    "X-Kuasar-Sandbox-Group: " + group,
+    "X-Kuasar-Route-Key: user1/session1",
+    "X-Access-Token: " + token,
+]
+inner = [
+    "GET /exec-probe HTTP/1.1",
+    "Host: guest",
+    "Connection: close",
+]
+# One send covers both the outer CONNECT and the already-buffered inner bytes.
+request = ("\r\n".join(headers) + "\r\n\r\n" + "\r\n".join(inner) + "\r\n\r\n").encode()
+
+def read_head(stream):
+    status = stream.readline().decode("ascii", "strict").rstrip("\r\n")
+    response_headers = {}
+    while True:
+        line = stream.readline().decode("ascii", "strict")
+        if line == "\r\n":
+            break
+        name, value = line.split(":", 1)
+        response_headers[name.strip().lower()] = value.strip()
+    return status, response_headers
+
+with socket.create_connection(("127.0.0.1", int(router_port)), timeout=5) as conn:
+    conn.settimeout(5)
+    conn.sendall(request)
+    stream = conn.makefile("rb")
+    outer_status, _ = read_head(stream)
+    assert outer_status.startswith("HTTP/1.1 200 "), outer_status
+    inner_status, _ = read_head(stream)
+    assert inner_status.startswith("HTTP/1.1 204 "), inner_status
+PY
+
+python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "exec tunnel did not reach the current NodeSandboxID"
+import json, sys, urllib.request
+admin, group, stable_sid = sys.argv[1:]
+hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2))
+exec_hits = [hit for hit in hits if hit.get("path") == "/exec-probe"]
+assert len(exec_hits) == 1, exec_hits
+hit = exec_hits[0]
+assert hit.get("sid") == stable_sid + "-g0", hit
+assert hit.get("method") == "GET", hit
+assert hit.get("host") == "guest", hit
+cluster = hit.get("cluster", {})
+assert cluster.get("group") == group, hit
+assert cluster.get("route_key") == "user1/session1", hit
+assert cluster.get("auth_sandbox_id") == stable_sid, hit
+PY
+
 code="$(retry_code 204 "$WORK/data1.body" \
     -H "Host: 49983-$SESSION1_SID.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
