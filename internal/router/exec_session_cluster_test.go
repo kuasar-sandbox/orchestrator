@@ -272,8 +272,11 @@ func TestClusterExecSessionRejectsInconsistentReserveResult(t *testing.T) {
 			defer control.Close()
 			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			response := clusterExecSessionRequest(t, rt, `{}`, -1, "")
-			if response.Code != http.StatusBadGateway {
-				t.Fatalf("status = %d, want 502; body = %q", response.Code, response.Body.String())
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body = %q", response.Code, response.Body.String())
+			}
+			if got := response.Body.String(); got != "exec session unavailable\n" {
+				t.Fatalf("body = %q, want fixed unavailable error", got)
 			}
 			if cached := rt.cachedRoute("/g", "rk", "stable"); cached != nil {
 				t.Fatalf("invalid result entered cache: %+v", cached)

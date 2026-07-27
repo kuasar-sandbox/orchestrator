@@ -465,24 +465,35 @@ func TestCreateExecSessionRequiresExplicitAPIKeyHeader(t *testing.T) {
 	}
 }
 
-func TestCreateExecSessionSanitizesOperationalFailureAsUnavailable(t *testing.T) {
+func TestCreateExecSessionSanitizesOperationalFailuresAsUnavailable(t *testing.T) {
 	const internalDetail = "node stable-g7 failed at /private/run/ctl.sock"
-	for _, migrationToken := range []string{"", "kmt1.opaque"} {
-		core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
-			return "", errors.New(internalDetail)
-		}}
-		handler, apiKey := newMigrationTestHandler(t, core)
-		headers := http.Header{}
-		if migrationToken != "" {
-			headers.Set(MigrationTokenHeader, migrationToken)
-		}
-		response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader("{}"), headers)
-		if response.Code != http.StatusServiceUnavailable {
-			t.Fatalf("migration=%t status = %d, want 503; body=%s", migrationToken != "", response.Code, response.Body.String())
-		}
-		if strings.Contains(response.Body.String(), internalDetail) || strings.Contains(response.Body.String(), "stable-g7") {
-			t.Fatalf("public response leaked internal detail: %s", response.Body.String())
-		}
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "operation failure", err: errors.New(internalDetail)},
+		{name: "incompatible import", err: fmt.Errorf("%s: %w", internalDetail, migrationtoken.ErrIncompatible)},
+		{name: "occupied import target", err: fmt.Errorf("%s: %w", internalDetail, ErrAlreadyExists)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, migrationToken := range []string{"", "kmt1.opaque"} {
+				core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+					return "", test.err
+				}}
+				handler, apiKey := newMigrationTestHandler(t, core)
+				headers := http.Header{}
+				if migrationToken != "" {
+					headers.Set(MigrationTokenHeader, migrationToken)
+				}
+				response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader("{}"), headers)
+				if response.Code != http.StatusServiceUnavailable {
+					t.Fatalf("migration=%t status = %d, want 503; body=%s", migrationToken != "", response.Code, response.Body.String())
+				}
+				if got := response.Body.String(); got != "{\"message\":\"exec session unavailable\"}\n" {
+					t.Fatalf("public response = %q, want fixed unavailable error", got)
+				}
+			}
+		})
 	}
 }
 

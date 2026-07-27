@@ -412,10 +412,6 @@ func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
 // internal error details.
 func (a *API) failExecSession(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, ErrAlreadyExists):
-		writeErr(w, http.StatusConflict, "target sandbox already exists")
-	case errors.Is(err, migrationtoken.ErrIncompatible):
-		writeErr(w, http.StatusConflict, "target environment incompatible")
 	case errors.Is(err, migrationtoken.ErrAuthentication),
 		errors.Is(err, migrationtoken.ErrCredentialMismatch),
 		errors.Is(err, ErrNotAllowed):

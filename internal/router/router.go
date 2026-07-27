@@ -729,7 +729,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 	route := &res.Route
 	result := res.ExecSession
 	if !routeMatchesIdentity(route, group, routeKey, sandboxID) || result == nil || result.ExecAccessToken == "" {
-		http.Error(w, "registry returned an invalid exec session result", http.StatusBadGateway)
+		http.Error(w, "exec session unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	rt.rememberRoute(route)
