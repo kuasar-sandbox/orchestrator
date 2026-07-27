@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -14,6 +16,9 @@ const (
 	testAuthSandboxID = "sandbox-01"
 	testServiceSecret = "0213051156fc06b40aebdeb333caeb9c95866d91f08298264901787551897989"
 	testForwardToken  = "kat1.eyJ2IjoxLCJzaWQiOiJzYW5kYm94LTAxIiwiYXVkIjoiZm9yd2FyZCJ9.uk154F30--e531Hogd4pgj0oGFsuIJJT0nWr17gkdSw"
+	testExecSessionID = "01890f35-7b2c-7cc6-98c4-dc0c0c07398f"
+	testExecExpiry    = int64(1784835600)
+	testExecToken     = "kat1.eyJ2IjoxLCJzZXNzaW9uX2lkIjoiMDE4OTBmMzUtN2IyYy03Y2M2LTk4YzQtZGMwYzBjMDczOThmIiwic2lkIjoic2FuZGJveC0wMSIsImF1ZCI6ImV4ZWMiLCJleHAiOjE3ODQ4MzU2MDB9.Xjxz_Gy7SXW7P6J985sabIi_i0MWjRYCCNsvXZRoVWI"
 )
 
 func TestMintSecretCanonicalHex(t *testing.T) {
@@ -198,6 +203,124 @@ func TestForwardAccessTokenBindingAndInputValidation(t *testing.T) {
 	}
 }
 
+func TestExecAccessTokenGoldenVector(t *testing.T) {
+	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != testExecToken {
+		t.Fatalf("mintExecAccessToken() = %q, want golden vector", token)
+	}
+	if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0)); err != nil {
+		t.Fatalf("VerifyExecAccessToken(golden) = %v", err)
+	}
+}
+
+func TestMintExecAccessTokenUsesUUIDv7AndOptionalExpiry(t *testing.T) {
+	tokens := make(map[string]bool)
+	for _, expiry := range []int64{0, testExecExpiry} {
+		token, err := MintExecAccessToken(testServiceSecret, testAuthSandboxID, expiry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tokens[token] {
+			t.Fatal("two exec sessions returned the same token")
+		}
+		tokens[token] = true
+		claims := execClaimsFromToken(t, token)
+		if claims.Version != 1 || claims.SID != testAuthSandboxID || claims.Audience != execAudience ||
+			!validUUIDv7(claims.SessionID) {
+			t.Fatalf("minted exec claims = %+v", claims)
+		}
+		if expiry == 0 && claims.Expires != nil {
+			t.Fatalf("long-lived token contains exp=%v", *claims.Expires)
+		}
+		if expiry > 0 && (claims.Expires == nil || *claims.Expires != expiry) {
+			t.Fatalf("expiring token claims = %+v", claims)
+		}
+	}
+}
+
+func TestExecAccessTokenStrictWire(t *testing.T) {
+	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(token, ".")
+	nonCanonicalSignature := nonCanonicalRawURL(t, parts[2])
+	tests := map[string]string{
+		"empty":                   "",
+		"two segments":            parts[0] + "." + parts[1],
+		"four segments":           token + ".extra",
+		"wrong prefix":            "KAT1." + parts[1] + "." + parts[2],
+		"empty payload":           "kat1.." + parts[2],
+		"empty signature":         "kat1." + parts[1] + ".",
+		"padded payload":          "kat1." + parts[1] + "=." + parts[2],
+		"padded signature":        token + "=",
+		"non-canonical signature": "kat1." + parts[1] + "." + nonCanonicalSignature,
+		"short signature":         "kat1." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 31)),
+		"long signature":          "kat1." + parts[1] + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 33)),
+		"tampered signature":      token[:len(token)-2] + "AA",
+	}
+	for name, candidate := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := VerifyExecAccessToken(candidate, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+				t.Fatalf("VerifyExecAccessToken() error = %v, want fixed invalid-token error", err)
+			}
+		})
+	}
+}
+
+func TestExecAccessTokenRequiresCanonicalClaims(t *testing.T) {
+	payloads := map[string]string{
+		"field order":     `{"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","v":1,"sid":"sandbox-01","aud":"exec"}`,
+		"whitespace":      `{"v": 1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}`,
+		"escaped SID":     `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sand\u0062ox-01","aud":"exec"}`,
+		"duplicate":       `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","sid":"sandbox-01","aud":"exec"}`,
+		"extra":           `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec","extra":true}`,
+		"missing session": `{"v":1,"sid":"sandbox-01","aud":"exec"}`,
+		"wrong version":   `{"v":2,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}`,
+		"wrong SID":       `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-02","aud":"exec"}`,
+		"wrong audience":  `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"forward"}`,
+		"UUIDv4":          `{"v":1,"session_id":"550e8400-e29b-41d4-a716-446655440000","sid":"sandbox-01","aud":"exec"}`,
+		"upper UUID":      `{"v":1,"session_id":"01890F35-7B2C-7CC6-98C4-DC0C0C07398F","sid":"sandbox-01","aud":"exec"}`,
+		"zero expiry":     `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec","exp":0}`,
+		"trailing value":  `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}{}`,
+	}
+	for name, payload := range payloads {
+		t.Run(name, func(t *testing.T) {
+			token := signedRawPayload(t, []byte(payload), testServiceSecret)
+			if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+				t.Fatalf("VerifyExecAccessToken() error = %v, want fixed invalid-token error", err)
+			}
+		})
+	}
+}
+
+func TestExecAccessTokenExpiryAndBinding(t *testing.T) {
+	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(99, 0)); err != nil {
+		t.Fatalf("token before expiry: %v", err)
+	}
+	for _, now := range []int64{100, 101} {
+		if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(now, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+			t.Fatalf("token at now=%d error=%v, want expired", now, err)
+		}
+	}
+	if err := VerifyExecAccessToken(token, strings.Repeat("a", 64), testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+		t.Fatalf("wrong ServiceSecret error = %v", err)
+	}
+	if err := VerifyExecAccessToken(token, testServiceSecret, "sandbox-02", time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+		t.Fatalf("wrong AuthSandboxID error = %v", err)
+	}
+	if _, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, -1); !errors.Is(err, errInvalidExecExpiry) {
+		t.Fatalf("negative expiry error = %v", err)
+	}
+}
+
 func TestKATErrorsDoNotEchoInputs(t *testing.T) {
 	badToken := "kat1.secret-token-fragment.bad"
 	err := VerifyForwardAccessToken(badToken, testServiceSecret, testAuthSandboxID)
@@ -216,6 +339,23 @@ func signedRawPayload(t *testing.T, payload []byte, serviceSecretHex string) str
 	t.Helper()
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
 	return "kat1." + payloadB64 + "." + signatureForPayloadB64(t, payloadB64, serviceSecretHex)
+}
+
+func execClaimsFromToken(t *testing.T, token string) execPayload {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("exec token has %d segments", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims execPayload
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return claims
 }
 
 func signatureForPayloadB64(t *testing.T, payloadB64, serviceSecretHex string) string {
