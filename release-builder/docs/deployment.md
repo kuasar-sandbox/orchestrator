@@ -15,7 +15,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 角色 | 集群规模 | 职责 | 关键进程 |
 |---|---|---|---|
-| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
+| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen;external 模式另启 proxy master + workers)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
 | Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 路由缓存)/ placer(放置调度 + group provider);显式创建沙箱后按 sandbox-group + route-key + 稳定 sandbox_id 路由请求,Router 在 node 边界替换为 NodeSandboxID,并按需激活已知的非 READY 沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
 
@@ -33,7 +33,8 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip及经显式 capability 授权的 native exec)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
+| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl;`proxy.mode=internal` 时还在本进程承载数据面 proxy | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
+| `node-ctl proxy`(`serve`,external 仅)| proxy master 经 config-socket 订阅路由、绑定独立数据入口并管理 worker;worker 共享继承的 listener fd 和只读路由视图,执行数据面鉴权、反代及 native exec gate | 1 master + `workers` 个 worker | systemd | 平台内,`orchestrator/docs/node-proxy.md` |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 node-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
 | `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<run-id>` 单元(`run-sandbox`)assignment 后启动 | 平台内,`docs/sandbox.md` |
@@ -51,11 +52,16 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | `cache-ctl tiered` | `127.0.0.1:7071` | gRPC | health / `ping` / `info` |
 | `node-ctl conductor serve(resource_listen)` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
-| `node-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`及 service-addressed CONNECT);native exec 先调用 `POST /sandboxes/{sid}/exec-sessions`,再以 `service=exec` + `X-Access-Token` CONNECT;转发层设计见 `orchestrator/docs/node-proxy.md` |
-| `node-ctl` | `/run/sandbox/node-ctl.socket` | UDS,framed JSON | config-socket(task/admin/plugin/api 四平面):`run-sandbox`/`run-builder` 取 LaunchSpec / BuildSpec(密钥经 env);external proxy / 平台 agent 经 plugin 平面注册并同步路由(SO_PEERCRED + `<id>.pid` / pidfile 鉴别)|
+| `node-ctl`(`serve`) | `api.listen`,如 `:443` | HTTPS/h2 | **对外** e2b 控制面 API;`proxy.mode=internal` 时同一 handler 也承载沙箱数据面,`proxy.data_listen` 可另设数据入口 |
+| `node-ctl proxy`(`serve`,external 仅)| `proxy.yaml.data_listen` | HTTPS/h2 或 h2c | **独立数据入口**;master 绑定 listener 并把 fd 交给 workers,native exec 使用 `service=exec` + `X-Access-Token` CONNECT |
+| `node-ctl`(`serve`) | `/run/sandbox/node-ctl.socket` | UDS,framed JSON | config-socket(task/admin/plugin/api 四平面):`run-sandbox`/`run-builder` 取 LaunchSpec / BuildSpec(密钥经 env);external proxy master / 平台 agent 经 plugin 平面注册并同步路由(SO_PEERCRED + `<id>.pid` / pidfile 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
-端口(详见 §3)。**对外服务端口仅 `node-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
+端口(详见 §3)。internal 模式下,conductor 进程内 proxy 与控制面共用 handler;
+external 模式下,`node-ctl proxy serve` 启动 1 个 master 和配置数量的 workers,正常数据面流量进入
+`proxy.yaml.data_listen`,而控制面仍由 conductor 的 `api.listen` 承载。external worker 使用自身
+`proxy.yaml` 中必填的 `run_root` 定位 `<run_root>/<NodeSandboxID>/ctl.sock`;该值是节点本地部署配置,
+不经 routesync `Policy` 或共享内存路由视图传递。其余本机进程均使用 loopback/UDS。
 `sandbox-ctl` 由 `node-ctl` 经 systemd **模板单元 `sandbox-runner@<run-id>.service`** 拉起
 (`StartUnit`/预启动 → 单元内 `run-sandbox` WaitAssignment 后 `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
 另走第二个模板单元 **`sandbox-builder@<run-id>.service`**(单元内 `run-builder` WaitAssignment 后
@@ -255,7 +261,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
 (shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
 按 sandbox-group + route-key + 稳定 sandbox_id 路由,在 node 边界使用 NodeSandboxID;
-Exec Session 通过 `Reserve(op=exec-session)` + `CmdExecSession` 由 node 签发,数据面由
+Exec Session 通过 `Reserve(operation=exec-session)` + `CmdExecSession` 由 node 签发,数据面由
 Router 与 node 验证同一 KAT;非 READY route 进入 data Reserve 时,Registry 在触发生命周期
 动作前再次验证)、**placer**(group provider/importer、WATCH_LIST 消费方与
 放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
