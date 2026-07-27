@@ -176,8 +176,46 @@ func TestClusterExecSessionPropagatesReserveTTLOverflow(t *testing.T) {
 	if response.Code != http.StatusBadRequest || reserveHits.Load() != 1 {
 		t.Fatalf("status = %d, reserve hits = %d, body = %q", response.Code, reserveHits.Load(), response.Body.String())
 	}
+	if response.Body.String() != "invalid exec session request\n" {
+		t.Fatalf("public body = %q", response.Body.String())
+	}
 	if cached := rt.cachedRoute("/g", "rk", "stable"); cached != nil {
 		t.Fatalf("overflowing request entered cache: %+v", cached)
+	}
+}
+
+func TestClusterExecSessionSanitizesRegistryFailure(t *testing.T) {
+	const internalDetail = "node stable-g7 failed at /private/run/ctl.sock"
+	for _, test := range []struct {
+		name       string
+		upstream   int
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "bad request", upstream: http.StatusBadRequest, wantStatus: http.StatusBadRequest, wantBody: "invalid exec session request\n"},
+		{name: "unauthorized", upstream: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized, wantBody: "unauthorized\n"},
+		{name: "forbidden", upstream: http.StatusForbidden, wantStatus: http.StatusForbidden, wantBody: "exec session credential not allowed\n"},
+		{name: "not found", upstream: http.StatusNotFound, wantStatus: http.StatusNotFound, wantBody: "not found\n"},
+		{name: "node failure", upstream: http.StatusInternalServerError, wantStatus: http.StatusServiceUnavailable, wantBody: "exec session unavailable\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, internalDetail, test.upstream)
+			}))
+			defer control.Close()
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil,
+				slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			response := clusterExecSessionRequest(t, rt, `{}`, -1, "")
+			if response.Code != test.wantStatus || response.Body.String() != test.wantBody {
+				t.Fatalf("status = %d, body = %q; want %d, %q",
+					response.Code, response.Body.String(), test.wantStatus, test.wantBody)
+			}
+			if strings.Contains(response.Body.String(), internalDetail) ||
+				strings.Contains(response.Body.String(), "stable-g7") || strings.Contains(response.Body.String(), "/private/run") {
+				t.Fatalf("public response leaked internal detail: %q", response.Body.String())
+			}
+		})
 	}
 }
 

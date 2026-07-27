@@ -723,7 +723,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, request.TTLSeconds, nil, headers,
 	)
 	if err != nil {
-		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+		writeExecSessionRouteLinkError(w, err)
 		return
 	}
 	route := &res.Route
@@ -1546,6 +1546,31 @@ func writeRouteLinkError(w http.ResponseWriter, err error, fallbackStatus int) {
 		message = routeErr.body
 		if message == "" {
 			message = http.StatusText(status)
+		}
+	}
+	http.Error(w, message, status)
+}
+
+// writeExecSessionRouteLinkError preserves the public exec-session status
+// contract without forwarding Registry or node-link error details.
+func writeExecSessionRouteLinkError(w http.ResponseWriter, err error) {
+	status := http.StatusServiceUnavailable
+	message := "exec session unavailable"
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) {
+		switch routeErr.status {
+		case http.StatusBadRequest:
+			status = http.StatusBadRequest
+			message = "invalid exec session request"
+		case http.StatusUnauthorized:
+			status = http.StatusUnauthorized
+			message = "unauthorized"
+		case http.StatusForbidden:
+			status = http.StatusForbidden
+			message = "exec session credential not allowed"
+		case http.StatusNotFound:
+			status = http.StatusNotFound
+			message = "not found"
 		}
 	}
 	http.Error(w, message, status)
