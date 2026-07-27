@@ -3,19 +3,22 @@
 ## 1. 概述
 
 数据面 proxy 是沙箱流量的 L7 转发层:把外部 e2b SDK/CLI、端口转发或
-cluster-router 进入本节点的请求按 `(sid, port)` 路由到 guest envd UDS 或沙箱
-floatingip 用户端口。控制面 API、生命周期、密钥、构建由
+cluster-router 进入本节点的请求按 `(sid, target)` 路由到 guest envd/CI UDS 或沙箱
+floatingip 用户端口。普通 HTTP 的 target 仍是 legacy port;CONNECT 可以用
+`E2b-Sandbox-Service` 显式选择逻辑服务。控制面 API、生命周期、密钥、构建由
 `node-ctl conductor serve` 承载,见 [node.md](node.md);本文只描述数据面转发层。
 
 ```text
 client / cluster-router
   │ Host: <port>-<sid>.<domain>
-  │ or E2b-Sandbox-Id + E2b-Sandbox-Port + X-Access-Token
+  │ or E2b-Sandbox-Id + E2b-Sandbox-Port
+  │ CONNECT may add E2b-Sandbox-Service + X-Access-Token
   ▼
 node proxy worker
   │ shared route view (read-only mmap)
-  ├─ e2b 49983/49999 ─► envd / ci UDS
-  └─ user port ───────► floatingip:port
+  ├─ e2b legacy 49983/49999 ─► envd / ci UDS
+  ├─ legacy/forward port ────► floatingip:port
+  └─ unsupported service ────► 501
 ```
 
 ### 1.1 设计原则
@@ -34,6 +37,8 @@ node proxy worker
   netns dialer;external 模式让 worker 进程直接在该 netns 内运行。
 - **无上游连接池**:普通 HTTP 每请求拨一次后端并关闭;CONNECT 是一条请求绑定一条
   TCP/UDS 连接。不同 sandbox/port 不复用上游连接。
+- **逻辑服务只影响 CONNECT**:普通 HTTP 不解析 `E2b-Sandbox-Service`,应用层
+  Header 保持不变;CONNECT 中显式 service 是 backend 选择的权威输入。
 - **确定性 MMDS 密钥**:`MmdsSecret = MAC(manifest_key, sid)`,PUT 和 GET 即使落到
   不同 worker 也一致。
 
@@ -142,15 +147,33 @@ ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关
 
 ## 5. 转发路径
 
-请求按 `Host: <port>-<sid>.<domain>` 或 `E2b-Sandbox-Id` /
-`E2b-Sandbox-Port` 解析 `(sid, port)`;cluster 第二跳的 `sid` 必须是当前 NodeSandboxID.
+普通 HTTP 按 `Host: <port>-<sid>.<domain>` 或 `E2b-Sandbox-Id` /
+`E2b-Sandbox-Port` 解析 `(sid, port)`。它不解析 `E2b-Sandbox-Service`;该 Header 作为
+应用层 Header 原样转发,不改变 backend。CONNECT 解析 `(sid, service?, port?)`。
+cluster 第二跳的 `sid` 必须是当前 NodeSandboxID。
+
+未显式携带 service 时,Node 从本地受信 profile 应用 legacy 映射:
 
 ```text
 profile=e2b  and port ∈ {49983,49999} → envd / ci UDS
-profile=bare and port ∈ {49983,49999} → 501
 otherwise                              → floatingip:port
 unknown or not running before timeout   → 404
 ```
+
+因此 bare 的 49983/49999 与其它合法端口一样转发到 `floatingip:port`,不具有
+envd/CI 逻辑含义,也不返回 501。
+
+CONNECT 显式携带 `E2b-Sandbox-Service` 时,service 取代 legacy 端口推导:
+
+| Service | 支持 profile | Backend | Port 语义 |
+|---|---|---|---|
+| `forward` | e2b / bare | `floatingip:port` | 必须由 `E2b-Sandbox-Port`、legacy Host 或 CONNECT authority 之一提供 |
+| `e2b:envd` | e2b | envd UDS | 可携带,但不参与 backend 选择 |
+| `e2b:code-interpreter` | e2b | CI UDS | 可携带,但不参与 backend 选择 |
+| `exec` | e2b / bare | 当前未装配,返回 501 | 可携带,但不参与 backend 选择 |
+
+bare 显式请求 `e2b:envd` 或 `e2b:code-interpreter` 返回 501。unknown/空 service 返回 400。
+service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显式 service。
 
 普通 HTTP:
 
@@ -163,26 +186,33 @@ unknown or not running before timeout   → 404
 
 CONNECT:
 
-- CONNECT 目标 host 被忽略,只取端口;
-- sandbox id 来自 `E2b-Sandbox-Id` 或 authority label;
-- 认证和路由判定同普通 HTTP;
-- 成功后把客户端连接与后端连接双向 splice。
+- sandbox id 来自 `E2b-Sandbox-Id` 或 legacy authority label;
+- legacy/`forward` 可从 CONNECT authority 取实际 port;无端口逻辑服务的 authority
+  只是 transport 占位,不会生成 `E2b-Sandbox-Port`;
+- 普通 forward/envd/CI 目标鉴权成功后,把客户端连接与后端连接双向 splice;
+- 已识别但未装配的 `exec` 直接返回 501,不触发 paused sandbox 的 Wake/resume。
 
 proxyForwarder:
 
 - conductor 收到数据面请求但处于 external 模式时,不会自己查路由;
-- 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid、port,并原样携带客户端的
+- 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid、可选 service/port,并原样携带客户端的
   `X-Access-Token`;
 - 普通 HTTP 在该 CONNECT 隧道里发送一条请求;CONNECT 则继续隧道化到沙箱。
+
+上述显式 service 支持限定在 Node internal proxy 以及 conductor 到 external worker 的
+chained CONNECT。当前 cluster Router 第二跳仍构造 legacy port target;本层不代表
+cluster 入口的完整 service 转发已实现。
 
 ## 6. 数据面鉴权
 
 数据面请求头统一为 `X-Access-Token`,但期望值按转发目标选择:
 
-- e2b 49983/49999 使用 create 响应中的 `envdAccessToken`;
-- e2b/bare 的其他允许转发端口使用 `forwardAccessToken`;
+- e2b legacy 49983/49999 以及显式 `e2b:envd`/`e2b:code-interpreter` 使用 create
+  响应中的 `envdAccessToken`;
+- bare 的任意 legacy 端口、e2b 的其它 legacy 端口和显式 `forward` 使用
+  `forwardAccessToken`;
 - `trafficAccessToken` 只供外部网关及 e2b 数据面组件验证,node proxy 不消费;
-- bare 的 49983/49999 不进入鉴权或转发,直接按不支持的控制端口处理。
+- 当前未装配的 `exec` 不进入普通 token 比较。
 
 proxy 逐请求以常数时间比较请求 token 与选中的显式字段。
 
@@ -234,8 +264,8 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
   路由,Bookmark 后清除断连期间删除的记录。
 - **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;resume
   单飞仍由 conductor 执行。
-- **失败码**:未知/未就绪 sid = 404;鉴权失败 = 401;bare 控制端口或 off = 501;
-  proxy 未注册/不可达 = 502。
+- **失败码**:非法 target = 400;未知/未就绪 sid = 404;鉴权失败 = 401;已识别但
+  profile/当前 proxy 模式不支持的 service 或 off = 501;proxy 未注册/不可达 = 502。
 
 ## 9. 性能
 
