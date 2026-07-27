@@ -765,12 +765,17 @@ func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, rr *rout
 		req.Host = apiHost
 		req.Header.Del(HeaderAccessTok) // control verbs authorize via X-API-KEY, not a client token
 	}
-	if adaptSandboxIdentity {
-		proxy.ModifyResponse = func(resp *http.Response) error {
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode == http.StatusNotFound {
+			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, rr.SandboxID, rr.NodeSandboxID)
+		}
+		if adaptSandboxIdentity {
 			return rewriteSandboxIdentityResponse(resp, rr.SandboxID, rr.NodeSandboxID)
 		}
+		return nil
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
+		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, rr.SandboxID, rr.NodeSandboxID)
 		rt.log.Warn("router: control forward", "node", rr.DataEndpoint, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}

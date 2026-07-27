@@ -606,6 +606,96 @@ func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
 	}
 }
 
+func TestControlForwardEvictsCurrentRouteOnNodeNotFound(t *testing.T) {
+	var nodeHits int
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nodeHits++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer node.Close()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileE2B)
+	rt.rememberRoute(&route)
+	rec := httptest.NewRecorder()
+
+	rt.forwardToNode(rec, httptest.NewRequest(http.MethodGet, "/sandboxes/sb-1", nil), &route, "/sandboxes/sb-1-g0", true)
+
+	if rec.Code != http.StatusNotFound || nodeHits != 1 {
+		t.Fatalf("control forward status=%d nodeHits=%d, want 404/1", rec.Code, nodeHits)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("stale route remained cached: %+v", got)
+	}
+}
+
+func TestControlForwardEvictionPreservesNewRoute(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer node.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	g0 := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileE2B)
+	rt.rememberRoute(&g0)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		rt.forwardToNode(rec, httptest.NewRequest(http.MethodGet, "/sandboxes/sb-1", nil), &g0, "/sandboxes/sb-1-g0", true)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control forward did not reach the node")
+	}
+	g1 := g0
+	g1.NodeSandboxID = "sb-1-g1"
+	g1.RouteRevision++
+	rt.rememberRoute(&g1)
+	close(release)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control forward did not complete")
+	}
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("control forward status=%d, want 404", rec.Code)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("new route was evicted: %+v", got)
+	}
+}
+
+func TestControlForwardEvictsCurrentRouteOnTransportFailure(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	node.Close()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B)
+	rt.rememberRoute(&route)
+	rec := httptest.NewRecorder()
+
+	rt.forwardToNode(rec, httptest.NewRequest(http.MethodPost, "/sandboxes/sb-1/pause", nil), &route, "/sandboxes/sb-1-g0/pause", false)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("control forward status=%d, want 502", rec.Code)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("unreachable route remained cached: %+v", got)
+	}
+}
+
 type routeRegistryFunc func(context.Context, string) ([]clusterclient.Endpoint, error)
 
 func (f routeRegistryFunc) RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error) {
