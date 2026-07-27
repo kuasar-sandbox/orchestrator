@@ -43,25 +43,34 @@ func DecodeRequest(body io.Reader, contentLength int64) (Request, error) {
 		return Request{}, nil
 	}
 
-	var wire *struct {
-		TTLSeconds json.RawMessage `json:"ttlSeconds"`
-	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&wire); err != nil || wire == nil {
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return Request{}, ErrInvalidRequest
+	}
+
+	var request Request
+	seenTTL := false
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil || key != "ttlSeconds" || seenTTL {
+			return Request{}, ErrInvalidRequest
+		}
+		seenTTL = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil ||
+			bytes.Equal(bytes.TrimSpace(value), []byte("null")) ||
+			json.Unmarshal(value, &request.TTLSeconds) != nil || request.TTLSeconds < 0 {
+			return Request{}, ErrInvalidRequest
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
 		return Request{}, ErrInvalidRequest
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return Request{}, ErrInvalidRequest
-	}
-
-	var request Request
-	if wire.TTLSeconds != nil {
-		if bytes.Equal(bytes.TrimSpace(wire.TTLSeconds), []byte("null")) ||
-			json.Unmarshal(wire.TTLSeconds, &request.TTLSeconds) != nil || request.TTLSeconds < 0 {
-			return Request{}, ErrInvalidRequest
-		}
 	}
 	return request, nil
 }

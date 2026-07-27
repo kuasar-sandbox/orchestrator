@@ -35,20 +35,24 @@ func TestDecodeRequestValidForms(t *testing.T) {
 
 func TestDecodeRequestRejectsInvalidJSONContract(t *testing.T) {
 	tests := map[string]string{
-		"whitespace only":  " \n\t ",
-		"null body":        `null`,
-		"array":            `[]`,
-		"string":           `"value"`,
-		"number":           `1`,
-		"unknown field":    `{"other":1}`,
-		"null ttl":         `{"ttlSeconds":null}`,
-		"string ttl":       `{"ttlSeconds":"1"}`,
-		"fractional ttl":   `{"ttlSeconds":1.5}`,
-		"exponent ttl":     `{"ttlSeconds":1e2}`,
-		"negative ttl":     `{"ttlSeconds":-1}`,
-		"overflow ttl":     `{"ttlSeconds":9223372036854775808}`,
-		"second object":    `{} {}`,
-		"trailing garbage": `{} x`,
+		"whitespace only":   " \n\t ",
+		"null body":         `null`,
+		"array":             `[]`,
+		"string":            `"value"`,
+		"number":            `1`,
+		"unknown field":     `{"other":1}`,
+		"case variant":      `{"TTLSeconds":1}`,
+		"upper-case field":  `{"TTLSECONDS":1}`,
+		"duplicate ttl":     `{"ttlSeconds":1,"ttlSeconds":2}`,
+		"escaped duplicate": `{"ttlSeconds":1,"\u0074tlSeconds":2}`,
+		"null ttl":          `{"ttlSeconds":null}`,
+		"string ttl":        `{"ttlSeconds":"1"}`,
+		"fractional ttl":    `{"ttlSeconds":1.5}`,
+		"exponent ttl":      `{"ttlSeconds":1e2}`,
+		"negative ttl":      `{"ttlSeconds":-1}`,
+		"overflow ttl":      `{"ttlSeconds":9223372036854775808}`,
+		"second object":     `{} {}`,
+		"trailing garbage":  `{} x`,
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
