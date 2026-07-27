@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -354,7 +355,28 @@ func acceptConnect(cmd *routesync.Command, result *routesync.ConnectResult) *rou
 }
 
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
-	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: err.Error()}
+	status, reason := clusterCommandRejection(err)
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckRejected,
+		Reason: reason, HTTPStatus: status,
+	}
+}
+
+func clusterCommandRejection(err error) (int, string) {
+	switch {
+	case errors.Is(err, migrationtoken.ErrMalformedToken),
+		errors.Is(err, migrationtoken.ErrInvalidPayload):
+		return http.StatusBadRequest, "invalid migration token"
+	case errors.Is(err, migrationtoken.ErrAuthentication),
+		errors.Is(err, migrationtoken.ErrCredentialMismatch):
+		return http.StatusForbidden, "migration credential not allowed"
+	case errors.Is(err, migrationtoken.ErrIncompatible):
+		return http.StatusConflict, "target environment incompatible"
+	case errors.Is(err, migrationtoken.ErrTokenTooLarge):
+		return http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error()
+	default:
+		return 0, err.Error()
+	}
 }
 
 // CreateCluster is the synchronous precheck + boot of a node-link create. The

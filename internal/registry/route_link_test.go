@@ -283,3 +283,31 @@ func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
 		t.Fatalf("reserve result=%+v", result)
 	}
 }
+
+func TestServeReserveConnectPropagatesTypedNodeRejection(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	record := testE2BSandboxRecord("/g", "rk", "sb-route", "n1", StatePaused)
+	if _, err := reg.stores.PutSandbox(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected,
+			Reason: "migration credential not allowed", HTTPStatus: http.StatusForbidden,
+		})
+	}})
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	req := httptest.NewRequest(http.MethodPost,
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=connect&sid=sb-route", nil)
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+	if resp.Code != http.StatusForbidden || strings.TrimSpace(resp.Body.String()) != "migration credential not allowed" {
+		t.Fatalf("status=%d body=%q, want typed node rejection", resp.Code, resp.Body.String())
+	}
+}

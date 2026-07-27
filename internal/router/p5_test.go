@@ -345,6 +345,41 @@ func TestConnectRejectsOversizedMigrationTokenBeforeReserve(t *testing.T) {
 	}
 }
 
+func TestConnectPropagatesRouteLinkMigrationRejection(t *testing.T) {
+	var reserveHits int
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/reserve" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		reserveHits++
+		http.Error(w, "migration credential not allowed", http.StatusForbidden)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes/sb-1/connect", nil)
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAPIKey, "api-key")
+	req.Header.Set(HeaderMigration, "kmt1.invalid")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden || strings.TrimSpace(string(body)) != "migration credential not allowed" || reserveHits != 1 {
+		t.Fatalf("status=%d body=%q reserveHits=%d", resp.StatusCode, body, reserveHits)
+	}
+}
+
 func TestServeDataSandboxHostUsesRouteResolve(t *testing.T) {
 	var reserveHits int
 	var routeHits int

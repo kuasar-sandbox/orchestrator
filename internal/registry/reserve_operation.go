@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
@@ -221,11 +222,7 @@ func (r *Registry) connectCurrent(ctx context.Context, req SandboxReserveRequest
 	}
 	if ack == nil || ack.Status != routesync.AckAccepted {
 		r.rollbackConnect(&current, currentRev, &before, false)
-		reason := ""
-		if ack != nil {
-			reason = ack.Reason
-		}
-		return nil, false, fmt.Errorf("registry: connect rejected: %s", reason)
+		return nil, false, connectRejection(ack)
 	}
 	if err := validateConnectResult(ack.Connect, &current); err != nil {
 		r.rollbackConnect(&current, currentRev, &before, true)
@@ -379,11 +376,10 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			r.rollbackConnect(&target, targetRev, current, false)
-			reason := ""
-			if ack != nil {
-				reason = ack.Reason
+			lastFailure = connectRejection(ack)
+			if terminalConnectRejection(lastFailure) {
+				return nil, lastFailure
 			}
-			lastFailure = fmt.Errorf("registry: connect rejected: %s", reason)
 			excluded.add(target.NodeID)
 			continue
 		}
@@ -397,6 +393,39 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		}
 		return &ReserveResult{Route: *route, Connect: cloneConnectResult(ack.Connect)}, nil
 	}
+}
+
+type nodeConnectRejection struct {
+	status int
+	reason string
+}
+
+func (e *nodeConnectRejection) Error() string { return e.reason }
+
+func connectRejection(ack *routesync.CmdAck) error {
+	reason := ""
+	status := 0
+	if ack != nil {
+		reason = ack.Reason
+		status = ack.HTTPStatus
+	}
+	switch status {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict, http.StatusRequestEntityTooLarge:
+		if reason == "" {
+			reason = http.StatusText(status)
+		}
+		return &nodeConnectRejection{status: status, reason: reason}
+	default:
+		return fmt.Errorf("registry: connect rejected: %s", reason)
+	}
+}
+
+func terminalConnectRejection(err error) bool {
+	var rejected *nodeConnectRejection
+	if !errors.As(err, &rejected) {
+		return false
+	}
+	return rejected.status != http.StatusConflict
 }
 
 func (r *Registry) reserveData(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {

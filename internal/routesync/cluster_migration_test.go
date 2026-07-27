@@ -44,6 +44,18 @@ func TestNodeLinkConnectAckRoundTripPreservesTypedResult(t *testing.T) {
 	}
 }
 
+func TestNodeLinkRejectedAckRoundTripPreservesHTTPStatus(t *testing.T) {
+	want := &CmdAck{
+		CmdID: "connect-rejected", Status: AckRejected,
+		Reason: "migration credential not allowed", HTTPStatus: 403,
+	}
+	got := roundTrip(t, &Msg{Type: TypeCmdAck, Ack: want})
+	if got.Ack == nil || got.Ack.CmdID != want.CmdID || got.Ack.Status != want.Status ||
+		got.Ack.Reason != want.Reason || got.Ack.HTTPStatus != want.HTTPStatus {
+		t.Fatalf("rejected ack round-trip: %+v", got.Ack)
+	}
+}
+
 func TestNodeLinkMigrationTokenWireSizeLimit(t *testing.T) {
 	exact := &Msg{
 		Type: TypeCommand,

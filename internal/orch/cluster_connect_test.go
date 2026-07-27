@@ -3,6 +3,8 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -88,8 +90,37 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		},
 		MigrationToken: strings.Repeat("!", migrationtoken.MaxWireSize+1),
 	})
-	if ack.Status != routesync.AckRejected || ack.Reason != migrationtoken.ErrTokenTooLarge.Error() {
+	if ack.Status != routesync.AckRejected || ack.Reason != migrationtoken.ErrTokenTooLarge.Error() ||
+		ack.HTTPStatus != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized existing-target connect ack = %+v", ack)
+	}
+}
+
+func TestClusterCommandRejectMapsMigrationErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantReason string
+	}{
+		{name: "malformed", err: migrationtoken.ErrMalformedToken, wantStatus: http.StatusBadRequest, wantReason: "invalid migration token"},
+		{name: "invalid payload", err: migrationtoken.ErrInvalidPayload, wantStatus: http.StatusBadRequest, wantReason: "invalid migration token"},
+		{name: "authentication", err: migrationtoken.ErrAuthentication, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
+		{name: "fingerprint", err: migrationtoken.ErrCredentialMismatch, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
+		{name: "incompatible", err: migrationtoken.ErrIncompatible, wantStatus: http.StatusConflict, wantReason: "target environment incompatible"},
+		{name: "too large", err: migrationtoken.ErrTokenTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantReason: migrationtoken.ErrTokenTooLarge.Error()},
+		{name: "unclassified", err: errors.New("ordinary rejection"), wantReason: "private-detail: ordinary rejection"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ack := reject(&routesync.Command{CmdID: "connect-rejected"}, fmt.Errorf("private-detail: %w", tc.err))
+			if ack.Status != routesync.AckRejected || ack.HTTPStatus != tc.wantStatus || ack.Reason != tc.wantReason {
+				t.Fatalf("ack = %+v, want status=%d reason=%q", ack, tc.wantStatus, tc.wantReason)
+			}
+			if tc.wantStatus != 0 && strings.Contains(ack.Reason, "private-detail") {
+				t.Fatalf("typed rejection exposed private detail: %+v", ack)
+			}
+		})
 	}
 }
 

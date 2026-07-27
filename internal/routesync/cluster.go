@@ -205,8 +205,9 @@ type ConnectResult struct {
 // synchronously prepared result; asynchronous resume completion still arrives
 // through the route stream.
 type CmdAck struct {
-	CmdID   string         `json:"cmd_id"`
-	Status  string         `json:"status"` // AckAccepted | AckRejected
-	Reason  string         `json:"reason,omitempty"`
-	Connect *ConnectResult `json:"connect,omitempty"`
+	CmdID      string         `json:"cmd_id"`
+	Status     string         `json:"status"` // AckAccepted | AckRejected
+	Reason     string         `json:"reason,omitempty"`
+	HTTPStatus int            `json:"http_status,omitempty"`
+	Connect    *ConnectResult `json:"connect,omitempty"`
 }

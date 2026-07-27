@@ -299,6 +299,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func routeLinkStatus(err error) int {
+	var rejected *nodeConnectRejection
+	if errors.As(err, &rejected) {
+		return rejected.status
+	}
 	switch {
 	case errors.Is(err, ErrReserveBadRequest), errors.Is(err, errInvalidSandboxConfig):
 		return http.StatusBadRequest

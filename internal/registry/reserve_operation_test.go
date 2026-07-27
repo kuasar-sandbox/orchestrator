@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -319,7 +320,10 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 		mu.Lock()
 		commands["n1"] = cmd
 		mu.Unlock()
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "candidate refused"})
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected,
+			Reason: "target environment incompatible", HTTPStatus: http.StatusConflict,
+		})
 	}})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
 		mu.Lock()
@@ -377,6 +381,68 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 	if err != nil || !found || stored.State != StateReserved || stored.SandboxGeneration != 2 ||
 		stored.NextSandboxGeneration != 3 || stored.NodeSandboxID != n2.SID || !sameRouteCredentials(stored, original) {
 		t.Fatalf("migration route=%+v found=%v err=%v", stored, found, err)
+	}
+}
+
+func TestReserveConnectMigrationStopsOnRequestWideNodeRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		reason string
+	}{
+		{name: "malformed", status: http.StatusBadRequest, reason: "invalid migration token"},
+		{name: "credential", status: http.StatusForbidden, reason: "migration credential not allowed"},
+		{name: "too large", status: http.StatusRequestEntityTooLarge, reason: migrationtoken.ErrTokenTooLarge.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			original := testE2BSandboxRecord("/g", "rk", "sb-terminal", "gone", StatePaused)
+			if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			for _, nodeID := range []string{"n1", "n2"} {
+				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+				go reg.ackCommand(&routesync.CmdAck{
+					CmdID: cmd.CmdID, Status: routesync.AckRejected,
+					Reason: tc.reason, HTTPStatus: tc.status,
+				})
+			}})
+			secondCommands := 0
+			reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(*routesync.Command) {
+				secondCommands++
+			}})
+			placements := 0
+			reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+				placements++
+				nodeID := "n1"
+				if placements > 1 {
+					nodeID = "n2"
+				}
+				return &Placement{NodeID: nodeID, APISecretFingerprint: original.APISecretFingerprint}, nil
+			}))
+
+			req := testConnectReserve(original)
+			req.MigrationToken = "kmt1.invalid-for-all-candidates"
+			result, err := reg.ReserveSandbox(ctx, req)
+			var rejected *nodeConnectRejection
+			if result != nil || !errors.As(err, &rejected) || rejected.status != tc.status || rejected.reason != tc.reason {
+				t.Fatalf("result=%+v err=%v rejection=%+v", result, err, rejected)
+			}
+			if placements != 1 || secondCommands != 0 {
+				t.Fatalf("terminal rejection placements=%d secondCommands=%d, want 1/0", placements, secondCommands)
+			}
+			stored, _, found, err := reg.stores.GetSandbox(ctx, original.Group, original.RouteKey)
+			if err != nil || !found || stored.NodeID != original.NodeID ||
+				stored.NodeSandboxID != original.NodeSandboxID || stored.SandboxGeneration != original.SandboxGeneration ||
+				stored.NextSandboxGeneration != 2 || stored.State != original.State {
+				t.Fatalf("terminal rejection rollback=%+v found=%v err=%v", stored, found, err)
+			}
+		})
 	}
 }
 
