@@ -364,7 +364,7 @@ echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
-REQ_MMDS_HEADER="{\"schema_version\":1,\"endpoints\":[{\"name\":\"user-data\",\"path\":\"/latest/user-data\",\"backend\":{\"type\":\"store\"}},{\"name\":\"credentials\",\"path\":\"/latest/credentials\",\"backend\":{\"type\":\"relay\",\"url\":\"$RELAY_URL\",\"auth\":{\"header_name\":\"X-MMDS-E2E-Auth\"}}}]}"
+REQ_MMDS_HEADER="{\"endpoints\":[{\"name\":\"user-data\",\"path\":\"/latest/user-data\",\"backend\":{\"type\":\"store\"}},{\"name\":\"credentials\",\"path\":\"/latest/credentials\",\"backend\":{\"type\":\"relay\",\"url\":\"$RELAY_URL\",\"auth\":{\"header_name\":\"X-MMDS-E2E-Auth\"}}}]}"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
 unset REQ_MMDS_HEADER
 if [ "$code" != "201" ]; then
