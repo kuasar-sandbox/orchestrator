@@ -147,8 +147,8 @@ func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwar
 		}
 		return Route{Kind: KindUDS, UDS: ciUDS, AccessToken: envdAccessToken}
 	case ConnectServiceExec:
-		// #64 replaces this recognized boundary with the authenticated ctl.sock
-		// gate. Until then it is deliberately distinct from an unknown service.
+		// Exec CONNECT is dispatched to the authenticated ctl.sock path before
+		// generic route lookup. Keep direct route-selection callers fail-closed.
 		return Route{Kind: KindDeny}
 	default:
 		// HTTP parsing rejects unknown services before route lookup. Keep direct

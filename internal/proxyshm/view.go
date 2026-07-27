@@ -201,9 +201,9 @@ func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.Connect
 			current.Profile, current.EnvdUDS, current.CiUDS, current.FloatingIP,
 			current.EnvdAccessToken, current.ForwardAccessToken, target,
 		)
-		// Do not wake a paused sandbox for a recognized target that has no
-		// backend. service=exec remains this side-effect-free 501 boundary until
-		// #64 installs its authenticated wake + ctl.sock path.
+		// Generic route resolution does not wake a paused sandbox for a target
+		// with no backend. Exec CONNECT is handled earlier by the authenticated
+		// LookupExec/ActivateExec path; direct Route callers remain fail-closed.
 		if selected.Kind == proxy.KindDeny {
 			return selected, nil
 		}

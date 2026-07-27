@@ -597,9 +597,9 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy
 		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
 		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
 	)
-	// A recognized but unsupported logical service has no backend to activate.
-	// In particular, service=exec remains a side-effect-free 501 boundary until
-	// #64 installs its authenticated ctl.sock gate.
+	// A recognized but unsupported logical service has no generic backend to
+	// activate. Exec CONNECT is handled earlier by the authenticated
+	// LookupExec/ActivateExec path; direct Route callers remain fail-closed.
 	if selected.Kind == proxy.KindDeny {
 		return selected, nil
 	}
