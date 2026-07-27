@@ -354,6 +354,107 @@ func TestConnectRejectsOversizedMigrationTokenHeader(t *testing.T) {
 	}
 }
 
+func TestCreateExecSessionPassesStrictRequestAndReturnsOnlyToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantTTL int64
+	}{
+		{name: "empty"},
+		{name: "object", body: `{}`},
+		{name: "ttl", body: `{"ttlSeconds":37}`, wantTTL: 37},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotID, gotAPIKey, gotMigrationToken string
+			var gotTTL int64
+			core := &execSessionCoreStub{execSession: func(_ context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error) {
+				gotID, gotAPIKey, gotMigrationToken, gotTTL = id, apiKey, migrationToken, ttlSeconds
+				return "kat1.exec", nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			headers := header(MigrationTokenHeader, "kmt1.opaque")
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader(test.body), headers)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201; body=%s", response.Code, response.Body.String())
+			}
+			if gotID != "stable" || gotAPIKey != apiKey || gotMigrationToken != "kmt1.opaque" || gotTTL != test.wantTTL {
+				t.Fatalf("ExecSession args = id=%q apiKey=%q migration=%q ttl=%d", gotID, gotAPIKey, gotMigrationToken, gotTTL)
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", got)
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != 1 || payload["execAccessToken"] != "kat1.exec" {
+				t.Fatalf("response = %#v", payload)
+			}
+		})
+	}
+}
+
+func TestCreateExecSessionRejectsBodyBeforeCore(t *testing.T) {
+	called := false
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+		called = true
+		return "", nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{name: "unknown", body: `{"unknown":true}`, wantStatus: http.StatusBadRequest},
+		{name: "negative ttl", body: `{"ttlSeconds":-1}`, wantStatus: http.StatusBadRequest},
+		{name: "second value", body: `{} {}`, wantStatus: http.StatusBadRequest},
+		{name: "oversized streamed", body: `{}` + strings.Repeat(" ", 64<<10-1), wantStatus: http.StatusRequestEntityTooLarge},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader(test.body))
+			request.ContentLength = -1
+			request.Header.Set("X-API-KEY", apiKey)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+		})
+	}
+	if called {
+		t.Fatal("invalid exec-session request reached Core")
+	}
+}
+
+func TestCreateExecSessionRejectsOversizedMigrationTokenBeforeCore(t *testing.T) {
+	called := false
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+		called = true
+		return "", nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader("{}"),
+		header(MigrationTokenHeader, strings.Repeat("x", migrationtoken.MaxWireSize+1)))
+	if response.Code != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("status = %d, want 431; body=%s", response.Code, response.Body.String())
+	}
+	if called {
+		t.Fatal("oversized migration token reached Core.ExecSession")
+	}
+}
+
+type execSessionCoreStub struct {
+	Core
+	execSession func(context.Context, string, string, string, int64) (string, error)
+}
+
+func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error) {
+	return c.execSession(ctx, id, apiKey, migrationToken, ttlSeconds)
+}
+
 type migrationCoreStub struct {
 	Core
 	importSandbox func(context.Context, string, string, string) (string, error)
