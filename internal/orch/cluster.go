@@ -55,7 +55,8 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
-		sb, err := o.prepareClusterConnect(ctx, cmd)
+		requestedDeadline := clusterConnectDeadline(cmd.TimeoutSeconds)
+		sb, err := o.prepareClusterConnect(ctx, cmd, requestedDeadline)
 		if err != nil {
 			return reject(cmd, err)
 		}
@@ -63,8 +64,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if err != nil {
 			return reject(cmd, err)
 		}
-		requestedDeadline, err := o.applyClusterConnectDeadline(ctx, sb, cmd.TimeoutSeconds)
-		if err != nil {
+		if err := o.applyClusterConnectDeadline(ctx, sb, requestedDeadline); err != nil {
 			return reject(cmd, err)
 		}
 		if sb.State == types.StatePaused {
@@ -526,7 +526,7 @@ func validateClusterSandboxContext(sb *types.Sandbox, cmd *routesync.Command) er
 // prepareClusterConnect validates an existing exact target without touching the
 // optional token. If the target is absent, it synchronously authenticates and
 // imports KMT1 under the Registry-selected NodeSandboxID before the Ack is sent.
-func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
+func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync.Command, requestedDeadline int64) (*types.Sandbox, error) {
 	if cmd == nil || !types.ValidLocalSandboxID(cmd.SID) || cmd.APISecretFingerprint == "" {
 		return nil, fmt.Errorf("cluster connect: valid sandbox id and API secret fingerprint are required")
 	}
@@ -570,6 +570,7 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		cmd.SID,
 		migrationtoken.Expectations{AuthSandboxID: authSandboxID, Profile: profile},
 		&types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		requestedDeadline,
 	)
 	if err != nil {
 		if !errors.Is(err, api.ErrAlreadyExists) {
@@ -588,23 +589,29 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 	return sb, nil
 }
 
-// applyClusterConnectDeadline persists an explicitly positive connect timeout
-// before CmdAck is returned. A missing or non-positive timeout preserves the
-// existing row deadline, matching the standalone /connect contract.
-func (o *Orchestrator) applyClusterConnectDeadline(ctx context.Context, sb *types.Sandbox, timeoutSeconds int) (int64, error) {
-	if sb == nil {
-		return 0, fmt.Errorf("cluster connect: sandbox row is required")
-	}
+func clusterConnectDeadline(timeoutSeconds int) int64 {
 	if timeoutSeconds <= 0 {
-		return 0, nil
+		return 0
 	}
-	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
+	return time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
+}
+
+// applyClusterConnectDeadline persists an explicitly positive absolute deadline
+// for an existing or concurrently inserted target. A freshly imported target
+// receives the same value in its insert and does not pass through this update.
+func (o *Orchestrator) applyClusterConnectDeadline(ctx context.Context, sb *types.Sandbox, deadline int64) error {
+	if sb == nil {
+		return fmt.Errorf("cluster connect: sandbox row is required")
+	}
+	if deadline <= 0 || sb.DeadlineUnix == deadline {
+		return nil
+	}
 	if err := o.st.SetDeadline(ctx, sb.ID, deadline); err != nil {
-		return 0, fmt.Errorf("cluster connect: persist deadline: %w", err)
+		return fmt.Errorf("cluster connect: persist deadline: %w", err)
 	}
 	sb.DeadlineUnix = deadline
 	o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.DeadlineUnix = deadline })
-	return deadline, nil
+	return nil
 }
 
 func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {

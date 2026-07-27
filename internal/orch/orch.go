@@ -470,9 +470,21 @@ func (o *Orchestrator) scheduleResume(id string) {
 		defer o.releaseResumeRequest(request)
 		ctx := o.asyncCtx()
 		if err := o.resumeSandboxRequest(ctx, request); err != nil {
+			o.publishPausedAfterResumeFailure(context.WithoutCancel(ctx), id)
 			o.log.Error("sandbox connect resume", "sid", id, "err", err)
 		}
 	}()
+}
+
+func (o *Orchestrator) publishPausedAfterResumeFailure(ctx context.Context, id string) {
+	sb, err := o.st.Get(ctx, id)
+	if err != nil {
+		o.log.Error("sandbox connect reload after resume failure", "sid", id, "err", err)
+		return
+	}
+	if sb != nil && sb.State == types.StatePaused {
+		o.publishUpsert(sb)
+	}
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {

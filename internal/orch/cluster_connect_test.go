@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -105,6 +106,105 @@ func TestHandleClusterConnectMissingTargetRequiresMigrationToken(t *testing.T) {
 	}
 	if sb, err := o.st.Get(context.Background(), "stable-g1"); err != nil || sb != nil {
 		t.Fatalf("missing-target connect inserted a row: sandbox=%+v err=%v", sb, err)
+	}
+}
+
+func TestHandleClusterConnectWritesImportedDeadlineInInitialInsert(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 1)}
+	fixture.o.vs = failingVS
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_connect_deadline_update BEFORE UPDATE OF deadline_unix ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced connect deadline update failure'); END`)
+
+	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.TimeoutSeconds = 41
+	deadlineFloor := time.Now().Add(40 * time.Second).Unix()
+	ack := fixture.o.HandleCommand(context.Background(), cmd)
+	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("missing-target connect with failing deadline UPDATE = %+v", ack)
+	}
+	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
+	if err != nil || stored == nil {
+		t.Fatalf("read imported target: sandbox=%+v err=%v", stored, err)
+	}
+	if stored.DeadlineUnix < deadlineFloor || stored.DeadlineUnix > time.Now().Add(42*time.Second).Unix() {
+		t.Fatalf("inserted deadline = %d, want approximately now+41s", stored.DeadlineUnix)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+}
+
+func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 2)}
+	fixture.o.vs = failingVS
+
+	initial := fixture.command("stable-g1", fixture.token)
+	if ack := fixture.o.HandleCommand(context.Background(), initial); ack.Status != routesync.AckAccepted {
+		t.Fatalf("initial import ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	before, err := fixture.o.st.Get(context.Background(), initial.SID)
+	if err != nil || before == nil {
+		t.Fatalf("read initial target: sandbox=%+v err=%v", before, err)
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_existing_connect_deadline BEFORE UPDATE OF deadline_unix ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced existing deadline update failure'); END`)
+	retry := fixture.command(initial.SID, "malformed-token-is-ignored")
+	retry.CmdID = "connect-existing-timeout"
+	retry.TimeoutSeconds = 23
+	ack := fixture.o.HandleCommand(context.Background(), retry)
+	if ack.Status != routesync.AckRejected || ack.Connect != nil || !strings.Contains(ack.Reason, "persist deadline") {
+		t.Fatalf("existing-target deadline failure ack = %+v", ack)
+	}
+	after, err := fixture.o.st.Get(context.Background(), initial.SID)
+	if err != nil || after == nil || after.DeadlineUnix != before.DeadlineUnix {
+		t.Fatalf("failed existing deadline update changed row: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 2)}
+	fixture.o.vs = failingVS
+	events, cancel := fixture.o.Subscribe()
+	defer cancel()
+
+	cmd := fixture.command("stable-g1", fixture.token)
+	if ack := fixture.o.HandleCommand(context.Background(), cmd); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("initial connect ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitPausedClusterRoute(t, events, cmd.SID)
+	if stored, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("failed resume row = %+v err=%v, want paused", stored, err)
+	}
+
+	retry := fixture.command(cmd.SID, "malformed-token-is-ignored")
+	retry.CmdID = "connect-retry"
+	if ack := fixture.o.HandleCommand(context.Background(), retry); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("retry connect ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitPausedClusterRoute(t, events, cmd.SID)
+}
+
+func waitClusterConnectAttempt(t *testing.T, attempted <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-attempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("asynchronous cluster resume did not reach the failing vswitch")
+	}
+}
+
+func waitPausedClusterRoute(t *testing.T, events <-chan routesync.Event, sid string) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sid || event.Route.State != routesync.StatePaused {
+			t.Fatalf("resume failure event = %+v, want paused upsert for %s", event, sid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume failure did not republish the paused route")
 	}
 }
 
@@ -246,7 +346,7 @@ func TestPrepareClusterConnectRejectsTokenMismatchBeforeInsert(t *testing.T) {
 			fixture := newClusterConnectFixture(t)
 			cmd := fixture.command("stable-g1", fixture.token)
 			wantErr := mutate(t, fixture, cmd)
-			if _, err := fixture.o.prepareClusterConnect(context.Background(), cmd); !errors.Is(err, wantErr) {
+			if _, err := fixture.o.prepareClusterConnect(context.Background(), cmd, 0); !errors.Is(err, wantErr) {
 				t.Fatalf("prepareClusterConnect error = %v, want %v", err, wantErr)
 			}
 			if sb, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || sb != nil {
@@ -294,7 +394,7 @@ func TestPrepareClusterConnectConcurrentTargetIsInsertOnly(t *testing.T) {
 		go func(i int, token string) {
 			defer wg.Done()
 			<-start
-			sb, err := fixture.o.prepareClusterConnect(context.Background(), fixture.command("stable-g1", token))
+			sb, err := fixture.o.prepareClusterConnect(context.Background(), fixture.command("stable-g1", token), 0)
 			results <- result{sandbox: sb, err: err}
 		}(i, token)
 	}
@@ -341,6 +441,7 @@ func TestHandleClusterConnectRejectsInvalidTargetID(t *testing.T) {
 
 type clusterConnectFixture struct {
 	o           *Orchestrator
+	dbPath      string
 	pair        store.KeyPair
 	fingerprint string
 	source      *types.Sandbox
@@ -350,6 +451,7 @@ type clusterConnectFixture struct {
 func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	t.Helper()
 	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "node.db")
 	o := migrationOrchestrator(t, dir, []byte("cluster-runtime"))
 	// migrationOrchestrator intentionally builds a minimal Config without loading
 	// defaults; provide the one network value needed for the async-resume probe to
@@ -382,7 +484,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &clusterConnectFixture{o: o, pair: pair, fingerprint: fingerprint, source: source, token: token}
+	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token}
 }
 
 func (f *clusterConnectFixture) command(targetID, token string) *routesync.Command {
@@ -444,3 +546,15 @@ func (v *blockingClusterConnectVS) Attach(ctx context.Context, _ vswitch.AttachR
 
 func (*blockingClusterConnectVS) Detach(context.Context, string) error { return nil }
 func (*blockingClusterConnectVS) TapFD(string) vswitch.TapFD           { return vswitch.TapFD{} }
+
+type failingClusterConnectVS struct {
+	attempted chan struct{}
+}
+
+func (v *failingClusterConnectVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	v.attempted <- struct{}{}
+	return nil, errors.New("forced cluster resume failure")
+}
+
+func (*failingClusterConnectVS) Detach(context.Context, string) error { return nil }
+func (*failingClusterConnectVS) TapFD(string) vswitch.TapFD           { return vswitch.TapFD{} }
