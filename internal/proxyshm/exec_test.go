@@ -1,0 +1,249 @@
+package proxyshm
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+)
+
+const workerExecServiceSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *testing.T) {
+	tbl := newExecTable(t)
+	for _, route := range []routesync.RouteEntry{
+		execWorkerRoute("paused", routesync.StatePaused),
+		execWorkerRoute("running", routesync.StateRunning),
+		execWorkerRoute("dead", routesync.StateDead),
+		{SandboxID: "missing-auth", State: routesync.StatePaused, ServiceSecret: workerExecServiceSecret},
+		{SandboxID: "missing-secret", State: routesync.StateRunning, AuthSandboxID: "stable-missing-secret"},
+	} {
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tbl.Bookmark()
+
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+	for _, sid := range []string{"paused", "running"} {
+		got, found, err := view.LookupExec(context.Background(), sid)
+		if err != nil || !found {
+			t.Fatalf("LookupExec(%q) = %+v, %v, %v", sid, got, found, err)
+		}
+		want := execWorkerIdentity(sid)
+		if got != want {
+			t.Fatalf("LookupExec(%q) identity = %+v, want %+v", sid, got, want)
+		}
+	}
+	for _, sid := range []string{"dead", "missing-auth", "missing-secret", "unknown"} {
+		got, found, err := view.LookupExec(context.Background(), sid)
+		if err != nil || found || got != (proxy.ExecIdentity{}) {
+			t.Fatalf("LookupExec(%q) = %+v, %v, %v, want absent", sid, got, found, err)
+		}
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("side-effect-free lookups emitted %d wakes", got)
+	}
+	paused, ok := tbl.Lookup("paused")
+	if !ok || paused.State != routesync.StatePaused {
+		t.Fatalf("paused route changed during lookup: %+v ok=%v", paused, ok)
+	}
+}
+
+func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *testing.T) {
+	tbl := newExecTable(t)
+	route := execWorkerRoute("paused", routesync.StatePaused)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+
+	updates := &Updates{ch: make(chan struct{})}
+	wakes := make(chan string, 1)
+	view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second)
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	expected := execWorkerIdentity(route.SandboxID)
+	go func() {
+		identity, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+		done <- result{identity: identity, found: found, err: err}
+	}()
+
+	select {
+	case sid := <-wakes:
+		if sid != route.SandboxID {
+			t.Fatalf("wake sid = %q, want %q", sid, route.SandboxID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authorized paused activation did not wake sandbox")
+	}
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+
+	select {
+	case got := <-done:
+		if got.err != nil || !got.found || got.identity != expected {
+			t.Fatalf("ActivateExec() = %+v, %v, %v, want matching running identity", got.identity, got.found, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activation did not observe running update")
+	}
+}
+
+func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testing.T) {
+	t.Run("already running", func(t *testing.T) {
+		tbl := newExecTable(t)
+		route := execWorkerRoute("running", routesync.StateRunning)
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+		tbl.Bookmark()
+		var wakes atomic.Int32
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+		expected := execWorkerIdentity(route.SandboxID)
+		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+		if err != nil || !found || got != expected {
+			t.Fatalf("ActivateExec(running) = %+v, %v, %v", got, found, err)
+		}
+		if wakes.Load() != 0 {
+			t.Fatal("running sandbox was woken")
+		}
+	})
+
+	t.Run("mismatched expected identity", func(t *testing.T) {
+		tbl := newExecTable(t)
+		route := execWorkerRoute("mismatch", routesync.StatePaused)
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+		tbl.Bookmark()
+		var wakes atomic.Int32
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, 50*time.Millisecond)
+		expected := execWorkerIdentity(route.SandboxID)
+		expected.AuthSandboxID = "different-lineage"
+		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+		if err != nil || found || got != (proxy.ExecIdentity{}) {
+			t.Fatalf("ActivateExec(mismatch) = %+v, %v, %v", got, found, err)
+		}
+		if wakes.Load() != 0 {
+			t.Fatal("mismatched identity woke paused sandbox")
+		}
+	})
+
+	t.Run("identity changes while resuming", func(t *testing.T) {
+		tbl := newExecTable(t)
+		route := execWorkerRoute("drift", routesync.StatePaused)
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+		tbl.Bookmark()
+		updates := &Updates{ch: make(chan struct{})}
+		wakes := make(chan string, 1)
+		view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second)
+		type result struct {
+			identity proxy.ExecIdentity
+			found    bool
+			err      error
+		}
+		done := make(chan result, 1)
+		expected := execWorkerIdentity(route.SandboxID)
+		go func() {
+			identity, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+			done <- result{identity: identity, found: found, err: err}
+		}()
+		select {
+		case <-wakes:
+		case <-time.After(time.Second):
+			t.Fatal("activation did not wake paused sandbox")
+		}
+		route.State = routesync.StateRunning
+		route.AuthSandboxID = "replacement-lineage"
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+		updates.bump()
+		select {
+		case got := <-done:
+			if got.err != nil || got.found || got.identity != (proxy.ExecIdentity{}) {
+				t.Fatalf("ActivateExec(identity drift) = %+v, %v, %v", got.identity, got.found, got.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("activation did not reject identity drift")
+		}
+	})
+}
+
+func TestExternalExecInvalidKATDoesNotWakeOrDial(t *testing.T) {
+	tbl := newExecTable(t)
+	route := execWorkerRoute("external", routesync.StatePaused)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	var wakes atomic.Int32
+	var dials atomic.Int32
+	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+	px := proxy.NewWithDialer(view, func() string { return "off" }, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}, t.TempDir())
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, route.SandboxID)
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	req.Header.Set(proxy.HeaderAccessToken, "not-a-kat")
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid KAT response = %d, want 401", resp.Code)
+	}
+	if wakes.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("invalid KAT caused side effects: wakes=%d dials=%d", wakes.Load(), dials.Load())
+	}
+}
+
+func newExecTable(t *testing.T) *Table {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tbl.Close() })
+	tbl.BeginSync()
+	return tbl
+}
+
+func execWorkerRoute(sid, state string) routesync.RouteEntry {
+	return routesync.RouteEntry{
+		SandboxID:     sid,
+		State:         state,
+		AuthSandboxID: "stable-" + sid,
+		ServiceSecret: workerExecServiceSecret,
+	}
+}
+
+func execWorkerIdentity(sid string) proxy.ExecIdentity {
+	return proxy.ExecIdentity{
+		NodeSandboxID: sid,
+		AuthSandboxID: "stable-" + sid,
+		ServiceSecret: workerExecServiceSecret,
+	}
+}

@@ -221,6 +221,76 @@ func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.Connect
 	), nil
 }
 
+// LookupExec reads the node-local identity needed by the exec KAT gate. It is
+// deliberately side-effect-free: a paused route remains paused and no Wake is
+// emitted until the caller has authenticated the capability.
+func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIdentity, bool, error) {
+	if !v.waitSynced(ctx) {
+		return proxy.ExecIdentity{}, false, nil
+	}
+	r, ok := v.table.Lookup(sid)
+	identity, present := workerExecIdentity(r, ok)
+	return identity, present, nil
+}
+
+// ActivateExec is entered only after the proxy has authenticated the KAT against
+// expected. It wakes a paused sandbox, waits for the running route update, and
+// rejects any node-local or credential identity change before returning.
+func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
+	if !v.waitSynced(ctx) {
+		return proxy.ExecIdentity{}, false, nil
+	}
+	r, ok := v.table.Lookup(sid)
+	identity, present := workerExecIdentity(r, ok)
+	if !present || identity != expected {
+		return proxy.ExecIdentity{}, false, nil
+	}
+	if r.State == routesync.StateRunning {
+		return identity, true, nil
+	}
+	if v.wake != nil {
+		v.wake(sid)
+	}
+	identity, present = v.waitExecRunning(ctx, sid, expected)
+	return identity, present, nil
+}
+
+func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity, bool) {
+	if !found || (r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+		return proxy.ExecIdentity{}, false
+	}
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: r.SandboxID,
+		AuthSandboxID: r.AuthSandboxID,
+		ServiceSecret: r.ServiceSecret,
+	}
+	if identity.NodeSandboxID == "" || identity.AuthSandboxID == "" || identity.ServiceSecret == "" {
+		return proxy.ExecIdentity{}, false
+	}
+	return identity, true
+}
+
+func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool) {
+	deadline := time.Now().Add(v.parkTimeout())
+	for {
+		if ctx.Err() != nil {
+			return proxy.ExecIdentity{}, false
+		}
+		rev := v.table.Rev()
+		r, ok := v.table.Lookup(sid)
+		identity, present := workerExecIdentity(r, ok)
+		if !present || identity != expected {
+			return proxy.ExecIdentity{}, false
+		}
+		if r.State == routesync.StateRunning {
+			return identity, true
+		}
+		if !v.waitChange(ctx, deadline, rev) {
+			return proxy.ExecIdentity{}, false
+		}
+	}
+}
+
 func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
 	if !v.waitSynced(ctx) {
 		return routesync.RouteEntry{}, false
@@ -302,6 +372,8 @@ func (v *WorkerView) waitChange(ctx context.Context, deadline time.Time, rev uin
 		return v.table.Rev() != rev
 	}
 }
+
+var _ proxy.ExecRouter = (*WorkerView)(nil)
 
 // Updates converts a notification pipe into local waitable revisions.
 type Updates struct {
