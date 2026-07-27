@@ -329,6 +329,7 @@ if [ "$code" != "201" ]; then
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
 
 # ---- list -----------------------------------------------------------------
@@ -394,7 +395,7 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
 grep -q 'EXIT_CODE 0' "$WORK/start-user-port.out" || { sed 's/^/  envd| /' "$WORK/start-user-port.out"; fail "start guest user-port server"; }
 ok=""
 for _ in $(seq 1 30); do
-    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$ENVD_TOKEN" || true)
+    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$FORWARD_TOKEN" || true)
     grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
     sleep 0.5
 done
