@@ -51,6 +51,8 @@ type Orchestrator struct {
 	vs  vsClient
 	log *slog.Logger
 
+	sandboxReadyTimeout time.Duration
+
 	mu             sync.Mutex
 	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
@@ -98,14 +100,15 @@ type clusterBuild struct {
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:             map[string]*types.Sandbox{},
-		clusterCreates:  map[string]struct{}{},
-		deadlineIntents: map[string]struct{}{},
-		subs:            map[int]chan routesync.Event{},
-		routeFP:         uuid.NewString(),
-		pend:            map[string]*pendingBuild{},
-		clusterBuilds:   map[string]*clusterBuild{},
-		buildEvents:     make(chan *routesync.BuildEvent, 64),
+		sandboxReadyTimeout: 60 * time.Second,
+		reg:                 map[string]*types.Sandbox{},
+		clusterCreates:      map[string]struct{}{},
+		deadlineIntents:     map[string]struct{}{},
+		subs:                map[int]chan routesync.Event{},
+		routeFP:             uuid.NewString(),
+		pend:                map[string]*pendingBuild{},
+		clusterBuilds:       map[string]*clusterBuild{},
+		buildEvents:         make(chan *routesync.BuildEvent, 64),
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -278,7 +281,11 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 		// Headroom for a cold microVM boot + envd ready; FC mode (mmds.enabled) adds the
 		// MMDS poll handshake, and a remote-snapshot restore (migration/fork) is heavier
 		// than a warm img cold-boot.
-		if err := o.waitReady(ctx, sb, 60*time.Second); err != nil {
+		readyTimeout := o.sandboxReadyTimeout
+		if readyTimeout <= 0 {
+			readyTimeout = 60 * time.Second
+		}
+		if err := o.waitReady(ctx, sb, readyTimeout); err != nil {
 			return err
 		}
 		if err := o.envdInit(ctx, sb); err != nil {
@@ -470,7 +477,6 @@ func (o *Orchestrator) scheduleResume(id string) {
 		defer o.releaseResumeRequest(request)
 		ctx := o.asyncCtx()
 		if err := o.resumeSandboxRequest(ctx, request); err != nil {
-			o.publishPausedAfterResumeFailure(context.WithoutCancel(ctx), id)
 			o.log.Error("sandbox connect resume", "sid", id, "err", err)
 		}
 	}()
@@ -483,6 +489,7 @@ func (o *Orchestrator) publishPausedAfterResumeFailure(ctx context.Context, id s
 		return
 	}
 	if sb != nil && sb.State == types.StatePaused {
+		o.cache(sb)
 		o.publishUpsert(sb)
 	}
 }
@@ -533,16 +540,29 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDe
 		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
 	}
 	if err := o.launch(ctx, &nb, tmpl); err != nil {
-		return err
-	}
-	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
-		return err
+		return errors.Join(err, o.rollbackFailedResume(sb, &nb))
 	}
 	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
 	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
 	return nil
+}
+
+func (o *Orchestrator) rollbackFailedResume(original, attempted *types.Sandbox) error {
+	if attempted == nil {
+		return nil
+	}
+	ctx := context.Background()
+	o.teardown(ctx, attempted)
+	// launch persists the new runner from inside the pool assignment callback.
+	// Before that point the stored row is still the original paused record and
+	// needs no state rollback.
+	if original == nil || attempted.RunID == "" || attempted.RunID == original.RunID {
+		return nil
+	}
+	_, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateRunning, types.StatePaused)
+	return err
 }
 
 // --- proxy.Router (internal mode) ---
@@ -590,7 +610,11 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, preserveD
 	if sb.State != types.StatePaused {
 		return nil
 	}
-	return o.resume(ctx, sb, preserveDeadline)
+	if err := o.resume(ctx, sb, preserveDeadline); err != nil {
+		o.publishPausedAfterResumeFailure(context.WithoutCancel(ctx), sid)
+		return err
+	}
+	return nil
 }
 
 // snapInfo is the config the orchestrator inherits from a restore snapshot: the

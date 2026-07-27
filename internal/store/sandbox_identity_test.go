@@ -88,6 +88,31 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 	}
 }
 
+func TestCASRunStateFencesStaleRunner(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	pair := testKeyPair("5", "6")
+	sb := &types.Sandbox{
+		ID: "stable-g0", Profile: types.ProfileBare,
+		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StateRunning,
+		RunID: "sandbox-current", APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
+	}
+	setTestSandboxServiceCredentials(sb)
+	if err := st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.CASRunState(ctx, sb.ID, "sandbox-stale", types.StateRunning, types.StatePaused); err != nil || changed {
+		t.Fatalf("stale runner state change = %v, %v", changed, err)
+	}
+	if changed, err := st.CASRunState(ctx, sb.ID, sb.RunID, types.StateRunning, types.StatePaused); err != nil || !changed {
+		t.Fatalf("current runner state change = %v, %v", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got == nil || got.State != types.StatePaused {
+		t.Fatalf("sandbox after fenced state change = %+v, %v", got, err)
+	}
+}
+
 func TestSandboxIdentityValidation(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -185,6 +186,78 @@ func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *test
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
 	waitPausedClusterRoute(t, events, cmd.SID)
+}
+
+func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	started := make(chan struct{}, 2)
+	lc := &countingLauncher{started: started}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	o.sandboxReadyTimeout = 10 * time.Millisecond
+
+	manifestKey := strings.Repeat("6", 64)
+	apiSecret := deriveTestAPISecret(t, manifestKey)
+	fingerprint, err := store.APISecretHash(apiSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	const sid = "stable-g0"
+	sb := &types.Sandbox{
+		ID: sid, Profile: types.ProfileE2B,
+		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		AuthSandboxIDValue: "stable",
+		TemplateID:         "e2b-img-" + strings.Repeat("a", 64),
+		State:              types.StatePaused,
+		APISecret:          apiSecret,
+		ManifestKey:        manifestKey,
+		RunDir:             filepath.Join(cfg.Paths.RunRoot, sid),
+		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, sid),
+		EnvdUDS:            filepath.Join(cfg.Paths.RunRoot, sid, "envd.sock"),
+		CiUDS:              filepath.Join(cfg.Paths.RunRoot, sid, "ci.sock"),
+		CreatedUnix:        1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	connect := func(cmdID string) {
+		t.Helper()
+		ack := o.HandleCommand(ctx, &routesync.Command{
+			CmdID: cmdID, Kind: routesync.CmdConnect, SID: sid,
+			Profile: string(types.ProfileE2B), APISecretFingerprint: fingerprint,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey, AuthSandboxID: sb.AuthSandboxID(),
+			},
+		})
+		if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+			t.Fatalf("cluster connect ack = %+v", ack)
+		}
+		waitForLauncherStart(t, started)
+		waitPausedClusterRoute(t, events, sid)
+		stored, err := o.st.Get(ctx, sid)
+		if err != nil || stored == nil || stored.State != types.StatePaused {
+			t.Fatalf("late resume failure row = %+v err=%v, want paused", stored, err)
+		}
+	}
+
+	connect("connect-late-failure")
+	connect("connect-late-failure-retry")
+	if got := lc.starts.Load(); got != 2 {
+		t.Fatalf("launcher starts = %d, want 2", got)
+	}
 }
 
 func waitClusterConnectAttempt(t *testing.T, attempted <-chan struct{}) {
