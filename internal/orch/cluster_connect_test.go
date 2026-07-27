@@ -162,6 +162,85 @@ func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testi
 	}
 }
 
+func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.TimeoutSec = 900
+	started := make(chan struct{}, 4)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+
+	manifestKey := strings.Repeat("6", 64)
+	sb := &types.Sandbox{
+		ID:                 "cluster-timeout-target",
+		Profile:            types.ProfileBare,
+		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		AuthSandboxIDValue: "stable",
+		TemplateID:         "bare-img-" + strings.Repeat("7", 64),
+		State:              types.StatePaused,
+		APISecret:          deriveTestAPISecret(t, manifestKey),
+		ManifestKey:        manifestKey,
+		RunDir:             filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
+		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, "cluster-timeout-target"),
+		CreatedUnix:        1,
+		DeadlineUnix:       10,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := store.APISecretHash(sb.APISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := func(cmdID string, timeout int) *routesync.Command {
+		return &routesync.Command{
+			CmdID: cmdID, Kind: routesync.CmdConnect, SID: sb.ID,
+			Profile: string(sb.Profile), APISecretFingerprint: fingerprint,
+			TimeoutSeconds: timeout,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey,
+				AuthSandboxID: sb.AuthSandboxID(),
+			},
+		}
+	}
+
+	if ack := o.HandleCommand(ctx, command("connect-resume", 0)); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("initial cluster connect = %+v", ack)
+	}
+	waitForLauncherStart(t, started)
+
+	done := make(chan *routesync.CmdAck, 1)
+	before := time.Now().Unix()
+	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 91)) }()
+	select {
+	case ack := <-done:
+		t.Fatalf("later cluster Connect returned before the in-flight resume completed: %+v", ack)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(startGate)
+	var ack *routesync.CmdAck
+	select {
+	case ack = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("later cluster Connect did not complete after resume")
+	}
+	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("later cluster Connect = %+v", ack)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
+	}
+	if stored.DeadlineUnix < before+90 || stored.DeadlineUnix > time.Now().Unix()+92 {
+		t.Fatalf("deadline = %d, want the later cluster Connect timeout", stored.DeadlineUnix)
+	}
+	if cached := o.lookup(sb.ID); cached == nil || cached.DeadlineUnix != stored.DeadlineUnix {
+		t.Fatalf("cache deadline differs from stored sandbox: cached=%+v stored=%+v", cached, stored)
+	}
+}
+
 func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
 	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 2)}
