@@ -135,7 +135,8 @@ EnvdAccessToken,拨 sandbox-ctl `--connect` 暴露的 host UDS 直达 envd;其�
 数据面组件使用,node 平台层不消费。对 paused
 沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1,
 转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
-注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发进本节点 proxy,节点侧零改动(cluster-router.md)。
+把公开稳定 SandboxID 转换为当前 NodeSandboxID,再注入 `E2b-Sandbox-Id` +
+`X-Access-Token` 转发进本节点 proxy(cluster-router.md)。
 
 ## 2. 命令行接口
 
@@ -818,8 +819,8 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
   - **单飞**:同一 sid 的并发数据面请求经 per-sid single-flight 合并为一次 resume,
     杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
-    external 模式经 routesync `Wake` 上行,serve 端同样单飞(§9.2)。集群级会话亲和的
-    单飞在 registry 端按 (group, route-key) 进行(cluster.md)。
+    external 模式经 routesync `Wake` 上行,serve 端同样单飞(§9.2)。集群数据面激活在 registry 端
+    通过 route CAS 和稳定 lineage wait 收敛;控制面 connect 不与它合并(cluster.md)。
   - 数据面 auto-resume 等待恢复完成后再转发;`POST /sandboxes/{id}/connect` 则只同步
     完成鉴权、可选 KMT import 和凭据读取,接受同一 single-flight 的异步 resume 后立即返回;
     带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
@@ -1010,8 +1011,9 @@ bookmark{full_sync}
 
 node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelink owner 在任务下发前已维护
 本节点完整的 sandbox/build 归属表,收到事件后以 `(node_id,sid)` 或
-`(node_id,build_id)` 查表取得 group/route_key。生产 ID 由 UUIDv7 或等价随机机制保证
-全局唯一,但事件处理不依赖该假设,也不存在 cluster 全局 ID 索引。
+`(node_id,build_id)` 查表取得 group/route_key。sandbox event 的 `sid` 是 node-local NodeSandboxID;集群下由
+Registry 以 `<stable-sandbox-id>-g<N>` 分配.node 不接收 SandboxGeneration,不解析该 ID;稳定 SandboxID
+和代际由 Registry 归属表恢复,不存在跨 group 的 SandboxID 索引.
 
 全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner 仅将本轮出现的 sid 与
 订阅建立前捕获的本节点归属表基线比较;清理前再次确认当前表项仍与基线一致,避免删除
@@ -1019,13 +1021,14 @@ node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelin
 
 ### 10.4 命令受理
 
-registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,以 sid / build_id 幂等,
-受理即回 `cmd_ack`,终态经 sandbox/build 事件上报:
+registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,以 sid / build_id 幂等.
+普通命令受理后回 `cmd_ack`,终态经 sandbox/build 事件上报;CmdConnect 先同步准备并在 Ack 中返回
+typed result,再异步 resume:
 
   | 命令 | 节点动作 |
   |---|---|
   | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离 |
-  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?}` | target 已存在时忽略 token,校验完整指纹、profile 和 cluster context后接受异步恢复;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行,再 Ack并异步恢复;缺失且无 token 则拒绝 |
+  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行.deadline 在 Ack 前持久化;Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint,随后异步 resume;缺失且无 token 则拒绝 |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按完整 APISecret 指纹解析凭据对、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
@@ -1324,7 +1327,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);profile=bare fromImage → bare-img(拒绝 start、bare 网络、image-only);分别从 e2b-snp/bare-img create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
-| `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
+| `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、稳定 SandboxID 的 CmdConnect、稳定/Node SandboxID 转换、route cache、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由
 `orchestrator/release-builder` umbrella 目录的 e2e 脚本聚合执行。

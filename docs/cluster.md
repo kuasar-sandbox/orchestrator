@@ -35,10 +35,13 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
                                └────────────── placer consumes one owner
 ```
 
-稳态数据面不经过 registry。只有显式 create、已知 route 激活和 cache miss/fail-fast 路径需要 registry:
+稳态数据面不经过 registry。只有显式 create/connect、已知 route 激活和
+cache miss/fail-fast 路径需要 registry:
 
-- 显式 create 或已知非 READY sandbox 的激活调用 `ReserveSandbox`;数据面 cache miss/fail-fast 先调用
-  `Resolve`,不会用未知 route 隐式创建 sandbox。显式 build register 调用 `ReserveBuild`。
+- `POST /route-link/reserve` 以 `operation=create|connect|data` 区分三种操作。create 直接
+  Reserve;connect 由 registry 经 node-link 完成;data 在 cache miss/fail-fast 时先 `Resolve`,只对已知
+  非 READY route 做 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
+  `ReserveBuild`。
 - registry 调 placer `PlaceSandbox` / `PlaceBuild`。
 - registry 经 node owner 下发 create/connect/delete/build/key 命令。
 - node 经 node_link 上报 sandbox/build 状态和低频节点目录。
@@ -58,15 +61,16 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
    不重拉旧 sandbox。
 7. **placer 不拥有生命周期**:placer 只做 group 导入、selector patch、shuffle-sharding、P2C 与 Place
    建议。最终资源确认在 node owner admission。
-8. **router 不订阅海量 group**:Reserve 返回 READY 或失败;router 只维护 route cache 和 active connection
-   cache。
+8. **router 不订阅海量 group**:create/data Reserve 返回 READY 或失败;connect Reserve 在
+   node 同步准备完成后返回,不等待异步 resume。router 只维护有界 route cache;在途请求不作为
+   新请求的路由来源。
 
 ### 1.3 角色边界
 
 | 角色 | 职责 |
 |---|---|
 | registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `placer_link` 执行态和 membership |
-| router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,显式 create 或已知 route 激活时 Reserve;热路径复用活动连接 |
+| router | e2b 统一入口;按 group 定位 route owner;cache miss 时 Resolve,按 create/connect/data 调用 Reserve;热路径使用本地 route cache |
 | placer | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
 | node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/delete/build/key 命令 |
 
@@ -253,7 +257,7 @@ owner count 是 registry 内部复制因子。`placer_link.placer_replica_count`
 | `route_link` | group | `sandbox` | route_key | route 记录 |
 | `route_link` | group | `build` | build_id | build 执行态 |
 | `node_link` | node_id | `profile` | `profile` | node profile、labels、liveness、link_owner、低频容量 |
-| `node_link` | node_id | `sandbox` | sandbox_id | node 维度 sandbox 归属表,值含 group + route_key + profile + api_secret_fingerprint |
+| `node_link` | node_id | `sandbox` | node_sandbox_id | node 维度 sandbox 归属表,值含 sandbox_id + sandbox_generation + group + route_key + profile + api_secret_fingerprint |
 | `node_link` | node_id | `build` | build_id | node 维度 build 归属表,值含 group |
 | `node_link` | node_id | `key_pair` | api_secret_fingerprint | node APISecret+ManifestKey pair cache |
 | `node_list` | `node_list` | `nodes` | node_id | 低频节点目录和 WATCH_LIST |
@@ -581,7 +585,9 @@ membership 重新解析 owner。
 node_link 维护以下 recordSet:
 
 - `profile`:node_id、labels、runtime_digest、data_endpoint、build_capacity、draining、liveness、link_owner。
-- `sandbox`:该 node 上 sandbox 的 `sandbox_id -> {group,route_key,profile,api_secret_fingerprint}` 完整归属表。
+- `sandbox`:该 node 上 sandbox 的
+  `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
+  完整归属表。
 - `build`:该 node 上 build 的 `build_id -> group` 完整归属表。
 - `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
 
@@ -591,9 +597,10 @@ build record 删除;key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
 build 的 cluster group 仍保存在其内部 metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
 
-同一 node 内 `sandbox_id` 归属以 CAS 写入:相同 `{group,route_key,profile,api_secret_fingerprint}` 重放为幂等刷新,不同归属返回冲突且
-不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED record,生成新 sandbox_id
-后重试同一健康 node;node 端也必须在异步 launch 前同步拒绝已有或正在创建的 sandbox_id。
+同一 node 内 `node_sandbox_id` 归属以 CAS 写入:相同完整归属重放为幂等刷新,不同归属返回
+冲突且不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED
+record,保持稳定 `sandbox_id`,消费下一个 `sandbox_generation` 并生成新 `node_sandbox_id`
+后重试。node 端在异步 launch 前同步拒绝已有或正在创建的 node-local ID。
 
 node_link 流按事件重要性处理:
 
@@ -603,8 +610,9 @@ node_link 流按事件重要性处理:
 - node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
 - `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
 
-这样 Reserve 的 READY route report 不会被心跳持久化阻塞。sandbox事件携带 sandbox ID、profile 与 node-owned 执行态;
-nodelink owner 以 `(node_id,id)` 查本节点归属表得到 group/route_key,再更新 route_link。若 READY 晚于
+这样 Reserve 的 READY route report 不会被心跳持久化阻塞。sandbox 事件携带 NodeSandboxID、profile
+与 node-owned 执行态;nodelink owner 以 `(node_id,NodeSandboxID)` 查本节点归属表得到稳定
+SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
@@ -619,7 +627,8 @@ fingerprint 匹配且 changelog 可用时 replay 增量;否则全量 resync。no
 做全量 resync。
 
 全量订阅开始前,nodelink owner 捕获本节点 sandbox 归属表基线。bookmark 表示本轮同步结束时,只清理
-基线中未按 sandbox_id 出现的条目;清理前再次读取并确认当前 `{group,route_key}` 仍等于基线,从而保护
+基线中未按 node_sandbox_id 出现的条目;清理前再次读取并确认当前完整稳定/节点代际归属
+仍等于基线,从而保护
 同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token,不做缺失清理。
 
 ## 7. node_list
@@ -658,23 +667,29 @@ node_link 重建第二条事实传播路径。
 
 ### 8.1 身份
 
-- 稳定会话身份:`(group, route_key)`。
-- 当前运行实例:`sandbox_id`。生产创建和跨节点导入都分配全局唯一新 ID,外部不解析。
-- cluster 在 route_link 和 node 归属表中维护 `group`、`route_key`、`sandbox_id`、`profile`、
-  `api_secret_fingerprint`,但 node 事件不携带
-  group,事件定位也不依赖 sandbox/build ID 全局唯一。不存在 cluster 全局 ID 索引。
+- route 定位键:`(group, route_key)`。
+- 稳定公开身份:`sandbox_id`。Registry 在首次 create 时生成,同节点 resume、跨节点迁移和
+  re-place 均不改变;公开 API、Host 和 router cache key 使用该 ID。
+- 节点执行身份:`node_sandbox_id = <sandbox_id>-g<sandbox_generation>`。首个候选为 g0;候选
+  冲突/失败或跨节点迁移消费下一个 generation,同节点 resume 保持当前 NodeSandboxID。
+  NodeSandboxID 是不透明的 node-local ID,权威映射在 Registry 归属表,组件不从字符串反向解析。
+- node 事件不携带 group/route_key/SandboxGeneration。Registry 以 `(node_id,node_sandbox_id)` 查归属表
+  恢复稳定身份和 group 上下文;不存在跨 group 的 SandboxID 索引。
 
 ### 8.2 route 记录
 
 | 字段 | 说明 |
 |---|---|
 | `group` | 分片键 |
-| `route_key` | 稳定会话键 |
-| `sandbox_id` | 当前实例 |
+| `route_key` | group 内 route 定位键 |
+| `sandbox_id` | 稳定公开 SandboxID |
+| `node_sandbox_id` | 当前 node-local 执行 ID |
+| `sandbox_generation` | 当前 NodeSandboxID 的 Registry-owned 代际 |
+| `next_sandbox_generation` | 下一可分配代际;只由 Registry 持久化,不下发 node |
 | `state` | `reserved` / `ready` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
 | `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
-| `api_secret_fingerprint` | 当前实例创建时绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
+| `api_secret_fingerprint` | sandbox 业务记录绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
 | `manifest_key_fingerprint` | 与 APISecret 配对的 ManifestKey 完整指纹;route 不保存或投影 ManifestKey 原文 |
 | `auth_sandbox_id` | ServiceSecret 和 KAT token 使用的稳定认证 subject |
 | `api_secret` | 当前 sandbox 已绑定的 APISecret;仅存在于受保护 route 存储和可信 router/proxy 投影 |
@@ -699,41 +714,40 @@ Reserve 才重新放置。
 ### 8.3 Reserve
 
 ```text
-router
-  │ ReserveSandbox(group, route_key)
-  ▼
-route_link owner
-  │ existing ready? return
-  │ none/paused? CAS reserved
-  ▼
-placer PlaceSandbox
-  │ choose node + APISecretFingerprint + target_port
-  ▼
-route owner
-  │ attach typed {group,route_key,auth_sandbox_id} + profile
-  │ record node_id/sandbox_id ownership
-  ▼
-node owner
-  │ create/connect (system context is persisted separately)
-  ▼
-node reports RUNNING/READY
-  │ with node-issued Envd/Traffic/Forward access tokens
-  │
-  ▼
-route_link CAS ready
-  │
-  ▼
-Reserve returns READY
+POST /route-link/reserve
+  ?operation=create|connect|data
+  &group=<group>&route_key=<route-key>
+  [&sid=<stable-sandbox-id>][&port=<effective-port>][&timeout=<seconds>]
 ```
 
-`ReserveSandbox` 返回时必须 READY 或失败。若已有 `reserved`,新请求 join 同一 in-flight 状态机。
-node READY 事件到达后,route owner 通过本地 group WATCH 或短周期 quorum read 唤醒 waiter。router 不订阅
-route_link 更新。
+Reserve body 只属于 create;connect/data body 为空。三种 operation 的凭据和完成条件不同:
 
-孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,sandbox_id)` 查归属表;表项不存在,
+- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 只允许 restore/credentials
+  config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+  SandboxID 和首个 NodeSandboxID,下发 CmdCreate,等待 node READY 事件后返回 `Route`。并发
+  create 在 Registry 内合并。
+- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;Header 携 `X-API-KEY`,可选
+  `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
+  对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
+  排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、可选
+  import、deadline 持久化和凭据读取,Ack 返回 typed `ConnectResult`;Registry 校验其
+  NodeSandboxID/TemplateID/Profile/三项公开 token 与 route 一致后返回 `Route + Connect`。
+  resume 异步进行,connect 不等待 READY,也不在 Router 合并不同请求。
+- `data`:query 必须携期望的稳定 `sid`,可选有效 `port`;Header 携 `X-Access-Token`。
+  Registry 先按 profile/端口选择 EnvdAccessToken 或 ForwardAccessToken 验证。READY 直接返回;
+  PAUSED 先 CAS RESERVED 并下发 CmdConnect;RESERVED 等待当前稳定 lineage 的事件。只在获得
+  READY 且 DataEndpoint 有效时返回 `Route`。不存在的 route 直接返回 not found,不创建
+  sandbox。
+
+`Route` 是受保护结果,同时携稳定 SandboxID、当前 NodeSandboxID 和 `route_revision`。
+`route_revision` 取当前 group route recordSet 的已提交 revision,供 Router 拒绝迟到的旧节点
+结果。Router 不订阅 route_link 更新。
+
+孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,node_sandbox_id)` 查归属表;表项不存在,
 或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过
 数据面,不依赖 access token 或全局 sandbox ID 查询。全量同步、孤儿清理和节点回收均比较
-`(group,route_key,sandbox_id,profile,api_secret_fingerprint)` 完整归属,避免迟到事件跨凭据 binding 删除新记录。
+`(group,route_key,sandbox_id,node_sandbox_id,sandbox_generation,profile,api_secret_fingerprint)` 完整归属,
+避免迟到事件跨代际或凭据 binding 删除新记录。
 
 ## 9. placer_link 与 placer
 
@@ -799,19 +813,18 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 
 router 是无状态北向入口,但持本地缓存:
 
-- route resolution cache:`(group, route_key, sandbox_id)` -> node endpoint / profile /
+- route resolution cache:`(group, route_key, stable sandbox_id)` -> NodeSandboxID / node endpoint / profile /
   AuthSandboxID / APISecret / 两项 root fingerprint / ServiceSecret /
-  EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / route Rev。
+  EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / RouteRevision。
 - build forwarding cache:`(group, build_id)` -> node endpoint;不能只以 build_id 为键。
-- active connection cache:同一路由已有活动 HTTP/CONNECT/WebSocket 时,新请求不调用 Reserve。
-- singleflight:同一 `(group, route_key)` 的并发显式 create 或已知 route 激活只发起一次 Reserve。
+- 在途请求只持有自身的 route 副本和计数,不作为新请求的路由 cache,也不阻止新
+  RouteRevision 替换旧 NodeSandboxID。
 
 ```text
 request(group, route_key, sandbox_id)
   │
-  ├─ active connection cache hit ──► node proxy
-  │
-  ├─ route cache hit ──────────────► node proxy
+  ├─ READY route cache hit ────────► node proxy
+  ├─ non-READY route cache hit ────► data Reserve ──► node proxy
   │
   └─ miss/fail-fast ───────────────► route owner Resolve
                                       │
@@ -820,6 +833,13 @@ request(group, route_key, sandbox_id)
 ```
 
 未知 route 的数据面请求在 Resolve 后返回 not found,不会触发 sandbox 创建。
+命中 route 后,Router 在 node 边界把公开 SandboxID 转换为 NodeSandboxID:控制面重写路径,
+数据面外层 CONNECT、Host 和已有 sandbox identity Header 使用 NodeSandboxID。公开 create/connect/list/get
+结果仍只呈现稳定 SandboxID。
+
+Router 接收新 route 时,不允许更低 RouteRevision 覆盖 cache,也不允许相同 RouteRevision 以不同
+NodeSandboxID 覆盖当前值。旧代际在途请求失败时,仅在 cache 仍指向该 NodeSandboxID 时才能
+驱逐,避免删除已切换的新代际。
 
 所有请求必须带 group。router 通过 bootstrap 拉取 `/cluster/membership`,再按 active membership 定位
 route owner。membership refresh 会尝试 bootstrap 和已知 active/next/old_grace 成员,选择 active version
@@ -959,7 +979,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 
 ## 15. 性能
 
-- 数据面热路径:router active cache / route cache 命中后直转 node,不访问 registry。
+- 数据面热路径:router READY route cache 命中后直转 node,不访问 registry。
 - Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 在线校验/admission；失败候选排除后重选。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
@@ -979,11 +999,12 @@ node,但不启动 microVM。除 microVM/应用进程外,它模拟节点控制面
 
 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/placer` 与 `node-stub-ctl`。
 `test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
-import、key 分发、显式 create/Reserve、按 SID 数据面转发、active cache、BuildRegister、孤儿 route 清理和节点清空收敛。
+import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、SandboxID 与 NodeSandboxID
+转换、按稳定 SID 数据面转发、route cache、BuildRegister、孤儿 route 清理和节点清空收敛。
 
 ## 17. See Also
 
-- [cluster-router.md](cluster-router.md) — router 入口、活动连接缓存和数据面转发。
+- [cluster-router.md](cluster-router.md) — router 入口、route cache 和数据面转发。
 - [cluster-placer.md](cluster-placer.md) — group provider/importer、WATCH_LIST、Place 与 key distribution。
 - [node.md](node.md) — node-ctl 单机主机与 node-link 节点侧行为。
 - [node-proxy.md](node-proxy.md) — node 数据面 proxy、routesync 与 CONNECT。

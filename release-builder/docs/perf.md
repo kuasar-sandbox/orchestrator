@@ -600,20 +600,20 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 
 ### 3.8 cluster 控制面冷路径
 
-cluster 性能口径应区分热路径与冷路径。热路径是 router 已有活动连接缓存后的
-数据转发,不应进入 registry Reserve;冷路径是首次连接、沙箱创建、build 创建、
+cluster 性能口径应区分热路径与冷路径。热路径是 router READY route cache 命中后的数据转发,
+不应进入 registry Reserve;冷路径是首次连接、沙箱创建、build 创建、
 node 状态变化、group 导入与成员切换。这些路径进入 registry/placer,目标是
 保证可靠性和扩展线性,而不是把所有 QPS 都压到 registry 上。
 
 ```
 hot path:
 
-client ── data stream ──► router active connection cache ──► node/proxy/envd
-          no Reserve while same route connection is alive
+client ── data stream ──► router READY route cache ──► node/proxy/envd
+          no Resolve/Reserve on a READY route-cache hit
 
 cold path:
 
-router ── Reserve(group,sandbox) ──► registry route_link ── Place ──► placer
+router ── Reserve(operation,group,route_key,sandbox) ──► registry route_link ──► node/placer
 node   ── state/heartbeat/events ──► registry node_link/node_list
 placer ── group import / key selector ──► registry route_link/node_link
 ```
@@ -629,8 +629,9 @@ placer ── group import / key selector ──► registry route_link/node_lin
 - node_link 重定向/转发:任意 registry 接入 node 时,若自身不是 node owner,
   应逐个尝试 owner;节点支持 redirect 时可重连到 owner,否则在 relay 链路上
   订阅并复制状态。
-- router cache:同一 route 的活动连接存在时,新连接不走 Reserve;活动连接过期
-  或路由失效后才回到冷路径。
+- router cache:READY route cache 命中时新请求不走 Resolve/Reserve;命中非 READY route 时执行
+  data Reserve,cache 过期或 fail-fast 失效后回到 Resolve 冷路径。
+  性能统计应分开 create/data 等待 READY 与 connect 同步准备后返回的不同完成条件。
 - placer import:同一个 `source_id` 的导入任务由 placer_link 中的 lease 串行
   执行;文件源只用于开发/e2e,生产源通过 provider/importer 接口实现。
 

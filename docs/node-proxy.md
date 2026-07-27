@@ -118,6 +118,9 @@ master 把下行路由流投影到共享内存:
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
+本文中 `RouteEntry.SandboxID`、`sid` 和共享表 key 均是 node-local SandboxID.集群路径下,它们是
+Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公开稳定 SandboxID 转换为该值.
+
 共享表是固定容量开放寻址 hash 表。master 单写;每条记录带 seqlock,worker 读取时若遇到
 写中状态或版本变化会重试,不会看到半条路由。worker 只依赖共享表本地读取:
 
@@ -140,7 +143,7 @@ ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关
 ## 5. 转发路径
 
 请求按 `Host: <port>-<sid>.<domain>` 或 `E2b-Sandbox-Id` /
-`E2b-Sandbox-Port` 解析 `(sid, port)`。
+`E2b-Sandbox-Port` 解析 `(sid, port)`;cluster 第二跳的 `sid` 必须是当前 NodeSandboxID.
 
 ```text
 profile=e2b  and port ∈ {49983,49999} → envd / ci UDS
