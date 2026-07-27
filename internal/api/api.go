@@ -400,15 +400,36 @@ func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
 		r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, request.TTLSeconds,
 	)
 	if err != nil {
-		if migrationToken != "" {
-			a.failMigrate(w, err)
-		} else {
-			a.fail(w, err)
-		}
+		a.failExecSession(w, err)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, map[string]string{"execAccessToken": token})
+}
+
+// failExecSession preserves the public control-plane status contract without
+// forwarding node paths, node-local sandbox IDs, command state, or other
+// internal error details.
+func (a *API) failExecSession(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrAlreadyExists):
+		writeErr(w, http.StatusConflict, "target sandbox already exists")
+	case errors.Is(err, migrationtoken.ErrIncompatible):
+		writeErr(w, http.StatusConflict, "target environment incompatible")
+	case errors.Is(err, migrationtoken.ErrAuthentication),
+		errors.Is(err, migrationtoken.ErrCredentialMismatch),
+		errors.Is(err, ErrNotAllowed):
+		writeErr(w, http.StatusForbidden, "exec session credential not allowed")
+	case errors.Is(err, migrationtoken.ErrMalformedToken),
+		errors.Is(err, migrationtoken.ErrInvalidPayload),
+		errors.Is(err, ErrBadRequest):
+		writeErr(w, http.StatusBadRequest, "invalid exec session request")
+	case errors.Is(err, ErrNotFound):
+		writeErr(w, http.StatusNotFound, "not found")
+	default:
+		a.log.Warn("exec session error", "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "exec session unavailable")
+	}
 }
 
 func (a *API) pause(w http.ResponseWriter, r *http.Request) {

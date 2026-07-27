@@ -465,6 +465,27 @@ func TestCreateExecSessionRequiresExplicitAPIKeyHeader(t *testing.T) {
 	}
 }
 
+func TestCreateExecSessionSanitizesOperationalFailureAsUnavailable(t *testing.T) {
+	const internalDetail = "node stable-g7 failed at /private/run/ctl.sock"
+	for _, migrationToken := range []string{"", "kmt1.opaque"} {
+		core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+			return "", errors.New(internalDetail)
+		}}
+		handler, apiKey := newMigrationTestHandler(t, core)
+		headers := http.Header{}
+		if migrationToken != "" {
+			headers.Set(MigrationTokenHeader, migrationToken)
+		}
+		response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/stable/exec-sessions", strings.NewReader("{}"), headers)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("migration=%t status = %d, want 503; body=%s", migrationToken != "", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), internalDetail) || strings.Contains(response.Body.String(), "stable-g7") {
+			t.Fatalf("public response leaked internal detail: %s", response.Body.String())
+		}
+	}
+}
+
 type execSessionCoreStub struct {
 	Core
 	execSession func(context.Context, string, string, string, int64) (string, error)
