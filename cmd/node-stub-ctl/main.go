@@ -28,6 +28,7 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -491,6 +492,12 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 		s.serveControlStub(w, r)
 		return
 	}
+	execService := r.Header.Get("E2b-Sandbox-Service") == "exec"
+	if execService && r.Method != http.MethodConnect {
+		w.Header().Set("Allow", http.MethodConnect)
+		http.Error(w, "exec requires CONNECT", http.StatusMethodNotAllowed)
+		return
+	}
 	sid := r.Header.Get("E2b-Sandbox-Id")
 	if sid == "" {
 		sid = sidFromHost(host)
@@ -504,6 +511,14 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Kuasar-Proxy-Error", "not_found")
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
+	}
+	if execService {
+		if err := keys.VerifyExecAccessToken(
+			r.Header.Get("X-Access-Token"), sb.ServiceSecret, sb.AuthSandboxID, time.Now(),
+		); err != nil {
+			http.Error(w, "invalid access token", http.StatusUnauthorized)
+			return
+		}
 	}
 	if r.Method == http.MethodConnect {
 		s.serveDataConnect(w, r, n, sb)
@@ -835,6 +850,8 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		return n.handleCreate(cmd)
 	case routesync.CmdConnect:
 		return n.handleConnect(cmd)
+	case routesync.CmdExecSession:
+		return n.handleExecSession(cmd)
 	case routesync.CmdDelete:
 		return n.handleDelete(cmd)
 	case routesync.CmdBuildRegister:
@@ -959,6 +976,99 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 	accepted := ack(cmd, routesync.AckAccepted, "")
 	accepted.Connect = result
 	return accepted
+}
+
+func (n *stubNode) handleExecSession(cmd *routesync.Command) *routesync.CmdAck {
+	if err := validateStubExecSessionEnvelope(cmd); err != nil {
+		return ack(cmd, routesync.AckRejected, err.Error())
+	}
+	if _, err := execsession.ExpiryUnix(time.Now().Unix(), cmd.TTLSeconds); err != nil {
+		return ack(cmd, routesync.AckRejected, "invalid exec session ttl")
+	}
+
+	n.mu.Lock()
+	sb := n.sandboxes[cmd.SID]
+	if sb == nil {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox not found")
+	}
+	if cmd.APISecretFingerprint != sb.APISecretFingerprint {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox credential binding mismatch")
+	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil || cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox context binding is incomplete")
+	}
+	authSandboxID := cmd.Cluster.AuthSandboxID
+	if authSandboxID == "" {
+		authSandboxID = cmd.SID
+	}
+	if sb.Profile != string(profile) || sb.Cluster == nil ||
+		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
+		sb.AuthSandboxID != authSandboxID {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox context binding mismatch")
+	}
+	if sb.State != routesync.StateRunning && sb.State != routesync.StatePaused {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox not found")
+	}
+	template, err := types.ParseTemplateID(sb.TemplateID)
+	if err != nil || template.Profile != profile {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox template and profile are inconsistent")
+	}
+	expiresUnix, err := execsession.ExpiryUnix(time.Now().Unix(), cmd.TTLSeconds)
+	if err != nil {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "invalid exec session ttl")
+	}
+	token, err := keys.MintExecAccessToken(sb.ServiceSecret, sb.AuthSandboxID, expiresUnix)
+	if err != nil {
+		n.mu.Unlock()
+		return ack(cmd, routesync.AckRejected, "sandbox exec credentials are invalid")
+	}
+	paused := sb.State == routesync.StatePaused
+	n.mu.Unlock()
+
+	accepted := ack(cmd, routesync.AckAccepted, "")
+	accepted.ExecSession = &routesync.ExecSessionResult{ExecAccessToken: token}
+	if paused {
+		n.scheduleExecResume(cmd.SID, sb)
+	}
+	return accepted
+}
+
+func validateStubExecSessionEnvelope(cmd *routesync.Command) error {
+	if cmd == nil || cmd.Kind != routesync.CmdExecSession || cmd.CmdID == "" ||
+		!types.ValidLocalSandboxID(cmd.SID) || cmd.APISecretFingerprint == "" {
+		return errors.New("exec session command identity is incomplete")
+	}
+	if cmd.TTLSeconds < 0 || cmd.TimeoutSeconds != 0 || cmd.TemplateRef != "" || len(cmd.Config) != 0 ||
+		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
+		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
+		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+		return errors.New("exec session command contains fields for another operation")
+	}
+	return nil
+}
+
+func (n *stubNode) scheduleExecResume(sid string, expected *stubSandbox) {
+	go func() {
+		time.Sleep(n.CreateDelay)
+		n.mu.Lock()
+		current := n.sandboxes[sid]
+		if current != expected || current.State != routesync.StatePaused {
+			n.mu.Unlock()
+			return
+		}
+		current.State = routesync.StateRunning
+		entry := current.routeEntry()
+		n.mu.Unlock()
+		n.publishRoute(entry)
+	}()
 }
 
 func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
