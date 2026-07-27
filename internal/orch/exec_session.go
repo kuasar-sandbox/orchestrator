@@ -19,11 +19,15 @@ func (o *Orchestrator) ExecSession(
 	id, apiKey, migrationToken string,
 	ttlSeconds int64,
 ) (string, error) {
+	nowUnix := time.Now().Unix()
+	if _, err := execSessionExpiry(nowUnix, ttlSeconds); err != nil {
+		return "", err
+	}
 	sb, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
 	if err != nil {
 		return "", err
 	}
-	token, err := mintExecSessionToken(sb, ttlSeconds, time.Now().Unix())
+	token, err := mintExecSessionToken(sb, ttlSeconds, nowUnix)
 	if err != nil {
 		return "", err
 	}

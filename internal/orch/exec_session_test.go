@@ -71,6 +71,12 @@ func TestExecSessionRejectsUnauthorizedAndInvalidTTL(t *testing.T) {
 	if _, err := o.ExecSession(context.Background(), "missing", "invalid", "", 0); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("missing target error = %v, want not found", err)
 	}
+	if _, err := o.ExecSession(context.Background(), "overflow-target", "invalid", "kmt1.not-opened", math.MaxInt64); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("overflow request error = %v, want bad request", err)
+	}
+	if sb, err := o.st.Get(context.Background(), "overflow-target"); err != nil || sb != nil {
+		t.Fatalf("overflow request reached import: sandbox=%+v err=%v", sb, err)
+	}
 	for _, test := range []struct {
 		name string
 		now  int64
