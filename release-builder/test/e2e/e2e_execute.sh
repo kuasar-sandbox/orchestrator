@@ -29,7 +29,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-EXEC_CONNECT_BRIDGE="$REPO_ROOT/release-builder/test/e2e/exec_connect_bridge.py"
+EXEC_CONNECT_BRIDGE="$REPO_ROOT/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
@@ -184,7 +184,7 @@ exec_through_connect() {
     local bridge_pid status
 
     mkdir -p "$bridge_root/$sid"
-    EXEC_CONNECT_TOKEN="$token" python3 "$EXEC_CONNECT_BRIDGE" \
+    EXEC_CONNECT_TOKEN="$token" timeout -k 5s 75 python3 "$EXEC_CONNECT_BRIDGE" \
         --listen "$bridge_root/$sid/ctl.sock" \
         --ready-file "$ready_file" \
         --upstream "127.0.0.1:$PORT" \
