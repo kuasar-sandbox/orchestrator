@@ -50,7 +50,8 @@ type SandboxReserveRequest struct {
 // lifecycle mutation and command dispatch.
 func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
 	if !req.Operation.Valid() || req.Group == "" || req.RouteKey == "" ||
-		req.Port < 0 || req.Port > 65535 || req.TimeoutSeconds < 0 {
+		req.Port < 0 || req.Port > 65535 || req.TimeoutSeconds < 0 ||
+		int64(req.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
 		return nil, ErrReserveBadRequest
 	}
 	if len(req.MigrationToken) > migrationtoken.MaxWireSize {

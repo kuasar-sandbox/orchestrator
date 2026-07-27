@@ -56,6 +56,12 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
+		if cmd.TimeoutSeconds < 0 || int64(cmd.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
+			return &routesync.CmdAck{
+				CmdID: cmd.CmdID, Status: routesync.AckRejected,
+				Reason: "connect timeout is out of range", HTTPStatus: http.StatusBadRequest,
+			}
+		}
 		if cmd.TimeoutSeconds > 0 {
 			unlock := o.lifecycle.Lock(cmd.SID)
 			defer unlock()

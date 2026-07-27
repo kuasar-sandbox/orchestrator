@@ -167,12 +167,20 @@ func TestReserveRejectsOperationSpecificAndOversizedFields(t *testing.T) {
 		{Operation: ReserveConnect, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb", APIKey: "key", AccessToken: "token"},
 		{Operation: ReserveData, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb", AccessToken: "token", APIKey: "key"},
 		{Operation: ReserveData, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb", AccessToken: "token", TimeoutSeconds: 1},
+		{Operation: ReserveConnect, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb", APIKey: "key", TimeoutSeconds: int(routesync.MaxConnectTimeoutSeconds + 1)},
 		{Operation: ReserveConnect, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb", APIKey: "key", MigrationToken: strings.Repeat("x", migrationtoken.MaxWireSize+1)},
 	}
 	for i, req := range tests {
 		if _, err := reg.ReserveSandbox(context.Background(), req); !errors.Is(err, ErrReserveBadRequest) {
 			t.Fatalf("case %d error=%v, want bad request", i, err)
 		}
+	}
+	maxTimeout := SandboxReserveRequest{
+		Operation: ReserveConnect, Group: "/g", RouteKey: "rk", ExpectedSandboxID: "sb",
+		APIKey: "key", TimeoutSeconds: int(routesync.MaxConnectTimeoutSeconds),
+	}
+	if _, err := reg.ReserveSandbox(context.Background(), maxTimeout); !errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("maximum safe timeout error=%v, want request to pass validation", err)
 	}
 }
 

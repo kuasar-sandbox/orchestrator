@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
@@ -171,8 +172,8 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	timeoutSeconds, err := reserveQueryInt(q.Get("timeout"), "timeout")
-	if err != nil {
-		http.Error(w, "timeout must be a non-negative integer", http.StatusBadRequest)
+	if err != nil || int64(timeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
+		http.Error(w, fmt.Sprintf("timeout must be an integer between 0 and %d", routesync.MaxConnectTimeoutSeconds), http.StatusBadRequest)
 		return
 	}
 	var body SandboxReserveReq

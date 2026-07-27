@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -222,6 +223,7 @@ func TestServeReserveMapsOperationErrorsWithoutLifecycleSideEffects(t *testing.T
 		{name: "connected node unavailable", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), wantStatus: http.StatusServiceUnavailable},
 		{name: "wrong data credential", path: "?group=/g&route_key=rk&operation=data&sid=sb-route&port=8080", access: "wrong", wantStatus: http.StatusUnauthorized},
 		{name: "connect body", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
+		{name: "overflowing connect timeout", path: fmt.Sprintf("?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=%d", routesync.MaxConnectTimeoutSeconds+1), apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
 		{name: "oversized migration token", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), migration: strings.Repeat("x", migrationtoken.MaxWireSize+1), wantStatus: http.StatusBadRequest},
 	}
 	for _, tc := range tests {

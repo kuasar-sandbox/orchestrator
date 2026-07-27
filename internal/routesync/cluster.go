@@ -112,6 +112,10 @@ type ClusterSandboxContext struct {
 const (
 	AckAccepted = "accepted"
 	AckRejected = "rejected"
+
+	// MaxConnectTimeoutSeconds is the largest whole-second timeout that can be
+	// converted to time.Duration without overflow.
+	MaxConnectTimeoutSeconds int64 = (1<<63 - 1) / 1_000_000_000
 )
 
 // NodeRegister is the node's first up-frame on node-link: its identity + capacity,

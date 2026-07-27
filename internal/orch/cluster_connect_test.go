@@ -141,6 +141,27 @@ func TestHandleClusterConnectMissingTargetRequiresMigrationToken(t *testing.T) {
 	}
 }
 
+func TestHandleClusterConnectRejectsTimeoutDurationOverflow(t *testing.T) {
+	for _, timeout := range []int{-1, int(routesync.MaxConnectTimeoutSeconds + 1)} {
+		ack := testOrch(t).HandleCommand(context.Background(), &routesync.Command{
+			CmdID: "connect-invalid-timeout", Kind: routesync.CmdConnect,
+			TimeoutSeconds: timeout,
+		})
+		if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest ||
+			ack.Reason != "connect timeout is out of range" {
+			t.Fatalf("timeout %d ack = %+v", timeout, ack)
+		}
+	}
+}
+
+func TestClusterConnectDeadlineAcceptsMaximumDuration(t *testing.T) {
+	now := time.Now().Unix()
+	deadline := clusterConnectDeadline(int(routesync.MaxConnectTimeoutSeconds))
+	if deadline <= now {
+		t.Fatalf("maximum connect timeout deadline = %d, want later than %d", deadline, now)
+	}
+}
+
 func TestHandleClusterConnectWritesImportedDeadlineInInitialInsert(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
 	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 1)}
