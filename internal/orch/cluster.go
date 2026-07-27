@@ -86,7 +86,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return acceptConnect(cmd, result)
 	case routesync.CmdExecSession:
-		sb, result, err := o.prepareClusterExecSession(ctx, cmd, time.Now().Unix())
+		sb, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
 		if err != nil {
 			return reject(cmd, err)
 		}
@@ -640,19 +640,20 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 func (o *Orchestrator) prepareClusterExecSession(
 	ctx context.Context,
 	cmd *routesync.Command,
-	nowUnix int64,
+	now unixClock,
 ) (*types.Sandbox, *routesync.ExecSessionResult, error) {
 	if err := validateClusterExecSessionEnvelope(cmd); err != nil {
 		return nil, nil, err
 	}
-	if _, err := execSessionExpiry(nowUnix, cmd.TTLSeconds); err != nil {
+	if _, err := execSessionExpiry(now(), cmd.TTLSeconds); err != nil {
 		return nil, nil, err
 	}
 	sb, err := o.prepareClusterConnect(ctx, cmd, 0)
 	if err != nil {
 		return nil, nil, err
 	}
-	token, err := mintExecSessionToken(sb, cmd.TTLSeconds, nowUnix)
+	// Sample signing time after the synchronous import/validation phase.
+	token, err := mintExecSessionToken(sb, cmd.TTLSeconds, now())
 	if err != nil {
 		return nil, nil, err
 	}

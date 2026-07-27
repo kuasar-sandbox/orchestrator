@@ -20,9 +20,12 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	cmd.CmdID = "exec-import"
 	cmd.Kind = routesync.CmdExecSession
 	cmd.TTLSeconds = 37
-	const now = int64(1_800_000_000)
+	const preflight = int64(1_800_000_000)
+	const signing = int64(1_800_000_100)
 
-	sb, result, err := fixture.o.prepareClusterExecSession(context.Background(), cmd, now)
+	sb, result, err := fixture.o.prepareClusterExecSession(
+		context.Background(), cmd, scriptedUnixClock(t, preflight, signing),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,13 +37,13 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	if result == nil || result.ExecAccessToken == "" {
 		t.Fatalf("exec-session result = %+v", result)
 	}
-	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(now+36, 0)); err != nil {
+	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+36, 0)); err != nil {
 		t.Fatalf("token before expiry: %v", err)
 	}
-	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(now+37, 0)); err == nil {
+	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+37, 0)); err == nil {
 		t.Fatal("token accepted at expiry")
 	}
-	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.ID, time.Unix(now, 0)); err == nil {
+	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.ID, time.Unix(signing, 0)); err == nil {
 		t.Fatal("token accepted NodeSandboxID instead of stable AuthSandboxID")
 	}
 }
@@ -50,14 +53,14 @@ func TestPrepareClusterExecSessionMintsPerCommandLongLivedTokens(t *testing.T) {
 	first := fixture.command("stable-g1", fixture.token)
 	first.CmdID = "exec-first"
 	first.Kind = routesync.CmdExecSession
-	sb, firstResult, err := fixture.o.prepareClusterExecSession(context.Background(), first, 1)
+	sb, firstResult, err := fixture.o.prepareClusterExecSession(context.Background(), first, func() int64 { return 1 })
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := fixture.command(first.SID, "malformed-token-is-ignored-for-existing-target")
 	second.CmdID = "exec-second"
 	second.Kind = routesync.CmdExecSession
-	_, secondResult, err := fixture.o.prepareClusterExecSession(context.Background(), second, 1)
+	_, secondResult, err := fixture.o.prepareClusterExecSession(context.Background(), second, func() int64 { return 1 })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,12 +149,33 @@ func TestClusterExecSessionRejectsTTLOverflowWithoutResume(t *testing.T) {
 	cmd := fixture.command("stable-g1", fixture.token)
 	cmd.CmdID = "exec-overflow"
 	cmd.Kind = routesync.CmdExecSession
-	cmd.TTLSeconds = 2
-	if _, _, err := fixture.o.prepareClusterExecSession(context.Background(), cmd, math.MaxInt64-1); !errors.Is(err, api.ErrBadRequest) {
+	cmd.TTLSeconds = math.MaxInt64
+	if _, _, err := fixture.o.prepareClusterExecSession(context.Background(), cmd, func() int64 { return 1 }); !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("overflow ttl error = %v, want bad request", err)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
 	if err != nil || stored != nil {
 		t.Fatalf("overflow ttl inserted target = %+v, %v", stored, err)
+	}
+}
+
+func TestClusterExecSessionRejectsDeadLocalTarget(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	initial := fixture.command("stable-g1", fixture.token)
+	initial.CmdID = "exec-import-paused"
+	initial.Kind = routesync.CmdExecSession
+	if _, _, err := fixture.o.prepareClusterExecSession(context.Background(), initial, func() int64 { return 1 }); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.o.st.SetState(context.Background(), initial.SID, types.StateDead); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := fixture.command(initial.SID, "malformed-token-is-ignored-for-existing-target")
+	retry.CmdID = "exec-dead"
+	retry.Kind = routesync.CmdExecSession
+	ack := fixture.o.HandleCommand(context.Background(), retry)
+	if ack.Status != routesync.AckRejected || ack.ExecSession != nil || !strings.Contains(ack.Reason, "not found") {
+		t.Fatalf("dead-target ack = %+v", ack)
 	}
 }

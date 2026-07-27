@@ -55,7 +55,9 @@ func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
 
 func TestExecSessionWithoutTTLIsLongLived(t *testing.T) {
 	sb := &types.Sandbox{
-		ID: "bare-1", ServiceSecret: strings.Repeat("1", 64),
+		ID: "bare-1", Profile: types.ProfileBare,
+		TemplateID: "bare-img-" + strings.Repeat("2", 64), State: types.StateRunning,
+		ServiceSecret: strings.Repeat("1", 64),
 	}
 	token, err := mintExecSessionToken(sb, 0, 1)
 	if err != nil {
@@ -63,6 +65,34 @@ func TestExecSessionWithoutTTLIsLongLived(t *testing.T) {
 	}
 	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.ID, time.Unix(math.MaxInt64, 0)); err != nil {
 		t.Fatalf("long-lived token at distant time: %v", err)
+	}
+}
+
+func TestExecSessionTTLStartsAtSigningAfterTargetPreparation(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("4", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	sb := &types.Sandbox{
+		ID: "signing-time", Profile: types.ProfileBare,
+		TemplateID: "bare-img-" + strings.Repeat("5", 64), State: types.StateRunning,
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	clock := scriptedUnixClock(t, 1_800_000_000, 1_800_000_100)
+	token, err := o.execSession(ctx, sb.ID, apiKey, "", 37, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_136, 0)); err != nil {
+		t.Fatalf("TTL was consumed before signing: %v", err)
+	}
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_137, 0)); err == nil {
+		t.Fatal("token accepted at signing time + TTL")
 	}
 }
 
@@ -91,5 +121,46 @@ func TestExecSessionRejectsUnauthorizedAndInvalidTTL(t *testing.T) {
 				t.Fatalf("execSessionExpiry() error = %v, want bad request", err)
 			}
 		})
+	}
+}
+
+func TestExecSessionRejectsDeadAndInconsistentSandbox(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("6", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	dead := &types.Sandbox{
+		ID: "dead-exec", Profile: types.ProfileBare,
+		TemplateID: "bare-img-" + strings.Repeat("7", 64), State: types.StateDead,
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, dead)
+	if err := o.st.Put(ctx, dead); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ExecSession(ctx, dead.ID, apiKey, "", 0); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("dead sandbox error = %v, want not found", err)
+	}
+	inconsistent := &types.Sandbox{
+		ID: "bad-template", Profile: types.ProfileBare,
+		TemplateID: "e2b-img-" + strings.Repeat("8", 64), State: types.StateRunning,
+		ServiceSecret: strings.Repeat("9", 64),
+	}
+	if _, err := mintExecSessionToken(inconsistent, 0, 1); err == nil {
+		t.Fatal("inconsistent template/profile minted a token")
+	}
+}
+
+func scriptedUnixClock(t *testing.T, values ...int64) unixClock {
+	t.Helper()
+	index := 0
+	return func() int64 {
+		if index >= len(values) {
+			t.Fatalf("clock called more than %d times", len(values))
+		}
+		value := values[index]
+		index++
+		return value
 	}
 }
