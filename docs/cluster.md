@@ -879,7 +879,7 @@ Cluster native exec 的控制面不把 public node API reverse-proxy 到当前 n
 
 ```text
 POST /sandboxes/<stableSID>/exec-sessions
-  X-Kuasar-Sandbox-Group + X-Kuasar-Sandbox-Route-Key + X-API-KEY
+  X-Kuasar-Sandbox-Group + X-Kuasar-Route-Key + X-API-KEY
   empty / {} / {"ttlSeconds":N} + optional MigrationToken
     ↓ Router strict 64 KiB decode
 Reserve(operation=exec-session, expected stableSID)
