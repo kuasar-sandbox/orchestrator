@@ -913,8 +913,8 @@ func (a *API) sandboxBaseResp(sb *types.Sandbox) map[string]any {
 func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d := a.sandboxBaseResp(sb)
 	d["state"] = string(sb.State)
-	d["startedAt"] = sb.CreatedUnix
-	d["endAt"] = sb.DeadlineUnix
+	d["startedAt"] = isoUnix(sb.CreatedUnix)
+	d["endAt"] = isoUnix(sandboxEndUnix(sb))
 	d["metadata"] = sb.Metadata
 	return d
 }
@@ -925,10 +925,6 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 // missing field crashes next_items(). State is always running/paused here (dead rows
 // are deleted on kill), matching the SDK's SandboxState enum.
 func (a *API) listed(sb *types.Sandbox) map[string]any {
-	end := sb.DeadlineUnix
-	if end == 0 { // no deadline: report start so endAt is still a valid timestamp
-		end = sb.CreatedUnix
-	}
 	return map[string]any{
 		"sandboxID":   sb.ID,
 		"templateID":  sb.TemplateID,
@@ -939,9 +935,16 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"diskSizeMB":  a.res.DiskMB,
 		"envdVersion": a.envdVersion(sb),
 		"startedAt":   isoUnix(sb.CreatedUnix),
-		"endAt":       isoUnix(end),
+		"endAt":       isoUnix(sandboxEndUnix(sb)),
 		"metadata":    sb.Metadata,
 	}
+}
+
+func sandboxEndUnix(sb *types.Sandbox) int64 {
+	if sb.DeadlineUnix == 0 { // no deadline: report start so endAt is still a valid timestamp
+		return sb.CreatedUnix
+	}
+	return sb.DeadlineUnix
 }
 
 // isoUnix formats a Unix-seconds timestamp as RFC3339 (ISO-8601) for the SDK.

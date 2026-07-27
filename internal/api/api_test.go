@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
@@ -403,6 +404,35 @@ func TestSandboxResponseUsesProfileSpecificCredentials(t *testing.T) {
 	}
 	if _, ok := bare["trafficAccessToken"]; ok {
 		t.Fatalf("bare response exposed trafficAccessToken: %+v", bare)
+	}
+}
+
+func TestSandboxDetailUsesISO8601Timestamps(t *testing.T) {
+	a := &API{domain: "example.test"}
+	created := int64(1_700_000_000)
+	sandbox := &types.Sandbox{ID: "sandbox", CreatedUnix: created}
+
+	detail := a.sandboxDetail(sandbox)
+	startedAt, ok := detail["startedAt"].(string)
+	if !ok {
+		t.Fatalf("startedAt type = %T, want string", detail["startedAt"])
+	}
+	endAt, ok := detail["endAt"].(string)
+	if !ok {
+		t.Fatalf("endAt type = %T, want string", detail["endAt"])
+	}
+
+	want := time.Unix(created, 0).UTC().Format(time.RFC3339)
+	if startedAt != want || endAt != want {
+		t.Fatalf("detail timestamps = startedAt %q, endAt %q; want %q for both", startedAt, endAt, want)
+	}
+
+	deadline := created + 300
+	sandbox.DeadlineUnix = deadline
+	detail = a.sandboxDetail(sandbox)
+	wantEnd := time.Unix(deadline, 0).UTC().Format(time.RFC3339)
+	if got := detail["endAt"]; got != wantEnd {
+		t.Fatalf("detail endAt = %v, want %q", got, wantEnd)
 	}
 }
 
