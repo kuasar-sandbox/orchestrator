@@ -1,7 +1,7 @@
 # cluster-router — e2b 统一入口与路由缓存
 
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
-不订阅 route 或 node_list;它通过 group 定位 route owner。显式 create/connect 调用对应
+不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
 Reserve operation,数据面 cache miss / fail-fast 先 Resolve,已知非 READY sandbox 再调用 data
 Reserve;热路径通过本地 route cache 直接转发到 node。
 
@@ -29,18 +29,20 @@ node owner / placer / node
 ### 1.2 原则
 
 1. **每个请求必须有 group**:`X-Kuasar-Sandbox-Group` 是 cluster 控制面和数据面的分片依据。
-2. **Reserve 操作显式分类**:create/data 只在 READY 时返回;connect 在 node 同步准备并返回
-   typed ConnectResult 后完成,不等待异步 resume。router 不订阅 route watch。
+2. **Reserve 操作显式分类**:create/data 只在 READY 时返回;connect/exec-session 在 node
+   同步准备并返回 typed result 后完成,不等待异步 resume.router 不订阅 route watch.
 3. **热路径优先使用 route cache**:近期解析的 READY route 命中时,新请求不触发 Resolve/Reserve;
    在途请求不作为新请求的路由来源。
 4. **fail-fast 失效**:node 返回 sandbox 不存在、token 不匹配、连接失败时,router 淘汰本地缓存并重新 Resolve;
    只有已存在但非 READY 的 route 才继续 Reserve。
-5. **数据面字节不进 registry**:registry 只参与显式 create/connect、已知 route 激活和
+5. **数据面字节不进 registry**:registry 只参与显式 create/connect/exec-session,已知 route 激活和
    miss/fail-fast Resolve。
-6. **根凭据用途分离**:create/connect 由 Reserve 强制验证原始 API key;其它控制操作由 router 调
-   route owner 的 verify-key,registry failover 到 ready placer,由 placer 使用 provider 的 APISecret 验证。
-   READY route 的受保护返回同时投影该 sandbox 已绑定的 APISecret、ServiceSecret 和用途明确的 access tokens
-   给可信 router;ManifestKey 原文不进入 registry/router 路由链路。
+6. **根凭据用途分离**:create/connect/exec-session 由 Reserve 强制验证原始 API key;
+   create 的 group admission 经 ready placer 使用 provider APISecret,connect/exec-session 使用
+   Sandbox 记录已绑定的 APISecret.其它控制操作由 router 调 route owner 的 verify-key,
+   registry failover 到 ready placer 验证.READY route 的受保护返回同时投影该 sandbox 已绑定的
+   APISecret,ServiceSecret 和用途明确的 access tokens 给可信 router;ManifestKey 原文不进入
+   registry/router 路由链路.
 
 ## 2. 命令行
 
@@ -104,9 +106,10 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | create | group + route_key(可缺省生成) | 提取并校验本次请求的 `kuasar-sandbox.restore` 与 `kuasar-sandbox.credentials`,定位 route owner 后随 `ReserveSandbox` 传递 |
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | connect | group + route_key + stable sandbox_id | 调用 `operation=connect` Reserve;registry 经 node-link 下发 CmdConnect,不 Resolve 或转发 node HTTP `/connect` |
+| exec session | group + route_key + stable sandbox_id | 调用 `operation=exec-session` Reserve;Registry 验证 API key,经 node-link 下发 CmdExecSession,只对外返回 ExecAccessToken |
 | get/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面 |
 | list/get | group | 读取 group 分片 |
-| data plane | group + route_key + stable sandbox_id + port | READY cache 命中后建立一次性 CONNECT;cache 中已知非 READY route 调用 `operation=data` Reserve;miss 先 Resolve |
+| data plane | group + route_key + stable sandbox_id + target | READY cache 命中后建立一次性 CONNECT;当前 target 是 legacy port 或显式 `service=exec` + 可选 port;cache 中已知非 READY route 调用 `operation=data` Reserve;miss 先 Resolve |
 | build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
@@ -127,9 +130,12 @@ Router 调用同一 `POST /route-link/reserve` 时按 operation 组装不同请�
 - `create`:query 为 `operation=create&group=&route_key=`,Header 携 `X-API-KEY`,body 只携上述 create config。
 - `connect`:query 为 `operation=connect&group=&route_key=&sid=[&timeout=]`,Header 携 `X-API-KEY`
   和可选 `X-Kuasar-Migration-Token`,body 为空。
-- `data`:query 为 `operation=data&group=&route_key=&sid=[&port=]`,Header 携 `X-Access-Token`,body 为空。
+- `exec-session`:query 为 `operation=exec-session&group=&route_key=&sid=[&ttl_seconds=]`,Header 携
+  `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`,body 为空.Router 已先严格解析 public body.
+- `data`:query 为 `operation=data&group=&route_key=&sid=[&port=]`,Header 携 `X-Access-Token`;
+  exec 目标同时携 `E2b-Sandbox-Service: exec`,body 为空.
 
-connect/data 中的 `sid` 均是客户期望的稳定 SandboxID,用于防止 route_key 被删除重建后请求
+connect/exec-session/data 中的 `sid` 均是客户期望的稳定 SandboxID,用于防止 route_key 被删除重建后请求
 跨越 lineage。
 
 ## 6. 缓存模型
@@ -178,9 +184,13 @@ value:
 revision 相同但 NodeSandboxID 不同时也拒绝覆盖。这使迟到的旧代际 Resolve/Reserve 结果不能
 回退已切换的新节点目标。
 
-端口不从 route_key 解析。数据面端口来自请求显式端口(`E2b-Sandbox-Port`、`<port>-<sandbox_id>` Host
-或 CONNECT authority)或 route_link 返回的 `target_port`。`target_port>0` 表示强制端口:请求未显式带端口时
-使用它;请求显式端口与它不一致时拒绝 400。两者都缺失时拒绝 400,router 不默认 49983。
+端口不从 route_key 解析.Legacy 实际端口来自
+`E2b-Sandbox-Port`,`<port>-<sandbox_id>` Host,CONNECT authority 或 route_link 返回的
+`target_port`.`target_port>0` 表示强制端口:请求未显式带端口时使用它;请求显式
+端口与它不一致时拒绝 400.所有来源都缺失时,legacy 拒绝 400,
+Router 不默认 49983.`exec` 是无端口逻辑服务;请求可以携带 port,
+但 Router 不用它选择 backend,缺失 port 也不拒绝.其它显式 service 的 port 合同
+属于 #63 边界.
 
 ### 6.3 在途请求
 
@@ -202,7 +212,8 @@ CONNECT。普通 HTTP 请求也先对 node proxy 发 CONNECT,再在隧道内发�
 
 Router 不合并 Reserve 请求,避免把不同 operation、凭据、timeout 或 migration token 合并到同一次调用。
 Registry 只对并发 create 合并创建状态机;data 通过 route CAS 和稳定 lineage wait 收敛同一次激活;
-connect 的每个请求均针对当前 NodeSandboxID 独立下发 CmdConnect。未知 route 的数据面请求只
+connect 的每个请求均针对当前 NodeSandboxID 独立下发 CmdConnect;exec-session 的每个
+API 调用也使用独立 CmdID 和 ExecSessionResult,不共享 token.未知 route 的数据面请求只
 Resolve,不会隐式创建 sandbox。
 
 ### 6.5 失效
@@ -219,15 +230,18 @@ fail-fast 代价,不为此维护 router route 订阅。
 
 ## 7. 控制面
 
-API key 鉴权不可关闭。create/connect 把客户端原始 API key 交给 Reserve,由 Registry 在任何生命周期
-副作用前完成验证;其它控制操作由 router 调 route owner `verify-key`,route owner failover 到 ready placer,
-实际校验由 placer 使用 provider 侧 APISecret 完成。ManifestKey 只用于内容路径,不参与该校验。
+API key 鉴权不可关闭.create/connect/exec-session 把客户端原始 API key 交给 Reserve,
+由 Registry 在任何生命周期副作用前完成验证:create 的 group admission 经 ready placer 使用
+provider APISecret,connect/exec-session 使用 Sandbox 业务记录已绑定的 APISecret.其它控制操作
+由 router 调 route owner `verify-key`,route owner failover 到 ready placer 验证.ManifestKey
+只用于内容路径,不参与 API 鉴权.
 
 | 操作 | 行为 |
 |---|---|
 | create | 调用 `operation=create` Reserve,传递请求级 restore policy 与 credentials object;credentials 在写普通 metadata 前分离 |
 | kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
 | connect | 调用 `operation=connect` Reserve;Registry 对当前 NodeSandboxID 下发 CmdConnect,验证 typed ConnectResult 后返回;Router 不 Resolve,不二次转发 node HTTP `/connect` |
+| exec session | 严格解析 64 KiB body,调用 `operation=exec-session` Reserve;Registry 验证原始 API key 并下发 CmdExecSession;Router 只投影 ExecAccessToken |
 | get/pause/timeout/export | Resolve 当前 route,把公开 SandboxID 路径替换为 NodeSandboxID 后转发;typed get 响应重写回稳定 SandboxID |
 | get/list | 读 group route_link |
 | build register | 生成稳定 build_id/template_id 后调 ReserveBuild |
@@ -238,12 +252,48 @@ root 凭据或 fingerprint。Router 校验 Ack 与受保护 Route 一致,再组�
 profile 对应公开 token 的 e2b 响应。node 已同步完成校验、可选迁移导入、deadline 持久化和
 凭据读取;resume 在 Ack 后异步进行。
 
+Exec session 的 public endpoint 是 `POST /sandboxes/{stableSandboxID}/exec-sessions`.请求必须携
+group,route-key 和原始 `X-API-KEY`,可选 `X-Kuasar-Migration-Token`.body 只允许空,
+`{}` 或 `{"ttlSeconds":<non-negative int64>}`;完整原始 body(含尾随空白)上限 64 KiB.
+已知 Content-Length 超限或实际读到 64 KiB + 1 返回 413;unknown/duplicate 字段,
+`null`,第二个 JSON value,负数或 TTL 加法/时间表示溢出返回 400.
+
+Router 将 API key 送到 Registry verifier,但不把它写入 command;CmdExecSession 只携
+APISecretFingerprint,expected Profile,TTLSeconds,可选 MigrationToken/cluster context.
+Node 同步 import/校验/签名,在 Ack 中返回 `ExecSessionResult`,然后异步 resume.
+Registry 把该 result 与当前 stable lineage 的 Route 汇合;Router 验证两者一致后返回:
+
+```http
+HTTP/1.1 201 Created
+Cache-Control: no-store
+Content-Type: application/json
+
+{"execAccessToken":"kat1..."}
+```
+
+响应不包含 session ID,exp,NodeSandboxID,ServiceSecret 或 route.运行时失败返回固定
+脱敏错误,不原样转发 node Ack reason 或内部路径.异步 resume 在 Ack 后失败不回溯
+修改已返回 token,后续连接按当前 route/state 失败.
+
 ## 8. 数据面
 
-router 在 sid-host 数据面路径先校验凭证:
+Router 先分离普通 legacy target 和 native exec 逻辑服务:
+
+- 普通 HTTP 只使用 Host/`E2b-Sandbox-Id + E2b-Sandbox-Port` 的 legacy port;
+  不解析 `E2b-Sandbox-Service`,该 Header 作为应用层 Header 在内层请求中保留.
+- 未携 service 的 CONNECT 同样使用 legacy raw port.
+- `E2b-Sandbox-Service: exec` 是已接入的 portless CONNECT target,可与 port 并存,
+  但 port 不参与 backend 选择.
+- `forward|e2b:envd|e2b:code-interpreter` 的完整 cluster service-aware 转发合同由
+  [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) 跟踪.当前 cluster 入口不将这三个
+  Header 值描述为已支持的 backend selector;最终 Node 依其本地受信 profile 选择 backend.
+
+Legacy sid-host 数据面路径先校验凭证:
 
 - e2b profile 的 49983/49999 端口必须带 `X-Access-Token: <envd_access_token>`。
-- 其他 forward 目标必须带 `X-Access-Token: <forward_access_token>`。
+- e2b 其它端口与 bare 的所有端口必须带
+  `X-Access-Token: <forward_access_token>`.bare 的 49983/49999 也是普通 TCP forward,
+  不是 501 控制端口.
 - `traffic_access_token` 供外部网关及 e2b 数据面组件使用,cluster router 不消费。
 - envd 预签名文件 URL 可不带 token,但仅限 `port=49983`、`GET/POST /files`、非空 `signature` query。
 - 同一请求若带了非空但错误的 `X-Access-Token`,不回退到 signature。
@@ -257,7 +307,7 @@ E2b-Sandbox-Port: <port>
 X-Access-Token: <client X-Access-Token>
 ```
 
-客户请求的 Host/路径使用稳定 SandboxID。Router 向 node proxy 建立外层 CONNECT 时使用当前
+客户请求的 Host/路径使用稳定 SandboxID.Router 向 node proxy 建立外层 CONNECT 时使用当前
 NodeSandboxID;普通 HTTP 的内层 Host 也改为 `<port>-<node_sandbox_id>.<domain>`。内层请求已有
 `E2b-Sandbox-Id` 时把值替换为 NodeSandboxID,保留该 Header 供用户应用感知当前 node-local ID。
 
@@ -273,8 +323,37 @@ Registry 按当前 profile/端口再验证凭据,通过后才允许 CmdConnect �
 `auth.data_plane=off` 只跳过 Router 对普通 READY 转发的本地 token 闸门,不取消 Reserve 激活的鉴权;
 带显式错误 token 的 `/files` 在任何 Router 鉴权模式下都不回退 signature。
 
+Exec CONNECT 使用单独的 KAT 合同:
+
+```text
+client CONNECT
+  stable SandboxID + service=exec + X-Access-Token=KAT
+    ↓ side-effect-free cache/Resolve
+Router verifies stable AuthSandboxID + ServiceSecret
+    ↓ only when non-READY and already authorized
+Reserve(operation=data, same KAT + service=exec)
+    ↓ Registry re-verifies before CmdConnect
+current Route
+    ↓ rewrite only SID
+node CONNECT
+  current NodeSandboxID + service=exec + optional original port + same KAT
+```
+
+Exec 始终 enforce,不受 `auth.data_plane=off|log|enforce` 影响.EnvdAccessToken,
+ForwardAccessToken 或 TrafficAccessToken 不能代替 exec KAT.KAT 缺失,过期,签名错误,
+SID/audience 错误时返回 401,且不能触发 Router Reserve,Registry CmdConnect 或 Node resume.
+READY cache hot path 不增加 Registry 调用,但 Router 和 Node 仍验证同一 KAT.非 READY
+路径中,Registry 复验通过后才可以执行生命周期副作用;Reserve 后 Router 必须使用重读的
+current NodeSandboxID,不能复用验证前的旧 node target.
+
+最终 Node 从本地 route 再次校验 `AuthSandboxID + ServiceSecret`,授权成功后才连接
+`<run_root>/<NodeSandboxID>/ctl.sock`,回复 CONNECT 200 并进入 `ctl.ProxyExec` gate.Router 只做
+前置 CONNECT 中继,不拨 `ctl.sock`,不执行首帧 gate.
+
 CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL
-或 fail-fast 失效。
+或 fail-fast 失效.Router→Node CONNECT 的 response reader 已预读字节会随 tunnel 保留;
+中继在单向 EOF 时只传播 half-close,等待另一方向的 `exec_ack`,stdout/stderr 和 exit status
+完整结束,不在首个 `io.Copy` 返回时截断 tunnel.
 
 ## 9. 可靠性
 
