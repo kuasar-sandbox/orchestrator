@@ -74,7 +74,7 @@ bash test/e2e/run_all.sh
 | `e2e_sandbox_proto.sh` | host↔guest 双向 launch 协议 |
 | `e2e_sandbox_stdio.sh` | sandbox-ctl stdio 转发模型 |
 | `e2e_sandbox_tapfd.sh` | 网络来自 tapfd handoff 的沙箱启动 |
-| `e2e_sandbox_placeholder.sh` | launch.placeholder 空跑锚点:exec 驱动 + kill 锚点原地重启不 reboot |
+| `e2e_sandbox_placeholder.sh` | launch.placeholder 无 NIC 冷启动:CH 无 `--net`,guest 仅 `lo`,vsock exec + kill 锚点原地重启不 reboot |
 | `e2e_sandbox_disks.sh` | boot.disks[] 多数据盘(单盘 + overlay)冷启挂载 + 快照/恢复数据存活 |
 
 ### 快照 / 恢复

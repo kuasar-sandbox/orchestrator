@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# e2e_sandbox_placeholder.sh — boot a no-exec "placeholder" sandbox and verify
-# the exec-driven anchor model (launch.placeholder, docs/sandbox.md launch §).
+# e2e_sandbox_placeholder.sh — boot a no-exec "placeholder" sandbox without a
+# virtio-net device and verify the exec-driven anchor model (launch.placeholder,
+# docs/sandbox.md launch §).
 #
 # A placeholder sandbox runs NO external program: sandbox-init forks the app
 # child, which does its namespace/cgroup/stdio setup and then waits for a stop
@@ -11,9 +12,9 @@
 # kills PID 1 restarts the anchor in place rather than tearing the sandbox down.
 #
 # This exercises:
-#   1. launch.placeholder boot (no launch.exec, image Cmd ignored)
+#   1. launch.placeholder boot without a virtio-net device
 #   2. the guest handshake + phase-2 fork accept a no-exec spec (no "kill init")
-#   3. `sandbox-ctl exec` into the placeholder sandbox actually runs commands
+#   3. no CH --net, guest has only lo, and vsock-backed exec still works
 #   4. PID 1 in the app ns is the placeholder (exec-child-placeholder argv)
 #   5. SIGTERM the anchor from an exec session → in-place restart, NOT reboot
 #   6. graceful stop (SIGTERM the run process) exits 0
@@ -21,7 +22,8 @@
 # Prerequisites (checked; missing → skip with a message, exit 0):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
 #   sandbox-runtime.erofs,flatten-ctl} · $VMLINUX · docker (or BLK0_IMAGE=) ·
-#   mkfs.ext4 · root (tap/cgroup/vsock). Set REQUIRE_KVM=1 to fail hard.
+#   mkfs.ext4 · root (cgroup/userfaultfd/rootful flatten). Set REQUIRE_KVM=1 to
+#   fail hard.
 #
 # Any rootfs with /bin/sh works; default base is busybox (tiny, fast). Override
 # IMAGE= or BLK0_IMAGE=path/to/prebuilt.erofs.
@@ -31,7 +33,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-busybox:latest}"
-TAP_NAME="${TAP_NAME:-sb-tap0}"
 SID="${SID:-ph1}"
 
 skip() {
@@ -53,8 +54,8 @@ VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run 'make vmlinux' or set VMLINUX)"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH (apt install e2fsprogs)"
 
-# Self-elevate: tap creation, cgroup writes, vsock and (rootful) flatten all
-# need root. After the cheap prereq checks so skips stay fast.
+# Self-elevate: cgroup writes, userfaultfd and rootful flatten need root. After
+# the cheap prereq checks so skips stay fast.
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
@@ -64,7 +65,6 @@ RUNROOT="$WORK/runtime"; mkdir -p "$RUNROOT"
 RUNLOG="$WORK/run.log"
 RUNPID=""
 CTL_PID=""
-TAP_CREATED=0
 
 cleanup() {
     set +e
@@ -77,18 +77,9 @@ cleanup() {
     [ -n "$CTL_PID" ] && kill -0 "$CTL_PID" 2>/dev/null && kill -KILL "$CTL_PID" 2>/dev/null
     [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null && kill -KILL "$RUNPID" 2>/dev/null
     pkill -f "cloud-hypervisor.*$SID" 2>/dev/null
-    [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
 }
 trap cleanup EXIT
-
-# ---- TAP ------------------------------------------------------------------
-if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
-    ip tuntap add dev "$TAP_NAME" mode tap
-    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
-    ip link set "$TAP_NAME" up
-    TAP_CREATED=1
-fi
 
 # ---- blk0 base (any /bin/sh rootfs) ---------------------------------------
 BLK0_IMAGE="${BLK0_IMAGE:-}"
@@ -114,11 +105,6 @@ cat > "$WORK/sandbox.yaml" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
   allocatable: { cpu: 1, memory: 512MiB }
-network:
-  tap: $TAP_NAME
-  interface: eth0
-  ip: 169.254.1.1/31
-  hostname: e2e-placeholder
 boot:
   kernel:  file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
@@ -165,6 +151,32 @@ for _ in $(seq 1 90); do
 done
 [ "$READY" = 1 ] || { echo "==> FAIL: sandbox never became exec-ready"; tail -60 "$RUNLOG"; exit 1; }
 echo "==> PASS: booted no-exec placeholder, sandbox is exec-ready"
+
+# The no-network contract has two independent observable sides: CH receives no
+# virtio-net argument, while the guest retains loopback and the vsock control
+# plane used by this exec check.
+CH_ARGS="$(grep -m1 '\[sandbox-ctl\] CH args:' "$RUNLOG" || true)"
+[ -n "$CH_ARGS" ] || { echo "==> FAIL: CH args line missing"; tail -60 "$RUNLOG"; exit 1; }
+if grep -Eq '(^|[[:space:]])--net([[:space:]]|$)' <<<"$CH_ARGS"; then
+    echo "==> FAIL: no-network sandbox received --net: $CH_ARGS"
+    exit 1
+fi
+if ! exec1 -- /bin/sh -c \
+    'for path in /sys/class/net/*; do printf "%s\n" "${path##*/}"; done' \
+    >"$WORK/netdevs" 2>"$WORK/netdevs.err"; then
+    echo "==> FAIL: could not inspect guest network devices"
+    sed 's/^/    /' "$WORK/netdevs.err"
+    tail -60 "$RUNLOG"
+    exit 1
+fi
+NETDEVS="$(tr -d '\r' <"$WORK/netdevs")"
+[ "$NETDEVS" = "lo" ] || {
+    echo "==> FAIL: expected guest network devices to be exactly 'lo', got:"
+    sed 's/^/    /' "$WORK/netdevs"
+    exit 1
+}
+echo "==> PASS: CH omitted --net, guest exposes only lo, and vsock exec works"
+
 grep -q "placeholder app (no exec)" "$RUNLOG" \
     && echo "==> PASS: guest log confirms the placeholder is waiting" \
     || echo "==> INFO: placeholder console line not captured (lag); proven via exec below"
