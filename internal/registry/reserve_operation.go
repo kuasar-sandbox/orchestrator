@@ -358,7 +358,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 			SandboxGeneration: target.SandboxGeneration, NodeSandboxID: target.NodeSandboxID,
 			Profile: target.Profile, APISecretFingerprint: target.APISecretFingerprint,
 		}); err != nil {
-			r.rollbackConnect(&target, targetRev, original, true)
+			r.rollbackConnect(&target, targetRev, current, true)
 			if errors.Is(err, errNodeSandboxIDConflict) {
 				lastFailure = err
 				excluded.add(target.NodeID)
@@ -369,7 +369,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, connectCommand(req, &target), lifecycleAckTimeout)
 		if err != nil {
 			ambiguous := !errors.Is(err, ErrNodeGone)
-			r.rollbackConnect(&target, targetRev, original, ambiguous)
+			r.rollbackConnect(&target, targetRev, current, ambiguous)
 			if errors.Is(err, ErrNodeGone) {
 				lastFailure = err
 				excluded.add(target.NodeID)
@@ -378,7 +378,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 			return nil, err
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			r.rollbackConnect(&target, targetRev, original, false)
+			r.rollbackConnect(&target, targetRev, current, false)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -388,7 +388,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 			continue
 		}
 		if err := validateConnectResult(ack.Connect, &target); err != nil {
-			r.rollbackConnect(&target, targetRev, original, true)
+			r.rollbackConnect(&target, targetRev, current, true)
 			return nil, err
 		}
 		route, err := r.routeWithDataEndpoint(ctx, &target, targetRev)

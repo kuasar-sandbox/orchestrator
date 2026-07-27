@@ -380,6 +380,54 @@ func TestReserveConnectMigrationRetriesCandidateWithHigherGeneration(t *testing.
 	}
 }
 
+func TestReserveConnectMigrationRollbackPreservesPlacementTimeRecord(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	original := testE2BSandboxRecord("/g", "rk", "sb-migrate", "gone", StateReady)
+	original.TargetPort = 8080
+	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "n1:9443"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "candidate refused",
+		})
+	}})
+
+	placements := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		if placements > 1 {
+			return nil, ErrNoNode
+		}
+		// Placement runs before placeAndConnect re-reads the route. Model a
+		// same-generation lifecycle update committed in that window; a failed
+		// candidate must roll back to this record, not the caller's stale copy.
+		current := *original
+		current.State = StatePaused
+		current.TargetPort = 8088
+		if _, err := reg.stores.PutSandbox(ctx, &current); err != nil {
+			t.Fatal(err)
+		}
+		return &Placement{NodeID: "n1", APISecretFingerprint: original.APISecretFingerprint}, nil
+	}))
+
+	req := testConnectReserve(original)
+	req.MigrationToken = "kmt1.migration-ciphertext"
+	if result, err := reg.ReserveSandbox(ctx, req); err == nil || result != nil {
+		t.Fatalf("rejected migration result=%+v err=%v, want failure", result, err)
+	}
+	stored, _, found, err := reg.stores.GetSandbox(ctx, original.Group, original.RouteKey)
+	if err != nil || !found || stored.State != StatePaused || stored.TargetPort != 8088 ||
+		stored.NodeID != original.NodeID || stored.NodeSandboxID != original.NodeSandboxID ||
+		stored.SandboxGeneration != original.SandboxGeneration || stored.NextSandboxGeneration != 2 {
+		t.Fatalf("migration rollback stored=%+v found=%v err=%v", stored, found, err)
+	}
+}
+
 func TestReserveConnectMigratesReservedTargetAfterNodeLoss(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
