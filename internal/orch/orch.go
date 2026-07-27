@@ -567,11 +567,11 @@ func (o *Orchestrator) rollbackFailedResume(original, attempted *types.Sandbox) 
 
 // --- proxy.Router (internal mode) ---
 
-// Route resolves a (sid, port) for the in-process proxy. A paused sandbox is
+// Route resolves a canonical target for the in-process proxy. A paused sandbox is
 // auto-resumed on the spot (single-flight: concurrent data-plane requests collapse
 // to one resume). The forwarding decision is shared with the external route table
 // via proxy.RouteForTarget.
-func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (proxy.Route, error) {
+func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy.ConnectTarget) (proxy.Route, error) {
 	sb := o.lookup(sandboxID)
 	if sb == nil {
 		s, _ := o.st.Get(ctx, sandboxID)
@@ -580,6 +580,16 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 		}
 		sb = s
 		o.cache(sb)
+	}
+	selected := proxy.RouteForTarget(
+		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
+		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
+	)
+	// A recognized but unsupported logical service has no backend to activate.
+	// In particular, service=exec remains a side-effect-free 501 boundary until
+	// #64 installs its authenticated ctl.sock gate.
+	if selected.Kind == proxy.KindDeny {
+		return selected, nil
 	}
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
 		if err := o.resumeSandbox(ctx, sandboxID); err != nil {
@@ -591,7 +601,7 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 	}
 	return proxy.RouteForTarget(
 		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
-		sb.EnvdAccessToken, sb.ForwardAccessToken, port,
+		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
 	), nil
 }
 

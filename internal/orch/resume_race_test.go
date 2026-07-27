@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -139,7 +140,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := o.Route(ctx, sid, 49983)
+			_, err := o.Route(ctx, sid, proxy.LegacyTarget(49983))
 			errs <- err
 		}()
 	}
@@ -155,7 +156,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		})
 	}
 	timer := time.AfterFunc(100*time.Millisecond, releaseStart)
-	_, routeErr := o.Route(ctx, sid, 49983)
+	_, routeErr := o.Route(ctx, sid, proxy.LegacyTarget(49983))
 	returnedBeforeRelease := timer.Stop()
 	if returnedBeforeRelease {
 		releaseStart()

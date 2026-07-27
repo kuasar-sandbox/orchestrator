@@ -30,7 +30,7 @@ type Kind int
 
 const (
 	KindNotFound Kind = iota // unknown sandbox -> 404
-	KindDeny                 // e.g. bare data-plane port -> 501
+	KindDeny                 // recognized service unsupported by this route -> 501
 	KindUDS                  // dial unix socket (e2b control: --connect)
 	KindTCP                  // dial floatingip:port
 )
@@ -43,10 +43,11 @@ type Route struct {
 }
 
 const (
-	HeaderSandboxID   = "E2b-Sandbox-Id"
-	HeaderSandboxPort = "E2b-Sandbox-Port"
-	HeaderAccessToken = "X-Access-Token"
-	HeaderProxyError  = "X-Kuasar-Proxy-Error"
+	HeaderSandboxID      = "E2b-Sandbox-Id"
+	HeaderSandboxPort    = "E2b-Sandbox-Port"
+	HeaderSandboxService = "E2b-Sandbox-Service"
+	HeaderAccessToken    = "X-Access-Token"
+	HeaderProxyError     = "X-Kuasar-Proxy-Error"
 
 	ProxyErrorBadRequest    = "bad_request"
 	ProxyErrorRouteError    = "route_error"
@@ -56,11 +57,36 @@ const (
 	ProxyErrorUpstreamError = "upstream_error"
 )
 
-// Router resolves a (sandboxID, port) to a Route. It may block to auto-resume a
+// ConnectService is the canonical logical service selected by a CONNECT request.
+// The empty value is the legacy profile + raw-port mapping used when the service
+// Header is absent.
+type ConnectService string
+
+const (
+	ConnectServiceLegacy         ConnectService = ""
+	ConnectServiceForward        ConnectService = "forward"
+	ConnectServiceE2BEnvd        ConnectService = "e2b:envd"
+	ConnectServiceE2BInterpreter ConnectService = "e2b:code-interpreter"
+	ConnectServiceExec           ConnectService = "exec"
+)
+
+// ConnectTarget carries the canonical CONNECT target. Port is optional for
+// logical services and required for legacy and explicit forward targets.
+type ConnectTarget struct {
+	Service ConnectService
+	Port    int
+}
+
+// LegacyTarget builds the target used by ordinary HTTP and service-less CONNECT.
+func LegacyTarget(port int) ConnectTarget {
+	return ConnectTarget{Service: ConnectServiceLegacy, Port: port}
+}
+
+// Router resolves a (sandboxID, target) to a Route. It may block to auto-resume a
 // paused sandbox (internal) or park awaiting a route push (external), returning
 // KindUDS/KindTCP once up, or KindNotFound if it never came up.
 type Router interface {
-	Route(ctx context.Context, sandboxID string, port int) (Route, error)
+	Route(ctx context.Context, sandboxID string, target ConnectTarget) (Route, error)
 }
 
 // Counter is the narrow metrics surface the proxy needs.
@@ -75,22 +101,43 @@ func (noopCounter) Inc(string) {}
 // RouteDialer opens a backend connection for a resolved route.
 type RouteDialer func(context.Context, Route) (net.Conn, error)
 
-// RouteForTarget builds the forwarding decision for a resolved, running sandbox
-// from its targets + the requested port. Shared by the internal router (orch) and
-// the external route table so both classify ports identically.
-func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwardAccessToken string, port int) Route {
-	control := port == 49983 || port == 49999
-	if profile == string(types.ProfileE2B) && control {
-		uds := envdUDS
-		if port == 49999 {
-			uds = ciUDS
+// RouteForTarget builds the forwarding decision for a resolved sandbox. Explicit
+// CONNECT services are authoritative; the legacy service retains the profile +
+// raw-port mapping. Shared by internal and external node proxies.
+func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwardAccessToken string, target ConnectTarget) Route {
+	switch target.Service {
+	case ConnectServiceLegacy:
+		if profile == string(types.ProfileE2B) && (target.Port == 49983 || target.Port == 49999) {
+			uds := envdUDS
+			if target.Port == 49999 {
+				uds = ciUDS
+			}
+			return Route{Kind: KindUDS, UDS: uds, AccessToken: envdAccessToken}
 		}
-		return Route{Kind: KindUDS, UDS: uds, AccessToken: envdAccessToken}
-	}
-	if profile == string(types.ProfileBare) && control {
+		// A bare sandbox has no reserved logical-service ports. In particular,
+		// 49983 and 49999 are ordinary guest TCP destinations.
+		return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, target.Port), AccessToken: forwardAccessToken}
+	case ConnectServiceForward:
+		return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, target.Port), AccessToken: forwardAccessToken}
+	case ConnectServiceE2BEnvd:
+		if profile != string(types.ProfileE2B) {
+			return Route{Kind: KindDeny}
+		}
+		return Route{Kind: KindUDS, UDS: envdUDS, AccessToken: envdAccessToken}
+	case ConnectServiceE2BInterpreter:
+		if profile != string(types.ProfileE2B) {
+			return Route{Kind: KindDeny}
+		}
+		return Route{Kind: KindUDS, UDS: ciUDS, AccessToken: envdAccessToken}
+	case ConnectServiceExec:
+		// #64 replaces this recognized boundary with the authenticated ctl.sock
+		// gate. Until then it is deliberately distinct from an unknown service.
+		return Route{Kind: KindDeny}
+	default:
+		// HTTP parsing rejects unknown services before route lookup. Keep direct
+		// callers fail-closed as an unsupported target.
 		return Route{Kind: KindDeny}
 	}
-	return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, port), AccessToken: forwardAccessToken}
 }
 
 type Proxy struct {
@@ -133,7 +180,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, port)
+	route, err := p.router.Route(r.Context(), sid, LegacyTarget(port))
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
@@ -181,12 +228,16 @@ func ParseSandbox(r *http.Request) (sid string, port int, ok bool) {
 	if h := r.Header.Get(HeaderSandboxID); h != "" {
 		sid = h
 		port, _ = strconv.Atoi(r.Header.Get(HeaderSandboxPort))
-		if port <= 0 {
+		if !validPort(port) {
 			return "", 0, false
 		}
 		return sid, port, true
 	}
-	host := r.Host
+	return parseSandboxHost(r.Host)
+}
+
+func parseSandboxHost(authority string) (sid string, port int, ok bool) {
+	host := authority
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
@@ -202,6 +253,9 @@ func ParseSandbox(r *http.Request) (sid string, port int, ok bool) {
 	}
 	port, err := strconv.Atoi(label[:dash])
 	if err != nil {
+		return "", 0, false
+	}
+	if !validPort(port) {
 		return "", 0, false
 	}
 	sid = label[dash+1:]

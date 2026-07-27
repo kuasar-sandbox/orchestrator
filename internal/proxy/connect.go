@@ -12,13 +12,12 @@ import (
 	"strings"
 )
 
-// This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
-// stream to a sandbox port. Per the data-plane model the CONNECT target HOST is
-// ignored (it is uniformly the sandbox's floating IP) and only the PORT is honored;
-// the sandbox id comes from E2b-Sandbox-Id (or the authority label). The route is
-// resolved + access-token-checked exactly like a forwarded request, then the client
-// connection is spliced to the backend. The same Tunnel primitive serves both the
-// proxy's direct ingress and the external-mode proxyForwarder's CONNECT relay.
+// This file adds CONNECT tunneling to the data plane. A legacy request selects a
+// raw sandbox port; an explicit E2b-Sandbox-Service selects a logical backend and
+// may carry an optional meaningful port. The sandbox id comes from
+// E2b-Sandbox-Id or a legacy authority label. The final node resolves the canonical
+// target, checks its access token, and splices the client to the selected backend.
+// The same Tunnel primitive serves direct ingress and external chained CONNECT.
 
 // directDialRoute opens a connection to a resolved route's backend in the
 // process's current network namespace.
@@ -34,17 +33,17 @@ func directDialRoute(ctx context.Context, r Route) (net.Conn, error) {
 	}
 }
 
-// serveConnect handles a CONNECT request: resolve the sandbox + port, auth, dial the
-// backend, then splice. Mirrors ServeHTTP's classification (404/501/401) so CONNECT
-// and forwarded requests behave identically.
+// serveConnect resolves the sandbox + canonical target, authenticates the selected
+// backend, then splices it. Recognized services unsupported by the local profile
+// return 501; malformed or unknown services are rejected before route lookup.
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	sid, port, ok := parseConnect(r)
+	sid, target, ok := ParseConnect(r)
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)
 		writeProxyError(w, http.StatusBadRequest, "bad connect target", ProxyErrorBadRequest)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, port)
+	route, err := p.router.Route(r.Context(), sid, target)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
@@ -65,7 +64,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 		return
 	}
-	if !p.authorized(r, route, port) {
+	if !p.authorized(r, route, target.Port) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return
@@ -80,53 +79,143 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	Tunnel(w, r, backend)
 }
 
-// parseConnect resolves (sid, port) for a CONNECT: sid from E2b-Sandbox-Id (or the
-// authority's <port>-<sid> label as a fallback), port from the CONNECT target
-// authority — the target host itself is ignored (uniformly the sandbox's floating IP).
-func parseConnect(r *http.Request) (sid string, port int, ok bool) {
-	sid = r.Header.Get(HeaderSandboxID)
-	if sid == "" {
-		if s, _, parsed := ParseSandbox(r); parsed {
-			sid = s
+// ParseConnect resolves the sandbox identity and canonical CONNECT target. An
+// explicit logical service ignores the CONNECT authority port, which is only a
+// transport placeholder; a port explicitly carried by E2b-Sandbox-Port or the
+// legacy <port>-<sid> host is retained for second-hop forwarding. Legacy and
+// explicit forward targets also accept the authority port as an existing source.
+// Conflicting identity or meaningful-port sources are rejected.
+func ParseConnect(r *http.Request) (sid string, target ConnectTarget, ok bool) {
+	if r == nil || r.Method != http.MethodConnect {
+		return "", ConnectTarget{}, false
+	}
+	service, explicit, ok := parseConnectService(r.Header)
+	if !ok {
+		return "", ConnectTarget{}, false
+	}
+	target.Service = service
+
+	addSID := func(value string) bool {
+		if value == "" {
+			return false
+		}
+		if sid != "" && sid != value {
+			return false
+		}
+		sid = value
+		return true
+	}
+	portSet := false
+	addPort := func(value int) bool {
+		if !validPort(value) {
+			return false
+		}
+		if portSet && target.Port != value {
+			return false
+		}
+		target.Port = value
+		portSet = true
+		return true
+	}
+
+	if values, present := headerValues(r.Header, HeaderSandboxID); present {
+		for _, value := range values {
+			if !addSID(value) {
+				return "", ConnectTarget{}, false
+			}
+		}
+	}
+	if values, present := headerValues(r.Header, HeaderSandboxPort); present {
+		for _, value := range values {
+			port, err := strconv.Atoi(value)
+			if err != nil || !addPort(port) {
+				return "", ConnectTarget{}, false
+			}
+		}
+	}
+	if hostSID, hostPort, parsed := parseSandboxHost(r.Host); parsed {
+		if !addSID(hostSID) || !addPort(hostPort) {
+			return "", ConnectTarget{}, false
 		}
 	}
 	if sid == "" {
-		return "", 0, false
+		return "", ConnectTarget{}, false
 	}
-	if hp := r.Header.Get(HeaderSandboxPort); hp != "" {
-		p, err := strconv.Atoi(hp)
-		if err == nil && p > 0 {
-			return sid, p, true
+
+	if !explicit || service == ConnectServiceForward {
+		if authorityPort, parsed := parseConnectAuthorityPort(r); parsed {
+			if !addPort(authorityPort) {
+				return "", ConnectTarget{}, false
+			}
 		}
-		return "", 0, false
+		if !portSet {
+			return "", ConnectTarget{}, false
+		}
 	}
-	target := r.URL.Host
-	if target == "" {
-		target = r.Host
-	}
-	_, ps, err := net.SplitHostPort(target)
-	if err != nil {
-		return "", 0, false
-	}
-	port, err = strconv.Atoi(ps)
-	if err != nil || port <= 0 {
-		return "", 0, false
-	}
-	return sid, port, true
+	return sid, target, true
 }
 
-// WriteSandboxConnect issues the node/proxy-worker data-plane CONNECT handshake.
-// The CONNECT authority is deliberately generic: sandbox identity and port are
-// carried as explicit headers, so intermediates do not parse route-key or host
-// labels and the backend connection is bound to exactly one sandbox port.
-func WriteSandboxConnect(w io.Writer, sid string, port int, token string) error {
-	if sid == "" || port <= 0 {
-		return fmt.Errorf("proxy: sandbox id and port are required for CONNECT")
+func parseConnectService(header http.Header) (service ConnectService, explicit bool, ok bool) {
+	values, present := headerValues(header, HeaderSandboxService)
+	if !present {
+		return ConnectServiceLegacy, false, true
 	}
-	target := fmt.Sprintf("sandbox:%d", port)
+	if len(values) != 1 || values[0] == "" {
+		return "", true, false
+	}
+	service = ConnectService(values[0])
+	switch service {
+	case ConnectServiceForward, ConnectServiceE2BEnvd, ConnectServiceE2BInterpreter, ConnectServiceExec:
+		return service, true, true
+	default:
+		return "", true, false
+	}
+}
+
+func headerValues(header http.Header, name string) ([]string, bool) {
+	values, present := header[http.CanonicalHeaderKey(name)]
+	return values, present
+}
+
+func parseConnectAuthorityPort(r *http.Request) (int, bool) {
+	authority := r.URL.Host
+	if authority == "" {
+		authority = r.Host
+	}
+	_, portString, err := net.SplitHostPort(authority)
+	if err != nil {
+		return 0, false
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || !validPort(port) {
+		return 0, false
+	}
+	return port, true
+}
+
+func validPort(port int) bool { return port > 0 && port <= 65535 }
+
+// WriteSandboxConnect issues a node/proxy-worker data-plane CONNECT handshake.
+// Logical services use a generic authority and carry an optional meaningful port
+// only in E2b-Sandbox-Port; the generic 443 is never synthesized as a port Header.
+func WriteSandboxConnect(w io.Writer, sid string, target ConnectTarget, token string) error {
+	if sid == "" || !validConnectTarget(target) {
+		return fmt.Errorf("proxy: valid sandbox id and CONNECT target are required")
+	}
+	authorityPort := target.Port
+	if target.Service != ConnectServiceLegacy && target.Service != ConnectServiceForward {
+		authorityPort = 443
+	}
+	authority := fmt.Sprintf("sandbox:%d", authorityPort)
 	var b strings.Builder
-	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	fmt.Fprintf(&b, "%s: %s\r\n%s: %d\r\n", HeaderSandboxID, sid, HeaderSandboxPort, port)
+	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", authority, authority)
+	fmt.Fprintf(&b, "%s: %s\r\n", HeaderSandboxID, sid)
+	if target.Service != ConnectServiceLegacy {
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderSandboxService, target.Service)
+	}
+	if target.Port > 0 {
+		fmt.Fprintf(&b, "%s: %d\r\n", HeaderSandboxPort, target.Port)
+	}
 	if token != "" {
 		fmt.Fprintf(&b, "%s: %s\r\n", HeaderAccessToken, token)
 	}
@@ -135,14 +224,28 @@ func WriteSandboxConnect(w io.Writer, sid string, port int, token string) error 
 	return err
 }
 
+func validConnectTarget(target ConnectTarget) bool {
+	if target.Port < 0 || target.Port > 65535 {
+		return false
+	}
+	switch target.Service {
+	case ConnectServiceLegacy, ConnectServiceForward:
+		return validPort(target.Port)
+	case ConnectServiceE2BEnvd, ConnectServiceE2BInterpreter, ConnectServiceExec:
+		return true
+	default:
+		return false
+	}
+}
+
 // DialSandboxConnect dials addr and performs WriteSandboxConnect. The caller owns
 // conn and must close it unless it passes the connection to Tunnel/TunnelBuffered.
-func DialSandboxConnect(ctx context.Context, network, addr, sid string, port int, token string) (net.Conn, *bufio.Reader, *http.Response, error) {
+func DialSandboxConnect(ctx context.Context, network, addr, sid string, target ConnectTarget, token string) (net.Conn, *bufio.Reader, *http.Response, error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if err := WriteSandboxConnect(conn, sid, port, token); err != nil {
+	if err := WriteSandboxConnect(conn, sid, target, token); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
 	}

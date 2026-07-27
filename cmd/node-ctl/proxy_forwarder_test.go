@@ -21,7 +21,7 @@ import (
 
 type connectStubRouter struct{ r proxy.Route }
 
-func (s connectStubRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
+func (s connectStubRouter) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
 	return s.r, nil
 }
 

@@ -48,7 +48,7 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // token, and on 200 splice the client to the worker (which tunnels onward to the
 // sandbox). Ordinary HTTP is then written through the same one-shot tunnel.
 func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, sid string, port int) {
-	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, port, r.Header.Get(proxy.HeaderAccessToken))
+	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, proxy.LegacyTarget(port), r.Header.Get(proxy.HeaderAccessToken))
 	if err != nil {
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
 		http.Error(w, "proxy unreachable", http.StatusBadGateway)
