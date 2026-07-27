@@ -214,6 +214,23 @@ create_sandbox() {
         "http://127.0.0.1:$ROUTER_PORT/sandboxes"
 }
 
+retry_create_sandbox() {
+    local out="$1" code="000"
+    for attempt in $(seq 1 12); do
+        code="$(create_sandbox "$out" || true)"
+        if [ "$code" = "201" ]; then
+            echo "$code"
+            return 0
+        fi
+        if [ "$code" != "503" ] || [ "$attempt" = "12" ]; then
+            echo "$code"
+            return 1
+        fi
+        step "sandbox create attempt $attempt returned 503; waiting for placement convergence"
+        sleep 2
+    done
+}
+
 sandbox_route() {
     python3 - "$1" "$ROUTE_KEY" <<'PY'
 import json, sys
@@ -643,9 +660,9 @@ wait_cluster_node_key_pair() {
 run_cluster_flow() {
     local code sid envd_token create_response="$WORK/create.credentials"
     step "creating sandbox explicitly through router"
-    code="$(create_sandbox "$create_response" || true)"
+    code="$(retry_create_sandbox "$create_response" || true)"
     if [ "$code" != "201" ]; then
-        rm -f "$create_response"
+        [ -s "$create_response" ] && { step "sandbox create response:"; sed 's/^/  create| /' "$create_response" >&2; }
         fail "sandbox create returned $code"
     fi
     if ! IFS=$'\t' read -r sid envd_token < <(sandbox_route "$create_response"); then
