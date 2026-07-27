@@ -348,6 +348,76 @@ func TestConnectRejectsOversizedMigrationTokenBeforeReserve(t *testing.T) {
 	}
 }
 
+func TestConnectBoundsAndValidatesRequestBody(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		body          func() io.Reader
+		contentLength int64
+		wantStatus    int
+		wantReserve   int
+	}{
+		{
+			name:          "exact limit",
+			body:          func() io.Reader { return sizedJSONBody(maxClusterConnectBodyBytes) },
+			contentLength: -1,
+			wantStatus:    http.StatusOK,
+			wantReserve:   1,
+		},
+		{
+			name:          "chunked over limit",
+			body:          func() io.Reader { return sizedJSONBody(maxClusterConnectBodyBytes + 1) },
+			contentLength: -1,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:          "declared over limit",
+			body:          func() io.Reader { return strings.NewReader(`{}`) },
+			contentLength: maxClusterConnectBodyBytes + 1,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:          "malformed",
+			body:          func() io.Reader { return strings.NewReader(`{"timeout":`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "trailing value",
+			body:          func() io.Reader { return strings.NewReader(`{} {}`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reserveHits int
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/route-link/reserve" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				reserveHits++
+				_ = json.NewEncoder(w).Encode(routerTestConnectReserveResult(t, "sb-1", "/g", "rk", "node.invalid:1", types.ProfileBare))
+			}))
+			defer control.Close()
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			req := httptest.NewRequest(http.MethodPost, "/sandboxes/sb-1/connect", nil)
+			req.Body = io.NopCloser(tc.body())
+			req.ContentLength = tc.contentLength
+			req.Header.Set(HeaderGroup, "/g")
+			req.Header.Set(HeaderRouteKey, "rk")
+			req.Header.Set(HeaderAPIKey, "api-key")
+			rec := httptest.NewRecorder()
+
+			rt.handleConnect(rec, req)
+
+			if rec.Code != tc.wantStatus || reserveHits != tc.wantReserve {
+				t.Fatalf("connect status=%d reserveHits=%d, want %d/%d; body=%q", rec.Code, reserveHits, tc.wantStatus, tc.wantReserve, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestConnectPropagatesRouteLinkMigrationRejection(t *testing.T) {
 	var reserveHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -216,6 +216,32 @@ func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 	}
 }
 
+func TestRouteLinkHTTPFailsOverOnConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusConflict, "stale owner"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Join(calls, ",") != "first,second" {
+		t.Fatalf("status=%d calls=%v", resp.StatusCode, calls)
+	}
+}
+
 func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
 	var calls []string
 	oldClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -286,6 +312,10 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 			headers: map[string]string{HeaderAPIKey: "api-key", HeaderMigration: "kmt1.token"},
 		},
 		{
+			name: "connect negative timeout", operation: "connect", timeout: -1,
+			headers: map[string]string{HeaderAPIKey: "api-key"},
+		},
+		{
 			name: "data", operation: "data", port: 8080,
 			headers: map[string]string{HeaderAccessTok: "access-token"},
 		},
@@ -305,7 +335,7 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 					t.Fatalf("reserve port=%q, want %q", query.Get("port"), wantPort)
 				}
 				wantTimeout := ""
-				if tc.timeout > 0 {
+				if tc.timeout != 0 {
 					wantTimeout = strconv.Itoa(tc.timeout)
 				}
 				if query.Get("timeout") != wantTimeout {
@@ -341,6 +371,37 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestRouteLinkReserveConnectDoesNotRetryConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusConflict, "target environment incompatible"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		body, err := json.Marshal(routerTestConnectReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return textResponse(http.StatusOK, string(body)), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+
+	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, map[string]string{HeaderAPIKey: "api-key"})
+	var routeErr *routeLinkCallError
+	if !errors.As(err, &routeErr) || routeErr.status != http.StatusConflict {
+		t.Fatalf("connect reserve error=%v, want route-link 409", err)
+	}
+	if got := strings.Join(calls, ","); got != "first" {
+		t.Fatalf("connect conflict calls=%q, want first", got)
 	}
 }
 

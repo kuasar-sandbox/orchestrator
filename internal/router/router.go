@@ -45,7 +45,8 @@ const (
 	HeaderAccessTok   = "X-Access-Token"
 	HeaderMigration   = "X-Kuasar-Migration-Token"
 
-	maxClusterCreateBodyBytes int64 = 16 << 20
+	maxClusterCreateBodyBytes  int64 = 16 << 20
+	maxClusterConnectBodyBytes int64 = 64 << 10
 )
 
 // reserveResult / routeResolve mirror registry route_link JSON.
@@ -579,8 +580,31 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Timeout int `json:"timeout"`
 	}
+	if r.ContentLength > maxClusterConnectBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		r.Body = http.MaxBytesReader(w, r.Body, maxClusterConnectBodyBytes)
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+			}
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+			}
+			return
+		}
 	}
 	headers := map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}
 	if migrationToken != "" {
@@ -1213,7 +1237,7 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	if port > 0 {
 		query.Set("port", strconv.Itoa(port))
 	}
-	if timeout > 0 {
+	if timeout != 0 {
 		query.Set("timeout", strconv.Itoa(timeout))
 	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
@@ -1226,7 +1250,7 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 		headers["Content-Type"] = "application/json"
 	}
 	var res reserveResult
-	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, body, headers, &res); err != nil {
+	if err := rt.routeLinkCallWithConflictRetry(ctx, group, http.MethodPost, path, body, headers, &res, operation != "connect"); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -1282,7 +1306,11 @@ func (rt *Router) routeLinkDelete(ctx context.Context, group, routeKey, sid stri
 }
 
 func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string, body []byte, headers map[string]string, out any) error {
-	resp, err := rt.routeLinkHTTP(ctx, group, method, path, body, headers)
+	return rt.routeLinkCallWithConflictRetry(ctx, group, method, path, body, headers, out, true)
+}
+
+func (rt *Router) routeLinkCallWithConflictRetry(ctx context.Context, group, method, path string, body []byte, headers map[string]string, out any, retryConflict bool) error {
+	resp, err := rt.routeLinkHTTPWithConflictRetry(ctx, group, method, path, body, headers, retryConflict)
 	if err != nil {
 		return err
 	}
@@ -1320,9 +1348,13 @@ func writeRouteLinkError(w http.ResponseWriter, err error, fallbackStatus int) {
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+	return rt.routeLinkHTTPWithConflictRetry(ctx, group, method, path, body, headers, true)
+}
+
+func (rt *Router) routeLinkHTTPWithConflictRetry(ctx context.Context, group, method, path string, body []byte, headers map[string]string, retryConflict bool) (*http.Response, error) {
 	refreshed := false
 	for {
-		resp, err, retry := rt.routeLinkHTTPOnce(ctx, group, method, path, body, headers)
+		resp, err, retry := rt.routeLinkHTTPOnce(ctx, group, method, path, body, headers, retryConflict)
 		if !retry || refreshed {
 			return resp, err
 		}
@@ -1340,7 +1372,7 @@ func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string,
 	}
 }
 
-func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error, bool) {
+func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path string, body []byte, headers map[string]string, retryConflict bool) (*http.Response, error, bool) {
 	eps, err := rt.routeRegistry.RouteCandidates(ctx, group)
 	if err != nil {
 		return nil, err, false
@@ -1359,7 +1391,7 @@ func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path str
 			last = err
 			continue
 		}
-		if routeLinkRetryableStatus(resp.StatusCode) {
+		if routeLinkRetryableStatus(resp.StatusCode, retryConflict) {
 			if i+1 >= len(eps) {
 				return resp, nil, true
 			}
@@ -1376,8 +1408,8 @@ func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path str
 	return nil, fmt.Errorf("router: no registry candidates for group %q", group), false
 }
 
-func routeLinkRetryableStatus(status int) bool {
-	return status == http.StatusConflict || status >= 500
+func routeLinkRetryableStatus(status int, retryConflict bool) bool {
+	return status >= 500 || retryConflict && status == http.StatusConflict
 }
 
 // --- local route cache ---
