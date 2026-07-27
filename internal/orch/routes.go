@@ -119,7 +119,7 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 	case types.StateRunning:
 		o.publishUpsert(sb) // already up; re-announce so the proxy unparks
 	case types.StatePaused:
-		if err := o.sf.Do(sid, func() error { return o.resumeIfPaused(ctx, sid) }); err != nil {
+		if err := o.resumeSandbox(ctx, sid); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 			// stays paused; the proxy's park times out -> 404.
 		}

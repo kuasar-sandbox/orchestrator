@@ -296,6 +296,176 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	}
 }
 
+func TestKillWaitsForAsyncResumeAndDoesNotResurrectSandbox(t *testing.T) {
+	f := newBlockedResumeFixture(t)
+
+	connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 0)
+	if err != nil || connected == nil || connected.State != types.StatePaused {
+		t.Fatalf("Connect = %+v, %v; want paused result", connected, err)
+	}
+	waitForLauncherStart(t, f.started)
+
+	type killResult struct {
+		found bool
+		err   error
+	}
+	done := make(chan killResult, 1)
+	go func() {
+		found, err := f.o.Kill(f.ctx, f.sb.ID, f.apiKey)
+		done <- killResult{found: found, err: err}
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("Kill returned before the in-flight resume completed: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(f.startGate)
+	select {
+	case result := <-done:
+		if result.err != nil || !result.found {
+			t.Fatalf("Kill = %+v, want successful deletion", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Kill did not complete after resume released the lifecycle boundary")
+	}
+	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	if err != nil || stored != nil {
+		t.Fatalf("sandbox was resurrected after Kill: %+v, %v", stored, err)
+	}
+	if cached := f.o.lookup(f.sb.ID); cached != nil {
+		t.Fatalf("deleted sandbox remained cached: %+v", cached)
+	}
+}
+
+func TestSetTimeoutAfterAsyncConnectWins(t *testing.T) {
+	f := newBlockedResumeFixture(t)
+	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 37); err != nil {
+		t.Fatal(err)
+	}
+	waitForLauncherStart(t, f.started)
+
+	type timeoutResult struct {
+		found bool
+		err   error
+	}
+	done := make(chan timeoutResult, 1)
+	before := time.Now().Unix()
+	go func() {
+		found, err := f.o.SetTimeout(f.ctx, f.sb.ID, f.apiKey, 91)
+		done <- timeoutResult{found: found, err: err}
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("SetTimeout returned before the in-flight resume completed: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(f.startGate)
+	select {
+	case result := <-done:
+		if result.err != nil || !result.found {
+			t.Fatalf("SetTimeout = %+v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetTimeout did not complete after resume")
+	}
+	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
+	}
+	if stored.DeadlineUnix < before+90 || stored.DeadlineUnix > time.Now().Unix()+92 {
+		t.Fatalf("deadline = %d, want the later SetTimeout value", stored.DeadlineUnix)
+	}
+	if cached := f.o.lookup(f.sb.ID); cached == nil || cached.DeadlineUnix != stored.DeadlineUnix {
+		t.Fatalf("cache deadline differs from stored sandbox: cached=%+v stored=%+v", cached, stored)
+	}
+}
+
+func TestLaterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
+	f := newBlockedResumeFixture(t)
+	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 37); err != nil {
+		t.Fatal(err)
+	}
+	waitForLauncherStart(t, f.started)
+
+	type connectResult struct {
+		sb  *types.Sandbox
+		err error
+	}
+	done := make(chan connectResult, 1)
+	before := time.Now().Unix()
+	go func() {
+		sb, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 91)
+		done <- connectResult{sb: sb, err: err}
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("later Connect returned before the in-flight resume completed: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(f.startGate)
+	var result connectResult
+	select {
+	case result = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("later Connect did not complete after resume")
+	}
+	if result.err != nil || result.sb == nil || result.sb.State != types.StateRunning {
+		t.Fatalf("later Connect = %+v, %v", result.sb, result.err)
+	}
+	if result.sb.DeadlineUnix < before+90 || result.sb.DeadlineUnix > time.Now().Unix()+92 {
+		t.Fatalf("deadline = %d, want the later Connect timeout", result.sb.DeadlineUnix)
+	}
+	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	if err != nil || stored == nil || stored.DeadlineUnix != result.sb.DeadlineUnix {
+		t.Fatalf("stored deadline differs from Connect result: stored=%+v result=%+v err=%v", stored, result.sb, err)
+	}
+}
+
+type blockedResumeFixture struct {
+	o         *Orchestrator
+	ctx       context.Context
+	sb        *types.Sandbox
+	apiKey    string
+	started   <-chan struct{}
+	startGate chan struct{}
+}
+
+func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
+	t.Helper()
+	cfg := &config.Config{}
+	cfg.Sandbox.TimeoutSec = 900
+	started := make(chan struct{}, 4)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+
+	mk := strings.Repeat("6", 64)
+	_, apiKey := defaultTestCredentials(t, mk)
+	sb := &types.Sandbox{
+		ID:           "blocked-resume-target",
+		Profile:      types.ProfileBare,
+		TemplateID:   "bare-img-" + strings.Repeat("7", 64),
+		State:        types.StatePaused,
+		APISecret:    deriveTestAPISecret(t, mk),
+		ManifestKey:  mk,
+		RunDir:       filepath.Join(cfg.Paths.RunRoot, "blocked-resume-target"),
+		BaseDir:      filepath.Join(cfg.Paths.BaseRoot, "blocked-resume-target"),
+		CreatedUnix:  1,
+		DeadlineUnix: 10,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	return blockedResumeFixture{
+		o: o, ctx: ctx, sb: sb, apiKey: apiKey,
+		started: started, startGate: startGate,
+	}
+}
+
 func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *countingLauncher) (*Orchestrator, context.Context) {
 	t.Helper()
 	dir := t.TempDir()

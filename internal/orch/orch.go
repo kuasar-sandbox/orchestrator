@@ -55,7 +55,11 @@ type Orchestrator struct {
 	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
 
-	sf flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	sf        flightGroup    // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	lifecycle keyedLockGroup // serialize resume against destructive/deadline mutations for one sid
+
+	deadlineIntentMu sync.Mutex
+	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -92,13 +96,14 @@ type clusterBuild struct {
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:            map[string]*types.Sandbox{},
-		clusterCreates: map[string]struct{}{},
-		subs:           map[int]chan routesync.Event{},
-		routeFP:        uuid.NewString(),
-		pend:           map[string]*pendingBuild{},
-		clusterBuilds:  map[string]*clusterBuild{},
-		buildEvents:    make(chan *routesync.BuildEvent, 64),
+		reg:             map[string]*types.Sandbox{},
+		clusterCreates:  map[string]struct{}{},
+		deadlineIntents: map[string]struct{}{},
+		subs:            map[int]chan routesync.Event{},
+		routeFP:         uuid.NewString(),
+		pend:            map[string]*pendingBuild{},
+		clusterBuilds:   map[string]*clusterBuild{},
+		buildEvents:     make(chan *routesync.BuildEvent, 64),
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -309,6 +314,9 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 }
 
 func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error) {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return false, err
@@ -317,7 +325,10 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 		return false, nil
 	}
 	o.teardown(ctx, sb)
-	_ = o.st.Delete(ctx, id)
+	if err := o.st.Delete(ctx, id); err != nil {
+		return false, err
+	}
+	o.clearDeadlineIntent(id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
 	return true, nil
@@ -384,47 +395,66 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 			return nil, err
 		}
 	}
+	if timeoutSec <= 0 {
+		if !ownsSandbox(sb, apiKey) {
+			return nil, api.ErrNotFound
+		}
+		if sb.State == types.StatePaused {
+			// A credential-only Connect remains non-blocking even when another
+			// caller already owns the asynchronous resume flight.
+			o.scheduleResume(id)
+		}
+		return sb, nil
+	}
+
+	unlock := o.lifecycle.Lock(id)
+	// Re-read under the per-sandbox lifecycle boundary: an asynchronous resume or
+	// delete may have completed since the initial existence/import decision.
+	if sb, err = o.st.Get(ctx, id); err != nil {
+		unlock()
+		return nil, err
+	}
 	if !ownsSandbox(sb, apiKey) {
+		unlock()
 		return nil, api.ErrNotFound
 	}
-	var requestedDeadline int64
-	if timeoutSec > 0 {
-		requestedDeadline = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline }); s != nil {
-			sb = s // cached: published a fresh snapshot with the new deadline
-		} else {
-			sb.DeadlineUnix = requestedDeadline // not cached (fresh, unpublished) — safe in place
-		}
-		_ = o.st.SetDeadline(ctx, id, requestedDeadline)
+	requestedDeadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline }); s != nil {
+		sb = s // cached: published a fresh snapshot with the new deadline
+	} else {
+		sb.DeadlineUnix = requestedDeadline // not cached (fresh, unpublished) — safe in place
+	}
+	if err := o.st.SetDeadline(ctx, id, requestedDeadline); err != nil {
+		unlock()
+		return nil, err
 	}
 	if sb.State == types.StatePaused {
+		o.markDeadlineIntent(id)
+	}
+	shouldResume := sb.State == types.StatePaused
+	unlock()
+	if shouldResume {
 		// Import and credential lookup are complete before this point. Resume is
 		// deliberately asynchronous, but still shares the per-sandbox flight with
 		// data-plane wakes and other Connect calls.
-		o.scheduleResume(id, requestedDeadline)
+		o.scheduleResume(id)
 	}
 	return sb, nil
 }
 
-func (o *Orchestrator) scheduleResume(id string, requestedDeadline int64) {
+func (o *Orchestrator) scheduleResume(id string) {
 	go func() {
 		ctx := o.asyncCtx()
-		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
+		if err := o.resumeSandbox(ctx, id); err != nil {
 			o.log.Error("sandbox connect resume", "sid", id, "err", err)
-			return
-		}
-		// resume applies the node default TTL. A timeout explicitly supplied by
-		// this Connect remains authoritative and is restored after the flight.
-		if requestedDeadline > 0 {
-			o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline })
-			if err := o.st.SetDeadline(ctx, id, requestedDeadline); err != nil {
-				o.log.Error("sandbox connect deadline", "sid", id, "err", err)
-			}
 		}
 	}()
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {
+	unlock := o.lifecycle.Lock(id)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return false, err
@@ -432,13 +462,24 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
-	sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	return true, o.st.SetDeadline(ctx, id, sb.DeadlineUnix)
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if cached := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline }); cached != nil {
+		sb = cached
+	} else {
+		sb.DeadlineUnix = deadline
+	}
+	if err := o.st.SetDeadline(ctx, id, deadline); err != nil {
+		return false, err
+	}
+	if sb.State == types.StatePaused {
+		o.markDeadlineIntent(id)
+	}
+	return true, nil
 }
 
 // resume restarts a paused sandbox from its snapshot (no api_key needed: the
 // manifest key comes from the store via the config-socket).
-func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDeadline bool) error {
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
 		return err
@@ -452,7 +493,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
 	// deadline is from before the pause (already passed), so without this the reaper
 	// would immediately re-suspend it.
-	if o.cfg.Sandbox.TimeoutSec > 0 {
+	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
 	}
 	if err := o.launch(ctx, &nb, tmpl); err != nil {
@@ -461,7 +502,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
 		return err
 	}
-	if o.cfg.Sandbox.TimeoutSec > 0 {
+	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
 	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
@@ -485,7 +526,7 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 		o.cache(sb)
 	}
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
-		if err := o.sf.Do(sandboxID, func() error { return o.resumeIfPaused(ctx, sandboxID) }); err != nil {
+		if err := o.resumeSandbox(ctx, sandboxID); err != nil {
 			return proxy.Route{}, err
 		}
 		if sb = o.lookup(sandboxID); sb == nil {
@@ -498,9 +539,9 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (p
 	), nil
 }
 
-// resumeIfPaused (run under the per-sid single-flight) resumes sid only if it is
-// still paused — a loser of the race finds it already running and returns.
-func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
+// resumeIfPaused (run under the per-sid single-flight and lifecycle lock) resumes
+// sid only if it is still paused — a loser of the race finds it already running.
+func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, preserveDeadline bool) error {
 	sb := o.lookup(sid)
 	if sb == nil {
 		s, _ := o.st.Get(ctx, sid)
@@ -513,7 +554,7 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
 	if sb.State != types.StatePaused {
 		return nil
 	}
-	return o.resume(ctx, sb)
+	return o.resume(ctx, sb, preserveDeadline)
 }
 
 // snapInfo is the config the orchestrator inherits from a restore snapshot: the

@@ -30,6 +30,9 @@ import (
 // token (default). A move relinquishes the source row unless
 // keepSource (copy) — the remote snapshot persists either way.
 func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
 	if apiKey == "" {
 		return "", fmt.Errorf("export-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
@@ -86,6 +89,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 		}
 		o.uncache(sid)
+		o.clearDeadlineIntent(sid)
 		o.publishDelete(sid)
 	}
 	return tok, nil

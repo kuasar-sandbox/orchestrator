@@ -577,16 +577,27 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 
 // connectCluster resumes an already-authorized node-local sandbox.
 func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
-	return o.sf.Do(sid, func() error { return o.resumeIfPaused(ctx, sid) })
+	return o.resumeSandbox(ctx, sid)
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
-	o.teardown(ctx, sb)
-	if err := o.st.Delete(ctx, sb.ID); err != nil {
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
 		return err
 	}
-	o.uncache(sb.ID)
-	o.publishDelete(sb.ID)
+	if current == nil {
+		return nil
+	}
+	o.teardown(ctx, current)
+	if err := o.st.Delete(ctx, current.ID); err != nil {
+		return err
+	}
+	o.clearDeadlineIntent(current.ID)
+	o.uncache(current.ID)
+	o.publishDelete(current.ID)
 	return nil
 }
 
