@@ -26,7 +26,18 @@ func newProxyForwarder(reg *configsock.Registry, mx *metrics.M, log *slog.Logger
 }
 
 func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	sid, port, ok := proxy.ParseSandbox(r)
+	var (
+		sid    string
+		target proxy.ConnectTarget
+		ok     bool
+	)
+	if r.Method == http.MethodConnect {
+		sid, target, ok = proxy.ParseConnect(r)
+	} else {
+		var port int
+		sid, port, ok = proxy.ParseSandbox(r)
+		target = proxy.LegacyTarget(port)
+	}
 	if !ok {
 		http.Error(w, "bad sandbox host", http.StatusBadRequest)
 		return
@@ -40,15 +51,15 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sid))
 	sock := targets[h.Sum32()%uint32(len(targets))]
-	pf.forward(w, r, sock, sid, port)
+	pf.forward(w, r, sock, sid, target)
 }
 
 // forward sends a CONNECT to a proxy UDS as a chained
 // CONNECT: dial the worker, issue a CONNECT carrying the sandbox identity + access
 // token, and on 200 splice the client to the worker (which tunnels onward to the
 // sandbox). Ordinary HTTP is then written through the same one-shot tunnel.
-func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, sid string, port int) {
-	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, proxy.LegacyTarget(port), r.Header.Get(proxy.HeaderAccessToken))
+func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, sid string, target proxy.ConnectTarget) {
+	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, target, r.Header.Get(proxy.HeaderAccessToken))
 	if err != nil {
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
 		http.Error(w, "proxy unreachable", http.StatusBadGateway)
