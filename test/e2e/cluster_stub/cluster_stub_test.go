@@ -343,10 +343,19 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if create.APISecretFingerprint != fullFingerprint(t, testAPISecret) {
 		t.Fatalf("create APISecretFingerprint=%q, want group API secret fingerprint", create.APISecretFingerprint)
 	}
-	reserved, err := h.reg.ReserveSandbox(h.ctx, testGroup, routeKey, nil)
+	reserved, err := h.reg.ReserveSandbox(h.ctx, registry.SandboxReserveRequest{
+		Operation: registry.ReserveCreate,
+		Group:     testGroup,
+		RouteKey:  routeKey,
+		APIKey:    h.apiKey,
+	})
 	if err != nil {
 		t.Fatalf("ready Reserve: %v", err)
 	}
+	if reserved.Connect != nil {
+		t.Fatalf("ready create Reserve returned a connect result: %+v", reserved.Connect)
+	}
+	reservedRoute := &reserved.Route
 	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, create.Cluster.AuthSandboxID)
 	if err != nil {
 		t.Fatal(err)
@@ -355,12 +364,12 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserved.SandboxID != created.SandboxID || reserved.NodeSandboxID != create.SID ||
-		reserved.AuthSandboxID != create.Cluster.AuthSandboxID || reserved.APISecret != testAPISecret ||
-		reserved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
-		reserved.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
-		reserved.ServiceSecret != serviceSecret || reserved.EnvdAccessToken != testEnvdAccessToken ||
-		reserved.TrafficAccessToken != testTrafficAccessToken || reserved.ForwardAccessToken != forwardAccessToken {
+	if reservedRoute.RouteRevision <= 0 || reservedRoute.SandboxID != created.SandboxID || reservedRoute.NodeSandboxID != create.SID ||
+		reservedRoute.AuthSandboxID != create.Cluster.AuthSandboxID || reservedRoute.APISecret != testAPISecret ||
+		reservedRoute.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
+		reservedRoute.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
+		reservedRoute.ServiceSecret != serviceSecret || reservedRoute.EnvdAccessToken != testEnvdAccessToken ||
+		reservedRoute.TrafficAccessToken != testTrafficAccessToken || reservedRoute.ForwardAccessToken != forwardAccessToken {
 		t.Fatal("ready Reserve did not preserve explicit node-reported credentials")
 	}
 	if created.ForwardAccessToken != forwardAccessToken {
