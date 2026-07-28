@@ -399,35 +399,11 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 }
 
 func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
-	sb, err := o.st.Get(ctx, id)
+	sb, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
 	if err != nil {
 		return nil, err
 	}
-	// Auto-migrate: connecting to a sandbox absent on this node with a migration
-	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
-	// schedules an asynchronous resume. ImportSandbox checks the tenant key,
-	// token fingerprints, runtime digest, and exact caller-selected target ID.
-	// An existing target ignores the token completely, including malformed input.
-	if sb == nil && migrationToken != "" {
-		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id)
-		if ierr != nil {
-			if !errors.Is(ierr, api.ErrAlreadyExists) {
-				return nil, ierr
-			}
-			// Another Connect may have won the insert-only import race. Treat the
-			// winner as an existing target, then apply the normal ownership check
-			// below. Never overwrite or merge the row that won.
-		} else if imported != id {
-			return nil, fmt.Errorf("connect: imported sandbox ID mismatch")
-		}
-		if sb, err = o.st.Get(ctx, id); err != nil {
-			return nil, err
-		}
-	}
 	if timeoutSec <= 0 {
-		if !ownsSandbox(sb, apiKey) {
-			return nil, api.ErrNotFound
-		}
 		if sb.State == types.StatePaused {
 			// A credential-only Connect remains non-blocking even when another
 			// caller already owns the asynchronous resume flight.
@@ -467,6 +443,42 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		// deliberately asynchronous, but still shares the per-sandbox flight with
 		// data-plane wakes and other Connect calls.
 		o.scheduleResume(id)
+	}
+	return sb, nil
+}
+
+// prepareStandaloneTarget synchronously resolves, optionally imports, and
+// authenticates a standalone API operation target. Callers perform their own
+// operation-specific result preparation before scheduling an asynchronous
+// resume.
+func (o *Orchestrator) prepareStandaloneTarget(ctx context.Context, id, apiKey, migrationToken string) (*types.Sandbox, error) {
+	sb, err := o.st.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Auto-migrate: connecting to a sandbox absent on this node with a migration
+	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
+	// schedules an asynchronous resume. ImportSandbox checks the tenant key,
+	// token fingerprints, runtime digest, and exact caller-selected target ID.
+	// An existing target ignores the token completely, including malformed input.
+	if sb == nil && migrationToken != "" {
+		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken, id)
+		if ierr != nil {
+			if !errors.Is(ierr, api.ErrAlreadyExists) {
+				return nil, ierr
+			}
+			// Another Connect may have won the insert-only import race. Treat the
+			// winner as an existing target, then apply the normal ownership check
+			// below. Never overwrite or merge the row that won.
+		} else if imported != id {
+			return nil, fmt.Errorf("connect: imported sandbox ID mismatch")
+		}
+		if sb, err = o.st.Get(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	if !ownsSandbox(sb, apiKey) {
+		return nil, api.ErrNotFound
 	}
 	return sb, nil
 }
@@ -585,9 +597,9 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy
 		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
 		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
 	)
-	// A recognized but unsupported logical service has no backend to activate.
-	// In particular, service=exec remains a side-effect-free 501 boundary until
-	// #64 installs its authenticated ctl.sock gate.
+	// A recognized but unsupported logical service has no generic backend to
+	// activate. Exec CONNECT is handled earlier by the authenticated
+	// LookupExec/ActivateExec path; direct Route callers remain fail-closed.
 	if selected.Kind == proxy.KindDeny {
 		return selected, nil
 	}

@@ -4,7 +4,8 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 
 - **`node-ctl`**(节点)——计算节点上的单实例常驻 daemon。对外是 **e2b 兼容北向入口**
   (未改造的 e2b SDK/CLI 直接指向即可 create/exec/pause/resume/kill microVM 沙箱、构建
-  自定义模板);内含数据面 proxy(反代 guest envd / floatingip)、可选的**节点资源控制器**
+  自定义模板);同时提供显式 ExecAccessToken 签发和 `service=exec` native exec,
+  不依赖 guest envd;内含数据面 proxy(反代 guest envd / floatingip / native exec),可选的**节点资源控制器**
   (沙箱准入、内存预算分配、主动回收,把固定虚拟规格下的物理密度推到单节点 3,000+ 沙箱),
   以及 **node-link 客户端**(接入集群)。既可独立运行,也可经 node-link 交由 cluster-ctl 编排。
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
@@ -34,10 +35,10 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `internal/nodectl` | 资源控制器:两环仲裁、四级水位 + 应急池、cgroup 真相源对账恢复、审计 |
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
 | `internal/{registry,router,placer}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
-| `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
-| `internal/proxy` `internal/proxyshm` `internal/routesync` | 数据面 L7 反代(含 CONNECT 隧道)、proxy master/worker 共享路由视图(park/wake、世代清扫)、路由同步协议(注册 + bookmark) |
+| `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权,export/import 扩展,ExecAccessToken 签发) |
+| `internal/proxy` `internal/proxyshm` `internal/routesync` | 数据面 L7 反代(service-addressed CONNECT,native exec gate),proxy master/worker 共享路由视图(park/wake,世代清扫),路由/node-link 同步协议(注册 + bookmark + typed command result) |
 | `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ plugin(proxy 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
-| `internal/{apikey,secretbox,keys,regcreds}` | APISecret 派生与 api_key MAC、根凭据落盘 AES-GCM、数据面 token、ManifestKey 封装的镜像拉取凭据 |
+| `internal/{apikey,secretbox,keys,regcreds}` | APISecret 派生与 api_key MAC,根凭据落盘 AES-GCM,Forward/Exec `kat1` 与数据面 token,ManifestKey 封装的镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys 凭据对) |
 | `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
 | `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy.service`、`cluster-{registry,router,placer}.service`) |
@@ -85,12 +86,12 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 - [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
 - [docs/node-proxy.md](docs/node-proxy.md) — 数据面转发层:路由判定 / 部署模式(internal/external/off)/
-  routesync / 数据面鉴权 / MMDS / CONNECT 隧道。
+  routesync / 数据面鉴权 / MMDS / service-addressed CONNECT / native exec gate.
 - [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、
   node_link / route_link / node_list / placer_link、Reserve 状态机、成员变更与 e2e。
 - [docs/cluster-router.md](docs/cluster-router.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
-  Reserve 消费、两跳转发与 CONNECT、token 注入。
+  ExecSession Reserve,两跳转发与 CONNECT,stable/NodeSandboxID 改写和 KAT 双验.
 - [docs/cluster-placer.md](docs/cluster-placer.md) — 放置调度器:SandboxGroupProvider/Importer、
   placer memberlist、node_list WATCH_LIST、source lease、selector patch、PlaceSandbox / PlaceBuild。

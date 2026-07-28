@@ -193,6 +193,86 @@ json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
 
+assert_no_default_exec_token() {
+    python3 - "$1" <<'PY'
+import json, sys
+created = json.load(open(sys.argv[1]))
+if "execAccessToken" in created:
+    raise SystemExit("create response unexpectedly contains execAccessToken")
+PY
+}
+
+issue_cluster_exec_session() {
+    local sid="$1" code
+    code="$(curl -sS --noproxy '*' --max-time 30 \
+        -D "$WORK/exec-session.headers" \
+        -o "$WORK/exec-session.secret" \
+        -w '%{http_code}' \
+        -X POST \
+        -H "Host: api.$DOMAIN" \
+        -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        -H "X-API-KEY: $CLUSTER_API_KEY" \
+        -H 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:$ROUTER_PORT/sandboxes/$sid/exec-sessions")"
+    [ "$code" = "201" ] || fail "exec-session returned $code (want 201)"
+    python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
+import json, sys
+headers = [line.strip().lower() for line in open(sys.argv[1], "rb").read().splitlines()]
+if b"cache-control: no-store" not in headers:
+    raise SystemExit("exec-session response omitted Cache-Control: no-store")
+payload = json.load(open(sys.argv[2]))
+if not isinstance(payload, dict) or set(payload) != {"execAccessToken"}:
+    raise SystemExit("exec-session response must contain only execAccessToken")
+token = payload["execAccessToken"]
+if not isinstance(token, str) or not token.startswith("kat1.") or len(token.split(".")) != 3:
+    raise SystemExit("exec-session response contains an invalid KAT token")
+print(token)
+PY
+}
+
+exec_through_cluster_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local retries="${4:-1}"
+    local input="$WORK/native-exec.stdin"
+    local output="$WORK/native-exec.stdout"
+    local error_output="$WORK/native-exec.stderr"
+    local diagnostics="$WORK/native-exec.client.log"
+    local attempt status
+
+    printf 'stdin:%s\n' "$marker" >"$input"
+    for attempt in $(seq 1 "$retries"); do
+        : >"$output"; : >"$error_output"; : >"$diagnostics"
+        if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+            --proxy "http://127.0.0.1:$ROUTER_PORT" \
+            --proxy-header "E2b-Sandbox-Id: $sid" \
+            --proxy-header "E2b-Sandbox-Service: exec" \
+            --proxy-header "X-Access-Token: $token" \
+            --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+            --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+            --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+            --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+            --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+            /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+            >"$diagnostics" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        if [ "$status" = "47" ] && \
+            grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null && \
+            grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null; then
+            return 0
+        fi
+        [ "$attempt" = "$retries" ] || sleep 0.5
+    done
+    sed 's/^/  client| /' "$diagnostics" >&2
+    sed 's/^/  stdout| /' "$output" 2>/dev/null >&2
+    sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
+    fail "native exec did not complete after $retries attempt(s), last exit=$status"
+}
+
 router_req() {
     local method="$1" path="$2" key="$3" route_key="${4:-}" body="${5:-}"
     local args=(-sS --noproxy '*' --max-time 260 -o "$WORK/router-resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $key")
@@ -664,12 +744,30 @@ run_cluster_flow() {
         [ -s "$create_response" ] && { step "sandbox create response:"; sed 's/^/  create| /' "$create_response" >&2; }
         fail "sandbox create returned $code"
     fi
+    assert_no_default_exec_token "$create_response" || {
+        rm -f "$create_response"
+        fail "create response exposed a default exec token"
+    }
     if ! IFS=$'\t' read -r sid envd_token < <(sandbox_route "$create_response"); then
         rm -f "$create_response"
         fail "sandbox create returned an invalid e2b response"
     fi
     rm -f "$create_response"
     step "created sandbox: $sid"
+
+    step "issuing explicit exec capability through router (stable SID + group + route-key)"
+    local exec_token native_mark
+    exec_token="$(issue_cluster_exec_session "$sid")" || fail "issue cluster exec capability"
+    rm -f "$WORK/exec-session.secret"
+    native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
+    exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
+    step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
+    code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
+    [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
+    local resume_mark="CLUSTER_NATIVE_EXEC_RESUME_$RANDOM"
+    exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark" 40
+    unset exec_token
+    step "PASS: real sandbox-ctl used stable SID through exec CONNECT, then the same KAT resumed the paused sandbox"
 
     step "checking SID-addressed envd data request with X-Access-Token"
     code="$(retry_data_by_sid "$sid" "$envd_token" || true)"

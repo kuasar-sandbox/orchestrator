@@ -437,7 +437,7 @@ func TestReserveConnectMigrationStopsOnRequestWideNodeRejection(t *testing.T) {
 			req := testConnectReserve(original)
 			req.MigrationToken = "kmt1.invalid-for-all-candidates"
 			result, err := reg.ReserveSandbox(ctx, req)
-			var rejected *nodeConnectRejection
+			var rejected *nodeCommandRejection
 			if result != nil || !errors.As(err, &rejected) || rejected.status != tc.status || rejected.reason != tc.reason {
 				t.Fatalf("result=%+v err=%v rejection=%+v", result, err, rejected)
 			}

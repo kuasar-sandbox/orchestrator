@@ -27,6 +27,8 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -51,8 +53,9 @@ const (
 
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
-	Route   routeResolve   `json:"route"`
-	Connect *connectResult `json:"connect,omitempty"`
+	Route       routeResolve       `json:"route"`
+	Connect     *connectResult     `json:"connect,omitempty"`
+	ExecSession *execSessionResult `json:"exec_session,omitempty"`
 }
 
 type connectResult struct {
@@ -62,6 +65,10 @@ type connectResult struct {
 	EnvdAccessToken    string `json:"envd_access_token,omitempty"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	ForwardAccessToken string `json:"forward_access_token"`
+}
+
+type execSessionResult struct {
+	ExecAccessToken string `json:"exec_access_token"`
 }
 type routeResolve struct {
 	SandboxID              string `json:"sandbox_id"`
@@ -215,6 +222,15 @@ func (rt *Router) Handler() http.Handler {
 			rt.serveControl(w, r)
 			return
 		}
+		if r.Header.Get(proxypkg.HeaderSandboxService) == string(proxypkg.ConnectServiceExec) {
+			if r.Method != http.MethodConnect {
+				w.Header().Set("Allow", http.MethodConnect)
+				http.Error(w, "exec requires CONNECT", http.StatusMethodNotAllowed)
+				return
+			}
+			rt.serveExecData(w, r)
+			return
+		}
 		rt.serveData(w, r, host)
 	})
 }
@@ -244,6 +260,14 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 		// the exact node-local target synchronously and the node resumes it
 		// asynchronously.
 		rt.handleConnect(w, r)
+	case isSandboxExecSessionPath(path):
+		// Exec capability issuance is a Registry operation over the current
+		// node-local instance; the public request is never forwarded to a node.
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rt.handleExecSession(w, r)
 	case isSandboxVerbPath(path):
 		// get / kill / pause / timeout / export: forward to the node by sid.
 		rt.handleSandboxVerb(w, r)
@@ -270,6 +294,14 @@ func isSandboxConnectPath(path string) bool {
 	}
 	sid := extractSandboxID(path)
 	return sid != "" && sid != "import" && path == sandboxPathPrefix(path)+sid+"/connect"
+}
+
+func isSandboxExecSessionPath(path string) bool {
+	if !strings.HasPrefix(path, "/sandboxes/") || !strings.HasSuffix(path, "/exec-sessions") {
+		return false
+	}
+	sid := extractSandboxID(path)
+	return sid != "" && sid != "import" && path == "/sandboxes/"+sid+"/exec-sessions"
 }
 
 func sandboxPathPrefix(path string) string {
@@ -303,7 +335,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "create", group, routeKey, "", 0, 0, createConfig,
+		r.Context(), "create", group, routeKey, "", 0, 0, 0, createConfig,
 		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
 	)
 	if err != nil {
@@ -611,7 +643,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, headers,
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, 0, nil, headers,
 	)
 	if err != nil {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -646,6 +678,67 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
+	sandboxID := extractSandboxID(r.URL.Path)
+	if sandboxID == "" || sandboxID == "import" {
+		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
+		return
+	}
+	apiKey := r.Header.Get(HeaderAPIKey)
+	if apiKey == "" {
+		http.Error(w, HeaderAPIKey+" required", http.StatusUnauthorized)
+		return
+	}
+	migrationToken := r.Header.Get(HeaderMigration)
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		http.Error(w, migrationtoken.ErrTokenTooLarge.Error(), http.StatusRequestHeaderFieldsTooLarge)
+		return
+	}
+	request, err := execsession.DecodeRequest(r.Body, r.ContentLength)
+	if err != nil {
+		if errors.Is(err, execsession.ErrRequestTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, execsession.ErrInvalidRequest.Error(), http.StatusBadRequest)
+		return
+	}
+	headers := map[string]string{HeaderAPIKey: apiKey}
+	if migrationToken != "" {
+		headers[HeaderMigration] = migrationToken
+	}
+	res, err := rt.routeLinkReserve(
+		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, request.TTLSeconds, nil, headers,
+	)
+	if err != nil {
+		writeExecSessionRouteLinkError(w, err)
+		return
+	}
+	route := &res.Route
+	result := res.ExecSession
+	if !routeMatchesIdentity(route, group, routeKey, sandboxID) || result == nil || result.ExecAccessToken == "" {
+		http.Error(w, "exec session unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	rt.rememberRoute(route)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(struct {
+		ExecAccessToken string `json:"execAccessToken"`
+	}{ExecAccessToken: result.ExecAccessToken})
 }
 
 // handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
@@ -852,6 +945,78 @@ func rewriteSandboxIdentityResponse(resp *http.Response, sandboxID, nodeSandboxI
 
 // --- data plane ---
 
+// serveExecData handles the cluster-facing logical exec service. Route lookup is
+// read-only; a KAT must validate against the stable route identity before the
+// Router is allowed to call Reserve(data). The final node receives the same
+// service, optional port, and token with only the sandbox ID rewritten.
+func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
+	sid, target, ok := proxypkg.ParseConnect(r)
+	if !ok || target.Service != proxypkg.ConnectServiceExec {
+		http.Error(w, "bad connect target", http.StatusBadRequest)
+		return
+	}
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
+
+	rr := rt.cachedRoute(group, routeKey, sid)
+	if rr != nil && !routeMatchesIdentity(rr, group, routeKey, sid) {
+		rr = nil
+	}
+	if rr == nil {
+		var err error
+		if rr, err = rt.routeLinkRoute(r.Context(), group, routeKey, sid); err != nil {
+			writeExecDataRouteError(w, err)
+			return
+		}
+		if !routeMatchesIdentity(rr, group, routeKey, sid) {
+			rt.evictRoute(group, routeKey, sid)
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+			return
+		}
+		rt.rememberRoute(rr)
+	}
+
+	token := r.Header.Get(HeaderAccessTok)
+	if err := keys.VerifyExecAccessToken(token, rr.ServiceSecret, rr.AuthSandboxID, time.Now()); err != nil {
+		http.Error(w, "invalid access token", http.StatusUnauthorized)
+		return
+	}
+
+	if rr.State != "ready" || rr.DataEndpoint == "" {
+		res, err := rt.routeLinkReserve(
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
+			map[string]string{
+				HeaderAccessTok:               token,
+				proxypkg.HeaderSandboxService: string(target.Service),
+			},
+		)
+		if err != nil {
+			writeExecDataReserveError(w, err)
+			return
+		}
+		current := &res.Route
+		if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) {
+			http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+			return
+		}
+		rt.rememberRoute(current)
+		rr = current
+	}
+	if rr.State != "ready" || rr.DataEndpoint == "" {
+		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	rt.forwardSandboxConnect(w, r, rr, sid, target, token)
+}
+
 func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string) {
 	sub := strings.TrimSuffix(host, "."+rt.domain)
 	if sub == host { // not under our domain
@@ -954,7 +1119,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// unchanged.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil,
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
 			map[string]string{HeaderAccessTok: connectToken},
 		)
 		if err != nil {
@@ -972,6 +1137,32 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		return
 	}
 	rt.forwardSandboxData(w, r, rr, sid, effectivePort, connectToken)
+}
+
+func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, target proxypkg.ConnectTarget, token string) {
+	doneActive := rt.beginActiveRoute(rr)
+	defer doneActive()
+	rt.mx.Inc(`router_requests_total{plane="data"}`)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(
+		r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, target, token,
+	)
+	if err != nil {
+		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
+		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		backend.Close()
+		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
+			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+		}
+		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
+		http.Error(w, "connect refused by node", resp.StatusCode)
+		return
+	}
+	proxypkg.TunnelBuffered(w, r, backend, br)
 }
 
 func expectedDataAccessToken(route *routeResolve, port int) string {
@@ -1230,7 +1421,7 @@ func randomHexID() string {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, config map[string]string, headers map[string]string) (*reserveResult, error) {
+func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, ttlSeconds int64, config map[string]string, headers map[string]string) (*reserveResult, error) {
 	query := url.Values{
 		"operation": []string{operation},
 		"group":     []string{group},
@@ -1244,6 +1435,9 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	}
 	if timeout != 0 {
 		query.Set("timeout", strconv.Itoa(timeout))
+	}
+	if ttlSeconds > 0 {
+		query.Set("ttl_seconds", strconv.FormatInt(ttlSeconds, 10))
 	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
@@ -1350,6 +1544,55 @@ func writeRouteLinkError(w http.ResponseWriter, err error, fallbackStatus int) {
 		}
 	}
 	http.Error(w, message, status)
+}
+
+// writeExecSessionRouteLinkError preserves the public exec-session status
+// contract without forwarding Registry or node-link error details.
+func writeExecSessionRouteLinkError(w http.ResponseWriter, err error) {
+	status := http.StatusServiceUnavailable
+	message := "exec session unavailable"
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) {
+		switch routeErr.status {
+		case http.StatusBadRequest:
+			status = http.StatusBadRequest
+			message = "invalid exec session request"
+		case http.StatusUnauthorized:
+			status = http.StatusUnauthorized
+			message = "unauthorized"
+		case http.StatusForbidden:
+			status = http.StatusForbidden
+			message = "exec session credential not allowed"
+		case http.StatusNotFound:
+			status = http.StatusNotFound
+			message = "not found"
+		}
+	}
+	http.Error(w, message, status)
+}
+
+func writeExecDataRouteError(w http.ResponseWriter, err error) {
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) && routeErr.status == http.StatusNotFound {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, "routing unavailable", http.StatusServiceUnavailable)
+}
+
+func writeExecDataReserveError(w http.ResponseWriter, err error) {
+	var routeErr *routeLinkCallError
+	if errors.As(err, &routeErr) {
+		switch routeErr.status {
+		case http.StatusUnauthorized:
+			http.Error(w, "invalid access token", http.StatusUnauthorized)
+			return
+		case http.StatusNotFound:
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+			return
+		}
+	}
+	http.Error(w, "sandbox activation failed", http.StatusServiceUnavailable)
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {

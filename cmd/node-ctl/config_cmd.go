@@ -229,6 +229,8 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 # on conductor's plugin plane, owns listener sockets, and supervises workers that
 # read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
+paths:
+  run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
 # proxy_netns: sw0_mgmt                          # forwarding netns for workers' floatingip dials + mmds_listen; "" = current netns
 proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder

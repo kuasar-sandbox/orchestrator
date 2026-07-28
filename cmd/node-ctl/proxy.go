@@ -165,7 +165,7 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 		return cfg.Auth
 	}
 	mx := newMetricsPipeCounter(ctx, fdEnv(envProxyMetricsFD), log.With("proxy_worker", workerID))
-	px := proxy.New(view, authMode, log.With("proxy_worker", workerID), mx)
+	px := proxy.NewWithDialer(view, authMode, log.With("proxy_worker", workerID), mx, nil, cfg.Paths.RunRoot)
 
 	errCh := make(chan error, 3)
 	forwardLn, err := listenerFromFD(fdEnv(envProxyForwardFD), "proxy-forward")

@@ -15,7 +15,10 @@
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
 #                                in the guest below (§4.6 config passing chain).
-#   exec                       -> run a command in the guest via envd (incl. hostname).
+#   exec-session + CONNECT     -> issue an explicit exec capability, then use the
+#                                real sandbox-ctl HTTP CONNECT client against the
+#                                guest (stdio, PTY resize, exit status, pause wake).
+#   envd exec                  -> run a command in the guest via envd (incl. hostname).
 #   DELETE                     -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
@@ -134,6 +137,127 @@ req() {
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
+assert_no_default_exec_token() {
+    python3 - "$1" <<'PY'
+import json, sys
+created = json.load(open(sys.argv[1]))
+if "execAccessToken" in created:
+    raise SystemExit("create response unexpectedly contains execAccessToken")
+PY
+}
+issue_exec_session() {
+    local sid="$1" key="$2" code
+    code="$(curl -sS --noproxy '*' --max-time 30 \
+        -D "$WORK/exec-session.headers" \
+        -o "$WORK/exec-session.secret" \
+        -w '%{http_code}' \
+        -X POST \
+        -H "Host: api.$DOMAIN" \
+        -H "X-API-KEY: $key" \
+        -H 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:$PORT/sandboxes/$sid/exec-sessions")"
+    [ "$code" = "201" ] || fail "exec-session=$code (want 201)"
+    python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
+import json, sys
+headers = [line.strip().lower() for line in open(sys.argv[1], "rb").read().splitlines()]
+if b"cache-control: no-store" not in headers:
+    raise SystemExit("exec-session response omitted Cache-Control: no-store")
+payload = json.load(open(sys.argv[2]))
+if not isinstance(payload, dict) or set(payload) != {"execAccessToken"}:
+    raise SystemExit("exec-session response must contain only execAccessToken")
+token = payload["execAccessToken"]
+if not isinstance(token, str) or not token.startswith("kat1.") or len(token.split(".")) != 3:
+    raise SystemExit("exec-session response contains an invalid KAT token")
+print(token)
+PY
+}
+exec_through_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local input="$WORK/native-exec.stdin"
+    local output="$WORK/native-exec.stdout"
+    local error_output="$WORK/native-exec.stderr"
+    local diagnostics="$WORK/native-exec.client.log"
+    local status
+
+    printf 'stdin:%s\n' "$marker" >"$input"
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+        --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+        /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+        >"$diagnostics" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
+    grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
+    [ "$status" = "47" ] \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
+}
+
+exec_pty_resize_through_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local output="$WORK/native-exec-pty.out"
+    local status=0
+
+    python3 - "$output" "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --tty -- /bin/sh -c \
+        "stty size; trap 'stty size; echo $marker; exit 23' WINCH; echo PTY_READY; while :; do sleep 1; done" <<'PY' || status=$?
+import errno, fcntl, os, pty, select, signal, struct, subprocess, sys, termios, time
+
+output_path, argv = sys.argv[1], sys.argv[2:]
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 37, 91, 0, 0))
+proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+captured = bytearray()
+resized = False
+deadline = time.monotonic() + 60
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            proc.kill()
+            proc.wait()
+            raise SystemExit(124)
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if not resized and b"PTY_READY" in captured:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 41, 101, 0, 0))
+            os.kill(proc.pid, signal.SIGWINCH)
+            resized = True
+finally:
+    os.close(master)
+    with open(output_path, "wb") as output_file:
+        output_file.write(captured)
+raise SystemExit(proc.wait())
+PY
+    grep -q '37 91' "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec initial PTY size mismatch"; }
+    grep -q '41 101' "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec resized PTY size mismatch"; }
+    grep -q "$marker" "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec PTY marker missing"; }
+    [ "$status" = "23" ] || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec PTY exit=$status (want 23)"; }
 }
 dp() {
     local port_sid="$1" path="$2" token="${3:-}"
@@ -330,12 +454,23 @@ fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
+assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
 echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
 grep -q "$SID" "$WORK/resp.body" || fail "sandbox $SID not listed"
 echo "==> PASS: sandbox listed"
+
+# ---- native exec capability -> CONNECT -> sandbox-ctl -> real guest -------
+echo "==> issue an explicit native exec capability (create has no default token)"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capability"
+rm -f "$WORK/exec-session.secret"
+NATIVE_MARK="NATIVE_EXEC_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
+PTY_MARK="NATIVE_EXEC_PTY_$RANDOM"
+exec_pty_resize_through_connect "$SID" "$EXEC_TOKEN" "$PTY_MARK"
+echo "==> PASS: real sandbox-ctl CONNECT reached the guest (stdio, duplicate headers, PTY resize, exit status)"
 
 # ---- execute a command in the guest via envd (Connect-RPC over envd.sock) --
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
@@ -415,12 +550,11 @@ echo "==> pause (snapshot+upload) $SID"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
     echo "==> PASS: sandbox paused (snapshot uploaded to store)"
-    echo "==> resume via connect"
-    code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
-    [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
-    # Connect acknowledges after import and schedules resume asynchronously. The
-    # old UDS path can survive pause, so its mere existence is not a readiness
-    # signal; probe the service until the restored envd is accepting requests.
+    echo "==> resume via authenticated service=exec CONNECT using the same KAT"
+    RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
+    exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+    # The exec CONNECT completes only after restore and guest command execution;
+    # probe envd as an independent restored-service readiness check.
     resumed=""
     for _ in $(seq 1 90); do
         code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
@@ -432,7 +566,7 @@ if [ "$code" = "204" ]; then
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
     grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
-    echo "==> PASS: pre-pause guest state survived resume (snapshot/restore + img-resume restore)"
+    echo "==> PASS: same KAT woke the paused sandbox and pre-pause guest state survived restore"
 else
     echo "==> NOTE: pause=$code — snapshot error (diagnostic):"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
@@ -440,6 +574,7 @@ else
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     PAUSE_FAILED=1
 fi
+unset EXEC_TOKEN
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill=$code (want 204)"
