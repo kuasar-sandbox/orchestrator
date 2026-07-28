@@ -91,7 +91,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			return reject(cmd, err)
 		}
 		if sb.State == types.StatePaused {
-			o.scheduleResume(sb.ID, 0)
+			o.scheduleResume(sb.ID)
 		}
 		return acceptExecSession(cmd, result)
 	case routesync.CmdDelete:

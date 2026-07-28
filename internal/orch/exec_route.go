@@ -37,16 +37,7 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 	}
 
 	if sb.State == types.StatePaused {
-		err := o.sf.Do(sandboxID, func() error {
-			current, err := o.lookupExecSandbox(ctx, sandboxID)
-			if err != nil {
-				return err
-			}
-			if !execRoutePresent(current) || execIdentity(current) != expected {
-				return errExecIdentityChanged
-			}
-			return o.resumeIfPaused(ctx, sandboxID)
-		})
+		err := o.resumeExecSandbox(ctx, sandboxID, expected)
 		if errors.Is(err, errExecIdentityChanged) {
 			return proxy.ExecIdentity{}, false, nil
 		}
@@ -63,6 +54,42 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 		return proxy.ExecIdentity{}, false, nil
 	}
 	return execIdentity(ready), true, nil
+}
+
+// resumeExecSandbox preserves the normal resume fencing and lifecycle boundary
+// while revalidating the already-authorized identity immediately before any
+// resume side effect.
+func (o *Orchestrator) resumeExecSandbox(ctx context.Context, sandboxID string, expected proxy.ExecIdentity) error {
+	request := o.newResumeRequest(sandboxID)
+	defer o.releaseResumeRequest(request)
+	for {
+		err := o.sf.Do(sandboxID, func() error {
+			unlock := o.lifecycle.Lock(sandboxID)
+			defer unlock()
+			if !o.resumeRequestValid(request) {
+				return errResumeFenced
+			}
+			current, err := o.lookupExecSandbox(ctx, sandboxID)
+			if err != nil {
+				return err
+			}
+			if !execRoutePresent(current) || execIdentity(current) != expected {
+				return errExecIdentityChanged
+			}
+			preserveDeadline := o.hasDeadlineIntent(sandboxID)
+			if err := o.resumeIfPaused(ctx, sandboxID, preserveDeadline); err != nil {
+				return err
+			}
+			o.clearDeadlineIntent(sandboxID)
+			return nil
+		})
+		if !errors.Is(err, errResumeFenced) {
+			return err
+		}
+		if !o.resumeRequestValid(request) {
+			return nil
+		}
+	}
 }
 
 func (o *Orchestrator) lookupExecSandbox(ctx context.Context, sandboxID string) (*types.Sandbox, error) {
