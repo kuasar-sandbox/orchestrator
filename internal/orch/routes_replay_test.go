@@ -68,25 +68,38 @@ func TestInternalRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 	}}
 	tests := []struct {
 		sid       string
-		port      int
+		target    proxy.ConnectTarget
 		wantKind  proxy.Kind
 		wantToken string
 	}{
-		{"e2b", 49983, proxy.KindUDS, "envd"},
-		{"e2b", 49999, proxy.KindUDS, "envd"},
-		{"e2b", 8080, proxy.KindTCP, "forward"},
-		{"bare", 49983, proxy.KindDeny, ""},
-		{"bare", 49999, proxy.KindDeny, ""},
-		{"bare", 8080, proxy.KindTCP, "bare-forward"},
+		{"e2b", proxy.LegacyTarget(49983), proxy.KindUDS, "envd"},
+		{"e2b", proxy.LegacyTarget(49999), proxy.KindUDS, "envd"},
+		{"e2b", proxy.LegacyTarget(8080), proxy.KindTCP, "forward"},
+		{"bare", proxy.LegacyTarget(49983), proxy.KindTCP, "bare-forward"},
+		{"bare", proxy.LegacyTarget(49999), proxy.KindTCP, "bare-forward"},
+		{"bare", proxy.LegacyTarget(8080), proxy.KindTCP, "bare-forward"},
+		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, proxy.KindTCP, "forward"},
+		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}, proxy.KindUDS, "envd"},
+		{"bare", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, proxy.KindDeny, ""},
 	}
 	for _, tc := range tests {
-		route, err := o.Route(context.Background(), tc.sid, tc.port)
+		route, err := o.Route(context.Background(), tc.sid, tc.target)
 		if err != nil {
-			t.Fatalf("Route(%s, %d): %v", tc.sid, tc.port, err)
+			t.Fatalf("Route(%s, %+v): %v", tc.sid, tc.target, err)
 		}
 		if route.Kind != tc.wantKind || route.AccessToken != tc.wantToken {
-			t.Fatalf("Route(%s, %d) = %+v, want kind=%v token=%q", tc.sid, tc.port, route, tc.wantKind, tc.wantToken)
+			t.Fatalf("Route(%s, %+v) = %+v, want kind=%v token=%q", tc.sid, tc.target, route, tc.wantKind, tc.wantToken)
 		}
+	}
+}
+
+func TestInternalKnownExecDoesNotResumePausedSandboxBeforeIssue64(t *testing.T) {
+	o := &Orchestrator{reg: map[string]*types.Sandbox{
+		"paused": {ID: "paused", Profile: types.ProfileBare, State: types.StatePaused},
+	}}
+	route, err := o.Route(context.Background(), "paused", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
+	if err != nil || route.Kind != proxy.KindDeny {
+		t.Fatalf("exec route = %+v err=%v, want deny without resume", route, err)
 	}
 }
 

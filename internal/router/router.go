@@ -995,7 +995,7 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
-	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, port, connectToken)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, proxypkg.LegacyTarget(port), connectToken)
 	if err != nil {
 		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)

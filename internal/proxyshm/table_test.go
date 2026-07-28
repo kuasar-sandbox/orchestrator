@@ -165,7 +165,7 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 
 	done := make(chan proxy.Route, 1)
 	go func() {
-		route, _ := worker.Route(context.Background(), "s1", 49983)
+		route, _ := worker.Route(context.Background(), "s1", proxy.LegacyTarget(49983))
 		done <- route
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -218,25 +218,57 @@ func TestWorkerRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 
 	tests := []struct {
 		sid       string
-		port      int
+		target    proxy.ConnectTarget
 		wantKind  proxy.Kind
 		wantToken string
 	}{
-		{"e2b", 49983, proxy.KindUDS, "envd"},
-		{"e2b", 49999, proxy.KindUDS, "envd"},
-		{"e2b", 8080, proxy.KindTCP, "forward"},
-		{"bare", 49983, proxy.KindDeny, ""},
-		{"bare", 49999, proxy.KindDeny, ""},
-		{"bare", 8080, proxy.KindTCP, "bare-forward"},
+		{"e2b", proxy.LegacyTarget(49983), proxy.KindUDS, "envd"},
+		{"e2b", proxy.LegacyTarget(49999), proxy.KindUDS, "envd"},
+		{"e2b", proxy.LegacyTarget(8080), proxy.KindTCP, "forward"},
+		{"bare", proxy.LegacyTarget(49983), proxy.KindTCP, "bare-forward"},
+		{"bare", proxy.LegacyTarget(49999), proxy.KindTCP, "bare-forward"},
+		{"bare", proxy.LegacyTarget(8080), proxy.KindTCP, "bare-forward"},
+		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, proxy.KindTCP, "forward"},
+		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}, proxy.KindUDS, "envd"},
+		{"bare", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, proxy.KindDeny, ""},
+		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceExec}, proxy.KindDeny, ""},
 	}
 	for _, tc := range tests {
-		route, err := view.Route(context.Background(), tc.sid, tc.port)
+		route, err := view.Route(context.Background(), tc.sid, tc.target)
 		if err != nil {
-			t.Fatalf("Route(%s, %d): %v", tc.sid, tc.port, err)
+			t.Fatalf("Route(%s, %+v): %v", tc.sid, tc.target, err)
 		}
 		if route.Kind != tc.wantKind || route.AccessToken != tc.wantToken {
-			t.Fatalf("Route(%s, %d) = %+v, want kind=%v token=%q", tc.sid, tc.port, route, tc.wantKind, tc.wantToken)
+			t.Fatalf("Route(%s, %+v) = %+v, want kind=%v token=%q", tc.sid, tc.target, route, tc.wantKind, tc.wantToken)
 		}
+	}
+}
+
+func TestWorkerKnownUnsupportedServiceDoesNotWakePausedRoute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	master := NewMasterView(tbl, 50*time.Millisecond, nil)
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: "s1", Profile: "e2b", State: routesync.StatePaused,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	worker := NewWorkerView(tbl, nil, master.Wake, 50*time.Millisecond)
+
+	route, err := worker.Route(context.Background(), "s1", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
+	if err != nil || route.Kind != proxy.KindDeny {
+		t.Fatalf("exec route = %+v err=%v, want deny", route, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if sid, ok := master.NextWake(ctx); ok {
+		t.Fatalf("unsupported service woke paused sandbox %q", sid)
 	}
 }
 

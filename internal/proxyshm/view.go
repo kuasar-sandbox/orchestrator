@@ -192,14 +192,32 @@ func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPar
 	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark}
 }
 
-func (v *WorkerView) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
+func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
+	if !v.waitSynced(ctx) {
+		return proxy.Route{Kind: proxy.KindNotFound}, nil
+	}
+	if current, found := v.table.Lookup(sid); found && current.State != routesync.StateDead {
+		selected := proxy.RouteForTarget(
+			current.Profile, current.EnvdUDS, current.CiUDS, current.FloatingIP,
+			current.EnvdAccessToken, current.ForwardAccessToken, target,
+		)
+		// Do not wake a paused sandbox for a recognized target that has no
+		// backend. service=exec remains this side-effect-free 501 boundary until
+		// #64 installs its authenticated wake + ctl.sock path.
+		if selected.Kind == proxy.KindDeny {
+			return selected, nil
+		}
+		if current.State == routesync.StateRunning {
+			return selected, nil
+		}
+	}
 	r, ok := v.Resolve(ctx, sid)
 	if !ok {
 		return proxy.Route{Kind: proxy.KindNotFound}, nil
 	}
 	return proxy.RouteForTarget(
 		r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP,
-		r.EnvdAccessToken, r.ForwardAccessToken, port,
+		r.EnvdAccessToken, r.ForwardAccessToken, target,
 	), nil
 }
 

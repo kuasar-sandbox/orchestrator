@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -21,7 +22,7 @@ import (
 
 type stubRouter struct{ r proxy.Route }
 
-func (s stubRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
+func (s stubRouter) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
 	return s.r, nil
 }
 
@@ -39,20 +40,35 @@ func (l *countingListener) Accept() (net.Conn, error) {
 }
 
 func TestRouteForTarget(t *testing.T) {
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 49983); r.Kind != proxy.KindUDS || r.UDS != "/e.sock" || r.AccessToken != "envd" {
-		t.Fatalf("envd port: %+v", r)
+	tests := []struct {
+		name      string
+		profile   string
+		target    proxy.ConnectTarget
+		wantKind  proxy.Kind
+		wantUDS   string
+		wantAddr  string
+		wantToken string
+	}{
+		{name: "legacy e2b envd", profile: "e2b", target: proxy.LegacyTarget(49983), wantKind: proxy.KindUDS, wantUDS: "/e.sock", wantToken: "envd"},
+		{name: "legacy e2b interpreter", profile: "e2b", target: proxy.LegacyTarget(49999), wantKind: proxy.KindUDS, wantUDS: "/c.sock", wantToken: "envd"},
+		{name: "legacy e2b forward", profile: "e2b", target: proxy.LegacyTarget(8080), wantKind: proxy.KindTCP, wantAddr: "10.0.0.5:8080", wantToken: "forward"},
+		{name: "legacy bare 49983", profile: "bare", target: proxy.LegacyTarget(49983), wantKind: proxy.KindTCP, wantAddr: "10.0.0.5:49983", wantToken: "forward"},
+		{name: "legacy bare 49999", profile: "bare", target: proxy.LegacyTarget(49999), wantKind: proxy.KindTCP, wantAddr: "10.0.0.5:49999", wantToken: "forward"},
+		{name: "explicit e2b forward reserved port", profile: "e2b", target: proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, wantKind: proxy.KindTCP, wantAddr: "10.0.0.5:49983", wantToken: "forward"},
+		{name: "explicit bare forward", profile: "bare", target: proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49999}, wantKind: proxy.KindTCP, wantAddr: "10.0.0.5:49999", wantToken: "forward"},
+		{name: "explicit envd ignores port", profile: "e2b", target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}, wantKind: proxy.KindUDS, wantUDS: "/e.sock", wantToken: "envd"},
+		{name: "explicit interpreter ignores port", profile: "e2b", target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BInterpreter, Port: 49983}, wantKind: proxy.KindUDS, wantUDS: "/c.sock", wantToken: "envd"},
+		{name: "bare envd unsupported", profile: "bare", target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, wantKind: proxy.KindDeny},
+		{name: "bare interpreter unsupported", profile: "bare", target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BInterpreter}, wantKind: proxy.KindDeny},
+		{name: "known exec pending issue 64", profile: "e2b", target: proxy.ConnectTarget{Service: proxy.ConnectServiceExec}, wantKind: proxy.KindDeny},
 	}
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 49999); r.Kind != proxy.KindUDS || r.UDS != "/c.sock" || r.AccessToken != "envd" {
-		t.Fatalf("ci port: %+v", r)
-	}
-	if r := proxy.RouteForTarget("e2b", "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", 8080); r.Kind != proxy.KindTCP || r.Addr != "10.0.0.5:8080" || r.AccessToken != "forward" {
-		t.Fatalf("user port: %+v", r)
-	}
-	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "envd", "forward", 49983); r.Kind != proxy.KindDeny {
-		t.Fatalf("bare control: %+v", r)
-	}
-	if r := proxy.RouteForTarget("bare", "", "", "10.0.0.5", "envd", "forward", 8080); r.Kind != proxy.KindTCP || r.AccessToken != "forward" {
-		t.Fatalf("bare user: %+v", r)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			route := proxy.RouteForTarget(tc.profile, "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", tc.target)
+			if route.Kind != tc.wantKind || route.UDS != tc.wantUDS || route.Addr != tc.wantAddr || route.AccessToken != tc.wantToken {
+				t.Fatalf("route = %+v, want kind=%v uds=%q addr=%q token=%q", route, tc.wantKind, tc.wantUDS, tc.wantAddr, tc.wantToken)
+			}
+		})
 	}
 }
 
@@ -78,6 +94,166 @@ func TestParseSandbox(t *testing.T) {
 	if _, _, ok := proxy.ParseSandbox(req); ok {
 		t.Fatal("expected parse failure for host without <port>-<sid>")
 	}
+}
+
+func TestParseConnectCanonicalTargetAndSourceConflicts(t *testing.T) {
+	request := func(authority string) *http.Request {
+		req := httptest.NewRequest(http.MethodConnect, authority, nil)
+		req.Host = authority
+		return req
+	}
+
+	t.Run("portless exec ignores generic authority", func(t *testing.T) {
+		req := request("sandbox:443")
+		req.Header.Set(proxy.HeaderSandboxID, "s1")
+		req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+		sid, target, ok := proxy.ParseConnect(req)
+		if !ok || sid != "s1" || target != (proxy.ConnectTarget{Service: proxy.ConnectServiceExec}) {
+			t.Fatalf("ParseConnect = %q %+v %v", sid, target, ok)
+		}
+	})
+
+	t.Run("logical service retains explicit port and ignores authority", func(t *testing.T) {
+		req := request("sandbox:443")
+		req.Header.Set(proxy.HeaderSandboxID, "s1")
+		req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceE2BEnvd))
+		req.Header.Set(proxy.HeaderSandboxPort, "8080")
+		sid, target, ok := proxy.ParseConnect(req)
+		if !ok || sid != "s1" || target != (proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}) {
+			t.Fatalf("ParseConnect = %q %+v %v", sid, target, ok)
+		}
+	})
+
+	t.Run("forward uses authority port", func(t *testing.T) {
+		req := request("sandbox:8080")
+		req.Header.Set(proxy.HeaderSandboxID, "s1")
+		req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceForward))
+		sid, target, ok := proxy.ParseConnect(req)
+		if !ok || sid != "s1" || target != (proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 8080}) {
+			t.Fatalf("ParseConnect = %q %+v %v", sid, target, ok)
+		}
+	})
+
+	t.Run("legacy host source", func(t *testing.T) {
+		req := request("49983-s1.test.local:49983")
+		sid, target, ok := proxy.ParseConnect(req)
+		if !ok || sid != "s1" || target != proxy.LegacyTarget(49983) {
+			t.Fatalf("ParseConnect = %q %+v %v", sid, target, ok)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{name: "empty service", mutate: func(r *http.Request) {
+			r.Header.Set(proxy.HeaderSandboxID, "s1")
+			r.Header[proxy.HeaderSandboxService] = []string{""}
+		}},
+		{name: "unknown service", mutate: func(r *http.Request) {
+			r.Header.Set(proxy.HeaderSandboxID, "s1")
+			r.Header.Set(proxy.HeaderSandboxService, "unknown")
+		}},
+		{name: "forward missing port", mutate: func(r *http.Request) {
+			r.URL.Host, r.Host = "sandbox", "sandbox"
+			r.Header.Set(proxy.HeaderSandboxID, "s1")
+			r.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceForward))
+		}},
+		{name: "conflicting forward ports", mutate: func(r *http.Request) {
+			r.Header.Set(proxy.HeaderSandboxID, "s1")
+			r.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceForward))
+			r.Header.Set(proxy.HeaderSandboxPort, "8080")
+		}},
+		{name: "conflicting sandbox ids", mutate: func(r *http.Request) {
+			r.URL.Host, r.Host = "8080-s2.test.local:8080", "8080-s2.test.local:8080"
+			r.Header.Set(proxy.HeaderSandboxID, "s1")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := request("sandbox:9090")
+			tc.mutate(req)
+			if _, _, ok := proxy.ParseConnect(req); ok {
+				t.Fatal("conflicting or invalid CONNECT target accepted")
+			}
+		})
+	}
+}
+
+func TestWriteSandboxConnectPreservesServiceAndOptionalPort(t *testing.T) {
+	tests := []struct {
+		name          string
+		target        proxy.ConnectTarget
+		wantAuthority string
+		wantService   string
+		wantPort      string
+	}{
+		{name: "legacy", target: proxy.LegacyTarget(8080), wantAuthority: "sandbox:8080", wantPort: "8080"},
+		{name: "forward", target: proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, wantAuthority: "sandbox:49983", wantService: "forward", wantPort: "49983"},
+		{name: "logical with port", target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}, wantAuthority: "sandbox:443", wantService: "e2b:envd", wantPort: "8080"},
+		{name: "portless exec", target: proxy.ConnectTarget{Service: proxy.ConnectServiceExec}, wantAuthority: "sandbox:443", wantService: "exec"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var wire bytes.Buffer
+			if err := proxy.WriteSandboxConnect(&wire, "s1", tc.target, "tok"); err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.ReadRequest(bufio.NewReader(&wire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.Method != http.MethodConnect || req.URL.Host != tc.wantAuthority ||
+				req.Header.Get(proxy.HeaderSandboxID) != "s1" ||
+				req.Header.Get(proxy.HeaderSandboxService) != tc.wantService ||
+				req.Header.Get(proxy.HeaderSandboxPort) != tc.wantPort ||
+				req.Header.Get(proxy.HeaderAccessToken) != "tok" {
+				t.Fatalf("CONNECT request = method=%q authority=%q headers=%v", req.Method, req.URL.Host, req.Header)
+			}
+		})
+	}
+}
+
+func TestOrdinaryHTTPIgnoresAndPreservesServiceHeader(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(proxy.HeaderSandboxService); got != "application-defined" {
+			t.Errorf("backend service header = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	var routed proxy.ConnectTarget
+	router := &recordingRouter{
+		route:  proxy.Route{Kind: proxy.KindTCP, Addr: strings.TrimPrefix(backend.URL, "http://"), AccessToken: "tok"},
+		target: &routed,
+	}
+	px := proxy.New(router, func() string { return "enforce" }, log, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox/health", nil)
+	req.Header.Set(proxy.HeaderSandboxID, "s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "49983")
+	req.Header.Set(proxy.HeaderSandboxService, "application-defined")
+	req.Header.Set(proxy.HeaderAccessToken, "tok")
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", resp.Code)
+	}
+	if routed != proxy.LegacyTarget(49983) {
+		t.Fatalf("ordinary HTTP route target = %+v, want legacy port", routed)
+	}
+}
+
+type recordingRouter struct {
+	route  proxy.Route
+	target *proxy.ConnectTarget
+}
+
+func (r *recordingRouter) Route(_ context.Context, _ string, target proxy.ConnectTarget) (proxy.Route, error) {
+	if r.target != nil {
+		*r.target = target
+	}
+	return r.route, nil
 }
 
 func TestProxyForwardAndAuth(t *testing.T) {

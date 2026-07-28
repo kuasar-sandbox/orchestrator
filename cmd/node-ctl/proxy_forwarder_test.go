@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -19,9 +20,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-type connectStubRouter struct{ r proxy.Route }
+type connectStubRouter struct {
+	r      proxy.Route
+	target *proxy.ConnectTarget
+}
 
-func (s connectStubRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
+func (s connectStubRouter) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
+	if s.target != nil {
+		*s.target = target
+	}
 	return s.r, nil
 }
 
@@ -54,7 +61,11 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wln.Close()
-	px := proxy.New(connectStubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+	var workerTarget proxy.ConnectTarget
+	px := proxy.New(connectStubRouter{
+		r:      proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"},
+		target: &workerTarget,
+	},
 		func() string { return "enforce" }, log, nil)
 	wsrv := &http.Server{Handler: px}
 	go wsrv.Serve(wln)
@@ -75,7 +86,7 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	fmt.Fprintf(c, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\nE2b-Sandbox-Port: %s\r\nX-Access-Token: tok\r\n\r\n", bport, bport, bport)
+	fmt.Fprintf(c, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\nE2b-Sandbox-Service: forward\r\nE2b-Sandbox-Port: %s\r\nX-Access-Token: tok\r\n\r\n", bport, bport, bport)
 	br := bufio.NewReader(c)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
@@ -91,4 +102,154 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 	if strings.TrimSpace(line) != "ping" {
 		t.Fatalf("relayed tunnel echo = %q (want ping)", line)
 	}
+	if want := (proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: mustAtoi(t, bport)}); workerTarget != want {
+		t.Fatalf("worker target = %#v, want %#v", workerTarget, want)
+	}
+}
+
+func TestProxyForwarderPreservesPortlessLogicalService(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	workerSock := filepath.Join(t.TempDir(), "px.sock")
+	wln, err := net.Listen("unix", workerSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wln.Close()
+
+	type observedConnect struct {
+		authority string
+		sid       string
+		service   string
+		port      string
+		token     string
+	}
+	observed := make(chan observedConnect, 1)
+	wsrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed <- observedConnect{
+			authority: r.Host,
+			sid:       r.Header.Get(proxy.HeaderSandboxID),
+			service:   r.Header.Get(proxy.HeaderSandboxService),
+			port:      r.Header.Get(proxy.HeaderSandboxPort),
+			token:     r.Header.Get(proxy.HeaderAccessToken),
+		}
+		http.Error(w, "not implemented", http.StatusNotImplemented)
+	})}
+	go wsrv.Serve(wln)
+	defer wsrv.Close()
+
+	reg := configsock.NewRegistry()
+	reg.Add(&configsock.Plugin{ID: "px0", Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: workerSock}}}})
+	pf := newProxyForwarder(reg, metrics.New(), log)
+	ts := httptest.NewServer(pf)
+	defer ts.Close()
+
+	c, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "CONNECT sandbox:443 HTTP/1.1\r\nHost: sandbox:443\r\n%s: s1\r\n%s: exec\r\n%s: tok\r\n\r\n",
+		proxy.HeaderSandboxID, proxy.HeaderSandboxService, proxy.HeaderAccessToken)
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotImplemented)
+	}
+	got := <-observed
+	want := observedConnect{authority: "sandbox:443", sid: "s1", service: "exec", token: "tok"}
+	if got != want {
+		t.Fatalf("worker CONNECT = %#v, want %#v", got, want)
+	}
+}
+
+func TestProxyForwarderOrdinaryHTTPKeepsServiceInsideLegacyTunnel(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	workerSock := filepath.Join(t.TempDir(), "px.sock")
+	wln, err := net.Listen("unix", workerSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wln.Close()
+
+	type observedRequest struct {
+		outerService string
+		outerPort    string
+		innerService string
+	}
+	observed := make(chan observedRequest, 1)
+	wsrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("worker response writer cannot hijack")
+			return
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := rw.Flush(); err != nil {
+			t.Error(err)
+			return
+		}
+		inner, err := http.ReadRequest(rw.Reader)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		observed <- observedRequest{
+			outerService: r.Header.Get(proxy.HeaderSandboxService),
+			outerPort:    r.Header.Get(proxy.HeaderSandboxPort),
+			innerService: inner.Header.Get(proxy.HeaderSandboxService),
+		}
+		_, _ = rw.WriteString("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+		_ = rw.Flush()
+	})}
+	go wsrv.Serve(wln)
+	defer wsrv.Close()
+
+	reg := configsock.NewRegistry()
+	reg.Add(&configsock.Plugin{ID: "px0", Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: workerSock}}}})
+	pf := newProxyForwarder(reg, metrics.New(), log)
+	ts := httptest.NewServer(pf)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(proxy.HeaderSandboxID, "s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "49983")
+	req.Header.Set(proxy.HeaderSandboxService, "application-defined")
+	req.Header.Set(proxy.HeaderAccessToken, "tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	got := <-observed
+	want := observedRequest{outerPort: "49983", innerService: "application-defined"}
+	if got != want {
+		t.Fatalf("worker request = %#v, want %#v", got, want)
+	}
+}
+
+func mustAtoi(t *testing.T, value string) int {
+	t.Helper()
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
