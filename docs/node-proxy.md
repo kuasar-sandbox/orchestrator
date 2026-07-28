@@ -142,6 +142,13 @@ sid hash ─► record slot ─► RouteEntry
 worker 对 missing/paused sid 写 wake pipe 给 master;master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 
+共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
+`<stableSandboxID>-g<SandboxGeneration>`,正常流程不会让不同逻辑沙箱复用同一个
+node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配给另一个逻辑沙箱,
+在 Delete/新 Upsert 尚未到达 external proxy 的极短窗口内,worker 仍可能持有旧实例的
+凭据投影和同名运行目录。external 模式不得主动执行这种跨逻辑沙箱的即时 ID 复用;
+为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
+
 受保护 `RouteEntry` 显式携带 `AuthSandboxID`、`APISecret`、`APISecretFingerprint`、
 `ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
 `ForwardAccessToken`。
