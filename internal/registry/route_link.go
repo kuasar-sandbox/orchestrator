@@ -163,7 +163,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	}
 	operation := ReserveOperation(q.Get("operation"))
 	if !operation.Valid() {
-		http.Error(w, "operation must be create, connect, or data", http.StatusBadRequest)
+		http.Error(w, "operation must be create, connect, exec-session, or data", http.StatusBadRequest)
 		return
 	}
 	port, err := reserveQueryInt(q.Get("port"), "port")
@@ -174,6 +174,11 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	timeoutSeconds, err := reserveQueryInt(q.Get("timeout"), "timeout")
 	if err != nil || int64(timeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
 		http.Error(w, fmt.Sprintf("timeout must be an integer between 0 and %d", routesync.MaxConnectTimeoutSeconds), http.StatusBadRequest)
+		return
+	}
+	ttlSeconds, err := reserveQueryInt64(q.Get("ttl_seconds"), "ttl_seconds")
+	if err != nil {
+		http.Error(w, "ttl_seconds must be a non-negative integer", http.StatusBadRequest)
 		return
 	}
 	var body SandboxReserveReq
@@ -207,8 +212,10 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		ExpectedSandboxID: q.Get("sid"),
 		Port:              port,
 		TimeoutSeconds:    timeoutSeconds,
+		TTLSeconds:        ttlSeconds,
 		APIKey:            req.Header.Get("X-API-KEY"),
 		AccessToken:       req.Header.Get("X-Access-Token"),
+		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
 		Config:            body.Config,
 	})
@@ -224,6 +231,17 @@ func reserveQueryInt(value, field string) (int, error) {
 		return 0, nil
 	}
 	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("registry: invalid %s", field)
+	}
+	return n, nil
+}
+
+func reserveQueryInt64(value, field string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("registry: invalid %s", field)
 	}
@@ -300,7 +318,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func routeLinkStatus(err error) int {
-	var rejected *nodeConnectRejection
+	var rejected *nodeCommandRejection
 	if errors.As(err, &rejected) {
 		return rejected.status
 	}

@@ -89,6 +89,23 @@ type Router interface {
 	Route(ctx context.Context, sandboxID string, target ConnectTarget) (Route, error)
 }
 
+// ExecIdentity is the credential and node-local identity needed to authorize an
+// exec tunnel. ServiceSecret is trusted internal state and must never be logged
+// or returned to the client.
+type ExecIdentity struct {
+	NodeSandboxID string
+	AuthSandboxID string
+	ServiceSecret string
+}
+
+// ExecRouter separates the side-effect-free credential lookup from the
+// authorized lifecycle transition. ActivateExec may resume a paused sandbox and
+// must re-read its identity before returning.
+type ExecRouter interface {
+	LookupExec(ctx context.Context, sandboxID string) (ExecIdentity, bool, error)
+	ActivateExec(ctx context.Context, sandboxID string, expected ExecIdentity) (ExecIdentity, bool, error)
+}
+
 // Counter is the narrow metrics surface the proxy needs.
 type Counter interface {
 	Inc(name string)
@@ -130,8 +147,8 @@ func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwar
 		}
 		return Route{Kind: KindUDS, UDS: ciUDS, AccessToken: envdAccessToken}
 	case ConnectServiceExec:
-		// #64 replaces this recognized boundary with the authenticated ctl.sock
-		// gate. Until then it is deliberately distinct from an unknown service.
+		// Exec CONNECT is dispatched to the authenticated ctl.sock path before
+		// generic route lookup. Keep direct route-selection callers fail-closed.
 		return Route{Kind: KindDeny}
 	default:
 		// HTTP parsing rejects unknown services before route lookup. Keep direct
@@ -141,22 +158,24 @@ func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwar
 }
 
 type Proxy struct {
-	router   Router
-	authMode func() string // config.Auth* (off|log|enforce), read per-request so a
-	log      *slog.Logger  // pushed routesync policy can change it centrally
-	mx       Counter
-	dial     RouteDialer
+	router      Router
+	authMode    func() string // config.Auth* (off|log|enforce), read per-request so a
+	log         *slog.Logger  // pushed routesync policy can change it centrally
+	mx          Counter
+	dial        RouteDialer
+	execRunRoot string
 }
 
 // New builds a proxy over router. authMode is read per request and returns one of
 // config.AuthOff/Log/Enforce (nil => enforce). mx may be nil (metrics off).
 func New(router Router, authMode func() string, log *slog.Logger, mx Counter) *Proxy {
-	return NewWithDialer(router, authMode, log, mx, nil)
+	return NewWithDialer(router, authMode, log, mx, nil, "")
 }
 
 // NewWithDialer builds a proxy with an explicit backend dialer. A nil dialer uses
-// the process's current network namespace.
-func NewWithDialer(router Router, authMode func() string, log *slog.Logger, mx Counter, dial RouteDialer) *Proxy {
+// the process's current network namespace. execRunRoot is the trusted node run
+// root used only by a final node proxy; an empty value leaves exec unavailable.
+func NewWithDialer(router Router, authMode func() string, log *slog.Logger, mx Counter, dial RouteDialer, execRunRoot string) *Proxy {
 	if authMode == nil {
 		authMode = func() string { return config.AuthEnforce }
 	}
@@ -166,12 +185,18 @@ func NewWithDialer(router Router, authMode func() string, log *slog.Logger, mx C
 	if dial == nil {
 		dial = directDialRoute
 	}
-	return &Proxy{router: router, authMode: authMode, log: log, mx: mx, dial: dial}
+	return &Proxy{router: router, authMode: authMode, log: log, mx: mx, dial: dial, execRunRoot: execRunRoot}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		p.serveConnect(w, r)
+		return
+	}
+	if r.Header.Get(HeaderSandboxService) == string(ConnectServiceExec) {
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		w.Header().Set("Allow", http.MethodConnect)
+		writeProxyError(w, http.StatusMethodNotAllowed, "exec requires CONNECT", ProxyErrorBadRequest)
 		return
 	}
 	sid, port, ok := ParseSandbox(r)

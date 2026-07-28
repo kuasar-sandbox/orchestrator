@@ -11,6 +11,8 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -21,13 +23,16 @@ import (
 type ReserveOperation string
 
 const (
-	ReserveCreate  ReserveOperation = "create"
-	ReserveConnect ReserveOperation = "connect"
-	ReserveData    ReserveOperation = "data"
+	ReserveCreate      ReserveOperation = "create"
+	ReserveConnect     ReserveOperation = "connect"
+	ReserveExecSession ReserveOperation = "exec-session"
+	ReserveData        ReserveOperation = "data"
+
+	reserveDataServiceExec = "exec"
 )
 
 func (op ReserveOperation) Valid() bool {
-	return op == ReserveCreate || op == ReserveConnect || op == ReserveData
+	return op == ReserveCreate || op == ReserveConnect || op == ReserveExecSession || op == ReserveData
 }
 
 // SandboxReserveRequest is the explicit trusted Router-to-Registry reserve
@@ -40,8 +45,10 @@ type SandboxReserveRequest struct {
 	ExpectedSandboxID string
 	Port              int
 	TimeoutSeconds    int
+	TTLSeconds        int64
 	APIKey            string
 	AccessToken       string
+	Service           string
 	MigrationToken    string
 	Config            map[string]string
 }
@@ -51,7 +58,7 @@ type SandboxReserveRequest struct {
 func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
 	if !req.Operation.Valid() || req.Group == "" || req.RouteKey == "" ||
 		req.Port < 0 || req.Port > 65535 || req.TimeoutSeconds < 0 ||
-		int64(req.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
+		int64(req.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds || req.TTLSeconds < 0 {
 		return nil, ErrReserveBadRequest
 	}
 	if len(req.MigrationToken) > migrationtoken.MaxWireSize {
@@ -60,7 +67,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 	switch req.Operation {
 	case ReserveCreate:
 		if req.ExpectedSandboxID != "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
-			req.AccessToken != "" || req.MigrationToken != "" {
+			req.TTLSeconds != 0 || req.AccessToken != "" || req.Service != "" || req.MigrationToken != "" {
 			return nil, fmt.Errorf("%w: create contains fields for another operation", ErrReserveBadRequest)
 		}
 		if err := r.authenticateCreate(ctx, req.Group, req.APIKey); err != nil {
@@ -68,13 +75,21 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 		}
 		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config)
 	case ReserveConnect:
-		if req.ExpectedSandboxID == "" || req.Port != 0 || req.AccessToken != "" || len(req.Config) != 0 {
+		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TTLSeconds != 0 ||
+			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
 			return nil, fmt.Errorf("%w: connect contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveConnect(ctx, req)
+	case ReserveExecSession:
+		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
+			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
+			return nil, fmt.Errorf("%w: exec-session contains fields for another operation", ErrReserveBadRequest)
+		}
+		return r.reserveExecSession(ctx, req)
 	case ReserveData:
 		if req.ExpectedSandboxID == "" || req.TimeoutSeconds != 0 || req.APIKey != "" ||
-			req.MigrationToken != "" || len(req.Config) != 0 {
+			req.TTLSeconds != 0 || req.MigrationToken != "" || len(req.Config) != 0 ||
+			(req.Service != "" && req.Service != reserveDataServiceExec) {
 			return nil, fmt.Errorf("%w: data contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveData(ctx, req)
@@ -113,12 +128,18 @@ func authenticateRecordAPIKey(rec *SandboxRecord, apiKey string) error {
 	return nil
 }
 
-func authenticateRecordAccessToken(rec *SandboxRecord, requestedPort int, accessToken string) error {
+func authenticateRecordAccessToken(rec *SandboxRecord, requestedPort int, service, accessToken string, now time.Time) error {
 	if accessToken == "" {
 		return ErrReserveUnauthorized
 	}
 	if rec == nil {
 		return ErrSandboxNotFound
+	}
+	if service == reserveDataServiceExec {
+		if err := keys.VerifyExecAccessToken(accessToken, rec.ServiceSecret, rec.AuthSandboxID, now); err != nil {
+			return ErrReserveUnauthorized
+		}
+		return nil
 	}
 	port, err := reserveDataPort(rec, requestedPort)
 	if err != nil {
@@ -223,7 +244,7 @@ func (r *Registry) connectCurrent(ctx context.Context, req SandboxReserveRequest
 	}
 	if ack == nil || ack.Status != routesync.AckAccepted {
 		r.rollbackConnect(&current, currentRev, &before, false)
-		return nil, false, connectRejection(ack)
+		return nil, false, commandRejection("connect", ack)
 	}
 	if err := validateConnectResult(ack.Connect, &current); err != nil {
 		r.rollbackConnect(&current, currentRev, &before, true)
@@ -266,6 +287,144 @@ func cloneConnectResult(result *routesync.ConnectResult) *routesync.ConnectResul
 	}
 	clone := *result
 	return &clone
+}
+
+func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		rec, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
+		if err != nil {
+			return nil, err
+		}
+		if !found || rec.SandboxID != req.ExpectedSandboxID {
+			return nil, ErrSandboxNotFound
+		}
+		if err := authenticateRecordAPIKey(rec, req.APIKey); err != nil {
+			return nil, err
+		}
+		if _, err := execsession.ExpiryUnix(time.Now().Unix(), req.TTLSeconds); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
+		}
+		if _, _, err := replacementCredentials(rec); err != nil {
+			return nil, err
+		}
+		switch rec.State {
+		case StateReserved, StateReady, StatePaused:
+		default:
+			return nil, ErrSandboxNotFound
+		}
+
+		if r.nodeOwner == nil {
+			if req.MigrationToken == "" {
+				return nil, ErrNodeGone
+			}
+			return r.placeAndExecSession(ctx, req, rec)
+		}
+		if err := r.nodeOwner.Connected(ctx, rec.NodeID); err != nil {
+			if !errors.Is(err, ErrNodeGone) || req.MigrationToken == "" {
+				return nil, err
+			}
+			return r.placeAndExecSession(ctx, req, rec)
+		}
+		result, retry, err := r.execSessionCurrent(ctx, req, rec, rev)
+		if retry {
+			continue
+		}
+		if errors.Is(err, ErrNodeGone) && req.MigrationToken != "" {
+			return r.placeAndExecSession(ctx, req, rec)
+		}
+		return result, err
+	}
+	return nil, clusterstate.ErrConflict
+}
+
+func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveRequest, rec *SandboxRecord, rev int64) (*ReserveResult, bool, error) {
+	before := *rec
+	current := *rec
+	currentRev := rev
+	transitioned := false
+	if current.State == StatePaused {
+		current.State = StateReserved
+		var ok bool
+		var err error
+		currentRev, ok, err = r.stores.CASSandbox(ctx, &current, rev)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return nil, true, nil
+		}
+		transitioned = true
+		if err := r.stores.AddNodeSandboxRef(ctx, current.NodeID, clusterstate.NodeSandboxRef{
+			Group: current.Group, RouteKey: current.RouteKey, SandboxID: current.SandboxID,
+			SandboxGeneration: current.SandboxGeneration, NodeSandboxID: current.NodeSandboxID,
+			Profile: current.Profile, APISecretFingerprint: current.APISecretFingerprint,
+		}); err != nil {
+			r.rollbackConnect(&current, currentRev, &before, true)
+			return nil, false, err
+		}
+	}
+	ack, err := r.nodeOwner.SendCommandAndWait(ctx, current.NodeID, execSessionCommand(req, &current), lifecycleAckTimeout)
+	if err != nil {
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, !errors.Is(err, ErrNodeGone))
+		}
+		return nil, false, err
+	}
+	if ack == nil || ack.Status != routesync.AckAccepted {
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, false)
+		}
+		return nil, false, commandRejection("exec session", ack)
+	}
+	if err := validateExecSessionResult(ack.ExecSession); err != nil {
+		if transitioned {
+			r.rollbackConnect(&current, currentRev, &before, true)
+		}
+		return nil, false, err
+	}
+	route, err := r.currentExecSessionRoute(ctx, req)
+	if err != nil {
+		return nil, false, err
+	}
+	return &ReserveResult{Route: *route, ExecSession: cloneExecSessionResult(ack.ExecSession)}, false, nil
+}
+
+func execSessionCommand(req SandboxReserveRequest, rec *SandboxRecord) *routesync.Command {
+	return &routesync.Command{
+		CmdID: newID(), Kind: routesync.CmdExecSession, SID: rec.NodeSandboxID,
+		Profile: rec.Profile, APISecretFingerprint: rec.APISecretFingerprint,
+		Cluster: &routesync.ClusterSandboxContext{
+			Group: rec.Group, RouteKey: rec.RouteKey, AuthSandboxID: rec.AuthSandboxID,
+		},
+		MigrationToken: req.MigrationToken,
+		TTLSeconds:     req.TTLSeconds,
+	}
+}
+
+func validateExecSessionResult(result *routesync.ExecSessionResult) error {
+	if result == nil || result.ExecAccessToken == "" {
+		return errors.New("registry: exec session result is incomplete")
+	}
+	return nil
+}
+
+func cloneExecSessionResult(result *routesync.ExecSessionResult) *routesync.ExecSessionResult {
+	if result == nil {
+		return nil
+	}
+	clone := *result
+	return &clone
+}
+
+func (r *Registry) currentExecSessionRoute(ctx context.Context, req SandboxReserveRequest) (*RouteResolve, error) {
+	current, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
+	if err != nil {
+		return nil, err
+	}
+	if !found || current.SandboxID != req.ExpectedSandboxID {
+		return nil, ErrSandboxNotFound
+	}
+	return r.routeWithDataEndpoint(ctx, current, rev)
 }
 
 func (r *Registry) rollbackConnect(current *SandboxRecord, currentRev int64, before *SandboxRecord, retainOwnership bool) {
@@ -377,8 +536,8 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			r.rollbackConnect(&target, targetRev, current, false)
-			lastFailure = connectRejection(ack)
-			if terminalConnectRejection(lastFailure) {
+			lastFailure = commandRejection("connect", ack)
+			if terminalCommandRejection(lastFailure) {
 				return nil, lastFailure
 			}
 			excluded.add(target.NodeID)
@@ -396,14 +555,14 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 	}
 }
 
-type nodeConnectRejection struct {
+type nodeCommandRejection struct {
 	status int
 	reason string
 }
 
-func (e *nodeConnectRejection) Error() string { return e.reason }
+func (e *nodeCommandRejection) Error() string { return e.reason }
 
-func connectRejection(ack *routesync.CmdAck) error {
+func commandRejection(operation string, ack *routesync.CmdAck) error {
 	reason := ""
 	status := 0
 	if ack != nil {
@@ -415,18 +574,139 @@ func connectRejection(ack *routesync.CmdAck) error {
 		if reason == "" {
 			reason = http.StatusText(status)
 		}
-		return &nodeConnectRejection{status: status, reason: reason}
+		return &nodeCommandRejection{status: status, reason: reason}
 	default:
-		return fmt.Errorf("registry: connect rejected: %s", reason)
+		return fmt.Errorf("registry: %s rejected: %s", operation, reason)
 	}
 }
 
-func terminalConnectRejection(err error) bool {
-	var rejected *nodeConnectRejection
+func terminalCommandRejection(err error) bool {
+	var rejected *nodeCommandRejection
 	if !errors.As(err, &rejected) {
 		return false
 	}
 	return rejected.status != http.StatusConflict
+}
+
+// placeAndExecSession moves the same stable sandbox lineage to a new
+// node-local generation when its current node is gone and the caller supplied
+// the migration capability required by CmdExecSession's optional import.
+func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRequest, original *SandboxRecord) (*ReserveResult, error) {
+	if original == nil || req.MigrationToken == "" || original.SandboxID != req.ExpectedSandboxID {
+		return nil, ErrSandboxNotFound
+	}
+	excluded := placementExclusions{}
+	excluded.add(original.NodeID)
+	var lastFailure error
+	for {
+		placement, err := r.placer.Place(ctx, PlaceRequest{
+			Group: req.Group, RouteKey: req.RouteKey, SandboxID: original.SandboxID,
+			ExcludeNodeIDs: excluded.values(),
+		})
+		if err != nil {
+			if errors.Is(err, ErrNoNode) && lastFailure != nil {
+				return nil, lastFailure
+			}
+			return nil, err
+		}
+		if placement == nil || placement.NodeID == "" {
+			if lastFailure != nil {
+				return nil, lastFailure
+			}
+			return nil, ErrNoNode
+		}
+		if excluded.has(placement.NodeID) {
+			if lastFailure != nil {
+				return nil, lastFailure
+			}
+			return nil, ErrNoNode
+		}
+		if placement.APISecretFingerprint != original.APISecretFingerprint {
+			return nil, errors.New("registry: migration credential binding mismatch")
+		}
+		if err := r.nodeRuntimeLive(ctx, placement.NodeID); err != nil {
+			if !errors.Is(err, ErrNodeGone) {
+				return nil, err
+			}
+			lastFailure = err
+			excluded.add(placement.NodeID)
+			continue
+		}
+
+		current, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
+		if err != nil {
+			return nil, err
+		}
+		if !found || current.SandboxID != req.ExpectedSandboxID {
+			return nil, ErrSandboxNotFound
+		}
+		if !sameSandboxGeneration(current, original) ||
+			(current.State != StateReserved && current.State != StateReady && current.State != StatePaused) {
+			return nil, clusterstate.ErrConflict
+		}
+		if current.NextSandboxGeneration == math.MaxUint64 {
+			return nil, errors.New("registry: sandbox generation exhausted")
+		}
+		generation := current.NextSandboxGeneration
+		target := *current
+		target.NodeID = placement.NodeID
+		target.NodeSandboxID = EncodeNodeSandboxID(target.SandboxID, generation)
+		target.SandboxGeneration = generation
+		target.NextSandboxGeneration = generation + 1
+		target.State = StateReserved
+		if !validNodeSandboxIdentity(target.SandboxID, target.NodeSandboxID, target.SandboxGeneration) {
+			return nil, errors.New("registry: generated node sandbox identity is invalid")
+		}
+		targetRev, ok, err := r.stores.CASSandbox(ctx, &target, rev)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, clusterstate.ErrConflict
+		}
+		if err := r.stores.AddNodeSandboxRef(ctx, target.NodeID, clusterstate.NodeSandboxRef{
+			Group: target.Group, RouteKey: target.RouteKey, SandboxID: target.SandboxID,
+			SandboxGeneration: target.SandboxGeneration, NodeSandboxID: target.NodeSandboxID,
+			Profile: target.Profile, APISecretFingerprint: target.APISecretFingerprint,
+		}); err != nil {
+			r.rollbackConnect(&target, targetRev, current, true)
+			if errors.Is(err, errNodeSandboxIDConflict) {
+				lastFailure = err
+				excluded.add(target.NodeID)
+				continue
+			}
+			return nil, err
+		}
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, execSessionCommand(req, &target), lifecycleAckTimeout)
+		if err != nil {
+			ambiguous := !errors.Is(err, ErrNodeGone)
+			r.rollbackConnect(&target, targetRev, current, ambiguous)
+			if errors.Is(err, ErrNodeGone) {
+				lastFailure = err
+				excluded.add(target.NodeID)
+				continue
+			}
+			return nil, err
+		}
+		if ack == nil || ack.Status != routesync.AckAccepted {
+			r.rollbackConnect(&target, targetRev, current, false)
+			lastFailure = commandRejection("exec session", ack)
+			if terminalCommandRejection(lastFailure) {
+				return nil, lastFailure
+			}
+			excluded.add(target.NodeID)
+			continue
+		}
+		if err := validateExecSessionResult(ack.ExecSession); err != nil {
+			r.rollbackConnect(&target, targetRev, current, true)
+			return nil, err
+		}
+		route, err := r.currentExecSessionRoute(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return &ReserveResult{Route: *route, ExecSession: cloneExecSessionResult(ack.ExecSession)}, nil
+	}
 }
 
 func (r *Registry) reserveData(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
@@ -447,7 +727,7 @@ func (r *Registry) reserveDataAttempt(ctx context.Context, req SandboxReserveReq
 	if _, _, err := replacementCredentials(rec); err != nil {
 		return nil, err
 	}
-	if err := authenticateRecordAccessToken(rec, req.Port, req.AccessToken); err != nil {
+	if err := authenticateRecordAccessToken(rec, req.Port, req.Service, req.AccessToken, time.Now()); err != nil {
 		return nil, err
 	}
 	switch rec.State {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // This file adds CONNECT tunneling to the data plane. A legacy request selects a
@@ -41,6 +42,10 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)
 		writeProxyError(w, http.StatusBadRequest, "bad connect target", ProxyErrorBadRequest)
+		return
+	}
+	if target.Service == ConnectServiceExec {
+		p.serveExecConnect(w, r, sid)
 		return
 	}
 	route, err := p.router.Route(r.Context(), sid, target)
@@ -305,43 +310,101 @@ func removeHopHeaders(h http.Header) {
 	}
 }
 
-// Tunnel splices the client connection (the CONNECT request) to backend,
-// bidirectionally, for both HTTP/1.1 (Hijack + "200 Connection established") and
-// HTTP/2 (200 response + request/response stream copy). It closes backend on return.
-// Exported so the external-mode proxyForwarder can reuse it when relaying a CONNECT to a
-// proxy worker.
-func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
-	defer backend.Close()
+// h1ConnectStream keeps both the raw hijacked connection and net/http's
+// buffered reader. Bytes read with the CONNECT headers remain visible to the
+// tunnel, while writes and half-close operate on the connection itself.
+type h1ConnectStream struct {
+	net.Conn
+	reader *bufio.Reader
+}
 
+func (s *h1ConnectStream) Read(p []byte) (int, error) { return s.reader.Read(p) }
+
+func (s *h1ConnectStream) CloseWrite() error {
+	if closer, ok := s.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
+// h2ConnectStream maps an HTTP/2 CONNECT request/response pair to a duplex
+// stream. Closing its write direction closes the request body so backend EOF can
+// unblock a pending request-body read; handler return ends the response stream.
+type h2ConnectStream struct {
+	reader    io.ReadCloser
+	writer    io.Writer
+	flusher   http.Flusher
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (s *h2ConnectStream) Read(p []byte) (int, error) { return s.reader.Read(p) }
+
+func (s *h2ConnectStream) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	s.flusher.Flush()
+	return n, err
+}
+
+func (s *h2ConnectStream) CloseWrite() error { return s.closeReader() }
+func (s *h2ConnectStream) Close() error      { return s.closeReader() }
+
+func (s *h2ConnectStream) closeReader() error {
+	s.closeOnce.Do(func() { s.closeErr = s.reader.Close() })
+	return s.closeErr
+}
+
+var _ io.ReadWriteCloser = (*h1ConnectStream)(nil)
+var _ interface{ CloseWrite() error } = (*h1ConnectStream)(nil)
+var _ io.ReadWriteCloser = (*h2ConnectStream)(nil)
+var _ interface{ CloseWrite() error } = (*h2ConnectStream)(nil)
+
+// Tunnel splices the client CONNECT stream to backend for HTTP/1.1 and HTTP/2.
+// A clean EOF half-closes the destination and both pumps are drained; an I/O
+// error closes both streams to unblock the peer pump. Tunnel owns and closes the
+// backend. Exported so chained CONNECT forwarders can use the same relay.
+func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
 	if r.ProtoMajor == 2 {
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			_ = backend.Close()
+			http.Error(w, "connect unsupported", http.StatusInternalServerError)
+			return
 		}
-		done := make(chan struct{}, 2)
-		go func() { _, _ = io.Copy(backend, r.Body); done <- struct{}{} }()         // client -> backend
-		go func() { _, _ = io.Copy(flushWriter{w}, backend); done <- struct{}{} }() // backend -> client
-		<-done
+		body := r.Body
+		if body == nil {
+			body = http.NoBody
+		}
+		downstream := &h2ConnectStream{reader: body, writer: w, flusher: flusher}
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		relayConnectStreams(downstream, backend)
 		return
 	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		_ = backend.Close()
 		http.Error(w, "connect unsupported", http.StatusInternalServerError)
 		return
 	}
-	client, _, err := hj.Hijack()
+	client, rw, err := hj.Hijack()
 	if err != nil {
+		_ = backend.Close()
 		return
 	}
-	defer client.Close()
-	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+	downstream := &h1ConnectStream{Conn: client, reader: rw.Reader}
+	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = downstream.Close()
+		_ = backend.Close()
 		return
 	}
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(backend, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, backend); done <- struct{}{} }()
-	<-done
+	if err := rw.Flush(); err != nil {
+		_ = downstream.Close()
+		_ = backend.Close()
+		return
+	}
+	relayConnectStreams(downstream, backend)
 }
 
 func TunnelBuffered(w http.ResponseWriter, r *http.Request, backend net.Conn, br *bufio.Reader) {
@@ -354,6 +417,43 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (c *bufferedConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
+func relayConnectStreams(left, right io.ReadWriteCloser) {
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = left.Close()
+			_ = right.Close()
+		})
+	}
+	defer closeBoth()
+
+	type result struct{ err error }
+	results := make(chan result, 2)
+	pump := func(dst io.Writer, src io.Reader) {
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if closer, ok := dst.(interface{ CloseWrite() error }); ok {
+				err = closer.CloseWrite()
+			}
+		}
+		results <- result{err: err}
+	}
+	go pump(right, left)
+	go pump(left, right)
+	for range 2 {
+		if result := <-results; result.err != nil {
+			closeBoth()
+		}
+	}
+}
 
 // flushWriter flushes after each write so the HTTP/2 backend->client tunnel half
 // streams promptly instead of buffering.

@@ -85,6 +85,15 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			o.scheduleResume(sb.ID)
 		}
 		return acceptConnect(cmd, result)
+	case routesync.CmdExecSession:
+		sb, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
+		if err != nil {
+			return reject(cmd, err)
+		}
+		if sb.State == types.StatePaused {
+			o.scheduleResume(sb.ID)
+		}
+		return acceptExecSession(cmd, result)
 	case routesync.CmdDelete:
 		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 		if err != nil {
@@ -360,6 +369,10 @@ func acceptConnect(cmd *routesync.Command, result *routesync.ConnectResult) *rou
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, Connect: result}
 }
 
+func acceptExecSession(cmd *routesync.Command, result *routesync.ExecSessionResult) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, ExecSession: result}
+}
+
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 	status, reason := clusterCommandRejection(err)
 	return &routesync.CmdAck{
@@ -619,6 +632,45 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		return nil, err
 	}
 	return sb, nil
+}
+
+// prepareClusterExecSession uses the same exact-target validation and optional
+// synchronous KMT import as CmdConnect, then mints the operation-specific result
+// before its caller is allowed to schedule resume.
+func (o *Orchestrator) prepareClusterExecSession(
+	ctx context.Context,
+	cmd *routesync.Command,
+	now unixClock,
+) (*types.Sandbox, *routesync.ExecSessionResult, error) {
+	if err := validateClusterExecSessionEnvelope(cmd); err != nil {
+		return nil, nil, err
+	}
+	if _, err := execSessionExpiry(now(), cmd.TTLSeconds); err != nil {
+		return nil, nil, err
+	}
+	sb, err := o.prepareClusterConnect(ctx, cmd, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Sample signing time after the synchronous import/validation phase.
+	token, err := mintExecSessionToken(sb, cmd.TTLSeconds, now())
+	if err != nil {
+		return nil, nil, err
+	}
+	return sb, &routesync.ExecSessionResult{ExecAccessToken: token}, nil
+}
+
+func validateClusterExecSessionEnvelope(cmd *routesync.Command) error {
+	if cmd == nil || cmd.Kind != routesync.CmdExecSession || cmd.CmdID == "" {
+		return fmt.Errorf("cluster exec session: command id and kind are required")
+	}
+	if cmd.TTLSeconds < 0 || cmd.TimeoutSeconds != 0 || cmd.TemplateRef != "" || len(cmd.Config) != 0 ||
+		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
+		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
+		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+		return fmt.Errorf("cluster exec session: command contains fields for another operation")
+	}
+	return nil
 }
 
 func clusterConnectDeadline(timeoutSeconds int) int64 {

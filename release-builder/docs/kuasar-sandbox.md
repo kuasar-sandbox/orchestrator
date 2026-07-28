@@ -151,7 +151,8 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 cluster 控制面由 `cluster-ctl` 的 registry/router/placer 三个角色组成。
 registry 是可靠状态集群,以 group/node 等逻辑键分片,分片内全复制并提供 CAS
 与 WATCH;router 处理统一入口、稳定 SandboxID 到 NodeSandboxID 的 node 边界转换与 route cache;
-placer 通过 node_list 与
+native exec 先由 node 显式签发绑定稳定身份的 capability,再由 Router 与 node 对同一
+`X-Access-Token` 分别验证并通过 `service=exec` CONNECT 进入现有 `ctl.sock`;placer 通过 node_list 与
 sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替换的访问
 加速层:延迟与吞吐达标时可由托管 NAS 加速服务(如 SFS Turbo,对 OBS 提供近端
 加速)承担,对上层提供相同访问语义。GC 与代管理作用于对象存储,处于控制平面,
@@ -163,10 +164,10 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
 | 仓 | 角色 | 关键进程/产物 | 导出面 | 详设 |
 |---|---|---|---|---|
 | **orchestrator/release-builder** | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 可合并组件包;源码树 `make e2e-tools` 可辅助获取测试环境工具 | — | 本文 + `deployment.md`/`perf.md` |
-| **sandboxer** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程源码 | `sandbox-ctl`、`sandbox-init` | `pkg/resource`(资源控制协议+Client) | `sandboxer/docs/sandbox.md`、`sandboxer/docs/sandbox-init.md` |
+| **sandboxer** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、native exec、内存统一持有、balloon 环)+ Guest 一号进程源码 | `sandbox-ctl`、`sandbox-init` | `pkg/resource`(资源控制协议+Client)、`pkg/ctl`(受限 exec gate/relay) | `sandboxer/docs/sandbox.md`、`sandboxer/docs/sandbox-init.md` |
 | **accelerator** | 内容加速:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 | `manifest-ctl`、`store-ctl`、`cache-ctl` | `pkg/manifest`、`pkg/{cache,store}/client` | `accelerator/docs/{manifest,store,cache}.md` |
 | **connector** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `connector-ctl vswitch`、`connector-ctl tapfd get` | `pkg/tapfd`(fd 交接规约) | `connector/docs/{vswitch,tapfd}.md` |
-| **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
+| **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、显式 native exec capability/CONNECT、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
 | **guest-runtime** | Guest runtime 镜像、镜像展平 CLI 与原生依赖:打包 `sandbox-init`,构建定制 Guest 内核、erofs 工具与 envd | `flatten-ctl`、`sandbox-runtime.bundle`、`vmlinux`、`mkfs.erofs` | native-deps 构建脚本 + kernel configs;`flatten-ctl` 复用 `accelerator/pkg/{flatten,image,remote,tar}` | `guest-runtime/docs/{sandbox-runtime,flatten,vmlinux}.md`、`guest-runtime/native-deps/docs/build.md` |
 
 ### 2.3 依赖关系
@@ -723,7 +724,9 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 - **计算节点**(~5,000/AZ):`node-ctl` + `cache-ctl tiered`
   + `store-ctl`(sidecar)+ `sandbox-ctl × ~3K`(每沙箱一进程,派生
   `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<run-id>`
-  → 三阶段,见 `deployment.md` §5),无独立展平池。
+  → 三阶段,见 `deployment.md` §5),无独立展平池。`node-ctl` 还负责 native exec
+  capability 签发与最终 `ctl.sock` CONNECT gate;external proxy 模式由独立 worker
+  承担相同的最终鉴权和 gate。
 - **Cluster 控制面**(AZ 级或 Region 级):`cluster-ctl registry` 按
   membership 配置形成可靠状态集群;`cluster-ctl router` 提供 group-scoped
   统一入口、稳定 SandboxID 路由和 route cache;`cluster-ctl placer` 订阅 node_list、导入 group
@@ -750,8 +753,9 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 - `connector/docs/vswitch.md` — eBPF 虚拟交换机;`tapfd.md` — tap fd 交接
   协议。
 - `orchestrator/docs/node-resource.md` — 节点资源仲裁协议与算法。
-- `orchestrator/docs/node.md` — e2b 兼容控制面、模板构建、密钥与归属模型、
-  集群接入(node-link)。
+- `orchestrator/docs/node.md` — e2b 兼容控制面、native exec capability、模板构建、
+  密钥与归属模型、集群接入(node-link);`node-proxy.md` — service-addressed CONNECT、
+  数据面鉴权与 external worker。
 - `orchestrator/docs/cluster.md` — 集群级 registry 自聚簇 / Reserve 状态机 /
   placer 放置与密钥分发。
 - `sandboxer/docs/cloud-hypervisor.md` — VMM 补丁集、启动协议与设备模型。

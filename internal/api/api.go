@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -182,6 +183,7 @@ type Core interface {
 	List(ctx context.Context, apiKey, state string, limit int, cursor string) ([]*types.Sandbox, string, error)
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
 	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
+	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error)
 	Pause(ctx context.Context, id, apiKey string) error // ErrAlreadyPaused / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 
@@ -239,6 +241,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
+	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.authAPIKey(a.execSession))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", a.auth(a.pause))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", a.auth(a.timeout))
 	// Template build (e2b v3). The CLI authenticates with a Bearer access token;
@@ -274,6 +277,20 @@ func (a *API) auth(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		h(w, r.WithContext(context.WithValue(r.Context(), apiKeyCtxKey{}, k)))
+	}
+}
+
+// authAPIKey is the capability-issuance authentication adapter. Unlike the e2b
+// template/account compatibility surface, exec-session creation accepts only
+// the explicit X-API-KEY carrier.
+func (a *API) authAPIKey(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-KEY")
+		if _, err := apikey.Parse(key); err != nil {
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		h(w, r.WithContext(context.WithValue(r.Context(), apiKeyCtxKey{}, key)))
 	}
 }
 
@@ -362,6 +379,53 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.sandboxResp(sb))
+}
+
+func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
+	migrationToken := r.Header.Get(MigrationTokenHeader)
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+		return
+	}
+	request, err := execsession.DecodeRequest(r.Body, r.ContentLength)
+	if err != nil {
+		if errors.Is(err, execsession.ErrRequestTooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeErr(w, http.StatusBadRequest, execsession.ErrInvalidRequest.Error())
+		return
+	}
+	token, err := a.core.ExecSession(
+		r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, request.TTLSeconds,
+	)
+	if err != nil {
+		a.failExecSession(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, map[string]string{"execAccessToken": token})
+}
+
+// failExecSession preserves the public control-plane status contract without
+// forwarding node paths, node-local sandbox IDs, command state, or other
+// internal error details.
+func (a *API) failExecSession(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, migrationtoken.ErrAuthentication),
+		errors.Is(err, migrationtoken.ErrCredentialMismatch),
+		errors.Is(err, ErrNotAllowed):
+		writeErr(w, http.StatusForbidden, "exec session credential not allowed")
+	case errors.Is(err, migrationtoken.ErrMalformedToken),
+		errors.Is(err, migrationtoken.ErrInvalidPayload),
+		errors.Is(err, ErrBadRequest):
+		writeErr(w, http.StatusBadRequest, "invalid exec session request")
+	case errors.Is(err, ErrNotFound):
+		writeErr(w, http.StatusNotFound, "not found")
+	default:
+		a.log.Warn("exec session error", "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "exec session unavailable")
+	}
 }
 
 func (a *API) pause(w http.ResponseWriter, r *http.Request) {

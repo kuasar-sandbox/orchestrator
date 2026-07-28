@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +72,236 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	svc.mu.Unlock()
 	if eventCount != 1 {
 		t.Fatalf("replay restarted build state machine: events=%d", eventCount)
+	}
+}
+
+func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *testing.T) {
+	service, node, sandbox, command := newExecStubFixture(t, routesync.StatePaused, 250*time.Millisecond)
+	events, cancel := node.Subscribe()
+	defer cancel()
+	command.TTLSeconds = 37
+	command.MigrationToken = "kmt1.ignored-for-existing-target"
+
+	issuedAt := time.Now()
+	got := node.HandleCommand(context.Background(), command)
+	if got.Status != routesync.AckAccepted || got.Reason != "" || got.Connect != nil ||
+		got.ExecSession == nil || got.ExecSession.ExecAccessToken == "" {
+		t.Fatalf("exec_session ack = %+v", got)
+	}
+	if err := keys.VerifyExecAccessToken(
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now(),
+	); err != nil {
+		t.Fatalf("exec access token = invalid: %v", err)
+	}
+	if err := keys.VerifyExecAccessToken(
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, issuedAt.Add(time.Minute),
+	); err == nil {
+		t.Fatal("TTL-bound exec access token remained valid after expiry")
+	}
+	node.mu.Lock()
+	stateAfterAck := node.sandboxes[sandbox.SID].State
+	node.mu.Unlock()
+	if stateAfterAck != routesync.StatePaused {
+		t.Fatalf("exec_session synchronously resumed sandbox: state=%q", stateAfterAck)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sandbox.SID ||
+			event.Route.State != routesync.StateRunning {
+			t.Fatalf("asynchronous resume event = %+v", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("asynchronous exec-session resume did not publish a running route")
+	}
+
+	longLived := *command
+	longLived.CmdID = "exec-session-2"
+	longLived.TTLSeconds = 0
+	second := node.HandleCommand(context.Background(), &longLived)
+	if second.Status != routesync.AckAccepted || second.ExecSession == nil ||
+		second.ExecSession.ExecAccessToken == "" || second.ExecSession.ExecAccessToken == got.ExecSession.ExecAccessToken {
+		t.Fatalf("second exec_session ack = %+v", second)
+	}
+	if err := keys.VerifyExecAccessToken(
+		second.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID,
+		issuedAt.Add(365*24*time.Hour),
+	); err != nil {
+		t.Fatalf("long-lived exec access token = invalid: %v", err)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if encoded, err := json.Marshal(service.events); err != nil {
+		t.Fatal(err)
+	} else if strings.Contains(string(encoded), got.ExecSession.ExecAccessToken) ||
+		strings.Contains(string(encoded), second.ExecSession.ExecAccessToken) {
+		t.Fatal("stub events exposed an exec access token")
+	}
+}
+
+func TestExecSessionRejectsInvalidEnvelopeAndBindingWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name          string
+		mutateCommand func(*routesync.Command)
+		mutateSandbox func(*stubSandbox)
+	}{
+		{name: "negative ttl", mutateCommand: func(c *routesync.Command) { c.TTLSeconds = -1 }},
+		{name: "unrepresentable ttl", mutateCommand: func(c *routesync.Command) { c.TTLSeconds = math.MaxInt64 }},
+		{name: "foreign operation field", mutateCommand: func(c *routesync.Command) { c.TimeoutSeconds = 1 }},
+		{name: "wrong credential", mutateCommand: func(c *routesync.Command) { c.APISecretFingerprint = strings.Repeat("f", 64) }},
+		{name: "wrong profile", mutateCommand: func(c *routesync.Command) { c.Profile = string(types.ProfileE2B) }},
+		{name: "wrong cluster context", mutateCommand: func(c *routesync.Command) { c.Cluster.Group = "/other" }},
+		{name: "unavailable state", mutateSandbox: func(s *stubSandbox) { s.State = "creating" }},
+		{name: "inconsistent template", mutateSandbox: func(s *stubSandbox) {
+			s.TemplateID = "e2b-img-" + strings.Repeat("a", 64)
+		}},
+		{name: "invalid service secret", mutateSandbox: func(s *stubSandbox) { s.ServiceSecret = "invalid" }},
+		{name: "missing target does not import", mutateCommand: func(c *routesync.Command) {
+			c.SID = "missing-g1"
+			c.MigrationToken = "kmt1.not-imported-by-stub"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, node, sandbox, command := newExecStubFixture(t, routesync.StatePaused, time.Second)
+			if test.mutateCommand != nil {
+				test.mutateCommand(command)
+			}
+			if test.mutateSandbox != nil {
+				test.mutateSandbox(sandbox)
+			}
+			beforeState := sandbox.State
+			got := node.HandleCommand(context.Background(), command)
+			if got.Status != routesync.AckRejected || got.ExecSession != nil || got.Connect != nil {
+				t.Fatalf("rejected exec_session ack = %+v", got)
+			}
+			node.mu.Lock()
+			stored := node.sandboxes[sandbox.SID]
+			count := len(node.sandboxes)
+			node.mu.Unlock()
+			if stored != sandbox || stored.State != beforeState || count != 1 {
+				t.Fatalf("rejected exec_session changed sandboxes: stored=%+v count=%d", stored, count)
+			}
+		})
+	}
+}
+
+func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
+	service, node, sandbox, _ := newExecStubFixture(t, routesync.StateRunning, 0)
+
+	ordinary := httptest.NewRequest(http.MethodGet, "http://sandbox:443/", nil)
+	ordinary.Host = "sandbox:443"
+	ordinary.Header.Set("E2b-Sandbox-Service", "exec")
+	ordinaryResponse := httptest.NewRecorder()
+	service.serveData(ordinaryResponse, ordinary)
+	if ordinaryResponse.Code != http.StatusMethodNotAllowed || ordinaryResponse.Header().Get("Allow") != http.MethodConnect {
+		t.Fatalf("ordinary exec response = %d Allow=%q", ordinaryResponse.Code, ordinaryResponse.Header().Get("Allow"))
+	}
+
+	expired, err := keys.MintExecAccessToken(
+		sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now().Add(-time.Second).Unix(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSubject, err := keys.MintExecAccessToken(sandbox.ServiceSecret, "other-stable", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongAudience, err := keys.MintForwardAccessToken(sandbox.ServiceSecret, sandbox.AuthSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{
+		"missing":        "",
+		"malformed":      "not-a-kat",
+		"expired":        expired,
+		"wrong subject":  wrongSubject,
+		"wrong audience": wrongAudience,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+			request.Host = "sandbox:443"
+			request.Header.Set("E2b-Sandbox-Id", sandbox.SID)
+			request.Header.Set("E2b-Sandbox-Service", "exec")
+			if token != "" {
+				request.Header.Set("X-Access-Token", token)
+			}
+			response := httptest.NewRecorder()
+			service.serveData(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("invalid exec token status = %d, want 401", response.Code)
+			}
+			service.mu.Lock()
+			hits := len(service.dataHits)
+			service.mu.Unlock()
+			node.mu.Lock()
+			state := node.sandboxes[sandbox.SID].State
+			node.mu.Unlock()
+			if hits != 0 || state != routesync.StateRunning {
+				t.Fatalf("invalid exec token caused side effects: hits=%d state=%q", hits, state)
+			}
+		})
+	}
+
+	token, err := keys.MintExecAccessToken(sandbox.ServiceSecret, sandbox.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(service.serveData))
+	defer server.Close()
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	request := fmt.Sprintf(
+		"CONNECT sandbox:443 HTTP/1.1\r\nHost: sandbox:443\r\nE2b-Sandbox-Id: %s\r\n"+
+			"E2b-Sandbox-Service: exec\r\nX-Access-Token: %s\r\n\r\n"+
+			"GET /exec-probe HTTP/1.1\r\nHost: guest\r\nConnection: close\r\n\r\n",
+		sandbox.SID, token,
+	)
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.1 200 ") {
+		t.Fatalf("CONNECT status line = %q", statusLine)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	inner, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Body.Close()
+	if inner.StatusCode != http.StatusNoContent {
+		t.Fatalf("inner response status = %d", inner.StatusCode)
+	}
+	service.mu.Lock()
+	hits := append([]dataHit(nil), service.dataHits...)
+	service.mu.Unlock()
+	if len(hits) != 1 || hits[0].SandboxID != sandbox.SID || hits[0].Path != "/exec-probe" ||
+		hits[0].Method != http.MethodGet {
+		t.Fatalf("exec data hits = %+v", hits)
+	}
+	if encoded, err := json.Marshal(hits); err != nil {
+		t.Fatal(err)
+	} else if strings.Contains(string(encoded), token) {
+		t.Fatal("exec data observation exposed the access token")
 	}
 }
 
@@ -466,6 +702,46 @@ func TestKeyPutRejectsHalfPairAndFingerprintRebinding(t *testing.T) {
 	if stored.ExpiresUnix != renewed.ExpiresUnix {
 		t.Fatalf("renewal expiry = %d, want %d", stored.ExpiresUnix, renewed.ExpiresUnix)
 	}
+}
+
+func newExecStubFixture(
+	t *testing.T,
+	state string,
+	resumeDelay time.Duration,
+) (*service, *stubNode, *stubSandbox, *routesync.Command) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{ID: "n1", CreateDelay: resumeDelay}, svc)
+	svc.addNode(node)
+	authSandboxID := "stable-sandbox"
+	serviceSecret := strings.Repeat("ab", 32)
+	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := &routesync.ClusterSandboxContext{
+		Group: "/g", RouteKey: "rk", AuthSandboxID: authSandboxID,
+	}
+	sandbox := &stubSandbox{
+		SID:                    "stable-sandbox-g0",
+		Profile:                string(types.ProfileBare),
+		State:                  state,
+		TemplateID:             "bare-img-" + strings.Repeat("a", 64),
+		AuthSandboxID:          authSandboxID,
+		APISecretFingerprint:   strings.Repeat("c", 64),
+		ManifestKeyFingerprint: strings.Repeat("d", 64),
+		ServiceSecret:          serviceSecret,
+		ForwardAccessToken:     forwardToken,
+		Cluster:                cloneStubClusterContext(cluster),
+	}
+	node.sandboxes[sandbox.SID] = sandbox
+	command := &routesync.Command{
+		CmdID: "exec-session-1", Kind: routesync.CmdExecSession, SID: sandbox.SID,
+		Profile: sandbox.Profile, APISecretFingerprint: sandbox.APISecretFingerprint,
+		Cluster: cloneStubClusterContext(cluster),
+	}
+	return svc, node, sandbox, command
 }
 
 func testStubFingerprint(t *testing.T, secretHex string) string {

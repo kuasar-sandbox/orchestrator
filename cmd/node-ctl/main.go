@@ -349,6 +349,6 @@ func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *config
 		log.Info("external proxy mode: proxy master registers on the config socket")
 		return newProxyForwarder(plugins, mx, log)
 	default: // internal
-		return proxy.NewWithDialer(core, func() string { return cfg.Proxy.Auth }, log, mx, routeDialerInNetNS(proxyNS))
+		return proxy.NewWithDialer(core, func() string { return cfg.Proxy.Auth }, log, mx, routeDialerInNetNS(proxyNS), cfg.Paths.RunRoot)
 	}
 }

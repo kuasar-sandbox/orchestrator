@@ -697,18 +697,25 @@ func (c *Config) validateProxy() error {
 // still pushes the authoritative auth/park policy over the registration stream;
 // local values are bootstrap fallbacks until that handshake completes.
 type ProxyFileConfig struct {
-	ConfigSocket  string    `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
-	DataListen    string    `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
-	ProxyNetNS    string    `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
-	ProxySocket   string    `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
-	ShmPath       string    `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
-	RouteCapacity int       `yaml:"route_capacity"` // fixed shared route slots; default 65536
-	Workers       int       `yaml:"workers"`        // worker processes supervised by this master; default 1
-	TLS           TLSConfig `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
-	Auth          string    `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
-	ParkTimeout   string    `yaml:"park_timeout"`   // bootstrap fallback; default 30s
-	MMDSListen    string    `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
-	MetricsListen string    `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	ConfigSocket  string           `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
+	Paths         ProxyPathsConfig `yaml:"paths"`          // node-local paths used directly by proxy workers
+	DataListen    string           `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
+	ProxyNetNS    string           `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
+	ProxySocket   string           `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
+	ShmPath       string           `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
+	RouteCapacity int              `yaml:"route_capacity"` // fixed shared route slots; default 65536
+	Workers       int              `yaml:"workers"`        // worker processes supervised by this master; default 1
+	TLS           TLSConfig        `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth          string           `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout   string           `yaml:"park_timeout"`   // bootstrap fallback; default 30s
+	MMDSListen    string           `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
+	MetricsListen string           `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+}
+
+// ProxyPathsConfig contains only paths consumed by the external proxy. It is
+// deliberately separate from the conductor's broader PathsConfig.
+type ProxyPathsConfig struct {
+	RunRoot string `yaml:"run_root"` // sandbox runtime root containing <sid>/ctl.sock; required
 }
 
 // LoadProxy reads the proxy master config, applies defaults, and validates.
@@ -750,6 +757,9 @@ func (p *ProxyFileConfig) applyDefaults() {
 }
 
 func (p *ProxyFileConfig) validate() error {
+	if p.Paths.RunRoot == "" {
+		return fmt.Errorf("proxy config: paths.run_root is required")
+	}
 	switch p.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
 	default:
