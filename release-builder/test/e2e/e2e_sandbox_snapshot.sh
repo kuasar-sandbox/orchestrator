@@ -26,7 +26,7 @@ skip() {
 }
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -86,7 +86,7 @@ network:
   hostname: e2e-snap
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE
@@ -167,16 +167,21 @@ INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
 grep -qF '"BaseRef"' <<<"$INFO_JSON" || { echo "==> FAIL: info --json missing BaseRef"; echo "$INFO_JSON" | head -10; exit 1; }
 echo "==> PASS: snapshot.cfg readable through the artifact (info --json)"
 
-# Content addressing: the basename IS the sha256 of the artifact bytes.
+# Content addressing: the basename matches the digest declared by the
+# artifact's final empty marker. The marker digest covers the deterministic
+# tar prefix, not the self-describing marker or end blocks.
 for f in "$OVERLAY_FILE" "$(readlink -f "$SNAP_FILE")"; do
     base=$(basename "$f"); base=${base%.*}
-    sum=$(sha256sum "$f" | cut -d' ' -f1)
-    if [ "$base" != "$sum" ]; then
-        echo "==> FAIL: $(basename $f) basename != sha256 of artifact bytes ($sum)"
+    markers=$(tar -tf "$f" | grep -E '^\.kuasar\.sha256\.[0-9a-f]{64}$' || true)
+    marker_count=$(grep -c . <<<"$markers" || true)
+    [ "$marker_count" = 1 ] || { echo "==> FAIL: $(basename "$f") has $marker_count digest markers"; exit 1; }
+    digest=${markers#.kuasar.sha256.}
+    if [ "$base" != "$digest" ]; then
+        echo "==> FAIL: $(basename "$f") basename != digest marker ($digest)"
         exit 1
     fi
 done
-echo "==> PASS: artifacts are content-addressed by their own bytes"
+echo "==> PASS: artifact basenames match their digest markers"
 
 # The envelope is a valid tar; the overlay entry holds an ext4 image.
 if command -v file >/dev/null && file -L "$SNAP_FILE" 2>&1 | grep -qiE "tar archive"; then

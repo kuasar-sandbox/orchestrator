@@ -14,7 +14,7 @@
 #
 # Prerequisites (checked; missing → skip, exit 0; REQUIRE_KVM=1 to fail hard):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
-#   sandbox-runtime.erofs,flatten-ctl,mkfs.erofs} · $VMLINUX · docker (or
+#   sandbox-runtime.bundle,flatten-ctl,mkfs.erofs} · $VMLINUX · docker (or
 #   BLK0_IMAGE=) · mkfs.ext4 · root (tap/cgroup/vsock). Any /bin/sh rootfs works
 #   (default base busybox).
 
@@ -34,7 +34,7 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl mkfs.erofs; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl mkfs.erofs; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -85,7 +85,7 @@ resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks }
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE
@@ -142,7 +142,7 @@ cat > "$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-r }
 boot:
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   root:
     base: file://$BLK0_IMAGE
     overlay: { diff: file://$WORK/root-r.ext4, size: 512MiB }

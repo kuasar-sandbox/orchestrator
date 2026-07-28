@@ -68,7 +68,7 @@ fail() { echo "==> FAIL: $*" >&2; exit 1; }
 for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
-for f in vmlinux sandbox-runtime.erofs; do
+for f in vmlinux sandbox-runtime.bundle; do
     [ -f "$BIN/$f" ] || skip "missing $BIN/$f — run 'make all'"
 done
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
@@ -251,7 +251,7 @@ sandbox:
     tapfd_socket: $TAPFD_SOCKET
   boot:
     kernel: $BIN/vmlinux
-    runtime: $BIN/sandbox-runtime.erofs
+    runtime: $BIN/sandbox-runtime.bundle
     overlay_diff_template: $OVL
 builder:
   insecure_registry: true

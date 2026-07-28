@@ -26,7 +26,7 @@ e2e/perf 套件,以及生成各子项目可合并组件包的大版本构建入�
 | **orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `node-stub-ctl` + `e2b-key-ctl` |
 | **accelerator** | 内容加速:内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` + `manifest-ctl`/`store-ctl`/`cache-ctl` |
 | **connector** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `connector-ctl vswitch`/`connector-ctl tapfd get` |
-| **guest-runtime** | Guest runtime 镜像、镜像展平工具与 guest 原生依赖:vmlinux / mkfs.erofs / runtime payload | `flatten-ctl`、`sandbox-runtime.erofs`、native-deps 构建脚本 + kernel configs |
+| **guest-runtime** | Guest runtime 镜像、镜像展平工具与 guest 原生依赖:vmlinux / mkfs.erofs / runtime payload | `flatten-ctl`、`sandbox-runtime.bundle`、native-deps 构建脚本 + kernel configs |
 
 ## 构建
 
@@ -34,7 +34,7 @@ e2e/perf 套件,以及生成各子项目可合并组件包的大版本构建入�
 `scripts/bin-inputs.manifest` 收集子仓运行文件到 `bin/$(TARGET_ARCH)/`;测试环境
 工具(如 `zot`、`versitygw`)只由 `make e2e-tools` 放到 `build/e2e-tools/`,不进入
 `bin/` 或 release 包。单一
-`sandbox-runtime.erofs` 由 `guest-runtime` 构建,已内置 envd、flatten-ctl 与
+`sandbox-runtime.bundle` 由 `guest-runtime` 构建,已内置 envd、flatten-ctl 与
 mkfs.erofs;`envd` 不作为独立 release bin 下发:
 
 ```bash

@@ -33,7 +33,7 @@ skip() {
 }
 
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs connector-ctl; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle connector-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -80,7 +80,7 @@ network:
   hostname: e2e-tapfd
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
     base: file://$BLK0_IMAGE

@@ -60,8 +60,7 @@ type ResourceSpec struct {
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
 }
 
-// RestoreSpec is the tenant-selectable subset of the host restore policy. File
-// reference trust remains node-managed and is deliberately not represented here.
+// RestoreSpec is the tenant-selectable restore prefetch request.
 type RestoreSpec struct {
 	Prefetch string `json:"prefetch,omitempty"`
 }

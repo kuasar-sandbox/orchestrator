@@ -54,7 +54,7 @@ die()  { echo $'\e[1;31m'"  ✗ $*"$'\e[0m' >&2; exit 1; }
 
 # ---- prerequisites --------------------------------------------------------
 for b in node-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
-[ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime.erofs" ] || die "missing kernel/runtime erofs in $BIN"
+[ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime.bundle" ] || die "missing kernel/runtime erofs in $BIN"
 [ -S "${STORE_SOCK:-}" ] || die "store socket $STORE_SOCK absent — run demo_prep.sh"
 [ -S "${CACHE_SOCK:-}" ] || die "cache socket $CACHE_SOCK absent — run demo_prep.sh"
 [ -n "${REGISTRY:-}" ] && [ -n "${BASE_REF:-}" ] || die "REGISTRY/BASE_REF not set — run demo_prep.sh"
@@ -159,7 +159,7 @@ sandbox:
   network: { switch: $SWITCH }            # e2b defaults: ip 169.254.0.21/30 nexthop .22; hostname/dns injected via files:
   boot:
     kernel: $BIN/vmlinux
-    runtime: $BIN/sandbox-runtime.erofs
+    runtime: $BIN/sandbox-runtime.bundle
     overlay_diff_template: $OVL
 builder:                                    # no image_uri_mask: from_image names the image directly
   insecure_registry: $INSECURE

@@ -92,7 +92,7 @@ overlay 层必须落盘,不能用 tmpfs。两者分别由 `--run-root`/`SANDBOX_
   kernel/
     <ver>/vmlinux                    # 多版本并存,SANDBOX_CONFIG 按名引用
   runtime/
-    <ver>/sandbox-runtime.erofs      # 多版本并存
+    <ver>/sandbox-runtime.bundle      # 多版本并存
   overlay-templates/
     overlay-1g.ext4                  # 预格式化空 ext4,大小不同的多份
     overlay-4g.ext4
@@ -104,14 +104,14 @@ overlay 层必须落盘,不能用 tmpfs。两者分别由 `--run-root`/`SANDBOX_
 ```yaml
 boot:
   kernel:  file:///opt/sandbox/kernel/6.1.169-sandbox/vmlinux
-  runtime: file:///opt/sandbox/runtime/v1/sandbox-runtime.erofs
+  runtime: file:///opt/sandbox/runtime/v1/sandbox-runtime.bundle
   root:
     overlay:
       # diff 省略 → 自动落在 /var/lib/sandbox/<sid>/<sid>.overlay.diff(磁盘)
       diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4  # 见下
 ```
 
-**复制约定**:`sandbox-runtime.erofs` 与 `vmlinux` **不复制**——`sandbox-ctl`
+**复制约定**:`sandbox-runtime.bundle` 与 `vmlinux` **不复制**——`sandbox-ctl`
 让 CH 以只读 mmap / 直接打开方式使用(DAX 共享 host page cache,N 个沙箱共一份
 RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写盘:`diff` 省略时
 `sandbox-ctl` 自动在 base 目录(磁盘)创建,并在 `diff_template` 给定时从模板
@@ -226,7 +226,7 @@ e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建�
 
 | 阶段 | 触发 | 做什么 |
 |---|---|---|
-| A import | 有 fromImage | 空单盘沙箱 + 单一 `sandbox-runtime.erofs` 内置的 flatten-ctl/mkfs.erofs;guest 内 `flatten-ctl export -` 以租户凭据拉取 + 确定性展平,tarstream 工件经 exec stdio 流回宿主 |
+| A import | 有 fromImage | 空单盘沙箱 + 单一 `sandbox-runtime.bundle` 内置的 flatten-ctl/mkfs.erofs;guest 内 `flatten-ctl export -` 以租户凭据拉取 + 确定性展平,tarstream 工件经 exec stdio 流回宿主 |
 | B steps | 有 steps | base 镜像 + 单一 runtime + 大可写层;**envd 为 app**,RUN/ENV/ARG/WORKDIR/USER 经 envd `process.Start` 执行(与 e2b 同形);导出新镜像工件 |
 | C template | 有 startCmd | 生产 e2b runtime 冷启最终镜像;startCmd 经 envd 启动、readyCmd 轮询;`sandbox-ctl snapshot` 出本地快照 bundle |
 

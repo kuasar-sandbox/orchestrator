@@ -64,7 +64,7 @@ sleep 0.5
 
 # Fast-path binaries to /tmp to skip WSL2 drvfs exec overhead.
 echo "==> caching binaries to $BIN_CACHE" >&2
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl manifest-ctl store-ctl cache-ctl mkfs.erofs vmlinux; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl manifest-ctl store-ctl cache-ctl mkfs.erofs vmlinux; do
     if [ -e "$SRC_BIN/$b" ]; then
         cp -u "$SRC_BIN/$b" "$BIN_CACHE/$b" \
           || { echo "FATAL: cp $b → $BIN_CACHE failed (still busy?)" >&2; exit 1; }
@@ -78,7 +78,7 @@ require() {
 }
 require "$BIN/cloud-hypervisor"
 require "$BIN/sandbox-ctl"
-require "$BIN/sandbox-runtime.erofs"
+require "$BIN/sandbox-runtime.bundle"
 require "$BIN/sandbox-init"
 require "$BIN/store-ctl"
 require "$BIN/cache-ctl"
@@ -294,7 +294,7 @@ network:
   hostname: perf
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: manifest://$MKEY
@@ -320,7 +320,7 @@ network:
   hostname: perf-restored
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: manifest://$MKEY

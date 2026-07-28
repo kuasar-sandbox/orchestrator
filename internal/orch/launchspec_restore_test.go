@@ -9,11 +9,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
+func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ManifestConfig = "/tmp/manifest.yaml"
 	cfg.Paths.RunRoot = "/tmp/run"
-	cfg.Sandbox.Restore.FileRefs = config.RestoreFileRefsTrust
 
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
@@ -43,16 +42,12 @@ func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
 	if !hasArgPair(spec.Args, "--restore", "manifest://"+key) {
 		t.Fatalf("restore arg missing from %v", spec.Args)
 	}
-	if !hasArgPair(spec.Args, "--restore-file-refs", config.RestoreFileRefsTrust) {
-		t.Fatalf("restore-file-refs trust missing from %v", spec.Args)
-	}
 }
 
-func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T) {
+func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ManifestConfig = "/tmp/manifest.yaml"
 	cfg.Paths.RunRoot = "/tmp/run"
-	cfg.Sandbox.Restore.FileRefs = config.RestoreFileRefsTrust
 
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
@@ -80,9 +75,6 @@ func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T
 	}
 	if hasArg(spec.Args, "--restore") {
 		t.Fatalf("cold boot should not carry restore args: %v", spec.Args)
-	}
-	if hasArg(spec.Args, "--restore-file-refs") {
-		t.Fatalf("cold boot should not carry restore-file-refs: %v", spec.Args)
 	}
 }
 

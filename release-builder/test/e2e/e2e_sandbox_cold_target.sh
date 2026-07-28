@@ -40,7 +40,7 @@ skip() {
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
-for b in cloud-hypervisor sandbox-ctl node-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
+for b in cloud-hypervisor sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 
@@ -92,7 +92,7 @@ proxy: { mode: internal, auth: enforce }
 sandbox:
   boot:
     kernel: $VMLINUX
-    runtime: $BIN/sandbox-runtime.erofs
+    runtime: $BIN/sandbox-runtime.bundle
 paths:
   run_root: $WORK/node-run
   base_root: $WORK/node-lib
@@ -220,7 +220,7 @@ network:
   hostname: e2e-target
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE

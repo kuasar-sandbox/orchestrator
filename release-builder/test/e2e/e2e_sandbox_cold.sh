@@ -13,7 +13,7 @@
 #   1. KVM accessible:                /dev/kvm exists, current user has rw
 #   2. cloud-hypervisor built:        bin/cloud-hypervisor (make build)
 #   3. sandbox-* binaries built:      bin/sandbox-ctl, bin/sandbox-init,
-#                                      bin/sandbox-runtime.erofs, bin/flatten-ctl
+#                                      bin/sandbox-runtime.bundle, bin/flatten-ctl
 #   4. Kernel image:                  $VMLINUX (default $REPO/bin/vmlinux)
 #   5. Pre-existing TAP up:           $TAP_NAME (default sb-tap0)
 #   6. Docker for image fetch:        `docker pull python:3.12-slim`
@@ -48,7 +48,7 @@ skip() {
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 
@@ -121,7 +121,7 @@ network:
   hostname: e2e-cold
 boot:
   kernel: file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE
