@@ -15,9 +15,9 @@
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
 #                                in the guest below (§4.6 config passing chain).
-#   exec-session + CONNECT     -> issue an explicit exec capability, bridge a local
-#                                ctl.sock through service=exec, and run sandbox-ctl
-#                                against the real guest (including guest exit status).
+#   exec-session + CONNECT     -> issue an explicit exec capability, then use the
+#                                real sandbox-ctl HTTP CONNECT client against the
+#                                guest (stdio, PTY resize, exit status, pause wake).
 #   envd exec                  -> run a command in the guest via envd (incl. hostname).
 #   DELETE                     -> teardown.
 #
@@ -29,7 +29,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-EXEC_CONNECT_BRIDGE="$REPO_ROOT/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
@@ -53,7 +52,6 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-[ -f "$EXEC_CONNECT_BRIDGE" ] || skip "missing $EXEC_CONNECT_BRIDGE"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -177,42 +175,89 @@ PY
 }
 exec_through_connect() {
     local sid="$1" token="$2" marker="$3"
-    local bridge_root="$WORK/exec-connect-run"
-    local ready_file="$WORK/exec-connect.ready"
-    local bridge_log="$WORK/exec-connect-bridge.log"
-    local output="$WORK/native-exec.out"
-    local bridge_pid status
+    local input="$WORK/native-exec.stdin"
+    local output="$WORK/native-exec.stdout"
+    local error_output="$WORK/native-exec.stderr"
+    local diagnostics="$WORK/native-exec.client.log"
+    local status
 
-    mkdir -p "$bridge_root/$sid"
-    EXEC_CONNECT_TOKEN="$token" timeout -k 5s 75 python3 "$EXEC_CONNECT_BRIDGE" \
-        --listen "$bridge_root/$sid/ctl.sock" \
-        --ready-file "$ready_file" \
-        --upstream "127.0.0.1:$PORT" \
-        --sandbox-id "$sid" \
-        >"$bridge_log" 2>&1 &
-    bridge_pid=$!
-    PIDS+=("$bridge_pid")
-    for _ in $(seq 1 100); do
-        [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] && break
-        kill -0 "$bridge_pid" 2>/dev/null || { cat "$bridge_log"; fail "exec CONNECT bridge exited before readiness"; }
-        sleep 0.05
-    done
-    [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] \
-        || { cat "$bridge_log"; fail "exec CONNECT bridge did not become ready"; }
-
+    printf 'stdin:%s\n' "$marker" >"$input"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --sandbox-id "$sid" --run-root "$bridge_root" -- \
-        /bin/sh -c "printf '%s\\n' '$marker'; exit 47" >"$output" 2>&1; then
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+        --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+        /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+        >"$diagnostics" 2>&1; then
         status=0
     else
         status=$?
     fi
-    if ! wait "$bridge_pid"; then
-        cat "$bridge_log"
-        fail "exec CONNECT bridge failed"
-    fi
-    grep -Fxq "$marker" "$output" || { sed 's/^/  guest| /' "$output"; fail "native exec output missing $marker"; }
-    [ "$status" = "47" ] || { sed 's/^/  guest| /' "$output"; fail "native exec exit=$status (want guest status 47)"; }
+    grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
+    grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
+    [ "$status" = "47" ] \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
+}
+
+exec_pty_resize_through_connect() {
+    local sid="$1" token="$2" marker="$3"
+    local output="$WORK/native-exec-pty.out"
+    local status=0
+
+    python3 - "$output" "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --tty -- /bin/sh -c \
+        "stty size; trap 'stty size; echo $marker; exit 23' WINCH; echo PTY_READY; while :; do sleep 1; done" <<'PY' || status=$?
+import errno, fcntl, os, pty, select, signal, struct, subprocess, sys, termios, time
+
+output_path, argv = sys.argv[1], sys.argv[2:]
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 37, 91, 0, 0))
+proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+captured = bytearray()
+resized = False
+deadline = time.monotonic() + 60
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            proc.kill()
+            proc.wait()
+            raise SystemExit(124)
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        captured.extend(chunk)
+        if not resized and b"PTY_READY" in captured:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 41, 101, 0, 0))
+            os.kill(proc.pid, signal.SIGWINCH)
+            resized = True
+finally:
+    os.close(master)
+    with open(output_path, "wb") as output_file:
+        output_file.write(captured)
+raise SystemExit(proc.wait())
+PY
+    grep -q '37 91' "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec initial PTY size mismatch"; }
+    grep -q '41 101' "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec resized PTY size mismatch"; }
+    grep -q "$marker" "$output" 2>/dev/null || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec PTY marker missing"; }
+    [ "$status" = "23" ] || { sed 's/^/  pty| /' "$output" 2>/dev/null; fail "native exec PTY exit=$status (want 23)"; }
 }
 dp() {
     local port_sid="$1" path="$2" token="${3:-}"
@@ -423,8 +468,9 @@ EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capab
 rm -f "$WORK/exec-session.secret"
 NATIVE_MARK="NATIVE_EXEC_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
-unset EXEC_TOKEN
-echo "==> PASS: service=exec CONNECT reached the real guest (marker=$NATIVE_MARK, exit=47)"
+PTY_MARK="NATIVE_EXEC_PTY_$RANDOM"
+exec_pty_resize_through_connect "$SID" "$EXEC_TOKEN" "$PTY_MARK"
+echo "==> PASS: real sandbox-ctl CONNECT reached the guest (stdio, duplicate headers, PTY resize, exit status)"
 
 # ---- execute a command in the guest via envd (Connect-RPC over envd.sock) --
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
@@ -504,12 +550,11 @@ echo "==> pause (snapshot+upload) $SID"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
     echo "==> PASS: sandbox paused (snapshot uploaded to store)"
-    echo "==> resume via connect"
-    code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
-    [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
-    # Connect acknowledges after import and schedules resume asynchronously. The
-    # old UDS path can survive pause, so its mere existence is not a readiness
-    # signal; probe the service until the restored envd is accepting requests.
+    echo "==> resume via authenticated service=exec CONNECT using the same KAT"
+    RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
+    exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+    # The exec CONNECT completes only after restore and guest command execution;
+    # probe envd as an independent restored-service readiness check.
     resumed=""
     for _ in $(seq 1 90); do
         code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
@@ -521,7 +566,7 @@ if [ "$code" = "204" ]; then
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
     grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
-    echo "==> PASS: pre-pause guest state survived resume (snapshot/restore + img-resume restore)"
+    echo "==> PASS: same KAT woke the paused sandbox and pre-pause guest state survived restore"
 else
     echo "==> NOTE: pause=$code — snapshot error (diagnostic):"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
@@ -529,6 +574,7 @@ else
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     PAUSE_FAILED=1
 fi
+unset EXEC_TOKEN
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill=$code (want 204)"

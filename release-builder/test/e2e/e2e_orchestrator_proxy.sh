@@ -28,7 +28,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-EXEC_CONNECT_BRIDGE="$REPO_ROOT/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-3443}"
@@ -54,7 +53,6 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-[ -f "$EXEC_CONNECT_BRIDGE" ] || skip "missing $EXEC_CONNECT_BRIDGE"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -203,42 +201,33 @@ PY
 }
 exec_through_proxy_connect() {
     local sid="$1" token="$2" marker="$3"
-    local bridge_root="$WORK/exec-connect-run"
-    local ready_file="$WORK/exec-connect.ready"
-    local bridge_log="$WORK/exec-connect-bridge.log"
-    local output="$WORK/native-exec.out"
-    local bridge_pid status
+    local input="$WORK/native-exec.stdin"
+    local output="$WORK/native-exec.stdout"
+    local error_output="$WORK/native-exec.stderr"
+    local diagnostics="$WORK/native-exec.client.log"
+    local status
 
-    mkdir -p "$bridge_root/$sid"
-    EXEC_CONNECT_TOKEN="$token" timeout -k 5s 75 python3 "$EXEC_CONNECT_BRIDGE" \
-        --listen "$bridge_root/$sid/ctl.sock" \
-        --ready-file "$ready_file" \
-        --upstream "127.0.0.1:$PROXY_PORT" \
-        --sandbox-id "$sid" \
-        >"$bridge_log" 2>&1 &
-    bridge_pid=$!
-    PIDS+=("$bridge_pid")
-    for _ in $(seq 1 100); do
-        [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] && break
-        kill -0 "$bridge_pid" 2>/dev/null || { cat "$bridge_log"; fail "exec CONNECT bridge exited before readiness"; }
-        sleep 0.05
-    done
-    [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] \
-        || { cat "$bridge_log"; fail "exec CONNECT bridge did not become ready"; }
-
+    printf 'stdin:%s\n' "$marker" >"$input"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --sandbox-id "$sid" --run-root "$bridge_root" -- \
-        /bin/sh -c "printf '%s\\n' '$marker'; exit 47" >"$output" 2>&1; then
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+        --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+        /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+        >"$diagnostics" 2>&1; then
         status=0
     else
         status=$?
     fi
-    if ! wait "$bridge_pid"; then
-        cat "$bridge_log"
-        fail "exec CONNECT bridge failed"
-    fi
-    grep -Fxq "$marker" "$output" || { sed 's/^/  guest| /' "$output"; fail "native exec output missing $marker"; }
-    [ "$status" = "47" ] || { sed 's/^/  guest| /' "$output"; fail "native exec exit=$status (want guest status 47)"; }
+    grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
+    grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
+    [ "$status" = "47" ] \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
 }
 # data-plane request through the PROXY (:PROXY_PORT), Host <port>-<sid>.<domain>
 dp() {
@@ -591,22 +580,24 @@ EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capab
 rm -f "$WORK/exec-session.secret"
 NATIVE_MARK="EXTERNAL_PROXY_NATIVE_EXEC_$RANDOM"
 exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
-unset EXEC_TOKEN
-echo "==> PASS: service=exec CONNECT through the external proxy reached the real guest (marker=$NATIVE_MARK, exit=47)"
+echo "==> PASS: real sandbox-ctl CONNECT through the external proxy verified stdin/stdout/stderr and exit status"
 
 # ---- (5) auto-resume THROUGH the proxy ------------------------------------
-echo "==> pause $SID, then drive the proxy to trigger wake -> auto-resume"
+echo "==> pause $SID, then reuse the same exec KAT through the external proxy"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
+    RESUME_MARK="EXTERNAL_PROXY_EXEC_RESUME_$RANDOM"
+    exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
     ok=""
     for _ in $(seq 1 40); do
         code=$(dp "49983-$SID" /health "$ENVD_TOKEN")
         { [ "$code" = "204" ] || [ "$code" = "200" ]; } && { ok=1; break; }
         sleep 0.5
     done
-    if [ -n "$ok" ]; then echo "==> PASS: auto-resume through the proxy (wake -> resume -> forwarded, code=$code)"
+    if [ -n "$ok" ]; then echo "==> PASS: same KAT woke the paused sandbox through external proxy (envd code=$code)"
     else dump_logs; fail "auto-resume via proxy did not complete, last code=$code"; fi
 else dump_logs; fail "pause returned $code (want 204 before auto-resume check)"; fi
+unset EXEC_TOKEN
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || { dump_logs; fail "kill=$code (want 204)"; }

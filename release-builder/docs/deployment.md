@@ -77,8 +77,8 @@ external 模式下,`node-ctl proxy serve` 启动 1 个 master 和配置数量的
 token 及 cluster context 并建立 CONNECT;最终 node proxy 验证 token 后拨现有
 `ctl.sock`,由 `pkg/ctl.ProxyExec` 限制首帧只能是 `exec_request`.远程客户端由
 [`sandboxer#28`](https://github.com/kuasar-sandbox/sandboxer/issues/28)交付,也是
-standalone、cluster和external-proxy真实guest E2E的必需客户端;临时 CONNECT bridge
-不构成最终验收.完整规格见
+standalone,cluster和external-proxy真实guest E2E的必需客户端;这些测试直接调用该客户端,
+不再使用临时 CONNECT bridge.完整规格见
 `sandboxer/docs/sandbox.md` 和 `orchestrator/docs/node-proxy.md`.
 
 ### 2.3 持久化与运行时目录

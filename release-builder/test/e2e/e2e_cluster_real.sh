@@ -20,7 +20,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-EXEC_CONNECT_BRIDGE="$REPO_ROOT/test/e2e/exec_connect_bridge.py"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
@@ -92,7 +91,6 @@ done
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
-[ -f "$EXEC_CONNECT_BRIDGE" ] || skip "missing $EXEC_CONNECT_BRIDGE"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -236,44 +234,35 @@ PY
 
 exec_through_cluster_connect() {
     local sid="$1" token="$2" marker="$3"
-    local bridge_root="$WORK/exec-connect-run"
-    local ready_file="$WORK/exec-connect.ready"
-    local bridge_log="$WORK/exec-connect-bridge.log"
-    local output="$WORK/native-exec.out"
-    local bridge_pid status
+    local input="$WORK/native-exec.stdin"
+    local output="$WORK/native-exec.stdout"
+    local error_output="$WORK/native-exec.stderr"
+    local diagnostics="$WORK/native-exec.client.log"
+    local status
 
-    mkdir -p "$bridge_root/$sid"
-    EXEC_CONNECT_TOKEN="$token" timeout -k 5s 75 python3 "$EXEC_CONNECT_BRIDGE" \
-        --listen "$bridge_root/$sid/ctl.sock" \
-        --ready-file "$ready_file" \
-        --upstream "127.0.0.1:$ROUTER_PORT" \
-        --sandbox-id "$sid" \
-        --group "$GROUP" \
-        --route-key "$ROUTE_KEY" \
-        >"$bridge_log" 2>&1 &
-    bridge_pid=$!
-    PIDS+=("$bridge_pid")
-    for _ in $(seq 1 100); do
-        [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] && break
-        kill -0 "$bridge_pid" 2>/dev/null || { cat "$bridge_log" >&2; fail "exec CONNECT bridge exited before readiness"; }
-        sleep 0.05
-    done
-    [ -S "$bridge_root/$sid/ctl.sock" ] && [ -f "$ready_file" ] \
-        || { cat "$bridge_log" >&2; fail "exec CONNECT bridge did not become ready"; }
-
+    printf 'stdin:%s\n' "$marker" >"$input"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --sandbox-id "$sid" --run-root "$bridge_root" -- \
-        /bin/sh -c "printf '%s\\n' '$marker'; exit 47" >"$output" 2>&1; then
+        --proxy "http://127.0.0.1:$ROUTER_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+        --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+        --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+        --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+        /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+        >"$diagnostics" 2>&1; then
         status=0
     else
         status=$?
     fi
-    if ! wait "$bridge_pid"; then
-        cat "$bridge_log" >&2
-        fail "exec CONNECT bridge failed"
-    fi
-    grep -Fxq "$marker" "$output" || { sed 's/^/  guest| /' "$output" >&2; fail "native exec output missing $marker"; }
-    [ "$status" = "47" ] || { sed 's/^/  guest| /' "$output" >&2; fail "native exec exit=$status (want guest status 47)"; }
+    grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics" >&2; sed 's/^/  stdout| /' "$output" 2>/dev/null >&2; fail "native exec stdout/stdin mismatch"; }
+    grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
+        || { sed 's/^/  client| /' "$diagnostics" >&2; sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2; fail "native exec stderr mismatch"; }
+    [ "$status" = "47" ] \
+        || { sed 's/^/  client| /' "$diagnostics" >&2; fail "native exec exit=$status (want guest status 47)"; }
 }
 
 router_req() {
@@ -764,8 +753,13 @@ run_cluster_flow() {
     rm -f "$WORK/exec-session.secret"
     native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
+    step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
+    code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
+    [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
+    local resume_mark="CLUSTER_NATIVE_EXEC_RESUME_$RANDOM"
+    exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark"
     unset exec_token
-    step "PASS: cluster service=exec CONNECT reached real guest (stable SID=$sid, marker=$native_mark, exit=47)"
+    step "PASS: real sandbox-ctl used stable SID through exec CONNECT, then the same KAT resumed the paused sandbox"
 
     step "checking SID-addressed envd data request with X-Access-Token"
     code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
