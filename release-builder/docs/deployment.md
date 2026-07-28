@@ -71,11 +71,15 @@ external 模式下,`node-ctl proxy serve` 启动 1 个 master 和配置数量的
 `orchestrator/docs/node.md` §5/§12。
 
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
---sandbox-id <sid> -- CMD` 的本机入口。远程调用不会直接暴露该 UDS:客户端先以
-`X-API-KEY` 显式申请绑定 AuthSandboxID 的 `kat1` ExecAccessToken,再通过
-`service=exec` CONNECT;最终 node proxy 验证 token 后拨现有 `ctl.sock`,并由
-`pkg/ctl.ProxyExec` 限制首帧只能是 `exec_request`。完整规格见
-`sandboxer/docs/sandbox.md` 和 `orchestrator/docs/node-proxy.md`。
+--sandbox-id <sid> -- CMD` 的本机入口.远程调用不会直接暴露该 UDS:客户端先以
+`X-API-KEY` 显式申请绑定 AuthSandboxID 的 `kat1` ExecAccessToken,再由
+`sandbox-ctl exec --proxy` 和可重复的 `--proxy-header` 透传 SID、`service=exec`、
+token 及 cluster context 并建立 CONNECT;最终 node proxy 验证 token 后拨现有
+`ctl.sock`,由 `pkg/ctl.ProxyExec` 限制首帧只能是 `exec_request`.远程客户端由
+[`sandboxer#28`](https://github.com/kuasar-sandbox/sandboxer/issues/28)交付,也是
+standalone、cluster和external-proxy真实guest E2E的必需客户端;临时 CONNECT bridge
+不构成最终验收.完整规格见
+`sandboxer/docs/sandbox.md` 和 `orchestrator/docs/node-proxy.md`.
 
 ### 2.3 持久化与运行时目录
 

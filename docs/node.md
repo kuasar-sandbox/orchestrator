@@ -1101,9 +1101,10 @@ registry 上行下发命令.serve 复用既有 e2b 生命周期原语(§8 / §8.
 集群侧只停止向其分配。
 
 每个 exec-session API 调用是独立授权,因此使用新 CmdID 并签发新 KAT;resume
-可以继续按 SID single-flight.相同 CmdID 在断线或 node 重启后重放相同 typed result 的
-持久化边界由 [#71](https://github.com/kuasar-sandbox/orchestrator/issues/71) 单独跟踪;当前线格式不应被
-描述为已具备 durable CmdAck replay.
+可以继续按 SID single-flight.`CmdID` 只关联当前 Command 与 Ack waiter,node 不持久化
+command digest 或 typed result,Registry 也不在断线、超时或 node 重启后自动重投同一
+`CmdID`.本次调用失败后,API 重试是新的 operation;Connect 重新执行可重试的目标校验/恢复,
+Exec Session 可以签发新 KAT.
 
 ### 10.5 断线与安全
 

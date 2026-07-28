@@ -763,8 +763,11 @@ Reserve body 只属于 create;connect/exec-session/data body 为空.四种 opera
 `route_revision` 取当前 group route recordSet 的已提交 revision,供 Router 拒绝迟到的旧节点
 结果。Router 不订阅 route_link 更新。
 
-CmdConnect/CmdExecSession 的同 CmdID durable Ack/result replay 是独立可靠性边界,由
-[#71](https://github.com/kuasar-sandbox/orchestrator/issues/71) 单独跟踪;本节不将它描述为当前 Reserve 保证.
+CmdConnect/CmdExecSession 的 `CmdID` 只关联当前 Command 与 Ack waiter,不是持久幂等键.
+Registry 不在 Ack 超时、链路中断或 node 重启后自动重投同一个 Command/`CmdID`;本次调用
+返回临时失败,API 重试创建新的 operation 和 `CmdID`.Connect 依靠 target insert-only、对象
+绑定校验和 resume single-flight 保持可重试;Exec Session 重试可以签发新的 KAT.系统不持久化
+command digest、Ack/result 或临时去重状态.
 
 孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,node_sandbox_id)` 查归属表;表项不存在,
 或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过
