@@ -142,10 +142,10 @@ package_runtime_bundle() {
   local missing_before="${#missing[@]}"
   rm -rf "$stage"
   mkdir -p "$stage/bin"
-  need_bin sandbox-runtime.erofs
-  if [ -f "$SRC_BIN/sandbox-runtime.erofs" ]; then
-    cp -f "$SRC_BIN/sandbox-runtime.erofs" "$stage/bin/sandbox-runtime.erofs"
-    cp -f "$SRC_BIN/sandbox-runtime.erofs" "$stage/bin/sandbox-runtime-$ARCH-$VERSION.bundle"
+  need_bin sandbox-runtime.bundle
+  if [ -f "$SRC_BIN/sandbox-runtime.bundle" ]; then
+    cp -f "$SRC_BIN/sandbox-runtime.bundle" "$stage/bin/sandbox-runtime.bundle"
+    cp -f "$SRC_BIN/sandbox-runtime.bundle" "$stage/bin/sandbox-runtime-$ARCH-$VERSION.bundle"
   fi
   copy_spec "$stage" "docs" \
     "guest-runtime/docs/sandbox-runtime.md"

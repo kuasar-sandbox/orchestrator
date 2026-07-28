@@ -14,7 +14,7 @@ node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 
 **控制面 create / pause / kill / 模板构建始终在本节点**,集群只下发高层命令复用这些原语(§10)。
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
-跑原版 envd(由单一 `sandbox-runtime.erofs` 内置,§11),serve 经 UDS
+跑原版 envd(由单一 `sandbox-runtime.bundle` 内置,§11),serve 经 UDS
 反代其单端口协议(49983/Connect-RPC)。同一租户范围内的根凭据是
 **APISecret + ManifestKey**:APISecret 用于签发/验证 api_key 并派生每个 Sandbox 的
 ServiceSecret,ManifestKey 保护 manifest 内容和镜像拉取令牌;APISecret 缺省时由
@@ -67,7 +67,7 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 | **e2b** | guest 内跑原版 envd,agent 经其 exec / 读写文件 / 跑代码 | envd fs/process/pty/runCode + 平台 native exec | envd/CI + floatingip 用户端口 + native exec |
 | **bare** | 把客户镜像当网络化 microVM 跑起来,无 envd | 平台 native exec;不提供 envd API | floatingip 网络 + native exec |
 
-`bare` 直接复用基础沙箱运行时(`sandbox-runtime.erofs`),把基础沙箱接上北向 API;
+`bare` 直接复用基础沙箱运行时(`sandbox-runtime.bundle`),把基础沙箱接上北向 API;
 经 e2b API 构建的模板恒为 **e2b** profile。profile 编码在 templateID 前缀里(§4.4),
 运行期据此选 runtime erofs 与数据通路。
 
@@ -364,9 +364,8 @@ node-ctl 同目录 → PATH"自动发现。
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
-| `sandbox.restore.file_refs` | `verify` | restore 时本地 `file://` runtime/base 引用校验策略:`verify` 重算 SHA256 并比对 snapshot.cfg;`trust` 只校验协议、basename 和文件存在,由 LaunchSpec 传给 `sandbox-ctl --restore-file-refs trust`,仅适合受信本地性能模式 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
-| `sandbox.boot.runtime` | – | 单一 guest runtime erofs;内置 envd、flatten-ctl、mkfs.erofs(§11) |
+| `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl、mkfs.erofs(§11) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
 | `builder.max_concurrent` | `2` | 构建池并发(serve 内计数信号量,§12) |
 | `builder.cpu_quota` / `.memory_max` | 空 | 施加到 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` |
@@ -389,9 +388,8 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
-远程内存 Prefetch 没有节点统一开关。`sandbox.restore.file_refs` 是节点运营者控制的
-本地文件信任策略;是否请求 Prefetch 由每个 sandbox 的 `kuasar-sandbox.restore`
-命名空间决定(§4.6),二者不能互相覆盖。
+远程内存 Prefetch 没有节点统一开关。是否请求 Prefetch 由每个 sandbox 的
+`kuasar-sandbox.restore` 命名空间决定(§4.6)。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
@@ -538,7 +536,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
-| `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory`,不开放节点托管的 `file_refs` |
+| `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
 
 单 sandbox 显式启用的两种等价请求形态:
@@ -551,8 +549,8 @@ X-Kuasar-Sandbox-Restore: {"prefetch":"memory"}
 {"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}
 ```
 
-`restore` 只接受严格 JSON object。未知字段、非字符串 `prefetch`、非法枚举及
-`file_refs` 均在生命周期副作用前拒绝。未提供时默认关闭;同一请求的 Header 覆盖
+`restore` 只接受严格 JSON object。未知字段、非字符串 `prefetch` 和非法枚举
+均在生命周期副作用前拒绝。未提供时默认关闭;同一请求的 Header 覆盖
 metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch 能力:显式
 `memory` 在 restore 配置中原样表达,最终执行或跳过由 sandboxer 决定。
 
@@ -734,9 +732,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
   `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
   <shared> --run-root <run_root> --cgroup-adopt (--restore <ref>)
-  (--restore-file-refs trust) (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。
-  `--restore-file-refs trust` 只在 restore 且 `sandbox.restore.file_refs=trust`
-  时追加。`--run-root` 把 sandbox-ctl
+  (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
   pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
 - `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
@@ -1119,12 +1115,14 @@ plugin 平面,机群路由经 registry 聚合。
 
 ## 11. guest profile:envd 与工具链
 
-- 单一 **`sandbox-runtime.erofs`** 由 `guest-runtime` 构建:把 `sandboxer` 产出的
+- 单一 **`sandbox-runtime.bundle`** 由 `guest-runtime` 构建:把 `sandboxer` 产出的
   `sandbox-init` 打成 virtio-pmem/DAX runtime,并在 `/opt/sandbox-runtime/bin/`
-  内置固定版本 `envd`、`flatten-ctl`、`mkfs.erofs`。runtime 构建保持确定性 mkfs
-  参数,并把成品**补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor
-  报 `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部稀疏 padding 对 guest
-  mount 不可见)。
+  内置固定版本 `envd`、`flatten-ctl`、`mkfs.erofs`。runtime bundle 保持 raw EROFS
+  从 offset 0 开始,随后是 zero padding 和只含空 `.kuasar.sha256.<hex>` marker 的
+  ZIP;摘要覆盖 EROFS+padding,构建时一次生成,启动/恢复从 EOF 直接读取。成品总长
+  **补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor 报
+  `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部 padding/ZIP 对 guest mount
+  不可见)。
 - **零 sandbox-init 改动**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
   guest 同名路径,envd 直接作 `launch.exec`:
   `/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`(`mmds.enabled` 时去
@@ -1394,7 +1392,7 @@ native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等�
 
 跨仓 e2e 集中在 umbrella
 `orchestrator/release-builder/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
-sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
+sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自跳过
 (`REQUIRE_*=1` 改为硬失败):
 
 | 脚本 | 覆盖 | make 目标 |

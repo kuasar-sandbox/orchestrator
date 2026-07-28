@@ -12,7 +12,7 @@
 │                              mkfs.erofs / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / connector-ctl /
-│                              e2b-key-ctl / sandbox-runtime.erofs)
+│                              e2b-key-ctl / sandbox-runtime.bundle)
 ├── docs/                      平铺语义文档(kuasar-sandbox.md / sandboxer.md /
 │                              cloud-hypervisor.md / vmlinux.md / ...)
 ├── deploy/                    运维配置样例 + systemd 单元(config.example.yaml /

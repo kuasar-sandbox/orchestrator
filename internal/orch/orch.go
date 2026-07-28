@@ -795,9 +795,6 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	}
 	if r := p.RestoreRef(); r != "" {
 		args = append(args, "--restore", r)
-		if o.cfg.Sandbox.Restore.FileRefs == config.RestoreFileRefsTrust {
-			args = append(args, "--restore-file-refs", config.RestoreFileRefsTrust)
-		}
 	}
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)

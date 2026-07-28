@@ -102,7 +102,7 @@ command -v docker   >/dev/null 2>&1 || skip "docker not available"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
 command -v python3  >/dev/null 2>&1 || skip "python3 not on PATH"
 
-for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.erofs flatten-ctl cloud-hypervisor; do
+for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -284,7 +284,7 @@ network:
   tap: ${sid}-tap
 boot:
   kernel: file://${VMLINUX}
-  runtime: file://${BIN}/sandbox-runtime.erofs
+  runtime: file://${BIN}/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
     base: file://${BLK0}
@@ -322,7 +322,7 @@ proxy: { mode: internal, auth: enforce }
 sandbox:
   boot:
     kernel: $BIN/vmlinux
-    runtime: $BIN/sandbox-runtime.erofs
+    runtime: $BIN/sandbox-runtime.bundle
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib

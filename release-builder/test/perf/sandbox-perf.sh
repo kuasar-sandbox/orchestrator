@@ -31,7 +31,7 @@ mkdir -p "$BIN_CACHE"
 
 # Refresh binary cache on mtime. cp -u skips up-to-date files.
 echo "==> caching binaries to $BIN_CACHE (drvfs→tmpfs to skip ~500ms WSL2 exec overhead)"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl manifest-ctl store-ctl cache-ctl mkfs.erofs vmlinux; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl manifest-ctl store-ctl cache-ctl mkfs.erofs vmlinux; do
     if [ -e "$SRC_BIN/$b" ]; then
         cp -u "$SRC_BIN/$b" "$BIN_CACHE/$b"
     fi

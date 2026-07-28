@@ -10,7 +10,7 @@ guest-runtime            flatten-ctl
 sandboxer                sandbox-ctl
 sandboxer                sandbox-init
 sandboxer                cloud-hypervisor
-guest-runtime            sandbox-runtime.erofs
+guest-runtime            sandbox-runtime.bundle
 orchestrator             node-ctl
 orchestrator             cluster-ctl
 orchestrator             node-stub-ctl

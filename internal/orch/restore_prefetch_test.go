@@ -26,7 +26,7 @@ func TestCreateRejectsInvalidRestoreBeforeLaunchSideEffects(t *testing.T) {
 		TemplateID: "bare-img-" + strings.Repeat("a", 64),
 		TimeoutSec: 60,
 		Metadata: map[string]string{
-			sandboxcfg.NsRestore: `{"file_refs":"trust"}`,
+			sandboxcfg.NsRestore: `{"prefetch":"eager"}`,
 		},
 	}
 	if _, err := o.Create(context.Background(), req); !errors.Is(err, api.ErrBadRequest) {

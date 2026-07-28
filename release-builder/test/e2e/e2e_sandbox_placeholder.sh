@@ -21,7 +21,7 @@
 #
 # Prerequisites (checked; missing → skip with a message, exit 0):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
-#   sandbox-runtime.erofs,flatten-ctl} · $VMLINUX · docker (or BLK0_IMAGE=) ·
+#   sandbox-runtime.bundle,flatten-ctl} · $VMLINUX · docker (or BLK0_IMAGE=) ·
 #   mkfs.ext4 · root (cgroup/userfaultfd/rootful flatten). Set REQUIRE_KVM=1 to
 #   fail hard.
 #
@@ -47,7 +47,7 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -107,7 +107,7 @@ resources:
   allocatable: { cpu: 1, memory: 512MiB }
 boot:
   kernel:  file://$VMLINUX
-  runtime: file://$BIN/sandbox-runtime.erofs
+  runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE
@@ -176,6 +176,20 @@ NETDEVS="$(tr -d '\r' <"$WORK/netdevs")"
     exit 1
 }
 echo "==> PASS: CH omitted --net, guest exposes only lo, and vsock exec works"
+
+# The trailing digest ZIP must not change the offset-zero EROFS/PMEM contract.
+# Verify the runtime remains mounted with fs-DAX inside the switched root.
+if ! exec1 -- cat /proc/mounts >"$WORK/mounts" 2>"$WORK/mounts.err"; then
+    echo "==> FAIL: could not inspect guest mounts"
+    sed 's/^/    /' "$WORK/mounts.err"
+    exit 1
+fi
+if ! grep -Eq '^/dev/root /opt/sandbox-runtime erofs .*dax=always' "$WORK/mounts"; then
+    echo "==> FAIL: runtime EROFS is not mounted with dax=always"
+    grep -E ' /opt/sandbox-runtime ' "$WORK/mounts" | sed 's/^/    /' || true
+    exit 1
+fi
+echo "==> PASS: runtime bundle remains offset-zero EROFS mounted with dax=always"
 
 grep -q "placeholder app (no exec)" "$RUNLOG" \
     && echo "==> PASS: guest log confirms the placeholder is waiting" \

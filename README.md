@@ -53,7 +53,7 @@ make test-e2e                   # 启动真实 registry/router/placer + node-stu
 ```
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
-和 guest-runtime 构建出的 `sandbox-runtime.erofs`。
+和 guest-runtime 构建出的 `sandbox-runtime.bundle`。
 
 ## 快速开始
 

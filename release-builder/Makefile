@@ -44,7 +44,7 @@ ZOT_VERSION    ?= v2.1.17
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/mkfs.erofs from guest-runtime/native-deps,
-# sandbox-runtime.erofs from guest-runtime,
+# sandbox-runtime.bundle from guest-runtime,
 # manifest-ctl/store-ctl/cache-ctl from accelerator,
 # sandbox-ctl/sandbox-init/cloud-hypervisor from sandboxer, flatten-ctl from
 # guest-runtime, connector-ctl from connector,

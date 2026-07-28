@@ -168,7 +168,7 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
 | **accelerator** | 内容加速:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 | `manifest-ctl`、`store-ctl`、`cache-ctl` | `pkg/manifest`、`pkg/{cache,store}/client` | `accelerator/docs/{manifest,store,cache}.md` |
 | **connector** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `connector-ctl vswitch`、`connector-ctl tapfd get` | `pkg/tapfd`(fd 交接规约) | `connector/docs/{vswitch,tapfd}.md` |
 | **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、显式 native exec capability/CONNECT、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
-| **guest-runtime** | Guest runtime 镜像、镜像展平 CLI 与原生依赖:打包 `sandbox-init`,构建定制 Guest 内核、erofs 工具与 envd | `flatten-ctl`、`sandbox-runtime.erofs`、`vmlinux`、`mkfs.erofs` | native-deps 构建脚本 + kernel configs;`flatten-ctl` 复用 `accelerator/pkg/{flatten,image,remote,tar}` | `guest-runtime/docs/{sandbox-runtime,flatten,vmlinux}.md`、`guest-runtime/native-deps/docs/build.md` |
+| **guest-runtime** | Guest runtime 镜像、镜像展平 CLI 与原生依赖:打包 `sandbox-init`,构建定制 Guest 内核、erofs 工具与 envd | `flatten-ctl`、`sandbox-runtime.bundle`、`vmlinux`、`mkfs.erofs` | native-deps 构建脚本 + kernel configs;`flatten-ctl` 复用 `accelerator/pkg/{flatten,image,remote,tar}` | `guest-runtime/docs/{sandbox-runtime,flatten,vmlinux}.md`、`guest-runtime/native-deps/docs/build.md` |
 
 ### 2.3 依赖关系
 
@@ -185,7 +185,7 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
  orchestrator   (e2b ingress + node-ctl)            (T2)
 
  guest-runtime consumes sandboxer/bin/<arch>/sandbox-init and native-deps/mkfs.erofs
- to build sandbox-runtime.erofs; it is a release artifact dependency, not a Go import edge.
+ to build sandbox-runtime.bundle; it is a release artifact dependency, not a Go import edge.
 ```
 
 实线是 Go 导入边。`orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
