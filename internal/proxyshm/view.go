@@ -18,6 +18,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
+var errExecActivationTimeout = errors.New("proxyshm: exec activation timed out")
+
 // MasterView is the proxy master's routesync sink and wake source.
 type MasterView struct {
 	table     *Table
@@ -251,8 +253,7 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	if v.wake != nil {
 		v.wake(sid)
 	}
-	identity, present = v.waitExecRunning(ctx, sid, expected)
-	return identity, present, nil
+	return v.waitExecRunning(ctx, sid, expected)
 }
 
 func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity, bool) {
@@ -270,23 +271,26 @@ func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity,
 	return identity, true
 }
 
-func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool) {
+func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
 	deadline := time.Now().Add(v.parkTimeout())
 	for {
-		if ctx.Err() != nil {
-			return proxy.ExecIdentity{}, false
+		if err := ctx.Err(); err != nil {
+			return proxy.ExecIdentity{}, false, err
 		}
 		rev := v.table.Rev()
 		r, ok := v.table.Lookup(sid)
 		identity, present := workerExecIdentity(r, ok)
 		if !present || identity != expected {
-			return proxy.ExecIdentity{}, false
+			return proxy.ExecIdentity{}, false, nil
 		}
 		if r.State == routesync.StateRunning {
-			return identity, true
+			return identity, true, nil
 		}
 		if !v.waitChange(ctx, deadline, rev) {
-			return proxy.ExecIdentity{}, false
+			if err := ctx.Err(); err != nil {
+				return proxy.ExecIdentity{}, false, err
+			}
+			return proxy.ExecIdentity{}, false, errExecActivationTimeout
 		}
 	}
 }

@@ -201,33 +201,41 @@ PY
 }
 exec_through_proxy_connect() {
     local sid="$1" token="$2" marker="$3"
+    local retries="${4:-1}"
     local input="$WORK/native-exec.stdin"
     local output="$WORK/native-exec.stdout"
     local error_output="$WORK/native-exec.stderr"
     local diagnostics="$WORK/native-exec.client.log"
-    local status
+    local attempt status
 
     printf 'stdin:%s\n' "$marker" >"$input"
-    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --proxy "http://127.0.0.1:$PROXY_PORT" \
-        --proxy-header "E2b-Sandbox-Id: $sid" \
-        --proxy-header "E2b-Sandbox-Service: exec" \
-        --proxy-header "X-Access-Token: $token" \
-        --proxy-header "X-Kuasar-E2E-Duplicate: first" \
-        --proxy-header "X-Kuasar-E2E-Duplicate: second" \
-        --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
-        /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
-        >"$diagnostics" 2>&1; then
-        status=0
-    else
-        status=$?
-    fi
-    grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
-    grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
-    [ "$status" = "47" ] \
-        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
+    for attempt in $(seq 1 "$retries"); do
+        : >"$output"; : >"$error_output"; : >"$diagnostics"
+        if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+            --proxy "http://127.0.0.1:$PROXY_PORT" \
+            --proxy-header "E2b-Sandbox-Id: $sid" \
+            --proxy-header "E2b-Sandbox-Service: exec" \
+            --proxy-header "X-Access-Token: $token" \
+            --proxy-header "X-Kuasar-E2E-Duplicate: first" \
+            --proxy-header "X-Kuasar-E2E-Duplicate: second" \
+            --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
+            /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+            >"$diagnostics" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        if [ "$status" = "47" ] && \
+            grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null && \
+            grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null; then
+            return 0
+        fi
+        [ "$attempt" = "$retries" ] || sleep 0.5
+    done
+    sed 's/^/  client| /' "$diagnostics"
+    sed 's/^/  stdout| /' "$output" 2>/dev/null
+    sed 's/^/  stderr| /' "$error_output" 2>/dev/null
+    fail "native exec did not complete after $retries attempt(s), last exit=$status"
 }
 # data-plane request through the PROXY (:PROXY_PORT), Host <port>-<sid>.<domain>
 dp() {
@@ -587,7 +595,7 @@ echo "==> pause $SID, then reuse the same exec KAT through the external proxy"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
     RESUME_MARK="EXTERNAL_PROXY_EXEC_RESUME_$RANDOM"
-    exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+    exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK" 40
     ok=""
     for _ in $(seq 1 40); do
         code=$(dp "49983-$SID" /health "$ENVD_TOKEN")

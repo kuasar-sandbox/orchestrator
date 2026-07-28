@@ -166,6 +166,42 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 	}
 }
 
+func TestExecActivationFailureReturnsServiceUnavailableBeforeDial(t *testing.T) {
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: "node-s1",
+		AuthSandboxID: "stable-s1",
+		ServiceSecret: execTestServiceSecret,
+	}
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &execTestRouter{
+		identity: identity, found: true,
+		activateErr: fmt.Errorf("activation timed out"),
+	}
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(router, func() string { return "off" }, discardExecLogger(), nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}, t.TempDir())
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	req.Header.Set(proxy.HeaderAccessToken, token)
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("activation failure response = %d, want 503", resp.Code)
+	}
+	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 1 || dials.Load() != 0 {
+		t.Fatalf("calls lookup=%d activate=%d dial=%d",
+			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
+	}
+}
+
 func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{

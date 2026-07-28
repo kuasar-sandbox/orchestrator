@@ -2,6 +2,7 @@ package proxyshm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -185,6 +186,25 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 			}
 		case <-time.After(time.Second):
 			t.Fatal("activation did not reject identity drift")
+		}
+	})
+
+	t.Run("authorized wake times out", func(t *testing.T) {
+		tbl := newExecTable(t)
+		route := execWorkerRoute("timeout", routesync.StatePaused)
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+		tbl.Bookmark()
+		var wakes atomic.Int32
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Millisecond)
+		expected := execWorkerIdentity(route.SandboxID)
+		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+		if !errors.Is(err, errExecActivationTimeout) || found || got != (proxy.ExecIdentity{}) {
+			t.Fatalf("ActivateExec(timeout) = %+v, %v, %v", got, found, err)
+		}
+		if wakes.Load() != 1 {
+			t.Fatalf("authorized timeout wakes = %d, want 1", wakes.Load())
 		}
 	})
 }
