@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
@@ -163,11 +164,30 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+	rawAPISecret, err := hex.DecodeString(testAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey, err := apikey.Mint(rawAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
+	mux.HandleFunc(registry.PlacerLinkVerifyKeyPath, func(w http.ResponseWriter, req *http.Request) {
+		parsed, parseErr := apikey.Parse(req.Header.Get("X-API-KEY"))
+		if parseErr != nil || !apikey.Verify(parsed, rawAPISecret) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer srv.Close()
+	reg.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
+		return []registry.PlacerPeer{{ID: "test-placer", Advertise: srv.URL}}
+	})
 	addr := srv.Listener.Addr().String()
 
 	node := newFakeNode()
@@ -219,10 +239,14 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	}
 
 	var res *registry.ReserveResult
-	var err error
 	reserveDeadline := time.Now().Add(3 * time.Second)
 	for {
-		res, err = reg.ReserveSandbox(ctx, "/cell/proj/app/g1", "u1:sess1", nil)
+		res, err = reg.ReserveSandbox(ctx, registry.SandboxReserveRequest{
+			Operation: registry.ReserveCreate,
+			Group:     "/cell/proj/app/g1",
+			RouteKey:  "u1:sess1",
+			APIKey:    apiKey,
+		})
 		if err == nil {
 			break
 		}
@@ -231,18 +255,23 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if res.NodeID != "n1" || res.SID == "" {
+	if res.Connect != nil {
+		t.Fatalf("create reserve returned a connect result: %+v", res.Connect)
+	}
+	route := &res.Route
+	if route.RouteRevision <= 0 || route.NodeID != "n1" || route.SandboxID == "" ||
+		route.NodeSandboxID != registry.EncodeNodeSandboxID(route.SandboxID, 0) {
 		t.Fatalf("reserve result: %+v", res)
 	}
 	if got := node.createFingerprint(); got != apiFingerprint {
 		t.Fatalf("create APISecretFingerprint=%q, placement fingerprint=%q", got, apiFingerprint)
 	}
-	if res.AuthSandboxID != res.SID || res.APISecret != testAPISecret ||
-		res.APISecretFingerprint != apiFingerprint || res.ManifestKeyFingerprint != manifestFingerprint ||
-		res.EnvdAccessToken != testEnvdAccessToken || res.TrafficAccessToken != testTrafficAccessToken {
+	if route.AuthSandboxID != route.SandboxID || route.APISecret != testAPISecret ||
+		route.APISecretFingerprint != apiFingerprint || route.ManifestKeyFingerprint != manifestFingerprint ||
+		route.EnvdAccessToken != testEnvdAccessToken || route.TrafficAccessToken != testTrafficAccessToken {
 		t.Fatal("reserve result did not preserve explicit route credentials")
 	}
-	if err := keys.VerifyForwardAccessToken(res.ForwardAccessToken, res.ServiceSecret, res.AuthSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(route.ForwardAccessToken, route.ServiceSecret, route.AuthSandboxID); err != nil {
 		t.Fatalf("reserve ForwardAccessToken: %v", err)
 	}
 }

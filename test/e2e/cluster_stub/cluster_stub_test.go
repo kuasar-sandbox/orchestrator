@@ -329,12 +329,13 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
 	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != routeKey ||
-		create.Cluster.AuthSandboxID != create.SID || create.Profile != "e2b" ||
+		create.Cluster.AuthSandboxID != created.SandboxID ||
+		create.SID != registry.EncodeNodeSandboxID(created.SandboxID, 0) || create.Profile != "e2b" ||
 		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
 	}
-	if created.SandboxID != create.SID {
-		t.Fatalf("create response SID=%q, node command SID=%q", created.SandboxID, create.SID)
+	if created.SandboxID == create.SID {
+		t.Fatalf("create exposed node command SID=%q as the stable public ID", create.SID)
 	}
 	if _, found := create.Config[clusterstate.ObjectMetadataKey]; found {
 		t.Fatalf("create command leaked cluster context into user config: %+v", create.Config)
@@ -342,10 +343,19 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if create.APISecretFingerprint != fullFingerprint(t, testAPISecret) {
 		t.Fatalf("create APISecretFingerprint=%q, want group API secret fingerprint", create.APISecretFingerprint)
 	}
-	reserved, err := h.reg.ReserveSandbox(h.ctx, testGroup, routeKey, nil)
+	reserved, err := h.reg.ReserveSandbox(h.ctx, registry.SandboxReserveRequest{
+		Operation: registry.ReserveCreate,
+		Group:     testGroup,
+		RouteKey:  routeKey,
+		APIKey:    h.apiKey,
+	})
 	if err != nil {
 		t.Fatalf("ready Reserve: %v", err)
 	}
+	if reserved.Connect != nil {
+		t.Fatalf("ready create Reserve returned a connect result: %+v", reserved.Connect)
+	}
+	reservedRoute := &reserved.Route
 	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, create.Cluster.AuthSandboxID)
 	if err != nil {
 		t.Fatal(err)
@@ -354,18 +364,20 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserved.AuthSandboxID != create.Cluster.AuthSandboxID || reserved.APISecret != testAPISecret ||
-		reserved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
-		reserved.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
-		reserved.ServiceSecret != serviceSecret || reserved.EnvdAccessToken != testEnvdAccessToken ||
-		reserved.TrafficAccessToken != testTrafficAccessToken || reserved.ForwardAccessToken != forwardAccessToken {
+	if reservedRoute.RouteRevision <= 0 || reservedRoute.SandboxID != created.SandboxID || reservedRoute.NodeSandboxID != create.SID ||
+		reservedRoute.AuthSandboxID != create.Cluster.AuthSandboxID || reservedRoute.APISecret != testAPISecret ||
+		reservedRoute.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
+		reservedRoute.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
+		reservedRoute.ServiceSecret != serviceSecret || reservedRoute.EnvdAccessToken != testEnvdAccessToken ||
+		reservedRoute.TrafficAccessToken != testTrafficAccessToken || reservedRoute.ForwardAccessToken != forwardAccessToken {
 		t.Fatal("ready Reserve did not preserve explicit node-reported credentials")
 	}
 	if created.ForwardAccessToken != forwardAccessToken {
 		t.Fatal("create response ForwardAccessToken did not match the node-reported route")
 	}
-	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, create.SID)
-	if err != nil || !found || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
+	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, created.SandboxID)
+	if err != nil || !found || resolved.SandboxID != created.SandboxID ||
+		resolved.NodeSandboxID != create.SID || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
 		resolved.APISecret != testAPISecret || resolved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		resolved.ManifestKeyFingerprint != fullFingerprint(t, testMK) || resolved.ServiceSecret != serviceSecret ||
 		resolved.EnvdAccessToken != testEnvdAccessToken || resolved.TrafficAccessToken != testTrafficAccessToken ||

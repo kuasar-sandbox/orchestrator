@@ -228,7 +228,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 		Profile:       source.Profile,
 		RuntimeDigest: digest,
 		SnapshotRef:   source.SnapshotRef,
-	}, cluster)
+	}, cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	t.Run("API secret", func(t *testing.T) {
 		wrong := pair
 		wrong.APISecret = strings.Repeat("1", 64)
-		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "api-mismatch", migrationtoken.Expectations{}, nil)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "api-mismatch", migrationtoken.Expectations{}, nil, 0)
 		if !errors.Is(err, migrationtoken.ErrCredentialMismatch) {
 			t.Fatalf("error = %v, want credential mismatch", err)
 		}
@@ -269,7 +269,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	t.Run("manifest key", func(t *testing.T) {
 		wrong := pair
 		wrong.ManifestKey = strings.Repeat("2", 64)
-		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "manifest-mismatch", migrationtoken.Expectations{}, nil)
+		_, err := o.importSandboxWithKey(context.Background(), wrong, token, "manifest-mismatch", migrationtoken.Expectations{}, nil, 0)
 		if !errors.Is(err, migrationtoken.ErrAuthentication) {
 			t.Fatalf("error = %v, want authentication failure", err)
 		}
@@ -282,7 +282,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 		"snapshot": {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil)
+			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil, 0)
 			if !errors.Is(err, migrationtoken.ErrIncompatible) {
 				t.Fatalf("error = %v, want incompatible target", err)
 			}
@@ -292,7 +292,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	if err := os.WriteFile(o.runtimeFileFor(source.Profile), []byte("runtime-b"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := o.importSandboxWithKey(context.Background(), pair, token, "runtime-mismatch", migrationtoken.Expectations{}, nil); !errors.Is(err, migrationtoken.ErrIncompatible) {
+	if _, err := o.importSandboxWithKey(context.Background(), pair, token, "runtime-mismatch", migrationtoken.Expectations{}, nil, 0); !errors.Is(err, migrationtoken.ErrIncompatible) {
 		t.Fatalf("runtime mismatch error = %v, want incompatible target", err)
 	}
 }
@@ -308,7 +308,7 @@ func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
 	pair := store.KeyPair{APISecret: source.APISecret, ManifestKey: source.ManifestKey}
 	for _, target := range []string{"UPPER", "has/slash", "-prefix", "suffix-", strings.Repeat("a", 58)} {
 		t.Run(target, func(t *testing.T) {
-			if _, err := o.importSandboxWithKey(context.Background(), pair, token, target, migrationtoken.Expectations{}, nil); err == nil ||
+			if _, err := o.importSandboxWithKey(context.Background(), pair, token, target, migrationtoken.Expectations{}, nil, 0); err == nil ||
 				!strings.Contains(err.Error(), "invalid target sandbox ID") {
 				t.Fatalf("target %q error = %v", target, err)
 			}
@@ -472,7 +472,7 @@ func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrat
 	cfg.Sandbox.Boot.Runtime = runtimePath
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
-	return testOrchCfg(t, cfg)
+	return testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
 }
 
 type migrationCredentials struct {

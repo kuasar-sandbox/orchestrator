@@ -3,13 +3,17 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -34,6 +38,7 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		AuthSandboxIDValue: "stable",
 		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
 		State:              types.StateRunning,
+		DeadlineUnix:       1_900_000_000,
 		APISecret:          apiSecret,
 		ManifestKey:        manifestKey,
 		CreatedUnix:        1,
@@ -62,7 +67,19 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 			if ack.Status != routesync.AckAccepted {
 				t.Fatalf("existing-target connect ack = %+v", ack)
 			}
+			if ack.Connect == nil || ack.Connect.NodeSandboxID != sb.ID ||
+				ack.Connect.TemplateID != sb.TemplateID || ack.Connect.Profile != string(sb.Profile) ||
+				ack.Connect.ForwardAccessToken != sb.ForwardAccessToken {
+				t.Fatalf("existing-target connect result = %+v, sandbox = %+v", ack.Connect, sb)
+			}
+			if ack.Connect.EnvdAccessToken != "" || ack.Connect.TrafficAccessToken != "" {
+				t.Fatalf("bare connect result exposed e2b tokens: %+v", ack.Connect)
+			}
 		})
+	}
+	preserved, err := o.st.Get(ctx, sb.ID)
+	if err != nil || preserved == nil || preserved.DeadlineUnix != sb.DeadlineUnix {
+		t.Fatalf("connect without timeout changed deadline: sandbox=%+v err=%v", preserved, err)
 	}
 
 	ack := o.HandleCommand(ctx, &routesync.Command{
@@ -73,8 +90,37 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		},
 		MigrationToken: strings.Repeat("!", migrationtoken.MaxWireSize+1),
 	})
-	if ack.Status != routesync.AckRejected || ack.Reason != migrationtoken.ErrTokenTooLarge.Error() {
+	if ack.Status != routesync.AckRejected || ack.Reason != migrationtoken.ErrTokenTooLarge.Error() ||
+		ack.HTTPStatus != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized existing-target connect ack = %+v", ack)
+	}
+}
+
+func TestClusterCommandRejectMapsMigrationErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantReason string
+	}{
+		{name: "malformed", err: migrationtoken.ErrMalformedToken, wantStatus: http.StatusBadRequest, wantReason: "invalid migration token"},
+		{name: "invalid payload", err: migrationtoken.ErrInvalidPayload, wantStatus: http.StatusBadRequest, wantReason: "invalid migration token"},
+		{name: "authentication", err: migrationtoken.ErrAuthentication, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
+		{name: "fingerprint", err: migrationtoken.ErrCredentialMismatch, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
+		{name: "incompatible", err: migrationtoken.ErrIncompatible, wantStatus: http.StatusConflict, wantReason: "target environment incompatible"},
+		{name: "too large", err: migrationtoken.ErrTokenTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantReason: migrationtoken.ErrTokenTooLarge.Error()},
+		{name: "unclassified", err: errors.New("ordinary rejection"), wantReason: "private-detail: ordinary rejection"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ack := reject(&routesync.Command{CmdID: "connect-rejected"}, fmt.Errorf("private-detail: %w", tc.err))
+			if ack.Status != routesync.AckRejected || ack.HTTPStatus != tc.wantStatus || ack.Reason != tc.wantReason {
+				t.Fatalf("ack = %+v, want status=%d reason=%q", ack, tc.wantStatus, tc.wantReason)
+			}
+			if tc.wantStatus != 0 && strings.Contains(ack.Reason, "private-detail") {
+				t.Fatalf("typed rejection exposed private detail: %+v", ack)
+			}
+		})
 	}
 }
 
@@ -92,6 +138,280 @@ func TestHandleClusterConnectMissingTargetRequiresMigrationToken(t *testing.T) {
 	}
 	if sb, err := o.st.Get(context.Background(), "stable-g1"); err != nil || sb != nil {
 		t.Fatalf("missing-target connect inserted a row: sandbox=%+v err=%v", sb, err)
+	}
+}
+
+func TestHandleClusterConnectRejectsTimeoutDurationOverflow(t *testing.T) {
+	for _, timeout := range []int{-1, int(routesync.MaxConnectTimeoutSeconds + 1)} {
+		ack := testOrch(t).HandleCommand(context.Background(), &routesync.Command{
+			CmdID: "connect-invalid-timeout", Kind: routesync.CmdConnect,
+			TimeoutSeconds: timeout,
+		})
+		if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest ||
+			ack.Reason != "connect timeout is out of range" {
+			t.Fatalf("timeout %d ack = %+v", timeout, ack)
+		}
+	}
+}
+
+func TestClusterConnectDeadlineAcceptsMaximumDuration(t *testing.T) {
+	now := time.Now().Unix()
+	deadline := clusterConnectDeadline(int(routesync.MaxConnectTimeoutSeconds))
+	if deadline <= now {
+		t.Fatalf("maximum connect timeout deadline = %d, want later than %d", deadline, now)
+	}
+}
+
+func TestHandleClusterConnectWritesImportedDeadlineInInitialInsert(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 1)}
+	fixture.o.vs = failingVS
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_connect_deadline_update BEFORE UPDATE OF deadline_unix ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced connect deadline update failure'); END`)
+
+	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.TimeoutSeconds = 41
+	deadlineFloor := time.Now().Add(40 * time.Second).Unix()
+	ack := fixture.o.HandleCommand(context.Background(), cmd)
+	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("missing-target connect with failing deadline UPDATE = %+v", ack)
+	}
+	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
+	if err != nil || stored == nil {
+		t.Fatalf("read imported target: sandbox=%+v err=%v", stored, err)
+	}
+	if stored.DeadlineUnix < deadlineFloor || stored.DeadlineUnix > time.Now().Add(42*time.Second).Unix() {
+		t.Fatalf("inserted deadline = %d, want approximately now+41s", stored.DeadlineUnix)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+}
+
+func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 2)}
+	fixture.o.vs = failingVS
+
+	initial := fixture.command("stable-g1", fixture.token)
+	if ack := fixture.o.HandleCommand(context.Background(), initial); ack.Status != routesync.AckAccepted {
+		t.Fatalf("initial import ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	before, err := fixture.o.st.Get(context.Background(), initial.SID)
+	if err != nil || before == nil {
+		t.Fatalf("read initial target: sandbox=%+v err=%v", before, err)
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_existing_connect_deadline BEFORE UPDATE OF deadline_unix ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced existing deadline update failure'); END`)
+	retry := fixture.command(initial.SID, "malformed-token-is-ignored")
+	retry.CmdID = "connect-existing-timeout"
+	retry.TimeoutSeconds = 23
+	ack := fixture.o.HandleCommand(context.Background(), retry)
+	if ack.Status != routesync.AckRejected || ack.Connect != nil || !strings.Contains(ack.Reason, "persist deadline") {
+		t.Fatalf("existing-target deadline failure ack = %+v", ack)
+	}
+	after, err := fixture.o.st.Get(context.Background(), initial.SID)
+	if err != nil || after == nil || after.DeadlineUnix != before.DeadlineUnix {
+		t.Fatalf("failed existing deadline update changed row: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.TimeoutSec = 900
+	started := make(chan struct{}, 4)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+
+	manifestKey := strings.Repeat("6", 64)
+	sb := &types.Sandbox{
+		ID:                 "cluster-timeout-target",
+		Profile:            types.ProfileBare,
+		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		AuthSandboxIDValue: "stable",
+		TemplateID:         "bare-img-" + strings.Repeat("7", 64),
+		State:              types.StatePaused,
+		APISecret:          deriveTestAPISecret(t, manifestKey),
+		ManifestKey:        manifestKey,
+		RunDir:             filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
+		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, "cluster-timeout-target"),
+		CreatedUnix:        1,
+		DeadlineUnix:       10,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := store.APISecretHash(sb.APISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := func(cmdID string, timeout int) *routesync.Command {
+		return &routesync.Command{
+			CmdID: cmdID, Kind: routesync.CmdConnect, SID: sb.ID,
+			Profile: string(sb.Profile), APISecretFingerprint: fingerprint,
+			TimeoutSeconds: timeout,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey,
+				AuthSandboxID: sb.AuthSandboxID(),
+			},
+		}
+	}
+
+	if ack := o.HandleCommand(ctx, command("connect-resume", 0)); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("initial cluster connect = %+v", ack)
+	}
+	waitForLauncherStart(t, started)
+
+	done := make(chan *routesync.CmdAck, 1)
+	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 1)) }()
+	select {
+	case ack := <-done:
+		t.Fatalf("later cluster Connect returned before the in-flight resume completed: %+v", ack)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Keep the later Connect behind the lifecycle boundary for longer than its
+	// requested lifetime. Its timeout must start after the wait, not before it.
+	time.Sleep(1100 * time.Millisecond)
+	releasedAt := time.Now().Unix()
+	close(startGate)
+	var ack *routesync.CmdAck
+	select {
+	case ack = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("later cluster Connect did not complete after resume")
+	}
+	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("later cluster Connect = %+v", ack)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
+	}
+	if stored.DeadlineUnix <= releasedAt {
+		t.Fatalf("deadline = %d, want a timeout starting after lifecycle release at %d", stored.DeadlineUnix, releasedAt)
+	}
+	if cached := o.lookup(sb.ID); cached == nil || cached.DeadlineUnix != stored.DeadlineUnix {
+		t.Fatalf("cache deadline differs from stored sandbox: cached=%+v stored=%+v", cached, stored)
+	}
+}
+
+func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 2)}
+	fixture.o.vs = failingVS
+	events, cancel := fixture.o.Subscribe()
+	defer cancel()
+
+	cmd := fixture.command("stable-g1", fixture.token)
+	if ack := fixture.o.HandleCommand(context.Background(), cmd); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("initial connect ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitPausedClusterRoute(t, events, cmd.SID)
+	if stored, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("failed resume row = %+v err=%v, want paused", stored, err)
+	}
+
+	retry := fixture.command(cmd.SID, "malformed-token-is-ignored")
+	retry.CmdID = "connect-retry"
+	if ack := fixture.o.HandleCommand(context.Background(), retry); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("retry connect ack = %+v", ack)
+	}
+	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitPausedClusterRoute(t, events, cmd.SID)
+}
+
+func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	started := make(chan struct{}, 2)
+	lc := &countingLauncher{started: started}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	o.sandboxReadyTimeout = 10 * time.Millisecond
+
+	manifestKey := strings.Repeat("6", 64)
+	apiSecret := deriveTestAPISecret(t, manifestKey)
+	fingerprint, err := store.APISecretHash(apiSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	const sid = "stable-g0"
+	sb := &types.Sandbox{
+		ID: sid, Profile: types.ProfileE2B,
+		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		AuthSandboxIDValue: "stable",
+		TemplateID:         "e2b-img-" + strings.Repeat("a", 64),
+		State:              types.StatePaused,
+		APISecret:          apiSecret,
+		ManifestKey:        manifestKey,
+		RunDir:             filepath.Join(cfg.Paths.RunRoot, sid),
+		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, sid),
+		EnvdUDS:            filepath.Join(cfg.Paths.RunRoot, sid, "envd.sock"),
+		CiUDS:              filepath.Join(cfg.Paths.RunRoot, sid, "ci.sock"),
+		CreatedUnix:        1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	connect := func(cmdID string) {
+		t.Helper()
+		ack := o.HandleCommand(ctx, &routesync.Command{
+			CmdID: cmdID, Kind: routesync.CmdConnect, SID: sid,
+			Profile: string(types.ProfileE2B), APISecretFingerprint: fingerprint,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey, AuthSandboxID: sb.AuthSandboxID(),
+			},
+		})
+		if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+			t.Fatalf("cluster connect ack = %+v", ack)
+		}
+		waitForLauncherStart(t, started)
+		waitPausedClusterRoute(t, events, sid)
+		stored, err := o.st.Get(ctx, sid)
+		if err != nil || stored == nil || stored.State != types.StatePaused {
+			t.Fatalf("late resume failure row = %+v err=%v, want paused", stored, err)
+		}
+	}
+
+	connect("connect-late-failure")
+	connect("connect-late-failure-retry")
+	if got := lc.starts.Load(); got != 2 {
+		t.Fatalf("launcher starts = %d, want 2", got)
+	}
+}
+
+func waitClusterConnectAttempt(t *testing.T, attempted <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-attempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("asynchronous cluster resume did not reach the failing vswitch")
+	}
+}
+
+func waitPausedClusterRoute(t *testing.T, events <-chan routesync.Event, sid string) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sid || event.Route.State != routesync.StatePaused {
+			t.Fatalf("resume failure event = %+v, want paused upsert for %s", event, sid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume failure did not republish the paused route")
 	}
 }
 
@@ -114,9 +434,18 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	})
 
 	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.TimeoutSeconds = 37
+	deadlineFloor := time.Now().Add(36 * time.Second).Unix()
 	ack := fixture.o.HandleCommand(context.Background(), cmd)
 	if ack.Status != routesync.AckAccepted {
 		t.Fatalf("cluster migration connect ack = %+v", ack)
+	}
+	if ack.Connect == nil || ack.Connect.NodeSandboxID != cmd.SID ||
+		ack.Connect.TemplateID != fixture.source.TemplateID || ack.Connect.Profile != string(fixture.source.Profile) ||
+		ack.Connect.EnvdAccessToken != fixture.source.EnvdAccessToken ||
+		ack.Connect.TrafficAccessToken != fixture.source.TrafficAccessToken ||
+		ack.Connect.ForwardAccessToken != fixture.source.ForwardAccessToken {
+		t.Fatalf("cluster migration connect result = %+v", ack.Connect)
 	}
 
 	// HandleCommand may return Accepted only after KMT authentication and the
@@ -129,6 +458,9 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	if got.ID != "stable-g1" || got.State != types.StatePaused || got.Profile != fixture.source.Profile ||
 		got.AuthSandboxID() != fixture.source.AuthSandboxID() || got.CreatedUnix != fixture.source.CreatedUnix {
 		t.Fatalf("imported identity/state = %+v", got)
+	}
+	if got.DeadlineUnix < deadlineFloor || got.DeadlineUnix > time.Now().Add(38*time.Second).Unix() {
+		t.Fatalf("persisted connect deadline = %d, want approximately now+37s", got.DeadlineUnix)
 	}
 	if got.Cluster == nil || got.Cluster.Group != cmd.Cluster.Group || got.Cluster.RouteKey != cmd.Cluster.RouteKey {
 		t.Fatalf("imported cluster context = %+v, command = %+v", got.Cluster, cmd.Cluster)
@@ -150,6 +482,41 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	case <-blocker.returned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("asynchronous cluster resume did not observe cancellation")
+	}
+}
+
+func TestClusterConnectResultEnforcesProfileCredentialShape(t *testing.T) {
+	base := &types.Sandbox{
+		ID: "stable-g1", Profile: types.ProfileBare,
+		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
+		ForwardAccessToken: "kat1.forward",
+	}
+	result, err := clusterConnectResult(base)
+	if err != nil {
+		t.Fatalf("bare result: %v", err)
+	}
+	if result.EnvdAccessToken != "" || result.TrafficAccessToken != "" {
+		t.Fatalf("bare result = %+v", result)
+	}
+
+	e2b := *base
+	e2b.Profile = types.ProfileE2B
+	e2b.TemplateID = "e2b-img-" + strings.Repeat("b", 64)
+	if _, err := clusterConnectResult(&e2b); err == nil {
+		t.Fatal("e2b result accepted missing e2b access tokens")
+	}
+	e2b.EnvdAccessToken = "envd"
+	e2b.TrafficAccessToken = "traffic"
+	if result, err = clusterConnectResult(&e2b); err != nil {
+		t.Fatalf("e2b result: %v", err)
+	} else if result.EnvdAccessToken != "envd" || result.TrafficAccessToken != "traffic" {
+		t.Fatalf("e2b result = %+v", result)
+	}
+
+	bareWithE2BTokens := *base
+	bareWithE2BTokens.EnvdAccessToken = "envd"
+	if _, err := clusterConnectResult(&bareWithE2BTokens); err == nil {
+		t.Fatal("bare result accepted an e2b access token")
 	}
 }
 
@@ -186,7 +553,7 @@ func TestPrepareClusterConnectRejectsTokenMismatchBeforeInsert(t *testing.T) {
 			fixture := newClusterConnectFixture(t)
 			cmd := fixture.command("stable-g1", fixture.token)
 			wantErr := mutate(t, fixture, cmd)
-			if _, err := fixture.o.prepareClusterConnect(context.Background(), cmd); !errors.Is(err, wantErr) {
+			if _, err := fixture.o.prepareClusterConnect(context.Background(), cmd, 0); !errors.Is(err, wantErr) {
 				t.Fatalf("prepareClusterConnect error = %v, want %v", err, wantErr)
 			}
 			if sb, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || sb != nil {
@@ -234,7 +601,7 @@ func TestPrepareClusterConnectConcurrentTargetIsInsertOnly(t *testing.T) {
 		go func(i int, token string) {
 			defer wg.Done()
 			<-start
-			sb, err := fixture.o.prepareClusterConnect(context.Background(), fixture.command("stable-g1", token))
+			sb, err := fixture.o.prepareClusterConnect(context.Background(), fixture.command("stable-g1", token), 0)
 			results <- result{sandbox: sb, err: err}
 		}(i, token)
 	}
@@ -281,6 +648,7 @@ func TestHandleClusterConnectRejectsInvalidTargetID(t *testing.T) {
 
 type clusterConnectFixture struct {
 	o           *Orchestrator
+	dbPath      string
 	pair        store.KeyPair
 	fingerprint string
 	source      *types.Sandbox
@@ -290,6 +658,7 @@ type clusterConnectFixture struct {
 func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	t.Helper()
 	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "node.db")
 	o := migrationOrchestrator(t, dir, []byte("cluster-runtime"))
 	// migrationOrchestrator intentionally builds a minimal Config without loading
 	// defaults; provide the one network value needed for the async-resume probe to
@@ -322,7 +691,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &clusterConnectFixture{o: o, pair: pair, fingerprint: fingerprint, source: source, token: token}
+	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token}
 }
 
 func (f *clusterConnectFixture) command(targetID, token string) *routesync.Command {
@@ -384,3 +753,15 @@ func (v *blockingClusterConnectVS) Attach(ctx context.Context, _ vswitch.AttachR
 
 func (*blockingClusterConnectVS) Detach(context.Context, string) error { return nil }
 func (*blockingClusterConnectVS) TapFD(string) vswitch.TapFD           { return vswitch.TapFD{} }
+
+type failingClusterConnectVS struct {
+	attempted chan struct{}
+}
+
+func (v *failingClusterConnectVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	v.attempted <- struct{}{}
+	return nil, errors.New("forced cluster resume failure")
+}
+
+func (*failingClusterConnectVS) Detach(context.Context, string) error { return nil }
+func (*failingClusterConnectVS) TapFD(string) vswitch.TapFD           { return vswitch.TapFD{} }

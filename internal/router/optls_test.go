@@ -40,7 +40,7 @@ func TestRouteLinkClientTLS(t *testing.T) {
 		t.Fatalf("routeLinkBase should be https for a TLS route_link endpoint, got %q", rt.routeLinkBase)
 	}
 	rr := rt.resolveRoute(context.Background(), "/g", "rk", "sb-1")
-	if rr == nil || rr.SID != "sb-1" || rr.DataEndpoint != "10.0.0.1:1" {
+	if rr == nil || rr.SandboxID != "sb-1" || rr.NodeSandboxID != "sb-1-g0" || rr.DataEndpoint != "10.0.0.1:1" {
 		t.Fatalf("resolveRoute over TLS: %+v", rr)
 	}
 }

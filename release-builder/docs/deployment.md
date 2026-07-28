@@ -17,7 +17,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 |---|---|---|---|
 | Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
-| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ placer(放置调度 + group provider);显式创建沙箱后按 sandbox-group + route-key + sandbox_id 路由请求,并按需激活已知的非 READY 沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
+| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 路由缓存)/ placer(放置调度 + group provider);显式创建沙箱后按 sandbox-group + route-key + 稳定 sandbox_id 路由请求,Router 在 node 边界替换为 NodeSandboxID,并按需激活已知的非 READY 沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl placer` |
 
 **Region 级共享资源**(由各自的平台管理面运营,平台外)
 
@@ -252,7 +252,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
 (shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key + sandbox_id 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
+按 sandbox-group + route-key + 稳定 sandbox_id 路由,在 node 边界使用 NodeSandboxID)、**placer**(group provider/importer、WATCH_LIST 消费方与
 放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
 时**不需要** cluster 层。
 
@@ -275,7 +275,7 @@ cluster-ctl placer
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
 | `cluster-ctl registry` | registry 自聚簇成员;复制 `route_link` / `node_link` / `node_list` / `placer_link` 执行态,承载 node 长连接和 route/node owner RPC | 1 或 N 副本;每个 group/node 由 LocateN 选 owner set | systemd | 平台内,`cluster.md` |
-| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持活动连接 cache 和近期路由 cache,miss 时经 Reserve 路由 / 拉起沙箱 | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
+| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持近期 route cache;数据面 miss 时 Resolve 并对已知非 READY route 做 data Reserve,create/connect 使用对应 Reserve operation | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
 | `cluster-ctl placer` | group provider/importer、WATCH_LIST 消费方与放置调度器;向 registry 提供 PlaceSandbox / PlaceBuild / verify-key | N 副本;按 placer memberlist ready 视图和 group 确定性 failover | systemd | 平台内,`cluster-placer.md` |
 
 小规模可三角色同机共置;大规模按 registry 成员表、router 入口副本和 placer 副本分别扩展。

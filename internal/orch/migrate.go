@@ -161,7 +161,7 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetI
 	if pair.APISecret == "" {
 		return "", fmt.Errorf("import-sandbox: credential pair is not installed: %w", api.ErrNotAllowed)
 	}
-	sb, err := o.importSandboxWithKey(ctx, pair, token, targetID, migrationtoken.Expectations{}, nil)
+	sb, err := o.importSandboxWithKey(ctx, pair, token, targetID, migrationtoken.Expectations{}, nil, 0)
 	if err != nil {
 		return "", err
 	}
@@ -171,13 +171,16 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetI
 // importSandboxWithKey is the shared synchronous KMT import core. expected and
 // cluster are trusted caller inputs: standalone import passes zero values, while
 // cluster commands can constrain the token subject/profile/runtime and attach
-// system-owned Group/RouteKey state. The token never supplies that context.
+// system-owned Group/RouteKey state. A positive deadlineOverride is written as
+// part of the insert; zero preserves the token deadline. The token never
+// supplies trusted cluster context.
 func (o *Orchestrator) importSandboxWithKey(
 	ctx context.Context,
 	pair store.KeyPair,
 	token, targetID string,
 	expected migrationtoken.Expectations,
 	cluster *types.ClusterSandboxContext,
+	deadlineOverride int64,
 ) (*types.Sandbox, error) {
 	if targetID != "" && !types.ValidLocalSandboxID(targetID) {
 		return nil, fmt.Errorf("import-sandbox: invalid target sandbox ID: %w", api.ErrBadRequest)
@@ -236,6 +239,9 @@ func (o *Orchestrator) importSandboxWithKey(
 		ForwardAccessToken: payload.ForwardAccessToken,
 		Metadata:           metadata,
 		Env:                payload.Env,
+	}
+	if deadlineOverride > 0 {
+		sb.DeadlineUnix = deadlineOverride
 	}
 	if profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"

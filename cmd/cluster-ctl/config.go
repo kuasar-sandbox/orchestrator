@@ -119,7 +119,6 @@ ingress:                             # downstream: e2b client ingress
   listen: ":443"
   # tls: { cert: ..., key: ... }     # wildcard *.<domain> + api.<domain>
 auth:
-  api_key: enforce                   # caller api_key auth: off | log | enforce
   data_plane: enforce                # data-plane access-token check: off | log | enforce
   cache_ttl: 60s                     # api_key↔group verification cache
 cache:

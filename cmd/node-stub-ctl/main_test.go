@@ -199,8 +199,21 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	connect.APISecretFingerprint = apiSecretFingerprint
 	connect.Profile = create.Profile
 	connect.Cluster = create.Cluster
+	connect.TimeoutSeconds = 31
+	deadlineFloor := time.Now().Add(30 * time.Second).Unix()
 	if got := node.HandleCommand(context.Background(), &connect); got.Status != routesync.AckAccepted {
 		t.Fatalf("connect after key drop ack = %+v", got)
+	} else if got.Connect == nil || got.Connect.NodeSandboxID != create.SID ||
+		got.Connect.TemplateID != create.TemplateRef || got.Connect.Profile != create.Profile ||
+		got.Connect.EnvdAccessToken != envdToken || got.Connect.TrafficAccessToken != trafficToken ||
+		got.Connect.ForwardAccessToken != forwardToken {
+		t.Fatalf("connect result = %+v", got.Connect)
+	}
+	node.mu.Lock()
+	connectDeadline := node.sandboxes[create.SID].DeadlineUnix
+	node.mu.Unlock()
+	if connectDeadline < deadlineFloor || connectDeadline > time.Now().Add(32*time.Second).Unix() {
+		t.Fatalf("connect deadline = %d, want approximately now+31s", connectDeadline)
 	}
 
 	wrongDelete := &routesync.Command{

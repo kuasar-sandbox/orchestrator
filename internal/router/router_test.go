@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestHandleCreateRejectsBodyPast16MiBWithoutHeader(t *testing.T) {
 	req.Header.Set(HeaderGroup, "/g")
 	rec := httptest.NewRecorder()
 
-	(&Router{authMode: "off"}).handleCreate(rec, req)
+	(&Router{}).handleCreate(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
@@ -182,7 +183,7 @@ func TestHandleCreateRejectsChunkedBodyPast16MiBWithoutHeader(t *testing.T) {
 	req.Header.Set(HeaderGroup, "/g")
 	rec := httptest.NewRecorder()
 
-	(&Router{authMode: "off"}).handleCreate(rec, req)
+	(&Router{}).handleCreate(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
@@ -194,6 +195,32 @@ func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		calls = append(calls, "first")
 		return textResponse(http.StatusServiceUnavailable, "down"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Join(calls, ",") != "first,second" {
+		t.Fatalf("status=%d calls=%v", resp.StatusCode, calls)
+	}
+}
+
+func TestRouteLinkHTTPFailsOverOnConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusConflict, "stale owner"), nil
 	})}
 	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		calls = append(calls, "second")
@@ -243,13 +270,17 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 		Config map[string]string `json:"config"`
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
+		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("operation") != "create" ||
+			req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
 			t.Fatalf("reserve request path=%q query=%q", req.URL.Path, req.URL.RawQuery)
+		}
+		if req.Header.Get(HeaderAPIKey) != "api-key" {
+			t.Fatalf("reserve X-API-KEY=%q", req.Header.Get(HeaderAPIKey))
 		}
 		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
-		body, err := json.Marshal(routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B))
+		body, err := json.Marshal(routerTestReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileE2B))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -260,7 +291,7 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	})}
 
 	config := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
-	if _, err := rt.routeLinkReserve(context.Background(), "/g", "rk", config); err != nil {
+	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
 		t.Fatal(err)
 	}
 	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
@@ -268,20 +299,109 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	}
 }
 
-func TestReserveByKeyJoinsExistingRouteFlight(t *testing.T) {
-	resultValue := routerTestReserveResult(t, "s1", "node:1", types.ProfileE2B)
-	result := &resultValue
-	flight := &reserveFlight{done: make(chan struct{}), res: result}
-	close(flight.done)
-	rt := &Router{reserveInFlight: map[string]*reserveFlight{
-		routeCacheKey("/g", "rk"): flight,
-	}}
+func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		operation string
+		port      int
+		timeout   int
+		headers   map[string]string
+	}{
+		{
+			name: "connect", operation: "connect", timeout: 37,
+			headers: map[string]string{HeaderAPIKey: "api-key", HeaderMigration: "kmt1.token"},
+		},
+		{
+			name: "connect negative timeout", operation: "connect", timeout: -1,
+			headers: map[string]string{HeaderAPIKey: "api-key"},
+		},
+		{
+			name: "data", operation: "data", port: 8080,
+			headers: map[string]string{HeaderAccessTok: "access-token"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				query := req.URL.Query()
+				if req.URL.Path != "/route-link/reserve" || query.Get("operation") != tc.operation ||
+					query.Get("group") != "/g" || query.Get("route_key") != "rk" || query.Get("sid") != "s1" {
+					t.Fatalf("reserve path=%q query=%q", req.URL.Path, req.URL.RawQuery)
+				}
+				wantPort := ""
+				if tc.port > 0 {
+					wantPort = strconv.Itoa(tc.port)
+				}
+				if query.Get("port") != wantPort {
+					t.Fatalf("reserve port=%q, want %q", query.Get("port"), wantPort)
+				}
+				wantTimeout := ""
+				if tc.timeout != 0 {
+					wantTimeout = strconv.Itoa(tc.timeout)
+				}
+				if query.Get("timeout") != wantTimeout {
+					t.Fatalf("reserve timeout=%q, want %q", query.Get("timeout"), wantTimeout)
+				}
+				if body, err := io.ReadAll(req.Body); err != nil || len(body) != 0 {
+					t.Fatalf("reserve body=%q err=%v, want empty", body, err)
+				}
+				if contentType := req.Header.Get("Content-Type"); contentType != "" {
+					t.Fatalf("reserve Content-Type=%q, want empty", contentType)
+				}
+				for name, want := range tc.headers {
+					if got := req.Header.Get(name); got != want {
+						t.Fatalf("reserve %s=%q, want %q", name, got, want)
+					}
+				}
+				result := routerTestReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				if tc.operation == "connect" {
+					result = routerTestConnectReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				}
+				body, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return textResponse(http.StatusOK, string(body)), nil
+			})}
+			rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+				return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
+			})}
+			if _, err := rt.routeLinkReserve(
+				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, tc.headers,
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
-	got, err := rt.reserveByKey(context.Background(), "/g", "rk", map[string]string{
-		"kuasar-sandbox.restore": `{"prefetch":"memory"}`,
-	})
-	if err != nil || got != result {
-		t.Fatalf("existing route flight result=%+v err=%v", got, err)
+func TestRouteLinkReserveConnectDoesNotRetryConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusConflict, "target environment incompatible"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		body, err := json.Marshal(routerTestConnectReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return textResponse(http.StatusOK, string(body)), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+
+	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, map[string]string{HeaderAPIKey: "api-key"})
+	var routeErr *routeLinkCallError
+	if !errors.As(err, &routeErr) || routeErr.status != http.StatusConflict {
+		t.Fatalf("connect reserve error=%v, want route-link 409", err)
+	}
+	if got := strings.Join(calls, ","); got != "first" {
+		t.Fatalf("connect conflict calls=%q, want first", got)
 	}
 }
 
@@ -368,24 +488,26 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	var node1Hits, node2Hits int
 	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		node1Hits++
-		if r.URL.Path != "/sandboxes/sb-1" {
+		if r.URL.Path != "/sandboxes/sb-1-g0" {
 			t.Fatalf("node1 saw path %q", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": "sb-1-g0", "opaque": "sb-1-g0"})
 	}))
 	defer node1.Close()
 	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		node2Hits++
-		if r.URL.Path != "/sandboxes/sb-2" {
+		if r.URL.Path != "/sandboxes/sb-2-g0" {
 			t.Fatalf("node2 saw path %q", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusNoContent)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": "sb-2-g0", "opaque": "sb-2-g0"})
 	}))
 	defer node2.Close()
 	node1Host := strings.TrimPrefix(node1.URL, "http://")
 	node2Host := strings.TrimPrefix(node2.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/route-link/verify-key":
+			w.WriteHeader(http.StatusOK)
 		case "/route-link/route":
 			switch r.URL.Query().Get("sid") {
 			case "sb-1":
@@ -401,7 +523,6 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -414,17 +535,164 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		req.Host = "api.test.local"
 		req.Header.Set(HeaderGroup, "/g")
 		req.Header.Set(HeaderRouteKey, tc.routeKey)
+		req.Header.Set(HeaderAPIKey, "e2b_test")
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
+		var body map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s status=%d, want 204", tc.sid, resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%d, want 200", tc.sid, resp.StatusCode)
+		}
+		if body["sandboxID"] != tc.sid || body["opaque"] != tc.sid+"-g0" {
+			t.Fatalf("%s adapted response=%v", tc.sid, body)
 		}
 	}
 	if node1Hits != 1 || node2Hits != 1 {
 		t.Fatalf("node hits node1=%d node2=%d, want one hit each", node1Hits, node2Hits)
+	}
+}
+
+func TestSandboxControlForwardRewritesOnlyPathIdentity(t *testing.T) {
+	var nodeHits int
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nodeHits++
+		if r.URL.Path != "/v2/sandboxes/sb-1-g0/pause" || r.URL.RawQuery != "reason=sb-1" {
+			t.Fatalf("node request path=%q query=%q", r.URL.Path, r.URL.RawQuery)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != `{"opaque":"sb-1"}` {
+			t.Fatalf("node body=%q, want unchanged", body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/route-link/verify-key" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/route-link/route" || r.URL.Query().Get("sid") != "sb-1" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B))
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+`/v2/sandboxes/sb-1/pause?reason=sb-1`, strings.NewReader(`{"opaque":"sb-1"}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent || nodeHits != 1 {
+		t.Fatalf("control forward status=%d nodeHits=%d", resp.StatusCode, nodeHits)
+	}
+}
+
+func TestControlForwardEvictsCurrentRouteOnNodeNotFound(t *testing.T) {
+	var nodeHits int
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nodeHits++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer node.Close()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileE2B)
+	rt.rememberRoute(&route)
+	rec := httptest.NewRecorder()
+
+	rt.forwardToNode(rec, httptest.NewRequest(http.MethodGet, "/sandboxes/sb-1", nil), &route, "/sandboxes/sb-1-g0", true)
+
+	if rec.Code != http.StatusNotFound || nodeHits != 1 {
+		t.Fatalf("control forward status=%d nodeHits=%d, want 404/1", rec.Code, nodeHits)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("stale route remained cached: %+v", got)
+	}
+}
+
+func TestControlForwardEvictionPreservesNewRoute(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer node.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	g0 := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileE2B)
+	rt.rememberRoute(&g0)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		rt.forwardToNode(rec, httptest.NewRequest(http.MethodGet, "/sandboxes/sb-1", nil), &g0, "/sandboxes/sb-1-g0", true)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control forward did not reach the node")
+	}
+	g1 := g0
+	g1.NodeSandboxID = "sb-1-g1"
+	g1.RouteRevision++
+	rt.rememberRoute(&g1)
+	close(release)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control forward did not complete")
+	}
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("control forward status=%d, want 404", rec.Code)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("new route was evicted: %+v", got)
+	}
+}
+
+func TestControlForwardEvictsCurrentRouteOnTransportFailure(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	node.Close()
+	rt := New("127.0.0.1:1", "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileE2B)
+	rt.rememberRoute(&route)
+	rec := httptest.NewRecorder()
+
+	rt.forwardToNode(rec, httptest.NewRequest(http.MethodPost, "/sandboxes/sb-1/pause", nil), &route, "/sandboxes/sb-1-g0/pause", false)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("control forward status=%d, want 502", rec.Code)
+	}
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("unreachable route remained cached: %+v", got)
 	}
 }
 

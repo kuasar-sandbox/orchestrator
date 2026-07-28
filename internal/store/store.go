@@ -563,6 +563,22 @@ func (s *Store) SetState(ctx context.Context, id string, st types.State) error {
 	return err
 }
 
+// CASRunState changes lifecycle state only while the row still names the exact
+// runner that observed the transition. It fences late cleanup from changing a
+// deleted, recreated, or subsequently launched sandbox with the same ID.
+func (s *Store) CASRunState(ctx context.Context, id, runID string, from, to types.State) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET state=? WHERE id=? AND run_id=? AND state=?`,
+		string(to), id, runID, string(from))
+	if err != nil {
+		return false, fmt.Errorf("store: cas sandbox %s run state: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: cas sandbox %s run state rows: %w", id, err)
+	}
+	return n == 1, nil
+}
+
 func (s *Store) SetDeadline(ctx context.Context, id string, unix int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET deadline_unix=? WHERE id=?`, unix, id)
 	return err

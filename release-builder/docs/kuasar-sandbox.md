@@ -150,7 +150,8 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 
 cluster 控制面由 `cluster-ctl` 的 registry/router/placer 三个角色组成。
 registry 是可靠状态集群,以 group/node 等逻辑键分片,分片内全复制并提供 CAS
-与 WATCH;router 只处理数据面入口与活动连接缓存;placer 通过 node_list 与
+与 WATCH;router 处理统一入口、稳定 SandboxID 到 NodeSandboxID 的 node 边界转换与 route cache;
+placer 通过 node_list 与
 sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替换的访问
 加速层:延迟与吞吐达标时可由托管 NAS 加速服务(如 SFS Turbo,对 OBS 提供近端
 加速)承担,对上层提供相同访问语义。GC 与代管理作用于对象存储,处于控制平面,
@@ -725,7 +726,7 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
   → 三阶段,见 `deployment.md` §5),无独立展平池。
 - **Cluster 控制面**(AZ 级或 Region 级):`cluster-ctl registry` 按
   membership 配置形成可靠状态集群;`cluster-ctl router` 提供 group-scoped
-  数据入口与活动连接缓存;`cluster-ctl placer` 订阅 node_list、导入 group
+  统一入口、稳定 SandboxID 路由和 route cache;`cluster-ctl placer` 订阅 node_list、导入 group
   配置并执行放置。registry 与 placer 各自通过 memberlist 健康检测隔离成员
   label,成员清单由配置和注册路径提供。
 - **L2 缓存集群**(AZ 级,100-200 节点):`cache-ctl shard`,RS 4+1 + Maglev

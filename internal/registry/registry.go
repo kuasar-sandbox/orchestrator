@@ -35,6 +35,10 @@ var (
 	errMissingImportSourceLease = errors.New("registry: import source lease fields are required")
 	errInvalidSandboxConfig     = errors.New("registry: invalid sandbox config")
 	errStaleImportSourceLease   = errors.New("registry: stale import source lease")
+	ErrReserveBadRequest        = errors.New("registry: invalid reserve request")
+	ErrReserveUnauthorized      = errors.New("registry: reserve credential is required")
+	ErrReserveForbidden         = errors.New("registry: reserve credential is invalid")
+	ErrSandboxNotFound          = errors.New("registry: sandbox not found")
 )
 
 const lifecycleAckTimeout = 5 * time.Second
@@ -150,28 +154,37 @@ type reserveCall struct {
 	// re-Place context (§7.4): a rejected create re-places once on another node
 	// before failing the Reserve. orig is the pre-reserve record to restore on
 	// timeout/reject while the row is still RESERVED.
-	group, routeKey string
-	orig            *SandboxRecord
-	found           bool
-	createConfig    map[string]string
+	group, routeKey   string
+	expectedSandboxID string
+	orig              *SandboxRecord
+	found             bool
+	createConfig      map[string]string
+	rollbackFence     reserveRollbackFence
 }
 
-// ReserveResult is the protected route material returned to a trusted router
-// after ReserveSandbox has converged the node-reported business record.
+type reserveRollbackFence struct {
+	SandboxID         string
+	NodeSandboxID     string
+	SandboxGeneration uint64
+	Revision          int64
+}
+
+func (f reserveRollbackFence) valid() bool {
+	return f.SandboxID != "" && f.NodeSandboxID != "" && f.Revision > 0
+}
+
+func (f reserveRollbackFence) matches(rec *SandboxRecord, revision int64) bool {
+	return f.valid() && rec != nil && rec.State == StateReserved &&
+		revision == f.Revision && rec.SandboxID == f.SandboxID &&
+		rec.NodeSandboxID == f.NodeSandboxID && rec.SandboxGeneration == f.SandboxGeneration
+}
+
+// ReserveResult is the operation result returned to a trusted router. Route is
+// always the complete authoritative forwarding record; Connect is present only
+// after an accepted CmdConnect.
 type ReserveResult struct {
-	NodeID                 string `json:"node_id"`
-	SID                    string `json:"sid"`
-	Profile                string `json:"profile"`
-	AuthSandboxID          string `json:"auth_sandbox_id"`
-	APISecret              string `json:"api_secret"`
-	APISecretFingerprint   string `json:"api_secret_fingerprint"`
-	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
-	ServiceSecret          string `json:"service_secret"`
-	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
-	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
-	ForwardAccessToken     string `json:"forward_access_token"`
-	TargetPort             int    `json:"target_port,omitempty"`
-	DataEndpoint           string `json:"data_endpoint"`
+	Route   RouteResolve             `json:"route"`
+	Connect *routesync.ConnectResult `json:"connect,omitempty"`
 }
 
 // New builds a Registry. Production callers set a placer_link placer explicitly.
@@ -443,10 +456,10 @@ func (r *Registry) Stores() *Stores { return r.stores }
 
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
-// ReserveSandbox resolves (group, route_key) to a running sandbox, placing +
+// reserveCreate resolves (group, route_key) to a running sandbox, placing +
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md).
-func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
+func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
@@ -459,7 +472,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		return nil, err
 	}
 	if found && rec.State == StateReady {
-		res, live, err := r.readyResultFromRecord(ctx, rec)
+		res, live, err := r.readyResultFromRecord(ctx, rec, rev)
 		if err != nil {
 			return nil, err
 		}
@@ -476,6 +489,9 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		return waitCall(ctx, call)
 	}
 	call := &reserveCall{done: make(chan struct{}), group: group, routeKey: routeKey, orig: rec, found: found, createConfig: createConfig}
+	if found && rec != nil {
+		call.expectedSandboxID = rec.SandboxID
+	}
 	r.inflight[key] = call
 	r.mu.Unlock()
 	defer func() {
@@ -486,12 +502,29 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 
 	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials); err != nil {
 		r.finish(key, nil, err)
-		if errors.Is(err, errNodeSandboxIDConflict) {
-			r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
-		} else {
-			r.rollbackReserve(group, routeKey, rec, found)
+		if fence, ok := r.reserveRollbackFence(key); ok {
+			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
+			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, dropCurrentRef)
 		}
 		return waitCall(ctx, call)
+	}
+	if r.reserveExpectedSandboxID(key) == "" {
+		current, _, currentFound, currentErr := r.getSandboxForReserve(ctx, group, routeKey)
+		if currentErr != nil {
+			r.finish(key, nil, currentErr)
+			if fence, ok := r.reserveRollbackFence(key); ok {
+				r.rollbackReserveAtFence(group, routeKey, fence, rec, found, false)
+			}
+			return waitCall(ctx, call)
+		}
+		if !currentFound || current.SandboxID == "" {
+			r.finish(key, nil, ErrSandboxNotFound)
+			if fence, ok := r.reserveRollbackFence(key); ok {
+				r.rollbackReserveAtFence(group, routeKey, fence, rec, found, false)
+			}
+			return waitCall(ctx, call)
+		}
+		r.setReserveExpectedSandboxID(key, current.SandboxID)
 	}
 	wctx, cancel := context.WithTimeout(ctx, r.parkTimeout)
 	defer cancel()
@@ -501,7 +534,9 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		// it doesn't strand the route. Keep the ownership ref because command
 		// delivery may have succeeded; a late live event must still be deleted as
 		// registry-owned rather than ignored as a node-local sandbox.
-		r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
+		if fence, ok := r.reserveRollbackFence(key); ok {
+			r.rollbackReserveAtFence(group, routeKey, fence, rec, found, false)
+		}
 		r.finish(key, nil, rerr)
 		return nil, rerr
 	}
@@ -525,25 +560,16 @@ func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey str
 	}
 }
 
-// rollbackReserve restores a (group, route_key) to its pre-reserve state when a
-// Reserve fails without reaching READY (cluster.md): a pre-existing PAUSED
-// row is put back and a fresh one is deleted, but only while the row is still
-// RESERVED (a late running route may have won).
-func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, found bool) {
-	r.rollbackReserveWithRefPolicy(group, routeKey, orig, found, true)
-}
-
-func (r *Registry) rollbackReserveRetainingOwnership(group, routeKey string, orig *SandboxRecord, found bool) {
-	r.rollbackReserveWithRefPolicy(group, routeKey, orig, found, false)
-}
-
-func (r *Registry) rollbackReserveWithRefPolicy(group, routeKey string, orig *SandboxRecord, found, dropCurrentRef bool) {
-	ctx := context.Background() // must complete even if the caller's ctx is done
-	cur, rev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
-	if err != nil || !curFound || cur.State != StateReserved {
-		return // already resolved (READY) / gone — nothing to roll back
+func (r *Registry) rollbackReserveAtFence(group, routeKey string, fence reserveRollbackFence, orig *SandboxRecord, found, dropCurrentRef bool) bool {
+	if !fence.valid() {
+		return false
 	}
-	r.rollbackReservedAtRevision(ctx, group, routeKey, cur, rev, orig, found, dropCurrentRef)
+	ctx := context.Background()
+	cur, rev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil || !curFound || !fence.matches(cur, rev) {
+		return false
+	}
+	return r.rollbackReservedAtRevision(ctx, group, routeKey, cur, rev, orig, found, dropCurrentRef)
 }
 
 func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev int64, orig *SandboxRecord, found, dropCurrentRef bool) bool {
@@ -551,15 +577,21 @@ func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeK
 		if orig == nil {
 			return false
 		}
-		if _, ok, err := r.stores.CASSandbox(ctx, orig, rev); err != nil || !ok {
+		restored := *orig
+		if cur.SandboxID == orig.SandboxID && cur.NextSandboxGeneration > restored.NextSandboxGeneration {
+			restored.NextSandboxGeneration = cur.NextSandboxGeneration
+		}
+		if _, ok, err := r.stores.CASSandbox(ctx, &restored, rev); err != nil || !ok {
 			return false
 		}
 		if dropCurrentRef && cur.NodeID != "" && !sameSandboxGeneration(cur, orig) {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
+			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.NodeSandboxID)
 		}
 		if orig.NodeID != "" {
 			_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
-				Group: group, RouteKey: routeKey, SandboxID: orig.SID, Profile: orig.Profile,
+				Group: group, RouteKey: routeKey, SandboxID: orig.SandboxID,
+				SandboxGeneration: orig.SandboxGeneration, NodeSandboxID: orig.NodeSandboxID,
+				Profile:              orig.Profile,
 				APISecretFingerprint: orig.APISecretFingerprint,
 			})
 		}
@@ -574,7 +606,7 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 		return false
 	}
 	if dropCurrentRef && cur != nil && cur.NodeID != "" {
-		_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
+		_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.NodeSandboxID)
 	}
 	return true
 }
@@ -594,22 +626,23 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 		reserved := *rec
 		reserved.State = StateReserved
-		if _, ok, err := r.stores.CASSandbox(ctx, &reserved, rev); err != nil || !ok {
+		reservedRev, ok, err := r.stores.CASSandbox(ctx, &reserved, rev)
+		if err != nil || !ok {
 			return cas(err, ok)
 		}
+		r.setReserveRollbackFence(flightKey(group, routeKey), &reserved, reservedRev)
 		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{
-			Group: group, RouteKey: routeKey, SandboxID: rec.SID, Profile: rec.Profile,
+			Group: group, RouteKey: routeKey, SandboxID: rec.SandboxID,
+			SandboxGeneration: rec.SandboxGeneration, NodeSandboxID: rec.NodeSandboxID,
+			Profile:              rec.Profile,
 			APISecretFingerprint: rec.APISecretFingerprint,
 		}); err != nil {
-			if errors.Is(err, errNodeSandboxIDConflict) {
-				r.rollbackReserveRetainingOwnership(group, routeKey, rec, true)
-			} else {
-				r.rollbackReserve(group, routeKey, rec, true)
-			}
+			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
+			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, dropCurrentRef)
 			return err
 		}
 		ccmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID,
+			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.NodeSandboxID,
 			Profile: rec.Profile,
 			Cluster: &routesync.ClusterSandboxContext{
 				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
@@ -618,11 +651,11 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, ccmd, lifecycleAckTimeout)
 		if err != nil {
-			r.rollbackReserve(group, routeKey, rec, true)
+			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
 			return err
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			r.rollbackReserve(group, routeKey, rec, true)
+			_ = r.rollbackReservedAtRevision(ctx, group, routeKey, &reserved, reservedRev, rec, true, true)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -651,7 +684,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 	}
 	workflowCredentials := cloneCreateCredentials(createCredentials)
 	workflowReplacement := replaceReady
+	sandboxID := "sb-" + newID()
+	nextGeneration := uint64(0)
 	if replaceReady != nil {
+		if !validNodeSandboxIdentity(replaceReady.SandboxID, replaceReady.NodeSandboxID, replaceReady.SandboxGeneration) ||
+			replaceReady.NextSandboxGeneration <= replaceReady.SandboxGeneration {
+			return errors.New("registry: replacement sandbox identity is invalid")
+		}
+		sandboxID = replaceReady.SandboxID
+		nextGeneration = replaceReady.NextSandboxGeneration
 		var err error
 		workflowCredentials, _, err = replacementCredentials(replaceReady)
 		if err != nil {
@@ -672,6 +713,18 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
 		}
+		if curFound {
+			if cur.SandboxID == "" {
+				return errors.New("registry: sandbox route is missing stable identity")
+			}
+			if replaceReady != nil && cur.SandboxID != replaceReady.SandboxID {
+				return errors.New("registry: replacement stable sandbox identity mismatch")
+			}
+			sandboxID = cur.SandboxID
+			if cur.NextSandboxGeneration > nextGeneration {
+				nextGeneration = cur.NextSandboxGeneration
+			}
+		}
 		selectedCredentials := cloneCreateCredentials(workflowCredentials)
 		selectedReplacement := workflowReplacement
 		binding := workflowReplacement
@@ -691,9 +744,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 				selectedReplacement = nil
 			}
 		}
-		sid := "sb-" + newID()
 		placement, perr := r.placer.Place(ctx, PlaceRequest{
-			Group: group, RouteKey: routeKey, SandboxID: sid, Config: createConfig,
+			Group: group, RouteKey: routeKey, SandboxID: sandboxID, Config: createConfig,
 			ExcludeNodeIDs: excluded.values(),
 		})
 		if perr != nil {
@@ -723,10 +775,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 		}
-		ref := clusterstate.NodeSandboxRef{
-			Group: group, RouteKey: routeKey, SandboxID: sid, Profile: string(template.Profile),
-			APISecretFingerprint: placement.APISecretFingerprint,
-		}
 		nodeID := placement.NodeID
 		if excluded.has(nodeID) {
 			if lastFailure != nil {
@@ -742,12 +790,28 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			excluded.add(nodeID)
 			continue
 		}
+		if nextGeneration == ^uint64(0) {
+			return errors.New("registry: sandbox generation exhausted")
+		}
+		generation := nextGeneration
+		nodeSandboxID := EncodeNodeSandboxID(sandboxID, generation)
+		if !validNodeSandboxIdentity(sandboxID, nodeSandboxID, generation) {
+			return errors.New("registry: generated node sandbox identity is invalid")
+		}
+		ref := clusterstate.NodeSandboxRef{
+			Group: group, RouteKey: routeKey, SandboxID: sandboxID,
+			SandboxGeneration: generation, NodeSandboxID: nodeSandboxID,
+			Profile: string(template.Profile), APISecretFingerprint: placement.APISecretFingerprint,
+		}
 		expect := int64(0)
 		if curFound {
 			expect = curRev
 		}
 		reserved := &SandboxRecord{
-			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
+			Group: group, RouteKey: routeKey,
+			SandboxID: sandboxID, NodeSandboxID: nodeSandboxID,
+			SandboxGeneration: generation, NextSandboxGeneration: generation + 1,
+			State: StateReserved, NodeID: nodeID,
 			TemplateID: placement.TemplateRef, Profile: string(template.Profile),
 			APISecretFingerprint: placement.APISecretFingerprint,
 			CreateCredentials:    cloneCreateCredentials(selectedCredentials),
@@ -764,6 +828,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			}
 			return ErrNoNode
 		}
+		r.setReserveRollbackFence(flightKey(group, routeKey), reserved, reservedRev)
+		nextGeneration = reserved.NextSandboxGeneration
 		workflowCredentials = cloneCreateCredentials(selectedCredentials)
 		if hasRouteCredentials(reserved) {
 			copy := *reserved
@@ -785,12 +851,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return err
 		}
 
-		authSandboxID := sid
+		authSandboxID := sandboxID
 		if selectedReplacement != nil {
 			authSandboxID = selectedReplacement.AuthSandboxID
 		}
+		if authSandboxID != sandboxID {
+			return errors.New("registry: sandbox authentication identity does not match stable identity")
+		}
 		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdCreate, SID: sid,
+			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
 			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
 			Cluster: &routesync.ClusterSandboxContext{
 				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
@@ -798,7 +867,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			APISecretFingerprint: placement.APISecretFingerprint,
 		}
 		if r.nodeOwner == nil {
-			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
+			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
+				replaceReady, replaceReady != nil, true) {
+				return ErrNodeGone
+			}
 			lastFailure = ErrNodeGone
 			excluded.add(nodeID)
 			continue
@@ -811,18 +883,24 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			if !errors.Is(err, ErrNodeGone) {
 				return nil // delivery is ambiguous; keep RESERVED and wait for the route event
 			}
-			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
+			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
+				replaceReady, replaceReady != nil, true) {
+				return err
+			}
 			lastFailure = err
 			excluded.add(nodeID)
 			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
 			}
 			lastFailure = fmt.Errorf("registry: create rejected: %s", reason)
+			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
+				replaceReady, replaceReady != nil, true) {
+				return lastFailure
+			}
 			excluded.add(nodeID)
 			continue
 		}
@@ -886,7 +964,7 @@ func replacementCredentials(record *SandboxRecord) (*sandboxcfg.Credentials, str
 		ServiceSecret:          record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
 		TrafficAccessToken: record.TrafficAccessToken, ForwardAccessToken: record.ForwardAccessToken,
 	}
-	if err := validateRouteCredentials(route, record.APISecretFingerprint); err != nil {
+	if err := validateRouteCredentials(route, record.APISecretFingerprint, record.SandboxID); err != nil {
 		return nil, "", errors.New("registry: replacement route credentials are invalid")
 	}
 	return &sandboxcfg.Credentials{
@@ -980,7 +1058,9 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		return
 	}
 	rec := &SandboxRecord{
-		Group: ref.Group, RouteKey: ref.RouteKey, SID: e.SandboxID, NodeID: nodeID,
+		Group: ref.Group, RouteKey: ref.RouteKey,
+		SandboxID: ref.SandboxID, NodeSandboxID: ref.NodeSandboxID,
+		SandboxGeneration: ref.SandboxGeneration, NodeID: nodeID,
 		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, Profile: ref.Profile,
 		APISecretFingerprint:   ref.APISecretFingerprint,
 		ManifestKeyFingerprint: e.ManifestKeyFingerprint,
@@ -1004,7 +1084,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	r.applyLiveRoute(ctx, nodeID, e, rec)
 }
 
-func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint string) error {
+func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint, expectedAuthSandboxID string) error {
 	apiSecretFingerprint, err := nodestore.APISecretHash(e.APISecret)
 	if err != nil || apiSecretFingerprint != e.APISecretFingerprint ||
 		apiSecretFingerprint != expectedAPISecretFingerprint {
@@ -1015,6 +1095,9 @@ func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerpr
 	}
 	if e.AuthSandboxID == "" || !utf8.ValidString(e.AuthSandboxID) {
 		return errors.New("registry: route authentication sandbox ID is invalid")
+	}
+	if expectedAuthSandboxID != "" && e.AuthSandboxID != expectedAuthSandboxID {
+		return errors.New("registry: route authentication sandbox ID binding is invalid")
 	}
 	if err := keys.VerifyForwardAccessToken(e.ForwardAccessToken, e.ServiceSecret, e.AuthSandboxID); err != nil {
 		return errors.New("registry: route forward credential is invalid")
@@ -1060,12 +1143,12 @@ func hasRouteCredentials(record *SandboxRecord) bool {
 		record.TrafficAccessToken != "" || record.ForwardAccessToken != "")
 }
 
-func (r *Registry) lookupNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
+func (r *Registry) lookupNodeSandboxRef(ctx context.Context, nodeID, nodeSandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
 	var ref clusterstate.NodeSandboxRef
 	var found bool
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
-		ref, found, err = r.stores.GetNodeSandboxRef(ctx, nodeID, sandboxID)
+		ref, found, err = r.stores.GetNodeSandboxRef(ctx, nodeID, nodeSandboxID)
 		if err == nil || !transientRouteRead(err) {
 			return ref, found, err
 		}
@@ -1108,13 +1191,15 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		r.log.Warn("registry: read sandbox route", "group", rec.Group, "err", err)
 		return true
 	}
-	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) ||
+	if !found || cur.SandboxID != rec.SandboxID || cur.NodeSandboxID != e.SandboxID ||
+		cur.SandboxGeneration != rec.SandboxGeneration ||
+		(cur.NodeID != "" && cur.NodeID != nodeID) ||
 		cur.Profile != rec.Profile ||
 		cur.APISecretFingerprint != rec.APISecretFingerprint {
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey, rec.APISecretFingerprint)
 		return true
 	}
-	if err := validateRouteCredentials(e, rec.APISecretFingerprint); err != nil {
+	if err := validateRouteCredentials(e, rec.APISecretFingerprint, rec.SandboxID); err != nil {
 		r.log.Warn("registry: ignored route with invalid credentials", "node", nodeID, "sid", e.SandboxID, "err", err)
 		return true
 	}
@@ -1128,7 +1213,9 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	if rec.TargetPort == 0 {
 		rec.TargetPort = cur.TargetPort
 	}
-	if _, ok, err := r.stores.CASSandbox(ctx, rec, rev); err != nil || !ok {
+	rec.NextSandboxGeneration = cur.NextSandboxGeneration
+	committedRev, ok, err := r.stores.CASSandbox(ctx, rec, rev)
+	if err != nil || !ok {
 		if transientRouteRead(err) {
 			return false
 		}
@@ -1139,14 +1226,12 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		return true
 	}
 	if rec.State == StateReady {
-		r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{
-			NodeID: nodeID, SID: e.SandboxID, Profile: rec.Profile,
-			AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
-			APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
-			ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
-			TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
-			TargetPort: rec.TargetPort, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID),
-		}, nil)
+		route, err := r.routeFromRecord(ctx, rec, committedRev)
+		if err != nil {
+			r.finish(flightKey(rec.Group, rec.RouteKey), nil, err)
+		} else {
+			r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{Route: *route}, nil)
+		}
 	}
 	return true
 }
@@ -1163,8 +1248,8 @@ func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, 
 // applyDelete converges a removed route only while it still names the reporting
 // node and sandbox. A late DEAD from a replaced instance must not delete its
 // successor's route.
-func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey, apiSecretFingerprint string) bool {
-	if nodeID == "" || sandboxID == "" || group == "" || routeKey == "" ||
+func (r *Registry) applyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) bool {
+	if nodeID == "" || nodeSandboxID == "" || group == "" || routeKey == "" ||
 		!validFullFingerprint(apiSecretFingerprint) {
 		return false
 	}
@@ -1177,15 +1262,15 @@ func (r *Registry) applyDelete(ctx context.Context, nodeID, sandboxID, group, ro
 			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
 			}
 		}
-		if r.tryApplyDelete(ctx, nodeID, sandboxID, group, routeKey, apiSecretFingerprint) {
+		if r.tryApplyDelete(ctx, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint) {
 			return true
 		}
 	}
-	r.log.Warn("registry: delete route report did not converge", "node", nodeID, "sid", sandboxID, "group", group, "route_key", routeKey)
+	r.log.Warn("registry: delete route report did not converge", "node", nodeID, "sid", nodeSandboxID, "group", group, "route_key", routeKey)
 	return false
 }
 
-func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, sandboxID, group, routeKey, apiSecretFingerprint string) bool {
+func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, nodeSandboxID, group, routeKey, apiSecretFingerprint string) bool {
 	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil {
 		return false
@@ -1193,7 +1278,7 @@ func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, sandboxID, group,
 	if !found {
 		return true
 	}
-	if rec.NodeID != nodeID || rec.SID != sandboxID || rec.APISecretFingerprint != apiSecretFingerprint {
+	if rec.NodeID != nodeID || rec.NodeSandboxID != nodeSandboxID || rec.APISecretFingerprint != apiSecretFingerprint {
 		return true
 	}
 	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
@@ -1208,33 +1293,35 @@ func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, exp
 		return
 	}
 	for _, ref := range expected {
-		if ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+		if ref.Group == "" || ref.RouteKey == "" ||
+			!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			continue
 		}
-		if _, ok := seen[ref.SandboxID]; ok {
+		if _, ok := seen[ref.NodeSandboxID]; ok {
 			continue
 		}
-		current, found, err := r.stores.GetNodeSandboxRef(ctx, nodeID, ref.SandboxID)
+		current, found, err := r.stores.GetNodeSandboxRef(ctx, nodeID, ref.NodeSandboxID)
 		if err != nil || !found || current.Group != ref.Group || current.RouteKey != ref.RouteKey ||
+			current.SandboxID != ref.SandboxID || current.SandboxGeneration != ref.SandboxGeneration ||
 			current.Profile != ref.Profile || current.APISecretFingerprint != ref.APISecretFingerprint {
 			continue
 		}
-		if r.applyDelete(ctx, nodeID, ref.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, ref.SandboxID)
+		if r.applyDelete(ctx, nodeID, ref.NodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
+			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, ref.NodeSandboxID)
 		}
 	}
 }
 
-// applyDeleteBySID converges a route delete. The node-link owner resolves its
-// group route through the per-node sandbox table.
-func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, sid string) {
-	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, sid)
+// applyDeleteBySID converges a route delete. The node-link owner resolves the
+// node-local sandbox ID through the per-node ownership table.
+func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, nodeSandboxID string) {
+	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, nodeSandboxID)
 	if err != nil || !found {
 		return
 	}
-	if r.applyDelete(ctx, nodeID, sid, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
-		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, sid)
+	if r.applyDelete(ctx, nodeID, nodeSandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
+		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, nodeSandboxID)
 	}
 }
 
@@ -1242,6 +1329,10 @@ func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, sid string) {
 func (r *Registry) finish(key string, res *ReserveResult, err error) {
 	r.mu.Lock()
 	call := r.inflight[key]
+	if call != nil && res != nil && call.expectedSandboxID != "" && res.Route.SandboxID != call.expectedSandboxID {
+		r.mu.Unlock()
+		return
+	}
 	r.mu.Unlock()
 	if call == nil {
 		return
@@ -1250,6 +1341,53 @@ func (r *Registry) finish(key string, res *ReserveResult, err error) {
 		call.result, call.err = res, err
 		close(call.done)
 	})
+}
+
+func (r *Registry) setReserveRollbackFence(key string, rec *SandboxRecord, revision int64) {
+	fence := reserveRollbackFence{Revision: revision}
+	if rec != nil {
+		fence.SandboxID = rec.SandboxID
+		fence.NodeSandboxID = rec.NodeSandboxID
+		fence.SandboxGeneration = rec.SandboxGeneration
+	}
+	if !fence.valid() {
+		return
+	}
+	r.mu.Lock()
+	if call := r.inflight[key]; call != nil && (call.expectedSandboxID == "" || call.expectedSandboxID == fence.SandboxID) {
+		call.expectedSandboxID = fence.SandboxID
+		call.rollbackFence = fence
+	}
+	r.mu.Unlock()
+}
+
+func (r *Registry) setReserveExpectedSandboxID(key, sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	r.mu.Lock()
+	if call := r.inflight[key]; call != nil && (call.expectedSandboxID == "" || call.expectedSandboxID == sandboxID) {
+		call.expectedSandboxID = sandboxID
+	}
+	r.mu.Unlock()
+}
+
+func (r *Registry) reserveRollbackFence(key string) (reserveRollbackFence, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if call := r.inflight[key]; call != nil && call.rollbackFence.valid() {
+		return call.rollbackFence, true
+	}
+	return reserveRollbackFence{}, false
+}
+
+func (r *Registry) reserveExpectedSandboxID(key string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if call := r.inflight[key]; call != nil {
+		return call.expectedSandboxID
+	}
+	return ""
 }
 
 func waitCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
@@ -1274,7 +1412,10 @@ func (r *Registry) waitReserveCall(ctx context.Context, call *reserveCall) (*Res
 			return call.result, call.err
 		default:
 		}
-		if res, ready, err := r.reserveReadyResult(ctx, call.group, call.routeKey); transientRouteRead(err) {
+		expectedSandboxID := r.reserveExpectedSandboxID(flightKey(call.group, call.routeKey))
+		if res, ready, err := r.reserveReadyResult(ctx, call.group, call.routeKey, expectedSandboxID); expectedSandboxID == "" {
+			// The create leader has not committed its stable lineage yet.
+		} else if transientRouteRead(err) {
 			// A route owner may be accepting the node's READY update concurrently;
 			// keep the parked reserve until the event/read settles or times out.
 		} else if err != nil {
@@ -1297,15 +1438,21 @@ func transientRouteRead(err error) bool {
 	return errors.Is(err, clusterstate.ErrQuorum) || errors.Is(err, clusterstate.ErrConflict)
 }
 
-func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey string) (*ReserveResult, bool, error) {
-	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
-	if err != nil || !found || rec.State != StateReady {
+func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey, expectedSandboxID string) (*ReserveResult, bool, error) {
+	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil {
 		return nil, false, err
 	}
-	return r.readyResultFromRecord(ctx, rec)
+	if !found || rec.SandboxID != expectedSandboxID {
+		return nil, false, ErrSandboxNotFound
+	}
+	if rec.State != StateReady {
+		return nil, false, nil
+	}
+	return r.readyResultFromRecord(ctx, rec, rev)
 }
 
-func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord) (*ReserveResult, bool, error) {
+func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord, routeRevision int64) (*ReserveResult, bool, error) {
 	if rec == nil || rec.NodeID == "" || r.nodeOwner == nil {
 		return nil, false, nil
 	}
@@ -1322,34 +1469,32 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	if !found || node == nil {
 		return nil, false, fmt.Errorf("registry: runtime profile for connected node %q is unavailable", rec.NodeID)
 	}
-	return &ReserveResult{
-		NodeID: rec.NodeID, SID: rec.SID, Profile: rec.Profile,
-		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
-		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
-		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
-		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
-		TargetPort: rec.TargetPort, DataEndpoint: node.DataEndpoint,
-	}, true, nil
+	route, err := r.routeFromRecord(ctx, rec, routeRevision)
+	if err != nil {
+		return nil, false, err
+	}
+	route.DataEndpoint = node.DataEndpoint
+	return &ReserveResult{Route: *route}, true, nil
 }
 
 // DeleteSandboxRoute sends the authoritative delete command for an exact
-// group-scoped route. The caller must provide group + route_key + current sid so
-// a stale client cannot delete a replacement sandbox generation.
-func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sid string) (bool, error) {
-	if group == "" || routeKey == "" || sid == "" {
+// group-scoped route. The caller supplies the stable public SandboxID so a
+// request for a deleted lineage cannot affect a route-key reuse.
+func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sandboxID string) (bool, error) {
+	if group == "" || routeKey == "" || sandboxID == "" {
 		return false, nil
 	}
 	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil || !found {
 		return false, err
 	}
-	if rec.SID != sid {
+	if rec.SandboxID != sandboxID {
 		return false, nil
 	}
 	if r.nodeOwner == nil || rec.NodeID == "" {
 		return r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
 	}
-	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, sid, rec.APISecretFingerprint); err != nil {
+	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, rec.NodeSandboxID, rec.APISecretFingerprint); err != nil {
 		if !errors.Is(err, ErrNodeGone) {
 			return false, err
 		}
@@ -1357,7 +1502,7 @@ func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sid 
 		if err != nil || !deleted {
 			return false, err
 		}
-		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, sid)
+		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, rec.NodeSandboxID)
 		return true, nil
 	}
 	return true, nil
@@ -1815,7 +1960,9 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			return
 		}
 		plan := sandboxReapPlan{ref: child}
-		if !routeFound || s.NodeID != nodeID || s.SID != ref.SandboxID || s.Profile != ref.Profile ||
+		if !routeFound || s.NodeID != nodeID || s.SandboxID != ref.SandboxID ||
+			s.NodeSandboxID != ref.NodeSandboxID || s.SandboxGeneration != ref.SandboxGeneration ||
+			s.Profile != ref.Profile ||
 			s.APISecretFingerprint != ref.APISecretFingerprint {
 			sandboxPlans = append(sandboxPlans, plan)
 			continue
@@ -1864,8 +2011,8 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 		if plan.deleteRoute && !r.deleteSandboxAtRevision(ctx, plan.record.Group, plan.record.RouteKey, plan.record, plan.revision, false) {
 			continue
 		}
-		if _, err := r.stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, plan.ref.Ref.SandboxID, plan.ref.Revision); err != nil {
-			r.log.Warn("registry: remove reaped sandbox ownership", "node", nodeID, "sandbox", plan.ref.Ref.SandboxID, "err", err)
+		if _, err := r.stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, plan.ref.Ref.NodeSandboxID, plan.ref.Revision); err != nil {
+			r.log.Warn("registry: remove reaped sandbox ownership", "node", nodeID, "sandbox", plan.ref.Ref.NodeSandboxID, "err", err)
 			continue
 		}
 		if plan.deleteRoute {

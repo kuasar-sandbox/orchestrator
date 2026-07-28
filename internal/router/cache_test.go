@@ -9,15 +9,54 @@ import (
 	"testing"
 )
 
-// TestAuthRejectsBadKey checks the Phase 7g router auth: a create whose api key
-// the registry rejects is 403'd at the router, before any reserve.
+func TestStableSandboxCacheDoesNotPinOrEvictNewNodeIdentity(t *testing.T) {
+	rt := &Router{
+		cache:  map[string]*routeResolve{},
+		active: map[string]*activeRoute{},
+	}
+	g0 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g0", RouteRevision: 10}
+	g1 := &routeResolve{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", NodeSandboxID: "sb-1-g1", RouteRevision: 11}
+	rt.rememberRoute(g0)
+	done := rt.beginActiveRoute(g0)
+	defer done()
+	rt.rememberRoute(g1)
+	rt.rememberRoute(g0) // a late g0 result must not overwrite current g1
+	sameRevisionDifferentTarget := *g1
+	sameRevisionDifferentTarget.NodeSandboxID = "sb-1-g2"
+	rt.rememberRoute(&sameRevisionDifferentTarget)
+
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("cached route after cutover=%+v, want g1", got)
+	}
+	rt.evictRouteIfCurrent("/g", "rk", "sb-1", "sb-1-g0")
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got == nil || got.NodeSandboxID != "sb-1-g1" {
+		t.Fatalf("old generation evicted current route: %+v", got)
+	}
+	rt.evictRouteIfCurrent("/g", "rk", "sb-1", "sb-1-g1")
+	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
+		t.Fatalf("current generation remained cached: %+v", got)
+	}
+}
+
+// TestAuthRejectsBadKey checks that create authentication is part of Reserve:
+// the router carries the client's API key to the registry and returns its 403
+// without a separate verify-key round trip.
 func TestAuthRejectsBadKey(t *testing.T) {
+	var reserveHits, verifyHits int
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/route-link/verify-key" {
+		switch r.URL.Path {
+		case "/route-link/reserve":
+			reserveHits++
+			if r.URL.Query().Get("operation") != "create" || r.Header.Get(HeaderAPIKey) != "e2b_bad" {
+				t.Fatalf("create reserve query=%q api-key=%q", r.URL.RawQuery, r.Header.Get(HeaderAPIKey))
+			}
 			w.WriteHeader(http.StatusForbidden)
-			return
+		case "/route-link/verify-key":
+			verifyHits++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer control.Close()
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -35,6 +74,9 @@ func TestAuthRejectsBadKey(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("create with a rejected key status=%d, want 403", resp.StatusCode)
+	}
+	if reserveHits != 1 || verifyHits != 0 {
+		t.Fatalf("create auth calls reserve=%d verify-key=%d, want 1/0", reserveHits, verifyHits)
 	}
 }
 

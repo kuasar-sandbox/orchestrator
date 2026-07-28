@@ -45,7 +45,9 @@ func (r *Registry) nodeRuntimeLive(ctx context.Context, nodeID string) error {
 }
 
 func sameSandboxGeneration(a, b *SandboxRecord) bool {
-	return a != nil && b != nil && a.SID == b.SID && a.NodeID == b.NodeID &&
+	return a != nil && b != nil && a.SandboxID == b.SandboxID &&
+		a.NodeSandboxID == b.NodeSandboxID && a.SandboxGeneration == b.SandboxGeneration &&
+		a.NodeID == b.NodeID &&
 		a.Profile == b.Profile && a.APISecretFingerprint == b.APISecretFingerprint
 }
 

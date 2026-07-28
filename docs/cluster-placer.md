@@ -306,6 +306,9 @@ registry 不对 placer 做 P2C。P2C 只用于 placer 内部从 node 候选中�
 group, route_key, sandbox_id, target_runtime_digest?, config?, exclude_node_ids?
 ```
 
+`sandbox_id` 是 Registry 持有的稳定公开 SandboxID;placer 不分配、解析或接收 NodeSandboxID
+和 SandboxGeneration.
+
 流程:
 
 ```text
@@ -388,5 +391,5 @@ placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 ## 12. See Also
 
 - [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
-- [cluster-router.md](cluster-router.md) — router Reserve 消费、active connection cache 和数据面转发。
+- [cluster-router.md](cluster-router.md) — router Reserve 消费、route cache 和数据面转发.
 - [node.md](node.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

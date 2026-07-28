@@ -112,6 +112,10 @@ type ClusterSandboxContext struct {
 const (
 	AckAccepted = "accepted"
 	AckRejected = "rejected"
+
+	// MaxConnectTimeoutSeconds is the largest whole-second timeout that can be
+	// converted to time.Duration without overflow.
+	MaxConnectTimeoutSeconds int64 = (1<<63 - 1) / 1_000_000_000
 )
 
 // NodeRegister is the node's first up-frame on node-link: its identity + capacity,
@@ -169,7 +173,8 @@ type Command struct {
 	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
 	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
 	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
-	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect/exec-session import when the exact target is absent
+	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
+	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put
@@ -188,10 +193,25 @@ type Command struct {
 	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient
 }
 
-// CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the
-// route stream, not here.
+// ConnectResult is the synchronous result of an accepted CmdConnect. It projects
+// only the public service credentials stored in the sandbox business row; secret
+// roots and their fingerprints never appear in the result.
+type ConnectResult struct {
+	NodeSandboxID      string `json:"node_sandbox_id"`
+	TemplateID         string `json:"template_id"`
+	Profile            string `json:"profile"`
+	EnvdAccessToken    string `json:"envd_access_token,omitempty"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	ForwardAccessToken string `json:"forward_access_token"`
+}
+
+// CmdAck acknowledges a Command's receipt. CmdConnect additionally returns its
+// synchronously prepared result; asynchronous resume completion still arrives
+// through the route stream.
 type CmdAck struct {
-	CmdID  string `json:"cmd_id"`
-	Status string `json:"status"` // AckAccepted | AckRejected
-	Reason string `json:"reason,omitempty"`
+	CmdID      string         `json:"cmd_id"`
+	Status     string         `json:"status"` // AckAccepted | AckRejected
+	Reason     string         `json:"reason,omitempty"`
+	HTTPStatus int            `json:"http_status,omitempty"`
+	Connect    *ConnectResult `json:"connect,omitempty"`
 }

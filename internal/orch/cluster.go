@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -55,12 +56,35 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
-		sb, err := o.prepareClusterConnect(ctx, cmd)
+		if cmd.TimeoutSeconds < 0 || int64(cmd.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
+			return &routesync.CmdAck{
+				CmdID: cmd.CmdID, Status: routesync.AckRejected,
+				Reason: "connect timeout is out of range", HTTPStatus: http.StatusBadRequest,
+			}
+		}
+		if cmd.TimeoutSeconds > 0 {
+			unlock := o.lifecycle.Lock(cmd.SID)
+			defer unlock()
+		}
+		requestedDeadline := clusterConnectDeadline(cmd.TimeoutSeconds)
+		sb, err := o.prepareClusterConnect(ctx, cmd, requestedDeadline)
 		if err != nil {
 			return reject(cmd, err)
 		}
-		o.scheduleResume(sb.ID)
-		return accept(cmd)
+		result, err := clusterConnectResult(sb)
+		if err != nil {
+			return reject(cmd, err)
+		}
+		if err := o.applyClusterConnectDeadline(ctx, sb, requestedDeadline); err != nil {
+			return reject(cmd, err)
+		}
+		if sb.State == types.StatePaused {
+			if requestedDeadline > 0 {
+				o.markDeadlineIntent(sb.ID)
+			}
+			o.scheduleResume(sb.ID)
+		}
+		return acceptConnect(cmd, result)
 	case routesync.CmdDelete:
 		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 		if err != nil {
@@ -332,8 +356,33 @@ func accept(cmd *routesync.Command) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
 }
 
+func acceptConnect(cmd *routesync.Command, result *routesync.ConnectResult) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, Connect: result}
+}
+
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
-	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: err.Error()}
+	status, reason := clusterCommandRejection(err)
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckRejected,
+		Reason: reason, HTTPStatus: status,
+	}
+}
+
+func clusterCommandRejection(err error) (int, string) {
+	switch {
+	case errors.Is(err, migrationtoken.ErrMalformedToken),
+		errors.Is(err, migrationtoken.ErrInvalidPayload):
+		return http.StatusBadRequest, "invalid migration token"
+	case errors.Is(err, migrationtoken.ErrAuthentication),
+		errors.Is(err, migrationtoken.ErrCredentialMismatch):
+		return http.StatusForbidden, "migration credential not allowed"
+	case errors.Is(err, migrationtoken.ErrIncompatible):
+		return http.StatusConflict, "target environment incompatible"
+	case errors.Is(err, migrationtoken.ErrTokenTooLarge):
+		return http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error()
+	default:
+		return 0, err.Error()
+	}
 }
 
 // CreateCluster is the synchronous precheck + boot of a node-link create. The
@@ -509,7 +558,7 @@ func validateClusterSandboxContext(sb *types.Sandbox, cmd *routesync.Command) er
 // prepareClusterConnect validates an existing exact target without touching the
 // optional token. If the target is absent, it synchronously authenticates and
 // imports KMT1 under the Registry-selected NodeSandboxID before the Ack is sent.
-func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
+func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync.Command, requestedDeadline int64) (*types.Sandbox, error) {
 	if cmd == nil || !types.ValidLocalSandboxID(cmd.SID) || cmd.APISecretFingerprint == "" {
 		return nil, fmt.Errorf("cluster connect: valid sandbox id and API secret fingerprint are required")
 	}
@@ -553,6 +602,7 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		cmd.SID,
 		migrationtoken.Expectations{AuthSandboxID: authSandboxID, Profile: profile},
 		&types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		requestedDeadline,
 	)
 	if err != nil {
 		if !errors.Is(err, api.ErrAlreadyExists) {
@@ -569,6 +619,66 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 		return nil, err
 	}
 	return sb, nil
+}
+
+func clusterConnectDeadline(timeoutSeconds int) int64 {
+	if timeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
+}
+
+// applyClusterConnectDeadline persists an explicitly positive absolute deadline
+// for an existing or concurrently inserted target. A freshly imported target
+// receives the same value in its insert and does not pass through this update.
+func (o *Orchestrator) applyClusterConnectDeadline(ctx context.Context, sb *types.Sandbox, deadline int64) error {
+	if sb == nil {
+		return fmt.Errorf("cluster connect: sandbox row is required")
+	}
+	if deadline <= 0 || sb.DeadlineUnix == deadline {
+		return nil
+	}
+	if err := o.st.SetDeadline(ctx, sb.ID, deadline); err != nil {
+		return fmt.Errorf("cluster connect: persist deadline: %w", err)
+	}
+	sb.DeadlineUnix = deadline
+	o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.DeadlineUnix = deadline })
+	return nil
+}
+
+func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
+	if sb == nil || !types.ValidLocalSandboxID(sb.ID) {
+		return nil, fmt.Errorf("cluster connect: valid node sandbox ID is required")
+	}
+	template, err := types.ParseTemplateID(sb.TemplateID)
+	if err != nil || template.Profile != sb.Profile {
+		return nil, fmt.Errorf("cluster connect: sandbox template and profile are inconsistent")
+	}
+	if sb.ForwardAccessToken == "" {
+		return nil, fmt.Errorf("cluster connect: forward access token is required")
+	}
+	switch sb.Profile {
+	case types.ProfileBare:
+		if sb.EnvdAccessToken != "" || sb.TrafficAccessToken != "" {
+			return nil, fmt.Errorf("cluster connect: bare sandbox contains e2b access tokens")
+		}
+	case types.ProfileE2B:
+		if sb.EnvdAccessToken == "" || sb.TrafficAccessToken == "" ||
+			!sandboxcfg.ValidE2BAccessToken(sb.EnvdAccessToken) ||
+			!sandboxcfg.ValidE2BAccessToken(sb.TrafficAccessToken) {
+			return nil, fmt.Errorf("cluster connect: e2b access tokens are required and must be valid")
+		}
+	default:
+		return nil, fmt.Errorf("cluster connect: invalid sandbox profile %q", sb.Profile)
+	}
+	return &routesync.ConnectResult{
+		NodeSandboxID:      sb.ID,
+		TemplateID:         sb.TemplateID,
+		Profile:            string(sb.Profile),
+		EnvdAccessToken:    sb.EnvdAccessToken,
+		TrafficAccessToken: sb.TrafficAccessToken,
+		ForwardAccessToken: sb.ForwardAccessToken,
+	}, nil
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {

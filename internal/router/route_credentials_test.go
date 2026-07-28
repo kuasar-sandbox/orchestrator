@@ -26,7 +26,7 @@ func routerTestFingerprint(t *testing.T, secretHex string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func routerTestReserveResult(t *testing.T, sid, endpoint string, profile types.Profile) reserveResult {
+func routerTestRouteResolve(t *testing.T, sid, group, routeKey, endpoint string, profile types.Profile) routeResolve {
 	t.Helper()
 	serviceSecret, err := keys.DeriveServiceSecret(routerTestAPISecret, sid)
 	if err != nil {
@@ -36,10 +36,15 @@ func routerTestReserveResult(t *testing.T, sid, endpoint string, profile types.P
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := reserveResult{
+	result := routeResolve{
 		NodeID:                 "n1",
-		SID:                    sid,
+		SandboxID:              sid,
+		NodeSandboxID:          sid + "-g0",
+		RouteRevision:          1,
+		Group:                  group,
+		RouteKey:               routeKey,
 		Profile:                string(profile),
+		TemplateID:             string(profile) + "-img-template",
 		AuthSandboxID:          sid,
 		APISecret:              routerTestAPISecret,
 		APISecretFingerprint:   routerTestFingerprint(t, routerTestAPISecret),
@@ -47,6 +52,7 @@ func routerTestReserveResult(t *testing.T, sid, endpoint string, profile types.P
 		ServiceSecret:          serviceSecret,
 		ForwardAccessToken:     forwardAccessToken,
 		DataEndpoint:           endpoint,
+		State:                  "ready",
 	}
 	if profile == types.ProfileE2B {
 		result.EnvdAccessToken = routerTestEnvdAccessToken
@@ -55,26 +61,24 @@ func routerTestReserveResult(t *testing.T, sid, endpoint string, profile types.P
 	return result
 }
 
-func routerTestRouteResolve(t *testing.T, sid, group, routeKey, endpoint string, profile types.Profile) routeResolve {
+func routerTestReserveResult(t *testing.T, sid, group, routeKey, endpoint string, profile types.Profile) reserveResult {
 	t.Helper()
-	reserved := routerTestReserveResult(t, sid, endpoint, profile)
-	return routeResolve{
-		SID:                    reserved.SID,
-		Group:                  group,
-		RouteKey:               routeKey,
-		NodeID:                 reserved.NodeID,
-		DataEndpoint:           reserved.DataEndpoint,
-		Profile:                reserved.Profile,
-		AuthSandboxID:          reserved.AuthSandboxID,
-		APISecret:              reserved.APISecret,
-		APISecretFingerprint:   reserved.APISecretFingerprint,
-		ManifestKeyFingerprint: reserved.ManifestKeyFingerprint,
-		ServiceSecret:          reserved.ServiceSecret,
-		EnvdAccessToken:        reserved.EnvdAccessToken,
-		TrafficAccessToken:     reserved.TrafficAccessToken,
-		ForwardAccessToken:     reserved.ForwardAccessToken,
-		State:                  "ready",
+	return reserveResult{Route: routerTestRouteResolve(t, sid, group, routeKey, endpoint, profile)}
+}
+
+func routerTestConnectReserveResult(t *testing.T, sid, group, routeKey, endpoint string, profile types.Profile) reserveResult {
+	t.Helper()
+	result := routerTestReserveResult(t, sid, group, routeKey, endpoint, profile)
+	route := &result.Route
+	result.Connect = &connectResult{
+		NodeSandboxID:      route.NodeSandboxID,
+		TemplateID:         route.TemplateID,
+		Profile:            route.Profile,
+		EnvdAccessToken:    route.EnvdAccessToken,
+		TrafficAccessToken: route.TrafficAccessToken,
+		ForwardAccessToken: route.ForwardAccessToken,
 	}
+	return result
 }
 
 func TestEffectiveDataPort(t *testing.T) {

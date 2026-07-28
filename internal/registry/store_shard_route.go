@@ -320,5 +320,11 @@ func validateSandboxRecord(r *SandboxRecord) error {
 	if !types.Profile(r.Profile).Valid() {
 		return errors.New("registry: sandbox route profile is invalid")
 	}
+	if !validNodeSandboxIdentity(r.SandboxID, r.NodeSandboxID, r.SandboxGeneration) {
+		return errors.New("registry: sandbox route identity is invalid")
+	}
+	if r.NextSandboxGeneration <= r.SandboxGeneration {
+		return errors.New("registry: sandbox route next generation is invalid")
+	}
 	return nil
 }
