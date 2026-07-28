@@ -318,7 +318,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func routeLinkStatus(err error) int {
-	var rejected *nodeConnectRejection
+	var rejected *nodeCommandRejection
 	if errors.As(err, &rejected) {
 		return rejected.status
 	}

@@ -244,7 +244,7 @@ func (r *Registry) connectCurrent(ctx context.Context, req SandboxReserveRequest
 	}
 	if ack == nil || ack.Status != routesync.AckAccepted {
 		r.rollbackConnect(&current, currentRev, &before, false)
-		return nil, false, connectRejection(ack)
+		return nil, false, commandRejection("connect", ack)
 	}
 	if err := validateConnectResult(ack.Connect, &current); err != nil {
 		r.rollbackConnect(&current, currentRev, &before, true)
@@ -374,11 +374,7 @@ func (r *Registry) execSessionCurrent(ctx context.Context, req SandboxReserveReq
 		if transitioned {
 			r.rollbackConnect(&current, currentRev, &before, false)
 		}
-		reason := ""
-		if ack != nil {
-			reason = ack.Reason
-		}
-		return nil, false, fmt.Errorf("registry: exec session rejected: %s", reason)
+		return nil, false, commandRejection("exec session", ack)
 	}
 	if err := validateExecSessionResult(ack.ExecSession); err != nil {
 		if transitioned {
@@ -540,8 +536,8 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			r.rollbackConnect(&target, targetRev, current, false)
-			lastFailure = connectRejection(ack)
-			if terminalConnectRejection(lastFailure) {
+			lastFailure = commandRejection("connect", ack)
+			if terminalCommandRejection(lastFailure) {
 				return nil, lastFailure
 			}
 			excluded.add(target.NodeID)
@@ -559,14 +555,14 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 	}
 }
 
-type nodeConnectRejection struct {
+type nodeCommandRejection struct {
 	status int
 	reason string
 }
 
-func (e *nodeConnectRejection) Error() string { return e.reason }
+func (e *nodeCommandRejection) Error() string { return e.reason }
 
-func connectRejection(ack *routesync.CmdAck) error {
+func commandRejection(operation string, ack *routesync.CmdAck) error {
 	reason := ""
 	status := 0
 	if ack != nil {
@@ -578,14 +574,14 @@ func connectRejection(ack *routesync.CmdAck) error {
 		if reason == "" {
 			reason = http.StatusText(status)
 		}
-		return &nodeConnectRejection{status: status, reason: reason}
+		return &nodeCommandRejection{status: status, reason: reason}
 	default:
-		return fmt.Errorf("registry: connect rejected: %s", reason)
+		return fmt.Errorf("registry: %s rejected: %s", operation, reason)
 	}
 }
 
-func terminalConnectRejection(err error) bool {
-	var rejected *nodeConnectRejection
+func terminalCommandRejection(err error) bool {
+	var rejected *nodeCommandRejection
 	if !errors.As(err, &rejected) {
 		return false
 	}
@@ -694,11 +690,10 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			r.rollbackConnect(&target, targetRev, current, false)
-			reason := ""
-			if ack != nil {
-				reason = ack.Reason
+			lastFailure = commandRejection("exec session", ack)
+			if terminalCommandRejection(lastFailure) {
+				return nil, lastFailure
 			}
-			lastFailure = fmt.Errorf("registry: exec session rejected: %s", reason)
 			excluded.add(target.NodeID)
 			continue
 		}

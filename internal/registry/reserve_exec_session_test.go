@@ -423,7 +423,10 @@ func TestReserveExecSessionReplacementRetriesRejectedCandidate(t *testing.T) {
 		mu.Lock()
 		commands["n1"] = &clone
 		mu.Unlock()
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "candidate refused"})
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected,
+			Reason: "target environment incompatible", HTTPStatus: http.StatusConflict,
+		})
 	}})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
 		clone := *cmd
@@ -479,6 +482,57 @@ func TestReserveExecSessionReplacementRetriesRejectedCandidate(t *testing.T) {
 	if err != nil || !found || stored.SandboxGeneration != 2 || stored.NextSandboxGeneration != 3 ||
 		stored.NodeSandboxID != n2.SID || stored.State != StateReserved {
 		t.Fatalf("replacement record = %+v, found=%v err=%v", stored, found, err)
+	}
+}
+
+func TestReserveExecSessionReplacementStopsOnRequestWideNodeRejection(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	original := testE2BSandboxRecord("/g", "rk", "stable", "gone", StatePaused)
+	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"n1", "n2"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, DataEndpoint: nodeID + ":9443"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected,
+			Reason: "invalid migration token", HTTPStatus: http.StatusBadRequest,
+		})
+	}})
+	secondCommands := 0
+	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(*routesync.Command) {
+		secondCommands++
+	}})
+	placements := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		nodeID := "n1"
+		if placements > 1 {
+			nodeID = "n2"
+		}
+		return &Placement{NodeID: nodeID, APISecretFingerprint: original.APISecretFingerprint}, nil
+	}))
+
+	req := testExecSessionReserve(original)
+	req.MigrationToken = "kmt1.invalid-for-all-candidates"
+	result, err := reg.ReserveSandbox(ctx, req)
+	var rejected *nodeCommandRejection
+	if result != nil || !errors.As(err, &rejected) || rejected.status != http.StatusBadRequest ||
+		rejected.reason != "invalid migration token" {
+		t.Fatalf("result=%+v err=%v rejection=%+v", result, err, rejected)
+	}
+	if placements != 1 || secondCommands != 0 {
+		t.Fatalf("terminal rejection placements=%d secondCommands=%d, want 1/0", placements, secondCommands)
+	}
+	stored, _, found, err := reg.stores.GetSandbox(ctx, original.Group, original.RouteKey)
+	if err != nil || !found || stored.NodeID != original.NodeID ||
+		stored.NodeSandboxID != original.NodeSandboxID || stored.SandboxGeneration != original.SandboxGeneration ||
+		stored.NextSandboxGeneration != 2 || stored.State != original.State {
+		t.Fatalf("terminal rejection rollback=%+v found=%v err=%v", stored, found, err)
 	}
 }
 

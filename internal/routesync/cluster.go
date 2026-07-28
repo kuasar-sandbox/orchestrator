@@ -162,8 +162,9 @@ type Heartbeat struct {
 
 // Command is a lifecycle / key primitive the registry sends the node (cluster.md
 // §5.1). The node replies with a CmdAck(cmd_id) immediately (accepted/rejected)
-// and reports the terminal sandbox state via the route stream; commands are
-// idempotent by SID. Fields are populated per Kind.
+// and reports the terminal sandbox state via the route stream. CmdID correlates
+// only the current delivery with its Ack; retry semantics are operation-specific.
+// Fields are populated per Kind.
 type Command struct {
 	CmdID string `json:"cmd_id"`
 	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
