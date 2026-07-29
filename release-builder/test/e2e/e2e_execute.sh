@@ -39,6 +39,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
+MMDS_ROUTES_CONFIG=""
+if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
+fi
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
@@ -174,6 +179,9 @@ req() {
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "${REQ_CHECKPOINT_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Checkpoint: ${REQ_CHECKPOINT_HEADER}")
+    if [ "$method" = "POST" ] && [ "$path" = "/sandboxes" ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
+        args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -525,7 +533,10 @@ write_orchestrator_config() { # $1=unset|node-policy
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS }
-mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
+mmds:
+  enabled: true
+  listen: "$PROXY_NS_IP:$MMDS_PORT"
+$MMDS_ROUTES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -716,6 +727,13 @@ if err is not None:
 sys.stdout.write("OUTPUT_BEGIN\n"); sys.stdout.flush()
 sys.stdout.buffer.write(out); sys.stdout.write("\nOUTPUT_END\n")
 PY
+if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    # Scenario: static route.
+    source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS declaration/static route guest GET"
+    echo "==> PASS: real guest GET reached internal MMDS declared static route"
+fi
 MARK="HELLO_FROM_GUEST_$RANDOM"
 echo "==> exec in guest: sh -c 'hostname; id; echo $MARK; uname -sm'"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "hostname; id; echo $MARK; uname -sm" > "$WORK/exec.out" 2>&1 || true
