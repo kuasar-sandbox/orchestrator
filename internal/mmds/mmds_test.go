@@ -1,6 +1,7 @@
 package mmds
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,8 +10,10 @@ import (
 )
 
 type fakeSource struct {
-	fip  map[string]string    // floatingip -> sid
-	info map[string][2]string // sid -> {tid, token}
+	fip      map[string]string               // floatingip -> sid
+	info     map[string][2]string            // sid -> {tid, token}
+	routes   map[string]map[string]MMDSRoute // sid -> path -> route
+	routeErr error                           // if set, MMDSRoute always fails with this error
 }
 
 func (f fakeSource) ByFloatingIP(ip string) (string, bool) { sid, ok := f.fip[ip]; return sid, ok }
@@ -27,6 +30,18 @@ func (f fakeSource) MmdsSecret(sid string) ([]byte, bool) {
 		return nil, false
 	}
 	return []byte("secret-for-" + sid), true
+}
+
+func (f fakeSource) MMDSRoute(sid, path string) (MMDSRoute, bool, error) {
+	if f.routeErr != nil {
+		return MMDSRoute{}, false, f.routeErr
+	}
+	byPath, ok := f.routes[sid]
+	if !ok {
+		return MMDSRoute{}, false, nil
+	}
+	route, ok := byPath[path]
+	return route, ok, nil
 }
 
 func TestPutGetFlow(t *testing.T) {
@@ -79,6 +94,285 @@ func TestPutGetFlow(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("PUT unknown ip: code=%d (want 503)", w.Code)
+	}
+}
+
+// mintedToken returns a valid session token for sid via the real PUT flow.
+func mintedToken(t *testing.T, h http.Handler, floatingIP, sid string) string {
+	t.Helper()
+	req := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+	req.RemoteAddr = floatingIP + ":1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("PUT: code=%d body=%q", w.Code, w.Body.String())
+	}
+	return w.Body.String()
+}
+
+func TestGetMetaServesSpecifiedStaticRoute(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {
+				"/static-path": {Type: "static", ContentType: "application/json", Data: `{"key":"value"}`},
+			},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/static-path", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("GET specified static route: code=%d body=%q", w.Code, w.Body.String())
+	}
+	if got, want := w.Body.String(), `{"key":"value"}`; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if got, want := w.Header().Get("Content-Type"), "application/json"; got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+}
+
+func TestGetMetaReturns503ForSpecifiedSecretOrServiceRoute(t *testing.T) {
+	for _, routeType := range []string{"secret", "service"} {
+		t.Run(routeType, func(t *testing.T) {
+			src := fakeSource{
+				fip:  map[string]string{"100.100.96.5": "sbx-1"},
+				info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+				routes: map[string]map[string]MMDSRoute{
+					"sbx-1": {"/backend-path": {Type: routeType}},
+				},
+			}
+			h := New(src, 50*time.Millisecond, nil).Handler()
+			token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+			req := httptest.NewRequest("GET", "http://169.254.169.254/backend-path", nil)
+			req.Header.Set("X-metadata-token", token)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET specified %s route: code=%d (want 503)", routeType, w.Code)
+			}
+		})
+	}
+}
+
+func TestGetMetaReturns503OnRouteResolutionError(t *testing.T) {
+	src := fakeSource{
+		fip:      map[string]string{"100.100.96.5": "sbx-1"},
+		info:     map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routeErr: errors.New("rpc timeout"),
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/some-path", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET with a resolution error: code=%d (want 503, must NOT silently fall through)", w.Code)
+	}
+}
+
+func TestGetMetaRootStillServesFixedInstanceInfo(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("GET /: code=%d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"instanceID":"sbx-1"`) {
+		t.Fatalf("unexpected root body: %s", w.Body.String())
+	}
+}
+
+func TestGetMetaUnspecifiedPathReturns404(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/some/unspecified/path", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	// An unspecified path must NOT silently alias the root instance-info
+	// response (that was the pre-Phase-1 ServeMux subtree-match behavior,
+	// which the design's guest HTTP contract explicitly rejects: unknown
+	// route -> 404).
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GET unspecified path: code=%d, want 404", w.Code)
+	}
+	if strings.Contains(w.Body.String(), `"instanceID"`) {
+		t.Fatalf("unspecified path leaked the root instance-info body: %s", w.Body.String())
+	}
+}
+
+func TestResponsesCarrySecureHeaders(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/x": {Type: "static", ContentType: "text/plain", Data: "hi"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	cases := []struct {
+		name string
+		req  func() *http.Request
+	}{
+		{"root 200", func() *http.Request {
+			r := httptest.NewRequest("GET", "http://169.254.169.254/", nil)
+			r.Header.Set("X-metadata-token", token)
+			return r
+		}},
+		{"specified static 200", func() *http.Request {
+			r := httptest.NewRequest("GET", "http://169.254.169.254/x", nil)
+			r.Header.Set("X-metadata-token", token)
+			return r
+		}},
+		{"unspecified 404", func() *http.Request {
+			r := httptest.NewRequest("GET", "http://169.254.169.254/nope", nil)
+			r.Header.Set("X-metadata-token", token)
+			return r
+		}},
+		{"invalid token 401", func() *http.Request {
+			r := httptest.NewRequest("GET", "http://169.254.169.254/", nil)
+			r.Header.Set("X-metadata-token", "sbx-evil.deadbeef")
+			return r
+		}},
+		{"unknown floating ip 503 (PUT)", func() *http.Request {
+			r := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+			r.RemoteAddr = "9.9.9.9:1"
+			return r
+		}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, tt.req())
+			if got := w.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q (code=%d)", got, "no-store", w.Code)
+			}
+			if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want %q (code=%d)", got, "nosniff", w.Code)
+			}
+		})
+	}
+}
+
+func TestGuardRawRequestRejectsNonCanonicalPathsBeforeServeMuxRedirects(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/a/b": {Type: "static", ContentType: "text/plain", Data: "specified"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	for _, tt := range []struct {
+		name string
+		raw  string // raw request-target, sent verbatim so it isn't pre-cleaned by httptest/net/url
+	}{
+		{"double slash", "/a//b"},
+		{"dot-dot segment", "/a/../b"},
+		{"dot segment", "/a/./b"},
+		{"trailing slash", "/a/b/"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://169.254.169.254"+tt.raw, nil)
+			req.Header.Set("X-metadata-token", token)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			// http.ServeMux would otherwise clean this path and issue a 301/308 to
+			// it BEFORE any handler (including our 404 logic) ever runs -- the
+			// design forbids any auto-redirect/rewrite of a non-canonical path.
+			if w.Code == http.StatusMovedPermanently || w.Code == http.StatusPermanentRedirect {
+				t.Fatalf("guard did not intercept before ServeMux's own redirect: code=%d location=%q", w.Code, w.Header().Get("Location"))
+			}
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d, want 400", w.Code)
+			}
+		})
+	}
+}
+
+func TestGuardRawRequestRejectsPercentEscapedPathEvenWhenSpecified(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/a/b": {Type: "static", ContentType: "text/plain", Data: "specified"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	// "/a%2Fb" decodes to the specified "/a/b" -- it must NOT match via the
+	// decoded r.URL.Path; the raw percent-escape is rejected outright.
+	req := httptest.NewRequest("GET", "http://169.254.169.254/a%2Fb", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("percent-escaped path: code=%d body=%q, want 400", w.Code, w.Body.String())
+	}
+}
+
+func TestGuardRawRequestRejectsQueryOnSpecifiedRoute(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/x": {Type: "static", ContentType: "text/plain", Data: "specified"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/x?q=1", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("path with query: code=%d body=%q, want 400", w.Code, w.Body.String())
+	}
+}
+
+func TestGuardRawRequestAllowsCanonicalPaths(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/", nil)
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("canonical root path rejected: code=%d", w.Code)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const (
@@ -58,6 +59,7 @@ type fakeNode struct {
 	routes               map[string]routesync.RouteEntry
 	keyPairs             map[string]routesync.Command
 	createAPIFingerprint string
+	createConfig         map[string]string
 	events               chan routesync.Event
 }
 
@@ -99,6 +101,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		var installed bool
 		keyPair, installed = n.keyPairs[cmd.APISecretFingerprint]
 		n.createAPIFingerprint = cmd.APISecretFingerprint
+		n.createConfig = cmd.Config
 		n.mu.Unlock()
 		if !installed {
 			ack.Status = routesync.AckRejected
@@ -157,6 +160,12 @@ func (n *fakeNode) createFingerprint() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.createAPIFingerprint
+}
+
+func (n *fakeNode) createConfigSnapshot() map[string]string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.createConfig
 }
 
 func TestNodeLinkReserveRoundTrip(t *testing.T) {
@@ -273,6 +282,117 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	}
 	if err := keys.VerifyForwardAccessToken(route.ForwardAccessToken, route.ServiceSecret, route.AuthSandboxID); err != nil {
 		t.Fatalf("reserve ForwardAccessToken: %v", err)
+	}
+}
+
+// TestNodeLinkReserveRoundTripPreservesMMDSConfig closes the gap between the
+// registry-level ("does Reserve accept an mmds config key") and
+// precheckCluster-level ("does precheckCluster correctly process a
+// hand-built Command.Config") tests: it drives the SAME real wire as
+// TestNodeLinkReserveRoundTrip (registry.ReserveSandbox -> node-link h2c
+// stream -> nodelink.Client -> HandleCommand) with a Config map carrying
+// kuasar-sandbox.mmds, and asserts the node process receives it byte-for-byte
+// after a real JSON-over-the-wire round trip. It does not include the
+// internal/router HTTP layer (covered separately by
+// TestCreateSandboxMetadataMMDS*) or a real *orch.Orchestrator in place of
+// fakeNode (no test in this repo stands one up; see mmds_routes_test.go's
+// TestPrecheckClusterAppliesMMDSPolicyAndCanonicalizes for that hop).
+func TestNodeLinkReserveRoundTripPreservesMMDSConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+	rawAPISecret, err := hex.DecodeString(testAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey, err := apikey.Mint(rawAPISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
+	mux.HandleFunc(registry.PlacerLinkVerifyKeyPath, func(w http.ResponseWriter, req *http.Request) {
+		parsed, parseErr := apikey.Parse(req.Header.Get("X-API-KEY"))
+		if parseErr != nil || !apikey.Verify(parsed, rawAPISecret) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+	reg.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
+		return []registry.PlacerPeer{{ID: "test-placer", Advertise: srv.URL}}
+	})
+	addr := srv.Listener.Addr().String()
+
+	node := newFakeNode()
+	client := New(
+		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
+		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
+		node, 50*time.Millisecond, nil, log,
+	)
+	go client.Run(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, found, _ := reg.Stores().GetNode(ctx, "n1"); found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("node never registered over node-link")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	apiFingerprint := testFingerprint(testAPISecret)
+	manifestFingerprint := testFingerprint(testManifestKey)
+	if err := reg.Stores().UpsertNodeKeyPair(ctx, "n1", clusterstate.NodeKeyPair{
+		APISecretFingerprint:   apiFingerprint,
+		APISecretType:          clusterstate.SecretInline,
+		APISecret:              testAPISecret,
+		ManifestKeyFingerprint: manifestFingerprint,
+		ManifestKeyType:        clusterstate.SecretInline,
+		ManifestKey:            testManifestKey,
+		ExpiresUnix:            time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keyDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := node.installedKeyPair(apiFingerprint); ok {
+			break
+		}
+		if time.Now().After(keyDeadline) {
+			t.Fatal("credential pair was not distributed over node-link")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	const mmdsSpec = `{"version":1,"routes":[{"path":"/x","type":"static","content_type":"text/plain","data":"hi"}]}`
+	reserveDeadline := time.Now().Add(3 * time.Second)
+	for {
+		_, err = reg.ReserveSandbox(ctx, registry.SandboxReserveRequest{
+			Operation: registry.ReserveCreate,
+			Group:     "/cell/proj/app/g1",
+			RouteKey:  "u1:sess1",
+			APIKey:    apiKey,
+					Config:    map[string]string{sandboxcfg.NsMMDS: mmdsSpec},
+		})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(reserveDeadline) {
+			t.Fatalf("reserve over node-link: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got := node.createConfigSnapshot()
+			if got[sandboxcfg.NsMMDS] != mmdsSpec {
+		t.Fatalf("mmds specification did not survive the registry -> node-link wire round trip: got %+v", got)
 	}
 }
 

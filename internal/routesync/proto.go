@@ -105,6 +105,15 @@ type RouteEntry struct {
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
+	// MMDSRoutes is the canonical kuasar-sandbox.mmds specification JSON (see
+	// internal/sandboxcfg.ExtractMMDS), empty for the common case of a sandbox
+	// with no specified routes. Only static route bodies ride here today, which
+	// are not secret data; a secret-route backend will need a separate,
+	// access-gated channel rather than riding on this field. A proxy master
+	// consuming this holds it in ordinary process memory, NOT the fixed-layout
+	// proxyshm mmap table, since this field is bounded but variable-length (see
+	// internal/mmdsrpc).
+	MMDSRoutes string `json:"mmds_routes,omitempty"`
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake

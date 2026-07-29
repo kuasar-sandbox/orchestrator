@@ -7,6 +7,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -47,6 +48,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		ForwardAccessToken:     sb.ForwardAccessToken,
 		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+		MMDSRoutes:             sb.Metadata[sandboxcfg.NsMMDS],
 	}
 	return e
 }

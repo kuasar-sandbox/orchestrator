@@ -43,6 +43,7 @@ const (
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
+	HeaderMMDS        = "X-Kuasar-Sandbox-MMDS"
 	HeaderAPIKey      = "X-API-KEY"
 	HeaderAccessTok   = "X-Access-Token"
 	HeaderMigration   = "X-Kuasar-Migration-Token"
@@ -367,17 +368,19 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// createSandboxMetadata selects request-scoped restore and credential objects
-// from the cluster create request. Each dedicated header replaces the matching
-// metadata object. The body is skipped only when both objects are supplied by
-// headers; otherwise it is read within the cluster create limit.
+// createSandboxMetadata selects request-scoped restore, credential, and mmds
+// specification objects from the cluster create request. Each dedicated header
+// replaces the matching metadata object. The body is skipped only when all
+// three objects are supplied by headers; otherwise it is read within the
+// cluster create limit.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
+	mmdsRaw, mmdsHeader := createHeaderValue(r.Header, HeaderMMDS)
 	var body struct {
 		Metadata map[string]string `json:"metadata"`
 	}
-	if (!restoreHeader || !credentialsHeader) && r.Body != nil {
+	if (!restoreHeader || !credentialsHeader || !mmdsHeader) && r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
 			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
 		}
@@ -400,11 +403,17 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	if raw, ok := body.Metadata[sandboxcfg.NsCredentials]; ok {
 		selected[sandboxcfg.NsCredentials] = raw
 	}
+	if raw, ok := body.Metadata[sandboxcfg.NsMMDS]; ok {
+		selected[sandboxcfg.NsMMDS] = raw
+	}
 	if restoreHeader {
 		selected[sandboxcfg.NsRestore] = restoreRaw
 	}
 	if credentialsHeader {
 		selected[sandboxcfg.NsCredentials] = credentialsRaw
+	}
+	if mmdsHeader {
+		selected[sandboxcfg.NsMMDS] = mmdsRaw
 	}
 	if len(selected) == 0 {
 		return nil, nil

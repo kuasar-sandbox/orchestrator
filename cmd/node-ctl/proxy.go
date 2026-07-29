@@ -20,10 +20,12 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const (
@@ -35,6 +37,7 @@ const (
 	envProxyWakeFD    = "KUASAR_PROXY_WAKE_FD"
 	envProxyNotifyFD  = "KUASAR_PROXY_NOTIFY_FD"
 	envProxyMetricsFD = "KUASAR_PROXY_METRICS_FD"
+	envProxyMmdsRPCFD = "KUASAR_PROXY_MMDSRPC_FD"
 	envProxyWorkerID  = "KUASAR_PROXY_WORKER_ID"
 )
 
@@ -157,7 +160,12 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if wakes != nil {
 		wakeFn = wakes.Wake
 	}
-	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur())
+	var mmdsClient *mmdsrpc.Client
+	if fd := fdEnv(envProxyMmdsRPCFD); fd >= 0 {
+		mmdsClient = mmdsrpc.NewClient(os.NewFile(uintptr(fd), "proxy-mmdsrpc"))
+		defer mmdsClient.Close()
+	}
+	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur(), mmdsClient, cfg.ProxyRPCTimeoutDur())
 	authMode := func() string {
 		if m := view.Policy().AuthMode; m != "" {
 			return m
@@ -266,9 +274,15 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW))
 		return err
 	}
+	mmdsRPCMaster, mmdsRPCWorker, err := newSocketpair()
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW, metricsR, metricsW))
+		return err
+	}
 	removeNotify := view.RegisterNotifyWriter(notifyW)
 	go proxyshm.ReadWakeLoop(ctx, wakeR, view.Wake)
 	go readMetricsLoop(ctx, metricsR, mx)
+	go mmdsrpc.NewServer(mmdsRPCMaster, mmdsRPCHandler(view), log).Serve()
 
 	addFile(envProxyDataFD, dataFile)
 	addFile(envProxyForwardFD, forwardFile)
@@ -276,6 +290,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	addFile(envProxyWakeFD, wakeW)
 	addFile(envProxyNotifyFD, notifyR)
 	addFile(envProxyMetricsFD, metricsW)
+	addFile(envProxyMmdsRPCFD, mmdsRPCWorker)
 	env = append(env, envProxyWorkerID+"="+workerID)
 
 	cmd := exec.CommandContext(ctx, exe, "proxy", "serve", "--config", cfgPath, "--worker")
@@ -285,16 +300,46 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	cmd.Stderr = os.Stderr
 	if err := startCommandInNetNS(proxyNS, cmd); err != nil {
 		removeNotify()
+		_ = mmdsRPCMaster.Close()
 		closeFiles(files)
 		return err
 	}
 	closeFiles(files)
 	defer removeNotify()
+	defer mmdsRPCMaster.Close()
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return nil
 	}
 	return err
+}
+
+// newSocketpair returns a connected AF_UNIX SOCK_STREAM pair for the
+// mmdsrpc master<->worker channel: unlike the existing wake/notify/metrics
+// pipes (each one-directional), request/response needs a bidirectional
+// connection.
+func newSocketpair() (masterEnd, workerEnd *os.File, err error) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(fds[0]), "mmdsrpc-master"), os.NewFile(uintptr(fds[1]), "mmdsrpc-worker"), nil
+}
+
+// mmdsRPCHandler answers a worker's EndpointRequest from the proxy master's
+// in-heap MMDSRoutes store (see proxyshm.MMDSRoutes's doc comment).
+func mmdsRPCHandler(view *proxyshm.MasterView) mmdsrpc.Handler {
+	return func(sid, path string) (mmdsrpc.Route, bool) {
+		canonical, ok := view.MMDSRoutes().Get(sid)
+		if !ok {
+			return mmdsrpc.Route{}, false
+		}
+		route, ok := sandboxcfg.LookupMMDSRoute(map[string]string{sandboxcfg.NsMMDS: canonical}, path)
+		if !ok {
+			return mmdsrpc.Route{}, false
+		}
+		return mmdsrpc.Route{Type: route.Type, ContentType: route.ContentType, Body: route.Data}, true
+	}
 }
 
 func listenUnix(path string) (net.Listener, error) {

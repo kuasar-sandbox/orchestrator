@@ -41,4 +41,5 @@ auth: enforce
 park_timeout: 30s
 
 # mmds_listen: 127.0.0.1:19254   # FC MMDS addr workers share when serve has mmds.enabled
+# proxy_rpc_timeout: 2s          # worker<->master RPC bound (e.g. MMDS lookups); distinct from park_timeout
 # metrics_listen: 127.0.0.1:9095 # master metrics endpoint (aggregates worker counters)

@@ -189,7 +189,7 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	defer tbl.Close()
 	master := NewMasterView(tbl, time.Second, nil)
 	updates := &Updates{ch: make(chan struct{})}
-	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond)
+	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond, nil, 0)
 	master.BeginSync()
 	master.Bookmark()
 
@@ -244,7 +244,7 @@ func TestWorkerRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 		}
 	}
 	tbl.Bookmark()
-	view := NewWorkerView(tbl, nil, nil, time.Second)
+	view := NewWorkerView(tbl, nil, nil, time.Second, nil, 0)
 
 	tests := []struct {
 		sid       string
@@ -289,7 +289,7 @@ func TestWorkerKnownUnsupportedServiceDoesNotWakePausedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
-	worker := NewWorkerView(tbl, nil, master.Wake, 50*time.Millisecond)
+	worker := NewWorkerView(tbl, nil, master.Wake, 50*time.Millisecond, nil, 0)
 
 	route, err := worker.Route(context.Background(), "s1", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
 	if err != nil || route.Kind != proxy.KindDeny {
@@ -318,7 +318,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
-	view := NewWorkerView(tbl, nil, nil, time.Second)
+	view := NewWorkerView(tbl, nil, nil, time.Second, nil, 0)
 	if sid, ok := view.ByFloatingIP("100.100.0.3"); !ok || sid != "s1" {
 		t.Fatalf("ByFloatingIP = %q ok=%v", sid, ok)
 	}

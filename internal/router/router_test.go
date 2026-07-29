@@ -86,6 +86,34 @@ func TestCreateSandboxMetadataCredentialsHeaderWinsAsWholeObject(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxMetadataMMDSHeaderWinsAsWholeObject(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[{\"path\":\"/from-body\",\"type\":\"static\",\"data\":\"b\"}]}"}}`,
+	))
+	req.Header.Set(HeaderMMDS, `{"version":1,"routes":[{"path":"/from-header","type":"static","data":"h"}]}`)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[sandboxcfg.NsMMDS] != `{"version":1,"routes":[{"path":"/from-header","type":"static","data":"h"}]}` {
+		t.Fatalf("mmds header did not win as a whole object: %+v", got)
+	}
+}
+
+func TestCreateSandboxMetadataMMDSFromBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[{\"path\":\"/x\",\"type\":\"static\",\"data\":\"d\"}]}"}}`,
+	))
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[sandboxcfg.NsMMDS] == "" {
+		t.Fatalf("mmds specification from body was dropped: %+v", got)
+	}
+}
+
 func TestCreateSandboxMetadataRejectsInvalidCredentials(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
 	req.Header.Set(HeaderCredentials, `{"forward_access_token":"forbidden"}`)
@@ -133,16 +161,36 @@ func TestCreateSandboxMetadataHeadersBypassBody(t *testing.T) {
 	req.ContentLength = maxClusterCreateBodyBytes + 1
 	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
 	req.Header.Set(HeaderCredentials, `{}`)
+	req.Header.Set(HeaderMMDS, `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}`)
 
 	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if body.read {
-		t.Fatal("restore header path read the create body")
+		t.Fatal("all-headers path read the create body")
 	}
-	if len(got) != 2 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` || got[sandboxcfg.NsCredentials] != `{}` {
-		t.Fatalf("restore metadata=%v", got)
+	if len(got) != 3 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` || got[sandboxcfg.NsCredentials] != `{}` ||
+		got[sandboxcfg.NsMMDS] != `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}` {
+		t.Fatalf("create metadata=%v", got)
+	}
+}
+
+func TestCreateSandboxMetadataReadsBodyWhenMMDSHeaderMissing(t *testing.T) {
+	// Restore + credentials headers alone must NOT bypass the body -- the
+	// mmds specification, if any, can only come from there.
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[{\"path\":\"/x\",\"type\":\"static\",\"data\":\"d\"}]}"}}`,
+	))
+	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
+	req.Header.Set(HeaderCredentials, `{}`)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[sandboxcfg.NsMMDS] == "" {
+		t.Fatalf("mmds specification from body was dropped when only restore/credentials headers were set: %+v", got)
 	}
 }
 

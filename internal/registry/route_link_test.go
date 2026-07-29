@@ -119,6 +119,34 @@ func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestServeReserveAcceptsMMDSConfig(t *testing.T) {
+	placements := 0
+	reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		placements++
+		if _, found := req.Config[sandboxcfg.NsMMDS]; !found {
+			t.Fatalf("mmds specification did not reach placement config: %+v", req.Config)
+		}
+		return nil, ErrNoNode
+	}), 0, nil)
+	enableTestCreateAuth(t, reg)
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	body := []byte(`{"config":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[{\"path\":\"/x\",\"type\":\"static\",\"data\":\"d\"}]}"}}`)
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	// A pre-Phase-1 allowlist rejected any config key other than restore/
+	// credentials with 400 before reservation ever ran -- confirm the mmds
+	// specification now reaches placement (503 from ErrNoNode) instead.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%q, want 503 after accepted config reached placement", rec.Code, rec.Body.String())
+	}
+	if placements != 1 {
+		t.Fatalf("accepted mmds config reached placement %d times, want 1", placements)
+	}
+}
+
 func TestServeReserveAcceptsCredentialsWithoutSendingThemToPlacer(t *testing.T) {
 	placements := 0
 	reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {

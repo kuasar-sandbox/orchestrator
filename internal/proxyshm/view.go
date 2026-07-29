@@ -14,15 +14,32 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+// defaultMMDSRPCTimeout is WorkerView's fallback when the caller passes
+// mmdsRPCTimeout <= 0 — config.DefaultProxyRPCTimeout is the single source of
+// truth for this value (also seeds ProxyFileConfig.ProxyRPCTimeout's default
+// and ProxyRPCTimeoutDur's parse-failure fallback), so this package doesn't
+// carry its own independent "2 * time.Second" literal. Deliberately a
+// different knob from proxy.mode=internal's park_timeout: that one bounds a
+// guest request waiting on distributed route-sync convergence (tens of
+// seconds is normal), while this bounds a worker's own local socketpair round
+// trip to the proxy master, which should be near-instant; reusing
+// park_timeout's longer default would let a stuck master turn every MMDS
+// lookup into a multi-second guest-visible stall instead of failing fast.
+const defaultMMDSRPCTimeout = config.DefaultProxyRPCTimeout
 
 var errExecActivationTimeout = errors.New("proxyshm: exec activation timed out")
 
 // MasterView is the proxy master's routesync sink and wake source.
 type MasterView struct {
 	table     *Table
+	mmds      *MMDSRoutes
 	wakes     *WakeQueue
 	notify    *Broadcaster
 	defaultPk time.Duration
@@ -35,6 +52,7 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 	}
 	return &MasterView{
 		table:     table,
+		mmds:      NewMMDSRoutes(),
 		wakes:     NewWakeQueue(4096),
 		notify:    NewBroadcaster(),
 		defaultPk: defaultPark,
@@ -42,8 +60,14 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 	}
 }
 
+// MMDSRoutes returns the sparse in-heap MMDS-specification store (see
+// MMDSRoutes's doc comment for why this rides outside the mmap Table) —
+// wired into an internal/mmdsrpc.Server per worker.
+func (v *MasterView) MMDSRoutes() *MMDSRoutes { return v.mmds }
+
 func (v *MasterView) BeginSync() {
 	v.table.BeginSync()
+	v.mmds.BeginSync()
 	v.notify.Notify()
 }
 
@@ -54,16 +78,19 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 		}
 		return
 	}
+	v.mmds.Upsert(r.SandboxID, r.MMDSRoutes)
 	v.notify.Notify()
 }
 
 func (v *MasterView) ApplyDelete(sid string) {
 	v.table.Delete(sid)
+	v.mmds.Delete(sid)
 	v.notify.Notify()
 }
 
 func (v *MasterView) Bookmark() {
 	v.table.Bookmark()
+	v.mmds.Bookmark()
 	v.notify.Notify()
 }
 
@@ -181,17 +208,46 @@ func (b *Broadcaster) Notify() {
 
 // WorkerView is a read-only proxy.Router and MMDS source backed by shared memory.
 type WorkerView struct {
-	table       *Table
-	updates     *Updates
-	wake        func(string)
-	defaultPark time.Duration
+	table          *Table
+	updates        *Updates
+	wake           func(string)
+	defaultPark    time.Duration
+	mmdsClient     *mmdsrpc.Client // nil => MMDSRoute always reports unspecified, no error
+	mmdsRPCTimeout time.Duration
 }
 
-func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration) *WorkerView {
+// NewWorkerView builds a WorkerView. mmdsClient may be nil (MMDSRoute then
+// always returns ok=false, err=nil — treated as "no MMDS routes specified").
+// mmdsRPCTimeout <= 0 falls back to defaultMMDSRPCTimeout.
+func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, mmdsClient *mmdsrpc.Client, mmdsRPCTimeout time.Duration) *WorkerView {
 	if defaultPark <= 0 {
 		defaultPark = 30 * time.Second
 	}
-	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark}
+	if mmdsRPCTimeout <= 0 {
+		mmdsRPCTimeout = defaultMMDSRPCTimeout
+	}
+	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark, mmdsClient: mmdsClient, mmdsRPCTimeout: mmdsRPCTimeout}
+}
+
+// MMDSRoute resolves sid's specified MMDS route at path by asking the proxy
+// master over internal/mmdsrpc (implements mmds.Source; external mode's
+// per-sandbox MMDS specifications live in the master's in-heap
+// MMDSRoutes store, not the shared-memory Table -- see MMDSRoutes's doc
+// comment for why).
+func (v *WorkerView) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
+	if v.mmdsClient == nil {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), v.mmdsRPCTimeout)
+	defer cancel()
+	resp, err := v.mmdsClient.Resolve(ctx, sid, path)
+	if err != nil {
+		return mmds.MMDSRoute{}, false, err
+	}
+	if !resp.Found {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	return mmds.MMDSRoute{Type: resp.Type, ContentType: resp.ContentType, Data: resp.Body}, true, nil
 }
 
 func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
