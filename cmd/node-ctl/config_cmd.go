@@ -241,5 +241,6 @@ tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
 # mmds_listen: 127.0.0.1:19254                    # FC MMDS addr workers share when serve has mmds.enabled
+# proxy_rpc_timeout: 2s                           # worker<->master RPC bound (e.g. MMDS lookups)
 # metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)
 `

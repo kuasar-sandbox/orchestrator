@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -189,6 +190,10 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	_, meta, err = sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -221,6 +226,20 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
 	}
 	return sb, nil
+}
+
+// mmdsPolicy translates the node's mmds.routes config into the sandboxcfg
+// validation policy ExtractMMDS enforces.
+func (o *Orchestrator) mmdsPolicy() sandboxcfg.MMDSPolicy {
+	return sandboxcfg.MMDSPolicy{
+		Enabled:               o.cfg.MMDS.Routes.Enabled,
+		MaxRoutesPerSandbox:   o.cfg.MMDS.Routes.MaxRoutesPerSandbox,
+		MaxSecretsPerSandbox:  o.cfg.MMDS.Routes.Secret.MaxPerSandbox,
+		MaxServicesPerSandbox: o.cfg.MMDS.Routes.Service.MaxPerSandbox,
+		MaxStaticBodyBytes:    o.cfg.MMDS.Routes.Static.MaxBodyBytes,
+		MaxNamespaceBytes:     o.cfg.MMDS.Routes.MaxNamespaceBytes,
+		ReservedPathPrefixes:  o.cfg.MMDS.Routes.ReservedPathPrefixes,
+	}
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
@@ -1232,6 +1251,26 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 	}
 	s := keys.MmdsSecret(sb.ManifestKey, sid)
 	return s, s != nil
+}
+
+// MMDSRoute resolves sid's specified kuasar-sandbox.mmds route at path for the
+// in-process MMDS service (proxy_mode=internal); implements mmds.Source.
+// Decodes sb.Metadata on every call rather than maintaining a compiled index:
+// o.cache(sb) has many call sites and the persisted form (bounded by
+// mmds.routes.max_namespace_bytes, already canonicalized by ExtractMMDS) is
+// cheap to re-parse per request.
+func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
+	o.mu.Lock()
+	sb, found := o.reg[sid]
+	o.mu.Unlock()
+	if !found {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	route, ok := sandboxcfg.LookupMMDSRoute(sb.Metadata, path)
+	if !ok {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	return mmds.MMDSRoute{Type: route.Type, ContentType: route.ContentType, Data: route.Data}, true, nil
 }
 
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {

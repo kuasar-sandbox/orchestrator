@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCheckpointRefLocationURI(t *testing.T) {
@@ -162,6 +163,66 @@ sandbox:
 	}
 	if !strings.Contains(err.Error(), "runtime_e2b") {
 		t.Fatalf("error %q does not mention obsolete field", err)
+	}
+}
+
+func TestLoadMMDSRoutesDefaults(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.MMDS.Routes.Enabled {
+		t.Fatal("MMDS.Routes.Enabled should default to false")
+	}
+	if got, want := cfg.MMDS.Routes.MaxRoutesPerSandbox, 32; got != want {
+		t.Fatalf("MaxRoutesPerSandbox = %d, want %d", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.Secret.MaxPerSandbox, 16; got != want {
+		t.Fatalf("Secret.MaxPerSandbox = %d, want %d", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.Service.MaxPerSandbox, 16; got != want {
+		t.Fatalf("Service.MaxPerSandbox = %d, want %d", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.Static.MaxBodyBytes, 16*1024; got != want {
+		t.Fatalf("Static.MaxBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.MaxNamespaceBytes, 64*1024; got != want {
+		t.Fatalf("MaxNamespaceBytes = %d, want %d", got, want)
+	}
+}
+
+func TestLoadRejectsMMDSRoutesWithoutMMDSService(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  routes:
+    enabled: true
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with MMDS routes enabled while MMDS is disabled")
+	}
+	if !strings.Contains(err.Error(), "mmds.routes.enabled=true requires mmds.enabled=true") {
+		t.Fatalf("error %q does not describe the MMDS dependency", err)
 	}
 }
 
@@ -418,6 +479,54 @@ func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	}
 	if got := cfg.Paths.RunRoot; got != "/run/sandbox" {
 		t.Fatalf("paths.run_root = %q", got)
+	}
+}
+
+func TestLoadProxyRPCTimeoutDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("paths: { run_root: /run/sandbox }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy failed: %v", err)
+	}
+	if cfg.ProxyRPCTimeout != "2s" {
+		t.Fatalf("proxy_rpc_timeout default = %q, want 2s", cfg.ProxyRPCTimeout)
+	}
+	if got, want := cfg.ProxyRPCTimeoutDur(), 2*time.Second; got != want {
+		t.Fatalf("ProxyRPCTimeoutDur() = %v, want %v", got, want)
+	}
+}
+
+func TestLoadProxyAcceptsRPCTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("paths: { run_root: /run/sandbox }\nproxy_rpc_timeout: 500ms\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy failed: %v", err)
+	}
+	if got, want := cfg.ProxyRPCTimeoutDur(), 500*time.Millisecond; got != want {
+		t.Fatalf("ProxyRPCTimeoutDur() = %v, want %v", got, want)
+	}
+}
+
+func TestLoadProxyRejectsMalformedRPCTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("paths: { run_root: /run/sandbox }\nproxy_rpc_timeout: soon\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadProxy(path)
+	if err == nil {
+		t.Fatal("LoadProxy accepted a malformed proxy_rpc_timeout")
+	}
+	if !strings.Contains(err.Error(), "proxy_rpc_timeout") {
+		t.Fatalf("error %q does not mention proxy_rpc_timeout", err)
 	}
 }
 

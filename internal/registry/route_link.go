@@ -201,7 +201,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	for key := range body.Config {
-		if key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials && key != sandboxcfg.NsCheckpoint {
+		if key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials && key != sandboxcfg.NsCheckpoint && key != sandboxcfg.NsMMDS {
 			http.Error(w, fmt.Sprintf("unsupported sandbox reserve config %q", key), http.StatusBadRequest)
 			return
 		}

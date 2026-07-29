@@ -47,6 +47,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if _, ok := metadata[sandboxcfg.NsMMDS]; ok {
+		return nil, fmt.Errorf("%w: kuasar-sandbox.mmds is not accepted on template register/build", api.ErrBadRequest)
+	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
@@ -122,6 +125,9 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	// build's trust scope cannot be altered at trigger time.
 	if triggerBuilder.Registry != nil {
 		return fmt.Errorf("%w: builder.registry is register-time only", api.ErrBadRequest)
+	}
+	if _, ok := triggerMeta[sandboxcfg.NsMMDS]; ok {
+		return fmt.Errorf("%w: kuasar-sandbox.mmds is not accepted on template register/build", api.ErrBadRequest)
 	}
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up

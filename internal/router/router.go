@@ -44,6 +44,7 @@ const (
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
 	HeaderCheckpoint  = "X-Kuasar-Sandbox-Checkpoint"
+	HeaderMMDS        = "X-Kuasar-Sandbox-MMDS"
 	HeaderAPIKey      = "X-API-KEY"
 	HeaderAccessTok   = "X-Access-Token"
 	HeaderMigration   = "X-Kuasar-Migration-Token"
@@ -368,15 +369,16 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// createSandboxMetadata selects request-scoped restore, credential, and
-// checkpoint objects from the cluster create request. Restore and credential
-// headers replace their whole body objects. Checkpoint is overlaid fieldwise.
-// The body is still decoded when present so malformed lower-priority checkpoint
-// metadata cannot bypass the shared strict parser.
+// createSandboxMetadata selects request-scoped restore, credential, checkpoint,
+// and mmds specification objects from the cluster create request. Restore,
+// credential, and mmds headers replace their whole body objects. Checkpoint is
+// overlaid fieldwise. The body is still decoded when present so malformed
+// lower-priority metadata cannot bypass the shared strict parser.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
 	checkpointRaw, checkpointHeader := createHeaderValue(r.Header, HeaderCheckpoint)
+	mmdsRaw, mmdsHeader := createHeaderValue(r.Header, HeaderMMDS)
 	checkpointHeaderPolicy := sandboxcfg.CheckpointPolicy{}
 	if checkpointHeader {
 		var err error
@@ -414,6 +416,9 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	if raw, ok := body.Metadata[sandboxcfg.NsCheckpoint]; ok {
 		selected[sandboxcfg.NsCheckpoint] = raw
 	}
+	if raw, ok := body.Metadata[sandboxcfg.NsMMDS]; ok {
+		selected[sandboxcfg.NsMMDS] = raw
+	}
 	if restoreHeader {
 		selected[sandboxcfg.NsRestore] = restoreRaw
 	}
@@ -439,6 +444,9 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 			}
 			selected[sandboxcfg.NsCheckpoint] = canonical
 		}
+	}
+	if mmdsHeader {
+		selected[sandboxcfg.NsMMDS] = mmdsRaw
 	}
 	if len(selected) == 0 {
 		return nil, nil

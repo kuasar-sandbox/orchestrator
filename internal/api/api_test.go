@@ -55,6 +55,7 @@ func TestMergeConfigHeaders(t *testing.T) {
 	h.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`)
 	h.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"memory"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"envd"}`)
+	h.Set("X-Kuasar-Sandbox-MMDS", `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}`)
 	m := mergeConfigHeaders(nil, h)
 	if m[sandboxcfg.NsNetwork] != `{"hostname":"h1"}` || m[sandboxcfg.NsResource] != `{"capacity":{"cpu":4}}` {
 		t.Fatalf("headers not normalized: %+v", m)
@@ -62,11 +63,17 @@ func TestMergeConfigHeaders(t *testing.T) {
 	if _, ok := m[sandboxcfg.NsRestore]; ok {
 		t.Fatalf("generic/template headers admitted request-scoped restore: %+v", m)
 	}
+	if _, ok := m[sandboxcfg.NsMMDS]; ok {
+		t.Fatalf("generic/template headers admitted request-scoped mmds: %+v", m)
+	}
 	if got := mustMergeCreateConfigHeaders(t, nil, h); got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
 		t.Fatalf("create restore header not normalized: %+v", got)
 	}
 	if got := mustMergeCreateConfigHeaders(t, nil, h); got[sandboxcfg.NsCredentials] != `{"envd_access_token":"envd"}` {
 		t.Fatalf("create credentials header not normalized: %+v", got)
+	}
+	if got := mustMergeCreateConfigHeaders(t, nil, h); got[sandboxcfg.NsMMDS] != `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}` {
+		t.Fatalf("create mmds header not normalized: %+v", got)
 	}
 
 	// Header wins over an e2b metadata key of the same namespace.
@@ -97,6 +104,17 @@ func TestMergeConfigHeaders(t *testing.T) {
 	if got[sandboxcfg.NsCredentials] != `{"envd_access_token":"header"}` {
 		t.Fatalf("credentials header should replace the metadata object: %+v", got)
 	}
+	emptyMMDS := http.Header{}
+	emptyMMDS.Set("X-Kuasar-Sandbox-MMDS", "")
+	got = mustMergeCreateConfigHeaders(t, nil, emptyMMDS)
+	if _, ok := got[sandboxcfg.NsMMDS]; !ok {
+		t.Fatalf("present empty mmds header must reach strict validation: %+v", got)
+	}
+	metadataMMDS := map[string]string{sandboxcfg.NsMMDS: `{"version":1,"routes":[{"path":"/from-metadata","type":"static","data":"m"}]}`}
+	got = mustMergeCreateConfigHeaders(t, metadataMMDS, header("X-Kuasar-Sandbox-MMDS", `{"version":1,"routes":[{"path":"/from-header","type":"static","data":"h"}]}`))
+	if got[sandboxcfg.NsMMDS] != `{"version":1,"routes":[{"path":"/from-header","type":"static","data":"h"}]}` {
+		t.Fatalf("mmds header should replace the metadata object as a whole: %+v", got)
+	}
 
 	// Builder is build-only and is not folded by the generic sandbox header path.
 	got = mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`))
@@ -120,6 +138,7 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"build"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"must-not-enter-build"}`)
 	h.Set(checkpointHeader, `{"merge_ref":false}`)
+	h.Set("X-Kuasar-Sandbox-MMDS", `{"version":1,"routes":[{"path":"/must-not-enter-build","type":"static","data":"d"}]}`)
 	got := mergeBuildConfigHeaders(nil, h)
 	if got[buildcfg.NsBuilder] != `{"referer":{"enabled":false}}` {
 		t.Fatalf("builder header not normalized: %+v", got)
@@ -132,6 +151,9 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	}
 	if _, ok := got[sandboxcfg.NsCheckpoint]; ok {
 		t.Fatalf("checkpoint header entered build metadata: %+v", got)
+	}
+	if _, ok := got[sandboxcfg.NsMMDS]; ok {
+		t.Fatalf("mmds header entered build metadata: %+v", got)
 	}
 }
 

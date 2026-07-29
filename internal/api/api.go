@@ -42,6 +42,7 @@ const (
 	restoreHeader     = "X-Kuasar-Sandbox-Restore"
 	credentialsHeader = "X-Kuasar-Sandbox-Credentials"
 	checkpointHeader  = "X-Kuasar-Sandbox-Checkpoint"
+	mmdsHeader        = "X-Kuasar-Sandbox-MMDS"
 )
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
@@ -74,6 +75,7 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	for _, item := range []struct{ header, metaKey string }{
 		{restoreHeader, sandboxcfg.NsRestore},
 		{credentialsHeader, sandboxcfg.NsCredentials},
+		{mmdsHeader, sandboxcfg.NsMMDS},
 	} {
 		if _, present := h[http.CanonicalHeaderKey(item.header)]; !present {
 			continue

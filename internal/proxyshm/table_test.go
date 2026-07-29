@@ -190,7 +190,7 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	defer tbl.Close()
 	master := NewMasterView(tbl, time.Second, nil)
 	updates := &Updates{ch: make(chan struct{})}
-	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond)
+	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond, nil, 0)
 	master.BeginSync()
 	master.Bookmark()
 
@@ -229,7 +229,7 @@ func TestWorkerStartingRouteWaitsWithoutWake(t *testing.T) {
 	defer tbl.Close()
 	updates := &Updates{ch: make(chan struct{})}
 	var wakes atomic.Int32
-	worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, 500*time.Millisecond)
+	worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, 500*time.Millisecond, nil, 0)
 	route := routesync.RouteEntry{
 		SandboxID: "s1", Profile: "e2b", State: routesync.StateStarting,
 		EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
@@ -288,7 +288,7 @@ func TestWorkerStartingRouteStopsWaitingOnRollback(t *testing.T) {
 			defer tbl.Close()
 			updates := &Updates{ch: make(chan struct{})}
 			var wakes atomic.Int32
-			worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+			worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second, nil, 0)
 			route := routesync.RouteEntry{
 				SandboxID: "s1", Profile: "e2b", State: routesync.StateStarting,
 				EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd",
@@ -347,7 +347,7 @@ func TestWorkerDeadRouteReturnsNotFoundWithoutWake(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
-	worker := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+	worker := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0)
 	route, err := worker.Route(context.Background(), "dead", proxy.LegacyTarget(49983))
 	if err != nil || route.Kind != proxy.KindNotFound {
 		t.Fatalf("dead route = %+v err=%v, want not found", route, err)
@@ -382,7 +382,7 @@ func TestWorkerRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 		}
 	}
 	tbl.Bookmark()
-	view := NewWorkerView(tbl, nil, nil, time.Second)
+	view := NewWorkerView(tbl, nil, nil, time.Second, nil, 0)
 
 	tests := []struct {
 		sid       string
@@ -427,7 +427,7 @@ func TestWorkerKnownUnsupportedServiceDoesNotWakePausedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
-	worker := NewWorkerView(tbl, nil, master.Wake, 50*time.Millisecond)
+	worker := NewWorkerView(tbl, nil, master.Wake, 50*time.Millisecond, nil, 0)
 
 	route, err := worker.Route(context.Background(), "s1", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
 	if err != nil || route.Kind != proxy.KindDeny {
@@ -457,7 +457,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
-	view := NewWorkerView(tbl, nil, nil, time.Second)
+	view := NewWorkerView(tbl, nil, nil, time.Second, nil, 0)
 	assertSource := func(state string) {
 		t.Helper()
 		if sid, ok := view.ByFloatingIP("100.100.0.3"); !ok || sid != "s1" {

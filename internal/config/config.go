@@ -69,6 +69,10 @@ type Config struct {
 	Checkpoint CheckpointConfig `yaml:"checkpoint"`
 	// MMDS is the optional envd metadata service (re-keys envd to fresh per-identity
 	// tokens). Disabled => envd runs non-secure and the proxy is the sole data-plane gate.
+	// MMDS.Routes is the separate node policy for tenant-specified kuasar-sandbox.mmds
+	// routes -- nested here because it's still MMDS-adjacent config, even though
+	// it gates an unrelated tenant-facing feature from the built-in
+	// Firecracker-compat token/metadata service above it.
 	MMDS MMDSConfig `yaml:"mmds"`
 	// Cluster connects this node to a cluster-ctl registry over node-link
 	// (node.md §10); empty = standalone single-node.
@@ -271,6 +275,50 @@ type ProxyConfig struct {
 type MMDSConfig struct {
 	Enabled bool   `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
 	Listen  string `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
+	// Routes is the node policy for tenant-specified kuasar-sandbox.mmds routes --
+	// a separate tenant-facing feature from Enabled/Listen above (the built-in
+	// Firecracker-compat token/metadata service), grouped here only because
+	// both are MMDS-adjacent.
+	Routes MMDSRoutesConfig `yaml:"routes"`
+}
+
+// MMDSRoutesConfig is the node policy for tenant-specified MMDS route
+// namespaces (kuasar-sandbox.mmds). Disabled (default) => Create
+// requests carrying the namespace are rejected 400 before any tenant-supplied
+// JSON is parsed. Applies uniformly to standalone and cluster create, and to
+// both proxy.mode=internal and proxy.mode=external. Per-type policy (static/
+// secret/service, matching the specification's own route taxonomy) is grouped
+// into the nested Static/Secret/Service structs below; only limits that apply
+// across every route type stay flat here.
+type MMDSRoutesConfig struct {
+	Enabled              bool     `yaml:"enabled"`
+	MaxRoutesPerSandbox  int      `yaml:"max_routes_per_sandbox"` // total routes[] cap, across all types
+	MaxNamespaceBytes    int      `yaml:"max_namespace_bytes"`    // raw kuasar-sandbox.mmds JSON cap
+	ReservedPathPrefixes []string `yaml:"reserved_path_prefixes"`
+
+	Static  MMDSStaticRoutesConfig  `yaml:"static"`
+	Secret  MMDSSecretRoutesConfig  `yaml:"secret"`
+	Service MMDSServiceRoutesConfig `yaml:"service"`
+}
+
+// MMDSStaticRoutesConfig is node policy specific to type:"static" routes.
+type MMDSStaticRoutesConfig struct {
+	MaxBodyBytes int `yaml:"max_body_bytes"` // one static route's specified data
+}
+
+// MMDSSecretRoutesConfig is node policy specific to type:"secret" routes.
+// Only the specification-time count limit exists on this branch; the admin-PUT
+// value limit and guest-wait policy are a later phase's runtime backend, not
+// yet implemented.
+type MMDSSecretRoutesConfig struct {
+	MaxPerSandbox int `yaml:"max_per_sandbox"` // secrets[] cap in the specification
+}
+
+// MMDSServiceRoutesConfig is node policy specific to type:"service" routes.
+// Only the specification-time count limit exists on this branch; the service
+// backend is a later phase.
+type MMDSServiceRoutesConfig struct {
+	MaxPerSandbox int `yaml:"max_per_sandbox"` // services[] cap in the specification
 }
 
 // PathsConfig holds node-local directories and sockets.
@@ -590,6 +638,21 @@ func (c *Config) applyDefaults() {
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
+	if c.MMDS.Routes.MaxRoutesPerSandbox <= 0 {
+		c.MMDS.Routes.MaxRoutesPerSandbox = 32
+	}
+	if c.MMDS.Routes.Secret.MaxPerSandbox <= 0 {
+		c.MMDS.Routes.Secret.MaxPerSandbox = 16
+	}
+	if c.MMDS.Routes.Service.MaxPerSandbox <= 0 {
+		c.MMDS.Routes.Service.MaxPerSandbox = 16
+	}
+	if c.MMDS.Routes.Static.MaxBodyBytes <= 0 {
+		c.MMDS.Routes.Static.MaxBodyBytes = 16 * 1024
+	}
+	if c.MMDS.Routes.MaxNamespaceBytes <= 0 {
+		c.MMDS.Routes.MaxNamespaceBytes = 64 * 1024
+	}
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
@@ -733,6 +796,9 @@ func (c *Config) validateProxy() error {
 	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
 		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
 	}
+	if c.MMDS.Routes.Enabled && !c.MMDS.Enabled {
+		return fmt.Errorf("config: mmds.routes.enabled=true requires mmds.enabled=true (the MMDS service must be available to serve specified routes)")
+	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
 	}
@@ -758,7 +824,25 @@ type ProxyFileConfig struct {
 	ParkTimeout   string           `yaml:"park_timeout"`   // bootstrap fallback; default 30s
 	MMDSListen    string           `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
 	MetricsListen string           `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	// ProxyRPCTimeout bounds a worker's per-request round trip to the master
+	// over an inherited local socketpair -- default 2s. Currently only
+	// internal/mmdsrpc (resolving a tenant-specified MMDS route for one guest
+	// GET) uses this channel, but the name is deliberately general: it's meant
+	// to bound worker<->master RPCs as a class, not just MMDS lookups. Distinct
+	// from ParkTimeout: that one bounds a guest request awaiting distributed
+	// route-sync convergence (tens of seconds is normal); this one bounds a
+	// same-node IPC call that should be near-instant, so a stuck/unresponsive
+	// master fails fast instead of stalling the guest for as long as
+	// ParkTimeout allows.
+	ProxyRPCTimeout string `yaml:"proxy_rpc_timeout"`
 }
+
+// DefaultProxyRPCTimeout is the single source of truth for the
+// proxy_rpc_timeout default (2s): used both to seed ProxyFileConfig.ProxyRPCTimeout
+// and as ProxyRPCTimeoutDur's parse-failure fallback below, and imported by
+// internal/proxyshm as its own NewWorkerView(mmdsRPCTimeout<=0) fallback --
+// one value, not three independent "2 * time.Second" literals.
+const DefaultProxyRPCTimeout = 2 * time.Second
 
 // ProxyPathsConfig contains only paths consumed by the external proxy. It is
 // deliberately separate from the conductor's broader PathsConfig.
@@ -802,6 +886,9 @@ func (p *ProxyFileConfig) applyDefaults() {
 	if p.ParkTimeout == "" {
 		p.ParkTimeout = "30s"
 	}
+	if p.ProxyRPCTimeout == "" {
+		p.ProxyRPCTimeout = DefaultProxyRPCTimeout.String()
+	}
 }
 
 func (p *ProxyFileConfig) validate() error {
@@ -815,6 +902,9 @@ func (p *ProxyFileConfig) validate() error {
 	}
 	if _, err := time.ParseDuration(p.ParkTimeout); err != nil {
 		return fmt.Errorf("proxy config: park_timeout %q: %w", p.ParkTimeout, err)
+	}
+	if _, err := time.ParseDuration(p.ProxyRPCTimeout); err != nil {
+		return fmt.Errorf("proxy config: proxy_rpc_timeout %q: %w", p.ProxyRPCTimeout, err)
 	}
 	if p.Workers <= 0 {
 		return fmt.Errorf("proxy config: workers must be positive")
@@ -830,6 +920,16 @@ func (p *ProxyFileConfig) ParkTimeoutDur() time.Duration {
 	d, err := time.ParseDuration(p.ParkTimeout)
 	if err != nil || d <= 0 {
 		return 30 * time.Second
+	}
+	return d
+}
+
+// ProxyRPCTimeoutDur parses the worker's proxy_rpc_timeout fallback (default
+// DefaultProxyRPCTimeout).
+func (p *ProxyFileConfig) ProxyRPCTimeoutDur() time.Duration {
+	d, err := time.ParseDuration(p.ProxyRPCTimeout)
+	if err != nil || d <= 0 {
+		return DefaultProxyRPCTimeout
 	}
 	return d
 }

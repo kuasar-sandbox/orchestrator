@@ -49,6 +49,21 @@ type Source interface {
 	// from the manifest key + id, so a token minted by any proxy worker verifies in
 	// any other through the same shared route view. ok=false for an unknown sandbox.
 	MmdsSecret(sandboxID string) (secret []byte, ok bool)
+	// MMDSRoute returns the tenant-specified kuasar-sandbox.mmds route at path for
+	// sid. ok=false with err=nil means sid or path is genuinely unspecified — the
+	// caller falls through to the existing fixed instance-info response. err!=nil
+	// means resolution could not be completed (e.g. an external-mode RPC to the
+	// proxy master timed out) — this is distinct from "unspecified" so the caller
+	// can fail closed (503) instead of silently serving the wrong response for a
+	// route that may well be specified.
+	MMDSRoute(sandboxID, path string) (route MMDSRoute, ok bool, err error)
+}
+
+// MMDSRoute is the resolved backend for one specified guest-visible path.
+type MMDSRoute struct {
+	Type        string // "secret" | "service" | "static"
+	ContentType string // static only
+	Data        string // static only
 }
 
 // Server is the MMDS handler. Serve it on a listener the host redirects
@@ -75,12 +90,62 @@ type opts struct {
 	AccessTokenHash string `json:"accessTokenHash"`
 }
 
-// Handler routes the two Firecracker MMDS v2 calls envd makes.
+// Handler routes the two Firecracker MMDS v2 calls envd makes, plus specified
+// MMDS route dispatch (getMeta). Every response -- success and error alike --
+// carries Cache-Control: no-store and X-Content-Type-Options: nosniff, per
+// design: applied once here rather than at each write/http.Error call site so
+// an error path can't accidentally omit them. guardRawRequest runs BEFORE the
+// mux: http.ServeMux cleans "/a//b" and "/a/../b" internally and issues a 301
+// to the cleaned path before any handler runs (verified against the stdlib),
+// which the design's exact-path contract forbids (no auto-redirect/rewrite);
+// the guard rejects those, along with percent-escapes and a query string,
+// with 400 before ServeMux ever sees the request.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /latest/api/token", s.putToken)
 	mux.HandleFunc("GET /", s.getMeta)
-	return mux
+	return secureHeaders(guardRawRequest(mux))
+}
+
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// guardRawRequest rejects a request outright -- 400, never a redirect or a
+// rewrite -- if its raw (still-escaped) path is not already canonical: any
+// percent-escape, a query or fragment, an empty/"."/".." segment, or a
+// trailing slash on a non-root path. r.URL.EscapedPath() is used throughout
+// (not r.URL.Path) specifically because Path is already percent-decoded --
+// checking it would let "/a%2Fb" silently match a specified "/a/b" route.
+func guardRawRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawFragment != "" {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		raw := r.URL.EscapedPath()
+		if strings.Contains(raw, "%") {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		if raw != "/" {
+			if strings.HasSuffix(raw, "/") {
+				http.Error(w, "", http.StatusBadRequest)
+				return
+			}
+			for _, seg := range strings.Split(strings.TrimPrefix(raw, "/"), "/") {
+				if seg == "" || seg == "." || seg == ".." {
+					http.Error(w, "", http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Serve runs the MMDS HTTP/1.1 server on ln until ctx is cancelled.
@@ -119,6 +184,34 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	sid, ok := s.verifyToken(r.Header.Get("X-metadata-token"))
 	if !ok {
 		http.Error(w, "", http.StatusUnauthorized)
+		return
+	}
+	// The built-in instance-info document is served only at the exact root;
+	// every other path goes through specified-route dispatch, unspecified or
+	// not -- an unspecified path is 404, not a silent alias for "/".
+	if r.URL.Path != "/" {
+		route, ok, err := s.src.MMDSRoute(sid, r.URL.Path)
+		if err != nil {
+			// Resolution failed (e.g. an external-mode RPC to the proxy master
+			// timed out) rather than the path being genuinely unspecified — fail
+			// closed instead of risking a silent fallthrough to the wrong response.
+			if s.log != nil {
+				s.log.Debug("mmds: route resolution failed", "sid", sid, "path", r.URL.Path, "err", err)
+			}
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+		if !ok {
+			http.Error(w, "", http.StatusNotFound)
+			return
+		}
+		switch route.Type {
+		case "static":
+			w.Header().Set("Content-Type", route.ContentType)
+			_, _ = w.Write([]byte(route.Data))
+		default: // "secret" | "service" — backend lands in a later phase
+			http.Error(w, "", http.StatusServiceUnavailable)
+		}
 		return
 	}
 	tid, token, ok := s.src.SandboxInfo(sid)

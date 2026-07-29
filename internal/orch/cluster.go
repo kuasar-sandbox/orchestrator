@@ -456,6 +456,10 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
+	_, config, err = sandboxcfg.ExtractMMDS(config, o.mmdsPolicy())
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
 	cmd.Config = config
 	return pair, tmpl, credentials, nil
 }
