@@ -70,6 +70,82 @@ func TestBadKeys(t *testing.T) {
 	}
 }
 
+func TestEncryptAADRoundTrip(t *testing.T) {
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.EncryptAAD([]byte("plaintext"), []byte("aad-context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.DecryptAAD(rec, []byte("aad-context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "plaintext" {
+		t.Fatalf("decrypt = %q, want %q", got, "plaintext")
+	}
+}
+
+func TestDecryptAADRejectsWrongAAD(t *testing.T) {
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.EncryptAAD([]byte("plaintext"), []byte("aad-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DecryptAAD(rec, []byte("aad-v2")); err == nil {
+		t.Fatal("decrypt succeeded with mismatched AAD")
+	}
+	if _, err := b.DecryptAAD(rec, nil); err == nil {
+		t.Fatal("decrypt succeeded with nil AAD against a record encrypted with AAD")
+	}
+}
+
+func TestDecryptAADRejectsWrongKey(t *testing.T) {
+	b1, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b1.EncryptAAD([]byte("plaintext"), []byte("aad"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2.DecryptAAD(rec, []byte("aad")); err == nil {
+		t.Fatal("decrypt succeeded with a box holding an unrelated key")
+	}
+}
+
+func TestEncryptDecryptStillWorkWithNilAAD(t *testing.T) {
+	// Back-compat: plain Encrypt/Decrypt must remain equivalent to
+	// EncryptAAD/DecryptAAD with nil AAD, interchangeably.
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.Encrypt([]byte("plaintext"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.DecryptAAD(rec, nil); err != nil || string(got) != "plaintext" {
+		t.Fatalf("DecryptAAD(nil) on an Encrypt()'d record: got=%q err=%v", got, err)
+	}
+	rec2, err := b.EncryptAAD([]byte("plaintext2"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.Decrypt(rec2); err != nil || string(got) != "plaintext2" {
+		t.Fatalf("Decrypt() on an EncryptAAD(nil)'d record: got=%q err=%v", got, err)
+	}
+}
+
 func TestDedupSameKey(t *testing.T) {
 	k := hexKey(t)
 	b, err := NewFromColonHex(k + ":" + k)

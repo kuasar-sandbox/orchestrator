@@ -6,6 +6,7 @@ package orch
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,8 @@ type Orchestrator struct {
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 
+	secretWait *mmdsSecretWaiter // parks guest GETs on a never-configured MMDS secret
+
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
@@ -111,6 +114,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		clusterBuilds:       map[string]*clusterBuild{},
 		buildEvents:         make(chan *routesync.BuildEvent, 64),
 	}
+	o.secretWait = newMMDSSecretWaiter(cfg.MMDS.Routes.Secret.ParkTimeoutDur())
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
 	o.builderRunPool = newRunPool(runKindBuild, cfg.Units.BuilderPoolSize, wait, cfg.Paths.RunRoot, lc, o.builderUnit, log.With("pool", "builder"))
@@ -358,6 +362,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	}
 	o.clearDeadlineIntent(id)
 	o.uncache(id)
+	o.secretWait.ForgetSandbox(id)
 	o.publishDelete(id) // tell external proxies the route is gone
 	return true, nil
 }
@@ -939,6 +944,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		o.teardown(ctx, sb)
+		o.secretWait.ForgetSandbox(sb.ID)
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
@@ -1051,12 +1057,38 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 	return s, s != nil
 }
 
+// Incarnation returns sid's current run incarnation (types.Sandbox.RunID) for
+// the in-process MMDS service (proxy_mode=internal); implements mmds.Source.
+// Not gated on running state, matching MmdsSecret above -- a paused sandbox
+// still has the RunID of its last run, and a token minted under it must keep
+// failing verification (wrong incarnation) rather than erroring differently
+// while paused. ok=false for an unknown sandbox or one with no RunID yet.
+func (o *Orchestrator) Incarnation(sid string) (incarnation string, ok bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	sb, found := o.reg[sid]
+	if !found || sb.RunID == "" {
+		return "", false
+	}
+	return sb.RunID, true
+}
+
 // MMDSRoute resolves sid's specified kuasar-sandbox.mmds route at path for the
 // in-process MMDS service (proxy_mode=internal); implements mmds.Source.
 // Decodes sb.Metadata on every call rather than maintaining a compiled index:
 // o.cache(sb) has many call sites and the persisted form (bounded by
 // mmds.routes.max_namespace_bytes, already canonicalized by ExtractMMDS) is
 // cheap to re-parse per request.
+//
+// For a "secret" route this may block: a specification with no value yet
+// (revision==0, i.e. the operator hasn't PUT it through the admin API) parks
+// on o.secretWait, bounded by mmds.routes.secret.park_timeout, so a guest
+// whose Create beat the operator's PUT doesn't see a spurious 404 during that
+// narrow window. A secret that was configured and later revoked
+// (revision>0, absent) returns immediately with Present=false -- a
+// deliberate revoke gets no grace period. MMDSRoute has no ctx parameter
+// (mmds.Source's signature, shared with the external-mode WorkerView path),
+// so context.Background() is used for the store read/wait.
 func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
 	o.mu.Lock()
 	sb, found := o.reg[sid]
@@ -1068,7 +1100,42 @@ func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error)
 	if !ok {
 		return mmds.MMDSRoute{}, false, nil
 	}
-	return mmds.MMDSRoute{Type: route.Type, ContentType: route.ContentType, Data: route.Data}, true, nil
+	if route.Type != sandboxcfg.MMDSRouteSecret {
+		return mmds.MMDSRoute{Type: route.Type, ContentType: route.ContentType, Data: route.Data}, true, nil
+	}
+	ctx := context.Background()
+	value, present, revision, err := o.st.GetMMDSSecretValue(ctx, sid, route.SecretName)
+	if err != nil {
+		return mmds.MMDSRoute{}, false, err
+	}
+	if !present && revision == 0 {
+		// Register *before* the re-check below, not after: PutMMDSSecret's
+		// Notify runs right after its DB write commits, and a registration
+		// that instead happened only once we already knew we'd wait could
+		// land after that Notify already ran and found nobody parked --
+		// silently losing the wakeup, forcing the guest to sit out the full
+		// park timeout even though the PUT had just landed. Registering
+		// first closes that window: any Notify from here on is guaranteed to
+		// close this exact channel, whether or not block has started
+		// selecting on it yet.
+		ch := o.secretWait.register(sid, route.SecretName)
+		if value, present, revision, err = o.st.GetMMDSSecretValue(ctx, sid, route.SecretName); err != nil {
+			return mmds.MMDSRoute{}, false, err
+		}
+		if !present && revision == 0 && o.secretWait.block(ctx, ch) {
+			if value, present, _, err = o.st.GetMMDSSecretValue(ctx, sid, route.SecretName); err != nil {
+				return mmds.MMDSRoute{}, false, err
+			}
+		}
+	}
+	if !present {
+		return mmds.MMDSRoute{Type: route.Type, Present: false}, true, nil
+	}
+	body, err := base64.StdEncoding.DecodeString(value.BodyBase64)
+	if err != nil {
+		return mmds.MMDSRoute{}, false, fmt.Errorf("mmds secret: decode stored value for %s/%s: %w", sid, route.SecretName, err)
+	}
+	return mmds.MMDSRoute{Type: route.Type, ContentType: value.ContentType, Data: string(body), Present: true}, true, nil
 }
 
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -26,11 +27,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
 const (
-	proxyPluginID = "proxy"
-
 	envProxyDataFD    = "KUASAR_PROXY_DATA_FD"
 	envProxyForwardFD = "KUASAR_PROXY_FORWARD_FD"
 	envProxyMMDSFD    = "KUASAR_PROXY_MMDS_FD"
@@ -117,14 +117,15 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	reg := routesync.Register{
-		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
-		Mmds:      cfg.MMDSListen != "",
+		Subscribe:   &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:       &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
+		Mmds:        cfg.MMDSListen != "",
+		MMDSSecrets: cfg.MMDSListen != "",
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
-	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, view, log).Run(ctx)
+	go routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(ctx)
 
 	log.Info("node-ctl proxy master serving",
 		"workers", cfg.Workers,
@@ -327,7 +328,13 @@ func newSocketpair() (masterEnd, workerEnd *os.File, err error) {
 }
 
 // mmdsRPCHandler answers a worker's EndpointRequest from the proxy master's
-// in-heap MMDSRoutes store (see proxyshm.MMDSRoutes's doc comment).
+// in-heap MMDSRoutes/MMDSSecrets stores (see their doc comments). For a
+// "secret" route it resolves the named value out of the synced
+// store.MMDSSecretBlob -- absent because the sandbox's secrets row has never
+// been touched at all (blob not synced yet) is Retryable, matching
+// internal-mode Orchestrator.MMDSRoute's revision==0 bootstrap wait; absent
+// with a synced blob (this name specifically was never set, or was revoked)
+// is not.
 func mmdsRPCHandler(view *proxyshm.MasterView) mmdsrpc.Handler {
 	return func(sid, path string) (mmdsrpc.Route, bool) {
 		canonical, ok := view.MMDSRoutes().Get(sid)
@@ -338,7 +345,33 @@ func mmdsRPCHandler(view *proxyshm.MasterView) mmdsrpc.Handler {
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}
-		return mmdsrpc.Route{Type: route.Type, ContentType: route.ContentType, Body: route.Data}, true
+		if route.Type != sandboxcfg.MMDSRouteSecret {
+			return mmdsrpc.Route{Type: route.Type, ContentType: route.ContentType, Body: route.Data}, true
+		}
+		if !view.MMDSSecrets().Synced() {
+			// Mid-resync (or never yet synced) after a disconnect: fail
+			// closed rather than risk serving stale plaintext or a false
+			// "never configured" 404 for a secret that may well be
+			// configured -- WorkerView.MMDSRoute maps this to a hard error
+			// (503), distinct from both outcomes.
+			return mmdsrpc.Route{Type: route.Type, Unavailable: true}, true
+		}
+		blobJSON, ok := view.MMDSSecrets().Get(sid)
+		if !ok {
+			return mmdsrpc.Route{Type: route.Type, Present: false, Retryable: true}, true
+		}
+		var blob store.MMDSSecretBlob
+		if err := json.Unmarshal([]byte(blobJSON), &blob); err != nil {
+			return mmdsrpc.Route{Type: route.Type, Present: false, Retryable: true}, true
+		}
+		value, present := blob.Values[route.SecretName]
+		if present && store.MMDSSecretExpired(value) {
+			present = false
+		}
+		if !present {
+			return mmdsrpc.Route{Type: route.Type, Present: false, Retryable: blob.Revision == 0}, true
+		}
+		return mmdsrpc.Route{Type: route.Type, ContentType: value.ContentType, Body: value.BodyBase64, Present: true}, true
 	}
 }
 

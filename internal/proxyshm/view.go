@@ -2,8 +2,10 @@ package proxyshm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -40,6 +42,7 @@ var errExecActivationTimeout = errors.New("proxyshm: exec activation timed out")
 type MasterView struct {
 	table     *Table
 	mmds      *MMDSRoutes
+	secrets   *MMDSSecrets
 	wakes     *WakeQueue
 	notify    *Broadcaster
 	defaultPk time.Duration
@@ -53,6 +56,7 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 	return &MasterView{
 		table:     table,
 		mmds:      NewMMDSRoutes(),
+		secrets:   NewMMDSSecrets(),
 		wakes:     NewWakeQueue(4096),
 		notify:    NewBroadcaster(),
 		defaultPk: defaultPark,
@@ -65,9 +69,16 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 // wired into an internal/mmdsrpc.Server per worker.
 func (v *MasterView) MMDSRoutes() *MMDSRoutes { return v.mmds }
 
+// MMDSSecrets returns the sparse in-heap decrypted-secret-blob store (see
+// MMDSSecrets's doc comment) — wired into an internal/mmdsrpc.Server per
+// worker alongside MMDSRoutes. Only ever populated when this master
+// registered with the gated MMDSSecrets capability; otherwise it stays empty.
+func (v *MasterView) MMDSSecrets() *MMDSSecrets { return v.secrets }
+
 func (v *MasterView) BeginSync() {
 	v.table.BeginSync()
 	v.mmds.BeginSync()
+	v.secrets.BeginSync()
 	v.notify.Notify()
 }
 
@@ -79,19 +90,37 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 		return
 	}
 	v.mmds.Upsert(r.SandboxID, r.MMDSRoutes)
+	v.secrets.Upsert(r.SandboxID, r.MMDSSecrets)
 	v.notify.Notify()
 }
 
 func (v *MasterView) ApplyDelete(sid string) {
 	v.table.Delete(sid)
 	v.mmds.Delete(sid)
+	v.secrets.Delete(sid)
 	v.notify.Notify()
 }
 
 func (v *MasterView) Bookmark() {
 	v.table.Bookmark()
 	v.mmds.Bookmark()
+	v.secrets.Bookmark()
 	v.notify.Notify()
+}
+
+// InvalidateSync implements routesync.Sink: it fails the secret view closed
+// immediately when the sync stream ends for any reason (disconnect, protocol
+// error), rather than leaving it reporting synced (and serving plaintext)
+// for the entire reconnect backoff window until the next session's
+// BeginSync/Bookmark completes. Reuses MMDSSecrets.BeginSync -- eagerly
+// discarding held plaintext and marking the store unsynced is exactly
+// InvalidateSync's contract; the next session's own BeginSync call is a
+// no-op on top of this (same effect, one more generation bump). table/mmds
+// (the base route table and MMDS static/service route declarations) are
+// deliberately untouched: neither holds secret plaintext, and their existing
+// staleness-tolerant behavior across a disconnect is unchanged by this fix.
+func (v *MasterView) InvalidateSync() {
+	v.secrets.BeginSync()
 }
 
 func (v *MasterView) SetPolicy(p routesync.Policy) {
@@ -234,20 +263,120 @@ func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPar
 // per-sandbox MMDS specifications live in the master's in-heap
 // MMDSRoutes store, not the shared-memory Table -- see MMDSRoutes's doc
 // comment for why).
+// MMDSRoute resolves sid's specified MMDS route at path by asking the proxy
+// master over internal/mmdsrpc. For a "secret" route that has never been
+// configured (Retryable=true), this parks -- bounded by the master-pushed
+// Policy.MMDSParkTimeoutMS -- re-asking the master on every shared-table
+// change (mirrors waitRunning's loop shape), so a guest whose Create beat the
+// operator's admin PUT doesn't see a spurious 404 during that narrow window.
+// A secret that was configured and later revoked (Retryable=false) returns
+// immediately, matching internal-mode Orchestrator.MMDSRoute.
+//
+// Each table revision used to decide whether to keep waiting is sampled
+// *before* the RPC call it's paired with, not after: an admin PUT bumps the
+// table revision as part of the same sync apply that updates the master's
+// secret store, so a revision sampled after the RPC call could already
+// postdate a PUT the RPC response itself doesn't yet reflect -- waitChange
+// would then wait for a "future" change that already happened, sitting out
+// the full park timeout despite the PUT having just landed (the same
+// lost-wakeup shape internal-mode Orchestrator.MMDSRoute had). Sampling first
+// guarantees any PUT landing after the sample is visible either in the RPC
+// response itself (if it lands before the master answers) or as a revision
+// change waitChange can see (if it lands after).
 func (v *WorkerView) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
 	if v.mmdsClient == nil {
 		return mmds.MMDSRoute{}, false, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), v.mmdsRPCTimeout)
-	defer cancel()
-	resp, err := v.mmdsClient.Resolve(ctx, sid, path)
+	// table is nil only in unit tests that never exercise the secret-retry
+	// loop below (production always provides a real shared-mmap table); rev
+	// staying 0 in that case is harmless since it's never read unless that
+	// loop actually runs, which itself already assumes a non-nil table (see
+	// waitChange).
+	var rev uint64
+	if v.table != nil {
+		rev = v.table.Rev()
+	}
+	resp, err := v.resolveMMDSOnce(sid, path)
 	if err != nil {
 		return mmds.MMDSRoute{}, false, err
 	}
 	if !resp.Found {
 		return mmds.MMDSRoute{}, false, nil
 	}
-	return mmds.MMDSRoute{Type: resp.Type, ContentType: resp.ContentType, Data: resp.Body}, true, nil
+	if resp.Type != "secret" || resp.Present || !resp.Retryable {
+		return mmdsRouteFromResponse(resp)
+	}
+	park := v.mmdsParkTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), park)
+	defer cancel()
+	deadline := time.Now().Add(park)
+	for {
+		if !v.waitChange(ctx, deadline, rev) {
+			return mmdsRouteFromResponse(resp) // last known (absent) response
+		}
+		rev = v.table.Rev()
+		resp, err = v.resolveMMDSOnce(sid, path)
+		if err != nil {
+			return mmds.MMDSRoute{}, false, err
+		}
+		if !resp.Found {
+			return mmds.MMDSRoute{}, false, nil
+		}
+		if resp.Type != "secret" || resp.Present || !resp.Retryable {
+			return mmdsRouteFromResponse(resp)
+		}
+	}
+}
+
+// resolveMMDSOnce makes one bounded round trip to the proxy master, distinct
+// from -- and nested inside -- MMDSRoute's overall park deadline: this bounds
+// a single same-node socketpair call (near-instant), not the guest-visible
+// wait for an admin PUT to land.
+func (v *WorkerView) resolveMMDSOnce(sid, path string) (mmdsrpc.EndpointResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), v.mmdsRPCTimeout)
+	defer cancel()
+	return v.mmdsClient.Resolve(ctx, sid, path)
+}
+
+// mmdsRouteFromResponse converts one master response into the mmds.Source
+// return shape. A "secret" body is base64-encoded on the wire (see
+// mmdsrpc.EndpointResponse's doc comment -- secret values aren't required to
+// be valid UTF-8, unlike a static route's body) and is decoded here, the one
+// place that needs raw bytes.
+func mmdsRouteFromResponse(resp mmdsrpc.EndpointResponse) (mmds.MMDSRoute, bool, error) {
+	if resp.Type != "secret" {
+		return mmds.MMDSRoute{Type: resp.Type, ContentType: resp.ContentType, Data: resp.Body}, true, nil
+	}
+	if resp.Unavailable {
+		// The master's secret view isn't currently synced (mid-resync after
+		// a disconnect, or never yet synced) -- fail closed via a hard error
+		// (mmds.Server.getMeta maps err!=nil to 503), never a stale value or
+		// a false "never configured" 404.
+		return mmds.MMDSRoute{}, false, errors.New("proxyshm: mmds secret sync unavailable")
+	}
+	route := mmds.MMDSRoute{Type: resp.Type, Present: resp.Present}
+	if !resp.Present {
+		return route, true, nil
+	}
+	body, err := base64.StdEncoding.DecodeString(resp.Body)
+	if err != nil {
+		return mmds.MMDSRoute{}, false, fmt.Errorf("proxyshm: decode mmds secret body for %q: %w", resp.Type, err)
+	}
+	route.ContentType = resp.ContentType
+	route.Data = string(body)
+	return route, true, nil
+}
+
+// mmdsParkTimeout is the master-pushed bound for MMDSRoute's secret-retry
+// loop -- the external-mode mirror of config.MMDSSecretRoutesConfig's
+// park_timeout, carried over routesync.Policy.MMDSParkTimeoutMS rather than
+// read from local config (a worker has no config file of its own).
+func (v *WorkerView) mmdsParkTimeout() time.Duration {
+	p := v.table.Policy()
+	if p.MMDSParkTimeoutMS > 0 {
+		return time.Duration(p.MMDSParkTimeoutMS) * time.Millisecond
+	}
+	return v.defaultPark
 }
 
 func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
@@ -374,6 +503,10 @@ func (v *WorkerView) SandboxInfo(sid string) (templateID, accessToken string, ok
 
 func (v *WorkerView) MmdsSecret(sid string) ([]byte, bool) {
 	return v.table.MmdsSecret(sid)
+}
+
+func (v *WorkerView) Incarnation(sid string) (string, bool) {
+	return v.table.Incarnation(sid)
 }
 
 func (v *WorkerView) Policy() routesync.Policy {

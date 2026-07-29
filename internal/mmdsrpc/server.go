@@ -6,10 +6,21 @@ import (
 )
 
 // Route is a resolved MMDS route, as returned by a Handler.
+//
+// For Type=="secret": Present/Retryable/ContentType/Body mirror
+// EndpointResponse's fields of the same name -- Body is base64-encoded
+// exactly like the underlying store.MMDSSecretValue.BodyBase64 (unlike a
+// static route's Body, which is raw UTF-8 text); Server passes it straight
+// through onto the wire unchanged, and WorkerView.MMDSRoute is the one place
+// that decodes it back to raw bytes, since a secret value is not required to
+// be valid UTF-8 and encoding/json would silently corrupt it otherwise.
 type Route struct {
 	Type        string // "secret" | "service" | "static"
-	ContentType string // static only
-	Body        string // static only
+	ContentType string // static, and secret once Present
+	Body        string // static (raw) or secret (base64, once Present)
+	Present     bool   // secret only
+	Retryable   bool   // secret only, meaningful when !Present
+	Unavailable bool   // secret only; see EndpointResponse.Unavailable
 }
 
 // Handler resolves sid's specified MMDS route at path. ok=false means sid or
@@ -49,6 +60,9 @@ func (s *Server) Serve() {
 			resp.Type = route.Type
 			resp.ContentType = route.ContentType
 			resp.Body = route.Body
+			resp.Present = route.Present
+			resp.Retryable = route.Retryable
+			resp.Unavailable = route.Unavailable
 		}
 		if err := writeFrame(s.rw, resp); err != nil {
 			if s.log != nil {

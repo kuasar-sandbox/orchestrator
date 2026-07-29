@@ -27,6 +27,10 @@ type routeLogEntry struct {
 // routeEntry projects a sandbox into the wire route entry pushed to proxies. The
 // MMDS secret is derived deterministically (so every proxy worker agrees) and is
 // carried on every entry — subscribers that don't serve MMDS simply ignore it.
+// MMDSSecrets, unlike every other field here, is gated per-subscriber downstream
+// (routesync.writeEvent/Range) rather than at construction -- this always
+// populates it when the sandbox has an MMDS specification at all, and lets the
+// wire layer decide who actually receives it.
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
@@ -49,6 +53,15 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		MMDSRoutes:             sb.Metadata[sandboxcfg.NsMMDS],
+		RunID:                  sb.RunID,
+	}
+	if sb.Metadata[sandboxcfg.NsMMDS] != "" {
+		blob, _, _, err := o.st.GetMMDSSecretBlob(context.Background(), sb.ID)
+		if err != nil {
+			o.log.Warn("routeEntry: get mmds secret blob", "sid", sb.ID, "err", err)
+		} else {
+			e.MMDSSecrets = blob
+		}
 	}
 	return e
 }
@@ -133,9 +146,10 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 // Policy is the operational policy pushed to proxies at handshake.
 func (o *Orchestrator) Policy() routesync.Policy {
 	return routesync.Policy{
-		Domain:        o.cfg.API.Domain,
-		AuthMode:      o.cfg.Proxy.Auth,
-		ParkTimeoutMS: int(o.cfg.ParkTimeoutDur() / time.Millisecond),
+		Domain:            o.cfg.API.Domain,
+		AuthMode:          o.cfg.Proxy.Auth,
+		ParkTimeoutMS:     int(o.cfg.ParkTimeoutDur() / time.Millisecond),
+		MMDSParkTimeoutMS: int(o.cfg.MMDS.Routes.Secret.ParkTimeoutDur() / time.Millisecond),
 	}
 }
 

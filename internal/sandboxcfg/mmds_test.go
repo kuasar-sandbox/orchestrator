@@ -488,3 +488,39 @@ func TestLookupMMDSRoute(t *testing.T) {
 		t.Fatal("expected an absent namespace to be not found")
 	}
 }
+
+func TestMMDSSpecifiesSecretName(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"version":1,"secrets":[{"name":"key1"}],"routes":[{"path":"/x","type":"secret","secret_name":"key1"}]}`}
+
+	if !MMDSSpecifiesSecretName(meta, "key1") {
+		t.Fatal("expected key1 to be specified")
+	}
+	if MMDSSpecifiesSecretName(meta, "key2") {
+		t.Fatal("expected key2 to be unspecified")
+	}
+	if MMDSSpecifiesSecretName(map[string]string{}, "key1") {
+		t.Fatal("expected an absent namespace to specify nothing")
+	}
+	if MMDSSpecifiesSecretName(map[string]string{NsMMDS: "not json"}, "key1") {
+		t.Fatal("expected corrupt namespace value to specify nothing")
+	}
+}
+
+func TestMMDSConfigDigest(t *testing.T) {
+	meta1 := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":"static","data":"a"}]}`}
+	meta2 := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/y","type":"static","data":"b"}]}`}
+
+	d1 := MMDSConfigDigest(meta1)
+	if d1 == "" {
+		t.Fatal("expected a non-empty digest")
+	}
+	if d1 != MMDSConfigDigest(meta1) {
+		t.Fatal("digest is not deterministic")
+	}
+	if d1 == MMDSConfigDigest(meta2) {
+		t.Fatal("distinct specifications produced the same digest")
+	}
+	if got := MMDSConfigDigest(map[string]string{}); got != "" {
+		t.Fatalf("expected an empty digest for an absent namespace, got %q", got)
+	}
+}

@@ -10,10 +10,14 @@
 //
 //   - PUT /latest/api/token : resolve the request's source IP — the guest's
 //     vswitch-SNAT'd floating IP — to a running sandbox id, PARKING (bounded) until it
-//     registers; return an HMAC-signed session token that binds this session to that id.
-//   - GET /                 : verify + decode the session token (the in-guest code is
-//     untrusted, so we trust the token we minted, not a re-read of the source), then
-//     return that sandbox's current {instanceID, envID, accessTokenHash}.
+//     registers; return an HMAC-signed, TTL-bounded session token that binds this
+//     session to that id, that exact source IP, and that sandbox's current run
+//     incarnation (so pause/resume invalidates it).
+//   - GET /                 : verify the session token (the in-guest code is
+//     untrusted, so we trust the token we minted, not a re-read of the source) --
+//     expiry, audience, source IP, and current incarnation are all re-checked on
+//     every call, not just at mint time -- then return that sandbox's current
+//     {instanceID, envID, accessTokenHash}.
 //
 // Hosted by the proxy component (proxy_mode=internal: the serve daemon; external:
 // proxy workers sharing the master's listener fd). envd hard-codes
@@ -26,18 +30,21 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Source is the orchestrator's view the MMDS reads. Both the orchestrator
 // (proxy_mode=internal) and the synced route table (external) implement it; lookups are
-// non-blocking and the server does the parking.
+// non-blocking and the server does the parking, with one exception: the
+// MMDSRoute method below, for a specified-but-never-configured secret.
 type Source interface {
 	// ByFloatingIP returns the running sandbox id whose floating IP is ip (the guest's
 	// SNAT'd source). ok=false if none is registered yet.
@@ -48,21 +55,37 @@ type Source interface {
 	// from the manifest key + id, so a token minted by any proxy worker verifies in
 	// any other through the same shared route view. ok=false for an unknown sandbox.
 	MmdsSecret(sandboxID string) (secret []byte, ok bool)
+	// Incarnation returns sid's current run incarnation (the launch/resume-scoped
+	// run id, e.g. types.Sandbox.RunID) -- a minted token binds to this exact
+	// value, so pause/resume (which assigns a fresh incarnation) invalidates
+	// every token minted under the prior one, without needing an explicit
+	// revocation list. ok=false for an unknown sandbox or one with no
+	// incarnation yet (e.g. between Create and its first successful launch) --
+	// a token cannot be minted or verified without one.
+	Incarnation(sandboxID string) (incarnation string, ok bool)
 	// MMDSRoute returns the tenant-specified kuasar-sandbox.mmds route at path for
 	// sid. ok=false with err=nil means sid or path is genuinely unspecified — the
 	// caller falls through to the existing fixed instance-info response. err!=nil
 	// means resolution could not be completed (e.g. an external-mode RPC to the
 	// proxy master timed out) — this is distinct from "unspecified" so the caller
 	// can fail closed (503) instead of silently serving the wrong response for a
-	// route that may well be specified.
+	// route that may well be specified. For a "secret" route whose value has
+	// never been configured (revision==0), this call may block, bounded by node
+	// policy, waiting for an admin PUT to land before returning -- ok is still
+	// true (the route IS specified); the caller distinguishes "present" from
+	// "specified but absent" via MMDSRoute.Present.
 	MMDSRoute(sandboxID, path string) (route MMDSRoute, ok bool, err error)
 }
 
 // MMDSRoute is the resolved backend for one specified guest-visible path.
 type MMDSRoute struct {
 	Type        string // "secret" | "service" | "static"
-	ContentType string // static only
-	Data        string // static only
+	ContentType string // static and secret (once Present)
+	Data        string // static and secret (once Present)
+	// Present is meaningful for "secret" routes only: true iff Data holds a
+	// real configured value. A specified-but-absent secret is a valid 404, not
+	// an error.
+	Present bool
 }
 
 // Server is the MMDS handler. Serve it on a listener the host redirects
@@ -157,7 +180,34 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	return nil
 }
 
+// mmdsTokenAudience scopes a minted token to this service specifically, so
+// it can never be confused with (or replayed into) some other subsystem
+// that happened to reuse the same per-sandbox HMAC secret.
+const mmdsTokenAudience = "mmds"
+
+// Token TTL bounds, in seconds -- the design's own "1 through 21600" range
+// (21600s = 6h), enforced on the requested value before a token is minted.
+const (
+	minTokenTTLSeconds = 1
+	maxTokenTTLSeconds = 21600
+)
+
 func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
+	// Exactly one X-metadata-token-ttl-seconds header, a decimal integer in
+	// [1, 21600] -- missing, duplicate (Values returns one entry per header
+	// line), malformed, zero, negative, or out-of-range all fail before any
+	// sandbox resolution/token work happens.
+	ttlHeader := r.Header.Values("X-metadata-token-ttl-seconds")
+	if len(ttlHeader) != 1 {
+		http.Error(w, "", http.StatusBadRequest)
+		return
+	}
+	ttlSeconds, err := strconv.ParseInt(ttlHeader[0], 10, 64)
+	if err != nil || ttlSeconds < minTokenTTLSeconds || ttlSeconds > maxTokenTTLSeconds {
+		http.Error(w, "", http.StatusBadRequest)
+		return
+	}
+
 	ip := sourceIP(r.RemoteAddr)
 	sid, ok := s.resolve(r.Context(), ip)
 	if !ok {
@@ -175,12 +225,33 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return
 	}
+	incarnation, ok := s.src.Incarnation(sid)
+	if !ok {
+		// No current incarnation to bind to (e.g. between Create and the first
+		// successful launch) -- fail closed the same way a missing secret does;
+		// envd's poll PUTs again once one exists.
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+	token, err := mintToken(tokenPayload{
+		SID:         sid,
+		SourceIP:    ip,
+		Incarnation: incarnation,
+		Audience:    mmdsTokenAudience,
+		ExpiresUnix: time.Now().Unix() + ttlSeconds,
+	}, secret)
+	if err != nil {
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	// Echo the accepted (parsed, canonical) value, not the raw header bytes.
+	w.Header().Set("X-metadata-token-ttl-seconds", strconv.FormatInt(ttlSeconds, 10))
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = w.Write([]byte(sid + "." + sign(sid, secret)))
+	_, _ = w.Write([]byte(token))
 }
 
 func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
-	sid, ok := s.verifyToken(r.Header.Get("X-metadata-token"))
+	sid, ok := s.verifyToken(r.Header.Get("X-metadata-token"), sourceIP(r.RemoteAddr))
 	if !ok {
 		http.Error(w, "", http.StatusUnauthorized)
 		return
@@ -208,7 +279,14 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		case "static":
 			w.Header().Set("Content-Type", route.ContentType)
 			_, _ = w.Write([]byte(route.Data))
-		default: // "secret" | "service" — backend lands in a later phase
+		case "secret":
+			if route.Present {
+				w.Header().Set("Content-Type", route.ContentType)
+				_, _ = w.Write([]byte(route.Data))
+			} else {
+				http.Error(w, "", http.StatusNotFound)
+			}
+		default: // "service" — backend not yet implemented
 			http.Error(w, "", http.StatusServiceUnavailable)
 		}
 		return
@@ -244,16 +322,54 @@ func (s *Server) resolve(ctx context.Context, ip string) (string, bool) {
 	}
 }
 
-// A session token is "<sid>.<hex(HMAC-SHA256(secret, sid))>" — opaque to envd,
-// unforgeable by the guest (it lacks the secret). The sid is not secret (it's the
-// sandbox id). The secret is the per-sandbox key from the Source, so any worker mints
-// and verifies the same token.
-func (s *Server) verifyToken(tok string) (string, bool) {
-	sid, sig, found := strings.Cut(tok, ".")
-	if !found || sid == "" {
+// tokenPayload is the integrity-protected, HMAC-signed body of a session
+// token minted by putToken. Every field is re-checked against live state on
+// every protected GET (verifyToken), not just at mint time: Audience scopes
+// the token to this service; ExpiresUnix bounds its lifetime to the TTL
+// requested at mint; SourceIP must match the current request's source
+// exactly; Incarnation must match the sandbox's *current* run incarnation --
+// a stale incarnation (paused and resumed since this token was minted) fails
+// closed rather than silently authenticating a session from a prior run.
+// Reusable (not single-use): the same source/sandbox/incarnation may present
+// this token repeatedly until it expires.
+type tokenPayload struct {
+	SID         string `json:"sid"`
+	SourceIP    string `json:"ip"`
+	Incarnation string `json:"run"`
+	Audience    string `json:"aud"`
+	ExpiresUnix int64  `json:"exp"`
+}
+
+// mintToken renders p as "<base64url(JSON payload)>.<hex(HMAC-SHA256(secret,
+// payload bytes))>" -- opaque to envd, unforgeable by the guest (it lacks
+// secret). The internal encoding is not part of the guest API contract (see
+// package doc); only mintToken/verifyToken need to agree on it.
+func mintToken(p tokenPayload, secret []byte) (string, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + hex.EncodeToString(signBytes(payload, secret)), nil
+}
+
+// verifyToken decodes and fully re-validates tok against live state:
+// integrity (HMAC), audience, expiry, the current request's source IP, and
+// the sandbox's current run incarnation. currentSourceIP is the caller's own
+// fresh sourceIP(r.RemoteAddr) call, never cached from token mint time.
+func (s *Server) verifyToken(tok, currentSourceIP string) (string, bool) {
+	payloadB64, sig, found := strings.Cut(tok, ".")
+	if !found || payloadB64 == "" {
 		return "", false
 	}
-	secret, ok := s.src.MmdsSecret(sid)
+	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return "", false
+	}
+	var p tokenPayload
+	if err := json.Unmarshal(payload, &p); err != nil || p.SID == "" {
+		return "", false
+	}
+	secret, ok := s.src.MmdsSecret(p.SID)
 	if !ok {
 		return "", false
 	}
@@ -261,17 +377,28 @@ func (s *Server) verifyToken(tok string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if !hmac.Equal(got, signBytes(sid, secret)) {
+	if !hmac.Equal(got, signBytes(payload, secret)) {
 		return "", false
 	}
-	return sid, true
+	if p.Audience != mmdsTokenAudience {
+		return "", false
+	}
+	if time.Now().Unix() >= p.ExpiresUnix {
+		return "", false
+	}
+	if p.SourceIP != currentSourceIP {
+		return "", false
+	}
+	incarnation, ok := s.src.Incarnation(p.SID)
+	if !ok || incarnation != p.Incarnation {
+		return "", false
+	}
+	return p.SID, true
 }
 
-func sign(sid string, secret []byte) string { return hex.EncodeToString(signBytes(sid, secret)) }
-
-func signBytes(sid string, secret []byte) []byte {
+func signBytes(payload, secret []byte) []byte {
 	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(sid))
+	mac.Write(payload)
 	return mac.Sum(nil)
 }
 

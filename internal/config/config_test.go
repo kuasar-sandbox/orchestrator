@@ -97,6 +97,39 @@ sandbox:
 	if got, want := cfg.MMDS.Routes.MaxNamespaceBytes, 64*1024; got != want {
 		t.Fatalf("MaxNamespaceBytes = %d, want %d", got, want)
 	}
+	if got, want := cfg.MMDS.Routes.Secret.MaxValueBytes, 16*1024; got != want {
+		t.Fatalf("Secret.MaxValueBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.Secret.ParkTimeout, "3s"; got != want {
+		t.Fatalf("Secret.ParkTimeout = %q, want %q", got, want)
+	}
+	if got, want := cfg.MMDS.Routes.Secret.ParkTimeoutDur(), 3*time.Second; got != want {
+		t.Fatalf("Secret.ParkTimeoutDur() = %v, want %v", got, want)
+	}
+}
+
+func TestLoadRejectsMalformedMMDSParkTimeout(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  routes:
+    secret:
+      park_timeout: soon
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with a malformed mmds.routes.secret.park_timeout")
+	}
+	if !strings.Contains(err.Error(), "park_timeout") {
+		t.Fatalf("error %q does not mention park_timeout", err)
+	}
 }
 
 func TestLoadRejectsMMDSRoutesWithoutMMDSService(t *testing.T) {

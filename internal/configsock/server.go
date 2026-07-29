@@ -29,8 +29,11 @@ package configsock
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -44,6 +47,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -55,7 +59,57 @@ const (
 	PathRunAssignment    = "/internal/run/assignment"
 	PathRunBuildResult   = "/internal/run/build-result"
 	PathAdminManifestKey = "/internal/admin/manifest-keys"
+	// PathAdminMMDSSecretPut/Delete are Go 1.22 method+wildcard patterns (see
+	// routesync.PluginRegisterPattern for the same style): an operator PUTs or
+	// DELETEs one named secret value for one sandbox. Never reachable from a
+	// tenant's Create request -- this is admin-plane only.
+	PathAdminMMDSSecretPut    = "PUT /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
+	PathAdminMMDSSecretDelete = "DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 )
+
+// maxMMDSSecretBodyBytes bounds how much of a PUT's body this server will
+// buffer before rejecting -- a fixed memory-safety backstop, independent of
+// and larger than any operator-configured mmds.routes.secret.max_value_bytes
+// (which internal/orch.PutMMDSSecret enforces as the real, tunable policy
+// limit; configsock stays policy-agnostic).
+const maxMMDSSecretBodyBytes = 1 << 20 // 1MiB
+
+// maxMMDSSecretContentTypeBytes bounds the admin PUT's optional Content-Type
+// header.
+const maxMMDSSecretContentTypeBytes = 256
+
+// validMMDSSecretContentType reports whether v is acceptable as a secret's
+// stored Content-Type: empty (the admin API defaults it) or a bounded,
+// well-formed media type. This rejects a malformed value outright (400) --
+// this is a deliberate admin write, not an untrusted backend response being
+// filtered, so failing loud (matching this handler's existing
+// X-Kuasar-MMDS-Expires-Unix validation) beats silently storing a default
+// the caller never asked for.
+func validMMDSSecretContentType(v string) bool {
+	if v == "" {
+		return true
+	}
+	if len(v) > maxMMDSSecretContentTypeBytes {
+		return false
+	}
+	_, _, err := mime.ParseMediaType(v)
+	return err == nil
+}
+
+// MMDSSecretsAdmin is the admin plane's PUT/DELETE surface for per-sandbox
+// MMDS secret values specified in kuasar-sandbox.mmds secrets[]. Values are
+// never accepted from the tenant's Create request -- only through here.
+type MMDSSecretsAdmin interface {
+	PutMMDSSecret(ctx context.Context, sandboxID, name string, body []byte, contentType string, expiresUnix int64) (revision int64, err error)
+	DeleteMMDSSecret(ctx context.Context, sandboxID, name string) (revision int64, err error)
+}
+
+// AdminMMDSSecretResponse is the PUT/DELETE error response body. Success
+// carries no body (204, see writeMMDSSecretMutationSuccess) -- this type
+// exists only for the failure paths.
+type AdminMMDSSecretResponse struct {
+	Error string `json:"error,omitempty"`
+}
 
 // journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
 // producers — sandbox-ctl, the build pipeline — and the orchestrator's log query
@@ -264,13 +318,20 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
-	Provider      Provider         // task plane (LaunchSpec by config-id)
-	Admin         Admin            // admin plane (manifest-key allowlist)
-	API           http.Handler     // api plane (e2b control plane + export/import); the fallback
-	AdminPidfile  string           // optional PID allowlist gating the admin plane ("" => socket perms only)
-	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
-	Plugins       *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
-	PluginPidfile string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
+	Provider         Provider         // task plane (LaunchSpec by config-id)
+	Admin            Admin            // admin plane (manifest-key allowlist)
+	MMDSSecretsAdmin MMDSSecretsAdmin // admin plane: per-sandbox MMDS secret PUT/DELETE (nil => routes off)
+	API              http.Handler     // api plane (e2b control plane + export/import); the fallback
+	AdminPidfile     string           // optional PID allowlist gating the admin plane ("" => socket perms only)
+	RouteSource      routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
+	Plugins          *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
+	PluginPidfile    string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
+	// MMDSSecretsPidfile additionally narrows which peer PID may register
+	// with the MMDSSecrets capability (live secret plaintext), on top of the
+	// identity checks handlePluginRegister always applies regardless of this
+	// setting -- see mmdsSecretsAuthed. "" => that PID check alone falls back
+	// to socket perms only, matching PluginPidfile's own fallback.
+	MMDSSecretsPidfile string
 }
 
 type Server struct {
@@ -342,6 +403,10 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.MMDSSecretsAdmin != nil {
+		mux.HandleFunc(PathAdminMMDSSecretPut, s.handleAdminMMDSSecretPut)
+		mux.HandleFunc(PathAdminMMDSSecretDelete, s.handleAdminMMDSSecretDelete)
+	}
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
 	}
@@ -554,6 +619,105 @@ func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResp
 		out.Error = "unknown op (want add|remove|check)"
 	}
 	return out
+}
+
+// handleAdminMMDSSecretPut installs/overwrites one named secret value for one
+// sandbox. The byte limit is enforced by MMDSSecretsAdmin (the orch layer,
+// which owns mmds.routes.secret.max_value_bytes); this handler only guards
+// against buffering an unbounded body (maxMMDSSecretBodyBytes). Content-Type
+// is optional (the implementation defaults it); X-Kuasar-MMDS-Expires-Unix is
+// an optional Unix-seconds expiry, absent/0 = no expiry.
+func (s *Server) handleAdminMMDSSecretPut(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		writeJSON(w, http.StatusForbidden, &AdminMMDSSecretResponse{Error: "not authorized (admin)"})
+		return
+	}
+	sid, name := r.PathValue("id"), r.PathValue("name")
+	if sid == "" || name == "" {
+		writeJSON(w, http.StatusBadRequest, &AdminMMDSSecretResponse{Error: "sandbox id and secret name are required"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxMMDSSecretBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, &AdminMMDSSecretResponse{Error: "body too large"})
+		return
+	}
+	var expiresUnix int64
+	if v := r.Header.Get("X-Kuasar-MMDS-Expires-Unix"); v != "" {
+		// ParseUint, not ParseInt: expires_unix is a Unix-seconds timestamp
+		// (0 = no expiry), so a negative value is malformed input, not a
+		// valid-but-unusual expiry -- ParseInt would silently accept "-1" and
+		// (since MMDSSecretExpired only treats ExpiresUnix>0 as bounded) it
+		// would be misread as "never expires" instead of rejected.
+		unsigned, perr := strconv.ParseUint(v, 10, 63)
+		if perr != nil {
+			writeJSON(w, http.StatusBadRequest, &AdminMMDSSecretResponse{Error: "invalid X-Kuasar-MMDS-Expires-Unix"})
+			return
+		}
+		expiresUnix = int64(unsigned)
+	}
+	contentType := r.Header.Get("Content-Type")
+	if !validMMDSSecretContentType(contentType) {
+		writeJSON(w, http.StatusBadRequest, &AdminMMDSSecretResponse{Error: "invalid Content-Type"})
+		return
+	}
+	rev, err := s.deps.MMDSSecretsAdmin.PutMMDSSecret(r.Context(), sid, name, body, contentType, expiresUnix)
+	if err != nil {
+		// Audit failures too, but never the body/content-type -- only identity + outcome.
+		s.log.Warn("configsock admin mmds secret put", "peer", peer, "sandbox_id", sid, "name", name, "err", err)
+		writeJSON(w, adminMMDSSecretErrorCode(err), &AdminMMDSSecretResponse{Error: err.Error()})
+		return
+	}
+	s.log.Info("configsock admin mmds secret put", "peer", peer, "sandbox_id", sid, "name", name, "revision", rev)
+	writeMMDSSecretMutationSuccess(w, rev)
+}
+
+// handleAdminMMDSSecretDelete clears one named secret value for one sandbox.
+// Deleting a name that was never configured is an idempotent 200 (see
+// internal/orch.DeleteMMDSSecret); deleting an unspecified name is a 400.
+func (s *Server) handleAdminMMDSSecretDelete(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		writeJSON(w, http.StatusForbidden, &AdminMMDSSecretResponse{Error: "not authorized (admin)"})
+		return
+	}
+	sid, name := r.PathValue("id"), r.PathValue("name")
+	if sid == "" || name == "" {
+		writeJSON(w, http.StatusBadRequest, &AdminMMDSSecretResponse{Error: "sandbox id and secret name are required"})
+		return
+	}
+	rev, err := s.deps.MMDSSecretsAdmin.DeleteMMDSSecret(r.Context(), sid, name)
+	if err != nil {
+		s.log.Warn("configsock admin mmds secret delete", "peer", peer, "sandbox_id", sid, "name", name, "err", err)
+		writeJSON(w, adminMMDSSecretErrorCode(err), &AdminMMDSSecretResponse{Error: err.Error()})
+		return
+	}
+	s.log.Info("configsock admin mmds secret delete", "peer", peer, "sandbox_id", sid, "name", name, "revision", rev)
+	writeMMDSSecretMutationSuccess(w, rev)
+}
+
+// adminMMDSSecretErrorCode maps internal/orch's sentinel-wrapped errors to an
+// HTTP status; anything else is an unexpected internal failure.
+// writeMMDSSecretMutationSuccess replies 204 No Content per the confirmed
+// #42 design ("admin mutation success" -- no response body), carrying the
+// new revision on X-Kuasar-MMDS-Revision instead of a JSON body, mirroring
+// the header the design already uses for revision on the guest-facing GET.
+func writeMMDSSecretMutationSuccess(w http.ResponseWriter, revision int64) {
+	w.Header().Set("X-Kuasar-MMDS-Revision", strconv.FormatInt(revision, 10))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func adminMMDSSecretErrorCode(err error) int {
+	switch {
+	case errors.Is(err, api.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, api.ErrBadRequest):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // adminAuthed gates the admin plane: when admin_pidfile is set the peer pid must be

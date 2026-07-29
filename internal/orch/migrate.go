@@ -90,6 +90,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		}
 		o.uncache(sid)
 		o.clearDeadlineIntent(sid)
+		o.secretWait.ForgetSandbox(sid)
 		o.publishDelete(sid)
 	}
 	return tok, nil

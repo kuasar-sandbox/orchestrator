@@ -18,20 +18,22 @@ import (
 
 // fakeSink records what the proxy side receives.
 type fakeSink struct {
-	begin chan struct{}
-	up    chan routesync.RouteEntry
-	del   chan string
-	book  chan struct{}
-	pol   chan routesync.Policy
+	begin      chan struct{}
+	up         chan routesync.RouteEntry
+	del        chan string
+	book       chan struct{}
+	pol        chan routesync.Policy
+	invalidate chan struct{}
 }
 
 func newFakeSink() *fakeSink {
 	return &fakeSink{
-		begin: make(chan struct{}, 4),
-		up:    make(chan routesync.RouteEntry, 4),
-		del:   make(chan string, 4),
-		book:  make(chan struct{}, 4),
-		pol:   make(chan routesync.Policy, 4),
+		begin:      make(chan struct{}, 4),
+		up:         make(chan routesync.RouteEntry, 4),
+		del:        make(chan string, 4),
+		book:       make(chan struct{}, 4),
+		pol:        make(chan routesync.Policy, 4),
+		invalidate: make(chan struct{}, 4),
 	}
 }
 
@@ -40,6 +42,17 @@ func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry) { f.up <- r }
 func (f *fakeSink) ApplyDelete(sid string)             { f.del <- sid }
 func (f *fakeSink) Bookmark()                          { f.book <- struct{}{} }
 func (f *fakeSink) SetPolicy(p routesync.Policy)       { f.pol <- p }
+
+// InvalidateSync is called every time session() returns, including on a
+// deliberate shutdown -- unlike the other hooks above (each asserted exactly
+// once per test scenario), tests that don't care about this signal must not
+// block on it, so this send is non-blocking.
+func (f *fakeSink) InvalidateSync() {
+	select {
+	case f.invalidate <- struct{}{}:
+	default:
+	}
+}
 
 type fakeWakes struct{ ch chan string }
 
@@ -59,9 +72,15 @@ type fakeSource struct {
 	pol    routesync.Policy
 	fp     string
 	replay []routesync.Event
+	// rangeEntry overrides Range's single hardcoded entry when SandboxID != "" --
+	// used by tests that need extra fields (e.g. MMDSSecrets) on the initial snapshot.
+	rangeEntry routesync.RouteEntry
 }
 
 func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
+	if s.rangeEntry.SandboxID != "" {
+		return fn(s.rangeEntry)
+	}
 	return fn(routesync.RouteEntry{SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning})
 }
 func (s *fakeSource) Subscribe() (<-chan routesync.Event, func()) { return s.sub, func() {} }
@@ -168,6 +187,55 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	if got := recv(t, src.woke, "wake"); got != "s9" {
 		t.Fatalf("wake = %q", got)
 	}
+}
+
+// TestRouteSyncInvalidatesSyncOnDisconnect proves a mid-stream disconnect
+// (the server ending the response body right after a completed Bookmark, so
+// the subscriber's next ReadMsg gets an error) calls the sink's
+// InvalidateSync immediately -- not only once a NEW session's own BeginSync
+// eventually lands after the reconnect backoff, which (thanks to that
+// backoff) could be a visibly later point in time. Reconnection itself is
+// Run's pre-existing, separately-tested behavior; this test's scope is only
+// the immediate-invalidation signal.
+func TestRouteSyncInvalidatesSyncOnDisconnect(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := routesync.ReadRegister(r.Body); err != nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		// Hand off a minimal completed sync, then return (ending the
+		// response body) without an explicit close message -- the
+		// subscriber's ReadMsg sees this as a stream error, exactly like a
+		// real dropped connection would.
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Policy: routesync.Policy{}}})
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeBookmark})
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	sink := newFakeSink()
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	reg := routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: "/x"}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go routesync.NewSubscriber(dial, "px0", reg, sink, nil, log).Run(ctx)
+
+	recv(t, sink.begin, "session begin-sync")
+	recv(t, sink.book, "session bookmark")
+	recv(t, sink.invalidate, "invalidate on disconnect")
 }
 
 func TestRouteSyncResumeReplay(t *testing.T) {

@@ -109,12 +109,21 @@ CREATE TABLE IF NOT EXISTS manifest_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_ascandidate ON manifest_keys(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_key_hash);
+
+CREATE TABLE IF NOT EXISTS sandbox_mmds_secrets (
+  sandbox_id        TEXT PRIMARY KEY,
+  config_digest     TEXT NOT NULL,
+  revision          INTEGER NOT NULL DEFAULT 0,
+  secret_ciphertext TEXT NOT NULL DEFAULT '',
+  updated_unix      INTEGER NOT NULL,
+  FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}

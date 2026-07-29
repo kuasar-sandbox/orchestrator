@@ -43,15 +43,40 @@ type EndpointRequest struct {
 // EndpointResponse is the master's answer. Found=false means sid or path is
 // unspecified -- the worker's mmds.Source falls through exactly as the internal
 // implementation does. Found=true with an empty Type never happens; Type is
-// "static" (ContentType/Body populated), "secret", or "service" (their
-// backends land in a later phase; the worker maps those to 503, matching
-// internal/mmds's getMeta dispatch).
+// "static" (ContentType/Body populated), "secret" (Present/Retryable/
+// ContentType/Body meaningful, see below), or "service" (backend not yet
+// implemented; the worker maps it to 503, matching internal/mmds's getMeta
+// dispatch).
+//
+// For Type=="secret": Present distinguishes "configured" (ContentType/Body
+// hold the real value) from "specified but absent". Retryable is meaningful
+// only when !Present -- true means the secret has never been configured
+// (revision==0, worth polling, matching the internal-mode bounded wait);
+// false means it was configured and later revoked (a deliberate revoke gets
+// no grace period). The master owns this decision (it has the synced
+// revision state); the worker's retry loop just obeys Retryable, never
+// reasoning about revisions itself. Body, unlike a static route's Data, may
+// be arbitrary non-UTF-8 bytes, so it travels base64-encoded on this wire
+// (Type=="static" bodies are always valid UTF-8 and are NOT base64'd).
+//
+// Unavailable is meaningful only for Type=="secret": true means the master's
+// secret view is not currently synced (proxyshm.MMDSSecrets.Synced()==false
+// -- mid-resync after a disconnect, or never yet synced), so Present/
+// Retryable/ContentType/Body are meaningless and must not be trusted even if
+// they carry zero values that would otherwise look like "never configured".
+// The worker maps this to a hard error (503 to the guest), never to the
+// 404 a genuinely absent/revoked secret would get -- serving stale plaintext
+// or a false "not configured" during a resync is exactly what this guards
+// against.
 type EndpointResponse struct {
 	RequestID   uint64 `json:"id"`
 	Found       bool   `json:"found"`
 	Type        string `json:"type,omitempty"`
 	ContentType string `json:"content_type,omitempty"`
 	Body        string `json:"body,omitempty"`
+	Present     bool   `json:"present,omitempty"`
+	Retryable   bool   `json:"retryable,omitempty"`
+	Unavailable bool   `json:"unavailable,omitempty"`
 }
 
 func writeFrame(w io.Writer, v any) error {

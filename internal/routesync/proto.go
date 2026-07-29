@@ -48,6 +48,17 @@ const pluginPathPrefix = "/internal/plugin/"
 // PluginRegisterPath is the registration path for a given plugin id.
 func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/register" }
 
+// ProxyPluginID is the well-known plugin registration id the external-mode
+// proxy master (cmd/node-ctl/proxy.go's runProxyMaster) always registers
+// under. A shared constant (rather than each side hard-coding its own copy
+// of "proxy") so the config-socket's MMDSSecrets-capability authorization
+// (internal/configsock's handlePluginRegister) and the proxy's own
+// registration can never drift apart -- that check is part of what stands
+// between an ordinary route observer and live MMDS secret plaintext, so it
+// must name the exact same identity the real proxy uses, not a
+// coincidentally-matching literal.
+const ProxyPluginID = "proxy"
+
 // Subscribe kinds (Register.Subscribe.Kind).
 const (
 	KindRoute     = "route"      // route stream only (observer)
@@ -114,6 +125,23 @@ type RouteEntry struct {
 	// proxyshm mmap table, since this field is bounded but variable-length (see
 	// internal/mmdsrpc).
 	MMDSRoutes string `json:"mmds_routes,omitempty"`
+	// MMDSSecrets is sid's decrypted MMDS secret-value blob (internal/store's
+	// GetMMDSSecretBlob JSON), empty for the common case of no configured
+	// secret values. Unlike MMDSRoutes (static bodies, not secret), this field
+	// carries real secret plaintext, so — unlike every other field on this
+	// struct — it is NOT synced unconditionally: writeEvent/Range clear it
+	// per-subscriber unless the subscriber registered with MMDSSecrets: true
+	// (see Register.MMDSSecrets), so only a subscriber prepared to serve MMDS
+	// secrets ever receives it over the wire.
+	MMDSSecrets string `json:"mmds_secrets,omitempty"`
+	// RunID is the sandbox's current run incarnation (the systemd runner
+	// instance id assigned at launch/resume). Not secret, but not synced
+	// unconditionally to every subscriber's own external interpretation
+	// either -- it exists on the wire so a proxy can bind a minted MMDS
+	// token to "this specific incarnation" and reject a token replayed
+	// after pause/resume (which assigns a fresh RunID), matching the
+	// internal-mode orchestrator's own live view of the same field.
+	RunID string `json:"run_id,omitempty"`
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -122,6 +150,13 @@ type Policy struct {
 	Domain        string `json:"domain,omitempty"`
 	AuthMode      string `json:"auth_mode,omitempty"`       // off | log | enforce
 	ParkTimeoutMS int    `json:"park_timeout_ms,omitempty"` // hold a request awaiting route/resume
+	// MMDSParkTimeoutMS bounds how long a worker's MMDSRoute call parks on a
+	// specified-but-never-configured secret (revision==0) before returning
+	// absent -- the external-mode mirror of mmds.routes.secret.park_timeout,
+	// pushed as node policy so internal/external mode guest-observable wait
+	// behavior stays consistent without needing the value in the tenant's
+	// MMDS specification.
+	MMDSParkTimeoutMS int `json:"mmds_park_timeout_ms,omitempty"`
 }
 
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
@@ -160,6 +195,13 @@ type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
+	// MMDSSecrets opts this subscriber into receiving RouteEntry.MMDSSecrets
+	// (real secret plaintext) on its route stream -- unlike every other
+	// Register capability, gated per-subscriber at write time (writeEvent /
+	// Range) rather than always carried. A subscriber that isn't a real proxy
+	// prepared to serve MMDS secrets should leave this false; it simply never
+	// sees the field, not merely asked politely to ignore it.
+	MMDSSecrets bool `json:"mmds_secrets,omitempty"`
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
 	// string so a node owner can embed a source fingerprint and reject incremental

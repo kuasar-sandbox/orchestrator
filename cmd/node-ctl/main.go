@@ -228,13 +228,15 @@ func runConductor(args []string, log *slog.Logger) error {
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
 	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
-		Provider:      core,
-		Admin:         core,
-		API:           apiH,
-		AdminPidfile:  cfg.Paths.AdminPidfile,
-		RouteSource:   core,
-		Plugins:       plugins,
-		PluginPidfile: cfg.Paths.PluginPidfile,
+		Provider:           core,
+		Admin:              core,
+		MMDSSecretsAdmin:   core,
+		API:                apiH,
+		AdminPidfile:       cfg.Paths.AdminPidfile,
+		RouteSource:        core,
+		Plugins:            plugins,
+		PluginPidfile:      cfg.Paths.PluginPidfile,
+		MMDSSecretsPidfile: cfg.Paths.MMDSSecretsPidfile,
 	}, log)
 	configReady := make(chan struct{})
 	configDone := make(chan error, 1)

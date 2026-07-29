@@ -24,6 +24,16 @@ type Sink interface {
 	// disconnected).
 	Bookmark()
 	SetPolicy(p Policy)
+	// InvalidateSync marks the sink's synced state untrustworthy without
+	// starting a new sync stream -- called immediately whenever a session
+	// ends for any reason (a failed dial/RoundTrip, a ReadMsg protocol or
+	// connection error, or a deliberate shutdown). Without this, a sink would
+	// keep reporting itself synced (against whatever it last saw a completed
+	// Bookmark for) for the entire reconnect backoff window between one
+	// session ending and the next session's own BeginSync -- InvalidateSync
+	// closes that window immediately instead of leaving it open until the
+	// next successful reconnect.
+	InvalidateSync()
 }
 
 // WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
@@ -84,6 +94,13 @@ func (s *Subscriber) Run(ctx context.Context) {
 func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Whatever reason this session ends for, the sink's synced state as of
+	// its last completed Bookmark must not be trusted going forward: Run
+	// only calls BeginSync again once a NEW session's stream is established,
+	// which (thanks to the reconnect backoff) can be seconds away. Without
+	// this, a sink would keep reporting itself synced against a connection
+	// that is actually down for that entire window.
+	defer s.sink.InvalidateSync()
 
 	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(sctx, http.MethodPut, "http://orch"+PluginRegisterPath(s.id), pr)

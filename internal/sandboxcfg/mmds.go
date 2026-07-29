@@ -2,6 +2,8 @@ package sandboxcfg
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -263,6 +265,41 @@ func LookupMMDSRoute(meta map[string]string, path string) (MMDSRouteSpec, bool) 
 		}
 	}
 	return MMDSRouteSpec{}, false
+}
+
+// MMDSSpecifiesSecretName reports whether meta's canonical NsMMDS specification
+// specifies a secret with this name. ExtractMMDS already guarantees every
+// specified secret is referenced by at least one route, so this alone is
+// sufficient for the admin API to reject a name that was never part of the
+// sandbox's specification (e.g. an operator typo).
+func MMDSSpecifiesSecretName(meta map[string]string, name string) bool {
+	raw, ok := meta[NsMMDS]
+	if !ok {
+		return false
+	}
+	var spec MMDSSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return false
+	}
+	for _, s := range spec.Secrets {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// MMDSConfigDigest returns the hex-encoded SHA-256 digest of meta's canonical
+// NsMMDS specification, or "" if absent. Used as part of the secretbox AAD
+// binding a sandbox's encrypted MMDS secret blob to its specification, so
+// ciphertext cannot be replayed under a different specification state.
+func MMDSConfigDigest(meta map[string]string) string {
+	raw, ok := meta[NsMMDS]
+	if !ok {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 // canonicalMMDSPath validates raw as an absolute, exact, unambiguous guest

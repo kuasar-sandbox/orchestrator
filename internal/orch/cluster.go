@@ -761,6 +761,7 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) err
 	}
 	o.clearDeadlineIntent(current.ID)
 	o.uncache(current.ID)
+	o.secretWait.ForgetSandbox(current.ID)
 	o.publishDelete(current.ID)
 	return nil
 }

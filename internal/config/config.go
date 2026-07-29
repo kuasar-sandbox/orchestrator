@@ -312,17 +312,33 @@ type MMDSStaticRoutesConfig struct {
 	MaxBodyBytes int `yaml:"max_body_bytes"`
 }
 
-// MMDSSecretRoutesConfig is node policy specific to type:"secret" routes.
-// Only the specification-time count limit exists on this branch; the admin-PUT
-// value limit and guest-wait policy are a later phase's runtime backend, not
-// yet implemented.
+// MMDSSecretRoutesConfig is node policy specific to type:"secret" routes: the
+// specification-time count/value limits plus the admin-PUT/guest-wait runtime
+// policy for the secret backend.
 type MMDSSecretRoutesConfig struct {
 	MaxPerSandbox int `yaml:"max_per_sandbox"` // secrets[] cap in the specification
+	MaxValueBytes int `yaml:"max_value_bytes"` // one admin-PUT secret value (opaque bytes)
+	// ParkTimeout bounds how long a guest GET on a specified secret route
+	// parks when that secret has never been configured (revision==0) --
+	// deliberately distinct from proxy.park_timeout (route-sync convergence
+	// wait, unrelated semantics). A secret that was configured and later
+	// revoked returns 404 immediately, with no wait, regardless of this value.
+	ParkTimeout string `yaml:"park_timeout"`
+}
+
+// ParkTimeoutDur parses secret.park_timeout (default 3s on any parse error or
+// non-positive value).
+func (c MMDSSecretRoutesConfig) ParkTimeoutDur() time.Duration {
+	d, err := time.ParseDuration(c.ParkTimeout)
+	if err != nil || d <= 0 {
+		return 3 * time.Second
+	}
+	return d
 }
 
 // MMDSServiceRoutesConfig is node policy specific to type:"service" routes.
-// Only the specification-time count limit exists on this branch; the service
-// backend is a later phase.
+// Only the specification-time count limit exists today; the service backend
+// and its per-request forwarding timeout are not yet implemented.
 type MMDSServiceRoutesConfig struct {
 	MaxPerSandbox int `yaml:"max_per_sandbox"` // services[] cap in the specification
 }
@@ -335,6 +351,16 @@ type PathsConfig struct {
 	ConfigSocket  string `yaml:"config_socket"`  // default /run/sandbox/node-ctl.socket
 	AdminPidfile  string `yaml:"admin_pidfile"`  // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
 	PluginPidfile string `yaml:"plugin_pidfile"` // optional PID allowlist (multi-line) gating the socket plugin plane (proxy/agent registration); "" => socket perms only
+	// MMDSSecretsPidfile is an optional PID allowlist (multi-line) narrowing
+	// which peer PIDs may register with the MMDSSecrets sync capability (live
+	// secret plaintext), on top of the identity checks configsock always
+	// applies regardless of this setting (registration id must be
+	// routesync.ProxyPluginID, Register.Proxy must be set, and
+	// Register.Subscribe.Kind must be route_wake -- an ordinary route
+	// observer's registration shape never satisfies these). "" => the peer
+	// PID check itself falls back to socket perms only, same as
+	// plugin_pidfile's own fallback; production deployments should set this.
+	MMDSSecretsPidfile string `yaml:"mmds_secrets_pidfile"`
 }
 
 // UnitsConfig manages the systemd template units (generated + installed at startup).
@@ -658,6 +684,10 @@ func (c *Config) applyDefaults() {
 	if c.MMDS.Routes.MaxNamespaceBytes <= 0 {
 		c.MMDS.Routes.MaxNamespaceBytes = 64 * 1024
 	}
+	if c.MMDS.Routes.Secret.MaxValueBytes <= 0 {
+		c.MMDS.Routes.Secret.MaxValueBytes = 16 * 1024
+	}
+	def(&c.MMDS.Routes.Secret.ParkTimeout, "3s")
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
@@ -755,6 +785,11 @@ func (c *Config) validate() error {
 		if _, err := parseAbsoluteFileURI(parent); err != nil {
 			return fmt.Errorf("config: checkpoint.remote.ref_location_parent: %w", err)
 		}
+	}
+	if parkTimeout, err := time.ParseDuration(c.MMDS.Routes.Secret.ParkTimeout); err != nil {
+		return fmt.Errorf("config: mmds.routes.secret.park_timeout %q: %w", c.MMDS.Routes.Secret.ParkTimeout, err)
+	} else if parkTimeout <= 0 {
+		return fmt.Errorf("config: mmds.routes.secret.park_timeout must be > 0")
 	}
 	return c.validateProxy()
 }

@@ -24,7 +24,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 3
+	schema uint32 = 4                  // v4: mmapRecord gained RunID (MMDS token incarnation binding)
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -43,6 +43,7 @@ const (
 	maxAccessToken = 256
 	maxSnapLoc     = 32
 	maxMmdsSecret  = 128
+	maxRunID       = 64
 )
 
 var (
@@ -51,17 +52,18 @@ var (
 )
 
 type mmapHeader struct {
-	Magic        uint64
-	Schema       uint32
-	Capacity     uint32
-	Synced       uint32
-	_            uint32
-	GlobalRev    uint64
-	SyncGen      uint64
-	PolicySeq    uint64
-	PolicyParkMS int64
-	PolicyAuth   [maxProfile]byte
-	_            [32]byte
+	Magic            uint64
+	Schema           uint32
+	Capacity         uint32
+	Synced           uint32
+	_                uint32
+	GlobalRev        uint64
+	SyncGen          uint64
+	PolicySeq        uint64
+	PolicyParkMS     int64
+	PolicyMMDSParkMS int64
+	PolicyAuth       [maxProfile]byte
+	_                [24]byte
 }
 
 type mmapRecord struct {
@@ -89,6 +91,7 @@ type mmapRecord struct {
 	ForwardAccessToken     [maxAccessToken]byte
 	SnapshotLocation       [maxSnapLoc]byte
 	MmdsSecret             [maxMmdsSecret]byte
+	RunID                  [maxRunID]byte
 }
 
 // Table is a memory-mapped fixed-capacity route table.
@@ -231,6 +234,7 @@ func (t *Table) SetPolicy(p routesync.Policy) error {
 		return fmt.Errorf("policy.auth_mode: %w", err)
 	}
 	atomic.StoreInt64(&t.header.PolicyParkMS, int64(p.ParkTimeoutMS))
+	atomic.StoreInt64(&t.header.PolicyMMDSParkMS, int64(p.MMDSParkTimeoutMS))
 	finishHeaderWrite(&t.header.PolicySeq)
 	atomic.AddUint64(&t.header.GlobalRev, 1)
 	return nil
@@ -244,8 +248,9 @@ func (t *Table) Policy() routesync.Policy {
 			continue
 		}
 		p := routesync.Policy{
-			AuthMode:      fixedString(t.header.PolicyAuth[:]),
-			ParkTimeoutMS: int(atomic.LoadInt64(&t.header.PolicyParkMS)),
+			AuthMode:          fixedString(t.header.PolicyAuth[:]),
+			ParkTimeoutMS:     int(atomic.LoadInt64(&t.header.PolicyParkMS)),
+			MMDSParkTimeoutMS: int(atomic.LoadInt64(&t.header.PolicyMMDSParkMS)),
 		}
 		seq2 := atomic.LoadUint64(&t.header.PolicySeq)
 		if seq1 == seq2 && seq2&1 == 0 {
@@ -292,6 +297,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	_ = putFixed(rec.ForwardAccessToken[:], in.ForwardAccessToken)
 	_ = putFixed(rec.SnapshotLocation[:], in.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], in.MmdsSecret)
+	_ = putFixed(rec.RunID[:], in.RunID)
 	finishWrite(rec)
 	return nil
 }
@@ -330,6 +336,7 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	clearFixed(rec.ForwardAccessToken[:])
 	clearFixed(rec.SnapshotLocation[:])
 	clearFixed(rec.MmdsSecret[:])
+	clearFixed(rec.RunID[:])
 	finishWrite(rec)
 }
 
@@ -402,6 +409,18 @@ func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
 	return b, true
 }
 
+// Incarnation returns sid's current run incarnation (RunID), not gated on
+// running state -- a paused sandbox still has the RunID of its last run, and
+// a token minted under it must keep failing verification (wrong incarnation)
+// rather than erroring differently while paused, matching MmdsSecret above.
+func (t *Table) Incarnation(sid string) (string, bool) {
+	r, ok := t.Lookup(sid)
+	if !ok || r.RunID == "" {
+		return "", false
+	}
+	return r.RunID, true
+}
+
 func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
@@ -470,6 +489,7 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 			ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
 			SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
 			MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+			RunID:                  fixedString(rec.RunID[:]),
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
 		if seq1 == seq2 && seq2&1 == 0 {
@@ -534,6 +554,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"forward_access_token", r.ForwardAccessToken, maxAccessToken},
 		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
+		{"run_id", r.RunID, maxRunID},
 	}
 	for _, c := range checks {
 		if len(c.val) > c.max {

@@ -95,12 +95,24 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad register frame", http.StatusBadRequest)
 		return
 	}
+	// A self-declared Register.MMDSSecrets:true is never trusted on its own
+	// -- it's the difference between an ordinary route observer and a
+	// registrant that receives live secret plaintext on its stream. Reject
+	// the whole registration outright (never silently downgrade it and let
+	// the caller wonder why its secrets never show up) unless this specific
+	// peer/identity/shape combination is authorized. See mmdsSecretsAuthed.
+	if reg.MMDSSecrets {
+		if !s.mmdsSecretsAuthed(peer, id, reg) {
+			http.Error(w, "not authorized (mmds secrets)", http.StatusForbidden)
+			return
+		}
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	p := &Plugin{ID: id, Caps: reg, cancel: cancel}
 	s.deps.Plugins.Add(p)
 	defer s.deps.Plugins.Remove(p)
-	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
+	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds, "mmds_secrets", reg.MMDSSecrets)
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, s.log)
 	s.log.Info("plugin deregistered", "id", id)
 }
@@ -120,5 +132,40 @@ func (s *Server) pluginAuthed(peer int) bool {
 		return true
 	}
 	s.log.Warn("configsock plugin pid not allowlisted", "peer", peer, "pidfile", s.deps.PluginPidfile)
+	return false
+}
+
+// mmdsSecretsAuthed gates the MMDSSecrets capability specifically: unlike
+// pluginAuthed (the generic plugin-plane gate every subscriber, including an
+// ordinary route observer such as the platform agent, passes through), a
+// registration must additionally match the real proxy's own registration
+// shape -- id is the well-known routesync.ProxyPluginID (never a
+// coincidence: only cmd/node-ctl/proxy.go's runProxyMaster registers under
+// it), Proxy is set (a route observer never sets this -- it has no
+// data-plane socket to forward to), and Subscribe.Kind is route_wake (the
+// proxy always issues wakes; a pure observer never does) -- before even
+// considering the peer PID. These checks against the registration's own
+// shape hold regardless of whether mmds_secrets_pidfile is configured; the
+// PID allowlist on top of them (falling back to socket perms alone when
+// unset, like every other plane here) is defense in depth, not the only
+// gate -- an ordinary route observer's registration never has this shape at
+// all, so it can't obtain the capability merely by running as the same uid.
+func (s *Server) mmdsSecretsAuthed(peer int, id string, reg routesync.Register) bool {
+	if id != routesync.ProxyPluginID || reg.Proxy == nil || reg.Subscribe == nil || reg.Subscribe.Kind != routesync.KindRouteWake {
+		s.log.Warn("configsock mmds secrets: registration shape does not match the proxy", "peer", peer, "id", id)
+		return false
+	}
+	if s.deps.MMDSSecretsPidfile == "" {
+		return true
+	}
+	pids, err := readPIDs(s.deps.MMDSSecretsPidfile)
+	if err != nil {
+		s.log.Warn("configsock mmds secrets pidfile", "path", s.deps.MMDSSecretsPidfile, "err", err)
+		return false
+	}
+	if slices.Contains(pids, peer) {
+		return true
+	}
+	s.log.Warn("configsock mmds secrets pid not allowlisted", "peer", peer, "pidfile", s.deps.MMDSSecretsPidfile)
 	return false
 }

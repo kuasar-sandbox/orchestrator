@@ -152,7 +152,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		if rs, ok := src.(ResumableSource); ok {
 			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
 				err := rs.Replay(sctx, after, func(ev Event) error {
-					return writeEvent(w, ev)
+					return writeEvent(w, ev, reg.MMDSSecrets)
 				})
 				switch {
 				case err == nil:
@@ -167,6 +167,9 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	if !resumed {
 		if err := src.Range(sctx, func(r RouteEntry) error {
+			if !reg.MMDSSecrets {
+				r.MMDSSecrets = ""
+			}
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
@@ -187,7 +190,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev); err != nil {
+			if err := writeEvent(w, ev, reg.MMDSSecrets); err != nil {
 				return
 			}
 			flush()
@@ -209,7 +212,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev); err != nil {
+			if err := writeEvent(w, ev, reg.MMDSSecrets); err != nil {
 				return
 			}
 			flush()
@@ -217,11 +220,14 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 }
 
-func writeEvent(w io.Writer, ev Event) error {
+func writeEvent(w io.Writer, ev Event, includeMMDSSecrets bool) error {
 	m := &Msg{Type: ev.Kind}
 	switch ev.Kind {
 	case TypeUpsert:
 		r := ev.Route
+		if !includeMMDSSecrets {
+			r.MMDSSecrets = ""
+		}
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID

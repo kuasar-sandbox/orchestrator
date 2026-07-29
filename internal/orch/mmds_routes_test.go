@@ -139,7 +139,7 @@ func TestCreateRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Paths.RunRoot = filepath.Join(root, "run")
 	cfg.Paths.BaseRoot = filepath.Join(root, "base")
-	// MMDSRoutes.Enabled defaults to false (zero value) -- deliberately not set.
+	// MMDS.Routes.Enabled defaults to false (zero value) -- deliberately not set.
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
