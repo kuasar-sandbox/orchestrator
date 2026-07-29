@@ -20,6 +20,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
@@ -273,6 +274,31 @@ exec_through_cluster_connect() {
     fail "native exec did not complete after $retries attempt(s), last exit=$status"
 }
 
+mmds_static_through_cluster_connect() {
+    local sid="$1" token="$2"
+    local output="$WORK/mmds-static-guest-cluster.out"
+    local error_output="$WORK/mmds-static-guest-cluster.err"
+    local diagnostics="$WORK/mmds-static-guest-cluster.client.log"
+    local guest_command status=0
+
+    guest_command="$(mmds_static_guest_command)"
+    timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$ROUTER_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+        --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        --stdout-to "$output" --stderr-to "$error_output" -- \
+        /bin/sh -c "$guest_command" >"$diagnostics" 2>&1 || status=$?
+    if [ "$status" != "0" ] || ! grep -q 'MMDS_STATIC_GUEST_GET_OK' "$output" 2>/dev/null; then
+        sed 's/^/  client| /' "$diagnostics" >&2
+        sed 's/^/  stdout| /' "$output" 2>/dev/null >&2
+        sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
+        fail "cluster MMDS guest GET failed, exec status=$status"
+    fi
+}
+
 router_req() {
     local method="$1" path="$2" key="$3" route_key="${4:-}" body="${5:-}"
     local args=(-sS --noproxy '*' --max-time 260 -o "$WORK/router-resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $key")
@@ -283,12 +309,17 @@ router_req() {
 
 create_sandbox() {
     local out="$1"
+    local mmds_args=()
+    if [ -n "${REQ_MMDS_HEADER:-}" ]; then
+        mmds_args=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    fi
     http_code "$out" \
         -X POST \
         -H "Host: api.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
         -H "X-Kuasar-Route-Key: $ROUTE_KEY" \
         -H "X-API-KEY: $CLUSTER_API_KEY" \
+        "${mmds_args[@]}" \
         -H 'Content-Type: application/json' \
         --data '{}' \
         "http://127.0.0.1:$ROUTER_PORT/sandboxes"
@@ -413,6 +444,11 @@ EOF
     step "store-ctl + zot up; seeded $REF"
 
     MGMT_VIP="169.254.169.254"
+    MMDS_PORT="$(free_port)"
+    local mgmt_service_args=()
+    if [ "$MMDS_STATIC_E2E" = "1" ]; then
+        mgmt_service_args=(--mgmt-service="$MGMT_VIP:80:$MGMT_VIP:$MMDS_PORT")
+    fi
     "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
     ip netns del "$SW_NETNS" 2>/dev/null || true
     ip netns del "$SWITCH" 2>/dev/null || true
@@ -424,7 +460,8 @@ EOF
         --mac-addr=02:00:00:00:00:01 \
         --floating-ip-base=100.100.96.0 \
         --mode=tap \
-        --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 > >(tee "$WORK/vswitch-start.log" >&2) 2>&1 || fail "vswitch start"
+        --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
+        "${mgmt_service_args[@]}" > >(tee "$WORK/vswitch-start.log" >&2) 2>&1 || fail "vswitch start"
     SW_STARTED=1
     GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/cluster-real:v1"
     step "vswitch up; build sandboxes pull $GUEST_REF"
@@ -682,8 +719,17 @@ PY
 start_cluster_node() {
     NODE_PORT="$(free_port)"
     local node_id="$1"
+    local mmds_config=""
+    if [ "$MMDS_STATIC_E2E" = "1" ]; then
+        mmds_config="proxy: { mode: internal, auth: enforce }
+mmds:
+  enabled: true
+  listen: \"0.0.0.0:$MMDS_PORT\"
+  routes: { enabled: true }"
+    fi
     cat > "$WORK/cluster-node.yaml" <<EOF
 api: { domain: $DOMAIN, listen: "127.0.0.1:$NODE_PORT" }
+$mmds_config
 encryption_key: "$ENC_KEY"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/cr, base_root: $WORK/cl, config_socket: $WORK/cn.sock }
@@ -761,6 +807,12 @@ run_cluster_flow() {
     rm -f "$WORK/exec-session.secret"
     native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
+    if [ "$MMDS_STATIC_E2E" = "1" ]; then
+        # Scenario: static route.
+        source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
+        mmds_static_through_cluster_connect "$sid" "$exec_token"
+        step "PASS: cluster real guest GET reached declared MMDS static route"
+    fi
     step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }

@@ -220,6 +220,11 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
     "orchestrator/release-builder/test/e2e/e2e_run_builder.sh:e2e/e2e_run_builder.sh" \
     "orchestrator/release-builder/test/e2e/e2e_execute.sh:e2e/e2e_execute.sh" \
     "orchestrator/release-builder/test/e2e/e2e_orchestrator_proxy.sh:e2e/e2e_orchestrator_proxy.sh" \
+    "orchestrator/release-builder/test/e2e/e2e_mmds_endpoints_internal.sh:e2e/e2e_mmds_endpoints_internal.sh" \
+    "orchestrator/release-builder/test/e2e/e2e_mmds_endpoints_external.sh:e2e/e2e_mmds_endpoints_external.sh" \
+    "orchestrator/release-builder/test/e2e/e2e_mmds_endpoints_cluster.sh:e2e/e2e_mmds_endpoints_cluster.sh" \
+    "orchestrator/release-builder/test/e2e/lib/mmds_static_guest.sh:e2e/lib/mmds_static_guest.sh" \
+    "orchestrator/release-builder/test/e2e/e2e_cluster_real.sh:e2e/e2e_cluster_real.sh" \
     "orchestrator/test/e2e/e2e_cluster_stub.sh:e2e/e2e_cluster.sh" \
     "orchestrator/release-builder/test/perf/sandbox-perf.sh:perf/sandbox-perf.sh" \
     "orchestrator/release-builder/test/perf/sandbox-perf-manifest.sh:perf/sandbox-perf-manifest.sh" \

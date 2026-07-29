@@ -28,6 +28,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
+MMDS_ROUTES_CONFIG=""
+if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
+fi
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-3443}"
@@ -158,6 +163,9 @@ allow_proxy_forwarding() {
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
+    if [ "$method" = "POST" ] && [ "$path" = "/sandboxes" ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
+        args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -348,7 +356,10 @@ truncate -s 2G "$BLD"
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: external, auth: enforce, park_timeout: 2s }
-mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
+mmds:
+  enabled: true
+  listen: "$PROXY_NS_IP:$MMDS_PORT"
+$MMDS_ROUTES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -495,6 +506,13 @@ sys.stdout.flush()
 sys.stdout.buffer.write(out)
 sys.stdout.write("\nOUTPUT_END\n")
 PY
+if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    # Scenario: static route.
+    source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS declaration/static route guest GET"; }
+    echo "==> PASS: real guest GET reached external MMDS declared static route"
+fi
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
 ok=""
