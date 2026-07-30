@@ -21,6 +21,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
+MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
@@ -297,6 +298,85 @@ mmds_static_through_cluster_connect() {
         sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
         fail "cluster MMDS guest GET failed, exec status=$status"
     fi
+}
+
+mmds_secret_through_cluster_connect() {
+    local sid="$1" token="$2" expected_status="$3" expected_body="$4"
+    local expected_content_type="$5" marker="$6"
+    local output="$WORK/mmds-secret-guest-cluster.out"
+    local error_output="$WORK/mmds-secret-guest-cluster.err"
+    local diagnostics="$WORK/mmds-secret-guest-cluster.client.log"
+    local guest_command attempt status
+
+    guest_command="$(mmds_secret_guest_command "$expected_status" "$expected_body" \
+        "$expected_content_type" "$marker")"
+    for attempt in $(seq 1 20); do
+        status=0
+        : >"$output"; : >"$error_output"; : >"$diagnostics"
+        timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+            --proxy "http://127.0.0.1:$ROUTER_PORT" \
+            --proxy-header "E2b-Sandbox-Id: $sid" \
+            --proxy-header "E2b-Sandbox-Service: exec" \
+            --proxy-header "X-Access-Token: $token" \
+            --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+            --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+            --stdout-to "$output" --stderr-to "$error_output" -- \
+            /bin/sh -c "$guest_command" >"$diagnostics" 2>&1 || status=$?
+        if [ "$status" = "0" ] && grep -q "$marker" "$output" 2>/dev/null; then
+            sed 's/^/  mmds-secret-guest| /' "$output" >&2
+            return 0
+        fi
+        [ "$attempt" = "20" ] || sleep 0.25
+    done
+    sed 's/^/  client| /' "$diagnostics" >&2
+    sed 's/^/  stdout| /' "$output" 2>/dev/null >&2
+    sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
+    return 1
+}
+
+run_cluster_mmds_secret_e2e() {
+    local sid="$1" token="$2"
+    local response="$WORK/mmds-secret-admin-cluster.json" code node_sid
+    local initial="MMDS_SECRET_CLUSTER_INITIAL_$RANDOM"
+    local updated="MMDS_SECRET_CLUSTER_UPDATED_$RANDOM"
+
+    # Router APIs use the stable sandbox ID; the node-local admin socket owns a
+    # concrete generation (stable-gN), which is also the node store key.
+    node_sid="$(find "$WORK/cr" -mindepth 1 -maxdepth 1 -type d -name "$sid-g*" \
+        -printf '%f\n' | head -1)"
+    [ -n "$node_sid" ] || fail "node-local generation for stable sandbox $sid not found"
+
+    code="$(mmds_secret_admin_request "$WORK/cn.sock" PUT "$node_sid" "$MMDS_SECRET_NAME" \
+        "$initial" "text/plain" "$response")"
+    [ "$code" = "204" ] && mmds_secret_assert_revision "$response" 1 \
+        || fail "cluster MMDS secret initial admin PUT returned $code"
+    mmds_secret_assert_not_plaintext_at_rest "$WORK/cl" "$initial" \
+        || fail "cluster MMDS secret initial value persisted in plaintext"
+    mmds_secret_through_cluster_connect "$sid" "$token" 200 "$initial" "text/plain" \
+        "MMDS_SECRET_CLUSTER_INITIAL_OK" \
+        || fail "cluster MMDS secret initial guest GET"
+
+    code="$(mmds_secret_admin_request "$WORK/cn.sock" PUT "$node_sid" "$MMDS_SECRET_NAME" \
+        "$updated" "application/x-kuasar-e2e-secret" "$response")"
+    [ "$code" = "204" ] && mmds_secret_assert_revision "$response" 2 \
+        || fail "cluster MMDS secret update admin PUT returned $code"
+    mmds_secret_assert_not_plaintext_at_rest "$WORK/cl" "$updated" \
+        || fail "cluster MMDS secret updated value persisted in plaintext"
+    mmds_secret_through_cluster_connect "$sid" "$token" 200 "$updated" \
+        "application/x-kuasar-e2e-secret" "MMDS_SECRET_CLUSTER_UPDATED_OK" \
+        || fail "cluster MMDS secret updated guest GET"
+
+    code="$(mmds_secret_admin_request "$WORK/cn.sock" DELETE "$node_sid" "$MMDS_SECRET_NAME" \
+        "" "" "$response")"
+    [ "$code" = "204" ] && mmds_secret_assert_revision "$response" 3 \
+        || fail "cluster MMDS secret DELETE returned $code"
+    mmds_secret_through_cluster_connect "$sid" "$token" 404 "" "" \
+        "MMDS_SECRET_CLUSTER_REVOKED_OK" \
+        || fail "cluster MMDS secret revoked guest GET"
+
+    code="$(mmds_secret_admin_request "$WORK/cn.sock" PUT "$node_sid" undeclared \
+        "$initial" "text/plain" "$response")"
+    [ "$code" = "400" ] || fail "cluster undeclared MMDS secret PUT returned $code"
 }
 
 router_req() {
@@ -812,6 +892,12 @@ run_cluster_flow() {
         source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
         mmds_static_through_cluster_connect "$sid" "$exec_token"
         step "PASS: cluster real guest GET reached declared MMDS static route"
+    fi
+    if [ "$MMDS_SECRET_E2E" = "1" ]; then
+        # Scenario: secret backend.
+        source "$REPO_ROOT/test/e2e/lib/mmds_secret_guest.sh"
+        run_cluster_mmds_secret_e2e "$sid" "$exec_token"
+        step "PASS: cluster MMDS secret install/update/revoke lifecycle"
     fi
     step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"

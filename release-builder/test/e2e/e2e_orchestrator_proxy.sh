@@ -30,6 +30,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 MMDS_INVALID_REJECT_E2E="${MMDS_INVALID_REJECT_E2E:-0}"
+MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
 MMDS_POLICY_REPLAY_E2E="${MMDS_POLICY_REPLAY_E2E:-0}"
 MMDS_ROUTES_CONFIG=""
 if [ "$MMDS_STATIC_E2E" = "1" ]; then
@@ -285,8 +286,12 @@ dp() {
     curl "${args[@]}" "http://127.0.0.1:$PROXY_PORT$path"
 }
 dump_logs() {
-    echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log" 2>/dev/null
-    echo "==> proxy log:";        sed 's/^/  prxy| /' "$WORK/proxy.log" 2>/dev/null
+    local log
+    for log in "$WORK"/orch*.log "$WORK"/proxy*.log; do
+        [ -f "$log" ] || continue
+        echo "==> $(basename "$log"):"
+        sed 's/^/  /' "$log"
+    done
 }
 
 # ---- store + zot ----------------------------------------------------------
@@ -445,6 +450,7 @@ EOF
 "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 PROXY_MASTER_PID="${PIDS[-1]}"
+PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
 wait_mmds_listener
 wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
@@ -565,6 +571,50 @@ sys.stdout.flush()
 sys.stdout.buffer.write(out)
 sys.stdout.write("\nOUTPUT_END\n")
 PY
+restart_external_conductor() {
+    local log="$1" restarted=""
+    kill -TERM "$ORCH_PID" 2>/dev/null || true
+    wait "$ORCH_PID" 2>/dev/null || true
+    PIDS[$ORCH_PID_SLOT]=""
+    "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log" 2>&1 &
+    ORCH_PID=$!
+    PIDS+=("$ORCH_PID")
+    ORCH_PID_SLOT=$((${#PIDS[@]} - 1))
+    for _ in $(seq 1 60); do
+        curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null \
+            && { restarted=1; break; }
+        kill -0 "$ORCH_PID" 2>/dev/null || { sed 's/^/  /' "$log"; return 1; }
+        sleep 0.5
+    done
+    [ -n "$restarted" ] && kill -0 "$PROXY_MASTER_PID" 2>/dev/null || return 1
+}
+restart_external_proxy_fresh() {
+    local log="$1" old_workers worker stopped
+    old_workers="$(child_worker_pids "$PROXY_MASTER_PID")"
+    kill -TERM "$PROXY_MASTER_PID" 2>/dev/null || true
+    wait "$PROXY_MASTER_PID" 2>/dev/null || true
+    PIDS[$PROXY_MASTER_PID_SLOT]=""
+    for worker in $old_workers; do
+        stopped=""
+        for _ in $(seq 1 20); do
+            kill -0 "$worker" 2>/dev/null || { stopped=1; break; }
+            sleep 0.25
+        done
+        [ -n "$stopped" ] || return 1
+    done
+
+    # A new master starts with empty in-heap MMDS route/secret stores; the old
+    # master also removes its mmap table on exit. The following guest read must
+    # therefore wait for a fresh snapshot through the reconnected route stream.
+    "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$log" 2>&1 &
+    PROXY_MASTER_PID=$!
+    PIDS+=("$PROXY_MASTER_PID")
+    PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
+    wait_port 127.0.0.1 "$PROXY_PORT" proxy
+    wait_mmds_listener
+    wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+    kill -0 "$ORCH_PID" 2>/dev/null
+}
 if [ "$MMDS_STATIC_E2E" = "1" ]; then
     # Scenario: static route.
     source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
@@ -572,25 +622,26 @@ if [ "$MMDS_STATIC_E2E" = "1" ]; then
         || { dump_logs; fail "external MMDS declaration/static route guest GET"; }
     echo "==> PASS: real guest GET reached external MMDS declared static route"
 fi
+if [ "$MMDS_SECRET_E2E" = "1" ]; then
+    # Scenario: secret backend.
+    source "$REPO_ROOT/test/e2e/lib/mmds_secret_guest.sh"
+    mmds_secret_restart_before_revoke() {
+        echo "==> restarting conductor and empty proxy before secret revoke; encrypted state and route snapshot must recover"
+        restart_external_conductor "$WORK/orch-secret-restart.log" \
+            && restart_external_proxy_fresh "$WORK/proxy-secret-restart.log"
+    }
+    MMDS_SECRET_BEFORE_REVOKE_HOOK=mmds_secret_restart_before_revoke
+    run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS secret admin/store/sync/guest lifecycle"; }
+    unset MMDS_SECRET_BEFORE_REVOKE_HOOK
+    echo "==> PASS: external MMDS secret install/update/restart-preserve/revoke lifecycle"
+fi
 if [ "$MMDS_POLICY_REPLAY_E2E" = "1" ]; then
     echo "==> restarting conductor with MMDS routes disabled; external proxy must retain the existing route"
     sed -i '/routes: { enabled: true }/d' "$WORK/config.yaml"
-    kill -TERM "$ORCH_PID" 2>/dev/null || true
-    wait "$ORCH_PID" 2>/dev/null || true
-    PIDS[$ORCH_PID_SLOT]=""
-    "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch-restart.log" 2>&1 &
-    ORCH_PID=$!
-    PIDS+=("$ORCH_PID")
-    ORCH_PID_SLOT=$((${#PIDS[@]} - 1))
-    restarted=""
-    for _ in $(seq 1 60); do
-        curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null \
-            && { restarted=1; break; }
-        kill -0 "$ORCH_PID" 2>/dev/null || { sed 's/^/  /' "$WORK/orch-restart.log"; fail "restarted conductor exited"; }
-        sleep 0.5
-    done
-    [ -n "$restarted" ] || fail "restarted conductor health endpoint did not become ready"
-    kill -0 "$PROXY_MASTER_PID" 2>/dev/null || { dump_logs; fail "external proxy exited during conductor restart"; }
+    restart_external_conductor "$WORK/orch-restart.log" \
+        || { dump_logs; fail "restarted conductor or external proxy exited"; }
 
     before_reject="$(runtime_dir_count)"
     code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")

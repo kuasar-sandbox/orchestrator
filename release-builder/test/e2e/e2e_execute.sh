@@ -30,6 +30,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
+MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
 MMDS_ROUTES_CONFIG=""
 if [ "$MMDS_STATIC_E2E" = "1" ]; then
     MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
@@ -527,6 +528,14 @@ if [ "$MMDS_STATIC_E2E" = "1" ]; then
     run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
         || fail "internal MMDS declaration/static route guest GET"
     echo "==> PASS: real guest GET reached internal MMDS declared static route"
+fi
+if [ "$MMDS_SECRET_E2E" = "1" ]; then
+    # Scenario: secret backend.
+    source "$REPO_ROOT/test/e2e/lib/mmds_secret_guest.sh"
+    run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS secret admin/store/guest lifecycle"
+    echo "==> PASS: internal MMDS secret install/update/revoke lifecycle"
 fi
 MARK="HELLO_FROM_GUEST_$RANDOM"
 echo "==> exec in guest: sh -c 'hostname; id; echo $MARK; uname -sm'"
