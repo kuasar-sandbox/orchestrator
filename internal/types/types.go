@@ -2,9 +2,12 @@
 package types
 
 import (
+	"encoding/base64"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 )
 
 // Profile selects which guest runtime image (and whether envd is present).
@@ -42,8 +45,6 @@ const (
 	StateDead    State = "dead"
 )
 
-var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
-
 // MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
 const MaxLocalSandboxIDBytes = 57
 
@@ -56,41 +57,90 @@ func ValidLocalSandboxID(id string) bool {
 	return localSandboxIDRe.MatchString(id)
 }
 
-// TemplateID is the e2b templateID, self-describing as <profile>-<kind>-<key>.
-// key is the 64-hex manifest content key. There is no separate template registry.
+const (
+	MaxPortableRefBytes = 1024
+	MaxTemplateIDBytes  = 2048
+)
+
+// TemplateID is self-describing as <profile>-<kind>-<base64url(ref)>.
+// Ref is one canonical portable manifest or located-file reference. There is no
+// separate template registry or backend-specific template kind.
 type TemplateID struct {
 	Profile Profile
 	Kind    Kind
-	Key     string // 64-hex manifest content key
+	Ref     string
 }
 
-// ParseTemplateID parses "<profile>-<kind>-<key>", e.g. "e2b-snp-<64hex>".
+// ParseTemplateID parses <profile>-<kind>-<base64url(canonical-portable-ref)>.
 func ParseTemplateID(s string) (TemplateID, error) {
 	var t TemplateID
+	if len(s) > MaxTemplateIDBytes {
+		return t, fmt.Errorf("templateID: exceeds %d bytes", MaxTemplateIDBytes)
+	}
 	parts := strings.SplitN(s, "-", 3)
 	if len(parts) != 3 {
-		return t, fmt.Errorf("templateID %q: want <profile>-<kind>-<key>", s)
+		return t, fmt.Errorf("templateID %q: want <profile>-<kind>-<base64url-ref>", s)
 	}
 	profile, err := ParseProfile(parts[0])
 	if err != nil {
 		return t, fmt.Errorf("templateID %q: unknown profile %q", s, parts[0])
 	}
-	t.Profile, t.Kind, t.Key = profile, Kind(parts[1]), parts[2]
+	t.Profile, t.Kind = profile, Kind(parts[1])
 	switch t.Kind {
 	case KindImg, KindSnp:
 	default:
 		return t, fmt.Errorf("templateID %q: unknown kind %q", s, t.Kind)
 	}
-	if !hexKeyRe.MatchString(t.Key) {
-		return t, fmt.Errorf("templateID %q: key must be 64 hex chars", s)
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return TemplateID{}, fmt.Errorf("templateID %q: decode ref: %w", s, err)
+	}
+	if base64.RawURLEncoding.EncodeToString(decoded) != parts[2] {
+		return TemplateID{}, fmt.Errorf("templateID %q: ref encoding is not canonical base64url", s)
+	}
+	if len(decoded) == 0 || len(decoded) > MaxPortableRefBytes {
+		return TemplateID{}, fmt.Errorf("templateID %q: ref length must be 1..%d bytes", s, MaxPortableRefBytes)
+	}
+	t.Ref = string(decoded)
+	ref, err := ParsePortableRef(t.Ref)
+	if err != nil {
+		return TemplateID{}, fmt.Errorf("templateID %q: %w", s, err)
+	}
+	if ref.Scheme == manifest.RefSchemeFile {
+		ext := ".image"
+		if t.Kind == KindSnp {
+			ext = ".snapshot"
+		}
+		if !strings.HasSuffix(ref.Path, ext) {
+			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a %s artifact", s, t.Kind, ext)
+		}
 	}
 	return t, nil
 }
 
-func (t TemplateID) String() string { return fmt.Sprintf("%s-%s-%s", t.Profile, t.Kind, t.Key) }
+func (t TemplateID) String() string {
+	return fmt.Sprintf("%s-%s-%s", t.Profile, t.Kind, base64.RawURLEncoding.EncodeToString([]byte(t.Ref)))
+}
 
-// ManifestRef returns the manifest:// reference sandbox-ctl consumes.
-func (t TemplateID) ManifestRef() string { return "manifest://" + t.Key }
+// ParsePortableRef accepts only a canonical manifest or located-file reference.
+func ParsePortableRef(raw string) (manifest.Ref, error) {
+	if len(raw) == 0 || len(raw) > MaxPortableRefBytes {
+		return manifest.Ref{}, fmt.Errorf("portable ref length must be 1..%d bytes", MaxPortableRefBytes)
+	}
+	ref, err := manifest.ParseRef(raw)
+	if err != nil {
+		return manifest.Ref{}, fmt.Errorf("portable ref: %w", err)
+	}
+	if !ref.Portable() || ref.String() != raw {
+		return manifest.Ref{}, fmt.Errorf("portable ref %q is not canonical and portable", raw)
+	}
+	return ref, nil
+}
+
+func IsPortableRef(raw string) bool {
+	_, err := ParsePortableRef(raw)
+	return err == nil
+}
 
 // Sandbox is one managed sandbox instance.
 type Sandbox struct {
@@ -112,7 +162,7 @@ type Sandbox struct {
 	PortMAC            string // per-port MAC from attach -> Network.MAC
 	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
 	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
-	SnapshotRef        string // latest snapshot manifest key (for resume); empty if never paused
+	SnapshotRef        string // latest local path or canonical portable snapshot ref; empty if never paused
 	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
 	EnvdAccessToken    string
 	TrafficAccessToken string

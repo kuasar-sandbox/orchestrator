@@ -249,9 +249,12 @@ e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建�
 
 ### 5.2 收尾上传(平台凭据唯一出现点)
 
-阶段产物经宿主 workdir 顺序交接;终态:img ⇒ `manifest-ctl store image.img`(→ 64-hex manifest
-key)、快照 ⇒ 一条 `sandbox-ctl upload-snapshot <bundle>`(自动上传 snapshot.cfg 引用的本地工件
-并改写为 `manifest://`)。持久 id `e2b-<kind>-<key>`。本机 `store-ctl`(§2.1 sidecar)承载远端写。
+阶段产物经宿主 workdir 顺序交接;终态:img ⇒ `manifest-ctl store image.img` 后形成
+canonical manifest ref;快照 ⇒ 一条 `sandbox-ctl upload-snapshot <bundle>`。未配置
+named location 时发布到 manifest;配置 `checkpoint.remote.ref_location_parent` 时发布到
+共享文件 location。持久 id 为
+`<profile>-<kind>-<base64url(canonical-portable-ref)>`。manifest 模式由本机
+`store-ctl`(§2.1 sidecar)承载远端写。
 
 ### 5.3 凭据与隔离
 

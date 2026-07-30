@@ -25,7 +25,7 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 		EnvdUDS: "/run/s1/envd.sock", CiUDS: "/run/s1/ci.sock", FloatingIP: "100.100.0.2",
 		APISecret: apiSecret, ManifestKey: manifestKey, ServiceSecret: strings.Repeat("3", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
-		SnapshotRef: "manifest://snapshot",
+		SnapshotRef: "manifest://" + strings.Repeat("4", 64),
 	}
 	apiFingerprint, err := store.APISecretHash(apiSecret)
 	if err != nil {
@@ -51,6 +51,13 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 	}
 	if strings.Contains(string(wire), manifestKey) {
 		t.Fatal("route entry exposed manifest encryption key")
+	}
+}
+
+func TestSnapshotLocationTreatsLocatedRefAsRemote(t *testing.T) {
+	ref := "file://" + strings.Repeat("a", 64) + ".snapshot@location:source"
+	if got := snapshotLocation(ref); got != "remote" {
+		t.Fatalf("snapshotLocation() = %q, want remote", got)
 	}
 }
 

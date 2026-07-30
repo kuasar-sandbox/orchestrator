@@ -71,7 +71,7 @@ func TestParseTemplateDisk(t *testing.T) {
 			"Overlay": {"Base": "manifest://ccccdddd", "BaseFromRefs": null}
 		}}
 	}`
-	baseRef, overlayBase, meta, err := parseTemplateDisk([]byte(overlayJSON))
+	baseRef, overlayBase, overlayChain, meta, err := parseTemplateDisk([]byte(overlayJSON))
 	if err != nil {
 		t.Fatalf("overlay-mode: unexpected err: %v", err)
 	}
@@ -81,13 +81,16 @@ func TestParseTemplateDisk(t *testing.T) {
 	if overlayBase != "manifest://ccccdddd" {
 		t.Errorf("overlayBase = %q, want manifest://ccccdddd", overlayBase)
 	}
+	if len(overlayChain) != 0 {
+		t.Errorf("overlayChain = %v, want empty", overlayChain)
+	}
 	if meta["e2b.start_cmd"] != "node server.js" || meta["e2b.ready_cmd"] != "curl -sf localhost:3000" {
 		t.Errorf("meta = %v, want start/ready cmds", meta)
 	}
 
 	// overlay omitted (single-disk capture): base only, no overlay lower.
 	noOverlay := `{"Boot": {"Root": {"BaseRef": "manifest://eeee"}}}`
-	baseRef, overlayBase, _, err = parseTemplateDisk([]byte(noOverlay))
+	baseRef, overlayBase, overlayChain, _, err = parseTemplateDisk([]byte(noOverlay))
 	if err != nil {
 		t.Fatalf("no-overlay: unexpected err: %v", err)
 	}
@@ -95,41 +98,53 @@ func TestParseTemplateDisk(t *testing.T) {
 		t.Errorf("no-overlay: base=%q overlay=%q, want manifest://eeee + empty", baseRef, overlayBase)
 	}
 
-	// chained overlay folds into a multi-key overlay.base, top-first
-	// ([overlay.base] ++ base_from_refs) — the order restore layers them, never
-	// an error and never a dropped layer.
+	// A chained overlay remains an explicit top ref plus base_from_refs.
 	chained := `{"Boot": {"Root": {
 		"BaseRef": "manifest://eeee",
 		"Overlay": {"Base": "manifest://ffff", "BaseFromRefs": ["manifest://gggg", "manifest://hhhh"]}
 	}}}`
-	_, overlayBase, _, err = parseTemplateDisk([]byte(chained))
+	_, overlayBase, overlayChain, _, err = parseTemplateDisk([]byte(chained))
 	if err != nil {
 		t.Fatalf("chained overlay: unexpected err: %v", err)
 	}
-	if overlayBase != "manifest://ffff:gggg:hhhh" {
-		t.Errorf("chained overlay fold = %q, want manifest://ffff:gggg:hhhh", overlayBase)
+	if overlayBase != "manifest://ffff" || strings.Join(overlayChain, ",") != "manifest://gggg,manifest://hhhh" {
+		t.Errorf("chained overlay = %q + %v", overlayBase, overlayChain)
 	}
 
 	// missing base image ref is an error.
-	if _, _, _, err = parseTemplateDisk([]byte(`{"Boot": {"Root": {}}}`)); err == nil {
+	if _, _, _, _, err = parseTemplateDisk([]byte(`{"Boot": {"Root": {}}}`)); err == nil {
 		t.Error("missing base ref: expected error, got nil")
 	}
 
 	// malformed JSON is an error.
-	if _, _, _, err = parseTemplateDisk([]byte(`not json`)); err == nil {
+	if _, _, _, _, err = parseTemplateDisk([]byte(`not json`)); err == nil {
 		t.Error("malformed json: expected error, got nil")
 	}
 }
 
-func TestUploadImageReusesBaseImageKey(t *testing.T) {
-	key := strings.Repeat("a", 64)
-	p := &buildPipeline{baseImageKey: key}
+func TestUploadImageReusesBaseImageRef(t *testing.T) {
+	ref := "manifest://" + strings.Repeat("a", 64)
+	p := &buildPipeline{baseImageRef: ref}
 	got, err := p.uploadImage()
 	if err != nil {
 		t.Fatalf("uploadImage: %v", err)
 	}
-	if got != key {
-		t.Fatalf("uploadImage = %q, want %q", got, key)
+	if got != ref {
+		t.Fatalf("uploadImage = %q, want %q", got, ref)
+	}
+}
+
+func TestRootDocKeepsExplicitOverlayChain(t *testing.T) {
+	p := &buildPipeline{
+		baseRef:             "manifest://base",
+		overlayBase:         "manifest://top",
+		overlayBaseFromRefs: []string{"manifest://parent-1", "manifest://parent-2"},
+	}
+	root := p.rootDoc("file:///tmp/diff")
+	overlay := root["overlay"].(map[string]any)
+	chain := overlay["base_from_refs"].([]string)
+	if overlay["base"] != p.overlayBase || strings.Join(chain, ",") != strings.Join(p.overlayBaseFromRefs, ",") {
+		t.Fatalf("overlay = %#v", overlay)
 	}
 }
 

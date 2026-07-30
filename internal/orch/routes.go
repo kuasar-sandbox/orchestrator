@@ -3,7 +3,6 @@ package orch
 import (
 	"context"
 	"encoding/hex"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -54,12 +53,12 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 
 // snapshotLocation classifies a sandbox's persisted state so a subscriber can
 // decide migration: "" when never paused (running/dead), "remote" for an uploaded
-// (portable) manifest:// ref, else "local" (a node-bound checkpoint bundle).
+// portable canonical ref, else "local" (a node-bound checkpoint bundle).
 func snapshotLocation(ref string) string {
 	switch {
 	case ref == "":
 		return ""
-	case strings.HasPrefix(ref, "manifest://"):
+	case types.IsPortableRef(ref):
 		return "remote"
 	default:
 		return "local"

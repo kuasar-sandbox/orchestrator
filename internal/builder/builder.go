@@ -44,7 +44,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -59,8 +58,8 @@ func Run(spec *configsock.BuildSpec, log *slog.Logger) Result {
 
 // Result mirrors orch.buildResult.
 type Result struct {
-	ImageKey    string `json:"image_key,omitempty"`
-	SnapshotKey string `json:"snapshot_key,omitempty"`
+	ImageRef    string `json:"image_ref,omitempty"`
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
 	StartCmd    string `json:"start_cmd,omitempty"`
 	ReadyCmd    string `json:"ready_cmd,omitempty"`
 	Error       string `json:"error,omitempty"`
@@ -75,12 +74,13 @@ type buildPipeline struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	imagePath    string // workdir/image.img once a local image exists
-	baseImageKey string // manifest id for an already-uploaded base image
-	baseRef      string // phase B/C boot.root.base ("file://..." | "manifest://...")
-	overlayBase  string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
-	startCmd     string // effective (request else template-inherited)
-	readyCmd     string
+	imagePath           string // workdir/image.img once a local image exists
+	baseImageRef        string // portable ref for an already-published base image
+	baseRef             string // phase B/C boot.root.base ("file://..." | "manifest://...")
+	overlayBase         string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
+	overlayBaseFromRefs []string
+	startCmd            string // effective (request else template-inherited)
+	readyCmd            string
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
@@ -142,13 +142,13 @@ func (p *buildPipeline) run() (res Result) {
 		if err != nil {
 			return fail(fmt.Errorf("upload snapshot: %w", err))
 		}
-		res.SnapshotKey = key
-	case p.imagePath != "" || p.baseImageKey != "":
-		key, err := p.uploadImage()
+		res.SnapshotRef = key
+	case p.imagePath != "" || p.baseImageRef != "":
+		ref, err := p.uploadImage()
 		if err != nil {
 			return fail(fmt.Errorf("upload image: %w", err))
 		}
-		res.ImageKey = key
+		res.ImageRef = ref
 	default:
 		return fail(fmt.Errorf("nothing produced (no image, no snapshot)"))
 	}
@@ -172,24 +172,26 @@ func validateBuildProfile(s *configsock.BuildSpec) (types.Profile, error) {
 func (p *buildPipeline) resolveBase() error {
 	s := p.spec
 	switch {
-	case s.FromTemplate == "":
+	case s.FromTemplateRef == "":
 		return nil // base = the imported local image (set by phaseImport)
 	case s.FromTemplateKind == "img":
-		p.baseRef = "manifest://" + s.FromTemplate
+		p.baseRef = s.FromTemplateRef
 		return nil
 	default: // snp: the snapshot.cfg names the base image + overlay diff + start/ready
-		out, err := p.hostCmdEnv(s.Env, p.spec.Paths.SandboxCtl,
-			"info", "--json", "--manifest-config", s.Paths.ManifestConfig,
-			"manifest://"+s.FromTemplate)
+		args := []string{"info", "--json", "--manifest-config", s.Paths.ManifestConfig}
+		args = appendRefLocationArgs(args, s.RefLocations)
+		args = append(args, s.FromTemplateRef)
+		out, err := p.hostCmdEnv(s.Env, p.spec.Paths.SandboxCtl, args...)
 		if err != nil {
 			return fmt.Errorf("read base template cfg: %w", err)
 		}
-		baseRef, overlayBase, meta, err := parseTemplateDisk(out)
+		baseRef, overlayBase, overlayBaseFromRefs, meta, err := parseTemplateDisk(out)
 		if err != nil {
-			return fmt.Errorf("base template %s: %w", s.FromTemplate, err)
+			return fmt.Errorf("base template %s: %w", s.FromTemplateRef, err)
 		}
 		p.baseRef = baseRef
 		p.overlayBase = overlayBase
+		p.overlayBaseFromRefs = overlayBaseFromRefs
 		if p.profile == types.ProfileE2B && p.startCmd == "" {
 			p.startCmd = meta["e2b.start_cmd"]
 		}
@@ -205,12 +207,11 @@ func (p *buildPipeline) resolveBase() error {
 // (boot.root.base_ref) AND the accumulated overlay (boot.root.overlay) — the
 // read-only lower a fromTemplate cold-start MUST stack under its fresh writable
 // overlay, or the template's filesystem is lost. The overlay's captured top
-// (overlay.base) and its lower chain (overlay.base_from_refs) are folded into
-// one multi-key manifest ref (top-first, the order restore layers them) and
-// returned as overlayBase ("" when the template has no overlay). info --json
+// (overlay.base) and its lower chain (overlay.base_from_refs) remain an explicit
+// top ref plus top-to-bottom array. info --json
 // re-emits restore.SnapshotCfg by Go field name, hence the BaseRef / Overlay /
 // Base / BaseFromRefs JSON keys.
-func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, meta map[string]string, err error) {
+func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, overlayBaseFromRefs []string, meta map[string]string, err error) {
 	var cfg struct {
 		Metadata map[string]string `json:"Metadata"`
 		Boot     struct {
@@ -224,42 +225,14 @@ func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, meta map[s
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(infoJSON, &cfg); err != nil {
-		return "", "", nil, fmt.Errorf("parse template cfg: %w", err)
+		return "", "", nil, nil, fmt.Errorf("parse template cfg: %w", err)
 	}
 	if cfg.Boot.Root.BaseRef == "" {
-		return "", "", nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
+		return "", "", nil, nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
 	}
 	if ov := cfg.Boot.Root.Overlay; ov != nil {
-		overlayBase, err = foldOverlayChain(ov.Base, ov.BaseFromRefs)
-		if err != nil {
-			return "", "", nil, err
-		}
+		overlayBase = ov.Base
+		overlayBaseFromRefs = append([]string(nil), ov.BaseFromRefs...)
 	}
-	return cfg.Boot.Root.BaseRef, overlayBase, cfg.Metadata, nil
-}
-
-// foldOverlayChain combines a snapshot.cfg overlay's captured top (overlay.base)
-// and its lower chain (overlay.base_from_refs) into one multi-key manifest ref
-// for a cold-start boot.root.overlay.base. The runtime layers manifest://k1:k2
-// top→bottom in list order (fetch.NewLayered), exactly the order snapshot.cfg
-// records ([overlay.base] ++ base_from_refs) and that restore's reconstructDisk
-// rebuilds — so this is a plain key concatenation, no reordering. Every layer
-// must be a manifest:// ref (an uploaded template's all are); a layer that is
-// itself multi-key is flattened in place.
-func foldOverlayChain(top string, chain []string) (string, error) {
-	var keys []string
-	for _, ref := range append([]string{top}, chain...) {
-		if ref == "" {
-			continue
-		}
-		hexes, ok := strings.CutPrefix(ref, "manifest://")
-		if !ok {
-			return "", fmt.Errorf("overlay layer %q is not a manifest:// ref (a fromTemplate base must be uploaded)", ref)
-		}
-		keys = append(keys, strings.Split(hexes, ":")...)
-	}
-	if len(keys) == 0 {
-		return "", nil
-	}
-	return "manifest://" + strings.Join(keys, ":"), nil
+	return cfg.Boot.Root.BaseRef, overlayBase, overlayBaseFromRefs, cfg.Metadata, nil
 }

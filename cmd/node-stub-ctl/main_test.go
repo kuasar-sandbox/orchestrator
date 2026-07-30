@@ -152,7 +152,7 @@ func TestExecSessionRejectsInvalidEnvelopeAndBindingWithoutMutation(t *testing.T
 		{name: "wrong cluster context", mutateCommand: func(c *routesync.Command) { c.Cluster.Group = "/other" }},
 		{name: "unavailable state", mutateSandbox: func(s *stubSandbox) { s.State = "creating" }},
 		{name: "inconsistent template", mutateSandbox: func(s *stubSandbox) {
-			s.TemplateID = "e2b-img-" + strings.Repeat("a", 64)
+			s.TemplateID = types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 		}},
 		{name: "invalid service secret", mutateSandbox: func(s *stubSandbox) { s.ServiceSecret = "invalid" }},
 		{name: "missing target does not import", mutateCommand: func(c *routesync.Command) {
@@ -334,7 +334,7 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 
 	create := &routesync.Command{
 		CmdID: "create-1", Kind: routesync.CmdCreate, SID: "sb1",
-		TemplateRef: "e2b-img-" + strings.Repeat("b", 64), Profile: "e2b",
+		TemplateRef: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), Profile: "e2b",
 		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "sb1"},
 		APISecretFingerprint: apiSecretFingerprint,
 		Config: map[string]string{
@@ -624,7 +624,7 @@ func TestStubCreateRejectsUnavailableAPISecretMaterial(t *testing.T) {
 	}
 	create := &routesync.Command{
 		CmdID: "create-ref", Kind: routesync.CmdCreate, SID: "node-sandbox",
-		TemplateRef: "bare-img-" + strings.Repeat("a", 64), Profile: string(types.ProfileBare),
+		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), Profile: string(types.ProfileBare),
 		APISecretFingerprint: apiFingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "stable-sandbox"},
 	}
@@ -727,7 +727,7 @@ func newExecStubFixture(
 		SID:                    "stable-sandbox-g0",
 		Profile:                string(types.ProfileBare),
 		State:                  state,
-		TemplateID:             "bare-img-" + strings.Repeat("a", 64),
+		TemplateID:             types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		AuthSandboxID:          authSandboxID,
 		APISecretFingerprint:   strings.Repeat("c", 64),
 		ManifestKeyFingerprint: strings.Repeat("d", 64),

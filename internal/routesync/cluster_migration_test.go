@@ -33,7 +33,7 @@ func TestNodeLinkConnectAckRoundTripPreservesTypedResult(t *testing.T) {
 	want := &CmdAck{
 		CmdID: "connect-1", Status: AckAccepted,
 		Connect: &ConnectResult{
-			NodeSandboxID: "stable-g1", TemplateID: "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			NodeSandboxID: "stable-g1", TemplateID: "e2b-img-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh",
 			Profile: "e2b", EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "kat1.forward",
 		},
 	}

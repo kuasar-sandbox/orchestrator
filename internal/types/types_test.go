@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,44 @@ func TestParseProfile(t *testing.T) {
 				t.Fatalf("ParseProfile(%q) = %q, %v; want %q, error=%t", tt.raw, got, err, tt.want, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestTemplateIDPortableRef(t *testing.T) {
+	key := strings.Repeat("a", 64)
+	for _, tt := range []struct {
+		kind Kind
+		ref  string
+	}{
+		{kind: KindImg, ref: "manifest://" + key},
+		{kind: KindSnp, ref: "manifest://" + key},
+		{kind: KindImg, ref: "file://" + key + ".image@location:0198-build"},
+		{kind: KindSnp, ref: "file://" + key + ".snapshot@location:0198-build"},
+	} {
+		want := TemplateID{Profile: ProfileE2B, Kind: tt.kind, Ref: tt.ref}
+		got, err := ParseTemplateID(want.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("ParseTemplateID() = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestTemplateIDRejectsNonPortableOrWrongArtifact(t *testing.T) {
+	encode := func(ref string) string {
+		return "e2b-snp-" + base64.RawURLEncoding.EncodeToString([]byte(ref))
+	}
+	for _, raw := range []string{
+		"e2b-snp-not-base64!",
+		encode("file:///tmp/root.snapshot"),
+		encode("file://root.image@location:build"),
+		encode("manifest://short"),
+	} {
+		if _, err := ParseTemplateID(raw); err == nil {
+			t.Fatalf("ParseTemplateID(%q) succeeded", raw)
+		}
 	}
 }
 

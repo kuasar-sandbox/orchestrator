@@ -100,7 +100,7 @@ func TestCreateRejectsInvalidCredentialsBeforeLaunchSideEffects(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := o.Create(context.Background(), api.CreateReq{
-				APIKey: apiKey, TemplateID: "bare-img-" + strings.Repeat("a", 64), TimeoutSec: 60,
+				APIKey: apiKey, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), TimeoutSec: 60,
 				Metadata: map[string]string{sandboxcfg.NsCredentials: raw},
 			})
 			if !errors.Is(err, api.ErrBadRequest) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -23,7 +24,7 @@ const (
 	testMigrationKey        = "efc3f9ac75d63ece0a9065ab26bb24e6429bc78ef12ba07865bb99544c5e89b7"
 	testServiceSecret       = "0213051156fc06b40aebdeb333caeb9c95866d91f08298264901787551897989"
 	testForwardToken        = "kat1.eyJ2IjoxLCJzaWQiOiJzYW5kYm94LTAxIiwiYXVkIjoiZm9yd2FyZCJ9.uk154F30--e531Hogd4pgj0oGFsuIJJT0nWr17gkdSw"
-	testGoldenToken         = "kmt1.AAECAwQFBgcICQoLUgPF0Ywtt-Hjs7DXBF2VenGKKCGN6Ka1gZILGm361mVCZWNqWgBO2W0KHoXI2SBvkdrsTY7bVcqbsDa12jMEPrdDx_S8E8x6MtkUWLUdA_K_vt4m6fWB81zlvzFiDogHg8SrjK4FgCKFjKqJJy5dIPu5FZJCGayVOlRBUx_M__bMbI6e0msljL8DYjwGa_0JYeaO76G_ZCAg3zucM6NxDp1G0jVlB3AgsR2qw6Q-GhNg-7MzcrbRWjHGU-sGGr4xYeCjpN3y-u6i345nIsIeMI4MTb_wUDOZdSokqy8GmcjwPwnWeg_qlMIm-RbR6x6P6LkmkRILdTyTH3qnIcqQc1WOCpz5KcUceS-quXNTOpl_QYue4l3SIps8N6I8ZTzUrhQ8JGCjXzKrjyhsHIFWy8HVmEXH0UaaUAO0czoepRXK1bJlEKbSoPsmjps0ac1mZ5BROeclCydlNDUODtS-ylyGjQwn9pDiuQLR2UN_dtABwYxgVX7dRcXDucTCdcw04mO2rwyqjJk7IkL-j9Byw8MJLgYc4ML72NcPtids5bHHnbJFsxf0qFOXPgQNZ9KdYTtxVI9U2LM4-HIw6Bj51T6Fofi2AAAvIWmdKJKBxrybtQVMAFWz0ylElqW5oXgH7-9KjuPdX-aX_HPHM4Qv6W9lyzzUJQHyLTldi434WQkzOQW3Ll8xekQjwDVrQ8HrFV6VD_YLBq2I6XeCPPWAO0Hko09n_nghhfHRU33stfYr73bJ95Skdd2wzKIJY-sfdFqzo-k9DWFnawgU1BDGYUwgeDdmQuK0UxwYdm_P1MQRy7m1vvH_17FzLbyqRS2Dmwrl_C4E--E_QRJDhkH4LW15dqeT5avt0mDCoAUhH-zyVH522Fl3HtS06_f-4FT21QLiyiM-MuO7Ad55BvYZ_6iTqUmKWgyt3FxaWdUa1oU9Ox17opm0JA1XJXn98eAVb8zxEirIELHizVpO1W96cXjZc6T7HIvw7Jwo1XN6s7GZZH5Dnf-Rqd9tyEYv8bb8uthgL2s-w6IChiHwGeYYenbKO8NzPcWIsow8WpCz7ATWzYQx_lKEyHyhGBmSoKFYCcHqoA8M1FehfBzkyg0HaGaQ5HZhXHPTqDBKvgheeN6iv-J0UkmH6n_c_fH0Xdr7RN3zGwbOo_2eOUDnd73d0J8vLt2pPysRn4c-oH4rSAg-9hpgZqqqW_au-_5T-J-YwHPEvf-ypXtIrFWHXOou"
+	testGoldenTokenSHA256   = "0178aa5983d3d861af6edb774a3470c8a9d3c2848751906b59c0b3f1cd971c43"
 )
 
 var testMaterial = KeyMaterial{APISecret: testAPISecret, ManifestKey: testManifestKey}
@@ -35,7 +36,7 @@ func validPayload() MigrationTokenPayloadV1 {
 		AuthSandboxID:          "sandbox-01",
 		APISecretFingerprint:   testAPIFingerprint,
 		ManifestKeyFingerprint: testManifestFingerprint,
-		TemplateID:             "e2b-snp-" + strings.Repeat("a", 64),
+		TemplateID:             types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		Profile:                "e2b",
 		RuntimeDigest:          strings.Repeat("b", 64),
 		SnapshotRef:            "manifest://" + strings.Repeat("c", 64),
@@ -69,8 +70,8 @@ func TestSealOpenGoldenVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if token != testGoldenToken {
-		t.Fatalf("golden token = %q", token)
+	if got := sha256.Sum256([]byte(token)); hex.EncodeToString(got[:]) != testGoldenTokenSHA256 {
+		t.Fatalf("golden token sha256 = %s", hex.EncodeToString(got[:]))
 	}
 	payload, err := Open(testMaterial, token)
 	if err != nil {
@@ -235,6 +236,26 @@ func TestOptionalEnvAndMetadataMayBeOmitted(t *testing.T) {
 	}
 }
 
+func TestLocatedSnapshotRefRoundTrip(t *testing.T) {
+	payload := validPayload()
+	payload.SnapshotRef = "file://" + strings.Repeat("d", 64) + ".snapshot@location:source-1"
+	token, err := Seal(testMaterial, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Open(testMaterial, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SnapshotRef != payload.SnapshotRef {
+		t.Fatalf("SnapshotRef = %q, want %q", got.SnapshotRef, payload.SnapshotRef)
+	}
+	payload.SnapshotRef = "file:///mnt/shared/root.snapshot"
+	if _, err := Seal(testMaterial, payload); err == nil {
+		t.Fatal("local file ref was accepted in migration token")
+	}
+}
+
 func TestOpenValidatesPayloadSemantics(t *testing.T) {
 	tests := map[string]func(*MigrationTokenPayloadV1){
 		"version":              func(p *MigrationTokenPayloadV1) { p.Version = 2 },
@@ -244,16 +265,18 @@ func TestOpenValidatesPayloadSemantics(t *testing.T) {
 		"manifest fingerprint": func(p *MigrationTokenPayloadV1) { p.ManifestKeyFingerprint = p.ManifestKeyFingerprint[:62] },
 		"profile":              func(p *MigrationTokenPayloadV1) { p.Profile = "unknown" },
 		"template":             func(p *MigrationTokenPayloadV1) { p.TemplateID = "bad" },
-		"template profile":     func(p *MigrationTokenPayloadV1) { p.TemplateID = "bare-snp-" + strings.Repeat("a", 64) },
-		"runtime":              func(p *MigrationTokenPayloadV1) { p.RuntimeDigest = strings.Repeat("B", 64) },
-		"snapshot":             func(p *MigrationTokenPayloadV1) { p.SnapshotRef = "/local/snapshot" },
-		"created":              func(p *MigrationTokenPayloadV1) { p.CreatedUnix = 0 },
-		"deadline":             func(p *MigrationTokenPayloadV1) { p.DeadlineUnix = -1 },
-		"service secret":       func(p *MigrationTokenPayloadV1) { p.ServiceSecret = strings.Repeat("S", 64) },
-		"envd token":           func(p *MigrationTokenPayloadV1) { p.EnvdAccessToken = "" },
-		"traffic token":        func(p *MigrationTokenPayloadV1) { p.TrafficAccessToken = "" },
-		"forward token":        func(p *MigrationTokenPayloadV1) { p.ForwardAccessToken = "" },
-		"forward subject":      func(p *MigrationTokenPayloadV1) { p.AuthSandboxID = "other-sandbox" },
+		"template profile": func(p *MigrationTokenPayloadV1) {
+			p.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
+		},
+		"runtime":         func(p *MigrationTokenPayloadV1) { p.RuntimeDigest = strings.Repeat("B", 64) },
+		"snapshot":        func(p *MigrationTokenPayloadV1) { p.SnapshotRef = "/local/snapshot" },
+		"created":         func(p *MigrationTokenPayloadV1) { p.CreatedUnix = 0 },
+		"deadline":        func(p *MigrationTokenPayloadV1) { p.DeadlineUnix = -1 },
+		"service secret":  func(p *MigrationTokenPayloadV1) { p.ServiceSecret = strings.Repeat("S", 64) },
+		"envd token":      func(p *MigrationTokenPayloadV1) { p.EnvdAccessToken = "" },
+		"traffic token":   func(p *MigrationTokenPayloadV1) { p.TrafficAccessToken = "" },
+		"forward token":   func(p *MigrationTokenPayloadV1) { p.ForwardAccessToken = "" },
+		"forward subject": func(p *MigrationTokenPayloadV1) { p.AuthSandboxID = "other-sandbox" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -335,7 +358,7 @@ func TestE2BAccessTokenSizeContract(t *testing.T) {
 func TestProfileCredentialContract(t *testing.T) {
 	payload := validPayload()
 	payload.Profile = "bare"
-	payload.TemplateID = "bare-snp-" + strings.Repeat("a", 64)
+	payload.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 	payload.EnvdAccessToken = ""
 	payload.TrafficAccessToken = ""
 	token := fixedToken(t, payload)

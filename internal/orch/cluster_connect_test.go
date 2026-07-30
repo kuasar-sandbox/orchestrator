@@ -36,7 +36,7 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		Profile:            types.ProfileBare,
 		Cluster:            &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
 		AuthSandboxIDValue: "stable",
-		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		State:              types.StateRunning,
 		DeadlineUnix:       1_900_000_000,
 		APISecret:          apiSecret,
@@ -228,7 +228,7 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 		Profile:            types.ProfileBare,
 		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
 		AuthSandboxIDValue: "stable",
-		TemplateID:         "bare-img-" + strings.Repeat("7", 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:              types.StatePaused,
 		APISecret:          deriveTestAPISecret(t, manifestKey),
 		ManifestKey:        manifestKey,
@@ -350,7 +350,7 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 		ID: sid, Profile: types.ProfileE2B,
 		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
 		AuthSandboxIDValue: "stable",
-		TemplateID:         "e2b-img-" + strings.Repeat("a", 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		State:              types.StatePaused,
 		APISecret:          apiSecret,
 		ManifestKey:        manifestKey,
@@ -488,7 +488,7 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 func TestClusterConnectResultEnforcesProfileCredentialShape(t *testing.T) {
 	base := &types.Sandbox{
 		ID: "stable-g1", Profile: types.ProfileBare,
-		TemplateID:         "bare-img-" + strings.Repeat("a", 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		ForwardAccessToken: "kat1.forward",
 	}
 	result, err := clusterConnectResult(base)
@@ -501,7 +501,7 @@ func TestClusterConnectResultEnforcesProfileCredentialShape(t *testing.T) {
 
 	e2b := *base
 	e2b.Profile = types.ProfileE2B
-	e2b.TemplateID = "e2b-img-" + strings.Repeat("b", 64)
+	e2b.TemplateID = types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String()
 	if _, err := clusterConnectResult(&e2b); err == nil {
 		t.Fatal("e2b result accepted missing e2b access tokens")
 	}

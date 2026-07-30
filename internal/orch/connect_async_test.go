@@ -27,7 +27,7 @@ func TestConnectExistingTargetIgnoresMalformedMigrationToken(t *testing.T) {
 	sb := &types.Sandbox{
 		ID:           "existing-target",
 		Profile:      types.ProfileBare,
-		TemplateID:   "bare-img-" + strings.Repeat("b", 64),
+		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:        types.StateRunning,
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
@@ -86,7 +86,7 @@ func TestConnectImportsBeforeReturningAndResumesAsynchronously(t *testing.T) {
 	source := &types.Sandbox{
 		ID:           "portable-source",
 		Profile:      types.ProfileBare,
-		TemplateID:   "bare-img-" + strings.Repeat("d", 64),
+		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
 		State:        types.StatePaused,
 		SnapshotRef:  "manifest://" + strings.Repeat("e", 64),
 		APISecret:    apiSecret,
@@ -165,7 +165,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	makeSource := func(id, marker string) *types.Sandbox {
 		sb := &types.Sandbox{
 			ID: id, Profile: types.ProfileBare,
-			TemplateID: "bare-img-" + strings.Repeat("8", 64),
+			TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("8", 64)}.String(),
 			State:      types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("9", 64),
 			APISecret: apiSecret, ManifestKey: mk,
 			Metadata:    map[string]string{"winner": marker, "padding": strings.Repeat(marker, 128<<10)},
@@ -261,7 +261,7 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	sb := &types.Sandbox{
 		ID:           "timeout-target",
 		Profile:      types.ProfileBare,
-		TemplateID:   "bare-img-" + strings.Repeat("1", 64),
+		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
 		State:        types.StatePaused,
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
@@ -484,7 +484,7 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 	sb := &types.Sandbox{
 		ID:           "blocked-resume-target",
 		Profile:      types.ProfileBare,
-		TemplateID:   "bare-img-" + strings.Repeat("7", 64),
+		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:        types.StatePaused,
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,

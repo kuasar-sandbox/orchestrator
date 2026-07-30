@@ -182,7 +182,7 @@ func TestRunPlane(t *testing.T) {
 	if err != nil || taskID != "x" {
 		t.Fatalf("WaitAssignment = %q, %v; want x, nil", taskID, err)
 	}
-	if err := PostBuildResult(sock, "br-test", "x", BuildResult{ImageKey: "image"}); err != nil {
+	if err := PostBuildResult(sock, "br-test", "x", BuildResult{ImageRef: "image"}); err != nil {
 		t.Fatalf("PostBuildResult: %v", err)
 	}
 	if _, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-missing"); err == nil {

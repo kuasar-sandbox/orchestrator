@@ -1,11 +1,45 @@
 package config
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCheckpointRefLocationURI(t *testing.T) {
+	c := CheckpointConfig{Remote: CheckpointRemoteConfig{RefLocationParent: "file:///mnt/shared/snapshots"}}
+	name := "0198f7a1-1234"
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
+	want := "file:///mnt/shared/snapshots/" + digest[:2] + "/" + digest[2:4] + "/" + name
+	got, err := c.RefLocationURI(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("RefLocationURI() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsInvalidCheckpointRefLocationParent(t *testing.T) {
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+checkpoint:
+  remote:
+    ref_location_parent: https://example.test/snapshots
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "ref_location_parent") {
+		t.Fatalf("Load error = %v", err)
+	}
+}
 
 func TestLoadRejectsOldRuntimeFields(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")

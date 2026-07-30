@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // --- phase C: template snapshot ---------------------------------------------
@@ -153,8 +155,8 @@ func udsHTTP(uds string) *http.Client {
 // --- finale: uploads ---------------------------------------------------------
 
 func (p *buildPipeline) uploadImage() (string, error) {
-	if p.baseImageKey != "" {
-		return p.baseImageKey, nil
+	if p.baseImageRef != "" {
+		return p.baseImageRef, nil
 	}
 	p.progress("uploading image to the content store")
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.ManifestCtl,
@@ -166,9 +168,9 @@ func (p *buildPipeline) uploadImage() (string, error) {
 	if len(key) != 64 {
 		return "", fmt.Errorf("manifest-ctl store output %q (want 64-hex key)", key)
 	}
-	p.baseImageKey = key
+	p.baseImageRef = "manifest://" + key
 	p.progress("uploaded image: %s", key)
-	return key, nil
+	return p.baseImageRef, nil
 }
 
 func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
@@ -176,16 +178,21 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	// references (the base image is a bundle-dir sibling) and rewrites
 	// the refs to manifest:// — one command finishes the build.
 	p.progress("uploading template snapshot to the content store")
-	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl,
-		"upload-snapshot", "--manifest-config", p.spec.Paths.ManifestConfig, "--quiet", bundle)
+	args := []string{"upload-snapshot", "--quiet"}
+	if p.spec.ToRefLocation != "" {
+		args = append(args, "--to-ref-location", p.spec.ToRefLocation)
+	} else {
+		args = append(args, "--manifest-config", p.spec.Paths.ManifestConfig)
+	}
+	args = append(args, bundle)
+	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
 	if err != nil {
 		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
 	}
-	key := strings.TrimSpace(string(out))
-	key = strings.TrimPrefix(key, "manifest://")
-	if len(key) != 64 {
-		return "", fmt.Errorf("upload-snapshot output %q (want 64-hex key)", key)
+	ref := strings.TrimSpace(string(out))
+	if _, err := types.ParsePortableRef(ref); err != nil {
+		return "", fmt.Errorf("upload-snapshot output %q: %w", ref, err)
 	}
-	p.progress("uploaded template snapshot: %s", key)
-	return key, nil
+	p.progress("uploaded template snapshot: %s", ref)
+	return ref, nil
 }

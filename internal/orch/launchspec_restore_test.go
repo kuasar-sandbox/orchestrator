@@ -23,7 +23,7 @@ func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
 	sb := &types.Sandbox{
 		ID:          sid,
 		Profile:     types.ProfileBare,
-		TemplateID:  "bare-snp-" + key,
+		TemplateID:  types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + key}.String(),
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,
@@ -57,7 +57,7 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 	sb := &types.Sandbox{
 		ID:          sid,
 		Profile:     types.ProfileBare,
-		TemplateID:  "bare-img-" + strings.Repeat("b", 64),
+		TemplateID:  types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,

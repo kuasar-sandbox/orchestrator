@@ -19,7 +19,7 @@ func sandboxInsertFixture(id string, candidate int) *types.Sandbox {
 		Profile:            types.ProfileE2B,
 		Cluster:            &types.ClusterSandboxContext{Group: fmt.Sprintf("/group-%d", candidate), RouteKey: fmt.Sprintf("route-%d", candidate)},
 		AuthSandboxIDValue: fmt.Sprintf("stable-%d", candidate),
-		TemplateID:         "e2b-img-" + strings.Repeat(hexDigit, 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat(hexDigit, 64)}.String(),
 		State:              types.StateRunning,
 		DeadlineUnix:       int64(100 + candidate),
 		RunDir:             fmt.Sprintf("/run/%d", candidate),

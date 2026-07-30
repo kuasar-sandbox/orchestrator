@@ -349,7 +349,7 @@ done
 
 mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
-{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","api_secret":"$API_SECRET","template_ref":"e2b-snp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
+{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","api_secret":"$API_SECRET","template_ref":"e2b-snp-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
 for i in $(seq 1 "$REGISTRIES"); do

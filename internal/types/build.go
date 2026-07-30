@@ -4,7 +4,7 @@ import "strings"
 
 // TransientPrefix marks the register-time templateID the e2b SDK first receives,
 // "transient-<uuidv7>". It is a throwaway handle: once the build is ready, the
-// self-describing persist id "<profile>-<kind>-<key>" is surfaced via the
+// self-describing persist id "<profile>-<kind>-<base64url(portable-ref)>" is surfaced via the
 // template's names+aliases and used for everything afterwards.
 const TransientPrefix = "transient-"
 
@@ -66,7 +66,7 @@ type BuildRefererOptions struct {
 type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
 	TemplateID   string  // transient-<uuidv7>, the register-time handle
-	PersistID    string  // <profile>-<kind>-<key>, set when ready
+	PersistID    string  // <profile>-<kind>-<base64url(portable-ref)>, set when ready
 	APISecret    string  // per-tenant API authentication root (hex)
 	ManifestKey  string  // per-tenant manifest encryption root (hex)
 	Profile      Profile // immutable output profile selected at registration

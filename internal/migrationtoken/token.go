@@ -240,7 +240,7 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 	if !validHexDigest(payload.RuntimeDigest) {
 		return invalidPayload("runtime digest")
 	}
-	if !validManifestRef(payload.SnapshotRef) {
+	if !validSnapshotRef(payload.SnapshotRef) {
 		return invalidPayload("snapshot reference")
 	}
 	if payload.CreatedUnix <= 0 || payload.DeadlineUnix < 0 {
@@ -332,9 +332,9 @@ func validStringMap(values map[string]string) bool {
 	return true
 }
 
-func validManifestRef(ref string) bool {
-	key, ok := strings.CutPrefix(ref, "manifest://")
-	return ok && validHexDigest(key)
+func validSnapshotRef(raw string) bool {
+	ref, err := types.ParsePortableRef(raw)
+	return err == nil && (ref.Scheme != "file" || strings.HasSuffix(ref.Path, ".snapshot"))
 }
 
 func invalidPayload(field string) error {

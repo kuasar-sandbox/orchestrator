@@ -90,7 +90,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 
 	res := builder.Run(spec, log)
 	post := configsock.BuildResult{
-		ImageKey: res.ImageKey, SnapshotKey: res.SnapshotKey,
+		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
 	if err := configsock.PostBuildResult(*socket, *runID, bid, post); err != nil {

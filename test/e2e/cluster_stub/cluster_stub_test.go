@@ -38,7 +38,7 @@ const (
 	testGroup              = "/cell/proj/app/g1"
 	testAPISecret          = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 	testMK                 = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	testTemplateRef        = "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testTemplateRef        = "e2b-img-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh"
 	testEnvdAccessToken    = "opaque-envd-access-token-from-node"
 	testTrafficAccessToken = "opaque-traffic-access-token-from-node"
 )

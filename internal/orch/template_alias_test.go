@@ -15,7 +15,7 @@ func TestResolveTemplateAlias(t *testing.T) {
 	ctx := context.Background()
 	mk := strings.Repeat("4", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, mk)
-	persist := "e2b-img-" + strings.Repeat("a", 64)
+	persist := types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 	b := &types.Build{
 		BuildID: "b1", TemplateID: "transient-xyz", PersistID: persist,
 		APISecret: apiSecret, ManifestKey: mk, Profile: types.ProfileE2B, Kind: types.KindImg,

@@ -51,7 +51,7 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := &routesync.Command{
-		TemplateRef:          "bare-img-" + strings.Repeat("a", 64),
+		TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		Profile:              string(types.ProfileBare),
 		APISecretFingerprint: fingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
@@ -67,7 +67,7 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 func TestPrecheckClusterRequiresConsistentProfileAndContext(t *testing.T) {
 	o := testOrch(t)
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-	templateRef := "bare-img-" + strings.Repeat("a", 64)
+	templateRef := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 	valid := func() *routesync.Command {
 		return &routesync.Command{
 			SID:                  "stable-g0",
@@ -134,7 +134,7 @@ func TestPrecheckClusterExtractsCredentials(t *testing.T) {
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	secret := strings.Repeat("1", 64)
 	cmd := &routesync.Command{
-		SID: "stable-g0", TemplateRef: "e2b-img-" + strings.Repeat("a", 64), Profile: "e2b",
+		SID: "stable-g0", TemplateRef: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), Profile: "e2b",
 		APISecretFingerprint: fingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
 		Config: map[string]string{

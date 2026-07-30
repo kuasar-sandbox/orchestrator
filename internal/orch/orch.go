@@ -149,7 +149,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	tmpl, err := types.ParseTemplateID(req.TemplateID)
 	if err != nil {
-		// Not a <profile>-<kind>-<key> id — resolve the transient register id the SDK
+		// Not a canonical persistent id — resolve the transient register id the SDK
 		// reports (BuildInfo.template_id), or a build name/alias, to its persist id.
 		persist := o.resolveTemplateAlias(ctx, req.APIKey, req.TemplateID)
 		if persist == "" {
@@ -657,10 +657,13 @@ type snapInfo struct {
 // stays the capacity enforcer).
 func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) snapInfo {
 	var info snapInfo
-	args := []string{"info", "--json"}
-	if strings.HasPrefix(ref, "manifest://") {
-		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
+	args := []string{"info", "--json", "--manifest-config", o.cfg.ManifestConfig}
+	locations := map[string]string{}
+	if err := o.addRefLocation(locations, ref); err != nil {
+		o.log.Warn("snapshot config location failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return info
 	}
+	args = appendRefLocationArgs(args, locations)
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), append(args, ref)...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	out, err := cmd.Output()
@@ -793,6 +796,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		"--stderr-to", "journald=" + configsock.RunnerLogTag,
 		"--console", "journald=" + configsock.ConsoleTag,
 	}
+	locations, err := o.sandboxRefLocations(ctx, sb, tmpl)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("sandbox %s ref locations: %w", sid, err)
+	}
+	args = appendRefLocationArgs(args, locations)
 	if r := p.RestoreRef(); r != "" {
 		args = append(args, "--restore", r)
 	}
@@ -1007,14 +1015,17 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
 	o.uncache(sb.ID)
 }
 
-// snapshot pauses+captures the running sandbox via sandbox-ctl and returns the
-// snapshot manifest key. The client dials <run-root>/<sid>/ctl.sock; the running
+// snapshot pauses+captures the running sandbox via sandbox-ctl and returns its
+// restore ref. The client dials <run-root>/<sid>/ctl.sock; the running
 // snapshot captures sb per the configured checkpoint mode and returns the restore
-// ref to persist: "manifest://<key>" (remote — portable) or a local bundle path
+// ref to persist: a canonical portable ref or a local bundle path
 // (local — node-bound; the default). sandbox-ctl performs the work with its own
 // boot-time manifest config; we pass the resolved binary + the run root.
 func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox) (string, error) {
-	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
+	// Named-location publishing is deliberately outside the VM pause/capture
+	// operation. Pause writes a local bundle; export or template finalization
+	// later upgrades it to the configured portable location.
+	if o.cfg.Checkpoint.Mode == config.CheckpointLocal || o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		return o.snapshotLocal(ctx, sb)
 	}
 	key, err := o.snapshotRemote(ctx, sb)
@@ -1034,7 +1045,11 @@ func (o *Orchestrator) snapshotRemote(ctx context.Context, sb *types.Sandbox) (s
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("orch: snapshot %s: %w: %s", sb.ID, err, errb.String())
 	}
-	return strings.TrimSpace(out.String()), nil
+	key := strings.TrimSpace(out.String())
+	if _, err := types.ParsePortableRef("manifest://" + key); err != nil {
+		return "", fmt.Errorf("orch: snapshot %s: invalid manifest key %q", sb.ID, key)
+	}
+	return key, nil
 }
 
 // snapshotLocal writes the snapshot bundle to checkpoint.local_dir/<sid>/ and
@@ -1052,22 +1067,33 @@ func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox) (st
 	return filepath.Join(dir, sb.ID+".snapshot"), nil
 }
 
-// promote uploads a LOCAL checkpoint bundle to the manifest store WITHOUT booting
-// (sandbox-ctl upload-snapshot), returning "manifest://<key>". The tenant key
-// rides in MANIFEST_KEY; the base lower chain must already be remote. Used by
-// export-sandbox to make a node-bound checkpoint portable.
+// promote publishes a local checkpoint graph without booting it. The configured
+// publisher is either manifest storage or a named ref location.
 func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
-	// Flags before the positional: sandbox-ctl upload-snapshot parses with Go's flag,
-	// which stops at the first positional — a leading <path> would drop --manifest-config.
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "upload-snapshot",
-		"--manifest-config", o.cfg.ManifestConfig, "--quiet", localPath)
+	args := []string{"upload-snapshot", "--quiet"}
+	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
+		uri, err := o.cfg.Checkpoint.RefLocationURI(sb.ID)
+		if err != nil {
+			return "", fmt.Errorf("orch: promote %s: %w", sb.ID, err)
+		}
+		args = append(args, "--to-ref-location", sb.ID+"="+uri)
+	} else {
+		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
+	}
+	args = append(args, localPath)
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
 	}
-	return strings.TrimSpace(out.String()), nil // manifest://<key>
+	ref := strings.TrimSpace(out.String())
+	parsed, err := types.ParsePortableRef(ref)
+	if err != nil || (parsed.Scheme == "file" && !strings.HasSuffix(parsed.Path, ".snapshot")) {
+		return "", fmt.Errorf("orch: promote %s: invalid snapshot ref %q", sb.ID, ref)
+	}
+	return ref, nil
 }
 
 // udsClient builds an HTTP client that dials a unix socket (the envd --connect UDS).
