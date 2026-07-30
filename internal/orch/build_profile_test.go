@@ -81,6 +81,7 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	b := &types.Build{BuildID: "build-bare", Profile: types.ProfileBare}
 	o.pend[b.BuildID] = &pendingBuild{
 		build: b, workdir: t.TempDir(), innerIP: "169.254.1.1/31",
+		nexthop: "169.254.1.0",
 	}
 
 	spec, _, found, err := o.BuildSpecFor(context.Background(), "build:"+b.BuildID)

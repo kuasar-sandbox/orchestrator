@@ -403,6 +403,7 @@ type pendingBuild struct {
 	tapFD     vswitch.TapFD
 	mac       string
 	innerIP   string // CIDR
+	nexthop   string
 	floating  string
 	envdToken string
 	result    chan configsock.BuildResult
@@ -514,6 +515,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	pend := &pendingBuild{
 		build: b, workdir: dir,
 		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
+		nexthop: firstNonEmpty(spec.Network.Nexthop, o.innerGateway(b.Profile)),
 		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
 		result: make(chan configsock.BuildResult, 1),
 	}
@@ -678,7 +680,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			TapFD:    buildTapFD(pend.tapFD),
 			MAC:      pend.mac,
 			InnerIP:  pend.innerIP,
-			Nexthop:  o.innerGateway(b.Profile),
+			Nexthop:  pend.nexthop,
 			Hostname: "build-" + shortID(b.BuildID),
 			DNS:      o.cfg.Sandbox.Network.DNS,
 		},
