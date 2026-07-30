@@ -189,6 +189,81 @@ func TestGetMetaReturns503ForSpecifiedServiceRoute(t *testing.T) {
 	}
 }
 
+func TestGetMetaServesServiceRoutePassthrough(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/backend-path": {Type: "service", StatusCode: 200, ContentType: "application/json", Data: `{"ok":true}`}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/backend-path", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d, want 200", w.Code)
+	}
+	if got, want := w.Body.String(), `{"ok":true}`; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if got, want := w.Header().Get("Content-Type"), "application/json"; got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+}
+
+func TestGetMetaServesServiceRouteFailureWithRetryAfter(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/backend-path": {Type: "service", StatusCode: 503, RetryAfter: "5"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/backend-path", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d, want 503", w.Code)
+	}
+	if got, want := w.Header().Get("Retry-After"), "5"; got != want {
+		t.Fatalf("Retry-After = %q, want %q", got, want)
+	}
+}
+
+func TestGetMetaServesServiceRouteUpstreamErrorPassthrough(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+		routes: map[string]map[string]MMDSRoute{
+			"sbx-1": {"/backend-path": {Type: "service", StatusCode: 429, ContentType: "text/plain", Data: "slow down"}},
+		},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/backend-path", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 429 {
+		t.Fatalf("code=%d, want 429 (upstream provider status passed through verbatim)", w.Code)
+	}
+	if got, want := w.Body.String(), "slow down"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
 func TestGetMetaReturns404ForSpecifiedButAbsentSecretRoute(t *testing.T) {
 	src := fakeSource{
 		fip:  map[string]string{"192.0.2.1": "sbx-1"},

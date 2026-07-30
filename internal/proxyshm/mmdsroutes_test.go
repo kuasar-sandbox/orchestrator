@@ -52,3 +52,51 @@ func TestMMDSRoutesBookmarkDropsUnaffirmedEntries(t *testing.T) {
 		t.Fatal("expected sbx-2 (not re-affirmed) to be dropped at Bookmark")
 	}
 }
+
+func TestMMDSRoutesSyncedLifecycle(t *testing.T) {
+	m := NewMMDSRoutes()
+	if m.Synced() {
+		t.Fatal("a freshly constructed store must start unsynced")
+	}
+
+	m.BeginSync()
+	if m.Synced() {
+		t.Fatal("BeginSync must not mark the store synced")
+	}
+	m.Upsert("sbx-1", `{"version":1}`)
+	if m.Synced() {
+		t.Fatal("an in-flight Upsert must not mark the store synced -- only a completed Bookmark does")
+	}
+	m.Bookmark()
+	if !m.Synced() {
+		t.Fatal("expected the store to be synced once Bookmark completes")
+	}
+
+	// A disconnect (BeginSync of a fresh generation) must flip back to
+	// unsynced immediately, not only once the *next* Bookmark completes.
+	m.BeginSync()
+	if m.Synced() {
+		t.Fatal("expected BeginSync to immediately mark the store unsynced again")
+	}
+	m.Bookmark()
+	if !m.Synced() {
+		t.Fatal("expected the store to be synced again once the new Bookmark completes")
+	}
+}
+
+// TestMMDSRoutesBeginSyncDoesNotEagerlyClear proves BeginSync only flips
+// Synced() to false and leaves byID intact -- unlike MMDSSecrets, a stale
+// static-route declaration remains servable through a resync window (see
+// MMDSRoutes's doc comment); only the Synced() signal itself changes
+// immediately.
+func TestMMDSRoutesBeginSyncDoesNotEagerlyClear(t *testing.T) {
+	m := NewMMDSRoutes()
+	m.BeginSync()
+	m.Upsert("sbx-1", `{"version":1}`)
+	m.Bookmark()
+
+	m.BeginSync() // reconnect/resync begins; not yet re-affirmed
+	if _, ok := m.Get("sbx-1"); !ok {
+		t.Fatal("expected sbx-1's declaration to remain servable through BeginSync, unlike MMDSSecrets")
+	}
+}

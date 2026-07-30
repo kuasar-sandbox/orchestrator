@@ -34,7 +34,7 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 	tbl.Bookmark()
 
 	var wakes atomic.Int32
-	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0)
+	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0, nil)
 	for _, sid := range []string{"paused", "running"} {
 		got, found, err := view.LookupExec(context.Background(), sid)
 		if err != nil || !found {
@@ -70,7 +70,7 @@ func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *t
 
 	updates := &Updates{ch: make(chan struct{})}
 	wakes := make(chan string, 1)
-	view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second, nil, 0)
+	view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second, nil, 0, nil)
 	type result struct {
 		identity proxy.ExecIdentity
 		found    bool
@@ -116,7 +116,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 		}
 		tbl.Bookmark()
 		var wakes atomic.Int32
-		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0)
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0, nil)
 		expected := execWorkerIdentity(route.SandboxID)
 		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
 		if err != nil || !found || got != expected {
@@ -135,7 +135,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 		}
 		tbl.Bookmark()
 		var wakes atomic.Int32
-		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, 50*time.Millisecond, nil, 0)
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, 50*time.Millisecond, nil, 0, nil)
 		expected := execWorkerIdentity(route.SandboxID)
 		expected.AuthSandboxID = "different-lineage"
 		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
@@ -156,7 +156,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 		tbl.Bookmark()
 		updates := &Updates{ch: make(chan struct{})}
 		wakes := make(chan string, 1)
-		view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second, nil, 0)
+		view := NewWorkerView(tbl, updates, func(sid string) { wakes <- sid }, time.Second, nil, 0, nil)
 		type result struct {
 			identity proxy.ExecIdentity
 			found    bool
@@ -197,7 +197,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 		}
 		tbl.Bookmark()
 		var wakes atomic.Int32
-		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Millisecond, nil, 0)
+		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Millisecond, nil, 0, nil)
 		expected := execWorkerIdentity(route.SandboxID)
 		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
 		if !errors.Is(err, errExecActivationTimeout) || found || got != (proxy.ExecIdentity{}) {
@@ -218,7 +218,7 @@ func TestExternalExecInvalidKATDoesNotWakeOrDial(t *testing.T) {
 	tbl.Bookmark()
 	var wakes atomic.Int32
 	var dials atomic.Int32
-	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0)
+	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second, nil, 0, nil)
 	px := proxy.NewWithDialer(view, func() string { return "off" }, nil, nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)

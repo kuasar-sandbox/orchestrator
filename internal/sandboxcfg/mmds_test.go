@@ -506,6 +506,28 @@ func TestMMDSSpecifiesSecretName(t *testing.T) {
 	}
 }
 
+func TestLookupMMDSService(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"version":1,"services":[{"name":"svc1","target":"credential-broker"},{"name":"svc2","target":"other-broker"}],"routes":[{"path":"/x","type":"service","service_name":"svc1"},{"path":"/y","type":"service","service_name":"svc2"}]}`}
+
+	target, ok := LookupMMDSService(meta, "svc1")
+	if !ok || target != "credential-broker" {
+		t.Fatalf("svc1: target=%q ok=%t", target, ok)
+	}
+	target, ok = LookupMMDSService(meta, "svc2")
+	if !ok || target != "other-broker" {
+		t.Fatalf("svc2: target=%q ok=%t", target, ok)
+	}
+	if _, ok := LookupMMDSService(meta, "unknown"); ok {
+		t.Fatal("expected an unspecified service name to report ok=false")
+	}
+	if _, ok := LookupMMDSService(map[string]string{}, "svc1"); ok {
+		t.Fatal("expected an absent namespace to report ok=false")
+	}
+	if _, ok := LookupMMDSService(map[string]string{NsMMDS: "not json"}, "svc1"); ok {
+		t.Fatal("expected corrupt namespace value to report ok=false")
+	}
+}
+
 func TestMMDSConfigDigest(t *testing.T) {
 	meta1 := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":"static","data":"a"}]}`}
 	meta2 := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/y","type":"static","data":"b"}]}`}

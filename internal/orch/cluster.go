@@ -459,6 +459,15 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 		}
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %w", api.ErrBadRequest, err)
 	}
+	// Deliberately not validating services[].target against o.mmdsServices
+	// here, unlike the single-node Create path (Orchestrator.
+	// validateMMDSServiceTargets in orch.go): precheckCluster may run on a
+	// router/placer node distinct from whichever node ends up actually
+	// running this sandbox, and mmds.services is node-local, never synced --
+	// checking the wrong node's registry would be worse than not checking at
+	// all. Cross-node target-existence validation belongs to cluster
+	// placement (no node-capability-advertisement infrastructure for it
+	// exists yet), not here.
 	cmd.Config = config
 	return pair, tmpl, credentials, nil
 }

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -30,8 +32,15 @@ func mmdsRPCTestHandler(routes *MMDSRoutes, secrets *MMDSSecrets) mmdsrpc.Handle
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}
-		if route.Type != sandboxcfg.MMDSRouteSecret {
+		switch route.Type {
+		case sandboxcfg.MMDSRouteStatic:
 			return mmdsrpc.Route{Type: route.Type, ContentType: route.ContentType, Body: route.Data}, true
+		case sandboxcfg.MMDSRouteService:
+			if !routes.Synced() {
+				return mmdsrpc.Route{Type: route.Type, Unavailable: true}, true
+			}
+			target, _ := sandboxcfg.LookupMMDSService(map[string]string{sandboxcfg.NsMMDS: canonical}, route.ServiceName)
+			return mmdsrpc.Route{Type: route.Type, Target: target, ServiceName: route.ServiceName}, true
 		}
 		if !secrets.Synced() {
 			return mmdsrpc.Route{Type: route.Type, Unavailable: true}, true
@@ -65,7 +74,7 @@ func TestWorkerViewMMDSRouteOverRPC(t *testing.T) {
 	client := mmdsrpc.NewClient(a)
 	defer client.Close()
 
-	worker := NewWorkerView(nil, nil, nil, 0, client, 0)
+	worker := NewWorkerView(nil, nil, nil, 0, client, 0, nil)
 
 	route, ok, err := worker.MMDSRoute("sbx-1", "/x")
 	if err != nil {
@@ -80,6 +89,233 @@ func TestWorkerViewMMDSRouteOverRPC(t *testing.T) {
 	}
 	if _, ok, err := worker.MMDSRoute("unknown-sid", "/x"); err != nil || ok {
 		t.Fatalf("unknown sid: ok=%t err=%v", ok, err)
+	}
+}
+
+// TestWorkerViewMMDSRouteStaticSurvivesInvalidateSync proves a static route
+// stays servable end to end (real master/worker RPC round trip, not just a
+// direct MMDSRoutes.Get check) through the same disconnect that fails a
+// service route closed -- static content is immutable and non-sensitive, so
+// InvalidateSync must not interrupt it, unlike secret/service.
+func TestWorkerViewMMDSRouteStaticSurvivesInvalidateSync(t *testing.T) {
+	master := NewMasterView(nil, 0, nil)
+	master.mmds.Upsert("sbx-1", `{"version":1,"routes":[{"path":"/x","type":"static","content_type":"text/plain","data":"hi"}]}`)
+
+	a, b := net.Pipe()
+	server := mmdsrpc.NewServer(b, mmdsRPCTestHandler(master.MMDSRoutes(), master.MMDSSecrets()), nil)
+	go server.Serve()
+	client := mmdsrpc.NewClient(a)
+	defer client.Close()
+
+	worker := NewWorkerView(nil, nil, nil, 0, client, 0, nil)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/x")
+	if err != nil || !ok || route.Data != "hi" {
+		t.Fatalf("sanity check before disconnect: route=%+v ok=%t err=%v", route, ok, err)
+	}
+
+	master.InvalidateSync() // simulates a dropped connection
+
+	route, ok, err = worker.MMDSRoute("sbx-1", "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || route.Type != "static" || route.Data != "hi" || route.ContentType != "text/plain" {
+		t.Fatalf("expected the static route to survive InvalidateSync unchanged, got route=%+v ok=%t", route, ok)
+	}
+}
+
+const testMMDSServiceRouteSpec = `{"version":1,"services":[{"name":"svc1","target":"svc1"}],"routes":[{"path":"/service","type":"service","service_name":"svc1"}]}`
+
+// startFakeMMDSServiceForWorkerView serves handler over a real Unix domain
+// socket and returns a mmdssvc.Registry with one entry, "svc1" -- matching
+// the target testMMDSServiceRouteSpec's "/service" route resolves to.
+func startFakeMMDSServiceForWorkerView(t *testing.T, handler http.HandlerFunc, timeout time.Duration) mmdssvc.Registry {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "svc.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	return mmdssvc.Registry{"svc1": {SocketPath: sockPath, Timeout: timeout, MaxResponseBytes: 64 * 1024}}
+}
+
+// newMMDSServiceTestWorker wires a master (in-heap MMDSRoutes only, mirroring
+// TestWorkerViewMMDSRouteOverRPC's nil-table pattern -- the service path
+// needs no real shared-memory Table) and a worker with services as its local
+// registry, connected over a real net.Pipe RPC round trip, proving master
+// and worker agree on the resolved Target/ServiceName.
+func newMMDSServiceTestWorker(t *testing.T, services mmdssvc.Registry) (*MasterView, *WorkerView) {
+	t.Helper()
+	master := NewMasterView(nil, 0, nil)
+	// Simulate a completed (trivially empty) initial full sync directly on
+	// mmds -- master.BeginSync()/Bookmark() would also touch the (nil, in
+	// this fixture) table. Must run BEFORE the Upsert below: Bookmark's
+	// mark-and-sweep drops any entry whose syncGen predates the generation
+	// it just bumped to, so upserting first would have this immediately
+	// swept away. Without this pair at all, every service lookup below
+	// would see Synced()==false and fail closed (503) regardless of the
+	// declared route.
+	master.mmds.BeginSync()
+	master.mmds.Bookmark()
+	master.mmds.Upsert("sbx-1", testMMDSServiceRouteSpec)
+
+	a, b := net.Pipe()
+	server := mmdsrpc.NewServer(b, mmdsRPCTestHandler(master.MMDSRoutes(), master.MMDSSecrets()), nil)
+	go server.Serve()
+	client := mmdsrpc.NewClient(a)
+	t.Cleanup(func() { client.Close() })
+
+	return master, NewWorkerView(nil, nil, nil, 0, client, 0, services)
+}
+
+func TestWorkerViewMMDSRouteServiceWorkingPassesThroughResponse(t *testing.T) {
+	var gotHeaders http.Header
+	services := startFakeMMDSServiceForWorkerView(t, func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("hello"))
+	}, 0)
+	_, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	if route.Type != "service" || route.StatusCode != 200 || route.Data != "hello" || route.ContentType != "text/plain" {
+		t.Fatalf("route = %+v", route)
+	}
+	if gotHeaders.Get(mmdssvc.HeaderService) != "svc1" {
+		t.Fatalf("HeaderService = %q, want svc1", gotHeaders.Get(mmdssvc.HeaderService))
+	}
+	if gotHeaders.Get(mmdssvc.HeaderSandboxID) != "sbx-1" {
+		t.Fatalf("HeaderSandboxID = %q, want sbx-1", gotHeaders.Get(mmdssvc.HeaderSandboxID))
+	}
+}
+
+func TestWorkerViewMMDSRouteServiceDownReturns503(t *testing.T) {
+	services := mmdssvc.Registry{"svc1": {SocketPath: filepath.Join(t.TempDir(), "nope.sock"), Timeout: time.Second, MaxResponseBytes: 1024}}
+	_, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	if route.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want 503", route.StatusCode)
+	}
+}
+
+func TestWorkerViewMMDSRouteServiceSlowReturns504(t *testing.T) {
+	services := startFakeMMDSServiceForWorkerView(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(200)
+	}, 30*time.Millisecond)
+	_, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	if route.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("StatusCode = %d, want 504", route.StatusCode)
+	}
+}
+
+func TestWorkerViewMMDSRouteServiceOversizedReturns502(t *testing.T) {
+	services := startFakeMMDSServiceForWorkerView(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(make([]byte, 200))
+	}, 0)
+	services["svc1"] = mmdssvc.Entry{SocketPath: services["svc1"].SocketPath, Timeout: services["svc1"].Timeout, MaxResponseBytes: 100}
+	_, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok {
+		t.Fatalf("ok=%t err=%v", ok, err)
+	}
+	if route.StatusCode != http.StatusBadGateway {
+		t.Fatalf("StatusCode = %d, want 502", route.StatusCode)
+	}
+}
+
+// TestWorkerViewMMDSRouteServiceUnsyncedFailsClosedImmediately proves a
+// disconnect (BeginSync without a matching Bookmark, simulating a resync in
+// progress) makes a service route fail closed (503) rather than dial the
+// registered service using a possibly-stale declaration -- distinct from
+// static routes, which stay servable through the same window (see
+// MMDSRoutes's doc comment).
+func TestWorkerViewMMDSRouteServiceUnsyncedFailsClosedImmediately(t *testing.T) {
+	services := startFakeMMDSServiceForWorkerView(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("hello"))
+	}, 0)
+	master, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok || route.StatusCode != 200 {
+		t.Fatalf("sanity check before disconnect: route=%+v ok=%t err=%v", route, ok, err)
+	}
+
+	master.MMDSRoutes().BeginSync() // disconnect/resync begins; no matching Bookmark yet
+
+	start := time.Now()
+	route, ok, err = worker.MMDSRoute("sbx-1", "/service")
+	elapsed := time.Since(start)
+	if err != nil || !ok {
+		t.Fatalf("unsynced service route: ok=%t err=%v", ok, err)
+	}
+	if route.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want 503 while unsynced", route.StatusCode)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("unsynced should fail closed immediately, not dial the service, took %v", elapsed)
+	}
+}
+
+// TestWorkerViewMMDSRouteServiceInvalidateSyncFailsClosedImmediately mirrors
+// TestWorkerViewMMDSRouteServiceUnsyncedFailsClosedImmediately but drives the
+// disconnect through MasterView.InvalidateSync (the routesync.Sink hook a
+// real dropped connection now triggers) instead of calling
+// MMDSRoutes.BeginSync directly, proving the production entry point wires
+// through to the same fail-closed behavior for service routes, not just
+// secret ones.
+func TestWorkerViewMMDSRouteServiceInvalidateSyncFailsClosedImmediately(t *testing.T) {
+	services := startFakeMMDSServiceForWorkerView(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("hello"))
+	}, 0)
+	master, worker := newMMDSServiceTestWorker(t, services)
+
+	route, ok, err := worker.MMDSRoute("sbx-1", "/service")
+	if err != nil || !ok || route.StatusCode != 200 {
+		t.Fatalf("sanity check before disconnect: route=%+v ok=%t err=%v", route, ok, err)
+	}
+
+	master.InvalidateSync() // simulates a dropped connection, not a fresh BeginSync
+
+	if master.MMDSRoutes().Synced() {
+		t.Fatal("expected InvalidateSync to immediately mark MMDSRoutes unsynced")
+	}
+
+	start := time.Now()
+	route, ok, err = worker.MMDSRoute("sbx-1", "/service")
+	elapsed := time.Since(start)
+	if err != nil || !ok {
+		t.Fatalf("unsynced service route: ok=%t err=%v", ok, err)
+	}
+	if route.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want 503 while unsynced", route.StatusCode)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("unsynced should fail closed immediately, not dial the service, took %v", elapsed)
 	}
 }
 
@@ -106,7 +342,7 @@ func TestWorkerViewMMDSRouteRespectsConfiguredTimeout(t *testing.T) {
 	defer client.Close()
 
 	const configured = 50 * time.Millisecond
-	worker := NewWorkerView(nil, nil, nil, 0, client, configured)
+	worker := NewWorkerView(nil, nil, nil, 0, client, configured, nil)
 
 	start := time.Now()
 	_, ok, err := worker.MMDSRoute("sbx-1", "/x")
@@ -170,7 +406,7 @@ func newMMDSSecretTestPair(t *testing.T, mmdsParkTimeoutMS int) (master *MasterV
 	t.Cleanup(func() { client.Close() })
 
 	updates := &Updates{ch: make(chan struct{})}
-	worker = NewWorkerView(workerTable, updates, nil, 0, client, 0)
+	worker = NewWorkerView(workerTable, updates, nil, 0, client, 0, nil)
 	applyUpsert = func(e routesync.RouteEntry) {
 		master.ApplyUpsert(e)
 		updates.bump()
@@ -300,27 +536,33 @@ func TestWorkerViewMMDSRouteSecretInvalidateSyncFailsClosedImmediately(t *testin
 	}
 }
 
-// TestMasterViewInvalidateSyncLeavesRouteDeclarationsUntouched proves
-// InvalidateSync's scope is secret-only: a static/secret/service route
-// declaration (held in MMDSRoutes) upserted before the disconnect must
-// remain readable afterward, since only secret plaintext needs to fail
-// closed immediately -- MMDSRoutes keeps tolerating staleness across a
-// disconnect exactly as it already did before InvalidateSync existed. A
-// regression here (e.g. someone extending InvalidateSync to also touch
-// MMDSRoutes without updating this test) would silently widen the guest-
-// visible outage every reconnect causes.
-func TestMasterViewInvalidateSyncLeavesRouteDeclarationsUntouched(t *testing.T) {
+// TestMasterViewInvalidateSyncFlipsRouteSyncedButKeepsDeclarations proves
+// InvalidateSync's two-tier MMDSRoutes behavior: it immediately flips
+// Synced() to false (gating "service" routes closed -- a real dial must not
+// act on a possibly-stale declaration), but does NOT clear byID, so a
+// "static" route declaration upserted before the disconnect stays readable
+// (static content is immutable/non-sensitive and tolerates staleness). A
+// regression collapsing this into either extreme -- clearing declarations
+// outright, or never flipping Synced() -- would violate option A's agreed
+// split (see MasterView.InvalidateSync's doc comment).
+func TestMasterViewInvalidateSyncFlipsRouteSyncedButKeepsDeclarations(t *testing.T) {
 	master, _, applyUpsert := newMMDSSecretTestPair(t, 2000)
 	applyUpsert(mmdsSecretTestEntry("sbx-1", nil))
 
 	if _, ok := master.MMDSRoutes().Get("sbx-1"); !ok {
 		t.Fatal("sanity check: expected sbx-1's MMDS route declaration to be present before InvalidateSync")
 	}
+	if !master.MMDSRoutes().Synced() {
+		t.Fatal("sanity check: expected MMDSRoutes to be synced before InvalidateSync")
+	}
 
 	master.InvalidateSync()
 
 	if _, ok := master.MMDSRoutes().Get("sbx-1"); !ok {
-		t.Fatal("expected InvalidateSync to leave MMDSRoutes untouched (declarations tolerate staleness)")
+		t.Fatal("expected InvalidateSync to leave the declaration itself readable (static routes tolerate staleness)")
+	}
+	if master.MMDSRoutes().Synced() {
+		t.Fatal("expected InvalidateSync to immediately mark MMDSRoutes unsynced (gating service routes closed)")
 	}
 }
 

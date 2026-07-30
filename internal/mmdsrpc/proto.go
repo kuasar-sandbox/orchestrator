@@ -44,9 +44,8 @@ type EndpointRequest struct {
 // unspecified -- the worker's mmds.Source falls through exactly as the internal
 // implementation does. Found=true with an empty Type never happens; Type is
 // "static" (ContentType/Body populated), "secret" (Present/Retryable/
-// ContentType/Body meaningful, see below), or "service" (backend not yet
-// implemented; the worker maps it to 503, matching internal/mmds's getMeta
-// dispatch).
+// ContentType/Body meaningful), or "service" (Target/ServiceName meaningful,
+// see below).
 //
 // For Type=="secret": Present distinguishes "configured" (ContentType/Body
 // hold the real value) from "specified but absent". Retryable is meaningful
@@ -59,15 +58,37 @@ type EndpointRequest struct {
 // be arbitrary non-UTF-8 bytes, so it travels base64-encoded on this wire
 // (Type=="static" bodies are always valid UTF-8 and are NOT base64'd).
 //
-// Unavailable is meaningful only for Type=="secret": true means the master's
-// secret view is not currently synced (proxyshm.MMDSSecrets.Synced()==false
-// -- mid-resync after a disconnect, or never yet synced), so Present/
-// Retryable/ContentType/Body are meaningless and must not be trusted even if
-// they carry zero values that would otherwise look like "never configured".
-// The worker maps this to a hard error (503 to the guest), never to the
-// 404 a genuinely absent/revoked secret would get -- serving stale plaintext
-// or a false "not configured" during a resync is exactly what this guards
-// against.
+// For Type=="service": the master only resolves the specification -- it never
+// dials the registered local service itself. Target is the operator-
+// registered service name (an mmds.services key) the sandbox's own specified
+// ServiceName resolves to; the worker looks Target up in its own local
+// registry (each worker independently loads the same proxy.yaml the master
+// does) and dials it directly, setting the X-Kuasar-MMDS-Service header to
+// ServiceName -- never Target, since the guest's own alias is what a
+// registered service should see, not the operator-side name. No response
+// body/status crosses this RPC for "service": the worker calls the local
+// service itself, after this RPC has already returned.
+//
+// Unavailable is meaningful for Type=="secret" and Type=="service"; false
+// (its zero value) for every other type.
+//
+// For Type=="secret": true means the master's secret view is not currently
+// synced (proxyshm.MMDSSecrets.Synced()==false -- mid-resync after a
+// disconnect, or never yet synced), so Present/Retryable/ContentType/Body are
+// meaningless and must not be trusted even if they carry zero values that
+// would otherwise look like "never configured". The worker maps this to a
+// hard error (503 to the guest), never to the 404 a genuinely absent/revoked
+// secret would get -- serving stale plaintext or a false "not configured"
+// during a resync is exactly what this guards against.
+//
+// For Type=="service": true means the master's route declaration view is not
+// currently synced (proxyshm.MMDSRoutes.Synced()==false), so Target/
+// ServiceName are meaningless. Unlike secret, MMDSRoutes holds no plaintext to
+// protect, but a service route still drives a real dial to a local trusted
+// service under the sandbox's identity, so acting on a possibly-stale
+// declaration is unsafe regardless. The worker maps this to a 503
+// StatusCode -- unlike secret, never a hard error -- matching every other
+// service-route failure's guest-visible shape (see mmdssvc.Call's Result).
 type EndpointResponse struct {
 	RequestID   uint64 `json:"id"`
 	Found       bool   `json:"found"`
@@ -76,6 +97,8 @@ type EndpointResponse struct {
 	Body        string `json:"body,omitempty"`
 	Present     bool   `json:"present,omitempty"`
 	Retryable   bool   `json:"retryable,omitempty"`
+	Target      string `json:"target,omitempty"`
+	ServiceName string `json:"service_name,omitempty"`
 	Unavailable bool   `json:"unavailable,omitempty"`
 }
 

@@ -98,6 +98,34 @@ func TestPrecheckClusterAppliesMMDSPolicyAndCanonicalizes(t *testing.T) {
 	}
 }
 
+// TestPrecheckClusterDoesNotValidateServiceTargets proves the cluster Create
+// path deliberately skips validateMMDSServiceTargets (see its doc comment):
+// this node's own mmds.services registry may not be the destination node's,
+// so a target absent here must not be rejected -- unlike the single-node
+// Create path (TestCreateRejectsUnregisteredMMDSServiceTarget).
+func TestPrecheckClusterDoesNotValidateServiceTargets(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MMDS.Routes = testMMDSRoutesConfig()
+	// No cfg.MMDS.Services entries at all -- would be rejected by
+	// validateMMDSServiceTargets if precheckCluster called it.
+	o := testOrchCfg(t, cfg)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+
+	spec := `{"version":1,"services":[{"name":"svc1","target":"broker"}],` +
+		`"routes":[{"path":"/svc","type":"service","service_name":"svc1"}]}`
+	cmd := &routesync.Command{
+		SID:                  "stable-g0",
+		TemplateRef:          testMMDSTemplateRef(),
+		Profile:              string(types.ProfileBare),
+		APISecretFingerprint: fingerprint,
+		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
+		Config:               map[string]string{sandboxcfg.NsMMDS: spec},
+	}
+	if _, _, _, err := o.precheckCluster(context.Background(), cmd); err != nil {
+		t.Fatalf("precheckCluster rejected an unregistered service target: %v", err)
+	}
+}
+
 func TestMigrationSandboxMetadataPreservesMMDS(t *testing.T) {
 	meta := map[string]string{
 		sandboxcfg.NsMMDS:        testMMDSSpec,
@@ -155,6 +183,66 @@ func TestCreateRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("disabled-policy mmds metadata created %s: stat error = %v", path, err)
 		}
+	}
+}
+
+func TestCreateRejectsUnregisteredMMDSServiceTarget(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(root, "run")
+	cfg.Paths.BaseRoot = filepath.Join(root, "base")
+	cfg.MMDS.Routes = testMMDSRoutesConfig()
+	// No cfg.MMDS.Services entries at all -- any target is unregistered.
+	o := testOrchCfg(t, cfg)
+	o.vs = stubVS{}
+	apiKey, _, _ := allowlistedBuildIdentity(t, o)
+
+	spec := `{"version":1,"services":[{"name":"svc1","target":"broker"}],` +
+		`"routes":[{"path":"/svc","type":"service","service_name":"svc1"}]}`
+	_, err := o.Create(context.Background(), api.CreateReq{
+		APIKey: apiKey, TemplateID: testMMDSTemplateRef(), TimeoutSec: 60,
+		Metadata: map[string]string{sandboxcfg.NsMMDS: spec},
+	})
+	if !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("Create error = %v, want ErrBadRequest", err)
+	}
+	for _, path := range []string{cfg.Paths.RunRoot, cfg.Paths.BaseRoot} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("unregistered service target still created %s: stat error = %v", path, err)
+		}
+	}
+}
+
+func TestValidateMMDSServiceTargetsAcceptsRegisteredTarget(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MMDS.Services = map[string]config.MMDSServiceRegistryEntry{
+		"broker": {Endpoint: "unix:///tmp/broker.sock"},
+	}
+	o := testOrchCfg(t, cfg)
+
+	spec := sandboxcfg.MMDSSpec{Services: []sandboxcfg.MMDSServiceSpec{{Name: "svc1", Target: "broker"}}}
+	if err := o.validateMMDSServiceTargets(spec); err != nil {
+		t.Fatalf("validateMMDSServiceTargets: %v", err)
+	}
+}
+
+func TestValidateMMDSServiceTargetsRejectsUnregisteredTarget(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MMDS.Services = map[string]config.MMDSServiceRegistryEntry{
+		"broker": {Endpoint: "unix:///tmp/broker.sock"},
+	}
+	o := testOrchCfg(t, cfg)
+
+	spec := sandboxcfg.MMDSSpec{Services: []sandboxcfg.MMDSServiceSpec{{Name: "svc1", Target: "typo-broker"}}}
+	if err := o.validateMMDSServiceTargets(spec); err == nil {
+		t.Fatal("expected an unregistered target to be rejected")
+	}
+}
+
+func TestValidateMMDSServiceTargetsIgnoresSpecWithoutServices(t *testing.T) {
+	o := testOrchCfg(t, &config.Config{})
+	if err := o.validateMMDSServiceTargets(sandboxcfg.MMDSSpec{}); err != nil {
+		t.Fatalf("validateMMDSServiceTargets on an empty spec: %v", err)
 	}
 }
 

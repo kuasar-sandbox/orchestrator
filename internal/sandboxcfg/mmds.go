@@ -12,10 +12,10 @@ import (
 	"unicode/utf8"
 )
 
-// MMDS route types. Only MMDSRouteStatic is served today; MMDSRouteSecret and
-// MMDSRouteService are specified and validated now so their guest-visible paths
-// are stable and immutable from the start, but their backends are not yet
-// implemented (until then the guest GET returns 503).
+// MMDS route types: static content, an operator-installed secret value, and
+// delegation to a node-operator-registered local service. All three backends
+// are implemented -- see internal/mmds's getMeta dispatch, internal/store's
+// secret storage, and internal/mmdssvc's service dial.
 const (
 	MMDSRouteStatic  = "static"
 	MMDSRouteSecret  = "secret"
@@ -36,15 +36,19 @@ type MMDSSpec struct {
 
 // MMDSSecretSpec specifies a secret name a route may reference. The value
 // itself is never carried here -- it is written later through a separate
-// admin API, not yet implemented.
+// admin API (internal/orch.PutMMDSSecret/DeleteMMDSSecret).
 type MMDSSecretSpec struct {
 	Name string `json:"name"`
 }
 
-// MMDSServiceSpec specifies a service alias a route may reference. Target must
-// name a service the node operator has registered with a service registry
-// that does not exist yet; today ExtractMMDS only validates that Target is
-// non-empty.
+// MMDSServiceSpec specifies a service alias a route may reference. Target
+// must name a service the node operator has registered in mmds.services
+// (config.MMDSConfig.Services / ProxyFileConfig.Services, resolved at
+// request time by internal/mmdssvc.Call); ExtractMMDS itself only validates
+// that Target is non-empty -- an unregistered Target fails closed as a 503
+// at request time rather than being rejected at declare time, since the
+// registry is node-local and not necessarily known to whichever node
+// processes Create (see LookupMMDSService).
 type MMDSServiceSpec struct {
 	Name   string `json:"name"`
 	Target string `json:"target"`
@@ -287,6 +291,30 @@ func MMDSSpecifiesSecretName(meta map[string]string, name string) bool {
 		}
 	}
 	return false
+}
+
+// LookupMMDSService resolves name (an MMDSServiceSpec.Name, typically a
+// route's ServiceName) against meta's canonical NsMMDS specification and
+// returns the operator-registered Target the node's mmds.services registry
+// must contain. ok=false means meta has no canonical specification or does not
+// name a service called name -- ExtractMMDS already guarantees every route's
+// service_name references a specified service, so this should only be false
+// for a decode failure or a caller passing stale/foreign meta.
+func LookupMMDSService(meta map[string]string, name string) (target string, ok bool) {
+	raw, ok := meta[NsMMDS]
+	if !ok {
+		return "", false
+	}
+	var spec MMDSSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return "", false
+	}
+	for _, s := range spec.Services {
+		if s.Name == name {
+			return s.Target, true
+		}
+	}
+	return "", false
 }
 
 // MMDSConfigDigest returns the hex-encoded SHA-256 digest of meta's canonical

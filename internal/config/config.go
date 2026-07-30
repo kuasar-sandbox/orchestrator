@@ -280,6 +280,81 @@ type MMDSConfig struct {
 	// Firecracker-compat token/metadata service), grouped here only because
 	// both are MMDS-adjacent.
 	Routes MMDSRoutesConfig `yaml:"routes"`
+	// Services is the node operator's registry of local trusted services a
+	// type:"service" route may delegate to (keyed by the name a sandbox's own
+	// services[].target references). Node-local, static config: never synced
+	// to other nodes, never tenant-mutable -- unlike Routes.Secret, which is
+	// specified then filled in at runtime via the admin API. In proxy_mode=
+	// external, the proxy master and every worker each read this same
+	// registry from their own copy of ProxyFileConfig.Services instead (the
+	// two are independent, node-local copies of the same concept).
+	Services map[string]MMDSServiceRegistryEntry `yaml:"services"`
+}
+
+// MMDSServiceRegistryEntry is one node-operator-registered local service a
+// type:"service" MMDS route may delegate to. V1 supports unix:// endpoints
+// only (no TCP) -- loopback TCP is not by itself a sufficient identity
+// boundary for a locally-trusted service.
+type MMDSServiceRegistryEntry struct {
+	Endpoint         string `yaml:"endpoint"`           // required; unix://<absolute-path>
+	Timeout          string `yaml:"timeout"`            // per-request forwarding timeout; default 2s
+	MaxResponseBytes int    `yaml:"max_response_bytes"` // default 65536
+}
+
+// TimeoutDur parses Timeout (default 2s on any parse error or non-positive
+// value), mirroring MMDSSecretRoutesConfig.ParkTimeoutDur's style.
+func (e MMDSServiceRegistryEntry) TimeoutDur() time.Duration {
+	d, err := time.ParseDuration(e.Timeout)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	return d
+}
+
+// defaultMMDSServiceRegistry fills missing Timeout/MaxResponseBytes on every
+// entry in place. Shared by Config.applyDefaults and
+// ProxyFileConfig.applyDefaults -- both hold the same map type.
+func defaultMMDSServiceRegistry(m map[string]MMDSServiceRegistryEntry) {
+	for name, e := range m {
+		if e.Timeout == "" {
+			e.Timeout = "2s"
+		}
+		if e.MaxResponseBytes <= 0 {
+			e.MaxResponseBytes = 64 * 1024
+		}
+		m[name] = e
+	}
+}
+
+// validateMMDSServiceRegistry checks every entry's Endpoint/Timeout/
+// MaxResponseBytes. Shared by Config.validate ("config: mmds.services...")
+// and ProxyFileConfig.validate ("proxy config: services...") -- errPrefix is
+// each caller's own error-message convention, key is the field's own path
+// under that prefix (differs because Config nests the registry at
+// mmds.services, while ProxyFileConfig has it as a flat top-level services).
+func validateMMDSServiceRegistry(errPrefix, key string, m map[string]MMDSServiceRegistryEntry) error {
+	for name, e := range m {
+		if e.Endpoint == "" {
+			return fmt.Errorf("%s: %s[%q].endpoint is required", errPrefix, key, name)
+		}
+		if !strings.HasPrefix(e.Endpoint, "unix://") {
+			return fmt.Errorf("%s: %s[%q].endpoint %q: v1 supports unix:// endpoints only", errPrefix, key, name, e.Endpoint)
+		}
+		if path := strings.TrimPrefix(e.Endpoint, "unix://"); !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("%s: %s[%q].endpoint %q: unix:// path must be absolute", errPrefix, key, name, e.Endpoint)
+		}
+		if e.Timeout != "" {
+			if d, err := time.ParseDuration(e.Timeout); err != nil {
+				return fmt.Errorf("%s: %s[%q].timeout %q: %w", errPrefix, key, name, e.Timeout, err)
+			} else if d <= 0 {
+				return fmt.Errorf("%s: %s[%q].timeout must be > 0", errPrefix, key, name)
+			}
+		}
+		if e.MaxResponseBytes < 0 {
+			return fmt.Errorf("%s: %s[%q].max_response_bytes must be >= 0", errPrefix, key, name)
+		}
+	}
+	return nil
 }
 
 // MMDSRoutesConfig is the node policy for tenant-specified MMDS route
@@ -337,8 +412,11 @@ func (c MMDSSecretRoutesConfig) ParkTimeoutDur() time.Duration {
 }
 
 // MMDSServiceRoutesConfig is node policy specific to type:"service" routes.
-// Only the specification-time count limit exists today; the service backend
-// and its per-request forwarding timeout are not yet implemented.
+// Only the specification-time count limit lives here; the service backend's
+// runtime registry (per-service endpoint/timeout/response-size policy) is
+// node-local static config, not specification-time policy, so it lives
+// separately at MMDSConfig.Services (and, for proxy_mode=external, each
+// proxy process's own ProxyFileConfig.Services).
 type MMDSServiceRoutesConfig struct {
 	MaxPerSandbox int `yaml:"max_per_sandbox"` // services[] cap in the specification
 }
@@ -688,6 +766,7 @@ func (c *Config) applyDefaults() {
 		c.MMDS.Routes.Secret.MaxValueBytes = 16 * 1024
 	}
 	def(&c.MMDS.Routes.Secret.ParkTimeout, "3s")
+	defaultMMDSServiceRegistry(c.MMDS.Services)
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
@@ -791,6 +870,9 @@ func (c *Config) validate() error {
 	} else if parkTimeout <= 0 {
 		return fmt.Errorf("config: mmds.routes.secret.park_timeout must be > 0")
 	}
+	if err := validateMMDSServiceRegistry("config", "mmds.services", c.MMDS.Services); err != nil {
+		return err
+	}
 	return c.validateProxy()
 }
 
@@ -871,6 +953,13 @@ type ProxyFileConfig struct {
 	// master fails fast instead of stalling the guest for as long as
 	// ParkTimeout allows.
 	ProxyRPCTimeout string `yaml:"proxy_rpc_timeout"`
+	// Services is this proxy process's own node-local copy of the operator's
+	// registered local trusted services for type:"service" MMDS routes (see
+	// MMDSConfig.Services's doc comment for the full explanation). Both the
+	// proxy master and every worker read this same file independently, so
+	// each worker dials a registered service directly -- no sync from the
+	// master or conductor needed.
+	Services map[string]MMDSServiceRegistryEntry `yaml:"services"`
 }
 
 // DefaultProxyRPCTimeout is the single source of truth for the
@@ -925,6 +1014,7 @@ func (p *ProxyFileConfig) applyDefaults() {
 	if p.ProxyRPCTimeout == "" {
 		p.ProxyRPCTimeout = DefaultProxyRPCTimeout.String()
 	}
+	defaultMMDSServiceRegistry(p.Services)
 }
 
 func (p *ProxyFileConfig) validate() error {
@@ -947,6 +1037,9 @@ func (p *ProxyFileConfig) validate() error {
 	}
 	if p.RouteCapacity <= 0 {
 		return fmt.Errorf("proxy config: route_capacity must be positive")
+	}
+	if err := validateMMDSServiceRegistry("proxy config", "services", p.Services); err != nil {
+		return err
 	}
 	return nil
 }

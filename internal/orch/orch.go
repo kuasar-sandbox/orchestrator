@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -89,6 +90,8 @@ type Orchestrator struct {
 
 	secretWait *mmdsSecretWaiter // parks guest GETs on a never-configured MMDS secret
 
+	mmdsServices mmdssvc.Registry // node operator's registered local trusted services for "service" routes; nil-safe (Call 503s on a lookup miss)
+
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
@@ -115,6 +118,11 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		buildEvents:         make(chan *routesync.BuildEvent, 64),
 	}
 	o.secretWait = newMMDSSecretWaiter(cfg.MMDS.Routes.Secret.ParkTimeoutDur())
+	if reg, err := mmdssvc.BuildRegistry(cfg.MMDS.Services); err != nil {
+		log.Warn("mmds: invalid service registry entry; type:\"service\" routes fail closed (503)", "err", err)
+	} else {
+		o.mmdsServices = reg
+	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
 	o.builderRunPool = newRunPool(runKindBuild, cfg.Units.BuilderPoolSize, wait, cfg.Paths.RunRoot, lc, o.builderUnit, log.With("pool", "builder"))
@@ -186,13 +194,16 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	_, meta, err = sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy())
+	mmdsSpec, meta, err := sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy())
 	if err != nil {
 		var validationErr *sandboxcfg.MMDSValidationError
 		if errors.As(err, &validationErr) {
 			o.log.Warn("MMDS metadata rejected", "operation", "create", "err", validationErr.Diagnostic())
 		}
 		return nil, fmt.Errorf("%w: %w", api.ErrBadRequest, err)
+	}
+	if err := o.validateMMDSServiceTargets(mmdsSpec); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 
 	id, err := uuid.NewV7()
@@ -242,6 +253,28 @@ func (o *Orchestrator) mmdsPolicy() sandboxcfg.MMDSPolicy {
 		MaxNamespaceBytes:     o.cfg.MMDS.Routes.MaxNamespaceBytes,
 		ReservedPathPrefixes:  o.cfg.MMDS.Routes.ReservedPathPrefixes,
 	}
+}
+
+// validateMMDSServiceTargets rejects a specification whose services[].target
+// names aren't in this node's own mmds.services registry -- an early,
+// specific 400 instead of only discovering the typo/misconfiguration the
+// first time a guest hits the route and gets a 503. Returns a plain error
+// (like ExtractMMDS/ExtractCredentials); Create wraps it in api.ErrBadRequest
+// at the call site, matching this function's other validation steps.
+// Deliberately not applied to cluster Create (precheckCluster/createCluster
+// in cluster.go): a cluster sandbox's declaration may be validated on a
+// router/placer node distinct from whichever node actually ends up running
+// it, and mmds.services is node-local, never synced -- checking against the
+// wrong node's registry would be worse than not checking at all. That
+// cross-node check belongs to cluster placement (no infrastructure for it
+// exists yet; out of scope here), not to this single-node Create path.
+func (o *Orchestrator) validateMMDSServiceTargets(spec sandboxcfg.MMDSSpec) error {
+	for _, s := range spec.Services {
+		if _, ok := o.mmdsServices[s.Target]; !ok {
+			return fmt.Errorf("mmds: service %q: target %q is not registered on this node", s.Name, s.Target)
+		}
+	}
+	return nil
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
@@ -1105,8 +1138,16 @@ func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error)
 	if !ok {
 		return mmds.MMDSRoute{}, false, nil
 	}
-	if route.Type != sandboxcfg.MMDSRouteSecret {
+	switch route.Type {
+	case sandboxcfg.MMDSRouteStatic:
 		return mmds.MMDSRoute{Type: route.Type, ContentType: route.ContentType, Data: route.Data}, true, nil
+	case sandboxcfg.MMDSRouteService:
+		target, ok := sandboxcfg.LookupMMDSService(sb.Metadata, route.ServiceName)
+		if !ok || target == "" {
+			return mmds.MMDSRoute{Type: route.Type, StatusCode: http.StatusServiceUnavailable}, true, nil
+		}
+		result := mmdssvc.Call(context.Background(), o.mmdsServices, target, path, sid, sb.AuthSandboxID(), route.ServiceName)
+		return mmds.MMDSRoute{Type: route.Type, StatusCode: result.StatusCode, ContentType: result.ContentType, Data: result.Body, RetryAfter: result.RetryAfter}, true, nil
 	}
 	ctx := context.Background()
 	value, present, revision, err := o.st.GetMMDSSecretValue(ctx, sid, route.SecretName)

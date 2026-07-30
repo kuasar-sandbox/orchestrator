@@ -73,19 +73,32 @@ type Source interface {
 	// never been configured (revision==0), this call may block, bounded by node
 	// policy, waiting for an admin PUT to land before returning -- ok is still
 	// true (the route IS specified); the caller distinguishes "present" from
-	// "specified but absent" via MMDSRoute.Present.
+	// "specified but absent" via MMDSRoute.Present. For a "service" route,
+	// this call delegates to a node-operator-registered local service (see
+	// internal/mmdssvc) and always returns ok=true with err=nil once the
+	// route itself is specified -- the outcome of that delegation (success or
+	// any failure) is fully encoded in MMDSRoute.StatusCode, never in err.
 	MMDSRoute(sandboxID, path string) (route MMDSRoute, ok bool, err error)
 }
 
 // MMDSRoute is the resolved backend for one specified guest-visible path.
 type MMDSRoute struct {
 	Type        string // "secret" | "service" | "static"
-	ContentType string // static and secret (once Present)
-	Data        string // static and secret (once Present)
+	ContentType string // static, secret (once Present), and service
+	Data        string // static, secret (once Present), and service
 	// Present is meaningful for "secret" routes only: true iff Data holds a
 	// real configured value. A specified-but-absent secret is a valid 404, not
 	// an error.
 	Present bool
+	// StatusCode and RetryAfter are meaningful for "service" routes only.
+	// StatusCode is the exact status getMeta writes -- already fully
+	// classified by the Source implementation (the registered service's own
+	// 2xx/4xx/5xx passed through verbatim, or 502/503/504 on a Proxy-side
+	// failure -- see internal/mmdssvc.Call). Zero is treated defensively as
+	// 503 (should not happen for a "service"-typed route returned with
+	// ok=true).
+	StatusCode int
+	RetryAfter string
 }
 
 // Server is the MMDS handler. Serve it on a listener the host redirects
@@ -286,7 +299,20 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 			} else {
 				http.Error(w, "", http.StatusNotFound)
 			}
-		default: // "service" — backend not yet implemented
+		case "service":
+			code := route.StatusCode
+			if code == 0 {
+				code = http.StatusServiceUnavailable
+			}
+			if route.RetryAfter != "" {
+				w.Header().Set("Retry-After", route.RetryAfter)
+			}
+			if route.ContentType != "" {
+				w.Header().Set("Content-Type", route.ContentType)
+			}
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(route.Data))
+		default: // should not happen post-ExtractMMDS
 			http.Error(w, "", http.StatusServiceUnavailable)
 		}
 		return

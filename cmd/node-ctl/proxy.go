@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
@@ -166,7 +167,11 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 		mmdsClient = mmdsrpc.NewClient(os.NewFile(uintptr(fd), "proxy-mmdsrpc"))
 		defer mmdsClient.Close()
 	}
-	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur(), mmdsClient, cfg.ProxyRPCTimeoutDur())
+	services, err := mmdssvc.BuildRegistry(cfg.Services)
+	if err != nil {
+		log.Warn("proxy worker: invalid mmds service registry entry; type:\"service\" routes fail closed (503)", "err", err)
+	}
+	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur(), mmdsClient, cfg.ProxyRPCTimeoutDur(), services)
 	authMode := func() string {
 		if m := view.Policy().AuthMode; m != "" {
 			return m
@@ -345,8 +350,25 @@ func mmdsRPCHandler(view *proxyshm.MasterView) mmdsrpc.Handler {
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}
-		if route.Type != sandboxcfg.MMDSRouteSecret {
+		switch route.Type {
+		case sandboxcfg.MMDSRouteStatic:
 			return mmdsrpc.Route{Type: route.Type, ContentType: route.ContentType, Body: route.Data}, true
+		case sandboxcfg.MMDSRouteService:
+			if !view.MMDSRoutes().Synced() {
+				// Mid-resync (or never yet synced) after a disconnect: a
+				// service route drives a real dial to a local trusted service
+				// under the sandbox's identity, so a stale declaration must
+				// not be acted on -- fail closed (503) rather than risk
+				// dialing a target the sandbox is no longer (or was never)
+				// authorized to reach. Unlike secret, there is no plaintext
+				// to protect here, so MMDSRoutes only tracks sync readiness,
+				// never eagerly clears -- static routes below stay available
+				// through the same window since their content is immutable
+				// and non-sensitive.
+				return mmdsrpc.Route{Type: route.Type, Unavailable: true}, true
+			}
+			target, _ := sandboxcfg.LookupMMDSService(map[string]string{sandboxcfg.NsMMDS: canonical}, route.ServiceName)
+			return mmdsrpc.Route{Type: route.Type, Target: target, ServiceName: route.ServiceName}, true
 		}
 		if !view.MMDSSecrets().Synced() {
 			// Mid-resync (or never yet synced) after a disconnect: fail

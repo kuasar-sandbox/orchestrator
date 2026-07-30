@@ -14,13 +14,22 @@ import (
 // through onto the wire unchanged, and WorkerView.MMDSRoute is the one place
 // that decodes it back to raw bytes, since a secret value is not required to
 // be valid UTF-8 and encoding/json would silently corrupt it otherwise.
+//
+// For Type=="service": Target/ServiceName (once synced) are meaningful -- the
+// Handler resolves the specification (a fast, synchronous map lookup, same as
+// static/secret) but never dials the registered local service itself; the
+// worker does that independently after this RPC returns, using its own local
+// copy of the service registry. See EndpointResponse's doc comment for the
+// full reasoning.
 type Route struct {
 	Type        string // "secret" | "service" | "static"
 	ContentType string // static, and secret once Present
 	Body        string // static (raw) or secret (base64, once Present)
 	Present     bool   // secret only
 	Retryable   bool   // secret only, meaningful when !Present
-	Unavailable bool   // secret only; see EndpointResponse.Unavailable
+	Target      string // service only, meaningful when !Unavailable
+	ServiceName string // service only, meaningful when !Unavailable
+	Unavailable bool   // secret and service only; see EndpointResponse.Unavailable
 }
 
 // Handler resolves sid's specified MMDS route at path. ok=false means sid or
@@ -28,12 +37,12 @@ type Route struct {
 type Handler func(sandboxID, path string) (route Route, ok bool)
 
 // Server answers EndpointRequest frames from one worker's inherited
-// socketpair endpoint, strictly in request order. The current Handler (a
-// canonical-JSON map lookup backed by the proxy master's in-heap
-// proxyshm.MMDSRoutes store) is synchronous and non-blocking, so this loop is
-// deliberately sequential -- no per-request goroutines or inflight
-// bookkeeping. Revisit if a future Handler implementation can block (e.g. a
-// decrypt or a UDS call to a local service).
+// socketpair endpoint, strictly in request order. Handler (a canonical-JSON
+// map lookup backed by the proxy master's in-heap proxyshm.MMDSRoutes/
+// MMDSSecrets stores) is synchronous and non-blocking for every route type,
+// including "service" -- the registered local service is dialed by the
+// worker itself, never by Handler -- so this loop stays deliberately
+// sequential, with no per-request goroutines or inflight bookkeeping.
 type Server struct {
 	rw      io.ReadWriteCloser
 	handler Handler
@@ -62,6 +71,8 @@ func (s *Server) Serve() {
 			resp.Body = route.Body
 			resp.Present = route.Present
 			resp.Retryable = route.Retryable
+			resp.Target = route.Target
+			resp.ServiceName = route.ServiceName
 			resp.Unavailable = route.Unavailable
 		}
 		if err := writeFrame(s.rw, resp); err != nil {

@@ -132,6 +132,93 @@ mmds:
 	}
 }
 
+func TestLoadMMDSServicesDefaults(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  services:
+    credential-broker:
+      endpoint: unix:///run/kuasar/mmds/credential-broker.sock
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	e, ok := cfg.MMDS.Services["credential-broker"]
+	if !ok {
+		t.Fatal("expected credential-broker to be present in MMDS.Services")
+	}
+	if e.Endpoint != "unix:///run/kuasar/mmds/credential-broker.sock" {
+		t.Fatalf("Endpoint = %q", e.Endpoint)
+	}
+	if e.Timeout != "2s" {
+		t.Fatalf("Timeout default = %q, want 2s", e.Timeout)
+	}
+	if got, want := e.TimeoutDur(), 2*time.Second; got != want {
+		t.Fatalf("TimeoutDur() = %v, want %v", got, want)
+	}
+	if e.MaxResponseBytes != 64*1024 {
+		t.Fatalf("MaxResponseBytes default = %d, want %d", e.MaxResponseBytes, 64*1024)
+	}
+}
+
+func TestLoadRejectsNonUnixMMDSServiceEndpoint(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  services:
+    credential-broker:
+      endpoint: http://127.0.0.1:8080
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a non-unix:// mmds.services endpoint")
+	}
+	if !strings.Contains(err.Error(), "unix://") {
+		t.Fatalf("error %q does not mention unix://", err)
+	}
+}
+
+func TestLoadRejectsMalformedMMDSServiceTimeout(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  services:
+    credential-broker:
+      endpoint: unix:///run/kuasar/mmds/credential-broker.sock
+      timeout: soon
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a malformed mmds.services timeout")
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("error %q does not mention timeout", err)
+	}
+}
+
 func TestLoadRejectsMMDSRoutesWithoutMMDSService(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
@@ -457,6 +544,44 @@ func TestLoadProxyRejectsMalformedRPCTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "proxy_rpc_timeout") {
 		t.Fatalf("error %q does not mention proxy_rpc_timeout", err)
+	}
+}
+
+func TestLoadProxyMMDSServicesDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	doc := "paths: { run_root: /run/sandbox }\n" +
+		"services:\n  credential-broker:\n    endpoint: unix:///run/kuasar/mmds/credential-broker.sock\n"
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy failed: %v", err)
+	}
+	e, ok := cfg.Services["credential-broker"]
+	if !ok {
+		t.Fatal("expected credential-broker to be present in Services")
+	}
+	if e.Timeout != "2s" || e.MaxResponseBytes != 64*1024 {
+		t.Fatalf("defaults not applied: %+v", e)
+	}
+}
+
+func TestLoadProxyRejectsNonUnixMMDSServiceEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	doc := "paths: { run_root: /run/sandbox }\n" +
+		"services:\n  credential-broker:\n    endpoint: tcp://127.0.0.1:8080\n"
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadProxy(path)
+	if err == nil {
+		t.Fatal("LoadProxy accepted a non-unix:// services endpoint")
+	}
+	if !strings.Contains(err.Error(), "unix://") {
+		t.Fatalf("error %q does not mention unix://", err)
 	}
 }
 

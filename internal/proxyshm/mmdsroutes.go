@@ -18,23 +18,46 @@ import "sync"
 // Table (see Table.BeginSync/Bookmark): entries not re-affirmed by an Upsert
 // since the last BeginSync are dropped at Bookmark, recovering deletions that
 // happened while disconnected from the conductor.
+//
+// Unlike MMDSSecrets, BeginSync does NOT eagerly clear byID -- a stale
+// declaration held here is tolerable for a "static" route (non-sensitive,
+// immutable content) and Bookmark's own mark-and-sweep already recovers a
+// stale entry's deletion once resync completes. synced instead exists so a
+// caller resolving a "service" route (which, unlike static, drives a real
+// dial to a local trusted service under the sandbox's identity) can choose to
+// fail closed on a stale declaration without static routes losing
+// availability across every proxy-master reconnect too -- see
+// mmdsRPCHandler's per-route-type use of Synced().
 type MMDSRoutes struct {
 	mu      sync.RWMutex
 	byID    map[string]string
 	syncGen map[string]uint64
 	gen     uint64
+	synced  bool
 }
 
-// NewMMDSRoutes returns an empty store.
+// NewMMDSRoutes returns an empty, unsynced store.
 func NewMMDSRoutes() *MMDSRoutes {
 	return &MMDSRoutes{byID: map[string]string{}, syncGen: map[string]uint64{}}
 }
 
-// BeginSync starts a fresh sync generation.
+// BeginSync starts a fresh sync generation and marks the store unsynced until
+// the matching Bookmark completes.
 func (m *MMDSRoutes) BeginSync() {
 	m.mu.Lock()
 	m.gen++
+	m.synced = false
 	m.mu.Unlock()
+}
+
+// Synced reports whether a full sync generation has completed since the most
+// recent BeginSync (i.e. Bookmark has run and no new BeginSync has started
+// since). False during the resync window following a master reconnect, or
+// before the first sync ever completes.
+func (m *MMDSRoutes) Synced() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.synced
 }
 
 // Upsert records sid's canonical specification, or clears it when canonical is
@@ -59,7 +82,8 @@ func (m *MMDSRoutes) Delete(sid string) {
 	m.mu.Unlock()
 }
 
-// Bookmark drops every entry not re-affirmed since the last BeginSync.
+// Bookmark drops every entry not re-affirmed since the last BeginSync, then
+// marks the store synced.
 func (m *MMDSRoutes) Bookmark() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -69,6 +93,7 @@ func (m *MMDSRoutes) Bookmark() {
 			delete(m.syncGen, sid)
 		}
 	}
+	m.synced = true
 }
 
 // Get returns sid's canonical specification JSON, if any.

@@ -126,6 +126,47 @@ func TestImportRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	}
 }
 
+// TestImportRejectsUnregisteredMMDSServiceTarget proves import-sandbox applies
+// validateMMDSServiceTargets like Create does (TestCreateRejectsUnregisteredMMDSServiceTarget)
+// -- unlike precheckCluster (TestPrecheckClusterDoesNotValidateServiceTargets),
+// import always inserts the row on the node executing it, so a target absent
+// from this node's own mmds.services registry must be rejected at admission
+// rather than surfacing as a 503 the first time a guest hits the route.
+func TestImportRejectsUnregisteredMMDSServiceTarget(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("fake-runtime-bytes"))
+	o.cfg.MMDS.Routes = testMMDSRoutesConfig()
+	// No cfg.MMDS.Services entries at all -- any target is unregistered.
+	ctx := context.Background()
+
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	pair := store.KeyPair{APISecret: apiSecret, ManifestKey: mk}
+	if _, err := o.st.AddKeyPair(ctx, pair, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	sid := "mmds-service-import-source"
+	sb := migrationSandbox(t, dir, sid, mk, "manifest://"+strings.Repeat("b", 64))
+	sb.Metadata = map[string]string{sandboxcfg.NsMMDS: `{"version":1,"services":[{"name":"svc1","target":"broker"}],` +
+		`"routes":[{"path":"/svc","type":"service","service_name":"svc1"}]}`}
+	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	token, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if _, err := o.ImportSandbox(ctx, apiKey, token, ""); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("import error = %v, want api.ErrBadRequest", err)
+	}
+}
+
 func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))

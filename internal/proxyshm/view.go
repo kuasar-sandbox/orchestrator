@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -108,19 +110,34 @@ func (v *MasterView) Bookmark() {
 	v.notify.Notify()
 }
 
-// InvalidateSync implements routesync.Sink: it fails the secret view closed
-// immediately when the sync stream ends for any reason (disconnect, protocol
-// error), rather than leaving it reporting synced (and serving plaintext)
-// for the entire reconnect backoff window until the next session's
-// BeginSync/Bookmark completes. Reuses MMDSSecrets.BeginSync -- eagerly
-// discarding held plaintext and marking the store unsynced is exactly
-// InvalidateSync's contract; the next session's own BeginSync call is a
-// no-op on top of this (same effect, one more generation bump). table/mmds
-// (the base route table and MMDS static/service route declarations) are
-// deliberately untouched: neither holds secret plaintext, and their existing
-// staleness-tolerant behavior across a disconnect is unchanged by this fix.
+// InvalidateSync implements routesync.Sink: it fails the secret view and the
+// route-declaration Synced() signal closed immediately when the sync stream
+// ends for any reason (disconnect, protocol error), rather than leaving them
+// reporting synced for the entire reconnect backoff window until the next
+// session's BeginSync/Bookmark completes.
+//
+// secrets: reuses MMDSSecrets.BeginSync -- eagerly discarding held plaintext
+// and marking the store unsynced is exactly InvalidateSync's contract for
+// secret data.
+//
+// mmds: reuses MMDSRoutes.BeginSync, which (unlike MMDSSecrets) does NOT
+// eagerly clear byID -- calling it here only flips Synced() to false, so a
+// "service" route lookup fails closed (mmdsRPCHandler checks
+// MMDSRoutes.Synced() before dialing) while a "static" route stays servable
+// from its last-known declaration, exactly as option A specified: only the
+// route type that drives a real action against a possibly-stale declaration
+// needs to fail closed, not the type that just returns immutable content.
+//
+// table (the base, non-MMDS route table: EnvdUDS, FloatingIP, exec identity,
+// etc.) is deliberately untouched -- it holds no secret plaintext and no
+// service-dial-driving declarations, and issue #42's fail-closed requirement
+// is scoped to MMDS, not general route data.
+//
+// The next session's own BeginSync call is a no-op on top of both of these
+// (same effect, one more generation bump each).
 func (v *MasterView) InvalidateSync() {
 	v.secrets.BeginSync()
+	v.mmds.BeginSync()
 }
 
 func (v *MasterView) SetPolicy(p routesync.Policy) {
@@ -243,19 +260,22 @@ type WorkerView struct {
 	defaultPark    time.Duration
 	mmdsClient     *mmdsrpc.Client // nil => MMDSRoute always reports unspecified, no error
 	mmdsRPCTimeout time.Duration
+	services       mmdssvc.Registry // node operator's local trusted services for "service" routes; nil-safe (Call 503s on a lookup miss)
 }
 
 // NewWorkerView builds a WorkerView. mmdsClient may be nil (MMDSRoute then
 // always returns ok=false, err=nil — treated as "no MMDS routes specified").
-// mmdsRPCTimeout <= 0 falls back to defaultMMDSRPCTimeout.
-func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, mmdsClient *mmdsrpc.Client, mmdsRPCTimeout time.Duration) *WorkerView {
+// mmdsRPCTimeout <= 0 falls back to defaultMMDSRPCTimeout. services is this
+// worker's own local copy of the node operator's service registry (each
+// worker independently loads the same proxy.yaml the master does).
+func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, mmdsClient *mmdsrpc.Client, mmdsRPCTimeout time.Duration, services mmdssvc.Registry) *WorkerView {
 	if defaultPark <= 0 {
 		defaultPark = 30 * time.Second
 	}
 	if mmdsRPCTimeout <= 0 {
 		mmdsRPCTimeout = defaultMMDSRPCTimeout
 	}
-	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark, mmdsClient: mmdsClient, mmdsRPCTimeout: mmdsRPCTimeout}
+	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark, mmdsClient: mmdsClient, mmdsRPCTimeout: mmdsRPCTimeout, services: services}
 }
 
 // MMDSRoute resolves sid's specified MMDS route at path by asking the proxy
@@ -302,6 +322,17 @@ func (v *WorkerView) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
 	}
 	if !resp.Found {
 		return mmds.MMDSRoute{}, false, nil
+	}
+	if resp.Type == "service" {
+		if resp.Unavailable {
+			// The master's route declaration view isn't currently synced
+			// (mid-resync after a disconnect, or never yet synced) -- a
+			// service route drives a real dial under the sandbox's identity,
+			// so fail closed (503) rather than act on a stale declaration.
+			// See EndpointResponse.Unavailable's doc comment.
+			return mmds.MMDSRoute{Type: resp.Type, StatusCode: http.StatusServiceUnavailable}, true, nil
+		}
+		return v.serviceRoute(sid, path, resp), true, nil
 	}
 	if resp.Type != "secret" || resp.Present || !resp.Retryable {
 		return mmdsRouteFromResponse(resp)
@@ -365,6 +396,27 @@ func mmdsRouteFromResponse(resp mmdsrpc.EndpointResponse) (mmds.MMDSRoute, bool,
 	route.ContentType = resp.ContentType
 	route.Data = string(body)
 	return route, true, nil
+}
+
+// serviceRoute dials resp.Target (the master-resolved operator-registered
+// service name) directly over this worker's own local mmdssvc.Registry --
+// the master never dials it itself, see EndpointResponse's doc comment.
+func (v *WorkerView) serviceRoute(sid, path string, resp mmdsrpc.EndpointResponse) mmds.MMDSRoute {
+	result := mmdssvc.Call(context.Background(), v.services, resp.Target, path, sid, v.authSubject(sid), resp.ServiceName)
+	return mmds.MMDSRoute{Type: resp.Type, StatusCode: result.StatusCode, ContentType: result.ContentType, Data: result.Body, RetryAfter: result.RetryAfter}
+}
+
+// authSubject resolves sid's stable credential subject (routesync.RouteEntry.
+// AuthSandboxID, already mirrored into this worker's local shared Table) for
+// the X-Kuasar-Sandbox-Subject header -- falling back to sid itself if the
+// table has no entry or no AuthSandboxID recorded.
+func (v *WorkerView) authSubject(sid string) string {
+	if v.table != nil {
+		if e, ok := v.table.Lookup(sid); ok && e.AuthSandboxID != "" {
+			return e.AuthSandboxID
+		}
+	}
+	return sid
 }
 
 // mmdsParkTimeout is the master-pushed bound for MMDSRoute's secret-retry
