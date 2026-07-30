@@ -487,11 +487,21 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 
 	// One network slot for the whole build; the phase sandboxes reuse it
 	// sequentially (tapfd handoff re-acquires the queue fd each boot).
-	plainIP, cidrIP, err := o.allocInnerIP(b.Profile, "")
+	spec, perr := sandboxcfg.ParseSpec(b.Metadata)
+	if perr != nil {
+		return nil, perr
+	}
+
+	plainIP, cidrIP, err := o.allocInnerIP(b.Profile, spec.Network.InnerIP)
 	if err != nil {
 		return nil, err
 	}
-	port, err := o.vs.Attach(ctx, vswitch.AttachReq{InnerIP: plainIP})
+	port, err := o.vs.Attach(ctx, vswitch.AttachReq{
+		InnerIP:          plainIP,
+		TransitGatewayIP: spec.Network.TransitGatewayIP,
+		TransitGeneveVNI: spec.Network.TransitGeneveVNI,
+		TransitMAC:       spec.Network.TransitMAC,
+	})
 	if err != nil {
 		return nil, err
 	}
