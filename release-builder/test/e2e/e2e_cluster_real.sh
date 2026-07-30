@@ -22,6 +22,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
+MMDS_SERVICE_E2E="${MMDS_SERVICE_E2E:-0}"
+# Internal derived switch: every route scenario needs the same MMDS listener,
+# route engine, and management-service plumbing.
+MMDS_ROUTES_E2E_ENABLED=0
+if [ "$MMDS_STATIC_E2E" = "1" ] || [ "$MMDS_SECRET_E2E" = "1" ] || [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    MMDS_ROUTES_E2E_ENABLED=1
+fi
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
@@ -124,6 +131,9 @@ SW_STARTED=""
 
 cleanup() {
     set +e
+    if [ "$MMDS_SERVICE_E2E" = "1" ] && declare -F stop_mmds_service_backend >/dev/null; then
+        stop_mmds_service_backend
+    fi
     rm -f "$WORK/create.credentials"
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
@@ -379,6 +389,38 @@ run_cluster_mmds_secret_e2e() {
     [ "$code" = "400" ] || fail "cluster undeclared MMDS secret PUT returned $code"
 }
 
+mmds_service_through_cluster_connect() {
+    local sid="$1" token="$2" expected_status="$3" state="$4" marker="$5"
+    local output="$WORK/mmds-service-guest-cluster-$state.out"
+    local error_output="$WORK/mmds-service-guest-cluster-$state.err"
+    local diagnostics="$WORK/mmds-service-guest-cluster-$state.client.log"
+    local guest_command attempt status
+
+    guest_command="$(mmds_service_guest_command "$expected_status" "$state" "$marker")"
+    for attempt in $(seq 1 20); do
+        status=0
+        : >"$output"; : >"$error_output"; : >"$diagnostics"
+        timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+            --proxy "http://127.0.0.1:$ROUTER_PORT" \
+            --proxy-header "E2b-Sandbox-Id: $sid" \
+            --proxy-header "E2b-Sandbox-Service: exec" \
+            --proxy-header "X-Access-Token: $token" \
+            --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+            --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+            --stdout-to "$output" --stderr-to "$error_output" -- \
+            /bin/sh -c "$guest_command" >"$diagnostics" 2>&1 || status=$?
+        if [ "$status" = "0" ] && grep -q "$marker" "$output" 2>/dev/null; then
+            sed 's/^/  mmds-service-guest| /' "$output" >&2
+            return 0
+        fi
+        [ "$attempt" = "20" ] || sleep 0.25
+    done
+    sed 's/^/  client| /' "$diagnostics" >&2
+    sed 's/^/  stdout| /' "$output" 2>/dev/null >&2
+    sed 's/^/  stderr| /' "$error_output" 2>/dev/null >&2
+    return 1
+}
+
 router_req() {
     local method="$1" path="$2" key="$3" route_key="${4:-}" body="${5:-}"
     local args=(-sS --noproxy '*' --max-time 260 -o "$WORK/router-resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $key")
@@ -526,7 +568,7 @@ EOF
     MGMT_VIP="169.254.169.254"
     MMDS_PORT="$(free_port)"
     local mgmt_service_args=()
-    if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    if [ "$MMDS_ROUTES_E2E_ENABLED" = "1" ]; then
         mgmt_service_args=(--mgmt-service="$MGMT_VIP:80:$MGMT_VIP:$MMDS_PORT")
     fi
     "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
@@ -800,12 +842,20 @@ start_cluster_node() {
     NODE_PORT="$(free_port)"
     local node_id="$1"
     local mmds_config=""
-    if [ "$MMDS_STATIC_E2E" = "1" ]; then
+    if [ "$MMDS_ROUTES_E2E_ENABLED" = "1" ]; then
         mmds_config="proxy: { mode: internal, auth: enforce }
 mmds:
   enabled: true
   listen: \"0.0.0.0:$MMDS_PORT\"
   routes: { enabled: true }"
+        if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+            mmds_config="$mmds_config
+  services:
+    $MMDS_SERVICE_TARGET:
+      endpoint: unix://$MMDS_SERVICE_SOCKET
+      timeout: 200ms
+      max_response_bytes: 512"
+        fi
     fi
     cat > "$WORK/cluster-node.yaml" <<EOF
 api: { domain: $DOMAIN, listen: "127.0.0.1:$NODE_PORT" }
@@ -899,11 +949,44 @@ run_cluster_flow() {
         run_cluster_mmds_secret_e2e "$sid" "$exec_token"
         step "PASS: cluster MMDS secret install/update/revoke lifecycle"
     fi
+    if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+        # Scenario: service backend.
+        printf '%s\n' ok >"$MMDS_SERVICE_STATE"
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 200 ok MMDS_SERVICE_CLUSTER_OK \
+            || fail "cluster MMDS service success guest GET"
+        mmds_service_assert_request "$MMDS_SERVICE_REQUESTS" "$sid" generation \
+            || fail "cluster MMDS service identity headers"
+        printf '%s\n' retry >"$MMDS_SERVICE_STATE"
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 429 retry MMDS_SERVICE_CLUSTER_RETRY_OK \
+            || fail "cluster MMDS service response passthrough"
+        printf '%s\n' slow >"$MMDS_SERVICE_STATE"
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 504 slow MMDS_SERVICE_CLUSTER_TIMEOUT_OK \
+            || fail "cluster MMDS service timeout mapping"
+        printf '%s\n' oversized >"$MMDS_SERVICE_STATE"
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 502 oversized MMDS_SERVICE_CLUSTER_OVERSIZED_OK \
+            || fail "cluster MMDS service response-size mapping"
+
+        stop_mmds_service_backend
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 503 unavailable MMDS_SERVICE_CLUSTER_UNAVAILABLE_OK \
+            || fail "cluster MMDS unavailable-service mapping"
+        restart_mmds_service_backend "$WORK" || fail "restart cluster MMDS service backend"
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 200 ok MMDS_SERVICE_CLUSTER_RECOVERY_OK \
+            || fail "cluster MMDS service recovery"
+        mmds_service_assert_request "$MMDS_SERVICE_REQUESTS" "$sid" generation \
+            || fail "cluster MMDS service identity after backend restart"
+        step "PASS: cluster MMDS service UDS/identity/response lifecycle"
+    fi
     step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
     local resume_mark="CLUSTER_NATIVE_EXEC_RESUME_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark" 40
+    if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+        mmds_service_through_cluster_connect "$sid" "$exec_token" 200 ok MMDS_SERVICE_CLUSTER_RESUMED_OK \
+            || fail "cluster MMDS service guest GET after resume"
+        mmds_service_assert_request "$MMDS_SERVICE_REQUESTS" "$sid" generation \
+            || fail "cluster MMDS service identity after resume"
+    fi
     unset exec_token
     step "PASS: real sandbox-ctl used stable SID through exec CONNECT, then the same KAT resumed the paused sandbox"
 
@@ -973,6 +1056,10 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     step "probing node ids until bootstrap registry returns a node-link redirect"
     NODE_ID="$(choose_redirect_node_id)" || fail "could not find a node_id redirected away from bootstrap registry"
     step "selected redirected node_id=$NODE_ID"
+fi
+if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_service_guest.sh"
+    start_mmds_service_backend "$WORK" || fail "start MMDS service UDS backend"
 fi
 start_cluster_node "$NODE_ID"
 wait_cluster_node_key_pair

@@ -31,8 +31,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
+MMDS_SERVICE_E2E="${MMDS_SERVICE_E2E:-0}"
+# Internal derived switch: every route scenario needs the same MMDS listener,
+# route engine, and management-service plumbing.
+MMDS_ROUTES_E2E_ENABLED=0
+if [ "$MMDS_STATIC_E2E" = "1" ] || [ "$MMDS_SECRET_E2E" = "1" ] || [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    MMDS_ROUTES_E2E_ENABLED=1
+fi
 MMDS_ROUTES_CONFIG=""
-if [ "$MMDS_STATIC_E2E" = "1" ]; then
+if [ "$MMDS_ROUTES_E2E_ENABLED" = "1" ]; then
     MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
 fi
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -80,10 +87,21 @@ for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exis
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 declare -a PIDS=()
 declare -a TAGS=()
+MMDS_SERVICES_CONFIG=""
+if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_service_guest.sh"
+    start_mmds_service_backend "$WORK" || fail "start MMDS service UDS backend"
+    MMDS_SERVICES_CONFIG="  services:
+    $MMDS_SERVICE_TARGET:
+      endpoint: unix://$MMDS_SERVICE_SOCKET
+      timeout: 200ms
+      max_response_bytes: 512"
+fi
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
+    [ "$MMDS_SERVICE_E2E" = "1" ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
@@ -400,6 +418,7 @@ mmds:
   enabled: true
   listen: "$PROXY_NS_IP:$MMDS_PORT"
 $MMDS_ROUTES_CONFIG
+$MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -537,6 +556,13 @@ if [ "$MMDS_SECRET_E2E" = "1" ]; then
         || fail "internal MMDS secret admin/store/guest lifecycle"
     echo "==> PASS: internal MMDS secret install/update/revoke lifecycle"
 fi
+if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    # Scenario: service backend.
+    run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
+        "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS service UDS/identity/response lifecycle"
+    echo "==> PASS: internal MMDS service UDS/identity/response lifecycle"
+fi
 MARK="HELLO_FROM_GUEST_$RANDOM"
 echo "==> exec in guest: sh -c 'hostname; id; echo $MARK; uname -sm'"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "hostname; id; echo $MARK; uname -sm" > "$WORK/exec.out" 2>&1 || true
@@ -593,6 +619,13 @@ if [ "$code" = "204" ]; then
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
     grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
+    if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+        run_mmds_service_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" \
+            internal-resumed 200 ok MMDS_SERVICE_RESUMED_OK \
+            || fail "internal MMDS service guest GET after resume"
+        mmds_service_assert_request "$MMDS_SERVICE_REQUESTS" "$SID" direct \
+            || fail "internal MMDS service identity after resume"
+    fi
     echo "==> PASS: same KAT woke the paused sandbox and pre-pause guest state survived restore"
 else
     echo "==> NOTE: pause=$code — snapshot error (diagnostic):"

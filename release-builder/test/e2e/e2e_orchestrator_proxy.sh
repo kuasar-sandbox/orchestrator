@@ -32,8 +32,15 @@ MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 MMDS_INVALID_REJECT_E2E="${MMDS_INVALID_REJECT_E2E:-0}"
 MMDS_SECRET_E2E="${MMDS_SECRET_E2E:-0}"
 MMDS_POLICY_REPLAY_E2E="${MMDS_POLICY_REPLAY_E2E:-0}"
+MMDS_SERVICE_E2E="${MMDS_SERVICE_E2E:-0}"
+# Internal derived switch: every route scenario needs the same MMDS listener,
+# route engine, and management-service plumbing.
+MMDS_ROUTES_E2E_ENABLED=0
+if [ "$MMDS_STATIC_E2E" = "1" ] || [ "$MMDS_SECRET_E2E" = "1" ] || [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    MMDS_ROUTES_E2E_ENABLED=1
+fi
 MMDS_ROUTES_CONFIG=""
-if [ "$MMDS_STATIC_E2E" = "1" ]; then
+if [ "$MMDS_ROUTES_E2E_ENABLED" = "1" ]; then
     MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
 fi
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -83,10 +90,27 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 PROXY_SOCK="$WORK/run/proxy.sock"
 declare -a PIDS=()
 declare -a TAGS=()
+MMDS_SERVICES_CONFIG=""
+PROXY_SERVICES_CONFIG=""
+if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_service_guest.sh"
+    start_mmds_service_backend "$WORK" || fail "start MMDS service UDS backend"
+    MMDS_SERVICES_CONFIG="  services:
+    $MMDS_SERVICE_TARGET:
+      endpoint: unix://$MMDS_SERVICE_SOCKET
+      timeout: 200ms
+      max_response_bytes: 512"
+    PROXY_SERVICES_CONFIG="services:
+  $MMDS_SERVICE_TARGET:
+    endpoint: unix://$MMDS_SERVICE_SOCKET
+    timeout: 200ms
+    max_response_bytes: 512"
+fi
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
+    [ "$MMDS_SERVICE_E2E" = "1" ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
@@ -397,6 +421,7 @@ mmds:
   enabled: true
   listen: "$PROXY_NS_IP:$MMDS_PORT"
 $MMDS_ROUTES_CONFIG
+$MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -445,6 +470,7 @@ workers: 2
 auth: enforce
 park_timeout: 2s
 mmds_listen: $PROXY_NS_IP:$MMDS_PORT
+$PROXY_SERVICES_CONFIG
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
 "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
@@ -666,6 +692,13 @@ if [ "$MMDS_POLICY_REPLAY_E2E" = "1" ]; then
     [ -n "$replay_ok" ] || { dump_logs; fail "external proxy lost the existing MMDS route after conductor restart"; }
     echo "==> PASS: disabled policy rejected new create while the external proxy retained the replayed route"
 fi
+if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+    # Scenario: service backend.
+    run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
+        "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS service UDS/sync/identity/response lifecycle"; }
+    echo "==> PASS: external MMDS service UDS/sync/identity/response lifecycle"
+fi
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
 ok=""
@@ -773,7 +806,15 @@ if [ "$code" = "204" ]; then
         { [ "$code" = "204" ] || [ "$code" = "200" ]; } && { ok=1; break; }
         sleep 0.5
     done
-    if [ -n "$ok" ]; then echo "==> PASS: same KAT woke the paused sandbox through external proxy (envd code=$code)"
+    if [ -n "$ok" ]; then
+        if [ "$MMDS_SERVICE_E2E" = "1" ]; then
+            run_mmds_service_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" \
+                external-resumed 200 ok MMDS_SERVICE_RESUMED_OK \
+                || { dump_logs; fail "external MMDS service guest GET after resume"; }
+            mmds_service_assert_request "$MMDS_SERVICE_REQUESTS" "$SID" direct \
+                || { dump_logs; fail "external MMDS service identity after resume"; }
+        fi
+        echo "==> PASS: same KAT woke the paused sandbox through external proxy (envd code=$code)"
     else dump_logs; fail "auto-resume via proxy did not complete, last code=$code"; fi
 else dump_logs; fail "pause returned $code (want 204 before auto-resume check)"; fi
 unset EXEC_TOKEN

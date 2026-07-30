@@ -225,6 +225,7 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
     "orchestrator/release-builder/test/e2e/e2e_mmds_endpoints_cluster.sh:e2e/e2e_mmds_endpoints_cluster.sh" \
     "orchestrator/release-builder/test/e2e/lib/mmds_static_guest.sh:e2e/lib/mmds_static_guest.sh" \
     "orchestrator/release-builder/test/e2e/lib/mmds_secret_guest.sh:e2e/lib/mmds_secret_guest.sh" \
+    "orchestrator/release-builder/test/e2e/lib/mmds_service_guest.sh:e2e/lib/mmds_service_guest.sh" \
     "orchestrator/release-builder/test/e2e/e2e_cluster_real.sh:e2e/e2e_cluster_real.sh" \
     "orchestrator/test/e2e/e2e_cluster_stub.sh:e2e/e2e_cluster.sh" \
     "orchestrator/release-builder/test/perf/sandbox-perf.sh:perf/sandbox-perf.sh" \
