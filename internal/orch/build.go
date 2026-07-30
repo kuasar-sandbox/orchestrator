@@ -39,6 +39,12 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	// Validate the sandbox metadata that will be persisted as the build's network
+	// config now, not at runBuildUnit time: a malformed inner_ip / transit_* must
+	// surface as a 400 at register, not later degrade to a DNS-timeout build error.
+	if err := sandboxcfg.ParseSpec(metadata); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
@@ -161,7 +167,14 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	// Merge register + trigger metadata, then validate the final network config
+	// before persisting it: a malformed inner_ip / transit_* (from either side)
+	// must fail at trigger with 400, not degrade to a DNS-timeout build error.
+	mergedMetadata := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	if err := sandboxcfg.ParseSpec(mergedMetadata); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	b.Metadata = mergedMetadata
 	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err
@@ -396,14 +409,16 @@ type buildResult = configsock.BuildResult
 
 // pendingBuild is the per-execution state BuildSpecFor serves while the
 // build run-id unit executes: the pre-attached network slot, minted envd token,
-// and result channel.
+// and result channel. network is the single resolved NetworkSpec (defaults filled
+// by resolveNetwork) feeding both the host attach and the guest BuildNet; spec is
+// the parsed SandboxSpec (resource capacity is read straight from it).
 type pendingBuild struct {
 	build     *types.Build
 	workdir   string
+	spec      sandboxcfg.SandboxSpec
+	network   sandboxcfg.NetworkSpec
 	tapFD     vswitch.TapFD
 	mac       string
-	innerIP   string // CIDR
-	nexthop   string
 	floating  string
 	envdToken string
 	result    chan configsock.BuildResult
@@ -487,22 +502,22 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	defer os.RemoveAll(dir)
 
 	// One network slot for the whole build; the phase sandboxes reuse it
-	// sequentially (tapfd handoff re-acquires the queue fd each boot).
+	// sequentially (tapfd handoff re-acquires the queue fd each boot). ParseSpec is
+	// re-run defensively here even though Register/Trigger already validated the
+	// metadata: a stale or corrupted build row must surface as an explicit build
+	// error, not silently degrade to a zero-transit attach.
 	spec, perr := sandboxcfg.ParseSpec(b.Metadata)
 	if perr != nil {
 		return nil, perr
 	}
-
-	plainIP, cidrIP, err := o.allocInnerIP(b.Profile, spec.Network.InnerIP)
+	// One resolved NetworkSpec (shared resolveNetwork, same as a normal sandbox)
+	// feeds both the host attach and the guest BuildNet — hostname defaults to the
+	// build's short id so the three phase VMs resolve consistently.
+	network, err := o.resolveNetwork(b.Profile, spec.Network, "build-"+shortID(b.BuildID))
 	if err != nil {
 		return nil, err
 	}
-	port, err := o.vs.Attach(ctx, vswitch.AttachReq{
-		InnerIP:          plainIP,
-		TransitGatewayIP: spec.Network.TransitGatewayIP,
-		TransitGeneveVNI: spec.Network.TransitGeneveVNI,
-		TransitMAC:       spec.Network.TransitMAC,
-	})
+	port, err := o.attachNetwork(ctx, network)
 	if err != nil {
 		return nil, err
 	}
@@ -513,10 +528,9 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		envdTok, _ = keys.MintToken()
 	}
 	pend := &pendingBuild{
-		build: b, workdir: dir,
+		build: b, workdir: dir, spec: spec, network: network,
 		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
-		nexthop: firstNonEmpty(spec.Network.Nexthop, o.innerGateway(b.Profile)),
-		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
+		floating: port.FloatingIP, envdToken: envdTok,
 		result: make(chan configsock.BuildResult, 1),
 	}
 	o.pendMu.Lock()
@@ -637,16 +651,17 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		fromTemplate, fromTemplateKind = t.Key, string(t.Kind)
 	}
 
-	// Phase-C VM capacity: the template's declared resource.capacity (register
-	// cpuCount/memoryMB or a resource header) else the node builder default. This
-	// pins snapshot.cfg.resources.capacity, which a snp-template create inherits.
+	// Phase-C VM capacity: read the template's declared resource.capacity
+	// straight from the already-parsed pend.spec (no second ParseSpec); fall back
+	// to the node builder default. This pins snapshot.cfg.resources.capacity,
+	// which a snp-template create inherits.
 	vcpu, mem := o.cfg.Builder.VCPU, o.cfg.Builder.Memory
-	if cfgSpec, perr := sandboxcfg.ParseSpec(b.Metadata); perr == nil && cfgSpec.Resource.Capacity != nil {
-		if cfgSpec.Resource.Capacity.CPU > 0 {
-			vcpu = cfgSpec.Resource.Capacity.CPU
+	if c := pend.spec.Resource.Capacity; c != nil {
+		if c.CPU > 0 {
+			vcpu = c.CPU
 		}
-		if cfgSpec.Resource.Capacity.Memory != "" {
-			mem = cfgSpec.Resource.Capacity.Memory
+		if c.Memory != "" {
+			mem = c.Memory
 		}
 	}
 	importReferer, err := o.effectiveImportReferer(b)
@@ -654,6 +669,10 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		return nil, "", false, err
 	}
 
+	// Net is pure passthrough of the resolved NetworkSpec (pend.network) the host
+	// attach already used — BuildSpecFor does not re-derive defaults. transit_* is
+	// NOT here: it is host-side, consumed by attachNetwork; the guest sandbox YAML
+	// only needs inner_ip/nexthop/hostname/dns.
 	spec := &configsock.BuildSpec{
 		BuildID:          b.BuildID,
 		Profile:          string(b.Profile),
@@ -679,10 +698,10 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		Net: configsock.BuildNet{
 			TapFD:    buildTapFD(pend.tapFD),
 			MAC:      pend.mac,
-			InnerIP:  pend.innerIP,
-			Nexthop:  pend.nexthop,
-			Hostname: "build-" + shortID(b.BuildID),
-			DNS:      o.cfg.Sandbox.Network.DNS,
+			InnerIP:  pend.network.InnerIP,
+			Nexthop:  pend.network.Nexthop,
+			Hostname: pend.network.Hostname,
+			DNS:      pend.network.DNS,
 		},
 		VCPU:          vcpu,
 		Memory:        mem,

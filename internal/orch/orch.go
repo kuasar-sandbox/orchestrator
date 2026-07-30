@@ -235,29 +235,26 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	// Restore (resume / snp-template create / migration import): inherit the
 	// snapshot's logical network for fields the create config left unset (point 7 —
 	// explicit create config wins, the snapshot fills the rest), and pin capacity to
-	// the snapshot (the runtime refuses a mismatch). Read before attach so an
-	// inherited inner_ip / transit_* reaches allocInnerIP + vswitch.Attach.
+	// the snapshot (the runtime refuses a mismatch). Read before resolveNetwork so an
+	// inherited inner_ip / transit_* reaches the resolved NetworkSpec + attachNetwork.
 	var snap snapInfo
 	if ref := sandboxcfg.RestoreRefFor(sb, tmpl); ref != "" {
 		snap = o.snapshotConfig(ctx, sb, ref)
 		spec.Network = sandboxcfg.MergeNetwork(snap.Network, spec.Network)
 	}
-	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile, spec.Network.InnerIP)
+	// One resolved NetworkSpec feeds BOTH the host attach and the guest config, so
+	// the two can never diverge (the build path reuses the same resolveNetwork).
+	network, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname)
 	if err != nil {
 		return err
 	}
-	port, err := o.vs.Attach(ctx, vswitch.AttachReq{
-		InnerIP:          plainIP,
-		TransitGatewayIP: spec.Network.TransitGatewayIP,
-		TransitGeneveVNI: spec.Network.TransitGeneveVNI,
-		TransitMAC:       spec.Network.TransitMAC,
-	})
+	port, err := o.attachNetwork(ctx, network)
 	if err != nil {
 		return err
 	}
-	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, cidrIP
+	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, network.InnerIP
 
-	p := o.sandboxParams(sb, tmpl, spec)
+	p := o.sandboxParams(sb, tmpl, spec, network)
 	// Pin capacity to the snapshot the runtime froze (read above). Template
 	// snapshots are self-describing and may have been taken at a different budget
 	// than this node's create defaults (e.g. the build pipeline's builder.vcpu/memory).
@@ -698,7 +695,7 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 	return sb.RunDir + "/" + sb.ID + ".yaml"
 }
 
-func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec) sandboxcfg.Params {
+func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec, network sandboxcfg.NetworkSpec) sandboxcfg.Params {
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
 		Runtime:        o.cfg.Sandbox.Boot.Runtime,
@@ -706,7 +703,7 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, s
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
 		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
-		Network:     o.resolveNetwork(sb, tmpl, spec.Network),
+		Network:     network, // already resolved (incl. sb.InnerIP CIDR) by resolveNetwork
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		Spec:        spec,
 	}
@@ -721,25 +718,59 @@ func sandboxTapFD(t vswitch.TapFD) sandboxcfg.TapFD {
 	}
 }
 
-// resolveNetwork merges the tenant network override with profile/node defaults into
-// the resolved logical network used both for the guest config and for the
-// snapshot-borne metadata (kuasar-sandbox.network). inner_ip is the assigned CIDR
-// (set at attach). On restore the caller fills missing fields from the snapshot
-// before this (Stage 3); here a tenant value still wins over the node default.
-func (o *Orchestrator) resolveNetwork(sb *types.Sandbox, tmpl types.TemplateID, ov sandboxcfg.NetworkSpec) sandboxcfg.NetworkSpec {
+// resolveNetwork is the single shared resolution of a logical NetworkSpec from the
+// tenant override + profile/node defaults, used by BOTH the normal sandbox path
+// (launch) and the build path (runBuildUnit). It is the only place network
+// defaults are filled so the two paths can no longer diverge in interpretation.
+//
+// Precedence (per field, override wins):
+//
+//	InnerIP:   specified.inner_ip  > profile inner_ip        (kept as CIDR)
+//	Nexthop:   specified.nexthop   > profile nexthop
+//	Hostname:  specified.hostname  > defaultHostname          (caller-chosen per path)
+//	DNS:       specified.dns       > node sandbox.network.dns
+//	Transit*:  specified value kept verbatim (no node default)
+//
+// defaultHostname is "sandbox" (node) for normal sandboxes and "build-<short-id>"
+// for builds. On restore the caller layers the snapshot via MergeNetwork before
+// calling this, so "explicit create > snapshot > node/profile default" still holds.
+// The returned InnerIP is the resolved CIDR; callers derive the plain IP for
+// vswitch.Attach via attachNetwork.
+func (o *Orchestrator) resolveNetwork(profile types.Profile, specified sandboxcfg.NetworkSpec, defaultHostname string) (sandboxcfg.NetworkSpec, error) {
+	innerCIDR := firstNonEmpty(specified.InnerIP, o.profileNet(profile).InnerIP)
+	if _, _, err := net.ParseCIDR(innerCIDR); err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: inner_ip %q: %w", innerCIDR, err)
+	}
 	dns := o.cfg.Sandbox.Network.DNS
-	if len(ov.DNS) > 0 {
-		dns = ov.DNS
+	if len(specified.DNS) > 0 {
+		dns = specified.DNS
 	}
 	return sandboxcfg.NetworkSpec{
-		Hostname:         firstNonEmpty(ov.Hostname, o.cfg.Sandbox.Network.Hostname),
+		Hostname:         firstNonEmpty(specified.Hostname, defaultHostname),
 		DNS:              dns,
-		InnerIP:          sb.InnerIP, // assigned CIDR (vswitch attach)
-		Nexthop:          firstNonEmpty(ov.Nexthop, o.innerGateway(tmpl.Profile)),
-		TransitGatewayIP: ov.TransitGatewayIP,
-		TransitGeneveVNI: ov.TransitGeneveVNI,
-		TransitMAC:       ov.TransitMAC,
+		InnerIP:          innerCIDR,
+		Nexthop:          firstNonEmpty(specified.Nexthop, o.profileNet(profile).Nexthop),
+		TransitGatewayIP: specified.TransitGatewayIP,
+		TransitGeneveVNI: specified.TransitGeneveVNI,
+		TransitMAC:       specified.TransitMAC,
+	}, nil
+}
+
+// attachNetwork is the shared host-side attach: it derives the plain inner IP from
+// the resolved NetworkSpec's CIDR and attaches the vswitch port with the transit
+// overlay (if any). Port lifecycle (Detach/cleanup) stays with the caller — this
+// helper only builds AttachReq from the single resolved NetworkSpec.
+func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.NetworkSpec) (*vswitch.Port, error) {
+	ip, _, err := net.ParseCIDR(network.InnerIP)
+	if err != nil {
+		return nil, fmt.Errorf("orch: inner_ip %q: %w", network.InnerIP, err)
 	}
+	return o.vs.Attach(ctx, vswitch.AttachReq{
+		InnerIP:          ip.String(),
+		TransitGatewayIP: network.TransitGatewayIP,
+		TransitGeneveVNI: network.TransitGeneveVNI,
+		TransitMAC:       network.TransitMAC,
+	})
 }
 
 // LaunchSpecFor resolves "sandbox:<sid>" to the LaunchSpec the launcher
@@ -775,7 +806,17 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	p := o.sandboxParams(sb, tmpl, cfgSpec)
+	// Re-derive the resolved network for the re-rendered config. The sandbox is
+	// already attached, so InnerIP is the live CIDR on sb; resolveNetwork keeps the
+	// tenant hostname/DNS/transit overrides + node defaults consistent with launch.
+	if sb.InnerIP != "" {
+		cfgSpec.Network.InnerIP = sb.InnerIP
+	}
+	network, err := o.resolveNetwork(tmpl.Profile, cfgSpec.Network, o.cfg.Sandbox.Network.Hostname)
+	if err != nil {
+		return nil, "", false, err
+	}
+	p := o.sandboxParams(sb, tmpl, cfgSpec, network)
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
 	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
@@ -1140,30 +1181,10 @@ func firstNonEmpty(a, b string) string {
 }
 
 // profileNet returns the configured inner IP / gateway for a profile (e2b vs bare).
+// Used by resolveNetwork to fill profile-default inner_ip/nexthop.
 func (o *Orchestrator) profileNet(p types.Profile) config.ProfileNet {
 	if p == types.ProfileBare {
 		return o.cfg.Sandbox.Network.Bare
 	}
 	return o.cfg.Sandbox.Network.E2B
-}
-
-// allocInnerIP returns the guest's inner IP (plain, for vswitch attach) and its CIDR
-// (for Network.IP). override (the per-instance inner_ip, "" = none) wins over the
-// profile default: e2b 169.254.0.21/30 (envd port-forward needs the /30 + gateway),
-// bare 169.254.1.1/31. The inner IP is fixed per profile — every sandbox reuses it;
-// identity is the per-slot floating IP, and the eBPF datapath keys on slot/ifindex.
-func (o *Orchestrator) allocInnerIP(profile types.Profile, override string) (plain, cidr string, err error) {
-	cidr = firstNonEmpty(override, o.profileNet(profile).InnerIP)
-	ip, _, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return "", "", fmt.Errorf("orch: sandbox inner_ip %q: %w", cidr, err)
-	}
-	return ip.String(), cidr, nil
-}
-
-// innerGateway returns the guest's default-route next-hop for the profile. The
-// vswitch ARP-proxies it, so the guest reaches everything off its subnet through it
-// (the proxy/floatingip reply path + egress via host NAT).
-func (o *Orchestrator) innerGateway(profile types.Profile) string {
-	return o.profileNet(profile).Nexthop
 }

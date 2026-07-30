@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -79,9 +80,11 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	cfg.MMDS.Enabled = true
 	o := testOrchCfg(t, cfg)
 	b := &types.Build{BuildID: "build-bare", Profile: types.ProfileBare}
+	// pendingBuild.network is the resolved NetworkSpec (defaults already filled);
+	// BuildSpecFor only passes it through, it does not re-derive defaults.
 	o.pend[b.BuildID] = &pendingBuild{
-		build: b, workdir: t.TempDir(), innerIP: "169.254.1.1/31",
-		nexthop: "169.254.1.0",
+		build: b, workdir: t.TempDir(),
+		network: sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31", Nexthop: "169.254.1.0"},
 	}
 
 	spec, _, found, err := o.BuildSpecFor(context.Background(), "build:"+b.BuildID)

@@ -88,7 +88,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
-	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // allocInnerIP needs a valid CIDR
+	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // resolveNetwork needs a valid inner_ip CIDR
 
 	started := make(chan struct{}, 4)
 	startGate := make(chan struct{})
