@@ -39,6 +39,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
@@ -161,7 +164,11 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	mergedMetadata := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	if _, err := sandboxcfg.ParseSpec(mergedMetadata); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	b.Metadata = mergedMetadata
 	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err
@@ -395,17 +402,20 @@ func (o *Orchestrator) claimWaitingBuild(ctx context.Context, b *types.Build) (b
 type buildResult = configsock.BuildResult
 
 // pendingBuild is the per-execution state BuildSpecFor serves while the
-// build run-id unit executes: the pre-attached network slot, minted envd token,
-// and result channel.
+// build run-id unit executes: the pre-attached network slot, the resolved
+// temporary-VM and persistent-template network roles, minted envd token, and
+// result channel.
 type pendingBuild struct {
-	build     *types.Build
-	workdir   string
-	tapFD     vswitch.TapFD
-	mac       string
-	innerIP   string // CIDR
-	floating  string
-	envdToken string
-	result    chan configsock.BuildResult
+	build           *types.Build
+	workdir         string
+	spec            sandboxcfg.SandboxSpec
+	network         sandboxcfg.NetworkSpec
+	templateNetwork sandboxcfg.NetworkSpec
+	tapFD           vswitch.TapFD
+	mac             string
+	floating        string
+	envdToken       string
+	result          chan configsock.BuildResult
 }
 
 func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
@@ -485,13 +495,27 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	}
 	defer os.RemoveAll(dir)
 
-	// One network slot for the whole build; the phase sandboxes reuse it
-	// sequentially (tapfd handoff re-acquires the queue fd each boot).
-	plainIP, cidrIP, err := o.allocInnerIP(b.Profile, "")
+	// One resolved NetworkSpec feeds both the host-side attachment and the guest
+	// build config. Register/Trigger validate new records; this defensive parse
+	// keeps corrupt legacy rows from degrading into a misleading network timeout.
+	spec, err := sandboxcfg.ParseSpec(b.Metadata)
 	if err != nil {
 		return nil, err
 	}
-	port, err := o.vs.Attach(ctx, vswitch.AttachReq{InnerIP: plainIP})
+	inherited, err := o.sourceTemplateNetwork(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	network, templateNetwork, err := o.resolveBuildNetworks(
+		b.Profile,
+		inherited,
+		spec.Network,
+		"build-"+shortID(b.BuildID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	port, err := o.attachNetwork(ctx, network)
 	if err != nil {
 		return nil, err
 	}
@@ -502,9 +526,10 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		envdTok, _ = keys.MintToken()
 	}
 	pend := &pendingBuild{
-		build: b, workdir: dir,
+		build: b, workdir: dir, spec: spec,
+		network: network, templateNetwork: templateNetwork,
 		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
-		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
+		floating: port.FloatingIP, envdToken: envdTok,
 		result: make(chan configsock.BuildResult, 1),
 	}
 	o.pendMu.Lock()
@@ -629,12 +654,12 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	// cpuCount/memoryMB or a resource header) else the node builder default. This
 	// pins snapshot.cfg.resources.capacity, which a snp-template create inherits.
 	vcpu, mem := o.cfg.Builder.VCPU, o.cfg.Builder.Memory
-	if cfgSpec, perr := sandboxcfg.ParseSpec(b.Metadata); perr == nil && cfgSpec.Resource.Capacity != nil {
-		if cfgSpec.Resource.Capacity.CPU > 0 {
-			vcpu = cfgSpec.Resource.Capacity.CPU
+	if capacity := pend.spec.Resource.Capacity; capacity != nil {
+		if capacity.CPU > 0 {
+			vcpu = capacity.CPU
 		}
-		if cfgSpec.Resource.Capacity.Memory != "" {
-			mem = cfgSpec.Resource.Capacity.Memory
+		if capacity.Memory != "" {
+			mem = capacity.Memory
 		}
 	}
 	importReferer, err := o.effectiveImportReferer(b)
@@ -667,18 +692,19 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		Net: configsock.BuildNet{
 			TapFD:    buildTapFD(pend.tapFD),
 			MAC:      pend.mac,
-			InnerIP:  pend.innerIP,
-			Nexthop:  o.innerGateway(b.Profile),
-			Hostname: "build-" + shortID(b.BuildID),
-			DNS:      o.cfg.Sandbox.Network.DNS,
+			InnerIP:  pend.network.InnerIP,
+			Nexthop:  pend.network.Nexthop,
+			Hostname: pend.network.Hostname,
+			DNS:      pend.network.DNS,
 		},
-		VCPU:          vcpu,
-		Memory:        mem,
-		MMDSEnabled:   b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
-		EnvdToken:     pend.envdToken,
-		Insecure:      o.cfg.Builder.InsecureRegistry,
-		Platform:      o.cfg.Builder.Platform,
-		ImportReferer: importReferer,
+		TemplateNetwork: pend.templateNetwork,
+		VCPU:            vcpu,
+		Memory:          mem,
+		MMDSEnabled:     b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
+		EnvdToken:       pend.envdToken,
+		Insecure:        o.cfg.Builder.InsecureRegistry,
+		Platform:        o.cfg.Builder.Platform,
+		ImportReferer:   importReferer,
 		Timeouts: configsock.BuildTimeouts{
 			PullSec:  o.cfg.Builder.PullTimeoutSec,
 			StepSec:  o.cfg.Builder.StepTimeoutSec,
@@ -687,6 +713,58 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		},
 	}
 	return spec, filepath.Join(pend.workdir, b.BuildID+".pid"), true, nil
+}
+
+// resolveBuildNetworks derives two roles from the same merged logical network:
+// the temporary build VMs use buildHostname when no hostname was declared, while
+// the produced template uses the normal sandbox hostname default. Both preserve
+// current-build fields over source snapshot fields and share every other default.
+func (o *Orchestrator) resolveBuildNetworks(
+	profile types.Profile,
+	inherited sandboxcfg.NetworkSpec,
+	specified sandboxcfg.NetworkSpec,
+	buildHostname string,
+) (sandboxcfg.NetworkSpec, sandboxcfg.NetworkSpec, error) {
+	merged := sandboxcfg.MergeNetwork(inherited, specified)
+	buildNetwork, err := o.resolveNetwork(profile, merged, buildHostname)
+	if err != nil {
+		return sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, err
+	}
+	templateNetwork, err := o.resolveNetwork(profile, merged, o.cfg.Sandbox.Network.Hostname)
+	if err != nil {
+		return sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, err
+	}
+	return buildNetwork, templateNetwork, nil
+}
+
+// sourceTemplateNetwork returns the self-described network from a snapshot
+// source. Image templates have no snapshot metadata channel, so they intentionally
+// contribute no inherited network. A malformed or unreadable snapshot fails the
+// build before host attachment instead of silently changing network semantics.
+func (o *Orchestrator) sourceTemplateNetwork(ctx context.Context, b *types.Build) (sandboxcfg.NetworkSpec, error) {
+	if b.FromTemplate == "" {
+		return sandboxcfg.NetworkSpec{}, nil
+	}
+	tmpl, err := types.ParseTemplateID(b.FromTemplate)
+	if err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate %q: %w", b.FromTemplate, err)
+	}
+	if tmpl.Kind != types.KindSnp {
+		return sandboxcfg.NetworkSpec{}, nil
+	}
+	cfg, err := o.inspectSnapshotConfig(ctx, b.ManifestKey, tmpl.ManifestRef())
+	if err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
+	}
+	raw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork])
+	if raw == "" {
+		return sandboxcfg.NetworkSpec{}, nil
+	}
+	spec, err := sandboxcfg.ParseSpec(map[string]string{sandboxcfg.NsNetwork: raw})
+	if err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
+	}
+	return spec.Network, nil
 }
 
 // shortID returns the first 8 chars (hostname-friendly handle).

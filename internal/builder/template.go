@@ -18,7 +18,11 @@ import (
 func (p *buildPipeline) phaseTemplate() (string, error) {
 	s := p.spec
 	envdUDS := filepath.Join(s.Workdir, "envd.sock")
-	sb, err := p.startSandbox("c", p.templateYAML(),
+	doc, err := p.templateYAML()
+	if err != nil {
+		return "", err
+	}
+	sb, err := p.startSandbox("c", doc,
 		[]string{envdUDS + ":127.0.0.1:49983"})
 	if err != nil {
 		return "", err

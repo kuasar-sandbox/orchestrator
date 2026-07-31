@@ -1,11 +1,14 @@
 package builder
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
@@ -166,5 +169,45 @@ func TestNetworkDocTapFDSocket(t *testing.T) {
 	}
 	if _, ok := tapfdDoc["exec"]; ok {
 		t.Fatalf("tapfd doc unexpectedly has exec: %#v", tapfdDoc)
+	}
+}
+
+func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
+	network := sandboxcfg.NetworkSpec{
+		Hostname:         "sandbox",
+		DNS:              []string{"169.254.169.253"},
+		InnerIP:          "10.0.0.5/24",
+		Nexthop:          "10.0.0.1",
+		TransitGatewayIP: "192.0.2.1",
+		TransitGeneveVNI: 42,
+		TransitMAC:       "aa:bb:cc:dd:ee:ff",
+	}
+	p := &buildPipeline{
+		spec: &configsock.BuildSpec{
+			TemplateNetwork: network,
+			Net: configsock.BuildNet{
+				Hostname: "build-deadbeef",
+			},
+		},
+		startCmd: "node server.js",
+		readyCmd: "curl -sf localhost:3000",
+	}
+	doc, err := p.templateYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := doc["metadata"].(map[string]string)
+	if !ok {
+		t.Fatalf("metadata = %#v", doc["metadata"])
+	}
+	if strings.Contains(meta[sandboxcfg.NsNetwork], "build-deadbeef") {
+		t.Fatalf("template metadata leaked temporary hostname: %s", meta[sandboxcfg.NsNetwork])
+	}
+	var got sandboxcfg.NetworkSpec
+	if err := json.Unmarshal([]byte(meta[sandboxcfg.NsNetwork]), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, network) {
+		t.Fatalf("persisted network = %+v, want %+v", got, network)
 	}
 }
