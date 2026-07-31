@@ -2,6 +2,7 @@ package builder
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // --- yaml renderers -----------------------------------------------------------
@@ -138,7 +140,7 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 // snapshot as runtime_ref, envd as the app (FC mode per the
 // deployment's MMDS posture), and the e2b start/ready metadata recorded
 // into snapshot.cfg so the template is self-describing.
-func (p *buildPipeline) templateYAML() map[string]any {
+func (p *buildPipeline) templateYAML() (map[string]any, error) {
 	s := p.spec
 	envdArgs := []string{"-isnotfc", "-port", "49983"}
 	if s.MMDSEnabled {
@@ -148,6 +150,11 @@ func (p *buildPipeline) templateYAML() map[string]any {
 	if p.readyCmd != "" {
 		meta["e2b.ready_cmd"] = p.readyCmd
 	}
+	networkJSON, err := json.Marshal(s.TemplateNetwork)
+	if err != nil {
+		return nil, fmt.Errorf("marshal template network metadata: %w", err)
+	}
+	meta[sandboxcfg.NsNetwork] = string(networkJSON)
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
 		"network":   p.networkDoc(),
@@ -173,7 +180,7 @@ func (p *buildPipeline) templateYAML() map[string]any {
 	if f := p.dnsFiles(); f != nil {
 		doc["files"] = f
 	}
-	return doc
+	return doc, nil
 }
 
 // --- helpers -------------------------------------------------------------------
