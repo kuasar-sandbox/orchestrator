@@ -39,6 +39,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
@@ -140,30 +141,31 @@ type Provider interface {
 // template snapshot) needs. Secrets (manifest key, tenant registry
 // creds) ride here over the socket, never on disk.
 type BuildSpec struct {
-	BuildID          string             `json:"build_id"`
-	Profile          string             `json:"profile"`
-	RunID            string             `json:"run_id,omitempty"`
-	Workdir          string             `json:"workdir"` // build scratch dir (artifacts, run roots)
-	FromImage        string             `json:"from_image,omitempty"`
-	FromTemplateRef  string             `json:"from_template_ref,omitempty"`
-	FromTemplateKind string             `json:"from_template_kind,omitempty"`
-	RefLocations     map[string]string  `json:"ref_locations,omitempty"`
-	ToRefLocation    string             `json:"to_ref_location,omitempty"`
-	Steps            []BuildStep        `json:"steps,omitempty"`
-	StartCmd         string             `json:"start_cmd,omitempty"`
-	ReadyCmd         string             `json:"ready_cmd,omitempty"`
-	Env              map[string]string  `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
-	Paths            BuildPaths         `json:"paths"`
-	Net              BuildNet           `json:"net"`
-	VCPU             int                `json:"vcpu"`
-	Memory           string             `json:"memory"`
-	MMDSEnabled      bool               `json:"mmds_enabled"`
-	EnvdToken        string             `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure         bool               `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform         string             `json:"platform,omitempty"`
-	ImportReferer    BuildImportReferer `json:"import_referer,omitempty"`
-	Timeouts         BuildTimeouts      `json:"timeouts"`
-	Error            string             `json:"error,omitempty"`
+	BuildID          string                 `json:"build_id"`
+	Profile          string                 `json:"profile"`
+	RunID            string                 `json:"run_id,omitempty"`
+	Workdir          string                 `json:"workdir"` // build scratch dir (artifacts, run roots)
+	FromImage        string                 `json:"from_image,omitempty"`
+	FromTemplateRef  string                 `json:"from_template_ref,omitempty"`
+	FromTemplateKind string                 `json:"from_template_kind,omitempty"`
+	RefLocations     map[string]string      `json:"ref_locations,omitempty"`
+	ToRefLocation    string                 `json:"to_ref_location,omitempty"`
+	Steps            []BuildStep            `json:"steps,omitempty"`
+	StartCmd         string                 `json:"start_cmd,omitempty"`
+	ReadyCmd         string                 `json:"ready_cmd,omitempty"`
+	Env              map[string]string      `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
+	Paths            BuildPaths             `json:"paths"`
+	Net              BuildNet               `json:"net"`
+	TemplateNetwork  sandboxcfg.NetworkSpec `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
+	VCPU             int                    `json:"vcpu"`
+	Memory           string                 `json:"memory"`
+	MMDSEnabled      bool                   `json:"mmds_enabled"`
+	EnvdToken        string                 `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure         bool                   `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform         string                 `json:"platform,omitempty"`
+	ImportReferer    BuildImportReferer     `json:"import_referer,omitempty"`
+	Timeouts         BuildTimeouts          `json:"timeouts"`
+	Error            string                 `json:"error,omitempty"`
 }
 
 type BuildImportReferer struct {

@@ -606,11 +606,19 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   phase-C 构建 VM 容量。
 - **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
   快照**(runtime 拒容量不等)。
-- **network 随快照**:渲染时把已解析逻辑网络注入
-  `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
-  restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
-  token 同样携带 metadata。除 host-side restore policy 外,其余命名空间只在冷启生效或
-  已冻入快照,故只 network 需随快照。
+- **network 随快照**:普通 sandbox 渲染时把已解析逻辑网络注入
+  `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore
+  继承;restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。
+  Build 的临时 VM 与最终模板分别从同一个 `NetworkSpec` 解析:未声明 hostname 时前者使用
+  `build-<short-build-id>`,后者使用 `sandbox.network.hostname`;故临时 hostname 不进入模板。
+  C 阶段把模板的完整有效 `NetworkSpec` 写入同一 snapshot metadata,使仅持有 snapshot
+  制品、没有原 `builds` 记录的 create/restore 仍能恢复网络语义。`builds.metadata_json`
+  保留 register/trigger 声明,承担控制面索引和模板默认配置;snapshot metadata 承担制品
+  自描述。两者同时存在时先按既有 namespace 规则得到 create/模板声明,再以该声明字段覆盖
+  snapshot 字段,最后补 node/profile 默认值。img-only(包括 bare)没有 snapshot metadata
+  通道,仍由 `builds.metadata_json` 与运行节点默认值提供模板网络。迁移 token 同样携带
+  metadata。除 host-side restore policy 外,其余命名空间只在冷启生效或已冻入快照,故只
+  network 需随快照。
 - **restore policy 不随快照或模板**:`kuasar-sandbox.restore` 只由 create 请求写入
   sandbox metadata。image cold boot 不把它渲染进运行 YAML;snp create、pause 后 resume
   和 migration import 在存在 restore ref 时重新渲染。connect/resume 不提供临时覆盖。
@@ -1177,7 +1185,10 @@ plugin 平面,机群路由经 registry 聚合。
 (无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
 `img`,持久 id `<profile>-<kind>-<base64url(portable-ref)>` 写入 names/aliases。profile 从注册到
-BuildSpec 全链路显式携带,网络槽的 inner IP/nexthop 亦按该 profile 选择。
+BuildSpec 全链路显式携带。register/trigger 在入队前校验最终 network metadata;
+执行时只解析一次并补齐 profile/node 默认值,同一个 `NetworkSpec` 同时派生 host
+`vswitch.AttachReq` 与 guest `BuildNet`。`transit_*` 只在 host Attach 消费,不进入
+`BuildNet`;无 transit 时保持零值。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
 microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
@@ -1229,7 +1240,10 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
 与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。bare 不继承
 e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。overlay top 与
-`base_from_refs` 保持显式 top-to-bottom 数组,不编码复合 manifest ref。
+`base_from_refs` 保持显式 top-to-bottom 数组,不编码复合 manifest ref。snp 源模板的
+`kuasar-sandbox.network` 在 host Attach 前读取并按字段继承,优先级为
+**当前 Build 显式 NetworkSpec > 源 snapshot NetworkSpec > 当前 profile/node 默认值**;
+img 源模板没有 snapshot metadata 通道,不从本地数据库增加入口相关的隐式回退。
 
 **COPY/ADD step(构建上下文经对象存储直传)**:COPY 的本质是"把一份 tar 摊进
 rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec + flatten-ctl(不经
@@ -1262,8 +1276,9 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 `ref_location_parent` 时使用 build ID 作为 location name 发布到 named location,
 否则发布到 manifest。结果
 `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传;
-快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
-继承与 create 都读它)。
+快照模板的 start/ready 与模板有效 `NetworkSpec` 同时记进 snapshot.cfg metadata,
+模板自描述(fromTemplate 继承与 create 都读它);未显式声明 hostname 时这里记录正常
+sandbox 默认值,绝不记录 `build-<id>`。
 
 **构建日志流(journald 单汇 → status API → SDK on_build_logs)**:构建进度对 SDK
 实时可见,零临时文件——全部写 journald 标签 `build`(机制 + 标签词表见 §5.2),
