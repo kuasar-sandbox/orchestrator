@@ -286,6 +286,26 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+valid_persist_id() {
+    python3 - "$1" <<'PY'
+import base64
+import re
+import sys
+
+try:
+    profile, kind, payload = sys.argv[1].split("-", 2)
+    if profile not in {"e2b", "bare"} or kind not in {"img", "snp"}:
+        raise ValueError
+    raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    if base64.urlsafe_b64encode(raw).decode().rstrip("=") != payload:
+        raise ValueError
+    ref = raw.decode()
+    if not re.fullmatch(r"manifest://[0-9a-f]{64}", ref):
+        raise ValueError
+except (ValueError, UnicodeDecodeError):
+    raise SystemExit(1)
+PY
+}
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
@@ -305,7 +325,7 @@ diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- journal build $1 (tail) ----"
     journalctl KUASAR_BUILD_ID="$1" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
 }
-wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<64hex>)
+wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(portable-ref)>)
     local tid="$1" bid="$2" label="$3" status="" code
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
@@ -314,7 +334,7 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<64hex>)
         case "$status" in
             ready)
                 PERSIST=$(json_field "$WORK/resp.body" templateID)
-                [[ "$PERSIST" =~ ^(e2b|bare)-(img|snp)-[0-9a-f]{64}$ ]] || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
+                valid_persist_id "$PERSIST" || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
                 return 0;;
             error)
                 echo "    $label error response: $(cat "$WORK/resp.body")"
