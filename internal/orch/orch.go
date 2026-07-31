@@ -184,7 +184,11 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	_, meta, err = sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy())
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		var validationErr *sandboxcfg.MMDSValidationError
+		if errors.As(err, &validationErr) {
+			o.log.Warn("MMDS metadata rejected", "operation", "create", "err", validationErr.Diagnostic())
+		}
+		return nil, fmt.Errorf("%w: %w", api.ErrBadRequest, err)
 	}
 
 	id, err := uuid.NewV7()

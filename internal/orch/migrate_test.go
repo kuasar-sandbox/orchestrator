@@ -94,6 +94,38 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(sb))
 }
 
+func TestImportRejectsMMDSWhenPolicyDisabled(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("fake-runtime-bytes"))
+	ctx := context.Background()
+
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	pair := store.KeyPair{APISecret: apiSecret, ManifestKey: mk}
+	if _, err := o.st.AddKeyPair(ctx, pair, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	sid := "mmds-import-source"
+	sb := migrationSandbox(t, dir, sid, mk, "manifest://"+strings.Repeat("b", 64))
+	sb.Metadata = map[string]string{sandboxcfg.NsMMDS: `{"version":1,"routes":[]}`}
+	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	token, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if _, err := o.ImportSandbox(ctx, apiKey, token, ""); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("import error = %v, want api.ErrBadRequest", err)
+	}
+}
+
 func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))

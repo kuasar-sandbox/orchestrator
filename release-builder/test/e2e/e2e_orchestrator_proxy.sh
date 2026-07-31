@@ -29,6 +29,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
+MMDS_INVALID_REJECT_E2E="${MMDS_INVALID_REJECT_E2E:-0}"
+MMDS_POLICY_REPLAY_E2E="${MMDS_POLICY_REPLAY_E2E:-0}"
 MMDS_ROUTES_CONFIG=""
 if [ "$MMDS_STATIC_E2E" = "1" ]; then
     MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
@@ -171,6 +173,36 @@ req() {
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
+assert_mmds_rejection() {
+    local code="$1" response="$2" expected="$3" forbidden="${4:-}"
+    [ "$code" = "400" ] || { cat "$response"; fail "MMDS create=$code (want 400)"; }
+    python3 - "$response" "$expected" "$forbidden" <<'PY'
+import json, sys
+
+path, expected, forbidden = sys.argv[1:]
+payload = json.load(open(path))
+if not isinstance(payload, dict) or set(payload) != {"message"}:
+    raise SystemExit(f"MMDS rejection must contain only message: {payload!r}")
+if payload["message"] != expected:
+    raise SystemExit(f"MMDS rejection message={payload['message']!r}, want {expected!r}")
+if forbidden and forbidden in json.dumps(payload):
+    raise SystemExit("MMDS rejection exposed tenant-controlled payload data")
+PY
+}
+runtime_dir_count() {
+    find "$WORK/run" -mindepth 1 -maxdepth 1 -type d ! -name runs -printf . | wc -c
+}
+assert_sandbox_list_count() {
+    local response="$1" expected="$2"
+    python3 - "$response" "$expected" <<'PY'
+import json, sys
+
+payload = json.load(open(sys.argv[1]))
+expected = int(sys.argv[2])
+if not isinstance(payload, list) or len(payload) != expected:
+    raise SystemExit(f"sandbox list has {len(payload) if isinstance(payload, list) else 'non-list'} entries, want {expected}")
+PY
 }
 assert_no_default_exec_token() {
     python3 - "$1" <<'PY'
@@ -381,6 +413,8 @@ EOF
 echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
+ORCH_PID="${PIDS[-1]}"
+ORCH_PID_SLOT=$((${#PIDS[@]} - 1))
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { dump_logs; skip "orchestrator exited"; }
@@ -437,6 +471,31 @@ done
 echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
+if [ "$MMDS_INVALID_REJECT_E2E" = "1" ]; then
+    saved_mmds_header="$REQ_MMDS_HEADER"
+    before_invalid="$(runtime_dir_count)"
+
+    leak_marker="MMDS_E2E_DO_NOT_REFLECT_$RANDOM"
+    REQ_MMDS_HEADER="{\"version\":1,\"routes\":[],\"bogus\":\"$leak_marker\"}"
+    code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+    assert_mmds_rejection "$code" "$WORK/resp.body" \
+        'bad request: MMDS metadata: contains unknown field "bogus"' "$leak_marker" \
+        || fail "unknown-field MMDS rejection contract"
+
+    REQ_MMDS_HEADER="{\"version\":1,\"routes\":["
+    code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+    assert_mmds_rejection "$code" "$WORK/resp.body" \
+        'bad request: MMDS metadata: is not valid JSON' \
+        || fail "invalid-JSON MMDS rejection contract"
+    REQ_MMDS_HEADER="$saved_mmds_header"
+
+    [ "$(runtime_dir_count)" = "$before_invalid" ] \
+        || fail "invalid MMDS creates allocated sandbox runtime directories"
+    code=$(req GET /v2/sandboxes "$AK")
+    [ "$code" = "200" ] || fail "post-invalid MMDS sandbox list=$code"
+    assert_sandbox_list_count "$WORK/resp.body" 0 || fail "invalid MMDS creates persisted sandbox state"
+    echo "==> PASS: external suite rejected invalid MMDS declarations before allocation"
+fi
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
 if [ "$code" != "201" ]; then
@@ -512,6 +571,49 @@ if [ "$MMDS_STATIC_E2E" = "1" ]; then
     run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
         || { dump_logs; fail "external MMDS declaration/static route guest GET"; }
     echo "==> PASS: real guest GET reached external MMDS declared static route"
+fi
+if [ "$MMDS_POLICY_REPLAY_E2E" = "1" ]; then
+    echo "==> restarting conductor with MMDS routes disabled; external proxy must retain the existing route"
+    sed -i '/routes: { enabled: true }/d' "$WORK/config.yaml"
+    kill -TERM "$ORCH_PID" 2>/dev/null || true
+    wait "$ORCH_PID" 2>/dev/null || true
+    PIDS[$ORCH_PID_SLOT]=""
+    "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch-restart.log" 2>&1 &
+    ORCH_PID=$!
+    PIDS+=("$ORCH_PID")
+    ORCH_PID_SLOT=$((${#PIDS[@]} - 1))
+    restarted=""
+    for _ in $(seq 1 60); do
+        curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null \
+            && { restarted=1; break; }
+        kill -0 "$ORCH_PID" 2>/dev/null || { sed 's/^/  /' "$WORK/orch-restart.log"; fail "restarted conductor exited"; }
+        sleep 0.5
+    done
+    [ -n "$restarted" ] || fail "restarted conductor health endpoint did not become ready"
+    kill -0 "$PROXY_MASTER_PID" 2>/dev/null || { dump_logs; fail "external proxy exited during conductor restart"; }
+
+    before_reject="$(runtime_dir_count)"
+    code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+    assert_mmds_rejection "$code" "$WORK/resp.body" \
+        'bad request: MMDS metadata: MMDS routes are disabled by policy' 'MMDS_STATIC_GUEST_E2E' \
+        || fail "restarted disabled-policy rejection contract"
+    [ "$(runtime_dir_count)" = "$before_reject" ] \
+        || fail "post-restart rejected create changed runtime directory count"
+    code=$(req GET /v2/sandboxes "$AK")
+    [ "$code" = "200" ] || fail "post-restart sandbox list=$code"
+    assert_sandbox_list_count "$WORK/resp.body" 1 || fail "post-restart rejection changed persisted sandbox count"
+    grep -Fq "$SID" "$WORK/resp.body" || fail "existing sandbox disappeared after policy restart"
+
+    replay_ok=""
+    for _ in $(seq 1 30); do
+        if run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" replay; then
+            replay_ok=1
+            break
+        fi
+        sleep 0.5
+    done
+    [ -n "$replay_ok" ] || { dump_logs; fail "external proxy lost the existing MMDS route after conductor restart"; }
+    echo "==> PASS: disabled policy rejected new create while the external proxy retained the replayed route"
 fi
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
