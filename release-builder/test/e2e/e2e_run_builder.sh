@@ -286,7 +286,7 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
-valid_persist_id() {
+persist_ref() {
     python3 - "$1" <<'PY'
 import base64
 import re
@@ -304,8 +304,10 @@ try:
         raise ValueError
 except (ValueError, UnicodeDecodeError):
     raise SystemExit(1)
+print(ref)
 PY
 }
+valid_persist_id() { persist_ref "$1" >/dev/null; }
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
@@ -399,10 +401,11 @@ echo "==> PASS: B2 ready → $B2_PERSIST"
 # Deep asserts through the artifact chain: the uploaded snapshot.cfg names a
 # manifest:// base image and carries the e2b start/ready metadata; the base
 # image's runtime config holds the merged ENV/WORKDIR from the steps.
-B2_HEX="${B2_PERSIST##*-}"
+B2_REF=$(persist_ref "$B2_PERSIST") \
+    || fail "B2 persist id does not contain a valid portable ref: $B2_PERSIST"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
-    "manifest://$B2_HEX" >"$WORK/b2.cfg.json" 2>"$WORK/b2.cfg.err" \
-    || { cat "$WORK/b2.cfg.err"; fail "sandbox-ctl info manifest://$B2_HEX"; }
+    "$B2_REF" >"$WORK/b2.cfg.json" 2>"$WORK/b2.cfg.err" \
+    || { cat "$WORK/b2.cfg.err"; fail "sandbox-ctl info $B2_REF"; }
 grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
