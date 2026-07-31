@@ -37,8 +37,9 @@ func (o *Orchestrator) sandboxRefLocations(ctx context.Context, sb *types.Sandbo
 	return o.templateRefLocations(ctx, sb.ManifestKey, tmpl)
 }
 
-// snapshotRefLocations walks only snapshot parent refs. All disk/runtime refs
-// are scanned for logical locations but are not mistaken for snapshot bundles.
+// snapshotRefLocations walks only snapshot parent refs. Disk refs are scanned
+// for logical locations but are not mistaken for snapshot bundles. The runtime
+// is a node-provided platform artifact and never uses a named ref location.
 func (o *Orchestrator) snapshotRefLocations(ctx context.Context, manifestKey, root string) (map[string]string, error) {
 	if o.cfg.Checkpoint.Remote.RefLocationParent == "" {
 		if ref, err := manifest.ParseRef(root); err == nil && ref.Location != "" {
@@ -92,9 +93,8 @@ func (o *Orchestrator) addRefLocation(locations map[string]string, raw string) e
 type snapshotRefConfig struct {
 	FromRefs []string `json:"FromRefs"`
 	Boot     struct {
-		RuntimeRef string             `json:"RuntimeRef"`
-		Root       snapshotDiskNode   `json:"Root"`
-		Disks      []snapshotDiskNode `json:"Disks"`
+		Root  snapshotDiskNode   `json:"Root"`
+		Disks []snapshotDiskNode `json:"Disks"`
 	} `json:"Boot"`
 }
 
@@ -109,7 +109,7 @@ type snapshotDiskNode struct {
 }
 
 func (c snapshotRefConfig) artifactRefs() []string {
-	refs := []string{c.Boot.RuntimeRef}
+	var refs []string
 	add := func(node snapshotDiskNode) {
 		refs = append(refs, node.BaseRef, node.Base)
 		refs = append(refs, node.BaseFromRefs...)

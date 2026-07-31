@@ -18,6 +18,7 @@ func TestSnapshotRefLocationsWalksMultipleLocations(t *testing.T) {
 	rootRef := "file://" + strings.Repeat("a", 64) + ".snapshot@location:root-1"
 	parentRef := "file://" + strings.Repeat("b", 64) + ".snapshot@location:parent-2"
 	imageRef := "file://" + strings.Repeat("c", 64) + ".image@location:image-3"
+	runtimeRef := "file://runtime.bundle@location:platform"
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 last=""
@@ -28,7 +29,7 @@ case "$last" in
   *) exit 2 ;;
 esac
 `, logPath, rootRef,
-		`{"FromRefs":["`+parentRef+`"],"Boot":{"Root":{"BaseRef":"`+imageRef+`"}}}`,
+		`{"FromRefs":["`+parentRef+`"],"Boot":{"RuntimeRef":"`+runtimeRef+`","Root":{"BaseRef":"`+imageRef+`"}}}`,
 		parentRef, `{"Boot":{"Root":{}}}`)
 	path := filepath.Join(dir, "sandbox-ctl")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -48,6 +49,9 @@ esac
 		if got[name] != want {
 			t.Fatalf("location %q = %q, want %q", name, got[name], want)
 		}
+	}
+	if _, ok := got["platform"]; ok {
+		t.Fatal("snapshot runtime_ref was treated as a named tenant artifact")
 	}
 	logBody, err := os.ReadFile(logPath)
 	if err != nil {
