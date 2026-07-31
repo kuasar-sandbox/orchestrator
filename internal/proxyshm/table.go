@@ -19,11 +19,12 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 2
+	schema uint32 = 3
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -33,7 +34,7 @@ const (
 
 	maxSandboxID   = 128
 	maxProfile     = 16
-	maxTemplateID  = 128
+	maxTemplateID  = types.MaxTemplateIDBytes
 	maxState       = 16
 	maxUDS         = 256
 	maxFloatingIP  = 64

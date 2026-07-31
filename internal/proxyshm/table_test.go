@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestTableSharedLookupAndDelete(t *testing.T) {
@@ -63,6 +64,35 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 		deleted.EnvdAccessToken != "" || deleted.TrafficAccessToken != "" ||
 		deleted.ForwardAccessToken != "" || deleted.MmdsSecret != "" {
 		t.Fatalf("deleted record retained credential material: %+v", deleted)
+	}
+}
+
+func TestTableSupportsPortableTemplateID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	templateID := types.TemplateID{
+		Profile: types.ProfileE2B,
+		Kind:    types.KindSnp,
+		Ref: "file://" + strings.Repeat("a", 64) + ".snapshot@location:" +
+			"019fb713-6fd5-71f0-b9bc-4a2a20147e53",
+	}.String()
+	if len(templateID) <= 128 {
+		t.Fatalf("portable template ID length = %d, want >128", len(templateID))
+	}
+	entry := routesync.RouteEntry{
+		SandboxID: "s1", State: routesync.StateRunning, TemplateID: templateID,
+	}
+	if err := tbl.Upsert(entry); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := tbl.Lookup("s1")
+	if !ok || got.TemplateID != templateID {
+		t.Fatalf("template ID round-trip = %q ok=%v", got.TemplateID, ok)
 	}
 }
 

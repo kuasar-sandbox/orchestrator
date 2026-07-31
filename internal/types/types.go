@@ -58,8 +58,8 @@ func ValidLocalSandboxID(id string) bool {
 }
 
 const (
-	MaxPortableRefBytes = 1024
-	MaxTemplateIDBytes  = 2048
+	MaxPortableRefBytes = 256
+	MaxTemplateIDBytes  = len("bare-snp-") + (MaxPortableRefBytes*4+2)/3
 )
 
 // TemplateID is self-describing as <profile>-<kind>-<base64url(ref)>.

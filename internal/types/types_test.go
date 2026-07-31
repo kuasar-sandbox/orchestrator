@@ -64,6 +64,22 @@ func TestTemplateIDRejectsNonPortableOrWrongArtifact(t *testing.T) {
 	}
 }
 
+func TestTemplateIDLengthLimits(t *testing.T) {
+	fixed := "file://" + strings.Repeat("a", 64) + ".snapshot@sha256:" +
+		strings.Repeat("b", 64) + "@location:"
+	ref := fixed + strings.Repeat("c", MaxPortableRefBytes-len(fixed))
+	id := TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: ref}.String()
+	if len(id) != MaxTemplateIDBytes {
+		t.Fatalf("maximum template ID length = %d, want %d", len(id), MaxTemplateIDBytes)
+	}
+	if _, err := ParseTemplateID(id); err != nil {
+		t.Fatalf("maximum template ID rejected: %v", err)
+	}
+	if _, err := ParseTemplateID(TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: ref + "c"}.String()); err == nil {
+		t.Fatal("overlong template ID accepted")
+	}
+}
+
 func TestValidLocalSandboxID(t *testing.T) {
 	for _, tt := range []struct {
 		id   string
