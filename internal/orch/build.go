@@ -42,7 +42,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	// Validate the sandbox metadata that will be persisted as the build's network
 	// config now, not at runBuildUnit time: a malformed inner_ip / transit_* must
 	// surface as a 400 at register, not later degrade to a DNS-timeout build error.
-	if err := sandboxcfg.ParseSpec(metadata); err != nil {
+	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
@@ -171,7 +171,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	// before persisting it: a malformed inner_ip / transit_* (from either side)
 	// must fail at trigger with 400, not degrade to a DNS-timeout build error.
 	mergedMetadata := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
-	if err := sandboxcfg.ParseSpec(mergedMetadata); err != nil {
+	if _, err := sandboxcfg.ParseSpec(mergedMetadata); err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	b.Metadata = mergedMetadata
