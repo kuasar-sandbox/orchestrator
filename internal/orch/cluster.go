@@ -383,6 +383,8 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 
 func clusterCommandRejection(err error) (int, string) {
 	switch {
+	case errors.Is(err, api.ErrBadRequest):
+		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, migrationtoken.ErrMalformedToken),
 		errors.Is(err, migrationtoken.ErrInvalidPayload):
 		return http.StatusBadRequest, "invalid migration token"
@@ -458,7 +460,11 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	}
 	_, config, err = sandboxcfg.ExtractMMDS(config, o.mmdsPolicy())
 	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+		var validationErr *sandboxcfg.MMDSValidationError
+		if errors.As(err, &validationErr) {
+			o.log.Warn("MMDS metadata rejected", "operation", "cluster-create", "sid", cmd.SID, "err", validationErr.Diagnostic())
+		}
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %w", api.ErrBadRequest, err)
 	}
 	cmd.Config = config
 	return pair, tmpl, credentials, nil

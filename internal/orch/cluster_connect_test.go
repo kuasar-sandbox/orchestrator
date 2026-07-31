@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -109,11 +110,16 @@ func TestClusterCommandRejectMapsMigrationErrors(t *testing.T) {
 		{name: "fingerprint", err: migrationtoken.ErrCredentialMismatch, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
 		{name: "incompatible", err: migrationtoken.ErrIncompatible, wantStatus: http.StatusConflict, wantReason: "target environment incompatible"},
 		{name: "too large", err: migrationtoken.ErrTokenTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantReason: migrationtoken.ErrTokenTooLarge.Error()},
+		{name: "bad request", err: api.ErrBadRequest, wantStatus: http.StatusBadRequest, wantReason: api.ErrBadRequest.Error()},
 		{name: "unclassified", err: errors.New("ordinary rejection"), wantReason: "private-detail: ordinary rejection"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ack := reject(&routesync.Command{CmdID: "connect-rejected"}, fmt.Errorf("private-detail: %w", tc.err))
+			rejectionErr := tc.err
+			if tc.name != "bad request" {
+				rejectionErr = fmt.Errorf("private-detail: %w", tc.err)
+			}
+			ack := reject(&routesync.Command{CmdID: "connect-rejected"}, rejectionErr)
 			if ack.Status != routesync.AckRejected || ack.HTTPStatus != tc.wantStatus || ack.Reason != tc.wantReason {
 				t.Fatalf("ack = %+v, want status=%d reason=%q", ack, tc.wantStatus, tc.wantReason)
 			}

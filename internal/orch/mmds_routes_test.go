@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,14 @@ import (
 )
 
 const testMMDSSpec = `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}`
+
+func testMMDSTemplateRef() string {
+	return types.TemplateID{
+		Profile: types.ProfileBare,
+		Kind:    types.KindImg,
+		Ref:     "manifest://" + strings.Repeat("a", 64),
+	}.String()
+}
 
 func testMMDSRoutesConfig() config.MMDSRoutesConfig {
 	return config.MMDSRoutesConfig{
@@ -32,7 +41,8 @@ func TestPrecheckClusterRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	o := testOrch(t) // zero-value config.Config: MMDS.Routes.Enabled defaults to false
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := &routesync.Command{
-		TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		SID:                  "stable-g0",
+		TemplateRef:          testMMDSTemplateRef(),
 		Profile:              string(types.ProfileBare),
 		APISecretFingerprint: fingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
@@ -43,6 +53,25 @@ func TestPrecheckClusterRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	}
 }
 
+func TestHandleCommandCreateRejectsMMDSWithHTTP400(t *testing.T) {
+	o := testOrch(t)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	ack := o.HandleCommand(context.Background(), &routesync.Command{
+		Kind:                 routesync.CmdCreate,
+		CmdID:                "create-invalid-mmds",
+		SID:                  "stable-g0",
+		TemplateRef:          testMMDSTemplateRef(),
+		Profile:              string(types.ProfileBare),
+		APISecretFingerprint: fingerprint,
+		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
+		Config:               map[string]string{sandboxcfg.NsMMDS: testMMDSSpec},
+	})
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest ||
+		ack.Reason != "bad request: cluster create: MMDS metadata: MMDS routes are disabled by policy" {
+		t.Fatalf("ack = %+v, want rejected HTTP 400", ack)
+	}
+}
+
 func TestPrecheckClusterAppliesMMDSPolicyAndCanonicalizes(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.MMDS.Routes = testMMDSRoutesConfig()
@@ -50,7 +79,7 @@ func TestPrecheckClusterAppliesMMDSPolicyAndCanonicalizes(t *testing.T) {
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := &routesync.Command{
 		SID:                  "stable-g0",
-		TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		TemplateRef:          testMMDSTemplateRef(),
 		Profile:              string(types.ProfileBare),
 		APISecretFingerprint: fingerprint,
 		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
@@ -116,7 +145,7 @@ func TestCreateRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
 
 	_, err := o.Create(context.Background(), api.CreateReq{
-		APIKey: apiKey, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), TimeoutSec: 60,
+		APIKey: apiKey, TemplateID: testMMDSTemplateRef(), TimeoutSec: 60,
 		Metadata: map[string]string{sandboxcfg.NsMMDS: testMMDSSpec},
 	})
 	if !errors.Is(err, api.ErrBadRequest) {

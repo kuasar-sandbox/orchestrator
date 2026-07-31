@@ -97,17 +97,17 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 		return MMDSSpec{}, meta, nil
 	}
 	if !policy.Enabled {
-		return MMDSSpec{}, nil, mmdsError("is not accepted (mmds routes are disabled on this node)")
+		return MMDSSpec{}, nil, mmdsError("MMDS routes are disabled by policy")
 	}
 	if len(raw) > policy.MaxNamespaceBytes {
-		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes))
+		return MMDSSpec{}, nil, mmdsErrorWithPublic(fmt.Sprintf("exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes), fmt.Sprintf("metadata exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes))
 	}
 
 	var spec MMDSSpec
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
-		return MMDSSpec{}, nil, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: %w", NsMMDS, err)
+		return MMDSSpec{}, nil, invalidMMDSJSONError(err)
 	}
 	// Decode only consumes one JSON value; reject anything trailing it (a
 	// second concatenated document, stray text) rather than silently ignoring
@@ -121,7 +121,7 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 	// any other error means reject.
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		return MMDSSpec{}, nil, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: unexpected trailing data", NsMMDS)
+		return MMDSSpec{}, nil, mmdsError("contains unexpected trailing data")
 	}
 	if spec.Version != 0 && spec.Version != 1 {
 		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("has unsupported version %d", spec.Version))
@@ -326,8 +326,4 @@ func mmdsPathUnderPrefix(path, prefix string) bool {
 		return false
 	}
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
-}
-
-func mmdsError(message string) error {
-	return fmt.Errorf("sandboxcfg: metadata[%q] %s", NsMMDS, message)
 }

@@ -218,6 +218,13 @@ func (o *Orchestrator) importSandboxWithKey(
 		trustedCluster = &types.ClusterSandboxContext{Group: cluster.Group, RouteKey: cluster.RouteKey}
 		metadata = clusterSandboxMetadata(metadata)
 	}
+	if _, metadata, err = sandboxcfg.ExtractMMDS(metadata, o.mmdsPolicy()); err != nil {
+		var validationErr *sandboxcfg.MMDSValidationError
+		if errors.As(err, &validationErr) {
+			o.log.Warn("MMDS metadata rejected", "operation", "import", "err", validationErr.Diagnostic())
+		}
+		return nil, fmt.Errorf("%w: import-sandbox: %w", api.ErrBadRequest, err)
+	}
 	sb := &types.Sandbox{
 		ID:                 targetID,
 		Profile:            profile,

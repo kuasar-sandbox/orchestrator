@@ -47,12 +47,50 @@ func TestExtractMMDSDisabledPolicyRejectsBeforeParsing(t *testing.T) {
 	if !strings.Contains(err.Error(), "disabled") {
 		t.Fatalf("expected a disabled-policy error, got: %v", err)
 	}
+	if err.Error() != "MMDS metadata: MMDS routes are disabled by policy" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestExtractMMDSPublicErrorDoesNotExposePayload(t *testing.T) {
+	secret := "do-not-return-this-secret"
+	body := "do-not-return-this-body"
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":"static","data":"` + body + `","secret_name":"` + secret + `"}]}`}
+	_, _, err := ExtractMMDS(meta, testMMDSPolicy())
+	if err == nil {
+		t.Fatal("expected invalid cross-type fields")
+	}
+	public := err.Error()
+	if strings.Contains(public, body) || strings.Contains(public, secret) {
+		t.Fatalf("public error exposed payload data: %q", public)
+	}
+	if !strings.Contains(public, `route "/x"`) {
+		t.Fatalf("public error omitted safe route context: %q", public)
+	}
+}
+
+func TestExtractMMDSJSONErrorIsNormalized(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[`}
+	_, _, err := ExtractMMDS(meta, testMMDSPolicy())
+	if err == nil {
+		t.Fatal("expected invalid JSON")
+	}
+	if err.Error() != "MMDS metadata: is not valid JSON" {
+		t.Fatalf("JSON error = %q", err)
+	}
+	if strings.Contains(err.Error(), "unexpected end of JSON input") {
+		t.Fatalf("internal error should not depend on raw decoder wording: %v", err)
+	}
 }
 
 func TestExtractMMDSRejectsUnknownTopLevelField(t *testing.T) {
 	meta := map[string]string{NsMMDS: `{"version":1,"bogus":true,"routes":[]}`}
-	if _, _, err := ExtractMMDS(meta, testMMDSPolicy()); err == nil {
+	_, _, err := ExtractMMDS(meta, testMMDSPolicy())
+	if err == nil {
 		t.Fatal("expected an error for an unknown top-level field")
+	}
+	if err.Error() != `MMDS metadata: contains unknown field "bogus"` {
+		t.Fatalf("error = %q", err)
 	}
 }
 
@@ -410,7 +448,11 @@ func TestMMDSSpecNeverEntersGuestVisibleMetadata(t *testing.T) {
 		t.Fatalf("unrelated guest-visible metadata was lost: %+v", spec.Metadata)
 	}
 
-	tmpl := types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}
+	tmpl := types.TemplateID{
+		Profile: types.ProfileE2B,
+		Kind:    types.KindImg,
+		Ref:     "manifest://" + strings.Repeat("a", 64),
+	}
 	p := Params{
 		Sandbox:  &types.Sandbox{ID: "s1", TemplateID: tmpl.String()},
 		Template: tmpl, Runtime: "/r/sandbox-runtime.bundle", Kernel: "/r/vmlinux",
