@@ -913,6 +913,9 @@ func (a *API) sandboxBaseResp(sb *types.Sandbox) map[string]any {
 func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d := a.sandboxBaseResp(sb)
 	d["state"] = string(sb.State)
+	d["cpuCount"] = a.res.VCPU
+	d["memoryMB"] = a.res.MemoryMB
+	d["diskSizeMB"] = a.res.DiskMB
 	d["startedAt"] = isoUnix(sb.CreatedUnix)
 	d["endAt"] = isoUnix(sandboxEndUnix(sb))
 	d["metadata"] = sb.Metadata
