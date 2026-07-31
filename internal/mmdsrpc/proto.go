@@ -9,6 +9,8 @@
 // fetched over this RPC instead, one inherited AF_UNIX SOCK_STREAM socketpair
 // per worker, alongside the existing wake/notify/metrics pipes
 // (cmd/node-ctl/proxy.go).
+// The namespace limit must leave headroom below maxFrame because a frame also
+// carries the JSON envelope, sandbox ID, token, and other protocol metadata.
 //
 // The wire is the same length-prefixed JSON framing idiom as
 // internal/routesync, but hand-rolled here rather than shared: routesync's

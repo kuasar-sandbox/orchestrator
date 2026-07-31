@@ -6,7 +6,9 @@ import "sync"
 // canonical kuasar-sandbox.mmds specifications (see internal/sandboxcfg.ExtractMMDS).
 // Deliberately NOT part of the
 // fixed-layout mmap Table: a specification is bounded but variable-length (up to
-// mmds.routes.max_namespace_bytes, default 64KiB), and most sandboxes specify
+// mmds.routes.max_namespace_bytes, default 64KiB). This limit must leave
+// headroom below the transport frame limit for the frame envelope and other
+// protocol metadata. Most sandboxes specify
 // none -- a fixed mmap field sized for the worst case would multiply by the
 // table's record capacity regardless of use. Workers reach this store over
 // internal/mmdsrpc (a separate inherited socketpair per worker), since they run

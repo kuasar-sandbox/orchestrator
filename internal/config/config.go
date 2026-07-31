@@ -293,7 +293,11 @@ type MMDSConfig struct {
 type MMDSRoutesConfig struct {
 	Enabled              bool     `yaml:"enabled"`
 	MaxRoutesPerSandbox  int      `yaml:"max_routes_per_sandbox"` // total routes[] cap, across all types
-	MaxNamespaceBytes    int      `yaml:"max_namespace_bytes"`    // raw kuasar-sandbox.mmds JSON cap
+	// MaxNamespaceBytes caps the complete raw kuasar-sandbox.mmds JSON,
+	// including static route bodies. Keep it comfortably below the transport
+	// frame limit because a frame also carries the JSON envelope, sandbox ID,
+	// token, and other protocol metadata.
+	MaxNamespaceBytes    int      `yaml:"max_namespace_bytes"`
 	ReservedPathPrefixes []string `yaml:"reserved_path_prefixes"`
 
 	Static  MMDSStaticRoutesConfig  `yaml:"static"`
@@ -303,7 +307,9 @@ type MMDSRoutesConfig struct {
 
 // MMDSStaticRoutesConfig is node policy specific to type:"static" routes.
 type MMDSStaticRoutesConfig struct {
-	MaxBodyBytes int `yaml:"max_body_bytes"` // one static route's specified data
+	// MaxBodyBytes limits the data of one static route. The data is also part of
+	// the complete namespace accounted for by MaxNamespaceBytes.
+	MaxBodyBytes int `yaml:"max_body_bytes"`
 }
 
 // MMDSSecretRoutesConfig is node policy specific to type:"secret" routes.
