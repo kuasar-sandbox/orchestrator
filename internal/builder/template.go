@@ -174,9 +174,9 @@ func (p *buildPipeline) uploadImage() (string, error) {
 }
 
 func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
-	// upload-snapshot auto-uploads every local artifact the snapshot.cfg
-	// references (the base image is a bundle-dir sibling) and rewrites
-	// the refs to manifest:// — one command finishes the build.
+	// upload-snapshot publishes every local artifact the snapshot.cfg
+	// references (the base image is a bundle-dir sibling) to the configured
+	// portable backend — one command finishes the build.
 	p.progress("uploading template snapshot to the content store")
 	args := []string{"upload-snapshot", "--quiet"}
 	if p.spec.ToRefLocation != "" {

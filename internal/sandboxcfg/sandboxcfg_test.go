@@ -200,7 +200,7 @@ func TestBuildRendersPrefetchOnlyForRestore(t *testing.T) {
 	}
 
 	resume := baseParams(types.ProfileE2B)
-	resume.Sandbox.SnapshotRef = strings.Repeat("b", 64)
+	resume.Sandbox.SnapshotRef = "manifest://" + strings.Repeat("b", 64)
 	resume.Spec.Restore.Prefetch = "memory"
 	b, err = resume.BuildYAML()
 	if err != nil {

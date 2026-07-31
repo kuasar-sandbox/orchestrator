@@ -1036,7 +1036,7 @@ func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox) (string,
 }
 
 // snapshotRemote uploads the snapshot to the manifest store; stdout is the bare
-// 64-hex manifest key. Used for remote checkpoints and (always) template builds.
+// 64-hex manifest key. Used for remote checkpoints without a named location.
 func (o *Orchestrator) snapshotRemote(ctx context.Context, sb *types.Sandbox) (string, error) {
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "snapshot",
 		"--sandbox-id", sb.ID, "--upload", "--run-root", o.cfg.Paths.RunRoot)

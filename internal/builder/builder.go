@@ -33,10 +33,10 @@
 //
 // The finale uploads what was produced — platform credentials appear ONLY
 // here: an image-only build runs `manifest-ctl store image.img`; a snapshot
-// build runs ONE `sandbox-ctl upload-snapshot` (it auto-uploads every local
-// artifact the snapshot.cfg references, the base image included, and
-// rewrites the refs to manifest://). The result returns to the orchestrator over
-// the config-socket.
+// build runs ONE `sandbox-ctl upload-snapshot` (it publishes every local
+// artifact the snapshot.cfg references, the base image included, to the
+// configured portable backend). The result returns to the orchestrator over the
+// config-socket.
 package builder
 
 import (
