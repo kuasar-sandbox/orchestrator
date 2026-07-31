@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
@@ -174,7 +175,7 @@ func TestServeReserveRejectsCredentialsInvalidForPlacedProfile(t *testing.T) {
 			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
 		}
 		return &Placement{
-			NodeID: "n1", TemplateRef: "bare-img-" + strings.Repeat("a", 64),
+			NodeID: "n1", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 			APISecretFingerprint: testAPIFingerprint,
 		}, nil
 	}), 0, nil)

@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"sort"
 	"syscall"
 	"time"
 
@@ -51,9 +51,8 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		"--stdout-to", "journald=" + buildTag,
 		"--stderr-to", "journald=" + buildTag,
 		"--console", "journald=" + consoleTag}
-	if strings.HasPrefix(p.baseRef, "manifest://") || s.FromTemplateKind != "" {
-		args = append(args, "--manifest-config", s.Paths.ManifestConfig)
-	}
+	args = append(args, "--manifest-config", s.Paths.ManifestConfig)
+	args = appendRefLocationArgs(args, s.RefLocations)
 	for _, c := range connect {
 		args = append(args, "--connect", c)
 	}
@@ -75,6 +74,18 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	}()
 	p.log.Info("phase sandbox up", "phase", phase, "sid", sid)
 	return sb, nil
+}
+
+func appendRefLocationArgs(args []string, locations map[string]string) []string {
+	names := make([]string, 0, len(locations))
+	for name := range locations {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		args = append(args, "--ref-location", name+"="+locations[name])
+	}
+	return args
 }
 
 // waitExecReady polls a cheap in-guest command until the control plane

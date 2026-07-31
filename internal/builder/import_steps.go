@@ -170,8 +170,8 @@ func (p *buildPipeline) useImportRefererHit(id string) error {
 	if err != nil {
 		return fmt.Errorf("validate referer manifest %s: %w (%s)", id, err, firstLine(out))
 	}
-	p.baseImageKey = id
-	p.baseRef = "manifest://" + id
+	p.baseImageRef = "manifest://" + id
+	p.baseRef = p.baseImageRef
 	p.imagePath = ""
 	p.overlayBase = ""
 	return nil
@@ -313,9 +313,10 @@ func (p *buildPipeline) phaseSteps() error {
 	if err := os.Rename(newImg, p.imagePath); err != nil {
 		return err
 	}
-	p.baseImageKey = ""
+	p.baseImageRef = ""
 	p.baseRef = "file://" + p.imagePath
 	p.overlayBase = "" // the exported image flattens base+overlay+steps into one layer
+	p.overlayBaseFromRefs = nil
 	return nil
 }
 

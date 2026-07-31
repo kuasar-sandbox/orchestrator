@@ -164,7 +164,7 @@ func TestRestoreNetworkPrecedenceFeedsAttachAndGuestFromSameSpec(t *testing.T) {
 	}
 	params := o.sandboxParams(
 		&types.Sandbox{InnerIP: network.InnerIP},
-		types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Key: strings.Repeat("a", 64)},
+		types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)},
 		sandboxcfg.SandboxSpec{},
 		network,
 	)
@@ -259,7 +259,7 @@ printf '%s' '{"Metadata":{"kuasar-sandbox.network":"{\"hostname\":\"source\",\"i
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 	key := strings.Repeat("a", 64)
 	got, err := o.sourceTemplateNetwork(context.Background(), &types.Build{
-		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Key: key}.String(),
+		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + key}.String(),
 		ManifestKey:  strings.Repeat("b", 64),
 	})
 	if err != nil {
@@ -271,7 +271,7 @@ printf '%s' '{"Metadata":{"kuasar-sandbox.network":"{\"hostname\":\"source\",\"i
 	}
 
 	imageNetwork, err := o.sourceTemplateNetwork(context.Background(), &types.Build{
-		FromTemplate: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Key: key}.String(),
+		FromTemplate: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + key}.String(),
 	})
 	if err != nil || !imageNetwork.IsZero() {
 		t.Fatalf("image source network = %+v, err=%v", imageNetwork, err)

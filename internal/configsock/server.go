@@ -94,8 +94,8 @@ type AssignmentResponse struct {
 }
 
 type BuildResult struct {
-	ImageKey    string `json:"image_key,omitempty"`
-	SnapshotKey string `json:"snapshot_key,omitempty"`
+	ImageRef    string `json:"image_ref,omitempty"`
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
 	StartCmd    string `json:"start_cmd,omitempty"`
 	ReadyCmd    string `json:"ready_cmd,omitempty"`
 	Error       string `json:"error,omitempty"`
@@ -146,8 +146,10 @@ type BuildSpec struct {
 	RunID            string                 `json:"run_id,omitempty"`
 	Workdir          string                 `json:"workdir"` // build scratch dir (artifacts, run roots)
 	FromImage        string                 `json:"from_image,omitempty"`
-	FromTemplate     string                 `json:"from_template,omitempty"` // snapshot manifest key (hex) of the base template
+	FromTemplateRef  string                 `json:"from_template_ref,omitempty"`
 	FromTemplateKind string                 `json:"from_template_kind,omitempty"`
+	RefLocations     map[string]string      `json:"ref_locations,omitempty"`
+	ToRefLocation    string                 `json:"to_ref_location,omitempty"`
 	Steps            []BuildStep            `json:"steps,omitempty"`
 	StartCmd         string                 `json:"start_cmd,omitempty"`
 	ReadyCmd         string                 `json:"ready_cmd,omitempty"`

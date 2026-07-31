@@ -35,9 +35,9 @@ package main
 //
 // The finale uploads what was produced — platform credentials appear ONLY
 // here: an image-only build runs `manifest-ctl store image.img`; a snapshot build
-// runs ONE `sandbox-ctl upload-snapshot` (it auto-uploads every local artifact the
-// snapshot.cfg references, the base image included, and rewrites the refs to
-// manifest://). The result returns over the config-socket.
+// runs ONE `sandbox-ctl upload-snapshot` (it publishes every local artifact the
+// snapshot.cfg references, the base image included, to the configured portable
+// backend). The result returns over the config-socket.
 
 import (
 	"context"
@@ -90,7 +90,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 
 	res := builder.Run(spec, log)
 	post := configsock.BuildResult{
-		ImageKey: res.ImageKey, SnapshotKey: res.SnapshotKey,
+		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
 	if err := configsock.PostBuildResult(*socket, *runID, bid, post); err != nil {

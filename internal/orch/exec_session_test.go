@@ -26,7 +26,7 @@ func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
 		ID:                 "stable-g2",
 		Profile:            types.ProfileBare,
 		AuthSandboxIDValue: "stable",
-		TemplateID:         "bare-img-" + strings.Repeat("b", 64),
+		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:              types.StateRunning,
 		APISecret:          deriveTestAPISecret(t, manifestKey),
 		ManifestKey:        manifestKey,
@@ -59,7 +59,7 @@ func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
 func TestExecSessionWithoutTTLIsLongLived(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "bare-1", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("2", 64), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("2", 64)}.String(), State: types.StateRunning,
 		ServiceSecret: strings.Repeat("1", 64),
 	}
 	token, err := mintExecSessionToken(sb, 0, 1)
@@ -78,7 +78,7 @@ func TestExecSessionTTLStartsAtSigningAfterTargetPreparation(t *testing.T) {
 	_, apiKey := defaultTestCredentials(t, manifestKey)
 	sb := &types.Sandbox{
 		ID: "signing-time", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("5", 64), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("5", 64)}.String(), State: types.StateRunning,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
 	}
@@ -124,7 +124,7 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 	}
 	source := &types.Sandbox{
 		ID: "exec-portable-source", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StatePaused,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StatePaused,
 		SnapshotRef: "manifest://" + strings.Repeat("e", 64),
 		APISecret:   apiSecret, ManifestKey: manifestKey,
 		CreatedUnix: 1, DeadlineUnix: 100,
@@ -215,7 +215,7 @@ func TestExecSessionRejectsDeadAndInconsistentSandbox(t *testing.T) {
 	_, apiKey := defaultTestCredentials(t, manifestKey)
 	dead := &types.Sandbox{
 		ID: "dead-exec", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("7", 64), State: types.StateDead,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(), State: types.StateDead,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
 	}
@@ -228,7 +228,7 @@ func TestExecSessionRejectsDeadAndInconsistentSandbox(t *testing.T) {
 	}
 	inconsistent := &types.Sandbox{
 		ID: "bad-template", Profile: types.ProfileBare,
-		TemplateID: "e2b-img-" + strings.Repeat("8", 64), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("8", 64)}.String(), State: types.StateRunning,
 		ServiceSecret: strings.Repeat("9", 64),
 	}
 	if _, err := mintExecSessionToken(inconsistent, 0, 1); err == nil {

@@ -286,6 +286,28 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+persist_ref() {
+    python3 - "$1" <<'PY'
+import base64
+import re
+import sys
+
+try:
+    profile, kind, payload = sys.argv[1].split("-", 2)
+    if profile not in {"e2b", "bare"} or kind not in {"img", "snp"}:
+        raise ValueError
+    raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    if base64.urlsafe_b64encode(raw).decode().rstrip("=") != payload:
+        raise ValueError
+    ref = raw.decode()
+    if not re.fullmatch(r"manifest://[0-9a-f]{64}", ref):
+        raise ValueError
+except (ValueError, UnicodeDecodeError):
+    raise SystemExit(1)
+print(ref)
+PY
+}
+valid_persist_id() { persist_ref "$1" >/dev/null; }
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
@@ -305,7 +327,7 @@ diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- journal build $1 (tail) ----"
     journalctl KUASAR_BUILD_ID="$1" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
 }
-wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<64hex>)
+wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(portable-ref)>)
     local tid="$1" bid="$2" label="$3" status="" code
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
@@ -314,7 +336,7 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<64hex>)
         case "$status" in
             ready)
                 PERSIST=$(json_field "$WORK/resp.body" templateID)
-                [[ "$PERSIST" =~ ^(e2b|bare)-(img|snp)-[0-9a-f]{64}$ ]] || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
+                valid_persist_id "$PERSIST" || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
                 return 0;;
             error)
                 echo "    $label error response: $(cat "$WORK/resp.body")"
@@ -379,10 +401,11 @@ echo "==> PASS: B2 ready → $B2_PERSIST"
 # Deep asserts through the artifact chain: the uploaded snapshot.cfg names a
 # manifest:// base image and carries the e2b start/ready metadata; the base
 # image's runtime config holds the merged ENV/WORKDIR from the steps.
-B2_HEX="${B2_PERSIST##*-}"
+B2_REF=$(persist_ref "$B2_PERSIST") \
+    || fail "B2 persist id does not contain a valid portable ref: $B2_PERSIST"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
-    "manifest://$B2_HEX" >"$WORK/b2.cfg.json" 2>"$WORK/b2.cfg.err" \
-    || { cat "$WORK/b2.cfg.err"; fail "sandbox-ctl info manifest://$B2_HEX"; }
+    "$B2_REF" >"$WORK/b2.cfg.json" 2>"$WORK/b2.cfg.err" \
+    || { cat "$WORK/b2.cfg.err"; fail "sandbox-ctl info $B2_REF"; }
 grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \

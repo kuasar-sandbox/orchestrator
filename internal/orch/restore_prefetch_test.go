@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestCreateRejectsInvalidRestoreBeforeLaunchSideEffects(t *testing.T) {
@@ -23,7 +24,7 @@ func TestCreateRejectsInvalidRestoreBeforeLaunchSideEffects(t *testing.T) {
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
 	req := api.CreateReq{
 		APIKey:     apiKey,
-		TemplateID: "bare-img-" + strings.Repeat("a", 64),
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		TimeoutSec: 60,
 		Metadata: map[string]string{
 			sandboxcfg.NsRestore: `{"prefetch":"eager"}`,

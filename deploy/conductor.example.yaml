@@ -143,12 +143,14 @@ builder:
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 #   # dampening: { recover_duration: 60s, cooldown_periods: 10 }
 
-# Paused-state tiering. On pause a sandbox's snapshot is written either to node-local
-# files (mode=local, default) or straight to the remote manifest store (mode=remote;
-# portable = a template). A local checkpoint is promoted via `node-ctl export-sandbox`.
+# Paused-state tiering. mode=local writes a node-local bundle; mode=remote uploads
+# directly to manifest unless ref_location_parent is configured. Named-location
+# publishing keeps pause local and upgrades it during export, outside VM capture.
 checkpoint:
   mode: local
   local_dir: /var/lib/sandbox-saved
+  # remote:
+  #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
 
 # mmds: optional envd metadata service for FC-mode token re-keying.
 #   disabled (default) — envd runs non-secure; the proxy enforces X-Access-Token as the

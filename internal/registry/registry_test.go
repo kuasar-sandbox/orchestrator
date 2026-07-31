@@ -42,7 +42,7 @@ const testAPISecret = "ffeeddccbbaa99887766554433221100ffeeddccbbaa9988776655443
 const testAPIFingerprint = "5df404c22ba4e956e7ef06b6499f07ee62894450c25c928a7f5db26f6ea499a4"
 const testEnvdAccessToken = "test-envd-access-token"
 const testTrafficAccessToken = "test-traffic-access-token"
-const testTemplateRef = "e2b-snp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testTemplateRef = "e2b-snp-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh"
 
 func testE2BRoute(sandboxID, state string) routesync.RouteEntry {
 	nodeSandboxID := EncodeNodeSandboxID(sandboxID, 0)
@@ -2130,7 +2130,7 @@ func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 	reg := testReg(t)
 	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		return &Placement{
-			NodeID: "candidate", TemplateRef: "bare-img-" + strings.Repeat("b", 64),
+			NodeID: "candidate", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 			APISecretFingerprint: testAPIFingerprint,
 		}, nil
 	}))
@@ -2356,7 +2356,7 @@ func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T)
 			t.Fatalf("credentials leaked into placement config: %+v", req.Config)
 		}
 		return &Placement{
-			NodeID: "candidate", TemplateRef: "bare-img-" + strings.Repeat("b", 64),
+			NodeID: "candidate", TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 			APISecretFingerprint: testAPIFingerprint,
 		}, nil
 	}))

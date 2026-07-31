@@ -457,21 +457,27 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
-	if b.Profile == types.ProfileBare && (res.SnapshotKey != "" || res.StartCmd != "" || res.ReadyCmd != "") {
+	if b.Profile == types.ProfileBare && (res.SnapshotRef != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
 		_ = o.st.PutBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
 	switch {
-	case res.SnapshotKey != "":
+	case res.SnapshotRef != "":
 		b.Kind = types.KindSnp
-		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindSnp, Key: res.SnapshotKey}.String()
-	case res.ImageKey != "":
+		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindSnp, Ref: res.SnapshotRef}.String()
+	case res.ImageRef != "":
 		b.Kind = types.KindImg
-		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Key: res.ImageKey}.String()
+		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Ref: res.ImageRef}.String()
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
+		_ = o.st.PutBuild(ctx, b)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		return
+	}
+	if _, err := types.ParseTemplateID(b.PersistID); err != nil {
+		b.Status, b.Reason = types.BuildError, "build produced invalid portable ref: "+err.Error()
 		_ = o.st.PutBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
@@ -641,13 +647,26 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		}
 		steps = append(steps, bs)
 	}
-	fromTemplate, fromTemplateKind := "", ""
+	fromTemplateRef, fromTemplateKind := "", ""
+	var refLocations map[string]string
 	if b.FromTemplate != "" {
 		t, err := types.ParseTemplateID(b.FromTemplate)
 		if err != nil {
 			return nil, "", false, err
 		}
-		fromTemplate, fromTemplateKind = t.Key, string(t.Kind)
+		fromTemplateRef, fromTemplateKind = t.Ref, string(t.Kind)
+		refLocations, err = o.templateRefLocations(ctx, b.ManifestKey, t)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
+	toRefLocation := ""
+	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
+		uri, err := o.cfg.Checkpoint.RefLocationURI(b.BuildID)
+		if err != nil {
+			return nil, "", false, err
+		}
+		toRefLocation = b.BuildID + "=" + uri
 	}
 
 	// Phase-C VM capacity: the template's declared resource.capacity (register
@@ -673,8 +692,10 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		RunID:            b.RunID,
 		Workdir:          pend.workdir,
 		FromImage:        b.FromImage,
-		FromTemplate:     fromTemplate,
+		FromTemplateRef:  fromTemplateRef,
 		FromTemplateKind: fromTemplateKind,
+		RefLocations:     refLocations,
+		ToRefLocation:    toRefLocation,
 		Steps:            steps,
 		StartCmd:         b.StartCmd,
 		ReadyCmd:         b.ReadyCmd,
@@ -752,7 +773,7 @@ func (o *Orchestrator) sourceTemplateNetwork(ctx context.Context, b *types.Build
 	if tmpl.Kind != types.KindSnp {
 		return sandboxcfg.NetworkSpec{}, nil
 	}
-	cfg, err := o.inspectSnapshotConfig(ctx, b.ManifestKey, tmpl.ManifestRef())
+	cfg, err := o.inspectSnapshotConfig(ctx, b.ManifestKey, tmpl.Ref)
 	if err != nil {
 		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
 	}

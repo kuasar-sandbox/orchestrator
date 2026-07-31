@@ -118,7 +118,7 @@ func TestParseSpecNetworkValidation(t *testing.T) {
 }
 
 func baseParams(profile types.Profile) Params {
-	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Key: strings.Repeat("a", 64)}
+	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}
 	return Params{
 		Sandbox:  &types.Sandbox{ID: "s1", TemplateID: tmpl.String(), InnerIP: "10.0.0.5/30", PortMAC: "02:00:00:00:00:01"},
 		Template: tmpl, Runtime: "/r/sandbox-runtime.bundle", Kernel: "/r/vmlinux",
@@ -200,7 +200,7 @@ func TestBuildRendersPrefetchOnlyForRestore(t *testing.T) {
 	}
 
 	resume := baseParams(types.ProfileE2B)
-	resume.Sandbox.SnapshotRef = strings.Repeat("b", 64)
+	resume.Sandbox.SnapshotRef = "manifest://" + strings.Repeat("b", 64)
 	resume.Spec.Restore.Prefetch = "memory"
 	b, err = resume.BuildYAML()
 	if err != nil {

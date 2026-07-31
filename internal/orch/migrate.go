@@ -15,7 +15,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -54,31 +53,31 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if sb.Profile != tmpl.Profile {
 		return "", fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
 	}
-	// Ensure the snapshot is remote (portable). A local checkpoint is a bundle
-	// path; promote it to a manifest and repoint the row (local files redundant).
+	// Ensure the snapshot is portable. A local checkpoint is published through
+	// the configured manifest or named-location publisher and then repointed.
 	ref := sb.SnapshotRef
-	if !strings.HasPrefix(ref, "manifest://") {
+	if !types.IsPortableRef(ref) {
 		localRef := ref
-		mref, err := o.promote(ctx, sb, localRef)
+		portableRef, err := o.promote(ctx, sb, localRef)
 		if err != nil {
 			return "", err
 		}
-		if err := o.st.SetSnapshotRef(ctx, sid, mref); err != nil {
+		if err := o.st.SetSnapshotRef(ctx, sid, portableRef); err != nil {
 			return "", fmt.Errorf("export-sandbox: persist promoted snapshot ref for %s: %w", sid, err)
 		}
-		sb.SnapshotRef, ref = mref, mref
+		sb.SnapshotRef, ref = portableRef, portableRef
 		o.cache(sb)
 		o.publishUpsert(sb)
 		if err := os.RemoveAll(filepath.Dir(localRef)); err != nil {
 			o.log.Warn("export-sandbox: remove redundant local snapshot", "sid", sid, "path", filepath.Dir(localRef), "err", err)
 		}
 	}
-	key := strings.TrimPrefix(ref, "manifest://")
-
 	if toTemplate {
-		// A remote snapshot manifest IS a template: assemble the self-describing
-		// persist id. No builds row — usable directly via `e2b sandbox create`.
-		return types.TemplateID{Profile: tmpl.Profile, Kind: types.KindSnp, Key: key}.String(), nil
+		id := types.TemplateID{Profile: tmpl.Profile, Kind: types.KindSnp, Ref: ref}.String()
+		if _, err := types.ParseTemplateID(id); err != nil {
+			return "", fmt.Errorf("export-sandbox: snapshot template: %w", err)
+		}
+		return id, nil
 	}
 
 	tok, err := o.mintSandboxToken(sb, ref)

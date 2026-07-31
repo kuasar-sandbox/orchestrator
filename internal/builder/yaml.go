@@ -100,6 +100,9 @@ func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
 	if p.overlayBase != "" {
 		overlay["base"] = p.overlayBase
 	}
+	if len(p.overlayBaseFromRefs) > 0 {
+		overlay["base_from_refs"] = p.overlayBaseFromRefs
+	}
 	return map[string]any{"base": p.baseRef, "overlay": overlay}
 }
 

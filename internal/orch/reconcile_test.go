@@ -58,7 +58,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	failedUnit := "sandbox-runner@sr-00000000-0000-7000-8000-000000000003.service"
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
-		ID: "sandbox-1", TemplateID: "bare-img-" + strings.Repeat("b", 64),
+		ID: "sandbox-1", TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		Profile: types.ProfileBare, State: types.StateRunning, RunID: knownRun,
 		RunDir:    filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
 		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),

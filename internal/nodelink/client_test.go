@@ -45,7 +45,7 @@ type testPlacer struct{}
 func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
 	return &registry.Placement{
 		NodeID:               "n1",
-		TemplateRef:          "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		TemplateRef:          "e2b-img-bWFuaWZlc3Q6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh",
 		APISecretFingerprint: testFingerprint(testAPISecret),
 	}, nil
 }

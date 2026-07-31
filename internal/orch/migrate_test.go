@@ -277,7 +277,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 
 	for name, expected := range map[string]migrationtoken.Expectations{
 		"subject":  {AuthSandboxID: "different-subject"},
-		"template": {TemplateID: "e2b-snp-" + strings.Repeat("c", 64)},
+		"template": {TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("c", 64)}.String()},
 		"profile":  {Profile: types.ProfileBare},
 		"snapshot": {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
 	} {
@@ -318,7 +318,7 @@ func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
 
 func TestMintSandboxTokenRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
 	o := testOrch(t)
-	sb := &types.Sandbox{Profile: types.ProfileBare, TemplateID: "e2b-snp-" + strings.Repeat("a", 64)}
+	sb := &types.Sandbox{Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()}
 	if _, err := o.mintSandboxToken(sb, "manifest://"+strings.Repeat("b", 64)); err == nil ||
 		!strings.Contains(err.Error(), "does not match template profile") {
 		t.Fatalf("mint mismatch error = %v", err)
@@ -364,6 +364,48 @@ func TestExportPromotesLocalSnapshotState(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(localRef)); !os.IsNotExist(err) {
 		t.Fatalf("redundant local snapshot directory still exists: %v", err)
+	}
+}
+
+func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
+	o := testOrchCfg(t, cfg)
+	ctx := context.Background()
+	mk := strings.Repeat("7", 64)
+	_, apiKey := defaultTestCredentials(t, mk)
+	sid := "0198f7a1-1234"
+	localRef := makeLocalSnapshot(t, dir, sid)
+	portableRef := "file://" + strings.Repeat("c", 64) + ".snapshot@location:" + sid
+	argsPath := filepath.Join(dir, "promote.args")
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\nprintf '%s\\n' '" + portableRef + "'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "sandbox-ctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	sb := migrationSandbox(t, dir, sid, mk, localRef)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := types.ParseTemplateID(templateID)
+	if err != nil || tmpl.Ref != portableRef || tmpl.Kind != types.KindSnp {
+		t.Fatalf("template = %#v, %v", tmpl, err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locationURI, _ := cfg.Checkpoint.RefLocationURI(sid)
+	if !strings.Contains(string(args), "--to-ref-location "+sid+"="+locationURI) {
+		t.Fatalf("promote args = %q", args)
 	}
 }
 
@@ -452,7 +494,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 	t.Helper()
 	sb := &types.Sandbox{
-		ID: sid, Profile: types.ProfileE2B, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
+		ID: sid, Profile: types.ProfileE2B, TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), State: types.StatePaused,
 		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
 	}

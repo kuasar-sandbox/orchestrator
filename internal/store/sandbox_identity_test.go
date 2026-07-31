@@ -16,7 +16,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 	cluster := &types.Sandbox{
 		ID: "stable-g3", Profile: types.ProfileBare,
 		Cluster:            &types.ClusterSandboxContext{Group: "/tenant", RouteKey: "worker"},
-		AuthSandboxIDValue: "stable", TemplateID: "bare-img-" + strings.Repeat("a", 64),
+		AuthSandboxIDValue: "stable", TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
@@ -36,7 +36,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 
 	standalone := &types.Sandbox{
 		ID: "import-target", Profile: types.ProfileE2B, AuthSandboxIDValue: "source-subject",
-		TemplateID: "e2b-snp-" + strings.Repeat("b", 64), State: types.StatePaused,
+		TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), State: types.StatePaused,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 2,
 	}
 	setTestSandboxServiceCredentials(standalone)
@@ -59,7 +59,7 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "stable-g0", Profile: types.ProfileBare,
 		Cluster:            &types.ClusterSandboxContext{Group: "/original", RouteKey: "route"},
-		AuthSandboxIDValue: "stable", TemplateID: "bare-img-" + strings.Repeat("c", 64),
+		AuthSandboxIDValue: "stable", TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("c", 64)}.String(),
 		State: types.StateRunning, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
 		CreatedUnix: 1,
 	}
@@ -94,7 +94,7 @@ func TestCASRunStateFencesStaleRunner(t *testing.T) {
 	pair := testKeyPair("5", "6")
 	sb := &types.Sandbox{
 		ID: "stable-g0", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StateRunning,
 		RunID: "sandbox-current", APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
 	}
 	setTestSandboxServiceCredentials(sb)
@@ -119,7 +119,7 @@ func TestSandboxIdentityValidation(t *testing.T) {
 	pair := testKeyPair("5", "6")
 	base := types.Sandbox{
 		ID: "sandbox", Profile: types.ProfileBare,
-		TemplateID: "bare-img-" + strings.Repeat("d", 64), State: types.StateRunning,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StateRunning,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
 	}
 	setTestSandboxServiceCredentials(&base)

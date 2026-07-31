@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func roundTrip(t *testing.T, m *Msg) *Msg {
@@ -40,7 +42,7 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
 		CmdID: "x1", Kind: CmdCreate, SID: "stable-g0", Profile: "bare",
 		Cluster:     &ClusterSandboxContext{Group: "/c/p/a/g1", RouteKey: "u1:sess1", AuthSandboxID: "stable"},
-		TemplateRef: "bare-img-" + strings.Repeat("b", 64), APISecretFingerprint: strings.Repeat("a", 64),
+		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), APISecretFingerprint: strings.Repeat("a", 64),
 	}})
 	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.SID != "stable-g0" || c.Cmd.Profile != "bare" ||
 		c.Cmd.Cluster == nil || c.Cmd.Cluster.Group != "/c/p/a/g1" || c.Cmd.Cluster.RouteKey != "u1:sess1" ||

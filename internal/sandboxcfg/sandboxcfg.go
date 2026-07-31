@@ -373,7 +373,7 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	// boot.root.base is the read-only rootfs. Cold boot (img) = the flattened image
 	// manifest; restore (snp/resume) lets snapshot.cfg fill it (omit).
 	if p.Template.Kind == types.KindImg {
-		c.Boot.Root.Base = p.Template.ManifestRef()
+		c.Boot.Root.Base = p.Template.Ref
 	}
 	// Restore policy is host-only and meaningful only when this invocation has a
 	// restore ref. Keep image cold boots free of restore configuration while
@@ -533,15 +533,10 @@ func guestFiles(hostname string, dns []string) []rtconfig.FileConfig {
 // (to read the snapshot's inherited config).
 func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
 	if ref := sb.SnapshotRef; ref != "" {
-		// SnapshotRef is a full ref: "manifest://<key>" or a local bundle path. A
-		// scheme-less, non-path value is an older bare manifest key (back-compat).
-		if strings.Contains(ref, "://") || strings.HasPrefix(ref, "/") {
-			return ref
-		}
-		return "manifest://" + ref
+		return ref
 	}
 	if tmpl.Kind == types.KindSnp {
-		return tmpl.ManifestRef()
+		return tmpl.Ref
 	}
 	return ""
 }

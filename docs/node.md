@@ -81,8 +81,9 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 - 不提供 sandbox metrics 端点(e2b API 的 `/sandboxes/{id}/metrics` 面)。
 - 构建不支持 server 端执行 Dockerfile steps:服务端只对一个已存在的镜像引用做拉取 +
   展平(§12)。
-- 节点本地:路由、存储、单元管理都是节点本地的;跨机协作经远程 manifest store 携带
-  快照/模板(§8.1)与 cluster-ctl 的 node-link 编排(§10)。
+- 节点本地:路由、存储、单元管理都是节点本地的;跨机快照/模板使用 canonical
+  portable ref(数据位于 manifest store 或统一挂载的 named location,§8.1),编排走
+  cluster-ctl 的 node-link(§10)。
 - 依赖:stdlib + `modernc.org/sqlite`(纯 Go)+ `golang.org/x/net/http2`(h2c,
   config-socket 与 node-link 共用)+ `golang.org/x/sys`(pidfile 锁 / SO_PEERCRED /
   mmap)+ `coreos/go-systemd`(D-Bus)+ `google/uuid`(v7)+ `gopkg.in/yaml.v3`。
@@ -235,7 +236,7 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
 - **run-builder**:取得 bid 后锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec →
   **驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
-  `{image_key|snapshot_key, start_cmd, ready_cmd, error}` 经 config-socket 回传。
+  `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传。
 
 ```
 node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
@@ -377,8 +378,9 @@ node-ctl 同目录 → PATH"自动发现。
 | `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
-| `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
-| `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
+| `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件/ `remote` = manifest;配置 named location 时 pause 仍先落本机(§8.1) |
+| `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录 |
+| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute `file://` URI;配置后 export/builder 把 local refs 发布到 named location,宿主路径不进入 portable ref |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2,node-proxy.md §7):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
@@ -421,7 +423,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停回 **409** |
 | timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL |
 
-create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<key>`,§4.4)、注册期
+create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<base64url-ref>`,§4.4)、注册期
 transient id、或已 ready 构建的 name/alias——后两者解析到持久 id 再走统一路径。
 `envdVersion` 回 `0.6.1`(e2b)或 stub `0.1.0`(bare,≥0.1.0 否则 SDK 自毁)。bare 无
 envd,不生成也不返回 Envd/Traffic token;两种 profile 都返回独立的
@@ -496,14 +498,15 @@ authority 的 443 只是 transport 占位,不是 guest port;即使请求同时�
 ### 4.4 templateID 与模板形态(transient / persist,无 templates 表)
 
 ```
-persist  templateID = <profile>-<kind>-<key>    profile∈{e2b,bare}; kind∈{img,snp};
-                                                key = manifest content key (64-hex)
+persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
+                                                profile∈{e2b,bare}; kind∈{img,snp}
 transient templateID = transient-<uuidv7>       构建注册期临时句柄,build 完即弃
 ```
 
-- **持久 id 自描述**:即 manifest 键,是 create 的正式 templateID;运行期从前缀解析
-  profile(选 runtime erofs)与 kind(img = 冷启,snp = restore)。格式/枚举不合法
-  当场 4xx。
+- **持久 id 自描述**:payload 是 `manifest://<key>` 或
+  `file://<content-addressed-basename>@location:<name>`;运行期解析 profile(选
+  runtime erofs)、kind(img = 冷启,snp = restore)和 canonical portable ref。
+  local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
 - **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
   之后只用持久 id。
 - **无独立 templates 表**:`builds` 表兼任模板登记(§15);持久 id 由构建产物推导。
@@ -891,7 +894,8 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 
 ### 8.1 暂停态分层、转模板与跨机迁移
 
-沙箱快照有两态,`checkpoint.mode` 选 pause 的默认落地:
+沙箱状态引用分 node-local 与 portable 两类。未配置 named location 时,
+`checkpoint.mode` 选择 pause 的默认落地:
 
 | | **本机快照**(`local`,默认) | **远程快照**(`remote`) |
 |---|---|---|
@@ -900,8 +904,18 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 | 可恢复范围 | 仅本机(恰合"沙箱附着宿主") | 任意共享同一 store 的节点 |
 | 本质 | 暂停态 | **可移植,即模板** |
 
-本机快照可按需晋升:`export-sandbox` 内部走 `sandbox-ctl upload-snapshot <bundle>`
-上传为远程 manifest 并重指 `snapshot_ref`(本机 bundle 随之删除)。全部基于现有
+配置 `checkpoint.remote.ref_location_parent` 后,pause 始终先写本机 bundle,不在 VM
+capture 窗口中写共享文件系统。`export-sandbox` 根据 source sandbox ID 计算:
+
+```text
+hash = SHA256(location-name)
+location URI = <parent>/<hash[0:2]>/<hash[2:4]>/<location-name>
+```
+
+随后用 `upload-snapshot --to-ref-location` 发布,得到
+`file://<digest>.snapshot@location:<source-sid>`。没有 parent 时仍发布到 manifest。
+两者都是 canonical portable ref;数据库成功重指后才 best-effort 删除明确的本机
+checkpoint,located 目录绝不进入本机 cleanup。全部基于现有
 sandbox-ctl 原语(`snapshot --output|--upload`、`upload-snapshot`、`run --restore`),
 e2b API/CLI 零改动。
 
@@ -910,25 +924,26 @@ e2b API/CLI 零改动。
 `api.listen` 上同样可达(api-key 已按租户隔离),晋升/导出/插行全由 daemon 进程内
 完成,无第二写者。
 
-- **晋升 / 转模板**(`--to-template`,须 paused):确保远程后,组装并打印自描述持久
-  id `<profile>-snp-<key>`(不写 builds 表)。之后 `e2b sandbox create <id>` 即从该
-  快照扇出新沙箱(新 sid);create 由 api_key→白名单解析完整凭据对,再以 ManifestKey
-  访问快照内容。
-- **迁移 token**:`export-sandbox <sid>` 确保远程后导出
+- **晋升 / 转模板**(`--to-template`,须 paused):确保 portable 后,把完整 SnapshotRef
+  以 base64url-no-padding 编进 `<profile>-snp-<payload>`(不写 builds 表)。之后
+  `e2b sandbox create <id>` 即从该快照扇出新沙箱(新 sid)。
+- **迁移 token**:`export-sandbox <sid>` 确保 portable 后导出
   `kmt1.<base64url-no-padding(nonce|ciphertext)>`。ManifestKey 经
   `HMAC-SHA256(decodeHex(ManifestKey),"kuasar-migration-token-v1")` 派生 AES-256-GCM
   key,每次 export 使用随机 12-byte nonce。完整 wire 上限 512 KiB,旧 plain-base64
   token 不再接受。
 - **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`AuthSandboxID()`、Profile、
-  template/snapshot/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
+  template/canonical portable SnapshotRef/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
   以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
-  Group/RouteKey 或 generation。目标 node 从本地 key 表取得完整 pair,
+  host absolute path、Group/RouteKey 或 generation。目标 node 从本地 key 表取得完整 pair,
   校验 fingerprints/runtime/Profile/Forward KAT 后原样落库,不重新派生或生成 service credential。
 - **target 与冲突**:standalone import 省略 `sandboxID` 时复用 source NodeSandboxID;显式 target
   只替换本地 ID,保留 AuthSandboxID 与全部 credential。ID 使用 1..57 bytes 的 lowercase
   DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
   已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
-  目标机须共享同一 `manifest_config`(远程 store)并预装匹配的 tenant pair。
+  目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
+  `ref_location_parent` 部署映射。启动前 conductor 递归读取 snapshot `from_refs`,收集
+  graph 中实际出现的全部 location name,逐个派生 URI 并展开为 `--ref-location`。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
   decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
@@ -1169,7 +1184,7 @@ plugin 平面,机群路由经 registry 聚合。
 让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → 从 builder pool 分配 run-id
 (无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
-`img`,持久 id `<profile>-<kind>-<key>` 写入 names/aliases。profile 从注册到
+`img`,持久 id `<profile>-<kind>-<base64url(portable-ref)>` 写入 names/aliases。profile 从注册到
 BuildSpec 全链路显式携带。register/trigger 在入队前校验最终 network metadata;
 执行时只解析一次并补齐 profile/node 默认值,同一个 `NetworkSpec` 同时派生 host
 `vswitch.AttachReq` 与 guest `BuildNet`。`transit_*` 只在 host Attach 消费,不进入
@@ -1220,11 +1235,12 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 工件流回、就绪探针)走 `sandbox-ctl exec`——任意 rootfs 可用、裸 stdio 接力,
 不依赖镜像 userland。
 
-**fromTemplate**:base 来自既有模板——img 模板直接用其镜像 key;snp 模板经
-`sandbox-ctl info --json manifest://<key>` 读 snapshot.cfg 取 `base_ref`,并继承
+**fromTemplate**:base 来自既有模板——img 模板直接用 canonical image ref;snp 模板经
+`sandbox-ctl info --json <portable-ref>` 读 snapshot.cfg 取 `base_ref`,并继承
 metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
 与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。bare 不继承
-e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。snp 源模板的
+e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。overlay top 与
+`base_from_refs` 保持显式 top-to-bottom 数组,不编码复合 manifest ref。snp 源模板的
 `kuasar-sandbox.network` 在 host Attach 前读取并按字段继承,优先级为
 **当前 Build 显式 NetworkSpec > 源 snapshot NetworkSpec > 当前 profile/node 默认值**;
 img 源模板没有 snapshot metadata 通道,不从本地数据库增加入口相关的隐式回退。
@@ -1254,12 +1270,12 @@ COPY)。三段:
 唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`guest-runtime/native-deps make
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
-**收尾上传(平台凭据唯一出现点)**:img-only(包括所有 bare build) ⇒ `manifest-ctl store image.img`
-(stdout = 64-hex manifest key;若 import referer hit/miss 已得到 base manifest id 则直接
-复用);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <bundle>`——自动上传
-snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用改写为
-`manifest://`(runtime_ref 不动,宿主提供)。结果
-`{image_key|snapshot_key, start_cmd, ready_cmd, error}` 经 config-socket 回传;
+**收尾发布(平台凭据唯一出现点)**:img-only(包括所有 bare build) ⇒ `manifest-ctl store image.img`
+(stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用);
+产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <bundle>`。配置
+`ref_location_parent` 时使用 build ID 作为 location name 发布到 named location,
+否则发布到 manifest。结果
+`{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传;
 快照模板的 start/ready 与模板有效 `NetworkSpec` 同时记进 snapshot.cfg metadata,
 模板自描述(fromTemplate 继承与 create 都读它);未显式声明 hostname 时这里记录正常
 sandbox 默认值,绝不记录 `build-<id>`。
@@ -1356,7 +1372,7 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
                created_unix
-builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<key>),
+builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<base64url-ref>),
                api_secret_hash, api_secret_enc, manifest_key_hash, manifest_key_enc,
                profile, kind, from_image,
                start_cmd, status(registered|waiting|building|ready|error), reason,

@@ -9,8 +9,11 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -463,14 +466,37 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 	return time.Hour
 }
 
-// CheckpointConfig is the paused-state tiering policy. A sandbox pause writes its
-// snapshot either to node-local files (mode=local, default; restorable only on
-// this node — matches the sandbox-bound lifecycle) or straight to the remote
-// manifest store (mode=remote; portable = a template). A local checkpoint is
-// promoted to remote on demand via `node-ctl export-sandbox`.
+// CheckpointConfig is the paused-state tiering and portable-publish policy.
+// Without a named location, mode=remote uploads directly to manifest storage.
+// With a named location, pause stays local and export/build publish outside the
+// capture window.
 type CheckpointConfig struct {
-	Mode     string `yaml:"mode"`      // local (default) | remote
-	LocalDir string `yaml:"local_dir"` // local checkpoint files dir (mode=local); default /var/lib/sandbox-saved
+	Mode     string                 `yaml:"mode"`      // local (default) | remote
+	LocalDir string                 `yaml:"local_dir"` // local checkpoint files dir; default /var/lib/sandbox-saved
+	Remote   CheckpointRemoteConfig `yaml:"remote"`
+}
+
+type CheckpointRemoteConfig struct {
+	RefLocationParent string `yaml:"ref_location_parent"`
+}
+
+// RefLocationURI derives the node-local path for a logical location name. The
+// parent never enters a portable ref, TemplateID, or migration token.
+func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
+	if name == "" || path.Base(name) != name || strings.ContainsAny(name, `/\\`) || name == "." || name == ".." {
+		return "", fmt.Errorf("invalid ref location name %q", name)
+	}
+	if c.Remote.RefLocationParent == "" {
+		return "", fmt.Errorf("checkpoint.remote.ref_location_parent is not configured")
+	}
+	u, err := parseAbsoluteFileURI(c.Remote.RefLocationParent)
+	if err != nil {
+		return "", err
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
+	u.Path = path.Join(u.Path, digest[:2], digest[2:4], name)
+	u.RawPath = ""
+	return u.String(), nil
 }
 
 // Load reads the config file and applies defaults.
@@ -656,7 +682,24 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("config: checkpoint.mode %q (want local|remote)", c.Checkpoint.Mode)
 	}
+	if parent := c.Checkpoint.Remote.RefLocationParent; parent != "" {
+		if _, err := parseAbsoluteFileURI(parent); err != nil {
+			return fmt.Errorf("config: checkpoint.remote.ref_location_parent: %w", err)
+		}
+	}
 	return c.validateProxy()
+}
+
+func parseAbsoluteFileURI(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "file" || u.Host != "" || u.Path == "" || !path.IsAbs(u.Path) ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return nil, fmt.Errorf("%q must be an absolute file:// URI without host, query, or fragment", raw)
+	}
+	return u, nil
 }
 
 // validateProxy checks the proxy-mode + mmds invariants.
