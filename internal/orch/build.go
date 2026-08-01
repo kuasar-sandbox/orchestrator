@@ -553,20 +553,25 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		o.pendMu.Unlock()
 	}()
 
-	// MMDS visibility for the template phase: a synthetic running route
-	// (FC-mode envd resolves {id, token-hash} by its floating IP).
+	// MMDS visibility for the template phase: prepare a synthetic running route
+	// (FC-mode envd resolves {id, token-hash} by its floating IP). Do not publish
+	// it until the builder pool assigns a RunID: MMDS session tokens are bound to
+	// that incarnation, and the runner receives its assignment only after the
+	// Assign callback below completes.
+	var buildMMDSRoute *types.Sandbox
+	buildMMDSRoutePublished := false
 	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
-		row := &types.Sandbox{
+		buildMMDSRoute = &types.Sandbox{
 			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
 			State: types.StateRunning, FloatingIP: port.FloatingIP,
 			EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
 			CreatedUnix: time.Now().Unix(),
 		}
-		o.cache(row)
-		o.publishUpsert(row)
 		defer func() {
-			o.uncache(row.ID)
-			o.publishDelete(row.ID)
+			if buildMMDSRoutePublished {
+				o.uncache(buildMMDSRoute.ID)
+				o.publishDelete(buildMMDSRoute.ID)
+			}
 		}()
 	}
 
@@ -574,7 +579,16 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	if _, err := o.builderRunPool.Assign(ctx, b.BuildID, func(runID string) error {
 		b.RunID = runID
 		unit = o.builderUnit(runID)
-		return o.st.SetBuildRunID(ctx, b.BuildID, runID)
+		if err := o.st.SetBuildRunID(ctx, b.BuildID, runID); err != nil {
+			return err
+		}
+		if buildMMDSRoute != nil {
+			buildMMDSRoute.RunID = runID // not published before this callback
+			o.cache(buildMMDSRoute)
+			o.publishUpsert(buildMMDSRoute)
+			buildMMDSRoutePublished = true
+		}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
