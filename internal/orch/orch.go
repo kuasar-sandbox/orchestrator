@@ -1089,11 +1089,16 @@ func (o *Orchestrator) Incarnation(sid string) (incarnation string, ok bool) {
 // deliberate revoke gets no grace period. MMDSRoute has no ctx parameter
 // (mmds.Source's signature, shared with the external-mode WorkerView path),
 // so context.Background() is used for the store read/wait.
+//
+// Gated on StateRunning, unlike Incarnation/MmdsSecret above: those exist to
+// make token verification fail deterministically for a paused sandbox, but a
+// paused sandbox's floating IP can be reused, so a still-valid pre-pause
+// token must not be able to read a custom route through the new owner's IP.
 func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
 	o.mu.Lock()
 	sb, found := o.reg[sid]
 	o.mu.Unlock()
-	if !found {
+	if !found || sb.State != types.StateRunning {
 		return mmds.MMDSRoute{}, false, nil
 	}
 	route, ok := sandboxcfg.LookupMMDSRoute(sb.Metadata, path)

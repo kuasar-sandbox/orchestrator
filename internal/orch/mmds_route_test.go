@@ -87,6 +87,23 @@ func TestMMDSRouteSecretServesConfiguredValue(t *testing.T) {
 	}
 }
 
+func TestMMDSRouteRequiresRunningState(t *testing.T) {
+	o := testMMDSSecretsOrch(t, 1024)
+	sb := cachedTestSandboxForMMDSRoute(t, o, "sbx-1", 0)
+	if _, err := o.PutMMDSSecret(context.Background(), "sbx-1", "key1", []byte("sh-sh"), "text/plain", 0); err != nil {
+		t.Fatal(err)
+	}
+	sb.State = types.StatePaused
+	o.cache(sb)
+
+	if _, ok, err := o.MMDSRoute("sbx-1", "/static"); ok || err != nil {
+		t.Fatalf("static: ok=%t err=%v, want false/nil while paused", ok, err)
+	}
+	if _, ok, err := o.MMDSRoute("sbx-1", "/secret"); ok || err != nil {
+		t.Fatalf("secret: ok=%t err=%v, want false/nil while paused", ok, err)
+	}
+}
+
 func TestMMDSRouteSecretRevokedReturnsAbsentImmediately(t *testing.T) {
 	o := testMMDSSecretsOrch(t, 1024)
 	cachedTestSandboxForMMDSRoute(t, o, "sbx-1", 2*time.Second) // long park -- must NOT be waited out

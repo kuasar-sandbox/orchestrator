@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -101,6 +103,53 @@ func TestPutMMDSSecretSucceedsAndWakesParkedWaiter(t *testing.T) {
 	}
 	if !present || gotRev != 1 || v.ContentType != "text/plain" {
 		t.Fatalf("stored value = %+v present=%t rev=%d", v, present, gotRev)
+	}
+}
+
+func TestPutMMDSSecretSerializesWithLifecycleStateChange(t *testing.T) {
+	o := testMMDSSecretsOrch(t, 1024)
+	sb := putTestSandboxForMMDSSecretAdmin(t, o, "sbx-1", testMMDSSecretSpec)
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	// Hold the same lifecycle lock used by Pause/Kill/Connect. The PUT must
+	// not read and publish a running snapshot while a lifecycle transition is
+	// waiting to update the sandbox state.
+	unlock := o.lifecycle.Lock(sb.ID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := o.PutMMDSSecret(context.Background(), sb.ID, "key1", []byte("hello"), "text/plain", 0)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("PutMMDSSecret completed while lifecycle lock was held: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	sb.State = types.StatePaused
+	if err := o.st.SetState(context.Background(), sb.ID, types.StatePaused); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	unlock()
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind != routesync.TypeUpsert {
+			t.Fatalf("event kind = %v, want upsert", ev.Kind)
+		}
+		if ev.Route.State != string(types.StatePaused) {
+			t.Fatalf("published route state = %q, want paused", ev.Route.State)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for secret route publication")
 	}
 }
 

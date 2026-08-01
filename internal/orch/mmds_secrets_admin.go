@@ -14,6 +14,9 @@ import (
 // Create-time validation; the value itself is never accepted from the
 // tenant's Create request, only through this admin API.
 func (o *Orchestrator) PutMMDSSecret(ctx context.Context, sid, name string, body []byte, contentType string, expiresUnix int64) (int64, error) {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
 		return 0, err
@@ -42,6 +45,9 @@ func (o *Orchestrator) PutMMDSSecret(ctx context.Context, sid, name string, body
 // success; deleting a name that was never specified in secrets[] at all is a
 // bad request, same validation as PutMMDSSecret.
 func (o *Orchestrator) DeleteMMDSSecret(ctx context.Context, sid, name string) (int64, error) {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
 	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
 		return 0, err
