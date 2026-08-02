@@ -68,10 +68,15 @@ PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-repo-guest-runtime
 
 .PHONY: all build collect e2e-tools release vet test test-ci-tools clean help demo \
-        bench test-e2e perf dedup-report \
+        bench test-e2e perf dedup-report native-cache \
         $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
 all: build
+
+# Restore or populate the verified native-artifact cache. CI calls this once
+# before the regular build; ordinary developer builds remain incremental.
+native-cache:
+	$(CI_TIMED) cache/native env TARGET_ARCH="$(TARGET_ARCH)" bash scripts/native-cache.sh restore-or-build
 
 # Full platform build. Sub-repo order matters: guest-runtime/native-deps leads
 # (mkfs.erofs is needed by guest-runtime), sandboxer builds sandbox-init and

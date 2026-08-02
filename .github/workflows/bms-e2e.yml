@@ -402,7 +402,7 @@ jobs:
 
       - name: Restore or build verified native artifacts
         working-directory: src/orchestrator/release-builder
-        run: scripts/native-cache.sh restore-or-build
+        run: make native-cache
 
       - name: Build and test the platform
         working-directory: src/orchestrator/release-builder

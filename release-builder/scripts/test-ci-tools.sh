@@ -273,12 +273,16 @@ env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
 [ "$(wc -l <"$counter")" -eq 1 ] || fail "cold cache must build once"
 
 rm -f "$workspace/guest-runtime/native-deps/bin/x86_64/envd"
+touch "$workspace/guest-runtime/native-deps/Makefile"
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
     KUASAR_WORKSPACE_ROOT="$workspace" KUASAR_NATIVE_CACHE_ROOT="$cache" \
     KUASAR_NATIVE_CACHE_METRICS="$metrics" \
     "$SCRIPT_DIR/native-cache.sh" restore-or-build envd
 [ "$(wc -l <"$counter")" -eq 1 ] || fail "hot cache rebuilt the component"
 grep -q $'envd\thit\t' "$metrics" || fail "hot cache metric is missing"
+[ "$workspace/guest-runtime/native-deps/bin/x86_64/envd" -nt \
+  "$workspace/guest-runtime/native-deps/Makefile" ] \
+    || fail "restored output mtime was not refreshed past its build input"
 
 printf 'changed input\n' >>"$workspace/guest-runtime/native-deps/deps/build-envd.sh"
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \

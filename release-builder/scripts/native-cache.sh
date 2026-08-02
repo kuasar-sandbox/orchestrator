@@ -484,7 +484,10 @@ restore_entry() {
     local component=$1 entry=$2 key=$3
     verify_entry "$entry" "$key"
     remove_outputs "$component"
-    tar --extract --file "$entry/payload.tar" --directory "$WORKSPACE_ROOT" --no-same-owner
+    # Cache archives normalize mtimes to the epoch for reproducibility. GNU
+    # tar --touch stamps restored files and directories with extraction time so
+    # Make does not consider them older than freshly checked-out prerequisites.
+    tar --extract --touch --file "$entry/payload.tar" --directory "$WORKSPACE_ROOT" --no-same-owner
     validate_outputs "$component"
 }
 
