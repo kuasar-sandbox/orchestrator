@@ -85,6 +85,17 @@ type buildPipeline struct {
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
 
+// Guest-side paths for the flatten-ctl TLS config (projected via sandbox YAML
+// files into the Phase A import sandbox when a per-build registry TLS policy is
+// configured). /run is a tmpfs mounted by sandbox-init before applyFiles, so
+// these never land on the build root disk; phase B's --skip-mounts excludes
+// /run too. flatten-ctl reads the YAML via --config; tls.ca_cert points at the
+// projected CA bundle. Files are read-only (0444).
+const (
+	guestFlattenCfg = "/run/kuasar-build/flatten/config.yaml"
+	guestCACert     = "/run/kuasar-build/flatten/registry-ca.pem"
+)
+
 // journald SYSLOG_IDENTIFIER tags (shared contract with the orchestrator's log
 // query, defined in configsock): buildTag = curated build progress (SDK-visible),
 // consoleTag = guest kernel dmesg (host-only).

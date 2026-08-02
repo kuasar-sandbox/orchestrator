@@ -1307,6 +1307,23 @@ serve `journalctl KUASAR_BUILD_ID=<bid> SYSLOG_IDENTIFIER=build --output=json`
 vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 trigger 报错。
 配本机/私网 registry 时设 `builder.insecure_registry`、`builder.platform`。
 
+**registry TLS**(HTTPS + 内部/自签名 CA 场景):`--insecure` 只切 URL scheme(允许
+`http://`),**不影响 TLS 证书校验**;HTTPS + 内部 CA 需用 flatten-ctl 的 TLS 配置能力。
+registry TLS 是**单次 Build 的信任策略**,经 register-time 的 `X-Kuasar-Sandbox-Builder`
+头传入(`builder.registry.tls`),不进 Node 配置:
+
+- `ca_bundle_pem`(内联 PEM 文本,≤ 16 KiB,须含可解析 X.509 `CERTIFICATE` 块)或
+  `insecure_skip_verify: true`(跳过校验),二者互斥;空 `tls` 被拒。
+- 只在 register 时设置;trigger 时带 `builder.registry` 直接 400。
+- 仅 `fromImage` 构建可用;`fromTemplate` + `registry.tls` 被拒。
+- 与 Node `insecure_registry`(plain HTTP)互斥:同 Build 同时配置二者被拒。
+- builder 把 PEM 与生成的 flatten 配置 YAML 投影进 **Phase A import sandbox** 的只读文件
+  (`/run/kuasar-build/flatten/registry-ca.pem` + `/run/kuasar-build/flatten/config.yaml`,
+  `mode 0444` + `read_only`,`/run` tmpfs 不落 Build 根盘),import 阶段的
+  `export`/`referer lookup`/`referer put` 三处 flatten-ctl 调用追加
+  `--config /run/kuasar-build/flatten/config.yaml`;flatten-ctl 据此把 CA **追加到系统根证书池**
+  (非替换)后构建带 CA 的 TLS transport。不进最终模板 metadata,不被其他 Build 继承。
+
 **资源池**:`builder.max_concurrent`(默认 2)= serve 内计数信号量准入;
 `waiting → building` 用 builds 表 CAS 抢占(重启/多实例安全);CPU/内存上限经
 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加(整条流水线都在单元 cgroup
