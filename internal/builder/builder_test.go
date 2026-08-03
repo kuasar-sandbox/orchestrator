@@ -1,12 +1,19 @@
 package builder
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
@@ -58,6 +65,72 @@ func TestValidateBuildProfile(t *testing.T) {
 				t.Fatalf("validateBuildProfile() = %q, %v; want %q, error=%t", got, err, tt.want, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestUseLocalImageQualifiesTarstreamIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("builder image payload")
+	scheme, digest, writeErr := tarstream.WriteTo(
+		context.Background(), f, "image", sparse.Dense(bytes.NewReader(body), uint64(len(body))),
+	)
+	closeErr := f.Close()
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if scheme != tarstream.DigestSchemeSHA256 {
+		t.Fatalf("fixture scheme = %q", scheme)
+	}
+
+	p := &buildPipeline{
+		imagePath:           "old.img",
+		baseImageRef:        "manifest://old",
+		baseRef:             "manifest://old",
+		overlayBase:         "manifest://overlay",
+		overlayBaseFromRefs: []string{"manifest://parent"},
+	}
+	if err := p.useLocalImage(path); err != nil {
+		t.Fatal(err)
+	}
+	want := manifest.Ref{
+		Scheme:       manifest.RefSchemeFile,
+		Path:         path,
+		DigestScheme: scheme,
+		Digest:       digest,
+	}.String()
+	if p.baseRef != want {
+		t.Fatalf("baseRef = %q, want %q", p.baseRef, want)
+	}
+	if p.imagePath != path || p.baseImageRef != "" || p.overlayBase != "" || p.overlayBaseFromRefs != nil {
+		t.Fatalf("pipeline image state = %+v", p)
+	}
+	ref, err := manifest.ParseRef(p.baseRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.DigestScheme != tarstream.DigestSchemeSHA256 || ref.Digest != digest {
+		t.Fatalf("qualified ref = %+v", ref)
+	}
+}
+
+func TestUseLocalImageRejectsMalformedArtifactWithoutChangingState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.img")
+	if err := os.WriteFile(path, []byte("not a tarstream"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := &buildPipeline{imagePath: "old.img", baseImageRef: "manifest://old", baseRef: "manifest://old"}
+	if err := p.useLocalImage(path); err == nil {
+		t.Fatal("useLocalImage accepted a malformed artifact")
+	}
+	if p.imagePath != "old.img" || p.baseImageRef != "manifest://old" || p.baseRef != "manifest://old" {
+		t.Fatalf("failed validation changed pipeline state: %+v", p)
 	}
 }
 
