@@ -15,6 +15,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 
 skip() {
@@ -61,6 +62,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     BLK0_IMAGE="$WORK/blk0.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
@@ -83,7 +85,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
       size: 1GiB
@@ -155,7 +157,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
@@ -195,4 +197,3 @@ else
     tail -40 "$LOG2"
     exit 1
 fi
-

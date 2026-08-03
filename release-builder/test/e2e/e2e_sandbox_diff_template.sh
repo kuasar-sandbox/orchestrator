@@ -13,6 +13,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -53,6 +54,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     BLK0_IMAGE="$WORK/blk0.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 # Pre-formatted ext4 template (sparse). diff is seeded from this; no mkfs at boot.
 TEMPLATE="$WORK/basic.ext4"
@@ -72,7 +74,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay:
       diff_template: file://$TEMPLATE
 launch:

@@ -28,6 +28,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 # BIN overridable so perf bench can point at a /tmp-cached copy of the
 # binaries (some filesystems, e.g. WSL2 drvfs, add ~500ms per exec).
 BIN="${BIN:-$REPO_ROOT/bin}"
@@ -90,6 +91,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     echo "==> appended config preview:"
     "$BIN/flatten-ctl" info "$BLK0_IMAGE" 2>&1 | sed 's/^/    /' | head -20 || true
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 # ---- prepare sandbox.yaml -------------------------------------------------
 mkdir -p "$WORK/runtime"
@@ -124,7 +126,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
       size: 1GiB

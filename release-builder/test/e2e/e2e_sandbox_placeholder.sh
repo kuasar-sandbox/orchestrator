@@ -31,6 +31,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-busybox:latest}"
 SID="${SID:-ph1}"
@@ -94,6 +95,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
     echo "==> blk0 erofs ready ($(du -h "$BLK0_IMAGE" | cut -f1))"
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 
 # ---- blk1 overlay diff (fresh ext4 upper) ---------------------------------
 DIFF="$RUNROOT/blk1.diff"
@@ -110,7 +112,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF
       size: 1GiB

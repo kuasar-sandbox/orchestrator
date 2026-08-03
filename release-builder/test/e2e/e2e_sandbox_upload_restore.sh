@@ -20,6 +20,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -152,6 +153,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 BLK0_EROFS="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_EROFS")"
 
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
@@ -181,7 +183,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_EROFS
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
       size: 1GiB
@@ -264,7 +266,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: file://$BLK0_EROFS
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
@@ -355,7 +357,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: file://$BLK0_EROFS
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE2
       size: 1GiB
@@ -435,7 +437,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: file://$BLK0_EROFS
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_RESTORE3
       size: 1GiB

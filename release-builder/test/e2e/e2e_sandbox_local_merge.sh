@@ -19,6 +19,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -102,6 +103,7 @@ EOF
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then docker pull "$IMAGE" >/dev/null; fi
 BLK0_EROFS="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_EROFS")"
 mkdir -p "$WORK/runtime"; DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F "$DIFF_FILE"
 
@@ -117,7 +119,7 @@ while True:
     i+=1
     time.sleep(0.25)'
 write_yaml() { # $1=out $2=hostname [$3=diff override] [$4=base override; "none" omits]
-    local base_line="    base: file://$BLK0_EROFS"
+    local base_line="    base: $BLK0_REF"
     case "${4:-}" in
     none) base_line="" ;;       # manifest:// snapshots carry their own base ref
     "") ;;

@@ -21,6 +21,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-busybox:latest}"
 TAP_NAME="${TAP_NAME:-sb-tap0}"
@@ -78,6 +79,8 @@ mkdir -p "$WORK/ds"; echo "DATASET-OK" > "$WORK/ds/DATASET-OK"
 # disk artifacts are tarstream envelopes: build via flatten-ctl (dir source)
 MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/ds"
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
+DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
 truncate -s 256M "$WORK/dataset-up.ext4"; mkfs.ext4 -q -F "$WORK/dataset-up.ext4"
 
 cat > "$WORK/cold.yaml" <<EOF
@@ -88,11 +91,11 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay: { diff: file://$WORK/root-up.ext4, size: 512MiB }
   disks:
     - { name: scratch, diff_template: file://$WORK/scratch.ext4, diff_size: 256MiB }
-    - { name: dataset, base: file://$WORK/dataset.img, overlay: { diff_template: file://$WORK/dataset-up.ext4, diff_size: 256MiB } }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4, diff_size: 256MiB } }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
   - { target: /data,    type: disk, source: dataset }
@@ -144,11 +147,11 @@ network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-di
 boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay: { diff: file://$WORK/root-r.ext4, size: 512MiB }
   disks:
     - { name: scratch }
-    - { name: dataset, base: file://$WORK/dataset.img, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
 EOF
 SID2=dk-2
 timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
