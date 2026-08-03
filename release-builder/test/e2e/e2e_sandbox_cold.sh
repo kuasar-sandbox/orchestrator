@@ -33,6 +33,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # binaries (some filesystems, e.g. WSL2 drvfs, add ~500ms per exec).
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
+SID="${SID:-cold1}"
+source "$REPO_ROOT/test/e2e/readiness_helpers.sh"
 
 # ---- prerequisite checks --------------------------------------------------
 
@@ -48,6 +50,7 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH (needed to probe ctl.sock)"
 
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
@@ -75,7 +78,21 @@ fi
 
 # ---- prepare blk0 (python:3.12-slim → erofs with appended config.json) ----
 WORK="$(mktemp -d /tmp/e2e-sandbox-XXXXXX)"
-trap '[ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
+SBPID=""
+POST_PID=""
+cleanup() {
+    set +e
+    for pid in "$SBPID" "$POST_PID"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+    done
+    sleep 1
+    for pid in "$SBPID" "$POST_PID"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    done
+    [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
+    [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null
+}
+trap cleanup EXIT
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
 if [ -z "$BLK0_IMAGE" ]; then
@@ -134,12 +151,45 @@ launch:
   # Args use a uniquely-shaped python expression: the script computes
   # version components and emits a marker the e2e grep can distinguish
   # from the literal launch.args text appearing in sandbox-ctl logs.
-  args: ["-c", "import sys; print('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor)"]
+  args: ["-c", "import sys,time; print('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor, flush=True); time.sleep(5)"]
   restart: never
 EOF
 
 echo "==> sandbox.yaml:"
 sed 's/^/    /' "$WORK/sandbox.yaml"
+
+# ---- readiness failure semantics -----------------------------------------
+echo "==> readiness: failure before control_ready produces immediate EOF"
+readiness_begin_capture "$WORK/pre-control.ready"
+PRE_READER_PID=$READY_READER_PID
+set +e
+"$BIN/sandbox-ctl" run --ready-fd="$READY_WRITE_FD" \
+    --config "$WORK/does-not-exist.yaml" --sandbox-id cold-pre-fail \
+    --run-root "$WORK/runtime" >"$WORK/pre-control.log" 2>&1
+PRE_RC=$?
+set -e
+readiness_close_parent_writer
+[ "$PRE_RC" -ne 0 ] || { echo "==> FAIL: invalid config unexpectedly started"; exit 1; }
+readiness_assert_wire "$WORK/pre-control.ready" "$PRE_READER_PID" "" \
+    || { echo "==> FAIL: pre-control failure emitted readiness data"; exit 1; }
+
+echo "==> readiness: failure after control_ready closes without ready"
+readiness_begin_capture "$WORK/post-control.ready"
+POST_READER_PID=$READY_READER_PID
+"$BIN/sandbox-ctl" run --ready-fd="$READY_WRITE_FD" \
+    --config "$WORK/sandbox.yaml" --sandbox-id cold-post-fail \
+    --ch-binary "$WORK/missing-cloud-hypervisor" --run-root "$WORK/runtime" \
+    >"$WORK/post-control.log" 2>&1 &
+POST_PID=$!
+readiness_close_parent_writer
+readiness_wait_event "$WORK/post-control.ready" 1 control_ready "$POST_PID" \
+    || { tail -60 "$WORK/post-control.log"; exit 1; }
+set +e; wait "$POST_PID"; POST_RC=$?; set -e
+POST_PID=""
+[ "$POST_RC" -ne 0 ] || { echo "==> FAIL: missing CH binary unexpectedly succeeded"; exit 1; }
+readiness_assert_wire "$WORK/post-control.ready" "$POST_READER_PID" $'control_ready\n' \
+    || { echo "==> FAIL: post-control failure emitted an invalid wire"; exit 1; }
+echo "==> PASS: both pre-ready failure paths closed readiness exactly"
 
 # ---- run sandbox-ctl with timing ----------------------------------------
 echo "==> launching sandbox-ctl run (timeout 60s)"
@@ -154,13 +204,32 @@ set +e
 # PERF_STATS_JSON: external stats.json sink (used by test/perf/sandbox-perf.sh
 # to harvest runtime metrics). Defaults to a path inside $WORK (cleaned on exit).
 STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
+readiness_begin_capture "$WORK/cold.ready"
+COLD_READER_PID=$READY_READER_PID
 timeout -k 10s 60 "$BIN/sandbox-ctl" run \
+    --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" \
+    --sandbox-id "$SID" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
     > "$LOG" 2>&1 &
 SBPID=$!
+readiness_close_parent_writer
+
+readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID" \
+    || { tail -60 "$LOG"; exit 1; }
+readiness_connect_ctl "$WORK/runtime/$SID/ctl.sock" \
+    || { echo "==> FAIL: ctl.sock was not connectable at control_ready"; exit 1; }
+echo "==> PASS: control_ready observed only after ctl.sock accepted a connection"
+readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID" \
+    || { tail -60 "$LOG"; exit 1; }
+if ! "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" -- /bin/true; then
+    echo "==> FAIL: immediate exec after ready failed"; tail -60 "$LOG"; exit 1
+fi
+readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' \
+    || { echo "==> FAIL: cold readiness wire was not exact"; exit 1; }
+echo "==> PASS: exact control_ready -> ready -> EOF; immediate exec succeeded"
 
 T_APP_NS=""
 # Match python's actual stdout line ("^PYBOOT-OK <int>$"), not the
@@ -176,6 +245,7 @@ while kill -0 "$SBPID" 2>/dev/null; do
 done
 wait "$SBPID"
 EXIT=$?
+SBPID=""
 T_END_NS=$(date +%s%N)
 set -e
 

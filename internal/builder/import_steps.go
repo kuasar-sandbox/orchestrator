@@ -30,9 +30,12 @@ func (p *buildPipeline) phaseImport() error {
 		return err
 	}
 	defer sb.teardown()
-	if err := sb.waitExecReady(p.ctx, 60*time.Second); err != nil {
+	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 60*time.Second)
+	defer cancelBoot()
+	if err := sb.waitRuntimeReady(bootCtx); err != nil {
 		return err
 	}
+	cancelBoot()
 
 	var refSupported bool
 	var refSubject string
@@ -266,9 +269,15 @@ func (p *buildPipeline) phaseSteps() error {
 		return err
 	}
 	defer sb.teardown()
-	if err := p.waitEnvd(envdUDS, 90*time.Second); err != nil {
+	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
+	defer cancelBoot()
+	if err := sb.waitRuntimeReady(bootCtx); err != nil {
 		return err
 	}
+	if err := p.waitEnvd(bootCtx, envdUDS); err != nil {
+		return err
+	}
+	cancelBoot()
 
 	// RUN steps go through envd — the e2b exec channel (the step sandbox's
 	// envd is a plain build tool: -isnotfc, never /init-armed, no token).

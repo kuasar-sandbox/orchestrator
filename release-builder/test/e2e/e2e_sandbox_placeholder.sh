@@ -35,6 +35,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-busybox:latest}"
 SID="${SID:-ph1}"
+source "$REPO_ROOT/test/e2e/readiness_helpers.sh"
 
 skip() {
     echo
@@ -48,6 +49,7 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH (needed to probe ctl.sock)"
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
@@ -123,11 +125,15 @@ echo "==> sandbox.yaml:"; sed 's/^/    /' "$WORK/sandbox.yaml"
 
 # ---- boot (background; a placeholder never exits on its own) ---------------
 echo "==> launching placeholder sandbox (background)"
+readiness_begin_capture "$WORK/placeholder.ready"
+PLACEHOLDER_READER_PID=$READY_READER_PID
 timeout -k 10s 120 "$BIN/sandbox-ctl" run \
+    --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" --sandbox-id "$SID" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNROOT" \
     > "$RUNLOG" 2>&1 &
 RUNPID=$!
+readiness_close_parent_writer
 # timeout relays a handled signal to both its child PID and process group.
 # Capture sandbox-ctl so the graceful-stop assertion sends exactly one signal.
 for _ in $(seq 1 50); do
@@ -138,21 +144,18 @@ for _ in $(seq 1 50); do
 done
 [ -n "$CTL_PID" ] || { echo "==> FAIL: could not resolve sandbox-ctl child of timeout pid=$RUNPID"; exit 1; }
 
-# Readiness: ctl.sock is created early (host listener), so it is NOT a boot
-# signal — a working exec is. Poll exec until the guest answers.
 exec1() { "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" "$@"; }
-echo "==> waiting for the sandbox to become exec-ready"
-READY=0
-for _ in $(seq 1 90); do
-    if timeout -k 2s 6 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" \
-         -- /bin/sh -c 'echo READY' >"$WORK/ready.out" 2>/dev/null && grep -q READY "$WORK/ready.out"; then
-        READY=1; break
-    fi
-    kill -0 "$RUNPID" 2>/dev/null || { echo "==> FAIL: run exited during boot"; tail -60 "$RUNLOG"; exit 1; }
-    sleep 1
-done
-[ "$READY" = 1 ] || { echo "==> FAIL: sandbox never became exec-ready"; tail -60 "$RUNLOG"; exit 1; }
-echo "==> PASS: booted no-exec placeholder, sandbox is exec-ready"
+readiness_wait_event "$WORK/placeholder.ready" 1 control_ready "$RUNPID" \
+    || { tail -60 "$RUNLOG"; exit 1; }
+readiness_connect_ctl "$RUNROOT/$SID/ctl.sock" \
+    || { echo "==> FAIL: ctl.sock was not connectable at control_ready"; exit 1; }
+readiness_wait_event "$WORK/placeholder.ready" 2 ready "$RUNPID" \
+    || { tail -60 "$RUNLOG"; exit 1; }
+exec1 -- /bin/true \
+    || { echo "==> FAIL: immediate exec after placeholder ready failed"; tail -60 "$RUNLOG"; exit 1; }
+readiness_assert_wire "$WORK/placeholder.ready" "$PLACEHOLDER_READER_PID" $'control_ready\nready\n' \
+    || { echo "==> FAIL: placeholder readiness wire was not exact"; exit 1; }
+echo "==> PASS: placeholder emitted exact readiness wire and immediate exec succeeded"
 
 # The no-network contract has two independent observable sides: CH receives no
 # virtio-net argument, while the guest retains loopback and the vsock control
@@ -224,6 +227,9 @@ exec1 -- /bin/sh -c 'echo EXEC-OK-AFTER-RESTART' >"$WORK/x2.out" 2>&1 || true
 grep -q EXEC-OK-AFTER-RESTART "$WORK/x2.out" \
     || { echo "==> FAIL: exec failed after restart"; tail -80 "$RUNLOG"; exit 1; }
 echo "==> PASS: exec works again after the anchor restarted in place"
+readiness_assert_wire "$WORK/placeholder.ready" "$PLACEHOLDER_READER_PID" $'control_ready\nready\n' \
+    || { echo "==> FAIL: app restart changed the one-shot readiness stream"; exit 1; }
+echo "==> PASS: in-place app restart emitted no second ready"
 grep -q "restarting in" "$RUNLOG" \
     && echo "==> PASS: guest log shows in-place restart" \
     || echo "==> INFO: 'restarting in' console line not captured (lag)"

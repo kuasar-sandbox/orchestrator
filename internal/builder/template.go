@@ -31,9 +31,15 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	}
 	defer sb.teardown()
 
-	if err := p.waitEnvd(envdUDS, 90*time.Second); err != nil {
+	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
+	defer cancelBoot()
+	if err := sb.waitRuntimeReady(bootCtx); err != nil {
 		return "", err
 	}
+	if err := p.waitEnvd(bootCtx, envdUDS); err != nil {
+		return "", err
+	}
+	cancelBoot()
 	if err := p.envdInit(envdUDS); err != nil {
 		return "", fmt.Errorf("envd /init: %w", err)
 	}
@@ -96,12 +102,15 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	return bundle, nil
 }
 
-// waitEnvd polls envd's /health over its forwarded UDS.
-func (p *buildPipeline) waitEnvd(uds string, timeout time.Duration) error {
+// waitEnvd polls envd's /health within the phase boot context. Runtime events
+// and envd therefore share one deadline instead of receiving serial budgets.
+func (p *buildPipeline) waitEnvd(ctx context.Context, uds string) error {
 	cl := udsHTTP(uds)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		req, _ := http.NewRequestWithContext(p.ctx, http.MethodGet, "http://envd/health", nil)
+	defer cl.CloseIdleConnections()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://envd/health", nil)
 		if resp, err := cl.Do(req); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 || resp.StatusCode == 204 {
@@ -109,12 +118,11 @@ func (p *buildPipeline) waitEnvd(uds string, timeout time.Duration) error {
 			}
 		}
 		select {
-		case <-p.ctx.Done():
-			return p.ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return fmt.Errorf("envd not ready: %w", ctx.Err())
+		case <-ticker.C:
 		}
 	}
-	return fmt.Errorf("envd not ready within %s", timeout)
 }
 
 // envdInit provisions envd before the snapshot, matching the deployment

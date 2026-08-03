@@ -505,7 +505,7 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 
 func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *countingLauncher) (*Orchestrator, context.Context) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortOrchestratorTestDir(t)
 	if cfg.Paths.RunRoot == "" {
 		cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	}
@@ -533,6 +533,18 @@ func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *count
 		t.Fatal(err)
 	}
 	return o, ctx
+}
+
+// Unix socket paths are capped at 108 bytes on Linux. Go's nested t.TempDir
+// names can exceed that once a sandbox ID and ready.sock are appended.
+func shortOrchestratorTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "orch-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func waitForLauncherStart(t *testing.T, started <-chan struct{}) {

@@ -1,9 +1,11 @@
 package orch
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -22,10 +25,20 @@ import (
 
 // countingLauncher records how many times a unit was started — the launch count.
 type countingLauncher struct {
-	starts    atomic.Int64
-	orch      *Orchestrator
-	started   chan<- struct{}
-	startGate <-chan struct{}
+	starts atomic.Int64
+	stops  atomic.Int64
+	orch   *Orchestrator
+
+	started            chan<- struct{}
+	startGate          <-chan struct{}
+	assigned           chan<- string
+	connectGate        <-chan struct{}
+	readyConnected     chan<- struct{}
+	readinessWire      []byte // nil means the exact successful wire; empty means immediate EOF.
+	readinessDelay     time.Duration
+	readinessNoSend    bool
+	readinessNoConnect bool
+	readinessErrors    chan<- error
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -49,12 +62,88 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 			runID := l.orch.unitToRunID(unit)
 			// The systemd StartUnit call context only bounds the D-Bus job. The
 			// launched process has its own lifetime and keeps waiting afterward.
-			go func() { _, _, _ = l.orch.WaitAssignment(context.Background(), runKindSandbox, runID) }()
+			go l.runSandbox(runID)
 		}
 	}
 	return nil
 }
-func (l *countingLauncher) Stop(context.Context, string) error        { return nil }
+
+func (l *countingLauncher) runSandbox(runID string) {
+	sid, ok, err := l.orch.WaitAssignment(context.Background(), runKindSandbox, runID)
+	if err != nil || !ok {
+		l.reportReadinessError(err)
+		return
+	}
+	if l.assigned != nil {
+		select {
+		case l.assigned <- sid:
+		default:
+		}
+	}
+	ctx := l.orch.asyncCtx()
+	if l.connectGate != nil {
+		select {
+		case <-l.connectGate:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if l.readinessNoConnect {
+		return
+	}
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{
+		Name: configsock.ReadinessSocketPath(l.orch.cfg.Paths.RunRoot, sid),
+		Net:  "unix",
+	})
+	if err != nil {
+		l.reportReadinessError(err)
+		return
+	}
+	defer conn.Close()
+	if l.readyConnected != nil {
+		select {
+		case l.readyConnected <- struct{}{}:
+		default:
+		}
+	}
+	if l.readinessDelay > 0 {
+		timer := time.NewTimer(l.readinessDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if l.readinessNoSend {
+		// The orchestrator closes the accepted connection on timeout/cancel,
+		// which gives this deliberately silent fake a bounded exit path.
+		_, _ = io.Copy(io.Discard, conn)
+		return
+	}
+	wire := l.readinessWire
+	if wire == nil {
+		wire = []byte("control_ready\nready\n")
+	}
+	if _, err := io.Copy(conn, bytes.NewReader(wire)); err != nil {
+		l.reportReadinessError(err)
+	}
+}
+
+func (l *countingLauncher) reportReadinessError(err error) {
+	if err == nil || l.readinessErrors == nil {
+		return
+	}
+	select {
+	case l.readinessErrors <- err:
+	default:
+	}
+}
+
+func (l *countingLauncher) Stop(context.Context, string) error {
+	l.stops.Add(1)
+	return nil
+}
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
 	return nil, nil
@@ -86,8 +175,9 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := &config.Config{}
-	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
-	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
+	dir := shortOrchestratorTestDir(t)
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // resolveNetwork needs a valid CIDR
 
 	started := make(chan struct{}, 4)

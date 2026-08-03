@@ -229,10 +229,13 @@ systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--run-id` 是 
 `--pidfile` 指向 `<run_root>/runs/<run-id>.pid`,以 `fcntl(F_SETLK)` 排他锁防重入并写本
 PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者分道:
 
-- **run-sandbox**:取得 sid 后锁 `<run_root>/<sid>/<sid>.pid`,取 LaunchSpec →
-  `chdir(workdir)`、剥除 `TASK_*` 引导变量、合入
-  `spec.env`(密钥)→ `execve` 替换为 `sandbox-ctl run`,目标继承本 PID 与单元
-  cgroup(锁 fd 已清 `FD_CLOEXEC`,随 execve 存活)。
+- **run-sandbox**:取得 sid 后立即连接固定的
+  `<run_root>/<sid>/ready.sock`(此时 readiness fd 保持 `FD_CLOEXEC`)→ 锁
+  `<run_root>/<sid>/<sid>.pid`→ 取 LaunchSpec → `chdir(workdir)`、剥除 `TASK_*`
+  引导变量、合入 `spec.env`(密钥)→ 仅在最后一次 `execve` 前清 readiness fd 的
+  `FD_CLOEXEC`,向 argv 追加其实际编号 `--ready-fd=<fd>`并替换为
+  `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile 锁 fd 和 readiness fd;
+  任一 pre-exec 失败都会关闭 readiness 连接,serve 立即读到 EOF。
 - **run-builder**:取得 bid 后锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec →
   **驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
@@ -682,8 +685,12 @@ WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一
 - **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → tapfd `RELEASE` 或
   `connector-ctl vswitch detach`
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
-- **就绪**:`Type=exec` 下 exec 成功即视为单元已启动;e2b profile 再轮询 envd
-  `/health`(UDS,60s 上限)判数据面就绪。
+- **就绪**:serve 在分配 runner 前先绑定 `<run_root>/<sid>/ready.sock`(目录 0700、
+  socket 0600),分配后从 node-ctl 的 one-shot 连接严格读取
+  `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后仍轮询 envd `/health`,
+  因为 runtime 的 `ready` 不承诺 envd 已监听。runtime wire 与 envd health 共用一次
+  60s 启动预算;协议错误、提前 EOF、取消或超时沿现有 create teardown / resume
+  rollback 返回。envd `/init` 失败仍只记 warning。
 - **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
   run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
@@ -1191,8 +1198,11 @@ BuildSpec 全链路显式携带。register/trigger 在入队前校验最终 netw
 `BuildNet`;无 transit 时保持零值。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
-microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
-`flatten-ctl mountpoint /.probe`,B/C 阶段以 envd `/health` 为就绪:
+microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 pipe,通过
+`ExtraFiles` 传 `--ready-fd=<实际 child fd>`,严格等待
+`control_ready\nready\nEOF`;父端 writer 在 `Start` 成功后立即关闭,child 提前退出
+即表现为 EOF。A 阶段只等待这条 runtime wire(60s),不再用 guest exec 轮询;B/C
+在 runtime wire 后继续等 envd `/health`,两者共用一次 90s boot deadline:
 
 - **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
   复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
@@ -1232,7 +1242,7 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 
 **两类 guest 信道,刻意分离**:e2b 语义命令(steps/startCmd/readyCmd)走 envd,
 与 e2b 自家模板构建逐项同形;平台机制(flatten-ctl 拉取/导出、运行时配置注入、
-工件流回、就绪探针)走 `sandbox-ctl exec`——任意 rootfs 可用、裸 stdio 接力,
+工件流回)走 `sandbox-ctl exec`——任意 rootfs 可用、裸 stdio 接力,
 不依赖镜像 userland。
 
 **fromTemplate**:base 来自既有模板——img 模板直接用 canonical image ref;snp 模板经
@@ -1343,7 +1353,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
+| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --ready-fd=<fd> --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run --ready-fd=<pipe-fd>` 启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | readiness wire 固定为 `control_ready`→`ready`→EOF;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
