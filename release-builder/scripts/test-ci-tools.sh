@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
+SYSTEM_PATH="$PATH"
 cleanup() {
     chmod -R u+w "$TMP" 2>/dev/null || true
     rm -rf "$TMP"
@@ -35,7 +36,22 @@ setup_vmlinux_workspace() {
     local root=$1
     mkdir -p "$root/guest-runtime/native-deps/deps/vmlinux" \
         "$root/guest-runtime/native-deps/deps/linux-patches"
-    printf 'vmlinux target fixture\n' >"$root/guest-runtime/native-deps/Makefile"
+    cat >"$root/guest-runtime/native-deps/Makefile" <<'EOF'
+TARGET_ARCH ?= x86_64
+VMLINUX_BIN := $(abspath bin/$(TARGET_ARCH)/vmlinux)
+VMLINUX_INPUTS := deps/build-vmlinux.sh deps/common.sh \
+    deps/vmlinux/test.config \
+    deps/linux-patches \
+    $(wildcard deps/linux-patches/*.patch)
+
+.PHONY: vmlinux
+vmlinux: $(VMLINUX_BIN)
+$(VMLINUX_BIN): $(VMLINUX_INPUTS)
+	@mkdir -p "$(dir $@)"
+	@printf 'build\n' >>"$(FAKE_BUILD_COUNTER)"
+	@printf 'fake-vmlinux\n' >"$@"
+	@chmod +x "$@"
+EOF
     printf 'common fixture\n' >"$root/guest-runtime/native-deps/deps/common.sh"
     printf 'build vmlinux fixture\n' >"$root/guest-runtime/native-deps/deps/build-vmlinux.sh"
     printf 'config fixture\n' >"$root/guest-runtime/native-deps/deps/vmlinux/test.config"
@@ -219,6 +235,32 @@ vmlinux_key_versioned="$(env PATH="$TMP/bin:$PATH" LOCALVERSION=-ci KBUILD_BUILD
     "$SCRIPT_DIR/native-cache.sh" key vmlinux | cut -f2)"
 [ "$vmlinux_key_plain" != "$vmlinux_key_versioned" ] \
     || fail "Kbuild overrides did not invalidate the vmlinux key"
+
+vmlinux_cache="$TMP/vmlinux-cache"
+vmlinux_counter="$TMP/vmlinux-build-counter"
+vmlinux_metrics="$TMP/vmlinux-cache-metrics.tsv"
+env PATH="$SYSTEM_PATH" FAKE_BUILD_COUNTER="$vmlinux_counter" \
+    KUASAR_WORKSPACE_ROOT="$vmlinux_workspace" KUASAR_NATIVE_CACHE_ROOT="$vmlinux_cache" \
+    KUASAR_NATIVE_CACHE_METRICS="$vmlinux_metrics" \
+    "$SCRIPT_DIR/native-cache.sh" restore-or-build vmlinux
+[ "$(wc -l <"$vmlinux_counter")" -eq 1 ] || fail "cold vmlinux cache must build once"
+env PATH="$SYSTEM_PATH" FAKE_BUILD_COUNTER="$vmlinux_counter" \
+    make -C "$vmlinux_workspace/guest-runtime/native-deps" \
+    TARGET_ARCH=x86_64 vmlinux >/dev/null
+[ "$(wc -l <"$vmlinux_counter")" -eq 1 ] \
+    || fail "cold vmlinux cache restore left the Make target stale"
+
+rm -f "$vmlinux_workspace/guest-runtime/native-deps/bin/x86_64/vmlinux"
+env PATH="$SYSTEM_PATH" FAKE_BUILD_COUNTER="$vmlinux_counter" \
+    KUASAR_WORKSPACE_ROOT="$vmlinux_workspace" KUASAR_NATIVE_CACHE_ROOT="$vmlinux_cache" \
+    KUASAR_NATIVE_CACHE_METRICS="$vmlinux_metrics" \
+    "$SCRIPT_DIR/native-cache.sh" restore-or-build vmlinux
+env PATH="$SYSTEM_PATH" FAKE_BUILD_COUNTER="$vmlinux_counter" \
+    make -C "$vmlinux_workspace/guest-runtime/native-deps" \
+    TARGET_ARCH=x86_64 vmlinux >/dev/null
+[ "$(wc -l <"$vmlinux_counter")" -eq 1 ] \
+    || fail "hot vmlinux cache restore left the Make target stale"
+grep -q $'vmlinux\thit\t' "$vmlinux_metrics" || fail "hot vmlinux cache metric is missing"
 
 cloud_workspace="$TMP/cloud-workspace"
 cargo_home="$TMP/cargo-home"
