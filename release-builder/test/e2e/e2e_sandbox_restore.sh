@@ -17,6 +17,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
+source "$REPO_ROOT/test/e2e/readiness_helpers.sh"
 
 skip() {
     echo
@@ -26,6 +27,7 @@ skip() {
 }
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH (needed to probe ctl.sock)"
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b"
 done
@@ -50,7 +52,21 @@ fi
 if [ "$(id -u)" -ne 0 ]; then skip "must run as root"; fi
 
 WORK="$(mktemp -d /tmp/e2e-restore-XXXXXX)"
-trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
+SBPID1=""
+SBPID2=""
+cleanup() {
+    set +e
+    for pid in "$SBPID1" "$SBPID2"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+    done
+    sleep 1
+    for pid in "$SBPID1" "$SBPID2"; do
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    done
+    [ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"
+    [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null
+}
+trap cleanup EXIT
 
 IMAGE="${IMAGE:-python:3.12-slim}"
 BLK0_IMAGE="${BLK0_IMAGE:-}"
@@ -98,13 +114,29 @@ LOG1="$WORK/run1.log"
 SID1="r1-$$"
 RUNTIME_ROOT="$WORK/runtime"
 mkdir -p "$RUNTIME_ROOT/$SID1"
+readiness_begin_capture "$WORK/cold.ready"
+COLD_READER_PID=$READY_READER_PID
 "$BIN/sandbox-ctl" run \
+    --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID1" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
+readiness_close_parent_writer
+
+readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID1" \
+    || { tail -60 "$LOG1"; exit 1; }
+readiness_connect_ctl "$RUNTIME_ROOT/$SID1/ctl.sock" \
+    || { echo "==> FAIL: cold ctl.sock not connectable at control_ready"; exit 1; }
+readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" \
+    || { tail -60 "$LOG1"; exit 1; }
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RUNTIME_ROOT" -- /bin/true \
+    || { echo "==> FAIL: cold immediate exec after ready failed"; exit 1; }
+readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' \
+    || { echo "==> FAIL: cold readiness wire was not exact"; exit 1; }
+echo "==> PASS: cold exact readiness wire; ctl.sock and immediate exec succeeded"
 
 echo "==> waiting for TICK 10 in run1..."
 for i in $(seq 1 600); do
@@ -131,6 +163,7 @@ mkdir -p "$OUT"
 # --resume=false (default) shuts CH down via /vm.shutdown; sandbox-ctl
 # run1 returns naturally. wait() not kill().
 wait "$SBPID1" 2>/dev/null || true
+SBPID1=""
 
 SNAP_FILE="$OUT/$SID1.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID1.snapshot"; ls -la "$OUT"; exit 1; }
@@ -166,7 +199,10 @@ EOF
 LOG2="$WORK/run2.log"
 SID2="r2-$$"
 mkdir -p "$RUNTIME_ROOT/$SID2"
+readiness_begin_capture "$WORK/restore.ready"
+RESTORE_READER_PID=$READY_READER_PID
 "$BIN/sandbox-ctl" run \
+    --ready-fd="$READY_WRITE_FD" \
     --restore "$SNAP_FILE" \
     --config "$WORK/host.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
@@ -174,6 +210,19 @@ mkdir -p "$RUNTIME_ROOT/$SID2"
     --sandbox-id "$SID2" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
+readiness_close_parent_writer
+
+readiness_wait_event "$WORK/restore.ready" 1 control_ready "$SBPID2" \
+    || { tail -60 "$LOG2"; exit 1; }
+readiness_connect_ctl "$RUNTIME_ROOT/$SID2/ctl.sock" \
+    || { echo "==> FAIL: restore ctl.sock not connectable at control_ready"; exit 1; }
+readiness_wait_event "$WORK/restore.ready" 2 ready "$SBPID2" \
+    || { tail -60 "$LOG2"; exit 1; }
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUNTIME_ROOT" -- /bin/true \
+    || { echo "==> FAIL: restore immediate exec after ready failed"; exit 1; }
+readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' \
+    || { echo "==> FAIL: restore readiness wire was not exact"; exit 1; }
+echo "==> PASS: restore exact readiness wire; ctl.sock and immediate exec succeeded"
 
 echo "==> waiting for restored TICK > $PRE_SNAP_TICK..."
 WANT_TICK=$((PRE_SNAP_TICK + 3))
@@ -188,6 +237,7 @@ done
 # Tear down run2.
 kill -TERM "$SBPID2" 2>/dev/null || true
 wait "$SBPID2" 2>/dev/null || true
+SBPID2=""
 
 if grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2"; then
     echo "==> PASS: restored sandbox continued counting (saw TICK $WANT_TICK)"
