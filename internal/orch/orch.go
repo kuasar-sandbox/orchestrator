@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -280,10 +281,12 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 		if readyTimeout <= 0 {
 			readyTimeout = 60 * time.Second
 		}
-		if err := o.waitReady(ctx, sb, readyTimeout); err != nil {
+		envdClient := udsClient(sb.EnvdUDS)
+		defer envdClient.CloseIdleConnections()
+		if err := o.waitReady(ctx, sb, envdClient, readyTimeout); err != nil {
 			return err
 		}
-		if err := o.envdInit(ctx, sb); err != nil {
+		if err := o.envdInit(ctx, sb, envdClient); err != nil {
 			o.log.Warn("envd /init", "sid", sb.ID, "err", err)
 		}
 	}
@@ -1134,19 +1137,74 @@ func udsClient(sock string) *http.Client {
 	}
 }
 
-func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, timeout time.Duration) error {
-	cl := udsClient(sb.EnvdUDS)
-	deadline := time.Now().Add(timeout)
+func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, cl *http.Client, timeout time.Duration) error {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	// Phased adaptive polling tuned for the envd readiness profile:
+	//
+	//   [0-60ms]    skip        — backend is definitely not ready yet.
+	//   [60-140ms]  fast 20ms   — the normal readiness window is 100-140 ms;
+	//                             probes at 60, 80, 100, 120, 140 ms cover both
+	//                             boundaries with minimal wasted requests.
+	//   [140ms+]    exp backoff — if not ready by now, something is slower
+	//                             than usual; back off to avoid busy-polling
+	//                             (40 → 80 → 160 → 320 → 500 ms cap).
+	const (
+		initialDelay = 60 * time.Millisecond
+		hotEnd       = 140 * time.Millisecond
+		hotInterval  = 20 * time.Millisecond
+		minBackoff   = 40 * time.Millisecond
+		maxBackoff   = 500 * time.Millisecond
+	)
+	backoff := minBackoff
+	first := true
 	for time.Now().Before(deadline) {
+		var wait time.Duration
+		if first {
+			wait = initialDelay
+			first = false
+		} else if time.Since(start) < hotEnd {
+			wait = hotInterval
+		} else {
+			wait = backoff
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+		}
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			break
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://envd/health", nil)
 		resp, err := cl.Do(req)
 		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == 204 || resp.StatusCode == 200 {
 				return nil
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		// Assign returns only after a prestarted runner has requested work, so
+		// its pidfile must exist throughout startup. ExecStopPost removes it if
+		// sandbox-ctl/CH exits before envd becomes ready; surface that failure
+		// immediately instead of polling a dead sandbox for the full timeout.
+		if o.runnerPool != nil && sb.RunID != "" {
+			if _, statErr := os.Stat(o.runnerPool.runPidFile(sb.RunID)); errors.Is(statErr, os.ErrNotExist) {
+				return fmt.Errorf("orch: runner %s exited before envd was ready", sb.RunID)
+			}
+		}
 	}
 	return fmt.Errorf("orch: envd not ready for %s", sb.ID)
 }
@@ -1159,7 +1217,7 @@ func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, timeout
 // and the proxy already enforces X-Access-Token as the sole gate. With MMDS enabled
 // (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
 // to it — giving forks fresh per-identity tokens with envd-side enforcement too.
-func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox, cl *http.Client) error {
 	payload := map[string]any{
 		"envVars":        sb.Env,
 		"defaultUser":    "user",
@@ -1172,10 +1230,11 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://envd/init", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := udsClient(sb.EnvdUDS).Do(req)
+	resp, err := cl.Do(req)
 	if err != nil {
 		return err
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("orch: envd /init status %d", resp.StatusCode)
