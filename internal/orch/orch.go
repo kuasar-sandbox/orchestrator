@@ -228,6 +228,12 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
 		}
 	}
+	// MkdirAll preserves an existing directory's mode. The readiness socket is
+	// private launch coordination, so restore the run directory invariant before
+	// binding it even when this is a resume into a pre-existing directory.
+	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
+		return fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err)
+	}
 	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
 	if err != nil {
 		return err
@@ -262,6 +268,13 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return err
 	}
+	readyListener, err := listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
+	if err != nil {
+		return err
+	}
+	defer readyListener.Close()
+	// Binding precedes assignment so node-ctl can connect immediately after its
+	// long-poll returns; no retry window is needed between the two processes.
 	if _, err := o.runnerPool.Assign(ctx, sb.ID, func(runID string) error {
 		sb.RunID = runID
 		if err := o.st.Put(ctx, sb); err != nil {
@@ -272,18 +285,25 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	}); err != nil {
 		return err
 	}
+	readyTimeout := o.sandboxReadyTimeout
+	if readyTimeout <= 0 {
+		readyTimeout = 60 * time.Second
+	}
+	// Runtime readiness and, for E2B, envd health consume one launch budget
+	// beginning after assignment. A slow VM therefore leaves less time for envd
+	// instead of silently starting a second full timeout.
+	readyCtx, cancelReady := context.WithTimeout(ctx, readyTimeout)
+	defer cancelReady()
+	if err := waitRuntimeReadiness(readyCtx, readyListener); err != nil {
+		return fmt.Errorf("orch: sandbox %s: %w", sb.ID, err)
+	}
 	if tmpl.Profile == types.ProfileE2B {
-		// Headroom for a cold microVM boot + envd ready; FC mode (mmds.enabled) adds the
-		// MMDS poll handshake, and a remote-snapshot restore (migration/fork) is heavier
-		// than a warm img cold-boot.
-		readyTimeout := o.sandboxReadyTimeout
-		if readyTimeout <= 0 {
-			readyTimeout = 60 * time.Second
-		}
-		if err := o.waitReady(ctx, sb, readyTimeout); err != nil {
+		// app_started is a runtime boundary, not proof that envd is listening, so
+		// E2B retains its application-level health check after runtime readiness.
+		if err := o.waitReady(readyCtx, sb); err != nil {
 			return err
 		}
-		if err := o.envdInit(ctx, sb); err != nil {
+		if err := o.envdInit(readyCtx, sb); err != nil {
 			o.log.Warn("envd /init", "sid", sb.ID, "err", err)
 		}
 	}
@@ -1134,10 +1154,12 @@ func udsClient(sock string) *http.Client {
 	}
 }
 
-func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, timeout time.Duration) error {
+func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox) error {
 	cl := udsClient(sb.EnvdUDS)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	defer cl.CloseIdleConnections()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://envd/health", nil)
 		resp, err := cl.Do(req)
 		if err == nil {
@@ -1146,9 +1168,12 @@ func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, timeout
 				return nil
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("orch: envd not ready for %s: %w", sb.ID, ctx.Err())
+		case <-ticker.C:
+		}
 	}
-	return fmt.Errorf("orch: envd not ready for %s", sb.ID)
 }
 
 // envdInit provisions envd after boot/restore: env vars, default user/workdir, time,

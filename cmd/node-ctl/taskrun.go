@@ -19,13 +19,29 @@ import (
 // launchTask locks+writes the pidfile, fetches the LaunchSpec for
 // "sandbox:<sid>" over the config-socket, applies its workdir/env, and
 // exec-replaces into the target (which inherits this PID and the unit cgroup).
-func launchTask(socket, configID, pidfile string) error {
+func launchTask(socket, configID, pidfile string, ready *os.File) error {
+	return launchTaskWith(socket, configID, pidfile, ready, taskLaunchOps{
+		lockPidfile: lockPidfile,
+		fetchSpec:   configsock.FetchLaunchSpec,
+		chdir:       os.Chdir,
+		exec:        syscall.Exec,
+	})
+}
+
+type taskLaunchOps struct {
+	lockPidfile func(string) error
+	fetchSpec   func(string, string) (*configsock.LaunchSpec, error)
+	chdir       func(string) error
+	exec        func(string, []string, []string) error
+}
+
+func launchTaskWith(socket, configID, pidfile string, ready *os.File, ops taskLaunchOps) error {
 	if pidfile != "" {
-		if err := lockPidfile(pidfile); err != nil {
+		if err := ops.lockPidfile(pidfile); err != nil {
 			return err
 		}
 	}
-	spec, err := configsock.FetchLaunchSpec(socket, configID)
+	spec, err := ops.fetchSpec(socket, configID)
 	if err != nil {
 		return fmt.Errorf("fetch launch spec: %w", err)
 	}
@@ -33,12 +49,38 @@ func launchTask(socket, configID, pidfile string) error {
 		return fmt.Errorf("launch spec has no exec")
 	}
 	if spec.Workdir != "" {
-		if err := os.Chdir(spec.Workdir); err != nil {
+		if err := ops.chdir(spec.Workdir); err != nil {
 			return fmt.Errorf("chdir %s: %w", spec.Workdir, err)
 		}
 	}
 	argv := append([]string{spec.Exec}, spec.Args...)
-	return syscall.Exec(spec.Exec, argv, taskEnv(spec.Env))
+	if ready != nil {
+		fd := int(ready.Fd())
+		if fd < 3 {
+			return fmt.Errorf("readiness fd %d is not inheritable", fd)
+		}
+		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
+	}
+	env := taskEnv(spec.Env)
+	if ready != nil {
+		// This is the last fallible operation before exec. If exec itself fails,
+		// runAssignedSandbox's defer closes the now-inheritable descriptor.
+		if err := clearCloseOnExec(ready); err != nil {
+			return err
+		}
+	}
+	return ops.exec(spec.Exec, argv, env)
+}
+
+func clearCloseOnExec(f *os.File) error {
+	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		return fmt.Errorf("get readiness fd flags: %w", err)
+	}
+	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("clear readiness fd close-on-exec: %w", err)
+	}
+	return nil
 }
 
 func envDefault(p *string, key string) {
