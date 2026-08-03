@@ -484,7 +484,11 @@ restore_entry() {
     local component=$1 entry=$2 key=$3
     verify_entry "$entry" "$key"
     remove_outputs "$component"
-    tar --extract --file "$entry/payload.tar" --directory "$WORKSPACE_ROOT" --no-same-owner
+    # Cache payloads use a deterministic 1970 mtime.  A verified restore is
+    # authoritative for the current input key, so stamp extracted outputs at
+    # restore time instead of making downstream file targets appear stale.
+    tar --extract --touch --file "$entry/payload.tar" \
+        --directory "$WORKSPACE_ROOT" --no-same-owner
     validate_outputs "$component"
 }
 

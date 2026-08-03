@@ -52,6 +52,8 @@ Cargo 全局及 target-specific 编译选项、pkg-config 搜索环境及其解�
 同 key 的构建和命中恢复都持有条目 `flock`;miss 直到构建、校验和原子发布完成才
 释放,等待者随后验证并恢复同一条目。发布后的目录去除写权限。命中恢复前会校验
 descriptor hash、payload hash 和 tar 路径。损坏条目直接失败,不会在原路径修补。
+payload 内的 mtime 固定为 1970 年以保持归档确定性;校验通过后,恢复到工作区的
+制品使用恢复时间,避免 canonical Make 文件目标把已验证制品误判为陈旧输入。
 发布 staging 目录使用独立锁；正常退出直接清理，强制取消或 runner 重启留下的
 目录由后续 run 在确认锁已释放后回收，不会误删另一个 slot 正在发布的 payload。
 
