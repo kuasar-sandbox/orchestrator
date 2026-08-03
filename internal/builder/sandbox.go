@@ -9,20 +9,26 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"gopkg.in/yaml.v3"
 )
 
 // --- sandbox child management ------------------------------------------------
 
 type phaseSandbox struct {
-	p       *buildPipeline
-	sid     string
-	runRoot string
-	cmd     *exec.Cmd
-	done    chan error
+	p              *buildPipeline
+	sid            string
+	runRoot        string
+	cmd            *exec.Cmd
+	done           chan struct{}
+	waitMu         sync.Mutex
+	waitErr        error
+	readyR         *os.File
+	readyCloseOnce sync.Once
 }
 
 // startSandbox writes the phase yaml and spawns `sandbox-ctl run` as a
@@ -57,6 +63,10 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		args = append(args, "--connect", c)
 	}
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
+	readyR, readyW, _, err := attachReadinessPipe(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("create readiness pipe: %w", err)
+	}
 	cmd.Env = append(os.Environ(),
 		"MANIFEST_KEY="+s.Env["MANIFEST_KEY"],
 		"KUASAR_RUN_ID="+s.RunID,
@@ -66,14 +76,39 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	// run-builder's stderr → builder unit journal for host diagnostics.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
+		_ = readyR.Close()
+		_ = readyW.Close()
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)
 	}
-	sb := &phaseSandbox{p: p, sid: sid, runRoot: runRoot, cmd: cmd, done: make(chan error, 1)}
+	// os/exec has duplicated ExtraFiles into the child. Drop the parent's writer
+	// immediately so every pre-ready child exit is observable as EOF by readyR.
+	_ = readyW.Close()
+	sb := &phaseSandbox{
+		p: p, sid: sid, runRoot: runRoot, cmd: cmd,
+		done: make(chan struct{}), readyR: readyR,
+	}
 	go func() {
-		sb.done <- cmd.Wait()
+		err := cmd.Wait()
+		sb.waitMu.Lock()
+		sb.waitErr = err
+		sb.waitMu.Unlock()
+		close(sb.done)
 	}()
 	p.log.Info("phase sandbox up", "phase", phase, "sid", sid)
 	return sb, nil
+}
+
+// attachReadinessPipe gives the writer the next os/exec child descriptor. The
+// number is derived from the pre-existing ExtraFiles rather than assuming fd 3.
+func attachReadinessPipe(cmd *exec.Cmd) (reader, writer *os.File, childFD int, err error) {
+	reader, writer, err = os.Pipe()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	childFD = 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, writer)
+	cmd.Args = append(cmd.Args, fmt.Sprintf("--ready-fd=%d", childFD))
+	return reader, writer, childFD, nil
 }
 
 func appendRefLocationArgs(args []string, locations map[string]string) []string {
@@ -88,33 +123,62 @@ func appendRefLocationArgs(args []string, locations map[string]string) []string 
 	return args
 }
 
-// waitExecReady polls a cheap in-guest command until the control plane
-// answers (boot complete). flatten-ctl mountpoint doubles as the probe —
-// it exists in the builder runtime on ANY rootfs, empty ones included.
-// Each probe is time-boxed: a half-up control plane accepts the dial but
-// never answers, and an unbounded exec would absorb the whole build budget.
-func (sb *phaseSandbox) waitExecReady(ctx context.Context, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := sb.exec(probeCtx, execOpts{quiet: true}, guestFlatten, "mountpoint", "/.probe")
-		cancel()
-		if err == nil {
+func (sb *phaseSandbox) closeReady() {
+	sb.readyCloseOnce.Do(func() {
+		if sb.readyR != nil {
+			_ = sb.readyR.Close()
+		}
+	})
+}
+
+func (sb *phaseSandbox) waitError() error {
+	sb.waitMu.Lock()
+	defer sb.waitMu.Unlock()
+	return sb.waitErr
+}
+
+func (sb *phaseSandbox) childExitError() error {
+	if err := sb.waitError(); err != nil {
+		return fmt.Errorf("sandbox exited during boot: %w", err)
+	}
+	return fmt.Errorf("sandbox exited during boot")
+}
+
+// waitRuntimeReady consumes the same exact control_ready -> ready -> EOF wire
+// as the main runner. Closing readyR is the cancellation mechanism for the
+// parser goroutine; child exit is independently observable through done.
+func (sb *phaseSandbox) waitRuntimeReady(ctx context.Context) error {
+	if sb.readyR == nil {
+		return fmt.Errorf("sandbox readiness pipe is unavailable")
+	}
+	parsed := make(chan error, 1)
+	go func() { parsed <- configsock.ReadReadiness(sb.readyR) }()
+
+	select {
+	case err := <-parsed:
+		sb.closeReady()
+		if err != nil {
+			select {
+			case <-sb.done:
+				return sb.childExitError()
+			default:
+			}
+			return fmt.Errorf("sandbox runtime readiness: %w", err)
+		}
+		select {
+		case <-sb.done:
+			return sb.childExitError()
+		default:
 			return nil
 		}
-		select {
-		case e := <-sb.done:
-			return fmt.Errorf("sandbox exited during boot: %v", e)
-		default:
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("sandbox not exec-ready within %s: %v", timeout, err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-		}
+	case <-sb.done:
+		sb.closeReady()
+		<-parsed
+		return sb.childExitError()
+	case <-ctx.Done():
+		sb.closeReady()
+		<-parsed
+		return fmt.Errorf("sandbox runtime readiness: %w", ctx.Err())
 	}
 }
 
@@ -166,13 +230,22 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 // teardown stops the phase sandbox: SIGTERM, then SIGKILL after a grace
 // period.
 func (sb *phaseSandbox) teardown() {
+	sb.closeReady()
+	select {
+	case <-sb.done:
+		sb.p.log.Info("phase sandbox down", "sid", sb.sid)
+		return
+	default:
+	}
 	if sb.cmd.Process == nil {
 		return
 	}
 	_ = sb.cmd.Process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(20 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-sb.done:
-	case <-time.After(20 * time.Second):
+	case <-timer.C:
 		_ = sb.cmd.Process.Kill()
 		<-sb.done
 	}
