@@ -79,6 +79,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -253,6 +254,7 @@ if ! [ -f "$BLK0" ]; then
     fi
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0" --no-progress >/dev/null
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0")"
 
 [ -d /sys/fs/cgroup/sandboxes ] || mkdir /sys/fs/cgroup/sandboxes
 echo "+memory +cpu" > /sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/null || true
@@ -287,7 +289,7 @@ boot:
   runtime: file://${BIN}/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
-    base: file://${BLK0}
+    base: ${BLK0_REF}
     overlay:
       diff: file://${WORK}/${sid}.diff
 launch:

@@ -23,6 +23,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 TAP_NAME="$(printf 'etf%x' "$$")"
 
@@ -59,6 +60,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     BLK0_IMAGE="$WORK/blk0.img"
     docker save python:3.12-slim | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
 echo "==> blk0: $BLK0_IMAGE"
 
 GUEST_MAC="02:00:00:00:80:01"
@@ -83,7 +85,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
-    base: file://$BLK0_IMAGE
+    base: $BLK0_REF
     overlay: { diff: file://$diff, size: 1GiB }
 EOF
     if [ "$launch" = "1" ]; then

@@ -28,6 +28,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -124,6 +125,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 BLK0="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0" --no-progress
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0")"
 
 # ---------- cgroup parent ----------
 
@@ -195,7 +197,7 @@ boot:
   runtime: file://${BIN}/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
-    base: file://${BLK0}
+    base: ${BLK0_REF}
     overlay:
       diff: file://${WORK}/${sid}.diff
 launch:
@@ -239,7 +241,7 @@ boot:
   runtime: file://${BIN}/sandbox-runtime.bundle
   cmdline: "console=hvc0"
   root:
-    base: file://${BLK0}
+    base: ${BLK0_REF}
     overlay:
       diff: file://${WORK}/${sid}.diff
 launch:

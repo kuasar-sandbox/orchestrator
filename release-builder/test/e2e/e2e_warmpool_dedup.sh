@@ -31,6 +31,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 N="${WARMPOOL_N:-5}"
@@ -170,6 +171,7 @@ fi
 BLK0_EROFS="$WORK/blk0.img"
 echo "==> docker save $IMAGE | flatten-ctl export --output blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
+BLK0_REF="$(plaintext_tarstream_ref "$BLK0_EROFS")"
 
 # Single ingest of blk0 → manifest. Each sandbox references this same
 # manifest at boot via boot.root.base = manifest://<BLK0_MKEY>.
@@ -268,7 +270,7 @@ boot:
   # cross-instance dedup.
   cmdline: "console=hvc0 printk.time=1 nokaslr norandmaps"
   root:
-    base: file://$BLK0_EROFS
+    base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
       size: 1GiB
