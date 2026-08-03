@@ -71,14 +71,14 @@ CTL_PID=""
 
 cleanup() {
     set +e
+    readiness_stop_watchdog
     if [ -n "$CTL_PID" ] && kill -0 "$CTL_PID" 2>/dev/null; then
         kill -TERM "$CTL_PID" 2>/dev/null
     elif [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null; then
         kill -TERM "$RUNPID" 2>/dev/null
     fi
     sleep 1
-    [ -n "$CTL_PID" ] && kill -0 "$CTL_PID" 2>/dev/null && kill -KILL "$CTL_PID" 2>/dev/null
-    [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null && kill -KILL "$RUNPID" 2>/dev/null
+    [ -n "$RUNPID" ] && readiness_kill_session KILL "$RUNPID"
     pkill -f "cloud-hypervisor.*$SID" 2>/dev/null
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
 }
@@ -127,22 +127,17 @@ echo "==> sandbox.yaml:"; sed 's/^/    /' "$WORK/sandbox.yaml"
 echo "==> launching placeholder sandbox (background)"
 readiness_begin_capture "$WORK/placeholder.ready"
 PLACEHOLDER_READER_PID=$READY_READER_PID
-timeout -k 10s 120 "$BIN/sandbox-ctl" run \
+readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" --sandbox-id "$SID" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNROOT" \
     > "$RUNLOG" 2>&1 &
 RUNPID=$!
 readiness_close_parent_writer
-# timeout relays a handled signal to both its child PID and process group.
-# Capture sandbox-ctl so the graceful-stop assertion sends exactly one signal.
-for _ in $(seq 1 50); do
-    CTL_PID="$(pgrep -P "$RUNPID" -x sandbox-ctl 2>/dev/null | head -1 || true)"
-    [ -n "$CTL_PID" ] && break
-    kill -0 "$RUNPID" 2>/dev/null || { echo "==> FAIL: timeout wrapper exited before sandbox-ctl started"; exit 1; }
-    sleep 0.1
-done
-[ -n "$CTL_PID" ] || { echo "==> FAIL: could not resolve sandbox-ctl child of timeout pid=$RUNPID"; exit 1; }
+readiness_start_watchdog "$RUNPID" 120 10
+# sandbox-ctl is now the direct child. Signalling this PID exercises its own
+# graceful CH shutdown path without a timeout wrapper duplicating the signal.
+CTL_PID=$RUNPID
 
 exec1() { "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" "$@"; }
 readiness_wait_event "$WORK/placeholder.ready" 1 control_ready "$RUNPID" \
@@ -241,6 +236,7 @@ fi
 echo "==> [4] graceful stop (SIGTERM sandbox-ctl directly)"
 kill -TERM "$CTL_PID"
 set +e; wait "$RUNPID"; RC=$?; set -e
+readiness_stop_watchdog
 RUNPID=""
 CTL_PID=""
 echo "==> run exit code: $RC"
