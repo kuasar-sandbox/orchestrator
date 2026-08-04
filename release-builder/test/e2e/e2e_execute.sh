@@ -56,6 +56,11 @@ FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
+case "$BIN" in
+    /*) ;;
+    *) BIN="$(cd "$BIN" 2>/dev/null && pwd)" || skip "BIN directory not found";;
+esac
+
 for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
@@ -950,7 +955,7 @@ AUTO_BODY=$(python3 - "$TEMPLATE" <<'PY'
 import json, sys
 print(json.dumps({
     "templateID": sys.argv[1],
-    "timeout": 15,
+    "timeout": 120,
     "metadata": {
         "kuasar-sandbox.checkpoint": json.dumps({"merge_ref": False})
     },
@@ -961,6 +966,8 @@ AUTO_CALL=$(snapshot_argv_count)
 code=$(req POST /sandboxes "$AK" "$AUTO_BODY")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "auto-pause create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
+code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":15}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "arm auto-pause timeout=$code"; }
 AUTO_PAUSED=""
 for _ in $(seq 1 180); do
     state=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
