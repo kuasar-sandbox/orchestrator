@@ -251,14 +251,44 @@ cp "$TMP/resolution/resolved.json" "$TMP/resolved.json"
 
 env PATH="$TMP/fake-bin:$PATH" GH_TOKEN=fake \
   FAKE_API_DIR="$TMP/api" FAKE_ASSET_DIR="$TMP/assets" \
-  "$SCRIPT_DIR/aggregate-release.sh" fetch "$TMP/resolved.json" "$TMP/fetched"
+  "$SCRIPT_DIR/aggregate-release.sh" fetch-assets "$TMP/resolved.json" "$TMP/staged"
+[ "$(find "$TMP/staged/assets" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 6 ] \
+  || fail "asset fetcher did not stage exactly six component archives"
+[ ! -e "$TMP/staged/install" ] \
+  || fail "asset fetcher unexpectedly materialized component binaries"
+"$SCRIPT_DIR/aggregate-release.sh" materialize-assets \
+  "$TMP/resolved.json" "$TMP/staged" "$TMP/fetched"
 [ "$(find "$TMP/fetched/install/bin" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 17 ] \
-  || fail "fetcher did not install the complete component file set"
+  || fail "materializer did not install the complete component file set"
 while read -r repository file; do
   case "$repository" in ''|\#*) continue ;; esac
   [ -f "$TMP/fetched/install/bin/$file" ] \
-    || fail "fetcher did not install required prebuilt file: $file"
+    || fail "materializer did not install required prebuilt file: $file"
 done < "$SCRIPT_DIR/bin-inputs.manifest"
+
+cp -a "$TMP/staged" "$TMP/mismatched-staged"
+printf '\n' >> "$TMP/mismatched-staged/resolved.json"
+if "$SCRIPT_DIR/aggregate-release.sh" materialize-assets \
+  "$TMP/resolved.json" "$TMP/mismatched-staged" "$TMP/mismatched-materialized" \
+  >/dev/null 2>&1; then
+  fail "materializer accepted assets bound to a different resolved file"
+fi
+
+cp -a "$TMP/staged" "$TMP/tampered-staged"
+printf 'tampered\n' >> "$TMP/tampered-staged/assets/accelerator-v1.0.0-linux-x86_64.tar.gz"
+if "$SCRIPT_DIR/aggregate-release.sh" materialize-assets \
+  "$TMP/resolved.json" "$TMP/tampered-staged" "$TMP/tampered-materialized" \
+  >/dev/null 2>&1; then
+  fail "materializer accepted a staged archive with the wrong digest"
+fi
+
+cp -a "$TMP/staged" "$TMP/extra-staged"
+touch "$TMP/extra-staged/assets/unexpected.tar.gz"
+if "$SCRIPT_DIR/aggregate-release.sh" materialize-assets \
+  "$TMP/resolved.json" "$TMP/extra-staged" "$TMP/extra-materialized" \
+  >/dev/null 2>&1; then
+  fail "materializer accepted an unexpected staged asset"
+fi
 
 env \
   RELEASE_WORKFLOW_REPOSITORY=kuasar-sandbox/orchestrator \
