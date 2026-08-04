@@ -231,7 +231,7 @@ echo "==> PASS: both data disks + dataset base survived snapshot→restore"
 # Establish the working set from a known cold guest page cache. The first
 # mincore assertion proves the warm-up itself succeeded before W is captured.
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- /bin/sh -c \
-    'sync; echo 3 > /proc/sys/vm/drop_caches; cat "$1" >/dev/null' sh "$WARM_PATH" \
+    'sync && echo 3 > /proc/sys/vm/drop_caches && cat "$1" >/dev/null' sh "$WARM_PATH" \
     >"$WORK/warm-read.out" 2>&1 || { cat "$WORK/warm-read.out"; echo "FAIL: deterministic warm-up"; exit 1; }
 guest_mincore_all "$SID2" "$WARM_PATH" >"$WORK/warm-before-snapshot.out" 2>&1 \
     || { cat "$WORK/warm-before-snapshot.out"; echo "FAIL: warm-up file was not resident before W capture"; exit 1; }
