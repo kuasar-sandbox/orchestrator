@@ -19,7 +19,12 @@
 #                                real sandbox-ctl HTTP CONNECT client against the
 #                                guest (stdio, PTY resize, exit status, pause wake).
 #   envd exec                  -> run a command in the guest via envd (incl. hostname).
-#   DELETE                     -> teardown.
+#   local Pause policy        -> all-unset keeps the legacy argv; then node,
+#                                Create metadata/header, Pause body/header, and
+#                                automatic reaper policy are layered fieldwise.
+#                                Every capture is a real local W bundle and is
+#                                restored before teardown.
+#   DELETE                    -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
 # mkfs.erofs, and the built kernel + runtime erofs
@@ -47,7 +52,7 @@ FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl manifest-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
@@ -72,6 +77,32 @@ UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slic
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
+
+# Run conductor from a private sibling-bin directory so its normal binary
+# discovery reaches this transparent sandbox-ctl wrapper. The wrapper records
+# snapshot argv as JSONL, then execs the unmodified release candidate binary.
+# All non-snapshot behavior therefore remains the real KVM stack.
+ORCH_BIN_DIR="$WORK/orch-bin"
+SNAPSHOT_ARGV_LOG="$WORK/snapshot-argv.jsonl"
+mkdir -p "$ORCH_BIN_DIR"
+cp "$BIN/node-ctl" "$ORCH_BIN_DIR/node-ctl"
+for b in connector-ctl flatten-ctl manifest-ctl; do
+    ln -s "$BIN/$b" "$ORCH_BIN_DIR/$b"
+done
+cat > "$ORCH_BIN_DIR/sandbox-ctl" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "snapshot" ]; then
+    python3 - "$SNAPSHOT_ARGV_LOG" "\$@" <<'PY'
+import json, sys
+with open(sys.argv[1], "a", encoding="utf-8") as output:
+    output.write(json.dumps(sys.argv[2:]) + "\\n")
+PY
+fi
+exec "$BIN/sandbox-ctl" "\$@"
+EOF
+chmod +x "$ORCH_BIN_DIR/sandbox-ctl"
+
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
@@ -132,8 +163,48 @@ req() {
     # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
+    [ -n "${REQ_CHECKPOINT_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Checkpoint: ${REQ_CHECKPOINT_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+}
+
+snapshot_argv_count() {
+    python3 - "$SNAPSHOT_ARGV_LOG" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+if not os.path.exists(path):
+    print(0)
+else:
+    with open(path, encoding="utf-8") as source:
+        print(sum(1 for line in source if line.strip()))
+PY
+}
+
+assert_snapshot_argv() { # $1=index, remaining args=expected argv
+    local index="$1"
+    shift
+    python3 - "$SNAPSHOT_ARGV_LOG" "$index" "$@" <<'PY'
+import json, sys
+path, index, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+with open(path, encoding="utf-8") as source:
+    calls = [json.loads(line) for line in source if line.strip()]
+if index >= len(calls):
+    raise SystemExit(f"missing snapshot call {index}; captured {len(calls)}")
+if calls[index] != expected:
+    raise SystemExit(f"snapshot call {index}={calls[index]!r}, want {expected!r}")
+PY
+}
+
+assert_snapshot_has_no_policy_flags() { # $1=index
+    python3 - "$SNAPSHOT_ARGV_LOG" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    calls = [json.loads(line) for line in source if line.strip()]
+call = calls[int(sys.argv[2])]
+bad = [arg for arg in call if arg.startswith("--merge-ref=") or arg.startswith("--drop-caches=")]
+if bad:
+    raise SystemExit(f"builder snapshot unexpectedly received checkpoint policy flags: {bad!r}")
+PY
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
@@ -384,7 +455,10 @@ BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export
 truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
-cat > "$WORK/config.yaml" <<EOF
+CHECKPOINT_DIR="$WORK/checkpoints"
+write_orchestrator_config() { # $1=unset|node-policy
+    local policy_mode="$1"
+    cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS }
 mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
@@ -403,15 +477,49 @@ builder:
   diff_template: $BLD
   vcpu: 1
   memory: 1GiB
-checkpoint: { mode: remote }
+checkpoint:
+  mode: local
+  local_dir: $CHECKPOINT_DIR
 EOF
-"$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
-PIDS+=($!)
-for _ in $(seq 1 30); do
-    curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
-    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/  /' "$WORK/orch.log"; skip "orchestrator exited"; }
-    sleep 0.5
-done
+    if [ "$policy_mode" = "node-policy" ]; then
+        cat >> "$WORK/config.yaml" <<'EOF'
+  merge_ref: true
+  drop_caches: false
+EOF
+    fi
+}
+
+ORCH_PID=""
+start_orchestrator() { # $1=log path
+    local log_path="$1" ready=""
+    "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
+    ORCH_PID=$!
+    PIDS+=("$ORCH_PID")
+    for _ in $(seq 1 30); do
+        if curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        kill -0 "$ORCH_PID" 2>/dev/null || { sed 's/^/  /' "$log_path"; fail "orchestrator exited"; }
+        sleep 0.5
+    done
+    [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
+    grep -q 'checkpoint.mode=remote is deprecated' "$log_path" && fail "local checkpoint mode emitted the remote deprecation warning"
+}
+
+stop_orchestrator() {
+    [ -n "$ORCH_PID" ] || return 0
+    local stopped_pid="$ORCH_PID"
+    kill -TERM "$stopped_pid" 2>/dev/null || true
+    wait "$stopped_pid" 2>/dev/null || true
+    for i in "${!PIDS[@]}"; do
+        [ "${PIDS[$i]}" = "$stopped_pid" ] && unset 'PIDS[i]'
+    done
+    ORCH_PID=""
+}
+
+write_orchestrator_config unset
+start_orchestrator "$WORK/orch.log"
 echo "==> node-ctl up (:$PORT)"
 wait_mmds_listener
 echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
@@ -435,6 +543,12 @@ for _ in $(seq 1 120); do
 done
 [ -n "$TEMPLATE" ] || fail "build did not become ready"
 echo "==> built template: $TEMPLATE"
+BUILD_SNAPSHOT_COUNT=$(snapshot_argv_count)
+[ "$BUILD_SNAPSHOT_COUNT" -gt 0 ] || fail "builder did not invoke sandbox-ctl snapshot"
+for ((i=0; i<BUILD_SNAPSHOT_COUNT; i++)); do
+    assert_snapshot_has_no_policy_flags "$i" || fail "builder snapshot received Pause-only policy flags"
+done
+echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
 
 # ---- create the sandbox (boots the microVM) -------------------------------
 # Inject sandbox config via the X-Kuasar-Sandbox-Network header (§4.6): the guest
@@ -537,48 +651,188 @@ done
 [ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "internal proxy_netns -> floatingip user port did not return marker"; }
 echo "==> PASS: internal proxy per-dial proxy_netns reached sandbox floatingip:8000 (marker=$USER_MARK)"
 
-# ---- pause (snapshot+upload) -> resume -> verify state survived ------------
+# ---- local Pause, all policy fields unset -> exact legacy argv + restore ---
 # Write a marker file in the guest BEFORE pausing; after resume it must still be
-# there — proving both the snapshot/restore overlay AND that a resumed img sandbox
-# restores (not cold-boots). /home/user is user-owned (flatten preserves ownership).
+# there — proving both the local snapshot/restore overlay AND that a resumed img
+# sandbox restores (not cold-boots). /home/user is user-owned.
 PERSIST="PERSIST_$MARK"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "echo $PERSIST > /home/user/persist.txt; cat /home/user/persist.txt" > "$WORK/wr.out" 2>&1 || true
 grep -q "$PERSIST" "$WORK/wr.out" || { sed 's/^/  guest| /' "$WORK/wr.out"; fail "could not write /home/user/persist.txt as the guest user (ownership not preserved?)"; }
 echo "==> wrote /home/user/persist.txt in the guest (as user)"
 
-echo "==> pause (snapshot+upload) $SID"
+UNSET_CALL=$(snapshot_argv_count)
+echo "==> local pause with node/metadata/action policy all unset: $SID"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
-if [ "$code" = "204" ]; then
-    echo "==> PASS: sandbox paused (snapshot uploaded to store)"
-    echo "==> resume via authenticated service=exec CONNECT using the same KAT"
-    RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
-    exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
-    # The exec CONNECT completes only after restore and guest command execution;
-    # probe envd as an independent restored-service readiness check.
-    resumed=""
-    for _ in $(seq 1 90); do
-        code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
-            -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
-        case "$code" in 200|204) resumed=1; break ;; esac
-        sleep 0.5
-    done
-    [ -n "$resumed" ] || fail "envd did not become ready after asynchronous resume"
-    python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
-    sed 's/^/  guest2| /' "$WORK/exec2.out"
-    grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
-    echo "==> PASS: same KAT woke the paused sandbox and pre-pause guest state survived restore"
-else
-    echo "==> NOTE: pause=$code — snapshot error (diagnostic):"
+[ "$code" = "204" ] || {
+    echo "==> pause=$code — snapshot error:"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
     SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
-    PAUSE_FAILED=1
-fi
+    fail "local all-unset pause=$code (want 204)"
+}
+assert_snapshot_argv "$UNSET_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    || fail "all-unset local Pause changed the legacy snapshot argv"
+W_UNSET="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+[ -f "$W_UNSET" ] || fail "local Pause did not create $W_UNSET"
+"$BIN/sandbox-ctl" info --json "$W_UNSET" >"$WORK/w-unset.json" \
+    || fail "all-unset local W is not a readable snapshot bundle"
+echo "==> PASS: all-unset local Pause produced W and passed no policy flags"
+
+echo "==> restore all-unset W through authenticated exec wake"
+RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+resumed=""
+for _ in $(seq 1 90); do
+    code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
+        -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
+    case "$code" in 200|204) resumed=1; break ;; esac
+    sleep 0.5
+done
+[ -n "$resumed" ] || fail "envd did not become ready after local restore"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
+sed 's/^/  guest2| /' "$WORK/exec2.out"
+grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after local restore"
+echo "==> PASS: all-unset W restored locally and preserved guest state"
+
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox=$code (want 204)"
 unset EXEC_TOKEN
+SID_UNSET="$SID"
+
+# Restart the conductor against the same store with explicit node defaults.
+# Local mode must remain warning-free; these values are inherited only when a
+# higher layer leaves the corresponding field unset.
+stop_orchestrator
+write_orchestrator_config node-policy
+start_orchestrator "$WORK/orch-node-policy.log"
+wait_mmds_listener
+echo "==> PASS: conductor restarted in local mode with node merge_ref=true/drop_caches=false"
+
+# ---- Create metadata/header + Pause body/header fieldwise overlays --------
+CREATE_POLICY_BODY=$(python3 - "$TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 120,
+    "metadata": {
+        "kuasar-sandbox.checkpoint": json.dumps({"merge_ref": True, "drop_caches": True})
+    },
+}))
+PY
+)
+REQ_CHECKPOINT_HEADER='{"merge_ref":false,"drop_caches":null}'
+code=$(req POST /sandboxes "$AK" "$CREATE_POLICY_BODY")
+unset REQ_CHECKPOINT_HEADER
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "policy create=$code (want 201)"; }
+SID=$(json_field "$WORK/resp.body" sandboxID)
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+assert_no_default_exec_token "$WORK/resp.body" || fail "policy create exposed a default exec token"
+
+# The Create header overrides merge_ref, while its null drop_caches inherits
+# the body. The stored request-scoped namespace must be canonical.
+python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select metadata_json from sandboxes where id=?", (sys.argv[2],)).fetchone()
+if row is None:
+    raise SystemExit("created sandbox row not found")
+metadata = json.loads(row[0])
+got = metadata.get("kuasar-sandbox.checkpoint")
+want = '{"merge_ref":false,"drop_caches":true}'
+if got != want:
+    raise SystemExit(f"stored checkpoint metadata={got!r}, want {want!r}")
+PY
+echo "==> PASS: Create checkpoint header overlaid body per field and persisted canonical metadata"
+
+ENVD_SOCK="$WORK/run/$SID/envd.sock"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue policy sandbox exec capability"
+POLICY_PERSIST="POLICY_PERSIST_$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "echo $POLICY_PERSIST > /home/user/policy-persist.txt" >"$WORK/policy-write.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/policy-write.out" || { sed 's/^/  guest| /' "$WORK/policy-write.out"; fail "write policy sandbox marker"; }
+
+POLICY_CALL=$(snapshot_argv_count)
+# Body overrides stored metadata; the header then overrides only merge_ref.
+# Its null drop_caches must preserve the body's false.
+REQ_CHECKPOINT_HEADER='{"merge_ref":false,"drop_caches":null}'
+code=$(req POST "/sandboxes/$SID/pause" "$AK" \
+    '{"memory":true,"checkpoint_merge_ref":true,"checkpoint_drop_caches":false}')
+unset REQ_CHECKPOINT_HEADER
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "policy pause=$code (want 204)"; }
+assert_snapshot_argv "$POLICY_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    --merge-ref=false --drop-caches=false \
+    || fail "Pause body/header policy did not reach sandbox-ctl exactly"
+W_POLICY="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+[ -f "$W_POLICY" ] || fail "policy Pause did not create $W_POLICY"
+"$BIN/sandbox-ctl" info --json "$W_POLICY" >"$WORK/w-policy.json" || fail "policy W is unreadable"
+python3 - "$WORK/w-policy.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    info = json.load(source)
+refs = info.get("FromRefs") or []
+if not refs:
+    raise SystemExit("working-set W has no memory lower reference")
+if "kuasar-sandbox.checkpoint" in (info.get("Metadata") or {}):
+    raise SystemExit("host-only checkpoint policy leaked into snapshot.cfg metadata")
+PY
+echo "==> PASS: Pause header null inherited body, explicit false flags reached local capture, W self remains separate from its memory lower"
+
+RESUME_MARK="POLICY_W_RESUME_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+resumed=""
+for _ in $(seq 1 90); do
+    code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
+        -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
+    case "$code" in 200|204) resumed=1; break ;; esac
+    sleep 0.5
+done
+[ -n "$resumed" ] || fail "policy W did not restore locally"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/policy-persist.txt" >"$WORK/policy-read.out" 2>&1 || true
+grep -q "$POLICY_PERSIST" "$WORK/policy-read.out" || { sed 's/^/  guest| /' "$WORK/policy-read.out"; fail "policy W lost guest state"; }
+echo "==> PASS: policy W restored locally with guest state intact"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill policy sandbox=$code"
+unset EXEC_TOKEN
+SID_POLICY="$SID"
+
+# ---- automatic Pause: metadata merge_ref > node; node supplies drop_caches -
+AUTO_BODY=$(python3 - "$TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 15,
+    "metadata": {
+        "kuasar-sandbox.checkpoint": json.dumps({"merge_ref": False})
+    },
+}))
+PY
+)
+AUTO_CALL=$(snapshot_argv_count)
+code=$(req POST /sandboxes "$AK" "$AUTO_BODY")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "auto-pause create=$code"; }
+SID=$(json_field "$WORK/resp.body" sandboxID)
+AUTO_PAUSED=""
+for _ in $(seq 1 180); do
+    state=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select state from sandboxes where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "missing")
+PY
+)
+    [ "$state" = "paused" ] && { AUTO_PAUSED=1; break; }
+    sleep 0.5
+done
+[ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
+assert_snapshot_argv "$AUTO_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    --merge-ref=false --drop-caches=false \
+    || fail "auto-pause did not resolve metadata > node fieldwise"
+[ -f "$CHECKPOINT_DIR/$SID/$SID.snapshot" ] || fail "auto-pause did not create local W"
+echo "==> PASS: reaper auto-pause used metadata merge_ref=false and node drop_caches=false"
 
 # ---- teardown -------------------------------------------------------------
-code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill=$code (want 204)"
-echo "==> PASS: sandbox killed"
-[ -n "${PAUSE_FAILED:-}" ] && fail "pause/resume did not complete (see snapshot error above)"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill auto-paused sandbox=$code (want 204)"
+echo "==> PASS: all local checkpoint-policy sandboxes killed"
 echo
-echo "==> e2e_execute: OK   (template $TEMPLATE, sandbox $SID)"
+echo "==> e2e_execute: OK   (template $TEMPLATE, all-unset $SID_UNSET, policy $SID_POLICY, auto $SID)"

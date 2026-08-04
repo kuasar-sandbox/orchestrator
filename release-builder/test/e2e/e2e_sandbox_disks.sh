@@ -11,11 +11,14 @@
 #   4. both data disks are writable
 #   5. snapshot (--output, destroy) captures one .overlay per writable disk
 #   6. restore preserves data written to BOTH data disks (single + overlay)
+#   7. a second capture with --merge-ref=false keeps the local memory parent
+#      as W.from_refs while root and both data-disk parents are still merged;
+#      restoring W preserves every disk.
 #
 # Prerequisites (checked; missing → skip, exit 0; REQUIRE_KVM=1 to fail hard):
 #   /dev/kvm rw · bin/{cloud-hypervisor,sandbox-ctl,sandbox-init,
 #   sandbox-runtime.bundle,flatten-ctl,mkfs.erofs} · $VMLINUX · docker (or
-#   BLK0_IMAGE=) · mkfs.ext4 · root (tap/cgroup/vsock). Any /bin/sh rootfs works
+#   BLK0_IMAGE=) · mkfs.ext4 · python3 · root (tap/cgroup/vsock). Any /bin/sh rootfs works
 #   (default base busybox).
 
 set -euo pipefail
@@ -41,16 +44,17 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH (apt install e2fsprogs)"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 
 WORK=$(mktemp -d /tmp/e2e-disks-XXXXXX)
 RR=$WORK/runtime; mkdir -p "$RR"
 OUT=$WORK/out; mkdir -p "$OUT"
-P1=""; P2=""; TAP_CREATED=0
+P1=""; P2=""; P3=""; TAP_CREATED=0
 cleanup() {
     set +e
-    for P in "$P1" "$P2"; do [ -n "$P" ] && kill -0 "$P" 2>/dev/null && kill -KILL "$P" 2>/dev/null; done
+    for P in "$P1" "$P2" "$P3"; do [ -n "$P" ] && kill -0 "$P" 2>/dev/null && kill -KILL "$P" 2>/dev/null; done
     pkill -f "cloud-hypervisor.*dk-" 2>/dev/null
     [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
     [ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"
@@ -165,6 +169,87 @@ grep -q D-OK "$WORK/post.out" || { echo "FAIL: overlay-disk data lost across sna
 grep -q DATASET-OK "$WORK/post.out" || { echo "FAIL: dataset erofs base lost"; exit 1; }
 echo "==> PASS: both data disks + dataset base survived snapshot→restore"
 
-kill -TERM "$P2" 2>/dev/null || true; wait "$P2" 2>/dev/null || true; P2=""
+# ---- [7] working-set capture: memory stacks; every local disk merges ------
+WOUT="$WORK/working-set"; mkdir -p "$WOUT"
+# A non-merged local memory parent is an explicit sibling dependency. Place it
+# beside W as the sandboxer local-artifact contract requires; the product does
+# not copy or publish artifacts implicitly.
+PARENT_MEMORY_ARTIFACT="$(readlink -f "$SNAP")"
+[ -f "$PARENT_MEMORY_ARTIFACT" ] || { echo "FAIL: parent snapshot target is missing: $PARENT_MEMORY_ARTIFACT"; exit 1; }
+PARENT_MEMORY_BASENAME="$(basename "$PARENT_MEMORY_ARTIFACT")"
+ln "$PARENT_MEMORY_ARTIFACT" "$WOUT/$PARENT_MEMORY_BASENAME"
+"$BIN/sandbox-ctl" info --json "$SNAP" >"$WORK/s1-info.json"
+echo "==> [7] snapshot restored sandbox with --merge-ref=false"
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID2" --output "$WOUT" --run-root "$RR" \
+    --merge-ref=false 2>&1 | sed 's/^/    /'
+wait "$P2" 2>/dev/null || true; P2=""
+W="$WOUT/$SID2.snapshot"
+[ -f "$W" ] || { echo "FAIL: no working-set snapshot $W"; exit 1; }
+"$BIN/sandbox-ctl" info --json "$W" >"$WORK/w-info.json"
+python3 - "$WORK/s1-info.json" "$WORK/w-info.json" "$PARENT_MEMORY_BASENAME" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    parent = json.load(source)
+with open(sys.argv[2], encoding="utf-8") as source:
+    working = json.load(source)
+
+refs = working.get("FromRefs") or []
+if len(refs) != 1 or os.path.basename(refs[0].split("@", 1)[0]) != sys.argv[3]:
+    raise SystemExit(f"working-set memory from_refs={refs!r}, want one local parent {sys.argv[3]!r}")
+
+def disk_nodes(doc):
+    boot = doc["Boot"]
+    return [boot["Root"], *(boot.get("Disks") or [])]
+
+def top(node):
+    overlay = node.get("Overlay")
+    return overlay["Base"] if overlay else node["Base"]
+
+def chain(node):
+    overlay = node.get("Overlay")
+    return (overlay.get("BaseFromRefs") if overlay else node.get("BaseFromRefs")) or []
+
+parent_nodes = disk_nodes(parent)
+working_nodes = disk_nodes(working)
+if len(parent_nodes) != 3 or len(working_nodes) != 3:
+    raise SystemExit(f"disk node counts parent={len(parent_nodes)} working={len(working_nodes)}, want root+2 data")
+for index, (parent_node, working_node) in enumerate(zip(parent_nodes, working_nodes)):
+    parent_top = top(parent_node)
+    if parent_top in chain(working_node):
+        raise SystemExit(f"disk {index} retained local parent {parent_top!r}; local disks must merge even when memory stacks")
+PY
+echo "==> PASS: W memory self is independent (one local from_ref); root + two data-disk parents were merged"
+
+# Restore W with fresh writable uppers. Its memory parent is already a sibling
+# in WOUT; disk state must come entirely from W's merged disk artifacts.
+truncate -s 512M "$WORK/root-w.ext4"; mkfs.ext4 -q -F "$WORK/root-w.ext4"
+truncate -s 256M "$WORK/dataset-w.ext4"; mkfs.ext4 -q -F "$WORK/dataset-w.ext4"
+cat > "$WORK/restore-w.yaml" <<EOF
+resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
+network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: e2e-disks-w }
+boot:
+  runtime: file://$BIN/sandbox-runtime.bundle
+  root:
+    base: $BLK0_REF
+    overlay: { diff: file://$WORK/root-w.ext4, size: 512MiB }
+  disks:
+    - { name: scratch }
+    - { name: dataset, base: $DATASET_REF, overlay: { diff: file://$WORK/dataset-w.ext4, size: 256MiB } }
+EOF
+SID3=dk-3
+timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore-w.yaml" --sandbox-id "$SID3" \
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run3.log" 2>&1 &
+P3=$!
+ready "$SID3" || { echo "FAIL: working-set restore not ready"; tail -60 "$WORK/run3.log"; exit 1; }
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RR" -- /bin/sh -c \
+    'cat /scratch/persist /data/persist /data/DATASET-OK' > "$WORK/w-post.out" 2>&1 || true
+sed 's/^/    /' "$WORK/w-post.out"
+for marker in S-OK D-OK DATASET-OK; do
+    grep -q "$marker" "$WORK/w-post.out" || { echo "FAIL: W restore lost $marker"; tail -60 "$WORK/run3.log"; exit 1; }
+done
+echo "==> PASS: local working-set W restored memory, root, and both data disks"
+
+kill -TERM "$P3" 2>/dev/null || true; wait "$P3" 2>/dev/null || true; P3=""
 echo
-echo "==> e2e_sandbox_disks: OK"
+echo "==> e2e_sandbox_disks: OK (merge_ref=false affects memory only; all disks merge and restore)"

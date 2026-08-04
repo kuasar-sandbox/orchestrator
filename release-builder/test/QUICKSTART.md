@@ -118,7 +118,8 @@ bash test/e2e/run_all.sh
 | `e2e_orchestrator.sh` | node-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI(纯用户态,无 root/systemd/KVM)|
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create |
-| `e2e_execute.sh` | 启真实 microVM(KVM)→ envd 内执行 → 暂停/恢复状态存活 → kill |
+| `e2e_execute.sh` | 启真实 microVM(KVM)→ envd 内执行 → local Pause 三态 policy(node/Create/Pause/reaper)→ W 本地恢复 → kill |
+| `e2e_sandbox_disks.sh` | `merge_ref=false` working-set:memory self/parent 分层,root + data disk 仍合并并可本地恢复 |
 | `e2e_orchestrator_proxy.sh` | external proxy(master routesync + shm route view + worker fd inheritance)+ 数据面 X-Access-Token + auto-resume |
 | `e2e_cluster_real.sh` | cluster-ctl registry/router/placer + 真实 node-ctl + 真实 microVM;阶段一 N=1 registry,阶段二 N=3 registry + node-link redirect |
 
