@@ -219,6 +219,8 @@ type PauseRequest struct {
 	CheckpointDropCaches *bool `json:"checkpoint_drop_caches,omitempty"`
 }
 
+const maxPauseRequestBytes = 4 << 10
+
 // Core is the orchestrator behaviour the API needs. Every per-resource method
 // takes the raw API key; Core verifies it against the encrypted APISecret saved
 // on the target resource and treats a mismatch as not-found. Create/RegisterBuild
@@ -480,8 +482,18 @@ func (a *API) failExecSession(w http.ResponseWriter, err error) {
 }
 
 func (a *API) pause(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > maxPauseRequestBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPauseRequestBytes)
 	req, err := decodePauseRequest(r.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "bad body")
 		return
 	}

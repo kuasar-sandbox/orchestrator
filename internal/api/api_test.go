@@ -344,6 +344,38 @@ func TestPauseRejectsInvalidRequestsBeforeCore(t *testing.T) {
 	}
 }
 
+func TestPauseRejectsOversizedBodyBeforeCore(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "declared length", body: `{}`, contentLength: maxPauseRequestBytes + 1},
+		{name: "streamed", body: `{}` + strings.Repeat(" ", maxPauseRequestBytes-1), contentLength: -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error {
+				calls++
+				return nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			request := httptest.NewRequest(http.MethodPost, "/sandboxes/sid/pause", strings.NewReader(tc.body))
+			request.Header.Set("X-API-KEY", apiKey)
+			request.ContentLength = tc.contentLength
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413; body=%s", response.Code, response.Body.String())
+			}
+			if calls != 0 {
+				t.Fatalf("oversized request called Core.Pause %d times", calls)
+			}
+		})
+	}
+}
+
 func stringPtr(value string) *string { return &value }
 
 func TestSandboxResponseUsesProfileSpecificCredentials(t *testing.T) {
