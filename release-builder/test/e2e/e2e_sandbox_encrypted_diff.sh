@@ -173,12 +173,18 @@ ready() { # $1=sandbox id $2=process id $3=log
 }
 
 assert_diff() { # $1=active path $2=logical size
-    local path="$1" logical="$2" magic physical
+    local path="$1" logical="$2" magic physical blocks block_size allocated
     [ -f "$path" ] || { echo "FAIL: no active diff $path"; return 1; }
     magic=$(od -An -tx1 -N8 "$path" | tr -d ' \n')
     [ "$magic" = 894b44585453310a ] || { echo "FAIL: $path magic=$magic"; return 1; }
     physical=$(stat -c %s "$path")
     [ "$physical" -eq $((logical + 4096)) ] || { echo "FAIL: $path physical=$physical logical=$logical"; return 1; }
+    read -r blocks block_size < <(stat -c '%b %B' "$path")
+    allocated=$((blocks * block_size))
+    [ "$allocated" -lt "$physical" ] || {
+        echo "FAIL: $path is not sparse: allocated=$allocated physical=$physical"
+        return 1
+    }
 }
 
 echo "==> cold boot with required policy and plaintext templates"
@@ -219,6 +225,12 @@ mapfile -t OVERLAYS < <(find "$OUT" -maxdepth 1 -type f -name '*.overlay' -print
 for artifact in "${OVERLAYS[@]}" "$(readlink -f "$SNAP")"; do
     magic=$(od -An -tx1 -N8 "$artifact" | tr -d ' \n')
     [ "$magic" = 894b5453454e430a ] || { echo "FAIL: local artifact is not encrypted v1: $artifact"; exit 1; }
+done
+for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK; do
+    if grep -aFq "$marker" "${OVERLAYS[@]}" "$(readlink -f "$SNAP")"; then
+        echo "FAIL: guest plaintext marker appears in an encrypted snapshot artifact"
+        exit 1
+    fi
 done
 "$BIN/sandbox-ctl" info --json --manifest-config "$REQUIRED_CONFIG" "$SNAP" > "$WORK/snapshot.json"
 python3 - "$WORK/snapshot.json" <<'PY'
@@ -270,13 +282,20 @@ PID2=$!
 PIDS+=("$PID2")
 ready "$SID2" "$PID2" "$LOG2"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUN_ROOT" -- /bin/sh -c \
-    'cat /root-active /scratch/persist /data/persist /data/DATASET-BASE-OK' >"$WORK/restore-local-check.out" 2>&1
+    'cat /root-active /scratch/persist /data/persist /data/DATASET-BASE-OK; echo ROOT-RESTORED-OK > /root-restored; echo SCRATCH-RESTORED-OK > /scratch/restored; echo DATA-RESTORED-OK > /data/restored; sync' \
+    >"$WORK/restore-local-check.out" 2>&1
 for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK DATASET-BASE-OK; do
     grep -q "$marker" "$WORK/restore-local-check.out" || { echo "FAIL: local restore lost $marker"; cat "$WORK/restore-local-check.out"; exit 1; }
 done
 assert_diff "$ROOT_RESTORE" $((512 * 1024 * 1024))
 assert_diff "$SCRATCH_RESTORE" $((256 * 1024 * 1024))
 assert_diff "$DATASET_RESTORE" $((256 * 1024 * 1024))
+for marker in ROOT-RESTORED-OK SCRATCH-RESTORED-OK DATA-RESTORED-OK; do
+    if grep -aFq "$marker" "$ROOT_RESTORE" "$SCRATCH_RESTORE" "$DATASET_RESTORE"; then
+        echo "FAIL: restored guest plaintext marker appears in an encrypted body"
+        exit 1
+    fi
+done
 echo "==> PASS: required local restore rebuilt encrypted root and data uppers"
 
 SNAP_KEY=$("$BIN/sandbox-ctl" snapshot --sandbox-id "$SID2" --upload --run-root "$RUN_ROOT" 2>"$WORK/snapshot-upload.log")
@@ -296,8 +315,9 @@ PID3=$!
 PIDS+=("$PID3")
 ready "$SID3" "$PID3" "$LOG3"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RUN_ROOT" -- /bin/sh -c \
-    'cat /root-active /scratch/persist /data/persist /data/DATASET-BASE-OK' >"$WORK/restore-remote-check.out" 2>&1
-for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK DATASET-BASE-OK; do
+    'cat /root-active /scratch/persist /data/persist /root-restored /scratch/restored /data/restored /data/DATASET-BASE-OK' \
+    >"$WORK/restore-remote-check.out" 2>&1
+for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK ROOT-RESTORED-OK SCRATCH-RESTORED-OK DATA-RESTORED-OK DATASET-BASE-OK; do
     grep -q "$marker" "$WORK/restore-remote-check.out" || { echo "FAIL: manifest restore lost $marker"; cat "$WORK/restore-remote-check.out"; exit 1; }
 done
 assert_diff "$ROOT_REMOTE" $((512 * 1024 * 1024))
