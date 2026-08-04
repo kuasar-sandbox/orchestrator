@@ -11,8 +11,8 @@ fail() {
 }
 
 validate_version() {
-  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || fail "version must match vX.Y.Z without leading zeroes"
+  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    || fail "version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD without leading zeroes"
 }
 
 normalize_arch() {
@@ -212,7 +212,7 @@ validate_bundle() {
       and .kind == "component"
       and .name == $name
       and .repository == $repository
-      and (.version | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+      and (.version | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
       and .tag == .version
       and (.architecture == "x86_64" or .architecture == "aarch64")
       and (.commit | test("^[0-9a-f]{40}$"))

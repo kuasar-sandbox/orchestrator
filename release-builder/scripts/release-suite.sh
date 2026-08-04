@@ -13,8 +13,10 @@ release_exists() {
   local repository="$1" version="$2"
   local state="$TMP/release.json"
   if gh api "repos/$repository/releases/tags/$version" > "$state" 2> "$TMP/api-error"; then
-    jq -e --arg version "$version" '
-      .tag_name == $version and .draft == false and .prerelease == false
+    local prerelease=false
+    [[ "$version" != *-preview.* ]] || prerelease=true
+    jq -e --arg version "$version" --argjson prerelease "$prerelease" '
+      .tag_name == $version and .draft == false and .prerelease == $prerelease
     ' "$state" >/dev/null || fail "$repository $version exists but is not a completed release"
     return 0
   fi

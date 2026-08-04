@@ -1,13 +1,16 @@
 name: Aggregate Release
-run-name: Aggregate ${{ inputs.version }}
+run-name: ${{ github.event_name == 'schedule' && 'Daily release-v0.1.0 preview' || format('Aggregate {0}', inputs.version) }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Aggregate version in release-vX.Y.Z form
+        description: Aggregate version in release-vX.Y.Z or release-vX.Y.Z-preview.YYYYMMDD form
         required: true
         type: string
+  schedule:
+    - cron: "17 6 * * *"
+      timezone: Asia/Shanghai
 
 permissions:
   contents: read
@@ -19,26 +22,54 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     outputs:
       input_artifact: ${{ steps.input.outputs.artifact }}
+      publish: ${{ steps.request.outputs.publish }}
+      version: ${{ steps.request.outputs.version }}
     steps:
       - name: Check out trusted aggregate tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Validate aggregate request
+      - name: Resolve aggregate request
+        id: request
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] \
-            || { echo "Aggregate Release must be dispatched from main" >&2; exit 1; }
+            || { echo "Aggregate Release must run from main" >&2; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/release-v0.1.0" >/dev/null 2>&1; then
+              echo "version=release-v0.1.0" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            created_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+            VERSION="release-v0.1.0-preview.$(TZ=Asia/Shanghai date -d "$created_at" +%Y%m%d)"
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" > existing.json 2>/dev/null; then
+              jq -e --arg version "$VERSION" \
+                '.tag_name == $version and .draft == false and .prerelease == true' \
+                existing.json >/dev/null
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            VERSION="$INPUT_VERSION"
+          fi
           bash release-builder/scripts/publish-release.sh check "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Create read-only component token
         id: source-token
+        if: steps.request.outputs.publish == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
@@ -48,15 +79,77 @@ jobs:
           permission-contents: read
           skip-token-revoke: true
 
-      - name: Resolve release mapping and component releases
-        id: input
+      - name: Define scheduled aggregate mapping
+        if: github.event_name == 'schedule' && steps.request.outputs.publish == 'true'
         env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
-          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          VERSION: ${{ steps.request.outputs.version }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^release-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-            || { echo "version must match release-vX.Y.Z" >&2; exit 1; }
+          date=${VERSION##*.}
+          component_tags=(
+            "kuasar-sandbox/accelerator v0.1.0-preview.$date"
+            "kuasar-sandbox/connector v0.1.0-preview.$date"
+            "kuasar-sandbox/sandboxer v0.1.0-preview.$date"
+            "kuasar-sandbox/orchestrator v0.1.0-preview.$date"
+            "kuasar-sandbox/guest-runtime runtime-v0.1.0-preview.$date"
+            "kuasar-sandbox/guest-runtime vmlinux-v0.1.0-preview.$date"
+          )
+          ready=false
+          for attempt in $(seq 1 120); do
+            missing=()
+            for entry in "${component_tags[@]}"; do
+              read -r repository tag <<< "$entry"
+              if ! GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$repository/releases/tags/$tag" \
+                --jq 'select(.draft == false and .prerelease == true) | .tag_name' \
+                | grep -Fx "$tag" >/dev/null; then
+                missing+=("$repository@$tag")
+              fi
+            done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              ready=true
+              break
+            fi
+            printf 'Waiting for daily component previews (attempt %d/120): %s\n' \
+              "$attempt" "${missing[*]}"
+            sleep 60
+          done
+          [ "$ready" = true ] || { echo "Daily component previews did not become ready" >&2; exit 1; }
+          jq -n \
+            --arg version "$VERSION" \
+            --arg accelerator "v0.1.0-preview.$date" \
+            --arg connector "v0.1.0-preview.$date" \
+            --arg sandboxer "v0.1.0-preview.$date" \
+            --arg orchestrator "v0.1.0-preview.$date" \
+            --arg runtime "runtime-v0.1.0-preview.$date" \
+            --arg vmlinux "vmlinux-v0.1.0-preview.$date" '
+              {
+                schemaVersion: 1,
+                version: $version,
+                architecture: "x86_64",
+                components: {
+                  accelerator: $accelerator,
+                  connector: $connector,
+                  sandboxer: $sandboxer,
+                  orchestrator: $orchestrator,
+                  runtime: $runtime,
+                  vmlinux: $vmlinux
+                }
+              }
+            ' > mapping.json
+          bash release-builder/scripts/release-map.sh put mapping.json
+
+      - name: Resolve release mapping and component releases
+        id: input
+        if: steps.request.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^release-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+            || { echo "version must match release-vX.Y.Z or release-vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
           path="releases/$VERSION.json"
           mapping_commit=$(gh api \
             "repos/$GITHUB_REPOSITORY/commits?sha=release&path=$path&per_page=1" \
@@ -85,6 +178,7 @@ jobs:
             https://api.github.com/installation/token
 
       - name: Upload resolved aggregate input
+        if: steps.request.outputs.publish == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.input.outputs.artifact }}
@@ -94,6 +188,7 @@ jobs:
 
   bms:
     needs: preflight
+    if: needs.preflight.outputs.publish == 'true'
     permissions:
       contents: read
       pull-requests: read
@@ -106,6 +201,7 @@ jobs:
     needs:
       - preflight
       - bms
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read

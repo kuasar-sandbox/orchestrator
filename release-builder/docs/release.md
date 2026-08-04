@@ -13,6 +13,11 @@ Kuasar Sandbox 区分组件版本与平台聚合版本。组件版本回答“�
   `runtime-vX.Y.Z` 与 `vmlinux-vX.Y.Z`;
 - `orchestrator`:额外发布平台聚合版本 `release-vX.Y.Z`。
 
+每条版本线也接受日期预览后缀 `-preview.YYYYMMDD`,例如
+`v0.1.0-preview.20260804` 和 `release-v0.1.0-preview.20260804`。preview 是
+GitHub prerelease,不取代 Latest;正式版本由新的 workflow run 重新构建和验证,
+不重命名或覆盖 preview。
+
 一个聚合版本可以选择不同的组件版本。例如 `release-v0.2.1` 可以组合
 `accelerator v0.2.0`、`sandboxer v0.2.0`、`orchestrator v0.1.5`、
 `runtime-v0.2.1` 和 `vmlinux-v0.1.4`。选择关系存放在 `orchestrator` 仓的
@@ -94,12 +99,36 @@ gh workflow run aggregate-release.yml \
   -f version=release-v0.2.1
 ```
 
+### 2.3 每日 preview
+
+正式 `v0.1.0` 发布前,各仓按 `Asia/Shanghai` 错峰生成同一天的 preview:
+
+| 时间 | 发布入口 | 当日版本 |
+|---|---|---|
+| 00:17 | accelerator | `v0.1.0-preview.YYYYMMDD` |
+| 00:27 | connector | `v0.1.0-preview.YYYYMMDD` |
+| 00:37 | sandboxer | `v0.1.0-preview.YYYYMMDD` |
+| 00:47 | vmlinux | `vmlinux-v0.1.0-preview.YYYYMMDD` |
+| 00:57 | orchestrator | `v0.1.0-preview.YYYYMMDD` |
+| 02:17 | runtime | `runtime-v0.1.0-preview.YYYYMMDD` |
+| 06:17 | aggregate | `release-v0.1.0-preview.YYYYMMDD` |
+
+日期取 Actions run 的 `created_at` 并转换到上海时区,因此排队或 job 重试不会改变
+目标 tag。同日 Release 已完成时 workflow 幂等跳过;对应正式 `v0.1.0` 已发布后,
+该版本线停止自动 preview。
+
+runtime 使用同日 sandboxer preview 构建。聚合 job 最多等待两小时,直到六个同日
+组件 prerelease 均已公开,再把确定的版本组合写入 `release` 分支、执行完整 BMS
+E2E 并发布聚合 prerelease。等待和解析只有跨仓读取权限;组件工作流之间不互相
+dispatch,也不要求跨仓 Actions 写权限。
+
 ## 3. 配置
 
 ### 3.1 版本映射
 
 `release` 是与 `main` 无父子关系的独立分支。每个版本新增一个不可变文件
-`releases/release-vX.Y.Z.json`:
+`releases/release-vX.Y.Z.json`;preview 使用
+`releases/release-vX.Y.Z-preview.YYYYMMDD.json`:
 
 ```json
 {
@@ -135,8 +164,9 @@ fast-forward 追加 mapping。已存在的版本文件只能复用完全相同�
 
 GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、Release 元数据和
 资产。自托管 runner 在执行任何仓库代码前撤销 token。具备 `contents:write` 的
-`GITHUB_TOKEN` 只存在于 GitHub-hosted publish job;该 job 只验证 bundle、创建 tag、
-上传资产和发布 draft,不运行组件二进制。
+`GITHUB_TOKEN` 只存在于 GitHub-hosted publish job和每日聚合的 mapping step。
+publish job 只验证 bundle、创建 tag、上传资产和发布 draft,不运行组件二进制;
+每日 mapping step 只向本仓 `release` 分支追加当日不可变 mapping。
 
 ## 4. 设计
 
@@ -146,7 +176,7 @@ GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、R
 
 ```text
 preflight (read)        build (self-hosted, read)       publish (hosted, write)
-tag/release 不存在 ───► exact source → test → package ───► draft → upload → digest → publish
+resolve version ──────► exact source → test → package ───► draft+assets → digest → publish
 ```
 
 组件 archive 使用可合并的共享根布局:`bin/`、`docs/`、`test/`、`deploy/`、
@@ -176,10 +206,12 @@ vmlinux workflow 只恢复或构建 native cache 的 `vmlinux` 组件。相同 k
 
 ### 4.3 聚合解析
 
-`Aggregate Release` 只接受 `release-vX.Y.Z`,随后从 `release` 分支定位对应 mapping
+`Aggregate Release` 接受正式或 preview 的 `release-vX.Y.Z` 版本,随后从 `release`
+分支定位对应 mapping
 文件的提交。preflight 对六个组件逐项验证:
 
-- tag 与已发布、非 prerelease GitHub Release 一致;
+- tag 与已发布 GitHub Release 一致,且 tag 带 preview 后缀时 Release 必须为
+  prerelease,否则必须为正式 Release;
 - tag 指向组件 `release.json` 记录的 commit;
 - Release 恰好包含组件 archive、`SHA256SUMS`、`release.json`;
 - GitHub 计算的 `sha256:` digest、大小与组件清单一致;
@@ -213,9 +245,13 @@ publish job 按以下顺序执行:
 1. 重新验证 aggregate bundle、六个组件清单和所有本地 SHA-256;
 2. 确认 mapping commit 仍位于 `release` 分支历史,远端 mapping 字节未变化;
 3. 创建指向 mapping commit 的 lightweight `release-vX.Y.Z` tag;
-4. 创建 draft Release,上传八个资产;
+4. 在一次 `release create` 中创建 draft Release 并上传八个资产;
 5. 从 GitHub API 读取每个资产的大小、状态和服务器 `sha256:` digest;
-6. 全部一致后发布 draft,并再次确认 tag 未移动。
+6. 全部一致后按 tag 类型发布正式版或 prerelease,并再次确认 tag 未移动。
+
+GitHub 的按 tag 查询接口只返回已公开 Release,不会返回 draft。发布器因此通过
+Release 列表定位同 tag draft 的 ID;失败重试时先按 ID 删除残留 draft,再一次性重建
+并上传完整资产。tag 必须仍指向清单 commit,已公开 Release 永不覆盖。
 
 构建和 E2E job 没有写权限;publish job 不推进 `release` 分支。mapping 的提交与聚合
 发布是两个显式阶段,因此失败不会用另一组组件版本静默替换同名 Release。
@@ -228,7 +264,7 @@ publish job 按以下顺序执行:
 | 独立组件构建或测试 | mapping 已记录,缺少对应组件 Release | 修复组件后重跑快捷入口;已完成版本会复用 |
 | 聚合解析 | 组件 Release 不完整或 digest 不一致 | 修复/重新发布新的组件版本,新增聚合 mapping;不改写旧版本 |
 | BMS E2E | 六个组件 Release 保持不变,无聚合 Release | 修复组件并选择新版本,或修复测试环境后重跑同一 mapping |
-| draft 上传或 digest 校验 | 可能留下 tag/draft,公开 Release 不存在 | 在原 workflow run 重试 publish job |
+| draft 上传或 digest 校验 | 可能留下 tag/draft,公开 Release 不存在 | 重试 publish job;发布器按 ID 清理同 tag draft 后重建 |
 | 发布后最终检查 | Release 已公开 | 人工核查远端 ref;脚本不会覆盖已发布资产 |
 
 组件和聚合 workflow 都按仓库串行,但并发正确性不依赖 Actions concurrency。tag

@@ -24,17 +24,25 @@ api_optional() {
   return 1
 }
 
+validate_tag() {
+  [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    || fail "tag must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD without leading zeroes"
+}
+
+find_draft_release() {
+  local tag="$1"
+  local output="$2"
+  gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" \
+    | jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag and .draft == true)]' \
+    > "$output"
+  [ "$(jq 'length' "$output")" -le 1 ] \
+    || fail "multiple draft releases use tag $tag"
+}
+
 check_release() {
   [ "$#" -eq 1 ] || fail "usage: publish-component-release.sh check <tag>"
   local tag="$1"
-  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || fail "tag must match vX.Y.Z without leading zeroes"
-  if api_optional "repos/$REPOSITORY/git/ref/tags/$tag" "$TMP/tag"; then
-    fail "Git tag already exists: $tag"
-  else
-    local rc=$?
-    [ "$rc" -eq 4 ] || exit "$rc"
-  fi
+  validate_tag "$tag"
   if api_optional "repos/$REPOSITORY/releases/tags/$tag" "$TMP/release"; then
     fail "GitHub release already exists: $tag"
   else
@@ -73,6 +81,7 @@ publish_bundle() {
   commit="$(jq -er '.commit' "$manifest")"
   repository="$(jq -er '.repository' "$manifest")"
   [ "$repository" = "$REPOSITORY" ] || fail "bundle belongs to $repository, not $REPOSITORY"
+  validate_tag "$tag"
 
   local tag_state="$TMP/tag"
   if api_optional "repos/$REPOSITORY/git/ref/tags/$tag" "$tag_state"; then
@@ -87,15 +96,18 @@ publish_bundle() {
 
   local release_state="$TMP/release"
   if api_optional "repos/$REPOSITORY/releases/tags/$tag" "$release_state"; then
-    jq -e '.draft == true' "$release_state" >/dev/null \
-      || fail "$tag is already published; refusing to replace it"
-    gh release edit "$tag" --repo "$REPOSITORY" --draft --target "$commit" \
-      --title "$tag" --notes-file "$bundle/release-notes.md" >/dev/null
+    fail "$tag is already published; refusing to replace it"
   else
     local rc=$?
     [ "$rc" -eq 4 ] || exit "$rc"
-    gh release create "$tag" --repo "$REPOSITORY" --draft --verify-tag --target "$commit" \
-      --title "$tag" --notes-file "$bundle/release-notes.md" >/dev/null
+  fi
+
+  local drafts="$TMP/drafts"
+  find_draft_release "$tag" "$drafts"
+  if [ "$(jq 'length' "$drafts")" -eq 1 ]; then
+    local stale_id
+    stale_id="$(jq -er '.[0].id' "$drafts")"
+    gh api --method DELETE "repos/$REPOSITORY/releases/$stale_id" >/dev/null
   fi
 
   local files=()
@@ -103,16 +115,26 @@ publish_bundle() {
     files+=("$bundle/assets/$name")
   done < <(jq -r '.artifacts[].name' "$manifest")
   files+=("$manifest")
-  gh release upload "$tag" --repo "$REPOSITORY" --clobber "${files[@]}"
+  gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
+    --target "$commit" --title "$tag" --notes-file "$bundle/release-notes.md" >/dev/null
 
-  gh api "repos/$REPOSITORY/releases/tags/$tag" > "$release_state"
+  find_draft_release "$tag" "$drafts"
+  [ "$(jq 'length' "$drafts")" -eq 1 ] || fail "cannot locate newly created draft for $tag"
+  jq '.[0]' "$drafts" > "$release_state"
   verify_uploaded_assets "$release_state" "$bundle"
   local release_id
   release_id="$(jq -er '.id' "$release_state")"
-  jq -n '{draft: false, prerelease: false}' \
+  local prerelease=false
+  [[ "$tag" != *-preview.* ]] || prerelease=true
+  jq -n --argjson prerelease "$prerelease" '
+      {draft: false, prerelease: $prerelease,
+       make_latest: (if $prerelease then "false" else "true" end)}
+    ' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" --input - >/dev/null
   gh api "repos/$REPOSITORY/releases/tags/$tag" > "$release_state"
-  jq -e '.draft == false and .prerelease == false' "$release_state" >/dev/null \
+  jq -e --argjson prerelease "$prerelease" '
+      .draft == false and .prerelease == $prerelease
+    ' "$release_state" >/dev/null \
     || fail "$tag was not published"
   echo "==> published $REPOSITORY $tag from $commit"
 }
