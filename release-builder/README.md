@@ -81,5 +81,7 @@ make -C orchestrator/release-builder perf              # 性能 harness 全套
   端口、启停依赖、故障域。
 - [docs/perf.md](docs/perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
 - [docs/ci.md](docs/ci.md) — 五仓 BMS revision set、阶段计时、源码与原生制品缓存。
+- [docs/release.md](docs/release.md) — 自动聚合发布、`release` orphan 历史、权限边界、
+  失败恢复与资产校验。
 - 模块设计文档随各自仓(如 `sandboxer/docs/sandbox.md`、
   `accelerator/docs/manifest.md`、`orchestrator/docs/node.md`)。

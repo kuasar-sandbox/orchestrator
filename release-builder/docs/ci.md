@@ -69,6 +69,7 @@ cache miss 只允许在 CI 新装配、尚无原生源码目录的 workspace 中
 
 ```bash
 make -C orchestrator/release-builder test-ci-tools
+make -C orchestrator/release-builder test-release-tools
 ```
 
 它覆盖热命中、环境/工具链/Kbuild 输入失效、损坏拒绝、同 key 并发 miss 只构建
@@ -84,3 +85,14 @@ make -C orchestrator/release-builder test-ci-tools
 - `source-cache.tsv`:源码归档命中与摘要;
 - `native-cache.tsv`:原生制品 key、命中状态与等待/构建耗时;
 - `timings.tsv`:每个构建组件、umbrella E2E 和子仓 E2E 的资源数据。
+
+## Release reuse
+
+`.github/workflows/release.yml` 通过 `workflow_call` 复用同一份 `bms-e2e.yml`。
+release mode 不接受 PR candidate,而是在一次 GraphQL 响应中固定五仓当前 `main`
+revision,并要求 orchestrator revision 等于 dispatch 的 trusted workflow SHA。
+`revisions.tsv` 中这些记录的 role 为 `release`。
+
+完整 E2E 通过后,同一 BMS workspace 生成发布组件包和 release bundle。bundle 通过
+Actions artifact 交给 GitHub-hosted publish job;自托管 runner 不获得仓库写权限。
+分支、tag、清单和 GitHub Release 的具体一致性规则见 [release.md](release.md)。
