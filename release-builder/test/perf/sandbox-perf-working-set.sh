@@ -693,6 +693,8 @@ portable_restore() { # $1=group $2=iter $3=prefetch $4=portable-ref $5=artifact-
 
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$restore_dir/run" -- /bin/sh -c \
         'set -eu
+         sync
+         echo 3 > /proc/sys/vm/drop_caches
          [ "$(cat /root-w)" = ROOT-W-OK ]
          [ "$(cat /scratch/working-set)" = SCRATCH-W-OK ]
          [ "$(cat /data/working-set)" = DATA-W-OK ]
