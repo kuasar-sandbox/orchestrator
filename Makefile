@@ -8,7 +8,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl \
-        test vet bench test-e2e test-e2e-cluster-stub clean help
+	        test vet bench test-e2e test-e2e-cluster-stub release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -90,6 +90,25 @@ test-e2e: build test-e2e-cluster-stub
 test-e2e-cluster-stub:
 	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
+VERSION ?= v0.1.0
+
+release: build
+	@mkdir -p build
+	@{ \
+		printf 'repository\trequested_ref\tresolved_sha\trole\n'; \
+		printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tdependency\n' "$$(git -C ../accelerator rev-parse HEAD)"; \
+		printf 'kuasar-sandbox/connector\tHEAD\t%s\tdependency\n' "$$(git -C ../connector rev-parse HEAD)"; \
+		printf 'kuasar-sandbox/orchestrator\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)"; \
+		printf 'kuasar-sandbox/sandboxer\tHEAD\t%s\tdependency\n' "$$(git -C ../sandboxer rev-parse HEAD)"; \
+	} > build/revisions.tsv
+	rm -rf build/release-bundle
+	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
+		bash release-builder/scripts/component-release.sh \
+		package "$(VERSION)" "$(TARGET_ARCH)" build/revisions.tsv build/release-bundle
+
+test-release:
+	bash release-builder/scripts/test-component-release.sh
+
 help:
 	@echo "orchestrator. Targets:"
 	@echo "  build / node-ctl           build the node daemon (e2b host + resource control)"
@@ -98,4 +117,6 @@ help:
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
 	@echo "  test-e2e                   run real-process cluster e2e with node-stub-ctl"
+	@echo "  release                    build a validated orchestrator component bundle"
+	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

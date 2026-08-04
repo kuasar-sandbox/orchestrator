@@ -52,6 +52,11 @@ make test                       # 单元测试
 make test-e2e                   # 启动真实 registry/router/placer + node-stub-ctl 做集群 stub e2e
 ```
 
+`orchestrator` 自身通过 `Component Release` workflow 独立发布 `vX.Y.Z`。发布件
+`orchestrator-vX.Y.Z-linux-<arch>.tar.gz` 包含节点与集群控制面二进制、部署模板、
+系统文档和跨仓测试入口。平台聚合版本 `release-vX.Y.Z` 使用另一条工作流和版本映射,
+不从 `orchestrator/main` 推导组件组合。
+
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
 和 guest-runtime 构建出的 `sandbox-runtime.bundle`。
 
