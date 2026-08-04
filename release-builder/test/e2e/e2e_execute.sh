@@ -218,6 +218,23 @@ PY
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+sandbox_run_id() { # $1=sandbox id
+    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select run_id from sandboxes where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "")
+PY
+}
+wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
+    local unit="$1" pattern="$2" output="$3"
+    for _ in $(seq 1 50); do
+        journalctl -u "$unit" --no-pager >"$output" 2>/dev/null || true
+        grep -Fq "$pattern" "$output" && return 0
+        sleep 0.1
+    done
+    return 1
+}
 assert_no_default_exec_token() {
     python3 - "$1" <<'PY'
 import json, sys
@@ -729,6 +746,8 @@ echo "==> PASS: all-unset B restored locally and preserved guest state"
 # B.snapshot as an opaque memory lower instead of recursively publishing B's
 # stale disk graph.
 PORTABLE_W_CALL=$(snapshot_argv_count)
+PORTABLE_W_RUN_ID=$(sandbox_run_id "$SID")
+[ -n "$PORTABLE_W_RUN_ID" ] || fail "working-set source runner id is empty"
 code=$(req POST "/sandboxes/$SID/pause" "$AK" \
     '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
@@ -742,10 +761,10 @@ W_PORTABLE_ARTIFACT="$(readlink -f "$W_PORTABLE_LOCAL")"
 [ "$W_PORTABLE_ARTIFACT" != "$B_ARTIFACT" ] || fail "working-set W reused B memory self"
 "$BIN/sandbox-ctl" info --json "$W_PORTABLE_LOCAL" >"$WORK/w-portable-local.json" \
     || fail "local working-set W is unreadable"
-journalctl KUASAR_SANDBOX_ID="$SID" --no-pager >"$WORK/w-portable-local.journal" 2>/dev/null \
-    || fail "read local W sandbox journal"
-grep -Fq 'quiesce: guest acked (drop_caches=skipped' "$WORK/w-portable-local.journal" \
-    || fail "working-set Pause did not preserve guest page cache"
+PORTABLE_W_UNIT="sandbox-runner@$PORTABLE_W_RUN_ID.service"
+wait_unit_journal_contains "$PORTABLE_W_UNIT" \
+    'quiesce: guest acked (drop_caches=skipped' "$WORK/w-portable-local.journal" \
+    || { tail -40 "$WORK/w-portable-local.journal" | sed 's/^/  unit| /'; fail "working-set Pause did not preserve guest page cache"; }
 B_ROOT_TOP_BASENAME=$(python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_SNAPSHOT_BASENAME" <<'PY'
 import json, os, sys
 
@@ -840,10 +859,12 @@ done
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" \
     >"$WORK/portable-read.out" 2>&1 || true
 grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost guest state"; }
-journalctl KUASAR_SANDBOX_ID="$SID" --no-pager >"$WORK/portable-w.journal" 2>/dev/null \
-    || fail "read portable W sandbox journal"
-grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
-    "$WORK/portable-w.journal" || fail "portable restore did not prefetch W self"
+PORTABLE_RESTORE_RUN_ID=$(sandbox_run_id "$SID")
+[ -n "$PORTABLE_RESTORE_RUN_ID" ] || fail "portable restore runner id is empty"
+PORTABLE_RESTORE_UNIT="sandbox-runner@$PORTABLE_RESTORE_RUN_ID.service"
+wait_unit_journal_contains "$PORTABLE_RESTORE_UNIT" \
+    "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
+    "$WORK/portable-w.journal" || { tail -40 "$WORK/portable-w.journal" | sed 's/^/  unit| /'; fail "portable restore did not prefetch W self"; }
 MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/portable-w.journal" || true)
 [ "$MANIFEST_PREFETCH_COUNT" = "1" ] || fail "portable restore started $MANIFEST_PREFETCH_COUNT manifest prefetches, want W self only"
 grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
