@@ -537,7 +537,8 @@ code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl"}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)
-code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" "{\"fromImage\":\"$GUEST_REF\"}")
+code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
+    "{\"fromImage\":\"$GUEST_REF\",\"startCmd\":\"exec sleep 86400\",\"readyCmd\":\"true\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "trigger=$code"; }
 TEMPLATE=""
 for _ in $(seq 1 120); do
@@ -549,6 +550,7 @@ for _ in $(seq 1 120); do
     esac; sleep 1
 done
 [ -n "$TEMPLATE" ] || fail "build did not become ready"
+case "$TEMPLATE" in e2b-snp-*) : ;; *) fail "build produced $TEMPLATE (want e2b-snp-...)";; esac
 echo "==> built template: $TEMPLATE"
 BUILD_SNAPSHOT_COUNT=$(snapshot_argv_count)
 [ "$BUILD_SNAPSHOT_COUNT" -gt 0 ] || fail "builder did not invoke sandbox-ctl snapshot"
