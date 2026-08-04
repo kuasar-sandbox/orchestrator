@@ -149,7 +149,7 @@ jobs:
 
           [ "$GITHUB_REF" = refs/heads/main ] \
             || { echo "release workflow must select the trusted main ref" >&2; exit 1; }
-          [[ "$RELEASE_INPUT_ARTIFACT" =~ ^aggregate-input-release-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]] \
+          [[ "$RELEASE_INPUT_ARTIFACT" =~ ^aggregate-input-release-v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?-[0-9]+$ ]] \
             || { echo "invalid release input artifact name" >&2; exit 1; }
           [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
 

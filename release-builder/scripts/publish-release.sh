@@ -12,8 +12,17 @@ fail() {
 }
 
 validate_version() {
-  [[ "$1" =~ ^release-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || fail "version must match release-vX.Y.Z without leading zeroes"
+  [[ "$1" =~ ^release-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+    || fail "version must match release-vX.Y.Z or release-vX.Y.Z-preview.YYYYMMDD without leading zeroes"
+}
+
+find_draft_release() {
+  local version="$1" output="$2"
+  gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" \
+    | jq --arg version "$version" '[.[][] | select(.tag_name == $version and .draft == true)]' \
+    > "$output"
+  [ "$(jq 'length' "$output")" -le 1 ] \
+    || fail "multiple draft releases use tag $version"
 }
 
 api_optional() {
@@ -33,12 +42,6 @@ check_release() {
   [ "$#" -eq 1 ] || fail "usage: publish-release.sh check <release-vX.Y.Z>"
   local version="$1"
   validate_version "$version"
-  if api_optional "repos/$REPOSITORY/git/ref/tags/$version" "$TMP/tag"; then
-    fail "Git tag already exists: $version"
-  else
-    local rc=$?
-    [ "$rc" -eq 4 ] || exit "$rc"
-  fi
   if api_optional "repos/$REPOSITORY/releases/tags/$version" "$TMP/release"; then
     fail "GitHub release already exists: $version"
   else
@@ -120,15 +123,18 @@ publish_bundle() {
 
   local release_state="$TMP/release.json"
   if api_optional "repos/$REPOSITORY/releases/tags/$version" "$release_state"; then
-    jq -e '.draft == true' "$release_state" >/dev/null \
-      || fail "$version is already published; refusing to replace it"
-    gh release edit "$version" --repo "$REPOSITORY" --draft --target "$commit" \
-      --title "Kuasar Sandbox $version" --notes-file "$bundle/release-notes.md" >/dev/null
+    fail "$version is already published; refusing to replace it"
   else
     local rc=$?
     [ "$rc" -eq 4 ] || exit "$rc"
-    gh release create "$version" --repo "$REPOSITORY" --draft --verify-tag --target "$commit" \
-      --title "Kuasar Sandbox $version" --notes-file "$bundle/release-notes.md" >/dev/null
+  fi
+
+  local drafts="$TMP/drafts.json"
+  find_draft_release "$version" "$drafts"
+  if [ "$(jq 'length' "$drafts")" -eq 1 ]; then
+    local stale_id
+    stale_id="$(jq -er '.[0].id' "$drafts")"
+    gh api --method DELETE "repos/$REPOSITORY/releases/$stale_id" >/dev/null
   fi
 
   local files=()
@@ -136,16 +142,27 @@ publish_bundle() {
     files+=("$bundle/assets/$name")
   done < <(jq -r '.artifacts[].name' "$manifest")
   files+=("$manifest")
-  gh release upload "$version" --repo "$REPOSITORY" --clobber "${files[@]}"
+  gh release create "$version" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
+    --target "$commit" --title "Kuasar Sandbox $version" \
+    --notes-file "$bundle/release-notes.md" >/dev/null
 
-  gh api "repos/$REPOSITORY/releases/tags/$version" > "$release_state"
+  find_draft_release "$version" "$drafts"
+  [ "$(jq 'length' "$drafts")" -eq 1 ] || fail "cannot locate newly created draft for $version"
+  jq '.[0]' "$drafts" > "$release_state"
   verify_uploaded_assets "$release_state" "$bundle"
   local release_id
   release_id="$(jq -er '.id' "$release_state")"
-  jq -n '{draft: false, prerelease: false, make_latest: "true"}' \
+  local prerelease=false
+  [[ "$version" != *-preview.* ]] || prerelease=true
+  jq -n --argjson prerelease "$prerelease" '
+      {draft: false, prerelease: $prerelease,
+       make_latest: (if $prerelease then "false" else "true" end)}
+    ' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" --input - >/dev/null
   gh api "repos/$REPOSITORY/releases/tags/$version" > "$release_state"
-  jq -e '.draft == false and .prerelease == false' "$release_state" >/dev/null \
+  jq -e --argjson prerelease "$prerelease" '
+      .draft == false and .prerelease == $prerelease
+    ' "$release_state" >/dev/null \
     || fail "$version was not published"
   [ "$(gh api "repos/$REPOSITORY/git/ref/tags/$version" --jq '.object.sha')" = "$commit" ] \
     || fail "published aggregate tag moved from its release mapping commit"

@@ -35,15 +35,15 @@ validate_mapping() {
   [ -f "$mapping" ] || fail "mapping file not found: $mapping"
   jq -e '
     .schemaVersion == 1
-    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
     and (.architecture == "x86_64" or .architecture == "aarch64")
     and (.components | keys == ["accelerator", "connector", "orchestrator", "runtime", "sandboxer", "vmlinux"])
-    and (.components.accelerator | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    and (.components.connector | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    and (.components.orchestrator | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    and (.components.sandboxer | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    and (.components.runtime | test("^runtime-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    and (.components.vmlinux | test("^vmlinux-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    and (.components.accelerator | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
+    and (.components.connector | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
+    and (.components.orchestrator | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
+    and (.components.sandboxer | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
+    and (.components.runtime | test("^runtime-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
+    and (.components.vmlinux | test("^vmlinux-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
     and (keys == ["architecture", "components", "schemaVersion", "version"])
   ' "$mapping" >/dev/null || fail "release mapping failed schema validation"
 }
@@ -102,7 +102,7 @@ validate_component_manifest() {
         $name != "runtime"
         or ([.sources[] | select(
           .repository == "kuasar-sandbox/sandboxer"
-          and (.requestedRef | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+          and (.requestedRef | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
         )] | length == 1)
       )
       and (.validation.workflowRepository == $repository)
@@ -122,7 +122,7 @@ validate_resolved() {
   jq -e '
     .schemaVersion == 1
     and .kind == "resolved-aggregate"
-    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
     and (.architecture == "x86_64" or .architecture == "aarch64")
     and (.mapping.repository == "kuasar-sandbox/orchestrator")
     and .mapping.branch == "release"
@@ -193,8 +193,10 @@ resolve_release() {
     archive="$(component_archive "$name" "$tag" "$architecture")"
     release_state="$WORK/$name-release-state.json"
     api_get "repos/$repository/releases/tags/$tag" > "$release_state"
-    jq -e --arg tag "$tag" '
-      .tag_name == $tag and .draft == false and .prerelease == false
+    local prerelease=false
+    [[ "$tag" != *-preview.* ]] || prerelease=true
+    jq -e --arg tag "$tag" --argjson prerelease "$prerelease" '
+      .tag_name == $tag and .draft == false and .prerelease == $prerelease
     ' "$release_state" >/dev/null || fail "$repository $tag is not a published release"
 
     expected_names="$WORK/$name-expected-assets"
@@ -357,7 +359,7 @@ validate_bundle() {
   jq -e '
     .schemaVersion == 1
     and .kind == "aggregate"
-    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    and (.version | test("^release-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-preview\\.[0-9]{8})?$"))
     and .tag == .version
     and (.architecture == "x86_64" or .architecture == "aarch64")
     and (.mapping.commit | test("^[0-9a-f]{40}$"))
