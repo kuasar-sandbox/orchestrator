@@ -170,6 +170,16 @@ grep -q DATASET-OK "$WORK/post.out" || { echo "FAIL: dataset erofs base lost"; e
 echo "==> PASS: both data disks + dataset base survived snapshot→restore"
 
 # ---- [7] working-set capture: memory stacks; every local disk merges ------
+# Give each restored writable disk a W-only delta. Without this, a successful
+# content-addressed merge can legitimately reproduce the parent's top digest,
+# making top-identity checks unable to distinguish merge from stacking.
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RR" -- /bin/sh -c \
+    'echo ROOT-W-OK > /working-set-root; echo SCRATCH-W-OK > /scratch/working-set; echo DATA-W-OK > /data/working-set; cat /working-set-root /scratch/working-set /data/working-set' \
+    >"$WORK/w-write.out" 2>&1 || true
+for marker in ROOT-W-OK SCRATCH-W-OK DATA-W-OK; do
+    grep -q "$marker" "$WORK/w-write.out" \
+        || { echo "FAIL: could not write $marker before W capture"; cat "$WORK/w-write.out"; exit 1; }
+done
 WOUT="$WORK/working-set"; mkdir -p "$WOUT"
 # A non-merged local memory parent is an explicit sibling dependency. Place it
 # beside W as the sandboxer local-artifact contract requires; the product does
@@ -216,7 +226,7 @@ if len(parent_nodes) != 3 or len(working_nodes) != 3:
     raise SystemExit(f"disk node counts parent={len(parent_nodes)} working={len(working_nodes)}, want root+2 data")
 for index, (parent_node, working_node) in enumerate(zip(parent_nodes, working_nodes)):
     parent_top = top(parent_node)
-    if parent_top in chain(working_node):
+    if top(working_node) == parent_top or parent_top in chain(working_node):
         raise SystemExit(f"disk {index} retained local parent {parent_top!r}; local disks must merge even when memory stacks")
 PY
 echo "==> PASS: W memory self is independent (one local from_ref); root + two data-disk parents were merged"
@@ -243,9 +253,10 @@ timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore
 P3=$!
 ready "$SID3" || { echo "FAIL: working-set restore not ready"; tail -60 "$WORK/run3.log"; exit 1; }
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RR" -- /bin/sh -c \
-    'cat /scratch/persist /data/persist /data/DATASET-OK' > "$WORK/w-post.out" 2>&1 || true
+    'cat /scratch/persist /data/persist /data/DATASET-OK /working-set-root /scratch/working-set /data/working-set' \
+    > "$WORK/w-post.out" 2>&1 || true
 sed 's/^/    /' "$WORK/w-post.out"
-for marker in S-OK D-OK DATASET-OK; do
+for marker in S-OK D-OK DATASET-OK ROOT-W-OK SCRATCH-W-OK DATA-W-OK; do
     grep -q "$marker" "$WORK/w-post.out" || { echo "FAIL: W restore lost $marker"; tail -60 "$WORK/run3.log"; exit 1; }
 done
 echo "==> PASS: local working-set W restored memory, root, and both data disks"
