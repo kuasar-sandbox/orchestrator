@@ -150,8 +150,16 @@ boot:
 launch:
   # Args use a uniquely-shaped python expression: the script computes
   # version components and emits a marker the e2e grep can distinguish
-  # from the literal launch.args text appearing in sandbox-ctl logs.
-  args: ["-c", "import sys,time; print('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor, flush=True); time.sleep(5)"]
+  # from the literal launch.args text appearing in sandbox-ctl logs. The app
+  # waits on a test sentinel so readiness can be exercised without adding a
+  # fixed delay to the cold-start performance measurement.
+  args:
+    - "-c"
+    - |
+      import os, sys, time
+      print('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor, flush=True)
+      while not os.path.exists('/tmp/e2e-cold-exit'):
+          time.sleep(0.01)
   restart: never
 EOF
 
@@ -244,6 +252,10 @@ while kill -0 "$SBPID" 2>/dev/null; do
     fi
     sleep 0.005
 done
+if ! "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/runtime" \
+    -- /bin/sh -c 'touch /tmp/e2e-cold-exit'; then
+    echo "==> FAIL: could not release cold readiness test app"; tail -60 "$LOG"; exit 1
+fi
 wait "$SBPID"
 EXIT=$?
 T_END_NS=$(date +%s%N)
