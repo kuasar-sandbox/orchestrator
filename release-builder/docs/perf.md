@@ -322,7 +322,11 @@ sudo PERF_ITERS=30 make perf-sandbox-working-set
 
 报告覆盖 artifact 逻辑/物理大小、`MemoryResident`、snapshot/publish
 耗时、restore-to-ack、application ready、首次代表性 HTTP 请求、UFFD、
-root/data disk read 与 cache origin request。当前 cache/store pull-only info 接口
+root/data disk read 与 cache origin request。一个 root overlay、一个无 base 的
+scratch disk 和一个 dataset overlay 会展开为五个 CH backend：`blk0=root.base`、
+`blk1=root.top`、`blk2=scratch.top`、`blk3=dataset.base`、
+`blk4=dataset.top`；报告逐项保留该映射，而不是把三块逻辑 disk 错当成三个
+backend。当前 cache/store pull-only info 接口
 不提供精确传输字节 delta，因此字节数明确记为 `N/A`，不为本报告
 引入新 metrics 协议。
 
