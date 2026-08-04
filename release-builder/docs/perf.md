@@ -13,6 +13,7 @@
 make bench           # Go 微基准(各 Go 子仓)
 make perf            # 系统级 harness 全套:accelerator perf-cache + perf-sandbox/-manifest/-density
 make perf-sandbox
+make perf-sandbox-working-set
 make perf-density
 ```
 
@@ -280,7 +281,48 @@ restore 比 cold-start 平均批小一半(96 vs 196):snapshot 文件 SEEK_HOLE �
 更碎(混合 hole 和 data 段),每次 IsZero 切换都打断 batch。9000 页(35 MiB)
 在 92 次 ioctl 内完成。
 
-### 2.6 优化机会(按收益预估)
+### 2.6 Working-set snapshot A/B/C/D 矩阵
+
+`test/perf/sandbox-perf-working-set.sh` 使用同一个不可变本地 B、固定
+HTTP warm-up 和 root + 两块 data disk，分别隔离测量：
+
+| 组 | `drop-caches` | `merge-ref` | 观测目标 |
+|---|---:|---:|---|
+| A | true | true | 默认基线 |
+| B | false | true | 仅保留 guest cache |
+| C | true | false | 仅保留独立 memory self |
+| D | false | false | 完整 working-set snapshot |
+
+每个样本都会从只含 root/dataset 的不变 store baseline 重建
+store-ctl，重新启动空 RocksDB cache，丢弃 host page cache，再从同一
+B 恢复；不会在一个运行中的 sandbox 上连续保存四次，也不会让
+早先样本的 publish dedup 污染后续样本。W 首先本地生成，再独立
+执行 `upload-snapshot`；发布后删除本地 W artifact set，以防 portable
+restore 意外回退到本地文件。A/B/C/D 主矩阵固定
+`restore.prefetch: off`，另外为 D 执行一次配对的 `prefetch: memory`，
+并断言只预取 W self，不预取 memory parent 或 disk。
+
+```bash
+cd release-builder
+sudo PERF_ITERS=30 make perf-sandbox-working-set
+```
+
+默认 `PERF_ITERS=5` 用于本地 smoke；可用 `PERF_OUT_DIR` 固定输出目录。
+产物包含：
+
+- `environment.json`：五个组件仓库的精确 SHA、binary/kernel digest、
+  image ID、host 与全部测试参数；
+- `samples.jsonl`：每次独立 restore 的原始结构化样本；
+- `raw/`：snapshot/publisher/restore log、stats-json 与 cache 计数器快照；
+- `report.md`：按 nearest-rank 统计的 p50/p95/p99，不设硬性性能阈值。
+
+报告覆盖 artifact 逻辑/物理大小、`MemoryResident`、snapshot/publish
+耗时、restore-to-ack、application ready、首次代表性 HTTP 请求、UFFD、
+root/data disk read 与 cache origin request。当前 cache/store pull-only info 接口
+不提供精确传输字节 delta，因此字节数明确记为 `N/A`，不为本报告
+引入新 metrics 协议。
+
+### 2.7 优化机会(按收益预估)
 
 **StreamSnapshotSource 提供 RunLength 接口**(中,~30%):现 `extendBatch`
 对每个候选页调一次 `IsZero(off)`,256 次 bit lookup。StreamSnapshotSource

@@ -28,9 +28,17 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: Type run-full-e2e to start the full BMS suite
+        description: Type run-full-e2e or run-working-set-perf to confirm the selected run mode
         required: true
         type: string
+      run_mode:
+        description: Trusted BMS workload to execute
+        required: true
+        default: full-e2e
+        type: choice
+        options:
+          - full-e2e
+          - working-set-perf
       pull_request_number:
         description: Upstream pull request number whose merge commit is being tested
         required: true
@@ -63,7 +71,7 @@ jobs:
        !github.event.pull_request.draft) &&
       (github.event_name != 'workflow_dispatch' ||
        inputs.release_input_artifact != '' ||
-       inputs.confirm == 'run-full-e2e')
+       inputs.confirm == (inputs.run_mode == 'working-set-perf' && 'run-working-set-perf' || 'run-full-e2e'))
     outputs:
       release_artifact: ${{ steps.release-artifact.outputs.name }}
     runs-on:
@@ -73,7 +81,7 @@ jobs:
       - kuasar-e2e
       - kvm
       - cgroup-v2
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode == 'working-set-perf' && 180 || 30 }}
     env:
       TARGET_ARCH: x86_64
       GOPROXY: https://goproxy.cn,direct
@@ -91,6 +99,8 @@ jobs:
       KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
       KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
       RELEASE_INPUT_ARTIFACT: ${{ inputs.release_input_artifact || '' }}
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode || 'full-e2e' }}
+      CONFIRM: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm || '' }}
       CANDIDATE_REPOSITORY: ${{ github.repository }}
       CANDIDATE_PR: ${{ inputs.release_input_artifact != '' && '0' || (github.event_name == 'workflow_dispatch' && inputs.pull_request_number || github.event.pull_request.number || '0') }}
       CANDIDATE_SHA: ${{ inputs.release_input_artifact != '' && github.sha || (github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha) }}
@@ -108,6 +118,10 @@ jobs:
 
           [ "$GITHUB_REF" = refs/heads/main ] \
             || { echo "workflow_dispatch must select the trusted main ref" >&2; exit 1; }
+          case "$RUN_MODE:$CONFIRM" in
+            full-e2e:run-full-e2e|working-set-perf:run-working-set-perf) ;;
+            *) echo "confirmation does not match run mode: $RUN_MODE" >&2; exit 1 ;;
+          esac
           [[ "$CANDIDATE_PR" =~ ^[1-9][0-9]*$ ]] \
             || { echo "pull_request_number must be a positive integer" >&2; exit 1; }
           for variable in CANDIDATE_SHA CANDIDATE_BASE_SHA CANDIDATE_HEAD_SHA TRUSTED_WORKFLOW_SHA; do
@@ -115,8 +129,13 @@ jobs:
             [[ "$value" =~ ^[0-9a-f]{40}$ ]] \
               || { echo "$variable must be a full lowercase commit SHA" >&2; exit 1; }
           done
-          [ "$TRUSTED_WORKFLOW_SHA" = "$CANDIDATE_BASE_SHA" ] \
-            || { echo "trusted workflow SHA must equal the recorded main/base SHA" >&2; exit 1; }
+          if [ "$RUN_MODE" = working-set-perf ]; then
+            [ "$TRUSTED_WORKFLOW_SHA" = "$CANDIDATE_SHA" ] \
+              || { echo "working-set perf must run from its merged candidate on main" >&2; exit 1; }
+          else
+            [ "$TRUSTED_WORKFLOW_SHA" = "$CANDIDATE_BASE_SHA" ] \
+              || { echo "trusted workflow SHA must equal the recorded main/base SHA" >&2; exit 1; }
+          fi
 
           pr_response=$(curl --fail --show-error --silent \
             --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
@@ -128,13 +147,18 @@ jobs:
             --argjson number "$CANDIDATE_PR" \
             --arg candidate "$CANDIDATE_SHA" \
             --arg base "$CANDIDATE_BASE_SHA" \
-            --arg head "$CANDIDATE_HEAD_SHA" '
+            --arg head "$CANDIDATE_HEAD_SHA" \
+            --arg run_mode "$RUN_MODE" '
               .number == $number
-              and .state == "open"
               and .base.ref == "main"
               and .base.sha == $base
               and .head.sha == $head
               and .merge_commit_sha == $candidate
+              and (
+                ($run_mode == "full-e2e" and .state == "open")
+                or
+                ($run_mode == "working-set-perf" and .state == "closed" and .merged_at != null)
+              )
             ' <<< "$pr_response" >/dev/null; then
             echo "candidate metadata no longer matches the current pull request merge" >&2
             jq -c '{number, state, merge_commit_sha, base: {ref: .base.ref, sha: .base.sha}, head: {sha: .head.sha}}' \
@@ -293,27 +317,32 @@ jobs:
 
           if [ -z "$RELEASE_INPUT_ARTIFACT" ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             current_base=$(jq -r '.data.orchestrator.ref.target.oid' <<< "$revision_response")
-            [ "$current_base" = "$CANDIDATE_BASE_SHA" ] \
-              || { echo "main changed after the integration commit was recorded" >&2; exit 1; }
+            if [ "$RUN_MODE" = working-set-perf ]; then
+              [ "$current_base" = "$CANDIDATE_SHA" ] \
+                || { echo "main moved after the working-set candidate was merged" >&2; exit 1; }
+            else
+              [ "$current_base" = "$CANDIDATE_BASE_SHA" ] \
+                || { echo "main changed after the integration commit was recorded" >&2; exit 1; }
 
-            candidate_response=$(curl --fail --show-error --silent \
-              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/$CANDIDATE_REPOSITORY/git/commits/$CANDIDATE_SHA")
-            if ! jq -e \
-              --arg candidate "$CANDIDATE_SHA" \
-              --arg base "$CANDIDATE_BASE_SHA" \
-              --arg head "$CANDIDATE_HEAD_SHA" '
-                .sha == $candidate
-                and (.parents | length) == 2
-                and .parents[0].sha == $base
-                and .parents[1].sha == $head
-              ' <<< "$candidate_response" >/dev/null; then
-              echo "candidate is not the recorded two-parent PR integration commit" >&2
-              jq -c '{sha, parents: [.parents[]?.sha]}' <<< "$candidate_response" >&2 || true
-              exit 1
+              candidate_response=$(curl --fail --show-error --silent \
+                --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/$CANDIDATE_REPOSITORY/git/commits/$CANDIDATE_SHA")
+              if ! jq -e \
+                --arg candidate "$CANDIDATE_SHA" \
+                --arg base "$CANDIDATE_BASE_SHA" \
+                --arg head "$CANDIDATE_HEAD_SHA" '
+                  .sha == $candidate
+                  and (.parents | length) == 2
+                  and .parents[0].sha == $base
+                  and .parents[1].sha == $head
+                ' <<< "$candidate_response" >/dev/null; then
+                echo "candidate is not the recorded two-parent PR integration commit" >&2
+                jq -c '{sha, parents: [.parents[]?.sha]}' <<< "$candidate_response" >&2 || true
+                exit 1
+              fi
             fi
           fi
 
@@ -497,15 +526,23 @@ jobs:
         working-directory: src/orchestrator/release-builder
         run: scripts/native-cache.sh restore-or-build
 
-      - name: Validate release tooling
+      - name: Validate release and performance tooling
         if: inputs.release_input_artifact == ''
         working-directory: src/orchestrator/release-builder
-        run: make test-release-tools
+        run: make test-release-tools test-perf-tools
 
       - name: Build and test the platform
-        if: inputs.release_input_artifact == ''
+        if: inputs.release_input_artifact == '' && env.RUN_MODE == 'full-e2e'
         working-directory: src/orchestrator/release-builder
         run: make test-e2e
+
+      - name: Run the working-set performance matrix
+        if: inputs.release_input_artifact == '' && env.RUN_MODE == 'working-set-perf'
+        working-directory: src/orchestrator/release-builder
+        env:
+          PERF_ITERS: "30"
+          PERF_OUT_DIR: ${{ env.KUASAR_CI_DIR }}/working-set-perf
+        run: make perf-sandbox-working-set
 
       - name: Test the exact published component archives
         if: inputs.release_input_artifact != ''
