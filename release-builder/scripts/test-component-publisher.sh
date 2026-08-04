@@ -91,7 +91,13 @@ if [ "${1:-}" = api ]; then
       ;;
     "GET repos/$repository/releases?per_page=100")
       if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
-        json="[$(release_json)]"
+        delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
+        if [ "$delay" -gt 0 ]; then
+          printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
+          json='[]'
+        else
+          json="[$(release_json)]"
+        fi
       else
         json='[]'
       fi
@@ -99,7 +105,8 @@ if [ "${1:-}" = api ]; then
       emit "$json" "$filter"
       ;;
     "DELETE repos/$repository/releases/77")
-      rm -f "$state/release-draft" "$state/release-prerelease" "$state/assets.ndjson"
+      rm -f "$state/release-draft" "$state/release-prerelease" \
+        "$state/assets.ndjson" "$state/visibility-delay"
       count="$(cat "$state/delete-count" 2>/dev/null || printf 0)"
       printf '%s\n' "$((count + 1))" > "$state/delete-count"
       ;;
@@ -140,6 +147,7 @@ if [ "${1:-}" = release ] && [ "${2:-}" = create ]; then
     touch "$state/failed-once"
     exit 42
   fi
+  printf '1\n' > "$state/visibility-delay"
   exit 0
 fi
 
