@@ -466,7 +466,13 @@ if [ "${1:-}" = api ]; then
       ;;
     "GET repos/kuasar-sandbox/orchestrator/releases?per_page=100")
       if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
-        json="[$(render_release)]"
+        delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
+        if [ "$delay" -gt 0 ]; then
+          printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
+          json='[]'
+        else
+          json="[$(render_release)]"
+        fi
       else
         json='[]'
       fi
@@ -479,7 +485,8 @@ if [ "${1:-}" = api ]; then
       emit '{"ref":"refs/tags/release-v4.0.0-preview.20260804"}' "$filter"
       ;;
     "DELETE repos/kuasar-sandbox/orchestrator/releases/77")
-      rm -f "$state/release-draft" "$state/release-prerelease" "$state/assets.ndjson"
+      rm -f "$state/release-draft" "$state/release-prerelease" \
+        "$state/assets.ndjson" "$state/visibility-delay"
       printf 'true\n' > "$state/deleted-draft"
       ;;
     "PATCH repos/kuasar-sandbox/orchestrator/releases/77")
@@ -529,6 +536,7 @@ if [ "${1:-}" = release ]; then
         touch "$state/failed-once"
         exit 42
       fi
+      printf '1\n' > "$state/visibility-delay"
       ;;
     *) exit 2 ;;
   esac

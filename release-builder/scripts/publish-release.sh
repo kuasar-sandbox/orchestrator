@@ -25,6 +25,16 @@ find_draft_release() {
     || fail "multiple draft releases use tag $version"
 }
 
+wait_for_draft_release() {
+  local version="$1" output="$2" attempt
+  for attempt in {1..15}; do
+    find_draft_release "$version" "$output"
+    [ "$(jq 'length' "$output")" -ne 1 ] || return 0
+    [ "$attempt" -eq 15 ] || sleep 1
+  done
+  fail "cannot locate newly created draft for $version"
+}
+
 api_optional() {
   local endpoint="$1" output="$2"
   if gh api "$endpoint" > "$output" 2> "$TMP/api-error"; then
@@ -146,8 +156,7 @@ publish_bundle() {
     --target "$commit" --title "Kuasar Sandbox $version" \
     --notes-file "$bundle/release-notes.md" >/dev/null
 
-  find_draft_release "$version" "$drafts"
-  [ "$(jq 'length' "$drafts")" -eq 1 ] || fail "cannot locate newly created draft for $version"
+  wait_for_draft_release "$version" "$drafts"
   jq '.[0]' "$drafts" > "$release_state"
   verify_uploaded_assets "$release_state" "$bundle"
   local release_id

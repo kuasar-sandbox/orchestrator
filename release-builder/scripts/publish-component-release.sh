@@ -39,6 +39,18 @@ find_draft_release() {
     || fail "multiple draft releases use tag $tag"
 }
 
+wait_for_draft_release() {
+  local tag="$1"
+  local output="$2"
+  local attempt
+  for attempt in {1..15}; do
+    find_draft_release "$tag" "$output"
+    [ "$(jq 'length' "$output")" -ne 1 ] || return 0
+    [ "$attempt" -eq 15 ] || sleep 1
+  done
+  fail "cannot locate newly created draft for $tag"
+}
+
 check_release() {
   [ "$#" -eq 1 ] || fail "usage: publish-component-release.sh check <tag>"
   local tag="$1"
@@ -118,8 +130,7 @@ publish_bundle() {
   gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
     --target "$commit" --title "$tag" --notes-file "$bundle/release-notes.md" >/dev/null
 
-  find_draft_release "$tag" "$drafts"
-  [ "$(jq 'length' "$drafts")" -eq 1 ] || fail "cannot locate newly created draft for $tag"
+  wait_for_draft_release "$tag" "$drafts"
   jq '.[0]' "$drafts" > "$release_state"
   verify_uploaded_assets "$release_state" "$bundle"
   local release_id
