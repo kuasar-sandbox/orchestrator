@@ -63,10 +63,10 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 	REQUIRE_BUILDER=1 REQUIRE_RUNTASK=1 REQUIRE_CONNECTOR_E2E=1 \
 	REQUIRE_GUEST_RUNTIME=1
 
-PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
+PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-sandbox-working-set perf-density
 REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-repo-guest-runtime
 
-.PHONY: all build collect e2e-tools release verify-prebuilt vet test test-ci-tools test-release-tools clean help demo \
+.PHONY: all build collect e2e-tools release verify-prebuilt vet test test-ci-tools test-release-tools test-perf-tools clean help demo \
 	        bench test-e2e test-e2e-prebuilt perf dedup-report \
 	        $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
@@ -183,6 +183,8 @@ perf-sandbox: build
 	BIN=$(SBIN) bash test/perf/sandbox-perf.sh
 perf-sandbox-manifest: build
 	BIN=$(SBIN) bash test/perf/sandbox-perf-manifest.sh
+perf-sandbox-working-set: build
+	BIN=$(SBIN) bash test/perf/sandbox-perf-working-set.sh
 perf-density: build
 	BIN=$(SBIN) bash test/perf/density-perf.sh
 
@@ -221,6 +223,9 @@ test-ci-tools:
 test-release-tools:
 	bash scripts/test-release-tools.sh
 
+test-perf-tools:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/perf -p '*_test.py'
+
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
 	rm -rf bin build
@@ -241,5 +246,6 @@ help:
 	@echo "  vet / test    drive each Go sub-repo's vet/test target"
 	@echo "  test-ci-tools validate BMS cache/timing helpers"
 	@echo "  test-release-tools validate release manifests, bundles, and preflight guards"
+	@echo "  test-perf-tools validate performance report generators"
 	@echo "  clean         clean every sub-repo + this repo's bin/ build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64  (exported to sub-makes)"
