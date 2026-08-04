@@ -1,12 +1,20 @@
 # BMS CI
 
-五仓集成测试的唯一入口仍是:
+PR 与 `main` 的五仓源码集成测试入口为:
 
 ```bash
 make -C src/orchestrator/release-builder test-e2e
 ```
 
-工作流不会用外部脚本代替该入口。仓库内 `scripts/ci-timed.sh` 只包裹 Makefile
+聚合发布验证已经发布的组件 archive,使用不触发构建的入口:
+
+```bash
+make -C trusted/orchestrator/release-builder \
+  ORG=/path/to/versioned-sources test-e2e-prebuilt
+```
+
+两者运行同一套跨仓 E2E;前者先构建源码,后者要求 `bin/<arch>/` 已由六个组件包
+装配完成。仓库内 `scripts/ci-timed.sh` 只包裹 Makefile
 中的单个构建或测试 recipe,向 `KUASAR_CI_TIMINGS` 追加耗时、CPU、最大 RSS 和
 文件系统 IO 数据;未设置该变量时直接 `exec` 原命令。
 
@@ -86,13 +94,24 @@ make -C orchestrator/release-builder test-release-tools
 - `native-cache.tsv`:原生制品 key、命中状态与等待/构建耗时;
 - `timings.tsv`:每个构建组件、umbrella E2E 和子仓 E2E 的资源数据。
 
+聚合发布 run 还包含 `release-resolved.json`,记录 mapping commit、六个组件 tag/commit、
+原始 archive 的 GitHub 资产 ID、大小和 SHA-256。该模式不运行 native build,
+因此 `native-cache.tsv` 可以不存在。
+
 ## Release reuse
 
-`.github/workflows/release.yml` 通过 `workflow_call` 复用同一份 `bms-e2e.yml`。
-release mode 不接受 PR candidate,而是在一次 GraphQL 响应中固定五仓当前 `main`
-revision,并要求 orchestrator revision 等于 dispatch 的 trusted workflow SHA。
-`revisions.tsv` 中这些记录的 role 为 `release`。
+`.github/workflows/aggregate-release.yml` 通过 `workflow_call` 复用
+`bms-e2e.yml` 的 runner 初始化、源码 cache、环境清理和测试编排。release mode 不接受
+PR candidate,也不查询五仓 `main` 作为版本来源。它从已解析的 `resolved.json` 取得:
 
-完整 E2E 通过后,同一 BMS workspace 生成发布组件包和 release bundle。bundle 通过
-Actions artifact 交给 GitHub-hosted publish job;自托管 runner 不获得仓库写权限。
-分支、tag、清单和 GitHub Release 的具体一致性规则见 [release.md](release.md)。
+- accelerator、connector、sandboxer、orchestrator tag commit;
+- runtime tag 对应的 guest-runtime commit;
+- 独立 vmlinux tag、六个原始 archive 的资产 ID、大小和 SHA-256。
+
+五仓源码只提供该版本的测试数据和配置;执行文件来自下载并逐项校验的组件 Release。
+source token 在下载完源码和资产后撤销,随后 `test-e2e-prebuilt` 运行完整 BMS。该路径
+不调用 native cache 或 `make build`,因此不会重新编译 kernel 或其他组件。
+
+E2E 通过后,BMS 复制六个原始 archive,生成聚合 `SHA256SUMS` 与 `release.json`,再通过
+Actions artifact 交给 GitHub-hosted publish job。自托管 runner 不获得仓库写权限。
+mapping、tag、清单和 GitHub Release 的一致性规则见 [release.md](release.md)。

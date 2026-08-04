@@ -505,8 +505,8 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | 源仓 `accelerator/docs/manifest.md` §3;发布包 `docs/manifest.md` |
 | `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经单一 guest runtime 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| 源仓 `guest-runtime/docs/flatten.md` §2;发布包 `docs/flatten.md` |
 
-构建产物路径、跨架构、release 打包见 `orchestrator/release-builder/README.md`
-和 `orchestrator/release-builder/scripts/release.sh`;发布包解压与测试入口见
+构建产物路径、跨架构和独立/聚合发布见 `orchestrator/release-builder/README.md`
+与 `orchestrator/release-builder/docs/release.md`;发布包解压与测试入口见
 `test/QUICKSTART.md`;性能基线、回归 checklist 见 [`perf.md`](perf.md)。
 
 ## 12. See Also

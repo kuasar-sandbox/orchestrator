@@ -5,7 +5,7 @@
 **e2b 兼容**的沙箱编排/ingress(未改造的 e2b SDK 可直连本机)对外提供北向入口。
 
 本目录是平台的 **umbrella / release-builder**:承载系统级设计文档、跨仓
-e2e/perf 套件,以及生成各子项目可合并组件包的大版本构建入口。
+e2e/perf 套件,以及从各项目独立版本生成平台聚合版本的发布入口。
 它随 `orchestrator` 仓发布,但与 `cluster-ctl` / `node-ctl` 功能代码保持相对独立。
 各能力拆分为独立演进的子仓,
 边界只暴露薄的、命名具体的纯 Go 导入面;子仓分工、依赖 DAG 与导出面规则见
@@ -21,7 +21,7 @@ e2e/perf 套件,以及生成各子项目可合并组件包的大版本构建入�
 
 | 仓 | 角色 | 导出面 / 产物 |
 |---|---|---|
-| **orchestrator/release-builder**(本目录) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/`;源码树 `make e2e-tools` 可辅助获取测试环境工具 |
+| **orchestrator/release-builder**(本目录) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/{release-suite,aggregate-release}.sh`、`docs/`、`test/`;源码树 `make e2e-tools` 可辅助获取测试环境工具 |
 | **sandboxer** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client)、`sandbox-ctl`、`sandbox-init` |
 | **orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `node-stub-ctl` + `e2b-key-ctl` |
 | **accelerator** | 内容加速:内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` + `manifest-ctl`/`store-ctl`/`cache-ctl` |
@@ -39,12 +39,15 @@ mkfs.erofs;`envd` 不作为独立 release bin 下发:
 
 ```bash
 make -C orchestrator/release-builder all        # = build:全部子仓 + 装配 bin/
-make -C orchestrator/release-builder release    # 生成 dist/*-<ver>-linux-<arch>.tar.gz 组件包
+make -C orchestrator/release-builder release \
+  RELEASE_MAPPING=/path/to/release-vX.Y.Z.json  # 顺序发布独立组件和聚合版本
 make -C orchestrator/release-builder help       # 全部目标(test-e2e / perf / bench / demo / ...)
 ```
 
-发布阶段生成多个可合并的原始组件包,`release-v*` GitHub release 直接上传这些
-包与 `SHA256SUMS`,不再二次打一个总包。每个组件包内部都直接落在共享布局:
+各项目先在自身仓库发布版本化原始组件包;`guest-runtime` 分别发布
+`runtime-vX.Y.Z` 和 `vmlinux-vX.Y.Z`,不生成通用 `guest-runtime-*.tar.gz`。
+`release-vX.Y.Z` 按 `release` 分支 mapping 选择六个原始包并直接上传,不重新构建、
+不重新打总包。每个组件包内部都直接落在共享布局:
 `bin/`、`docs/`、`test/`、`deploy/`、`release/`。文档采用语义文件名
 (`docs/sandboxer.md`、`docs/cloud-hypervisor.md`、`docs/vmlinux.md` 等),
 连续解压到同一目录不会互相覆盖;脚本经相对路径自动定位 `bin/`,见
@@ -80,8 +83,8 @@ make -C orchestrator/release-builder perf              # 性能 harness 全套
 - [docs/deployment.md](docs/deployment.md) — 部署拓扑与组件清单:进程归属、
   端口、启停依赖、故障域。
 - [docs/perf.md](docs/perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
-- [docs/ci.md](docs/ci.md) — 五仓 BMS revision set、阶段计时、源码与原生制品缓存。
-- [docs/release.md](docs/release.md) — 自动聚合发布、`release` orphan 历史、权限边界、
-  失败恢复与资产校验。
+- [docs/ci.md](docs/ci.md) — PR/main BMS revision set、发布制品 BMS、阶段计时和缓存。
+- [docs/release.md](docs/release.md) — 独立组件版本、`release` mapping、顺序发布、
+  权限边界、失败恢复与资产校验。
 - 模块设计文档随各自仓(如 `sandboxer/docs/sandbox.md`、
   `accelerator/docs/manifest.md`、`orchestrator/docs/node.md`)。

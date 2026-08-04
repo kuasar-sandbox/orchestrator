@@ -1,0 +1,128 @@
+name: Aggregate Release
+run-name: Aggregate ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Aggregate version in release-vX.Y.Z form
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aggregate-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      input_artifact: ${{ steps.input.outputs.artifact }}
+    steps:
+      - name: Check out trusted aggregate tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate aggregate request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "Aggregate Release must be dispatched from main" >&2; exit 1; }
+          bash release-builder/scripts/publish-release.sh check "$VERSION"
+
+      - name: Create read-only component token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
+          owner: kuasar-sandbox
+          repositories: accelerator,connector,guest-runtime,orchestrator,sandboxer
+          permission-contents: read
+          skip-token-revoke: true
+
+      - name: Resolve release mapping and component releases
+        id: input
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^release-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "version must match release-vX.Y.Z" >&2; exit 1; }
+          path="releases/$VERSION.json"
+          mapping_commit=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits?sha=release&path=$path&per_page=1" \
+            --jq '.[0].sha')
+          [[ "$mapping_commit" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "cannot resolve $path on the release branch" >&2; exit 1; }
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/$path?ref=$mapping_commit" > mapping.json
+          rm -rf release-input
+          bash release-builder/scripts/aggregate-release.sh \
+            resolve mapping.json "$mapping_commit" release-input
+          artifact="aggregate-input-${VERSION}-${GITHUB_RUN_ID}"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
+      - name: Revoke component token
+        if: ${{ always() && steps.source-token.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: |
+          curl --fail --show-error --silent \
+            --request DELETE \
+            --output /dev/null \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/installation/token
+
+      - name: Upload resolved aggregate input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.input.outputs.artifact }}
+          path: release-input
+          if-no-files-found: error
+          retention-days: 7
+
+  bms:
+    needs: preflight
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/bms-e2e.yml
+    with:
+      release_input_artifact: ${{ needs.preflight.outputs.input_artifact }}
+    secrets: inherit
+
+  publish:
+    needs:
+      - preflight
+      - bms
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out trusted publish tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download BMS-validated aggregate bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.bms.outputs.release_artifact }}
+          path: release-bundle
+
+      - name: Publish aggregate release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash release-builder/scripts/publish-release.sh publish release-bundle

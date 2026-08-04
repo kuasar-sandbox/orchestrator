@@ -48,7 +48,13 @@
 
 ```bash
 mkdir kuasar-sandbox-release && cd kuasar-sandbox-release
-for f in ../*-<ver>-linux-<arch>.tar.gz ../sandbox-runtime-<arch>-<ver>.tar.gz ../vmlinux-<arch>-<ver>.tar.gz; do
+for f in \
+  ../accelerator-v*-linux-<arch>.tar.gz \
+  ../connector-v*-linux-<arch>.tar.gz \
+  ../sandboxer-v*-linux-<arch>.tar.gz \
+  ../orchestrator-v*-linux-<arch>.tar.gz \
+  ../sandbox-runtime-<arch>-runtime-v*.tar.gz \
+  ../vmlinux-<arch>-vmlinux-v*.tar.gz; do
   tar xzf "$f"
 done
 bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
