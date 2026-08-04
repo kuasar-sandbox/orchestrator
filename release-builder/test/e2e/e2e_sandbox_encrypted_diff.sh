@@ -196,9 +196,9 @@ PID1=$!
 PIDS+=("$PID1")
 ready "$SID1" "$PID1" "$LOG1"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RUN_ROOT" -- /bin/sh -c \
-    'cat /data/DATASET-BASE-OK; echo ROOT-ACTIVE-OK > /root-active; echo SCRATCH-ACTIVE-OK > /scratch/persist; echo DATA-ACTIVE-OK > /data/persist; sync' \
+    'set -e; cat /data/DATASET-BASE-OK; echo ROOT-ACTIVE-OK > /root-active; echo SCRATCH-ACTIVE-OK > /scratch/persist; echo DATA-ACTIVE-OK > /data/persist; sync' \
     >"$WORK/cold-check.out" 2>&1
-grep -q DATASET-BASE-OK "$WORK/cold-check.out" || { echo "FAIL: encrypted immutable data base was unreadable"; cat "$WORK/cold-check.out"; exit 1; }
+grep -qx DATASET-BASE-OK "$WORK/cold-check.out" || { echo "FAIL: encrypted immutable data base was unreadable"; cat "$WORK/cold-check.out"; exit 1; }
 
 assert_diff "$ROOT_DIFF" $((512 * 1024 * 1024))
 assert_diff "$SCRATCH_DIFF" $((256 * 1024 * 1024))
@@ -282,10 +282,10 @@ PID2=$!
 PIDS+=("$PID2")
 ready "$SID2" "$PID2" "$LOG2"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUN_ROOT" -- /bin/sh -c \
-    'cat /root-active /scratch/persist /data/persist /data/DATASET-BASE-OK; echo ROOT-RESTORED-OK > /root-restored; echo SCRATCH-RESTORED-OK > /scratch/restored; echo DATA-RESTORED-OK > /data/restored; sync' \
+    'set -e; cat /root-active /scratch/persist /data/persist /data/DATASET-BASE-OK; echo ROOT-RESTORED-OK > /root-restored; echo SCRATCH-RESTORED-OK > /scratch/restored; echo DATA-RESTORED-OK > /data/restored; sync' \
     >"$WORK/restore-local-check.out" 2>&1
 for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK DATASET-BASE-OK; do
-    grep -q "$marker" "$WORK/restore-local-check.out" || { echo "FAIL: local restore lost $marker"; cat "$WORK/restore-local-check.out"; exit 1; }
+    grep -qx "$marker" "$WORK/restore-local-check.out" || { echo "FAIL: local restore lost $marker"; cat "$WORK/restore-local-check.out"; exit 1; }
 done
 assert_diff "$ROOT_RESTORE" $((512 * 1024 * 1024))
 assert_diff "$SCRATCH_RESTORE" $((256 * 1024 * 1024))
@@ -315,10 +315,10 @@ PID3=$!
 PIDS+=("$PID3")
 ready "$SID3" "$PID3" "$LOG3"
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID3" --run-root "$RUN_ROOT" -- /bin/sh -c \
-    'cat /root-active /scratch/persist /data/persist /root-restored /scratch/restored /data/restored /data/DATASET-BASE-OK' \
+    'set -e; cat /root-active /scratch/persist /data/persist /root-restored /scratch/restored /data/restored /data/DATASET-BASE-OK' \
     >"$WORK/restore-remote-check.out" 2>&1
 for marker in ROOT-ACTIVE-OK SCRATCH-ACTIVE-OK DATA-ACTIVE-OK ROOT-RESTORED-OK SCRATCH-RESTORED-OK DATA-RESTORED-OK DATASET-BASE-OK; do
-    grep -q "$marker" "$WORK/restore-remote-check.out" || { echo "FAIL: manifest restore lost $marker"; cat "$WORK/restore-remote-check.out"; exit 1; }
+    grep -qx "$marker" "$WORK/restore-remote-check.out" || { echo "FAIL: manifest restore lost $marker"; cat "$WORK/restore-remote-check.out"; exit 1; }
 done
 assert_diff "$ROOT_REMOTE" $((512 * 1024 * 1024))
 assert_diff "$SCRATCH_REMOTE" $((256 * 1024 * 1024))
