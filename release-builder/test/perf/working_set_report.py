@@ -17,6 +17,14 @@ EXPECTED = {
     "D": (False, False),
 }
 
+EXPECTED_DISK_ROLES = {
+    "blk0": "root.base",
+    "blk1": "root.top",
+    "blk2": "scratch.top",
+    "blk3": "dataset.base",
+    "blk4": "dataset.top",
+}
+
 
 def percentile(values: Iterable[float], percent: int) -> float | None:
     ordered = sorted(float(value) for value in values if value is not None)
@@ -115,12 +123,15 @@ def validate(rows: list[dict[str, Any]], allow_partial: bool) -> None:
         missing_metrics = [name for name in required_metrics if row.get(name) is None]
         if missing_metrics:
             raise SystemExit(f"sample {sample} missing metrics: {missing_metrics}")
-        if not isinstance(row.get("disk_reads"), dict) or set(row["disk_reads"]) != {
-            "blk0",
-            "blk1",
-            "blk2",
-        }:
+        disk_reads = row.get("disk_reads")
+        if not isinstance(disk_reads, dict) or set(disk_reads) != set(EXPECTED_DISK_ROLES):
             raise SystemExit(f"sample {sample} has invalid disk_reads")
+        for name, role in EXPECTED_DISK_ROLES.items():
+            entry = disk_reads[name]
+            if not isinstance(entry, dict) or entry.get("role") != role:
+                raise SystemExit(f"sample {sample} has invalid disk role for {name}")
+            if any(entry.get(metric) is None for metric in ("bytes", "p50_us", "p99_us")):
+                raise SystemExit(f"sample {sample} has incomplete disk metrics for {name}")
         if prefetch == "memory" and (
             row.get("prefetch_started_ms") is None or row.get("prefetch_duration_ms") is None
         ):
@@ -202,8 +213,8 @@ def metric_table(scenarios: list[tuple[str, list[dict[str, Any]]]]) -> list[str]
 
 def disk_table(scenarios: list[tuple[str, list[dict[str, Any]]]]) -> list[str]:
     lines = [
-        "| Scenario | Backend | read bytes p50/p95/p99 | per-run read latency p50 median | per-run read latency p99 median |",
-        "|---|---|---:|---:|---:|",
+        "| Scenario | Backend | Logical disk role | read bytes p50/p95/p99 | per-run read latency p50 median | per-run read latency p99 median |",
+        "|---|---|---|---:|---:|---:|",
     ]
     for scenario, selected in scenarios:
         names = sorted({name for row in selected for name in (row.get("disk_reads") or {})})
@@ -215,7 +226,7 @@ def disk_table(scenarios: list[tuple[str, list[dict[str, Any]]]]) -> list[str]:
             p99_values = [entry.get("p99_us") for entry in entries if entry.get("p99_us") is not None]
             byte_triplet = "/".join(fmt(percentile(byte_values, p), " B") for p in (50, 95, 99))
             lines.append(
-                f"| {scenario} | {name} | {byte_triplet} | "
+                f"| {scenario} | {name} | {entries[0]['role']} | {byte_triplet} | "
                 f"{fmt(percentile(p50_values, 50), ' µs')} | {fmt(percentile(p99_values, 50), ' µs')} |"
             )
     return lines
