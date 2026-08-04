@@ -27,6 +27,7 @@ jobs:
       contents: write
     outputs:
       input_artifact: ${{ steps.input.outputs.artifact }}
+      assets_artifact: ${{ steps.assets.outputs.artifact }}
       publish: ${{ steps.request.outputs.publish }}
       version: ${{ steps.request.outputs.version }}
     steps:
@@ -164,6 +165,20 @@ jobs:
           artifact="aggregate-input-${VERSION}-${GITHUB_RUN_ID}"
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
 
+      - name: Download exact component release assets
+        id: assets
+        if: steps.request.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf release-assets
+          bash release-builder/scripts/aggregate-release.sh \
+            fetch-assets release-input/resolved.json release-assets
+          artifact="aggregate-assets-${VERSION}-${GITHUB_RUN_ID}"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
       - name: Revoke component token
         if: ${{ always() && steps.source-token.outputs.token != '' }}
         env:
@@ -186,6 +201,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload exact component release assets
+        if: steps.request.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.assets.outputs.artifact }}
+          path: release-assets
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
   bms:
     needs: preflight
     if: needs.preflight.outputs.publish == 'true'
@@ -195,6 +220,7 @@ jobs:
     uses: ./.github/workflows/bms-e2e.yml
     with:
       release_input_artifact: ${{ needs.preflight.outputs.input_artifact }}
+      release_assets_artifact: ${{ needs.preflight.outputs.assets_artifact }}
     secrets: inherit
 
   publish:

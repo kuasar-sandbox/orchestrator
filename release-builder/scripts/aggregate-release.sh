@@ -294,16 +294,16 @@ resolve_release() {
   echo "==> resolved $version from release mapping $mapping_commit"
 }
 
-fetch_release() {
-  [ "$#" -eq 2 ] || fail "usage: aggregate-release.sh fetch <resolved.json> <output-dir>"
+fetch_assets() {
+  [ "$#" -eq 2 ] || fail "usage: aggregate-release.sh fetch-assets <resolved.json> <output-dir>"
   local resolved="$1" output="$2"
   validate_resolved "$resolved"
   [ ! -e "$output" ] || fail "output already exists: $output"
   : "${GH_TOKEN:?GH_TOKEN is required}"
-  mkdir -p "$output/assets" "$output/install/bin"
+  mkdir -p "$output/assets"
   install -m 0644 "$resolved" "$output/resolved.json"
 
-  local name repository archive asset archive_path metadata expected_metadata bin_stage file
+  local name repository archive asset archive_path
   for name in "${COMPONENTS[@]}"; do
     repository="$(jq -er --arg name "$name" '.components[$name].repository' "$resolved")"
     archive="$(jq -er --arg name "$name" '.components[$name].archive' "$resolved")"
@@ -311,6 +311,50 @@ fetch_release() {
       '.components[$name].assets[] | select(.name == $archive)' "$resolved")"
     archive_path="$output/assets/$archive"
     download_asset "$repository" "$(jq -er '.id' <<< "$asset")" "$archive_path"
+    verify_download "$archive_path" "$asset"
+  done
+  echo "==> fetched six independently published component archives"
+}
+
+materialize_assets() {
+  [ "$#" -eq 3 ] \
+    || fail "usage: aggregate-release.sh materialize-assets <resolved.json> <staged-dir> <output-dir>"
+  local resolved="$1" staged="$2" output="$3"
+  validate_resolved "$resolved"
+  [ -f "$staged/resolved.json" ] || fail "staged resolved release file is missing"
+  [ -d "$staged/assets" ] || fail "staged component assets are missing"
+  cmp -s "$resolved" "$staged/resolved.json" \
+    || fail "staged component assets use a different resolved release"
+  [ ! -e "$output" ] || fail "output already exists: $output"
+
+  local expected="$WORK/staged-expected" actual="$WORK/staged-actual"
+  {
+    printf 'assets\n'
+    printf 'resolved.json\n'
+  } | LC_ALL=C sort > "$expected"
+  find "$staged" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$actual"
+  cmp -s "$expected" "$actual" || fail "staged release contains unexpected top-level entries"
+
+  : > "$expected"
+  local name archive asset archive_path metadata expected_metadata bin_stage file
+  for name in "${COMPONENTS[@]}"; do
+    jq -er --arg name "$name" '.components[$name].archive' "$resolved" >> "$expected"
+  done
+  LC_ALL=C sort -o "$expected" "$expected"
+  find "$staged/assets" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+    | LC_ALL=C sort > "$actual"
+  cmp -s "$expected" "$actual" || fail "staged release contains an unexpected asset set"
+  if find "$staged/assets" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+    fail "staged release contains a non-file asset"
+  fi
+
+  mkdir -p "$output/assets" "$output/install/bin"
+  install -m 0644 "$resolved" "$output/resolved.json"
+  for name in "${COMPONENTS[@]}"; do
+    archive="$(jq -er --arg name "$name" '.components[$name].archive' "$resolved")"
+    asset="$(jq -ec --arg name "$name" --arg archive "$archive" \
+      '.components[$name].assets[] | select(.name == $archive)' "$resolved")"
+    archive_path="$staged/assets/$archive"
     verify_download "$archive_path" "$asset"
 
     while IFS= read -r file; do
@@ -346,8 +390,9 @@ fetch_release() {
     jq -S . "$expected_metadata" > "$WORK/$name-expected-sorted.json"
     cmp -s "$WORK/$name-metadata.json" "$WORK/$name-expected-sorted.json" \
       || fail "$archive embedded metadata differs from the resolved release"
+    install -m 0644 "$archive_path" "$output/assets/$archive"
   done
-  echo "==> fetched and installed six component archives"
+  echo "==> verified and materialized six staged component archives"
 }
 
 validate_bundle() {
@@ -502,9 +547,13 @@ case "${1:-}" in
     shift
     resolve_release "$@"
     ;;
-  fetch)
+  fetch-assets)
     shift
-    fetch_release "$@"
+    fetch_assets "$@"
+    ;;
+  materialize-assets)
+    shift
+    materialize_assets "$@"
     ;;
   prepare)
     shift
@@ -515,6 +564,6 @@ case "${1:-}" in
     validate_bundle "$2"
     ;;
   *)
-    fail "usage: aggregate-release.sh <validate-map|validate-resolved|resolve|fetch|prepare|validate-bundle> ..."
+    fail "usage: aggregate-release.sh <validate-map|validate-resolved|resolve|fetch-assets|materialize-assets|prepare|validate-bundle> ..."
     ;;
 esac
