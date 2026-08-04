@@ -24,7 +24,7 @@ cat > "$TMP/mapping.json" <<'EOF'
     "vmlinux": "vmlinux-v3.0.0"
   },
   "schemaVersion": 1,
-  "version": "release-v4.0.0"
+  "version": "release-v4.0.0-preview.20260804"
 }
 EOF
 "$SCRIPT_DIR/aggregate-release.sh" validate-map "$TMP/mapping.json"
@@ -343,7 +343,7 @@ case "$method $endpoint" in
   GET\ repos/kuasar-sandbox/orchestrator/git/commits/*)
     emit '{"tree":{"sha":"1111111111111111111111111111111111111111"}}' "$filter"
     ;;
-  GET\ repos/kuasar-sandbox/orchestrator/contents/releases/release-v4.0.0.json\?ref=*)
+  GET\ repos/kuasar-sandbox/orchestrator/contents/releases/release-v4.0.0-preview.20260804.json\?ref=*)
     [ -f "$state/mapping" ] || not_found
     if [ "$raw" = true ]; then
       cat "$state/mapping"
@@ -351,7 +351,7 @@ case "$method $endpoint" in
       emit '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' "$filter"
     fi
     ;;
-  "GET repos/kuasar-sandbox/orchestrator/commits?sha=release&path=releases/release-v4.0.0.json&per_page=1")
+  "GET repos/kuasar-sandbox/orchestrator/commits?sha=release&path=releases/release-v4.0.0-preview.20260804.json&per_page=1")
     emit "$(jq -cn --arg sha "$(cat "$state/branch")" '[{sha: $sha}]')" "$filter"
     ;;
   "POST repos/kuasar-sandbox/orchestrator/git/trees")
@@ -405,10 +405,14 @@ render_release() {
   if [ -s "$state/assets.ndjson" ]; then
     assets="$(jq -s '.' "$state/assets.ndjson")"
   fi
+  local prerelease
+  prerelease="$(cat "$state/release-prerelease" 2>/dev/null || printf false)"
   jq -cn \
     --argjson draft "$(cat "$state/release-draft")" \
+    --argjson prerelease "$prerelease" \
     --argjson assets "$assets" \
-    '{id: 77, tag_name: "release-v4.0.0", draft: $draft, prerelease: false, assets: $assets}'
+    '{id: 77, tag_name: "release-v4.0.0-preview.20260804", draft: $draft,
+      prerelease: $prerelease, assets: $assets}'
 }
 
 emit() {
@@ -422,12 +426,15 @@ if [ "${1:-}" = api ]; then
   input=
   filter=
   raw=false
+  slurp=false
   endpoint=
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --method) method="$2"; shift 2 ;;
       --input) input="$2"; shift 2 ;;
       --jq) filter="$2"; shift 2 ;;
+      --paginate) shift ;;
+      --slurp) slurp=true; shift ;;
       -H)
         [[ "$2" != *github.raw* ]] || raw=true
         shift 2
@@ -444,25 +451,42 @@ if [ "${1:-}" = api ]; then
     "GET repos/kuasar-sandbox/orchestrator/compare/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
       emit '{"status":"identical"}' "$filter"
       ;;
-    "GET repos/kuasar-sandbox/orchestrator/contents/releases/release-v4.0.0.json?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    "GET repos/kuasar-sandbox/orchestrator/contents/releases/release-v4.0.0-preview.20260804.json?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
       [ "$raw" = true ] || exit 2
       cat "$state/mapping"
       ;;
-    "GET repos/kuasar-sandbox/orchestrator/git/ref/tags/release-v4.0.0")
+    "GET repos/kuasar-sandbox/orchestrator/git/ref/tags/release-v4.0.0-preview.20260804")
       [ -f "$state/tag" ] || not_found
       emit "$(jq -cn --arg sha "$(cat "$state/tag")" '{object: {sha: $sha}}')" "$filter"
       ;;
-    "GET repos/kuasar-sandbox/orchestrator/releases/tags/release-v4.0.0")
+    "GET repos/kuasar-sandbox/orchestrator/releases/tags/release-v4.0.0-preview.20260804")
       [ -f "$state/release-draft" ] || not_found
+      [ "$(cat "$state/release-draft")" = false ] || not_found
       emit "$(render_release)" "$filter"
       ;;
+    "GET repos/kuasar-sandbox/orchestrator/releases?per_page=100")
+      if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
+        json="[$(render_release)]"
+      else
+        json='[]'
+      fi
+      [ "$slurp" = false ] || json="[$json]"
+      emit "$json" "$filter"
+      ;;
     "POST repos/kuasar-sandbox/orchestrator/git/refs")
-      [ "$(jq -er '.ref' "$request")" = refs/tags/release-v4.0.0 ] || exit 2
+      [ "$(jq -er '.ref' "$request")" = refs/tags/release-v4.0.0-preview.20260804 ] || exit 2
       jq -er '.sha' "$request" > "$state/tag"
-      emit '{"ref":"refs/tags/release-v4.0.0"}' "$filter"
+      emit '{"ref":"refs/tags/release-v4.0.0-preview.20260804"}' "$filter"
+      ;;
+    "DELETE repos/kuasar-sandbox/orchestrator/releases/77")
+      rm -f "$state/release-draft" "$state/release-prerelease" "$state/assets.ndjson"
+      printf 'true\n' > "$state/deleted-draft"
       ;;
     "PATCH repos/kuasar-sandbox/orchestrator/releases/77")
       [ "$(jq -er '.draft' "$request")" = false ] || exit 2
+      [ "$(jq -er '.prerelease' "$request")" = true ] || exit 2
+      [ "$(jq -er '.make_latest' "$request")" = false ] || exit 2
+      printf 'true\n' > "$state/release-prerelease"
       printf 'false\n' > "$state/release-draft"
       emit "$(render_release)" "$filter"
       ;;
@@ -477,23 +501,18 @@ fi
 if [ "${1:-}" = release ]; then
   action="${2:-}"
   tag="${3:-}"
-  [ "$tag" = release-v4.0.0 ] || exit 2
+  [ "$tag" = release-v4.0.0-preview.20260804 ] || exit 2
   case "$action" in
     create)
       [ -f "$state/tag" ] || exit 2
       printf 'true\n' > "$state/release-draft"
+      printf 'false\n' > "$state/release-prerelease"
       : > "$state/assets.ndjson"
-      ;;
-    edit)
-      [ -f "$state/release-draft" ] || exit 2
-      ;;
-    upload)
       shift 3
-      : > "$state/assets.ndjson"
       while [ "$#" -gt 0 ]; do
         case "$1" in
-          --repo) shift 2 ;;
-          --clobber) shift ;;
+          --repo|--target|--title|--notes-file) shift 2 ;;
+          --draft|--verify-tag) shift ;;
           *)
             file="$1"
             jq -cn \
@@ -506,7 +525,10 @@ if [ "${1:-}" = release ]; then
             ;;
         esac
       done
-      [ "${FAKE_GH_FAIL_AFTER_UPLOAD:-0}" != 1 ] || exit 42
+      if [ "${FAKE_GH_FAIL_CREATE_ONCE:-0}" = 1 ] && [ ! -f "$state/failed-once" ]; then
+        touch "$state/failed-once"
+        exit 42
+      fi
       ;;
     *) exit 2 ;;
   esac
@@ -522,7 +544,7 @@ publish_state="$TMP/publish-state"
 mkdir -p "$publish_state"
 cp "$TMP/mapping.json" "$publish_state/mapping"
 if env PATH="$TMP/fake-bin:$PATH" GH_REPO=kuasar-sandbox/orchestrator \
-  FAKE_GH_STATE="$publish_state" FAKE_GH_FAIL_AFTER_UPLOAD=1 \
+  FAKE_GH_STATE="$publish_state" FAKE_GH_FAIL_CREATE_ONCE=1 \
   "$SCRIPT_DIR/publish-release.sh" publish "$TMP/bundle" >/dev/null 2>&1; then
   fail "publish fixture did not stop after the interrupted draft upload"
 fi
@@ -533,6 +555,10 @@ env PATH="$TMP/fake-bin:$PATH" GH_REPO=kuasar-sandbox/orchestrator \
   "$SCRIPT_DIR/publish-release.sh" publish "$TMP/bundle"
 [ "$(cat "$publish_state/release-draft")" = false ] \
   || fail "aggregate draft was not published after retry"
+[ -f "$publish_state/deleted-draft" ] \
+  || fail "aggregate retry did not delete the stale draft by release ID"
+[ "$(cat "$publish_state/release-prerelease")" = true ] \
+  || fail "aggregate preview was not published as a prerelease"
 [ "$(cat "$publish_state/tag")" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ] \
   || fail "aggregate tag does not point to its release mapping commit"
 
