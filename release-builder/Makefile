@@ -2,8 +2,8 @@
 #
 # `make build` drives every sub-repo's build (via their Makefiles) and then
 # assembles all platform runtime files into bin/$(TARGET_ARCH)/ (with native-arch
-# symlinks under bin/). `make release` produces merge-safe component tarballs
-# under dist/ for the release-v* aggregate.
+# symlinks under bin/). `make release` publishes the explicitly supplied
+# component-version mapping and its release-v* aggregate.
 #
 # Cross-repo e2e/perf tests (those that need binaries from multiple sub-repos)
 # live in this repo's test/; per-repo tests live in their own repo's test/.
@@ -12,7 +12,6 @@
 
 SHELL    := /bin/bash
 ORG      := $(abspath $(CURDIR)/../..)
-VERSION  ?= v0.1.0
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical normalization across kuasar-sandbox repos)
@@ -67,9 +66,9 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-repo-guest-runtime
 
-.PHONY: all build collect e2e-tools release vet test test-ci-tools test-release-tools clean help demo \
-        bench test-e2e perf dedup-report \
-        $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
+.PHONY: all build collect e2e-tools release verify-prebuilt vet test test-ci-tools test-release-tools clean help demo \
+	        bench test-e2e test-e2e-prebuilt perf dedup-report \
+	        $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
 all: build
 
@@ -118,11 +117,13 @@ collect:
 	 fi
 	@echo "==> assembled $(BINDIR)/"
 
-# Produce merge-safe component packages. release-v* uploads these original
-# component tarballs and checksums directly; it does not create another aggregate
-# tarball.
-release: build
-	bash scripts/release.sh $(VERSION)
+# Publish any missing component versions in the mapping, then publish the
+# aggregate. The mapping is committed to the orphan release branch before the
+# workflows are dispatched.
+RELEASE_MAPPING ?=
+release:
+	@[ -n "$(RELEASE_MAPPING)" ] || { echo "RELEASE_MAPPING=<mapping.json> is required" >&2; exit 1; }
+	bash scripts/release-suite.sh "$(RELEASE_MAPPING)"
 
 # ---------------------------------------------------------------------------
 # Tests + benchmarks + perf (cross-repo)
@@ -155,6 +156,27 @@ test-e2e: build e2e-tools
 	$(MAKE) -j1 $(UMBRELLA_E2E_RUN)
 	$(MAKE) test-e2e-repo-accelerator
 	$(MAKE) -j2 test-e2e-repo-connector test-e2e-repo-guest-runtime
+
+# Aggregate releases validate the already-published archives. This target never
+# invokes a component build; bin/<arch>/ must be populated by the release fetcher.
+verify-prebuilt:
+	@while read repo name; do \
+		case "$$repo" in ''|\#*) continue ;; esac; \
+		[ -f "$(SBIN)/$$name" ] || { echo "missing prebuilt release input: $$name" >&2; exit 1; }; \
+	done < $(BIN_INPUTS_MANIFEST)
+
+test-e2e-prebuilt: verify-prebuilt e2e-tools
+	$(MAKE) -j1 $(UMBRELLA_E2E_RUN)
+	$(MAKE) test-e2e-repo-accelerator
+	@cd $(ORG)/connector && for test_script in examples/*_test.sh; do \
+		echo "==> $$test_script"; \
+		sudo env REQUIRE_CONNECTOR_E2E=1 SWITCH_BIN="$(SBIN)/connector-ctl vswitch" \
+			bash "$$test_script" all || exit 1; \
+	done
+	REQUIRE_GUEST_RUNTIME=1 FLATTEN_CTL="$(SBIN)/flatten-ctl" \
+		STORE_CTL="$(SBIN)/store-ctl" ZOT_BIN="$(E2E_ZOT_BIN)" \
+		MKFS_EROFS_PATH="$(SBIN)/mkfs.erofs" \
+		bash $(ORG)/guest-runtime/test/e2e/e2e_flatten.sh
 
 # perf harnesses living in this repo (cross-repo binary use).
 perf-sandbox: build
@@ -201,15 +223,16 @@ test-release-tools:
 
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
-	rm -rf bin build dist
+	rm -rf bin build
 
 help:
 	@echo "kuasar-sandbox — platform build entry. Targets:"
 	@echo "  build         build every sub-repo + assemble bin/\$$(TARGET_ARCH)/ (multi-min cold)"
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
 	@echo "  e2e-tools     ensure local test environment tools under build/e2e-tools/\$$(TARGET_ARCH)/"
-	@echo "  release       build + package merge-safe component tarballs under dist/"
+	@echo "  release       publish a version mapping (RELEASE_MAPPING=<mapping.json>)"
 	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e ($(words $(UMBRELLA_E2E)))"
+	@echo "  test-e2e-prebuilt  run full compatibility E2E from fetched release binaries without rebuilding"
 	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,cluster-real,..})"
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
@@ -218,5 +241,5 @@ help:
 	@echo "  vet / test    drive each Go sub-repo's vet/test target"
 	@echo "  test-ci-tools validate BMS cache/timing helpers"
 	@echo "  test-release-tools validate release manifests, bundles, and preflight guards"
-	@echo "  clean         clean every sub-repo + this repo's bin/ build/ dist/"
+	@echo "  clean         clean every sub-repo + this repo's bin/ build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64  (exported to sub-makes)"
