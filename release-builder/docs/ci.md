@@ -25,6 +25,15 @@ SHA 写入 `ci-metrics/revisions.tsv`,再按精确 SHA 装配源码。私有 for
 后，由维护者从可信 `main` revision 执行 `workflow_dispatch`,并把 GitHub
 `refs/pull/<number>/merge` 的 SHA 作为独立 `candidate_sha` 输入。工作流验证可信
 workflow SHA、当前 PR 的 merge/base/head SHA 及候选提交的两个父提交后才装配源码。
+
+Working-set A/B/C/D 报告使用独立的 `workflow_dispatch`
+`run_mode=working-set-perf`，确认字符串为 `run-working-set-perf`。该模式只接受
+已合入的 PR，并要求 trusted workflow SHA、该 PR 的 merge commit 和当前
+orchestrator `main` 三者完全相同；若 main 在合入后继续前进则拒绝运行。
+这使性能报告使用已信任的 main workflow，同时把精确的合入 candidate
+SHA 记入 revision set。该路径只运行 `make perf-sandbox-working-set`；
+`full-e2e` 仍保留原有开放 PR/two-parent integration commit 校验。
+
 不要从 `src/*` 执行
 `git rev-parse`:GitHub tarball 不含 `.git`,该命令会向上找到 runner checkout 并
 报告无关 revision。五仓 `main` revision 通过一次 GitHub GraphQL 查询取得并整体
@@ -87,7 +96,7 @@ make -C orchestrator/release-builder test-release-tools
 
 每个 BMS run 上传 `ci-metadata-<run>-<attempt>`，包含:
 
-- `run.tsv`:event、candidate repository、PR 编号、候选 integration SHA、base SHA、
+- `run.tsv`:event、candidate repository、PR 编号、候选 integration/merged SHA、base SHA、
   reviewed head SHA 与 trusted workflow SHA;
 - `revisions.tsv`:五仓精确 revision set;
 - `source-cache.tsv`:源码归档命中与摘要;
