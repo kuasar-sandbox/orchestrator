@@ -27,6 +27,11 @@ MATRIX_GROUPS_RAW="${PERF_GROUPS:-A B C D}"
 read -r -a MATRIX_GROUPS <<<"$MATRIX_GROUPS_RAW"
 WARM_BYTES="${PERF_WARM_BYTES:-16777216}"
 OUT_DIR="${PERF_OUT_DIR:-$REPO_ROOT/test/results/sandbox-perf-working-set-$(date -u +%Y%m%dT%H%M%SZ)}"
+if [ -w /proc/sys/vm/drop_caches ]; then
+    HOST_CACHE_RESET_MODE=global-drop-caches
+else
+    HOST_CACHE_RESET_MODE=targeted-posix-fadvise-dontneed
+fi
 
 fatal() {
     echo "FATAL: $*" >&2
@@ -148,7 +153,48 @@ wait_http_ready() { # $1=pid, $2=log, $3=path
 
 drop_host_caches() {
     sync
-    echo 3 >/proc/sys/vm/drop_caches
+    if [ "$HOST_CACHE_RESET_MODE" = global-drop-caches ]; then
+        echo 3 >/proc/sys/vm/drop_caches
+        return
+    fi
+
+    python3 - "$STORE_ROOT" "$B_ARTIFACT" "${B_DISK_TOPS[@]}" \
+        "$VMLINUX" "$BIN/sandbox-runtime.bundle" "$BIN/cloud-hypervisor" "$BIN/sandbox-ctl" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+seen = set()
+paths = []
+for raw in sys.argv[1:]:
+    candidate = pathlib.Path(raw)
+    if candidate.is_dir():
+        for root, directories, names in os.walk(candidate, followlinks=False):
+            directories.sort()
+            for name in sorted(names):
+                paths.append(pathlib.Path(root, name))
+    else:
+        paths.append(candidate)
+
+for path in paths:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+            continue
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        raise SystemExit(f"cannot evict host page cache for {path}: {error}") from error
+PY
 }
 
 if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
@@ -423,7 +469,7 @@ cp "$B_DIR/info.json" "$B_DIR/run.log" "$B_DIR/seed.log" "$B_DIR/snapshot.log" \
 echo "==> immutable B: $B_ARTIFACT" >&2
 
 # Record the complete environment after every binary and image has been used.
-python3 - "$ENVIRONMENT" "$REPO_ROOT" "$BIN" "$VMLINUX" "$IMAGE" "$ITERS" "${MATRIX_GROUPS[*]}" "$WARM_BYTES" <<'PY'
+python3 - "$ENVIRONMENT" "$REPO_ROOT" "$BIN" "$VMLINUX" "$IMAGE" "$ITERS" "${MATRIX_GROUPS[*]}" "$WARM_BYTES" "$HOST_CACHE_RESET_MODE" <<'PY'
 import csv
 import datetime
 import hashlib
@@ -434,7 +480,8 @@ import platform
 import subprocess
 import sys
 
-output, repo_root, bindir, kernel, image, iterations, groups, warm_bytes = sys.argv[1:]
+(output, repo_root, bindir, kernel, image, iterations, groups, warm_bytes,
+ host_cache_reset_mode) = sys.argv[1:]
 workspace = pathlib.Path(repo_root).parent.parent
 repository_names = ("accelerator", "connector", "guest-runtime", "orchestrator", "sandboxer")
 revision_manifest = os.environ.get("KUASAR_REVISION_MANIFEST")
@@ -553,7 +600,7 @@ environment = {
         "manifest_encryption": {"chunk": "aes", "manifest": "aes"},
         "main_prefetch": "off",
         "paired_prefetch": "D/memory",
-        "host_cache_reset": "sync + /proc/sys/vm/drop_caches=3 before each B and portable restore",
+        "host_cache_reset": host_cache_reset_mode,
         "manifest_cache_reset": "restart cache-ctl with an empty RocksDB before each B and portable restore",
         "manifest_store_reset": "restart store-ctl from the immutable root/dataset baseline before each sample",
     },
