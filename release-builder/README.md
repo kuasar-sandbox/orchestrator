@@ -53,6 +53,11 @@ make -C orchestrator/release-builder help       # 全部目标(test-e2e / perf /
 连续解压到同一目录不会互相覆盖;脚本经相对路径自动定位 `bin/`,见
 `test/QUICKSTART.md`。
 
+正式 `v0.1.0` 之前,各组件及聚合 workflow 每天按上海日期发布
+`*-preview.YYYYMMDD` prerelease。preview 不更新 GitHub Latest;聚合 preview
+仍由 `release` mapping 固定六个组件版本并通过完整 BMS E2E。具体时序和失败恢复见
+[docs/release.md](docs/release.md) §2.3。
+
 **单仓(私网/离线,发布路径)**:每个仓 `go.mod` 用 `replace` 指向兄弟目录,
 clone 全组织为兄弟目录后即可离线构建,无需 GOPROXY 或版本 tag:
 
