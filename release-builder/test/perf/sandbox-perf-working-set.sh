@@ -424,6 +424,7 @@ echo "==> immutable B: $B_ARTIFACT" >&2
 
 # Record the complete environment after every binary and image has been used.
 python3 - "$ENVIRONMENT" "$REPO_ROOT" "$BIN" "$VMLINUX" "$IMAGE" "$ITERS" "${MATRIX_GROUPS[*]}" "$WARM_BYTES" <<'PY'
+import csv
 import datetime
 import hashlib
 import json
@@ -434,16 +435,52 @@ import subprocess
 import sys
 
 output, repo_root, bindir, kernel, image, iterations, groups, warm_bytes = sys.argv[1:]
-workspace = pathlib.Path(repo_root).parent
+workspace = pathlib.Path(repo_root).parent.parent
+repository_names = ("accelerator", "connector", "guest-runtime", "orchestrator", "sandboxer")
+revision_manifest = os.environ.get("KUASAR_REVISION_MANIFEST")
 repositories = {}
-for name in ("accelerator", "connector", "guest-runtime", "orchestrator", "sandboxer"):
-    path = workspace / name
-    try:
-        sha = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "-C", path, "status", "--porcelain"], text=True).strip())
-    except (OSError, subprocess.CalledProcessError):
-        sha, dirty = None, None
-    repositories[name] = {"sha": sha, "dirty": dirty}
+if revision_manifest:
+    manifest_path = pathlib.Path(revision_manifest)
+    if not manifest_path.is_file():
+        raise SystemExit(f"revision manifest is missing: {manifest_path}")
+    with manifest_path.open(newline="", encoding="utf-8") as source:
+        for row in csv.DictReader(source, delimiter="\t"):
+            name = row["repository"].removeprefix("kuasar-sandbox/")
+            if name in repository_names:
+                repositories[name] = {
+                    "sha": row["resolved_sha"],
+                    "dirty": False,
+                    "requested_ref": row["requested_ref"],
+                    "role": row["role"],
+                    "source": "revision-manifest",
+                }
+else:
+    for name in repository_names:
+        path = workspace / name
+        try:
+            top = pathlib.Path(
+                subprocess.check_output(
+                    ["git", "-C", path, "rev-parse", "--show-toplevel"], text=True
+                ).strip()
+            ).resolve()
+            if top != path.resolve():
+                raise RuntimeError(f"{path} resolved to unrelated git root {top}")
+            sha = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
+            dirty = bool(
+                subprocess.check_output(
+                    ["git", "-C", path, "status", "--porcelain"], text=True
+                ).strip()
+            )
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
+            raise SystemExit(f"cannot resolve exact revision for {name}: {error}") from error
+        repositories[name] = {"sha": sha, "dirty": dirty, "source": "git"}
+missing_repositories = sorted(set(repository_names) - set(repositories))
+if missing_repositories:
+    raise SystemExit(f"revision set is incomplete: {missing_repositories}")
+for name, revision in repositories.items():
+    sha = revision["sha"]
+    if len(sha) != 40 or any(character not in "0123456789abcdef" for character in sha):
+        raise SystemExit(f"invalid revision for {name}: {sha!r}")
 
 def digest(path):
     h = hashlib.sha256()
@@ -654,6 +691,16 @@ portable_restore() { # $1=group $2=iter $3=prefetch $4=portable-ref $5=artifact-
     rm -f -- "$restore_dir/first-request.bin"
     first_ms=$(python3 -c 'import sys; print(f"{float(sys.argv[1])*1000:.3f}")' "$first_seconds")
 
+    "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$restore_dir/run" -- /bin/sh -c \
+        'set -eu
+         [ "$(cat /root-w)" = ROOT-W-OK ]
+         [ "$(cat /scratch/working-set)" = SCRATCH-W-OK ]
+         [ "$(cat /data/working-set)" = DATA-W-OK ]
+         echo W-DISK-STATE-OK' >"$restore_dir/disk-state.log" 2>&1 \
+        || { cat "$restore_dir/disk-state.log" >&2; fatal "$group/$iteration/$prefetch lost W-only disk state"; }
+    grep -Fxq W-DISK-STATE-OK "$restore_dir/disk-state.log" \
+        || fatal "$group/$iteration/$prefetch did not confirm W-only disk state"
+
     if [ "$prefetch" = memory ]; then
         for _ in $(seq 1 600); do
             grep -Fq 'memory prefetch completed backend=manifest' "$restore_dir/run.log" && break
@@ -813,7 +860,7 @@ print(json.dumps(row, sort_keys=True))
 PY
 
     cat "$restore_dir/row.json" >>"$SAMPLES"
-    cp "$restore_dir/run.log" "$restore_dir/stats.json" "$restore_dir/cache-before.json" \
+    cp "$restore_dir/run.log" "$restore_dir/disk-state.log" "$restore_dir/stats.json" "$restore_dir/cache-before.json" \
         "$restore_dir/cache-after.json" "$restore_dir/row.json" "$raw_dir/"
     python3 - "$restore_dir/row.json" <<'PY'
 import json, sys
