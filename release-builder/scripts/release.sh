@@ -70,9 +70,11 @@ write_metadata() {
   local name="$2"
   local archive="$3"
   local repo="$name"
+  local commit
   case "$name" in
     sandbox-runtime|vmlinux) repo="guest-runtime" ;;
   esac
+  commit="$(resolve_commit "$repo")"
   mkdir -p "$stage/release"
   cat >"$stage/release/$name.json" <<EOF
 {
@@ -80,10 +82,44 @@ write_metadata() {
   "version": "$VERSION",
   "arch": "$ARCH",
   "archive": "$archive",
-  "commit": "$(git -C "$ORG/$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)",
+  "commit": "$commit",
   "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
+}
+
+resolve_commit() {
+  local repo="$1"
+  local manifest="${KUASAR_REVISION_MANIFEST:-}"
+  local resolved_sha
+
+  if [ -n "$manifest" ]; then
+    [ -f "$manifest" ] \
+      || { echo "release.sh: revision manifest not found: $manifest" >&2; return 1; }
+    if ! resolved_sha="$(awk -F '\t' -v target="kuasar-sandbox/$repo" '
+      $1 == target {
+        if (found) {
+          exit 2
+        }
+        value = $3
+        found = 1
+      }
+      END {
+        if (!found) {
+          exit 1
+        }
+        print value
+      }
+    ' "$manifest")" || ! [[ "$resolved_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "release.sh: missing, duplicate, or invalid revision for $repo in $manifest" >&2
+      return 1
+    fi
+    printf '%s\n' "$resolved_sha"
+    return 0
+  fi
+
+  git -C "$ORG/$repo" rev-parse HEAD 2>/dev/null \
+    || { echo "release.sh: cannot resolve revision for $repo" >&2; return 1; }
 }
 
 make_archive() {

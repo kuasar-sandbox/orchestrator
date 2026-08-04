@@ -67,7 +67,7 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-repo-guest-runtime
 
-.PHONY: all build collect e2e-tools release vet test test-ci-tools clean help demo \
+.PHONY: all build collect e2e-tools release vet test test-ci-tools test-release-tools clean help demo \
         bench test-e2e perf dedup-report \
         $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
@@ -196,6 +196,9 @@ test:
 test-ci-tools:
 	bash scripts/test-ci-tools.sh
 
+test-release-tools:
+	bash scripts/test-release-tools.sh
+
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
 	rm -rf bin build dist
@@ -213,5 +216,7 @@ help:
 	@echo "  bench         Go micro-benchmarks across every Go sub-repo"
 	@echo "  dedup-report  delegate to accelerator"
 	@echo "  vet / test    drive each Go sub-repo's vet/test target"
+	@echo "  test-ci-tools validate BMS cache/timing helpers"
+	@echo "  test-release-tools validate release manifests, bundles, and preflight guards"
 	@echo "  clean         clean every sub-repo + this repo's bin/ build/ dist/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64  (exported to sub-makes)"
