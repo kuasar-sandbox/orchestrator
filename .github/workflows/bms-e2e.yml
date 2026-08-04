@@ -8,6 +8,11 @@ on:
         required: false
         default: ""
         type: string
+      release_assets_artifact:
+        description: Actions artifact containing the exact component release archives
+        required: false
+        default: ""
+        type: string
     outputs:
       release_artifact:
         description: Actions artifact containing the validated release bundle
@@ -99,6 +104,7 @@ jobs:
       KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
       KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
       RELEASE_INPUT_ARTIFACT: ${{ inputs.release_input_artifact || '' }}
+      RELEASE_ASSETS_ARTIFACT: ${{ inputs.release_assets_artifact || '' }}
       RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode || 'full-e2e' }}
       CONFIRM: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm || '' }}
       CANDIDATE_REPOSITORY: ${{ github.repository }}
@@ -175,7 +181,13 @@ jobs:
             || { echo "release workflow must select the trusted main ref" >&2; exit 1; }
           [[ "$RELEASE_INPUT_ARTIFACT" =~ ^aggregate-input-release-v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?-[0-9]+$ ]] \
             || { echo "invalid release input artifact name" >&2; exit 1; }
+          [[ "$RELEASE_ASSETS_ARTIFACT" =~ ^aggregate-assets-release-v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?-[0-9]+$ ]] \
+            || { echo "invalid release assets artifact name" >&2; exit 1; }
           [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Reset staged release workspace
+        if: inputs.release_input_artifact != ''
+        run: rm -rf release-input release-assets release-components
 
       - name: Download resolved aggregate input
         if: inputs.release_input_artifact != ''
@@ -183,6 +195,13 @@ jobs:
         with:
           name: ${{ inputs.release_input_artifact }}
           path: release-input
+
+      - name: Download exact component release assets
+        if: inputs.release_input_artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.release_assets_artifact }}
+          path: release-assets
 
       - name: Check out trusted aggregate tooling
         if: inputs.release_input_artifact != ''
@@ -444,14 +463,12 @@ jobs:
           printf 'workflow/assemble\t%s\t%s\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\t0\n' \
             "$started_at" "$elapsed" >> "$KUASAR_CI_TIMINGS"
 
-      - name: Fetch independently published component archives
+      - name: Verify and materialize exact component release assets
         if: inputs.release_input_artifact != ''
-        env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
           set -euo pipefail
           trusted/orchestrator/release-builder/scripts/aggregate-release.sh \
-            fetch release-input/resolved.json release-components
+            materialize-assets release-input/resolved.json release-assets release-components
 
       - name: Revoke source token
         if: ${{ always() && steps.source-token.outputs.token != '' }}
