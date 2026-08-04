@@ -30,6 +30,9 @@ env \
   RELEASE_WORKFLOW_RUN_URL=https://github.com/kuasar-sandbox/orchestrator/actions/runs/123 \
   "$ROOT/release-builder/scripts/component-release.sh" package v1.2.3 x86_64 "$TMP/revisions.tsv" "$TMP/bundle"
 "$ROOT/release-builder/scripts/component-release.sh" validate "$TMP/bundle"
+bash "$ROOT/release-builder/scripts/test-component-publisher.sh" \
+  "$ROOT/release-builder/scripts/publish-component-release.sh" \
+  "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
 for path in \
@@ -47,6 +50,20 @@ printf 'tampered\n' >> "$TMP/tampered/assets/orchestrator-v1.2.3-linux-x86_64.ta
 if "$ROOT/release-builder/scripts/component-release.sh" validate "$TMP/tampered" >/dev/null 2>&1; then
   fail "validator accepted a tampered archive"
 fi
+
+env \
+  RELEASE_BIN_DIR="$TMP/bin" \
+  SOURCE_DATE_EPOCH=1700000000 \
+  RELEASE_WORKFLOW_REPOSITORY=kuasar-sandbox/orchestrator \
+  RELEASE_WORKFLOW_RUN_ID=124 \
+  RELEASE_WORKFLOW_RUN_ATTEMPT=1 \
+  RELEASE_WORKFLOW_RUN_URL=https://github.com/kuasar-sandbox/orchestrator/actions/runs/124 \
+  "$ROOT/release-builder/scripts/component-release.sh" package \
+    v1.2.3-preview.20260804 x86_64 "$TMP/revisions.tsv" "$TMP/preview-bundle"
+"$ROOT/release-builder/scripts/component-release.sh" validate "$TMP/preview-bundle"
+bash "$ROOT/release-builder/scripts/test-component-publisher.sh" \
+  "$ROOT/release-builder/scripts/publish-component-release.sh" \
+  "$TMP/preview-bundle" kuasar-sandbox/orchestrator v1.2.3-preview.20260804
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/release-builder/scripts/component-release.sh" package 01.2.3 x86_64 \
   "$TMP/revisions.tsv" "$TMP/invalid" >/dev/null 2>&1; then
