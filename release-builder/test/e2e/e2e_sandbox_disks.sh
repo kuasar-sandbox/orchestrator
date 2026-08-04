@@ -340,8 +340,8 @@ timeout -k 5s 30 "$BIN/sandbox-ctl" run --restore "$W" --config "$WORK/restore-w
 MISSING_LOWER_RC=$?
 set -e
 [ "$MISSING_LOWER_RC" -ne 0 ] || { cat "$WORK/missing-lower.log"; echo "FAIL: restore unexpectedly accepted a missing memory lower"; exit 1; }
-grep -Fq 'from_refs[0]' "$WORK/missing-lower.log" \
-    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify from_refs[0]"; exit 1; }
+grep -Fq 'snapshot memory layer 0' "$WORK/missing-lower.log" \
+    || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify snapshot memory layer 0"; exit 1; }
 grep -Fq "$PARENT_MEMORY_BASENAME" "$WORK/missing-lower.log" \
     || { cat "$WORK/missing-lower.log"; echo "FAIL: missing-lower error did not identify $PARENT_MEMORY_BASENAME"; exit 1; }
 [ ! -e "$VMM_MARKER" ] \
