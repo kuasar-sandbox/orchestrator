@@ -742,6 +742,14 @@ echo "==> PASS: all-unset B restored locally and preserved guest state"
 
 # ---- local B -> working-set W -> independent portable publication --------
 # The second local Pause keeps memory self separate while disks still merge.
+# Make the restored disk delta observably different from B: a content-addressed
+# merge with no intervening writes can legitimately reproduce B's top digest.
+# This W-only marker makes removal of B's old disk top a meaningful proof.
+W_DISK_PERSIST="W_DISK_PERSIST_$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "echo $W_DISK_PERSIST > /home/user/working-set-disk.txt" >"$WORK/w-disk-write.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/w-disk-write.out" \
+    || { sed 's/^/  guest| /' "$WORK/w-disk-write.out"; fail "write W-only disk marker"; }
 # Removing B's old root-disk top before promotion proves upload-snapshot treats
 # B.snapshot as an opaque memory lower instead of recursively publishing B's
 # stale disk graph.
@@ -856,9 +864,12 @@ for _ in $(seq 1 90); do
     sleep 0.5
 done
 [ -n "$resumed" ] || fail "portable W did not restore"
-python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" \
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/persist.txt /home/user/working-set-disk.txt" \
     >"$WORK/portable-read.out" 2>&1 || true
 grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost guest state"; }
+grep -q "$W_DISK_PERSIST" "$WORK/portable-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost merged W-only disk state"; }
 PORTABLE_RESTORE_RUN_ID=$(sandbox_run_id "$SID")
 [ -n "$PORTABLE_RESTORE_RUN_ID" ] || fail "portable restore runner id is empty"
 PORTABLE_RESTORE_UNIT="sandbox-runner@$PORTABLE_RESTORE_RUN_ID.service"
