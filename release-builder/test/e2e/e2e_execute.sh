@@ -22,8 +22,12 @@
 #   local Pause policy        -> all-unset keeps the legacy argv; then node,
 #                                Create metadata/header, Pause body/header, and
 #                                automatic reaper policy are layered fieldwise.
-#                                Every capture is a real local W bundle and is
-#                                restored before teardown.
+#                                Captures are real local bundles and are restored
+#                                before teardown.
+#   portable working set      -> restore local B, capture W -> local B, remove
+#                                B's merged disk top, explicitly export/promote
+#                                W, then restore the portable W with self-only
+#                                memory prefetch.
 #   DELETE                    -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
@@ -555,8 +559,19 @@ echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to build
 # hostname should become CFG_HOST, verified by `hostname` in the exec below.
 CFG_HOST="e2e-cfg-host"
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname=$CFG_HOST via header)"
+CREATE_BASE_BODY=$(python3 - "$TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 120,
+    "metadata": {
+        "kuasar-sandbox.restore": json.dumps({"prefetch": "memory"}),
+    },
+}))
+PY
+)
 REQ_NET_HEADER="{\"hostname\":\"$CFG_HOST\"}"
-code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+code=$(req POST /sandboxes "$AK" "$CREATE_BASE_BODY")
 unset REQ_NET_HEADER
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
@@ -673,13 +688,16 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK")
 assert_snapshot_argv "$UNSET_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
     || fail "all-unset local Pause changed the legacy snapshot argv"
-W_UNSET="$CHECKPOINT_DIR/$SID/$SID.snapshot"
-[ -f "$W_UNSET" ] || fail "local Pause did not create $W_UNSET"
-"$BIN/sandbox-ctl" info --json "$W_UNSET" >"$WORK/w-unset.json" \
-    || fail "all-unset local W is not a readable snapshot bundle"
-echo "==> PASS: all-unset local Pause produced W and passed no policy flags"
+B_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+[ -f "$B_LOCAL" ] || fail "local Pause did not create $B_LOCAL"
+B_ARTIFACT="$(readlink -f "$B_LOCAL")"
+[ -f "$B_ARTIFACT" ] || fail "local B target is missing: $B_ARTIFACT"
+B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
+"$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json" \
+    || fail "all-unset local B is not a readable snapshot bundle"
+echo "==> PASS: all-unset local Pause produced B and passed no policy flags"
 
-echo "==> restore all-unset W through authenticated exec wake"
+echo "==> restore all-unset B through authenticated exec wake"
 RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
 resumed=""
@@ -693,7 +711,134 @@ done
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
 sed 's/^/  guest2| /' "$WORK/exec2.out"
 grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after local restore"
-echo "==> PASS: all-unset W restored locally and preserved guest state"
+echo "==> PASS: all-unset B restored locally and preserved guest state"
+
+# ---- local B -> working-set W -> independent portable publication --------
+# The second local Pause keeps memory self separate while disks still merge.
+# Removing B's old root-disk top before promotion proves upload-snapshot treats
+# B.snapshot as an opaque memory lower instead of recursively publishing B's
+# stale disk graph.
+PORTABLE_W_CALL=$(snapshot_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" \
+    '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
+assert_snapshot_argv "$PORTABLE_W_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    --merge-ref=false --drop-caches=false \
+    || fail "portable W Pause policy did not reach sandbox-ctl exactly"
+W_PORTABLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+[ -f "$W_PORTABLE_LOCAL" ] || fail "working-set Pause did not create $W_PORTABLE_LOCAL"
+W_PORTABLE_ARTIFACT="$(readlink -f "$W_PORTABLE_LOCAL")"
+[ "$W_PORTABLE_ARTIFACT" != "$B_ARTIFACT" ] || fail "working-set W reused B memory self"
+"$BIN/sandbox-ctl" info --json "$W_PORTABLE_LOCAL" >"$WORK/w-portable-local.json" \
+    || fail "local working-set W is unreadable"
+journalctl KUASAR_SANDBOX_ID="$SID" --no-pager >"$WORK/w-portable-local.journal" 2>/dev/null \
+    || fail "read local W sandbox journal"
+grep -Fq 'quiesce: guest acked (drop_caches=skipped' "$WORK/w-portable-local.journal" \
+    || fail "working-set Pause did not preserve guest page cache"
+B_ROOT_TOP_BASENAME=$(python3 - "$WORK/b-local.json" "$WORK/w-portable-local.json" "$B_SNAPSHOT_BASENAME" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    parent = json.load(source)
+with open(sys.argv[2], encoding="utf-8") as source:
+    working = json.load(source)
+
+parent_refs = parent.get("FromRefs") or []
+memory_refs = working.get("FromRefs") or []
+if len(memory_refs) != len(parent_refs) + 1 or not memory_refs[0].startswith("file://"):
+    raise SystemExit(f"working-set from_refs={memory_refs!r}, want local B plus {parent_refs!r}")
+memory_path = memory_refs[0][len("file://"):].split("@", 1)[0]
+if os.path.basename(memory_path) != sys.argv[3]:
+    raise SystemExit(f"working-set memory lower={memory_refs[0]!r}, want {sys.argv[3]!r}")
+if memory_refs[1:] != parent_refs:
+    raise SystemExit(f"working-set lower tail={memory_refs[1:]!r}, want inherited {parent_refs!r}")
+
+def top(node):
+    overlay = node.get("Overlay")
+    return overlay["Base"] if overlay else node["Base"]
+
+def chain(node):
+    overlay = node.get("Overlay")
+    return (overlay.get("BaseFromRefs") if overlay else node.get("BaseFromRefs")) or []
+
+parent_top = top(parent["Boot"]["Root"])
+working_root = working["Boot"]["Root"]
+if parent_top == top(working_root) or parent_top in chain(working_root):
+    raise SystemExit(f"W retained B disk top {parent_top!r}; local disks must merge")
+if not parent_top.startswith("file://"):
+    raise SystemExit(f"B root disk top is not local: {parent_top!r}")
+relative = parent_top[len("file://"):].split("@", 1)[0]
+if relative != os.path.basename(relative) or not relative.endswith(".overlay"):
+    raise SystemExit(f"refusing to remove unexpected B disk ref {parent_top!r}")
+print(relative)
+PY
+) || fail "local B/W graph validation failed"
+B_ROOT_TOP_PATH="$CHECKPOINT_DIR/$SID/$B_ROOT_TOP_BASENAME"
+[ -f "$B_ROOT_TOP_PATH" ] || fail "B root disk top is missing before minimal-set test: $B_ROOT_TOP_PATH"
+rm -f -- "$B_ROOT_TOP_PATH"
+echo "==> PASS: W -> local B is separate; B root disk top was merged and removed"
+
+PROMOTION_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --socket "$WORK/node-ctl.socket") \
+    || fail "independent export/promote of local W failed"
+case "$PROMOTION_TOKEN" in kmt1.*) ;; *) fail "export-sandbox returned a non-KMT result" ;; esac
+PORTABLE_W_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select snapshot_ref from sandboxes where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "")
+PY
+)
+PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
+[[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "promoted W ref is not manifest://<64hex>: $PORTABLE_W_REF"
+[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "promotion retained redundant local checkpoint directory"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
+    || fail "promoted W is not readable from the manifest store"
+PORTABLE_LAYER_SUMMARY=$(python3 - "$WORK/w-portable-manifest.json" "$WORK/b-local.json" "$PORTABLE_W_REF" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    working = json.load(source)
+with open(sys.argv[2], encoding="utf-8") as source:
+    parent = json.load(source)
+refs = working.get("FromRefs") or []
+parent_refs = parent.get("FromRefs") or []
+if len(refs) != len(parent_refs) + 1 or not refs[0].startswith("manifest://"):
+    raise SystemExit(f"portable W from_refs={refs!r}, want manifest B plus {parent_refs!r}")
+if refs[1:] != parent_refs:
+    raise SystemExit(f"portable W lower tail={refs[1:]!r}, want preserved {parent_refs!r}")
+if refs[0] == sys.argv[3]:
+    raise SystemExit("portable W self and B memory lower collapsed to one ref")
+print(refs[0][len("manifest://"):], len(refs))
+PY
+) || fail "portable W/B layer validation failed"
+read -r PORTABLE_B_KEY PORTABLE_PARENT_LAYERS <<<"$PORTABLE_LAYER_SUMMARY"
+echo "==> PASS: independent promotion published distinct W self and opaque B memory layer"
+
+RESUME_MARK="PORTABLE_W_RESUME_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
+resumed=""
+for _ in $(seq 1 90); do
+    code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
+        -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
+    case "$code" in 200|204) resumed=1; break ;; esac
+    sleep 0.5
+done
+[ -n "$resumed" ] || fail "portable W did not restore"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" \
+    >"$WORK/portable-read.out" 2>&1 || true
+grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost guest state"; }
+journalctl KUASAR_SANDBOX_ID="$SID" --no-pager >"$WORK/portable-w.journal" 2>/dev/null \
+    || fail "read portable W sandbox journal"
+grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_W_KEY" \
+    "$WORK/portable-w.journal" || fail "portable restore did not prefetch W self"
+MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$WORK/portable-w.journal" || true)
+[ "$MANIFEST_PREFETCH_COUNT" = "1" ] || fail "portable restore started $MANIFEST_PREFETCH_COUNT manifest prefetches, want W self only"
+grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
+    "$WORK/portable-w.journal" && fail "portable restore prefetched B memory lower"
+echo "==> PASS: portable W restored state; prefetch targeted W self only (not B or disk)"
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox=$code (want 204)"
 unset EXEC_TOKEN
@@ -835,4 +980,4 @@ echo "==> PASS: reaper auto-pause used metadata merge_ref=false and node drop_ca
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill auto-paused sandbox=$code (want 204)"
 echo "==> PASS: all local checkpoint-policy sandboxes killed"
 echo
-echo "==> e2e_execute: OK   (template $TEMPLATE, all-unset $SID_UNSET, policy $SID_POLICY, auto $SID)"
+echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, auto $SID)"
