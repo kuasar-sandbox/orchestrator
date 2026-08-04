@@ -508,7 +508,10 @@ start_orchestrator() { # $1=log path
         sleep 0.5
     done
     [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
-    grep -q 'checkpoint.mode=remote is deprecated' "$log_path" && fail "local checkpoint mode emitted the remote deprecation warning"
+    if grep -q 'checkpoint.mode=remote is deprecated' "$log_path"; then
+        fail "local checkpoint mode emitted the remote deprecation warning"
+    fi
+    return 0
 }
 
 stop_orchestrator() {
