@@ -89,8 +89,7 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 		return "", err
 	}
 
-	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, "snapshot",
-		"--sandbox-id", sb.sid, "--output", s.Workdir, "--run-root", sb.runRoot)
+	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, templateSnapshotArgs(sb.sid, s.Workdir, sb.runRoot)...)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w (%s)", err, firstLine(out))
 	}
@@ -100,6 +99,10 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	}
 	p.progress("template: snapshot taken")
 	return bundle, nil
+}
+
+func templateSnapshotArgs(sandboxID, output, runRoot string) []string {
+	return []string{"snapshot", "--sandbox-id", sandboxID, "--output", output, "--run-root", runRoot}
 }
 
 // waitEnvd polls envd's /health within the phase boot context. Runtime events

@@ -94,6 +94,53 @@ func TestCreateSandboxMetadataRejectsInvalidCredentials(t *testing.T) {
 	}
 }
 
+func TestCreateCheckpointHeaderOverlaysBodyPerField(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}`,
+	))
+	req.Header.Set(HeaderCheckpoint, `{"merge_ref":false,"drop_caches":null}`)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[sandboxcfg.NsCheckpoint] != `{"merge_ref":false,"drop_caches":false}` {
+		t.Fatalf("checkpoint metadata = %+v", got)
+	}
+}
+
+func TestCreateCheckpointMetadataUsesStrictParser(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body   string
+		header *string
+	}{
+		"unknown body field": {
+			body: `{"metadata":{"kuasar-sandbox.checkpoint":"{\"unknown\":true}"}}`,
+		},
+		"wrong body type": {
+			body: `{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":1}"}}`,
+		},
+		"empty header": {
+			body:   `{}`,
+			header: new(string),
+		},
+		"second header value": {
+			body:   `{}`,
+			header: func() *string { value := `{} {}`; return &value }(),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(tc.body))
+			if tc.header != nil {
+				req.Header.Set(HeaderCheckpoint, *tc.header)
+			}
+			if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
+				t.Fatal("invalid checkpoint policy was accepted")
+			}
+		})
+	}
+}
+
 func TestCreateRestoreMetadataAcceptsBodyPastOneMiB(t *testing.T) {
 	body := `{"envVars":{"BIG":"` + strings.Repeat("x", (1<<20)+64) +
 		`"},"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`
@@ -110,13 +157,6 @@ func TestCreateRestoreMetadataAcceptsBodyPastOneMiB(t *testing.T) {
 	}
 }
 
-type failOnRead struct{ read bool }
-
-func (r *failOnRead) Read([]byte) (int, error) {
-	r.read = true
-	return 0, errors.New("body must not be read")
-}
-
 type fillReader byte
 
 func (r fillReader) Read(p []byte) (int, error) {
@@ -126,23 +166,16 @@ func (r fillReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestCreateSandboxMetadataHeadersBypassBody(t *testing.T) {
-	body := &failOnRead{}
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
-	req.Body = io.NopCloser(body)
-	req.ContentLength = maxClusterCreateBodyBytes + 1
+func TestCreateSandboxMetadataHeadersDoNotBypassInvalidCheckpointBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.checkpoint":"{\"unknown\":true}"}}`,
+	))
 	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
 	req.Header.Set(HeaderCredentials, `{}`)
+	req.Header.Set(HeaderCheckpoint, `{"merge_ref":false,"drop_caches":true}`)
 
-	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if body.read {
-		t.Fatal("restore header path read the create body")
-	}
-	if len(got) != 2 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` || got[sandboxcfg.NsCredentials] != `{}` {
-		t.Fatalf("restore metadata=%v", got)
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("complete headers bypassed malformed checkpoint body metadata")
 	}
 }
 

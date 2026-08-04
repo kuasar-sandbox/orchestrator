@@ -41,6 +41,109 @@ checkpoint:
 	}
 }
 
+func TestLoadCheckpointPolicyTriState(t *testing.T) {
+	base := `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`
+
+	omitted, err := Load(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitted.Checkpoint.Mode != CheckpointLocal || omitted.Checkpoint.MergeRef != nil || omitted.Checkpoint.DropCaches != nil {
+		t.Fatalf("omitted checkpoint policy = %+v", omitted.Checkpoint)
+	}
+
+	nulls, err := Load(writeConfig(t, base+`
+checkpoint:
+  mode: local
+  merge_ref: null
+  drop_caches: null
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nulls.Checkpoint.MergeRef != nil || nulls.Checkpoint.DropCaches != nil {
+		t.Fatalf("YAML null did not remain nil: %+v", nulls.Checkpoint)
+	}
+
+	for _, mergeRef := range []bool{false, true} {
+		for _, dropCaches := range []bool{false, true} {
+			name := fmt.Sprintf("merge_%t_drop_%t", mergeRef, dropCaches)
+			t.Run(name, func(t *testing.T) {
+				cfg, err := Load(writeConfig(t, base+fmt.Sprintf(`
+checkpoint:
+  mode: local
+  merge_ref: %t
+  drop_caches: %t
+`, mergeRef, dropCaches)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cfg.Checkpoint.MergeRef == nil || *cfg.Checkpoint.MergeRef != mergeRef ||
+					cfg.Checkpoint.DropCaches == nil || *cfg.Checkpoint.DropCaches != dropCaches {
+					t.Fatalf("loaded checkpoint policy = %+v", cfg.Checkpoint)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadRemoteCheckpointCompatibilityAndPolicyRejection(t *testing.T) {
+	base := `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+checkpoint:
+  mode: remote
+`
+	for name, suffix := range map[string]string{
+		"legacy direct": "",
+		"legacy local parent": `
+  remote:
+    ref_location_parent: file:///mnt/checkpoints
+`,
+		"null fields": `
+  merge_ref: null
+  drop_caches: null
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, base+suffix))
+			if err != nil {
+				t.Fatalf("Load remote compatibility config: %v", err)
+			}
+			if cfg.Checkpoint.Mode != CheckpointRemote {
+				t.Fatalf("mode = %q", cfg.Checkpoint.Mode)
+			}
+		})
+	}
+	for name, suffix := range map[string]string{
+		"merge true":     "  merge_ref: true\n",
+		"merge false":    "  merge_ref: false\n",
+		"drop true":      "  drop_caches: true\n",
+		"drop false":     "  drop_caches: false\n",
+		"both specified": "  merge_ref: false\n  drop_caches: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, base+suffix))
+			if err == nil || !strings.Contains(err.Error(), "require checkpoint.mode=local") {
+				t.Fatalf("Load error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsOldRuntimeFields(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `

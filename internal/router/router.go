@@ -43,6 +43,7 @@ const (
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
+	HeaderCheckpoint  = "X-Kuasar-Sandbox-Checkpoint"
 	HeaderAPIKey      = "X-API-KEY"
 	HeaderAccessTok   = "X-Access-Token"
 	HeaderMigration   = "X-Kuasar-Migration-Token"
@@ -367,17 +368,27 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// createSandboxMetadata selects request-scoped restore and credential objects
-// from the cluster create request. Each dedicated header replaces the matching
-// metadata object. The body is skipped only when both objects are supplied by
-// headers; otherwise it is read within the cluster create limit.
+// createSandboxMetadata selects request-scoped restore, credential, and
+// checkpoint objects from the cluster create request. Restore and credential
+// headers replace their whole body objects. Checkpoint is overlaid fieldwise.
+// The body is still decoded when present so malformed lower-priority checkpoint
+// metadata cannot bypass the shared strict parser.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
+	checkpointRaw, checkpointHeader := createHeaderValue(r.Header, HeaderCheckpoint)
+	checkpointHeaderPolicy := sandboxcfg.CheckpointPolicy{}
+	if checkpointHeader {
+		var err error
+		checkpointHeaderPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(checkpointRaw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", HeaderCheckpoint, err)
+		}
+	}
 	var body struct {
 		Metadata map[string]string `json:"metadata"`
 	}
-	if (!restoreHeader || !credentialsHeader) && r.Body != nil {
+	if r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
 			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
 		}
@@ -400,16 +411,43 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	if raw, ok := body.Metadata[sandboxcfg.NsCredentials]; ok {
 		selected[sandboxcfg.NsCredentials] = raw
 	}
+	if raw, ok := body.Metadata[sandboxcfg.NsCheckpoint]; ok {
+		selected[sandboxcfg.NsCheckpoint] = raw
+	}
 	if restoreHeader {
 		selected[sandboxcfg.NsRestore] = restoreRaw
 	}
 	if credentialsHeader {
 		selected[sandboxcfg.NsCredentials] = credentialsRaw
 	}
+	if checkpointHeader {
+		bodyPolicy := sandboxcfg.CheckpointPolicy{}
+		if raw, ok := selected[sandboxcfg.NsCheckpoint]; ok {
+			var err error
+			bodyPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(raw)
+			if err != nil {
+				return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
+			}
+		}
+		policy := sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, checkpointHeaderPolicy)
+		if policy.Empty() {
+			delete(selected, sandboxcfg.NsCheckpoint)
+		} else {
+			canonical, err := sandboxcfg.MarshalCheckpointPolicyJSON(policy)
+			if err != nil {
+				return nil, err
+			}
+			selected[sandboxcfg.NsCheckpoint] = canonical
+		}
+	}
 	if len(selected) == 0 {
 		return nil, nil
 	}
 	selected, err := sandboxcfg.NormalizeRestoreMetadata(selected)
+	if err != nil {
+		return nil, err
+	}
+	selected, err = sandboxcfg.NormalizeCheckpointMetadata(selected)
 	if err != nil {
 		return nil, err
 	}

@@ -52,7 +52,8 @@ type RouteResolve struct {
 
 // SandboxReserveReq is the router-to-registry create payload. Config remains a
 // map because it follows the existing placement command carrier. Cluster ingress
-// admits only the request-scoped restore and credentials namespaces into it.
+// admits only the request-scoped restore, credentials, and checkpoint
+// namespaces into it.
 type SandboxReserveReq struct {
 	Config map[string]string `json:"config,omitempty"`
 }
@@ -200,7 +201,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	for key := range body.Config {
-		if key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials {
+		if key != sandboxcfg.NsRestore && key != sandboxcfg.NsCredentials && key != sandboxcfg.NsCheckpoint {
 			http.Error(w, fmt.Sprintf("unsupported sandbox reserve config %q", key), http.StatusBadRequest)
 			return
 		}

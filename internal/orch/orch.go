@@ -159,24 +159,32 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 			return nil, err
 		}
 	}
-	// Layer the template's declared config under this create request. Restore is
-	// deliberately request-scoped, so a template metadata value is not inherited.
+	// Layer the template's declared config under this create request. Restore,
+	// credentials, and checkpoint policy are deliberately request-scoped, so
+	// template metadata values in those namespaces are not inherited.
 	var templateMetadata map[string]string
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
 		templateMetadata = tb.Metadata
 	}
 	meta := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
-	// Validate the create restore policy before allocating an
-	// identity, minting credentials, creating directories, attaching networking,
-	// or starting a process. Normalization also gives every later trust boundary
-	// one canonical value to parse.
+	// Validate request-scoped policy before allocating an identity, minting
+	// credentials, creating directories, attaching networking, or starting a
+	// process. Normalization also gives every later trust boundary one canonical
+	// value to parse.
 	meta, err = sandboxcfg.NormalizeRestoreMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	meta, err = sandboxcfg.NormalizeCheckpointMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	credentials, meta, err := sandboxcfg.ExtractCredentials(meta)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := o.validateCreateCheckpointMode(meta); err != nil {
+		return nil, err
 	}
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -361,7 +369,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	return true, nil
 }
 
-func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
+func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
 	unlock := o.lifecycle.Lock(id)
 	defer unlock()
 
@@ -372,8 +380,12 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
+	policy, err := o.resolveCheckpointPolicy(sb.Metadata, actionOverride)
+	if err != nil {
+		return err
+	}
 	o.cancelResumeRequests(id)
-	return o.pauseSandboxLocked(ctx, sb)
+	return o.pauseSandboxLocked(ctx, sb, policy)
 }
 
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
@@ -381,7 +393,6 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	o.cancelResumeRequests(sb.ID)
 
 	current, err := o.st.Get(ctx, sb.ID)
 	if err != nil {
@@ -390,14 +401,28 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if current == nil {
 		return api.ErrNotFound
 	}
-	return o.pauseSandboxLocked(ctx, current)
+	if current.State == types.StatePaused {
+		return api.ErrAlreadyPaused
+	}
+	policy, err := o.resolveCheckpointPolicy(current.Metadata, sandboxcfg.CheckpointPolicy{})
+	if err != nil {
+		return err
+	}
+	o.cancelResumeRequests(sb.ID)
+	return o.pauseSandboxLocked(ctx, current, policy)
 }
 
-func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
 	}
-	ref, err := o.snapshot(ctx, sb)
+	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
+		o.log.Info("checkpoint policy resolved",
+			"sid", sb.ID,
+			"merge_ref", checkpointPolicyValue(policy.MergeRef),
+			"drop_caches", checkpointPolicyValue(policy.DropCaches))
+	}
+	ref, err := o.snapshot(ctx, sb, policy)
 	if err != nil {
 		return err
 	}
@@ -413,6 +438,72 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	_ = o.vs.Detach(ctx, sb.VswitchPort)
 	o.publishUpsert(sb) // proxies keep the (now paused) route so traffic triggers a Wake
 	return nil
+}
+
+func checkpointPolicyValue(value *bool) string {
+	if value == nil {
+		return "default"
+	}
+	if *value {
+		return "true"
+	}
+	return "false"
+}
+
+func (o *Orchestrator) nodeCheckpointPolicy() sandboxcfg.CheckpointPolicy {
+	return sandboxcfg.CloneCheckpointPolicy(sandboxcfg.CheckpointPolicy{
+		MergeRef:   o.cfg.Checkpoint.MergeRef,
+		DropCaches: o.cfg.Checkpoint.DropCaches,
+	})
+}
+
+func checkpointMetadataPolicy(metadata map[string]string) (sandboxcfg.CheckpointPolicy, error) {
+	raw, ok := metadata[sandboxcfg.NsCheckpoint]
+	if !ok {
+		return sandboxcfg.CheckpointPolicy{}, nil
+	}
+	policy, err := sandboxcfg.ParseCheckpointPolicyJSON(raw)
+	if err != nil {
+		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("metadata[%q]: %w", sandboxcfg.NsCheckpoint, err)
+	}
+	return policy, nil
+}
+
+func (o *Orchestrator) validateCreateCheckpointMode(metadata map[string]string) error {
+	policy, err := checkpointMetadataPolicy(metadata)
+	if err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if o.cfg.Checkpoint.Mode == config.CheckpointRemote && !policy.Empty() {
+		return fmt.Errorf("%w: checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
+	}
+	return nil
+}
+
+// resolveCheckpointPolicy validates historical metadata under the lifecycle
+// lock and resolves local policy field by field: node < metadata < action. In
+// deprecated remote mode every new-policy source is rejected and legacy capture
+// routing remains unchanged.
+func (o *Orchestrator) resolveCheckpointPolicy(metadata map[string]string, actionOverride sandboxcfg.CheckpointPolicy) (sandboxcfg.CheckpointPolicy, error) {
+	metadataPolicy, err := checkpointMetadataPolicy(metadata)
+	if err != nil {
+		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	switch o.cfg.Checkpoint.Mode {
+	case config.CheckpointLocal:
+		policy := sandboxcfg.OverlayCheckpointPolicy(o.nodeCheckpointPolicy(), metadataPolicy)
+		return sandboxcfg.OverlayCheckpointPolicy(policy, actionOverride), nil
+	case config.CheckpointRemote:
+		if !metadataPolicy.Empty() {
+			return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: sandbox checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
+		}
+		if !actionOverride.Empty() {
+			return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: Pause checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
+		}
+		return sandboxcfg.CheckpointPolicy{}, nil
+	default:
+		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: unsupported checkpoint.mode %q", api.ErrBadRequest, o.cfg.Checkpoint.Mode)
+	}
 }
 
 func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
@@ -1069,12 +1160,15 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
 // ref to persist: a canonical portable ref or a local bundle path
 // (local — node-bound; the default). sandbox-ctl performs the work with its own
 // boot-time manifest config; we pass the resolved binary + the run root.
-func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox) (string, error) {
+func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
 	// Named-location publishing is deliberately outside the VM pause/capture
 	// operation. Pause writes a local bundle; export or template finalization
 	// later upgrades it to the configured portable location.
-	if o.cfg.Checkpoint.Mode == config.CheckpointLocal || o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		return o.snapshotLocal(ctx, sb)
+	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
+		return o.snapshotLocal(ctx, sb, policy)
+	}
+	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
+		return o.snapshotLocal(ctx, sb, sandboxcfg.CheckpointPolicy{})
 	}
 	key, err := o.snapshotRemote(ctx, sb)
 	if err != nil {
@@ -1103,16 +1197,27 @@ func (o *Orchestrator) snapshotRemote(ctx context.Context, sb *types.Sandbox) (s
 // snapshotLocal writes the snapshot bundle to checkpoint.local_dir/<sid>/ and
 // returns the bundle path (node-bound; restorable only on this node). The lower
 // chain (the base template) stays remote, carried by reference.
-func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox) (string, error) {
+func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
 	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "snapshot",
-		"--sandbox-id", sb.ID, "--output", dir, "--run-root", o.cfg.Paths.RunRoot)
+	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--run-root", o.cfg.Paths.RunRoot}
+	args = appendCheckpointPolicyArgs(args, policy)
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("orch: snapshot %s (local): %w: %s", sb.ID, err, errb.String())
 	}
 	return filepath.Join(dir, sb.ID+".snapshot"), nil
+}
+
+func appendCheckpointPolicyArgs(args []string, policy sandboxcfg.CheckpointPolicy) []string {
+	if policy.MergeRef != nil {
+		args = append(args, fmt.Sprintf("--merge-ref=%t", *policy.MergeRef))
+	}
+	if policy.DropCaches != nil {
+		args = append(args, fmt.Sprintf("--drop-caches=%t", *policy.DropCaches))
+	}
+	return args
 }
 
 // promote publishes a local checkpoint graph without booting it. The configured

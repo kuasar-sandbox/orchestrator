@@ -381,9 +381,10 @@ node-ctl 同目录 → PATH"自动发现。
 | `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
-| `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件/ `remote` = manifest;配置 named location 时 pause 仍先落本机(§8.1) |
+| `checkpoint.mode` | `local` | 暂停态 capture:`local` = 本机 working-set bundle;`remote` 仅保留旧部署兼容且已废弃(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录 |
-| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute `file://` URI;配置后 export/builder 把 local refs 发布到 named location,宿主路径不进入 portable ref |
+| `checkpoint.merge_ref` / `.drop_caches` | 未设置 | local Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省。remote mode 禁止设置 |
+| `checkpoint.remote.ref_location_parent` | 空 | remote 兼容字段:可选 absolute `file://` URI;非空时旧路径实际仍 local capture。portable publish 应在 local Pause 后独立执行 |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2,node-proxy.md §7):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
@@ -544,6 +545,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
+| `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
 
 单 sandbox 显式启用的两种等价请求形态:
 
@@ -577,6 +579,23 @@ Envd/Traffic override 必须是有效 UTF-8 且各不超过 256 bytes。
 ServiceSecret 缺省从 APISecret 与 `AuthSandboxID()` 派生;Forward token 始终由最终
 ServiceSecret 自动签发,不能由请求指定。credentials 在验证后立即从普通 metadata 分离。
 
+Local checkpoint policy 也支持 metadata 与 Create header 两个入口:
+
+```http
+X-Kuasar-Sandbox-Checkpoint: {"merge_ref":false,"drop_caches":null}
+```
+
+```json
+{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}
+```
+
+两处共用严格 JSON object 解析:只允许 `merge_ref`、`drop_caches`,每个值只允许
+`true`、`false`、`null`;unknown、错误类型、第二个 value 或尾随内容均返回 400。
+Header 按字段覆盖 metadata;`null`/缺失表示不覆盖,而不是清除低层值。合并后全为
+`null`/缺失则删除整个 namespace。该 namespace 不从 template/build metadata 继承;
+`X-Kuasar-Sandbox-Checkpoint` 也不是 Build header。remote mode 下非空 policy 在 Create
+副作用前拒绝,应迁移节点为 `checkpoint.mode=local`。
+
 `kuasar-sandbox.cluster` 不属于上述租户配置命名空间。构建任务仍用该 metadata 字段携带
 cluster 自有的 group;普通 sandbox 的 `Profile`、`Group`、`RouteKey` 和可选
 `AuthSandboxID` 则通过 node-link 的结构化系统上下文下发并独立持久化,不进入用户
@@ -601,7 +620,8 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
   create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
   `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
-  `restore` 是例外:只接受 create 请求,不进入模板构建。
+  `restore`、`credentials`、`checkpoint` 是 request-scoped 例外:只接受 create 请求,
+  不从模板继承;checkpoint header 不进入模板构建。
   集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
@@ -620,11 +640,13 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   自描述。两者同时存在时先按既有 namespace 规则得到 create/模板声明,再以该声明字段覆盖
   snapshot 字段,最后补 node/profile 默认值。img-only(包括 bare)没有 snapshot metadata
   通道,仍由 `builds.metadata_json` 与运行节点默认值提供模板网络。迁移 token 同样携带
-  metadata。除 host-side restore policy 外,其余命名空间只在冷启生效或已冻入快照,故只
+  metadata。除 host-side restore/checkpoint policy 外,其余命名空间只在冷启生效或已冻入快照,故只
   network 需随快照。
-- **restore policy 不随快照或模板**:`kuasar-sandbox.restore` 只由 create 请求写入
-  sandbox metadata。image cold boot 不把它渲染进运行 YAML;snp create、pause 后 resume
-  和 migration import 在存在 restore ref 时重新渲染。connect/resume 不提供临时覆盖。
+- **host policy 不随快照或模板**:`kuasar-sandbox.restore` 与
+  `kuasar-sandbox.checkpoint` 只由 create 请求写入 sandbox metadata。image cold boot
+  不把它们渲染进运行 YAML;snp create、pause 后 resume 和 migration import 在存在
+  restore ref 时重新渲染 restore policy;checkpoint 始终只由 host Pause 路径读取,
+  不进入 `SANDBOX_CONFIG`/`snapshot.cfg`。connect/resume 不提供临时覆盖。
 - **持久化**:`sandboxes.metadata_json` / `builds.metadata_json` / `builds.builder_json`。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
@@ -879,6 +901,16 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   失联的 running 标为 `dead`(§15);paused/dead 行中,paused 可再拉起,kill 删行。
   集群下,这些操作另由 node-link 命令触发(create/connect/exec_session/delete,§10),并把
   状态变化作为事件上报 registry。
+- `POST /sandboxes/{id}/pause` body 可为空或为:
+
+  ```json
+  {"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":null}
+  ```
+
+  `memory` 缺失/`null`/`true` 均表示内存 checkpoint;`false` 在调用 Core 前返回 400。
+  两个 checkpoint 字段仅覆盖本次动作,不写回 metadata。可同时携
+  `X-Kuasar-Sandbox-Checkpoint`;Header 的具体 `true`/`false` 按字段覆盖 body,
+  Header `null`/缺失继续继承 body。body/header 解析失败均无 Pause 副作用。
 - **auto-suspend**:reaper(5s 周期)发现 `deadline` 已过 → 对运行中 sandbox-ctl 封
   快照(按 `checkpoint.mode`,§8.1)→ 记 `snapshot_ref`、标 paused → `StopUnit` →
   detach。路由表保留 paused 路由,后续数据面流量可唤醒。
@@ -901,18 +933,42 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 
 ### 8.1 暂停态分层、转模板与跨机迁移
 
-沙箱状态引用分 node-local 与 portable 两类。未配置 named location 时,
-`checkpoint.mode` 选择 pause 的默认落地:
+新部署只应使用 `checkpoint.mode=local`:Pause 执行
+`sandbox-ctl snapshot --sandbox-id <sid> --output <checkpoint.local_dir>/<sid>
+--run-root <run-root>`,并把 `<sid>.snapshot` 存为 node-local `snapshot_ref`。local capture
+可按字段解析 working-set policy:
 
-| | **本机快照**(`local`,默认) | **远程快照**(`remote`) |
-|---|---|---|
-| 实现 | `sandbox-ctl snapshot --output` → `checkpoint.local_dir/<sid>/<sid>.snapshot` | `sandbox-ctl snapshot --upload` → manifest store |
-| `snapshot_ref` | 本机 bundle 路径 | `manifest://<key>` |
-| 可恢复范围 | 仅本机(恰合"沙箱附着宿主") | 任意共享同一 store 的节点 |
-| 本质 | 暂停态 | **可移植,即模板** |
+```text
+Pause Header > Pause body > sandbox metadata > node config > sandbox-ctl default
+```
 
-配置 `checkpoint.remote.ref_location_parent` 后,pause 始终先写本机 bundle,不在 VM
-capture 窗口中写共享文件系统。`export-sandbox` 根据 source sandbox ID 计算:
+API 先把 body 与 Header 合为 action override;Core 在 lifecycle lock 内重读 sandbox row,
+严格解析历史 metadata 后再逐字段叠加。reaper 没有 action override,所以使用
+`sandbox metadata > node config > sandbox-ctl default`。某字段最终为 `nil` 时完全不传
+对应 flag;只有显式值才在基础 argv 后追加 `--merge-ref=true|false` 或
+`--drop-caches=true|false`。两字段全未设置时 argv 与旧 local Pause 完全相同,缺省行为由
+sandbox-ctl 决定。policy 校验完成前不会 cancel resume、snapshot、停 unit、detach 或改库。
+snapshot 成功后才写 ref/paused state;Pause 本身不执行 promote。Build/template 的 snapshot
+命令不接入这两个 flag,也不把 ready/start command 解释为 working-set warm-up。
+本阶段只承诺 local W 的 capture/restore;含 local memory parent 的 W 要变为 portable artifact,
+仍须等待 `kuasar-sandbox/sandboxer#54` 的 publisher 修复后由独立 publish/restore E2E 验收,
+不得借 deprecated remote Pause 生成 working-set。
+
+`checkpoint.mode=remote` 已废弃,conductor 启动时会告警
+`checkpoint.mode=remote is deprecated; use checkpoint.mode=local and publish separately`。
+它只保留以下旧路由,两条都拒绝 node/sandbox/action checkpoint policy 且不追加新 flag:
+
+| remote 兼容配置 | 保留行为 |
+|---|---|
+| `ref_location_parent` 为空 | `sandbox-ctl snapshot --upload` → `manifest://<key>` |
+| `ref_location_parent` 非空 | 仍走旧 `snapshot --output` local capture;启动告警会指出应迁移为 local mode |
+
+remote mode 不增加 working-set、local-parent fallback、capture 后自动 promote 或重试。
+显式 Pause 遇到 action/metadata policy 返回 400且 sandbox 保持 running;auto-pause 遇到
+metadata policy 记录 warning 并保持 running。remote node config 中设置 merge/drop 在加载时失败。
+
+推荐配置 `mode=local` 后独立 publish。若配置
+`checkpoint.remote.ref_location_parent`,`export-sandbox` 根据 source sandbox ID 计算:
 
 ```text
 hash = SHA256(location-name)
@@ -922,9 +978,9 @@ location URI = <parent>/<hash[0:2]>/<hash[2:4]>/<location-name>
 随后用 `upload-snapshot --to-ref-location` 发布,得到
 `file://<digest>.snapshot@location:<source-sid>`。没有 parent 时仍发布到 manifest。
 两者都是 canonical portable ref;数据库成功重指后才 best-effort 删除明确的本机
-checkpoint,located 目录绝不进入本机 cleanup。全部基于现有
-sandbox-ctl 原语(`snapshot --output|--upload`、`upload-snapshot`、`run --restore`),
-e2b API/CLI 零改动。
+checkpoint,located 目录绝不进入本机 cleanup。没有 parent 时独立发布到 manifest。
+全部基于现有 sandbox-ctl 原语(`snapshot --output`、`upload-snapshot`、`run --restore`);
+legacy remote 的 `snapshot --upload` 只作兼容回归。
 
 `export-sandbox` / `import-sandbox`(CLI 形式见 §2.7)是 api 平面端点
 `POST /sandboxes/{id}/export`、`POST /sandboxes/import` 的客户端;两端点在 TLS
@@ -1441,7 +1497,8 @@ sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自
 | `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);profile=bare fromImage → bare-img(拒绝 start、bare 网络、image-only);分别从 e2b-snp/bare-img create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
-| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume;精确断言 all-unset argv,再覆盖 node/Create metadata+header/Pause body+header/reaper 的逐字段 policy,并验证 W 与 guest 状态可本地恢复;Builder argv 保持无新 flag | `test-e2e-execute` |
+| `e2e_sandbox_disks.sh` | root + 两类 data disk 的 snapshot/restore;第二代 `merge_ref=false` W 明确保留 memory parent,同时断言 root/data local parent 仍合并且 W 可恢复 | umbrella `run_all.sh` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入,key 分发,Reserve→READY→数据面转发,稳定 SandboxID 的 CmdConnect/ExecSession,KAT 拒绝和 exec 两跳 tunnel,稳定/Node SandboxID 转换,route cache,build_register,孤儿 route 清理,节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 

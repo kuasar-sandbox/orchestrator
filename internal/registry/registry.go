@@ -917,6 +917,10 @@ func normalizeSandboxReserveConfig(config map[string]string) (map[string]string,
 	if err != nil {
 		return nil, nil, err
 	}
+	config, err = sandboxcfg.NormalizeCheckpointMetadata(config)
+	if err != nil {
+		return nil, nil, err
+	}
 	_, present := config[sandboxcfg.NsCredentials]
 	credentials, cleaned, err := sandboxcfg.ExtractCredentials(config)
 	if err != nil {
