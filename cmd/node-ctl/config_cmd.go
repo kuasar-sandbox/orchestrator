@@ -203,9 +203,11 @@ builder:                                           # builds run INSIDE build san
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 #   # dampening: { recover_duration: 60s, cooldown_periods: 10 }
-checkpoint:                                        # paused-state tiering
-  mode: local                                     # local (node-bound files) | remote (portable manifest)
+checkpoint:                                        # paused-state capture
+  mode: local                                     # local; remote is deprecated compatibility-only
   local_dir: /var/lib/sandbox-saved
+  # merge_ref: false                              # omit/null => sandbox-ctl default
+  # drop_caches: false                            # omit/null => sandbox-ctl default
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)

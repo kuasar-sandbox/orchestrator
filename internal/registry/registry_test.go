@@ -1275,6 +1275,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 			return nil, err
 		}
 		placement.Config[sandboxcfg.NsRestore] = `{"prefetch":"memory"}`
+		placement.Config[sandboxcfg.NsCheckpoint] = `{"merge_ref":true}`
 		return placement, nil
 	}))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
@@ -1313,6 +1314,9 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	if _, ok := got.Config[sandboxcfg.NsRestore]; ok {
 		t.Fatalf("placement restore leaked without an explicit create value: %+v", got.Config)
 	}
+	if _, ok := got.Config[sandboxcfg.NsCheckpoint]; ok {
+		t.Fatalf("placement checkpoint policy leaked without an explicit create value: %+v", got.Config)
+	}
 	if got.APISecretFingerprint != fullFingerprint(testAPISecret) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.APISecretFingerprint)
 	}
@@ -1327,6 +1331,16 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		if got == nil || got.Config[sandboxcfg.NsRestore] != `{"prefetch":"`+mode+`"}` {
 			t.Fatalf("explicit create restore %q did not reach command: %+v", mode, got)
 		}
+	}
+
+	got = nil
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-checkpoint", map[string]string{
+		sandboxcfg.NsCheckpoint: ` { "merge_ref" : false, "drop_caches" : null } `,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+		t.Fatalf("explicit Create checkpoint policy did not reach command canonically: %+v", got)
 	}
 }
 
@@ -2374,6 +2388,7 @@ func TestNormalizeSandboxReserveConfigSeparatesCreateCredentials(t *testing.T) {
 	original := map[string]string{
 		sandboxcfg.NsRestore:     ` { "prefetch" : "memory" } `,
 		sandboxcfg.NsCredentials: ` { "service_secret" : "` + secret + `" } `,
+		sandboxcfg.NsCheckpoint:  ` { "merge_ref" : false, "drop_caches" : null } `,
 	}
 	cleaned, credentials, err := normalizeSandboxReserveConfig(original)
 	if err != nil {
@@ -2384,6 +2399,9 @@ func TestNormalizeSandboxReserveConfigSeparatesCreateCredentials(t *testing.T) {
 	}
 	if cleaned[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
 		t.Fatalf("restore was not canonicalized: %+v", cleaned)
+	}
+	if cleaned[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+		t.Fatalf("checkpoint policy was not canonicalized: %+v", cleaned)
 	}
 	if credentials == nil || credentials.ServiceSecret != secret {
 		t.Fatalf("separated credentials=%+v", credentials)
@@ -2401,6 +2419,28 @@ func TestNormalizeSandboxReserveConfigSeparatesCreateCredentials(t *testing.T) {
 	cleaned, credentials, err = normalizeSandboxReserveConfig(nil)
 	if err != nil || cleaned != nil || credentials != nil {
 		t.Fatalf("absent credentials: cleaned=%+v credentials=%+v err=%v", cleaned, credentials, err)
+	}
+}
+
+func TestReserveSandboxRejectsInvalidCheckpointBeforePlacement(t *testing.T) {
+	placements := 0
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
+	}))
+
+	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "rk-checkpoint-invalid", map[string]string{
+		sandboxcfg.NsCheckpoint: `{"merge_ref":"false"}`,
+	}))
+	if err == nil {
+		t.Fatal("invalid checkpoint policy should be rejected")
+	}
+	if placements != 0 {
+		t.Fatalf("invalid checkpoint policy reached placement %d times", placements)
+	}
+	if _, _, found, getErr := reg.stores.GetSandbox(context.Background(), "/g", "rk-checkpoint-invalid"); getErr != nil || found {
+		t.Fatalf("invalid checkpoint policy wrote route state: found=%v err=%v", found, getErr)
 	}
 }
 

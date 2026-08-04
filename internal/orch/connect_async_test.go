@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -345,7 +346,7 @@ func TestPauseFencesQueuedAsyncResumeButAllowsLaterWake(t *testing.T) {
 	// the interval before its goroutine starts, then let Pause linearize first.
 	queued := f.o.newResumeRequest(f.sb.ID)
 	defer f.o.releaseResumeRequest(queued)
-	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey); !errors.Is(err, api.ErrAlreadyPaused) {
+	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, sandboxcfg.CheckpointPolicy{}); !errors.Is(err, api.ErrAlreadyPaused) {
 		t.Fatalf("Pause already-paused sandbox = %v, want ErrAlreadyPaused", err)
 	}
 
@@ -474,6 +475,7 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 	t.Helper()
 	cfg := &config.Config{}
 	cfg.Sandbox.TimeoutSec = 900
+	cfg.Checkpoint.Mode = config.CheckpointLocal
 	started := make(chan struct{}, 4)
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}

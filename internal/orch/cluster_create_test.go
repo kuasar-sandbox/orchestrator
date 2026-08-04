@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -61,6 +62,42 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 	}
 	if _, _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
 		t.Fatal("cluster create accepted invalid restore policy")
+	}
+}
+
+func TestPrecheckClusterCheckpointPolicy(t *testing.T) {
+	newCommand := func(fingerprint, raw string) *routesync.Command {
+		return &routesync.Command{
+			SID:                  "stable-g0",
+			TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+			Profile:              string(types.ProfileBare),
+			APISecretFingerprint: fingerprint,
+			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+			Config:               map[string]string{sandboxcfg.NsCheckpoint: raw},
+		}
+	}
+
+	localCfg := &config.Config{}
+	localCfg.Checkpoint.Mode = config.CheckpointLocal
+	local := testOrchCfg(t, localCfg)
+	_, _, localFingerprint := allowlistedBuildIdentity(t, local)
+	cmd := newCommand(localFingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
+	if _, _, _, err := local.precheckCluster(context.Background(), cmd); err != nil {
+		t.Fatalf("local checkpoint policy rejected: %v", err)
+	}
+	if cmd.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+		t.Fatalf("cluster checkpoint policy was not canonicalized: %+v", cmd.Config)
+	}
+	if _, _, _, err := local.precheckCluster(context.Background(), newCommand(localFingerprint, `{"merge_ref":0}`)); err == nil {
+		t.Fatal("malformed cluster checkpoint policy was accepted")
+	}
+
+	remoteCfg := &config.Config{}
+	remoteCfg.Checkpoint.Mode = config.CheckpointRemote
+	remote := testOrchCfg(t, remoteCfg)
+	_, _, remoteFingerprint := allowlistedBuildIdentity(t, remote)
+	if _, _, _, err := remote.precheckCluster(context.Background(), newCommand(remoteFingerprint, `{"drop_caches":false}`)); err == nil || !strings.Contains(err.Error(), "checkpoint.mode=local") {
+		t.Fatalf("remote cluster checkpoint policy error = %v", err)
 	}
 }
 

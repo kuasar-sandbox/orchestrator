@@ -143,13 +143,16 @@ builder:
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 #   # dampening: { recover_duration: 60s, cooldown_periods: 10 }
 
-# Paused-state tiering. mode=local writes a node-local bundle; mode=remote uploads
-# directly to manifest unless ref_location_parent is configured. Named-location
-# publishing keeps pause local and upgrades it during export, outside VM capture.
+# Paused-state capture. Keep mode=local; mode=remote is deprecated compatibility
+# only. Optional bools are tri-state: omit/null delegates to sandbox-ctl, while
+# true/false is passed explicitly on local Pause. Publish separately via export.
 checkpoint:
   mode: local
   local_dir: /var/lib/sandbox-saved
+  # merge_ref: false
+  # drop_caches: false
   # remote:
+  #   # Used by export-sandbox publication; it does not make local Pause remote.
   #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
 
 # mmds: optional envd metadata service for FC-mode token re-keying.

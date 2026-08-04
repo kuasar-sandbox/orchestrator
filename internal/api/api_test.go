@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -60,10 +61,10 @@ func TestMergeConfigHeaders(t *testing.T) {
 	if _, ok := m[sandboxcfg.NsRestore]; ok {
 		t.Fatalf("generic/template headers admitted request-scoped restore: %+v", m)
 	}
-	if got := mergeCreateConfigHeaders(nil, h); got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+	if got := mustMergeCreateConfigHeaders(t, nil, h); got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
 		t.Fatalf("create restore header not normalized: %+v", got)
 	}
-	if got := mergeCreateConfigHeaders(nil, h); got[sandboxcfg.NsCredentials] != `{"envd_access_token":"envd"}` {
+	if got := mustMergeCreateConfigHeaders(t, nil, h); got[sandboxcfg.NsCredentials] != `{"envd_access_token":"envd"}` {
 		t.Fatalf("create credentials header not normalized: %+v", got)
 	}
 
@@ -74,24 +75,24 @@ func TestMergeConfigHeaders(t *testing.T) {
 		t.Fatalf("header should win over metadata: %+v", got)
 	}
 	meta = map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}
-	got = mergeCreateConfigHeaders(meta, header("X-Kuasar-Sandbox-Restore", `{"prefetch":"off"}`))
+	got = mustMergeCreateConfigHeaders(t, meta, header("X-Kuasar-Sandbox-Restore", `{"prefetch":"off"}`))
 	if got[sandboxcfg.NsRestore] != `{"prefetch":"off"}` {
 		t.Fatalf("restore header should win over metadata: %+v", got)
 	}
 	emptyRestore := http.Header{}
 	emptyRestore.Set("X-Kuasar-Sandbox-Restore", "")
-	got = mergeCreateConfigHeaders(nil, emptyRestore)
+	got = mustMergeCreateConfigHeaders(t, nil, emptyRestore)
 	if _, ok := got[sandboxcfg.NsRestore]; !ok {
 		t.Fatalf("present empty restore header must reach strict validation: %+v", got)
 	}
 	emptyCredentials := http.Header{}
 	emptyCredentials.Set("X-Kuasar-Sandbox-Credentials", "")
-	got = mergeCreateConfigHeaders(nil, emptyCredentials)
+	got = mustMergeCreateConfigHeaders(t, nil, emptyCredentials)
 	if _, ok := got[sandboxcfg.NsCredentials]; !ok {
 		t.Fatalf("present empty credentials header must reach strict validation: %+v", got)
 	}
 	metadataCredentials := map[string]string{sandboxcfg.NsCredentials: `{"service_secret":"metadata"}`}
-	got = mergeCreateConfigHeaders(metadataCredentials, header("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"header"}`))
+	got = mustMergeCreateConfigHeaders(t, metadataCredentials, header("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"header"}`))
 	if got[sandboxcfg.NsCredentials] != `{"envd_access_token":"header"}` {
 		t.Fatalf("credentials header should replace the metadata object: %+v", got)
 	}
@@ -103,11 +104,21 @@ func TestMergeConfigHeaders(t *testing.T) {
 	}
 }
 
+func mustMergeCreateConfigHeaders(t *testing.T, meta map[string]string, headers http.Header) map[string]string {
+	t.Helper()
+	got, err := mergeCreateConfigHeaders(meta, headers)
+	if err != nil {
+		t.Fatalf("mergeCreateConfigHeaders: %v", err)
+	}
+	return got
+}
+
 func TestMergeBuildConfigHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`)
 	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"build"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"must-not-enter-build"}`)
+	h.Set(checkpointHeader, `{"merge_ref":false}`)
 	got := mergeBuildConfigHeaders(nil, h)
 	if got[buildcfg.NsBuilder] != `{"referer":{"enabled":false}}` {
 		t.Fatalf("builder header not normalized: %+v", got)
@@ -118,7 +129,222 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	if _, ok := got[sandboxcfg.NsCredentials]; ok {
 		t.Fatalf("credentials header entered build metadata: %+v", got)
 	}
+	if _, ok := got[sandboxcfg.NsCheckpoint]; ok {
+		t.Fatalf("checkpoint header entered build metadata: %+v", got)
+	}
 }
+
+func TestCreateCheckpointHeaderOverlaysMetadataPerField(t *testing.T) {
+	var got CreateReq
+	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+		got = req
+		return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	body := `{"templateID":"bare:img:manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}`
+	headers := http.Header{}
+	headers.Set(checkpointHeader, `{"merge_ref":false,"drop_caches":null}`)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(body), headers)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got.Metadata[sandboxcfg.NsCheckpoint] != `{"merge_ref":false,"drop_caches":false}` {
+		t.Fatalf("merged checkpoint metadata = %+v", got.Metadata)
+	}
+}
+
+func TestCreateCheckpointHeaderValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		header string
+	}{
+		{name: "empty header", body: `{}`, header: ""},
+		{name: "unknown header field", body: `{}`, header: `{"unknown":true}`},
+		{name: "wrong header type", body: `{}`, header: `{"merge_ref":"false"}`},
+		{name: "trailing header value", body: `{}`, header: `{} {}`},
+		{name: "malformed body policy", body: `{"metadata":{"kuasar-sandbox.checkpoint":"not-json"}}`, header: `{}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			core := &checkpointCoreStub{create: func(context.Context, CreateReq) (*types.Sandbox, error) {
+				called = true
+				return &types.Sandbox{}, nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			headers := http.Header{}
+			headers.Set(checkpointHeader, tc.header)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(tc.body), headers)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			if called {
+				t.Fatal("invalid checkpoint header reached Core.Create")
+			}
+		})
+	}
+}
+
+func TestCreateCheckpointHeaderAbsentAndEmptyPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		headers     http.Header
+		wantPresent bool
+		wantRaw     string
+	}{
+		{name: "absent", body: `{}`, headers: http.Header{}},
+		{name: "body canonicalized", body: `{"metadata":{"kuasar-sandbox.checkpoint":" { \"merge_ref\" : false } "}}`,
+			headers: http.Header{}, wantPresent: true, wantRaw: `{"merge_ref":false}`},
+		{name: "body all null removed", body: `{"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":null}"}}`, headers: http.Header{}},
+		{name: "empty object", body: `{}`, headers: header(checkpointHeader, `{}`)},
+		{name: "all null", body: `{}`, headers: header(checkpointHeader, `{"merge_ref":null,"drop_caches":null}`)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+				raw, present := req.Metadata[sandboxcfg.NsCheckpoint]
+				if present != tc.wantPresent {
+					t.Fatalf("checkpoint namespace present=%t, want %t: %+v", present, tc.wantPresent, req.Metadata)
+				}
+				if raw != tc.wantRaw {
+					t.Fatalf("checkpoint metadata = %q, want %q", raw, tc.wantRaw)
+				}
+				return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(tc.body), tc.headers)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateCheckpointBodyValidationBeforeCore(t *testing.T) {
+	called := false
+	core := &checkpointCoreStub{create: func(context.Context, CreateReq) (*types.Sandbox, error) {
+		called = true
+		return &types.Sandbox{}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes",
+		strings.NewReader(`{"metadata":{"kuasar-sandbox.checkpoint":"{\"unknown\":true}"}}`), nil)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+	if called {
+		t.Fatal("invalid checkpoint body metadata reached Core.Create")
+	}
+}
+
+func TestPauseRequestPolicyAndStatus(t *testing.T) {
+	boolPtr := func(value bool) *bool { return &value }
+	tests := []struct {
+		name       string
+		body       string
+		header     *string
+		want       sandboxcfg.CheckpointPolicy
+		coreErr    error
+		wantStatus int
+		wantCalls  int
+	}{
+		{name: "empty body", body: "", wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "empty object", body: `{}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory null", body: `{"memory":null}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory true", body: `{"memory":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "body values", body: `{"checkpoint_merge_ref":false,"checkpoint_drop_caches":true}`,
+			want: sandboxcfg.CheckpointPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "body null inherits", body: `{"checkpoint_merge_ref":null,"checkpoint_drop_caches":false}`,
+			want: sandboxcfg.CheckpointPolicy{DropCaches: boolPtr(false)}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "unknown body field remains accepted", body: `{"future":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "already paused", body: `{}`, coreErr: ErrAlreadyPaused, wantStatus: http.StatusConflict, wantCalls: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CheckpointPolicy) error {
+				calls++
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("Pause override = %+v, want %+v", got, tc.want)
+				}
+				return tc.coreErr
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			headers := http.Header{}
+			if tc.header != nil {
+				headers.Set(checkpointHeader, *tc.header)
+			}
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/sid/pause", strings.NewReader(tc.body), headers)
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, tc.wantStatus, response.Body.String())
+			}
+			if calls != tc.wantCalls {
+				t.Fatalf("Core.Pause calls = %d, want %d", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestPauseCheckpointHeaderOverlaysBodyPerField(t *testing.T) {
+	headers := http.Header{}
+	headers.Set(checkpointHeader, `{"merge_ref":false,"drop_caches":null}`)
+	core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CheckpointPolicy) error {
+		if got.MergeRef == nil || *got.MergeRef || got.DropCaches == nil || *got.DropCaches {
+			t.Fatalf("merged action override = %+v, want merge=false drop=false", got)
+		}
+		return nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/sid/pause",
+		strings.NewReader(`{"checkpoint_merge_ref":true,"checkpoint_drop_caches":false}`), headers)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPauseRejectsInvalidRequestsBeforeCore(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		header *string
+	}{
+		{name: "memory false", body: `{"memory":false}`},
+		{name: "malformed body", body: `{`},
+		{name: "top-level null", body: `null`},
+		{name: "wrong memory type", body: `{"memory":"true"}`},
+		{name: "wrong policy type", body: `{"checkpoint_merge_ref":0}`},
+		{name: "second body value", body: `{} {}`},
+		{name: "empty header", body: `{}`, header: stringPtr("")},
+		{name: "unknown header field", body: `{}`, header: stringPtr(`{"unknown":true}`)},
+		{name: "wrong header type", body: `{}`, header: stringPtr(`{"drop_caches":[]}`)},
+		{name: "second header value", body: `{}`, header: stringPtr(`{} {}`)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error {
+				calls++
+				return nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			headers := http.Header{}
+			if tc.header != nil {
+				headers.Set(checkpointHeader, *tc.header)
+			}
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes/sid/pause", strings.NewReader(tc.body), headers)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			if calls != 0 {
+				t.Fatalf("invalid request called Core.Pause %d times", calls)
+			}
+		})
+	}
+}
+
+func stringPtr(value string) *string { return &value }
 
 func TestSandboxResponseUsesProfileSpecificCredentials(t *testing.T) {
 	a := &API{domain: "example.test"}
@@ -500,6 +726,20 @@ func TestCreateExecSessionSanitizesOperationalFailuresAsUnavailable(t *testing.T
 type execSessionCoreStub struct {
 	Core
 	execSession func(context.Context, string, string, string, int64) (string, error)
+}
+
+type checkpointCoreStub struct {
+	Core
+	create func(context.Context, CreateReq) (*types.Sandbox, error)
+	pause  func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error
+}
+
+func (c *checkpointCoreStub) Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) {
+	return c.create(ctx, req)
+}
+
+func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error {
+	return c.pause(ctx, id, apiKey, override)
 }
 
 func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error) {

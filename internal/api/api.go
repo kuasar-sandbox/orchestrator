@@ -3,9 +3,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,6 +41,7 @@ const (
 	builderHeader     = "X-Kuasar-Sandbox-Builder"
 	restoreHeader     = "X-Kuasar-Sandbox-Restore"
 	credentialsHeader = "X-Kuasar-Sandbox-Credentials"
+	checkpointHeader  = "X-Kuasar-Sandbox-Checkpoint"
 )
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
@@ -66,7 +69,7 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string
 	return meta
 }
 
-func mergeCreateConfigHeaders(meta map[string]string, h http.Header) map[string]string {
+func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
 	meta = mergeConfigHeaders(meta, h)
 	for _, item := range []struct{ header, metaKey string }{
 		{restoreHeader, sandboxcfg.NsRestore},
@@ -80,7 +83,41 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) map[string]
 		}
 		meta[item.metaKey] = h.Get(item.header)
 	}
-	return meta
+	bodyPolicy := sandboxcfg.CheckpointPolicy{}
+	bodyPresent := false
+	if raw, ok := meta[sandboxcfg.NsCheckpoint]; ok {
+		bodyPresent = true
+		var err error
+		bodyPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
+		}
+	}
+	_, headerPresent := h[http.CanonicalHeaderKey(checkpointHeader)]
+	if !bodyPresent && !headerPresent {
+		return meta, nil
+	}
+	policy := bodyPolicy
+	if headerPresent {
+		headerPolicy, err := sandboxcfg.ParseCheckpointPolicyJSON(h.Get(checkpointHeader))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", checkpointHeader, err)
+		}
+		policy = sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, headerPolicy)
+	}
+	if policy.Empty() {
+		delete(meta, sandboxcfg.NsCheckpoint)
+		return meta, nil
+	}
+	canonical, err := sandboxcfg.MarshalCheckpointPolicyJSON(policy)
+	if err != nil {
+		return nil, err
+	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	meta[sandboxcfg.NsCheckpoint] = canonical
+	return meta, nil
 }
 
 func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]string {
@@ -173,6 +210,15 @@ type CreateReq struct {
 	APIKey     string            `json:"-"` // injected from X-API-KEY
 }
 
+// PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
+// lower-priority sandbox/node policy. memory=false is unsupported because Pause
+// always captures memory.
+type PauseRequest struct {
+	Memory               *bool `json:"memory,omitempty"`
+	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`
+	CheckpointDropCaches *bool `json:"checkpoint_drop_caches,omitempty"`
+}
+
 // Core is the orchestrator behaviour the API needs. Every per-resource method
 // takes the raw API key; Core verifies it against the encrypted APISecret saved
 // on the target resource and treats a mismatch as not-found. Create/RegisterBuild
@@ -184,7 +230,7 @@ type Core interface {
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
 	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error)
-	Pause(ctx context.Context, id, apiKey string) error // ErrAlreadyPaused / ErrNotFound
+	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 
 	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
@@ -310,7 +356,12 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	req.APIKey = apiKeyFrom(r.Context())
 	// Headers are an alternate config-injection surface; fold them into the e2b
 	// metadata (header wins) so the orchestrator sees one uniform carrier.
-	req.Metadata = mergeCreateConfigHeaders(req.Metadata, r.Header)
+	var err error
+	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	sb, err := a.core.Create(r.Context(), req)
 	if err != nil {
 		a.fail(w, err)
@@ -429,7 +480,30 @@ func (a *API) failExecSession(w http.ResponseWriter, err error) {
 }
 
 func (a *API) pause(w http.ResponseWriter, r *http.Request) {
-	err := a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
+	req, err := decodePauseRequest(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	if req.Memory != nil && !*req.Memory {
+		writeErr(w, http.StatusBadRequest, "memory=false is not supported")
+		return
+	}
+	override := sandboxcfg.CheckpointPolicy{
+		MergeRef:   req.CheckpointMergeRef,
+		DropCaches: req.CheckpointDropCaches,
+	}
+	if _, present := r.Header[http.CanonicalHeaderKey(checkpointHeader)]; present {
+		headerPolicy, parseErr := sandboxcfg.ParseCheckpointPolicyJSON(r.Header.Get(checkpointHeader))
+		if parseErr != nil {
+			writeErr(w, http.StatusBadRequest, parseErr.Error())
+			return
+		}
+		override = sandboxcfg.OverlayCheckpointPolicy(override, headerPolicy)
+	} else {
+		override = sandboxcfg.CloneCheckpointPolicy(override)
+	}
+	err = a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), override)
 	switch {
 	case errors.Is(err, ErrAlreadyPaused):
 		w.WriteHeader(409)
@@ -438,6 +512,33 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(204)
 	}
+}
+
+func decodePauseRequest(body io.Reader) (PauseRequest, error) {
+	dec := json.NewDecoder(body)
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		if errors.Is(err, io.EOF) {
+			return PauseRequest{}, nil
+		}
+		return PauseRequest{}, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return PauseRequest{}, ErrBadRequest
+		}
+		return PauseRequest{}, err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return PauseRequest{}, ErrBadRequest
+	}
+	var req PauseRequest
+	if err := json.Unmarshal(trimmed, &req); err != nil {
+		return PauseRequest{}, err
+	}
+	return req, nil
 }
 
 func (a *API) timeout(w http.ResponseWriter, r *http.Request) {

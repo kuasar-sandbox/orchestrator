@@ -442,8 +442,15 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
+	config, err = sandboxcfg.NormalizeCheckpointMetadata(config)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
 	credentials, config, err := sandboxcfg.ExtractCredentials(config)
 	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	if err := o.validateCreateCheckpointMode(config); err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
 	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
