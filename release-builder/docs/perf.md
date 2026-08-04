@@ -320,6 +320,11 @@ sudo PERF_ITERS=30 make perf-sandbox-working-set
 - `raw/`：snapshot/publisher/restore log、stats-json 与 cache 计数器快照；
 - `report.md`：按 nearest-rank 统计的 p50/p95/p99，不设硬性性能阈值。
 
+首轮 canonical 30 次/场景报告及原始结构化样本已固化在
+[`docs/results/working-set-2026-08-04/`](results/working-set-2026-08-04/README.md)，
+对应候选 `d5c77bacaaf303852047ddb627e1b1ccc86cad24` 和 BMS run
+[`30907661187`](https://github.com/kuasar-sandbox/orchestrator/actions/runs/30907661187)。
+
 报告覆盖 artifact 逻辑/物理大小、`MemoryResident`、snapshot/publish
 耗时、restore-to-ack、application ready、首次代表性 HTTP 请求、UFFD、
 root/data disk read 与 cache origin request。一个 root overlay、一个无 base 的
