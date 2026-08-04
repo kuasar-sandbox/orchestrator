@@ -55,8 +55,13 @@ def complete_rows() -> list[dict[str, object]]:
                     "prefetch_duration_ms": 5.0 if prefetch == "memory" else None,
                     "cache_origin_bytes": None,
                     "disk_reads": {
-                        name: {"bytes": 4096, "p50_us": 2.0, "p99_us": 3.0}
-                        for name in ("blk0", "blk1", "blk2")
+                        name: {
+                            "role": role,
+                            "bytes": 4096,
+                            "p50_us": 2.0,
+                            "p99_us": 3.0,
+                        }
+                        for name, role in report.EXPECTED_DISK_ROLES.items()
                     },
                 }
             )
@@ -77,6 +82,7 @@ class WorkingSetReportTest(unittest.TestCase):
         self.assertIn("| D/memory | false | false | memory | completed | 1 |", rendered)
         self.assertIn("cache/store origin transferred bytes", rendered)
         self.assertIn("N/A/N/A/N/A", rendered)
+        self.assertIn("| A/off | blk4 | dataset.top |", rendered)
 
     def test_rejects_missing_scenario(self) -> None:
         with self.assertRaisesRegex(SystemExit, "incomplete matrix"):
@@ -92,6 +98,12 @@ class WorkingSetReportTest(unittest.TestCase):
         rows = complete_rows()
         rows[0]["merge_ref"] = False
         with self.assertRaisesRegex(SystemExit, "want True/True"):
+            report.validate(rows, allow_partial=False)
+
+    def test_rejects_wrong_disk_backend_role(self) -> None:
+        rows = complete_rows()
+        rows[0]["disk_reads"]["blk4"]["role"] = "dataset.base"
+        with self.assertRaisesRegex(SystemExit, "invalid disk role for blk4"):
             report.validate(rows, allow_partial=False)
 
 

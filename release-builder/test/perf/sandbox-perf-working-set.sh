@@ -845,11 +845,21 @@ for backend in stats.get("backends") or []:
         "p50_us": (read.get("p50_ns") or 0) / 1000,
         "p99_us": (read.get("p99_ns") or 0) / 1000,
     }
-if set(disk_reads) != {"blk0", "blk1", "blk2"}:
-    raise SystemExit(f"stats-json disk backends={sorted(disk_reads)}, want blk0/blk1/blk2")
+disk_roles = {
+    "blk0": "root.base",
+    "blk1": "root.top",
+    "blk2": "scratch.top",
+    "blk3": "dataset.base",
+    "blk4": "dataset.top",
+}
+if set(disk_reads) != set(disk_roles):
+    raise SystemExit(
+        f"stats-json disk backends={sorted(disk_reads)}, want {sorted(disk_roles)}"
+    )
 for name, read in disk_reads.items():
     if read["bytes"] is None:
         raise SystemExit(f"stats-json {name} missing read bytes")
+    read["role"] = disk_roles[name]
 
 prefetch_started_ms = None
 prefetch_duration_ms = None
