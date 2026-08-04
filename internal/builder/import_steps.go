@@ -17,6 +17,9 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
@@ -81,19 +84,20 @@ func (p *buildPipeline) phaseImport() error {
 	}
 	args = append(args, "--output", "-", importRef)
 
-	p.imagePath = filepath.Join(s.Workdir, "image.img")
+	imagePath := filepath.Join(s.Workdir, "image.img")
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("import: pulling + flattening %s", importRef)
-	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: p.imagePath, stderrTo: "journald=" + buildTag},
+	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: imagePath, stderrTo: "journald=" + buildTag},
 		append([]string{guestFlatten}, args...)...); err != nil {
 		return err
 	}
-	if st, err := os.Stat(p.imagePath); err != nil || st.Size() == 0 {
+	if st, err := os.Stat(imagePath); err != nil || st.Size() == 0 {
 		return fmt.Errorf("no image artifact produced")
 	}
-	p.baseRef = "file://" + p.imagePath
-	p.overlayBase = "" // a freshly imported image is a complete base, no overlay lower
+	if err := p.useLocalImage(imagePath); err != nil {
+		return err
+	}
 	p.progress("import: image artifact ready")
 	if refSupported && s.ImportReferer.Writeback {
 		key, err := p.uploadImage()
@@ -106,6 +110,45 @@ func (p *buildPipeline) phaseImport() error {
 		}
 		p.progress("import: referer writeback complete")
 	}
+	return nil
+}
+
+// useLocalImage records a freshly produced plaintext tarstream as the current
+// complete base image. The explicit digest qualifier lets downstream
+// sandbox-ctl consumers validate an artifact whose staging filename is not its
+// content identity.
+func (p *buildPipeline) useLocalImage(path string) error {
+	stream, err := fetch.OpenTarStream(path)
+	if err != nil {
+		return fmt.Errorf("local image artifact: %w", err)
+	}
+	digester, ok := stream.(tarstream.Digester)
+	if !ok {
+		_ = stream.Close()
+		return fmt.Errorf("local image artifact has no declared digest")
+	}
+	scheme, digest := digester.Digest()
+	if err := stream.Close(); err != nil {
+		return fmt.Errorf("close local image artifact: %w", err)
+	}
+	if scheme != tarstream.DigestSchemeSHA256 {
+		return fmt.Errorf("local image artifact has unexpected digest scheme %q", scheme)
+	}
+	ref := manifest.Ref{
+		Scheme:       manifest.RefSchemeFile,
+		Path:         path,
+		DigestScheme: scheme,
+		Digest:       digest,
+	}
+	if err := ref.Validate(); err != nil {
+		return fmt.Errorf("local image artifact identity: %w", err)
+	}
+
+	p.imagePath = path
+	p.baseImageRef = ""
+	p.baseRef = ref.String()
+	p.overlayBase = ""
+	p.overlayBaseFromRefs = nil
 	return nil
 }
 
@@ -318,15 +361,11 @@ func (p *buildPipeline) phaseSteps() error {
 		"--tmpdir", "/.kuasar-build", "--output", "-", "/"); err != nil {
 		return err
 	}
-	p.imagePath = filepath.Join(s.Workdir, "image.img")
-	if err := os.Rename(newImg, p.imagePath); err != nil {
+	imagePath := filepath.Join(s.Workdir, "image.img")
+	if err := os.Rename(newImg, imagePath); err != nil {
 		return err
 	}
-	p.baseImageRef = ""
-	p.baseRef = "file://" + p.imagePath
-	p.overlayBase = "" // the exported image flattens base+overlay+steps into one layer
-	p.overlayBaseFromRefs = nil
-	return nil
+	return p.useLocalImage(imagePath)
 }
 
 // applyStep executes one build step. RUN goes to the guest through envd
