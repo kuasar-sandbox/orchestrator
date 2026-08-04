@@ -294,8 +294,12 @@ HTTP warm-up 和 root + 两块 data disk，分别隔离测量：
 | D | false | false | 完整 working-set snapshot |
 
 每个样本都会从只含 root/dataset 的不变 store baseline 重建
-store-ctl，重新启动空 RocksDB cache，丢弃 host page cache，再从同一
-B 恢复；不会在一个运行中的 sandbox 上连续保存四次，也不会让
+store-ctl，重新启动空 RocksDB cache，并丢弃本次 restore 会读取的 host
+page cache，再从同一 B 恢复。若 `/proc/sys/vm/drop_caches` 可写，脚本使用
+全局 cache drop；在 sysctl 只读的受限 runner 上，则对 manifest store、B
+memory/disk tops、kernel、runtime、VMM 和 sandbox CLI artifacts 执行
+`POSIX_FADV_DONTNEED` 定向淘汰。实际策略记录在 `environment.json`。
+测试不会在一个运行中的 sandbox 上连续保存四次，也不会让
 早先样本的 publish dedup 污染后续样本。W 首先本地生成，再独立
 执行 `upload-snapshot`；发布后删除本地 W artifact set，以防 portable
 restore 意外回退到本地文件。A/B/C/D 主矩阵固定
