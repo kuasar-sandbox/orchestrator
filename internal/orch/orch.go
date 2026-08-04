@@ -303,7 +303,9 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 		if err := o.waitReady(readyCtx, sb); err != nil {
 			return err
 		}
-		if err := o.envdInit(readyCtx, sb); err != nil {
+		// /init remains warning-only initialization after readiness, so it uses
+		// the launch context rather than an exhausted runtime/health budget.
+		if err := o.envdInit(ctx, sb); err != nil {
 			o.log.Warn("envd /init", "sid", sb.ID, "err", err)
 		}
 	}

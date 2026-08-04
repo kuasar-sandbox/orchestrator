@@ -235,6 +235,87 @@ func TestE2BLaunchChecksEnvdAfterRuntimeAndInitRemainsWarning(t *testing.T) {
 	}
 }
 
+func TestE2BInitUsesLaunchContextAfterReadinessDeadline(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	o.sandboxReadyTimeout = 300 * time.Millisecond
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-after-ready-deadline")
+	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("unix", sb.EnvdUDS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initStarted := make(chan struct{})
+	initCanceled := make(chan error, 1)
+	releaseInit := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseInit:
+		default:
+			close(releaseInit)
+		}
+	}()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusNoContent)
+		case "/init":
+			close(initStarted)
+			select {
+			case <-releaseInit:
+				w.WriteHeader(http.StatusNoContent)
+			case <-r.Context().Done():
+				initCanceled <- r.Context().Err()
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- o.launch(ctx, sb, tmpl) }()
+	select {
+	case <-initStarted:
+	case err := <-done:
+		t.Fatalf("launch returned before envd /init started: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("envd /init did not start")
+	}
+
+	// Hold /init past the runtime/health deadline. It must remain live because
+	// warning-only initialization retains the parent launch context.
+	remaining := time.Until(started.Add(o.sandboxReadyTimeout + 100*time.Millisecond))
+	if remaining > 0 {
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case err := <-done:
+			t.Fatalf("launch returned when readiness context expired during /init: %v", err)
+		case err := <-initCanceled:
+			t.Fatalf("envd /init inherited readiness cancellation: %v", err)
+		case <-timer.C:
+		}
+	}
+
+	close(releaseInit)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("launch did not finish after envd /init completed")
+	}
+}
+
 func TestE2BRuntimeAndEnvdShareReadinessDeadline(t *testing.T) {
 	lc := &countingLauncher{readinessDelay: 200 * time.Millisecond}
 	cfg := &config.Config{}
