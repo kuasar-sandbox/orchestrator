@@ -1,0 +1,76 @@
+name: BMS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Aggregate release version in vX.Y.Z form
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: aggregate-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out the trusted release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate the release request
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "BMS Release must be dispatched from main" >&2; exit 1; }
+          bash release-builder/scripts/publish-release.sh check "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  bms:
+    needs: preflight
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/bms-e2e.yml
+    with:
+      release_version: ${{ needs.preflight.outputs.version }}
+    secrets: inherit
+
+  publish:
+    needs:
+      - preflight
+      - bms
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the trusted publish tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the BMS-validated release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.bms.outputs.release_artifact }}
+          path: release-bundle
+
+      - name: Publish the aggregate release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash release-builder/scripts/publish-release.sh publish release-bundle

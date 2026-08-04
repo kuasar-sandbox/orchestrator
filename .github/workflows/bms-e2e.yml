@@ -1,6 +1,20 @@
 name: BMS E2E
 
 on:
+  workflow_call:
+    inputs:
+      release_version:
+        description: Exact vX.Y.Z version to package after the full BMS suite
+        required: false
+        default: ""
+        type: string
+    outputs:
+      release_artifact:
+        description: Actions artifact containing the validated release bundle
+        value: ${{ jobs.e2e.outputs.release_artifact }}
+    secrets:
+      KUASAR_CI_APP_PRIVATE_KEY:
+        required: true
   pull_request:
     types:
       - opened
@@ -48,7 +62,10 @@ jobs:
       (github.event_name != 'pull_request' ||
        !github.event.pull_request.draft) &&
       (github.event_name != 'workflow_dispatch' ||
+       inputs.release_version != '' ||
        inputs.confirm == 'run-full-e2e')
+    outputs:
+      release_artifact: ${{ steps.release-artifact.outputs.name }}
     runs-on:
       - self-hosted
       - Linux
@@ -72,16 +89,17 @@ jobs:
       KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/revisions.tsv
       KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
       KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
+      RELEASE_VERSION: ${{ inputs.release_version || '' }}
       CANDIDATE_REPOSITORY: ${{ github.repository }}
-      CANDIDATE_PR: ${{ github.event_name == 'workflow_dispatch' && inputs.pull_request_number || github.event.pull_request.number || '0' }}
-      CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
-      CANDIDATE_BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.pull_request.base.sha || github.sha }}
-      CANDIDATE_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.pull_request.head.sha || github.sha }}
+      CANDIDATE_PR: ${{ inputs.release_version != '' && '0' || (github.event_name == 'workflow_dispatch' && inputs.pull_request_number || github.event.pull_request.number || '0') }}
+      CANDIDATE_SHA: ${{ inputs.release_version != '' && github.sha || (github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha) }}
+      CANDIDATE_BASE_SHA: ${{ inputs.release_version != '' && github.sha || (github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.pull_request.base.sha || github.sha) }}
+      CANDIDATE_HEAD_SHA: ${{ inputs.release_version != '' && github.sha || (github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.pull_request.head.sha || github.sha) }}
       TRUSTED_WORKFLOW_SHA: ${{ github.sha }}
 
     steps:
       - name: Validate trusted dispatch request
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_version == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -122,6 +140,17 @@ jobs:
               <<< "$pr_response" >&2 || true
             exit 1
           fi
+
+      - name: Validate release request
+        if: inputs.release_version != ''
+        run: |
+          set -euo pipefail
+
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "release workflow must select the trusted main ref" >&2; exit 1; }
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "release_version must match vX.Y.Z without leading zeroes" >&2; exit 1; }
+          [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
 
       - name: Initialize CI metadata
         run: |
@@ -226,7 +255,11 @@ jobs:
             exit 1
           fi
 
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+          if [ -n "$RELEASE_VERSION" ]; then
+            current_orchestrator=$(jq -r '.data.orchestrator.ref.target.oid' <<< "$revision_response")
+            [ "$current_orchestrator" = "$TRUSTED_WORKFLOW_SHA" ] \
+              || { echo "orchestrator main changed after the release workflow started" >&2; exit 1; }
+          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             current_base=$(jq -r '.data.orchestrator.ref.target.oid' <<< "$revision_response")
             [ "$current_base" = "$CANDIDATE_BASE_SHA" ] \
               || { echo "main changed after the integration commit was recorded" >&2; exit 1; }
@@ -255,7 +288,15 @@ jobs:
           for repo in "${repos[@]}"; do
             requested_ref=main
             role=sibling
-            if [[ "kuasar-sandbox/$repo" == "$CANDIDATE_REPOSITORY" ]]; then
+            if [ -n "$RELEASE_VERSION" ]; then
+              role=release
+              revision_key=$repo
+              if [ "$repo" = guest-runtime ]; then
+                revision_key=guest_runtime
+              fi
+              resolved_sha=$(jq -r --arg key "$revision_key" \
+                '.data[$key].ref.target.oid // empty' <<< "$revision_response")
+            elif [[ "kuasar-sandbox/$repo" == "$CANDIDATE_REPOSITORY" ]]; then
               requested_ref="$CANDIDATE_SHA"
               resolved_sha="$CANDIDATE_SHA"
               role=candidate
@@ -404,9 +445,42 @@ jobs:
         working-directory: src/orchestrator/release-builder
         run: scripts/native-cache.sh restore-or-build
 
+      - name: Validate release tooling
+        working-directory: src/orchestrator/release-builder
+        run: make test-release-tools
+
       - name: Build and test the platform
         working-directory: src/orchestrator/release-builder
         run: make test-e2e
+
+      - name: Package the validated release
+        if: inputs.release_version != ''
+        id: release-artifact
+        working-directory: src/orchestrator/release-builder
+        env:
+          RELEASE_WORKFLOW_REPOSITORY: ${{ github.repository }}
+          RELEASE_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          RELEASE_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RELEASE_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          bash scripts/release.sh "$RELEASE_VERSION"
+          rm -rf release-output
+          bash scripts/prepare-release.sh \
+            "$RELEASE_VERSION" "$TARGET_ARCH" "$KUASAR_REVISION_MANIFEST" dist release-output
+          artifact_name="aggregate-release-${RELEASE_VERSION}-${GITHUB_RUN_ID}"
+          echo "name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the validated release bundle
+        if: inputs.release_version != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release-artifact.outputs.name }}
+          path: src/orchestrator/release-builder/release-output
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
       - name: Upload revision and timing metadata
         if: always()
