@@ -82,13 +82,13 @@ SBPID=""
 POST_PID=""
 cleanup() {
     set +e
+    readiness_stop_watchdog
     for pid in "$SBPID" "$POST_PID"; do
         [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
     done
     sleep 1
-    for pid in "$SBPID" "$POST_PID"; do
-        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
-    done
+    [ -n "$SBPID" ] && readiness_kill_session KILL "$SBPID"
+    [ -n "$POST_PID" ] && kill -0 "$POST_PID" 2>/dev/null && kill -KILL "$POST_PID" 2>/dev/null
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
     [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null
 }
@@ -206,7 +206,7 @@ set +e
 STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
 readiness_begin_capture "$WORK/cold.ready"
 COLD_READER_PID=$READY_READER_PID
-timeout -k 10s 60 "$BIN/sandbox-ctl" run \
+readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" \
     --sandbox-id "$SID" \
@@ -216,6 +216,7 @@ timeout -k 10s 60 "$BIN/sandbox-ctl" run \
     > "$LOG" 2>&1 &
 SBPID=$!
 readiness_close_parent_writer
+readiness_start_watchdog "$SBPID" 60 10
 
 readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID" \
     || { tail -60 "$LOG"; exit 1; }
@@ -245,8 +246,9 @@ while kill -0 "$SBPID" 2>/dev/null; do
 done
 wait "$SBPID"
 EXIT=$?
-SBPID=""
 T_END_NS=$(date +%s%N)
+readiness_stop_watchdog
+SBPID=""
 set -e
 
 # Final fallback: if poll missed PYBOOT-OK between SBPID exit and the
