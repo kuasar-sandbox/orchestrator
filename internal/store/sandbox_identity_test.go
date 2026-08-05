@@ -159,3 +159,49 @@ func TestSandboxIdentityValidation(t *testing.T) {
 		t.Fatal("invalid stored profile was accepted")
 	}
 }
+
+func TestSandboxListDefaultExcludesInternalLifecycleStates(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	pair := testKeyPair("7", "8")
+	rows := []struct {
+		id    string
+		state types.State
+	}{
+		{id: "a-starting", state: types.StateStarting},
+		{id: "b-running", state: types.StateRunning},
+		{id: "c-paused", state: types.StatePaused},
+		{id: "d-dead", state: types.StateDead},
+	}
+	for _, row := range rows {
+		sb := &types.Sandbox{
+			ID: row.id, Profile: types.ProfileBare,
+			TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("e", 64)}.String(),
+			State:      row.state, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
+		}
+		setTestSandboxServiceCredentials(sb)
+		if err := st.Put(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, next, err := st.List(ctx, "", "", 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != "" || len(got) != 2 || got[0].ID != "b-running" || got[1].ID != "c-paused" {
+		t.Fatalf("default list = %+v next=%q, want running and paused only", got, next)
+	}
+	for _, row := range []struct {
+		state types.State
+		id    string
+	}{
+		{state: types.StateStarting, id: "a-starting"},
+		{state: types.StateDead, id: "d-dead"},
+	} {
+		got, next, err = st.List(ctx, string(row.state), "", 100, "")
+		if err != nil || next != "" || len(got) != 1 || got[0].ID != row.id {
+			t.Fatalf("explicit %s list = %+v next=%q err=%v, want %s", row.state, got, next, err, row.id)
+		}
+	}
+}

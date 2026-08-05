@@ -57,9 +57,10 @@ const (
 
 // RouteEntry.State values (mirror internal/types.State string values).
 const (
-	StateRunning = "running"
-	StatePaused  = "paused"
-	StateDead    = "dead"
+	StateStarting = "starting"
+	StateRunning  = "running"
+	StatePaused   = "paused"
+	StateDead     = "dead"
 )
 
 // Message types.
@@ -79,7 +80,7 @@ type RouteEntry struct {
 	SandboxID  string `json:"sid"`
 	Profile    string `json:"profile"`               // "e2b" | "bare"
 	TemplateID string `json:"template_id,omitempty"` // for MMDS envID (proxy-served metadata)
-	State      string `json:"state"`                 // "running" | "paused" | "dead"
+	State      string `json:"state"`                 // "starting" | "running" | "paused" | "dead"
 	EnvdUDS    string `json:"envd_uds,omitempty"`    // e2b control port 49983
 	CiUDS      string `json:"ci_uds,omitempty"`      // e2b code-interpreter port 49999
 	FloatingIP string `json:"floatingip,omitempty"`  // host-reachable addr for user ports

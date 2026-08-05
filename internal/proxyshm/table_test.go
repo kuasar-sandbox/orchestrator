@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,6 +220,88 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	}
 }
 
+func TestWorkerStartingRouteWaitsWithoutWake(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, 500*time.Millisecond)
+	route := routesync.RouteEntry{
+		SandboxID: "s1", Profile: "e2b", State: routesync.StateStarting,
+		EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
+	}
+	tbl.BeginSync()
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := worker.Resolve(canceled, route.SandboxID); ok {
+		t.Fatal("canceled starting route resolved before running")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("starting route emitted %d wakes", got)
+	}
+
+	done := make(chan proxy.Route, 1)
+	go func() {
+		got, _ := worker.Route(context.Background(), route.SandboxID, proxy.LegacyTarget(49983))
+		done <- got
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("starting route returned before running update: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		if got.Kind != proxy.KindUDS || got.UDS != route.EnvdUDS || got.AccessToken != route.EnvdAccessToken {
+			t.Fatalf("route after running update = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("starting route did not observe running update")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("starting route emitted %d wakes while waiting", got)
+	}
+}
+
+func TestWorkerDeadRouteReturnsNotFoundWithoutWake(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	var wakes atomic.Int32
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: "dead", Profile: "e2b", State: routesync.StateDead,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	worker := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+	route, err := worker.Route(context.Background(), "dead", proxy.LegacyTarget(49983))
+	if err != nil || route.Kind != proxy.KindNotFound {
+		t.Fatalf("dead route = %+v err=%v, want not found", route, err)
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("dead route emitted %d wakes", got)
+	}
+}
+
 func TestWorkerRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)
@@ -311,21 +394,41 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 	defer tbl.Close()
 	secret := []byte("secret")
 	tbl.BeginSync()
-	if err := tbl.Upsert(routesync.RouteEntry{
-		SandboxID: "s1", State: routesync.StateRunning, TemplateID: "tmpl",
+	route := routesync.RouteEntry{
+		SandboxID: "s1", State: routesync.StateStarting, TemplateID: "tmpl",
 		FloatingIP: "100.100.0.3", EnvdAccessToken: "envd", MmdsSecret: hex.EncodeToString(secret),
-	}); err != nil {
+	}
+	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
 	view := NewWorkerView(tbl, nil, nil, time.Second)
-	if sid, ok := view.ByFloatingIP("100.100.0.3"); !ok || sid != "s1" {
-		t.Fatalf("ByFloatingIP = %q ok=%v", sid, ok)
+	assertSource := func(state string) {
+		t.Helper()
+		if sid, ok := view.ByFloatingIP("100.100.0.3"); !ok || sid != "s1" {
+			t.Fatalf("ByFloatingIP(%s) = %q ok=%v", state, sid, ok)
+		}
+		if tid, tok, ok := view.SandboxInfo("s1"); !ok || tid != "tmpl" || tok != "envd" {
+			t.Fatalf("SandboxInfo(%s) = %q %q ok=%v", state, tid, tok, ok)
+		}
 	}
-	if tid, tok, ok := view.SandboxInfo("s1"); !ok || tid != "tmpl" || tok != "envd" {
-		t.Fatalf("SandboxInfo = %q %q ok=%v", tid, tok, ok)
+	assertSource(routesync.StateStarting)
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
 	}
+	assertSource(routesync.StateRunning)
 	if got, ok := view.MmdsSecret("s1"); !ok || string(got) != string(secret) {
 		t.Fatalf("MmdsSecret = %x ok=%v", got, ok)
+	}
+	route.State = routesync.StatePaused
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	if sid, ok := view.ByFloatingIP(route.FloatingIP); ok || sid != "" {
+		t.Fatalf("paused ByFloatingIP = %q ok=%v", sid, ok)
+	}
+	if tid, tok, ok := view.SandboxInfo(route.SandboxID); ok || tid != "" || tok != "" {
+		t.Fatalf("paused SandboxInfo = %q %q ok=%v", tid, tok, ok)
 	}
 }

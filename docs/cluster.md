@@ -610,7 +610,10 @@ node_link 流按事件重要性处理:
 - node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
 - `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
 
-这样 Reserve 的 READY route report 不会被心跳持久化阻塞。sandbox 事件携带 NodeSandboxID、profile
+这样 Reserve 的 READY route report 不会被心跳持久化阻塞。node-local `starting` upsert
+只为节点 proxy/MMDS 暴露 launch 身份:node_link owner 在全量同步时将其计入 seen set,
+但不把它增加为 route_link 业务状态,也不覆盖既有 RESERVED/PAUSED;后续 READY/PAUSED/Delete
+才推进 route_link。sandbox 事件携带 NodeSandboxID、profile
 与 node-owned 执行态;nodelink owner 以 `(node_id,NodeSandboxID)` 查本节点归属表得到稳定
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。

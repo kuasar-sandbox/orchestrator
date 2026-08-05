@@ -1580,6 +1580,38 @@ func TestDeadReportDeletesRoute(t *testing.T) {
 	}
 }
 
+func TestStartingReportPreservesRegistryRouteState(t *testing.T) {
+	for _, state := range []SandboxState{StateReserved, StatePaused} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			sid := "sb-starting-" + string(state)
+			record := testE2BSandboxRecord("/g", "rk", sid, "n1", state)
+			initialRevision, err := reg.stores.PutSandbox(ctx, record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := testNodeSandboxRef("/g", "rk", sid, "e2b", testAPIFingerprint)
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+				t.Fatal(err)
+			}
+
+			route := testE2BRoute(sid, routesync.StateStarting)
+			reg.applyRoute(ctx, "n1", &route)
+
+			stored, revision, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+			if err != nil || !found || revision != initialRevision || stored.State != state ||
+				stored.NodeSandboxID != record.NodeSandboxID {
+				t.Fatalf("route after starting report = %+v revision=%d found=%v err=%v", stored, revision, found, err)
+			}
+			storedRef, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", record.NodeSandboxID)
+			if err != nil || !found || storedRef != ref {
+				t.Fatalf("node ref after starting report = %+v found=%v err=%v", storedRef, found, err)
+			}
+		})
+	}
+}
+
 func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

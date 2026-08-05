@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -181,6 +182,8 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	o.sandboxReadyTimeout = 2 * time.Second
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "e2b-order")
+	events, cancelEvents := o.Subscribe()
+	defer cancelEvents()
 
 	done := make(chan error, 1)
 	go func() { done <- o.launch(ctx, sb, tmpl) }()
@@ -220,6 +223,20 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	case req := <-requests:
 		t.Fatalf("unexpected envd request after successful /init: %s", req)
 	default:
+	}
+	for _, want := range []string{routesync.StateStarting, routesync.StateRunning} {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("successful launch event = %+v, want upsert %s", event, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("successful launch did not publish %s", want)
+		}
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("stored sandbox after successful launch = %+v, %v", stored, err)
 	}
 }
 
@@ -421,6 +438,79 @@ func TestEnvdInitRetryDelay(t *testing.T) {
 	}
 }
 
+func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-create-dead")
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "init rejected", http.StatusInternalServerError)
+	}))
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	launchErr := o.launch(ctx, sb, tmpl)
+	if launchErr == nil || !strings.Contains(launchErr.Error(), "status 500") {
+		t.Fatalf("launch error = %v, want envd /init failure", launchErr)
+	}
+	if err := o.rollbackFailedCreate(sb); err != nil {
+		t.Fatalf("rollback failed create: %v", err)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateDead {
+		t.Fatalf("stored failed create = %+v, %v; want dead", stored, err)
+	}
+	if lc.stops.Load() == 0 {
+		t.Fatal("failed create did not stop its runner")
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
+			t.Fatalf("first failed-create event = %+v, want starting", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed create did not publish starting")
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+			t.Fatalf("terminal failed-create event = %+v, want delete", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed create did not publish delete")
+	}
+	var ranged []string
+	if err := o.Range(ctx, func(route routesync.RouteEntry) error {
+		ranged = append(ranged, route.SandboxID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranged) != 0 {
+		t.Fatalf("dead failed create remained in route snapshot: %v", ranged)
+	}
+}
+
+func TestFailedCreateBeforeAssignmentDoesNotInsertDead(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.Bare.InnerIP = "invalid"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileBare, "pre-assignment-failure")
+
+	if err := o.launch(ctx, sb, tmpl); err == nil {
+		t.Fatal("launch with invalid network succeeded")
+	}
+	if err := o.rollbackFailedCreate(sb); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored != nil {
+		t.Fatalf("pre-assignment failure persisted sandbox = %+v, %v", stored, err)
+	}
+}
+
 func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 	lc := &countingLauncher{readinessWire: []byte("ready\ncontrol_ready\n")}
 	cfg := &config.Config{}
@@ -447,13 +537,14 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 	}
 }
 
-func TestResumeEnvdInitFailureRollsBackWithoutRunningPublish(t *testing.T) {
+func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	lc := &countingLauncher{}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileE2B, "init-rollback")
 	sb.State = types.StatePaused
+	sb.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +556,7 @@ func TestResumeEnvdInitFailureRollsBackWithoutRunningPublish(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	err := o.resume(ctx, sb, false)
+	err := o.resumeIfPaused(ctx, sb.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "envd /init") || !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("resume error = %v, want mandatory envd /init failure", err)
 	}
@@ -479,9 +570,19 @@ func TestResumeEnvdInitFailureRollsBackWithoutRunningPublish(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("non-204 envd /init attempts = %d, want 1", got)
 	}
+	for _, want := range []string{routesync.StateStarting, routesync.StatePaused} {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("failed resume event = %+v, want upsert %s", event, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("failed resume did not publish %s", want)
+		}
+	}
 	select {
 	case event := <-events:
-		t.Fatalf("failed resume published a route event: %+v", event)
+		t.Fatalf("failed resume published an extra route event: %+v", event)
 	default:
 	}
 }
@@ -491,7 +592,7 @@ func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, 
 	manifestKey := strings.Repeat("a", 64)
 	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}
 	sb := &types.Sandbox{
-		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateRunning,
+		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateStarting,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(cfg.Paths.RunRoot, sid), BaseDir: filepath.Join(cfg.Paths.BaseRoot, sid),
 		CreatedUnix: 1,

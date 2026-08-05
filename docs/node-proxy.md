@@ -136,10 +136,12 @@ Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公�
 ```text
 sid hash ─► record slot ─► RouteEntry
                          ├─ running → 立即转发
+                         ├─ starting → MMDS 可见;数据面 park,不发 Wake
                          └─ missing/paused → wake pipe → park 等待共享表更新
 ```
 
-worker 对 missing/paused sid 写 wake pipe 给 master;master 去重后通过 routesync
+worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor launch owner
+推进,worker 只等待 running/delete/paused 更新,不得再发 Wake。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 
 共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
@@ -149,7 +151,8 @@ node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配�
 凭据投影和同名运行目录。external 模式不得主动执行这种跨逻辑沙箱的即时 ID 复用;
 为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
 
-受保护 `RouteEntry` 显式携带 `AuthSandboxID`、`APISecret`、`APISecretFingerprint`、
+受保护 `RouteEntry` 的 state 为 `starting|running|paused|dead`,并显式携带
+`AuthSandboxID`、`APISecret`、`APISecretFingerprint`、
 `ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
 `ForwardAccessToken`。
 ManifestKey 原文不进入路由。节点 proxy 转发时只按目标选择 EnvdAccessToken 或
@@ -207,7 +210,8 @@ CONNECT:
 
 node proxy 的 exec 路径先做无副作用本地查找,以 route 中的
 `AuthSandboxID + ServiceSecret` 严格验证 `X-Access-Token` KAT.仅验证成功后才可以
-resume paused sandbox;恢复后重读 NodeSandboxID 和 credential identity,二者必须与鉴权时
+resume paused sandbox;若 route 已是 starting,则不再 Wake,只等当前 launch 完成。恢复后
+重读 NodeSandboxID 和 credential identity,二者必须与鉴权时
 一致.然后拨 `<run_root>/<NodeSandboxID>/ctl.sock`,发送并 flush CONNECT 200,将两个 stream
 的所有权交给 `sandboxer/pkg/ctl.ProxyExec`.
 
@@ -285,7 +289,7 @@ proxy worker ─► shared route view
 
 两段式协议:
 
-1. `PUT /latest/api/token`:按请求源 IP 查 running route 的 floatingip;未同步时按
+1. `PUT /latest/api/token`:按请求源 IP 查 starting/running route 的 floatingip;未同步时按
    `park_timeout` 等待,超时 503。命中后返回 `<sid>.<hmac>` session token。
 2. `GET /`:校验 `X-metadata-token`,返回 `{instanceID, envID, accessTokenHash}`。
 
@@ -300,8 +304,8 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
   master 后重新注册、重建共享表并启动 worker。已运行沙箱不受影响。
 - **routesync 断开**:master 指数退避重连;重连后重新同步。共享表在重同步期间保留旧
   路由,Bookmark 后清除断连期间删除的记录。
-- **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;resume
-  单飞仍由 conductor 执行。
+- **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;starting
+  只 park、不 Wake;resume 单飞和当前 launch 的状态推进仍由 conductor 执行。
 - **失败码**:非法 target = 400;exec 的非 CONNECT method = 405;未知/未就绪 sid = 404;
   鉴权失败 = 401;已识别但 profile/当前 proxy 模式不支持的 service 或 off = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503.

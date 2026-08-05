@@ -1056,6 +1056,12 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint)
 		return
 	}
+	if e.State == routesync.StateStarting {
+		// Keep the Registry-owned reservation/paused state while the node makes
+		// starting visible to its proxy MMDS. Only running/paused are terminal
+		// route facts for the cluster state machine.
+		return
+	}
 	if e.State == routesync.StateDead {
 		if r.applyDelete(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.SandboxID)

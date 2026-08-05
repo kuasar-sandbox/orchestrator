@@ -201,7 +201,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		ID:           sid,
 		Profile:      tmpl.Profile,
 		TemplateID:   tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
-		State:        types.StateRunning,
+		State:        types.StateStarting,
 		RunDir:       o.cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:      o.cfg.Paths.BaseRoot + "/" + sid,
 		APISecret:    pair.APISecret,
@@ -219,10 +219,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
-		o.teardown(context.Background(), sb)
-		return nil, err
+		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
 	}
-	o.publishUpsert(sb) // tell external proxies about the new route
 	return sb, nil
 }
 
@@ -232,6 +230,9 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 // key rides in the run-sandbox LaunchSpec env (LaunchSpecFor). The cgroup is the
 // unit's own (--cgroup-adopt). Used by Create and Connect(resume).
 func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
+	if sb == nil || sb.State != types.StateStarting {
+		return fmt.Errorf("orch: launch requires a starting sandbox")
+	}
 	for _, d := range []string{sb.RunDir, sb.BaseDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
@@ -285,11 +286,17 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	// Binding precedes assignment so node-ctl can connect immediately after its
 	// long-poll returns; no retry window is needed between the two processes.
 	if _, err := o.runnerPool.Assign(ctx, sb.ID, func(runID string) error {
+		previousRunID := sb.RunID
 		sb.RunID = runID
 		if err := o.st.Put(ctx, sb); err != nil {
+			sb.RunID = previousRunID
 			return err
 		}
-		o.cache(sb)
+		// starting is routable only to MMDS. Publish a private copy so later
+		// success cannot mutate a cache entry already observed by readers.
+		starting := *sb
+		o.cache(&starting)
+		o.publishUpsert(&starting)
 		return nil
 	}); err != nil {
 		return err
@@ -311,6 +318,16 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return err
 		}
 	}
+	changed, err := o.st.CASRunState(ctx, sb.ID, sb.RunID, types.StateStarting, types.StateRunning)
+	if err != nil {
+		return fmt.Errorf("orch: commit launch %s: %w", sb.ID, err)
+	}
+	if !changed {
+		return fmt.Errorf("orch: commit launch %s: starting runner %s no longer owns the sandbox", sb.ID, sb.RunID)
+	}
+	sb.State = types.StateRunning
+	o.cache(sb)
+	o.publishUpsert(sb)
 	return nil
 }
 
@@ -646,7 +663,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDe
 	// entry is never mutated in place, so concurrent readers (Route, MMDS lookups)
 	// always observe a consistent snapshot and there is no field-level data race.
 	nb := *sb
-	nb.State = types.StateRunning
+	nb.State = types.StateStarting
 	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
 	// deadline is from before the pause (already passed), so without this the reaper
 	// would immediately re-suspend it.
@@ -659,7 +676,39 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDe
 	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
 		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
-	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
+	return nil
+}
+
+// rollbackFailedCreate retains a durable failed instance as dead, but only when
+// this exact attempted runner persisted the starting row. Failures before pool
+// assignment have no row and therefore no terminal record to transition.
+func (o *Orchestrator) rollbackFailedCreate(attempted *types.Sandbox) error {
+	if attempted == nil {
+		return nil
+	}
+	ctx := context.Background()
+	o.teardown(ctx, attempted)
+	if attempted.RunID == "" {
+		return nil
+	}
+	changed, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateStarting, types.StateDead)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		current, err := o.st.Get(ctx, attempted.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.RunID != attempted.RunID {
+			return nil // deleted or superseded: stale cleanup must not publish
+		}
+		if current.State != types.StateDead {
+			return fmt.Errorf("orch: rollback failed create %s: runner %s remains %s", attempted.ID, attempted.RunID, current.State)
+		}
+	}
+	attempted.State = types.StateDead
+	o.publishDelete(attempted.ID)
 	return nil
 }
 
@@ -675,8 +724,24 @@ func (o *Orchestrator) rollbackFailedResume(original, attempted *types.Sandbox) 
 	if original == nil || attempted.RunID == "" || attempted.RunID == original.RunID {
 		return nil
 	}
-	_, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateRunning, types.StatePaused)
-	return err
+	changed, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateStarting, types.StatePaused)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return nil
+	}
+	current, err := o.st.Get(ctx, attempted.ID)
+	if err != nil {
+		return err
+	}
+	if current != nil && current.State == types.StatePaused {
+		return nil // assignment persistence failed or another fenced cleanup won
+	}
+	if current == nil || current.RunID != attempted.RunID {
+		return nil // deleted or superseded: stale cleanup must not overwrite it
+	}
+	return fmt.Errorf("orch: rollback failed resume %s: runner %s remains %s", attempted.ID, attempted.RunID, current.State)
 }
 
 // --- proxy.Router (internal mode) ---
@@ -705,13 +770,21 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy
 	if selected.Kind == proxy.KindDeny {
 		return selected, nil
 	}
-	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
+	switch sb.State {
+	case types.StateRunning:
+		// Ready to route below.
+	case types.StatePaused, types.StateStarting:
+		// A starting resume joins the existing single-flight. A fresh create is
+		// not in that flight and remains non-routable until launch publishes
+		// running, so the state check after the join is authoritative.
 		if err := o.resumeSandbox(ctx, sandboxID); err != nil {
 			return proxy.Route{}, err
 		}
-		if sb = o.lookup(sandboxID); sb == nil {
+		if sb = o.lookup(sandboxID); sb == nil || sb.State != types.StateRunning {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
+	default:
+		return proxy.Route{Kind: proxy.KindNotFound}, nil
 	}
 	return proxy.RouteForTarget(
 		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
@@ -990,7 +1063,9 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 }
 
 // Reconcile adopts/cleans sandboxes after an orchestrator restart, using the
-// systemd unit set as the liveness authority.
+// systemd unit set as the liveness authority. A starting row is never adopted:
+// launch completion was not committed, so an interrupted resume returns to its
+// durable paused snapshot and an interrupted fresh create becomes dead.
 func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	units, err := o.lc.List(ctx, o.runnerPattern())
 	if err != nil {
@@ -1005,8 +1080,17 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
 	// collect the dead ones and tear them down after the scan, since teardown +
 	// SetState write the store and must not run while the read cursor is open.
-	var dead []*types.Sandbox
+	var interrupted, dead []*types.Sandbox
 	knownRuns := make(map[string]bool)
+	if err := o.st.RangeByState(ctx, types.StateStarting, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
+		interrupted = append(interrupted, sb)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
@@ -1019,6 +1103,21 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+	for _, sb := range interrupted {
+		target := types.StateDead
+		if sb.SnapshotRef != "" {
+			target = types.StatePaused
+		}
+		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
+		o.teardown(ctx, sb)
+		changed, err := o.st.CASRunState(ctx, sb.ID, sb.RunID, types.StateStarting, target)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			o.log.Warn("reconcile: interrupted launch state changed", "sid", sb.ID, "run_id", sb.RunID)
+		}
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
@@ -1094,26 +1193,27 @@ func (o *Orchestrator) mutateCached(id string, fn func(*types.Sandbox)) *types.S
 	return &nb
 }
 
-// ByFloatingIP maps a guest's (SNAT'd) source floating IP to its running sandbox id,
-// for the in-process MMDS service (proxy_mode=internal). Implements mmds.Source (PUT
-// stage). Running only: a paused sandbox's slot/floating IP is freed and may be reused
-// by another running sandbox, so matching paused rows would be ambiguous.
+// ByFloatingIP maps a guest's (SNAT'd) source floating IP to its starting/running
+// sandbox id for the in-process MMDS service (proxy_mode=internal). Starting must
+// be visible because envd consults MMDS during mandatory /init. A paused sandbox's
+// slot/floating IP is freed and may be reused, so paused remains excluded.
 func (o *Orchestrator) ByFloatingIP(ip string) (sandboxID string, ok bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, sb := range o.reg {
-		if sb.FloatingIP == ip && sb.State == types.StateRunning {
+		if sb.FloatingIP == ip && (sb.State == types.StateStarting || sb.State == types.StateRunning) {
 			return sb.ID, true
 		}
 	}
 	return "", false
 }
 
-// SandboxInfo returns sid's current template id + access token (mmds.Source, GET stage).
+// SandboxInfo returns a starting/running sid's template id + access token
+// (mmds.Source, GET stage).
 func (o *Orchestrator) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if sb, ok := o.reg[sid]; ok && sb.State == types.StateRunning {
+	if sb, ok := o.reg[sid]; ok && (sb.State == types.StateStarting || sb.State == types.StateRunning) {
 		return sb.TemplateID, sb.EnvdAccessToken, true
 	}
 	return "", "", false

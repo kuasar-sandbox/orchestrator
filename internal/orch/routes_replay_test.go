@@ -100,6 +100,29 @@ func TestInternalRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 	}
 }
 
+func TestStartingSandboxServesMMDSButNotDataPlane(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{
+		ID: "starting", Profile: types.ProfileE2B, State: types.StateStarting,
+		TemplateID: "template", FloatingIP: "100.100.0.4", EnvdUDS: "/run/starting/envd.sock",
+		EnvdAccessToken: "envd", ForwardAccessToken: "forward", ManifestKey: strings.Repeat("4", 64),
+	}
+	o.cache(sb)
+	if sid, ok := o.ByFloatingIP(sb.FloatingIP); !ok || sid != sb.ID {
+		t.Fatalf("ByFloatingIP(starting) = %q ok=%v", sid, ok)
+	}
+	if templateID, token, ok := o.SandboxInfo(sb.ID); !ok || templateID != sb.TemplateID || token != sb.EnvdAccessToken {
+		t.Fatalf("SandboxInfo(starting) = %q %q ok=%v", templateID, token, ok)
+	}
+	if secret, ok := o.MmdsSecret(sb.ID); !ok || len(secret) == 0 {
+		t.Fatalf("MmdsSecret(starting) = %x ok=%v", secret, ok)
+	}
+	route, err := o.Route(context.Background(), sb.ID, proxy.LegacyTarget(49983))
+	if err != nil || route.Kind != proxy.KindNotFound {
+		t.Fatalf("Route(starting) = %+v err=%v, want not found until running", route, err)
+	}
+}
+
 func TestInternalKnownExecDoesNotResumePausedSandboxBeforeIssue64(t *testing.T) {
 	o := &Orchestrator{reg: map[string]*types.Sandbox{
 		"paused": {ID: "paused", Profile: types.ProfileBare, State: types.StatePaused},

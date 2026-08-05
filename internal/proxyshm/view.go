@@ -236,8 +236,8 @@ func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIden
 }
 
 // ActivateExec is entered only after the proxy has authenticated the KAT against
-// expected. It wakes a paused sandbox, waits for the running route update, and
-// rejects any node-local or credential identity change before returning.
+// expected. It wakes a paused sandbox or waits without another Wake when launch
+// is already starting, then rejects any identity change before returning.
 func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
 	if !v.waitSynced(ctx) {
 		return proxy.ExecIdentity{}, false, nil
@@ -250,14 +250,14 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	if r.State == routesync.StateRunning {
 		return identity, true, nil
 	}
-	if v.wake != nil {
+	if r.State == routesync.StatePaused && v.wake != nil {
 		v.wake(sid)
 	}
 	return v.waitExecRunning(ctx, sid, expected)
 }
 
 func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity, bool) {
-	if !found || (r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
 		return proxy.ExecIdentity{}, false
 	}
 	identity := proxy.ExecIdentity{
@@ -299,10 +299,21 @@ func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEn
 	if !v.waitSynced(ctx) {
 		return routesync.RouteEntry{}, false
 	}
-	if r, ok := v.table.Lookup(sid); ok && r.State == routesync.StateRunning {
-		return r, true
-	}
-	if v.wake != nil {
+	r, found := v.table.Lookup(sid)
+	if found {
+		switch r.State {
+		case routesync.StateRunning:
+			return r, true
+		case routesync.StateStarting:
+			// The current launch owner will publish the terminal update.
+		case routesync.StatePaused:
+			if v.wake != nil {
+				v.wake(sid)
+			}
+		default:
+			return routesync.RouteEntry{}, false
+		}
+	} else if v.wake != nil {
 		v.wake(sid)
 	}
 	return v.waitRunning(ctx, sid)
