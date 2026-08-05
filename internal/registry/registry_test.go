@@ -2140,6 +2140,59 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 	}
 }
 
+func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.parkTimeout = 100 * time.Millisecond
+	reg.SetPlacer(placementWithToken("new"))
+	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
+	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"old", "new"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)); err != nil {
+		t.Fatal(err)
+	}
+	deleted := make(chan struct{})
+	var replacementSID string
+	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		replacementSID = cmd.SID
+		go func() {
+			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+			reg.applyDeleteBySID(context.Background(), "new", cmd.SID)
+			close(deleted)
+		}()
+	}})
+
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); err == nil {
+		t.Fatal("replacement create Delete unexpectedly completed Reserve")
+	}
+	select {
+	case <-deleted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement node did not report Delete")
+	}
+	restored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || restored.SandboxID != orig.SandboxID || restored.NodeSandboxID != orig.NodeSandboxID ||
+		restored.SandboxGeneration != orig.SandboxGeneration || restored.NextSandboxGeneration != 2 ||
+		restored.NodeID != orig.NodeID || restored.State != StateReady {
+		t.Fatalf("route after replacement Delete = %+v found=%v err=%v", restored, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "old", orig.NodeSandboxID); err != nil || !found || ref.RouteKey != orig.RouteKey {
+		t.Fatalf("original owner ref after replacement Delete = %+v found=%v err=%v", ref, found, err)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "new", replacementSID); err != nil || found {
+		t.Fatalf("failed replacement owner ref remained: found=%v err=%v", found, err)
+	}
+}
+
 func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
