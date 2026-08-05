@@ -9,7 +9,9 @@ on:
         required: true
         type: string
   schedule:
-    - cron: "57 0 * * *"
+    - cron: "27 2 * * *"
+      timezone: Asia/Shanghai
+    - cron: "27 4 * * *"
       timezone: Asia/Shanghai
 
 permissions:
@@ -74,7 +76,7 @@ jobs:
       - Linux
       - X64
       - kuasar-e2e
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -82,6 +84,9 @@ jobs:
       GOPROXY: https://goproxy.cn,direct
       GOSUMDB: sum.golang.google.cn
       GOTOOLCHAIN: local
+      http_proxy: ${{ secrets.KUASAR_CI_PROXY_URL }}
+      https_proxy: ${{ secrets.KUASAR_CI_PROXY_URL }}
+      no_proxy: ${{ vars.KUASAR_CI_NO_PROXY }}
     steps:
       - name: Create read-only source token
         id: source-token
@@ -95,6 +100,18 @@ jobs:
           skip-token-revoke: true
 
       - name: Check out exact orchestrator source
+        id: checkout-orchestrator
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/orchestrator
+          ref: ${{ github.sha }}
+          path: src/orchestrator
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Retry exact orchestrator source checkout
+        if: steps.checkout-orchestrator.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/orchestrator
@@ -104,6 +121,18 @@ jobs:
           persist-credentials: false
 
       - name: Check out accelerator dependency
+        id: checkout-accelerator
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/accelerator
+          ref: main
+          path: src/accelerator
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Retry accelerator dependency checkout
+        if: steps.checkout-accelerator.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/accelerator
@@ -113,6 +142,18 @@ jobs:
           persist-credentials: false
 
       - name: Check out connector dependency
+        id: checkout-connector
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/connector
+          ref: main
+          path: src/connector
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Retry connector dependency checkout
+        if: steps.checkout-connector.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/connector
@@ -122,6 +163,18 @@ jobs:
           persist-credentials: false
 
       - name: Check out sandboxer dependency
+        id: checkout-sandboxer
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/sandboxer
+          ref: main
+          path: src/sandboxer
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Retry sandboxer dependency checkout
+        if: steps.checkout-sandboxer.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/sandboxer
@@ -136,6 +189,7 @@ jobs:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
           curl --fail --show-error --silent \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
             -H "Accept: application/vnd.github+json" \

@@ -20,6 +20,8 @@ on:
     secrets:
       KUASAR_CI_APP_PRIVATE_KEY:
         required: true
+      KUASAR_CI_PROXY_URL:
+        required: false
   pull_request:
     types:
       - opened
@@ -86,7 +88,7 @@ jobs:
       - kuasar-e2e
       - kvm
       - cgroup-v2
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode == 'working-set-perf' && 180 || 30 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode == 'working-set-perf' && 180 || 45 }}
     env:
       TARGET_ARCH: x86_64
       GOPROXY: https://goproxy.cn,direct
@@ -97,6 +99,9 @@ jobs:
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      http_proxy: ${{ inputs.release_input_artifact != '' && secrets.KUASAR_CI_PROXY_URL || '' }}
+      https_proxy: ${{ inputs.release_input_artifact != '' && secrets.KUASAR_CI_PROXY_URL || '' }}
+      no_proxy: ${{ inputs.release_input_artifact != '' && vars.KUASAR_CI_NO_PROXY || '' }}
       KUASAR_CI_DIR: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}
       KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/timings.tsv
       KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/native-cache.tsv
@@ -205,6 +210,15 @@ jobs:
 
       - name: Check out trusted aggregate tooling
         if: inputs.release_input_artifact != ''
+        id: checkout-trusted-aggregate
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted/orchestrator
+          persist-credentials: false
+
+      - name: Retry trusted aggregate tooling checkout
+        if: inputs.release_input_artifact != '' && steps.checkout-trusted-aggregate.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: trusted/orchestrator
@@ -476,6 +490,7 @@ jobs:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
           curl --fail --show-error --silent \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
             -H "Accept: application/vnd.github+json" \
@@ -498,6 +513,7 @@ jobs:
               "$source_dir" "$source_dir/$resolved_sha.tar.gz"
           done < <(tail -n +2 "$KUASAR_REVISION_MANIFEST")
 
+          rm -f go.work go.work.sum src/go.work src/go.work.sum
           cd src
           go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer
 

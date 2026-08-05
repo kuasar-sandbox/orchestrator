@@ -101,26 +101,30 @@ gh workflow run aggregate-release.yml \
 
 ### 2.3 每日 preview
 
-正式 `v0.1.0` 发布前,各仓按 `Asia/Shanghai` 错峰生成同一天的 preview:
+正式 `v0.1.0` 发布前,各仓按 `Asia/Shanghai` 错峰生成同一天的 preview。主触发
+集中在 02:00 前后,同日恢复触发只在主流程没有完成 Release 时重新执行:
 
-| 时间 | 发布入口 | 当日版本 |
-|---|---|---|
-| 00:17 | accelerator | `v0.1.0-preview.YYYYMMDD` |
-| 00:27 | connector | `v0.1.0-preview.YYYYMMDD` |
-| 00:37 | sandboxer | `v0.1.0-preview.YYYYMMDD` |
-| 00:47 | vmlinux | `vmlinux-v0.1.0-preview.YYYYMMDD` |
-| 00:57 | orchestrator | `v0.1.0-preview.YYYYMMDD` |
-| 02:17 | runtime | `runtime-v0.1.0-preview.YYYYMMDD` |
-| 06:17 | aggregate | `release-v0.1.0-preview.YYYYMMDD` |
+| 主触发 | 恢复触发 | 发布入口 | 当日版本 |
+|---|---|---|---|
+| 02:07 | 04:07 | accelerator | `v0.1.0-preview.YYYYMMDD` |
+| 02:12 | 04:12 | connector | `v0.1.0-preview.YYYYMMDD` |
+| 02:17 | 04:17 | sandboxer | `v0.1.0-preview.YYYYMMDD` |
+| 02:22 | 04:22 | vmlinux | `vmlinux-v0.1.0-preview.YYYYMMDD` |
+| 02:27 | 04:27 | orchestrator | `v0.1.0-preview.YYYYMMDD` |
+| 02:47 | 04:47 | runtime | `runtime-v0.1.0-preview.YYYYMMDD` |
+| 03:47 | 06:17 | aggregate | `release-v0.1.0-preview.YYYYMMDD` |
 
 日期取 Actions run 的 `created_at` 并转换到上海时区,因此排队或 job 重试不会改变
-目标 tag。同日 Release 已完成时 workflow 幂等跳过;对应正式 `v0.1.0` 已发布后,
-该版本线停止自动 preview。
+目标 tag。同日 Release 已完成时 workflow 幂等跳过;主触发仍在执行时,同仓
+concurrency 会串行等待,随后再次检查并跳过。对应正式 `v0.1.0` 已发布后,该版本线
+停止自动 preview。两次独立 schedule 还覆盖 GitHub 高负载下定时事件延迟或丢弃的
+情况,不是对同一 Release 的覆盖发布。
 
-runtime 使用同日 sandboxer preview 构建。聚合 job 最多等待两小时,直到六个同日
-组件 prerelease 均已公开,再把确定的版本组合写入 `release` 分支、执行完整 BMS
-E2E 并发布聚合 prerelease。等待和解析只有跨仓读取权限;组件工作流之间不互相
-dispatch,也不要求跨仓 Actions 写权限。
+runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待两小时,因此也能接纳
+04:xx 组件恢复触发的结果;06:17 聚合恢复触发负责处理此前仍未形成公开聚合 Release
+的情况。六个同日组件 prerelease 均已公开后,workflow 才把确定的版本组合写入
+`release` 分支、执行完整 BMS E2E 并发布聚合 prerelease。等待和解析只有跨仓读取
+权限;组件工作流之间不互相 dispatch,也不要求跨仓 Actions 写权限。
 
 ## 3. 配置
 
@@ -160,13 +164,23 @@ fast-forward 追加 mapping。已存在的版本文件只能复用完全相同�
 组件和聚合工作流复用:
 
 - repository variable `KUASAR_CI_APP_CLIENT_ID`;
-- repository secret `KUASAR_CI_APP_PRIVATE_KEY`。
+- repository secret `KUASAR_CI_APP_PRIVATE_KEY`;
+- 可选 repository 或 organization secret `KUASAR_CI_PROXY_URL`,以及可选 variable
+  `KUASAR_CI_NO_PROXY`。
 
 GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、Release 元数据和
 资产。自托管 runner 在执行任何仓库代码前撤销 token。具备 `contents:write` 的
 `GITHUB_TOKEN` 只存在于 GitHub-hosted publish job和每日聚合的 mapping step。
 publish job 只验证 bundle、创建 tag、上传资产和发布 draft,不运行组件二进制;
 每日 mapping step 只向本仓 `release` 分支追加当日不可变 mapping。
+
+`KUASAR_CI_PROXY_URL` 只投影为受信组件/聚合发布 job 的小写 `http_proxy` /
+`https_proxy`,用于 GitHub checkout、API 和仍需外网的依赖下载;普通 PR BMS 不接收该
+secret。代理带凭据时必须使用 secret,不得把 URL 写入仓库。`KUASAR_CI_NO_PROXY` 由
+部署方列出本机、沙箱测试网段和内部服务。未配置 proxy secret 时保持直连。runner
+下载 Action 本身早于 job step,还需按 BMS runner 部署文档把同一组小写变量写入
+runner 安装目录的 `.env` 并重启 runner;执行 fork 代码的 runner 级代理只能依赖网络
+侧 ACL,不得向 workload 暴露可复用凭据。
 
 ## 4. 设计
 
@@ -260,10 +274,12 @@ Release 列表定位同 tag draft 的 ID;失败重试时先按 ID 删除残留 d
 
 | 失败位置 | 远端状态 | 处理 |
 |---|---|---|
+| 主 schedule 未触发或网络构建失败 | 无当日组件 Release | 04:xx 同日恢复 schedule 自动重试;已完成 Release 幂等跳过 |
+| 自托管源码 checkout 瞬断 | 无 Release 或只有本次 Actions 临时状态 | 同一 job 在首次 checkout 失败后执行一次有界重试;仍失败时交给同日恢复 schedule |
 | mapping 提交 | 无组件或聚合发布 | 修正 mapping/并发冲突后重试 `release-suite.sh` |
 | 独立组件构建或测试 | mapping 已记录,缺少对应组件 Release | 修复组件后重跑快捷入口;已完成版本会复用 |
 | 聚合解析 | 组件 Release 不完整或 digest 不一致 | 修复/重新发布新的组件版本,新增聚合 mapping;不改写旧版本 |
-| BMS E2E | 六个组件 Release 保持不变,无聚合 Release | 修复组件并选择新版本,或修复测试环境后重跑同一 mapping |
+| BMS E2E | 六个组件 Release 保持不变,无聚合 Release | 瞬时环境故障重跑同一 mapping;workspace 初始化先清理本 workflow 的 `go.work` 残留 |
 | draft 上传或 digest 校验 | 可能留下 tag/draft,公开 Release 不存在 | 重试 publish job;发布器按 ID 清理同 tag draft 后重建 |
 | 发布后最终检查 | Release 已公开 | 人工核查远端 ref;脚本不会覆盖已发布资产 |
 

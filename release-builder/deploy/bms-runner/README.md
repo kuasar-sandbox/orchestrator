@@ -144,6 +144,43 @@ the fixed PATH, and service enablement all succeed. Supplying a fresh token
 retries any markerless partial registration through the runner's `--replace`
 flow; a completed registration is left unchanged.
 
+## GitHub outbound proxy
+
+When direct GitHub connectivity from mainland China is unreliable, configure
+the organization-controlled egress proxy before starting the slots. Keep the
+proxy URL and optional credentials outside the repository in a root-readable
+file using the lowercase variable names consumed by the runner:
+
+```text
+https_proxy=<proxy-url>
+http_proxy=<proxy-url>
+no_proxy=<internal-hosts-and-test-networks>
+```
+
+Copy that file to each registered runner with mode `0600` while all slots are
+stopped:
+
+```bash
+for slot in 1 2 3 4 5 6; do
+  install -m 0600 /etc/kuasar-ci/runner-proxy.env \
+    "/var/lib/machines/kuasar-ci-$slot/opt/actions-runner/.env"
+done
+```
+
+The runner reads `.env` only at startup, so restart the slots after every proxy
+change. The provisioner deliberately preserves each runner's `.env` while it
+reconciles the runner distribution. These runners execute fork code; the
+runner-level proxy must therefore use network-side access control and must not
+put reusable credentials where a workload can read them.
+
+Release workflows also accept the same URL as the `KUASAR_CI_PROXY_URL` Actions
+secret and the bypass list as the `KUASAR_CI_NO_PROXY` variable. That secret is
+projected only into trusted component/aggregate release jobs, never ordinary
+PR BMS jobs. Configure it when release steps must use the proxy even on a
+runner without `.env`; never commit the URL or credentials. The bypass list
+must include local control endpoints, sandbox test networks, and internal
+registries so E2E traffic remains local.
+
 All runners join the existing `kuasar-e2e` organization group with labels
 `kuasar-e2e,kvm,cgroup-v2` plus a slot label. The group must remain
 organization-wide (`visibility=all`) with no selected-repository or workflow

@@ -9,6 +9,8 @@ on:
         required: true
         type: string
   schedule:
+    - cron: "47 3 * * *"
+      timezone: Asia/Shanghai
     - cron: "17 6 * * *"
       timezone: Asia/Shanghai
 
@@ -185,6 +187,7 @@ jobs:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
           curl --fail --show-error --silent \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
             -H "Accept: application/vnd.github+json" \
