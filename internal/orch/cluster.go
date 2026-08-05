@@ -471,7 +471,7 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		Cluster:            &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
 		AuthSandboxIDValue: cmd.Cluster.AuthSandboxID,
 		TemplateID:         tmpl.String(),
-		State:              types.StateRunning,
+		State:              types.StateStarting,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + cmd.SID,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + cmd.SID,
 		APISecret:          pair.APISecret,
@@ -488,10 +488,8 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
-		o.teardown(context.Background(), sb)
-		return nil, err
+		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
 	}
-	o.publishUpsert(sb)
 	return sb, nil
 }
 

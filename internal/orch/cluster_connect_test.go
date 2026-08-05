@@ -380,7 +380,7 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 			t.Fatalf("cluster connect ack = %+v", ack)
 		}
 		waitForLauncherStart(t, started)
-		waitPausedClusterRoute(t, events, sid)
+		waitClusterRouteStates(t, events, sid, routesync.StateStarting, routesync.StatePaused)
 		stored, err := o.st.Get(ctx, sid)
 		if err != nil || stored == nil || stored.State != types.StatePaused {
 			t.Fatalf("late resume failure row = %+v err=%v, want paused", stored, err)
@@ -405,13 +405,20 @@ func waitClusterConnectAttempt(t *testing.T, attempted <-chan struct{}) {
 
 func waitPausedClusterRoute(t *testing.T, events <-chan routesync.Event, sid string) {
 	t.Helper()
-	select {
-	case event := <-events:
-		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sid || event.Route.State != routesync.StatePaused {
-			t.Fatalf("resume failure event = %+v, want paused upsert for %s", event, sid)
+	waitClusterRouteStates(t, events, sid, routesync.StatePaused)
+}
+
+func waitClusterRouteStates(t *testing.T, events <-chan routesync.Event, sid string, states ...string) {
+	t.Helper()
+	for _, state := range states {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != sid || event.Route.State != state {
+				t.Fatalf("resume failure event = %+v, want %s upsert for %s", event, state, sid)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("resume failure did not publish %s route", state)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("resume failure did not republish the paused route")
 	}
 }
 

@@ -375,7 +375,9 @@ func (t *Table) ByFloatingIP(ip string) (string, bool) {
 			runtime.Gosched()
 			continue
 		}
-		if st == statusPresent && entry.State == routesync.StateRunning && entry.FloatingIP == ip {
+		if st == statusPresent &&
+			(entry.State == routesync.StateStarting || entry.State == routesync.StateRunning) &&
+			entry.FloatingIP == ip {
 			return entry.SandboxID, true
 		}
 	}
@@ -384,7 +386,7 @@ func (t *Table) ByFloatingIP(ip string) (string, bool) {
 
 func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
 	r, ok := t.Lookup(sid)
-	if !ok || r.State != routesync.StateRunning {
+	if !ok || (r.State != routesync.StateStarting && r.State != routesync.StateRunning) {
 		return "", "", false
 	}
 	return r.TemplateID, r.EnvdAccessToken, true

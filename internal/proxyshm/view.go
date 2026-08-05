@@ -236,8 +236,8 @@ func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIden
 }
 
 // ActivateExec is entered only after the proxy has authenticated the KAT against
-// expected. It wakes a paused sandbox, waits for the running route update, and
-// rejects any node-local or credential identity change before returning.
+// expected. It wakes a paused sandbox or waits without another Wake when launch
+// is already starting, then rejects any identity change before returning.
 func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
 	if !v.waitSynced(ctx) {
 		return proxy.ExecIdentity{}, false, nil
@@ -250,14 +250,15 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	if r.State == routesync.StateRunning {
 		return identity, true, nil
 	}
-	if v.wake != nil {
+	starting := r.State == routesync.StateStarting
+	if r.State == routesync.StatePaused && v.wake != nil {
 		v.wake(sid)
 	}
-	return v.waitExecRunning(ctx, sid, expected)
+	return v.waitExecRunning(ctx, sid, expected, starting)
 }
 
 func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity, bool) {
-	if !found || (r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
 		return proxy.ExecIdentity{}, false
 	}
 	identity := proxy.ExecIdentity{
@@ -271,7 +272,7 @@ func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity,
 	return identity, true
 }
 
-func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
+func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected proxy.ExecIdentity, stopOnStartingRollback bool) (proxy.ExecIdentity, bool, error) {
 	deadline := time.Now().Add(v.parkTimeout())
 	for {
 		if err := ctx.Err(); err != nil {
@@ -286,6 +287,9 @@ func (v *WorkerView) waitExecRunning(ctx context.Context, sid string, expected p
 		if r.State == routesync.StateRunning {
 			return identity, true, nil
 		}
+		if stopOnStartingRollback && r.State != routesync.StateStarting {
+			return proxy.ExecIdentity{}, false, nil
+		}
 		if !v.waitChange(ctx, deadline, rev) {
 			if err := ctx.Err(); err != nil {
 				return proxy.ExecIdentity{}, false, err
@@ -299,10 +303,22 @@ func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEn
 	if !v.waitSynced(ctx) {
 		return routesync.RouteEntry{}, false
 	}
-	if r, ok := v.table.Lookup(sid); ok && r.State == routesync.StateRunning {
-		return r, true
-	}
-	if v.wake != nil {
+	r, found := v.table.Lookup(sid)
+	if found {
+		switch r.State {
+		case routesync.StateRunning:
+			return r, true
+		case routesync.StateStarting:
+			// The current launch owner will publish running or a rollback.
+			return v.waitStartingRunning(ctx, sid)
+		case routesync.StatePaused:
+			if v.wake != nil {
+				v.wake(sid)
+			}
+		default:
+			return routesync.RouteEntry{}, false
+		}
+	} else if v.wake != nil {
 		v.wake(sid)
 	}
 	return v.waitRunning(ctx, sid)
@@ -343,6 +359,28 @@ func (v *WorkerView) waitRunning(ctx context.Context, sid string) (routesync.Rou
 			return r, true
 		}
 		if !v.waitChange(ctx, deadline, v.table.Rev()) {
+			r, ok := v.table.Lookup(sid)
+			return r, ok && r.State == routesync.StateRunning
+		}
+	}
+}
+
+func (v *WorkerView) waitStartingRunning(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
+	deadline := time.Now().Add(v.parkTimeout())
+	for {
+		rev := v.table.Rev()
+		r, ok := v.table.Lookup(sid)
+		if !ok {
+			return routesync.RouteEntry{}, false
+		}
+		switch r.State {
+		case routesync.StateRunning:
+			return r, true
+		case routesync.StateStarting:
+		default:
+			return routesync.RouteEntry{}, false
+		}
+		if !v.waitChange(ctx, deadline, rev) {
 			r, ok := v.table.Lookup(sid)
 			return r, ok && r.State == routesync.StateRunning
 		}

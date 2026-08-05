@@ -9,8 +9,9 @@
 // the first poll:
 //
 //   - PUT /latest/api/token : resolve the request's source IP — the guest's
-//     vswitch-SNAT'd floating IP — to a running sandbox id, PARKING (bounded) until it
-//     registers; return an HMAC-signed session token that binds this session to that id.
+//     vswitch-SNAT'd floating IP — to a starting/running sandbox id, PARKING (bounded)
+//     until it registers; return an HMAC-signed session token that binds this session
+//     to that id.
 //   - GET /                 : verify + decode the session token (the in-guest code is
 //     untrusted, so we trust the token we minted, not a re-read of the source), then
 //     return that sandbox's current {instanceID, envID, accessTokenHash}.
@@ -39,10 +40,10 @@ import (
 // (proxy_mode=internal) and the synced route table (external) implement it; lookups are
 // non-blocking and the server does the parking.
 type Source interface {
-	// ByFloatingIP returns the running sandbox id whose floating IP is ip (the guest's
-	// SNAT'd source). ok=false if none is registered yet.
+	// ByFloatingIP returns the starting/running sandbox id whose floating IP is ip
+	// (the guest's SNAT'd source). ok=false if none is registered yet.
 	ByFloatingIP(ip string) (sandboxID string, ok bool)
-	// SandboxInfo returns the running sandbox's current template id + access token.
+	// SandboxInfo returns the starting/running sandbox's current template id + access token.
 	SandboxInfo(sandboxID string) (templateID, accessToken string, ok bool)
 	// MmdsSecret returns sid's per-sandbox session-token signing key — deterministic
 	// from the manifest key + id, so a token minted by any proxy worker verifies in
@@ -130,7 +131,7 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
-// resolve parks (bounded by s.park) until a running sandbox owns ip — reusing the
+// resolve parks (bounded by s.park) until a starting/running sandbox owns ip — reusing the
 // data-plane "wait for the route to sync" semantics so external mode has no
 // launch-before-poll ordering constraint. A legit guest's own floating IP resolves
 // immediately; the park only spans the brief route-sync window.

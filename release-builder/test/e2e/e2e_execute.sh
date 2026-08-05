@@ -10,8 +10,9 @@
 #   POST /sandboxes            -> sandbox-runner@<run-id> assignment -> sandbox-ctl boots
 #                                cloud-hypervisor (KVM) from the template +
 #                                sandbox-runtime.bundle; envd comes up at 49983,
-#                                exposed as envd.sock; orchestrator waitReady(/health)
-#                                + envdInit(/init). 201 == microVM booted + envd ready.
+#                                exposed as envd.sock; after runtime readiness the
+#                                orchestrator requires envdInit(/init), without a
+#                                launch-time /health probe. 201 == booted + initialized.
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
 #                                in the guest below (§4.6 config passing chain).
@@ -605,13 +606,13 @@ if [ "$code" != "201" ]; then
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
     SID=$(ls "$WORK/run" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
-    fail "create=$code (want 201) — VM boot/envd readiness failed"
+    fail "create=$code (want 201) — VM boot/envd initialization failed"
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
+echo "==> PASS: sandbox $SID running (microVM booted + envd initialized)"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"

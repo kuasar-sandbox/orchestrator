@@ -1056,6 +1056,12 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint)
 		return
 	}
+	if e.State == routesync.StateStarting {
+		// Keep the Registry-owned reservation/paused state while the node makes
+		// starting visible to its proxy MMDS. Only running/paused are terminal
+		// route facts for the cluster state machine.
+		return
+	}
 	if e.State == routesync.StateDead {
 		if r.applyDelete(ctx, nodeID, e.SandboxID, ref.Group, ref.RouteKey, ref.APISecretFingerprint) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.SandboxID)
@@ -1286,11 +1292,36 @@ func (r *Registry) tryApplyDelete(ctx context.Context, nodeID, nodeSandboxID, gr
 	if rec.NodeID != nodeID || rec.NodeSandboxID != nodeSandboxID || rec.APISecretFingerprint != apiSecretFingerprint {
 		return true
 	}
+	if applies, rolledBack := r.tryRollbackCreateReserveDelete(ctx, group, routeKey, rec, rev); applies {
+		return rolledBack
+	}
 	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
 	if err != nil {
 		return false
 	}
 	return deleted
+}
+
+// tryRollbackCreateReserveDelete preserves the pre-reserve route when a node
+// reports that its accepted create candidate failed. Deleting the matching
+// RESERVED row first would destroy the revision fence that reserveCreate later
+// uses to restore a replaced route (or remove a fresh reservation). A paused
+// resume is excluded: its ordinary launch failure reports paused, while an
+// actual Delete remains authoritative for that existing sandbox.
+func (r *Registry) tryRollbackCreateReserveDelete(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64) (applies, rolledBack bool) {
+	if rec == nil || rec.State != StateReserved {
+		return false, false
+	}
+	key := flightKey(group, routeKey)
+	r.mu.Lock()
+	call := r.inflight[key]
+	if call == nil || !call.rollbackFence.matches(rec, rev) || (call.orig != nil && call.orig.State == StatePaused) {
+		r.mu.Unlock()
+		return false, false
+	}
+	orig, found := call.orig, call.found
+	r.mu.Unlock()
+	return true, r.rollbackReservedAtRevision(ctx, group, routeKey, rec, rev, orig, found, true)
 }
 
 func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, expected []clusterstate.NodeSandboxRef, seen map[string]struct{}) {

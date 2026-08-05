@@ -1580,6 +1580,38 @@ func TestDeadReportDeletesRoute(t *testing.T) {
 	}
 }
 
+func TestStartingReportPreservesRegistryRouteState(t *testing.T) {
+	for _, state := range []SandboxState{StateReserved, StatePaused} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			sid := "sb-starting-" + string(state)
+			record := testE2BSandboxRecord("/g", "rk", sid, "n1", state)
+			initialRevision, err := reg.stores.PutSandbox(ctx, record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := testNodeSandboxRef("/g", "rk", sid, "e2b", testAPIFingerprint)
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", ref); err != nil {
+				t.Fatal(err)
+			}
+
+			route := testE2BRoute(sid, routesync.StateStarting)
+			reg.applyRoute(ctx, "n1", &route)
+
+			stored, revision, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+			if err != nil || !found || revision != initialRevision || stored.State != state ||
+				stored.NodeSandboxID != record.NodeSandboxID {
+				t.Fatalf("route after starting report = %+v revision=%d found=%v err=%v", stored, revision, found, err)
+			}
+			storedRef, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", record.NodeSandboxID)
+			if err != nil || !found || storedRef != ref {
+				t.Fatalf("node ref after starting report = %+v found=%v err=%v", storedRef, found, err)
+			}
+		})
+	}
+}
+
 func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -2105,6 +2137,59 @@ func TestReadyReplacementFailureRestoresOriginalGeneration(t *testing.T) {
 	}
 	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "old", orig.NodeSandboxID); err != nil || !found || ref.RouteKey != "rk" {
 		t.Fatalf("failed replacement did not restore old owner ref: ref=%+v found=%v err=%v", ref, found, err)
+	}
+}
+
+func TestReadyReplacementDeleteRestoresOriginalRoute(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.parkTimeout = 100 * time.Millisecond
+	reg.SetPlacer(placementWithToken("new"))
+	orig := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
+	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"old", "new"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", testNodeSandboxRef("/g", "rk", orig.SandboxID, "e2b", testAPIFingerprint)); err != nil {
+		t.Fatal(err)
+	}
+	deleted := make(chan struct{})
+	var replacementSID string
+	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		replacementSID = cmd.SID
+		go func() {
+			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+			reg.applyDeleteBySID(context.Background(), "new", cmd.SID)
+			close(deleted)
+		}()
+	}})
+
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil)); err == nil {
+		t.Fatal("replacement create Delete unexpectedly completed Reserve")
+	}
+	select {
+	case <-deleted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement node did not report Delete")
+	}
+	restored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || restored.SandboxID != orig.SandboxID || restored.NodeSandboxID != orig.NodeSandboxID ||
+		restored.SandboxGeneration != orig.SandboxGeneration || restored.NextSandboxGeneration != 2 ||
+		restored.NodeID != orig.NodeID || restored.State != StateReady {
+		t.Fatalf("route after replacement Delete = %+v found=%v err=%v", restored, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "old", orig.NodeSandboxID); err != nil || !found || ref.RouteKey != orig.RouteKey {
+		t.Fatalf("original owner ref after replacement Delete = %+v found=%v err=%v", ref, found, err)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "new", replacementSID); err != nil || found {
+		t.Fatalf("failed replacement owner ref remained: found=%v err=%v", found, err)
 	}
 }
 
