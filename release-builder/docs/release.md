@@ -118,8 +118,10 @@ gh workflow run aggregate-release.yml \
 目标 tag。同日 Release 已完成时 workflow 幂等跳过;主触发仍在执行时,同仓
 schedule concurrency 会串行等待,随后再次检查并跳过。schedule 与人工
 `workflow_dispatch` 使用独立 concurrency group,恢复触发不会替换正在等待的人工发布。
-对应正式 `v0.1.0` 已发布后,该版本线停止自动 preview。两次独立 schedule 还覆盖
-GitHub 高负载下定时事件延迟或丢弃的情况,不是对同一 Release 的覆盖发布。
+preview 在实际发布前再次检查对应正式版;若人工正式版在 preview 构建期间完成,本次
+preview 直接成功结束而不创建 Release。对应正式 `v0.1.0` 已发布后,该版本线停止自动
+preview。两次独立 schedule 还覆盖 GitHub 高负载下定时事件延迟或丢弃的情况,不是对
+同一 Release 的覆盖发布。
 
 runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待两小时,因此也能接纳
 04:xx 组件恢复触发的结果;06:17 聚合恢复触发负责处理此前仍未形成公开聚合 Release
