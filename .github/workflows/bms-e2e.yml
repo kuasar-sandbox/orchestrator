@@ -20,8 +20,6 @@ on:
     secrets:
       KUASAR_CI_APP_PRIVATE_KEY:
         required: true
-      KUASAR_CI_PROXY_URL:
-        required: false
   pull_request:
     types:
       - opened
@@ -99,9 +97,6 @@ jobs:
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
-      http_proxy: ${{ inputs.release_input_artifact != '' && secrets.KUASAR_CI_PROXY_URL || '' }}
-      https_proxy: ${{ inputs.release_input_artifact != '' && secrets.KUASAR_CI_PROXY_URL || '' }}
-      no_proxy: ${{ inputs.release_input_artifact != '' && vars.KUASAR_CI_NO_PROXY || '' }}
       KUASAR_CI_DIR: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}
       KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/timings.tsv
       KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/native-cache.tsv
@@ -489,14 +484,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
-          curl --fail --show-error --silent \
+          set -euo pipefail
+          status=$(curl --show-error --silent \
             --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
+            --write-out '%{http_code}' \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/installation/token
+            https://api.github.com/installation/token)
+          case "$status" in
+            204|401) ;;
+            *) echo "failed to revoke source token: HTTP $status" >&2; exit 1 ;;
+          esac
 
       - name: Finalize the five-repository workspace
         run: |

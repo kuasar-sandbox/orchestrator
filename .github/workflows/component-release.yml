@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: component-release-${{ github.repository }}
+  group: component-release-${{ github.repository }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -84,9 +84,6 @@ jobs:
       GOPROXY: https://goproxy.cn,direct
       GOSUMDB: sum.golang.google.cn
       GOTOOLCHAIN: local
-      http_proxy: ${{ secrets.KUASAR_CI_PROXY_URL }}
-      https_proxy: ${{ secrets.KUASAR_CI_PROXY_URL }}
-      no_proxy: ${{ vars.KUASAR_CI_NO_PROXY }}
     steps:
       - name: Create read-only source token
         id: source-token
@@ -188,14 +185,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
-          curl --fail --show-error --silent \
+          set -euo pipefail
+          status=$(curl --show-error --silent \
             --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
+            --write-out '%{http_code}' \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/installation/token
+            https://api.github.com/installation/token)
+          case "$status" in
+            204|401) ;;
+            *) echo "failed to revoke source token: HTTP $status" >&2; exit 1 ;;
+          esac
 
       - name: Assemble source workspace
         run: |

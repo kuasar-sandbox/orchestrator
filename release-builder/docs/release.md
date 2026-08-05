@@ -116,9 +116,10 @@ gh workflow run aggregate-release.yml \
 
 日期取 Actions run 的 `created_at` 并转换到上海时区,因此排队或 job 重试不会改变
 目标 tag。同日 Release 已完成时 workflow 幂等跳过;主触发仍在执行时,同仓
-concurrency 会串行等待,随后再次检查并跳过。对应正式 `v0.1.0` 已发布后,该版本线
-停止自动 preview。两次独立 schedule 还覆盖 GitHub 高负载下定时事件延迟或丢弃的
-情况,不是对同一 Release 的覆盖发布。
+schedule concurrency 会串行等待,随后再次检查并跳过。schedule 与人工
+`workflow_dispatch` 使用独立 concurrency group,恢复触发不会替换正在等待的人工发布。
+对应正式 `v0.1.0` 已发布后,该版本线停止自动 preview。两次独立 schedule 还覆盖
+GitHub 高负载下定时事件延迟或丢弃的情况,不是对同一 Release 的覆盖发布。
 
 runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待两小时,因此也能接纳
 04:xx 组件恢复触发的结果;06:17 聚合恢复触发负责处理此前仍未形成公开聚合 Release
@@ -164,9 +165,7 @@ fast-forward 追加 mapping。已存在的版本文件只能复用完全相同�
 组件和聚合工作流复用:
 
 - repository variable `KUASAR_CI_APP_CLIENT_ID`;
-- repository secret `KUASAR_CI_APP_PRIVATE_KEY`;
-- 可选 repository 或 organization secret `KUASAR_CI_PROXY_URL`,以及可选 variable
-  `KUASAR_CI_NO_PROXY`。
+- repository secret `KUASAR_CI_APP_PRIVATE_KEY`。
 
 GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、Release 元数据和
 资产。自托管 runner 在执行任何仓库代码前撤销 token。具备 `contents:write` 的
@@ -174,13 +173,12 @@ GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、R
 publish job 只验证 bundle、创建 tag、上传资产和发布 draft,不运行组件二进制;
 每日 mapping step 只向本仓 `release` 分支追加当日不可变 mapping。
 
-`KUASAR_CI_PROXY_URL` 只投影为受信组件/聚合发布 job 的小写 `http_proxy` /
-`https_proxy`,用于 GitHub checkout、API 和仍需外网的依赖下载;普通 PR BMS 不接收该
-secret。代理带凭据时必须使用 secret,不得把 URL 写入仓库。`KUASAR_CI_NO_PROXY` 由
-部署方列出本机、沙箱测试网段和内部服务。未配置 proxy secret 时保持直连。runner
-下载 Action 本身早于 job step,还需按 BMS runner 部署文档把同一组小写变量写入
-runner 安装目录的 `.env` 并重启 runner;执行 fork 代码的 runner 级代理只能依赖网络
-侧 ACL,不得向 workload 暴露可复用凭据。
+自托管 BMS 的 GitHub 出口代理统一由 runner 安装目录的 `.env` 提供小写
+`http_proxy` / `https_proxy` / `no_proxy`,workflow 不覆盖这些变量。这样 Action 下载、
+checkout、API 请求和仍需外网的依赖下载使用同一条出口,未配置时则保持 runner 原有
+直连环境。各 workflow 另行配置 Go、Rust、Python 和 Linux kernel 中国大陆镜像以减少
+跨境依赖。`.env` 只允许配置依靠网络侧 ACL 的无凭据代理,不得向会执行 fork 代码的
+workload 暴露可复用凭据;修改后必须按 BMS runner 部署文档重启各 slot。
 
 ## 4. 设计
 

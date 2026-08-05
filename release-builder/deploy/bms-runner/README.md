@@ -147,13 +147,14 @@ flow; a completed registration is left unchanged.
 ## GitHub outbound proxy
 
 When direct GitHub connectivity from mainland China is unreliable, configure
-the organization-controlled egress proxy before starting the slots. Keep the
-proxy URL and optional credentials outside the repository in a root-readable
-file using the lowercase variable names consumed by the runner:
+the organization-controlled egress proxy before starting the slots. The proxy
+must be credentialless from the workload's perspective and authorize egress by
+network-side policy. Keep its URL outside the repository in a root-readable file
+using the lowercase variable names consumed by the runner:
 
 ```text
-https_proxy=<proxy-url>
-http_proxy=<proxy-url>
+https_proxy=<organization-proxy-url>
+http_proxy=<organization-proxy-url>
 no_proxy=<internal-hosts-and-test-networks>
 ```
 
@@ -173,13 +174,10 @@ reconciles the runner distribution. These runners execute fork code; the
 runner-level proxy must therefore use network-side access control and must not
 put reusable credentials where a workload can read them.
 
-Release workflows also accept the same URL as the `KUASAR_CI_PROXY_URL` Actions
-secret and the bypass list as the `KUASAR_CI_NO_PROXY` variable. That secret is
-projected only into trusted component/aggregate release jobs, never ordinary
-PR BMS jobs. Configure it when release steps must use the proxy even on a
-runner without `.env`; never commit the URL or credentials. The bypass list
-must include local control endpoints, sandbox test networks, and internal
-registries so E2E traffic remains local.
+The `.env` `no_proxy` list must include local control endpoints, sandbox test
+networks, and internal registries so E2E traffic remains local. Workflows do
+not override these variables, which also preserves a runner's direct network
+environment when no proxy is configured.
 
 All runners join the existing `kuasar-e2e` organization group with labels
 `kuasar-e2e,kvm,cgroup-v2` plus a slot label. The group must remain
