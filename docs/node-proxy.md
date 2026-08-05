@@ -136,12 +136,13 @@ Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公�
 ```text
 sid hash ─► record slot ─► RouteEntry
                          ├─ running → 立即转发
-                         ├─ starting → MMDS 可见;数据面 park,不发 Wake
+                         ├─ starting → MMDS 可见;数据面 park,不发 Wake;回滚即结束
                          └─ missing/paused → wake pipe → park 等待共享表更新
 ```
 
 worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor launch owner
-推进,worker 只等待 running/delete/paused 更新,不得再发 Wake。master 去重后通过 routesync
+推进,worker 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新立即结束
+starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 
 共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
@@ -305,7 +306,8 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
 - **routesync 断开**:master 指数退避重连;重连后重新同步。共享表在重同步期间保留旧
   路由,Bookmark 后清除断连期间删除的记录。
 - **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;starting
-  只 park、不 Wake;resume 单飞和当前 launch 的状态推进仍由 conductor 执行。
+  只 park、不 Wake,变为 paused/Delete 时立即结束;resume 单飞和当前 launch 的状态推进
+  仍由 conductor 执行。
 - **失败码**:非法 target = 400;exec 的非 CONNECT method = 405;未知/未就绪 sid = 404;
   鉴权失败 = 401;已识别但 profile/当前 proxy 模式不支持的 service 或 off = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503.

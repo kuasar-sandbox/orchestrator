@@ -116,6 +116,58 @@ func TestWorkerActivateExecWaitsForStartingWithoutWake(t *testing.T) {
 	}
 }
 
+func TestWorkerActivateExecStartingRollbackReturnsAbsent(t *testing.T) {
+	for _, rollback := range []string{routesync.StatePaused, routesync.StateDead} {
+		t.Run(rollback, func(t *testing.T) {
+			tbl := newExecTable(t)
+			route := execWorkerRoute("starting-rollback", routesync.StateStarting)
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+			tbl.Bookmark()
+			updates := &Updates{ch: make(chan struct{})}
+			var wakes atomic.Int32
+			view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+			type result struct {
+				identity proxy.ExecIdentity
+				found    bool
+				err      error
+			}
+			done := make(chan result, 1)
+			expected := execWorkerIdentity(route.SandboxID)
+			go func() {
+				identity, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+				done <- result{identity: identity, found: found, err: err}
+			}()
+			select {
+			case got := <-done:
+				t.Fatalf("starting exec returned before rollback: %+v", got)
+			case <-time.After(20 * time.Millisecond):
+			}
+			if rollback == routesync.StateDead {
+				tbl.Delete(route.SandboxID)
+			} else {
+				route.State = rollback
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			updates.bump()
+			select {
+			case got := <-done:
+				if got.err != nil || got.found || got.identity != (proxy.ExecIdentity{}) {
+					t.Fatalf("starting exec after %s rollback = %+v, %v, %v", rollback, got.identity, got.found, got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("starting exec did not stop waiting after %s rollback", rollback)
+			}
+			if got := wakes.Load(); got != 0 {
+				t.Fatalf("starting exec rollback emitted %d wakes", got)
+			}
+		})
+	}
+}
+
 func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *testing.T) {
 	tbl := newExecTable(t)
 	route := execWorkerRoute("paused", routesync.StatePaused)

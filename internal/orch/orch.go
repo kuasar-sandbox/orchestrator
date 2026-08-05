@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1343,10 +1342,7 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 	return ref, nil
 }
 
-const (
-	envdInitAttemptTimeout = 50 * time.Millisecond
-	envdInitErrorBodyLimit = 100
-)
+const envdInitAttemptTimeout = 50 * time.Millisecond
 
 // udsClient builds a bounded HTTP client that dials the envd --connect UDS.
 func udsClient(sock string) *http.Client {
@@ -1410,26 +1406,14 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := cl.Do(req)
 		if err == nil {
-			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, envdInitErrorBodyLimit+1))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent {
 				return nil
 			}
-			if readErr != nil {
-				return fmt.Errorf("orch: envd /init for %s status %d: read response: %w", sb.ID, resp.StatusCode, readErr)
-			}
-			truncated := len(responseBody) > envdInitErrorBodyLimit
-			if truncated {
-				responseBody = responseBody[:envdInitErrorBodyLimit]
-			}
-			detail := strings.TrimSpace(string(responseBody))
-			if detail == "" {
-				return fmt.Errorf("orch: envd /init for %s status %d", sb.ID, resp.StatusCode)
-			}
-			if truncated {
-				detail += "..."
-			}
-			return fmt.Errorf("orch: envd /init for %s status %d: %s", sb.ID, resp.StatusCode, detail)
+			// Do not include envd's response body: validation failures may echo the
+			// request's access token or user-supplied environment values, and this
+			// error is logged by create/cluster callers.
+			return fmt.Errorf("orch: envd /init for %s status %d", sb.ID, resp.StatusCode)
 		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("orch: envd /init for %s: %w", sb.ID, ctx.Err())

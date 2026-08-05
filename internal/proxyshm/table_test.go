@@ -277,6 +277,61 @@ func TestWorkerStartingRouteWaitsWithoutWake(t *testing.T) {
 	}
 }
 
+func TestWorkerStartingRouteStopsWaitingOnRollback(t *testing.T) {
+	for _, rollback := range []string{routesync.StatePaused, routesync.StateDead} {
+		t.Run(rollback, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "routes.shm")
+			tbl, err := Create(path, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			updates := &Updates{ch: make(chan struct{})}
+			var wakes atomic.Int32
+			worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+			route := routesync.RouteEntry{
+				SandboxID: "s1", Profile: "e2b", State: routesync.StateStarting,
+				EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd",
+			}
+			tbl.BeginSync()
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+			tbl.Bookmark()
+			done := make(chan proxy.Route, 1)
+			go func() {
+				got, _ := worker.Route(context.Background(), route.SandboxID, proxy.LegacyTarget(49983))
+				done <- got
+			}()
+			select {
+			case got := <-done:
+				t.Fatalf("starting route returned before rollback: %+v", got)
+			case <-time.After(20 * time.Millisecond):
+			}
+			if rollback == routesync.StateDead {
+				tbl.Delete(route.SandboxID)
+			} else {
+				route.State = rollback
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			updates.bump()
+			select {
+			case got := <-done:
+				if got.Kind != proxy.KindNotFound {
+					t.Fatalf("route after %s rollback = %+v", rollback, got)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("starting route did not stop waiting after %s rollback", rollback)
+			}
+			if got := wakes.Load(); got != 0 {
+				t.Fatalf("starting rollback emitted %d wakes", got)
+			}
+		})
+	}
+}
+
 func TestWorkerDeadRouteReturnsNotFoundWithoutWake(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)

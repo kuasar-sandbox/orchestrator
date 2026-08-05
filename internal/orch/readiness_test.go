@@ -398,7 +398,7 @@ func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
 	}
 }
 
-func TestEnvdInitNon204FailsWithoutRetry(t *testing.T) {
+func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
 	cfg := &config.Config{}
 	o := &Orchestrator{cfg: cfg}
 	sb := &types.Sandbox{ID: "hard-failure", EnvdUDS: filepath.Join(shortOrchestratorTestDir(t), "envd.sock")}
@@ -412,7 +412,7 @@ func TestEnvdInitNon204FailsWithoutRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err := o.envdInit(ctx, sb)
-	if err == nil || !strings.Contains(err.Error(), "status 503") || !strings.Contains(err.Error(), "temporary init failure") || !strings.HasSuffix(err.Error(), "...") {
+	if err == nil || !strings.Contains(err.Error(), "status 503") || strings.Contains(err.Error(), "temporary init failure") {
 		t.Fatalf("envd /init error = %v", err)
 	}
 	if got := attempts.Load(); got != 1 {

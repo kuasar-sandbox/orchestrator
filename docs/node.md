@@ -715,7 +715,8 @@ WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一
   请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。runtime
   wire 与 mandatory `/init` 共用一次 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
   错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
-  非 204(携带最多 100 bytes 响应摘要),协议错误、提前 EOF、取消或总预算超时都返回
+  非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
+  EOF、取消或总预算超时都返回
   launch 失败:create 将已持久化的 starting 行按 run-id fence 标 dead,resume 则回退
   paused;分配/持久化前失败不插入 dead 行.只有 `/init` 成功后才以同一 run-id 把
   starting CAS 为 running 并发布 running route.
@@ -917,7 +918,8 @@ starting ──success──► running ──pause / TTL──► paused
   starting/dead,显式 state 过滤仍可用于诊断。
 - starting route 对 MMDS 可见,使 guest 在 `/init` 中取得当前身份/token;普通 envd、forward
   和 native exec 数据面在 running 前不得转发。external worker 见 starting 时只 park 等待
-  running/delete/paused 更新,不发送第二次 Wake;paused 才发 Wake 触发 resume。
+  running/delete/paused 更新,不发送第二次 Wake;回滚为 paused/Delete 时立即结束等待,
+  paused 初始请求才发 Wake 触发 resume。
 - `POST /sandboxes/{id}/pause` body 可为空或为:
 
   ```json
@@ -941,7 +943,8 @@ starting ──success──► running ──pause / TTL──► paused
     完成鉴权、可选 KMT import 和凭据读取,接受同一 single-flight 的异步 resume 后立即返回;
     带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
   - exec-session 签发同步完成可选 import,对象/凭据校验和 KAT 签名,
-    然后只接受异步 resume 并立即返回.KAT 签名失败时不启动 resume;
+    然后只接受异步 resume 并立即返回;目标已 starting 时可继续签发但不重复 resume。
+    KAT 签名失败时不启动 resume;
     后续数据面的无效 KAT 也不能触发本地恢复.
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
