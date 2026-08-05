@@ -1,0 +1,13 @@
+{
+  "architecture": "x86_64",
+  "components": {
+    "accelerator": "v0.1.0-preview.20260806",
+    "connector": "v0.1.0-preview.20260806",
+    "orchestrator": "v0.1.0-preview.20260806",
+    "runtime": "runtime-v0.1.0-preview.20260806",
+    "sandboxer": "v0.1.0-preview.20260806",
+    "vmlinux": "vmlinux-v0.1.0-preview.20260806"
+  },
+  "schemaVersion": 1,
+  "version": "release-v0.1.0-preview.20260806"
+}
