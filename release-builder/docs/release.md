@@ -117,17 +117,18 @@ gh workflow run aggregate-release.yml \
 日期取 Actions run 的 `created_at` 并转换到上海时区,因此排队或 job 重试不会改变
 目标 tag。同日 Release 已完成时 workflow 幂等跳过;主触发仍在执行时,同仓
 schedule concurrency 会串行等待,随后再次检查并跳过。schedule 与人工
-`workflow_dispatch` 使用独立 concurrency group,恢复触发不会替换正在等待的人工发布。
-preview 在实际发布前再次检查对应正式版;若人工正式版在 preview 构建期间完成,本次
-preview 直接成功结束而不创建 Release。对应正式 `v0.1.0` 已发布后,该版本线停止自动
-preview。两次独立 schedule 还覆盖 GitHub 高负载下定时事件延迟或丢弃的情况,不是对
-同一 Release 的覆盖发布。
+`workflow_dispatch` 构建使用独立 concurrency group,恢复触发不会替换正在等待的人工
+构建;同一版本线的短暂 publish job 仍共享 concurrency group。preview 取得发布锁后
+再次检查对应正式版;若人工正式版先完成,本次 preview 直接成功结束而不创建 Release。
+对应正式 `v0.1.0` 已发布后,该版本线停止自动 preview。两次独立 schedule 还覆盖
+GitHub 高负载下定时事件延迟或丢弃的情况,不是对同一 Release 的覆盖发布。
 
-runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待两小时,因此也能接纳
-04:xx 组件恢复触发的结果;06:17 聚合恢复触发负责处理此前仍未形成公开聚合 Release
-的情况。六个同日组件 prerelease 均已公开后,workflow 才把确定的版本组合写入
-`release` 分支、执行完整 BMS E2E 并发布聚合 prerelease。等待和解析只有跨仓读取
-权限;组件工作流之间不互相 dispatch,也不要求跨仓 Actions 写权限。
+runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待 45 分钟,覆盖组件正常
+发布的短时延迟;06:17 聚合恢复触发负责接纳 04:xx 组件恢复结果及此前仍未形成的公开
+聚合 Release。等待结束后 workflow 重新签发短期只读 token,再解析和下载组件,避免
+轮询消耗后续凭据寿命。六个同日组件 prerelease 均已公开后,workflow 才把确定的版本
+组合写入 `release` 分支、执行完整 BMS E2E 并发布聚合 prerelease。等待和解析只有跨仓
+读取权限;组件工作流之间不互相 dispatch,也不要求跨仓 Actions 写权限。
 
 ## 3. 配置
 

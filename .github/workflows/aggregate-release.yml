@@ -100,7 +100,7 @@ jobs:
             "kuasar-sandbox/guest-runtime vmlinux-v0.1.0-preview.$date"
           )
           ready=false
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 45); do
             missing=()
             for entry in "${component_tags[@]}"; do
               read -r repository tag <<< "$entry"
@@ -114,9 +114,9 @@ jobs:
               ready=true
               break
             fi
-            printf 'Waiting for daily component previews (attempt %d/120): %s\n' \
+            printf 'Waiting for daily component previews (attempt %d/45): %s\n' \
               "$attempt" "${missing[*]}"
-            sleep 60
+            [ "$attempt" -eq 45 ] || sleep 60
           done
           [ "$ready" = true ] || { echo "Daily component previews did not become ready" >&2; exit 1; }
           jq -n \
@@ -143,11 +143,23 @@ jobs:
             ' > mapping.json
           bash release-builder/scripts/release-map.sh put mapping.json
 
+      - name: Refresh read-only component token after scheduled wait
+        id: fresh-source-token
+        if: github.event_name == 'schedule' && steps.request.outputs.publish == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
+          owner: kuasar-sandbox
+          repositories: accelerator,connector,guest-runtime,orchestrator,sandboxer
+          permission-contents: read
+          skip-token-revoke: true
+
       - name: Resolve release mapping and component releases
         id: input
         if: steps.request.outputs.publish == 'true'
         env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          GH_TOKEN: ${{ steps.fresh-source-token.outputs.token || steps.source-token.outputs.token }}
           VERSION: ${{ steps.request.outputs.version }}
         run: |
           set -euo pipefail
@@ -171,7 +183,7 @@ jobs:
         id: assets
         if: steps.request.outputs.publish == 'true'
         env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          GH_TOKEN: ${{ steps.fresh-source-token.outputs.token || steps.source-token.outputs.token }}
           VERSION: ${{ steps.request.outputs.version }}
         run: |
           set -euo pipefail
@@ -181,25 +193,29 @@ jobs:
           artifact="aggregate-assets-${VERSION}-${GITHUB_RUN_ID}"
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
 
-      - name: Revoke component token
-        if: ${{ always() && steps.source-token.outputs.token != '' }}
+      - name: Revoke component tokens
+        if: ${{ always() && (steps.source-token.outputs.token != '' || steps.fresh-source-token.outputs.token != '') }}
         env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          PRIMARY_TOKEN: ${{ steps.source-token.outputs.token }}
+          FRESH_TOKEN: ${{ steps.fresh-source-token.outputs.token }}
         run: |
           set -euo pipefail
-          status=$(curl --show-error --silent \
-            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-            --request DELETE \
-            --output /dev/null \
-            --write-out '%{http_code}' \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/installation/token)
-          case "$status" in
-            204|401) ;;
-            *) echo "failed to revoke component token: HTTP $status" >&2; exit 1 ;;
-          esac
+          for token in "$PRIMARY_TOKEN" "$FRESH_TOKEN"; do
+            [ -n "$token" ] || continue
+            status=$(curl --show-error --silent \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              --request DELETE \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $token" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/installation/token)
+            case "$status" in
+              204|401) ;;
+              *) echo "failed to revoke component token: HTTP $status" >&2; exit 1 ;;
+            esac
+          done
 
       - name: Upload resolved aggregate input
         if: steps.request.outputs.publish == 'true'
@@ -238,6 +254,9 @@ jobs:
       - bms
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: aggregate-publish-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
