@@ -86,7 +86,7 @@ jobs:
       - kuasar-e2e
       - kvm
       - cgroup-v2
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode == 'working-set-perf' && 180 || 30 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.run_mode == 'working-set-perf' && 180 || 45 }}
     env:
       TARGET_ARCH: x86_64
       GOPROXY: https://goproxy.cn,direct
@@ -205,6 +205,15 @@ jobs:
 
       - name: Check out trusted aggregate tooling
         if: inputs.release_input_artifact != ''
+        id: checkout-trusted-aggregate
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted/orchestrator
+          persist-credentials: false
+
+      - name: Retry trusted aggregate tooling checkout
+        if: inputs.release_input_artifact != '' && steps.checkout-trusted-aggregate.outcome == 'failure'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: trusted/orchestrator
@@ -475,13 +484,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
-          curl --fail --show-error --silent \
+          set -euo pipefail
+          status=$(curl --show-error --silent \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
             --request DELETE \
             --output /dev/null \
+            --write-out '%{http_code}' \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/installation/token
+            https://api.github.com/installation/token)
+          case "$status" in
+            204|401) ;;
+            *) echo "failed to revoke source token: HTTP $status" >&2; exit 1 ;;
+          esac
 
       - name: Finalize the five-repository workspace
         run: |
@@ -498,6 +514,7 @@ jobs:
               "$source_dir" "$source_dir/$resolved_sha.tar.gz"
           done < <(tail -n +2 "$KUASAR_REVISION_MANIFEST")
 
+          rm -f go.work go.work.sum src/go.work src/go.work.sum
           cd src
           go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer
 

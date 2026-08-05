@@ -101,26 +101,34 @@ gh workflow run aggregate-release.yml \
 
 ### 2.3 每日 preview
 
-正式 `v0.1.0` 发布前,各仓按 `Asia/Shanghai` 错峰生成同一天的 preview:
+正式 `v0.1.0` 发布前,各仓按 `Asia/Shanghai` 错峰生成同一天的 preview。主触发
+集中在 02:00 前后,同日恢复触发只在主流程没有完成 Release 时重新执行:
 
-| 时间 | 发布入口 | 当日版本 |
-|---|---|---|
-| 00:17 | accelerator | `v0.1.0-preview.YYYYMMDD` |
-| 00:27 | connector | `v0.1.0-preview.YYYYMMDD` |
-| 00:37 | sandboxer | `v0.1.0-preview.YYYYMMDD` |
-| 00:47 | vmlinux | `vmlinux-v0.1.0-preview.YYYYMMDD` |
-| 00:57 | orchestrator | `v0.1.0-preview.YYYYMMDD` |
-| 02:17 | runtime | `runtime-v0.1.0-preview.YYYYMMDD` |
-| 06:17 | aggregate | `release-v0.1.0-preview.YYYYMMDD` |
+| 主触发 | 恢复触发 | 发布入口 | 当日版本 |
+|---|---|---|---|
+| 02:07 | 04:07 | accelerator | `v0.1.0-preview.YYYYMMDD` |
+| 02:12 | 04:12 | connector | `v0.1.0-preview.YYYYMMDD` |
+| 02:17 | 04:17 | sandboxer | `v0.1.0-preview.YYYYMMDD` |
+| 02:22 | 04:22 | vmlinux | `vmlinux-v0.1.0-preview.YYYYMMDD` |
+| 02:27 | 04:27 | orchestrator | `v0.1.0-preview.YYYYMMDD` |
+| 02:47 | 04:47 | runtime | `runtime-v0.1.0-preview.YYYYMMDD` |
+| 03:47 | 06:17 | aggregate | `release-v0.1.0-preview.YYYYMMDD` |
 
 日期取 Actions run 的 `created_at` 并转换到上海时区,因此排队或 job 重试不会改变
-目标 tag。同日 Release 已完成时 workflow 幂等跳过;对应正式 `v0.1.0` 已发布后,
-该版本线停止自动 preview。
+目标 tag。同日 Release 已完成时 workflow 幂等跳过;主触发仍在执行时,同仓
+schedule concurrency 会串行等待,随后再次检查并跳过。schedule 与人工
+`workflow_dispatch` 构建使用独立 concurrency group,恢复触发不会替换正在等待的人工
+构建;同一版本线的短暂 publish job 仍共享 concurrency group。preview 取得发布锁后
+再次检查对应正式版;若人工正式版先完成,本次 preview 直接成功结束而不创建 Release。
+对应正式 `v0.1.0` 已发布后,该版本线停止自动 preview。两次独立 schedule 还覆盖
+GitHub 高负载下定时事件延迟或丢弃的情况,不是对同一 Release 的覆盖发布。
 
-runtime 使用同日 sandboxer preview 构建。聚合 job 最多等待两小时,直到六个同日
-组件 prerelease 均已公开,再把确定的版本组合写入 `release` 分支、执行完整 BMS
-E2E 并发布聚合 prerelease。等待和解析只有跨仓读取权限;组件工作流之间不互相
-dispatch,也不要求跨仓 Actions 写权限。
+runtime 使用同日 sandboxer preview 构建。聚合主触发最多等待 45 分钟,覆盖组件正常
+发布的短时延迟;06:17 聚合恢复触发负责接纳 04:xx 组件恢复结果及此前仍未形成的公开
+聚合 Release。等待结束后 workflow 重新签发短期只读 token,再解析和下载组件,避免
+轮询消耗后续凭据寿命。六个同日组件 prerelease 均已公开后,workflow 才把确定的版本
+组合写入 `release` 分支、执行完整 BMS E2E 并发布聚合 prerelease。等待和解析只有跨仓
+读取权限;组件工作流之间不互相 dispatch,也不要求跨仓 Actions 写权限。
 
 ## 3. 配置
 
@@ -167,6 +175,13 @@ GitHub App token 只有五仓 `contents:read`,用于读取依赖源码、tag、R
 `GITHUB_TOKEN` 只存在于 GitHub-hosted publish job和每日聚合的 mapping step。
 publish job 只验证 bundle、创建 tag、上传资产和发布 draft,不运行组件二进制;
 每日 mapping step 只向本仓 `release` 分支追加当日不可变 mapping。
+
+自托管 BMS 的 GitHub 出口代理统一由 runner 安装目录的 `.env` 提供小写
+`http_proxy` / `https_proxy` / `no_proxy`,workflow 不覆盖这些变量。这样 Action 下载、
+checkout、API 请求和仍需外网的依赖下载使用同一条出口,未配置时则保持 runner 原有
+直连环境。各 workflow 另行配置 Go、Rust、Python 和 Linux kernel 中国大陆镜像以减少
+跨境依赖。`.env` 只允许配置依靠网络侧 ACL 的无凭据代理,不得向会执行 fork 代码的
+workload 暴露可复用凭据;修改后必须按 BMS runner 部署文档重启各 slot。
 
 ## 4. 设计
 
@@ -260,10 +275,12 @@ Release 列表定位同 tag draft 的 ID;失败重试时先按 ID 删除残留 d
 
 | 失败位置 | 远端状态 | 处理 |
 |---|---|---|
+| 主 schedule 未触发或网络构建失败 | 无当日组件 Release | 04:xx 同日恢复 schedule 自动重试;已完成 Release 幂等跳过 |
+| 自托管源码 checkout 瞬断 | 无 Release 或只有本次 Actions 临时状态 | 同一 job 在首次 checkout 失败后执行一次有界重试;仍失败时交给同日恢复 schedule |
 | mapping 提交 | 无组件或聚合发布 | 修正 mapping/并发冲突后重试 `release-suite.sh` |
 | 独立组件构建或测试 | mapping 已记录,缺少对应组件 Release | 修复组件后重跑快捷入口;已完成版本会复用 |
 | 聚合解析 | 组件 Release 不完整或 digest 不一致 | 修复/重新发布新的组件版本,新增聚合 mapping;不改写旧版本 |
-| BMS E2E | 六个组件 Release 保持不变,无聚合 Release | 修复组件并选择新版本,或修复测试环境后重跑同一 mapping |
+| BMS E2E | 六个组件 Release 保持不变,无聚合 Release | 瞬时环境故障重跑同一 mapping;workspace 初始化先清理本 workflow 的 `go.work` 残留 |
 | draft 上传或 digest 校验 | 可能留下 tag/draft,公开 Release 不存在 | 重试 publish job;发布器按 ID 清理同 tag draft 后重建 |
 | 发布后最终检查 | Release 已公开 | 人工核查远端 ref;脚本不会覆盖已发布资产 |
 
