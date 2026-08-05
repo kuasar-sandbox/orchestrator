@@ -478,7 +478,9 @@ func (s *Store) Get(ctx context.Context, id string) (*types.Sandbox, error) {
 // List returns sandboxes ordered by id (cursor pagination). ownerCandidateHash
 // is the 24-hex API-secret fingerprint prefix embedded in an API key. It is only
 // a pre-filter; the caller must verify the API-key MAC against every candidate.
-// An empty ownerCandidateHash returns all records for internal callers.
+// An empty ownerCandidateHash disables only the owner filter. When state is
+// empty, List returns the public running/paused states and hides internal
+// starting/dead lifecycle records.
 func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limit int, cursor string) ([]*types.Sandbox, string, error) {
 	if limit <= 0 {
 		limit = 100 // default page
@@ -492,6 +494,11 @@ func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limi
 	if state != "" {
 		conds = append(conds, "state=?")
 		args = append(args, state)
+	} else {
+		// Match the upstream E2B list contract: an omitted state means the two
+		// public states, not internal starting/dead lifecycle records.
+		conds = append(conds, "state IN (?,?)")
+		args = append(args, string(types.StateRunning), string(types.StatePaused))
 	}
 	if ownerCandidateHash != "" {
 		conds = append(conds, "substr(api_secret_hash,1,24)=?")
@@ -564,8 +571,9 @@ func (s *Store) SetState(ctx context.Context, id string, st types.State) error {
 }
 
 // CASRunState changes lifecycle state only while the row still names the exact
-// runner that observed the transition. It fences late cleanup from changing a
-// deleted, recreated, or subsequently launched sandbox with the same ID.
+// runner that observed the transition. It fences late launch completion/cleanup
+// from changing a deleted, recreated, or subsequently launched sandbox with the
+// same ID.
 func (s *Store) CASRunState(ctx context.Context, id, runID string, from, to types.State) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET state=? WHERE id=? AND run_id=? AND state=?`,
 		string(to), id, runID, string(from))

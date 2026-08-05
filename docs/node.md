@@ -121,10 +121,12 @@ create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
 配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 拿
 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml`
 → 从 runner pool 分配一个 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)
-→ 持久化 `sid ↔ run-id` → 单元内 `run-sandbox` 经 config-socket 的
+→ 以 `starting` 持久化 `sid ↔ run-id`,并发布仅供 MMDS 使用的 starting route
+→ 单元内 `run-sandbox` 经 config-socket 的
 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
-→ 起 microVM → (e2b)等 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户
-→ 起 TTL。集群下,该 create 由 node-link 的 `create` 命令触发;profile、group、route-key
+→ 起 microVM → 严格完成 runtime readiness wire → (e2b)直接 `POST /init` 置 env/默认用户
+→ 以 run-id CAS 为 `running`并开放数据面 → 起 TTL。集群下,该 create 由 node-link 的
+`create` 命令触发;profile、group、route-key
 和可选认证主体通过结构化系统上下文下发并独立持久化。事件回报 profile、node-owned
 执行事实和受保护路由凭据投影,registry 从既有节点归属记录恢复其 cluster identity
 (§10、§4.6)。
@@ -420,7 +422,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 |---|---|---|
 | create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
-| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
+| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404 |
 | resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import,随后接受异步 resume 并返回(§8.1);目标已存在时不解析 token |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,可选 `ttlSeconds` 和 `X-Kuasar-Migration-Token`;不创建 guest process |
@@ -709,10 +711,15 @@ WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:serve 在分配 runner 前先绑定 `<run_root>/<sid>/ready.sock`(目录 0700、
   socket 0600),分配后从 node-ctl 的 one-shot 连接严格读取
-  `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后仍轮询 envd `/health`,
-  因为 runtime 的 `ready` 不承诺 envd 已监听。runtime wire 与 envd health 共用一次
-  60s 启动预算;协议错误、提前 EOF、取消或超时沿现有 create teardown / resume
-  rollback 返回。envd `/init` 失败仍只记 warning。
+  `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
+  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。runtime
+  wire 与 mandatory `/init` 共用一次 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
+  错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
+  非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
+  EOF、取消或总预算超时都返回
+  launch 失败:create 将已持久化的 starting 行按 run-id fence 标 dead,resume 则回退
+  paused;分配/持久化前失败不插入 dead 行.只有 `/init` 成功后才以同一 run-id 把
+  starting CAS 为 running 并发布 running route.
 - **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
   run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
@@ -885,15 +892,17 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 ## 8. 生命周期与状态机
 
 ```
-            create(img: cold boot / snp: restore)
-                 │
-                 ▼            pause / TTL(auto-suspend)
-   ┌────────► running ───────────────────────────────► paused
-   │             │                                       │
-   │             │ kill                                  │
-   │             ▼                                       │
-   │           (row deleted)                             │
-   └──────◄── connect(resume) / data-plane wake ──◄──────┘
+create(img: cold boot / snp: restore)
+  │
+  ▼
+starting ──success──► running ──pause / TTL──► paused
+  │                     │                       │
+  │                     └──kill──► row deleted  │ connect / data wake
+  │                                             ▼
+  └──create failure──► dead                  starting
+                                                │
+                          running ◄──success─────┤
+                                                └──resume failure──► paused
 ```
 
 - 操作映射:create(img = 冷启 / snp = restore)、connect = resume、pause = snapshot、
@@ -901,6 +910,16 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   失联的 running 标为 `dead`(§15);paused/dead 行中,paused 可再拉起,kill 删行。
   集群下,这些操作另由 node-link 命令触发(create/connect/exec_session/delete,§10),并把
   状态变化作为事件上报 registry。
+- `starting` 是持久化的节点内部 launch 状态,不是 e2b readiness。runner assignment 与
+  starting 行写入同一回调;写入失败会把 run-id 归还 pool,不生成业务行。create 和 resume
+  均在 runtime wire 与 mandatory `/init` 完成后,以精确 run-id CAS `starting -> running`。
+  create 的持久化后失败 CAS 为 dead;resume 的失败 CAS 回 paused。两条失败回滚都受 run-id
+  fence 保护,迟到清理不得覆盖已删除或后续重新 launch 的同 ID 实例。默认 list 隐藏
+  starting/dead,显式 state 过滤仍可用于诊断。
+- starting route 对 MMDS 可见,使 guest 在 `/init` 中取得当前身份/token;普通 envd、forward
+  和 native exec 数据面在 running 前不得转发。external worker 见 starting 时只 park 等待
+  running/delete/paused 更新,不发送第二次 Wake;回滚为 paused/Delete 时立即结束等待,
+  paused 初始请求才发 Wake 触发 resume。
 - `POST /sandboxes/{id}/pause` body 可为空或为:
 
   ```json
@@ -924,7 +943,8 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
     完成鉴权、可选 KMT import 和凭据读取,接受同一 single-flight 的异步 resume 后立即返回;
     带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
   - exec-session 签发同步完成可选 import,对象/凭据校验和 KAT 签名,
-    然后只接受异步 resume 并立即返回.KAT 签名失败时不启动 resume;
+    然后只接受异步 resume 并立即返回;目标已 starting 时可继续签发但不重复 resume。
+    KAT 签名失败时不启动 resume;
     后续数据面的无效 KAT 也不能触发本地恢复.
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
@@ -1061,6 +1081,9 @@ plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(clust
 - **auto-resume 单飞**:数据面打到 paused 沙箱触发 resume——internal 在请求内同步触发,
   external 经 routesync `Wake` 上行;同一 sid 的并发请求经 per-sid single-flight 合并为
   一次 resume(§8)。
+- **starting 投影**:runner assignment 持久化后即广播 starting,供 internal/external MMDS
+  完成 envd `/init`;它不开放数据面,也不触发 Wake。launch 成功再广播 running;create
+  失败广播 Delete,resume 失败广播 paused。
 - **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
   是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
   `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
@@ -1139,7 +1162,7 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 
 ```text
 sandbox{
-  sid, profile, state, snap_loc, template_id,
+  sid, profile, state(starting|running|paused|dead), snap_loc, template_id,
   auth_sandbox_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
@@ -1151,7 +1174,9 @@ bookmark{full_sync}
 ```
 
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
-物化受保护 route 时不采纳该字段。节点事件按以上用途显式携带其余凭据。
+物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry
+将它计入 full-sync seen set 但不改写 reserved/paused route;running/paused/delete 才驱动
+cluster route 状态收敛。节点事件按以上用途显式携带其余凭据。
 
 node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelink owner 在任务下发前已维护
 本节点完整的 sandbox/build 归属表,收到事件后以 `(node_id,sid)` 或
@@ -1231,8 +1256,10 @@ plugin 平面,机群路由经 registry 聚合。
   `files:` 机制注入 `/etc/hosts`(`127.0.1.1 <hostname>` 条目)与 `/etc/resolv.conf`
   (`sandbox.network.dns`),并经 `network.hostname` sethostname;launch 与 restore
   均生效。
-- host 在 envd 就绪后调 **`POST /init`**(经 UDS):置 `envVars`、默认用户
-  `user`/workdir `/home/user`,时间戳;仅 `mmds.enabled` 时携带 `accessToken`(node-proxy.md §7).
+- host 在 runtime readiness wire 完成后直接调 mandatory **`POST /init`**(经 UDS):置
+  `envVars`、默认用户 `user`/workdir `/home/user`,时间戳;仅 `mmds.enabled` 时携带
+  `accessToken`(node-proxy.md §7).envd socket 尚未可拨由上述短退避传输重试吸收,
+  无启动期 `/health` 探测.
 
 ## 12. 模板构建(三阶段流水线,构建在沙箱内进行)
 
@@ -1431,7 +1458,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, auth_sandbox_id,
-               template_id, state(running|paused|dead), deadline_unix,
+               template_id, state(starting|running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc, snapshot_ref,
@@ -1455,6 +1482,8 @@ AES-256-GCM、两项 `*_hash` 均为
 
 serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活权威:
 
+- 库内 starting 不收养为 running:先停止/清理对应 runner,有 `snapshot_ref` 表示被中断的
+  resume,按同一 run-id CAS 回 paused;否则是被中断的 fresh create,按同一 run-id CAS 为 dead;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;

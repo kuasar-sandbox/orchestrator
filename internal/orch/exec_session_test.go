@@ -56,6 +56,35 @@ func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
 	}
 }
 
+func TestExecSessionMintsTokenWithoutRestartingStartingResume(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("c", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	sb := &types.Sandbox{
+		ID: "starting-exec", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
+		State:      types.StateStarting, RunID: "starting-run",
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.ExecSession(ctx, sb.ID, apiKey, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Now()); err != nil {
+		t.Fatalf("starting exec token: %v", err)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != sb.RunID {
+		t.Fatalf("exec-session changed starting resume: %+v err=%v", stored, err)
+	}
+}
+
 func TestExecSessionWithoutTTLIsLongLived(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "bare-1", Profile: types.ProfileBare,

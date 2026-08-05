@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -9,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -171,7 +174,7 @@ func TestLaunchBindsBeforeAssignmentAndBareWaitsForRuntime(t *testing.T) {
 	}
 }
 
-func TestE2BLaunchChecksEnvdAfterRuntimeAndInitRemainsWarning(t *testing.T) {
+func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	assigned := make(chan string, 1)
 	lc := &countingLauncher{assigned: assigned, readinessDelay: 150 * time.Millisecond}
 	cfg := &config.Config{}
@@ -179,6 +182,8 @@ func TestE2BLaunchChecksEnvdAfterRuntimeAndInitRemainsWarning(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	o.sandboxReadyTimeout = 2 * time.Second
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "e2b-order")
+	events, cancelEvents := o.Subscribe()
+	defer cancelEvents()
 
 	done := make(chan error, 1)
 	go func() { done <- o.launch(ctx, sb, tmpl) }()
@@ -187,22 +192,11 @@ func TestE2BLaunchChecksEnvdAfterRuntimeAndInitRemainsWarning(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner did not receive assignment")
 	}
-	ln, err := net.Listen("unix", sb.EnvdUDS)
-	if err != nil {
-		t.Fatal(err)
-	}
 	requests := make(chan string, 4)
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.URL.Path
-		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		// /init failure is deliberately still only a warning.
-		w.WriteHeader(http.StatusInternalServerError)
-	})}
-	go func() { _ = srv.Serve(ln) }()
-	defer srv.Close()
+		w.WriteHeader(http.StatusNoContent)
+	}))
 
 	select {
 	case req := <-requests:
@@ -211,127 +205,309 @@ func TestE2BLaunchChecksEnvdAfterRuntimeAndInitRemainsWarning(t *testing.T) {
 	}
 	select {
 	case req := <-requests:
-		if req != "GET /health" {
-			t.Fatalf("first envd request = %q", req)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("envd health was not queried after runtime ready")
-	}
-	select {
-	case req := <-requests:
 		if req != "POST /init" {
-			t.Fatalf("second envd request = %q", req)
+			t.Fatalf("first envd request = %q, want POST /init", req)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("envd /init was not attempted")
+		t.Fatal("envd /init was not attempted after runtime readiness")
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("/init warning changed launch success: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("E2B launch did not return")
-	}
-}
-
-func TestE2BInitUsesLaunchContextAfterReadinessDeadline(t *testing.T) {
-	lc := &countingLauncher{}
-	cfg := &config.Config{}
-	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
-	o.sandboxReadyTimeout = 300 * time.Millisecond
-	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-after-ready-deadline")
-	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	ln, err := net.Listen("unix", sb.EnvdUDS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initStarted := make(chan struct{})
-	initCanceled := make(chan error, 1)
-	releaseInit := make(chan struct{})
-	defer func() {
-		select {
-		case <-releaseInit:
-		default:
-			close(releaseInit)
-		}
-	}()
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusNoContent)
-		case "/init":
-			close(initStarted)
-			select {
-			case <-releaseInit:
-				w.WriteHeader(http.StatusNoContent)
-			case <-r.Context().Done():
-				initCanceled <- r.Context().Err()
-			}
-		default:
-			http.NotFound(w, r)
-		}
-	})}
-	go func() { _ = srv.Serve(ln) }()
-	defer srv.Close()
-
-	started := time.Now()
-	done := make(chan error, 1)
-	go func() { done <- o.launch(ctx, sb, tmpl) }()
-	select {
-	case <-initStarted:
-	case err := <-done:
-		t.Fatalf("launch returned before envd /init started: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("envd /init did not start")
-	}
-
-	// Hold /init past the runtime/health deadline. It must remain live because
-	// warning-only initialization retains the parent launch context.
-	remaining := time.Until(started.Add(o.sandboxReadyTimeout + 100*time.Millisecond))
-	if remaining > 0 {
-		timer := time.NewTimer(remaining)
-		defer timer.Stop()
-		select {
-		case err := <-done:
-			t.Fatalf("launch returned when readiness context expired during /init: %v", err)
-		case err := <-initCanceled:
-			t.Fatalf("envd /init inherited readiness cancellation: %v", err)
-		case <-timer.C:
-		}
-	}
-
-	close(releaseInit)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("launch did not finish after envd /init completed")
+		t.Fatal("E2B launch did not return")
+	}
+	select {
+	case req := <-requests:
+		t.Fatalf("unexpected envd request after successful /init: %s", req)
+	default:
+	}
+	for _, want := range []string{routesync.StateStarting, routesync.StateRunning} {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("successful launch event = %+v, want upsert %s", event, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("successful launch did not publish %s", want)
+		}
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("stored sandbox after successful launch = %+v, %v", stored, err)
 	}
 }
 
-func TestE2BRuntimeAndEnvdShareReadinessDeadline(t *testing.T) {
-	lc := &countingLauncher{readinessDelay: 200 * time.Millisecond}
+func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
+	lc := &countingLauncher{}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
-	o.sandboxReadyTimeout = 400 * time.Millisecond
+	o.sandboxReadyTimeout = 180 * time.Millisecond
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-launch-deadline")
+	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var attempts atomic.Int64
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-r.Context().Done()
+	}))
+
+	started := time.Now()
+	err := o.launch(ctx, sb, tmpl)
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
+		t.Fatalf("launch error = %v, want mandatory envd /init deadline failure", err)
+	}
+	if elapsed < 140*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("launch elapsed %s, want the 180ms launch budget", elapsed)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("envd /init attempts = %d, want transport timeouts retried", got)
+	}
+}
+
+func TestE2BRuntimeAndInitShareLaunchDeadline(t *testing.T) {
+	lc := &countingLauncher{readinessDelay: 120 * time.Millisecond}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	o.sandboxReadyTimeout = 220 * time.Millisecond
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "shared-deadline")
 
 	started := time.Now()
 	err := o.launch(ctx, sb, tmpl)
 	elapsed := time.Since(started)
-	if err == nil || !strings.Contains(err.Error(), "envd not ready") {
-		t.Fatalf("launch error = %v, want envd readiness failure", err)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
+		t.Fatalf("launch error = %v, want envd /init deadline failure", err)
 	}
-	if elapsed < 350*time.Millisecond || elapsed > 600*time.Millisecond {
-		t.Fatalf("launch elapsed %s; runtime and envd did not share the 400ms budget", elapsed)
+	if elapsed < 180*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("launch elapsed %s; runtime and envd /init did not share the 220ms budget", elapsed)
+	}
+}
+
+func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "disabled"},
+		{name: "enabled", enabled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.MMDS.Enabled = tt.enabled
+			o := &Orchestrator{cfg: cfg}
+			sb := &types.Sandbox{
+				ID:              "payload-policy",
+				EnvdUDS:         filepath.Join(shortOrchestratorTestDir(t), "envd.sock"),
+				EnvdAccessToken: "envd-token",
+				Env:             map[string]string{"TEST_KEY": "test-value"},
+			}
+			type observedRequest struct {
+				method      string
+				path        string
+				contentType string
+				payload     map[string]any
+				err         error
+			}
+			observed := make(chan observedRequest, 1)
+			startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got := observedRequest{method: r.Method, path: r.URL.Path, contentType: r.Header.Get("Content-Type")}
+				got.err = json.NewDecoder(r.Body).Decode(&got.payload)
+				observed <- got
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := o.envdInit(ctx, sb); err != nil {
+				t.Fatal(err)
+			}
+			got := <-observed
+			if got.err != nil {
+				t.Fatalf("decode /init payload: %v", got.err)
+			}
+			if got.method != http.MethodPost || got.path != "/init" || got.contentType != "application/json" {
+				t.Fatalf("envd request = %s %s content-type=%q", got.method, got.path, got.contentType)
+			}
+			if got.payload["defaultUser"] != "user" || got.payload["defaultWorkdir"] != "/home/user" {
+				t.Fatalf("envd defaults = %+v", got.payload)
+			}
+			envVars, ok := got.payload["envVars"].(map[string]any)
+			if !ok || envVars["TEST_KEY"] != "test-value" {
+				t.Fatalf("envVars = %+v", got.payload["envVars"])
+			}
+			timestamp, ok := got.payload["timestamp"].(string)
+			if !ok {
+				t.Fatalf("timestamp = %v, want string", got.payload["timestamp"])
+			}
+			if _, err := time.Parse(time.RFC3339, timestamp); err != nil {
+				t.Fatalf("timestamp = %q: %v", timestamp, err)
+			}
+			token, hasToken := got.payload["accessToken"]
+			if tt.enabled && (!hasToken || token != sb.EnvdAccessToken) {
+				t.Fatalf("MMDS-enabled accessToken = %v, present=%t", token, hasToken)
+			}
+			if !tt.enabled && hasToken {
+				t.Fatalf("MMDS-disabled payload contains accessToken: %+v", got.payload)
+			}
+		})
+	}
+}
+
+func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
+	cfg := &config.Config{}
+	o := &Orchestrator{cfg: cfg}
+	sb := &types.Sandbox{ID: "transport-retry", EnvdUDS: filepath.Join(shortOrchestratorTestDir(t), "envd.sock")}
+	var attempts atomic.Int64
+	serverErrors := make(chan error, 1)
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		if attempt <= 3 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				select {
+				case serverErrors <- err:
+				default:
+				}
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := o.envdInit(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serverErrors:
+		t.Fatalf("force transport failure: %v", err)
+	default:
+	}
+	if got := attempts.Load(); got != 4 {
+		t.Fatalf("envd /init attempts = %d, want 4", got)
+	}
+}
+
+func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
+	cfg := &config.Config{}
+	o := &Orchestrator{cfg: cfg}
+	sb := &types.Sandbox{ID: "hard-failure", EnvdUDS: filepath.Join(shortOrchestratorTestDir(t), "envd.sock")}
+	var attempts atomic.Int64
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "temporary init failure "+strings.Repeat("x", 160))
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := o.envdInit(ctx, sb)
+	if err == nil || !strings.Contains(err.Error(), "status 503") || strings.Contains(err.Error(), "temporary init failure") {
+		t.Fatalf("envd /init error = %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("non-204 envd /init attempts = %d, want 1", got)
+	}
+}
+
+func TestEnvdInitRetryDelay(t *testing.T) {
+	for _, tt := range []struct {
+		failures int
+		want     time.Duration
+	}{
+		{failures: 0, want: 0},
+		{failures: 1, want: time.Millisecond},
+		{failures: 2, want: 2 * time.Millisecond},
+		{failures: 3, want: 4 * time.Millisecond},
+		{failures: 4, want: 5 * time.Millisecond},
+		{failures: 20, want: 5 * time.Millisecond},
+	} {
+		if got := envdInitRetryDelay(tt.failures); got != tt.want {
+			t.Fatalf("envdInitRetryDelay(%d) = %s, want %s", tt.failures, got, tt.want)
+		}
+	}
+}
+
+func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "init-create-dead")
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "init rejected", http.StatusInternalServerError)
+	}))
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	launchErr := o.launch(ctx, sb, tmpl)
+	if launchErr == nil || !strings.Contains(launchErr.Error(), "status 500") {
+		t.Fatalf("launch error = %v, want envd /init failure", launchErr)
+	}
+	if err := o.rollbackFailedCreate(sb); err != nil {
+		t.Fatalf("rollback failed create: %v", err)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateDead {
+		t.Fatalf("stored failed create = %+v, %v; want dead", stored, err)
+	}
+	if lc.stops.Load() == 0 {
+		t.Fatal("failed create did not stop its runner")
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
+			t.Fatalf("first failed-create event = %+v, want starting", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed create did not publish starting")
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+			t.Fatalf("terminal failed-create event = %+v, want delete", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed create did not publish delete")
+	}
+	var ranged []string
+	if err := o.Range(ctx, func(route routesync.RouteEntry) error {
+		ranged = append(ranged, route.SandboxID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranged) != 0 {
+		t.Fatalf("dead failed create remained in route snapshot: %v", ranged)
+	}
+}
+
+func TestFailedCreateBeforeAssignmentDoesNotInsertDead(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.Bare.InnerIP = "invalid"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileBare, "pre-assignment-failure")
+
+	if err := o.launch(ctx, sb, tmpl); err == nil {
+		t.Fatal("launch with invalid network succeeded")
+	}
+	if err := o.rollbackFailedCreate(sb); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sb.ID)
+	if err != nil || stored != nil {
+		t.Fatalf("pre-assignment failure persisted sandbox = %+v, %v", stored, err)
 	}
 }
 
@@ -361,12 +537,62 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 	}
 }
 
+func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
+	lc := &countingLauncher{}
+	cfg := &config.Config{}
+	cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb, _ := launchTestSandbox(t, cfg, types.ProfileE2B, "init-rollback")
+	sb.State = types.StatePaused
+	sb.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int64
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "init rejected", http.StatusInternalServerError)
+	}))
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	err := o.resumeIfPaused(ctx, sb.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "envd /init") || !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("resume error = %v, want mandatory envd /init failure", err)
+	}
+	stored, getErr := o.st.Get(ctx, sb.ID)
+	if getErr != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("stored sandbox after failed resume = %+v, %v", stored, getErr)
+	}
+	if lc.stops.Load() == 0 {
+		t.Fatal("envd /init failure did not trigger runner teardown")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("non-204 envd /init attempts = %d, want 1", got)
+	}
+	for _, want := range []string{routesync.StateStarting, routesync.StatePaused} {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("failed resume event = %+v, want upsert %s", event, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("failed resume did not publish %s", want)
+		}
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("failed resume published an extra route event: %+v", event)
+	default:
+	}
+}
+
 func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, sid string) (*types.Sandbox, types.TemplateID) {
 	t.Helper()
 	manifestKey := strings.Repeat("a", 64)
 	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}
 	sb := &types.Sandbox{
-		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateRunning,
+		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateStarting,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(cfg.Paths.RunRoot, sid), BaseDir: filepath.Join(cfg.Paths.BaseRoot, sid),
 		CreatedUnix: 1,
@@ -377,4 +603,18 @@ func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, 
 	}
 	materializeTestSandboxCredentials(t, sb)
 	return sb, tmpl
+}
+
+func startEnvdTestServer(t *testing.T, socket string, handler http.Handler) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 }

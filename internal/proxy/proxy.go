@@ -83,8 +83,8 @@ func LegacyTarget(port int) ConnectTarget {
 }
 
 // Router resolves a (sandboxID, target) to a Route. It may block to auto-resume a
-// paused sandbox (internal) or park awaiting a route push (external), returning
-// KindUDS/KindTCP once up, or KindNotFound if it never came up.
+// paused sandbox or park while a starting sandbox completes, returning KindUDS/
+// KindTCP once running, or KindNotFound if it never came up.
 type Router interface {
 	Route(ctx context.Context, sandboxID string, target ConnectTarget) (Route, error)
 }
@@ -99,8 +99,8 @@ type ExecIdentity struct {
 }
 
 // ExecRouter separates the side-effect-free credential lookup from the
-// authorized lifecycle transition. ActivateExec may resume a paused sandbox and
-// must re-read its identity before returning.
+// authorized lifecycle transition. ActivateExec may resume a paused sandbox or
+// wait for a starting one and must re-read its identity before returning.
 type ExecRouter interface {
 	LookupExec(ctx context.Context, sandboxID string) (ExecIdentity, bool, error)
 	ActivateExec(ctx context.Context, sandboxID string, expected ExecIdentity) (ExecIdentity, bool, error)

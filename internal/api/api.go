@@ -922,8 +922,9 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 // listed renders one item of GET /v2/sandboxes. The e2b SDK's ListedSandbox model
 // requires clientID/cpuCount/diskSizeMB/memoryMB/sandboxID/templateID/envdVersion/
 // state plus startedAt/endAt as ISO-8601 (it isoparse()s them) — a Unix int or a
-// missing field crashes next_items(). State is always running/paused here (dead rows
-// are deleted on kill), matching the SDK's SandboxState enum.
+// missing field crashes next_items(). With no state filter the store returns only
+// running/paused, matching the SDK's SandboxState enum; explicit internal-state
+// filters remain a diagnostic surface.
 func (a *API) listed(sb *types.Sandbox) map[string]any {
 	end := sb.DeadlineUnix
 	if end == 0 { // no deadline: report start so endAt is still a valid timestamp

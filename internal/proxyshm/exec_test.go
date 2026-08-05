@@ -21,6 +21,7 @@ const workerExecServiceSecret = "0123456789abcdef0123456789abcdef0123456789abcde
 func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *testing.T) {
 	tbl := newExecTable(t)
 	for _, route := range []routesync.RouteEntry{
+		execWorkerRoute("starting", routesync.StateStarting),
 		execWorkerRoute("paused", routesync.StatePaused),
 		execWorkerRoute("running", routesync.StateRunning),
 		execWorkerRoute("dead", routesync.StateDead),
@@ -35,7 +36,7 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 
 	var wakes atomic.Int32
 	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
-	for _, sid := range []string{"paused", "running"} {
+	for _, sid := range []string{"starting", "paused", "running"} {
 		got, found, err := view.LookupExec(context.Background(), sid)
 		if err != nil || !found {
 			t.Fatalf("LookupExec(%q) = %+v, %v, %v", sid, got, found, err)
@@ -57,6 +58,113 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 	paused, ok := tbl.Lookup("paused")
 	if !ok || paused.State != routesync.StatePaused {
 		t.Fatalf("paused route changed during lookup: %+v ok=%v", paused, ok)
+	}
+}
+
+func TestWorkerActivateExecWaitsForStartingWithoutWake(t *testing.T) {
+	tbl := newExecTable(t)
+	route := execWorkerRoute("starting", routesync.StateStarting)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+	expected := execWorkerIdentity(route.SandboxID)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	identity, found, err := view.ActivateExec(canceled, route.SandboxID, expected)
+	if !errors.Is(err, context.Canceled) || found || identity != (proxy.ExecIdentity{}) {
+		t.Fatalf("canceled starting activation = %+v, %v, %v", identity, found, err)
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("starting activation emitted %d wakes", got)
+	}
+
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		identity, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+		done <- result{identity: identity, found: found, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("starting activation returned before running update: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		if got.err != nil || !got.found || got.identity != expected {
+			t.Fatalf("starting activation after running = %+v, %v, %v", got.identity, got.found, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("starting activation did not observe running update")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("starting activation emitted %d wakes while waiting", got)
+	}
+}
+
+func TestWorkerActivateExecStartingRollbackReturnsAbsent(t *testing.T) {
+	for _, rollback := range []string{routesync.StatePaused, routesync.StateDead} {
+		t.Run(rollback, func(t *testing.T) {
+			tbl := newExecTable(t)
+			route := execWorkerRoute("starting-rollback", routesync.StateStarting)
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+			tbl.Bookmark()
+			updates := &Updates{ch: make(chan struct{})}
+			var wakes atomic.Int32
+			view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+			type result struct {
+				identity proxy.ExecIdentity
+				found    bool
+				err      error
+			}
+			done := make(chan result, 1)
+			expected := execWorkerIdentity(route.SandboxID)
+			go func() {
+				identity, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
+				done <- result{identity: identity, found: found, err: err}
+			}()
+			select {
+			case got := <-done:
+				t.Fatalf("starting exec returned before rollback: %+v", got)
+			case <-time.After(20 * time.Millisecond):
+			}
+			if rollback == routesync.StateDead {
+				tbl.Delete(route.SandboxID)
+			} else {
+				route.State = rollback
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			updates.bump()
+			select {
+			case got := <-done:
+				if got.err != nil || got.found || got.identity != (proxy.ExecIdentity{}) {
+					t.Fatalf("starting exec after %s rollback = %+v, %v, %v", rollback, got.identity, got.found, got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("starting exec did not stop waiting after %s rollback", rollback)
+			}
+			if got := wakes.Load(); got != 0 {
+				t.Fatalf("starting exec rollback emitted %d wakes", got)
+			}
+		})
 	}
 }
 

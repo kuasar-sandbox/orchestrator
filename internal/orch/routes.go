@@ -52,7 +52,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 }
 
 // snapshotLocation classifies a sandbox's persisted state so a subscriber can
-// decide migration: "" when never paused (running/dead), "remote" for an uploaded
+// decide migration: "" when never paused (starting/running/dead), "remote" for an uploaded
 // portable canonical ref, else "local" (a node-bound checkpoint bundle).
 func snapshotLocation(ref string) string {
 	switch {
@@ -67,11 +67,12 @@ func snapshotLocation(ref string) string {
 
 // --- routesync.Source ---
 
-// Range streams the full current route set (running + paused) one entry at a time,
-// in id order within each state. Streaming (vs materializing a slice) keeps
-// send-side memory bounded at high sandbox density — see store.RangeByState.
+// Range streams the full current route set (starting + running + paused) one entry
+// at a time, in id order within each state. Starting entries carry the identity
+// needed by MMDS but remain non-routable until a running update. Streaming (vs
+// materializing a slice) keeps send-side memory bounded at high sandbox density.
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
-	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
+	for _, st := range []types.State{types.StateStarting, types.StateRunning, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
 			return fn(o.routeEntry(sb))
 		}); err != nil {
@@ -123,6 +124,9 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 			// stays paused; the proxy's park times out -> 404.
 		}
 		// resume() publishes the running upsert on success.
+	case types.StateStarting:
+		// The launch already in progress will publish running or its rollback
+		// state. A second Wake must not start another runner.
 	default: // dead
 		o.publishDelete(sid)
 	}

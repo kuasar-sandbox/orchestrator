@@ -40,9 +40,10 @@ const (
 type State string
 
 const (
-	StateRunning State = "running"
-	StatePaused  State = "paused"
-	StateDead    State = "dead"
+	StateStarting State = "starting"
+	StateRunning  State = "running"
+	StatePaused   State = "paused"
+	StateDead     State = "dead"
 )
 
 // MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.

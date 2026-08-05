@@ -36,7 +36,7 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 		return proxy.ExecIdentity{}, false, nil
 	}
 
-	if sb.State == types.StatePaused {
+	if sb.State == types.StatePaused || sb.State == types.StateStarting {
 		err := o.resumeExecSandbox(ctx, sandboxID, expected)
 		if errors.Is(err, errExecIdentityChanged) {
 			return proxy.ExecIdentity{}, false, nil
@@ -100,7 +100,7 @@ func (o *Orchestrator) lookupExecSandbox(ctx context.Context, sandboxID string) 
 }
 
 func execRoutePresent(sb *types.Sandbox) bool {
-	return sb != nil && (sb.State == types.StateRunning || sb.State == types.StatePaused)
+	return sb != nil && (sb.State == types.StateStarting || sb.State == types.StateRunning || sb.State == types.StatePaused)
 }
 
 func execIdentity(sb *types.Sandbox) proxy.ExecIdentity {
