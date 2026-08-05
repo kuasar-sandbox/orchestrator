@@ -236,6 +236,43 @@ wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
     done
     return 1
 }
+assert_sandbox_detail() {
+    python3 - "$@" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+path, sandbox_id, expected_cpu, expected_memory, expected_disk = sys.argv[1:]
+expected = {
+    "cpuCount": int(expected_cpu),
+    "memoryMB": int(expected_memory),
+    "diskSizeMB": int(expected_disk),
+}
+RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+with open(path, encoding="utf-8") as f:
+    detail = json.load(f)
+
+if detail.get("sandboxID") != sandbox_id:
+    raise SystemExit(f"detail sandboxID={detail.get('sandboxID')!r}, want {sandbox_id!r}")
+for field in ("startedAt", "endAt"):
+    value = detail.get(field)
+    if not isinstance(value, str) or not RFC3339.fullmatch(value):
+        raise SystemExit(f"detail {field}={value!r} is not RFC3339")
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SystemExit(f"detail {field}={value!r} is not RFC3339: {exc}")
+
+started = datetime.datetime.fromisoformat(detail["startedAt"].replace("Z", "+00:00"))
+ended = datetime.datetime.fromisoformat(detail["endAt"].replace("Z", "+00:00"))
+if ended < started:
+    raise SystemExit(f"detail endAt={detail['endAt']!r} is before startedAt={detail['startedAt']!r}")
+for field, want in expected.items():
+    if detail.get(field) != want:
+        raise SystemExit(f"detail {field}={detail.get(field)!r}, want {want}")
+PY
+}
 assert_no_default_exec_token() {
     python3 - "$1" <<'PY'
 import json, sys
@@ -618,6 +655,18 @@ echo "==> PASS: sandbox $SID running (microVM booted + envd initialized)"
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
 grep -q "$SID" "$WORK/resp.body" || fail "sandbox $SID not listed"
 echo "==> PASS: sandbox listed"
+
+# ---- detail / info contract -----------------------------------------------
+# This is the HTTP endpoint used by the E2B-compatible sandbox info/get-info
+# path. Keep this in the real microVM E2E so the detail contract is checked
+# against a running sandbox, not only through an in-process handler test.
+code=$(req GET "/sandboxes/$SID" "$AK")
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "sandbox detail=$code"; }
+# These are the node defaults used by this E2E config. The API obtains them
+# from node-ctl's a.res, not from the sandbox create request.
+assert_sandbox_detail "$WORK/resp.body" "$SID" 2 2048 1024 \
+    || { cat "$WORK/resp.body"; fail "sandbox detail contract"; }
+echo "==> PASS: sandbox detail/info returned RFC3339 timestamps and resource fields"
 
 # ---- native exec capability -> CONNECT -> sandbox-ctl -> real guest -------
 echo "==> issue an explicit native exec capability (create has no default token)"

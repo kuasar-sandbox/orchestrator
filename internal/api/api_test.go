@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
@@ -406,6 +407,145 @@ func TestSandboxResponseUsesProfileSpecificCredentials(t *testing.T) {
 	}
 }
 
+func TestSandboxDetailUsesISO8601Timestamps(t *testing.T) {
+	a := &API{domain: "example.test", res: Resources{VCPU: 2, MemoryMB: 512, DiskMB: 2048}}
+	created := int64(1_700_000_000)
+	sandbox := &types.Sandbox{ID: "sandbox", CreatedUnix: created}
+
+	detail := a.sandboxDetail(sandbox)
+	for field, want := range map[string]int{
+		"cpuCount":   2,
+		"memoryMB":   512,
+		"diskSizeMB": 2048,
+	} {
+		if got := detail[field]; got != want {
+			t.Errorf("detail %s = %v, want %d", field, got, want)
+		}
+	}
+	startedAt, ok := detail["startedAt"].(string)
+	if !ok {
+		t.Fatalf("startedAt type = %T, want string", detail["startedAt"])
+	}
+	endAt, ok := detail["endAt"].(string)
+	if !ok {
+		t.Fatalf("endAt type = %T, want string", detail["endAt"])
+	}
+
+	want := time.Unix(created, 0).UTC().Format(time.RFC3339)
+	if startedAt != want || endAt != want {
+		t.Fatalf("detail timestamps = startedAt %q, endAt %q; want %q for both", startedAt, endAt, want)
+	}
+
+	deadline := created + 300
+	sandbox.DeadlineUnix = deadline
+	detail = a.sandboxDetail(sandbox)
+	wantEnd := time.Unix(deadline, 0).UTC().Format(time.RFC3339)
+	if got := detail["endAt"]; got != wantEnd {
+		t.Fatalf("detail endAt = %v, want %q", got, wantEnd)
+	}
+}
+
+func TestListedSandboxIncludesE2BDetailFields(t *testing.T) {
+	a := &API{res: Resources{VCPU: 4, MemoryMB: 1024, DiskMB: 4096}}
+	sandbox := &types.Sandbox{ID: "sandbox", CreatedUnix: 1_700_000_000, DeadlineUnix: 1_700_000_300}
+
+	listed := a.listed(sandbox)
+	for field, want := range map[string]int{
+		"cpuCount":   4,
+		"memoryMB":   1024,
+		"diskSizeMB": 4096,
+	} {
+		if got := listed[field]; got != want {
+			t.Errorf("listed %s = %v, want %d", field, got, want)
+		}
+	}
+	for _, field := range []string{"startedAt", "endAt"} {
+		value, ok := listed[field].(string)
+		if !ok {
+			t.Fatalf("listed %s type = %T, want string", field, listed[field])
+		}
+		if _, err := time.Parse(time.RFC3339, value); err != nil {
+			t.Errorf("listed %s = %q is not RFC3339: %v", field, value, err)
+		}
+	}
+}
+
+func TestSandboxDetailAndListHTTPContract(t *testing.T) {
+	created := int64(1_700_000_000)
+	for _, deadlineCase := range []struct {
+		name     string
+		deadline int64
+	}{
+		{name: "without deadline", deadline: 0},
+		{name: "with deadline", deadline: created + 300},
+	} {
+		t.Run(deadlineCase.name, func(t *testing.T) {
+			sandbox := &types.Sandbox{
+				ID: "sandbox", TemplateID: "e2b-img-template", Profile: types.ProfileE2B,
+				State: types.StateRunning, CreatedUnix: created, DeadlineUnix: deadlineCase.deadline,
+			}
+			h, apiKey := newSandboxContractHandler(t, &sandboxContractCoreStub{sandbox: sandbox}, Resources{VCPU: 2, MemoryMB: 512, DiskMB: 2048})
+
+			for _, endpoint := range []struct {
+				name string
+				path string
+			}{
+				{name: "detail", path: "/sandboxes/sandbox"},
+				{name: "list", path: "/v2/sandboxes"},
+			} {
+				t.Run(endpoint.name, func(t *testing.T) {
+					response := migrationRequest(t, h, apiKey, http.MethodGet, endpoint.path, nil, nil)
+					if response.Code != http.StatusOK {
+						t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+					}
+
+					var body map[string]any
+					if endpoint.name == "list" {
+						var items []map[string]any
+						if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
+							t.Fatal(err)
+						}
+						if len(items) != 1 {
+							t.Fatalf("list returned %d items, want 1", len(items))
+						}
+						body = items[0]
+					} else if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+						t.Fatal(err)
+					}
+
+					for field, want := range map[string]float64{
+						"cpuCount":   2,
+						"memoryMB":   512,
+						"diskSizeMB": 2048,
+					} {
+						if got := body[field]; got != want {
+							t.Errorf("%s = %v, want %v", field, got, want)
+						}
+					}
+					for _, field := range []string{"startedAt", "endAt"} {
+						value, ok := body[field].(string)
+						if !ok {
+							t.Fatalf("%s type = %T, want string", field, body[field])
+						}
+						if _, err := time.Parse(time.RFC3339, value); err != nil {
+							t.Errorf("%s = %q is not RFC3339: %v", field, value, err)
+						}
+					}
+					if deadlineCase.deadline == 0 && body["startedAt"] != body["endAt"] {
+						t.Errorf("no-deadline endAt = %v, want startedAt %v", body["endAt"], body["startedAt"])
+					}
+					if deadlineCase.deadline != 0 {
+						wantEnd := time.Unix(deadlineCase.deadline, 0).UTC().Format(time.RFC3339)
+						if body["endAt"] != wantEnd {
+							t.Errorf("deadline endAt = %v, want %s", body["endAt"], wantEnd)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestImportSandboxPassesOptionalTargetID(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -783,6 +923,29 @@ type migrationCoreStub struct {
 	importSandbox func(context.Context, string, string, string) (string, error)
 	exportSandbox func(context.Context, string, string, bool, bool) (string, error)
 	connect       func(context.Context, string, string, string, int) (*types.Sandbox, error)
+}
+
+type sandboxContractCoreStub struct {
+	Core
+	sandbox *types.Sandbox
+}
+
+func (c *sandboxContractCoreStub) Get(context.Context, string, string) (*types.Sandbox, error) {
+	return c.sandbox, nil
+}
+
+func (c *sandboxContractCoreStub) List(context.Context, string, string, int, string) ([]*types.Sandbox, string, error) {
+	return []*types.Sandbox{c.sandbox}, "", nil
+}
+
+func newSandboxContractHandler(t *testing.T, core Core, resources Resources) (http.Handler, string) {
+	t.Helper()
+	apiKey, err := apikey.Mint(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(core, "example.test", resources, logger).Handler(), apiKey
 }
 
 func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
