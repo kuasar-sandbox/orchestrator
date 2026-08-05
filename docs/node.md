@@ -123,7 +123,7 @@ create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
 → 从 runner pool 分配一个 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)
 → 持久化 `sid ↔ run-id` → 单元内 `run-sandbox` 经 config-socket 的
 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
-→ 起 microVM → (e2b)等 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户
+→ 起 microVM → 严格完成 runtime readiness wire → (e2b)直接 `POST /init` 置 env/默认用户
 → 起 TTL。集群下,该 create 由 node-link 的 `create` 命令触发;profile、group、route-key
 和可选认证主体通过结构化系统上下文下发并独立持久化。事件回报 profile、node-owned
 执行事实和受保护路由凭据投影,registry 从既有节点归属记录恢复其 cluster identity
@@ -709,10 +709,12 @@ WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:serve 在分配 runner 前先绑定 `<run_root>/<sid>/ready.sock`(目录 0700、
   socket 0600),分配后从 node-ctl 的 one-shot 连接严格读取
-  `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后仍轮询 envd `/health`,
-  因为 runtime 的 `ready` 不承诺 envd 已监听。runtime wire 与 envd health 共用一次
-  60s 启动预算;协议错误、提前 EOF、取消或超时沿现有 create teardown / resume
-  rollback 返回。envd `/init` 失败仍只记 warning。
+  `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
+  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。runtime
+  wire 与 mandatory `/init` 共用一次 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
+  错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
+  非 204(携带最多 100 bytes 响应摘要),协议错误、提前 EOF、取消或总预算超时都沿
+  现有 create teardown / resume rollback 返回,成功前不发布 running route.
 - **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
   run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
@@ -1231,8 +1233,10 @@ plugin 平面,机群路由经 registry 聚合。
   `files:` 机制注入 `/etc/hosts`(`127.0.1.1 <hostname>` 条目)与 `/etc/resolv.conf`
   (`sandbox.network.dns`),并经 `network.hostname` sethostname;launch 与 restore
   均生效。
-- host 在 envd 就绪后调 **`POST /init`**(经 UDS):置 `envVars`、默认用户
-  `user`/workdir `/home/user`,时间戳;仅 `mmds.enabled` 时携带 `accessToken`(node-proxy.md §7).
+- host 在 runtime readiness wire 完成后直接调 mandatory **`POST /init`**(经 UDS):置
+  `envVars`、默认用户 `user`/workdir `/home/user`,时间戳;仅 `mmds.enabled` 时携带
+  `accessToken`(node-proxy.md §7).envd socket 尚未可拨由上述短退避传输重试吸收,
+  无启动期 `/health` 探测.
 
 ## 12. 模板构建(三阶段流水线,构建在沙箱内进行)
 

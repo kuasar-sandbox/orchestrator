@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -293,28 +294,21 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	}); err != nil {
 		return err
 	}
-	readyTimeout := o.sandboxReadyTimeout
-	if readyTimeout <= 0 {
-		readyTimeout = 60 * time.Second
+	launchTimeout := o.sandboxReadyTimeout
+	if launchTimeout <= 0 {
+		launchTimeout = 60 * time.Second
 	}
-	// Runtime readiness and, for E2B, envd health consume one launch budget
-	// beginning after assignment. A slow VM therefore leaves less time for envd
-	// instead of silently starting a second full timeout.
-	readyCtx, cancelReady := context.WithTimeout(ctx, readyTimeout)
-	defer cancelReady()
-	if err := waitRuntimeReadiness(readyCtx, readyListener); err != nil {
+	// Runtime readiness and, for E2B, mandatory envd initialization consume one
+	// launch budget beginning after assignment. /init is the first envd request:
+	// health is meaningful only after initialization and is not a launch gate.
+	launchCtx, cancelLaunch := context.WithTimeout(ctx, launchTimeout)
+	defer cancelLaunch()
+	if err := waitRuntimeReadiness(launchCtx, readyListener); err != nil {
 		return fmt.Errorf("orch: sandbox %s: %w", sb.ID, err)
 	}
 	if tmpl.Profile == types.ProfileE2B {
-		// app_started is a runtime boundary, not proof that envd is listening, so
-		// E2B retains its application-level health check after runtime readiness.
-		if err := o.waitReady(readyCtx, sb); err != nil {
+		if err := o.envdInit(launchCtx, sb); err != nil {
 			return err
-		}
-		// /init remains warning-only initialization after readiness, so it uses
-		// the launch context rather than an exhausted runtime/health budget.
-		if err := o.envdInit(ctx, sb); err != nil {
-			o.log.Warn("envd /init", "sid", sb.ID, "err", err)
 		}
 	}
 	return nil
@@ -1249,10 +1243,15 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 	return ref, nil
 }
 
-// udsClient builds an HTTP client that dials a unix socket (the envd --connect UDS).
+const (
+	envdInitAttemptTimeout = 50 * time.Millisecond
+	envdInitErrorBodyLimit = 100
+)
+
+// udsClient builds a bounded HTTP client that dials the envd --connect UDS.
 func udsClient(sock string) *http.Client {
 	return &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: envdInitAttemptTimeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
@@ -1261,25 +1260,20 @@ func udsClient(sock string) *http.Client {
 	}
 }
 
-func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox) error {
-	cl := udsClient(sb.EnvdUDS)
-	defer cl.CloseIdleConnections()
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://envd/health", nil)
-		resp, err := cl.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 204 || resp.StatusCode == 200 {
-				return nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("orch: envd not ready for %s: %w", sb.ID, ctx.Err())
-		case <-ticker.C:
-		}
+// envdInitRetryDelay returns the delay after the given consecutive transport
+// failure. The first request has no delay; retries ramp quickly and cap at 5ms.
+func envdInitRetryDelay(failures int) time.Duration {
+	switch {
+	case failures <= 0:
+		return 0
+	case failures == 1:
+		return time.Millisecond
+	case failures == 2:
+		return 2 * time.Millisecond
+	case failures == 3:
+		return 4 * time.Millisecond
+	default:
+		return 5 * time.Millisecond
 	}
 }
 
@@ -1292,27 +1286,63 @@ func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox) error {
 // (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
 // to it — giving forks fresh per-identity tokens with envd-side enforcement too.
 func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
-	payload := map[string]any{
-		"envVars":        sb.Env,
-		"defaultUser":    "user",
-		"defaultWorkdir": "/home/user",
-		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+	cl := udsClient(sb.EnvdUDS)
+	defer cl.CloseIdleConnections()
+
+	for failures := 0; ; failures++ {
+		payload := map[string]any{
+			"envVars":        sb.Env,
+			"defaultUser":    "user",
+			"defaultWorkdir": "/home/user",
+			"timestamp":      time.Now().UTC().Format(time.RFC3339),
+		}
+		if o.cfg.MMDS.Enabled {
+			payload["accessToken"] = sb.EnvdAccessToken
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("orch: encode envd /init for %s: %w", sb.ID, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://envd/init", bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("orch: create envd /init for %s: %w", sb.ID, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := cl.Do(req)
+		if err == nil {
+			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, envdInitErrorBodyLimit+1))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent {
+				return nil
+			}
+			if readErr != nil {
+				return fmt.Errorf("orch: envd /init for %s status %d: read response: %w", sb.ID, resp.StatusCode, readErr)
+			}
+			truncated := len(responseBody) > envdInitErrorBodyLimit
+			if truncated {
+				responseBody = responseBody[:envdInitErrorBodyLimit]
+			}
+			detail := strings.TrimSpace(string(responseBody))
+			if detail == "" {
+				return fmt.Errorf("orch: envd /init for %s status %d", sb.ID, resp.StatusCode)
+			}
+			if truncated {
+				detail += "..."
+			}
+			return fmt.Errorf("orch: envd /init for %s status %d: %s", sb.ID, resp.StatusCode, detail)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("orch: envd /init for %s: %w", sb.ID, ctx.Err())
+		}
+
+		timer := time.NewTimer(envdInitRetryDelay(failures + 1))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("orch: envd /init for %s: %w", sb.ID, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	if o.cfg.MMDS.Enabled {
-		payload["accessToken"] = sb.EnvdAccessToken
-	}
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://envd/init", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := udsClient(sb.EnvdUDS).Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("orch: envd /init status %d", resp.StatusCode)
-	}
-	return nil
 }
 
 // firstNonEmpty returns a if non-empty, else b (override-over-default helper).
