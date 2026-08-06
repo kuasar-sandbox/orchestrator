@@ -9,13 +9,13 @@
 #   sandbox.yaml network.tapfd.exec = `connector-ctl tapfd get --new <tap>`, which CREATES the
 #   tap (host-side IP, up) and OPENS an IFF_VNET_HDR queue fd, handing it to
 #   sandbox-ctl over SCM_RIGHTS. CH is driven with --net fd=<N>,mac=,id=_net0.
-#   The guest gets eth0=169.254.1.1/31 and an app prints NETUP then sleeps.
-#   The host binds its ping to that per-run tap and reaches 169.254.1.1 — success
+#   The guest gets a per-run link-local /31 and an app prints NETUP then sleeps.
+#   The host binds its ping to that per-run tap and reaches the guest — success
 #   proves the handed-off fd carries traffic with correct vnet_hdr framing.
 #
 # Stage 2 (restore with new identity):
-#   snapshot the running VM, then `run --restore` with a NEW ip
-#   (169.254.4.1/31). The guest re-applies the IP flush-and-replace and CH
+#   snapshot the running VM, then `run --restore` with a NEW per-run /31.
+#   The guest re-applies the IP flush-and-replace and CH
 #   re-binds the fresh fd via net_fds; the host pings the NEW address.
 #
 # Skips (exit 0) on missing prerequisites; REQUIRE_KVM=1 to fail hard.
@@ -40,11 +40,56 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
+command -v ip >/dev/null 2>&1 || skip "ip not on PATH"
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
 [ -z "$BLK0_IMAGE" ] && [ -f "$REPO_ROOT/build/python-312.erofs" ] && BLK0_IMAGE="$REPO_ROOT/build/python-312.erofs"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
+
+# The cold and restore ranges are intentionally disjoint so restore always
+# changes the guest identity. Start from a PID-derived slot, but scan the host
+# state so PID reuse cannot select a /31 still owned by an interrupted run.
+declare -A HOST_IPV4_ADDRESSES=() HOST_IPV4_ROUTES=()
+while read -r address; do
+    HOST_IPV4_ADDRESSES["${address%/*}"]=1
+done < <(ip -o -4 addr show | awk '{print $4}')
+while read -r destination _; do
+    [[ "$destination" == */* ]] && HOST_IPV4_ROUTES["$destination"]=1
+done < <(ip -4 route show table all type unicast)
+
+network_in_use() { # <cidr> <host_ip> <guest_ip>
+    [ -n "${HOST_IPV4_ROUTES[$1]:-}" ] || \
+        [ -n "${HOST_IPV4_ADDRESSES[$2]:-}" ] || \
+        [ -n "${HOST_IPV4_ADDRESSES[$3]:-}" ]
+}
+
+allocate_networks() {
+    local start=$(( $$ % 8192 )) offset slot block host_byte
+    local cold_host_ip cold_guest_ip cold_cidr restore_host_ip restore_guest_ip restore_cidr
+    for ((offset = 0; offset < 8192; offset++)); do
+        slot=$(( (start + offset) % 8192 ))
+        block=$(( slot / 128 ))
+        host_byte=$(( (slot % 128) * 2 ))
+        cold_host_ip="169.254.$((64 + block)).$host_byte"
+        cold_guest_ip="169.254.$((64 + block)).$((host_byte + 1))"
+        cold_cidr="$cold_host_ip/31"
+        restore_host_ip="169.254.$((128 + block)).$host_byte"
+        restore_guest_ip="169.254.$((128 + block)).$((host_byte + 1))"
+        restore_cidr="$restore_host_ip/31"
+        if ! network_in_use "$cold_cidr" "$cold_host_ip" "$cold_guest_ip" && \
+            ! network_in_use "$restore_cidr" "$restore_host_ip" "$restore_guest_ip"; then
+            COLD_HOST_CIDR="$cold_cidr"
+            COLD_GUEST_IP="$cold_guest_ip"
+            RESTORE_HOST_CIDR="$restore_cidr"
+            RESTORE_GUEST_IP="$restore_guest_ip"
+            return 0
+        fi
+    done
+    echo "e2e_sandbox_tapfd: no unused per-run network pair is available" >&2
+    exit 1
+}
+allocate_networks
 
 if [ -z "$BLK0_IMAGE" ]; then
     command -v docker >/dev/null 2>&1 || skip "no prebuilt blk0 and docker unavailable"
@@ -112,9 +157,9 @@ ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 # ===================== Stage 1: cold boot + connectivity ===================
-echo "==> Stage 1: cold boot via tapfd + host<->guest connectivity"
+echo "==> Stage 1: cold boot via tapfd + host<->guest connectivity ($COLD_HOST_CIDR)"
 DIFF0="$WORK/blk1.diff"; mkdiff "$DIFF0"
-write_yaml "$WORK/cold.yaml" "169.254.1.1" "$DIFF0" "169.254.1.0/31" 1
+write_yaml "$WORK/cold.yaml" "$COLD_GUEST_IP" "$DIFF0" "$COLD_HOST_CIDR" 1
 SID="tapfd-e2e"
 LOG="$WORK/cold.log"
 mkdir -p "$WORK/runtime/$SID"
@@ -134,8 +179,8 @@ fi
 grep -q "tapfd: received tap fd" "$LOG" && ok "tapfd handoff engaged in sandbox-ctl" || bad "no tapfd handoff log"
 grep -qE "net fd=[0-9]+,mac=$GUEST_MAC,id=_net0" "$LOG" && ok "CH driven with --net fd=,mac=,id=_net0" || bad "fd-mode --net not in log"
 grep -q "^MTU=1400$" "$LOG" && ok "guest MTU came from sandbox network config" || bad "guest MTU was not 1400"
-ping_guest 169.254.1.1 && ok "host pinged guest 169.254.1.1 through $TAP_NAME over the vnet_hdr fd" \
-    || { echo "--- log ---"; tail -25 "$LOG"; ip -br addr || true; bad "ping 169.254.1.1 failed"; }
+ping_guest "$COLD_GUEST_IP" && ok "host pinged guest $COLD_GUEST_IP through $TAP_NAME over the vnet_hdr fd" \
+    || { echo "--- log ---"; tail -25 "$LOG"; ip -br addr || true; bad "ping $COLD_GUEST_IP failed"; }
 
 # snapshot the running VM (default --resume=false shuts it down → run exits)
 SNAP="$WORK/snap"; mkdir -p "$SNAP"
@@ -146,11 +191,11 @@ SNAP_FILE="$SNAP/$SID.snapshot"
 
 # ===================== Stage 2: restore with NEW identity ==================
 if [ -f "$SNAP_FILE" ]; then
-    echo "==> Stage 2: restore with fresh identity 169.254.4.1 (flush-and-replace)"
+    echo "==> Stage 2: restore with fresh identity $RESTORE_GUEST_IP (flush-and-replace)"
     # The fake provider recreates the named, non-persistent tap on the restore
     # handoff and assigns the new host /31 via --host-cidr — no manual setup.
     DIFF1="$WORK/blk1.restore.diff"; mkdiff "$DIFF1"
-    write_yaml "$WORK/restore.yaml" "169.254.4.1" "$DIFF1" "169.254.4.0/31" 0
+    write_yaml "$WORK/restore.yaml" "$RESTORE_GUEST_IP" "$DIFF1" "$RESTORE_HOST_CIDR" 0
     SIDR="tapfd-e2e-r"; RLOG="$WORK/restore.log"; mkdir -p "$WORK/runtime2/$SIDR"
     timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/restore.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime2" --sandbox-id "$SIDR" \
@@ -160,8 +205,8 @@ if [ -f "$SNAP_FILE" ]; then
         && ok "restore completed" || { echo "--- restore.log tail ---"; tail -40 "$RLOG"; bad "restore did not complete"; }
     grep -q "tapfd: received tap fd for restore" "$RLOG" && ok "tapfd re-handoff on restore" || bad "no restore re-handoff log"
     grep -q "net_fds=\[_net0@\[" "$RLOG" && ok "CH restore re-bound fd via net_fds" || bad "no net_fds in restore log"
-    ping_guest 169.254.4.1 && ok "host pinged restored guest at NEW ip 169.254.4.1 through $TAP_NAME (re-config worked)" \
-        || { echo "--- restore.log tail ---"; tail -30 "$RLOG"; bad "ping restored 169.254.4.1 failed"; }
+    ping_guest "$RESTORE_GUEST_IP" && ok "host pinged restored guest at NEW ip $RESTORE_GUEST_IP through $TAP_NAME (re-config worked)" \
+        || { echo "--- restore.log tail ---"; tail -30 "$RLOG"; bad "ping restored $RESTORE_GUEST_IP failed"; }
     kill -TERM "$RPID" 2>/dev/null || true; wait "$RPID" 2>/dev/null || true
 else
     echo "==> Stage 2 skipped (no snapshot at $SNAP_FILE)"
