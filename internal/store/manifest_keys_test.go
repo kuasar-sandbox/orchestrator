@@ -383,10 +383,15 @@ func TestBuildOptionsRoundTrip(t *testing.T) {
 		Profile:     types.ProfileE2B,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
-		Builder: types.BuildOptions{Referer: &types.BuildRefererOptions{
-			Enabled:   &enabled,
-			Writeback: &writeback,
-		}},
+		Builder: types.BuildOptions{
+			Referer: &types.BuildRefererOptions{
+				Enabled:   &enabled,
+				Writeback: &writeback,
+			},
+			Registry: &types.BuildRegistryOptions{
+				TLS: &types.BuildRegistryTLSOptions{CABundlePEM: "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"},
+			},
+		},
 		CreatedUnix: time.Now().Unix(),
 	}
 	if err := st.PutBuild(ctx, b); err != nil {
@@ -401,5 +406,9 @@ func TestBuildOptionsRoundTrip(t *testing.T) {
 	}
 	if got.Builder.Referer.Writeback == nil || *got.Builder.Referer.Writeback {
 		t.Fatalf("referer.writeback did not round-trip false: %+v", got.Builder)
+	}
+	if got.Builder.Registry == nil || got.Builder.Registry.TLS == nil ||
+		got.Builder.Registry.TLS.CABundlePEM != "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n" {
+		t.Fatalf("registry.tls.ca_bundle_pem did not round-trip: %+v", got.Builder)
 	}
 }

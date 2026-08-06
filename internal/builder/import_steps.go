@@ -28,7 +28,11 @@ import (
 
 func (p *buildPipeline) phaseImport() error {
 	s := p.spec
-	sb, err := p.startSandbox("a", p.importYAML(), nil)
+	importYAML, err := p.importYAML()
+	if err != nil {
+		return err
+	}
+	sb, err := p.startSandbox("a", importYAML, nil)
 	if err != nil {
 		return err
 	}
@@ -76,6 +80,7 @@ func (p *buildPipeline) phaseImport() error {
 	// command stderr, which sandbox-ctl streams to journald=build (stdout is
 	// the artifact). So the SDK sees `pull: N/M layers`, `flatten: …` live.
 	args := []string{"export", "--tmpdir", "/pull"}
+	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
 		args = append(args, "--insecure")
 	}
@@ -186,6 +191,7 @@ func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLook
 	}
 	outPath := filepath.Join(s.Workdir, "referer.lookup.json")
 	args := []string{"referer", "lookup", "--json", "--owner", s.ImportReferer.Owner}
+	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
 		args = append(args, "--insecure")
 	}
@@ -232,6 +238,7 @@ func (p *buildPipeline) writeImportReferer(sb *phaseSandbox, subject, manifestID
 	if s.ImportReferer.Validity != "" {
 		args = append(args, "--validity", s.ImportReferer.Validity)
 	}
+	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
 		args = append(args, "--insecure")
 	}
@@ -263,6 +270,17 @@ func (p *buildPipeline) tenantEnv() []string {
 		}
 	}
 	return out
+}
+
+// flattenConfigArg returns the --config flag for flatten-ctl commands that
+// access a registry, pointing at the projected config YAML when a per-build
+// registry TLS policy is configured. Returns nil when no TLS config is needed
+// (flatten-ctl uses system defaults).
+func (p *buildPipeline) flattenConfigArg() []string {
+	if p.spec.RegistryTLS == nil {
+		return nil
+	}
+	return []string{"--config", guestFlattenCfg}
 }
 
 // --- phase B: steps --------------------------------------------------------

@@ -36,6 +36,10 @@ func Extract(meta map[string]string) (map[string]string, types.BuildOptions, err
 
 // Merge overlays trigger-time options over register-time options. Nil pointers
 // mean "not specified", so only explicit trigger fields override.
+//
+// Registry is register-time only: a trigger-time builder.registry is rejected
+// upstream (TriggerBuild returns 400 before Merge runs), so Merge never carries
+// it over. The register-time base Registry is preserved verbatim.
 func Merge(base, over types.BuildOptions) types.BuildOptions {
 	out := clone(base)
 	if over.Referer == nil {
@@ -62,6 +66,15 @@ func clone(in types.BuildOptions) types.BuildOptions {
 		}
 		if in.Referer.Writeback != nil {
 			out.Referer.Writeback = boolPtr(*in.Referer.Writeback)
+		}
+	}
+	if in.Registry != nil {
+		out.Registry = &types.BuildRegistryOptions{}
+		if in.Registry.TLS != nil {
+			out.Registry.TLS = &types.BuildRegistryTLSOptions{
+				CABundlePEM:        in.Registry.TLS.CABundlePEM,
+				InsecureSkipVerify: in.Registry.TLS.InsecureSkipVerify,
+			}
 		}
 	}
 	return out

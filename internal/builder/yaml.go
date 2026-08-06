@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
@@ -68,10 +70,56 @@ func (p *buildPipeline) dnsFiles() []map[string]any {
 	return []map[string]any{{"path": "/etc/resolv.conf", "content": b.String(), "mode": "0644"}}
 }
 
+// flattenConfigFiles projects the per-build registry CA bundle (inline PEM)
+// and a generated flatten-ctl config YAML into the Phase A import sandbox when
+// a registry TLS policy is configured. flatten-ctl reads the config via
+// --config (tls.ca_cert points at the projected CA bundle). Files land under
+// /run (tmpfs, never on the build root disk) and are read-only (0444).
+// Returns (nil, nil) when no TLS policy is set. A generation error is returned
+// rather than silently degrading to "no TLS config".
+func (p *buildPipeline) flattenConfigFiles() ([]map[string]any, error) {
+	tls := p.spec.RegistryTLS
+	if tls == nil {
+		return nil, nil
+	}
+	var files []map[string]any
+
+	// Project the CA bundle (if configured). Content is inline PEM carried in
+	// the BuildSpec — no host file is read here.
+	if tls.CABundlePEM != "" {
+		files = append(files, map[string]any{
+			"path":      guestCACert,
+			"content":   tls.CABundlePEM,
+			"mode":      "0444",
+			"read_only": true,
+		})
+	}
+
+	// Generate and project the flatten-ctl config YAML.
+	tlsCfg := map[string]any{}
+	if tls.CABundlePEM != "" {
+		tlsCfg["ca_cert"] = guestCACert
+	}
+	if tls.InsecureSkipVerify {
+		tlsCfg["insecure_skip_verify"] = true
+	}
+	b, err := yaml.Marshal(map[string]any{"tls": tlsCfg})
+	if err != nil {
+		return nil, fmt.Errorf("marshal flatten-ctl tls config: %w", err)
+	}
+	files = append(files, map[string]any{
+		"path":      guestFlattenCfg,
+		"content":   string(b),
+		"mode":      "0444",
+		"read_only": true,
+	})
+	return files, nil
+}
+
 // importYAML: an EMPTY single-disk sandbox (no base image at all). The writable
 // ext4 root doubles as the pull scratch. launch.placeholder anchors it; the toolchain rides the
 // /opt/sandbox-runtime projection.
-func (p *buildPipeline) importYAML() map[string]any {
+func (p *buildPipeline) importYAML() (map[string]any, error) {
 	s := p.spec
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
@@ -85,10 +133,16 @@ func (p *buildPipeline) importYAML() map[string]any {
 		},
 		"launch": map[string]any{"placeholder": true},
 	}
-	if f := p.dnsFiles(); f != nil {
-		doc["files"] = f
+	files := p.dnsFiles()
+	tlsFiles, err := p.flattenConfigFiles()
+	if err != nil {
+		return nil, err
 	}
-	return doc
+	files = append(files, tlsFiles...)
+	if len(files) > 0 {
+		doc["files"] = files
+	}
+	return doc, nil
 }
 
 // rootDoc renders boot.root for the steps/template phases: the base image plus
