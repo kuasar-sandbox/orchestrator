@@ -60,6 +60,78 @@ func TestConnectMissingTargetWithoutMigrationTokenReturnsNotFound(t *testing.T) 
 	}
 }
 
+func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb := &types.Sandbox{
+		ID: "paused-finishing-owner", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare,
+			Kind:    types.KindImg,
+			Ref:     "manifest://" + strings.Repeat("b", 64),
+		}.String(),
+		State: types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("c", 64),
+		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
+		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-finishing-owner"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-finishing-owner"),
+		CreatedUnix: 1, DeadlineUnix: 100,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	previous, err := o.launches.Claim(o.launchContext(), sb.ID, launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { o.launches.Finish(previous, context.Canceled) })
+
+	validated := make(chan struct{})
+	var validatedOnce sync.Once
+	type acceptanceResult struct {
+		sb      *types.Sandbox
+		attempt *launchAttempt
+		err     error
+	}
+	done := make(chan acceptanceResult, 1)
+	go func() {
+		accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(*types.Sandbox) error {
+			validatedOnce.Do(func() { close(validated) })
+			return nil
+		})
+		done <- acceptanceResult{sb: accepted, attempt: attempt, err: err}
+	}()
+	select {
+	case <-validated:
+	case <-time.After(time.Second):
+		t.Fatal("resume admission did not reach its authoritative paused row")
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("paused admission escaped the previous cleanup fence: %+v, %v", result.sb, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	o.launches.Finish(previous, errors.New("previous resume failed"))
+	var result acceptanceResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("paused admission did not retry after the previous owner finished")
+	}
+	if result.err != nil || result.sb == nil || result.sb.State != types.StateStarting ||
+		result.attempt == nil || result.attempt == previous {
+		t.Fatalf("retried admission = %+v, attempt=%p, err=%v", result.sb, result.attempt, result.err)
+	}
+	waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after the finishing-owner fence")
+	if got := lc.starts.Load(); got != 1 {
+		t.Fatalf("launcher starts = %d, want one post-fence resume", got)
+	}
+}
+
 func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 	dir := t.TempDir()
 	runtimePath := filepath.Join(dir, "runtime.erofs")

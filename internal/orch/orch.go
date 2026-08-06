@@ -393,14 +393,23 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	}
 	changed, err := o.st.SetStartingResources(ctx, sb.ID, resources)
 	if err != nil || !changed {
-		detachCtx, cancelDetach := cleanupContext()
-		_ = o.vs.Detach(detachCtx, port.Port)
-		cancelDetach()
-		sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
-		if err != nil {
-			return launchFailed("resources", err)
+		ownershipErr := err
+		if ownershipErr == nil {
+			ownershipErr = errLaunchOwnershipLost
 		}
-		return launchFailed("resources", errLaunchOwnershipLost)
+		detachCtx, cancelDetach := cleanupContext()
+		detachErr := o.vs.Detach(detachCtx, port.Port)
+		cancelDetach()
+		if detachErr == nil {
+			sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
+		} else {
+			// Retain the exact local ownership until rollback cleanup has had a
+			// second chance to detach it. Clearing it here would permanently leak
+			// an unpersisted port when the immediate detach failed.
+			ownershipErr = errors.Join(ownershipErr,
+				fmt.Errorf("orch: detach uncommitted port %s: %w", port.Port, detachErr))
+		}
+		return launchFailed("resources", ownershipErr)
 	}
 
 	p := o.sandboxParams(sb, tmpl, spec, network)
@@ -904,7 +913,12 @@ func (o *Orchestrator) ensureResumeAccepted(
 ) (*types.Sandbox, *launchAttempt, error) {
 	admissionStarted := time.Now()
 	unlock := o.lifecycle.Lock(sid)
-	defer unlock()
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 
 	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
@@ -950,6 +964,18 @@ func (o *Orchestrator) ensureResumeAccepted(
 		}
 		return cloneSandbox(sb), attempt, nil
 	case types.StatePaused:
+		// A failed resume publishes paused before Finish closes done. During that
+		// intentional terminal-publication window the old attempt still owns the
+		// cleanup fence, so join it and retry admission after the claim is released.
+		// Never surface errLaunchClaimed or start a second runner from this state.
+		if previous, found := o.launches.Lookup(sid); found {
+			unlock()
+			locked = false
+			if waitErr := previous.wait(ctx); waitErr != nil && ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			return o.ensureResumeAccepted(ctx, sid, requestedDeadline, validate)
+		}
 		// Stored metadata is trusted only after its pure parsers succeed. Do not
 		// make starting durable if the worker could never consume its inputs.
 		tmpl, err := types.ParseTemplateID(sb.TemplateID)

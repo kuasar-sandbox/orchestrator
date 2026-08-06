@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,6 +71,37 @@ func (v *blockedKillAttachVS) Detach(_ context.Context, port string) error {
 	return nil
 }
 func (*blockedKillAttachVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
+
+type retryDetachKillAttachVS struct {
+	entered     chan struct{}
+	gate        chan struct{}
+	detached    chan string
+	firstErr    error
+	once        sync.Once
+	detachCalls atomic.Int32
+}
+
+func (v *retryDetachKillAttachVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	v.once.Do(func() { close(v.entered) })
+	<-v.gate // deliberately return ownership after Kill has canceled the attempt
+	return &vswitch.Port{
+		Port: "retry-detach-port", FloatingIP: "169.254.1.4",
+		MAC: "02:00:00:00:00:33", InnerIP: "169.254.1.1",
+	}, nil
+}
+
+func (v *retryDetachKillAttachVS) Detach(_ context.Context, port string) error {
+	if port == "" {
+		return nil
+	}
+	v.detached <- port
+	if v.detachCalls.Add(1) == 1 {
+		return v.firstErr
+	}
+	return nil
+}
+
+func (*retryDetachKillAttachVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
 func createRequestFixture(t *testing.T, o *Orchestrator, marker string) api.CreateReq {
 	t.Helper()
@@ -308,6 +340,60 @@ func TestKillDuringCreateAttachFencesClaimUntilLateCleanup(t *testing.T) {
 	next, err := o.launches.Claim(ctx, accepted.ID, launchCreate)
 	if err != nil {
 		t.Fatalf("claim after cleanup: %v", err)
+	}
+	o.launches.Finish(next, nil)
+}
+
+func TestCreateResourceCASLossRetriesFailedImmediateDetach(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	firstDetachErr := errors.New("injected immediate detach failure")
+	vs := &retryDetachKillAttachVS{
+		entered: make(chan struct{}), gate: make(chan struct{}), detached: make(chan string, 2),
+		firstErr: firstDetachErr,
+	}
+	o.vs = vs
+	req := createRequestFixture(t, o, "7")
+	accepted, err := o.Create(ctx, req)
+	if err != nil || accepted == nil {
+		t.Fatalf("Create = %+v, %v", accepted, err)
+	}
+	select {
+	case <-vs.entered:
+	case <-time.After(time.Second):
+		t.Fatal("create did not enter network attach")
+	}
+	attempt, found := o.launches.Lookup(accepted.ID)
+	if !found {
+		t.Fatal("accepted create has no launch owner")
+	}
+	if killed, err := o.Kill(ctx, accepted.ID, req.APIKey); err != nil || !killed {
+		t.Fatalf("Kill = %v, %v", killed, err)
+	}
+	close(vs.gate)
+	for call := 1; call <= 2; call++ {
+		select {
+		case port := <-vs.detached:
+			if port != "retry-detach-port" {
+				t.Fatalf("detach call %d port = %q", call, port)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("detach call %d did not occur", call)
+		}
+	}
+	if err := attempt.wait(ctx); !errors.Is(err, firstDetachErr) {
+		t.Fatalf("launch result = %v, want immediate detach evidence", err)
+	}
+	if got := vs.detachCalls.Load(); got != 2 {
+		t.Fatalf("detach calls = %d, want immediate attempt plus rollback retry", got)
+	}
+	if stored, err := o.st.Get(ctx, accepted.ID); err != nil || stored != nil {
+		t.Fatalf("resource CAS loss resurrected sandbox: %+v, %v", stored, err)
+	}
+	next, err := o.launches.Claim(ctx, accepted.ID, launchCreate)
+	if err != nil {
+		t.Fatalf("claim after detach retry cleanup: %v", err)
 	}
 	o.launches.Finish(next, nil)
 }

@@ -30,6 +30,8 @@ func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
 	startGate := make(chan struct{})
 	lc := &countingLauncher{started: started, startGate: startGate}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+	o.vs = blocked
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterCreateCommand(fingerprint, "stable-g0")
 	events, stopEvents := o.Subscribe()
@@ -38,6 +40,11 @@ func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
 	ack := o.HandleCommand(ctx, cmd)
 	if ack.Status != routesync.AckAccepted {
 		t.Fatalf("cluster create ack = %+v", ack)
+	}
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("accepted cluster create did not enter background resource preparation")
 	}
 	stored, err := o.st.Get(ctx, cmd.SID)
 	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" || stored.VswitchPort != "" {
@@ -52,6 +59,7 @@ func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
 		t.Fatalf("initial cluster starting route = %+v", initial)
 	}
 
+	close(blocked.gate)
 	waitForLauncherStart(t, started)
 	stored, err = o.st.Get(ctx, cmd.SID)
 	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" || stored.VswitchPort == "" {

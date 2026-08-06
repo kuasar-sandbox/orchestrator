@@ -225,14 +225,37 @@ func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.Connect
 
 // LookupExec reads the node-local identity needed by the exec KAT gate. It is
 // deliberately side-effect-free: a paused route remains paused and no Wake is
-// emitted until the caller has authenticated the capability.
+// emitted until the caller has authenticated the capability. A missing first
+// sample is parked briefly because Create may return before its starting route
+// reaches this worker.
 func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIdentity, bool, error) {
 	if !v.waitSynced(ctx) {
+		if err := ctx.Err(); err != nil {
+			return proxy.ExecIdentity{}, false, err
+		}
 		return proxy.ExecIdentity{}, false, nil
 	}
-	r, ok := v.table.Lookup(sid)
-	identity, present := workerExecIdentity(r, ok)
-	return identity, present, nil
+	deadline := time.Now().Add(v.parkTimeout())
+	initialRouteRev := v.table.RouteRev(sid)
+	for {
+		rev := v.table.Rev()
+		r, ok := v.table.Lookup(sid)
+		identity, present := workerExecIdentity(r, ok)
+		if present {
+			return identity, true, nil
+		}
+		// An observed route with no live, complete identity is authoritative.
+		// Only an initially missing route can still be in propagation.
+		if ok || v.table.RouteRev(sid) != initialRouteRev {
+			return proxy.ExecIdentity{}, false, nil
+		}
+		if !v.waitChange(ctx, deadline, rev) {
+			if err := ctx.Err(); err != nil {
+				return proxy.ExecIdentity{}, false, err
+			}
+			return proxy.ExecIdentity{}, false, nil
+		}
+	}
 }
 
 // ActivateExec is entered only after the proxy has authenticated the KAT against
