@@ -738,7 +738,7 @@ elif "snap_total" in r:
 
 # ---- run the matrix ------------------------------------------------------
 
-{
+run_matrix() {
     echo "# sandbox manifest:// perf matrix"
     echo "# date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "# iters:   $ITERS"
@@ -750,7 +750,7 @@ elif "snap_total" in r:
 
     # Scenario 1: cold-start manifest:// — cold L1 (one iteration with empty cache).
     echo "==> scenario 1: cold-start manifest:// (cold L1, single iter)" >&2
-    restart_cache_ctl_clean || exit 1
+    restart_cache_ctl_clean || return 1
     rows=()
     row=$(run_cold_iter "cold-start-cold-L1" 1) && rows+=("$row")
     aggregate_kv "cold-start manifest:// (cold L1, single iter)" "${rows[@]}"
@@ -816,7 +816,7 @@ print("    upload={}ms total={} dedup={}".format(int(r["wall_ms"]), r["snap_tota
         # Scenario 5: restore manifest:// — cold L1 (clear cache).
         echo "==> scenario 5: restore manifest:// (cold L1, single iter)" >&2
         sleep 1
-        restart_cache_ctl_clean || exit 1
+        restart_cache_ctl_clean || return 1
         rows=()
         row=$(run_restore_iter "restore-cold-L1" 1 "$SNAP_KEY") && rows+=("$row")
         aggregate_kv "restore manifest:// (cold L1, single iter)" "${rows[@]}"
@@ -829,8 +829,11 @@ print("    upload={}ms total={} dedup={}".format(int(r["wall_ms"]), r["snap_tota
 
     echo
     echo "==> done"
-} | tee "$OUT"
-matrix_status=${PIPESTATUS[0]}
+}
+
+matrix_status=0
+run_matrix >"$OUT" || matrix_status=$?
+cat "$OUT"
 if [ "$matrix_status" -ne 0 ]; then
     echo "FATAL: manifest perf matrix aborted with status $matrix_status — see $OUT" >&2
     exit "$matrix_status"
