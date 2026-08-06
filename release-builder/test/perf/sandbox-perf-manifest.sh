@@ -233,7 +233,8 @@ start_store_ctl() {
         (echo >/dev/tcp/127.0.0.1/$STORE_PORT) 2>/dev/null && return
         sleep 0.1
     done
-    echo "store-ctl did not come up" >&2; exit 1
+    echo "store-ctl did not come up" >&2
+    return 1
 }
 
 start_cache_ctl() {
@@ -244,12 +245,21 @@ start_cache_ctl() {
         "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -q SERVING && return
         sleep 0.1
     done
-    echo "cache-ctl did not come up" >&2; exit 1
+    echo "cache-ctl did not come up" >&2
+    return 1
 }
 
 restart_cache_ctl_clean() {
     if [ -n "${CACHE_PID:-}" ]; then
         kill "$CACHE_PID" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            kill -0 "$CACHE_PID" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$CACHE_PID" 2>/dev/null; then
+            echo "cache-ctl pid=$CACHE_PID did not stop before cold reset" >&2
+            return 1
+        fi
         wait "$CACHE_PID" 2>/dev/null || true
     fi
     rm -rf "$CACHE_ROCKS"
@@ -258,8 +268,8 @@ restart_cache_ctl_clean() {
 
 echo "==> spin up store-ctl + cache-ctl tiered" >&2
 "$BIN/store-ctl" init --config "$WORK/store-ctl.yaml" --generation G1 >>"$WORK/store.log" 2>&1
-start_store_ctl
-start_cache_ctl
+start_store_ctl || exit 1
+start_cache_ctl || exit 1
 
 # ---- prepare blk0 manifest ----------------------------------------------
 
@@ -515,26 +525,54 @@ start_long_sandbox() {
 run_upload_iter() {
     local tag="$1"; local i="$2"; local sbpid="$3"; local d="$4"
     local snap_log="$d/snap-$tag-$i.log"
-    local out="$d/snap-$tag-$i"
-    local t0=$(date +%s%N)
+    local t0
+    t0=$(date +%s%N)
     local key
-    key=$("$BIN/sandbox-ctl" snapshot \
+    if ! key=$("$BIN/sandbox-ctl" snapshot \
         --sandbox-id "$(basename "$d" | sed 's/long-//')" \
-        --output "$out" \
         --upload \
         --run-root "$d/runtime" \
-        --resume=true 2>"$snap_log")
-    local t_end=$(date +%s%N)
+        --resume=true 2>"$snap_log"); then
+        echo "snapshot upload $tag iter $i failed" >&2
+        sed -n '1,120p' "$snap_log" >&2
+        return 1
+    fi
+    if [[ ! "$key" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "snapshot upload $tag iter $i returned invalid manifest key: $key" >&2
+        sed -n '1,120p' "$snap_log" >&2
+        return 1
+    fi
+    local t_end
+    t_end=$(date +%s%N)
     local wall_ms
     wall_ms=$(awk "BEGIN{printf \"%.1f\", ($t_end - $t0) / 1000000.0}")
-    # Pull dedup numbers from the snapshot stderr line.
-    local snap_total snap_dedup disk_total disk_dedup
-    snap_total=$(grep -oE 'snapshot total=[0-9]+' "$snap_log" | head -1 | sed 's/.*=//')
-    snap_dedup=$(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' "$snap_log" | head -1 | grep -oE 'dedup=[0-9]+' | sed 's/.*=//')
-    disk_total=$(grep -oE 'disk total=[0-9]+' "$snap_log" | head -1 | sed 's/.*=//')
-    disk_dedup=$(grep -oE 'disk total=[0-9]+ dedup=[0-9]+' "$snap_log" | head -1 | grep -oE 'dedup=[0-9]+' | sed 's/.*=//')
-    local mem_resident
-    mem_resident=$(grep -oE 'resident=[0-9]+' "$snap_log" | head -1 | sed 's/.*=//')
+    local upload_line snapshot_line
+    upload_line=$(grep -m1 'upload OK; overlay stored=' "$snap_log") || {
+        echo "snapshot upload $tag iter $i did not report chunk statistics" >&2
+        sed -n '1,120p' "$snap_log" >&2
+        return 1
+    }
+    if [[ ! "$upload_line" =~ overlay[[:space:]]stored=([0-9]+)[[:space:]]dedup=([0-9]+),[[:space:]]snapshot[[:space:]]stored=([0-9]+)[[:space:]]dedup=([0-9]+) ]]; then
+        echo "snapshot upload $tag iter $i returned malformed chunk statistics: $upload_line" >&2
+        return 1
+    fi
+    local disk_stored="${BASH_REMATCH[1]}"
+    local disk_dedup="${BASH_REMATCH[2]}"
+    local snap_stored="${BASH_REMATCH[3]}"
+    local snap_dedup="${BASH_REMATCH[4]}"
+    local disk_total snap_total
+    disk_total=$((disk_stored + disk_dedup))
+    snap_total=$((snap_stored + snap_dedup))
+
+    snapshot_line=$(grep -m1 '^snapshot upload done:' "$snap_log") || {
+        echo "snapshot upload $tag iter $i did not report memory statistics" >&2
+        return 1
+    }
+    if [[ ! "$snapshot_line" =~ resident=([0-9]+) ]]; then
+        echo "snapshot upload $tag iter $i returned malformed memory statistics: $snapshot_line" >&2
+        return 1
+    fi
+    local mem_resident="${BASH_REMATCH[1]}"
     python3 - <<PY
 import json
 print(json.dumps({
@@ -557,7 +595,6 @@ run_restore_iter() {
     mkdir -p "$d/runtime"
     local diff="$d/runtime/blk1.diff"
     truncate -s 1G "$diff"
-    mkfs.ext4 -q -F "$diff"
     write_host_yaml "$d/host.yaml" "$diff"
 
     local log="$d/run.log"
@@ -569,8 +606,8 @@ run_restore_iter() {
     for try in 1 2 3; do
         rm -f "$log"
         t0=$(date +%s%N)
-        "$BIN/sandbox-ctl" restore \
-            --snapshot "manifest://$snap_key" \
+        "$BIN/sandbox-ctl" run \
+            --restore "manifest://$snap_key" \
             --config "$d/host.yaml" \
             --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
@@ -713,7 +750,7 @@ elif "snap_total" in r:
 
     # Scenario 1: cold-start manifest:// — cold L1 (one iteration with empty cache).
     echo "==> scenario 1: cold-start manifest:// (cold L1, single iter)" >&2
-    restart_cache_ctl_clean
+    restart_cache_ctl_clean || exit 1
     rows=()
     row=$(run_cold_iter "cold-start-cold-L1" 1) && rows+=("$row")
     aggregate_kv "cold-start manifest:// (cold L1, single iter)" "${rows[@]}"
@@ -779,7 +816,7 @@ print("    upload={}ms total={} dedup={}".format(int(r["wall_ms"]), r["snap_tota
         # Scenario 5: restore manifest:// — cold L1 (clear cache).
         echo "==> scenario 5: restore manifest:// (cold L1, single iter)" >&2
         sleep 1
-        restart_cache_ctl_clean
+        restart_cache_ctl_clean || exit 1
         rows=()
         row=$(run_restore_iter "restore-cold-L1" 1 "$SNAP_KEY") && rows+=("$row")
         aggregate_kv "restore manifest:// (cold L1, single iter)" "${rows[@]}"
@@ -793,6 +830,11 @@ print("    upload={}ms total={} dedup={}".format(int(r["wall_ms"]), r["snap_tota
     echo
     echo "==> done"
 } | tee "$OUT"
+matrix_status=${PIPESTATUS[0]}
+if [ "$matrix_status" -ne 0 ]; then
+    echo "FATAL: manifest perf matrix aborted with status $matrix_status — see $OUT" >&2
+    exit "$matrix_status"
+fi
 
 # Sanity: any scenario with zero successful iterations means the run is broken
 # (build/env/regression). The body's `|| continue` swallows per-iter failures
