@@ -274,7 +274,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	rec.Hash = hashSID(in.SandboxID)
 	rec.Status = statusPresent
 	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
-	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
+	atomic.StoreUint64(&rec.Rev, atomic.AddUint64(&t.header.GlobalRev, 1))
 	_ = putFixed(rec.SandboxID[:], in.SandboxID)
 	_ = putFixed(rec.Profile[:], in.Profile)
 	_ = putFixed(rec.TemplateID[:], in.TemplateID)
@@ -302,18 +302,33 @@ func (t *Table) Delete(sid string) bool {
 	}
 	idx, ok := t.findSlot(sid, false)
 	if !ok {
-		return false
+		// Preserve an explicit Delete for a worker that woke an initially
+		// missing sandbox. A tombstone gives that SID a new per-route revision
+		// without retaining any credential or identity material.
+		idx, ok = t.findSlot(sid, true)
+		if !ok {
+			return false
+		}
 	}
-	t.deleteRecord(&t.records[idx])
+	t.deleteRecordHash(&t.records[idx], hashSID(sid), sid)
 	return true
 }
 
 func (t *Table) deleteRecord(rec *mmapRecord) {
+	entry, _, ok := readRecord(rec)
+	if !ok {
+		return
+	}
+	t.deleteRecordHash(rec, atomic.LoadUint64(&rec.Hash), entry.SandboxID)
+}
+
+func (t *Table) deleteRecordHash(rec *mmapRecord, hash uint64, sid string) {
 	startWrite(rec)
+	rec.Hash = hash
 	rec.Status = statusDeleted
 	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
-	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
-	clearFixed(rec.SandboxID[:])
+	atomic.StoreUint64(&rec.Rev, atomic.AddUint64(&t.header.GlobalRev, 1))
+	_ = putFixed(rec.SandboxID[:], sid)
 	clearFixed(rec.Profile[:])
 	clearFixed(rec.TemplateID[:])
 	clearFixed(rec.State[:])
@@ -331,6 +346,41 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	clearFixed(rec.SnapshotLocation[:])
 	clearFixed(rec.MmdsSecret[:])
 	finishWrite(rec)
+}
+
+// RouteRev returns the latest revision associated with sid, including an
+// explicit Delete tombstone. It lets a worker distinguish a terminal response
+// to its Wake from unrelated global route-table traffic even when starting and
+// rollback updates are coalesced before the worker samples shared memory.
+func (t *Table) RouteRev(sid string) uint64 {
+	if sid == "" || len(t.records) == 0 {
+		return 0
+	}
+	h := hashSID(sid)
+	start := int(h % uint64(len(t.records)))
+	var latest uint64
+	for i := 0; i < len(t.records); i++ {
+		rec := &t.records[(start+i)%len(t.records)]
+		status := atomic.LoadUint32(&rec.Status)
+		if status == statusEmpty {
+			return latest
+		}
+		if atomic.LoadUint64(&rec.Hash) != h {
+			continue
+		}
+		entry, stableStatus, ok := readRecord(rec)
+		if !ok {
+			i--
+			runtime.Gosched()
+			continue
+		}
+		if stableStatus != statusEmpty && entry.SandboxID == sid {
+			if rev := atomic.LoadUint64(&rec.Rev); rev > latest {
+				latest = rev
+			}
+		}
+	}
+	return latest
 }
 
 func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
@@ -422,6 +472,17 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 			}
 			return idx, true
 		case statusDeleted:
+			if atomic.LoadUint64(&rec.Hash) == h {
+				entry, st, ok := readRecord(rec)
+				if !ok {
+					i--
+					runtime.Gosched()
+					continue
+				}
+				if st == statusDeleted && entry.SandboxID == sid {
+					return idx, true
+				}
+			}
 			if insert && firstDeleted < 0 {
 				firstDeleted = idx
 			}

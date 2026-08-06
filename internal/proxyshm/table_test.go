@@ -60,6 +60,9 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	if !ok || status != statusDeleted {
 		t.Fatalf("deleted record status=%d ok=%v", status, ok)
 	}
+	if deleted.SandboxID != entry.SandboxID {
+		t.Fatalf("deleted record SID = %q, want credential-free wake correlation %q", deleted.SandboxID, entry.SandboxID)
+	}
 	if deleted.AuthSandboxID != "" || deleted.APISecret != "" || deleted.APISecretFingerprint != "" ||
 		deleted.ManifestKeyFingerprint != "" || deleted.ServiceSecret != "" ||
 		deleted.EnvdAccessToken != "" || deleted.TrafficAccessToken != "" ||
@@ -217,6 +220,100 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not unpark")
+	}
+}
+
+func TestWorkerMissingAndPausedTransitionsThroughStarting(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		initialPaused  bool
+		directTerminal bool
+		terminal       string
+		wantRunning    bool
+	}{
+		{name: "missing to running", terminal: routesync.StateRunning, wantRunning: true},
+		{name: "missing to paused rollback", terminal: routesync.StatePaused},
+		{name: "missing to delete", terminal: routesync.TypeDelete},
+		{name: "missing direct delete", directTerminal: true, terminal: routesync.TypeDelete},
+		{name: "paused to running", initialPaused: true, terminal: routesync.StateRunning, wantRunning: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "routes.shm")
+			tbl, err := Create(path, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			updates := &Updates{ch: make(chan struct{})}
+			var wakes atomic.Int32
+			wakeSeen := make(chan struct{}, 1)
+			worker := NewWorkerView(tbl, updates, func(string) {
+				wakes.Add(1)
+				select {
+				case wakeSeen <- struct{}{}:
+				default:
+				}
+			}, 5*time.Second)
+			route := routesync.RouteEntry{
+				SandboxID: "transition", Profile: "e2b", State: routesync.StatePaused,
+				EnvdUDS: "/run/transition/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
+			}
+			tbl.BeginSync()
+			if tc.initialPaused {
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tbl.Bookmark()
+
+			done := make(chan proxy.Route, 1)
+			go func() {
+				got, _ := worker.Route(context.Background(), route.SandboxID, proxy.LegacyTarget(49983))
+				done <- got
+			}()
+			select {
+			case <-wakeSeen:
+			case <-time.After(time.Second):
+				t.Fatal("initial missing/paused route did not emit Wake")
+			}
+			if !tc.directTerminal {
+				route.State = routesync.StateStarting
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+				updates.bump()
+				select {
+				case got := <-done:
+					t.Fatalf("route returned at starting: %+v", got)
+				default:
+				}
+			}
+
+			if tc.terminal == routesync.TypeDelete {
+				tbl.Delete(route.SandboxID)
+			} else {
+				route.State = tc.terminal
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			updates.bump()
+			select {
+			case got := <-done:
+				if tc.wantRunning {
+					if got.Kind != proxy.KindUDS || got.UDS != route.EnvdUDS {
+						t.Fatalf("running route = %+v", got)
+					}
+				} else if got.Kind != proxy.KindNotFound {
+					t.Fatalf("rollback route = %+v, want not found", got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("terminal update consumed the full park timeout")
+			}
+			if got := wakes.Load(); got != 1 {
+				t.Fatalf("transition emitted %d Wake calls, want exactly 1", got)
+			}
+		})
 	}
 }
 

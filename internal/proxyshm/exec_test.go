@@ -199,6 +199,16 @@ func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *t
 	case <-time.After(time.Second):
 		t.Fatal("authorized paused activation did not wake sandbox")
 	}
+	route.State = routesync.StateStarting
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		t.Fatalf("activation returned at starting: %+v", got)
+	default:
+	}
 	route.State = routesync.StateRunning
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
