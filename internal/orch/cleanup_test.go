@@ -114,6 +114,36 @@ func TestLaunchCleanupRetriesInOwnershipOrder(t *testing.T) {
 	}
 }
 
+func TestReconcileCleanupStopsBeforeLaterOwnership(t *testing.T) {
+	stopErr := errors.New("injected reconcile stop failure")
+	lc := &orderedCleanupLauncher{stopErr: stopErr}
+	vs := &orderedCleanupVS{}
+	cfg := &config.Config{}
+	cfg.Units.Runner = "sandbox-runner@.service"
+	o := &Orchestrator{cfg: cfg, lc: lc, vs: vs}
+
+	root := t.TempDir()
+	sb := &types.Sandbox{
+		ID: "reconcile-ordered-cleanup", RunID: "sr-00000000-0000-7000-8000-000000000002",
+		VswitchPort: "reconcile-ordered-port",
+		RunDir:      filepath.Join(root, "run"),
+	}
+	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.teardownReconcile(context.Background(), sb); !errors.Is(err, stopErr) {
+		t.Fatalf("reconcile cleanup error = %v, want stop failure", err)
+	}
+	if lc.resetCalls.Load() != 0 || vs.detachCalls.Load() != 0 {
+		t.Fatalf("reconcile cleanup advanced past failed Stop: reset=%d detach=%d",
+			lc.resetCalls.Load(), vs.detachCalls.Load())
+	}
+	if _, err := os.Stat(sb.RunDir); err != nil {
+		t.Fatalf("reconcile cleanup removed run dir before ownership release: %v", err)
+	}
+}
+
 func assertCleanupDirsExist(t *testing.T, sb *types.Sandbox) {
 	t.Helper()
 	for _, dir := range []string{sb.RunDir, sb.BaseDir} {

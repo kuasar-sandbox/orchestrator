@@ -1578,7 +1578,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 			target = types.StatePaused
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
-		if err := o.teardown(ctx, sb); err != nil {
+		if err := o.teardownReconcile(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
 		}
 		if target == types.StateDead {
@@ -1601,7 +1601,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		if err := o.teardown(ctx, sb); err != nil {
+		if err := o.teardownReconcile(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
 		}
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
@@ -1768,6 +1768,26 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
 	}
 	o.uncache(sb.ID)
 	return cleanupErr
+}
+
+// teardownReconcile releases persisted ownership in dependency order. Unlike
+// the best-effort API teardown above, Reconcile has no live attempt to retain
+// per-step retry progress: on any failure it leaves later resources untouched,
+// preserves the durable row, and fails node startup so the next invocation can
+// retry safely before an API or data-plane surface opens.
+func (o *Orchestrator) teardownReconcile(ctx context.Context, sb *types.Sandbox) error {
+	progress := launchCleanupProgress{
+		port:   sb.VswitchPort,
+		runDir: sb.RunDir,
+	}
+	if sb.RunID != "" {
+		progress.unit = o.runnerUnit(sb.RunID)
+	}
+	if err := progress.step(ctx, o, true); err != nil {
+		return err
+	}
+	o.uncache(sb.ID)
+	return nil
 }
 
 // snapshot pauses+captures the running sandbox via sandbox-ctl and returns its

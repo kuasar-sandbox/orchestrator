@@ -246,6 +246,9 @@ func TestReconcileCleanupFailurePreservesStartingOwnership(t *testing.T) {
 	if err := os.MkdirAll(sb.BaseDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	lc := &reconcileLauncher{units: []launcher.Unit{{
 		Name: "sandbox-runner@" + runID + ".service", ActiveState: "active",
@@ -263,6 +266,9 @@ func TestReconcileCleanupFailurePreservesStartingOwnership(t *testing.T) {
 	}
 	if _, err := os.Stat(sb.BaseDir); err != nil {
 		t.Fatalf("fresh base dir removed before cleanup completed: %v", err)
+	}
+	if _, err := os.Stat(sb.RunDir); err != nil {
+		t.Fatalf("run dir removed before network ownership was released: %v", err)
 	}
 	if o.lookup(sb.ID) != nil {
 		t.Fatal("failed reconcile adopted starting sandbox into cache")
