@@ -129,7 +129,9 @@ PY
             exit 42
             ;;
         envd-init-failure)
-            python3 - "\$@" <<'PY'
+            # Replace this wrapper so no parent process retains ready-fd after
+            # Python closes it; EOF is the final readiness protocol event.
+            exec python3 - "\$@" <<'PY'
 import os, socket, sys, time
 
 args = sys.argv[1:]
