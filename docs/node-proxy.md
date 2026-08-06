@@ -144,6 +144,10 @@ worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor
 推进,worker 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新立即结束
 starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
+全局 revision/notify 只负责唤醒检查;worker 以该 SID 槽位(含 Delete tombstone)的 revision
+判断 Wake 是否已收到终态回应。因此即使异步共享表收敛把中间 starting 与随后
+paused/Delete 合并,也不会漏掉 rollback 后继续消耗完整 park timeout。一个请求只允许在
+初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次 Wake。
 
 共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
 `<stableSandboxID>-g<SandboxGeneration>`,正常流程不会让不同逻辑沙箱复用同一个
@@ -161,6 +165,11 @@ ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关
 不由 node 平台层消费.`AuthSandboxID + ServiceSecret` 用于验证 exec KAT,
 其中共享表 key 和本地运行目录仍只使用 NodeSandboxID.既有 `MmdsSecret` 独立服务于
 MMDS,不充当上述任一 token.
+
+初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
+state park,绝不尝试使用这些空字段。node 持久化 network ownership 并完成 YAML/ready.sock
+后会发布 enriched starting,此时 MMDS 才能按 FloatingIP 反查身份。ordinary data plane 仍
+须等 running。
 
 ## 5. 转发路径
 
@@ -290,8 +299,9 @@ proxy worker ─► shared route view
 
 两段式协议:
 
-1. `PUT /latest/api/token`:按请求源 IP 查 starting/running route 的 floatingip;未同步时按
-   `park_timeout` 等待,超时 503。命中后返回 `<sid>.<hmac>` session token。
+1. `PUT /latest/api/token`:按请求源 IP 查 enriched starting/running route 的 floatingip;
+   初始 starting 尚无 FloatingIP,按 `park_timeout` 等待后续 route,超时 503。命中后返回
+   `<sid>.<hmac>` session token。
 2. `GET /`:校验 `X-metadata-token`,返回 `{instanceID, envID, accessTokenHash}`。
 
 MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落到不同 worker
@@ -306,7 +316,7 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
 - **routesync 断开**:master 指数退避重连;重连后重新同步。共享表在重同步期间保留旧
   路由,Bookmark 后清除断连期间删除的记录。
 - **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;starting
-  只 park、不 Wake,变为 paused/Delete 时立即结束;resume 单飞和当前 launch 的状态推进
+  只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和当前 launch 的状态推进
   仍由 conductor 执行。
 - **失败码**:非法 target = 400;exec 的非 CONNECT method = 405;未知/未就绪 sid = 404;
   鉴权失败 = 401;已识别但 profile/当前 proxy 模式不支持的 service 或 off = 501;
@@ -322,6 +332,11 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
   `data_requests_total{result=...}`;队列饱和时优先保护数据面,可能丢弃个别 metrics 增量。
 - MMDS 按 floatingip 反查当前实现为共享表线性扫描,该路径只在 envd 初始化时使用,
   不在高 QPS 数据面热路径。
+
+这里的 running 只证明 orchestrator readiness wire 与 mandatory e2b `/init` 已成功,不保证
+code interpreter、forward 业务端口或用户应用 health 已监听;业务 backend readiness 仍由
+[#125](https://github.com/kuasar-sandbox/orchestrator/issues/125) 独立跟踪,proxy 不在本阶段
+增加通用 dial retry。
 
 ## 10. See Also
 

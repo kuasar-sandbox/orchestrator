@@ -6,7 +6,7 @@
 # network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
-# as an envd-managed process. One orchestrator, five builds + two creates:
+# as an envd-managed process. One orchestrator, five builds + three creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -21,7 +21,7 @@
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
 #   B5  profile=bare + fromImage                            → bare-img template
 #       rejects start/ready, uses bare build network, and remains image-only
-#   create from B3 and B5 → 201 → list → kill              (snp restore + bare cold boot)
+#   create from B3, B1 and B5 → 201 → wait running → kill  (snapshot + e2b/bare cold boot)
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
@@ -286,6 +286,20 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+wait_running() { # sid
+    local sid="$1" code state=""
+    for _ in $(seq 1 180); do
+        code=$(req GET "/sandboxes/$sid" "$AK" || true)
+        if [ "$code" = "200" ]; then
+            state=$(json_field "$WORK/resp.body" state)
+            [ "$state" = "running" ] && return 0
+            [ "$state" = "dead" ] && break
+        fi
+        sleep 0.5
+    done
+    echo "sandbox $sid state=$state, want running" >&2
+    return 1
+}
 persist_ref() {
     python3 - "$1" <<'PY'
 import base64
@@ -520,16 +534,27 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B3_BID"; fail "create = $code (want 201)"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$SID" ] || fail "create returned no sandboxID"
+wait_running "$SID" || { diag "$B3_BID"; fail "snapshot-template sandbox did not reach running"; }
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code (want 200)"
 grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"
 echo "==> PASS: sandbox create → list → kill from the built template"
+
+echo "==> create e2b cold sandbox from $B1_PERSIST (image path)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B1_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B1_BID"; fail "e2b cold create = $code (want 201)"; }
+E2B_COLD_SID=$(json_field "$WORK/resp.body" sandboxID)
+[ -n "$E2B_COLD_SID" ] || fail "e2b cold create returned no sandboxID"
+wait_running "$E2B_COLD_SID" || { diag "$B1_BID"; fail "e2b cold sandbox did not reach running"; }
+code=$(req DELETE "/sandboxes/$E2B_COLD_SID" "$AK"); [ "$code" = "204" ] || fail "e2b cold kill = $code (want 204)"
+echo "==> PASS: e2b image cold Create reached running and cleaned up"
 
 echo "==> create bare sandbox from $B5_PERSIST (image cold-boot path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B5_PERSIST\",\"timeout\":60}")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B5_BID"; fail "bare create = $code (want 201)"; }
 BARE_SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$BARE_SID" ] || fail "bare create returned no sandboxID"
+wait_running "$BARE_SID" || { diag "$B5_BID"; fail "bare cold sandbox did not reach running"; }
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "bare list = $code (want 200)"
 grep -q "$BARE_SID" "$WORK/resp.body" || fail "created bare sandbox $BARE_SID not in list"
 code=$(req DELETE "/sandboxes/$BARE_SID" "$AK"); [ "$code" = "204" ] || fail "bare kill = $code (want 204)"

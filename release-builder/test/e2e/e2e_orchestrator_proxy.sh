@@ -10,7 +10,8 @@
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
 #         # workers run in PROXY_NETNS, and mmds_listen is bound there
-#   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
+#   POST /sandboxes  -> durable starting acceptance; an immediate proxy request
+#                       parks across route propagation, runner boot and envd init
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
@@ -347,7 +348,7 @@ truncate -s 2G "$BLD"
 # ---- orchestrator config: proxy_mode=external -----------------------------
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: external, auth: enforce, park_timeout: 2s }
+proxy: { mode: external, auth: enforce, park_timeout: 120s }
 mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
@@ -393,7 +394,7 @@ shm_path: $WORK/run/proxy-routes.shm
 route_capacity: 1024
 workers: 2
 auth: enforce
-park_timeout: 2s
+park_timeout: 120s
 mmds_listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
@@ -440,7 +441,12 @@ FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
     || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID running (envd and forward tokens captured; no default exec token)"
+echo "==> PASS: sandbox $SID durably accepted (tokens captured; no default exec token)"
+echo "==> request envd immediately through external proxy; missing/starting must park to running"
+code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; dump_logs; fail "immediate external proxy request=$code"; }
+echo "==> PASS: external proxy parked post-Create request through starting to running (code=$code)"
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done

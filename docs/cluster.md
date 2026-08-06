@@ -620,6 +620,12 @@ RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
+node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
+`starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,
+不是 READY。后续资源准备/runner/runtime failure 以 matching Delete 驱动上述 reservation
+rollback。CmdConnect Ack 前则完成 paused→starting、清空旧 run/network ownership、提交 deadline
+并发布 starting;其 restore failure 发布 paused Upsert,不得进入 fresh-create Delete 分支。
+
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
 验证连接，失败候选加入本次 placement 的排除集合并重选。node_link profile 写入失败会拒绝订阅；node_list
@@ -731,13 +737,15 @@ Reserve body 只属于 create;connect/exec-session/data body 为空.四种 opera
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 只允许 restore/credentials
   config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
-  SandboxID 和首个 NodeSandboxID,下发 CmdCreate,等待 node READY 事件后返回 `Route`。并发
-  create 在 Registry 内合并。
+  SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
+  attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
+  Registry 内合并。
 - `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;Header 携 `X-API-KEY`,可选
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
   排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、可选
-  import、deadline 持久化和凭据读取,Ack 返回 typed `ConnectResult`;Registry 校验其
+  import、paused→starting、旧 run/network ownership 清理、deadline 持久化和凭据读取,Ack
+  返回 typed `ConnectResult`;Registry 校验其
   NodeSandboxID/TemplateID/Profile/三项公开 token 与 route 一致后返回 `Route + Connect`。
   resume 异步进行,connect 不等待 READY,也不在 Router 合并不同请求。
 - `exec-session`:query 必须携期望的稳定 `sid`,可选非负 int64 `ttl_seconds`;
@@ -771,7 +779,7 @@ Reserve body 只属于 create;connect/exec-session/data body 为空.四种 opera
 CmdConnect/CmdExecSession 的 `CmdID` 只关联当前 Command 与 Ack waiter,不是持久幂等键.
 Registry 不在 Ack 超时、链路中断或 node 重启后自动重投同一个 Command/`CmdID`;本次调用
 返回临时失败,API 重试创建新的 operation 和 `CmdID`.Connect 依靠 target insert-only、对象
-绑定校验和 resume single-flight 保持可重试;Exec Session 重试可以签发新的 KAT.系统不持久化
+绑定校验和 node-local launch ownership 保持可重试;Exec Session 重试可以签发新的 KAT.系统不持久化
 command digest、Ack/result 或临时去重状态.
 
 孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,node_sandbox_id)` 查归属表;表项不存在,

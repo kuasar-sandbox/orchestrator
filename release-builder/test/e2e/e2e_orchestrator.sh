@@ -83,6 +83,20 @@ req() {
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+wait_running() { # sid
+    local sid="$1" code state=""
+    for _ in $(seq 1 120); do
+        code=$(req GET "/sandboxes/$sid" "$AK" || true)
+        if [ "$code" = "200" ]; then
+            state=$(json_field "$WORK/resp.body" state)
+            [ "$state" = "running" ] && return 0
+            [ "$state" = "dead" ] && break
+        fi
+        sleep 0.5
+    done
+    echo "sandbox $sid state=$state, want running" >&2
+    return 1
+}
 
 # The control-plane / unit-install / build-API / ownership tests below do NOT need
 # a running vswitch — node-ctl only dials connector-ctl vswitch on sandbox *create*
@@ -186,6 +200,7 @@ if [ -n "${TEMPLATE_ID:-}" ]; then
     [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "create = $code (want 201)"; }
     SID=$(json_field "$WORK/resp.body" sandboxID)
     echo "    sandboxID=$SID"
+    wait_running "$SID" || fail "created sandbox $SID did not reach running"
     code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code"
     grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
     code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"

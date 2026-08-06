@@ -12,7 +12,9 @@
 #                                sandbox-runtime.bundle; envd comes up at 49983,
 #                                exposed as envd.sock; after runtime readiness the
 #                                orchestrator requires envdInit(/init), without a
-#                                launch-time /health probe. 201 == booted + initialized.
+#                                launch-time /health probe. 201 == durable starting
+#                                acceptance; the immediate data request below parks
+#                                until runtime readiness + /init complete.
 #                                The create injects sandbox config via the
 #                                X-Kuasar-Sandbox-Network header (hostname), checked
 #                                in the guest below (§4.6 config passing chain).
@@ -90,8 +92,9 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 
 # Run conductor from a private sibling-bin directory so its normal binary
 # discovery reaches this transparent sandbox-ctl wrapper. The wrapper records
-# snapshot argv as JSONL, then execs the unmodified release candidate binary.
-# All non-snapshot behavior therefore remains the real KVM stack.
+# snapshot argv as JSONL, then normally execs the unmodified release candidate
+# binary. Explicit sentinel modes below are confined to deterministic negative
+# lifecycle tests; every ordinary create/restore still uses the real KVM stack.
 ORCH_BIN_DIR="$WORK/orch-bin"
 SNAPSHOT_ARGV_LOG="$WORK/snapshot-argv.jsonl"
 mkdir -p "$ORCH_BIN_DIR"
@@ -108,6 +111,70 @@ import json, sys
 with open(sys.argv[1], "a", encoding="utf-8") as output:
     output.write(json.dumps(sys.argv[2:]) + "\\n")
 PY
+fi
+if [ "\${1:-}" = "run" ] && [ -f "$WORK/inject-sandbox-run" ]; then
+    mode="\$(<"$WORK/inject-sandbox-run")"
+    case "\$mode" in
+        hold)
+            while [ -f "$WORK/inject-sandbox-run" ]; do sleep 0.05; done
+            exit 44
+            ;;
+        runtime-wire-failure)
+            python3 - "\$@" <<'PY'
+import os, sys
+fd = next(int(arg.split("=", 1)[1]) for arg in sys.argv[1:] if arg.startswith("--ready-fd="))
+os.write(fd, b"control_ready\ninvalid_runtime_event\n")
+os.close(fd)
+PY
+            exit 42
+            ;;
+        envd-init-failure)
+            python3 - "\$@" <<'PY'
+import os, socket, sys, time
+
+args = sys.argv[1:]
+def value(name):
+    for index, arg in enumerate(args):
+        if arg == name:
+            return args[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    raise SystemExit("missing " + name)
+
+sid = value("--sandbox-id")
+run_root = value("--run-root")
+ready_fd = int(value("--ready-fd"))
+envd_path = os.path.join(run_root, sid, "envd.sock")
+try:
+    os.unlink(envd_path)
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(envd_path)
+server.listen(1)
+server.settimeout(15)
+os.write(ready_fd, b"control_ready\nready\n")
+os.close(ready_fd)
+conn, _ = server.accept()
+conn.settimeout(5)
+request = b""
+while b"\r\n\r\n" not in request:
+    chunk = conn.recv(65536)
+    if not chunk:
+        break
+    request += chunk
+conn.sendall(b"HTTP/1.1 500 Injected envd failure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+conn.close()
+server.close()
+time.sleep(300)
+PY
+            exit 43
+            ;;
+        *)
+            echo "unknown sandbox run injection: \$mode" >&2
+            exit 2
+            ;;
+    esac
 fi
 exec "$BIN/sandbox-ctl" "\$@"
 EOF
@@ -226,6 +293,24 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
     row = db.execute("select run_id from sandboxes where id=?", (sys.argv[2],)).fetchone()
 print(row[0] if row else "")
 PY
+}
+sandbox_state() { # $1=sandbox id
+    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select state from sandboxes where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "missing")
+PY
+}
+wait_sandbox_state() { # $1=sandbox id, $2=state, $3=attempts(optional)
+    local sid="$1" want="$2" attempts="${3:-120}" state=""
+    for _ in $(seq 1 "$attempts"); do
+        state="$(sandbox_state "$sid")"
+        [ "$state" = "$want" ] && return 0
+        sleep 0.1
+    done
+    echo "sandbox $sid state=$state, want $want" >&2
+    return 1
 }
 wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
     local unit="$1" pattern="$2" output="$3"
@@ -524,7 +609,7 @@ write_orchestrator_config() { # $1=unset|node-policy
     local policy_mode="$1"
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS }
+proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS, park_timeout: 120s }
 mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
@@ -619,6 +704,89 @@ for ((i=0; i<BUILD_SNAPSHOT_COUNT; i++)); do
 done
 echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
 
+# ---- async launch failure/kill gates --------------------------------------
+# These deterministic injections surround the release-candidate binaries; they
+# exercise the real conductor, sqlite store, run pool, systemd units, network,
+# routes and cleanup without relying on timing races.
+RUNNER_UNIT="$UNIT_DIR/sandbox-runner@.service"
+RUNNER_UNIT_SAVED="$WORK/sandbox-runner@.service.saved"
+cp "$RUNNER_UNIT" "$RUNNER_UNIT_SAVED"
+python3 - "$RUNNER_UNIT" <<'PY'
+import sys
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().splitlines()
+lines = ["ExecStart=/bin/sleep 30" if line.startswith("ExecStart=") else line for line in lines]
+open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+systemctl daemon-reload
+echo "==> inject runner WaitAssignment timeout; Create must still return durable 201"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "runner-timeout create=$code (want 201)"; }
+RUNNER_TIMEOUT_SID=$(json_field "$WORK/resp.body" sandboxID)
+RUNNER_TIMEOUT_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+wait_sandbox_state "$RUNNER_TIMEOUT_SID" dead 200 || fail "runner-timeout sandbox did not roll back to dead"
+[ -z "$(sandbox_run_id "$RUNNER_TIMEOUT_SID")" ] || fail "runner-timeout rollback retained run_id"
+code=$(DP_MAX_TIME=10 dp "49983-$RUNNER_TIMEOUT_SID" /health "$RUNNER_TIMEOUT_TOKEN" || true)
+[ "$code" = "404" ] || fail "runner-timeout route=$code (want prompt 404 after Delete)"
+code=$(req DELETE "/sandboxes/$RUNNER_TIMEOUT_SID" "$AK"); [ "$code" = "204" ] || fail "delete runner-timeout sandbox=$code"
+cp "$RUNNER_UNIT_SAVED" "$RUNNER_UNIT"
+systemctl daemon-reload
+systemctl stop 'sandbox-runner@*.service' >/dev/null 2>&1 || true
+systemctl reset-failed 'sandbox-runner@*.service' >/dev/null 2>&1 || true
+echo "==> PASS: runner wait timeout rolled accepted fresh Create to dead + Delete with empty run_id"
+
+printf '%s\n' runtime-wire-failure >"$WORK/inject-sandbox-run"
+echo "==> inject malformed runtime readiness after runner commit"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "runtime-failure create=$code (want 201)"; }
+RUNTIME_FAILURE_SID=$(json_field "$WORK/resp.body" sandboxID)
+RUNTIME_FAILURE_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+wait_sandbox_state "$RUNTIME_FAILURE_SID" dead 120 || fail "runtime protocol failure did not roll back to dead"
+rm -f "$WORK/inject-sandbox-run"
+code=$(DP_MAX_TIME=10 dp "49983-$RUNTIME_FAILURE_SID" /health "$RUNTIME_FAILURE_TOKEN" || true)
+[ "$code" = "404" ] || fail "runtime-failure route=$code (want prompt 404)"
+code=$(req DELETE "/sandboxes/$RUNTIME_FAILURE_SID" "$AK"); [ "$code" = "204" ] || fail "delete runtime-failure sandbox=$code"
+echo "==> PASS: readiness protocol failure fenced the assigned runner and published Delete"
+
+printf '%s\n' envd-init-failure >"$WORK/inject-sandbox-run"
+echo "==> inject mandatory envd /init HTTP 500 after valid readiness wire"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "envd-failure create=$code (want 201)"; }
+ENVD_FAILURE_SID=$(json_field "$WORK/resp.body" sandboxID)
+ENVD_FAILURE_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+wait_sandbox_state "$ENVD_FAILURE_SID" dead 120 || fail "envd init failure did not roll back to dead"
+rm -f "$WORK/inject-sandbox-run"
+code=$(DP_MAX_TIME=10 dp "49983-$ENVD_FAILURE_SID" /health "$ENVD_FAILURE_TOKEN" || true)
+[ "$code" = "404" ] || fail "envd-failure route=$code (want prompt 404)"
+code=$(req DELETE "/sandboxes/$ENVD_FAILURE_SID" "$AK"); [ "$code" = "204" ] || fail "delete envd-failure sandbox=$code"
+echo "==> PASS: mandatory envd /init failure rolled accepted Create to dead + Delete"
+
+printf '%s\n' hold >"$WORK/inject-sandbox-run"
+echo "==> hold assigned runtime to exercise starting SetTimeout/Pause/Kill"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "starting-kill create=$code (want 201)"; }
+STARTING_KILL_SID=$(json_field "$WORK/resp.body" sandboxID)
+wait_sandbox_state "$STARTING_KILL_SID" starting 50 || fail "held sandbox was not starting"
+STARTING_KILL_RUN_ID=""
+for _ in $(seq 1 100); do
+    STARTING_KILL_RUN_ID="$(sandbox_run_id "$STARTING_KILL_SID")"
+    [ -n "$STARTING_KILL_RUN_ID" ] && break
+    sleep 0.1
+done
+[ -n "$STARTING_KILL_RUN_ID" ] || fail "held starting sandbox never bound a runner"
+code=$(req POST "/sandboxes/$STARTING_KILL_SID/timeout" "$AK" '{"timeout":77}')
+[ "$code" = "204" ] || fail "SetTimeout starting=$code (want 204)"
+code=$(req POST "/sandboxes/$STARTING_KILL_SID/pause" "$AK")
+[ "$code" = "409" ] || fail "Pause starting=$code (want 409)"
+code=$(req DELETE "/sandboxes/$STARTING_KILL_SID" "$AK")
+[ "$code" = "204" ] || fail "Kill starting=$code (want 204)"
+rm -f "$WORK/inject-sandbox-run"
+wait_sandbox_state "$STARTING_KILL_SID" missing 50 || fail "Kill starting left a durable row"
+if systemctl is-active --quiet "sandbox-runner@$STARTING_KILL_RUN_ID.service"; then
+    fail "Kill starting left runner $STARTING_KILL_RUN_ID active"
+fi
+echo "==> PASS: starting SetTimeout=204, Pause=409, Kill removed row/runner without resurrection"
+
 # ---- create the sandbox (boots the microVM) -------------------------------
 # Inject sandbox config via the X-Kuasar-Sandbox-Network header (§4.6): the guest
 # hostname should become CFG_HOST, verified by `hostname` in the exec below.
@@ -643,13 +811,21 @@ if [ "$code" != "201" ]; then
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
     SID=$(ls "$WORK/run" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
-    fail "create=$code (want 201) — VM boot/envd initialization failed"
+    fail "create=$code (want 201 durable acceptance)"
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID running (microVM booted + envd initialized)"
+CREATE_RETURN_STATE="$(sandbox_state "$SID")"
+case "$CREATE_RETURN_STATE" in starting|running) ;; *) fail "state immediately after 201=$CREATE_RETURN_STATE";; esac
+echo "==> PASS: Create 201 durably accepted sandbox $SID (observed state=$CREATE_RETURN_STATE)"
+echo "==> issue data request immediately after Create; starting must park until running"
+code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "immediate post-Create data request=$code"; }
+wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
+echo "==> PASS: post-Create data request parked through runner handoff/readiness/envd init (code=$code)"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
@@ -774,7 +950,11 @@ B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
     || fail "all-unset local B is not a readable snapshot bundle"
 echo "==> PASS: all-unset local Pause produced B and passed no policy flags"
 
-echo "==> restore all-unset B through authenticated exec wake"
+echo "==> accept paused -> starting through POST /connect, then activate native exec immediately"
+code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113}')
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "Connect paused=$code (want 200)"; }
+CONNECT_RETURN_STATE="$(sandbox_state "$SID")"
+case "$CONNECT_RETURN_STATE" in starting|running) ;; *) fail "state immediately after Connect=$CONNECT_RETURN_STATE (must not remain paused)";; esac
 RESUME_MARK="NATIVE_EXEC_RESUME_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
 resumed=""
@@ -785,6 +965,7 @@ for _ in $(seq 1 90); do
     sleep 0.5
 done
 [ -n "$resumed" ] || fail "envd did not become ready after local restore"
+echo "==> PASS: Connect returned after durable starting acceptance (observed $CONNECT_RETURN_STATE); immediate native exec parked to running"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
 sed 's/^/  guest2| /' "$WORK/exec2.out"
 grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after local restore"
@@ -937,8 +1118,31 @@ grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PAREN
     "$WORK/portable-w.journal" && fail "portable restore prefetched B memory lower"
 echo "==> PASS: portable W restored state; prefetch targeted W self only (not B or disk)"
 
-code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox=$code (want 204)"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
 unset EXEC_TOKEN
+
+echo "==> KMT missing import -> paused -> durable starting -> asynchronous restore"
+code=$(curl -sS --noproxy '*' --max-time 30 -o "$WORK/resp.body" -w '%{http_code}' \
+    -X POST -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" \
+    -H "X-Kuasar-Migration-Token: $PROMOTION_TOKEN" \
+    -H 'Content-Type: application/json' --data '{"timeout":119}' \
+    "http://127.0.0.1:$PORT/sandboxes/$SID/connect")
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "KMT Connect=$code (want 200)"; }
+[ "$(json_field "$WORK/resp.body" sandboxID)" = "$SID" ] || fail "KMT Connect changed sandbox identity"
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+KMT_RETURN_STATE="$(sandbox_state "$SID")"
+case "$KMT_RETURN_STATE" in starting|running) ;; *) fail "KMT Connect returned with state=$KMT_RETURN_STATE";; esac
+KMT_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue exec capability during KMT starting"
+rm -f "$WORK/exec-session.secret"
+KMT_MARK="KMT_RESTORE_$RANDOM"
+exec_through_connect "$SID" "$KMT_EXEC_TOKEN" "$KMT_MARK"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" >"$WORK/kmt-read.out" 2>&1 || true
+grep -q "$PERSIST" "$WORK/kmt-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/kmt-read.out"; fail "KMT restore lost portable guest state"; }
+wait_sandbox_state "$SID" running 20 || fail "KMT restore did not commit running"
+echo "==> PASS: KMT Connect returned at $KMT_RETURN_STATE; immediate native exec parked and portable state restored"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill KMT-imported sandbox=$code (want 204)"
+unset KMT_EXEC_TOKEN
 SID_UNSET="$SID"
 
 # Restart the conductor against the same store with explicit node defaults.
@@ -988,6 +1192,9 @@ echo "==> PASS: Create checkpoint header overlaid body per field and persisted c
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue policy sandbox exec capability"
+POLICY_START_MARK="POLICY_CREATE_ACTIVATION_$RANDOM"
+exec_through_connect "$SID" "$EXEC_TOKEN" "$POLICY_START_MARK"
+wait_sandbox_state "$SID" running 20 || fail "policy sandbox did not reach running after exec activation"
 POLICY_PERSIST="POLICY_PERSIST_$RANDOM"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "echo $POLICY_PERSIST > /home/user/policy-persist.txt" >"$WORK/policy-write.out" 2>&1 || true
