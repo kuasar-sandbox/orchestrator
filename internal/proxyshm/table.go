@@ -348,70 +348,64 @@ func (t *Table) deleteRecordHash(rec *mmapRecord, hash uint64, sid string) {
 	finishWrite(rec)
 }
 
+// LookupRevision returns a route and its per-SID revision from the same record
+// seqlock snapshot. When the latest matching record is a Delete tombstone it
+// returns found=false with that tombstone's revision. Keeping these values in
+// one snapshot prevents waiters from combining an old route with a newer
+// revision while the writer publishes a starting or terminal transition.
+func (t *Table) LookupRevision(sid string) (routesync.RouteEntry, bool, uint64) {
+	if sid == "" || len(t.records) == 0 {
+		return routesync.RouteEntry{}, false, 0
+	}
+	h := hashSID(sid)
+	start := int(h % uint64(len(t.records)))
+	var latest recordSnapshot
+	haveLatest := false
+	for i := 0; i < len(t.records); i++ {
+		rec := &t.records[(start+i)%len(t.records)]
+		// Preserve the existing hot-path probe: unrelated and empty slots do not
+		// require copying the full credential-bearing record. A matching slot is
+		// then re-read wholly under its seqlock below.
+		status := atomic.LoadUint32(&rec.Status)
+		if status == statusEmpty {
+			break
+		}
+		if atomic.LoadUint64(&rec.Hash) != h {
+			continue
+		}
+		snapshot, ok := readRecordSnapshot(rec)
+		if !ok {
+			i--
+			runtime.Gosched()
+			continue
+		}
+		if snapshot.status == statusEmpty {
+			break
+		}
+		if snapshot.hash == h && snapshot.entry.SandboxID == sid &&
+			(!haveLatest || snapshot.rev > latest.rev) {
+			latest = snapshot
+			haveLatest = true
+		}
+	}
+	if !haveLatest || latest.status != statusPresent {
+		return routesync.RouteEntry{}, false, latest.rev
+	}
+	return latest.entry, true, latest.rev
+}
+
 // RouteRev returns the latest revision associated with sid, including an
 // explicit Delete tombstone. It lets a worker distinguish a terminal response
 // to its Wake from unrelated global route-table traffic even when starting and
 // rollback updates are coalesced before the worker samples shared memory.
 func (t *Table) RouteRev(sid string) uint64 {
-	if sid == "" || len(t.records) == 0 {
-		return 0
-	}
-	h := hashSID(sid)
-	start := int(h % uint64(len(t.records)))
-	var latest uint64
-	for i := 0; i < len(t.records); i++ {
-		rec := &t.records[(start+i)%len(t.records)]
-		status := atomic.LoadUint32(&rec.Status)
-		if status == statusEmpty {
-			return latest
-		}
-		if atomic.LoadUint64(&rec.Hash) != h {
-			continue
-		}
-		entry, stableStatus, ok := readRecord(rec)
-		if !ok {
-			i--
-			runtime.Gosched()
-			continue
-		}
-		if stableStatus != statusEmpty && entry.SandboxID == sid {
-			if rev := atomic.LoadUint64(&rec.Rev); rev > latest {
-				latest = rev
-			}
-		}
-	}
-	return latest
+	_, _, rev := t.LookupRevision(sid)
+	return rev
 }
 
 func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
-	if sid == "" || len(t.records) == 0 {
-		return routesync.RouteEntry{}, false
-	}
-	h := hashSID(sid)
-	start := int(h % uint64(len(t.records)))
-	for i := 0; i < len(t.records); i++ {
-		rec := &t.records[(start+i)%len(t.records)]
-		status := atomic.LoadUint32(&rec.Status)
-		if status == statusEmpty {
-			return routesync.RouteEntry{}, false
-		}
-		if status != statusPresent || atomic.LoadUint64(&rec.Hash) != h {
-			continue
-		}
-		entry, st, ok := readRecord(rec)
-		if !ok {
-			i--
-			runtime.Gosched()
-			continue
-		}
-		if st == statusPresent && entry.SandboxID == sid {
-			return entry, true
-		}
-		if st == statusEmpty {
-			return routesync.RouteEntry{}, false
-		}
-	}
-	return routesync.RouteEntry{}, false
+	entry, found, _ := t.LookupRevision(sid)
+	return entry, found
 }
 
 func (t *Table) ByFloatingIP(ip string) (string, bool) {
@@ -507,39 +501,55 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 	return 0, false
 }
 
-func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
+type recordSnapshot struct {
+	entry  routesync.RouteEntry
+	status uint32
+	hash   uint64
+	rev    uint64
+}
+
+func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 	for spin := 0; spin < 64; spin++ {
 		seq1 := atomic.LoadUint64(&rec.Seq)
 		if seq1&1 == 1 {
 			runtime.Gosched()
 			continue
 		}
-		st := atomic.LoadUint32(&rec.Status)
-		entry := routesync.RouteEntry{
-			SandboxID:              fixedString(rec.SandboxID[:]),
-			Profile:                fixedString(rec.Profile[:]),
-			TemplateID:             fixedString(rec.TemplateID[:]),
-			State:                  fixedString(rec.State[:]),
-			EnvdUDS:                fixedString(rec.EnvdUDS[:]),
-			CiUDS:                  fixedString(rec.CiUDS[:]),
-			FloatingIP:             fixedString(rec.FloatingIP[:]),
-			AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
-			APISecret:              fixedString(rec.APISecret[:]),
-			APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
-			ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
-			ServiceSecret:          fixedString(rec.ServiceSecret[:]),
-			EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
-			TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
-			ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
-			SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
-			MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+		snapshot := recordSnapshot{
+			status: atomic.LoadUint32(&rec.Status),
+			hash:   atomic.LoadUint64(&rec.Hash),
+			rev:    atomic.LoadUint64(&rec.Rev),
+			entry: routesync.RouteEntry{
+				SandboxID:              fixedString(rec.SandboxID[:]),
+				Profile:                fixedString(rec.Profile[:]),
+				TemplateID:             fixedString(rec.TemplateID[:]),
+				State:                  fixedString(rec.State[:]),
+				EnvdUDS:                fixedString(rec.EnvdUDS[:]),
+				CiUDS:                  fixedString(rec.CiUDS[:]),
+				FloatingIP:             fixedString(rec.FloatingIP[:]),
+				AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
+				APISecret:              fixedString(rec.APISecret[:]),
+				APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
+				ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
+				ServiceSecret:          fixedString(rec.ServiceSecret[:]),
+				EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
+				TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
+				ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
+				SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
+				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+			},
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
 		if seq1 == seq2 && seq2&1 == 0 {
-			return entry, st, true
+			return snapshot, true
 		}
 	}
-	return routesync.RouteEntry{}, statusEmpty, false
+	return recordSnapshot{}, false
+}
+
+func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
+	snapshot, ok := readRecordSnapshot(rec)
+	return snapshot.entry, snapshot.status, ok
 }
 
 func startWrite(rec *mmapRecord) {

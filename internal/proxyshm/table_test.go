@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -68,6 +70,121 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 		deleted.EnvdAccessToken != "" || deleted.TrafficAccessToken != "" ||
 		deleted.ForwardAccessToken != "" || deleted.MmdsSecret != "" {
 		t.Fatalf("deleted record retained credential material: %+v", deleted)
+	}
+}
+
+func TestTableLookupRevisionTracksLiveAndDeletedSnapshots(t *testing.T) {
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	route := routesync.RouteEntry{SandboxID: "revision-snapshot", State: routesync.StatePaused}
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	paused, found, pausedRev := tbl.LookupRevision(route.SandboxID)
+	if !found || paused.State != routesync.StatePaused || pausedRev == 0 {
+		t.Fatalf("paused snapshot = %+v, found=%v rev=%d", paused, found, pausedRev)
+	}
+
+	route.State = routesync.StateStarting
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	starting, found, startingRev := tbl.LookupRevision(route.SandboxID)
+	if !found || starting.State != routesync.StateStarting || startingRev <= pausedRev {
+		t.Fatalf("starting snapshot = %+v, found=%v rev=%d; paused rev=%d", starting, found, startingRev, pausedRev)
+	}
+	if got := tbl.RouteRev(route.SandboxID); got != startingRev {
+		t.Fatalf("RouteRev = %d, want atomic lookup rev %d", got, startingRev)
+	}
+
+	if !tbl.Delete(route.SandboxID) {
+		t.Fatal("delete returned false")
+	}
+	deleted, found, deletedRev := tbl.LookupRevision(route.SandboxID)
+	if found || deleted != (routesync.RouteEntry{}) || deletedRev <= startingRev {
+		t.Fatalf("deleted snapshot = %+v, found=%v rev=%d; starting rev=%d", deleted, found, deletedRev, startingRev)
+	}
+
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	running, found, runningRev := tbl.LookupRevision(route.SandboxID)
+	if !found || running.State != routesync.StateRunning || runningRev <= deletedRev {
+		t.Fatalf("running snapshot = %+v, found=%v rev=%d; deleted rev=%d", running, found, runningRev, deletedRev)
+	}
+}
+
+func TestTableLookupRevisionNeverMixesConcurrentRouteAndRevision(t *testing.T) {
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	const sid = "revision-race"
+	firstWritten := make(chan struct{})
+	continueWriter := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		route := routesync.RouteEntry{SandboxID: sid, State: routesync.StateStarting}
+		for i := 0; i < 5000; i++ {
+			nextRev := tbl.Rev() + 1
+			route.TemplateID = strconv.FormatUint(nextRev, 10)
+			if i%2 == 0 {
+				route.State = routesync.StateStarting
+			} else {
+				route.State = routesync.StateRunning
+			}
+			if err := tbl.Upsert(route); err != nil {
+				done <- err
+				return
+			}
+			if i == 0 {
+				close(firstWritten)
+				<-continueWriter
+			}
+			runtime.Gosched()
+		}
+		done <- nil
+	}()
+	select {
+	case <-firstWritten:
+	case err := <-done:
+		t.Fatalf("first route write: %v", err)
+	}
+	firstRoute, found, firstRev := tbl.LookupRevision(sid)
+	close(continueWriter)
+	if !found || firstRoute.TemplateID != strconv.FormatUint(firstRev, 10) {
+		writerErr := <-done
+		if writerErr != nil {
+			t.Fatal(writerErr)
+		}
+		t.Fatalf("invalid first route/revision snapshot: route=%+v found=%v rev=%d", firstRoute, found, firstRev)
+	}
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		route, found, rev := tbl.LookupRevision(sid)
+		if found && route.TemplateID != strconv.FormatUint(rev, 10) {
+			writerErr := <-done
+			if writerErr != nil {
+				t.Fatal(writerErr)
+			}
+			t.Fatalf("mixed route/revision snapshot: route=%+v rev=%d", route, rev)
+		}
+		runtime.Gosched()
 	}
 }
 

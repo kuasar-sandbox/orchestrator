@@ -145,7 +145,9 @@ worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor
 starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 全局 revision/notify 只负责唤醒检查;worker 以该 SID 槽位(含 Delete tombstone)的 revision
-判断 Wake 是否已收到终态回应。因此即使异步共享表收敛把中间 starting 与随后
+判断 Wake 是否已收到终态回应。RouteEntry 与该 per-SID revision 在同一次 record
+seqlock snapshot 中读取,waiter 不会把旧 missing/paused 路由与新 revision 混合为假终态。
+因此即使异步共享表收敛把中间 starting 与随后
 paused/Delete 合并,也不会漏掉 rollback 后继续消耗完整 park timeout。一个请求只允许在
 初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次 Wake。
 
