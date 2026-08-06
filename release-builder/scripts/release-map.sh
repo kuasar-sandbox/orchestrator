@@ -30,6 +30,20 @@ read_remote_mapping() {
     "repos/$REPOSITORY/contents/$path?ref=$ref" > "$output"
 }
 
+wait_for_release_ref() {
+  local expected="$1" observed="" attempt error="$TMP/ref-error"
+  for attempt in $(seq 1 10); do
+    : > "$error"
+    if observed="$(gh api "repos/$REPOSITORY/git/ref/heads/$RELEASE_BRANCH" \
+      --jq '.object.sha' 2> "$error")" && [ "$observed" = "$expected" ]; then
+      return 0
+    fi
+    [ "$attempt" -eq 10 ] || sleep 1
+  done
+  [ ! -s "$error" ] || cat "$error" >&2
+  fail "$RELEASE_BRANCH did not expose the new mapping commit: expected $expected, observed ${observed:-unavailable}"
+}
+
 put_mapping() {
   [ "$#" -eq 1 ] || fail "usage: release-map.sh put <mapping.json>"
   local mapping="$1"
@@ -99,8 +113,7 @@ put_mapping() {
       | gh api --method POST "repos/$REPOSITORY/git/refs" --input - >/dev/null
   fi
 
-  [ "$(gh api "repos/$REPOSITORY/git/ref/heads/$RELEASE_BRANCH" --jq '.object.sha')" = "$commit_sha" ] \
-    || fail "$RELEASE_BRANCH did not advance to the new mapping commit"
+  wait_for_release_ref "$commit_sha"
   read_remote_mapping "$commit_sha" "$path" "$TMP/published-mapping.json"
   jq -S . "$TMP/published-mapping.json" > "$TMP/published-canonical.json"
   cmp -s "$canonical" "$TMP/published-canonical.json" \

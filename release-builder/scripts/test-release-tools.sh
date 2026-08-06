@@ -339,6 +339,16 @@ emit() {
   fi
 }
 
+publish_ref() {
+  local sha="$1" delay="${FAKE_REF_VISIBILITY_DELAY:-0}"
+  if [ "$delay" -gt 0 ]; then
+    printf '%s\n' "$sha" > "$state/pending-branch"
+    printf '%s\n' "$delay" > "$state/ref-delay"
+  else
+    printf '%s\n' "$sha" > "$state/branch"
+  fi
+}
+
 [ "${1:-}" = api ] || { echo "unsupported fake gh command" >&2; exit 2; }
 shift
 method=GET
@@ -367,6 +377,15 @@ fi
 
 case "$method $endpoint" in
   "GET repos/kuasar-sandbox/orchestrator/git/ref/heads/release")
+    if [ -f "$state/pending-branch" ]; then
+      delay="$(cat "$state/ref-delay")"
+      if [ "$delay" -gt 0 ]; then
+        printf '%s\n' "$((delay - 1))" > "$state/ref-delay"
+      else
+        mv "$state/pending-branch" "$state/branch"
+        rm -f "$state/ref-delay"
+      fi
+    fi
     [ -f "$state/branch" ] || not_found
     emit "$(jq -cn --arg sha "$(cat "$state/branch")" '{object: {sha: $sha}}')" "$filter"
     ;;
@@ -392,7 +411,11 @@ case "$method $endpoint" in
     emit '{"sha":"2222222222222222222222222222222222222222"}' "$filter"
     ;;
   "POST repos/kuasar-sandbox/orchestrator/git/refs")
-    jq -er '.sha' "$request" > "$state/branch"
+    publish_ref "$(jq -er '.sha' "$request")"
+    emit '{"ref":"refs/heads/release"}' "$filter"
+    ;;
+  "PATCH repos/kuasar-sandbox/orchestrator/git/refs/heads/release")
+    publish_ref "$(jq -er '.sha' "$request")"
     emit '{"ref":"refs/heads/release"}' "$filter"
     ;;
   *)
@@ -404,10 +427,21 @@ EOF
 chmod +x "$TMP/fake-bin/gh"
 
 map_state="$TMP/map-state"
-first_commit="$(env PATH="$TMP/fake-bin:$PATH" FAKE_GH_STATE="$map_state" \
+first_commit="$(env PATH="$TMP/fake-bin:$PATH" FAKE_GH_STATE="$map_state" FAKE_REF_VISIBILITY_DELAY=2 \
   "$SCRIPT_DIR/release-map.sh" put "$TMP/mapping.json")"
 [ "$first_commit" = 2222222222222222222222222222222222222222 ] \
   || fail "first mapping did not create the expected orphan commit"
+
+patch_state="$TMP/patch-map-state"
+mkdir -p "$patch_state"
+printf '%s\n' 3333333333333333333333333333333333333333 > "$patch_state/branch"
+patch_commit="$(env PATH="$TMP/fake-bin:$PATH" FAKE_GH_STATE="$patch_state" FAKE_REF_VISIBILITY_DELAY=2 \
+  "$SCRIPT_DIR/release-map.sh" put "$TMP/mapping.json")"
+[ "$patch_commit" = 2222222222222222222222222222222222222222 ] \
+  || fail "mapping update did not return the expected commit after delayed ref visibility"
+[ "$(cat "$patch_state/branch")" = "$patch_commit" ] \
+  || fail "updated release ref did not become visible after the bounded retry"
+
 second_commit="$(env PATH="$TMP/fake-bin:$PATH" FAKE_GH_STATE="$map_state" \
   "$SCRIPT_DIR/release-map.sh" put "$TMP/mapping.json")"
 [ "$second_commit" = "$first_commit" ] || fail "identical mapping was not idempotent"
