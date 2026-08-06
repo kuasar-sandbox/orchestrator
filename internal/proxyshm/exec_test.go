@@ -316,6 +316,19 @@ func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *t
 	case <-time.After(time.Second):
 		t.Fatal("authorized paused activation did not wake sandbox")
 	}
+	_, _, beforeReplay := tbl.LookupRevision(route.SandboxID)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	if _, _, afterReplay := tbl.LookupRevision(route.SandboxID); afterReplay != beforeReplay {
+		t.Fatalf("identical paused replay advanced route revision: %d -> %d", beforeReplay, afterReplay)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("duplicate paused replay completed exec activation: %+v", got)
+	default:
+	}
 	route.State = routesync.StateStarting
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)

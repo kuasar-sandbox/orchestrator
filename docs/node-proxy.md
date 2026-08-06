@@ -122,8 +122,10 @@ conductor → master : upsert* → bookmark → upsert/delete...
 master 把下行路由流投影到共享内存:
 
 - `BeginSync` 开启新同步世代;
-- `Upsert` 写入或更新 `sid` 槽位;
-- `Delete` 把槽位置为 tombstone,保持开放寻址探测链;
+- `Upsert` 写入或更新 `sid` 槽位;完全相同的重放只刷新同步世代,不推进生命周期
+  revision;
+- `Delete` 用 backshift 删除回收 live 槽位,并在独立的有界终态 cache 中记录无凭据的
+  `(sid, revision)`;
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
 
@@ -144,12 +146,17 @@ worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor
 推进,worker 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新立即结束
 starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
-全局 revision/notify 只负责唤醒检查;worker 以该 SID 槽位(含 Delete tombstone)的 revision
-判断 Wake 是否已收到终态回应。RouteEntry 与该 per-SID revision 在同一次 record
-seqlock snapshot 中读取,waiter 不会把旧 missing/paused 路由与新 revision 混合为假终态。
-因此即使异步共享表收敛把中间 starting 与随后
-paused/Delete 合并,也不会漏掉 rollback 后继续消耗完整 park timeout。一个请求只允许在
-初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次 Wake。
+全局 revision/notify 只负责唤醒检查;worker 以该 SID 的 live 或终态 revision 判断 Wake
+是否已收到终态回应。live 路由、终态 cache 和 revision 在同一次 table seqlock snapshot
+中读取,waiter 不会把旧 missing/paused 路由与新 revision 混合为假终态。重复的相同 paused
+Upsert 不推进 per-SID revision,因此订阅重放不能伪装成 Wake 的完成响应。live hash 的删除
+会在同一 table seqlock 下 backshift 并立即回收槽位;终态 cache 固定最多 4096 条且不含任何
+凭据。极端 churn 下 cache 碰撞只会淘汰较旧的终态相关性,对应 waiter 保守地继续 park 到
+后续状态或 timeout,不会错误路由或把无关 SID 当作 Wake 结果。
+正常的单次 Wake 路径中,即使异步共享表收敛把中间 starting 与随后 paused/Delete 合并,
+终态 revision 仍会让 waiter 及时观察 rollback;只有前述极端 cache 淘汰才退化为保守 timeout。
+一个请求只允许在初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次
+Wake。
 
 共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
 `<stableSandboxID>-g<SandboxGeneration>`,正常流程不会让不同逻辑沙箱复用同一个
