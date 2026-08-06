@@ -364,6 +364,15 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning && current.DeadlineUnix == expectedDeadline
 	}, "running with explicit Connect deadline")
+	// The exact store CAS is the terminal linearization point and deliberately
+	// precedes cache/route publication. Join an attempt that is still finishing
+	// so the assertion below observes the complete terminal publication rather
+	// than that valid, narrow handoff window.
+	if attempt, found := o.launches.Lookup(sb.ID); found {
+		if err := attempt.wait(ctx); err != nil {
+			t.Fatalf("resume launch failed after running commit: %v", err)
+		}
+	}
 	if cached := o.lookup(sb.ID); cached == nil || cached.State != types.StateRunning || cached.DeadlineUnix != expectedDeadline {
 		t.Fatalf("cached sandbox did not retain explicit Connect deadline: %+v", cached)
 	}

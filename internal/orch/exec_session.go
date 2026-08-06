@@ -16,8 +16,8 @@ type unixClock func() int64
 func wallUnix() int64 { return time.Now().Unix() }
 
 // ExecSession synchronously authenticates and, when requested, imports the
-// target before minting a node-signed exec capability. A paused target is
-// resumed asynchronously only after token preparation succeeds.
+// target. Token preparation runs under the resume-admission lifecycle fence,
+// after any previous cleanup owner but before a new paused-to-starting mutation.
 func (o *Orchestrator) ExecSession(
 	ctx context.Context,
 	id, apiKey, migrationToken string,
@@ -35,25 +35,25 @@ func (o *Orchestrator) execSession(
 	if _, err := execSessionExpiry(now(), ttlSeconds); err != nil {
 		return "", err
 	}
-	sb, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
-	if err != nil {
+	if _, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken); err != nil {
 		return "", err
 	}
-	// Signing time is intentionally sampled after synchronous target import and
-	// validation so migration latency never consumes the requested token TTL.
-	token, err := mintExecSessionToken(sb, ttlSeconds, now())
-	if err != nil {
-		return "", err
-	}
-	if sb.State == types.StatePaused {
-		if _, _, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(current *types.Sandbox) error {
-			if !ownsSandbox(current, apiKey) {
-				return api.ErrNotFound
-			}
-			return nil
-		}); err != nil {
-			return "", err
+	var token string
+	_, _, err := o.ensureResumeAcceptedPrepared(ctx, id, nil, func(current *types.Sandbox) error {
+		if !ownsSandbox(current, apiKey) {
+			return api.ErrNotFound
 		}
+		return nil
+	}, func(current *types.Sandbox) error {
+		var err error
+		// Sample signing time only after synchronous import, lifecycle contention,
+		// and any previous launch cleanup have completed. The hook still runs
+		// before BeginResume, so token generation failure has no launch side effect.
+		token, err = mintExecSessionToken(current, ttlSeconds, now())
+		return err
+	})
+	if err != nil {
+		return "", err
 	}
 	return token, nil
 }

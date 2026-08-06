@@ -67,6 +67,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "base")
+	cfg.Sandbox.TimeoutSec = 300
 	cfg.Units.Runner = "sandbox-runner@.service"
 	cfg.Units.Builder = "sandbox-builder@.service"
 	knownRun := "sr-00000000-0000-7000-8000-000000000001"
@@ -107,6 +108,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeStarting.State = types.StateStarting
 	resumeStarting.RunID = resumeStartingRun
 	resumeStarting.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
+	resumeStarting.DeadlineUnix = 1_900_000_111
 	resumeStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeStarting.ID)
 	resumeStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeStarting.ID)
 	resumeStarting.VswitchPort = "resume-assigned-port"
@@ -129,6 +131,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeEmpty := resumeStarting
 	resumeEmpty.ID = "resume-starting-empty-run"
 	resumeEmpty.RunID = ""
+	resumeEmpty.DeadlineUnix = 1_900_000_222
 	resumeEmpty.VswitchPort = "resume-empty-port"
 	resumeEmpty.FloatingIP = "192.0.2.13"
 	resumeEmpty.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeEmpty.ID)
@@ -186,6 +189,17 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		}
 		if o.lookup(tt.id) != nil {
 			t.Fatalf("interrupted starting sandbox %s was adopted into cache", tt.id)
+		}
+		if tt.want == types.StatePaused {
+			if !o.hasDeadlineIntent(tt.id) {
+				t.Fatalf("interrupted resume %s lost durable deadline intent", tt.id)
+			}
+			if gotDeadline := o.resumeDeadline(got, nil); gotDeadline != got.DeadlineUnix {
+				t.Fatalf("interrupted resume %s re-armed deadline=%d, want durable %d",
+					tt.id, gotDeadline, got.DeadlineUnix)
+			}
+		} else if o.hasDeadlineIntent(tt.id) {
+			t.Fatalf("interrupted fresh create %s gained resume deadline intent", tt.id)
 		}
 	}
 	for _, port := range []string{"create-assigned-port", "resume-assigned-port", "create-empty-port", "resume-empty-port"} {

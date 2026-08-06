@@ -445,14 +445,18 @@ Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 
 用于诊断。Connect 已是 running 时直接返回;已是 starting 时只应用显式 timeout 的窄更新,
 不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
 starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在恢复失败
-回 paused 后继续保留,只在某次 exact-run 成功提交 running 后消费。
+回 paused 后继续保留,只在某次 exact-run 成功提交 running 后消费。V1 没有持久 intent
+字段,所以 Reconcile 将中断 resume 的 durable deadline 保守恢复为 intent,避免重启后被
+node default 覆盖。
 
 Exec session 是显式授权动作,不是服务端 session 对象,也不启动 guest process.请求 body
 只允许空,`{}` 或仅含一个 int64 `ttlSeconds` 字段的 JSON object.完整原始 body
 (含尾随空白)上限 64 KiB;unknown/duplicate 字段,`null`,负数,第二个 JSON value
 和越界 TTL 均在生命周期副作用之前拒绝.64 KiB + 1 返回 413;其它无效 body
 返回 400.`ttlSeconds` 缺省或为 0 时 token 长期有效;为正数时以实际签发时刻计算
-`exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.
+`exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.签发位于 SID lifecycle fence 内:
+先等前一 attempt 的 terminal cleanup 完成,再生成 token,随后才允许新的 paused→starting;
+因此 fence 等待不消耗 token TTL,签名失败也不会产生新的 launch side effect.
 
 目标已存在时不解析 migration token;目标缺失且提供该 token 时可以先同步 import 并完成对象,
 credential binding 和 profile 校验.随后 node 以沙箱记录中的 ServiceSecret 签发 KAT;
@@ -1570,6 +1574,7 @@ serve 在开放 API、routesync、node-link 和数据面前先以
   空/非空 run-id CAS 回 paused 并保留 base/snapshot identity,否则是被中断的 fresh create,
   按同一 fence CAS 为 dead 并清理其 base dir。任一 Stop/Reset/detach/目录 cleanup 失败时
   Reconcile 直接使节点启动失败并保留原 starting ownership,不得先清字段或开放 API;
+  resume 回 paused 后把 durable deadline 保守恢复为显式 intent,直到下次 exact-run 成功;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;

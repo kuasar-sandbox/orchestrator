@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,6 +126,84 @@ func TestExecSessionTTLStartsAtSigningAfterTargetPreparation(t *testing.T) {
 	}
 	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_137, 0)); err == nil {
 		t.Fatal("token accepted at signing time + TTL")
+	}
+}
+
+func TestExecSessionPreparationWaitsForPreviousCleanupFence(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("b", 64)
+	sb := &types.Sandbox{
+		ID: "exec-cleanup-fence", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("c", 64),
+		}.String(),
+		State: types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("d", 64),
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := o.launches.Claim(context.Background(), sb.ID, launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	validated := make(chan struct{})
+	prepared := make(chan struct{})
+	var validateOnce, prepareOnce sync.Once
+	type result struct {
+		sb  *types.Sandbox
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		current, _, err := o.ensureResumeAcceptedPrepared(ctx, sb.ID, nil, func(*types.Sandbox) error {
+			validateOnce.Do(func() { close(validated) })
+			return nil
+		}, func(*types.Sandbox) error {
+			prepareOnce.Do(func() { close(prepared) })
+			return nil
+		})
+		done <- result{sb: current, err: err}
+	}()
+	select {
+	case <-validated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepared admission did not reach the previous cleanup fence")
+	}
+
+	// Acquiring this lock is a deterministic barrier: the first admission pass
+	// has observed the paused row, released the lifecycle fence, and is waiting
+	// for the old attempt's terminal cleanup before it can recurse.
+	unlock := o.lifecycle.Lock(sb.ID)
+	if err := o.st.SetState(ctx, sb.ID, types.StateRunning); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	select {
+	case <-prepared:
+		t.Fatal("operation-specific token preparation ran before previous cleanup finished")
+	default:
+	}
+	o.launches.Finish(previous, nil)
+
+	select {
+	case got := <-done:
+		if got.err != nil || got.sb == nil || got.sb.State != types.StateRunning {
+			t.Fatalf("prepared admission = %+v, %v", got.sb, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepared admission did not continue after cleanup finished")
+	}
+	select {
+	case <-prepared:
+	default:
+		t.Fatal("operation-specific token preparation did not run after cleanup")
 	}
 }
 

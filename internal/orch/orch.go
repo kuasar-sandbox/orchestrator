@@ -1050,6 +1050,21 @@ func (o *Orchestrator) ensureResumeAccepted(
 	requestedDeadline *int64,
 	validate func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
+	return o.ensureResumeAcceptedPrepared(ctx, sid, requestedDeadline, validate, nil)
+}
+
+// ensureResumeAcceptedPrepared adds a lightweight operation-specific prepare
+// hook under the lifecycle fence. It runs after any previous terminal cleanup
+// owner has finished, but before a new resume claim or durable mutation. Exec
+// session issuance uses it to sample/mint token TTL at the end of synchronous
+// admission without allowing a signing failure to start a sandbox.
+func (o *Orchestrator) ensureResumeAcceptedPrepared(
+	ctx context.Context,
+	sid string,
+	requestedDeadline *int64,
+	validate func(*types.Sandbox) error,
+	prepare func(*types.Sandbox) error,
+) (*types.Sandbox, *launchAttempt, error) {
 	admissionStarted := time.Now()
 	unlock := o.lifecycle.Lock(sid)
 	locked := true
@@ -1074,6 +1089,11 @@ func (o *Orchestrator) ensureResumeAccepted(
 
 	switch sb.State {
 	case types.StateRunning:
+		if prepare != nil {
+			if err := prepare(sb); err != nil {
+				return nil, nil, err
+			}
+		}
 		if requestedDeadline != nil {
 			if err := o.st.SetDeadline(ctx, sid, *requestedDeadline); err != nil {
 				return nil, nil, err
@@ -1083,6 +1103,11 @@ func (o *Orchestrator) ensureResumeAccepted(
 		}
 		return cloneSandbox(sb), nil, nil
 	case types.StateStarting:
+		if prepare != nil {
+			if err := prepare(sb); err != nil {
+				return nil, nil, err
+			}
+		}
 		if requestedDeadline != nil {
 			if err := o.st.SetDeadline(ctx, sid, *requestedDeadline); err != nil {
 				return nil, nil, err
@@ -1113,7 +1138,7 @@ func (o *Orchestrator) ensureResumeAccepted(
 			if waitErr := previous.wait(ctx); waitErr != nil && ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			return o.ensureResumeAccepted(ctx, sid, requestedDeadline, validate)
+			return o.ensureResumeAcceptedPrepared(ctx, sid, requestedDeadline, validate, prepare)
 		}
 		// Stored metadata is trusted only after its pure parsers succeed. Do not
 		// make starting durable if the worker could never consume its inputs.
@@ -1127,6 +1152,11 @@ func (o *Orchestrator) ensureResumeAccepted(
 		lifecycleCtx := o.launchContext()
 		if err := lifecycleCtx.Err(); err != nil {
 			return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		}
+		if prepare != nil {
+			if err := prepare(sb); err != nil {
+				return nil, nil, err
+			}
 		}
 		attempt, err := o.launches.Claim(lifecycleCtx, sid, launchResume)
 		if err != nil {
@@ -1597,6 +1627,12 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		}
 		if !changed {
 			o.log.Warn("reconcile: interrupted launch state changed", "sid", sb.ID, "run_id", sb.RunID)
+		} else if target == types.StatePaused {
+			// V1 has no persistent explicit-deadline marker. Conservatively retain
+			// the durable deadline of every interrupted resume so a caller-selected
+			// Connect/SetTimeout value cannot be replaced by the node default after
+			// restart. The intent is consumed by the next exact-run success.
+			o.markDeadlineIntent(sb.ID)
 		}
 	}
 	for _, sb := range dead {

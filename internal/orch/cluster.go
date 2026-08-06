@@ -79,19 +79,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return acceptConnect(cmd, result)
 	case routesync.CmdExecSession:
-		sb, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
+		_, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
 		if err != nil {
 			return reject(cmd, err)
-		}
-		if sb.State == types.StatePaused {
-			if _, _, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(current *types.Sandbox) error {
-				if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
-					return err
-				}
-				return validateClusterSandboxContext(current, cmd)
-			}); err != nil {
-				return reject(cmd, err)
-			}
 		}
 		return acceptExecSession(cmd, result)
 	case routesync.CmdDelete:
@@ -647,9 +637,9 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 	return sb, nil
 }
 
-// prepareClusterExecSession uses the same exact-target validation and optional
-// synchronous KMT import as CmdConnect, then mints the operation-specific result
-// before its caller is allowed to schedule resume.
+// prepareClusterExecSession uses the same exact-target validation, optional
+// synchronous KMT import, and durable resume admission as CmdConnect. Token
+// signing runs under the lifecycle fence immediately before any new transition.
 func (o *Orchestrator) prepareClusterExecSession(
 	ctx context.Context,
 	cmd *routesync.Command,
@@ -661,12 +651,20 @@ func (o *Orchestrator) prepareClusterExecSession(
 	if _, err := execSessionExpiry(now(), cmd.TTLSeconds); err != nil {
 		return nil, nil, err
 	}
-	sb, err := o.prepareClusterConnect(ctx, cmd, 0)
-	if err != nil {
+	if _, err := o.prepareClusterConnect(ctx, cmd, 0); err != nil {
 		return nil, nil, err
 	}
-	// Sample signing time after the synchronous import/validation phase.
-	token, err := mintExecSessionToken(sb, cmd.TTLSeconds, now())
+	var token string
+	sb, _, err := o.ensureResumeAcceptedPrepared(ctx, cmd.SID, nil, func(current *types.Sandbox) error {
+		if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
+			return err
+		}
+		return validateClusterSandboxContext(current, cmd)
+	}, func(current *types.Sandbox) error {
+		var err error
+		token, err = mintExecSessionToken(current, cmd.TTLSeconds, now())
+		return err
+	})
 	if err != nil {
 		return nil, nil, err
 	}
