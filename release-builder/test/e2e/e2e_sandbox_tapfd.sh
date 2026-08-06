@@ -26,13 +26,6 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$REPO_ROOT/test/lib/tarstream.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 TAP_NAME="$(printf 'etf%x' "$$")"
-NET_SLOT=$(( $$ % 8192 ))
-NET_BLOCK=$(( NET_SLOT / 128 ))
-NET_HOST_BYTE=$(( (NET_SLOT % 128) * 2 ))
-COLD_HOST_CIDR="169.254.$((64 + NET_BLOCK)).$NET_HOST_BYTE/31"
-COLD_GUEST_IP="169.254.$((64 + NET_BLOCK)).$((NET_HOST_BYTE + 1))"
-RESTORE_HOST_CIDR="169.254.$((128 + NET_BLOCK)).$NET_HOST_BYTE/31"
-RESTORE_GUEST_IP="169.254.$((128 + NET_BLOCK)).$((NET_HOST_BYTE + 1))"
 
 skip() {
     echo; echo "==> e2e_sandbox_tapfd: skipping ($*)"
@@ -47,11 +40,56 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
+command -v ip >/dev/null 2>&1 || skip "ip not on PATH"
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
 [ -z "$BLK0_IMAGE" ] && [ -f "$REPO_ROOT/build/python-312.erofs" ] && BLK0_IMAGE="$REPO_ROOT/build/python-312.erofs"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
+
+# The cold and restore ranges are intentionally disjoint so restore always
+# changes the guest identity. Start from a PID-derived slot, but scan the host
+# state so PID reuse cannot select a /31 still owned by an interrupted run.
+declare -A HOST_IPV4_ADDRESSES=() HOST_IPV4_ROUTES=()
+while read -r address; do
+    HOST_IPV4_ADDRESSES["${address%/*}"]=1
+done < <(ip -o -4 addr show | awk '{print $4}')
+while read -r destination _; do
+    [[ "$destination" == */* ]] && HOST_IPV4_ROUTES["$destination"]=1
+done < <(ip -4 route show table all type unicast)
+
+network_in_use() { # <cidr> <host_ip> <guest_ip>
+    [ -n "${HOST_IPV4_ROUTES[$1]:-}" ] || \
+        [ -n "${HOST_IPV4_ADDRESSES[$2]:-}" ] || \
+        [ -n "${HOST_IPV4_ADDRESSES[$3]:-}" ]
+}
+
+allocate_networks() {
+    local start=$(( $$ % 8192 )) offset slot block host_byte
+    local cold_host_ip cold_guest_ip cold_cidr restore_host_ip restore_guest_ip restore_cidr
+    for ((offset = 0; offset < 8192; offset++)); do
+        slot=$(( (start + offset) % 8192 ))
+        block=$(( slot / 128 ))
+        host_byte=$(( (slot % 128) * 2 ))
+        cold_host_ip="169.254.$((64 + block)).$host_byte"
+        cold_guest_ip="169.254.$((64 + block)).$((host_byte + 1))"
+        cold_cidr="$cold_host_ip/31"
+        restore_host_ip="169.254.$((128 + block)).$host_byte"
+        restore_guest_ip="169.254.$((128 + block)).$((host_byte + 1))"
+        restore_cidr="$restore_host_ip/31"
+        if ! network_in_use "$cold_cidr" "$cold_host_ip" "$cold_guest_ip" && \
+            ! network_in_use "$restore_cidr" "$restore_host_ip" "$restore_guest_ip"; then
+            COLD_HOST_CIDR="$cold_cidr"
+            COLD_GUEST_IP="$cold_guest_ip"
+            RESTORE_HOST_CIDR="$restore_cidr"
+            RESTORE_GUEST_IP="$restore_guest_ip"
+            return 0
+        fi
+    done
+    echo "e2e_sandbox_tapfd: no unused per-run network pair is available" >&2
+    exit 1
+}
+allocate_networks
 
 if [ -z "$BLK0_IMAGE" ]; then
     command -v docker >/dev/null 2>&1 || skip "no prebuilt blk0 and docker unavailable"
