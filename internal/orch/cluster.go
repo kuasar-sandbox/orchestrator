@@ -26,11 +26,10 @@ import (
 // from its per-node ownership table.
 
 // HandleCommand executes a registry node-link command and returns a receipt ack
-// (cluster.md): accepted once the synchronous preconditions hold (key
-// installed, template valid), rejected otherwise. Slow work (a boot/resume/
-// teardown) runs asynchronously so the ack is prompt and the node-link reader
-// isn't blocked; the terminal sandbox state is reported on the route stream,
-// which a Reserve waits on.
+// (cluster.md). Create/Connect are accepted only after their durable starting
+// transition and launch ownership are established; the remaining boot/restore
+// work runs asynchronously so the node-link reader is not blocked. Terminal
+// sandbox state is reported on the route stream, which a Reserve waits on.
 func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	// The node-link wire enforces the same complete-token bound, but keep the
 	// command entry defensive for direct callers and tests that bypass framing.
@@ -44,16 +43,10 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
-		if err := o.claimClusterCreate(ctx, cmd.SID); err != nil {
+		if _, _, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, credentials); err != nil {
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
-		go func() {
-			defer o.releaseClusterCreate(cmd.SID)
-			if _, err := o.bootCluster(o.asyncCtx(), cmd, pair, tmpl, credentials); err != nil {
-				o.log.Error("cluster create", "sid", cmd.SID, "err", err)
-			}
-		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
 		if cmd.TimeoutSeconds < 0 || int64(cmd.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds {
@@ -62,12 +55,21 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 				Reason: "connect timeout is out of range", HTTPStatus: http.StatusBadRequest,
 			}
 		}
-		if cmd.TimeoutSeconds > 0 {
-			unlock := o.lifecycle.Lock(cmd.SID)
-			defer unlock()
-		}
 		requestedDeadline := clusterConnectDeadline(cmd.TimeoutSeconds)
 		sb, err := o.prepareClusterConnect(ctx, cmd, requestedDeadline)
+		if err != nil {
+			return reject(cmd, err)
+		}
+		var deadline *int64
+		if requestedDeadline > 0 {
+			deadline = &requestedDeadline
+		}
+		sb, _, err = o.ensureResumeAccepted(ctx, cmd.SID, deadline, func(current *types.Sandbox) error {
+			if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
+				return err
+			}
+			return validateClusterSandboxContext(current, cmd)
+		})
 		if err != nil {
 			return reject(cmd, err)
 		}
@@ -75,23 +77,11 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if err != nil {
 			return reject(cmd, err)
 		}
-		if err := o.applyClusterConnectDeadline(ctx, sb, requestedDeadline); err != nil {
-			return reject(cmd, err)
-		}
-		if sb.State == types.StatePaused {
-			if requestedDeadline > 0 {
-				o.markDeadlineIntent(sb.ID)
-			}
-			o.scheduleResume(sb.ID)
-		}
 		return acceptConnect(cmd, result)
 	case routesync.CmdExecSession:
-		sb, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
+		_, result, err := o.prepareClusterExecSession(ctx, cmd, wallUnix)
 		if err != nil {
 			return reject(cmd, err)
-		}
-		if sb.State == types.StatePaused {
-			o.scheduleResume(sb.ID)
 		}
 		return acceptExecSession(cmd, result)
 	case routesync.CmdDelete:
@@ -127,40 +117,6 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	default:
 		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
-}
-
-func (o *Orchestrator) claimClusterCreate(ctx context.Context, sid string) error {
-	if !types.ValidLocalSandboxID(sid) {
-		return fmt.Errorf("cluster create: invalid sandbox id")
-	}
-	o.mu.Lock()
-	if o.reg[sid] != nil {
-		o.mu.Unlock()
-		return fmt.Errorf("cluster create: sandbox %q already exists", sid)
-	}
-	if _, claimed := o.clusterCreates[sid]; claimed {
-		o.mu.Unlock()
-		return fmt.Errorf("cluster create: sandbox %q is already being created", sid)
-	}
-	o.clusterCreates[sid] = struct{}{}
-	o.mu.Unlock()
-
-	existing, err := o.st.Get(ctx, sid)
-	if err != nil {
-		o.releaseClusterCreate(sid)
-		return err
-	}
-	if existing != nil {
-		o.releaseClusterCreate(sid)
-		return fmt.Errorf("cluster create: sandbox %q already exists", sid)
-	}
-	return nil
-}
-
-func (o *Orchestrator) releaseClusterCreate(sid string) {
-	o.mu.Lock()
-	delete(o.clusterCreates, sid)
-	o.mu.Unlock()
 }
 
 // ResourceProbe surfaces the node's water level for the cluster heartbeat. serve
@@ -349,16 +305,38 @@ func (o *Orchestrator) ClusterNodeInfo() (capacity int, buildCap *routesync.Buil
 	return o.cfg.Sandbox.Capacity, buildCap, runtimeDigest
 }
 
-// SetClusterContext sets the lifetime for node-link async work (boots / resumes /
-// teardowns): serve passes its shutdown context so in-flight work is cancelled on
-// drain instead of leaking past it. Call before starting the node-link client.
-func (o *Orchestrator) SetClusterContext(ctx context.Context) { o.clusterCtx = ctx }
-
-func (o *Orchestrator) asyncCtx() context.Context {
-	if o.clusterCtx != nil {
-		return o.clusterCtx
+// SetLifecycleContext sets the common lifetime for every accepted standalone,
+// data-plane, exec, and cluster launch. node-ctl calls it unconditionally before
+// exposing any API or route surface.
+func (o *Orchestrator) SetLifecycleContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return context.Background()
+	o.lifecycleCtxMu.Lock()
+	o.lifecycleCtx = ctx
+	o.lifecycleCtxMu.Unlock()
+}
+
+func (o *Orchestrator) launchContext() context.Context {
+	o.lifecycleCtxMu.RLock()
+	ctx := o.lifecycleCtx
+	o.lifecycleCtxMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// SetClusterContext and asyncCtx remain thin aliases for existing embedders and
+// tests; there is only one lifecycle context source.
+func (o *Orchestrator) SetClusterContext(ctx context.Context) { o.SetLifecycleContext(ctx) }
+func (o *Orchestrator) asyncCtx() context.Context             { return o.launchContext() }
+
+// DrainLaunches waits for all accepted create/resume attempts to finish their
+// terminal state, route publication, and resource cleanup. The lifecycle root
+// must be canceled before calling it so admission cannot add a successor.
+func (o *Orchestrator) DrainLaunches(ctx context.Context) error {
+	return o.launches.Drain(ctx)
 }
 
 func accept(cmd *routesync.Command) *routesync.CmdAck {
@@ -398,15 +376,29 @@ func clusterCommandRejection(err error) (int, string) {
 	}
 }
 
-// CreateCluster is the synchronous precheck + boot of a node-link create. The
-// async path (HandleCommand) splits it so the ack is prompt; callers/tests that
-// want the result synchronously use this.
+// CreateCluster is a synchronous wrapper over the same durable admission used by
+// HandleCommand. It waits for that exact attempt; it does not maintain a second
+// launch implementation.
 func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
 	pair, tmpl, credentials, err := o.precheckCluster(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
-	return o.bootCluster(ctx, cmd, pair, tmpl, credentials)
+	_, attempt, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, credentials)
+	if err != nil {
+		return nil, err
+	}
+	if err := attempt.wait(ctx); err != nil {
+		return nil, err
+	}
+	current, err := o.st.Get(ctx, cmd.SID)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.State != types.StateRunning {
+		return nil, fmt.Errorf("cluster create %s did not reach running", cmd.SID)
+	}
+	return cloneSandbox(current), nil
 }
 
 // precheckCluster resolves the manifest key (by the fingerprint the registry
@@ -456,13 +448,17 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
+	if _, err := sandboxcfg.ParseSpec(config); err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
 	cmd.Config = config
 	return pair, tmpl, credentials, nil
 }
 
-// bootCluster builds + launches the sandbox from the registry-supplied metadata
-// and publishes its route, which satisfies the registry's Reserve.
-func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, credentials sandboxcfg.Credentials) (*types.Sandbox, error) {
+// acceptClusterCreate persists and publishes starting before returning, so an
+// Accepted ACK always names both a durable row and an active launch owner.
+func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, credentials sandboxcfg.Credentials) (*types.Sandbox, *launchAttempt, error) {
+	admissionStarted := time.Now()
 	meta := clusterSandboxMetadata(cmd.Config)
 
 	sb := &types.Sandbox{
@@ -481,16 +477,18 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		DeadlineUnix:       time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix(),
 	}
 	if err := materializeSandboxCredentials(sb, credentials); err != nil {
-		return nil, fmt.Errorf("cluster create: %w", err)
+		return nil, nil, fmt.Errorf("cluster create: %w", err)
 	}
 	if tmpl.Profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	if err := o.launch(ctx, sb, tmpl); err != nil {
-		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
+	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	if err != nil {
+		return nil, nil, err
 	}
-	return sb, nil
+	o.logLaunchPhase(attempt, accepted, "admission_duration", time.Since(admissionStarted))
+	return accepted, attempt, nil
 }
 
 func clusterSandboxMetadata(config map[string]string) map[string]string {
@@ -639,9 +637,9 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 	return sb, nil
 }
 
-// prepareClusterExecSession uses the same exact-target validation and optional
-// synchronous KMT import as CmdConnect, then mints the operation-specific result
-// before its caller is allowed to schedule resume.
+// prepareClusterExecSession uses the same exact-target validation, optional
+// synchronous KMT import, and durable resume admission as CmdConnect. Token
+// signing runs under the lifecycle fence immediately before any new transition.
 func (o *Orchestrator) prepareClusterExecSession(
 	ctx context.Context,
 	cmd *routesync.Command,
@@ -653,12 +651,20 @@ func (o *Orchestrator) prepareClusterExecSession(
 	if _, err := execSessionExpiry(now(), cmd.TTLSeconds); err != nil {
 		return nil, nil, err
 	}
-	sb, err := o.prepareClusterConnect(ctx, cmd, 0)
-	if err != nil {
+	if _, err := o.prepareClusterConnect(ctx, cmd, 0); err != nil {
 		return nil, nil, err
 	}
-	// Sample signing time after the synchronous import/validation phase.
-	token, err := mintExecSessionToken(sb, cmd.TTLSeconds, now())
+	var token string
+	sb, _, err := o.ensureResumeAcceptedPrepared(ctx, cmd.SID, nil, func(current *types.Sandbox) error {
+		if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
+			return err
+		}
+		return validateClusterSandboxContext(current, cmd)
+	}, func(current *types.Sandbox) error {
+		var err error
+		token, err = mintExecSessionToken(current, cmd.TTLSeconds, now())
+		return err
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -683,24 +689,6 @@ func clusterConnectDeadline(timeoutSeconds int) int64 {
 		return 0
 	}
 	return time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
-}
-
-// applyClusterConnectDeadline persists an explicitly positive absolute deadline
-// for an existing or concurrently inserted target. A freshly imported target
-// receives the same value in its insert and does not pass through this update.
-func (o *Orchestrator) applyClusterConnectDeadline(ctx context.Context, sb *types.Sandbox, deadline int64) error {
-	if sb == nil {
-		return fmt.Errorf("cluster connect: sandbox row is required")
-	}
-	if deadline <= 0 || sb.DeadlineUnix == deadline {
-		return nil
-	}
-	if err := o.st.SetDeadline(ctx, sb.ID, deadline); err != nil {
-		return fmt.Errorf("cluster connect: persist deadline: %w", err)
-	}
-	sb.DeadlineUnix = deadline
-	o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.DeadlineUnix = deadline })
-	return nil
 }
 
 func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
@@ -741,7 +729,7 @@ func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
 func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	o.cancelResumeRequests(sb.ID)
+	o.launches.Cancel(sb.ID)
 
 	current, err := o.st.Get(ctx, sb.ID)
 	if err != nil {
@@ -750,9 +738,24 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) err
 	if current == nil {
 		return nil
 	}
-	o.teardown(ctx, current)
+	attempt, launchActive := o.launches.Lookup(current.ID)
 	if err := o.st.Delete(ctx, current.ID); err != nil {
 		return err
+	}
+	if current.State == types.StateStarting && launchActive {
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.stepLaunchCleanup(cleanupCtx, attempt, current, false); err != nil {
+			o.log.Error("cluster sandbox delete cleanup incomplete; launch will retry",
+				"sid", current.ID, "run_id", current.RunID, "err", err)
+		}
+		cancel()
+	} else {
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.teardown(cleanupCtx, current); err != nil {
+			o.log.Error("cluster sandbox delete cleanup incomplete",
+				"sid", current.ID, "run_id", current.RunID, "err", err)
+		}
+		cancel()
 	}
 	o.clearDeadlineIntent(current.ID)
 	o.uncache(current.ID)

@@ -361,6 +361,108 @@ func (s *Store) InsertSandbox(ctx context.Context, sb *types.Sandbox) error {
 	return nil
 }
 
+// StartingResources is the host network ownership acquired by one launch before
+// a runner is assigned. It is persisted separately from the immutable sandbox
+// identity so concurrent deadline/lifecycle updates cannot be overwritten by a
+// stale whole-row write.
+type StartingResources struct {
+	FloatingIP  string
+	VswitchPort string
+	InnerIP     string
+	PortMAC     string
+}
+
+func sandboxUpdateChanged(operation, id string, result sql.Result) (bool, error) {
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: %s sandbox %s rows: %w", operation, id, err)
+	}
+	return n == 1, nil
+}
+
+// BeginResume atomically accepts a paused resume. The previous runner and
+// network fields are cleared in the same update because a paused FloatingIP may
+// already have been released and reused while starting/running MMDS lookups are
+// allowed.
+func (s *Store) BeginResume(ctx context.Context, id string, deadlineUnix int64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET state=?, deadline_unix=?, run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac=''
+		 WHERE id=? AND state=?`,
+		string(types.StateStarting), deadlineUnix, id, string(types.StatePaused))
+	if err != nil {
+		return false, fmt.Errorf("store: begin resume sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("begin resume", id, result)
+}
+
+// SetStartingResources transfers freshly attached network ownership to the
+// durable starting row only before any runner has been bound.
+func (s *Store) SetStartingResources(ctx context.Context, id string, resources StartingResources) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET floatingip=?, vswitch_port=?, inner_ip=?, port_mac=?
+		 WHERE id=? AND state=? AND run_id=''`,
+		resources.FloatingIP, resources.VswitchPort, resources.InnerIP, resources.PortMAC,
+		id, string(types.StateStarting))
+	if err != nil {
+		return false, fmt.Errorf("store: set starting resources sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("set starting resources", id, result)
+}
+
+// BindStartingRunner is the runner-pool commit fence. It succeeds exactly once
+// while the accepted launch still owns an unassigned starting row.
+func (s *Store) BindStartingRunner(ctx context.Context, id, runID string) (bool, error) {
+	if runID == "" {
+		return false, fmt.Errorf("store: bind starting runner sandbox %s: empty run id", id)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes SET run_id=?
+		 WHERE id=? AND state=? AND run_id=''`,
+		runID, id, string(types.StateStarting))
+	if err != nil {
+		return false, fmt.Errorf("store: bind starting runner sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("bind starting runner", id, result)
+}
+
+// CommitStartingRunning commits a successfully initialized sandbox only while
+// the exact runner bound by the assignment callback still owns it.
+func (s *Store) CommitStartingRunning(ctx context.Context, id, runID string) (bool, error) {
+	if runID == "" {
+		return false, fmt.Errorf("store: commit starting running sandbox %s: empty run id", id)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes SET state=?
+		 WHERE id=? AND state=? AND run_id=?`,
+		string(types.StateRunning), id, string(types.StateStarting), runID)
+	if err != nil {
+		return false, fmt.Errorf("store: commit starting running sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("commit starting running", id, result)
+}
+
+func (s *Store) rollbackStarting(ctx context.Context, id, expectedRunID string, target types.State) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET state=?, run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac=''
+		 WHERE id=? AND state=? AND run_id=?`,
+		string(target), id, string(types.StateStarting), expectedRunID)
+	if err != nil {
+		return false, fmt.Errorf("store: rollback starting sandbox %s to %s: %w", id, target, err)
+	}
+	return sandboxUpdateChanged("rollback starting to "+string(target), id, result)
+}
+
+func (s *Store) RollbackStartingDead(ctx context.Context, id, expectedRunID string) (bool, error) {
+	return s.rollbackStarting(ctx, id, expectedRunID, types.StateDead)
+}
+
+func (s *Store) RollbackStartingPaused(ctx context.Context, id, expectedRunID string) (bool, error) {
+	return s.rollbackStarting(ctx, id, expectedRunID, types.StatePaused)
+}
+
 var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`

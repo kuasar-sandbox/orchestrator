@@ -71,6 +71,232 @@ func runIDFromTestUnit(unit string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(unit, "sandbox-runner@"), ".service")
 }
 
+func startRunPoolTest(t *testing.T, size int) (*runPool, *runPoolTestLauncher, context.Context, context.CancelFunc) {
+	t.Helper()
+	lc := newRunPoolTestLauncher()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindSandbox, size, time.Second, t.TempDir(), lc, testRunUnit, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return p, lc, ctx, cancel
+}
+
+func addIdleRunForTest(t *testing.T, p *runPool, lc *runPoolTestLauncher, ctx context.Context) (string, *runWaitReq) {
+	t.Helper()
+	var runID string
+	select {
+	case unit := <-lc.started:
+		runID = runIDFromTestUnit(unit)
+	case <-time.After(time.Second):
+		t.Fatal("runner unit was not started")
+	}
+	req := &runWaitReq{runID: runID, ctx: ctx, resp: make(chan runWaitResp, 1)}
+	select {
+	case p.waitCh <- req:
+	case <-time.After(time.Second):
+		t.Fatal("WaitAssignment request was not accepted")
+	}
+	return runID, req
+}
+
+func TestRunPoolAssignCanceledBeforeQueue(t *testing.T) {
+	p, _, _, _ := startRunPoolTest(t, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	committed := false
+	if runID, err := p.Assign(ctx, "never-queued", func(string) error {
+		committed = true
+		return nil
+	}); !errors.Is(err, context.Canceled) || runID != "" {
+		t.Fatalf("Assign canceled before queue = %q, %v", runID, err)
+	}
+	if committed {
+		t.Fatal("pre-queue cancellation invoked commit")
+	}
+}
+
+func TestRunPoolAssignCancelWhilePendingIsDecidedByLoop(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 0)
+	ctx, cancel := context.WithCancel(baseCtx)
+	done := make(chan error, 1)
+	committed := false
+	go func() {
+		_, err := p.Assign(ctx, "pending-cancel", func(string) error {
+			committed = true
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case <-lc.started: // demand start is queued only after the request is pending
+	case <-time.After(time.Second):
+		t.Fatal("pending assignment was not accepted")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pending cancellation error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending cancellation was not replied to")
+	}
+	if committed {
+		t.Fatal("pending cancellation invoked commit")
+	}
+}
+
+func TestRunPoolCancelBeforeCommitNeverHandsTaskToRunner(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 0)
+	assignCtx, cancelAssign := context.WithCancel(baseCtx)
+	assignDone := make(chan error, 1)
+	committed := false
+	go func() {
+		_, err := p.Assign(assignCtx, "canceled-task", func(string) error {
+			committed = true
+			return nil
+		})
+		assignDone <- err
+	}()
+	var runID string
+	select {
+	case unit := <-lc.started:
+		runID = runIDFromTestUnit(unit)
+	case <-time.After(time.Second):
+		t.Fatal("on-demand runner was not started")
+	}
+	cancelAssign()
+	if err := <-assignDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Assign cancellation = %v", err)
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(baseCtx, time.Second)
+	defer cancelWait()
+	taskID, ok, err := p.WaitAssignment(waitCtx, runID)
+	if err == nil || ok || taskID != "" {
+		t.Fatalf("runner received canceled task = %q, %v, %v", taskID, ok, err)
+	}
+	if committed {
+		t.Fatal("commit ran after assignment had been canceled")
+	}
+}
+
+func TestRunPoolCommitSuccessWinsConcurrentCancel(t *testing.T) {
+	p, lc, baseCtx, _ := startRunPoolTest(t, 1)
+	runID, waiter := addIdleRunForTest(t, p, lc, baseCtx)
+	assignCtx, cancelAssign := context.WithCancel(baseCtx)
+	commitStarted := make(chan struct{})
+	commitGate := make(chan struct{})
+	type assignResult struct {
+		runID string
+		err   error
+	}
+	done := make(chan assignResult, 1)
+	go func() {
+		got, err := p.Assign(assignCtx, "linearized-task", func(gotRunID string) error {
+			if gotRunID != runID {
+				t.Errorf("commit run id = %q, want %q", gotRunID, runID)
+			}
+			close(commitStarted)
+			<-commitGate
+			return nil
+		})
+		done <- assignResult{runID: got, err: err}
+	}()
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("commit did not start")
+	}
+	cancelAssign()
+	close(commitGate)
+
+	select {
+	case result := <-done:
+		if result.err != nil || result.runID != runID {
+			t.Fatalf("Assign after committed cancellation race = %q, %v", result.runID, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Assign did not return its committed result")
+	}
+	select {
+	case result := <-waiter.resp:
+		if result.err != nil || !result.ok || result.taskID != "linearized-task" {
+			t.Fatalf("runner task after commit = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner did not receive committed task")
+	}
+}
+
+func TestRunPoolCommitErrorDoesNotHandTaskAndRunnerCanBeReused(t *testing.T) {
+	p, lc, ctx, _ := startRunPoolTest(t, 1)
+	runID, waiter := addIdleRunForTest(t, p, lc, ctx)
+	wantErr := errors.New("commit failed")
+	if got, err := p.Assign(ctx, "rejected-task", func(string) error { return wantErr }); !errors.Is(err, wantErr) || got != "" {
+		t.Fatalf("failed commit Assign = %q, %v", got, err)
+	}
+	select {
+	case result := <-waiter.resp:
+		t.Fatalf("runner received task for failed commit: %+v", result)
+	default:
+	}
+	got, err := p.Assign(ctx, "accepted-task", func(gotRunID string) error {
+		if gotRunID != runID {
+			t.Fatalf("reused run id = %q, want %q", gotRunID, runID)
+		}
+		return nil
+	})
+	if err != nil || got != runID {
+		t.Fatalf("Assign after commit error = %q, %v", got, err)
+	}
+	result := <-waiter.resp
+	if result.err != nil || !result.ok || result.taskID != "accepted-task" {
+		t.Fatalf("runner reuse task = %+v", result)
+	}
+}
+
+func TestRunPoolShutdownRepliesPendingAndIdleRequests(t *testing.T) {
+	t.Run("pending assignment", func(t *testing.T) {
+		p, lc, ctx, stop := startRunPoolTest(t, 0)
+		done := make(chan error, 1)
+		go func() {
+			_, err := p.Assign(ctx, "pending-at-stop", func(string) error { return nil })
+			done <- err
+		}()
+		select {
+		case <-lc.started:
+		case <-time.After(time.Second):
+			t.Fatal("assignment did not become pending")
+		}
+		stop()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("pending shutdown error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("pending assignment was stuck at shutdown")
+		}
+	})
+
+	t.Run("idle runner", func(t *testing.T) {
+		p, lc, ctx, stop := startRunPoolTest(t, 1)
+		_, waiter := addIdleRunForTest(t, p, lc, ctx)
+		stop()
+		select {
+		case result := <-waiter.resp:
+			if !errors.Is(result.err, context.Canceled) || result.ok {
+				t.Fatalf("idle shutdown result = %+v", result)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("idle WaitAssignment was stuck at shutdown")
+		}
+	})
+}
+
 func TestRunPoolDemandAssignment(t *testing.T) {
 	lc := newRunPoolTestLauncher()
 	ctx, cancel := context.WithCancel(context.Background())

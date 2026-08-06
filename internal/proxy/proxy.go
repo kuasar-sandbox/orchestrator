@@ -5,7 +5,7 @@
 // Streaming-safe (no buffering).
 //
 // The same Proxy serves both deployment modes — only the Router differs:
-//   - internal: the orchestrator itself resolves the route (single-flight resume);
+//   - internal: the orchestrator itself resolves the route (shared launch owner);
 //   - external: a proxy worker resolves it from the shared route view written by
 //     the proxy master (parking a request and prompting a Wake until the
 //     orchestrator resumes the sandbox).

@@ -24,13 +24,13 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 3
+	schema uint32 = 4
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
-	statusDeleted uint32 = 2
 
-	defaultCapacity = 65536
+	defaultCapacity      = 65536
+	maxTerminalRevisions = 4096
 
 	maxSandboxID   = 128
 	maxProfile     = 16
@@ -46,8 +46,9 @@ const (
 )
 
 var (
-	headerSize = alignSize(int(unsafe.Sizeof(mmapHeader{})), 8)
-	recordSize = int(unsafe.Sizeof(mmapRecord{}))
+	headerSize         = alignSize(int(unsafe.Sizeof(mmapHeader{})), 8)
+	recordSize         = int(unsafe.Sizeof(mmapRecord{}))
+	terminalRecordSize = int(unsafe.Sizeof(mmapTerminalRecord{}))
 )
 
 type mmapHeader struct {
@@ -55,13 +56,14 @@ type mmapHeader struct {
 	Schema       uint32
 	Capacity     uint32
 	Synced       uint32
-	_            uint32
+	TerminalCap  uint32
 	GlobalRev    uint64
 	SyncGen      uint64
+	TableSeq     uint64
 	PolicySeq    uint64
 	PolicyParkMS int64
 	PolicyAuth   [maxProfile]byte
-	_            [32]byte
+	_            [24]byte
 }
 
 type mmapRecord struct {
@@ -91,13 +93,25 @@ type mmapRecord struct {
 	MmdsSecret             [maxMmdsSecret]byte
 }
 
+// mmapTerminalRecord is a bounded, credential-free correlation cache for
+// Delete events. It is deliberately separate from the live open-addressed
+// table so normal route deletion can reclaim its probe slot without losing the
+// short-lived per-SID revision that unparks a worker.
+type mmapTerminalRecord struct {
+	Seq       uint64
+	Hash      uint64
+	Rev       uint64
+	SandboxID [maxSandboxID]byte
+}
+
 // Table is a memory-mapped fixed-capacity route table.
 type Table struct {
-	path     string
-	data     []byte
-	header   *mmapHeader
-	records  []mmapRecord
-	readonly bool
+	path      string
+	data      []byte
+	header    *mmapHeader
+	records   []mmapRecord
+	terminals []mmapTerminalRecord
+	readonly  bool
 }
 
 // Create replaces path with a zeroed route table of capacity records.
@@ -129,6 +143,7 @@ func Create(path string, capacity int) (*Table, error) {
 	t.header.Magic = magic
 	t.header.Schema = schema
 	t.header.Capacity = uint32(capacity)
+	t.header.TerminalCap = uint32(terminalCapacity(capacity))
 	return t, nil
 }
 
@@ -158,12 +173,27 @@ func Open(path string) (*Table, error) {
 	return t, nil
 }
 
-// Size returns the mmap size for capacity records.
+// Size returns the mmap size for capacity live records plus the bounded,
+// credential-free terminal revision cache.
 func Size(capacity int) int {
 	if capacity <= 0 {
 		capacity = defaultCapacity
 	}
-	return headerSize + capacity*recordSize
+	return mappedSize(capacity, terminalCapacity(capacity))
+}
+
+func terminalCapacity(capacity int) int {
+	if capacity <= 0 {
+		capacity = defaultCapacity
+	}
+	if capacity > maxTerminalRevisions {
+		return maxTerminalRevisions
+	}
+	return capacity
+}
+
+func mappedSize(capacity, terminalCap int) int {
+	return headerSize + capacity*recordSize + terminalCap*terminalRecordSize
 }
 
 func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int) (*Table, error) {
@@ -171,18 +201,27 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 		return nil, errors.New("proxyshm: mmap too small")
 	}
 	h := (*mmapHeader)(unsafe.Pointer(&data[0]))
+	terminalCap := terminalCapacity(expectedCapacity)
 	if expectedCapacity == 0 {
-		if h.Magic != magic || h.Schema != schema || h.Capacity == 0 {
+		if h.Magic != magic || h.Schema != schema || h.Capacity == 0 || h.TerminalCap == 0 {
 			return nil, fmt.Errorf("proxyshm: invalid header in %s", path)
 		}
 		expectedCapacity = int(h.Capacity)
+		terminalCap = int(h.TerminalCap)
+		if terminalCap != terminalCapacity(expectedCapacity) {
+			return nil, fmt.Errorf("proxyshm: invalid terminal capacity %d in %s", terminalCap, path)
+		}
 	}
-	if len(data) < Size(expectedCapacity) {
-		return nil, fmt.Errorf("proxyshm: mmap size %d smaller than expected %d", len(data), Size(expectedCapacity))
+	expectedSize := mappedSize(expectedCapacity, terminalCap)
+	if len(data) < expectedSize {
+		return nil, fmt.Errorf("proxyshm: mmap size %d smaller than expected %d", len(data), expectedSize)
 	}
 	first := unsafe.Pointer(&data[headerSize])
 	records := unsafe.Slice((*mmapRecord)(first), expectedCapacity)
-	return &Table{path: path, data: data, header: h, records: records, readonly: readonly}, nil
+	terminalOffset := headerSize + expectedCapacity*recordSize
+	terminalFirst := unsafe.Pointer(&data[terminalOffset])
+	terminals := unsafe.Slice((*mmapTerminalRecord)(terminalFirst), terminalCap)
+	return &Table{path: path, data: data, header: h, records: records, terminals: terminals, readonly: readonly}, nil
 }
 
 // Close unmaps the table.
@@ -210,12 +249,24 @@ func (t *Table) Bookmark() {
 	if t.readonly {
 		return
 	}
+	startHeaderWrite(&t.header.TableSeq)
+	defer finishHeaderWrite(&t.header.TableSeq)
 	gen := atomic.LoadUint64(&t.header.SyncGen)
+	stale := make([]string, 0)
 	for i := range t.records {
-		r := &t.records[i]
-		if atomic.LoadUint32(&r.Status) == statusPresent && atomic.LoadUint64(&r.SyncGen) != gen {
-			t.deleteRecord(r)
+		snapshot, ok := readRecordSnapshot(&t.records[i])
+		if ok && snapshot.status == statusPresent && snapshot.syncGen != gen {
+			stale = append(stale, snapshot.entry.SandboxID)
 		}
+	}
+	for _, sid := range stale {
+		idx, found := t.findSlot(sid, false)
+		if !found {
+			continue
+		}
+		rev := atomic.AddUint64(&t.header.GlobalRev, 1)
+		t.writeTerminal(sid, rev)
+		t.deleteLiveRecord(idx)
 	}
 	atomic.StoreUint32(&t.header.Synced, 1)
 	atomic.AddUint64(&t.header.GlobalRev, 1)
@@ -265,34 +316,26 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	if err := validateRoute(in); err != nil {
 		return err
 	}
+	startHeaderWrite(&t.header.TableSeq)
+	defer finishHeaderWrite(&t.header.TableSeq)
 	idx, ok := t.findSlot(in.SandboxID, true)
 	if !ok {
 		return errors.New("proxyshm: route table full")
 	}
 	rec := &t.records[idx]
-	startWrite(rec)
-	rec.Hash = hashSID(in.SandboxID)
-	rec.Status = statusPresent
-	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
-	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
-	_ = putFixed(rec.SandboxID[:], in.SandboxID)
-	_ = putFixed(rec.Profile[:], in.Profile)
-	_ = putFixed(rec.TemplateID[:], in.TemplateID)
-	_ = putFixed(rec.State[:], in.State)
-	_ = putFixed(rec.EnvdUDS[:], in.EnvdUDS)
-	_ = putFixed(rec.CiUDS[:], in.CiUDS)
-	_ = putFixed(rec.FloatingIP[:], in.FloatingIP)
-	_ = putFixed(rec.AuthSandboxID[:], in.AuthSandboxID)
-	_ = putFixed(rec.APISecret[:], in.APISecret)
-	_ = putFixed(rec.APISecretFingerprint[:], in.APISecretFingerprint)
-	_ = putFixed(rec.ManifestKeyFingerprint[:], in.ManifestKeyFingerprint)
-	_ = putFixed(rec.ServiceSecret[:], in.ServiceSecret)
-	_ = putFixed(rec.EnvdAccessToken[:], in.EnvdAccessToken)
-	_ = putFixed(rec.TrafficAccessToken[:], in.TrafficAccessToken)
-	_ = putFixed(rec.ForwardAccessToken[:], in.ForwardAccessToken)
-	_ = putFixed(rec.SnapshotLocation[:], in.SnapshotLocation)
-	_ = putFixed(rec.MmdsSecret[:], in.MmdsSecret)
-	finishWrite(rec)
+	gen := atomic.LoadUint64(&t.header.SyncGen)
+	if current, stable := readRecordSnapshot(rec); stable && current.status == statusPresent &&
+		current.hash == hashSID(in.SandboxID) && current.entry == in {
+		// Replay during Subscribe-before-Range synchronization still adopts the
+		// route into the current generation, but an identical business record is
+		// not a lifecycle response and must not advance its per-SID revision.
+		if current.syncGen != gen {
+			current.syncGen = gen
+			writeRecordSnapshot(rec, current)
+		}
+		return nil
+	}
+	t.writeRoute(rec, in, gen, atomic.AddUint64(&t.header.GlobalRev, 1))
 	return nil
 }
 
@@ -300,88 +343,117 @@ func (t *Table) Delete(sid string) bool {
 	if t.readonly || sid == "" {
 		return false
 	}
+	startHeaderWrite(&t.header.TableSeq)
+	defer finishHeaderWrite(&t.header.TableSeq)
+	rev := atomic.AddUint64(&t.header.GlobalRev, 1)
+	t.writeTerminal(sid, rev)
 	idx, ok := t.findSlot(sid, false)
-	if !ok {
-		return false
+	if ok {
+		t.deleteLiveRecord(idx)
 	}
-	t.deleteRecord(&t.records[idx])
 	return true
 }
 
-func (t *Table) deleteRecord(rec *mmapRecord) {
-	startWrite(rec)
-	rec.Status = statusDeleted
-	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
-	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
-	clearFixed(rec.SandboxID[:])
-	clearFixed(rec.Profile[:])
-	clearFixed(rec.TemplateID[:])
-	clearFixed(rec.State[:])
-	clearFixed(rec.EnvdUDS[:])
-	clearFixed(rec.CiUDS[:])
-	clearFixed(rec.FloatingIP[:])
-	clearFixed(rec.AuthSandboxID[:])
-	clearFixed(rec.APISecret[:])
-	clearFixed(rec.APISecretFingerprint[:])
-	clearFixed(rec.ManifestKeyFingerprint[:])
-	clearFixed(rec.ServiceSecret[:])
-	clearFixed(rec.EnvdAccessToken[:])
-	clearFixed(rec.TrafficAccessToken[:])
-	clearFixed(rec.ForwardAccessToken[:])
-	clearFixed(rec.SnapshotLocation[:])
-	clearFixed(rec.MmdsSecret[:])
-	finishWrite(rec)
+// LookupRevision returns a route and its per-SID revision from one atomic table
+// snapshot. When the live route is absent it also consults the bounded terminal
+// revision cache. This prevents waiters from combining an old route with a
+// newer revision while the writer publishes a starting or terminal transition.
+func (t *Table) LookupRevision(sid string) (routesync.RouteEntry, bool, uint64) {
+	if sid == "" || len(t.records) == 0 {
+		return routesync.RouteEntry{}, false, 0
+	}
+	for {
+		seq1 := atomic.LoadUint64(&t.header.TableSeq)
+		if seq1&1 == 1 {
+			runtime.Gosched()
+			continue
+		}
+		entry, found, rev := t.lookupLiveRevision(sid)
+		if !found {
+			rev = t.terminalRevision(sid)
+		}
+		seq2 := atomic.LoadUint64(&t.header.TableSeq)
+		if seq1 == seq2 && seq2&1 == 0 {
+			return entry, found, rev
+		}
+	}
 }
 
-func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
-	if sid == "" || len(t.records) == 0 {
-		return routesync.RouteEntry{}, false
-	}
+func (t *Table) lookupLiveRevision(sid string) (routesync.RouteEntry, bool, uint64) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
 	for i := 0; i < len(t.records); i++ {
 		rec := &t.records[(start+i)%len(t.records)]
+		// Preserve the existing hot-path probe: unrelated and empty slots do not
+		// require copying the full credential-bearing record. A matching slot is
+		// then re-read wholly under its seqlock below.
 		status := atomic.LoadUint32(&rec.Status)
 		if status == statusEmpty {
-			return routesync.RouteEntry{}, false
+			break
 		}
-		if status != statusPresent || atomic.LoadUint64(&rec.Hash) != h {
+		if atomic.LoadUint64(&rec.Hash) != h {
 			continue
 		}
-		entry, st, ok := readRecord(rec)
+		snapshot, ok := readRecordSnapshot(rec)
 		if !ok {
 			i--
 			runtime.Gosched()
 			continue
 		}
-		if st == statusPresent && entry.SandboxID == sid {
-			return entry, true
+		if snapshot.status == statusEmpty {
+			break
 		}
-		if st == statusEmpty {
-			return routesync.RouteEntry{}, false
+		if snapshot.status == statusPresent && snapshot.hash == h && snapshot.entry.SandboxID == sid {
+			return snapshot.entry, true, snapshot.rev
 		}
 	}
-	return routesync.RouteEntry{}, false
+	return routesync.RouteEntry{}, false, 0
+}
+
+// RouteRev returns the latest live or cached terminal revision associated with
+// sid. It lets a worker distinguish a terminal response to its Wake from
+// unrelated global route-table traffic even when starting and rollback updates
+// are coalesced before the worker samples shared memory.
+func (t *Table) RouteRev(sid string) uint64 {
+	_, _, rev := t.LookupRevision(sid)
+	return rev
+}
+
+func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
+	entry, found, _ := t.LookupRevision(sid)
+	return entry, found
 }
 
 func (t *Table) ByFloatingIP(ip string) (string, bool) {
 	if ip == "" {
 		return "", false
 	}
-	for i := range t.records {
-		entry, st, ok := readRecord(&t.records[i])
-		if !ok {
-			i--
+	for {
+		seq1 := atomic.LoadUint64(&t.header.TableSeq)
+		if seq1&1 == 1 {
 			runtime.Gosched()
 			continue
 		}
-		if st == statusPresent &&
-			(entry.State == routesync.StateStarting || entry.State == routesync.StateRunning) &&
-			entry.FloatingIP == ip {
-			return entry.SandboxID, true
+		var sid string
+		for i := 0; i < len(t.records); i++ {
+			entry, st, ok := readRecord(&t.records[i])
+			if !ok {
+				i--
+				runtime.Gosched()
+				continue
+			}
+			if st == statusPresent &&
+				(entry.State == routesync.StateStarting || entry.State == routesync.StateRunning) &&
+				entry.FloatingIP == ip {
+				sid = entry.SandboxID
+				break
+			}
+		}
+		seq2 := atomic.LoadUint64(&t.header.TableSeq)
+		if seq1 == seq2 && seq2&1 == 0 {
+			return sid, sid != ""
 		}
 	}
-	return "", false
 }
 
 func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
@@ -407,7 +479,6 @@ func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
 func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
-	firstDeleted := -1
 	for i := 0; i < len(t.records); i++ {
 		idx := (start + i) % len(t.records)
 		rec := &t.records[idx]
@@ -417,16 +488,9 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 			if !insert {
 				return 0, false
 			}
-			if firstDeleted >= 0 {
-				return firstDeleted, true
-			}
 			return idx, true
-		case statusDeleted:
-			if insert && firstDeleted < 0 {
-				firstDeleted = idx
-			}
 		case statusPresent:
-			if rec.Hash != h {
+			if atomic.LoadUint64(&rec.Hash) != h {
 				continue
 			}
 			entry, st, ok := readRecord(rec)
@@ -440,45 +504,175 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 			}
 		}
 	}
-	if insert && firstDeleted >= 0 {
-		return firstDeleted, true
-	}
 	return 0, false
 }
 
-func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
+type recordSnapshot struct {
+	entry   routesync.RouteEntry
+	status  uint32
+	hash    uint64
+	syncGen uint64
+	rev     uint64
+}
+
+func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 	for spin := 0; spin < 64; spin++ {
 		seq1 := atomic.LoadUint64(&rec.Seq)
 		if seq1&1 == 1 {
 			runtime.Gosched()
 			continue
 		}
-		st := atomic.LoadUint32(&rec.Status)
-		entry := routesync.RouteEntry{
-			SandboxID:              fixedString(rec.SandboxID[:]),
-			Profile:                fixedString(rec.Profile[:]),
-			TemplateID:             fixedString(rec.TemplateID[:]),
-			State:                  fixedString(rec.State[:]),
-			EnvdUDS:                fixedString(rec.EnvdUDS[:]),
-			CiUDS:                  fixedString(rec.CiUDS[:]),
-			FloatingIP:             fixedString(rec.FloatingIP[:]),
-			AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
-			APISecret:              fixedString(rec.APISecret[:]),
-			APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
-			ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
-			ServiceSecret:          fixedString(rec.ServiceSecret[:]),
-			EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
-			TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
-			ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
-			SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
-			MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+		snapshot := recordSnapshot{
+			status:  atomic.LoadUint32(&rec.Status),
+			hash:    atomic.LoadUint64(&rec.Hash),
+			syncGen: atomic.LoadUint64(&rec.SyncGen),
+			rev:     atomic.LoadUint64(&rec.Rev),
+			entry: routesync.RouteEntry{
+				SandboxID:              fixedString(rec.SandboxID[:]),
+				Profile:                fixedString(rec.Profile[:]),
+				TemplateID:             fixedString(rec.TemplateID[:]),
+				State:                  fixedString(rec.State[:]),
+				EnvdUDS:                fixedString(rec.EnvdUDS[:]),
+				CiUDS:                  fixedString(rec.CiUDS[:]),
+				FloatingIP:             fixedString(rec.FloatingIP[:]),
+				AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
+				APISecret:              fixedString(rec.APISecret[:]),
+				APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
+				ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
+				ServiceSecret:          fixedString(rec.ServiceSecret[:]),
+				EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
+				TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
+				ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
+				SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
+				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+			},
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
 		if seq1 == seq2 && seq2&1 == 0 {
-			return entry, st, true
+			return snapshot, true
 		}
 	}
-	return routesync.RouteEntry{}, statusEmpty, false
+	return recordSnapshot{}, false
+}
+
+func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
+	snapshot, ok := readRecordSnapshot(rec)
+	return snapshot.entry, snapshot.status, ok
+}
+
+func (t *Table) writeRoute(rec *mmapRecord, entry routesync.RouteEntry, syncGen, rev uint64) {
+	writeRecordSnapshot(rec, recordSnapshot{
+		entry: entry, status: statusPresent, hash: hashSID(entry.SandboxID), syncGen: syncGen, rev: rev,
+	})
+}
+
+func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
+	startWrite(rec)
+	rec.Hash = snapshot.hash
+	rec.Status = snapshot.status
+	rec.SyncGen = snapshot.syncGen
+	rec.Rev = snapshot.rev
+	_ = putFixed(rec.SandboxID[:], snapshot.entry.SandboxID)
+	_ = putFixed(rec.Profile[:], snapshot.entry.Profile)
+	_ = putFixed(rec.TemplateID[:], snapshot.entry.TemplateID)
+	_ = putFixed(rec.State[:], snapshot.entry.State)
+	_ = putFixed(rec.EnvdUDS[:], snapshot.entry.EnvdUDS)
+	_ = putFixed(rec.CiUDS[:], snapshot.entry.CiUDS)
+	_ = putFixed(rec.FloatingIP[:], snapshot.entry.FloatingIP)
+	_ = putFixed(rec.AuthSandboxID[:], snapshot.entry.AuthSandboxID)
+	_ = putFixed(rec.APISecret[:], snapshot.entry.APISecret)
+	_ = putFixed(rec.APISecretFingerprint[:], snapshot.entry.APISecretFingerprint)
+	_ = putFixed(rec.ManifestKeyFingerprint[:], snapshot.entry.ManifestKeyFingerprint)
+	_ = putFixed(rec.ServiceSecret[:], snapshot.entry.ServiceSecret)
+	_ = putFixed(rec.EnvdAccessToken[:], snapshot.entry.EnvdAccessToken)
+	_ = putFixed(rec.TrafficAccessToken[:], snapshot.entry.TrafficAccessToken)
+	_ = putFixed(rec.ForwardAccessToken[:], snapshot.entry.ForwardAccessToken)
+	_ = putFixed(rec.SnapshotLocation[:], snapshot.entry.SnapshotLocation)
+	_ = putFixed(rec.MmdsSecret[:], snapshot.entry.MmdsSecret)
+	finishWrite(rec)
+}
+
+func (t *Table) deleteLiveRecord(index int) {
+	if index < 0 || index >= len(t.records) {
+		return
+	}
+	hole := index
+	n := len(t.records)
+	for step := 1; step < n; step++ {
+		scan := (index + step) % n
+		snapshot, ok := readRecordSnapshot(&t.records[scan])
+		if !ok {
+			step--
+			runtime.Gosched()
+			continue
+		}
+		if snapshot.status == statusEmpty {
+			writeRecordSnapshot(&t.records[hole], recordSnapshot{})
+			return
+		}
+		if snapshot.status != statusPresent {
+			continue
+		}
+		home := int(snapshot.hash % uint64(n))
+		if probeDistance(home, hole, n) < probeDistance(home, scan, n) {
+			writeRecordSnapshot(&t.records[hole], snapshot)
+			hole = scan
+		}
+	}
+	// A completely full table has no terminating empty slot. The backshift above
+	// has still preserved every live record, leaving exactly this final hole.
+	writeRecordSnapshot(&t.records[hole], recordSnapshot{})
+}
+
+func probeDistance(home, index, capacity int) int {
+	return (index - home + capacity) % capacity
+}
+
+type terminalSnapshot struct {
+	hash uint64
+	rev  uint64
+	sid  string
+}
+
+func (t *Table) writeTerminal(sid string, rev uint64) {
+	if len(t.terminals) == 0 {
+		return
+	}
+	h := hashSID(sid)
+	rec := &t.terminals[int(h%uint64(len(t.terminals)))]
+	startHeaderWrite(&rec.Seq)
+	rec.Hash = h
+	rec.Rev = rev
+	_ = putFixed(rec.SandboxID[:], sid)
+	finishHeaderWrite(&rec.Seq)
+}
+
+func (t *Table) terminalRevision(sid string) uint64 {
+	if sid == "" || len(t.terminals) == 0 {
+		return 0
+	}
+	h := hashSID(sid)
+	rec := &t.terminals[int(h%uint64(len(t.terminals)))]
+	for {
+		seq1 := atomic.LoadUint64(&rec.Seq)
+		if seq1&1 == 1 {
+			runtime.Gosched()
+			continue
+		}
+		snapshot := terminalSnapshot{
+			hash: atomic.LoadUint64(&rec.Hash),
+			rev:  atomic.LoadUint64(&rec.Rev),
+			sid:  fixedString(rec.SandboxID[:]),
+		}
+		seq2 := atomic.LoadUint64(&rec.Seq)
+		if seq1 != seq2 || seq2&1 == 1 {
+			continue
+		}
+		if snapshot.hash == h && snapshot.sid == sid {
+			return snapshot.rev
+		}
+		return 0
+	}
 }
 
 func startWrite(rec *mmapRecord) {

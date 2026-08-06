@@ -60,7 +60,79 @@ func TestConnectMissingTargetWithoutMigrationTokenReturnsNotFound(t *testing.T) 
 	}
 }
 
-func TestConnectImportsBeforeReturningAndResumesAsynchronously(t *testing.T) {
+func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	sb := &types.Sandbox{
+		ID: "paused-finishing-owner", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare,
+			Kind:    types.KindImg,
+			Ref:     "manifest://" + strings.Repeat("b", 64),
+		}.String(),
+		State: types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("c", 64),
+		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
+		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-finishing-owner"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-finishing-owner"),
+		CreatedUnix: 1, DeadlineUnix: 100,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	previous, err := o.launches.Claim(o.launchContext(), sb.ID, launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { o.launches.Finish(previous, context.Canceled) })
+
+	validated := make(chan struct{})
+	var validatedOnce sync.Once
+	type acceptanceResult struct {
+		sb      *types.Sandbox
+		attempt *launchAttempt
+		err     error
+	}
+	done := make(chan acceptanceResult, 1)
+	go func() {
+		accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(*types.Sandbox) error {
+			validatedOnce.Do(func() { close(validated) })
+			return nil
+		})
+		done <- acceptanceResult{sb: accepted, attempt: attempt, err: err}
+	}()
+	select {
+	case <-validated:
+	case <-time.After(time.Second):
+		t.Fatal("resume admission did not reach its authoritative paused row")
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("paused admission escaped the previous cleanup fence: %+v, %v", result.sb, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	o.launches.Finish(previous, errors.New("previous resume failed"))
+	var result acceptanceResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("paused admission did not retry after the previous owner finished")
+	}
+	if result.err != nil || result.sb == nil || result.sb.State != types.StateStarting ||
+		result.attempt == nil || result.attempt == previous {
+		t.Fatalf("retried admission = %+v, attempt=%p, err=%v", result.sb, result.attempt, result.err)
+	}
+	waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after the finishing-owner fence")
+	if got := lc.starts.Load(); got != 1 {
+		t.Fatalf("launcher starts = %d, want one post-fence resume", got)
+	}
+}
+
+func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 	dir := t.TempDir()
 	runtimePath := filepath.Join(dir, "runtime.erofs")
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
@@ -118,7 +190,7 @@ func TestConnectImportsBeforeReturningAndResumesAsynchronously(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Connect waited for the blocked asynchronous resume")
 	}
-	if result.err != nil || result.sb == nil || result.sb.ID != targetID || result.sb.State != types.StatePaused {
+	if result.err != nil || result.sb == nil || result.sb.ID != targetID || result.sb.State != types.StateStarting {
 		t.Fatalf("Connect imported result = %+v, %v", result.sb, result.err)
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(result.sb), sandboxCredentials(source))
@@ -131,8 +203,8 @@ func TestConnectImportsBeforeReturningAndResumesAsynchronously(t *testing.T) {
 
 	waitForLauncherStart(t, started)
 	blocked, err := o.st.Get(ctx, targetID)
-	if err != nil || blocked == nil || blocked.State != types.StatePaused {
-		t.Fatalf("imported row before launcher release = %+v, %v; want paused", blocked, err)
+	if err != nil || blocked == nil || blocked.State != types.StateStarting || blocked.RunID != "" {
+		t.Fatalf("imported row before launcher release = %+v, %v; want unassigned starting", blocked, err)
 	}
 	close(startGate)
 	waitForSandbox(t, o, ctx, targetID, func(sb *types.Sandbox) bool {
@@ -239,6 +311,9 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 		if sb.AuthSandboxID() != winner.AuthSandboxID() || sb.Metadata["winner"] != winner.Metadata["winner"] {
 			t.Fatalf("Connect returned a non-winning record: got=%+v winner=%+v", sb, winner)
 		}
+		if sb.State != types.StateStarting {
+			t.Fatalf("concurrent Connect returned state %q, want starting", sb.State)
+		}
 		assertMigrationCredentialsEqual(t, sandboxCredentials(sb), sandboxCredentials(winner))
 	}
 
@@ -289,6 +364,15 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning && current.DeadlineUnix == expectedDeadline
 	}, "running with explicit Connect deadline")
+	// The exact store CAS is the terminal linearization point and deliberately
+	// precedes cache/route publication. Join an attempt that is still finishing
+	// so the assertion below observes the complete terminal publication rather
+	// than that valid, narrow handoff window.
+	if attempt, found := o.launches.Lookup(sb.ID); found {
+		if err := attempt.wait(ctx); err != nil {
+			t.Fatalf("resume launch failed after running commit: %v", err)
+		}
+	}
 	if cached := o.lookup(sb.ID); cached == nil || cached.State != types.StateRunning || cached.DeadlineUnix != expectedDeadline {
 		t.Fatalf("cached sandbox did not retain explicit Connect deadline: %+v", cached)
 	}
@@ -297,12 +381,83 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	}
 }
 
-func TestKillWaitsForAsyncResumeAndDoesNotResurrectSandbox(t *testing.T) {
+func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Sandbox.TimeoutSec = 900
+	assigned := make(chan string, 1)
+	firstReadiness := make(chan struct{})
+	lc := &countingLauncher{
+		assigned: assigned, connectGate: firstReadiness,
+		readinessWire: []byte("ready\ncontrol_ready\n"),
+	}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	mk := strings.Repeat("5", 64)
+	_, apiKey := defaultTestCredentials(t, mk)
+	sb := &types.Sandbox{
+		ID: "deadline-retry", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("4", 64)}.String(),
+		State:      types.StatePaused, APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
+		RunDir: filepath.Join(cfg.Paths.RunRoot, "deadline-retry"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "deadline-retry"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", 73)
+	if err != nil || accepted == nil || accepted.State != types.StateStarting {
+		t.Fatalf("first Connect = %+v, %v", accepted, err)
+	}
+	explicitDeadline := accepted.DeadlineUnix
+	select {
+	case <-assigned:
+	case <-time.After(time.Second):
+		t.Fatal("first resume was not assigned")
+	}
+	attempt, found := o.launches.Lookup(sb.ID)
+	if !found {
+		t.Fatal("first resume lost its launch owner before readiness")
+	}
+	close(firstReadiness)
+	if err := attempt.wait(ctx); err == nil {
+		t.Fatal("malformed readiness unexpectedly succeeded")
+	}
+	paused := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StatePaused
+	}, "paused after failed explicit resume")
+	if paused.DeadlineUnix != explicitDeadline {
+		t.Fatalf("failed resume deadline = %d, want %d", paused.DeadlineUnix, explicitDeadline)
+	}
+	if !o.hasDeadlineIntent(sb.ID) {
+		t.Fatal("failed resume consumed the explicit deadline intent")
+	}
+
+	// The first attempt has fully cleaned up before paused becomes visible to its
+	// waiter. A normal retry must preserve the explicit deadline, then consume
+	// the in-memory intent only after the exact runner commits running.
+	lc.connectGate = nil
+	lc.readinessWire = nil
+	retry, err := o.Connect(ctx, sb.ID, apiKey, "", 0)
+	if err != nil || retry == nil || retry.State != types.StateStarting || retry.DeadlineUnix != explicitDeadline {
+		t.Fatalf("retry Connect = %+v, %v; want preserved deadline %d", retry, err, explicitDeadline)
+	}
+	running := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after deadline-preserving retry")
+	if running.DeadlineUnix != explicitDeadline {
+		t.Fatalf("running deadline = %d, want %d", running.DeadlineUnix, explicitDeadline)
+	}
+	if o.hasDeadlineIntent(sb.ID) {
+		t.Fatal("successful resume retained the consumed deadline intent")
+	}
+}
+
+func TestKillCancelsStartingResumeWithoutWaitingOrResurrection(t *testing.T) {
 	f := newBlockedResumeFixture(t)
 
 	connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 0)
-	if err != nil || connected == nil || connected.State != types.StatePaused {
-		t.Fatalf("Connect = %+v, %v; want paused result", connected, err)
+	if err != nil || connected == nil || connected.State != types.StateStarting {
+		t.Fatalf("Connect = %+v, %v; want starting result", connected, err)
 	}
 	waitForLauncherStart(t, f.started)
 
@@ -317,19 +472,13 @@ func TestKillWaitsForAsyncResumeAndDoesNotResurrectSandbox(t *testing.T) {
 	}()
 	select {
 	case result := <-done:
-		t.Fatalf("Kill returned before the in-flight resume completed: %+v", result)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(f.startGate)
-	select {
-	case result := <-done:
 		if result.err != nil || !result.found {
 			t.Fatalf("Kill = %+v, want successful deletion", result)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Kill did not complete after resume released the lifecycle boundary")
+	case <-time.After(time.Second):
+		t.Fatal("Kill waited for the blocked starting resume")
 	}
+	close(f.startGate)
 	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
 	if err != nil || stored != nil {
 		t.Fatalf("sandbox was resurrected after Kill: %+v, %v", stored, err)
@@ -339,37 +488,72 @@ func TestKillWaitsForAsyncResumeAndDoesNotResurrectSandbox(t *testing.T) {
 	}
 }
 
-func TestPauseFencesQueuedAsyncResumeButAllowsLaterWake(t *testing.T) {
-	f := newBlockedResumeFixture(t)
-
-	// scheduleResume registers its request before returning to the caller. Model
-	// the interval before its goroutine starts, then let Pause linearize first.
-	queued := f.o.newResumeRequest(f.sb.ID)
-	defer f.o.releaseResumeRequest(queued)
-	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, sandboxcfg.CheckpointPolicy{}); !errors.Is(err, api.ErrAlreadyPaused) {
-		t.Fatalf("Pause already-paused sandbox = %v, want ErrAlreadyPaused", err)
+func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *testing.T) {
+	cfg := &config.Config{}
+	assigned := make(chan string, 1)
+	lc := &countingLauncher{assigned: assigned, readinessNoConnect: true}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	manifestKey := strings.Repeat("9", 64)
+	_, apiKey := defaultTestCredentials(t, manifestKey)
+	sb := &types.Sandbox{
+		ID: "kill-readiness", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		State:      types.StatePaused, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(cfg.Paths.RunRoot, "kill-readiness"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "kill-readiness"), CreatedUnix: 1,
 	}
-
-	close(f.startGate)
-	if err := f.o.resumeSandboxRequest(f.ctx, queued); err != nil {
-		t.Fatalf("fenced resume request = %v", err)
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", 0)
+	if err != nil || accepted == nil || accepted.State != types.StateStarting {
+		t.Fatalf("Connect = %+v, %v", accepted, err)
+	}
+	attempt, found := o.launches.Lookup(sb.ID)
+	if !found {
+		t.Fatal("resume attempt not found")
 	}
 	select {
-	case <-f.started:
-		t.Fatal("resume request queued before Pause started the sandbox")
-	default:
+	case sid := <-assigned:
+		if sid != sb.ID {
+			t.Fatalf("assigned sandbox = %q", sid)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resume did not reach assigned readiness wait")
+	}
+	starting, err := o.st.Get(ctx, sb.ID)
+	if err != nil || starting == nil || starting.State != types.StateStarting || starting.RunID == "" {
+		t.Fatalf("assigned starting row = %+v, %v", starting, err)
+	}
+	if killed, err := o.Kill(ctx, sb.ID, apiKey); err != nil || !killed {
+		t.Fatalf("Kill = %v, %v", killed, err)
+	}
+	if err := attempt.wait(ctx); err == nil {
+		t.Fatal("canceled readiness launch reported success")
+	}
+	if stored, err := o.st.Get(ctx, sb.ID); err != nil || stored != nil {
+		t.Fatalf("assigned launch resurrected after Kill: %+v, %v", stored, err)
+	}
+	if got := lc.stops.Load(); got == 0 {
+		t.Fatal("Kill did not stop the assigned runner")
+	}
+}
+
+func TestPauseStartingReturnsConflictWithoutSnapshotting(t *testing.T) {
+	f := newBlockedResumeFixture(t)
+	if connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 0); err != nil || connected.State != types.StateStarting {
+		t.Fatalf("Connect = %+v, %v", connected, err)
+	}
+	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, sandboxcfg.CheckpointPolicy{}); !errors.Is(err, api.ErrSandboxStarting) {
+		t.Fatalf("Pause starting sandbox = %v, want ErrSandboxStarting", err)
 	}
 	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused {
-		t.Fatalf("sandbox after fenced resume = %+v, %v; want paused", stored, err)
+	if err != nil || stored == nil || stored.State != types.StateStarting {
+		t.Fatalf("sandbox after rejected Pause = %+v, %v; want starting", stored, err)
 	}
-
-	// Pause is a fence, not a permanent block: a later data-plane wake remains
-	// eligible to resume the sandbox.
-	if err := f.o.resumeSandbox(f.ctx, f.sb.ID); err != nil {
-		t.Fatalf("resume request registered after Pause = %v", err)
-	}
+	close(f.startGate)
 	waitForLauncherStart(t, f.started)
+	waitForSandbox(t, f.o, f.ctx, f.sb.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "running after rejected Pause")
 	stored, err = f.o.st.Get(f.ctx, f.sb.ID)
 	if err != nil || stored == nil || stored.State != types.StateRunning {
 		t.Fatalf("sandbox after later wake = %+v, %v; want running", stored, err)
@@ -395,20 +579,15 @@ func TestSetTimeoutAfterAsyncConnectWins(t *testing.T) {
 	}()
 	select {
 	case result := <-done:
-		t.Fatalf("SetTimeout returned before the in-flight resume completed: %+v", result)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(f.startGate)
-	select {
-	case result := <-done:
 		if result.err != nil || !result.found {
 			t.Fatalf("SetTimeout = %+v", result)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("SetTimeout did not complete after resume")
+	case <-time.After(time.Second):
+		t.Fatal("SetTimeout waited for the blocked starting resume")
 	}
-	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	close(f.startGate)
+	stored := waitForSandbox(t, f.o, f.ctx, f.sb.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "running after SetTimeout")
+	var err error
 	if err != nil || stored == nil || stored.State != types.StateRunning {
 		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
 	}
@@ -437,26 +616,21 @@ func TestLaterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 		sb, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 91)
 		done <- connectResult{sb: sb, err: err}
 	}()
-	select {
-	case result := <-done:
-		t.Fatalf("later Connect returned before the in-flight resume completed: %+v", result)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(f.startGate)
 	var result connectResult
 	select {
 	case result = <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("later Connect did not complete after resume")
+		if result.err != nil || result.sb == nil || result.sb.State != types.StateStarting {
+			t.Fatalf("later Connect = %+v, %v", result.sb, result.err)
+		}
+		if result.sb.DeadlineUnix < before+90 || result.sb.DeadlineUnix > time.Now().Unix()+92 {
+			t.Fatalf("deadline = %d, want the later Connect timeout", result.sb.DeadlineUnix)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("later Connect waited for the blocked starting resume")
 	}
-	if result.err != nil || result.sb == nil || result.sb.State != types.StateRunning {
-		t.Fatalf("later Connect = %+v, %v", result.sb, result.err)
-	}
-	if result.sb.DeadlineUnix < before+90 || result.sb.DeadlineUnix > time.Now().Unix()+92 {
-		t.Fatalf("deadline = %d, want the later Connect timeout", result.sb.DeadlineUnix)
-	}
-	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
+	close(f.startGate)
+	stored := waitForSandbox(t, f.o, f.ctx, f.sb.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "running after later Connect")
+	var err error
 	if err != nil || stored == nil || stored.DeadlineUnix != result.sb.DeadlineUnix {
 		t.Fatalf("stored deadline differs from Connect result: stored=%+v result=%+v err=%v", stored, result.sb, err)
 	}

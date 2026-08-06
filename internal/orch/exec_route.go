@@ -25,8 +25,8 @@ func (o *Orchestrator) LookupExec(ctx context.Context, sandboxID string) (proxy.
 }
 
 // ActivateExec is called only after the proxy has verified a KAT against
-// expected. It resumes a paused sandbox through the existing single-flight and
-// re-reads the node-local identity before returning a ctl.sock target subject.
+// expected. It accepts or joins the common launch attempt and re-reads the
+// node-local identity before returning a ctl.sock target subject.
 func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
 	sb, err := o.lookupExecSandbox(ctx, sandboxID)
 	if err != nil {
@@ -36,8 +36,13 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 		return proxy.ExecIdentity{}, false, nil
 	}
 
-	if sb.State == types.StatePaused || sb.State == types.StateStarting {
-		err := o.resumeExecSandbox(ctx, sandboxID, expected)
+	if sb.State == types.StatePaused {
+		_, _, err := o.ensureResumeAccepted(ctx, sandboxID, nil, func(current *types.Sandbox) error {
+			if !execRoutePresent(current) || execIdentity(current) != expected {
+				return errExecIdentityChanged
+			}
+			return nil
+		})
 		if errors.Is(err, errExecIdentityChanged) {
 			return proxy.ExecIdentity{}, false, nil
 		}
@@ -45,8 +50,13 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 			return proxy.ExecIdentity{}, false, err
 		}
 	}
+	if sb.State == types.StatePaused || sb.State == types.StateStarting {
+		if _, err := o.waitLaunchState(ctx, sandboxID); err != nil {
+			return proxy.ExecIdentity{}, false, err
+		}
+	}
 
-	ready, err := o.lookupExecSandbox(ctx, sandboxID)
+	ready, err := o.st.Get(ctx, sandboxID)
 	if err != nil {
 		return proxy.ExecIdentity{}, false, err
 	}
@@ -54,42 +64,6 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 		return proxy.ExecIdentity{}, false, nil
 	}
 	return execIdentity(ready), true, nil
-}
-
-// resumeExecSandbox preserves the normal resume fencing and lifecycle boundary
-// while revalidating the already-authorized identity immediately before any
-// resume side effect.
-func (o *Orchestrator) resumeExecSandbox(ctx context.Context, sandboxID string, expected proxy.ExecIdentity) error {
-	request := o.newResumeRequest(sandboxID)
-	defer o.releaseResumeRequest(request)
-	for {
-		err := o.sf.Do(sandboxID, func() error {
-			unlock := o.lifecycle.Lock(sandboxID)
-			defer unlock()
-			if !o.resumeRequestValid(request) {
-				return errResumeFenced
-			}
-			current, err := o.lookupExecSandbox(ctx, sandboxID)
-			if err != nil {
-				return err
-			}
-			if !execRoutePresent(current) || execIdentity(current) != expected {
-				return errExecIdentityChanged
-			}
-			preserveDeadline := o.hasDeadlineIntent(sandboxID)
-			if err := o.resumeIfPaused(ctx, sandboxID, preserveDeadline); err != nil {
-				return err
-			}
-			o.clearDeadlineIntent(sandboxID)
-			return nil
-		})
-		if !errors.Is(err, errResumeFenced) {
-			return err
-		}
-		if !o.resumeRequestValid(request) {
-			return nil
-		}
-	}
 }
 
 func (o *Orchestrator) lookupExecSandbox(ctx context.Context, sandboxID string) (*types.Sandbox, error) {

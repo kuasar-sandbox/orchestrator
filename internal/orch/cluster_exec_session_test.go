@@ -16,6 +16,7 @@ import (
 
 func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
+	blockClusterExecLaunch(t, fixture)
 	cmd := fixture.command("stable-g1", fixture.token)
 	cmd.CmdID = "exec-import"
 	cmd.Kind = routesync.CmdExecSession
@@ -29,7 +30,7 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sb == nil || sb.ID != cmd.SID || sb.State != types.StatePaused || sb.Cluster == nil ||
+	if sb == nil || sb.ID != cmd.SID || sb.State != types.StateStarting || sb.Cluster == nil ||
 		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
 		sb.AuthSandboxID() != cmd.Cluster.AuthSandboxID {
 		t.Fatalf("prepared sandbox = %+v", sb)
@@ -50,6 +51,7 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 
 func TestPrepareClusterExecSessionMintsPerCommandLongLivedTokens(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
+	blockClusterExecLaunch(t, fixture)
 	first := fixture.command("stable-g1", fixture.token)
 	first.CmdID = "exec-first"
 	first.Kind = routesync.CmdExecSession
@@ -97,7 +99,7 @@ func TestHandleClusterExecSessionReturnsBeforeAsynchronousResume(t *testing.T) {
 		t.Fatalf("exec-session ack = %+v", ack)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
-	if err != nil || stored == nil || stored.State != types.StatePaused {
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
 		t.Fatalf("synchronously imported target = %+v, %v", stored, err)
 	}
 	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.AuthSandboxID(), time.Now()); err != nil {
@@ -161,6 +163,7 @@ func TestClusterExecSessionRejectsTTLOverflowWithoutResume(t *testing.T) {
 
 func TestClusterExecSessionRejectsDeadLocalTarget(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
+	blockClusterExecLaunch(t, fixture)
 	initial := fixture.command("stable-g1", fixture.token)
 	initial.CmdID = "exec-import-paused"
 	initial.Kind = routesync.CmdExecSession
@@ -178,4 +181,25 @@ func TestClusterExecSessionRejectsDeadLocalTarget(t *testing.T) {
 	if ack.Status != routesync.AckRejected || ack.ExecSession != nil || !strings.Contains(ack.Reason, "not found") {
 		t.Fatalf("dead-target ack = %+v", ack)
 	}
+}
+
+func blockClusterExecLaunch(t *testing.T, fixture *clusterConnectFixture) {
+	t.Helper()
+	blocker := &blockingClusterConnectVS{started: make(chan struct{}), returned: make(chan struct{})}
+	fixture.o.vs = blocker
+	launchCtx, cancel := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(launchCtx)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-blocker.returned:
+		case <-time.After(2 * time.Second):
+			t.Error("blocked cluster exec launch did not stop")
+		}
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer drainCancel()
+		if err := fixture.o.DrainLaunches(drainCtx); err != nil {
+			t.Errorf("drain blocked cluster exec launch: %v", err)
+		}
+	})
 }

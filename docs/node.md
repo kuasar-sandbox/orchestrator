@@ -117,15 +117,19 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
                          guest: sandbox-init + envd
 ```
 
-create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
-配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 拿
-`{port, floatingip, mac}` → 写非密配置 `<sid>.yaml`
-→ 从 runner pool 分配一个 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)
-→ 以 `starting` 持久化 `sid ↔ run-id`,并发布仅供 MMDS 使用的 starting route
-→ 单元内 `run-sandbox` 经 config-socket 的
-WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
-→ 起 microVM → 严格完成 runtime readiness wire → (e2b)直接 `POST /init` 置 env/默认用户
-→ 以 run-id CAS 为 `running`并开放数据面 → 起 TTL。集群下,该 create 由 node-link 的
+create 同步受理流程只做请求校验/纯解析、身份和 token 生成、进程内 launch ownership claim,
+然后 insert `starting, run_id=""`(网络字段为空)、cache/publish starting 并调度后台 launch。
+此时即返回 HTTP 201;它表示资源已被持久接受,不表示 runner 已分配、runtime 已 ready 或
+e2b `/init` 已完成。后台流程再建 `<run_root>/<sid>/`(tmpfs)+
+`<base_root>/<sid>/`(disk)→检查 snapshot→配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、
+否则经 `connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` 并先以 CAS 持久化网络
+ownership→写非密配置 `<sid>.yaml`、绑定 `ready.sock`、发布 enriched starting→从 runner
+pool 分配 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)。pool commit callback
+先以 `starting AND run_id=''` CAS 绑定 run-id,成功后才把 sid 交给 runner。单元内
+`run-sandbox` 经 config-socket 的 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后
+`execve` 成 `sandbox-ctl run`→起 microVM→严格完成 runtime readiness wire→(e2b)直接
+`POST /init` 置 env/默认用户→以 exact run-id CAS 为 `running`并开放数据面。集群下,该
+create 由 node-link 的
 `create` 命令触发;profile、group、route-key
 和可选认证主体通过结构化系统上下文下发并独立持久化。事件回报 profile、node-owned
 执行事实和受保护路由凭据投影,registry 从既有节点归属记录恢复其 cluster identity
@@ -140,7 +144,8 @@ legacy `(sid, port)`.e2b profile 的 49983/49999 使用 EnvdAccessToken,拨 sand
 恢复副作用之前完成 KAT 校验,最终进入 `<run_root>/<NodeSandboxID>/ctl.sock`.
 TrafficAccessToken 仅供外部网关及 e2b
 数据面组件使用,node 平台层不消费。对 paused
-沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1,
+沙箱的请求触发自动 resume(与其它入口共用 launch owner,§8)。部署形态
+(internal/external/off)见 §9.1,
 转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
 把公开稳定 SandboxID 转换为当前 NodeSandboxID,再注入 `E2b-Sandbox-Id` +
 `X-Access-Token` 转发进本节点 proxy(cluster-router.md)。
@@ -420,14 +425,14 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
-| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404 |
-| resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import,随后接受异步 resume 并返回(§8.1);目标已存在时不解析 token |
+| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
+| resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,可选 `ttlSeconds` 和 `X-Kuasar-Migration-Token`;不创建 guest process |
-| pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停回 **409** |
-| timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL |
+| pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停或正在 starting 回 **409**;starting 不调用 snapshot/ctl.sock |
+| timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL;starting 允许窄字段更新 |
 
 create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<base64url-ref>`,§4.4)、注册期
 transient id、或已 ready 构建的 name/alias——后两者解析到持久 id 再走统一路径。
@@ -435,12 +440,26 @@ transient id、或已 ready 构建的 name/alias——后两者解析到持久 i
 envd,不生成也不返回 Envd/Traffic token;两种 profile 都返回独立的
 `forwardAccessToken`。该 token 在创建时签发并随 Sandbox 记录持久化。
 
+Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 worker 使用不同的对象
+副本。GET 可观察 `starting`;默认 List 仍只列 running/paused,显式 `state=starting|dead`
+用于诊断。Connect 已是 running 时直接返回;已是 starting 时只应用显式 timeout 的窄更新,
+不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
+starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在同一
+conductor 进程内的恢复失败回 paused 后继续保留,只在某次 exact-run 成功提交 running 后
+消费。V1 没有持久 intent 字段,所以 Reconcile 可从仍为 starting 的中断 resume 推断并在
+本次进程内保守恢复 intent,避免紧随其后的普通 Wake/Connect 被 node default 覆盖。如果该行
+已经回到 paused 后 conductor 再次重启,数据库中已没有办法把它与普通 paused/default-rearm
+区分;精确跨多次重启保留需要 #139 单独批准 schema discriminator,不在 #135 中用隐式编码或
+sidecar 绕过。
+
 Exec session 是显式授权动作,不是服务端 session 对象,也不启动 guest process.请求 body
 只允许空,`{}` 或仅含一个 int64 `ttlSeconds` 字段的 JSON object.完整原始 body
 (含尾随空白)上限 64 KiB;unknown/duplicate 字段,`null`,负数,第二个 JSON value
 和越界 TTL 均在生命周期副作用之前拒绝.64 KiB + 1 返回 413;其它无效 body
 返回 400.`ttlSeconds` 缺省或为 0 时 token 长期有效;为正数时以实际签发时刻计算
-`exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.
+`exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.签发位于 SID lifecycle fence 内:
+先等前一 attempt 的 terminal cleanup 完成,再生成 token,随后才允许新的 paused→starting;
+因此 fence 等待不消耗 token TTL,签名失败也不会产生新的 launch side effect.
 
 目标已存在时不解析 migration token;目标缺失且提供该 token 时可以先同步 import 并完成对象,
 credential binding 和 profile 校验.随后 node 以沙箱记录中的 ServiceSecret 签发 KAT;
@@ -704,21 +723,30 @@ serve 分别维护 runner/builder 的目标 idle 数量。分配会消费一个�
 WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一个固定控制循环串行
 执行,状态循环通过 channel 投递请求,不为每次补池派生启动协程。`pool_wait_timeout` 覆盖
 `StartUnit` 调用到 WaitAssignment 的完整区间;启动失败、等待超时或等待连接取消都会
-`StopUnit` + `ResetFailedUnit`,再生成新的 UUIDv7 run-id 补足目标数量。
+`StopUnit` + `ResetFailedUnit`,再生成新的 UUIDv7 run-id 补足目标数量。沙箱 launch 的
+runner assignment budget 从调用 pool Assign 起覆盖排队、按需 StartUnit 和
+WaitAssignment;匹配 idle runner 后,pool 先调用 commit callback 绑定 run-id,commit 成功
+才把 task ID 发给 runner 并向 Assign 调用方返回成功。commit 是 assignment 线性化点:
+其后发生的 caller cancel 不得把成功翻转为 canceled;pending cancel 与 pool shutdown 由
+pool loop 唯一回复,每个请求恰有一次结果。
 
-- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → tapfd `RELEASE` 或
-  `connector-ctl vswitch detach`
-  → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
+- **kill**:在 SID lifecycle fence 内取消 active launch→删除 durable row→
+  `StopUnit`(连 CH 一并 SIGKILL)→`ResetFailedUnit`→tapfd `RELEASE` 或
+  `connector-ctl vswitch detach`→删运行目录/cache→发布 Delete。launch claim 仍保留到旧
+  attempt 完成其局部资源清理,因此迟到 CAS 不能复活该行,同 SID 也不能提前启动后继 attempt。
+  `kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:serve 在分配 runner 前先绑定 `<run_root>/<sid>/ready.sock`(目录 0700、
   socket 0600),分配后从 node-ctl 的 one-shot 连接严格读取
   `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
   请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。runtime
-  wire 与 mandatory `/init` 共用一次 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
+  launch budget 从 Assign 成功/runner handoff 后才开始,与前述 runner assignment budget
+  独立;它覆盖 wire 与 mandatory `/init` 的 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
   错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
   非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
   EOF、取消或总预算超时都返回
   launch 失败:create 将已持久化的 starting 行按 run-id fence 标 dead,resume 则回退
-  paused;分配/持久化前失败不插入 dead 行.只有 `/init` 成功后才以同一 run-id 把
+  paused;durable acceptance 后即使尚未分配 runner,失败也按空 run-id fence 收敛到该终态。
+  只有 `/init` 成功后才以同一 run-id 把
   starting CAS 为 running 并发布 running route.
 - **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
   run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
@@ -910,16 +938,39 @@ starting ──success──► running ──pause / TTL──► paused
   失联的 running 标为 `dead`(§15);paused/dead 行中,paused 可再拉起,kill 删行。
   集群下,这些操作另由 node-link 命令触发(create/connect/exec_session/delete,§10),并把
   状态变化作为事件上报 registry。
-- `starting` 是持久化的节点内部 launch 状态,不是 e2b readiness。runner assignment 与
-  starting 行写入同一回调;写入失败会把 run-id 归还 pool,不生成业务行。create 和 resume
-  均在 runtime wire 与 mandatory `/init` 完成后,以精确 run-id CAS `starting -> running`。
-  create 的持久化后失败 CAS 为 dead;resume 的失败 CAS 回 paused。两条失败回滚都受 run-id
-  fence 保护,迟到清理不得覆盖已删除或后续重新 launch 的同 ID 实例。默认 list 隐藏
+- `starting` 是一个持久业务生命周期状态,不是 runner 状态或 e2b readiness。它从请求已被
+  durable acceptance 开始,连续覆盖资源/snapshot/network/YAML/ready.sock 准备、runner pool
+  排队和分配、sandbox-ctl/VMM 启动、runtime readiness 与 mandatory `/init`;对外不增加
+  queued/assigned/booting/initializing。初始行为 `starting,run_id=""`,pool commit callback
+  以 `state=starting AND run_id=''` 绑定 run-id;最终 running commit 和分配后 rollback 均要求
+  exact run-id,分配前 rollback 则要求空 run-id。create 失败到 dead 并发布 Delete;resume
+  失败清空本次 runner/network ownership、回到 paused 并发布 paused Upsert。默认 list 隐藏
   starting/dead,显式 state 过滤仍可用于诊断。
-- starting route 对 MMDS 可见,使 guest 在 `/init` 中取得当前身份/token;普通 envd、forward
-  和 native exec 数据面在 running 前不得转发。external worker 见 starting 时只 park 等待
-  running/delete/paused 更新,不发送第二次 Wake;回滚为 paused/Delete 时立即结束等待,
-  paused 初始请求才发 Wake 触发 resume。
+- 所有 fresh Create、snapshot-template Create、paused resume、KMT restore、cluster
+  Create/Connect、data Wake 与 native exec activation 共用一个进程内 launch group。每个 SID
+  在 starting 持久化/发布前先 claim 唯一 owner;Kill/Delete 的 Cancel 只发取消信号,claim
+  要等该 attempt 完成 runner/network/local resource cleanup 才释放。waiter 被唤醒前终态
+  store/cache/route 已收敛,并且 waiter 始终重读权威状态。若 store 为 starting 但进程内没有
+  attempt,节点记录 invariant violation 并 fail closed,不得再分配第二个 runner;重启 Reconcile
+  或终态操作负责收敛。Stop/Reset/detach/local cleanup 任一步失败时按有界退避重试,在全部
+  成功前不清空 durable runner/network ownership、不提交 dead/paused、也不释放 claim。
+- network attach 后先以 `starting AND run_id=''` CAS 持久化 ownership,再发布 enriched
+  starting;CAS 丢失时立即 detach 本地 port,不再写 cache/route 或启动 runner。初始 starting
+  route 没有 FloatingIP,预先确定的 UDS 路径也尚未绑定,因而没有可用 backend endpoint;
+  普通数据面只能 park。enriched starting 才可供 guest MMDS `/init` 查到完整身份。后台只使用
+  窄 CAS,不得用 admission 时的旧 Sandbox 整行覆盖
+  并发 SetTimeout/Kill/Connect 更新。
+- ordinary envd、forward 和 native exec 数据面在 running 前不得转发。internal proxy 对
+  starting 只等待当前 attempt;paused 先完成同一个 durable resume acceptance 再等待。external
+  worker 见 starting 时只 park 等待 running/dead/Delete/paused 更新,不发送第二次 Wake;
+  回滚为 paused/Delete 时立即结束等待,只有初始 missing/paused 请求最多发一次 Wake。所有
+  waiter 以权威终态决定 not-found/route-error,不向普通数据面泄漏 raw launch error。
+- Create/Connect handler 返回后的 launch 使用 node lifecycle root,不继承 HTTP request context;
+  node shutdown 和 Kill 可取消 attempt。conductor 关闭 store/systemd launcher 前会 drain
+  launch group,保证所有已受理 attempt 已完成终态发布与 cleanup;永久不可用的 cleanup 依赖
+  由外层 service-manager stop budget 最终约束。Pause starting 明确返回 409,不接触 ctl.sock;
+  SetTimeout starting 只更新 deadline;Connect starting 不重复 launch。Reaper 仍只扫描 running,
+  Sandbox TTL 的既有定义在本改动中不变。
 - `POST /sandboxes/{id}/pause` body 可为空或为:
 
   ```json
@@ -935,17 +986,27 @@ starting ──success──► running ──pause / TTL──► paused
   detach。路由表保留 paused 路由,后续数据面流量可唤醒。
 - **auto-resume**:数据面流量打到 paused 沙箱 → 读库 → 重走 launch(建目录 + attach
   + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
-  - **单飞**:同一 sid 的并发数据面请求经 per-sid single-flight 合并为一次 resume,
-    杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
-    external 模式经 routesync `Wake` 上行,serve 端同样单飞(§9.2)。集群数据面激活在 registry 端
-    通过 route CAS 和稳定 lineage wait 收敛;控制面 connect 不与它合并(cluster.md)。
+  - **launch ownership**:同一 sid 的并发 Connect/Wake/exec activation 与 create/resume 均由
+    上述 launch group 合并,杜绝重复 IP 分配、attach 或 StartUnit。internal 模式 proxy 在
+    请求内接受/等待;external 模式经 routesync `Wake` 上行。集群数据面激活另由 registry
+    route CAS 和稳定 lineage wait 收敛,但 node-local CmdConnect 仍使用同一 launch owner。
   - 数据面 auto-resume 等待恢复完成后再转发;`POST /sandboxes/{id}/connect` 则只同步
-    完成鉴权、可选 KMT import 和凭据读取,接受同一 single-flight 的异步 resume 后立即返回;
+    完成鉴权、可选 KMT import 和凭据读取,接受/加入同一 launch attempt 后立即返回;
     带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
   - exec-session 签发同步完成可选 import,对象/凭据校验和 KAT 签名,
     然后只接受异步 resume 并立即返回;目标已 starting 时可继续签发但不重复 resume。
     KAT 签名失败时不启动 resume;
     后续数据面的无效 KAT 也不能触发本地恢复.
+- **phase timing**:launch 以低基数 `kind=create|resume`、`profile=e2b|bare`、
+  `result=success|failure` 和 bounded `failure_stage` 记录 admission/prepare/runner_wait/
+  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration。sandbox ID 和
+  run ID 只进入结构化日志字段,不作为 metric label。`runner_wait` 从调用 Assign 到 commit
+  callback 首次拿到 run-id,`runner_commit` 只计窄 Bind/cache,`runtime_ready` 从 handoff 完成
+  到 readiness wire 完整成功,`starting_total` 从 durable starting 到终态 commit。
+- `running` 仅表示 orchestrator runtime readiness 与 mandatory e2b `/init` 已完成,不保证
+  code interpreter、forward 业务端口或用户应用 HTTP/TCP health 已监听。通用业务 backend
+  readiness/dial retry 仍由 [#125](https://github.com/kuasar-sandbox/orchestrator/issues/125)
+  独立跟踪。
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
   门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
@@ -1078,12 +1139,13 @@ serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill �
 plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
 把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
 
-- **auto-resume 单飞**:数据面打到 paused 沙箱触发 resume——internal 在请求内同步触发,
-  external 经 routesync `Wake` 上行;同一 sid 的并发请求经 per-sid single-flight 合并为
-  一次 resume(§8)。
-- **starting 投影**:runner assignment 持久化后即广播 starting,供 internal/external MMDS
-  完成 envd `/init`;它不开放数据面,也不触发 Wake。launch 成功再广播 running;create
-  失败广播 Delete,resume 失败广播 paused。
+- **auto-resume launch owner**:数据面打到 paused 沙箱触发 resume——internal 在请求内完成
+  durable acceptance 并等待,external 经 routesync `Wake` 上行;同一 sid 的 Connect/Wake/
+  exec activation 与其它 launch 入口共用唯一 attempt(§8)。
+- **starting 投影**:初始 `starting,run_id=""` durable insert 后即广播,此时没有 FloatingIP
+  或可用 endpoint;network ownership 已 CAS 持久化且 YAML/ready.sock 已准备后再广播 enriched
+  starting,供 internal/external MMDS 完成 envd `/init`。starting 不开放普通数据面,也不触发
+  Wake。launch 成功广播 running;create 失败广播 Delete,resume 失败广播 paused。
 - **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
   是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
   `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
@@ -1192,13 +1254,16 @@ Registry 以 `<stable-sandbox-id>-g<N>` 分配.node 不接收 SandboxGeneration,
 
 registry 上行下发命令.serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,
 所有 sandbox 操作的 `sid` 均是精确 NodeSandboxID.普通命令受理后回 `cmd_ack`,
-终态经 sandbox/build 事件上报;CmdConnect 和 CmdExecSession 先同步准备并在 Ack
-中返回 typed result,再异步 resume:
+终态经 sandbox/build 事件上报。CmdCreate 只有在唯一 launch owner 已 claim、starting 行已
+insert 且 cache/route starting 已发布后才 Ack;该 Ack 表示 durable acceptance,不表示 READY。
+CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network ownership、提交最终 deadline
+并 cache/publish;CmdExecSession 在 Ack 前完成可选 import、鉴权/签名及同一 resume acceptance。
+三者随后均由共同 lifecycle root 异步 launch:
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离 |
-  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行.deadline 在 Ack 前持久化;Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint,随后异步 resume;缺失且无 token 则拒绝 |
+  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
+  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成 paused→starting、旧 network/run 清理与 deadline 持久化.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.校验通过后生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后异步 resume,不等待 READY |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
@@ -1207,8 +1272,14 @@ registry 上行下发命令.serve 复用既有 e2b 生命周期原语(§8 / §8.
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。
 
+CmdCreate 的任一 Ack 后 launch failure 将 fresh starting 回滚为 dead 并发 Delete;
+CmdConnect/ExecSession 的 resume failure 则回滚为 paused 并发 paused Upsert,不得误走 create
+replacement Delete 分支。Registry 既有 replacement reservation rollback fence 保留:匹配本次
+create 的 Delete 才恢复 Reserve 前旧 route,不能提前删除 reservation 丢失回滚依据。并发
+cluster create/connect/delete 不能取得第二个 node-local launch owner。
+
 每个 exec-session API 调用是独立授权,因此使用新 CmdID 并签发新 KAT;resume
-可以继续按 SID single-flight.`CmdID` 只关联当前 Command 与 Ack waiter,node 不持久化
+可以继续按 SID 查找同一 launch attempt.`CmdID` 只关联当前 Command 与 Ack waiter,node 不持久化
 command digest 或 typed result,Registry 也不在断线、超时或 node 重启后自动重投同一
 `CmdID`.本次调用失败后,API 重试是新的 operation;Connect 重新执行可重试的目标校验/恢复,
 Exec Session 可以签发新 KAT.
@@ -1497,10 +1568,17 @@ AES-256-GCM、两项 `*_hash` 均为
 
 ### 15.2 重启对账
 
-serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活权威:
+serve 在开放 API、routesync、node-link 和数据面前先以
+`ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
 
-- 库内 starting 不收养为 running:先停止/清理对应 runner,有 `snapshot_ref` 表示被中断的
-  resume,按同一 run-id CAS 回 paused;否则是被中断的 fresh create,按同一 run-id CAS 为 dead;
+- 库内 starting 不收养为 running,也不装入 cache。`run_id=""` 表示进程中断于 runner
+  assignment 前;非空则先 Stop/Reset exact runner。两种情况都 detach 已持久化的新 network
+  ownership、清理 stale ready.sock/run dir;有 `snapshot_ref` 表示被中断的 resume,按 exact
+  空/非空 run-id CAS 回 paused 并保留 base/snapshot identity,否则是被中断的 fresh create,
+  按同一 fence CAS 为 dead 并清理其 base dir。任一 Stop/Reset/detach/目录 cleanup 失败时
+  Reconcile 直接使节点启动失败并保留原 starting ownership,不得先清字段或开放 API;
+  resume 回 paused 后在本次 conductor 进程内把 durable deadline 保守恢复为显式 intent,
+  直到下次 exact-run 成功;paused 后再次重启的持久 discriminator 由 #139 跟踪;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
@@ -1508,6 +1586,9 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
   `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
 - `run_root` 为 tmpfs ⇒ 整机重启后 running 全部判 dead;`paused` 行与 snp 模板保留,
   可被 connect/auto-resume 重新拉起(本机快照存于磁盘 `checkpoint.local_dir`)。
+
+因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
+已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。
 
 ### 15.3 故障域
 
@@ -1526,7 +1607,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
 proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession,H1/H2 `ctl.ProxyExec` gate 与
-buffered half-close tunnel,mmds(确定性密钥),单飞,沙箱配置注入(命名空间解析/容量折叠/网络合并),
+buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
 
 Native exec 的真实 microVM 特性用例分别覆盖 standalone 和 cluster 路径的

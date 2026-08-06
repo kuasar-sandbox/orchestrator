@@ -140,11 +140,23 @@ func runConductor(args []string, log *slog.Logger) error {
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
+	core.SetLifecycleContext(ctx)
+	// This defer is registered after the store and launcher closes, so it runs
+	// first on every conductor exit path. Cancel admission/launch work, then keep
+	// its dependencies open until every accepted attempt has finished terminal
+	// publication and cleanup. The service manager remains the outer bound for a
+	// permanently unavailable cleanup dependency.
+	defer func() {
+		stop()
+		if err := core.DrainLaunches(context.Background()); err != nil {
+			log.Error("drain sandbox launches", "err", err)
+		}
+	}()
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
 	if err := core.Reconcile(ctx); err != nil {
-		log.Warn("reconcile", "err", err)
+		return fmt.Errorf("reconcile: %w", err)
 	}
 	go core.Reaper(ctx, 5*time.Second)
 
@@ -184,7 +196,6 @@ func runConductor(args []string, log *slog.Logger) error {
 			}
 			clientTLS = ct
 		}
-		core.SetClusterContext(ctx) // node-link async work (boots) cancels on serve shutdown
 		capacity, buildCap, runtimeDigest := core.ClusterNodeInfo()
 		nl := nodelink.NewWithEndpoint(
 			regAddr,
