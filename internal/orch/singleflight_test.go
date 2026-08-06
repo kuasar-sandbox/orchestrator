@@ -147,6 +147,58 @@ func TestLaunchGroupRejectsCanceledLifecycle(t *testing.T) {
 	}
 }
 
+func TestLaunchGroupDrainWaitsForEveryCleanup(t *testing.T) {
+	var g launchGroup
+	first, err := g.Claim(context.Background(), "first", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := g.Claim(context.Background(), "second", launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drained := make(chan error, 1)
+	go func() { drained <- g.Drain(context.Background()) }()
+
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned with active attempts: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	g.Finish(first, errors.New("first failed after cleanup"))
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned before all attempts finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	g.Finish(second, nil)
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("Drain error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Drain did not observe all completed attempts")
+	}
+}
+
+func TestLaunchGroupDrainHonorsCallerContext(t *testing.T) {
+	var g launchGroup
+	attempt, err := g.Claim(context.Background(), "active", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := g.Drain(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain error = %v, want context canceled", err)
+	}
+	if current, found := g.Lookup("active"); !found || current != attempt {
+		t.Fatal("canceled Drain released the active attempt")
+	}
+	g.Finish(attempt, nil)
+}
+
 // TestPublishToSubscriber remains the route fan-out regression guard: an event
 // reaches a live subscriber (lagging subscribers are handled by publish itself).
 func TestPublishToSubscriber(t *testing.T) {

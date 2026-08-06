@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -38,14 +39,17 @@ func (l *reconcileLauncher) List(context.Context, string) ([]launcher.Unit, erro
 func (l *reconcileLauncher) Reload(context.Context) error { return nil }
 func (l *reconcileLauncher) Close() error                 { return nil }
 
-type reconcileVS struct{ detached []string }
+type reconcileVS struct {
+	detached []string
+	err      error
+}
 
 func (*reconcileVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
 	return nil, nil
 }
 func (v *reconcileVS) Detach(_ context.Context, port string) error {
 	v.detached = append(v.detached, port)
-	return nil
+	return v.err
 }
 func (*reconcileVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
@@ -203,6 +207,65 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		if _, err := os.Stat(resume.BaseDir); err != nil {
 			t.Fatalf("resume base directory %s was removed: %v", resume.BaseDir, err)
 		}
+	}
+}
+
+func TestReconcileCleanupFailurePreservesStartingOwnership(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "base")
+	cfg.Units.Runner = "sandbox-runner@.service"
+	runID := "sr-00000000-0000-7000-8000-000000000099"
+	sb := &types.Sandbox{
+		ID: "cleanup-failure", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("b", 64),
+		}.String(),
+		State: types.StateStarting, RunID: runID,
+		RunDir:      filepath.Join(cfg.Paths.RunRoot, "cleanup-failure"),
+		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "cleanup-failure"),
+		VswitchPort: "still-owned-port", FloatingIP: "192.0.2.99",
+		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
+		CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sb.BaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	lc := &reconcileLauncher{units: []launcher.Unit{{
+		Name: "sandbox-runner@" + runID + ".service", ActiveState: "active",
+	}}}
+	detachErr := errors.New("injected reconcile detach failure")
+	vs := &reconcileVS{err: detachErr}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.Reconcile(context.Background()); !errors.Is(err, detachErr) {
+		t.Fatalf("Reconcile error = %v, want detach failure", err)
+	}
+	stored, err := st.Get(context.Background(), sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateStarting ||
+		stored.RunID != runID || stored.VswitchPort != sb.VswitchPort || stored.FloatingIP != sb.FloatingIP {
+		t.Fatalf("starting ownership after failed reconcile cleanup = %+v, %v", stored, err)
+	}
+	if _, err := os.Stat(sb.BaseDir); err != nil {
+		t.Fatalf("fresh base dir removed before cleanup completed: %v", err)
+	}
+	if o.lookup(sb.ID) != nil {
+		t.Fatal("failed reconcile adopted starting sandbox into cache")
 	}
 }
 

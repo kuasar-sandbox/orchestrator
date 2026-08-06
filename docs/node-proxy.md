@@ -220,7 +220,9 @@ CONNECT:
 
 node proxy 的 exec 路径先做无副作用本地查找,以 route 中的
 `AuthSandboxID + ServiceSecret` 严格验证 `X-Access-Token` KAT.仅验证成功后才可以
-resume paused sandbox;若 route 已是 starting,则不再 Wake,只等当前 launch 完成。恢复后
+resume paused sandbox;若 cold Create 已返回但首个 starting route 尚未传播到 worker,
+lookup 在 `park_timeout` 内只等待该 identity 到达而不发送未鉴权 Wake;若 route 已是
+starting,则同样不再 Wake,只等当前 launch 完成。恢复后
 重读 NodeSandboxID 和 credential identity,二者必须与鉴权时
 一致.然后拨 `<run_root>/<NodeSandboxID>/ctl.sock`,发送并 flush CONNECT 200,将两个 stream
 的所有权交给 `sandboxer/pkg/ctl.ProxyExec`.

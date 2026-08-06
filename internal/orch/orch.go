@@ -565,75 +565,205 @@ func cleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
-func (o *Orchestrator) cleanupLaunchResources(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox) error {
-	var cleanupErr error
+const (
+	launchCleanupRetryMin = 100 * time.Millisecond
+	launchCleanupRetryMax = 5 * time.Second
+)
+
+// launchCleanupProgress remembers individual cleanup successes across retries.
+// Stop/detach are expected to be idempotent, but retaining progress avoids
+// turning an already released resource into a permanent retry error when a
+// different cleanup operation failed in the same pass.
+type launchCleanupProgress struct {
+	unit           string
+	runnerStopped  bool
+	runnerReset    bool
+	port           string
+	portDetached   bool
+	runDir         string
+	runDirRemoved  bool
+	baseDir        string
+	baseDirRemoved bool
+}
+
+func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, sb *types.Sandbox) {
 	runID := attempt.RunID()
 	if runID == "" {
 		runID = sb.RunID
 	}
-	if runID != "" {
-		unit := o.runnerUnit(runID)
-		if err := o.lc.Stop(ctx, unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", unit, err))
-		}
-		if err := o.lc.ResetFailed(ctx, unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", unit, err))
+	if p.unit == "" && runID != "" {
+		p.unit = o.runnerUnit(runID)
+	}
+	if p.port == "" && sb.VswitchPort != "" {
+		p.port = sb.VswitchPort
+	}
+	if p.runDir == "" {
+		p.runDir = sb.RunDir
+	}
+	if p.baseDir == "" && attempt.Kind() == launchCreate {
+		p.baseDir = sb.BaseDir
+	}
+}
+
+func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
+	var cleanupErr error
+	if p.unit != "" && !p.runnerStopped {
+		if err := o.lc.Stop(ctx, p.unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", p.unit, err))
+		} else {
+			p.runnerStopped = true
 		}
 	}
-	if sb.VswitchPort != "" {
-		if err := o.vs.Detach(ctx, sb.VswitchPort); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", sb.VswitchPort, err))
+	if p.unit != "" && p.runnerStopped && !p.runnerReset {
+		if err := o.lc.ResetFailed(ctx, p.unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", p.unit, err))
+		} else {
+			p.runnerReset = true
 		}
 	}
-	if err := os.RemoveAll(sb.RunDir); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", sb.RunDir, err))
+	if p.port != "" && !p.portDetached {
+		if err := o.vs.Detach(ctx, p.port); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", p.port, err))
+		} else {
+			p.portDetached = true
+		}
 	}
-	if attempt.Kind() == launchCreate {
-		if err := os.RemoveAll(sb.BaseDir); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove base dir %s: %w", sb.BaseDir, err))
+	if includeLocal && p.runDir != "" && !p.runDirRemoved {
+		if err := os.RemoveAll(p.runDir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", p.runDir, err))
+		} else {
+			p.runDirRemoved = true
+		}
+	}
+	if includeLocal && p.baseDir != "" && !p.baseDirRemoved {
+		if err := os.RemoveAll(p.baseDir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove base dir %s: %w", p.baseDir, err))
+		} else {
+			p.baseDirRemoved = true
 		}
 	}
 	return cleanupErr
 }
 
-func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox) error {
-	ctx, cancel := cleanupContext()
-	defer cancel()
-	cleanupErr := o.cleanupLaunchResources(ctx, attempt, sb)
-	expectedRunID := attempt.RunID()
+func (o *Orchestrator) stepLaunchCleanup(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, includeLocal bool) error {
+	attempt.cleanupMu.Lock()
+	defer attempt.cleanupMu.Unlock()
+	if attempt.cleanup == nil {
+		attempt.cleanup = &launchCleanupProgress{}
+	}
+	attempt.cleanup.merge(o, attempt, sb)
+	return attempt.cleanup.step(ctx, o, includeLocal)
+}
 
-	unlock := o.lifecycle.Lock(sb.ID)
-	defer unlock()
-	var (
-		changed bool
-		err     error
-	)
-	if attempt.Kind() == launchResume {
-		changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, expectedRunID)
-	} else {
-		changed, err = o.st.RollbackStartingDead(ctx, sb.ID, expectedRunID)
+func nextLaunchCleanupRetry(delay time.Duration) time.Duration {
+	delay *= 2
+	if delay > launchCleanupRetryMax {
+		return launchCleanupRetryMax
 	}
-	if err != nil {
-		return errors.Join(cleanupErr, err)
+	return delay
+}
+
+func waitLaunchCleanupRetry(delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
+}
+
+func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox) error {
+	retryDelay := launchCleanupRetryMin
+	var firstCleanupErr error
+	for {
+		ctx, cancel := cleanupContext()
+		cleanupErr := o.stepLaunchCleanup(ctx, attempt, sb, true)
+		cancel()
+		if cleanupErr == nil {
+			break
+		}
+		if firstCleanupErr == nil {
+			firstCleanupErr = cleanupErr
+		}
+		// Durable runner/network ownership and the process-local claim remain
+		// starting until every local cleanup operation succeeds. This retry is
+		// deliberately independent of the canceled attempt context; conductor
+		// shutdown drains launchGroup before closing the store/launcher.
+		o.log.Error("sandbox launch cleanup incomplete; retrying",
+			"sid", sb.ID, "run_id", attempt.RunID(), "kind", attempt.Kind(),
+			"retry_in", retryDelay, "err", cleanupErr)
+		waitLaunchCleanupRetry(retryDelay)
+		retryDelay = nextLaunchCleanupRetry(retryDelay)
 	}
-	if !changed {
-		return cleanupErr
+
+	expectedRunID := attempt.RunID()
+	retryDelay = launchCleanupRetryMin
+	var firstStoreErr error
+	for {
+		ctx, cancel := cleanupContext()
+		unlock := o.lifecycle.Lock(sb.ID)
+		var (
+			changed bool
+			err     error
+		)
+		if attempt.Kind() == launchResume {
+			changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, expectedRunID)
+		} else {
+			changed, err = o.st.RollbackStartingDead(ctx, sb.ID, expectedRunID)
+		}
+		if err != nil {
+			unlock()
+			cancel()
+			if firstStoreErr == nil {
+				firstStoreErr = err
+			}
+			o.log.Error("sandbox launch rollback commit failed; retrying",
+				"sid", sb.ID, "run_id", expectedRunID, "kind", attempt.Kind(),
+				"retry_in", retryDelay, "err", err)
+			waitLaunchCleanupRetry(retryDelay)
+			retryDelay = nextLaunchCleanupRetry(retryDelay)
+			continue
+		}
+		if !changed {
+			unlock()
+			cancel()
+			return errors.Join(firstCleanupErr, firstStoreErr)
+		}
+		if attempt.Kind() == launchCreate {
+			o.uncache(sb.ID)
+			o.publishDelete(sb.ID)
+			unlock()
+			cancel()
+			return errors.Join(firstCleanupErr, firstStoreErr)
+		}
+
+		// Keep the lifecycle lock from the paused CAS through authoritative
+		// reload and publication. A transient local-store read failure retries
+		// without exposing paused to a new admission before its route is visible.
+		for {
+			paused, getErr := o.st.Get(ctx, sb.ID)
+			if getErr == nil {
+				if paused == nil || paused.State != types.StatePaused {
+					unlock()
+					cancel()
+					return errors.Join(firstCleanupErr, firstStoreErr,
+						fmt.Errorf("orch: resume rollback %s did not produce paused state", sb.ID))
+				}
+				o.cache(paused)
+				o.publishUpsert(paused)
+				unlock()
+				cancel()
+				return errors.Join(firstCleanupErr, firstStoreErr)
+			}
+			cancel()
+			if firstStoreErr == nil {
+				firstStoreErr = getErr
+			}
+			o.log.Error("sandbox resume rollback reload failed; retrying",
+				"sid", sb.ID, "run_id", expectedRunID,
+				"retry_in", retryDelay, "err", getErr)
+			waitLaunchCleanupRetry(retryDelay)
+			retryDelay = nextLaunchCleanupRetry(retryDelay)
+			ctx, cancel = cleanupContext()
+		}
 	}
-	if attempt.Kind() == launchCreate {
-		o.uncache(sb.ID)
-		o.publishDelete(sb.ID)
-		return cleanupErr
-	}
-	paused, err := o.st.Get(ctx, sb.ID)
-	if err != nil {
-		return errors.Join(cleanupErr, err)
-	}
-	if paused == nil || paused.State != types.StatePaused {
-		return errors.Join(cleanupErr, fmt.Errorf("orch: resume rollback %s did not produce paused state", sb.ID))
-	}
-	o.cache(paused)
-	o.publishUpsert(paused)
-	return cleanupErr
 }
 
 func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error) {
@@ -674,13 +804,28 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	attempt, launchActive := o.launches.Lookup(id)
 	o.launches.Cancel(id)
 	if err := o.st.Delete(ctx, id); err != nil {
 		return false, err
 	}
-	cleanupCtx, cancel := cleanupContext()
-	o.teardown(cleanupCtx, sb)
-	cancel()
+	if sb.State == types.StateStarting && launchActive {
+		// Share exact runner/network cleanup progress with rollback. Local dirs
+		// remain the worker's responsibility because preparation may still be
+		// returning from a late external call after this synchronous Kill pass.
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.stepLaunchCleanup(cleanupCtx, attempt, sb, false); err != nil {
+			o.log.Error("sandbox kill cleanup incomplete; launch will retry",
+				"sid", sb.ID, "run_id", sb.RunID, "err", err)
+		}
+		cancel()
+	} else {
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.teardown(cleanupCtx, sb); err != nil {
+			o.log.Error("sandbox kill cleanup incomplete", "sid", sb.ID, "run_id", sb.RunID, "err", err)
+		}
+		cancel()
+	}
 	o.clearDeadlineIntent(id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
@@ -1439,13 +1584,19 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 			target = types.StatePaused
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
-		o.teardown(ctx, sb)
+		if err := o.teardown(ctx, sb); err != nil {
+			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
+		}
+		if target == types.StateDead {
+			if err := os.RemoveAll(sb.BaseDir); err != nil {
+				return fmt.Errorf("reconcile: remove interrupted sandbox base dir %s: %w", sb.ID, err)
+			}
+		}
 		var changed bool
 		if target == types.StatePaused {
 			changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, sb.RunID)
 		} else {
 			changed, err = o.st.RollbackStartingDead(ctx, sb.ID, sb.RunID)
-			_ = os.RemoveAll(sb.BaseDir)
 		}
 		if err != nil {
 			return err
@@ -1456,7 +1607,9 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		o.teardown(ctx, sb)
+		if err := o.teardown(ctx, sb); err != nil {
+			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
+		}
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
@@ -1597,17 +1750,30 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 	return s, s != nil
 }
 
-func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
+func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
 	// The sandbox runs in its systemd unit's own cgroup (sandbox-ctl --cgroup-adopt),
 	// and the unit is KillMode=control-group, so StopUnit SIGKILLs every straggler
 	// (cloud-hypervisor included). No separate cgroup drain/rmdir is needed.
+	var cleanupErr error
 	if sb.RunID != "" {
-		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
-		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
+		unit := o.runnerUnit(sb.RunID)
+		if err := o.lc.Stop(ctx, unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", unit, err))
+		}
+		if err := o.lc.ResetFailed(ctx, unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", unit, err))
+		}
 	}
-	_ = o.vs.Detach(ctx, sb.VswitchPort)
-	_ = os.RemoveAll(sb.RunDir)
+	if sb.VswitchPort != "" {
+		if err := o.vs.Detach(ctx, sb.VswitchPort); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", sb.VswitchPort, err))
+		}
+	}
+	if err := os.RemoveAll(sb.RunDir); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", sb.RunDir, err))
+	}
 	o.uncache(sb.ID)
+	return cleanupErr
 }
 
 // snapshot pauses+captures the running sandbox via sandbox-ctl and returns its

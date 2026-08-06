@@ -141,6 +141,17 @@ func runConductor(args []string, log *slog.Logger) error {
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
 	core.SetLifecycleContext(ctx)
+	// This defer is registered after the store and launcher closes, so it runs
+	// first on every conductor exit path. Cancel admission/launch work, then keep
+	// its dependencies open until every accepted attempt has finished terminal
+	// publication and cleanup. The service manager remains the outer bound for a
+	// permanently unavailable cleanup dependency.
+	defer func() {
+		stop()
+		if err := core.DrainLaunches(context.Background()); err != nil {
+			log.Error("drain sandbox launches", "err", err)
+		}
+	}()
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}

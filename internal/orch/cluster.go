@@ -342,6 +342,13 @@ func (o *Orchestrator) launchContext() context.Context {
 func (o *Orchestrator) SetClusterContext(ctx context.Context) { o.SetLifecycleContext(ctx) }
 func (o *Orchestrator) asyncCtx() context.Context             { return o.launchContext() }
 
+// DrainLaunches waits for all accepted create/resume attempts to finish their
+// terminal state, route publication, and resource cleanup. The lifecycle root
+// must be canceled before calling it so admission cannot add a successor.
+func (o *Orchestrator) DrainLaunches(ctx context.Context) error {
+	return o.launches.Drain(ctx)
+}
+
 func accept(cmd *routesync.Command) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
 }
@@ -733,12 +740,25 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) err
 	if current == nil {
 		return nil
 	}
+	attempt, launchActive := o.launches.Lookup(current.ID)
 	if err := o.st.Delete(ctx, current.ID); err != nil {
 		return err
 	}
-	cleanupCtx, cancel := cleanupContext()
-	o.teardown(cleanupCtx, current)
-	cancel()
+	if current.State == types.StateStarting && launchActive {
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.stepLaunchCleanup(cleanupCtx, attempt, current, false); err != nil {
+			o.log.Error("cluster sandbox delete cleanup incomplete; launch will retry",
+				"sid", current.ID, "run_id", current.RunID, "err", err)
+		}
+		cancel()
+	} else {
+		cleanupCtx, cancel := cleanupContext()
+		if err := o.teardown(cleanupCtx, current); err != nil {
+			o.log.Error("cluster sandbox delete cleanup incomplete",
+				"sid", current.ID, "run_id", current.RunID, "err", err)
+		}
+		cancel()
+	}
 	o.clearDeadlineIntent(current.ID)
 	o.uncache(current.ID)
 	o.publishDelete(current.ID)

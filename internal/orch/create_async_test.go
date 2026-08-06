@@ -103,6 +103,44 @@ func (v *retryDetachKillAttachVS) Detach(_ context.Context, port string) error {
 
 func (*retryDetachKillAttachVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
+type retryRollbackCleanupVS struct {
+	firstFailed  chan struct{}
+	retryEntered chan struct{}
+	allowRetry   chan struct{}
+	firstErr     error
+	failedOnce   sync.Once
+	retryOnce    sync.Once
+	detachCalls  atomic.Int32
+}
+
+func (*retryRollbackCleanupVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	return &vswitch.Port{
+		Port: "retry-rollback-port", FloatingIP: "169.254.1.5",
+		MAC: "02:00:00:00:00:34", InnerIP: "169.254.1.1",
+	}, nil
+}
+
+func (v *retryRollbackCleanupVS) Detach(ctx context.Context, port string) error {
+	if port == "" {
+		return nil
+	}
+	if call := v.detachCalls.Add(1); call == 1 {
+		v.failedOnce.Do(func() { close(v.firstFailed) })
+		return v.firstErr
+	}
+	v.retryOnce.Do(func() { close(v.retryEntered) })
+	select {
+	case <-v.allowRetry:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*retryRollbackCleanupVS) TapFD(port string) vswitch.TapFD {
+	return vswitch.TapFD{Exec: []string{"true", port}}
+}
+
 func createRequestFixture(t *testing.T, o *Orchestrator, marker string) api.CreateReq {
 	t.Helper()
 	manifestKey := strings.Repeat(marker, 64)
@@ -396,4 +434,71 @@ func TestCreateResourceCASLossRetriesFailedImmediateDetach(t *testing.T) {
 		t.Fatalf("claim after detach retry cleanup: %v", err)
 	}
 	o.launches.Finish(next, nil)
+}
+
+func TestCreateRollbackRetainsOwnershipAndClaimUntilCleanupRetrySucceeds(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{readinessWire: []byte("ready\ncontrol_ready\n")}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	firstCleanupErr := errors.New("injected rollback detach failure")
+	vs := &retryRollbackCleanupVS{
+		firstFailed: make(chan struct{}), retryEntered: make(chan struct{}), allowRetry: make(chan struct{}),
+		firstErr: firstCleanupErr,
+	}
+	var releaseRetry sync.Once
+	t.Cleanup(func() { releaseRetry.Do(func() { close(vs.allowRetry) }) })
+	o.vs = vs
+	req := createRequestFixture(t, o, "8")
+	accepted, err := o.Create(ctx, req)
+	if err != nil || accepted == nil {
+		t.Fatalf("Create = %+v, %v", accepted, err)
+	}
+	attempt, found := o.launches.Lookup(accepted.ID)
+	if !found {
+		t.Fatal("accepted create has no launch owner")
+	}
+	select {
+	case <-vs.firstFailed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed launch did not reach rollback detach")
+	}
+	select {
+	case <-vs.retryEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rollback cleanup did not retry detach")
+	}
+
+	stored, err := o.st.Get(ctx, accepted.ID)
+	if err != nil || stored == nil || stored.State != types.StateStarting ||
+		stored.RunID == "" || stored.VswitchPort != "retry-rollback-port" {
+		t.Fatalf("ownership while cleanup is incomplete = %+v, %v", stored, err)
+	}
+	if current, found := o.launches.Lookup(accepted.ID); !found || current != attempt {
+		t.Fatal("cleanup failure released the active launch claim")
+	}
+	if _, err := o.launches.Claim(ctx, accepted.ID, launchCreate); !errors.Is(err, errLaunchClaimed) {
+		t.Fatalf("claim during cleanup retry = %v, want cleanup fence", err)
+	}
+	select {
+	case <-attempt.done:
+		t.Fatal("attempt finished before rollback cleanup succeeded")
+	default:
+	}
+
+	releaseRetry.Do(func() { close(vs.allowRetry) })
+	if err := attempt.wait(ctx); !errors.Is(err, firstCleanupErr) || !strings.Contains(err.Error(), "runtime readiness protocol") {
+		t.Fatalf("launch result after cleanup retry = %v", err)
+	}
+	dead := waitForSandbox(t, o, ctx, accepted.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateDead
+	}, "dead after rollback cleanup retry")
+	if dead.RunID != "" || dead.VswitchPort != "" || dead.FloatingIP != "" {
+		t.Fatalf("terminal rollback retained released ownership: %+v", dead)
+	}
+	if got := vs.detachCalls.Load(); got != 2 {
+		t.Fatalf("detach calls = %d, want failed pass plus successful retry", got)
+	}
+	if _, found := o.launches.Lookup(accepted.ID); found {
+		t.Fatal("completed rollback retained its launch claim")
+	}
 }

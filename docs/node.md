@@ -945,7 +945,8 @@ starting ──success──► running ──pause / TTL──► paused
   要等该 attempt 完成 runner/network/local resource cleanup 才释放。waiter 被唤醒前终态
   store/cache/route 已收敛,并且 waiter 始终重读权威状态。若 store 为 starting 但进程内没有
   attempt,节点记录 invariant violation 并 fail closed,不得再分配第二个 runner;重启 Reconcile
-  或终态操作负责收敛。
+  或终态操作负责收敛。Stop/Reset/detach/local cleanup 任一步失败时按有界退避重试,在全部
+  成功前不清空 durable runner/network ownership、不提交 dead/paused、也不释放 claim。
 - network attach 后先以 `starting AND run_id=''` CAS 持久化 ownership,再发布 enriched
   starting;CAS 丢失时立即 detach 本地 port,不再写 cache/route 或启动 runner。初始 starting
   route 没有 FloatingIP,预先确定的 UDS 路径也尚未绑定,因而没有可用 backend endpoint;
@@ -958,7 +959,9 @@ starting ──success──► running ──pause / TTL──► paused
   回滚为 paused/Delete 时立即结束等待,只有初始 missing/paused 请求最多发一次 Wake。所有
   waiter 以权威终态决定 not-found/route-error,不向普通数据面泄漏 raw launch error。
 - Create/Connect handler 返回后的 launch 使用 node lifecycle root,不继承 HTTP request context;
-  node shutdown 和 Kill 可取消 attempt。Pause starting 明确返回 409,不接触 ctl.sock;
+  node shutdown 和 Kill 可取消 attempt。conductor 关闭 store/systemd launcher 前会 drain
+  launch group,保证所有已受理 attempt 已完成终态发布与 cleanup;永久不可用的 cleanup 依赖
+  由外层 service-manager stop budget 最终约束。Pause starting 明确返回 409,不接触 ctl.sock;
   SetTimeout starting 只更新 deadline;Connect starting 不重复 launch。Reaper 仍只扫描 running,
   Sandbox TTL 的既有定义在本改动中不变。
 - `POST /sandboxes/{id}/pause` body 可为空或为:
@@ -1565,7 +1568,8 @@ serve 在开放 API、routesync、node-link 和数据面前先以
   assignment 前;非空则先 Stop/Reset exact runner。两种情况都 detach 已持久化的新 network
   ownership、清理 stale ready.sock/run dir;有 `snapshot_ref` 表示被中断的 resume,按 exact
   空/非空 run-id CAS 回 paused 并保留 base/snapshot identity,否则是被中断的 fresh create,
-  按同一 fence CAS 为 dead 并清理其 base dir;
+  按同一 fence CAS 为 dead 并清理其 base dir。任一 Stop/Reset/detach/目录 cleanup 失败时
+  Reconcile 直接使节点启动失败并保留原 starting ownership,不得先清字段或开放 API;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;

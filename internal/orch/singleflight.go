@@ -36,6 +36,11 @@ type launchAttempt struct {
 	err        error
 	acceptedAt time.Time
 
+	// cleanup serializes Kill/Delete with rollback and retains per-resource
+	// successes so the two paths never race duplicate Stop/Detach operations.
+	cleanupMu sync.Mutex
+	cleanup   *launchCleanupProgress
+
 	finishOnce sync.Once
 }
 
@@ -156,6 +161,28 @@ func (g *launchGroup) Cancel(sid string) {
 	a, ok := g.Lookup(sid)
 	if ok {
 		a.cancel()
+	}
+}
+
+// Drain waits until every claimed launch has completed terminal publication
+// and cleanup. Callers must first cancel the lifecycle root so no new attempt
+// can be admitted while shutdown is draining the current set.
+func (g *launchGroup) Drain(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		attempts := make([]*launchAttempt, 0, len(g.m))
+		for _, attempt := range g.m {
+			attempts = append(attempts, attempt)
+		}
+		g.mu.Unlock()
+		if len(attempts) == 0 {
+			return nil
+		}
+		for _, attempt := range attempts {
+			if err := attempt.wait(ctx); err != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
 	}
 }
 
