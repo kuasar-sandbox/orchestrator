@@ -444,10 +444,13 @@ Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 
 副本。GET 可观察 `starting`;默认 List 仍只列 running/paused,显式 `state=starting|dead`
 用于诊断。Connect 已是 running 时直接返回;已是 starting 时只应用显式 timeout 的窄更新,
 不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
-starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在恢复失败
-回 paused 后继续保留,只在某次 exact-run 成功提交 running 后消费。V1 没有持久 intent
-字段,所以 Reconcile 将中断 resume 的 durable deadline 保守恢复为 intent,避免重启后被
-node default 覆盖。
+starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在同一
+conductor 进程内的恢复失败回 paused 后继续保留,只在某次 exact-run 成功提交 running 后
+消费。V1 没有持久 intent 字段,所以 Reconcile 可从仍为 starting 的中断 resume 推断并在
+本次进程内保守恢复 intent,避免紧随其后的普通 Wake/Connect 被 node default 覆盖。如果该行
+已经回到 paused 后 conductor 再次重启,数据库中已没有办法把它与普通 paused/default-rearm
+区分;精确跨多次重启保留需要 #139 单独批准 schema discriminator,不在 #135 中用隐式编码或
+sidecar 绕过。
 
 Exec session 是显式授权动作,不是服务端 session 对象,也不启动 guest process.请求 body
 只允许空,`{}` 或仅含一个 int64 `ttlSeconds` 字段的 JSON object.完整原始 body
@@ -1574,7 +1577,8 @@ serve 在开放 API、routesync、node-link 和数据面前先以
   空/非空 run-id CAS 回 paused 并保留 base/snapshot identity,否则是被中断的 fresh create,
   按同一 fence CAS 为 dead 并清理其 base dir。任一 Stop/Reset/detach/目录 cleanup 失败时
   Reconcile 直接使节点启动失败并保留原 starting ownership,不得先清字段或开放 API;
-  resume 回 paused 后把 durable deadline 保守恢复为显式 intent,直到下次 exact-run 成功;
+  resume 回 paused 后在本次 conductor 进程内把 durable deadline 保守恢复为显式 intent,
+  直到下次 exact-run 成功;paused 后再次重启的持久 discriminator 由 #139 跟踪;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
