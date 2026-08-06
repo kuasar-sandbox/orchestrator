@@ -164,8 +164,22 @@ type BuildSpec struct {
 	Insecure         bool                   `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
 	Platform         string                 `json:"platform,omitempty"`
 	ImportReferer    BuildImportReferer     `json:"import_referer,omitempty"`
-	Timeouts         BuildTimeouts          `json:"timeouts"`
-	Error            string                 `json:"error,omitempty"`
+	// RegistryTLS carries the per-build registry TLS trust (inline CA bundle
+	// PEM and/or skip-verify) projected into the Phase A import sandbox as a
+	// flatten-ctl config YAML. Nil = use system root CAs. Register-time only;
+	// not inherited by templates.
+	RegistryTLS *BuildRegistryTLS `json:"registry_tls,omitempty"`
+	Timeouts    BuildTimeouts     `json:"timeouts"`
+	Error       string            `json:"error,omitempty"`
+}
+
+// BuildRegistryTLS is the flattened, resolved per-build registry TLS policy
+// handed to the build unit (mirrors how BuildImportReferer flattens the
+// referer options). CABundlePEM is inline PEM content (not a host path);
+// InsecureSkipVerify disables cert verification. Mutually exclusive.
+type BuildRegistryTLS struct {
+	CABundlePEM        string `json:"ca_bundle_pem,omitempty"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
 }
 
 type BuildImportReferer struct {

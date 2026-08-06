@@ -54,12 +54,31 @@ type TemplateStep struct {
 // BuildOptions are build-only controls. They are intentionally separate from
 // Build.Metadata, which becomes the template's default sandbox config.
 type BuildOptions struct {
-	Referer *BuildRefererOptions `json:"referer,omitempty" yaml:"referer,omitempty"`
+	Referer  *BuildRefererOptions  `json:"referer,omitempty" yaml:"referer,omitempty"`
+	Registry *BuildRegistryOptions `json:"registry,omitempty" yaml:"registry,omitempty"`
 }
 
 type BuildRefererOptions struct {
 	Enabled   *bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	Writeback *bool `json:"writeback,omitempty" yaml:"writeback,omitempty"`
+}
+
+// BuildRegistryOptions carries the per-build registry source trust policy.
+// Register-time only: a trigger-time builder.registry is rejected (400) and
+// does not participate in buildcfg.Merge — the register-time base is kept.
+type BuildRegistryOptions struct {
+	TLS *BuildRegistryTLSOptions `json:"tls,omitempty" yaml:"tls,omitempty"`
+}
+
+// BuildRegistryTLSOptions tunes how the build's Phase A import sandbox verifies
+// the source registry's HTTPS certificate. CABundlePEM is an inline PEM bundle
+// (appended to the guest system root CAs); InsecureSkipVerify disables cert
+// verification entirely. They are mutually exclusive. Projected into the guest
+// via a flatten-ctl config YAML (--config); never persisted into template
+// metadata, never inherited by other builds.
+type BuildRegistryTLSOptions struct {
+	CABundlePEM        string `json:"ca_bundle_pem,omitempty" yaml:"ca_bundle_pem,omitempty"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 }
 
 // Build is one template build, doubling as the template record.

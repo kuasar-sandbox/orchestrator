@@ -299,3 +299,190 @@ func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
 		t.Fatalf("persisted network = %+v, want %+v", got, network)
 	}
 }
+
+// testCACertPEM is a self-signed X.509 certificate (CN=test-ca, RSA 2048,
+// 1-day validity) used to exercise CA-bundle projection and validation. It is
+// parseable by x509.AppendCertsFromPEM but trusts nothing in production.
+const testCACertPEM = `-----BEGIN CERTIFICATE-----
+MIIDBTCCAe2gAwIBAgIUbWpRZGX/cczZpPOfcQzODmJMdNwwDQYJKoZIhvcNAQEL
+BQAwEjEQMA4GA1UEAwwHdGVzdC1jYTAeFw0yNjA4MDQxMTU5MjNaFw0yNjA4MDUx
+MTU5MjNaMBIxEDAOBgNVBAMMB3Rlc3QtY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IB
+DwAwggEKAoIBAQC2xO647J/yYuOueFHc2PXnAKvHkPNb4HbWH5FLPfe2nmvUd3bY
+lbELV6teLY6yN+NmtvSJ63j2OF+RNIpC3ZFhsWrBDxEuP0juMqKnZ9WVnB/9KsLX
+OjfohHY4k1qoQYFxT9yU8eJxmY82Wjd/yf5tV8xHC1zL4UAd0y7rOTyAvozBOXZv
+uLr9K3eQgQfylpmP1tYwVoQVvUUf1D5fk5yD9vcUtok2e+7ktBN1f667URznf8hP
+hLaQ5C2bZCgOOh78huTrcFqU9LORyk8AS/QYg8esglmrgy3y5iz0M4IN30csTqZN
+SvKk9u/2eW26htiq5IOvKu0Xj5xW1wbOmvFlAgMBAAGjUzBRMB0GA1UdDgQWBBQQ
+cFRflziG3f5nJyv8FwuE1d0LcTAfBgNVHSMEGDAWgBQQcFRflziG3f5nJyv8FwuE
+1d0LcTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAoHtMT9F8m
+HT+8tQke93pIbS9pq41PiOeBuDdF/yrgB5IKlVticAhzUCHHAG8UpEuqU2OjbF30
+tIgwoUe1A+vNeanPjiOq3+rWADvMbgcleVWRUfxYlyxAdZ2yq+PfiqTI96UQIw3n
+STeBSM7HZ6i/DqbAV+GvFaGmEC0OsOxOQAxPPuK8hFLU2eJ3HIdluW7stLcXtMe7
+MuijqSVF8COlC+zKndt52yoJpU70bHZzLnEHYU7NvBeHgfUHqGBfvmyg3auGlSfE
+peTd6+1IyyBTa6XbTg9wcMRPZE0uB+xsns0ArNR+jALUzNgoe7tBChAaFNyQPD1u
+8NdJbsFlXbvO
+-----END CERTIFICATE-----
+`
+
+// flattenFile finds the projected file entry at guestPath, or fails.
+func flattenFile(t *testing.T, files []map[string]any, guestPath string) map[string]any {
+	t.Helper()
+	for _, f := range files {
+		if f["path"] == guestPath {
+			return f
+		}
+	}
+	t.Fatalf("projected file %q not found in %v", guestPath, files)
+	return nil
+}
+
+func TestFlattenConfigFilesNilWithoutTLSConfig(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{}}
+	files, err := p.flattenConfigFiles()
+	if err != nil {
+		t.Fatalf("flattenConfigFiles: %v", err)
+	}
+	if files != nil {
+		t.Fatalf("flattenConfigFiles() = %v, want nil", files)
+	}
+}
+
+func TestFlattenConfigFilesProjectsCABundle(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+	}}
+	files, err := p.flattenConfigFiles()
+	if err != nil {
+		t.Fatalf("flattenConfigFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("got %d files, want 2 (CA + yaml)", len(files))
+	}
+	ca := flattenFile(t, files, guestCACert)
+	// Inline PEM content, read-only, 0444 — never on the build root disk.
+	if ca["mode"] != "0444" || ca["read_only"] != true {
+		t.Fatalf("CA file not read-only: %#v", ca)
+	}
+	if ca["content"] != testCACertPEM {
+		t.Fatalf("CA content mismatch: got %q", ca["content"])
+	}
+	cfg := flattenFile(t, files, guestFlattenCfg)
+	if cfg["mode"] != "0444" || cfg["read_only"] != true {
+		t.Fatalf("flatten yaml not read-only: %#v", cfg)
+	}
+	// tls.ca_cert must point at the guest path (no host path crosses the wire).
+	if !strings.Contains(cfg["content"].(string), "ca_cert: "+guestCACert) {
+		t.Fatalf("flatten yaml missing guest ca_cert:\n%s", cfg["content"])
+	}
+	if strings.Contains(cfg["content"].(string), "insecure_skip_verify") {
+		t.Fatalf("flatten yaml should not set insecure_skip_verify:\n%s", cfg["content"])
+	}
+}
+
+func TestFlattenConfigFilesProjectsSkipVerifyOnly(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{InsecureSkipVerify: true},
+	}}
+	files, err := p.flattenConfigFiles()
+	if err != nil {
+		t.Fatalf("flattenConfigFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("got %d files, want 1 (yaml only, no CA)", len(files))
+	}
+	cfg := flattenFile(t, files, guestFlattenCfg)
+	if !strings.Contains(cfg["content"].(string), "insecure_skip_verify: true") {
+		t.Fatalf("flatten yaml missing insecure_skip_verify:\n%s", cfg["content"])
+	}
+	if strings.Contains(cfg["content"].(string), "ca_cert") {
+		t.Fatalf("flatten yaml should not set ca_cert:\n%s", cfg["content"])
+	}
+}
+
+func TestImportYAMLProjectsFlattenConfigFiles(t *testing.T) {
+	// Phase A (import) is the only phase that pulls from a registry, so the
+	// TLS files must appear here.
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
+	}}
+	doc, err := p.importYAML()
+	if err != nil {
+		t.Fatalf("importYAML: %v", err)
+	}
+	files, ok := doc["files"].([]map[string]any)
+	if !ok {
+		t.Fatalf("files not projected: %#v", doc["files"])
+	}
+	paths := map[string]bool{}
+	for _, f := range files {
+		paths[f["path"].(string)] = true
+	}
+	if !paths[guestCACert] || !paths[guestFlattenCfg] {
+		t.Fatalf("TLS config files missing from import projection: %v", paths)
+	}
+}
+
+func TestStepsYAMLOmitsFlattenConfigFiles(t *testing.T) {
+	// Phase B (steps) never touches a registry: TLS config must not be projected.
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
+	}}
+	doc := p.stepsYAML()
+	if files, ok := doc["files"]; ok {
+		for _, f := range files.([]map[string]any) {
+			if f["path"] == guestCACert || f["path"] == guestFlattenCfg {
+				t.Fatalf("TLS file leaked into steps YAML: %#v", f)
+			}
+		}
+	}
+}
+
+func TestTemplateYAMLOmitsFlattenConfigFiles(t *testing.T) {
+	// Phase C never touches a registry, so TLS config must not be projected.
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
+	}}
+	doc, err := p.templateYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files, ok := doc["files"]; ok {
+		for _, f := range files.([]map[string]any) {
+			if f["path"] == guestCACert || f["path"] == guestFlattenCfg {
+				t.Fatalf("TLS file leaked into template YAML: %#v", f)
+			}
+		}
+	}
+}
+
+func TestFlattenConfigArgNilWithoutTLSConfig(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{}}
+	if got := p.flattenConfigArg(); got != nil {
+		t.Fatalf("flattenConfigArg() = %v, want nil", got)
+	}
+}
+
+func TestFlattenConfigArgForRegistryTLS(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+	}}
+	got := p.flattenConfigArg()
+	want := []string{"--config", guestFlattenCfg}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("flattenConfigArg() = %v, want %v", got, want)
+	}
+}
+
+func TestFlattenConfigArgForSkipVerify(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		RegistryTLS: &configsock.BuildRegistryTLS{InsecureSkipVerify: true},
+	}}
+	got := p.flattenConfigArg()
+	want := []string{"--config", guestFlattenCfg}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("flattenConfigArg() = %v, want %v", got, want)
+	}
+}

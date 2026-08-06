@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -26,6 +27,10 @@ import (
 )
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// maxCABundlePEMSize bounds the inline CA bundle a build may register. Larger
+// bundles and a general build-input upload facility are tracked separately.
+const maxCABundlePEMSize = 16 * 1024
 
 // newRegisteredBuild allocates the transient templateID + build id, resolves the
 // allowlist, and records a registered build. fromImage is pre-derived from
@@ -112,6 +117,12 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	// builder.registry is register-time only: a trigger-time registry (e.g. a
+	// per-build TLS trust policy) is rejected outright rather than merged, so a
+	// build's trust scope cannot be altered at trigger time.
+	if triggerBuilder.Registry != nil {
+		return fmt.Errorf("%w: builder.registry is register-time only", api.ErrBadRequest)
+	}
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
 	// front so the build fails fast instead of mid-pipeline.
@@ -170,6 +181,13 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	b.Metadata = mergedMetadata
 	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
+	// Node builder.insecure_registry (plain HTTP) and a per-build registry TLS
+	// policy address disjoint registry schemes; allowing both would be
+	// contradictory, so reject the combination. (fromTemplate + registry.tls
+	// is rejected by validateBuildOptions below.)
+	if o.cfg.Builder.InsecureRegistry && b.Builder.Registry != nil && b.Builder.Registry.TLS != nil {
+		return fmt.Errorf("%w: builder.registry.tls conflicts with node builder.insecure_registry", api.ErrBadRequest)
+	}
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err
 	}
@@ -188,28 +206,59 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 }
 
 func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplate bool) error {
-	r := opts.Referer
-	if r == nil {
+	if r := opts.Referer; r != nil {
+		explicitReferer := r.Enabled != nil && *r.Enabled
+		explicitWriteback := r.Writeback != nil && *r.Writeback
+		if fromTemplate && (explicitReferer || explicitWriteback) {
+			return fmt.Errorf("%w: builder.referer applies only to fromImage builds", api.ErrBadRequest)
+		}
+		if r.Enabled != nil && !*r.Enabled && explicitWriteback {
+			return fmt.Errorf("%w: builder.referer.writeback=true requires builder.referer.enabled=true", api.ErrBadRequest)
+		}
+		cfg := o.cfg.Builder.Referer
+		if explicitReferer && !cfg.Enabled {
+			return fmt.Errorf("%w: builder.referer.enabled=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
+		}
+		if explicitWriteback {
+			switch {
+			case !cfg.Enabled:
+				return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
+			case !cfg.WritebackEnabled():
+				return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.writeback=false", api.ErrBadRequest)
+			}
+		}
+	}
+	if err := validateRegistryTLS(opts.Registry, fromTemplate); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRegistryTLS checks the per-build registry TLS trust policy. It is
+// register-time only (a trigger-time builder.registry is rejected before Merge
+// runs); fromTemplate builds must not carry it (their base image is already
+// resolved, so there is no source-registry pull to tune).
+func validateRegistryTLS(reg *types.BuildRegistryOptions, fromTemplate bool) error {
+	if reg == nil || reg.TLS == nil {
 		return nil
 	}
-	explicitReferer := r.Enabled != nil && *r.Enabled
-	explicitWriteback := r.Writeback != nil && *r.Writeback
-	if fromTemplate && (explicitReferer || explicitWriteback) {
-		return fmt.Errorf("%w: builder.referer applies only to fromImage builds", api.ErrBadRequest)
+	tls := reg.TLS
+	if tls.CABundlePEM == "" && !tls.InsecureSkipVerify {
+		return fmt.Errorf("%w: builder.registry.tls is empty", api.ErrBadRequest)
 	}
-	if r.Enabled != nil && !*r.Enabled && explicitWriteback {
-		return fmt.Errorf("%w: builder.referer.writeback=true requires builder.referer.enabled=true", api.ErrBadRequest)
+	if tls.CABundlePEM != "" && tls.InsecureSkipVerify {
+		return fmt.Errorf("%w: builder.registry.tls.ca_bundle_pem and builder.registry.tls.insecure_skip_verify are mutually exclusive", api.ErrBadRequest)
 	}
-	cfg := o.cfg.Builder.Referer
-	if explicitReferer && !cfg.Enabled {
-		return fmt.Errorf("%w: builder.referer.enabled=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
+	if fromTemplate {
+		return fmt.Errorf("%w: builder.registry.tls applies only to fromImage builds", api.ErrBadRequest)
 	}
-	if explicitWriteback {
-		switch {
-		case !cfg.Enabled:
-			return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
-		case !cfg.WritebackEnabled():
-			return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.writeback=false", api.ErrBadRequest)
+	if tls.CABundlePEM != "" {
+		if len(tls.CABundlePEM) > maxCABundlePEMSize {
+			return fmt.Errorf("%w: builder.registry.tls.ca_bundle_pem exceeds %d bytes", api.ErrBadRequest, maxCABundlePEMSize)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(tls.CABundlePEM)) {
+			return fmt.Errorf("%w: builder.registry.tls.ca_bundle_pem has no parseable X.509 certificate", api.ErrBadRequest)
 		}
 	}
 	return nil
@@ -249,6 +298,25 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 		Owner:     owner,
 		Validity:  cfg.Validity,
 	}, nil
+}
+
+// effectiveRegistryTLS flattens the per-build registry TLS options into the
+// resolved form handed to the build unit. Only fromImage builds pull from a
+// source registry in Phase A, so fromTemplate builds get no TLS config (their
+// base is already resolved). The content (inline PEM) is copied verbatim — no
+// host file path crosses the config socket.
+func (o *Orchestrator) effectiveRegistryTLS(b *types.Build) *configsock.BuildRegistryTLS {
+	if b.FromImage == "" {
+		return nil
+	}
+	r := b.Builder.Registry
+	if r == nil || r.TLS == nil {
+		return nil
+	}
+	return &configsock.BuildRegistryTLS{
+		CABundlePEM:        r.TLS.CABundlePEM,
+		InsecureSkipVerify: r.TLS.InsecureSkipVerify,
+	}
 }
 
 // resolveBuildCreds picks the registry pull credentials for this build and returns
@@ -726,6 +794,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		Insecure:        o.cfg.Builder.InsecureRegistry,
 		Platform:        o.cfg.Builder.Platform,
 		ImportReferer:   importReferer,
+		RegistryTLS:     o.effectiveRegistryTLS(b),
 		Timeouts: configsock.BuildTimeouts{
 			PullSec:  o.cfg.Builder.PullTimeoutSec,
 			StepSec:  o.cfg.Builder.StepTimeoutSec,
