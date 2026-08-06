@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
 type reconcileLauncher struct {
@@ -35,6 +37,17 @@ func (l *reconcileLauncher) List(context.Context, string) ([]launcher.Unit, erro
 }
 func (l *reconcileLauncher) Reload(context.Context) error { return nil }
 func (l *reconcileLauncher) Close() error                 { return nil }
+
+type reconcileVS struct{ detached []string }
+
+func (*reconcileVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	return nil, nil
+}
+func (v *reconcileVS) Detach(_ context.Context, port string) error {
+	v.detached = append(v.detached, port)
+	return nil
+}
+func (*reconcileVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
 func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
@@ -79,6 +92,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	createStarting.SnapshotRef = ""
 	createStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, createStarting.ID)
 	createStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, createStarting.ID)
+	createStarting.VswitchPort = "create-assigned-port"
+	createStarting.FloatingIP = "192.0.2.10"
 	materializeTestSandboxCredentials(t, &createStarting)
 	if err := st.Put(context.Background(), &createStarting); err != nil {
 		t.Fatal(err)
@@ -90,9 +105,44 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeStarting.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
 	resumeStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeStarting.ID)
 	resumeStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeStarting.ID)
+	resumeStarting.VswitchPort = "resume-assigned-port"
+	resumeStarting.FloatingIP = "192.0.2.11"
 	materializeTestSandboxCredentials(t, &resumeStarting)
 	if err := st.Put(context.Background(), &resumeStarting); err != nil {
 		t.Fatal(err)
+	}
+	createEmpty := createStarting
+	createEmpty.ID = "create-starting-empty-run"
+	createEmpty.RunID = ""
+	createEmpty.VswitchPort = "create-empty-port"
+	createEmpty.FloatingIP = "192.0.2.12"
+	createEmpty.RunDir = filepath.Join(cfg.Paths.RunRoot, createEmpty.ID)
+	createEmpty.BaseDir = filepath.Join(cfg.Paths.BaseRoot, createEmpty.ID)
+	materializeTestSandboxCredentials(t, &createEmpty)
+	if err := st.Put(context.Background(), &createEmpty); err != nil {
+		t.Fatal(err)
+	}
+	resumeEmpty := resumeStarting
+	resumeEmpty.ID = "resume-starting-empty-run"
+	resumeEmpty.RunID = ""
+	resumeEmpty.VswitchPort = "resume-empty-port"
+	resumeEmpty.FloatingIP = "192.0.2.13"
+	resumeEmpty.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeEmpty.ID)
+	resumeEmpty.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeEmpty.ID)
+	materializeTestSandboxCredentials(t, &resumeEmpty)
+	if err := st.Put(context.Background(), &resumeEmpty); err != nil {
+		t.Fatal(err)
+	}
+	for _, starting := range []*types.Sandbox{&createStarting, &resumeStarting, &createEmpty, &resumeEmpty} {
+		if err := os.MkdirAll(starting.RunDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(starting.RunDir, "ready.sock"), []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(starting.BaseDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	lc := &reconcileLauncher{units: []launcher.Unit{
 		{Name: knownUnit, ActiveState: "active"},
@@ -101,7 +151,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		{Name: createStartingUnit, ActiveState: "active"},
 		{Name: resumeStartingUnit, ActiveState: "active"},
 	}}
-	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	vs := &reconcileVS{}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := o.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -122,10 +173,35 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	}{
 		{id: createStarting.ID, want: types.StateDead},
 		{id: resumeStarting.ID, want: types.StatePaused},
+		{id: createEmpty.ID, want: types.StateDead},
+		{id: resumeEmpty.ID, want: types.StatePaused},
 	} {
 		got, err := st.Get(context.Background(), tt.id)
-		if err != nil || got == nil || got.State != tt.want {
+		if err != nil || got == nil || got.State != tt.want || got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" {
 			t.Fatalf("reconciled %s = %+v, %v; want %s", tt.id, got, err, tt.want)
+		}
+		if o.lookup(tt.id) != nil {
+			t.Fatalf("interrupted starting sandbox %s was adopted into cache", tt.id)
+		}
+	}
+	for _, port := range []string{"create-assigned-port", "resume-assigned-port", "create-empty-port", "resume-empty-port"} {
+		if !containsString(vs.detached, port) {
+			t.Fatalf("persisted network %s was not detached: %v", port, vs.detached)
+		}
+	}
+	for _, starting := range []*types.Sandbox{&createStarting, &resumeStarting, &createEmpty, &resumeEmpty} {
+		if _, err := os.Stat(starting.RunDir); !os.IsNotExist(err) {
+			t.Fatalf("stale run directory %s remains: %v", starting.RunDir, err)
+		}
+	}
+	for _, fresh := range []*types.Sandbox{&createStarting, &createEmpty} {
+		if _, err := os.Stat(fresh.BaseDir); !os.IsNotExist(err) {
+			t.Fatalf("fresh-create base directory %s remains: %v", fresh.BaseDir, err)
+		}
+	}
+	for _, resume := range []*types.Sandbox{&resumeStarting, &resumeEmpty} {
+		if _, err := os.Stat(resume.BaseDir); err != nil {
+			t.Fatalf("resume base directory %s was removed: %v", resume.BaseDir, err)
 		}
 	}
 }

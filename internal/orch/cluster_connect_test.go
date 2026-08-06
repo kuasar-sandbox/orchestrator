@@ -162,18 +162,17 @@ func TestClusterConnectDeadlineAcceptsMaximumDuration(t *testing.T) {
 	}
 }
 
-func TestHandleClusterConnectWritesImportedDeadlineInInitialInsert(t *testing.T) {
+func TestHandleClusterConnectPersistsImportedDeadlineBeforeAck(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
 	failingVS := &failingClusterConnectVS{attempted: make(chan struct{}, 1)}
 	fixture.o.vs = failingVS
-	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_connect_deadline_update BEFORE UPDATE OF deadline_unix ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced connect deadline update failure'); END`)
 
 	cmd := fixture.command("stable-g1", fixture.token)
 	cmd.TimeoutSeconds = 41
 	deadlineFloor := time.Now().Add(40 * time.Second).Unix()
 	ack := fixture.o.HandleCommand(context.Background(), cmd)
 	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
-		t.Fatalf("missing-target connect with failing deadline UPDATE = %+v", ack)
+		t.Fatalf("missing-target connect = %+v", ack)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
 	if err != nil || stored == nil {
@@ -183,6 +182,9 @@ func TestHandleClusterConnectWritesImportedDeadlineInInitialInsert(t *testing.T)
 		t.Fatalf("inserted deadline = %d, want approximately now+41s", stored.DeadlineUnix)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitForSandbox(t, fixture.o, context.Background(), cmd.SID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StatePaused
+	}, "deadline test resume rollback")
 }
 
 func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testing.T) {
@@ -195,6 +197,9 @@ func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testi
 		t.Fatalf("initial import ack = %+v", ack)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
+	waitForSandbox(t, fixture.o, context.Background(), initial.SID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StatePaused
+	}, "initial failed resume rollback")
 	before, err := fixture.o.st.Get(context.Background(), initial.SID)
 	if err != nil || before == nil {
 		t.Fatalf("read initial target: sandbox=%+v err=%v", before, err)
@@ -205,7 +210,7 @@ func TestHandleClusterConnectExistingTargetRejectsDeadlineUpdateFailure(t *testi
 	retry.CmdID = "connect-existing-timeout"
 	retry.TimeoutSeconds = 23
 	ack := fixture.o.HandleCommand(context.Background(), retry)
-	if ack.Status != routesync.AckRejected || ack.Connect != nil || !strings.Contains(ack.Reason, "persist deadline") {
+	if ack.Status != routesync.AckRejected || ack.Connect != nil || !strings.Contains(ack.Reason, "begin resume") {
 		t.Fatalf("existing-target deadline failure ack = %+v", ack)
 	}
 	after, err := fixture.o.st.Get(context.Background(), initial.SID)
@@ -262,34 +267,35 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 	}
 	waitForLauncherStart(t, started)
 
+	before := time.Now().Unix()
 	done := make(chan *routesync.CmdAck, 1)
-	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 1)) }()
-	select {
-	case ack := <-done:
-		t.Fatalf("later cluster Connect returned before the in-flight resume completed: %+v", ack)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// Keep the later Connect behind the lifecycle boundary for longer than its
-	// requested lifetime. Its timeout must start after the wait, not before it.
-	time.Sleep(1100 * time.Millisecond)
-	releasedAt := time.Now().Unix()
-	close(startGate)
+	go func() { done <- o.HandleCommand(ctx, command("connect-timeout", 91)) }()
 	var ack *routesync.CmdAck
 	select {
 	case ack = <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("later cluster Connect did not complete after resume")
+		if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+			t.Fatalf("later cluster Connect = %+v", ack)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("later cluster Connect waited for the blocked starting resume")
 	}
-	if ack.Status != routesync.AckAccepted || ack.Connect == nil {
-		t.Fatalf("later cluster Connect = %+v", ack)
+	starting, err := o.st.Get(ctx, sb.ID)
+	if err != nil || starting == nil || starting.State != types.StateStarting {
+		t.Fatalf("sandbox while resume is blocked = %+v, %v", starting, err)
 	}
-	stored, err := o.st.Get(ctx, sb.ID)
+	if starting.DeadlineUnix < before+90 || starting.DeadlineUnix > time.Now().Unix()+92 {
+		t.Fatalf("deadline = %d, want the later Connect timeout", starting.DeadlineUnix)
+	}
+	close(startGate)
+	stored := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after later cluster Connect")
+	stored, err = o.st.Get(ctx, sb.ID)
 	if err != nil || stored == nil || stored.State != types.StateRunning {
 		t.Fatalf("sandbox after resume = %+v, %v", stored, err)
 	}
-	if stored.DeadlineUnix <= releasedAt {
-		t.Fatalf("deadline = %d, want a timeout starting after lifecycle release at %d", stored.DeadlineUnix, releasedAt)
+	if stored.DeadlineUnix != starting.DeadlineUnix {
+		t.Fatalf("running deadline = %d, want accepted starting deadline %d", stored.DeadlineUnix, starting.DeadlineUnix)
 	}
 	if cached := o.lookup(sb.ID); cached == nil || cached.DeadlineUnix != stored.DeadlineUnix {
 		t.Fatalf("cache deadline differs from stored sandbox: cached=%+v stored=%+v", cached, stored)
@@ -308,7 +314,7 @@ func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *test
 		t.Fatalf("initial connect ack = %+v", ack)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
-	waitPausedClusterRoute(t, events, cmd.SID)
+	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StatePaused)
 	if stored, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || stored == nil || stored.State != types.StatePaused {
 		t.Fatalf("failed resume row = %+v err=%v, want paused", stored, err)
 	}
@@ -319,7 +325,7 @@ func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *test
 		t.Fatalf("retry connect ack = %+v", ack)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
-	waitPausedClusterRoute(t, events, cmd.SID)
+	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StatePaused)
 }
 
 func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *testing.T) {
@@ -380,7 +386,7 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 			t.Fatalf("cluster connect ack = %+v", ack)
 		}
 		waitForLauncherStart(t, started)
-		waitClusterRouteStates(t, events, sid, routesync.StateStarting, routesync.StatePaused)
+		waitClusterRouteStates(t, events, sid, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused)
 		stored, err := o.st.Get(ctx, sid)
 		if err != nil || stored == nil || stored.State != types.StatePaused {
 			t.Fatalf("late resume failure row = %+v err=%v, want paused", stored, err)
@@ -455,14 +461,14 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 		t.Fatalf("cluster migration connect result = %+v", ack.Connect)
 	}
 
-	// HandleCommand may return Accepted only after KMT authentication and the
-	// insert-only paused-row write have completed. The blocked Attach prevents the
-	// asynchronous resume from changing the persisted state during this check.
+	// HandleCommand may return Accepted only after KMT authentication, import,
+	// and the atomic paused -> starting transition have completed. The blocked
+	// Attach keeps the launch in its durable pre-assignment state for this check.
 	got, err := fixture.o.st.Get(context.Background(), cmd.SID)
 	if err != nil || got == nil {
 		t.Fatalf("imported row is not visible after Ack: sandbox=%+v err=%v", got, err)
 	}
-	if got.ID != "stable-g1" || got.State != types.StatePaused || got.Profile != fixture.source.Profile ||
+	if got.ID != "stable-g1" || got.State != types.StateStarting || got.RunID != "" || got.Profile != fixture.source.Profile ||
 		got.AuthSandboxID() != fixture.source.AuthSandboxID() || got.CreatedUnix != fixture.source.CreatedUnix {
 		t.Fatalf("imported identity/state = %+v", got)
 	}

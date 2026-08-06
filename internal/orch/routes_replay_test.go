@@ -123,6 +123,29 @@ func TestStartingSandboxServesMMDSButNotDataPlane(t *testing.T) {
 	}
 }
 
+func TestOnWakeDoesNotRepublishDeletedCachedStarting(t *testing.T) {
+	o := testOrch(t)
+	o.cache(&types.Sandbox{
+		ID: "deleted-starting", Profile: types.ProfileE2B, State: types.StateStarting,
+		TemplateID: "e2b-snp-" + strings.Repeat("a", 64),
+	})
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	// Model the post-Kill window in which a caller obtained the old immutable
+	// cache snapshot before Delete removed the durable row. Wake must resolve the
+	// authoritative row under the lifecycle fence and leave Delete as the last
+	// publication, never resurrect the stale starting route.
+	o.OnWake(context.Background(), "deleted-starting")
+	event := <-events
+	if event.Kind != routesync.TypeDelete || event.SID != "deleted-starting" {
+		t.Fatalf("OnWake stale starting event = %+v, want Delete", event)
+	}
+	if cached := o.lookup("deleted-starting"); cached != nil {
+		t.Fatalf("OnWake retained deleted starting cache = %+v", cached)
+	}
+}
+
 func TestInternalKnownExecDoesNotResumePausedSandboxBeforeIssue64(t *testing.T) {
 	o := &Orchestrator{reg: map[string]*types.Sandbox{
 		"paused": {ID: "paused", Profile: types.ProfileBare, State: types.StatePaused},

@@ -46,7 +46,14 @@ func (o *Orchestrator) execSession(
 		return "", err
 	}
 	if sb.State == types.StatePaused {
-		o.scheduleResume(sb.ID)
+		if _, _, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(current *types.Sandbox) error {
+			if !ownsSandbox(current, apiKey) {
+				return api.ErrNotFound
+			}
+			return nil
+		}); err != nil {
+			return "", err
+		}
 	}
 	return token, nil
 }

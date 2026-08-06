@@ -97,7 +97,7 @@ func TestHandleClusterExecSessionReturnsBeforeAsynchronousResume(t *testing.T) {
 		t.Fatalf("exec-session ack = %+v", ack)
 	}
 	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
-	if err != nil || stored == nil || stored.State != types.StatePaused {
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
 		t.Fatalf("synchronously imported target = %+v, %v", stored, err)
 	}
 	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.AuthSandboxID(), time.Now()); err != nil {

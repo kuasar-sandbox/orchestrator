@@ -1,7 +1,8 @@
 package orch
 
 import (
-	"sync"
+	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,59 +10,145 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-// TestFlightGroupCollapses proves the resume dedupe: while one call for a key is
-// in flight, concurrent calls for the same key collapse onto it (fn runs once).
-func TestFlightGroupCollapses(t *testing.T) {
-	var g flightGroup
-	var calls atomic.Int64
-	inDo := make(chan struct{})
-	release := make(chan struct{})
+func TestLaunchGroupClaimCancelAndCleanupFence(t *testing.T) {
+	var g launchGroup
+	a, err := g.Claim(context.Background(), "sid", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Claim(context.Background(), "sid", launchResume); !errors.Is(err, errLaunchClaimed) {
+		t.Fatalf("second Claim error = %v, want errLaunchClaimed", err)
+	}
 
-	go g.Do("k", func() error {
-		calls.Add(1)
-		close(inDo)
-		<-release
-		return nil
+	g.Cancel("sid")
+	select {
+	case <-a.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not cancel the attempt context")
+	}
+	if _, err := g.Claim(context.Background(), "sid", launchCreate); !errors.Is(err, errLaunchClaimed) {
+		t.Fatalf("Claim after Cancel error = %v, want cleanup fence", err)
+	}
+
+	g.Finish(a, context.Canceled)
+	if next, err := g.Claim(context.Background(), "sid", launchResume); err != nil {
+		t.Fatalf("Claim after Finish: %v", err)
+	} else {
+		g.Finish(next, nil)
+	}
+}
+
+func TestLaunchGroupWaitHonorsCallerContext(t *testing.T) {
+	var g launchGroup
+	a, err := g.Claim(context.Background(), "sid", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	found, err := g.Wait(ctx, "sid")
+	if !found || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait = found %v err %v, want true/context canceled", found, err)
+	}
+	if _, found := g.Lookup("sid"); !found {
+		t.Fatal("caller cancellation released the attempt")
+	}
+	g.Finish(a, nil)
+	if found, err := g.Wait(context.Background(), "missing"); found || err != nil {
+		t.Fatalf("missing Wait = found %v err %v", found, err)
+	}
+}
+
+func TestLaunchGroupAllowsDistinctSandboxes(t *testing.T) {
+	var g launchGroup
+	first, err := g.Claim(context.Background(), "first", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := g.Claim(context.Background(), "second", launchResume)
+	if err != nil {
+		t.Fatalf("distinct Claim: %v", err)
+	}
+	g.Finish(first, nil)
+	g.Finish(second, nil)
+}
+
+func TestLaunchGroupStartClosesDoneAfterTerminalWork(t *testing.T) {
+	var g launchGroup
+	a, err := g.Claim(context.Background(), "sid", launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	cleanup := make(chan struct{})
+	var terminalVisible atomic.Bool
+	g.Start(a, func(context.Context, *launchAttempt) error {
+		<-terminal
+		terminalVisible.Store(true)
+		close(cleanup)
+		return errors.New("launch failed")
 	})
-	<-inDo // first call is now inside fn (holding the key)
 
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = g.Do("k", func() error { calls.Add(1); return nil })
-		}()
+	waited := make(chan error, 1)
+	go func() {
+		waited <- a.wait(context.Background())
+	}()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned before terminal state and cleanup")
+	default:
 	}
-	time.Sleep(80 * time.Millisecond) // let followers enqueue as waiters
-	close(release)
-	wg.Wait()
-
-	if n := calls.Load(); n != 1 {
-		t.Fatalf("fn ran %d times, want 1 (single-flight collapse failed)", n)
+	close(terminal)
+	select {
+	case err := <-waited:
+		if err == nil || !terminalVisible.Load() {
+			t.Fatalf("Wait error = %v, terminal visible = %v", err, terminalVisible.Load())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not finish")
 	}
-}
-
-// TestFlightGroupDistinctKeys: different keys do not collapse.
-func TestFlightGroupDistinctKeys(t *testing.T) {
-	var g flightGroup
-	var calls atomic.Int64
-	var wg sync.WaitGroup
-	for _, k := range []string{"a", "b", "c"} {
-		wg.Add(1)
-		go func(k string) {
-			defer wg.Done()
-			_ = g.Do(k, func() error { calls.Add(1); return nil })
-		}(k)
-	}
-	wg.Wait()
-	if n := calls.Load(); n != 3 {
-		t.Fatalf("fn ran %d times, want 3 (distinct keys must not collapse)", n)
+	select {
+	case <-cleanup:
+	default:
+		t.Fatal("cleanup was not complete before Wait returned")
 	}
 }
 
-// TestPublishToSubscriber: an upsert event reaches a live subscriber; a lagging
-// subscriber is dropped + closed (so its routesync client reconnects/resnapshots).
+func TestLaunchGroupStaleFinishDoesNotDeleteSuccessor(t *testing.T) {
+	var g launchGroup
+	first, err := g.Claim(context.Background(), "sid", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a delayed old worker reaching Finish after a successor was installed.
+	// Normal Claim fencing prevents this ordering; the pointer comparison remains
+	// a defense against stale completion paths and future ownership handoffs.
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	second := &launchAttempt{
+		sid: "sid", kind: launchResume, ctx: secondCtx, cancel: secondCancel, done: make(chan struct{}),
+	}
+	g.mu.Lock()
+	g.m["sid"] = second
+	g.mu.Unlock()
+	g.Finish(first, errors.New("late finish"))
+	got, found := g.Lookup("sid")
+	if !found || got != second {
+		t.Fatalf("late Finish removed successor: found=%v got=%p want=%p", found, got, second)
+	}
+	g.Finish(second, nil)
+}
+
+func TestLaunchGroupRejectsCanceledLifecycle(t *testing.T) {
+	var g launchGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := g.Claim(ctx, "sid", launchCreate); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Claim error = %v, want context canceled", err)
+	}
+}
+
+// TestPublishToSubscriber remains the route fan-out regression guard: an event
+// reaches a live subscriber (lagging subscribers are handled by publish itself).
 func TestPublishToSubscriber(t *testing.T) {
 	o := &Orchestrator{subs: map[int]chan routesync.Event{}}
 	ch, cancel := o.Subscribe()

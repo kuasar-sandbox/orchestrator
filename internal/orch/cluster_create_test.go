@@ -2,8 +2,11 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -12,40 +15,257 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestClaimClusterCreateRejectsInflightAndStoredSandboxIDs(t *testing.T) {
-	ctx := context.Background()
-	o := testOrch(t)
+func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
+	return &routesync.Command{
+		CmdID: "create-" + sid, Kind: routesync.CmdCreate, SID: sid,
+		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		Profile:     string(types.ProfileBare), APISecretFingerprint: fingerprint,
+		Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+	}
+}
 
-	if err := o.claimClusterCreate(ctx, ""); err == nil {
-		t.Fatal("empty sandbox id was accepted")
-	}
-	if err := o.claimClusterCreate(ctx, "inflight"); err != nil {
-		t.Fatalf("first claim: %v", err)
-	}
-	if err := o.claimClusterCreate(ctx, "inflight"); err == nil {
-		t.Fatal("concurrent duplicate claim was accepted")
-	}
-	o.releaseClusterCreate("inflight")
-	if err := o.claimClusterCreate(ctx, "inflight"); err != nil {
-		t.Fatalf("released claim was not reusable: %v", err)
-	}
-	o.releaseClusterCreate("inflight")
+func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
+	cfg := &config.Config{}
+	started := make(chan struct{}, 1)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterCreateCommand(fingerprint, "stable-g0")
+	events, stopEvents := o.Subscribe()
+	defer stopEvents()
 
-	manifestKey := strings.Repeat("b", 64)
-	stored := &types.Sandbox{
-		ID: "stored", Profile: types.ProfileBare, State: types.StateRunning,
-		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+	ack := o.HandleCommand(ctx, cmd)
+	if ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster create ack = %+v", ack)
 	}
-	materializeTestSandboxCredentials(t, stored)
-	if err := o.st.Put(ctx, stored); err != nil {
-		t.Fatal(err)
+	stored, err := o.st.Get(ctx, cmd.SID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" || stored.VswitchPort != "" {
+		t.Fatalf("row at accepted Ack = %+v, %v", stored, err)
 	}
-	if err := o.claimClusterCreate(ctx, "stored"); err == nil {
-		t.Fatal("stored sandbox id was accepted")
+	attempt, found := o.launches.Lookup(cmd.SID)
+	if !found || attempt.Kind() != launchCreate {
+		t.Fatal("accepted cluster create has no active create attempt")
 	}
-	if _, claimed := o.clusterCreates["stored"]; claimed {
-		t.Fatal("failed stored-id claim leaked its in-flight marker")
+	initial := <-events
+	if initial.Kind != routesync.TypeUpsert || initial.Route.State != routesync.StateStarting || initial.Route.FloatingIP != "" {
+		t.Fatalf("initial cluster starting route = %+v", initial)
 	}
+
+	waitForLauncherStart(t, started)
+	stored, err = o.st.Get(ctx, cmd.SID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" || stored.VswitchPort == "" {
+		t.Fatalf("cluster pre-assignment row = %+v, %v", stored, err)
+	}
+	close(startGate)
+	waitForSandbox(t, o, ctx, cmd.SID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning && current.RunID != ""
+	}, "cluster create running")
+}
+
+func TestClusterCreatePreAssignmentFailurePublishesDelete(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	o.vs = failingCreateVS{err: errors.New("cluster attach failed")}
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterCreateCommand(fingerprint, "stable-g1")
+	events, stopEvents := o.Subscribe()
+	defer stopEvents()
+
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster create ack = %+v", ack)
+	}
+	dead := waitForSandbox(t, o, ctx, cmd.SID, func(current *types.Sandbox) bool {
+		return current.State == types.StateDead
+	}, "cluster create dead after attach failure")
+	if dead.RunID != "" || dead.VswitchPort != "" {
+		t.Fatalf("failed cluster create retained ownership: %+v", dead)
+	}
+	for _, want := range []string{routesync.StateStarting, routesync.TypeDelete} {
+		select {
+		case event := <-events:
+			if want == routesync.TypeDelete {
+				if event.Kind != routesync.TypeDelete || event.SID != cmd.SID {
+					t.Fatalf("cluster failure event = %+v", event)
+				}
+			} else if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("cluster failure event = %+v", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing cluster %s event", want)
+		}
+	}
+}
+
+func TestConcurrentClusterCreateHasOneLaunchOwner(t *testing.T) {
+	cfg := &config.Config{}
+	started := make(chan struct{}, 8)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+
+	const callers = 8
+	results := make(chan *routesync.CmdAck, callers)
+	release := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			ready.Done()
+			<-release
+			cmd := clusterCreateCommand(fingerprint, "stable-g2")
+			cmd.CmdID = "concurrent-" + string(rune('a'+i))
+			results <- o.HandleCommand(ctx, cmd)
+		}(i)
+	}
+	ready.Wait()
+	close(release)
+	accepted := 0
+	for range callers {
+		if ack := <-results; ack.Status == routesync.AckAccepted {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted concurrent creates = %d, want 1", accepted)
+	}
+	waitForLauncherStart(t, started)
+	if got := lc.starts.Load(); got != 1 {
+		t.Fatalf("cluster launcher starts = %d, want 1", got)
+	}
+	if _, found := o.launches.Lookup("stable-g2"); !found {
+		t.Fatal("winning cluster create lost its active launch owner")
+	}
+	close(startGate)
+	waitForSandbox(t, o, ctx, "stable-g2", func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "concurrent cluster create winner running")
+}
+
+func TestCreateClusterWrapperUsesAcceptedAttempt(t *testing.T) {
+	cfg := &config.Config{}
+	started := make(chan struct{}, 1)
+	startGate := make(chan struct{})
+	lc := &countingLauncher{started: started, startGate: startGate}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterCreateCommand(fingerprint, "stable-g3")
+	type result struct {
+		sb  *types.Sandbox
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sb, err := o.CreateCluster(ctx, cmd)
+		done <- result{sb: sb, err: err}
+	}()
+	waitForLauncherStart(t, started)
+	stored, err := o.st.Get(ctx, cmd.SID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
+		t.Fatalf("wrapper accepted row = %+v, %v", stored, err)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("CreateCluster returned before its accepted attempt: %+v", got)
+	default:
+	}
+	close(startGate)
+	select {
+	case got := <-done:
+		if got.err != nil || got.sb == nil || got.sb.State != types.StateRunning {
+			t.Fatalf("CreateCluster = %+v, %v", got.sb, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CreateCluster did not observe its launch completion")
+	}
+}
+
+func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	vs := &blockedKillAttachVS{
+		entered: make(chan struct{}), gate: make(chan struct{}), detached: make(chan string, 1),
+	}
+	o.vs = vs
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	create := clusterCreateCommand(fingerprint, "stable-g4")
+	events, stopEvents := o.Subscribe()
+	defer stopEvents()
+	if ack := o.HandleCommand(ctx, create); ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster create ack = %+v", ack)
+	}
+	if event := <-events; event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
+		t.Fatalf("cluster create initial event = %+v", event)
+	}
+	select {
+	case <-vs.entered:
+	case <-time.After(time.Second):
+		t.Fatal("cluster create did not enter blocked attach")
+	}
+	attempt, found := o.launches.Lookup(create.SID)
+	if !found || attempt.Kind() != launchCreate {
+		t.Fatal("cluster create has no active owner")
+	}
+
+	connect := &routesync.Command{
+		CmdID: "connect-existing-starting", Kind: routesync.CmdConnect, SID: create.SID,
+		Profile: create.Profile, APISecretFingerprint: fingerprint, Cluster: create.Cluster,
+	}
+	if ack := o.HandleCommand(ctx, connect); ack.Status != routesync.AckAccepted || ack.Connect == nil {
+		t.Fatalf("cluster Connect joining starting = %+v", ack)
+	}
+	if got, ok := o.launches.Lookup(create.SID); !ok || got != attempt {
+		t.Fatal("cluster Connect replaced the active create owner")
+	}
+	if got := lc.starts.Load(); got != 0 {
+		t.Fatalf("blocked preparation started %d runners", got)
+	}
+
+	deleteCmd := &routesync.Command{
+		CmdID: "delete-existing-starting", Kind: routesync.CmdDelete,
+		SID: create.SID, APISecretFingerprint: fingerprint,
+	}
+	if ack := o.HandleCommand(ctx, deleteCmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster Delete ack = %+v", ack)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
+			t.Fatalf("cluster Delete event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cluster Delete did not publish its terminal event")
+	}
+	if current, err := o.st.Get(ctx, create.SID); err != nil || current != nil {
+		t.Fatalf("cluster row after Delete = %+v, %v", current, err)
+	}
+	if _, err := o.launches.Claim(ctx, create.SID, launchCreate); !errors.Is(err, errLaunchClaimed) {
+		t.Fatalf("claim before late attach cleanup = %v, want cleanup fence", err)
+	}
+
+	close(vs.gate)
+	select {
+	case port := <-vs.detached:
+		if port != "late-kill-port" {
+			t.Fatalf("late detached port = %q", port)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cluster late attach was not detached")
+	}
+	if err := attempt.wait(ctx); err == nil {
+		t.Fatal("deleted cluster create reported launch success")
+	}
+	if stored, err := o.st.Get(ctx, create.SID); err != nil || stored != nil {
+		t.Fatalf("cluster launch resurrected after Delete: %+v, %v", stored, err)
+	}
+	next, err := o.launches.Claim(ctx, create.SID, launchCreate)
+	if err != nil {
+		t.Fatalf("claim after cluster cleanup: %v", err)
+	}
+	o.launches.Finish(next, nil)
 }
 
 func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {

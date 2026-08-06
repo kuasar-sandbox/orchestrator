@@ -185,7 +185,7 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 		t.Fatalf("ExecSession token = %q, error = %v", issued.token, issued.err)
 	}
 	imported, err := o.st.Get(ctx, targetID)
-	if err != nil || imported == nil || imported.State != types.StatePaused {
+	if err != nil || imported == nil || imported.State != types.StateStarting || imported.RunID != "" {
 		t.Fatalf("synchronously imported target = %+v, %v", imported, err)
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(imported), sandboxCredentials(source))
@@ -197,8 +197,8 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 
 	waitForLauncherStart(t, started)
 	blocked, err := o.st.Get(ctx, targetID)
-	if err != nil || blocked == nil || blocked.State != types.StatePaused {
-		t.Fatalf("imported row before launcher release = %+v, %v; want paused", blocked, err)
+	if err != nil || blocked == nil || blocked.State != types.StateStarting || blocked.RunID != "" || blocked.VswitchPort == "" {
+		t.Fatalf("imported row before launcher release = %+v, %v; want enriched pre-assignment starting", blocked, err)
 	}
 	close(startGate)
 	waitForSandbox(t, o, ctx, targetID, func(sb *types.Sandbox) bool {

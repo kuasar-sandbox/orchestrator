@@ -53,17 +53,17 @@ type Orchestrator struct {
 
 	sandboxReadyTimeout time.Duration
 
-	mu             sync.Mutex
-	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
-	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
+	mu  sync.Mutex
+	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	sf        flightGroup    // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
-	lifecycle keyedLockGroup // serialize resume against destructive/deadline mutations for one sid
+	launches  launchGroup    // sole process-local owner of create and resume attempts
+	lifecycle keyedLockGroup // serialize lifecycle mutations for one sid
+
+	lifecycleCtxMu sync.RWMutex
+	lifecycleCtx   context.Context // all accepted launch work; canceled on node shutdown
 
 	deadlineIntentMu sync.Mutex
 	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
-	resumeRequestMu  sync.Mutex
-	resumeRequests   map[string]*resumeRequestState // outstanding requests and the latest Pause/Delete fence
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -82,8 +82,7 @@ type Orchestrator struct {
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
-	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
-	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
+	probe ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -102,7 +101,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		sandboxReadyTimeout: 60 * time.Second,
 		reg:                 map[string]*types.Sandbox{},
-		clusterCreates:      map[string]struct{}{},
+		lifecycleCtx:        context.Background(),
 		deadlineIntents:     map[string]struct{}{},
 		subs:                map[int]chan routesync.Event{},
 		routeFP:             uuid.NewString(),
@@ -137,6 +136,7 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 // --- api.Core ---
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
+	admissionStarted := time.Now()
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
 	}
@@ -189,6 +189,9 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -217,35 +220,154 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	if err := o.launch(ctx, sb, tmpl); err != nil {
-		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
+	accepted, _, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	if err != nil {
+		return nil, err
 	}
-	return sb, nil
+	o.logLaunchPhase(nil, accepted, "admission_duration", time.Since(admissionStarted))
+	return cloneSandbox(accepted), nil
 }
 
-// launch prepares dirs + network, writes the sandbox config file, starts the unit
-// (node-ctl run-sandbox -> sandbox-ctl), waits for readiness and provisions
-// envd. The non-secret config lands at <run-dir>/<sid>.yaml; the secret manifest
-// key rides in the run-sandbox LaunchSpec env (LaunchSpecFor). The cgroup is the
-// unit's own (--cgroup-adopt). Used by Create and Connect(resume).
-func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
+// acceptFreshLaunch is the common standalone/cluster create admission. The
+// lifecycle lock orders initial publication against a concurrent Delete; launch
+// ownership is claimed before the durable starting row becomes visible.
+func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*types.Sandbox, *launchAttempt, error) {
 	if sb == nil || sb.State != types.StateStarting {
-		return fmt.Errorf("orch: launch requires a starting sandbox")
+		return nil, nil, fmt.Errorf("orch: fresh launch requires a starting sandbox")
 	}
+	if sb.RunID != "" || sb.FloatingIP != "" || sb.VswitchPort != "" || sb.InnerIP != "" || sb.PortMAC != "" {
+		return nil, nil, fmt.Errorf("orch: fresh launch admission requires empty runner and network ownership")
+	}
+	if _, err := sandboxcfg.ParseSpec(sb.Metadata); err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	lifecycleCtx := o.launchContext()
+	if err := lifecycleCtx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	attempt, err := o.launches.Claim(lifecycleCtx, sb.ID, launchCreate)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := lifecycleCtx.Err(); err != nil {
+		o.launches.Finish(attempt, err)
+		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+	if err := o.st.InsertSandbox(ctx, cloneSandbox(sb)); err != nil {
+		o.launches.Finish(attempt, err)
+		return nil, nil, err
+	}
+	attempt.SetAcceptedAt(time.Now())
+	initial := cloneSandbox(sb)
+	o.cache(initial)
+	o.publishUpsert(initial)
+	work := cloneSandbox(sb)
+	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
+		return o.runLaunch(launchCtx, current, work, tmpl)
+	})
+	return cloneSandbox(initial), attempt, nil
+}
+
+type launchStageError struct {
+	stage string
+	err   error
+}
+
+func (e *launchStageError) Error() string { return e.err.Error() }
+func (e *launchStageError) Unwrap() error { return e.err }
+
+func launchFailed(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &launchStageError{stage: stage, err: err}
+}
+
+func launchFailureStage(err error) string {
+	var staged *launchStageError
+	if errors.As(err, &staged) {
+		return staged.stage
+	}
+	return "unknown"
+}
+
+func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox, phase string, duration time.Duration) {
+	kind := launchCreate
+	if attempt != nil {
+		kind = attempt.Kind()
+	}
+	o.log.Info("sandbox launch phase",
+		"sid", sb.ID,
+		"run_id", sb.RunID,
+		"kind", kind,
+		"profile", sb.Profile,
+		"phase", phase,
+		"duration", duration)
+}
+
+func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID) error {
+	err := o.launchSandbox(ctx, attempt, sb, tmpl)
+	result := "success"
+	failureStage := ""
+	if err != nil {
+		result = "failure"
+		failureStage = launchFailureStage(err)
+		if rollbackErr := o.rollbackLaunch(attempt, sb); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
+	}
+	acceptedAt := attempt.AcceptedAt()
+	if acceptedAt.IsZero() {
+		acceptedAt = time.Now()
+	}
+	o.log.Info("sandbox launch terminal",
+		"sid", sb.ID,
+		"run_id", attempt.RunID(),
+		"kind", attempt.Kind(),
+		"profile", sb.Profile,
+		"result", result,
+		"failure_stage", failureStage,
+		"starting_total_duration", time.Since(acceptedAt),
+		"err", err)
+	return err
+}
+
+// launchSandbox prepares all runner handoff inputs, then spends separate runner
+// assignment and runtime readiness budgets. The durable starting row already
+// exists and is never replaced by a stale whole-row Put.
+func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID) error {
+	if sb == nil || attempt == nil || sb.State != types.StateStarting || sb.ID != attempt.SID() {
+		return launchFailed("prepare", fmt.Errorf("orch: launch requires its claimed starting sandbox"))
+	}
+	prepareStarted := time.Now()
+	prepareLogged := false
+	defer func() {
+		// A failure before runner handoff still needs a complete prepare timing.
+		// Successful preparation logs at its exact boundary below.
+		if !prepareLogged {
+			o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
+		}
+	}()
 	for _, d := range []string{sb.RunDir, sb.BaseDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
-			return fmt.Errorf("orch: mkdir %s: %w", d, err)
+			return launchFailed("prepare", fmt.Errorf("orch: mkdir %s: %w", d, err))
 		}
 	}
 	// MkdirAll preserves an existing directory's mode. The readiness socket is
 	// private launch coordination, so restore the run directory invariant before
 	// binding it even when this is a resume into a pre-existing directory.
 	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
-		return fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err)
+		return launchFailed("prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
 	}
 	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
 	if err != nil {
-		return err
+		return launchFailed("prepare", err)
 	}
 	// Restore (resume / snp-template create / migration import): inherit the
 	// snapshot's logical network for fields the create config left unset (point 7 —
@@ -259,13 +381,27 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	}
 	network, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname)
 	if err != nil {
-		return err
+		return launchFailed("prepare", err)
 	}
 	port, err := o.attachNetwork(ctx, network)
 	if err != nil {
-		return err
+		return launchFailed("network", err)
 	}
 	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, network.InnerIP
+	resources := store.StartingResources{
+		FloatingIP: sb.FloatingIP, VswitchPort: sb.VswitchPort, InnerIP: sb.InnerIP, PortMAC: sb.PortMAC,
+	}
+	changed, err := o.st.SetStartingResources(ctx, sb.ID, resources)
+	if err != nil || !changed {
+		detachCtx, cancelDetach := cleanupContext()
+		_ = o.vs.Detach(detachCtx, port.Port)
+		cancelDetach()
+		sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
+		if err != nil {
+			return launchFailed("resources", err)
+		}
+		return launchFailed("resources", errLaunchOwnershipLost)
+	}
 
 	p := o.sandboxParams(sb, tmpl, spec, network)
 	// Pin capacity to the snapshot the runtime froze (read above). Template
@@ -275,31 +411,80 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 		p.VCPU, p.Memory = snap.CapCPU, snap.CapMem
 	}
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
-		return err
+		return launchFailed("config", err)
 	}
 	readyListener, err := listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
 	if err != nil {
-		return err
+		return launchFailed("readiness_socket", err)
 	}
 	defer readyListener.Close()
+	// Persisted ownership comes first; publication is ordered against Delete and
+	// occurs only once every runner handoff input is ready.
+	unlock := o.lifecycle.Lock(sb.ID)
+	current, getErr := o.st.Get(ctx, sb.ID)
+	if getErr == nil && current != nil && current.State == types.StateStarting && current.RunID == "" && current.VswitchPort == sb.VswitchPort {
+		o.cache(current)
+		o.publishUpsert(current)
+	}
+	unlock()
+	if getErr != nil {
+		return launchFailed("resources", getErr)
+	}
+	if current == nil || current.State != types.StateStarting || current.RunID != "" || current.VswitchPort != sb.VswitchPort {
+		return launchFailed("resources", errLaunchOwnershipLost)
+	}
+	o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
+	prepareLogged = true
+
 	// Binding precedes assignment so node-ctl can connect immediately after its
 	// long-poll returns; no retry window is needed between the two processes.
-	if _, err := o.runnerPool.Assign(ctx, sb.ID, func(runID string) error {
-		previousRunID := sb.RunID
-		sb.RunID = runID
-		if err := o.st.Put(ctx, sb); err != nil {
-			sb.RunID = previousRunID
+	assignStarted := time.Now()
+	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
+	var commitStarted, commitFinished time.Time
+	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+		commitStarted = time.Now()
+		// Serialize the runner-binding linearization point with Kill/Delete and
+		// other lifecycle mutations. If deletion wins, the exact CAS below misses
+		// and the pool never hands the task to this runner; if binding wins, the
+		// destructive operation re-reads and stops the exact persisted run ID.
+		unlockCommit := o.lifecycle.Lock(sb.ID)
+		defer unlockCommit()
+		changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
+		if err != nil {
 			return err
 		}
-		// starting is routable only to MMDS. Publish a private copy so later
-		// success cannot mutate a cache entry already observed by readers.
-		starting := *sb
-		o.cache(&starting)
-		o.publishUpsert(&starting)
+		if !changed {
+			return errLaunchOwnershipLost
+		}
+		sb.RunID = runID
+		attempt.SetRunID(runID)
+		o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
+		commitFinished = time.Now()
 		return nil
-	}); err != nil {
-		return err
+	})
+	cancelAssignment()
+	waitFinished := time.Now()
+	if !commitStarted.IsZero() {
+		waitFinished = commitStarted
 	}
+	o.logLaunchPhase(attempt, sb, "runner_wait_duration", waitFinished.Sub(assignStarted))
+	if !commitStarted.IsZero() {
+		if commitFinished.IsZero() {
+			commitFinished = time.Now()
+		}
+		o.logLaunchPhase(attempt, sb, "runner_commit_duration", commitFinished.Sub(commitStarted))
+	}
+	if err != nil {
+		return launchFailed("runner", err)
+	}
+	if sb.RunID == "" {
+		sb.RunID = runID
+		attempt.SetRunID(runID)
+	}
+	if commitFinished.IsZero() {
+		commitFinished = assignStarted
+	}
+	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
 	launchTimeout := o.sandboxReadyTimeout
 	if launchTimeout <= 0 {
 		launchTimeout = 60 * time.Second
@@ -309,25 +494,137 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	// health is meaningful only after initialization and is not a launch gate.
 	launchCtx, cancelLaunch := context.WithTimeout(ctx, launchTimeout)
 	defer cancelLaunch()
-	if err := waitRuntimeReadiness(launchCtx, readyListener); err != nil {
-		return fmt.Errorf("orch: sandbox %s: %w", sb.ID, err)
+	runtimeStarted := time.Now()
+	err = waitRuntimeReadiness(launchCtx, readyListener)
+	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
+	if err != nil {
+		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
 	if tmpl.Profile == types.ProfileE2B {
-		if err := o.envdInit(launchCtx, sb); err != nil {
-			return err
+		envdStarted := time.Now()
+		err = o.envdInit(launchCtx, sb)
+		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
+		if err != nil {
+			return launchFailed("envd", err)
 		}
 	}
-	changed, err := o.st.CASRunState(ctx, sb.ID, sb.RunID, types.StateStarting, types.StateRunning)
+	unlock = o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	changed, err = o.st.CommitStartingRunning(ctx, sb.ID, sb.RunID)
 	if err != nil {
-		return fmt.Errorf("orch: commit launch %s: %w", sb.ID, err)
+		return launchFailed("commit", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
 	}
 	if !changed {
-		return fmt.Errorf("orch: commit launch %s: starting runner %s no longer owns the sandbox", sb.ID, sb.RunID)
+		return launchFailed("commit", fmt.Errorf("orch: commit launch %s: starting runner %s no longer owns the sandbox: %w", sb.ID, sb.RunID, errLaunchOwnershipLost))
+	}
+	if attempt.Kind() == launchResume {
+		// Explicit paused/starting deadline intent survives failed resumes and is
+		// consumed only by a successful exact-run terminal commit.
+		o.clearDeadlineIntent(sb.ID)
+	}
+	// Preserve narrow concurrent updates (notably SetTimeout) made after the
+	// launch started. The worker's sb is deliberately a private snapshot and
+	// must never replace the authoritative cached record after acceptance.
+	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
+		cached.State = types.StateRunning
+		cached.RunID = sb.RunID
+	})
+	if running == nil {
+		running, err = o.st.Get(ctx, sb.ID)
+		if err != nil {
+			// The exact CAS above is the terminal linearization point. A read
+			// failure must not turn a committed running sandbox into launch
+			// cleanup (which would stop its runner and detach its network).
+			o.log.Error("reload committed sandbox failed", "sid", sb.ID, "run_id", sb.RunID, "err", err)
+			running = cloneSandbox(sb)
+			running.State = types.StateRunning
+		}
+		if running == nil || running.State != types.StateRunning || running.RunID != sb.RunID {
+			o.log.Error("committed sandbox cache invariant failed", "sid", sb.ID, "run_id", sb.RunID)
+			running = cloneSandbox(sb)
+			running.State = types.StateRunning
+		}
+		o.cache(running)
 	}
 	sb.State = types.StateRunning
-	o.cache(sb)
-	o.publishUpsert(sb)
+	sb.DeadlineUnix = running.DeadlineUnix
+	o.publishUpsert(running)
 	return nil
+}
+
+func cleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+func (o *Orchestrator) cleanupLaunchResources(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox) error {
+	var cleanupErr error
+	runID := attempt.RunID()
+	if runID == "" {
+		runID = sb.RunID
+	}
+	if runID != "" {
+		unit := o.runnerUnit(runID)
+		if err := o.lc.Stop(ctx, unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", unit, err))
+		}
+		if err := o.lc.ResetFailed(ctx, unit); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", unit, err))
+		}
+	}
+	if sb.VswitchPort != "" {
+		if err := o.vs.Detach(ctx, sb.VswitchPort); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", sb.VswitchPort, err))
+		}
+	}
+	if err := os.RemoveAll(sb.RunDir); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", sb.RunDir, err))
+	}
+	if attempt.Kind() == launchCreate {
+		if err := os.RemoveAll(sb.BaseDir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove base dir %s: %w", sb.BaseDir, err))
+		}
+	}
+	return cleanupErr
+}
+
+func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox) error {
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	cleanupErr := o.cleanupLaunchResources(ctx, attempt, sb)
+	expectedRunID := attempt.RunID()
+
+	unlock := o.lifecycle.Lock(sb.ID)
+	defer unlock()
+	var (
+		changed bool
+		err     error
+	)
+	if attempt.Kind() == launchResume {
+		changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, expectedRunID)
+	} else {
+		changed, err = o.st.RollbackStartingDead(ctx, sb.ID, expectedRunID)
+	}
+	if err != nil {
+		return errors.Join(cleanupErr, err)
+	}
+	if !changed {
+		return cleanupErr
+	}
+	if attempt.Kind() == launchCreate {
+		o.uncache(sb.ID)
+		o.publishDelete(sb.ID)
+		return cleanupErr
+	}
+	paused, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return errors.Join(cleanupErr, err)
+	}
+	if paused == nil || paused.State != types.StatePaused {
+		return errors.Join(cleanupErr, fmt.Errorf("orch: resume rollback %s did not produce paused state", sb.ID))
+	}
+	o.cache(paused)
+	o.publishUpsert(paused)
+	return cleanupErr
 }
 
 func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error) {
@@ -368,11 +665,13 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
-	o.cancelResumeRequests(id)
-	o.teardown(ctx, sb)
+	o.launches.Cancel(id)
 	if err := o.st.Delete(ctx, id); err != nil {
 		return false, err
 	}
+	cleanupCtx, cancel := cleanupContext()
+	o.teardown(cleanupCtx, sb)
+	cancel()
 	o.clearDeadlineIntent(id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
@@ -390,11 +689,13 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
+	if sb.State == types.StateStarting {
+		return api.ErrSandboxStarting
+	}
 	policy, err := o.resolveCheckpointPolicy(sb.Metadata, actionOverride)
 	if err != nil {
 		return err
 	}
-	o.cancelResumeRequests(id)
 	return o.pauseSandboxLocked(ctx, sb, policy)
 }
 
@@ -414,17 +715,22 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if current.State == types.StatePaused {
 		return api.ErrAlreadyPaused
 	}
+	if current.State == types.StateStarting {
+		return api.ErrSandboxStarting
+	}
 	policy, err := o.resolveCheckpointPolicy(current.Metadata, sandboxcfg.CheckpointPolicy{})
 	if err != nil {
 		return err
 	}
-	o.cancelResumeRequests(sb.ID)
 	return o.pauseSandboxLocked(ctx, current, policy)
 }
 
 func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
+	}
+	if sb.State == types.StateStarting {
+		return api.ErrSandboxStarting
 	}
 	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
 		o.log.Info("checkpoint policy resolved",
@@ -517,52 +823,25 @@ func (o *Orchestrator) resolveCheckpointPolicy(metadata map[string]string, actio
 }
 
 func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
-	sb, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
+	_, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
 	if err != nil {
 		return nil, err
 	}
-	if timeoutSec <= 0 {
-		if sb.State == types.StatePaused {
-			// A credential-only Connect remains non-blocking even when another
-			// caller already owns the asynchronous resume flight.
-			o.scheduleResume(id)
+	var requestedDeadline *int64
+	if timeoutSec > 0 {
+		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+		requestedDeadline = &deadline
+	}
+	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, func(current *types.Sandbox) error {
+		if !ownsSandbox(current, apiKey) {
+			return api.ErrNotFound
 		}
-		return sb, nil
-	}
-
-	unlock := o.lifecycle.Lock(id)
-	// Re-read under the per-sandbox lifecycle boundary: an asynchronous resume or
-	// delete may have completed since the initial existence/import decision.
-	if sb, err = o.st.Get(ctx, id); err != nil {
-		unlock()
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if !ownsSandbox(sb, apiKey) {
-		unlock()
-		return nil, api.ErrNotFound
-	}
-	requestedDeadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = requestedDeadline }); s != nil {
-		sb = s // cached: published a fresh snapshot with the new deadline
-	} else {
-		sb.DeadlineUnix = requestedDeadline // not cached (fresh, unpublished) — safe in place
-	}
-	if err := o.st.SetDeadline(ctx, id, requestedDeadline); err != nil {
-		unlock()
-		return nil, err
-	}
-	if sb.State == types.StatePaused {
-		o.markDeadlineIntent(id)
-	}
-	shouldResume := sb.State == types.StatePaused
-	unlock()
-	if shouldResume {
-		// Import and credential lookup are complete before this point. Resume is
-		// deliberately asynchronous, but still shares the per-sandbox flight with
-		// data-plane wakes and other Connect calls.
-		o.scheduleResume(id)
-	}
-	return sb, nil
+	return cloneSandbox(sb), nil
 }
 
 // prepareStandaloneTarget synchronously resolves, optionally imports, and
@@ -601,26 +880,129 @@ func (o *Orchestrator) prepareStandaloneTarget(ctx context.Context, id, apiKey, 
 	return sb, nil
 }
 
-func (o *Orchestrator) scheduleResume(id string) {
-	request := o.newResumeRequest(id)
-	go func() {
-		defer o.releaseResumeRequest(request)
-		ctx := o.asyncCtx()
-		if err := o.resumeSandboxRequest(ctx, request); err != nil {
-			o.log.Error("sandbox connect resume", "sid", id, "err", err)
-		}
-	}()
+func (o *Orchestrator) resumeDeadline(sb *types.Sandbox, requested *int64) int64 {
+	if requested != nil {
+		return *requested
+	}
+	if o.hasDeadlineIntent(sb.ID) {
+		return sb.DeadlineUnix
+	}
+	if o.cfg.Sandbox.TimeoutSec > 0 {
+		return time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
+	}
+	return sb.DeadlineUnix
 }
 
-func (o *Orchestrator) publishPausedAfterResumeFailure(ctx context.Context, id string) {
-	sb, err := o.st.Get(ctx, id)
+// ensureResumeAccepted is the single durable resume admission used by Connect,
+// Wake, native exec, KMT restore, and cluster commands. The caller supplies an
+// authorization/identity validator that is re-run under the lifecycle lock.
+func (o *Orchestrator) ensureResumeAccepted(
+	ctx context.Context,
+	sid string,
+	requestedDeadline *int64,
+	validate func(*types.Sandbox) error,
+) (*types.Sandbox, *launchAttempt, error) {
+	admissionStarted := time.Now()
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
+	sb, err := o.st.Get(ctx, sid)
 	if err != nil {
-		o.log.Error("sandbox connect reload after resume failure", "sid", id, "err", err)
-		return
+		return nil, nil, err
 	}
-	if sb != nil && sb.State == types.StatePaused {
-		o.cache(sb)
-		o.publishUpsert(sb)
+	if sb == nil {
+		return nil, nil, api.ErrNotFound
+	}
+	if validate != nil {
+		if err := validate(sb); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	switch sb.State {
+	case types.StateRunning:
+		if requestedDeadline != nil {
+			if err := o.st.SetDeadline(ctx, sid, *requestedDeadline); err != nil {
+				return nil, nil, err
+			}
+			sb.DeadlineUnix = *requestedDeadline
+			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+		}
+		return cloneSandbox(sb), nil, nil
+	case types.StateStarting:
+		if requestedDeadline != nil {
+			if err := o.st.SetDeadline(ctx, sid, *requestedDeadline); err != nil {
+				return nil, nil, err
+			}
+			sb.DeadlineUnix = *requestedDeadline
+			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+		}
+		attempt, found := o.launches.Lookup(sid)
+		if !found {
+			if requestedDeadline != nil && sb.SnapshotRef != "" {
+				o.markDeadlineIntent(sid)
+			}
+			o.log.Error("sandbox starting without active launch attempt", "sid", sid, "invariant", "starting_without_launch_owner")
+			return cloneSandbox(sb), nil, nil
+		}
+		if requestedDeadline != nil && attempt.Kind() == launchResume {
+			o.markDeadlineIntent(sid)
+		}
+		return cloneSandbox(sb), attempt, nil
+	case types.StatePaused:
+		// Stored metadata is trusted only after its pure parsers succeed. Do not
+		// make starting durable if the worker could never consume its inputs.
+		tmpl, err := types.ParseTemplateID(sb.TemplateID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := sandboxcfg.ParseSpec(sb.Metadata); err != nil {
+			return nil, nil, err
+		}
+		lifecycleCtx := o.launchContext()
+		if err := lifecycleCtx.Err(); err != nil {
+			return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		}
+		attempt, err := o.launches.Claim(lifecycleCtx, sid, launchResume)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := lifecycleCtx.Err(); err != nil {
+			o.launches.Finish(attempt, err)
+			return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+		}
+		deadline := o.resumeDeadline(sb, requestedDeadline)
+		changed, err := o.st.BeginResume(ctx, sid, deadline)
+		if err != nil {
+			o.launches.Finish(attempt, err)
+			return nil, nil, err
+		}
+		if !changed {
+			o.launches.Finish(attempt, errLaunchOwnershipLost)
+			return nil, nil, errLaunchOwnershipLost
+		}
+		if requestedDeadline != nil {
+			o.markDeadlineIntent(sid)
+		}
+		attempt.SetAcceptedAt(time.Now())
+		starting := cloneSandbox(sb)
+		starting.State = types.StateStarting
+		starting.DeadlineUnix = deadline
+		starting.RunID = ""
+		starting.FloatingIP = ""
+		starting.VswitchPort = ""
+		starting.InnerIP = ""
+		starting.PortMAC = ""
+		o.cache(starting)
+		o.publishUpsert(starting)
+		work := cloneSandbox(starting)
+		o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
+			return o.runLaunch(launchCtx, current, work, tmpl)
+		})
+		o.logLaunchPhase(attempt, starting, "admission_duration", time.Since(admissionStarted))
+		return cloneSandbox(starting), attempt, nil
+	default:
+		return nil, nil, api.ErrNotFound
 	}
 }
 
@@ -636,119 +1018,27 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		return false, nil
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	if cached := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline }); cached != nil {
-		sb = cached
-	} else {
-		sb.DeadlineUnix = deadline
-	}
 	if err := o.st.SetDeadline(ctx, id, deadline); err != nil {
 		return false, err
 	}
+	sb.DeadlineUnix = deadline
+	o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
 	if sb.State == types.StatePaused {
 		o.markDeadlineIntent(id)
+	} else if sb.State == types.StateStarting {
+		if attempt, found := o.launches.Lookup(id); (found && attempt.Kind() == launchResume) || (!found && sb.SnapshotRef != "") {
+			o.markDeadlineIntent(id)
+		}
 	}
 	return true, nil
 }
 
-// resume restarts a paused sandbox from its snapshot (no api_key needed: the
-// manifest key comes from the store via the config-socket).
-func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox, preserveDeadline bool) error {
-	tmpl, err := types.ParseTemplateID(sb.TemplateID)
-	if err != nil {
-		return err
-	}
-	// Operate on a private copy. launch sets the network fields and publishes via
-	// o.cache, swapping the cached pointer in one locked step — a published cache
-	// entry is never mutated in place, so concurrent readers (Route, MMDS lookups)
-	// always observe a consistent snapshot and there is no field-level data race.
-	nb := *sb
-	nb.State = types.StateStarting
-	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
-	// deadline is from before the pause (already passed), so without this the reaper
-	// would immediately re-suspend it.
-	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
-		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
-	}
-	if err := o.launch(ctx, &nb, tmpl); err != nil {
-		return errors.Join(err, o.rollbackFailedResume(sb, &nb))
-	}
-	if !preserveDeadline && o.cfg.Sandbox.TimeoutSec > 0 {
-		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
-	}
-	return nil
-}
-
-// rollbackFailedCreate retains a durable failed instance as dead, but only when
-// this exact attempted runner persisted the starting row. Failures before pool
-// assignment have no row and therefore no terminal record to transition.
-func (o *Orchestrator) rollbackFailedCreate(attempted *types.Sandbox) error {
-	if attempted == nil {
-		return nil
-	}
-	ctx := context.Background()
-	o.teardown(ctx, attempted)
-	if attempted.RunID == "" {
-		return nil
-	}
-	changed, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateStarting, types.StateDead)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		current, err := o.st.Get(ctx, attempted.ID)
-		if err != nil {
-			return err
-		}
-		if current == nil || current.RunID != attempted.RunID {
-			return nil // deleted or superseded: stale cleanup must not publish
-		}
-		if current.State != types.StateDead {
-			return fmt.Errorf("orch: rollback failed create %s: runner %s remains %s", attempted.ID, attempted.RunID, current.State)
-		}
-	}
-	attempted.State = types.StateDead
-	o.publishDelete(attempted.ID)
-	return nil
-}
-
-func (o *Orchestrator) rollbackFailedResume(original, attempted *types.Sandbox) error {
-	if attempted == nil {
-		return nil
-	}
-	ctx := context.Background()
-	o.teardown(ctx, attempted)
-	// launch persists the new runner from inside the pool assignment callback.
-	// Before that point the stored row is still the original paused record and
-	// needs no state rollback.
-	if original == nil || attempted.RunID == "" || attempted.RunID == original.RunID {
-		return nil
-	}
-	changed, err := o.st.CASRunState(ctx, attempted.ID, attempted.RunID, types.StateStarting, types.StatePaused)
-	if err != nil {
-		return err
-	}
-	if changed {
-		return nil
-	}
-	current, err := o.st.Get(ctx, attempted.ID)
-	if err != nil {
-		return err
-	}
-	if current != nil && current.State == types.StatePaused {
-		return nil // assignment persistence failed or another fenced cleanup won
-	}
-	if current == nil || current.RunID != attempted.RunID {
-		return nil // deleted or superseded: stale cleanup must not overwrite it
-	}
-	return fmt.Errorf("orch: rollback failed resume %s: runner %s remains %s", attempted.ID, attempted.RunID, current.State)
-}
-
 // --- proxy.Router (internal mode) ---
 
-// Route resolves a canonical target for the in-process proxy. A paused sandbox is
-// auto-resumed on the spot (single-flight: concurrent data-plane requests collapse
-// to one resume). The forwarding decision is shared with the external route table
-// via proxy.RouteForTarget.
+// Route resolves a canonical target for the in-process proxy. A paused sandbox
+// first joins the common launch owner; concurrent control/data/exec activations
+// therefore collapse to one resume. The forwarding decision is shared with the
+// external route table via proxy.RouteForTarget.
 func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy.ConnectTarget) (proxy.Route, error) {
 	sb := o.lookup(sandboxID)
 	if sb == nil {
@@ -772,14 +1062,28 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy
 	switch sb.State {
 	case types.StateRunning:
 		// Ready to route below.
-	case types.StatePaused, types.StateStarting:
-		// A starting resume joins the existing single-flight. A fresh create is
-		// not in that flight and remains non-routable until launch publishes
-		// running, so the state check after the join is authoritative.
-		if err := o.resumeSandbox(ctx, sandboxID); err != nil {
+	case types.StatePaused:
+		if _, _, err := o.ensureResumeAccepted(ctx, sandboxID, nil, nil); err != nil {
+			if errors.Is(err, api.ErrNotFound) {
+				return proxy.Route{Kind: proxy.KindNotFound}, nil
+			}
 			return proxy.Route{}, err
 		}
-		if sb = o.lookup(sandboxID); sb == nil || sb.State != types.StateRunning {
+		var err error
+		sb, err = o.waitLaunchState(ctx, sandboxID)
+		if err != nil {
+			return proxy.Route{}, err
+		}
+		if sb == nil || sb.State != types.StateRunning {
+			return proxy.Route{Kind: proxy.KindNotFound}, nil
+		}
+	case types.StateStarting:
+		var err error
+		sb, err = o.waitLaunchState(ctx, sandboxID)
+		if err != nil {
+			return proxy.Route{}, err
+		}
+		if sb == nil || sb.State != types.StateRunning {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
 	default:
@@ -791,26 +1095,26 @@ func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy
 	), nil
 }
 
-// resumeIfPaused (run under the per-sid single-flight and lifecycle lock) resumes
-// sid only if it is still paused — a loser of the race finds it already running.
-func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, preserveDeadline bool) error {
-	sb := o.lookup(sid)
-	if sb == nil {
-		s, _ := o.st.Get(ctx, sid)
-		if s == nil {
-			return nil
-		}
-		o.cache(s)
-		sb = s
+// waitLaunchState waits only for the already-accepted owner and then reloads the
+// durable record. Raw worker errors never become data-plane responses; the
+// authoritative terminal state decides route availability.
+func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.Sandbox, error) {
+	found, waitErr := o.launches.Wait(ctx, sid)
+	if waitErr != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	if sb.State != types.StatePaused {
-		return nil
+	current, err := o.st.Get(ctx, sid)
+	if err != nil {
+		return nil, err
 	}
-	if err := o.resume(ctx, sb, preserveDeadline); err != nil {
-		o.publishPausedAfterResumeFailure(context.WithoutCancel(ctx), sid)
-		return err
+	if !found && current != nil && current.State == types.StateStarting {
+		o.log.Error("sandbox starting without active launch attempt", "sid", sid, "invariant", "starting_without_launch_owner")
 	}
-	return nil
+	if current == nil || current.State != types.StateRunning {
+		return nil, nil
+	}
+	o.cache(current)
+	return cloneSandbox(current), nil
 }
 
 // snapInfo is the config the orchestrator inherits from a restore snapshot: the
@@ -1110,7 +1414,13 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
 		o.teardown(ctx, sb)
-		changed, err := o.st.CASRunState(ctx, sb.ID, sb.RunID, types.StateStarting, target)
+		var changed bool
+		if target == types.StatePaused {
+			changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, sb.RunID)
+		} else {
+			changed, err = o.st.RollbackStartingDead(ctx, sb.ID, sb.RunID)
+			_ = os.RemoveAll(sb.BaseDir)
+		}
 		if err != nil {
 			return err
 		}
@@ -1157,9 +1467,36 @@ func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
 
 // --- helpers ---
 
+func cloneSandbox(sb *types.Sandbox) *types.Sandbox {
+	if sb == nil {
+		return nil
+	}
+	nb := *sb
+	if sb.Cluster != nil {
+		cluster := *sb.Cluster
+		nb.Cluster = &cluster
+	}
+	if sb.Metadata != nil {
+		nb.Metadata = make(map[string]string, len(sb.Metadata))
+		for key, value := range sb.Metadata {
+			nb.Metadata[key] = value
+		}
+	}
+	if sb.Env != nil {
+		nb.Env = make(map[string]string, len(sb.Env))
+		for key, value := range sb.Env {
+			nb.Env[key] = value
+		}
+	}
+	return &nb
+}
+
 func (o *Orchestrator) cache(sb *types.Sandbox) {
+	if sb == nil {
+		return
+	}
 	o.mu.Lock()
-	o.reg[sb.ID] = sb
+	o.reg[sb.ID] = cloneSandbox(sb)
 	o.mu.Unlock()
 }
 func (o *Orchestrator) uncache(id string) {
@@ -1186,10 +1523,10 @@ func (o *Orchestrator) mutateCached(id string, fn func(*types.Sandbox)) *types.S
 	if cur == nil {
 		return nil
 	}
-	nb := *cur
-	fn(&nb)
-	o.reg[id] = &nb
-	return &nb
+	nb := cloneSandbox(cur)
+	fn(nb)
+	o.reg[id] = nb
+	return nb
 }
 
 // ByFloatingIP maps a guest's (SNAT'd) source floating IP to its starting/running

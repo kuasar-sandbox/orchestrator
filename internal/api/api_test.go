@@ -139,7 +139,7 @@ func TestCreateCheckpointHeaderOverlaysMetadataPerField(t *testing.T) {
 	var got CreateReq
 	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
 		got = req
-		return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+		return &types.Sandbox{ID: "created", Profile: types.ProfileBare, State: types.StateStarting}, nil
 	}}
 	handler, apiKey := newMigrationTestHandler(t, core)
 	body := `{"templateID":"bare:img:manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}`
@@ -151,6 +151,13 @@ func TestCreateCheckpointHeaderOverlaysMetadataPerField(t *testing.T) {
 	}
 	if got.Metadata[sandboxcfg.NsCheckpoint] != `{"merge_ref":false,"drop_caches":false}` {
 		t.Fatalf("merged checkpoint metadata = %+v", got.Metadata)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exposed := payload["state"]; exposed {
+		t.Fatalf("Create response exposed internal starting state: %+v", payload)
 	}
 }
 
@@ -261,6 +268,7 @@ func TestPauseRequestPolicyAndStatus(t *testing.T) {
 			want: sandboxcfg.CheckpointPolicy{DropCaches: boolPtr(false)}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "unknown body field remains accepted", body: `{"future":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "already paused", body: `{}`, coreErr: ErrAlreadyPaused, wantStatus: http.StatusConflict, wantCalls: 1},
+		{name: "starting", body: `{}`, coreErr: ErrSandboxStarting, wantStatus: http.StatusConflict, wantCalls: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
