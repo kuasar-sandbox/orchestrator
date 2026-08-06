@@ -103,32 +103,50 @@ func (o *Orchestrator) Subscribe() (<-chan routesync.Event, func()) {
 	return ch, cancel
 }
 
-// OnWake handles a proxy's Wake: resume a paused sandbox (single-flight) so the
-// resulting Upsert unparks the proxy's held request; for an unknown/dead sandbox,
-// push a Delete so the proxy stops waiting and returns 404 instead of timing out.
+// OnWake handles a proxy's Wake: a paused sandbox accepts the common launch
+// attempt so the resulting Upsert unparks the held request; for unknown/dead,
+// push Delete so the proxy returns 404 instead of timing out.
 func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
-	sb := o.lookup(sid)
-	if sb == nil {
-		sb, _ = o.st.Get(ctx, sid)
+	// Read and publish stable states under the same per-SID lifecycle fence used
+	// by Kill and launch terminal commits. Otherwise a stale cached starting
+	// entry could be re-announced after a concurrent Delete and strand a worker
+	// until its full park timeout.
+	unlock := o.lifecycle.Lock(sid)
+	sb, err := o.st.Get(ctx, sid)
+	if err != nil {
+		unlock()
+		o.log.Warn("wake lookup failed", "sid", sid, "err", err)
+		return
 	}
 	if sb == nil {
+		o.uncache(sid)
 		o.publishDelete(sid)
+		unlock()
 		return
 	}
 	switch sb.State {
 	case types.StateRunning:
+		o.cache(sb)
 		o.publishUpsert(sb) // already up; re-announce so the proxy unparks
+		unlock()
 	case types.StatePaused:
-		if err := o.resumeSandbox(ctx, sid); err != nil {
+		// ensureResumeAccepted performs its own authoritative re-read under this
+		// lifecycle lock, so release it before entering the common admission.
+		unlock()
+		if _, _, err := o.ensureResumeAccepted(ctx, sid, nil, nil); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
-			// stays paused; the proxy's park times out -> 404.
 		}
-		// resume() publishes the running upsert on success.
 	case types.StateStarting:
-		// The launch already in progress will publish running or its rollback
-		// state. A second Wake must not start another runner.
+		// Never claim or launch here. Re-announcing the authoritative starting
+		// entry closes a route-propagation race for a worker that woke from a
+		// previously missing view.
+		o.cache(sb)
+		o.publishUpsert(sb)
+		unlock()
 	default: // dead
+		o.uncache(sid)
 		o.publishDelete(sid)
+		unlock()
 	}
 }
 

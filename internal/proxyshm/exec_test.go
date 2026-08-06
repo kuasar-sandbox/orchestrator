@@ -46,7 +46,7 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 			t.Fatalf("LookupExec(%q) identity = %+v, want %+v", sid, got, want)
 		}
 	}
-	for _, sid := range []string{"dead", "missing-auth", "missing-secret", "unknown"} {
+	for _, sid := range []string{"dead", "missing-auth", "missing-secret"} {
 		got, found, err := view.LookupExec(context.Background(), sid)
 		if err != nil || found || got != (proxy.ExecIdentity{}) {
 			t.Fatalf("LookupExec(%q) = %+v, %v, %v, want absent", sid, got, found, err)
@@ -58,6 +58,123 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 	paused, ok := tbl.Lookup("paused")
 	if !ok || paused.State != routesync.StatePaused {
 		t.Fatalf("paused route changed during lookup: %+v ok=%v", paused, ok)
+	}
+}
+
+func TestWorkerLookupExecParksForInitialRouteWithoutWake(t *testing.T) {
+	tbl := newExecTable(t)
+	tbl.Bookmark()
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	sid := "initial-route"
+	go func() {
+		identity, found, err := view.LookupExec(context.Background(), sid)
+		done <- result{identity: identity, found: found, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("missing initial route returned before propagation: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	route := execWorkerRoute(sid, routesync.StateStarting)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		if got.err != nil || !got.found || got.identity != execWorkerIdentity(sid) {
+			t.Fatalf("LookupExec after starting propagation = %+v, %v, %v", got.identity, got.found, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LookupExec did not observe the initial starting route")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("identity propagation wait emitted %d wakes", got)
+	}
+}
+
+func TestWorkerLookupExecInitialRouteWaitIsCancelable(t *testing.T) {
+	tbl := newExecTable(t)
+	tbl.Bookmark()
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		identity, found, err := view.LookupExec(ctx, "cancel-initial-route")
+		done <- result{identity: identity, found: found, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("missing initial route returned before cancellation: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) || got.found || got.identity != (proxy.ExecIdentity{}) {
+			t.Fatalf("canceled LookupExec = %+v, %v, %v", got.identity, got.found, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LookupExec did not observe caller cancellation")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("canceled identity wait emitted %d wakes", got)
+	}
+}
+
+func TestWorkerLookupExecInitialDeleteEndsPromptly(t *testing.T) {
+	tbl := newExecTable(t)
+	tbl.Bookmark()
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	sid := "initial-delete"
+	go func() {
+		identity, found, err := view.LookupExec(context.Background(), sid)
+		done <- result{identity: identity, found: found, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("missing initial route returned before terminal update: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	tbl.Delete(sid)
+	updates.bump()
+	select {
+	case got := <-done:
+		if got.err != nil || got.found || got.identity != (proxy.ExecIdentity{}) {
+			t.Fatalf("LookupExec after Delete = %+v, %v, %v", got.identity, got.found, got.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("LookupExec consumed its park timeout after Delete")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("terminal identity wait emitted %d wakes", got)
 	}
 }
 
@@ -198,6 +315,29 @@ func TestWorkerActivateExecWakesPausedAndReturnsOnlyMatchingRunningIdentity(t *t
 		}
 	case <-time.After(time.Second):
 		t.Fatal("authorized paused activation did not wake sandbox")
+	}
+	_, _, beforeReplay := tbl.LookupRevision(route.SandboxID)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	if _, _, afterReplay := tbl.LookupRevision(route.SandboxID); afterReplay != beforeReplay {
+		t.Fatalf("identical paused replay advanced route revision: %d -> %d", beforeReplay, afterReplay)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("duplicate paused replay completed exec activation: %+v", got)
+	default:
+	}
+	route.State = routesync.StateStarting
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	updates.bump()
+	select {
+	case got := <-done:
+		t.Fatalf("activation returned at starting: %+v", got)
+	default:
 	}
 	route.State = routesync.StateRunning
 	if err := tbl.Upsert(route); err != nil {

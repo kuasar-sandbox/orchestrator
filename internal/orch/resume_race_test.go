@@ -162,7 +162,7 @@ func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec:
 
 // TestResumeRace_ConnectAndRouteSingleLaunch is the regression guard for the
 // control-plane resume race: an asynchronous /connect resume held inside its
-// flight and concurrent data-plane Route calls must still launch exactly once.
+// launch attempt and concurrent data-plane Route calls must still launch once.
 func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
@@ -211,17 +211,14 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	}
 
 	// Connect returns while its asynchronous resume is blocked in launcher.Start.
-	// That guarantees the Route calls below enter the same still-active flight.
+	// That guarantees the Route calls below join the same active attempt.
 	connected, err := o.Connect(ctx, sid, apiKey, "", 60)
-	if err != nil || connected == nil || connected.State != types.StatePaused {
-		t.Fatalf("Connect = %+v, %v; want paused result and async resume", connected, err)
+	if err != nil || connected == nil || connected.State != types.StateStarting {
+		t.Fatalf("Connect = %+v, %v; want durable starting result", connected, err)
 	}
 	waitForLauncherStart(t, started)
-	o.sf.mu.Lock()
-	activeFlight := o.sf.m[sid]
-	o.sf.mu.Unlock()
-	if activeFlight == nil {
-		t.Fatal("asynchronous Connect resume did not register an active flight")
+	if active, found := o.launches.Lookup(sid); !found || active.Kind() != launchResume {
+		t.Fatal("Connect resume did not retain an active launch attempt")
 	}
 
 	var wg sync.WaitGroup
@@ -234,9 +231,9 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 			errs <- err
 		}()
 	}
-	// Execute one Route in this goroutine while the Connect flight is known to
+	// Execute one Route in this goroutine while the Connect attempt is known to
 	// be active. The timer channel releases launcher.Start; until then Route must
-	// be waiting on that same flight rather than starting a second resume.
+	// be waiting on that same attempt rather than starting a second resume.
 	released := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseStart := func() {

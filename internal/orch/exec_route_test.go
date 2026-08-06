@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,5 +120,69 @@ func TestLookupExecTreatsDeadAndMissingSandboxesAsAbsent(t *testing.T) {
 	}
 	if identity, found, err := o.LookupExec(context.Background(), "missing"); err != nil || found || identity != (proxy.ExecIdentity{}) {
 		t.Fatalf("missing LookupExec = %+v, %v, %v", identity, found, err)
+	}
+}
+
+func TestStartingWithoutLaunchOwnerFailsClosed(t *testing.T) {
+	o := testOrch(t)
+	manifestKey := strings.Repeat("c", 64)
+	sb := &types.Sandbox{
+		ID: "ownerless-starting", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
+		State:      types.StateStarting, FloatingIP: "192.0.2.30",
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.InsertSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	route, err := o.Route(context.Background(), sb.ID, proxy.LegacyTarget(8080))
+	if err != nil || route.Kind != proxy.KindNotFound {
+		t.Fatalf("ownerless starting route = %+v, %v; want fail-closed not found", route, err)
+	}
+	identity := execIdentity(sb)
+	if got, found, err := o.ActivateExec(context.Background(), sb.ID, identity); err != nil || found || got != (proxy.ExecIdentity{}) {
+		t.Fatalf("ownerless starting exec = %+v, %v, %v; want absent", got, found, err)
+	}
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
+		t.Fatalf("ownerless starting was mutated or relaunched: %+v, %v", stored, err)
+	}
+	if _, found := o.launches.Lookup(sb.ID); found {
+		t.Fatal("ownerless starting acquired a launch attempt")
+	}
+}
+
+func TestStartingInternalRouteAndExecWaitHonorCallerCancellation(t *testing.T) {
+	o := testOrch(t)
+	manifestKey := strings.Repeat("e", 64)
+	sb := &types.Sandbox{
+		ID: "cancel-starting", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("f", 64)}.String(),
+		State:      types.StateStarting, FloatingIP: "192.0.2.31",
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.InsertSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	attempt, err := o.launches.Claim(context.Background(), sb.ID, launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { o.launches.Finish(attempt, context.Canceled) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if route, err := o.Route(ctx, sb.ID, proxy.LegacyTarget(8080)); !errors.Is(err, context.Canceled) || route != (proxy.Route{}) {
+		t.Fatalf("canceled starting route = %+v, %v", route, err)
+	}
+	if identity, found, err := o.ActivateExec(ctx, sb.ID, execIdentity(sb)); !errors.Is(err, context.Canceled) || found || identity != (proxy.ExecIdentity{}) {
+		t.Fatalf("canceled starting exec = %+v, %v, %v", identity, found, err)
 	}
 }

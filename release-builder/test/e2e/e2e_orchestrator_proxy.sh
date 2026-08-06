@@ -10,7 +10,8 @@
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
 #         # workers run in PROXY_NETNS, and mmds_listen is bound there
-#   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
+#   POST /sandboxes  -> durable starting acceptance; immediate ordinary and exec
+#                       requests park across route propagation, runner boot and init
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
@@ -75,11 +76,13 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 PROXY_SOCK="$WORK/run/proxy.sock"
 declare -a PIDS=()
 declare -a TAGS=()
+IMMEDIATE_EXEC_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    [ -n "$IMMEDIATE_EXEC_PID" ] && kill "$IMMEDIATE_EXEC_PID" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
@@ -202,6 +205,7 @@ PY
 exec_through_proxy_connect() {
     local sid="$1" token="$2" marker="$3"
     local retries="${4:-1}"
+    local timeout_seconds="${5:-60}"
     local input="$WORK/native-exec.stdin"
     local output="$WORK/native-exec.stdout"
     local error_output="$WORK/native-exec.stderr"
@@ -211,7 +215,7 @@ exec_through_proxy_connect() {
     printf 'stdin:%s\n' "$marker" >"$input"
     for attempt in $(seq 1 "$retries"); do
         : >"$output"; : >"$error_output"; : >"$diagnostics"
-        if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        if timeout -k 5s "$timeout_seconds" "$BIN/sandbox-ctl" exec \
             --proxy "http://127.0.0.1:$PROXY_PORT" \
             --proxy-header "E2b-Sandbox-Id: $sid" \
             --proxy-header "E2b-Sandbox-Service: exec" \
@@ -347,7 +351,7 @@ truncate -s 2G "$BLD"
 # ---- orchestrator config: proxy_mode=external -----------------------------
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: external, auth: enforce, park_timeout: 2s }
+proxy: { mode: external, auth: enforce, park_timeout: 120s }
 mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
@@ -393,7 +397,7 @@ shm_path: $WORK/run/proxy-routes.shm
 route_capacity: 1024
 workers: 2
 auth: enforce
-park_timeout: 2s
+park_timeout: 120s
 mmds_listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
@@ -440,7 +444,25 @@ FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
     || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID running (envd and forward tokens captured; no default exec token)"
+echo "==> PASS: sandbox $SID durably accepted (tokens captured; no default exec token)"
+echo "==> issue native exec capability immediately and park its external CONNECT from starting"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue immediate native exec capability"
+rm -f "$WORK/exec-session.secret"
+IMMEDIATE_NATIVE_MARK="EXTERNAL_PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
+(
+    exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$IMMEDIATE_NATIVE_MARK" 1 130
+) &
+IMMEDIATE_EXEC_PID=$!
+echo "==> request envd immediately through external proxy; missing/starting must park to running"
+code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; dump_logs; fail "immediate external proxy request=$code"; }
+echo "==> PASS: external proxy parked post-Create request through starting to running (code=$code)"
+immediate_exec_status=0
+wait "$IMMEDIATE_EXEC_PID" || immediate_exec_status=$?
+IMMEDIATE_EXEC_PID=""
+[ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate external native exec did not park to running"; }
+echo "==> PASS: external native exec parked post-Create CONNECT through route propagation and starting"
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
@@ -583,9 +605,7 @@ else
 fi
 
 # ---- (4) native exec capability THROUGH the external proxy ----------------
-echo "==> issue an explicit native exec capability through the direct control API"
-EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capability"
-rm -f "$WORK/exec-session.secret"
+echo "==> reuse the explicit native exec capability after the sandbox is running"
 NATIVE_MARK="EXTERNAL_PROXY_NATIVE_EXEC_$RANDOM"
 exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
 echo "==> PASS: real sandbox-ctl CONNECT through the external proxy verified stdin/stdout/stderr and exit status"

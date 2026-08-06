@@ -139,7 +139,7 @@ func TestLaunchBindsBeforeAssignmentAndBareWaitsForRuntime(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- o.launch(ctx, sb, tmpl) }()
+	go func() { done <- runFreshLaunchForTest(t, o, ctx, sb, tmpl) }()
 	select {
 	case sid := <-assigned:
 		if sid != sb.ID {
@@ -186,7 +186,7 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	defer cancelEvents()
 
 	done := make(chan error, 1)
-	go func() { done <- o.launch(ctx, sb, tmpl) }()
+	go func() { done <- runFreshLaunchForTest(t, o, ctx, sb, tmpl) }()
 	select {
 	case <-assigned:
 	case <-time.After(2 * time.Second):
@@ -224,7 +224,7 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 		t.Fatalf("unexpected envd request after successful /init: %s", req)
 	default:
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StateRunning} {
+	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StateRunning} {
 		select {
 		case event := <-events:
 			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
@@ -258,7 +258,7 @@ func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
 	}))
 
 	started := time.Now()
-	err := o.launch(ctx, sb, tmpl)
+	err := runFreshLaunchForTest(t, o, ctx, sb, tmpl)
 	elapsed := time.Since(started)
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
 		t.Fatalf("launch error = %v, want mandatory envd /init deadline failure", err)
@@ -280,7 +280,7 @@ func TestE2BRuntimeAndInitShareLaunchDeadline(t *testing.T) {
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileE2B, "shared-deadline")
 
 	started := time.Now()
-	err := o.launch(ctx, sb, tmpl)
+	err := runFreshLaunchForTest(t, o, ctx, sb, tmpl)
 	elapsed := time.Since(started)
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "envd /init") {
 		t.Fatalf("launch error = %v, want envd /init deadline failure", err)
@@ -450,12 +450,9 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	launchErr := o.launch(ctx, sb, tmpl)
+	launchErr := runFreshLaunchForTest(t, o, ctx, sb, tmpl)
 	if launchErr == nil || !strings.Contains(launchErr.Error(), "status 500") {
 		t.Fatalf("launch error = %v, want envd /init failure", launchErr)
-	}
-	if err := o.rollbackFailedCreate(sb); err != nil {
-		t.Fatalf("rollback failed create: %v", err)
 	}
 	stored, err := o.st.Get(ctx, sb.ID)
 	if err != nil || stored == nil || stored.State != types.StateDead {
@@ -464,21 +461,19 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	if lc.stops.Load() == 0 {
 		t.Fatal("failed create did not stop its runner")
 	}
-	select {
-	case event := <-events:
-		if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
-			t.Fatalf("first failed-create event = %+v, want starting", event)
+	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
+		select {
+		case event := <-events:
+			if want == routesync.TypeDelete {
+				if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
+					t.Fatalf("terminal failed-create event = %+v, want delete", event)
+				}
+			} else if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+				t.Fatalf("failed-create event = %+v, want upsert %s", event, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("failed create did not publish %s", want)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("failed create did not publish starting")
-	}
-	select {
-	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
-			t.Fatalf("terminal failed-create event = %+v, want delete", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("failed create did not publish delete")
 	}
 	var ranged []string
 	if err := o.Range(ctx, func(route routesync.RouteEntry) error {
@@ -492,22 +487,19 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	}
 }
 
-func TestFailedCreateBeforeAssignmentDoesNotInsertDead(t *testing.T) {
+func TestFailedCreateBeforeAssignmentRollsBackToDead(t *testing.T) {
 	lc := &countingLauncher{}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.Bare.InnerIP = "invalid"
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	sb, tmpl := launchTestSandbox(t, cfg, types.ProfileBare, "pre-assignment-failure")
 
-	if err := o.launch(ctx, sb, tmpl); err == nil {
+	if err := runFreshLaunchForTest(t, o, ctx, sb, tmpl); err == nil {
 		t.Fatal("launch with invalid network succeeded")
 	}
-	if err := o.rollbackFailedCreate(sb); err != nil {
-		t.Fatal(err)
-	}
 	stored, err := o.st.Get(ctx, sb.ID)
-	if err != nil || stored != nil {
-		t.Fatalf("pre-assignment failure persisted sandbox = %+v, %v", stored, err)
+	if err != nil || stored == nil || stored.State != types.StateDead || stored.RunID != "" {
+		t.Fatalf("pre-assignment failure = %+v, %v; want unassigned dead", stored, err)
 	}
 }
 
@@ -521,7 +513,10 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := o.resume(ctx, sb, false)
+	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	if err == nil {
+		err = attempt.wait(ctx)
+	}
 	if err == nil || !strings.Contains(err.Error(), "runtime readiness protocol") {
 		t.Fatalf("resume error = %v", err)
 	}
@@ -556,7 +551,10 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	err := o.resumeIfPaused(ctx, sb.ID, false)
+	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	if err == nil {
+		err = attempt.wait(ctx)
+	}
 	if err == nil || !strings.Contains(err.Error(), "envd /init") || !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("resume error = %v, want mandatory envd /init failure", err)
 	}
@@ -570,7 +568,7 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("non-204 envd /init attempts = %d, want 1", got)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StatePaused} {
+	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StatePaused} {
 		select {
 		case event := <-events:
 			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
@@ -585,6 +583,15 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 		t.Fatalf("failed resume published an extra route event: %+v", event)
 	default:
 	}
+}
+
+func runFreshLaunchForTest(t *testing.T, o *Orchestrator, ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
+	t.Helper()
+	_, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	if err != nil {
+		return err
+	}
+	return attempt.wait(ctx)
 }
 
 func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, sid string) (*types.Sandbox, types.TemplateID) {

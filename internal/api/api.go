@@ -134,6 +134,10 @@ func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]s
 // ErrAlreadyPaused is returned by Core.Pause when the sandbox is already paused.
 var ErrAlreadyPaused = errors.New("already paused")
 
+// ErrSandboxStarting is returned when an operation such as Pause cannot run
+// until the accepted asynchronous launch reaches a terminal state.
+var ErrSandboxStarting = errors.New("sandbox starting")
+
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
@@ -232,7 +236,7 @@ type Core interface {
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
 	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error)
-	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrNotFound
+	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 
 	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
@@ -519,6 +523,8 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, ErrAlreadyPaused):
 		w.WriteHeader(409)
+	case errors.Is(err, ErrSandboxStarting):
+		writeErr(w, http.StatusConflict, ErrSandboxStarting.Error())
 	case err != nil:
 		a.fail(w, err)
 	default:

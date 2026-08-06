@@ -3,7 +3,11 @@ package proxyshm
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
+	"math/rand"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,6 +50,7 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	if !ok || got != entry {
 		t.Fatalf("lookup = %+v ok=%v", got, ok)
 	}
+	_, _, liveRev := worker.LookupRevision("s1")
 	idx, ok := master.findSlot("s1", false)
 	if !ok {
 		t.Fatal("route slot not found before delete")
@@ -56,15 +61,285 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	if _, ok := worker.Lookup("s1"); ok {
 		t.Fatal("worker still sees deleted route")
 	}
+	if deleted, found, rev := worker.LookupRevision("s1"); found || deleted != (routesync.RouteEntry{}) || rev <= liveRev {
+		t.Fatalf("deleted lookup = %+v found=%v rev=%d, live rev=%d", deleted, found, rev, liveRev)
+	}
 	deleted, status, ok := readRecord(&master.records[idx])
-	if !ok || status != statusDeleted {
+	if !ok || status != statusEmpty {
 		t.Fatalf("deleted record status=%d ok=%v", status, ok)
 	}
-	if deleted.AuthSandboxID != "" || deleted.APISecret != "" || deleted.APISecretFingerprint != "" ||
+	if deleted.SandboxID != "" || deleted.AuthSandboxID != "" || deleted.APISecret != "" || deleted.APISecretFingerprint != "" ||
 		deleted.ManifestKeyFingerprint != "" || deleted.ServiceSecret != "" ||
 		deleted.EnvdAccessToken != "" || deleted.TrafficAccessToken != "" ||
 		deleted.ForwardAccessToken != "" || deleted.MmdsSecret != "" {
 		t.Fatalf("deleted record retained credential material: %+v", deleted)
+	}
+}
+
+func TestTableLookupRevisionTracksLiveAndDeletedSnapshots(t *testing.T) {
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	route := routesync.RouteEntry{SandboxID: "revision-snapshot", State: routesync.StatePaused}
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	paused, found, pausedRev := tbl.LookupRevision(route.SandboxID)
+	if !found || paused.State != routesync.StatePaused || pausedRev == 0 {
+		t.Fatalf("paused snapshot = %+v, found=%v rev=%d", paused, found, pausedRev)
+	}
+
+	route.State = routesync.StateStarting
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	starting, found, startingRev := tbl.LookupRevision(route.SandboxID)
+	if !found || starting.State != routesync.StateStarting || startingRev <= pausedRev {
+		t.Fatalf("starting snapshot = %+v, found=%v rev=%d; paused rev=%d", starting, found, startingRev, pausedRev)
+	}
+	if got := tbl.RouteRev(route.SandboxID); got != startingRev {
+		t.Fatalf("RouteRev = %d, want atomic lookup rev %d", got, startingRev)
+	}
+
+	if !tbl.Delete(route.SandboxID) {
+		t.Fatal("delete returned false")
+	}
+	deleted, found, deletedRev := tbl.LookupRevision(route.SandboxID)
+	if found || deleted != (routesync.RouteEntry{}) || deletedRev <= startingRev {
+		t.Fatalf("deleted snapshot = %+v, found=%v rev=%d; starting rev=%d", deleted, found, deletedRev, startingRev)
+	}
+
+	route.State = routesync.StateRunning
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	running, found, runningRev := tbl.LookupRevision(route.SandboxID)
+	if !found || running.State != routesync.StateRunning || runningRev <= deletedRev {
+		t.Fatalf("running snapshot = %+v, found=%v rev=%d; deleted rev=%d", running, found, runningRev, deletedRev)
+	}
+}
+
+func TestTableIdenticalUpsertKeepsLifecycleRevision(t *testing.T) {
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	route := routesync.RouteEntry{SandboxID: "duplicate-paused", State: routesync.StatePaused}
+	tbl.BeginSync()
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	_, found, routeRev := tbl.LookupRevision(route.SandboxID)
+	if !found || routeRev == 0 {
+		t.Fatalf("initial route found=%v rev=%d", found, routeRev)
+	}
+	globalRev := tbl.Rev()
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, got := tbl.LookupRevision(route.SandboxID); !found || got != routeRev || tbl.Rev() != globalRev {
+		t.Fatalf("same-generation replay found=%v route_rev=%d global_rev=%d; want %d/%d",
+			found, got, tbl.Rev(), routeRev, globalRev)
+	}
+
+	// An identical route in a new Range generation must refresh SyncGen so the
+	// Bookmark retains it, but that replay still is not a lifecycle transition.
+	tbl.BeginSync()
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, got := tbl.LookupRevision(route.SandboxID); !found || got != routeRev || tbl.Rev() != globalRev {
+		t.Fatalf("new-generation replay found=%v route_rev=%d global_rev=%d; want %d/%d",
+			found, got, tbl.Rev(), routeRev, globalRev)
+	}
+	tbl.Bookmark()
+	if got, found := tbl.Lookup(route.SandboxID); !found || got != route {
+		t.Fatalf("identical replay was swept at Bookmark: %+v found=%v", got, found)
+	}
+}
+
+func TestTableDeleteBackshiftPreservesCollidingRoutes(t *testing.T) {
+	const capacity = 16
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	byHome := make(map[uint64][]string)
+	var colliding []string
+	for i := 0; len(colliding) < 6; i++ {
+		sid := fmt.Sprintf("collision-%d", i)
+		home := hashSID(sid) % capacity
+		byHome[home] = append(byHome[home], sid)
+		if len(byHome[home]) == 6 {
+			colliding = byHome[home]
+		}
+	}
+	for _, sid := range colliding {
+		if err := tbl.Upsert(routesync.RouteEntry{SandboxID: sid, State: routesync.StateRunning}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deletedSID := colliding[2]
+	if !tbl.Delete(deletedSID) {
+		t.Fatal("delete returned false")
+	}
+	if _, found := tbl.Lookup(deletedSID); found {
+		t.Fatalf("deleted colliding route %q remains live", deletedSID)
+	}
+	for _, sid := range append(colliding[:2], colliding[3:]...) {
+		if got, found := tbl.Lookup(sid); !found || got.SandboxID != sid {
+			t.Fatalf("colliding route %q lost after backshift: %+v found=%v", sid, got, found)
+		}
+	}
+}
+
+func TestTableDeleteChurnLeavesLiveProbeTableReclaimable(t *testing.T) {
+	const capacity = 16
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	for i := 0; i < 1000; i++ {
+		sid := fmt.Sprintf("churn-%d", i)
+		if err := tbl.Upsert(routesync.RouteEntry{SandboxID: sid, State: routesync.StateStarting}); err != nil {
+			t.Fatalf("upsert %d: %v", i, err)
+		}
+		if !tbl.Delete(sid) {
+			t.Fatalf("delete %d returned false", i)
+		}
+		// Unknown-Wake terminal correlation also stays entirely outside the live
+		// probe table, even under valid-length random-SID churn.
+		tbl.Delete(fmt.Sprintf("unknown-%d", i))
+	}
+	for i := range tbl.records {
+		if status := atomic.LoadUint32(&tbl.records[i].Status); status != statusEmpty {
+			t.Fatalf("live record %d retained status %d after churn", i, status)
+		}
+	}
+	if len(tbl.terminals) != capacity {
+		t.Fatalf("terminal cache capacity = %d, want bounded %d", len(tbl.terminals), capacity)
+	}
+	if got := terminalCapacity(defaultCapacity); got != maxTerminalRevisions {
+		t.Fatalf("default terminal cache capacity = %d, want bounded %d", got, maxTerminalRevisions)
+	}
+}
+
+func TestTableBackshiftMatchesMapUnderRandomChurn(t *testing.T) {
+	const capacity = 17
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	rng := rand.New(rand.NewSource(135))
+	want := make(map[string]routesync.RouteEntry)
+	allSIDs := make([]string, capacity*4)
+	for i := range allSIDs {
+		allSIDs[i] = fmt.Sprintf("model-%d", i)
+	}
+	for step := 0; step < 10000; step++ {
+		sid := allSIDs[rng.Intn(len(allSIDs))]
+		if _, found := want[sid]; found || len(want) == capacity || rng.Intn(3) == 0 {
+			tbl.Delete(sid)
+			delete(want, sid)
+		} else {
+			route := routesync.RouteEntry{
+				SandboxID: sid,
+				State:     []string{routesync.StateStarting, routesync.StateRunning, routesync.StatePaused}[step%3],
+				Profile:   fmt.Sprintf("p-%d", step),
+			}
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatalf("step %d upsert %q with %d live routes: %v", step, sid, len(want), err)
+			}
+			want[sid] = route
+		}
+		for _, probe := range allSIDs {
+			got, found := tbl.Lookup(probe)
+			expected, expectedFound := want[probe]
+			if found != expectedFound || found && got != expected {
+				t.Fatalf("step %d lookup %q = %+v found=%v, want %+v found=%v",
+					step, probe, got, found, expected, expectedFound)
+			}
+		}
+	}
+}
+
+func TestTableLookupRevisionNeverMixesConcurrentRouteAndRevision(t *testing.T) {
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	const sid = "revision-race"
+	firstWritten := make(chan struct{})
+	continueWriter := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		route := routesync.RouteEntry{SandboxID: sid, State: routesync.StateStarting}
+		for i := 0; i < 5000; i++ {
+			nextRev := tbl.Rev() + 1
+			route.TemplateID = strconv.FormatUint(nextRev, 10)
+			if i%2 == 0 {
+				route.State = routesync.StateStarting
+			} else {
+				route.State = routesync.StateRunning
+			}
+			if err := tbl.Upsert(route); err != nil {
+				done <- err
+				return
+			}
+			if i == 0 {
+				close(firstWritten)
+				<-continueWriter
+			}
+			runtime.Gosched()
+		}
+		done <- nil
+	}()
+	select {
+	case <-firstWritten:
+	case err := <-done:
+		t.Fatalf("first route write: %v", err)
+	}
+	firstRoute, found, firstRev := tbl.LookupRevision(sid)
+	close(continueWriter)
+	if !found || firstRoute.TemplateID != strconv.FormatUint(firstRev, 10) {
+		writerErr := <-done
+		if writerErr != nil {
+			t.Fatal(writerErr)
+		}
+		t.Fatalf("invalid first route/revision snapshot: route=%+v found=%v rev=%d", firstRoute, found, firstRev)
+	}
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		route, found, rev := tbl.LookupRevision(sid)
+		if found && route.TemplateID != strconv.FormatUint(rev, 10) {
+			writerErr := <-done
+			if writerErr != nil {
+				t.Fatal(writerErr)
+			}
+			t.Fatalf("mixed route/revision snapshot: route=%+v rev=%d", route, rev)
+		}
+		runtime.Gosched()
 	}
 }
 
@@ -217,6 +492,115 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not unpark")
+	}
+}
+
+func TestWorkerMissingAndPausedTransitionsThroughStarting(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		initialPaused  bool
+		directTerminal bool
+		terminal       string
+		wantRunning    bool
+	}{
+		{name: "missing to running", terminal: routesync.StateRunning, wantRunning: true},
+		{name: "missing to paused rollback", terminal: routesync.StatePaused},
+		{name: "missing to delete", terminal: routesync.TypeDelete},
+		{name: "missing direct delete", directTerminal: true, terminal: routesync.TypeDelete},
+		{name: "paused to running", initialPaused: true, terminal: routesync.StateRunning, wantRunning: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "routes.shm")
+			tbl, err := Create(path, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			updates := &Updates{ch: make(chan struct{})}
+			var wakes atomic.Int32
+			wakeSeen := make(chan struct{}, 1)
+			worker := NewWorkerView(tbl, updates, func(string) {
+				wakes.Add(1)
+				select {
+				case wakeSeen <- struct{}{}:
+				default:
+				}
+			}, 5*time.Second)
+			route := routesync.RouteEntry{
+				SandboxID: "transition", Profile: "e2b", State: routesync.StatePaused,
+				EnvdUDS: "/run/transition/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
+			}
+			tbl.BeginSync()
+			if tc.initialPaused {
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tbl.Bookmark()
+
+			done := make(chan proxy.Route, 1)
+			go func() {
+				got, _ := worker.Route(context.Background(), route.SandboxID, proxy.LegacyTarget(49983))
+				done <- got
+			}()
+			select {
+			case <-wakeSeen:
+			case <-time.After(time.Second):
+				t.Fatal("initial missing/paused route did not emit Wake")
+			}
+			if tc.initialPaused {
+				_, _, beforeReplay := tbl.LookupRevision(route.SandboxID)
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+				updates.bump()
+				if _, _, afterReplay := tbl.LookupRevision(route.SandboxID); afterReplay != beforeReplay {
+					t.Fatalf("identical paused replay advanced route revision: %d -> %d", beforeReplay, afterReplay)
+				}
+				select {
+				case got := <-done:
+					t.Fatalf("duplicate paused replay completed Wake: %+v", got)
+				default:
+				}
+			}
+			if !tc.directTerminal {
+				route.State = routesync.StateStarting
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+				updates.bump()
+				select {
+				case got := <-done:
+					t.Fatalf("route returned at starting: %+v", got)
+				default:
+				}
+			}
+
+			if tc.terminal == routesync.TypeDelete {
+				tbl.Delete(route.SandboxID)
+			} else {
+				route.State = tc.terminal
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			updates.bump()
+			select {
+			case got := <-done:
+				if tc.wantRunning {
+					if got.Kind != proxy.KindUDS || got.UDS != route.EnvdUDS {
+						t.Fatalf("running route = %+v", got)
+					}
+				} else if got.Kind != proxy.KindNotFound {
+					t.Fatalf("rollback route = %+v, want not found", got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("terminal update consumed the full park timeout")
+			}
+			if got := wakes.Load(); got != 1 {
+				t.Fatalf("transition emitted %d Wake calls, want exactly 1", got)
+			}
+		})
 	}
 }
 

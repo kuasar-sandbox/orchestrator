@@ -42,7 +42,6 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if !ownsSandbox(sb, apiKey) {
 		return "", api.ErrNotFound
 	}
-	o.cancelResumeRequests(sid)
 	if sb.State != types.StatePaused || sb.SnapshotRef == "" {
 		return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 	}

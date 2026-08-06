@@ -21,17 +21,21 @@ type runPool struct {
 	unitName    func(string) string
 	log         *slog.Logger
 
-	consumeCh   chan *runConsumeReq
-	waitCh      chan *runWaitReq
-	startDoneCh chan runStartDone
-	controlCh   chan runControlReq
+	consumeCh       chan *runConsumeReq
+	waitCh          chan *runWaitReq
+	startDoneCh     chan runStartDone
+	controlCh       chan runControlReq
+	consumeCancelCh chan *runConsumeReq
+	waitCancelCh    chan *runWaitReq
+	done            chan struct{}
 }
 
 type runConsumeReq struct {
-	taskID string
-	ctx    context.Context
-	commit func(runID string) error
-	resp   chan runConsumeResp
+	taskID     string
+	ctx        context.Context
+	commit     func(runID string) error
+	resp       chan runConsumeResp
+	stopCancel func() bool
 }
 
 type runConsumeResp struct {
@@ -40,9 +44,10 @@ type runConsumeResp struct {
 }
 
 type runWaitReq struct {
-	runID string
-	ctx   context.Context
-	resp  chan runWaitResp
+	runID      string
+	ctx        context.Context
+	resp       chan runWaitResp
+	stopCancel func() bool
 }
 
 type runWaitResp struct {
@@ -63,17 +68,19 @@ type runControlReq struct {
 
 type idleRun struct {
 	runID string
-	ctx   context.Context
-	resp  chan runWaitResp
+	req   *runWaitReq
 }
 
 func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string, lc launcher.Launcher, unitName func(string) string, log *slog.Logger) *runPool {
 	return &runPool{
 		kind: kind, size: size, waitTimeout: waitTimeout, runRoot: runRoot, lc: lc, unitName: unitName, log: log,
-		consumeCh:   make(chan *runConsumeReq),
-		waitCh:      make(chan *runWaitReq),
-		startDoneCh: make(chan runStartDone),
-		controlCh:   make(chan runControlReq),
+		consumeCh:       make(chan *runConsumeReq),
+		waitCh:          make(chan *runWaitReq),
+		startDoneCh:     make(chan runStartDone),
+		controlCh:       make(chan runControlReq),
+		consumeCancelCh: make(chan *runConsumeReq, 128),
+		waitCancelCh:    make(chan *runWaitReq, 128),
+		done:            make(chan struct{}),
 	}
 }
 
@@ -91,36 +98,41 @@ func (p *runPool) Start(ctx context.Context) error {
 }
 
 func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID string) error) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	req := &runConsumeReq{taskID: taskID, ctx: ctx, commit: commit, resp: make(chan runConsumeResp, 1)}
 	select {
 	case p.consumeCh <- req:
 	case <-ctx.Done():
 		return "", ctx.Err()
+	case <-p.done:
+		return "", fmt.Errorf("run pool: stopped")
 	}
-	select {
-	case res := <-req.resp:
-		return res.runID, res.err
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
+	// Once enqueued, the pool loop is the sole arbiter. In particular, caller
+	// cancellation cannot turn a successfully committed handoff into an error.
+	res := <-req.resp
+	return res.runID, res.err
 }
 
 func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	req := &runWaitReq{runID: runID, ctx: ctx, resp: make(chan runWaitResp, 1)}
 	select {
 	case p.waitCh <- req:
 	case <-ctx.Done():
 		return "", false, ctx.Err()
+	case <-p.done:
+		return "", false, fmt.Errorf("run pool: stopped")
 	}
-	select {
-	case res := <-req.resp:
-		return res.taskID, res.ok, res.err
-	case <-ctx.Done():
-		return "", false, ctx.Err()
-	}
+	res := <-req.resp
+	return res.taskID, res.ok, res.err
 }
 
 func (p *runPool) loop(ctx context.Context) {
+	defer close(p.done)
 	type startingRun struct {
 		started time.Time
 	}
@@ -136,6 +148,18 @@ func (p *runPool) loop(ctx context.Context) {
 			return
 		}
 		startControls = append(startControls, req)
+	}
+	replyConsume := func(req *runConsumeReq, resp runConsumeResp) {
+		if req.stopCancel != nil {
+			req.stopCancel()
+		}
+		req.resp <- resp
+	}
+	replyWait := func(req *runWaitReq, resp runWaitResp) {
+		if req.stopCancel != nil {
+			req.stopCancel()
+		}
+		req.resp <- resp
 	}
 
 	ensure := func() {
@@ -162,9 +186,10 @@ func (p *runPool) loop(ctx context.Context) {
 			queueControl(runControlReq{op: "stop", runID: runID})
 		}
 		idle = slices.DeleteFunc(idle, func(w idleRun) bool {
-			if w.ctx.Err() == nil {
+			if w.req.ctx.Err() == nil {
 				return false
 			}
+			replyWait(w.req, runWaitResp{err: w.req.ctx.Err()})
 			queueControl(runControlReq{op: "stop", runID: w.runID})
 			return true
 		})
@@ -172,7 +197,7 @@ func (p *runPool) loop(ctx context.Context) {
 			if req.ctx.Err() == nil {
 				return false
 			}
-			req.resp <- runConsumeResp{err: req.ctx.Err()}
+			replyConsume(req, runConsumeResp{err: req.ctx.Err()})
 			return true
 		})
 	}
@@ -181,7 +206,8 @@ func (p *runPool) loop(ctx context.Context) {
 		for len(idle) > 0 && len(pending) > 0 {
 			w := idle[0]
 			idle = idle[1:]
-			if w.ctx.Err() != nil {
+			if w.req.ctx.Err() != nil {
+				replyWait(w.req, runWaitResp{err: w.req.ctx.Err()})
 				queueControl(runControlReq{op: "stop", runID: w.runID})
 				continue
 			}
@@ -192,20 +218,25 @@ func (p *runPool) loop(ctx context.Context) {
 				if req.ctx.Err() == nil {
 					break
 				}
-				req.resp <- runConsumeResp{err: req.ctx.Err()}
+				replyConsume(req, runConsumeResp{err: req.ctx.Err()})
 				req = nil
 			}
 			if req == nil {
 				idle = append([]idleRun{w}, idle...)
 				return
 			}
-			if err := req.commit(w.runID); err != nil {
-				req.resp <- runConsumeResp{err: err}
+			if err := req.ctx.Err(); err != nil {
+				replyConsume(req, runConsumeResp{err: err})
 				idle = append([]idleRun{w}, idle...)
 				continue
 			}
-			w.resp <- runWaitResp{taskID: req.taskID, ok: true}
-			req.resp <- runConsumeResp{runID: w.runID}
+			if err := req.commit(w.runID); err != nil {
+				replyConsume(req, runConsumeResp{err: err})
+				idle = append([]idleRun{w}, idle...)
+				continue
+			}
+			replyWait(w.req, runWaitResp{taskID: req.taskID, ok: true})
+			replyConsume(req, runConsumeResp{runID: w.runID})
 		}
 	}
 
@@ -213,7 +244,7 @@ func (p *runPool) loop(ctx context.Context) {
 		for len(idle) > p.size {
 			w := idle[len(idle)-1]
 			idle = idle[:len(idle)-1]
-			w.resp <- runWaitResp{err: fmt.Errorf("run pool: idle capacity retired")}
+			replyWait(w.req, runWaitResp{err: fmt.Errorf("run pool: idle capacity retired")})
 			queueControl(runControlReq{op: "stop", runID: w.runID})
 		}
 	}
@@ -238,10 +269,10 @@ func (p *runPool) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			for _, w := range idle {
-				w.resp <- runWaitResp{err: ctx.Err()}
+				replyWait(w.req, runWaitResp{err: ctx.Err()})
 			}
 			for _, req := range pending {
-				req.resp <- runConsumeResp{err: ctx.Err()}
+				replyConsume(req, runConsumeResp{err: ctx.Err()})
 			}
 			return
 		case controlOut <- control:
@@ -255,8 +286,14 @@ func (p *runPool) loop(ctx context.Context) {
 				starting[control.runID] = st
 			}
 		case req := <-p.consumeCh:
+			req.stopCancel = context.AfterFunc(req.ctx, func() {
+				select {
+				case p.consumeCancelCh <- req:
+				case <-p.done:
+				}
+			})
 			if req.ctx.Err() != nil {
-				req.resp <- runConsumeResp{err: req.ctx.Err()}
+				replyConsume(req, runConsumeResp{err: req.ctx.Err()})
 				continue
 			}
 			pending = append(pending, req)
@@ -264,28 +301,56 @@ func (p *runPool) loop(ctx context.Context) {
 			trimIdle()
 			ensure()
 		case req := <-p.waitCh:
+			req.stopCancel = context.AfterFunc(req.ctx, func() {
+				select {
+				case p.waitCancelCh <- req:
+				case <-p.done:
+				}
+			})
 			st, ok := starting[req.runID]
 			if !ok {
-				req.resp <- runWaitResp{ok: false, err: fmt.Errorf("run %s is not starting", req.runID)}
+				replyWait(req, runWaitResp{ok: false, err: fmt.Errorf("run %s is not starting", req.runID)})
 				continue
 			}
 			if !st.started.IsZero() && time.Since(st.started) > p.waitTimeout {
 				delete(starting, req.runID)
-				req.resp <- runWaitResp{err: fmt.Errorf("run %s exceeded wait timeout", req.runID)}
+				replyWait(req, runWaitResp{err: fmt.Errorf("run %s exceeded wait timeout", req.runID)})
 				queueControl(runControlReq{op: "stop", runID: req.runID})
 				ensure()
 				continue
 			}
 			delete(starting, req.runID)
 			if req.ctx.Err() != nil {
-				req.resp <- runWaitResp{err: req.ctx.Err()}
+				replyWait(req, runWaitResp{err: req.ctx.Err()})
 				queueControl(runControlReq{op: "stop", runID: req.runID})
 				ensure()
 				continue
 			}
-			idle = append(idle, idleRun{runID: req.runID, ctx: req.ctx, resp: req.resp})
+			idle = append(idle, idleRun{runID: req.runID, req: req})
 			assign()
 			trimIdle()
+			ensure()
+		case req := <-p.consumeCancelCh:
+			for i, pendingReq := range pending {
+				if pendingReq != req {
+					continue
+				}
+				pending = slices.Delete(pending, i, i+1)
+				replyConsume(req, runConsumeResp{err: req.ctx.Err()})
+				break
+			}
+			trimIdle()
+			ensure()
+		case req := <-p.waitCancelCh:
+			for i, waiting := range idle {
+				if waiting.req != req {
+					continue
+				}
+				idle = slices.Delete(idle, i, i+1)
+				replyWait(req, runWaitResp{err: req.ctx.Err()})
+				queueControl(runControlReq{op: "stop", runID: waiting.runID})
+				break
+			}
 			ensure()
 		case done := <-p.startDoneCh:
 			st, ok := starting[done.runID]
