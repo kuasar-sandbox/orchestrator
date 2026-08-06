@@ -28,8 +28,9 @@ type Plugin struct {
 // ProxyTargets to forward data-plane requests to a registered proxy endpoint.
 // Concurrency-safe and shared between the config-socket server and the proxyForwarder.
 type Registry struct {
-	mu sync.Mutex
-	m  map[string]*Plugin
+	mu             sync.Mutex
+	m              map[string]*Plugin
+	mmdsChangeHook func()
 }
 
 func NewRegistry() *Registry { return &Registry{m: map[string]*Plugin{}} }
@@ -39,21 +40,61 @@ func NewRegistry() *Registry { return &Registry{m: map[string]*Plugin{}} }
 // against the evicted plugin's Remove, so the successor is never dropped.
 func (r *Registry) Add(p *Plugin) {
 	r.mu.Lock()
+	before := r.mmdsAvailableLocked()
 	if old := r.m[p.ID]; old != nil && old != p {
 		old.cancel() // ends the prior handler; its deferred Remove sees it is no longer current
 	}
 	r.m[p.ID] = p
+	changed := before != r.mmdsAvailableLocked()
+	hook := r.mmdsChangeHook
 	r.mu.Unlock()
+	if changed && hook != nil {
+		hook()
+	}
 }
 
 // Remove deregisters p only if it is still the current registration for its id, so
 // an evicted plugin's deferred Remove never drops its successor.
 func (r *Registry) Remove(p *Plugin) {
 	r.mu.Lock()
+	before := r.mmdsAvailableLocked()
 	if r.m[p.ID] == p {
 		delete(r.m, p.ID)
 	}
+	changed := before != r.mmdsAvailableLocked()
+	hook := r.mmdsChangeHook
 	r.mu.Unlock()
+	if changed && hook != nil {
+		hook()
+	}
+}
+
+// SetMMDSChangeHook installs a notification for changes to the live external
+// proxy MMDS capability. The hook receives no captured value: it must query
+// MMDSAvailable, so callbacks that race with a reconnect always observe the
+// latest registration rather than publishing stale state.
+func (r *Registry) SetMMDSChangeHook(hook func()) {
+	r.mu.Lock()
+	r.mmdsChangeHook = hook
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+// MMDSAvailable reports whether the external proxy master's live registration
+// proves that it has bound an MMDS listener. The held registration stream is
+// the lease; disconnecting it removes the capability.
+func (r *Registry) MMDSAvailable() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mmdsAvailableLocked()
+}
+
+func (r *Registry) mmdsAvailableLocked() bool {
+	p := r.m[routesync.ProxyPluginID]
+	return p != nil && p.Caps.Proxy != nil && p.Caps.Proxy.Socket.Path != "" &&
+		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake && p.Caps.Mmds
 }
 
 // ProxyTargets returns the data-forward UDS paths of registered proxy plugins, in

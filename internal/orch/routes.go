@@ -7,7 +7,6 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -27,7 +26,27 @@ type routeLogEntry struct {
 // routeEntry projects a sandbox into the wire route entry pushed to proxies. The
 // MMDS secret is derived deterministically (so every proxy worker agrees) and is
 // carried on every entry — subscribers that don't serve MMDS simply ignore it.
+// MMDSRoutes goes through admittedMMDSMetadata rather than reading
+// sb.Metadata directly: this fires both on ordinary publish and on Range's
+// full snapshot to a (re)connecting external proxy, which reads straight from
+// the store, so a specification that predates a restart/config change (mmds
+// routes now disabled, reserved prefixes since tightened) must not reach a
+// proxy just because it was admitted under an older policy.
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
+	return o.routeEntryWithMMDS(sb, o.admittedMMDSMetadata(sb))
+}
+
+// routeEntryWithMMDS is routeEntry with the MMDSRoutes field supplied by the
+// caller instead of re-derived via admittedMMDSMetadata. For a caller that
+// already holds an admission-checked canonical form from earlier in the same
+// call -- Create/bootCluster/runBuildUnit, immediately after their own
+// ExtractMMDS call on metadata nothing has touched since; or migrate.go's
+// import, which deliberately bypasses admittedMMDSMetadata's
+// MMDSRuntimeAvailable() gate to keep a carried-forward value dormant rather
+// than admitted -- going through routeEntry would pay a second full
+// ExtractMMDS pass (JSON decode plus policy validation) for an identical
+// result.
+func (o *Orchestrator) routeEntryWithMMDS(sb *types.Sandbox, mmdsRoutes string) routesync.RouteEntry {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
@@ -48,7 +67,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		ForwardAccessToken:     sb.ForwardAccessToken,
 		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
-		MMDSRoutes:             sb.Metadata[sandboxcfg.NsMMDS],
+		MMDSRoutes:             mmdsRoutes,
 	}
 	return e
 }

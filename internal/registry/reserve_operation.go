@@ -172,6 +172,15 @@ func reserveDataPort(rec *SandboxRecord, requestedPort int) (int, error) {
 }
 
 func (r *Registry) reserveConnect(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
+	// Connect never carries config (the ReserveSandbox boundary already
+	// rejects a non-empty req.Config for this operation) -- this only bounds
+	// req.MigrationToken against the node-link frame limit, once here rather
+	// than separately inside placeAndConnect, since it doesn't change across
+	// retry attempts and both connectCurrent and placeAndConnect serialize it
+	// into a routesync.Command and dispatch it.
+	if err := validateReconnectConfigTransportAdmission(routesync.CmdConnect, req.Config, req.MigrationToken); err != nil {
+		return nil, err
+	}
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
 		if err != nil {
@@ -290,6 +299,11 @@ func cloneConnectResult(result *routesync.ConnectResult) *routesync.ConnectResul
 }
 
 func (r *Registry) reserveExecSession(ctx context.Context, req SandboxReserveRequest) (*ReserveResult, error) {
+	// See reserveConnect's identical block: exec-session never carries
+	// config either, this only bounds req.MigrationToken.
+	if err := validateReconnectConfigTransportAdmission(routesync.CmdExecSession, req.Config, req.MigrationToken); err != nil {
+		return nil, err
+	}
 	for attempt := 0; attempt < 5; attempt++ {
 		rec, rev, found, err := r.getSandboxForReserve(ctx, req.Group, req.RouteKey)
 		if err != nil {
@@ -441,6 +455,15 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 	if original == nil || req.MigrationToken == "" || original.SandboxID != req.ExpectedSandboxID {
 		return nil, ErrSandboxNotFound
 	}
+	// This is the one path that actually reconstructs the sandbox on a new
+	// node from the migration token (the original owner is gone) --
+	// importSandboxWithKey keeps the token's own carried kuasar-sandbox.mmds
+	// by default, checked against the receiving node's own mmds.routes
+	// policy (dropped, not hard-failed, if it no longer passes). There is no
+	// redeclaration on this request itself. req.MigrationToken's
+	// transport-size admission is validated once by the caller
+	// (reserveConnect), before either this path or connectCurrent ever
+	// dispatches or mutates state.
 	excluded := placementExclusions{}
 	excluded.add(original.NodeID)
 	var lastFailure error
@@ -503,6 +526,10 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 		if !validNodeSandboxIdentity(target.SandboxID, target.NodeSandboxID, target.SandboxGeneration) {
 			return nil, errors.New("registry: generated node sandbox identity is invalid")
 		}
+		cmd := connectCommand(req, &target)
+		if err := validateCreateCommandTransport(cmd); err != nil {
+			return nil, err
+		}
 		targetRev, ok, err := r.stores.CASSandbox(ctx, &target, rev)
 		if err != nil {
 			return nil, err
@@ -523,7 +550,7 @@ func (r *Registry) placeAndConnect(ctx context.Context, req SandboxReserveReques
 			}
 			return nil, err
 		}
-		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, connectCommand(req, &target), lifecycleAckTimeout)
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, cmd, lifecycleAckTimeout)
 		if err != nil {
 			ambiguous := !errors.Is(err, ErrNodeGone)
 			r.rollbackConnect(&target, targetRev, current, ambiguous)
@@ -595,6 +622,9 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 	if original == nil || req.MigrationToken == "" || original.SandboxID != req.ExpectedSandboxID {
 		return nil, ErrSandboxNotFound
 	}
+	// See placeAndConnect's identical block: no redeclaration, and
+	// transport-size admission is validated once by the caller
+	// (reserveExecSession).
 	excluded := placementExclusions{}
 	excluded.add(original.NodeID)
 	var lastFailure error
@@ -657,6 +687,10 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 		if !validNodeSandboxIdentity(target.SandboxID, target.NodeSandboxID, target.SandboxGeneration) {
 			return nil, errors.New("registry: generated node sandbox identity is invalid")
 		}
+		cmd := execSessionCommand(req, &target)
+		if err := validateCreateCommandTransport(cmd); err != nil {
+			return nil, err
+		}
 		targetRev, ok, err := r.stores.CASSandbox(ctx, &target, rev)
 		if err != nil {
 			return nil, err
@@ -677,7 +711,7 @@ func (r *Registry) placeAndExecSession(ctx context.Context, req SandboxReserveRe
 			}
 			return nil, err
 		}
-		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, execSessionCommand(req, &target), lifecycleAckTimeout)
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, target.NodeID, cmd, lifecycleAckTimeout)
 		if err != nil {
 			ambiguous := !errors.Is(err, ErrNodeGone)
 			r.rollbackConnect(&target, targetRev, current, ambiguous)

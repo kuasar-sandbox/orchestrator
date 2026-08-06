@@ -165,6 +165,19 @@ checkpoint:
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254
+#   # Tenant-route admission below is this node's own policy. Registry has no
+#   # admission policy of its own, so a clustered create applies this same
+#   # node-local policy too (every node in a cluster deployment is expected
+#   # to run the same mmds.routes configuration), alongside this node's own
+#   # runtime availability.
+#   routes:
+#     enabled: false
+#     max_routes_per_sandbox: 32
+#     max_namespace_bytes: 65536
+#     reserved_path_prefixes: []
+#     static: { max_body_bytes: 16384 }
+#     secret: { max_per_sandbox: 16 }
+#     service: { max_per_sandbox: 16 }
 
 # cluster: connect this node to a cluster-ctl registry over node_link (node.md §10).
 # Omitted = standalone single-node.

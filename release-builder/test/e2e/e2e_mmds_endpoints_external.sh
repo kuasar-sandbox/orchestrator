@@ -12,7 +12,11 @@
 #   5. Assert the body/content type, security headers, undeclared-route 404,
 #      and rejection of non-canonical paths without redirects.
 #   6. Restart the conductor with tenant routes disabled, reject a new create,
-#      and prove the existing route remains available through the external proxy.
+#      and prove the existing route now fails closed (404) through the
+#      external proxy once it resyncs -- routeEntry/admittedMMDSMetadata
+#      re-derive admission on every read, so a declaration that no longer
+#      passes the current policy must stop being served, not be replayed
+#      from a stale proxy cache.
 #
 # Keep additional standalone/external MMDS scenarios in this suite. Extend the
 # shared helper or add an opt-in scenario hook to e2e_orchestrator_proxy.sh;

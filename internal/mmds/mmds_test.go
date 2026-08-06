@@ -97,6 +97,50 @@ func TestPutGetFlow(t *testing.T) {
 	}
 }
 
+func TestPutTokenRejectsRequestBody(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	req := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", strings.NewReader("unexpected"))
+	req.RemoteAddr = "100.100.96.5:1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT with body: code=%d body=%q, want 400", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+// TestPutTokenAllowsBodylessChunkedRequest proves a bodyless request whose
+// Body is a real (non-http.NoBody) reader -- what a chunked
+// Transfer-Encoding request always gets, since its length is never known in
+// advance -- is not rejected just because it isn't the NoBody sentinel:
+// rejectRequestBody must actually peek it and observe it's empty.
+// strings.NewReader("") reproduces the same shape httptest.NewRequest gives
+// any non-nil body reader (a real io.ReadCloser distinct from NoBody),
+// regardless of whether real chunked framing is involved.
+func TestPutTokenAllowsBodylessChunkedRequest(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	req := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", strings.NewReader(""))
+	if req.Body == http.NoBody {
+		t.Fatal("test setup: strings.NewReader(\"\") body was normalized to http.NoBody")
+	}
+	req.RemoteAddr = "100.100.96.5:1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT with empty non-NoBody body: code=%d body=%q, want 200", w.Code, w.Body.String())
+	}
+}
+
 // mintedToken returns a valid session token for sid via the real PUT flow.
 func mintedToken(t *testing.T, h http.Handler, floatingIP, sid string) string {
 	t.Helper()
@@ -135,6 +179,35 @@ func TestGetMetaServesSpecifiedStaticRoute(t *testing.T) {
 	}
 	if got, want := w.Header().Get("Content-Type"), "application/json"; got != want {
 		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+}
+
+func TestGetMetaRejectsRequestBody(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+	req := httptest.NewRequest("GET", "http://169.254.169.254/", strings.NewReader("unexpected"))
+	req.Header.Set("X-metadata-token", token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET with body: code=%d body=%q, want 400", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+
+	// Authentication remains the outer boundary: an invalid token is still
+	// classified as unauthorized even when the request also carries a body.
+	req = httptest.NewRequest("GET", "http://169.254.169.254/", strings.NewReader("unexpected"))
+	req.Header.Set("X-metadata-token", "sbx-evil.deadbeef")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized GET with body: code=%d, want 401", w.Code)
 	}
 }
 
@@ -221,6 +294,30 @@ func TestGetMetaUnspecifiedPathReturns404(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), `"instanceID"`) {
 		t.Fatalf("unspecified path leaked the root instance-info body: %s", w.Body.String())
+	}
+}
+
+// TestHeadRequestReturns405 proves HEAD is rejected outright: Go's ServeMux
+// implicitly matches "GET " patterns to HEAD requests too, which without an
+// explicit guard would dispatch straight into getMeta and return 200,
+// violating the exact-method contract that every non-PUT-token request other
+// than GET must be 405.
+func TestHeadRequestReturns405(t *testing.T) {
+	src := fakeSource{
+		fip:  map[string]string{"100.100.96.5": "sbx-1"},
+		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
+	}
+	h := New(src, 50*time.Millisecond, nil).Handler()
+	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
+
+	for _, path := range []string{"/", "/some/route"} {
+		req := httptest.NewRequest("HEAD", "http://169.254.169.254"+path, nil)
+		req.Header.Set("X-metadata-token", token)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("HEAD %s: code=%d, want 405", path, w.Code)
+		}
 	}
 }
 
@@ -339,7 +436,7 @@ func TestGuardRawRequestRejectsPercentEscapedPathEvenWhenSpecified(t *testing.T)
 	}
 }
 
-func TestGuardRawRequestRejectsQueryOnSpecifiedRoute(t *testing.T) {
+func TestGuardRawRequestRejectsQueries(t *testing.T) {
 	src := fakeSource{
 		fip:  map[string]string{"100.100.96.5": "sbx-1"},
 		info: map[string][2]string{"sbx-1": {"tmpl-1", "tok-abc"}},
@@ -350,12 +447,28 @@ func TestGuardRawRequestRejectsQueryOnSpecifiedRoute(t *testing.T) {
 	h := New(src, 50*time.Millisecond, nil).Handler()
 	token := mintedToken(t, h, "100.100.96.5", "sbx-1")
 
-	req := httptest.NewRequest("GET", "http://169.254.169.254/x?q=1", nil)
-	req.Header.Set("X-metadata-token", token)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("path with query: code=%d body=%q, want 400", w.Code, w.Body.String())
+	for _, tt := range []struct {
+		name   string
+		method string
+		target string
+	}{
+		{"non-empty query", "GET", "/x?q=1"},
+		{"empty query", "GET", "/x?"},
+		{"token endpoint empty query", "PUT", "/latest/api/token?"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "http://169.254.169.254"+tt.target, nil)
+			req.Header.Set("X-metadata-token", token)
+			req.RemoteAddr = "100.100.96.5:1"
+			if strings.HasSuffix(tt.target, "?") && !req.URL.ForceQuery {
+				t.Fatal("test request did not preserve the empty query")
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%s %s: code=%d body=%q, want 400", tt.method, tt.target, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

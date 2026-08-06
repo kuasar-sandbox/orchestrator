@@ -34,6 +34,52 @@ func TestExtractMMDSAbsentIsNoop(t *testing.T) {
 	}
 }
 
+// TestNormalizeMMDSAppliesInvariantsWithoutAdmissionPolicy proves
+// normalizeMMDS -- the schema/protocol-only core ExtractMMDS layers policy
+// enforcement around -- canonicalizes on its own, with no MMDSPolicy input.
+func TestNormalizeMMDSAppliesInvariantsWithoutAdmissionPolicy(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"routes":[{"path":"/tenant/value","data":"payload"}]}`}
+	spec, out, err := normalizeMMDS(meta, meta[NsMMDS])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Version != 1 || len(spec.Routes) != 1 {
+		t.Fatalf("unexpected canonical spec: %+v", spec)
+	}
+	route := spec.Routes[0]
+	if route.Type != MMDSRouteStatic || route.ContentType != "application/octet-stream" {
+		t.Fatalf("route was not canonicalized: %+v", route)
+	}
+	if out[NsMMDS] == meta[NsMMDS] {
+		t.Fatalf("expected canonical metadata, got %q", out[NsMMDS])
+	}
+}
+
+// TestNormalizeMMDSDoesNotApplyMutablePolicy proves normalizeMMDS itself
+// never enforces MMDSPolicy's mutable limits -- ExtractMMDS is solely
+// responsible for that layer, checked separately (validateMMDSPolicy) around
+// normalizeMMDS's schema/protocol-only result.
+func TestNormalizeMMDSDoesNotApplyMutablePolicy(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/operator/value","data":"payload"}]}`}
+	policy := testMMDSPolicy()
+	policy.MaxRoutesPerSandbox = 0
+	policy.MaxStaticBodyBytes = 1
+	policy.ReservedPathPrefixes = []string{"/operator"}
+	if _, _, err := ExtractMMDS(meta, policy); err == nil {
+		t.Fatal("expected ExtractMMDS to enforce admission policy")
+	}
+	if _, _, err := normalizeMMDS(meta, meta[NsMMDS]); err != nil {
+		t.Fatalf("normalizeMMDS must not enforce mutable policy: %v", err)
+	}
+}
+
+func TestNormalizeMMDSStillRejectsProtocolReservedPath(t *testing.T) {
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/latest/api/token","data":"payload"}]}`}
+	if _, _, err := normalizeMMDS(meta, meta[NsMMDS]); err == nil {
+		t.Fatal("expected protocol-reserved path to be rejected")
+	}
+}
+
 func TestExtractMMDSDisabledPolicyRejectsBeforeParsing(t *testing.T) {
 	policy := testMMDSPolicy()
 	policy.Enabled = false
@@ -69,6 +115,77 @@ func TestExtractMMDSPublicErrorDoesNotExposePayload(t *testing.T) {
 	}
 }
 
+func TestExtractMMDSInvalidPathIsNotReflectedPublicly(t *testing.T) {
+	marker := "do-not-reflect-invalid-route-path"
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"` + marker + `","type":"static","content_type":""}]}`}
+	_, _, err := ExtractMMDS(meta, testMMDSPolicy())
+	if err == nil {
+		t.Fatal("expected an invalid path error")
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("public error exposed the invalid route path: %q", err)
+	}
+	if err.Error() != "MMDS metadata: route path must be an absolute path" {
+		t.Fatalf("error = %q", err)
+	}
+	validationErr, ok := err.(*MMDSValidationError)
+	if !ok || !strings.Contains(validationErr.Diagnostic(), marker) {
+		t.Fatalf("trusted diagnostic omitted invalid path context: %v", err)
+	}
+}
+
+func TestExtractMMDSInvalidIdentifiersAreNotReflectedPublicly(t *testing.T) {
+	marker := "do-not-reflect-INVALID-identifier"
+	for _, tt := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			"secret name",
+			`{"version":1,"secrets":[{"name":"` + marker + `"}],"routes":[]}`,
+			"MMDS metadata: secret name is invalid",
+		},
+		{
+			"service name",
+			`{"version":1,"services":[{"name":"` + marker + `","target":"backend"}],"routes":[]}`,
+			"MMDS metadata: service name is invalid",
+		},
+		{
+			"secret reference",
+			`{"version":1,"routes":[{"path":"/x","type":"secret","secret_name":"` + marker + `"}]}`,
+			`MMDS metadata: route "/x": secret_name does not reference a specified secret`,
+		},
+		{
+			"service reference",
+			`{"version":1,"routes":[{"path":"/x","type":"service","service_name":"` + marker + `"}]}`,
+			`MMDS metadata: route "/x": service_name does not reference a specified service`,
+		},
+		{
+			"route type",
+			`{"version":1,"routes":[{"path":"/x","type":"` + marker + `"}]}`,
+			`MMDS metadata: route "/x": type must be "static", "secret", or "service"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := ExtractMMDS(map[string]string{NsMMDS: tt.raw}, testMMDSPolicy())
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			if got := err.Error(); got != tt.want {
+				t.Fatalf("error = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("public error exposed invalid identifier: %q", err)
+			}
+			validationErr, ok := err.(*MMDSValidationError)
+			if !ok || !strings.Contains(validationErr.Diagnostic(), marker) {
+				t.Fatalf("trusted diagnostic omitted invalid identifier context: %v", err)
+			}
+		})
+	}
+}
+
 func TestExtractMMDSJSONErrorIsNormalized(t *testing.T) {
 	meta := map[string]string{NsMMDS: `{"version":1,"routes":[`}
 	_, _, err := ExtractMMDS(meta, testMMDSPolicy())
@@ -98,6 +215,63 @@ func TestExtractMMDSRejectsUnknownNestedRouteField(t *testing.T) {
 	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":"static","data":"d","bogus":"y"}]}`}
 	if _, _, err := ExtractMMDS(meta, testMMDSPolicy()); err == nil {
 		t.Fatal("expected an error for an unknown nested field")
+	}
+}
+
+func TestExtractMMDSRejectsDuplicateJSONFields(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{"top level", `{"version":1,"version":1,"routes":[]}`},
+		{"nested route", `{"version":1,"routes":[{"path":"/x","path":"/y","data":"d"}]}`},
+		{"nested service", `{"version":1,"services":[{"name":"svc1","target":"a","target":"b"}],"routes":[{"path":"/x","type":"service","service_name":"svc1"}]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := ExtractMMDS(map[string]string{NsMMDS: tt.raw}, testMMDSPolicy())
+			if err == nil {
+				t.Fatal("expected a duplicate JSON field error")
+			}
+			if err.Error() != "MMDS metadata: contains a duplicate JSON field" {
+				t.Fatalf("error = %q", err)
+			}
+		})
+	}
+}
+
+func TestExtractMMDSRejectsCaseInsensitiveJSONFieldAliases(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{"single top-level alias", `{"Version":1,"routes":[]}`},
+		{"top-level overwrite alias", `{"version":1,"Version":2,"routes":[]}`},
+		{"nested route overwrite alias", `{"version":1,"routes":[{"path":"/x","Path":"/y","data":"d"}]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := ExtractMMDS(map[string]string{NsMMDS: tt.raw}, testMMDSPolicy())
+			if err == nil {
+				t.Fatal("expected a non-canonical JSON field error")
+			}
+			want := "MMDS metadata: JSON field names must use the exact schema spelling"
+			if err.Error() != want {
+				t.Fatalf("error = %q, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestExtractMMDSRequiresTopLevelJSONObject(t *testing.T) {
+	for _, raw := range []string{`null`, `[]`, `"value"`, `1`, `true`} {
+		t.Run(raw, func(t *testing.T) {
+			_, _, err := ExtractMMDS(map[string]string{NsMMDS: raw}, testMMDSPolicy())
+			if err == nil {
+				t.Fatal("expected a top-level object error")
+			}
+			if err.Error() != "MMDS metadata: must be a JSON object" {
+				t.Fatalf("error = %q", err)
+			}
+		})
 	}
 }
 
@@ -235,6 +409,40 @@ func TestExtractMMDSReservedPrefixIsSegmentAware(t *testing.T) {
 	}
 }
 
+func TestExtractMMDSReservedRootPrefixRejectsAllRoutes(t *testing.T) {
+	policy := testMMDSPolicy()
+	policy.ReservedPathPrefixes = []string{"/"}
+	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/tenant/path","type":"static","data":"x"}]}`}
+	if _, _, err := ExtractMMDS(meta, policy); err == nil {
+		t.Fatal("expected the root reserved prefix to reject every absolute route path")
+	}
+}
+
+func TestValidateMMDSReservedPathPrefixes(t *testing.T) {
+	for _, prefix := range []string{
+		"", "internal", "/internal?", "/internal#", "/internal%",
+		// Non-canonical shapes: mmdsPathUnderPrefix only ever compares against a
+		// canonicalMMDSPath'd tenant route, which never contains a wildcard, dot
+		// segment, empty segment, uppercase, or non-ASCII character -- so a
+		// prefix in any of these shapes can never match a real route and the
+		// reservation would silently fail open.
+		"/internal/*", "/internal//", "/internal/..", "/Internal", "/内部",
+	} {
+		t.Run("invalid_"+prefix, func(t *testing.T) {
+			if err := ValidateMMDSReservedPathPrefixes([]string{prefix}); err == nil {
+				t.Fatalf("expected prefix %q to be rejected", prefix)
+			}
+		})
+	}
+	for _, prefix := range []string{"/", "/internal", "/internal/"} {
+		t.Run("valid_"+prefix, func(t *testing.T) {
+			if err := ValidateMMDSReservedPathPrefixes([]string{prefix}); err != nil {
+				t.Fatalf("prefix %q rejected: %v", prefix, err)
+			}
+		})
+	}
+}
+
 func TestExtractMMDSRejectsYAMLSyntax(t *testing.T) {
 	// The Create wire contract is JSON (see package doc); YAML-only syntax
 	// (unquoted keys/values, comments) that a permissive YAML decoder would
@@ -297,6 +505,63 @@ func TestExtractMMDSRejectsOversizeNamespace(t *testing.T) {
 	}
 }
 
+// TestExtractMMDSRejectsCanonicalFormOverEscapeExpansion proves that a raw
+// namespace which itself fits under MaxNamespaceBytes can still be rejected,
+// because json.Marshal HTML-escapes '<'/'>'/'&' into six-byte \uXXXX
+// sequences when producing the canonical form that actually gets persisted
+// and re-encoded onto the routesync/mmdsrpc wire. Without re-checking the
+// canonical length, a spec built almost entirely of one of these characters
+// could be admitted under the raw check yet still be too large once
+// canonicalized -- exactly the gap the transport frame relies on
+// MaxNamespaceBytes to prevent.
+func TestExtractMMDSRejectsCanonicalFormOverEscapeExpansion(t *testing.T) {
+	policy := testMMDSPolicy()
+	policy.MaxNamespaceBytes = 300
+	policy.MaxStaticBodyBytes = 300
+	data := strings.Repeat("<", 200)
+	raw := `{"version":1,"routes":[{"path":"/x","type":"static","data":"` + data + `"}]}`
+	if len(raw) > policy.MaxNamespaceBytes {
+		t.Fatalf("test setup: raw namespace (%d bytes) already exceeds the policy limit (%d bytes)", len(raw), policy.MaxNamespaceBytes)
+	}
+	meta := map[string]string{NsMMDS: raw}
+	if _, _, err := ExtractMMDS(meta, policy); err == nil {
+		t.Fatal("expected an error: canonical form (post JSON-escaping) exceeds MaxNamespaceBytes even though the raw input did not")
+	}
+}
+
+// TestNormalizeMMDSRejectsOverProtocolCeiling proves the fixed ceiling is
+// enforced by normalizeMMDS itself -- the schema/protocol-only core every
+// MMDSPolicy, however permissive, is layered around -- not something
+// ExtractMMDS bolts on separately. A canonical form large enough to risk
+// overflowing the fixed 1 MiB routesync frame once published as a RouteEntry
+// (which carries credential/token fields beyond the MMDS namespace itself)
+// is rejected regardless of policy.
+func TestNormalizeMMDSRejectsOverProtocolCeiling(t *testing.T) {
+	data := strings.Repeat("a", 1_020_000)
+	raw := `{"version":1,"routes":[{"path":"/x","type":"static","data":"` + data + `"}]}`
+	meta := map[string]string{NsMMDS: raw}
+	if _, _, err := normalizeMMDS(meta, meta[NsMMDS]); err == nil {
+		t.Fatal("expected an error: canonical form exceeds the fixed protocol ceiling")
+	}
+}
+
+// TestExtractMMDSRejectsOverProtocolCeilingEvenWhenPolicyAllowsMore proves the
+// fixed protocol ceiling (maxMMDSCanonicalBytes) is a hard backstop independent
+// of MMDSPolicy.MaxNamespaceBytes: an operator setting max_namespace_bytes
+// unsafely close to the routesync frame limit must not be able to admit a
+// canonical form that overflows RouteEntry's own publication frame.
+func TestExtractMMDSRejectsOverProtocolCeilingEvenWhenPolicyAllowsMore(t *testing.T) {
+	policy := testMMDSPolicy()
+	policy.MaxNamespaceBytes = 1 << 20 // as permissive as the raw routesync frame itself
+	policy.MaxStaticBodyBytes = 1 << 20
+	data := strings.Repeat("a", 1_020_000)
+	raw := `{"version":1,"routes":[{"path":"/x","type":"static","data":"` + data + `"}]}`
+	meta := map[string]string{NsMMDS: raw}
+	if _, _, err := ExtractMMDS(meta, policy); err == nil {
+		t.Fatal("expected an error: fixed protocol ceiling should reject even though policy allows it")
+	}
+}
+
 func TestExtractMMDSRejectsOversizeStaticBody(t *testing.T) {
 	policy := testMMDSPolicy()
 	policy.MaxStaticBodyBytes = 4
@@ -348,19 +613,91 @@ func TestExtractMMDSCanonicalizesStaticShorthand(t *testing.T) {
 	}
 }
 
+func TestExtractMMDSValidatesStaticContentType(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","content_type":"application/json; charset=utf-8","data":"{}"}]}`}
+		spec, _, err := ExtractMMDS(meta, testMMDSPolicy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := spec.Routes[0].ContentType; got != "application/json; charset=utf-8" {
+			t.Fatalf("content_type = %q", got)
+		}
+	})
+
+	for _, tt := range []struct {
+		name        string
+		contentType string
+		want        string
+	}{
+		{"empty", "", "content_type must not be empty"},
+		{"invalid", "not a media type", "content_type is not a valid media type"},
+		{"too long", strings.Repeat("a", maxMMDSContentTypeBytes+1), "content_type exceeds the maximum size"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"version": 1,
+				"routes": []map[string]string{{
+					"path": "/x", "type": "static", "content_type": tt.contentType,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = ExtractMMDS(map[string]string{NsMMDS: string(raw)}, testMMDSPolicy())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want text %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractMMDSRejectsCrossTypeFields(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		raw  string
 	}{
 		{"secret with data", `{"version":1,"secrets":[{"name":"key1"}],"routes":[{"path":"/x","type":"secret","secret_name":"key1","data":"d"}]}`},
+		{"secret with empty data", `{"version":1,"secrets":[{"name":"key1"}],"routes":[{"path":"/x","type":"secret","secret_name":"key1","data":""}]}`},
 		{"static with secret_name", `{"version":1,"secrets":[{"name":"key1"}],"routes":[{"path":"/x","type":"static","data":"d","secret_name":"key1"}]}`},
+		{"static with empty service_name", `{"version":1,"routes":[{"path":"/x","type":"static","data":"d","service_name":""}]}`},
+		{"static with null service_name", `{"version":1,"routes":[{"path":"/x","type":"static","data":"d","service_name":null}]}`},
 		{"service with content_type", `{"version":1,"services":[{"name":"svc1","target":"t"}],"routes":[{"path":"/x","type":"service","service_name":"svc1","content_type":"text/plain"}]}`},
+		{"service with empty content_type", `{"version":1,"services":[{"name":"svc1","target":"t"}],"routes":[{"path":"/x","type":"service","service_name":"svc1","content_type":""}]}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			meta := map[string]string{NsMMDS: tt.raw}
 			if _, _, err := ExtractMMDS(meta, testMMDSPolicy()); err == nil {
 				t.Fatal("expected a cross-type field error")
+			}
+		})
+	}
+}
+
+func TestExtractMMDSRejectsExplicitEmptyType(t *testing.T) {
+	for _, routeType := range []string{`""`, `null`} {
+		meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":` + routeType + `,"data":"d"}]}`}
+		_, _, err := ExtractMMDS(meta, testMMDSPolicy())
+		if err == nil || !strings.Contains(err.Error(), "type must not be empty") {
+			t.Fatalf("type %s: error = %v", routeType, err)
+		}
+	}
+}
+
+func TestExtractMMDSRejectsServiceTargetWhitespace(t *testing.T) {
+	for _, target := range []string{" backend", "backend ", "\tbackend", "backend\n"} {
+		t.Run(target, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"version":  1,
+				"services": []map[string]string{{"name": "svc1", "target": target}},
+				"routes":   []map[string]string{{"path": "/x", "type": "service", "service_name": "svc1"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = ExtractMMDS(map[string]string{NsMMDS: string(raw)}, testMMDSPolicy())
+			if err == nil || !strings.Contains(err.Error(), "leading or trailing whitespace") {
+				t.Fatalf("error = %v", err)
 			}
 		})
 	}
@@ -471,9 +808,9 @@ func TestMMDSSpecNeverEntersGuestVisibleMetadata(t *testing.T) {
 }
 
 func TestLookupMMDSRoute(t *testing.T) {
-	meta := map[string]string{NsMMDS: `{"version":1,"routes":[{"path":"/x","type":"static","content_type":"text/plain","data":"hi"}]}`}
+	raw := `{"version":1,"routes":[{"path":"/x","type":"static","content_type":"text/plain","data":"hi"}]}`
 
-	route, ok := LookupMMDSRoute(meta, "/x")
+	route, ok := LookupMMDSRoute(raw, "/x")
 	if !ok {
 		t.Fatal("expected the specified route to be found")
 	}
@@ -481,10 +818,10 @@ func TestLookupMMDSRoute(t *testing.T) {
 		t.Fatalf("unexpected route: %+v", route)
 	}
 
-	if _, ok := LookupMMDSRoute(meta, "/unspecified"); ok {
+	if _, ok := LookupMMDSRoute(raw, "/unspecified"); ok {
 		t.Fatal("expected an unspecified path to be not found")
 	}
-	if _, ok := LookupMMDSRoute(map[string]string{}, "/x"); ok {
+	if _, ok := LookupMMDSRoute("", "/x"); ok {
 		t.Fatal("expected an absent namespace to be not found")
 	}
 }

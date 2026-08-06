@@ -134,7 +134,7 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 	}
 	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 	writeJSON(w, res)

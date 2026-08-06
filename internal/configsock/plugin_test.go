@@ -71,3 +71,42 @@ func TestRegistryEvictsSameID(t *testing.T) {
 		t.Fatalf("after final remove targets = %v, want []", got)
 	}
 }
+
+func TestRegistryMMDSAvailabilityTracksLiveProxyRegistration(t *testing.T) {
+	r := NewRegistry()
+	var states []bool
+	r.SetMMDSChangeHook(func() { states = append(states, r.MMDSAvailable()) })
+	if len(states) != 1 || states[0] {
+		t.Fatalf("initial MMDS states = %v, want [false]", states)
+	}
+
+	wrongID := &Plugin{ID: "observer", Caps: proxyCaps("/run/observer.sock"), cancel: func() {}}
+	wrongID.Caps.Mmds = true
+	r.Add(wrongID)
+	if r.MMDSAvailable() || len(states) != 1 {
+		t.Fatalf("non-proxy registration changed MMDS capability: available=%v states=%v", r.MMDSAvailable(), states)
+	}
+
+	withoutListener := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: func() {}}
+	r.Add(withoutListener)
+	if r.MMDSAvailable() || len(states) != 1 {
+		t.Fatalf("proxy without MMDS listener changed capability: available=%v states=%v", r.MMDSAvailable(), states)
+	}
+
+	withListener := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: func() {}}
+	withListener.Caps.Mmds = true
+	r.Add(withListener)
+	if !r.MMDSAvailable() || len(states) != 2 || !states[1] {
+		t.Fatalf("live MMDS proxy was not published: available=%v states=%v", r.MMDSAvailable(), states)
+	}
+
+	// The evicted registration's deferred Remove must not clear its successor.
+	r.Remove(withoutListener)
+	if !r.MMDSAvailable() || len(states) != 2 {
+		t.Fatalf("stale remove cleared live MMDS proxy: available=%v states=%v", r.MMDSAvailable(), states)
+	}
+	r.Remove(withListener)
+	if r.MMDSAvailable() || len(states) != 3 || states[2] {
+		t.Fatalf("disconnect did not revoke MMDS capability: available=%v states=%v", r.MMDSAvailable(), states)
+	}
+}

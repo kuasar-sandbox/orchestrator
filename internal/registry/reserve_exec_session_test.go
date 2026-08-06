@@ -609,7 +609,8 @@ func TestReserveExecSessionRejectsForeignFieldsAndRouteLinkBody(t *testing.T) {
 		}
 	}
 	request := httptest.NewRequest(http.MethodPost,
-		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable", strings.NewReader(`{}`))
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable",
+		strings.NewReader(`{"config":{"kuasar-sandbox.restore":"{}"}}`))
 	request.Header.Set("X-API-KEY", testAPIKeyValue())
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)

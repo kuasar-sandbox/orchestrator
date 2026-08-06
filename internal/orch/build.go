@@ -47,8 +47,20 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if _, ok := metadata[sandboxcfg.NsMMDS]; ok {
-		return nil, fmt.Errorf("%w: kuasar-sandbox.mmds is not accepted on template register/build", api.ErrBadRequest)
+	// A declared kuasar-sandbox.mmds is for the build's own synthetic sandbox
+	// (runBuildUnit's "MMDS visibility for the template phase" row) to serve
+	// during the build pipeline -- it is never inherited by sandboxes later
+	// created from the resulting template (MergeCreateMetadata excludes
+	// NsMMDS from template defaults regardless of what's stored here).
+	// Validated eagerly, like Create's own declaration, against this node's
+	// mmds.routes policy -- the only policy either cluster or standalone MMDS
+	// has. Runtime availability is deliberately not checked here: execution
+	// may be queued well after registration, so admittedMMDSMetadata's
+	// existing per-read MMDSRuntimeAvailable()/policy re-check (which this
+	// synthetic row goes through like any other sandbox) is what actually
+	// gates whether a route is servable once the build runs.
+	if _, metadata, err = sandboxcfg.ExtractMMDS(metadata, o.mmdsPolicy()); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
@@ -126,8 +138,13 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if triggerBuilder.Registry != nil {
 		return fmt.Errorf("%w: builder.registry is register-time only", api.ErrBadRequest)
 	}
-	if _, ok := triggerMeta[sandboxcfg.NsMMDS]; ok {
-		return fmt.Errorf("%w: kuasar-sandbox.mmds is not accepted on template register/build", api.ErrBadRequest)
+	// See newRegisteredBuild's identical validation: this is for the build's
+	// own synthetic sandbox, not inherited by sandboxes created from the
+	// resulting template. MergeMetadata below is a plain per-key overwrite,
+	// so a trigger-time redeclaration fully replaces (not merges with)
+	// whatever register already set.
+	if _, triggerMeta, err = sandboxcfg.ExtractMMDS(triggerMeta, o.mmdsPolicy()); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
@@ -622,13 +639,31 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	}()
 
 	// MMDS visibility for the template phase: a synthetic running route
-	// (FC-mode envd resolves {id, token-hash} by its floating IP).
+	// (FC-mode envd resolves {id, token-hash} by its floating IP). A
+	// register/trigger-declared kuasar-sandbox.mmds (already schema/policy
+	// validated -- see newRegisteredBuild) rides along on this same row, so
+	// the build pipeline can fetch its own specified static/secret/service
+	// routes through the ordinary MMDSRoute path -- this row goes through
+	// admittedMMDSMetadata like any other sandbox, so the usual
+	// MMDSRuntimeAvailable()/policy re-check still applies at serve time.
 	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
 		row := &types.Sandbox{
 			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
 			State: types.StateRunning, FloatingIP: port.FloatingIP,
 			EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
 			CreatedUnix: time.Now().Unix(),
+		}
+		if raw, ok := b.Metadata[sandboxcfg.NsMMDS]; ok {
+			row.Metadata = map[string]string{sandboxcfg.NsMMDS: raw}
+			// Mirrors Create's identical check (see validateMMDSRouteEntryTransport):
+			// newRegisteredBuild/TriggerBuild only bound the canonical form in
+			// isolation, not the RouteEntry this row is about to be published
+			// as. A rejection here surfaces as a normal build failure (see
+			// executeBuild's err != nil branch), unlike Create it does not
+			// need special-casing to reach the tenant.
+			if err := validateMMDSRouteEntryTransport(o.routeEntryWithMMDS(row, raw)); err != nil {
+				return nil, err
+			}
 		}
 		o.cache(row)
 		o.publishUpsert(row)

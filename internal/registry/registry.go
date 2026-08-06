@@ -41,6 +41,9 @@ var (
 	ErrSandboxNotFound          = errors.New("registry: sandbox not found")
 )
 
+const createRequestTooLargeMessage = "sandbox create request is too large; reduce its size and retry"
+const reconnectRequestTooLargeMessage = "sandbox reconnect request is too large; reduce its size and retry"
+
 const lifecycleAckTimeout = 5 * time.Second
 const nodeListProjectionRetryInterval = 200 * time.Millisecond
 const selectorPatchWriteConcurrency = 16
@@ -483,6 +486,16 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		// Definitive node loss: fall through to re-place (dead-node sweep also resets it).
 	}
 
+	// A live READY route (checked above) and a same-node PAUSED resume reuse
+	// the admitted, persisted sandbox metadata. Only a fresh placement sends a
+	// new CmdCreate and needs the node-link frame admission check below.
+	pausedResume := found && rec != nil && rec.State == StatePaused && rec.NodeID != ""
+	if !pausedResume {
+		if err = validateCreateConfigTransportAdmission(createConfig); err != nil {
+			return nil, err
+		}
+	}
+
 	key := flightKey(group, routeKey)
 	r.mu.Lock()
 	if call, ok := r.inflight[key]; ok {
@@ -804,6 +817,24 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			SandboxGeneration: generation, NodeSandboxID: nodeSandboxID,
 			Profile: string(template.Profile), APISecretFingerprint: placement.APISecretFingerprint,
 		}
+		authSandboxID := sandboxID
+		if selectedReplacement != nil {
+			authSandboxID = selectedReplacement.AuthSandboxID
+		}
+		if authSandboxID != sandboxID {
+			return errors.New("registry: sandbox authentication identity does not match stable identity")
+		}
+		cmd := &routesync.Command{
+			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
+			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
+			Cluster: &routesync.ClusterSandboxContext{
+				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
+			},
+			APISecretFingerprint: placement.APISecretFingerprint,
+		}
+		if err := validateCreateCommandTransport(cmd); err != nil {
+			return err
+		}
 		expect := int64(0)
 		if curFound {
 			expect = curRev
@@ -852,21 +883,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return err
 		}
 
-		authSandboxID := sandboxID
-		if selectedReplacement != nil {
-			authSandboxID = selectedReplacement.AuthSandboxID
-		}
-		if authSandboxID != sandboxID {
-			return errors.New("registry: sandbox authentication identity does not match stable identity")
-		}
-		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
-			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
-			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
-			},
-			APISecretFingerprint: placement.APISecretFingerprint,
-		}
 		if r.nodeOwner == nil {
 			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
 				replaceReady, replaceReady != nil, true) {
@@ -893,13 +909,12 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			reason := ""
-			if ack != nil {
-				reason = ack.Reason
-			}
-			lastFailure = fmt.Errorf("registry: create rejected: %s", reason)
+			lastFailure = commandRejection("create", ack)
 			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
 				replaceReady, replaceReady != nil, true) {
+				return lastFailure
+			}
+			if terminalCommandRejection(lastFailure) {
 				return lastFailure
 			}
 			excluded.add(nodeID)
@@ -909,9 +924,13 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 	}
 }
 
-// normalizeSandboxReserveConfig validates request-scoped namespaces before any
-// READY fast path, placement, route mutation, or lifecycle command. Credentials
-// are parsed once and removed from ordinary config at this boundary.
+// normalizeSandboxReserveConfig normalizes non-MMDS request-scoped namespaces.
+// kuasar-sandbox.mmds itself is never parsed or validated here or in
+// reserveCreate -- it rides through unexamined on every path (READY fast
+// path, in-flight join, PAUSED-resume, fresh placement) the same way. Only
+// the fresh-placement path still applies the general (MMDS-agnostic)
+// node-link transport size check. Credentials are parsed once and removed
+// from ordinary config at this boundary.
 func normalizeSandboxReserveConfig(config map[string]string) (map[string]string, *sandboxcfg.Credentials, error) {
 	config, err := sandboxcfg.NormalizeRestoreMetadata(config)
 	if err != nil {
@@ -930,6 +949,69 @@ func normalizeSandboxReserveConfig(config map[string]string) (map[string]string,
 		return cleaned, nil, nil
 	}
 	return cleaned, &credentials, nil
+}
+
+// validateCommandTransport runs cmd through routesync.ValidateMessage --
+// the same check WriteMsg itself applies at actual dispatch time -- and
+// classifies the result uniformly for all three transport-admission callers
+// below: nil on success, errInvalidSandboxConfig wrapping tooLargeMessage on
+// an oversized frame, or a wrapped diagnostic for any other validation
+// failure (e.g. an oversized MigrationToken, which validateMessageLimits
+// checks before the frame-size check). Every caller gets a ready-to-return
+// error and never needs to wrap errInvalidSandboxConfig itself, so the three
+// call sites can't drift on how that classification happens.
+func validateCommandTransport(cmd *routesync.Command, tooLargeMessage string) error {
+	err := routesync.ValidateMessage(&routesync.Msg{Type: routesync.TypeCommand, Cmd: cmd})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, routesync.ErrMessageTooLarge) {
+		return fmt.Errorf("%w: %s", errInvalidSandboxConfig, tooLargeMessage)
+	}
+	return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+}
+
+// validateCreateConfigTransportAdmission rejects request config that cannot fit
+// even in a minimal create command. The complete command is checked again after
+// placement, because its template, identity, credentials, and merged config add
+// variable JSON envelope overhead.
+func validateCreateConfigTransportAdmission(config map[string]string) error {
+	if len(config) == 0 {
+		return nil
+	}
+	return validateCommandTransport(&routesync.Command{Kind: routesync.CmdCreate, Config: config}, createRequestTooLargeMessage)
+}
+
+// validateCreateCommandTransport guarantees that the command can pass through
+// routesync before the RESERVED record is committed. An oversized command is
+// classified as invalid sandbox config so the public route-link response is
+// HTTP 400 rather than a dispatch-time 503 or timeout.
+func validateCreateCommandTransport(cmd *routesync.Command) error {
+	return validateCommandTransport(cmd, createRequestTooLargeMessage)
+}
+
+// validateReconnectConfigTransportAdmission is reserveConnect/reserveExecSession's
+// pre-flight counterpart to validateCreateConfigTransportAdmission, covering
+// both the current-node fast path and placeAndConnect/placeAndExecSession's
+// cross-node reconstruction path with a single check. connect/exec-session
+// never carry config (config is always empty here), so in practice this only
+// bounds MigrationToken -- kept generic (accepting config) rather than
+// narrowed to a token-only signature, since a future config-carrying use of
+// connect/exec-session would need this same transport check reinstated
+// anyway. Checked before any CAS/dispatch, so a doomed request returns 400
+// before RESERVED is touched or a node is selected, not a late dispatch
+// failure. The complete command (SID, cluster context, etc.) is checked again
+// via validateCreateCommandTransport right before the CAS write, since those
+// fields add variable JSON envelope overhead this early estimate can't see.
+func validateReconnectConfigTransportAdmission(kind string, config map[string]string, migrationToken string) error {
+	if len(config) == 0 && migrationToken == "" {
+		return nil
+	}
+	return validateCommandTransport(&routesync.Command{
+		Kind:           kind,
+		Config:         config,
+		MigrationToken: migrationToken,
+	}, reconnectRequestTooLargeMessage)
 }
 
 func attachCreateCredentials(config map[string]string, profile types.Profile, credentials *sandboxcfg.Credentials) (map[string]string, error) {

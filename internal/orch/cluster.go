@@ -62,6 +62,12 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 				Reason: "connect timeout is out of range", HTTPStatus: http.StatusBadRequest,
 			}
 		}
+		if len(cmd.Config) != 0 {
+			return &routesync.CmdAck{
+				CmdID: cmd.CmdID, Status: routesync.AckRejected,
+				Reason: "connect does not accept config", HTTPStatus: http.StatusBadRequest,
+			}
+		}
 		if cmd.TimeoutSeconds > 0 {
 			unlock := o.lifecycle.Lock(cmd.SID)
 			defer unlock()
@@ -196,6 +202,13 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	meta, builderOpts, err := buildcfg.Extract(cmd.Config)
 	if err != nil {
 		return err
+	}
+	// Mirrors RegisterBuild/TriggerBuild's standalone validation (build.go's
+	// newRegisteredBuild): the declaration is for the build's own synthetic
+	// sandbox, checked against this node's mmds.routes policy -- the same
+	// policy standalone uses, and the only one cluster mode has.
+	if _, meta, err = sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy()); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
@@ -385,6 +398,8 @@ func clusterCommandRejection(err error) (int, string) {
 	switch {
 	case errors.Is(err, api.ErrBadRequest):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, api.ErrTargetIncompatible):
+		return http.StatusConflict, api.ErrTargetIncompatible.Error()
 	case errors.Is(err, migrationtoken.ErrMalformedToken),
 		errors.Is(err, migrationtoken.ErrInvalidPayload):
 		return http.StatusBadRequest, "invalid migration token"
@@ -458,13 +473,17 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
+	_, mmdsPresent := config[sandboxcfg.NsMMDS]
 	_, config, err = sandboxcfg.ExtractMMDS(config, o.mmdsPolicy())
 	if err != nil {
 		var validationErr *sandboxcfg.MMDSValidationError
 		if errors.As(err, &validationErr) {
 			o.log.Warn("MMDS metadata rejected", "operation", "cluster-create", "sid", cmd.SID, "err", validationErr.Diagnostic())
 		}
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %w", api.ErrBadRequest, err)
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+	}
+	if mmdsPresent && !o.MMDSRuntimeAvailable() {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: MMDS is unavailable on this node", api.ErrTargetIncompatible)
 	}
 	cmd.Config = config
 	return pair, tmpl, credentials, nil
@@ -496,6 +515,21 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	if tmpl.Profile == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
+	}
+	// Mirrors Create's identical check: precheckCluster's ExtractMMDS only
+	// bounds the canonical form in isolation, not the RouteEntry it will
+	// actually be published as (which escapes it a second time -- see
+	// validateMMDSRouteEntryTransport). This runs after accept(cmd) has
+	// already been returned to the registry (bootCluster executes in the
+	// async goroutine in HandleCommand), so a rejection here only prevents
+	// the wasted launch and the sandbox from ever being cached/published
+	// with a route that would fail to publish repeatedly -- it does not
+	// itself turn into a client-facing 400, same as every other bootCluster
+	// failure today.
+	if raw, mmdsPresent := meta[sandboxcfg.NsMMDS]; mmdsPresent {
+		if err := validateMMDSRouteEntryTransport(o.routeEntryWithMMDS(sb, raw)); err != nil {
+			return nil, fmt.Errorf("cluster create: %w", err)
+		}
 	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
 		return nil, errors.Join(err, o.rollbackFailedCreate(sb))

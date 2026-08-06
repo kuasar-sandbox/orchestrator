@@ -726,11 +726,18 @@ POST /route-link/reserve
   [&timeout=<seconds>][&ttl_seconds=<seconds>]
 ```
 
-Reserve body 只属于 create;connect/exec-session/data body 为空.四种 operation 的凭据和
-完成条件不同:
+Reserve body 只属于 create;connect/exec-session/data body 为空。跨节点 reconnect（Registry 凭
+migration token 在新节点上重建该 sandbox）时,`kuasar-sandbox.mmds`（如果有）取自迁移令牌自带的
+值。
 
-- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 只允许 restore/credentials
-  config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+`kuasar-sandbox.mmds`（无论来自 create body 还是迁移令牌）由 registry 原样转发,不做任何解析或
+准入决策;真正的校验统一由 node 侧 `ExtractMMDS` 完成。用这个节点自己的 `mmds.routes` policy 做
+schema/协议和配额校验,外加 `MMDSRuntimeAvailable()` 防御检查。这个 node 本地的 `mmds.routes` 配置
+就是 cluster 唯一的 policy 来源,因此要求集群内所有 node 使用相同的 `mmds.routes` 配置,否则同一份
+声明在不同 node 上可能被不同对待。四种 operation 的凭据和完成条件不同:
+
+- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 允许 restore/credentials/checkpoint/
+  mmds config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate,等待 node READY 事件后返回 `Route`。并发
   create 在 Registry 内合并。
 - `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;Header 携 `X-API-KEY`,可选

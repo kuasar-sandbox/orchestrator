@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -500,6 +501,62 @@ func TestReserveBuildReleasesAdmissionOnDefinitiveSendFailure(t *testing.T) {
 	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000}})
 	if err != nil || res.NodeID != "n1" {
 		t.Fatalf("admission lease was not released after definitive send failure: res=%+v err=%v", res, err)
+	}
+}
+
+// TestReserveBuildSurfacesBadRequestWithoutRetryingOtherNodes proves a
+// build_register ack rejected with HTTPStatus 400 (registerClusterBuild's
+// api.ErrBadRequest for a disallowed kuasar-sandbox.mmds in build metadata,
+// mapped via clusterCommandRejection) is treated as a terminal client error,
+// not a retryable node failure -- placement must not move on to a second
+// node only to exhaust every candidate and report a generic 503. Mirrors
+// placeAndConnect's identical commandRejection/terminalCommandRejection use.
+func TestReserveBuildSurfacesBadRequestWithoutRetryingOtherNodes(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	for _, nodeID := range []string{"n1", "n2"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{
+			NodeID: nodeID, BuildCapacity: &routesync.BuildResources{CPU: 2000},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	placements := 0
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		placements++
+		if placements > 1 {
+			t.Fatal("placement must not run again after a terminal 400 build_register rejection")
+		}
+		return &Placement{NodeID: "n1", APISecretFingerprint: testAPIFingerprint}, nil
+	}))
+	n2Dispatched := false
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdBuildRegister {
+			return
+		}
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected, HTTPStatus: http.StatusBadRequest,
+			Reason: "kuasar-sandbox.mmds is not accepted on template register/build",
+		})
+	}})
+	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdBuildRegister {
+			n2Dispatched = true
+		}
+	}})
+
+	_, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000},
+		Metadata: map[string]string{"kuasar-sandbox.mmds": `{"version":1,"routes":[]}`},
+	})
+	if err == nil {
+		t.Fatal("expected the rejected build_register to surface an error")
+	}
+	if got := routeLinkStatus(err); got != http.StatusBadRequest {
+		t.Fatalf("routeLinkStatus(err) = %d, want 400 (got err: %v)", got, err)
+	}
+	if n2Dispatched {
+		t.Fatal("build_register reached a second node after a terminal 400 rejection")
 	}
 }
 

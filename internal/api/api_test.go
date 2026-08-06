@@ -138,7 +138,7 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"build"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"must-not-enter-build"}`)
 	h.Set(checkpointHeader, `{"merge_ref":false}`)
-	h.Set("X-Kuasar-Sandbox-MMDS", `{"version":1,"routes":[{"path":"/must-not-enter-build","type":"static","data":"d"}]}`)
+	h.Set("X-Kuasar-Sandbox-MMDS", `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}`)
 	got := mergeBuildConfigHeaders(nil, h)
 	if got[buildcfg.NsBuilder] != `{"referer":{"enabled":false}}` {
 		t.Fatalf("builder header not normalized: %+v", got)
@@ -152,8 +152,12 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	if _, ok := got[sandboxcfg.NsCheckpoint]; ok {
 		t.Fatalf("checkpoint header entered build metadata: %+v", got)
 	}
-	if _, ok := got[sandboxcfg.NsMMDS]; ok {
-		t.Fatalf("mmds header entered build metadata: %+v", got)
+	// A build's own kuasar-sandbox.mmds (for its synthetic "MMDS visibility"
+	// sandbox -- see runBuildUnit) is schema/policy-validated downstream
+	// (newRegisteredBuild/TriggerBuild), not here, so the header must be
+	// forwarded whenever present for that validation to actually run.
+	if got[sandboxcfg.NsMMDS] != `{"version":1,"routes":[{"path":"/x","type":"static","data":"d"}]}` {
+		t.Fatalf("mmds header not forwarded for downstream validation: %+v", got)
 	}
 }
 

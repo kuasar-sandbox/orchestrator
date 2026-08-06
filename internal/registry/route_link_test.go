@@ -119,31 +119,60 @@ func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 	}
 }
 
-func TestServeReserveAcceptsMMDSConfig(t *testing.T) {
+func TestServeReserveRejectsMMDSOverNodeLinkCapacityBeforePlacement(t *testing.T) {
 	placements := 0
-	reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
-		if _, found := req.Config[sandboxcfg.NsMMDS]; !found {
-			t.Fatalf("mmds specification did not reach placement config: %+v", req.Config)
-		}
 		return nil, ErrNoNode
 	}), 0, nil)
 	enableTestCreateAuth(t, reg)
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
-	body := []byte(`{"config":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[{\"path\":\"/x\",\"type\":\"static\",\"data\":\"d\"}]}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+
+	// The namespace is smaller than the route-link request-body limit, but its
+	// backslashes expand when Config is encoded as a JSON string in Command.
+	raw := `{"version":1,"routes":[{"path":"/x","data":"` + strings.Repeat(`\\`, 300*1024) + `"}]}`
+	body, err := json.Marshal(SandboxReserveReq{Config: map[string]string{sandboxcfg.NsMMDS: raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost,
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
 	req.Header.Set("X-API-KEY", testAPIKeyValue())
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	// A pre-Phase-1 allowlist rejected any config key other than restore/
-	// credentials with 400 before reservation ever ran -- confirm the mmds
-	// specification now reaches placement (503 from ErrNoNode) instead.
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d body=%q, want 503 after accepted config reached placement", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), createRequestTooLargeMessage) {
+		t.Fatalf("status=%d body=%q, want create-request-too-large HTTP 400", rec.Code, rec.Body.String())
 	}
-	if placements != 1 {
-		t.Fatalf("accepted mmds config reached placement %d times, want 1", placements)
+	if placements != 0 {
+		t.Fatalf("oversized MMDS reached placement %d times", placements)
+	}
+}
+
+func TestServeReserveCreatePropagatesTypedNodeRejection(t *testing.T) {
+	ctx := context.Background()
+	reg := New(NewStores(), placementWithToken("n1"), 0, nil)
+	enableTestCreateAuth(t, reg)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{
+			CmdID: cmd.CmdID, Status: routesync.AckRejected,
+			Reason: "bad request: invalid MMDS metadata", HTTPStatus: http.StatusBadRequest,
+		})
+	}})
+
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	req := httptest.NewRequest(http.MethodPost,
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=create",
+		strings.NewReader(`{"config":{"kuasar-sandbox.mmds":"{\"version\":1,\"routes\":[]}"}}`))
+	req.Header.Set("X-API-KEY", testAPIKeyValue())
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || strings.TrimSpace(rec.Body.String()) != "bad request: invalid MMDS metadata" {
+		t.Fatalf("status=%d body=%q, want typed create rejection", rec.Code, rec.Body.String())
 	}
 }
 
@@ -251,7 +280,7 @@ func TestServeReserveMapsOperationErrorsWithoutLifecycleSideEffects(t *testing.T
 		{name: "expected identity mismatch", path: "?group=/g&route_key=rk&operation=connect&sid=sb-other", apiKey: testAPIKeyValue(), wantStatus: http.StatusNotFound},
 		{name: "connected node unavailable", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), wantStatus: http.StatusServiceUnavailable},
 		{name: "wrong data credential", path: "?group=/g&route_key=rk&operation=data&sid=sb-route&port=8080", access: "wrong", wantStatus: http.StatusUnauthorized},
-		{name: "connect body", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
+		{name: "connect body with foreign config key", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{"config":{"kuasar-sandbox.restore":"{}"}}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
 		{name: "overflowing connect timeout", path: fmt.Sprintf("?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=%d", routesync.MaxConnectTimeoutSeconds+1), apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
 		{name: "oversized migration token", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), migration: strings.Repeat("x", migrationtoken.MaxWireSize+1), wantStatus: http.StatusBadRequest},
 	}

@@ -1119,12 +1119,15 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reserve did not send create command")
 	}
-
+	// Once the leader has been admitted, a retry must join that exact flight
+	// rather than starting a second, independent placement.
 	joinCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 	joiner := make(chan reserveOut, 1)
 	go func() {
-		res, err := reg.ReserveSandbox(joinCtx, testCreateReserve("/g", "rk", nil))
+		res, err := reg.ReserveSandbox(joinCtx, testCreateReserve("/g", "rk", map[string]string{
+			sandboxcfg.NsMMDS: `{"version":1,"routes":[{"path":"/a","data":"a"},{"path":"/b","data":"b"}]}`,
+		}))
 		joiner <- reserveOut{res: res, err: err}
 	}()
 	time.Sleep(25 * time.Millisecond)
@@ -2468,6 +2471,40 @@ func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T)
 	}
 }
 
+func TestCreateRejectsWhenCompleteCommandExceedsNodeLinkCapacity(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	placements := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{
+			NodeID: "n1", TemplateRef: testTemplateRef,
+			APISecretFingerprint: testAPIFingerprint,
+			Config:               map[string]string{"placement-overhead": strings.Repeat("p", 300*1024)},
+		}, nil
+	}))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	commands := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commands++ }})
+
+	raw := `{"version":1,"routes":[{"path":"/x","data":"` + strings.Repeat("m", 800*1024) + `"}]}`
+	result, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
+		sandboxcfg.NsMMDS: raw,
+	}))
+	if result != nil || !errors.Is(err, errInvalidSandboxConfig) ||
+		!strings.Contains(err.Error(), createRequestTooLargeMessage) {
+		t.Fatalf("result=%+v err=%v, want create-request-too-large rejection", result, err)
+	}
+	if placements != 1 || commands != 0 {
+		t.Fatalf("placements=%d commands=%d, want 1/0", placements, commands)
+	}
+	if _, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk"); getErr != nil || found {
+		t.Fatalf("oversized complete command mutated route: found=%v err=%v", found, getErr)
+	}
+}
+
 func TestNormalizeSandboxReserveConfigSeparatesCreateCredentials(t *testing.T) {
 	secret := strings.Repeat("1", 64)
 	original := map[string]string{
@@ -3175,6 +3212,7 @@ func TestReservePausedResume(t *testing.T) {
 
 	res, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"service_secret":"` + strings.Repeat("3", 64) + `"}`,
+		sandboxcfg.NsMMDS:        `{"version":1,"routes":[{"path":"/a","data":"a"},{"path":"/b","data":"b"}]}`,
 	}))
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
@@ -3432,6 +3470,14 @@ func TestNodeListWatchIgnoresHeartbeatWatermarks(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("draining heartbeat did not emit node_list event")
+	}
+
+	// Repeating the same draining state does not produce another projection event.
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{Draining: true})
+	select {
+	case ev := <-ch:
+		t.Fatalf("unchanged draining state emitted node_list event: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

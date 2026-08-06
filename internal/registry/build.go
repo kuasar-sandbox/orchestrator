@@ -185,11 +185,15 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
 			r.releaseBuildAdmission(id, req.Group, buildID)
-			reason := ""
-			if ack != nil {
-				reason = ack.Reason
+			// commandRejection/terminalCommandRejection (reserve_operation.go)
+			// preserve the ack's HTTPStatus -- a 400 (e.g. registerClusterBuild's
+			// api.ErrBadRequest for disallowed build MMDS metadata) must surface
+			// as a client error, not be retried against every other node only to
+			// exhaust the placer and report a generic 503.
+			lastFailure = commandRejection("build_register", ack)
+			if terminalCommandRejection(lastFailure) {
+				return nil, lastFailure
 			}
-			lastFailure = fmt.Errorf("registry: build_register rejected: %s", reason)
 			excluded.add(id)
 			continue
 		}

@@ -296,7 +296,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 // internal/router HTTP layer (covered separately by
 // TestCreateSandboxMetadataMMDS*) or a real *orch.Orchestrator in place of
 // fakeNode (no test in this repo stands one up; see mmds_routes_test.go's
-// TestPrecheckClusterAppliesMMDSPolicyAndCanonicalizes for that hop).
+// TestPrecheckClusterCanonicalizesMMDS for that hop).
 func TestNodeLinkReserveRoundTripPreservesMMDSConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -379,7 +379,7 @@ func TestNodeLinkReserveRoundTripPreservesMMDSConfig(t *testing.T) {
 			Group:     "/cell/proj/app/g1",
 			RouteKey:  "u1:sess1",
 			APIKey:    apiKey,
-					Config:    map[string]string{sandboxcfg.NsMMDS: mmdsSpec},
+			Config:    map[string]string{sandboxcfg.NsMMDS: mmdsSpec},
 		})
 		if err == nil {
 			break
@@ -391,7 +391,7 @@ func TestNodeLinkReserveRoundTripPreservesMMDSConfig(t *testing.T) {
 	}
 
 	got := node.createConfigSnapshot()
-			if got[sandboxcfg.NsMMDS] != mmdsSpec {
+	if got[sandboxcfg.NsMMDS] != mmdsSpec {
 		t.Fatalf("mmds specification did not survive the registry -> node-link wire round trip: got %+v", got)
 	}
 }

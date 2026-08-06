@@ -211,6 +211,14 @@ checkpoint:                                        # paused-state capture
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)
+#   routes:                                        # this node's admission policy; cluster uses it too (registry has none of its own)
+#     enabled: false
+#     max_routes_per_sandbox: 32
+#     max_namespace_bytes: 65536
+#     reserved_path_prefixes: []
+#     static: { max_body_bytes: 16384 }
+#     secret: { max_per_sandbox: 16 }
+#     service: { max_per_sandbox: 16 }
 # cluster:                                         # connect this node to registry node_link (node.md §10)
 #   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node

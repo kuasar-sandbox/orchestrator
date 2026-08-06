@@ -1,10 +1,9 @@
 package sandboxcfg
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
+	"mime"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -19,6 +18,43 @@ const (
 	MMDSRouteSecret  = "secret"
 	MMDSRouteService = "service"
 )
+
+// Keep tenant-controlled response headers bounded independently of body size.
+const maxMMDSContentTypeBytes = 256
+
+// maxMMDSCanonicalBytes is a fixed protocol-level backstop on the canonical
+// kuasar-sandbox.mmds form -- independent of, and in addition to, any
+// operator-configured MMDSPolicy.MaxNamespaceBytes. This is a fixed
+// invariant, not a tunable policy, so it applies as a hard ceiling
+// regardless of how large an operator sets mmds.routes.max_namespace_bytes --
+// the only policy either cluster or standalone MMDS has, since every node in
+// a cluster deployment runs the same node-local mmds.routes configuration.
+//
+// The canonical form is later embedded verbatim as a string value inside
+// other JSON-marshaled wire structures, which escapes it a second time (each
+// already-escaped "\\" in the canonical form becomes "\\\\") -- a
+// backslash-heavy specification can double in size on that second pass. Two
+// such structures matter here, and this package cannot import either one to
+// reference its limit directly (both import this package, directly or
+// transitively, so the reverse import would cycle):
+//
+//  1. routesync.RouteEntry.MMDSRoutes / Command.Config, bounded by
+//     routesync's fixed 1 MiB frame (maxFrame). orch.validateMMDSRouteEntryTransport
+//     checks the real encoded RouteEntry at create/import time and rejects
+//     (or, for a migration-carried value, drops) anything that would
+//     actually overflow, so this constant is a coarse backstop for that path,
+//     not the precise gate -- generous margin here is fine.
+//  2. migrationtoken.MigrationTokenPayloadV1.Metadata, part of the
+//     plaintext migrationtoken.Seal encrypts and base64-encodes into a token
+//     bounded by migrationtoken.MaxWireSize (also 512 KiB) -- and that budget
+//     is shared with Payload.Env, a second tenant-controlled, unbounded field
+//     with no size relationship to MMDS at all. There is no equivalent
+//     precise check for this path (deliberately -- see the discussion around
+//     this constant's value), so this constant is the only mitigation: kept
+//     well under MaxWireSize so a specification admitted here is very likely,
+//     not guaranteed, to still fit in a migration token alongside Env and the
+//     token's other fields once minted.
+const maxMMDSCanonicalBytes = 128 * 1024
 
 // MMDSSpec is the tenant-specified kuasar-sandbox.mmds namespace: named secrets
 // and services plus routes mapping an exact guest-visible path to one of them
@@ -60,7 +96,9 @@ type MMDSRouteSpec struct {
 	Data        string `json:"data,omitempty"`
 }
 
-// MMDSPolicy is the node-operator policy ExtractMMDS enforces.
+// MMDSPolicy is the admission policy ExtractMMDS enforces. Cluster mode has
+// no registry-owned policy of its own, so every node in a cluster deployment
+// runs the same node-local mmds.routes policy as standalone.
 type MMDSPolicy struct {
 	Enabled               bool
 	MaxRoutesPerSandbox   int
@@ -69,6 +107,30 @@ type MMDSPolicy struct {
 	MaxStaticBodyBytes    int
 	MaxNamespaceBytes     int
 	ReservedPathPrefixes  []string
+}
+
+// ValidateMMDSReservedPathPrefixes validates operator-configured path
+// reservations before they become admission policy. mmdsPathUnderPrefix
+// matches a prefix against tenant route paths only after they have gone
+// through canonicalMMDSPath, which never produces a wildcard, dot segment,
+// empty segment, uppercase, or non-ASCII character -- so a prefix in any of
+// those shapes can never actually match a real route and would silently
+// leave the intended namespace unreserved. Reusing canonicalMMDSPath here
+// (rather than a separate, looser check) keeps the two in lockstep as that
+// function evolves. "/" is special-cased because it reserves every absolute
+// route but is not itself a valid tenant path; a trailing slash is trimmed
+// first because mmdsPathUnderPrefix treats "/internal" and "/internal/" as
+// equivalent.
+func ValidateMMDSReservedPathPrefixes(prefixes []string) error {
+	for _, prefix := range prefixes {
+		if prefix == "/" {
+			continue
+		}
+		if _, err := canonicalMMDSPath(strings.TrimSuffix(prefix, "/")); err != nil {
+			return fmt.Errorf("invalid prefix %q: %w", prefix, err)
+		}
+	}
+	return nil
 }
 
 var mmdsNameRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
@@ -82,8 +144,8 @@ var reservedMMDSPaths = map[string]bool{
 	"/latest/api/token": true,
 }
 
-// ExtractMMDS strictly parses, canonicalizes, and validates metadata[NsMMDS]
-// against policy. Unlike ExtractCredentials it does not remove the namespace
+// ExtractMMDS applies policy and then strictly parses, canonicalizes, and
+// validates metadata[NsMMDS]. Unlike ExtractCredentials it does not remove the namespace
 // on success: it rewrites metadata[NsMMDS] to the canonical form (explicit
 // "type" on every route, static shorthand expanded, default content_type
 // filled in) in a clone of meta, and returns that clone -- the caller persists
@@ -102,63 +164,89 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 	if len(raw) > policy.MaxNamespaceBytes {
 		return MMDSSpec{}, nil, mmdsErrorWithPublic(fmt.Sprintf("exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes), fmt.Sprintf("metadata exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes))
 	}
-
-	var spec MMDSSpec
-	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&spec); err != nil {
-		return MMDSSpec{}, nil, invalidMMDSJSONError(err)
+	spec, out, err := normalizeMMDS(meta, raw)
+	if err != nil {
+		return MMDSSpec{}, nil, err
 	}
-	// Decode only consumes one JSON value; reject anything trailing it (a
-	// second concatenated document, stray text) rather than silently ignoring
-	// it. dec.More() is not a valid check for this: it reports whether the
-	// *current* array/object has another element pending, not whether
-	// unconsumed bytes remain in the stream once the top-level value is
-	// fully read -- it wrongly returns false (accepting the input) when the
-	// trailing content happens to start with a JSON structural byte, e.g.
-	// `{"version":1}]`. Decoding once more is reliable: it must be exactly
-	// io.EOF once the stream is legitimately exhausted -- a second value or
-	// any other error means reject.
-	var trailing any
-	if err := dec.Decode(&trailing); err != io.EOF {
-		return MMDSSpec{}, nil, mmdsError("contains unexpected trailing data")
+	// The raw check above bounds the tenant's input, but json.Marshal inside
+	// normalizeMMDS can expand it -- notably '<', '>', and '&' each become a
+	// six-byte \uXXXX escape. Re-check the canonical form actually persisted
+	// (and later re-encoded onto the routesync/mmdsrpc wire) so a policy near
+	// the transport frame limit can't admit a spec that is only exploitable
+	// after that expansion. MaxNamespaceBytes is documented as bounding "the
+	// complete...JSON", which the canonical form is.
+	if canonical := out[NsMMDS]; len(canonical) > policy.MaxNamespaceBytes {
+		return MMDSSpec{}, nil, mmdsErrorWithPublic(fmt.Sprintf("canonical form exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes), fmt.Sprintf("metadata exceeds the maximum size of %d bytes", policy.MaxNamespaceBytes))
+	}
+	if err := validateMMDSPolicy(spec, policy); err != nil {
+		return MMDSSpec{}, nil, err
+	}
+	return spec, out, nil
+}
+
+// validateMMDSUnionNames validates the name field shared by secrets[] and
+// services[] -- matches mmdsNameRE, no duplicates -- returning the declared
+// name set on success. kind ("secret" | "service") only selects the error
+// wording; any other field specific to one union member (e.g. a service's
+// Target) is validated separately by the caller.
+func validateMMDSUnionNames[T any](kind string, items []T, name func(T) string) (map[string]bool, error) {
+	names := make(map[string]bool, len(items))
+	for _, item := range items {
+		n := name(item)
+		if !mmdsNameRE.MatchString(n) {
+			return nil, mmdsErrorWithPublic(
+				fmt.Sprintf("%s name %q is invalid", kind, n),
+				fmt.Sprintf("%s name is invalid", kind),
+			)
+		}
+		if names[n] {
+			return nil, mmdsError(fmt.Sprintf("specifies %s %q more than once", kind, n))
+		}
+		names[n] = true
+	}
+	return names, nil
+}
+
+// validateMMDSNamesReferenced rejects a declared (secret or service) name
+// that no route actually uses -- dead configuration a tenant almost
+// certainly didn't intend.
+func validateMMDSNamesReferenced(kind string, declared, used map[string]bool) error {
+	for name := range declared {
+		if !used[name] {
+			return mmdsError(fmt.Sprintf("specifies %s %q but no route references it", kind, name))
+		}
+	}
+	return nil
+}
+
+// normalizeMMDS strictly parses and canonicalizes metadata[NsMMDS], enforcing
+// only schema and protocol invariants -- the core ExtractMMDS layers policy
+// enforcement around. It deliberately does not apply mutable operator
+// admission policy on its own.
+func normalizeMMDS(meta map[string]string, raw string) (MMDSSpec, map[string]string, error) {
+	spec, routeFields, err := decodeMMDSSpec(raw)
+	if err != nil {
+		return MMDSSpec{}, nil, err
 	}
 	if spec.Version != 0 && spec.Version != 1 {
 		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("has unsupported version %d", spec.Version))
 	}
 
-	secretNames := make(map[string]bool, len(spec.Secrets))
-	for _, s := range spec.Secrets {
-		if !mmdsNameRE.MatchString(s.Name) {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("secret name %q is invalid", s.Name))
-		}
-		if secretNames[s.Name] {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies secret %q more than once", s.Name))
-		}
-		secretNames[s.Name] = true
+	secretNames, err := validateMMDSUnionNames("secret", spec.Secrets, func(s MMDSSecretSpec) string { return s.Name })
+	if err != nil {
+		return MMDSSpec{}, nil, err
 	}
-	serviceNames := make(map[string]bool, len(spec.Services))
+	serviceNames, err := validateMMDSUnionNames("service", spec.Services, func(s MMDSServiceSpec) string { return s.Name })
+	if err != nil {
+		return MMDSSpec{}, nil, err
+	}
 	for _, s := range spec.Services {
-		if !mmdsNameRE.MatchString(s.Name) {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("service name %q is invalid", s.Name))
-		}
-		if serviceNames[s.Name] {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies service %q more than once", s.Name))
-		}
-		if strings.TrimSpace(s.Target) == "" {
+		if s.Target == "" {
 			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("service %q has an empty target", s.Name))
 		}
-		serviceNames[s.Name] = true
-	}
-
-	if len(spec.Secrets) > policy.MaxSecretsPerSandbox {
-		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies %d secrets, exceeding the limit of %d", len(spec.Secrets), policy.MaxSecretsPerSandbox))
-	}
-	if len(spec.Services) > policy.MaxServicesPerSandbox {
-		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies %d services, exceeding the limit of %d", len(spec.Services), policy.MaxServicesPerSandbox))
-	}
-	if len(spec.Routes) > policy.MaxRoutesPerSandbox {
-		return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies %d routes, exceeding the limit of %d", len(spec.Routes), policy.MaxRoutesPerSandbox))
+		if s.Target != strings.TrimSpace(s.Target) {
+			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("service %q target must not have leading or trailing whitespace", s.Name))
+		}
 	}
 
 	usedSecrets := make(map[string]bool, len(spec.Secrets))
@@ -166,53 +254,74 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 	paths := make(map[string]bool, len(spec.Routes))
 	canonRoutes := make([]MMDSRouteSpec, len(spec.Routes))
 	for i, r := range spec.Routes {
-		if r.Type == "" {
+		path, perr := canonicalMMDSPath(r.Path)
+		if perr != nil {
+			return MMDSSpec{}, nil, mmdsErrorWithPublic(
+				fmt.Sprintf("route path %q %v", r.Path, perr),
+				fmt.Sprintf("route path %v", perr),
+			)
+		}
+		r.Path = path
+
+		fields := routeFields[i]
+		if !fields.typeSet {
 			r.Type = MMDSRouteStatic
+		} else if r.Type == "" {
+			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: type must not be empty", r.Path))
 		}
 		switch r.Type {
 		case MMDSRouteStatic:
-			if r.SecretName != "" || r.ServiceName != "" {
+			if fields.secretNameSet || fields.serviceNameSet {
 				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: static routes must not set secret_name/service_name", r.Path))
 			}
 			if !utf8.ValidString(r.Data) {
 				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: data must be valid UTF-8", r.Path))
 			}
-			if len(r.Data) > policy.MaxStaticBodyBytes {
-				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: data exceeds the maximum size of %d bytes", r.Path, policy.MaxStaticBodyBytes))
-			}
-			if r.ContentType == "" {
+			if !fields.contentTypeSet {
 				r.ContentType = "application/octet-stream"
+			} else if r.ContentType == "" {
+				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: content_type must not be empty", r.Path))
+			}
+			if len(r.ContentType) > maxMMDSContentTypeBytes {
+				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: content_type exceeds the maximum size of %d bytes", r.Path, maxMMDSContentTypeBytes))
+			}
+			if _, _, err := mime.ParseMediaType(r.ContentType); err != nil {
+				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: content_type is not a valid media type", r.Path))
 			}
 		case MMDSRouteSecret:
-			if r.Data != "" || r.ContentType != "" || r.ServiceName != "" {
+			if fields.dataSet || fields.contentTypeSet || fields.serviceNameSet {
 				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: secret routes must only set secret_name", r.Path))
 			}
 			if !secretNames[r.SecretName] {
-				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: secret_name %q is not specified", r.Path, r.SecretName))
+				return MMDSSpec{}, nil, mmdsErrorWithPublic(
+					fmt.Sprintf("route %q: secret_name %q is not specified", r.Path, r.SecretName),
+					fmt.Sprintf("route %q: secret_name does not reference a specified secret", r.Path),
+				)
 			}
 			usedSecrets[r.SecretName] = true
 		case MMDSRouteService:
-			if r.Data != "" || r.ContentType != "" || r.SecretName != "" {
+			if fields.dataSet || fields.contentTypeSet || fields.secretNameSet {
 				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: service routes must only set service_name", r.Path))
 			}
 			if !serviceNames[r.ServiceName] {
-				return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: service_name %q is not specified", r.Path, r.ServiceName))
+				return MMDSSpec{}, nil, mmdsErrorWithPublic(
+					fmt.Sprintf("route %q: service_name %q is not specified", r.Path, r.ServiceName),
+					fmt.Sprintf("route %q: service_name does not reference a specified service", r.Path),
+				)
 			}
 			usedServices[r.ServiceName] = true
 		default:
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route %q: unknown type %q", r.Path, r.Type))
+			return MMDSSpec{}, nil, mmdsErrorWithPublic(
+				fmt.Sprintf("route %q: unknown type %q", r.Path, r.Type),
+				fmt.Sprintf("route %q: type must be %q, %q, or %q", r.Path, MMDSRouteStatic, MMDSRouteSecret, MMDSRouteService),
+			)
 		}
 
-		path, perr := canonicalMMDSPath(r.Path)
-		if perr != nil {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route path %q %v", r.Path, perr))
-		}
-		r.Path = path
 		if paths[path] {
 			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies path %q more than once", path))
 		}
 		paths[path] = true
-		if reservedMMDSPathCollision(path, policy.ReservedPathPrefixes) {
+		if reservedMMDSPaths[path] {
 			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("route path %q collides with a reserved path", path))
 		}
 
@@ -220,15 +329,11 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 	}
 	spec.Routes = canonRoutes
 
-	for name := range secretNames {
-		if !usedSecrets[name] {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies secret %q but no route references it", name))
-		}
+	if err := validateMMDSNamesReferenced("secret", secretNames, usedSecrets); err != nil {
+		return MMDSSpec{}, nil, err
 	}
-	for name := range serviceNames {
-		if !usedServices[name] {
-			return MMDSSpec{}, nil, mmdsError(fmt.Sprintf("specifies service %q but no route references it", name))
-		}
+	if err := validateMMDSNamesReferenced("service", serviceNames, usedServices); err != nil {
+		return MMDSSpec{}, nil, err
 	}
 
 	spec.Version = 1
@@ -241,16 +346,49 @@ func ExtractMMDS(meta map[string]string, policy MMDSPolicy) (MMDSSpec, map[strin
 		out[k] = v
 	}
 	out[NsMMDS] = string(canonical)
+	// Applies regardless of policy -- see maxMMDSCanonicalBytes's doc comment.
+	// Checked on the canonical form, not the raw input already bounded above
+	// in ExtractMMDS, because json.Marshal above can expand it past whatever
+	// was checked going in.
+	if len(canonical) > maxMMDSCanonicalBytes {
+		return MMDSSpec{}, nil, mmdsErrorWithPublic(
+			fmt.Sprintf("canonical form exceeds the maximum size of %d bytes", maxMMDSCanonicalBytes),
+			fmt.Sprintf("metadata exceeds the maximum size of %d bytes", maxMMDSCanonicalBytes),
+		)
+	}
 	return spec, out, nil
 }
 
-// LookupMMDSRoute decodes the canonical NsMMDS specification already persisted
-// in meta (produced by ExtractMMDS) and returns the route at path, if
-// specified. No validation is repeated -- the stored form is already
-// canonical, so a decode failure (e.g. absent/corrupt) is simply "not found".
-func LookupMMDSRoute(meta map[string]string, path string) (MMDSRouteSpec, bool) {
-	raw, ok := meta[NsMMDS]
-	if !ok {
+func validateMMDSPolicy(spec MMDSSpec, policy MMDSPolicy) error {
+	if len(spec.Secrets) > policy.MaxSecretsPerSandbox {
+		return mmdsError(fmt.Sprintf("specifies %d secrets, exceeding the limit of %d", len(spec.Secrets), policy.MaxSecretsPerSandbox))
+	}
+	if len(spec.Services) > policy.MaxServicesPerSandbox {
+		return mmdsError(fmt.Sprintf("specifies %d services, exceeding the limit of %d", len(spec.Services), policy.MaxServicesPerSandbox))
+	}
+	if len(spec.Routes) > policy.MaxRoutesPerSandbox {
+		return mmdsError(fmt.Sprintf("specifies %d routes, exceeding the limit of %d", len(spec.Routes), policy.MaxRoutesPerSandbox))
+	}
+	for _, route := range spec.Routes {
+		if route.Type == MMDSRouteStatic && len(route.Data) > policy.MaxStaticBodyBytes {
+			return mmdsError(fmt.Sprintf("route %q: data exceeds the maximum size of %d bytes", route.Path, policy.MaxStaticBodyBytes))
+		}
+		if reservedMMDSPathCollision(route.Path, policy.ReservedPathPrefixes) {
+			return mmdsError(fmt.Sprintf("route path %q collides with a reserved path", route.Path))
+		}
+	}
+	return nil
+}
+
+// LookupMMDSRoute decodes raw -- a sandbox's canonical NsMMDS specification
+// value, already persisted (produced by ExtractMMDS) -- and returns the route
+// at path, if specified. No validation is repeated -- the stored form is
+// already canonical, so a decode failure (e.g. absent/corrupt) is simply "not
+// found". Takes the raw string directly (not a namespace map) since every
+// caller already holds it standalone and would otherwise wrap it in a
+// throwaway single-entry map on every guest MMDS request.
+func LookupMMDSRoute(raw, path string) (MMDSRouteSpec, bool) {
+	if raw == "" {
 		return MMDSRouteSpec{}, false
 	}
 	var spec MMDSSpec
@@ -318,9 +456,13 @@ func reservedMMDSPathCollision(path string, extraPrefixes []string) bool {
 // a path segment -- a raw strings.HasPrefix would also match an unrelated
 // sibling that merely shares a textual prefix (e.g. prefix "/internal" would
 // wrongly block "/internal2/foo"), which is not what an operator declaring a
-// reserved prefix intends. A trailing slash on prefix is accepted and ignored,
-// so "/internal" and "/internal/" are equivalent.
+// reserved prefix intends. The root prefix reserves every absolute route. A
+// trailing slash on any other prefix is accepted and ignored, so "/internal"
+// and "/internal/" are equivalent.
 func mmdsPathUnderPrefix(path, prefix string) bool {
+	if prefix == "/" {
+		return strings.HasPrefix(path, "/")
+	}
 	prefix = strings.TrimSuffix(prefix, "/")
 	if prefix == "" {
 		return false

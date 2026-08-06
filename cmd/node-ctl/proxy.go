@@ -25,11 +25,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const (
-	proxyPluginID = "proxy"
+	proxyPluginID = routesync.ProxyPluginID
 
 	envProxyDataFD    = "KUASAR_PROXY_DATA_FD"
 	envProxyForwardFD = "KUASAR_PROXY_FORWARD_FD"
@@ -327,14 +326,12 @@ func newSocketpair() (masterEnd, workerEnd *os.File, err error) {
 }
 
 // mmdsRPCHandler answers a worker's EndpointRequest from the proxy master's
-// in-heap MMDSRoutes store (see proxyshm.MMDSRoutes's doc comment).
+// in-heap MMDSRoutes store, gated on the shared table's current state (see
+// MasterView.MMDSRoute's doc comment for why that gate lives there instead of
+// being re-implemented here).
 func mmdsRPCHandler(view *proxyshm.MasterView) mmdsrpc.Handler {
 	return func(sid, path string) (mmdsrpc.Route, bool) {
-		canonical, ok := view.MMDSRoutes().Get(sid)
-		if !ok {
-			return mmdsrpc.Route{}, false
-		}
-		route, ok := sandboxcfg.LookupMMDSRoute(map[string]string{sandboxcfg.NsMMDS: canonical}, path)
+		route, ok := view.MMDSRoute(sid, path)
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}

@@ -625,7 +625,6 @@ import_groups:
 placement:
   candidates: 2
   zone_admit_max: "yellow"
-  node_dead_after: "5s"
   import_source_lease_ttl: "10s"
   selector_patch_refresh_interval: "1s"
 EOF
@@ -721,6 +720,10 @@ start_cluster_node() {
     local node_id="$1"
     local mmds_config=""
     if [ "$MMDS_STATIC_E2E" = "1" ]; then
+        # cluster mode has no registry-owned MMDS admission policy -- this
+        # node's own mmds.routes is the only policy a cluster declaration is
+        # ever checked against (see docs/cluster.md's Reserve section), so it
+        # must be enabled here for a declared route to be admitted at all.
         mmds_config="proxy: { mode: internal, auth: enforce }
 mmds:
   enabled: true

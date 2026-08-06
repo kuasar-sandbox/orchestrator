@@ -32,7 +32,7 @@ MMDS_STATIC_E2E="${MMDS_STATIC_E2E:-0}"
 MMDS_INVALID_REJECT_E2E="${MMDS_INVALID_REJECT_E2E:-0}"
 MMDS_POLICY_REPLAY_E2E="${MMDS_POLICY_REPLAY_E2E:-0}"
 MMDS_ROUTES_CONFIG=""
-if [ "$MMDS_STATIC_E2E" = "1" ]; then
+if [ "$MMDS_STATIC_E2E" = "1" ] || [ "$MMDS_INVALID_REJECT_E2E" = "1" ]; then
     MMDS_ROUTES_CONFIG="  routes: { enabled: true }"
 fi
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -472,7 +472,12 @@ echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 if [ "$MMDS_INVALID_REJECT_E2E" = "1" ]; then
-    saved_mmds_header="$REQ_MMDS_HEADER"
+    mmds_header_was_set=0
+    saved_mmds_header=""
+    if [ "${REQ_MMDS_HEADER+x}" = "x" ]; then
+        mmds_header_was_set=1
+        saved_mmds_header="$REQ_MMDS_HEADER"
+    fi
     before_invalid="$(runtime_dir_count)"
 
     leak_marker="MMDS_E2E_DO_NOT_REFLECT_$RANDOM"
@@ -487,7 +492,23 @@ if [ "$MMDS_INVALID_REJECT_E2E" = "1" ]; then
     assert_mmds_rejection "$code" "$WORK/resp.body" \
         'bad request: MMDS metadata: is not valid JSON' \
         || fail "invalid-JSON MMDS rejection contract"
-    REQ_MMDS_HEADER="$saved_mmds_header"
+
+    REQ_MMDS_HEADER='{"version":1,"version":1,"routes":[]}'
+    code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+    assert_mmds_rejection "$code" "$WORK/resp.body" \
+        'bad request: MMDS metadata: contains a duplicate JSON field' \
+        || fail "duplicate-field MMDS rejection contract"
+
+    REQ_MMDS_HEADER='{"version":1,"routes":[{"path":"/bad-content-type","type":"static","content_type":"not a media type","data":"x"}]}'
+    code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+    assert_mmds_rejection "$code" "$WORK/resp.body" \
+        'bad request: MMDS metadata: route "/bad-content-type": content_type is not a valid media type' \
+        || fail "invalid-content-type MMDS rejection contract"
+    if [ "$mmds_header_was_set" = "1" ]; then
+        REQ_MMDS_HEADER="$saved_mmds_header"
+    else
+        unset REQ_MMDS_HEADER
+    fi
 
     [ "$(runtime_dir_count)" = "$before_invalid" ] \
         || fail "invalid MMDS creates allocated sandbox runtime directories"
@@ -573,7 +594,7 @@ if [ "$MMDS_STATIC_E2E" = "1" ]; then
     echo "==> PASS: real guest GET reached external MMDS declared static route"
 fi
 if [ "$MMDS_POLICY_REPLAY_E2E" = "1" ]; then
-    echo "==> restarting conductor with MMDS routes disabled; external proxy must retain the existing route"
+    echo "==> restarting conductor with MMDS routes disabled; the existing route must fail closed once the proxy resyncs"
     sed -i '/routes: { enabled: true }/d' "$WORK/config.yaml"
     kill -TERM "$ORCH_PID" 2>/dev/null || true
     wait "$ORCH_PID" 2>/dev/null || true
@@ -604,16 +625,24 @@ if [ "$MMDS_POLICY_REPLAY_E2E" = "1" ]; then
     assert_sandbox_list_count "$WORK/resp.body" 1 || fail "post-restart rejection changed persisted sandbox count"
     grep -Fq "$SID" "$WORK/resp.body" || fail "existing sandbox disappeared after policy restart"
 
-    replay_ok=""
+    # routeEntry/admittedMMDSMetadata re-derive whether a specified route is
+    # still admitted on every read (internal/orch/orch.go,
+    # internal/orch/routes.go), so once the proxy reconnects and does its full
+    # resync against the restarted (routes-disabled) conductor, this
+    # declaration must stop being served -- not keep being replayed from a
+    # stale proxy cache. Poll rather than check once: the proxy's reconnect +
+    # resync happens asynchronously relative to the conductor's health
+    # endpoint coming back.
+    removed_ok=""
     for _ in $(seq 1 30); do
-        if run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" replay; then
-            replay_ok=1
+        if run_mmds_static_guest_removed "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" replay; then
+            removed_ok=1
             break
         fi
         sleep 0.5
     done
-    [ -n "$replay_ok" ] || { dump_logs; fail "external proxy lost the existing MMDS route after conductor restart"; }
-    echo "==> PASS: disabled policy rejected new create while the external proxy retained the replayed route"
+    [ -n "$removed_ok" ] || { dump_logs; fail "external proxy kept serving the MMDS route after mmds.routes was disabled and the conductor restarted"; }
+    echo "==> PASS: disabled policy rejected new create and the external proxy's replayed route failed closed"
 fi
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------

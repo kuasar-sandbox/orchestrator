@@ -18,7 +18,7 @@ func mmdsRPCTestHandler(mmds *MMDSRoutes) mmdsrpc.Handler {
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}
-		route, ok := sandboxcfg.LookupMMDSRoute(map[string]string{sandboxcfg.NsMMDS: canonical}, path)
+		route, ok := sandboxcfg.LookupMMDSRoute(canonical, path)
 		if !ok {
 			return mmdsrpc.Route{}, false
 		}

@@ -688,6 +688,11 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if migrationToken != "" {
 		headers[HeaderMigration] = migrationToken
 	}
+	// Connect never carries config: unlike create, it never allocates a new
+	// sandbox. On a cross-node reconnect (import via migration token), the
+	// token's own carried kuasar-sandbox.mmds is what survives -- see
+	// importSandboxWithKey's cluster branch -- there is no redeclaration
+	// mechanism to override it on this request.
 	res, err := rt.routeLinkReserve(
 		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, 0, nil, headers,
 	)
@@ -765,6 +770,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 	if migrationToken != "" {
 		headers[HeaderMigration] = migrationToken
 	}
+	// See handleConnect: exec-session never carries config either.
 	res, err := rt.routeLinkReserve(
 		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, request.TTLSeconds, nil, headers,
 	)

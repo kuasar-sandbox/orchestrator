@@ -6,6 +6,7 @@
 package clustercfg
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -18,6 +19,17 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// strictUnmarshalYAML decodes raw into out, rejecting any field not present in
+// out's struct tags. Plain yaml.Unmarshal silently ignores unknown fields, so
+// a typo'd or stale key (e.g. in placer_link.placer_label) would otherwise
+// leave the intended setting at its zero-value default without any
+// indication the operator's value was never applied.
+func strictUnmarshalYAML(raw []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	return dec.Decode(out)
+}
 
 const (
 	defaultRegistryBootstrap = "127.0.0.1:7700"
@@ -427,7 +439,7 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &c); err != nil {
+		if err := strictUnmarshalYAML(raw, &c); err != nil {
 			return nil, fmt.Errorf("clustercfg: parse %s: %w", path, err)
 		}
 		c.applyDefaults()
@@ -732,7 +744,7 @@ func LoadRouter(path string) (*RouterConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &c); err != nil {
+		if err := strictUnmarshalYAML(raw, &c); err != nil {
 			return nil, fmt.Errorf("clustercfg: parse %s: %w", path, err)
 		}
 		c.applyDefaults()
@@ -834,7 +846,7 @@ func LoadPlacer(path string) (*PlacerConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clustercfg: read %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &c); err != nil {
+		if err := strictUnmarshalYAML(raw, &c); err != nil {
 			return nil, fmt.Errorf("clustercfg: parse %s: %w", path, err)
 		}
 		c.applyDefaults()

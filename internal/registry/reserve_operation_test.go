@@ -70,6 +70,64 @@ func TestReserveCreateAuthenticatesBeforePlacementOrRouteMutation(t *testing.T) 
 	}
 }
 
+func TestReserveCreateHandlesTypedNodeRejections(t *testing.T) {
+	tests := []struct {
+		name           string
+		statuses       []int
+		wantStatus     int
+		wantPlacements int
+	}{
+		{name: "request rejection is terminal", statuses: []int{http.StatusBadRequest}, wantStatus: http.StatusBadRequest, wantPlacements: 1},
+		{name: "target rejection retries then returns request rejection", statuses: []int{http.StatusConflict, http.StatusBadRequest}, wantStatus: http.StatusBadRequest, wantPlacements: 2},
+		{name: "last target rejection survives candidate exhaustion", statuses: []int{http.StatusConflict, http.StatusConflict}, wantStatus: http.StatusConflict, wantPlacements: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			placements := 0
+			reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+				if placements == len(tt.statuses) {
+					return nil, ErrNoNode
+				}
+				nodeID := fmt.Sprintf("n%d", placements+1)
+				placements++
+				return &Placement{
+					NodeID: nodeID, TemplateRef: testTemplateRef,
+					APISecretFingerprint: testAPIFingerprint,
+				}, nil
+			}))
+
+			for i, status := range tt.statuses {
+				nodeID := fmt.Sprintf("n%d", i+1)
+				if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+					t.Fatal(err)
+				}
+				status := status
+				reg.addNode(&fakeConn{nodeID: nodeID, onCmd: func(cmd *routesync.Command) {
+					go reg.ackCommand(&routesync.CmdAck{
+						CmdID: cmd.CmdID, Status: routesync.AckRejected,
+						HTTPStatus: status, Reason: http.StatusText(status),
+					})
+				}})
+			}
+
+			result, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk", nil))
+			var rejected *nodeCommandRejection
+			if result != nil || !errors.As(err, &rejected) || rejected.status != tt.wantStatus {
+				t.Fatalf("result=%+v err=%v rejection=%+v, want status %d", result, err, rejected, tt.wantStatus)
+			}
+			if placements != tt.wantPlacements {
+				t.Fatalf("placements=%d, want %d", placements, tt.wantPlacements)
+			}
+			if _, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk"); getErr != nil || found {
+				t.Fatalf("rejected create left a route: found=%v err=%v", found, getErr)
+			}
+		})
+	}
+}
+
 func TestReserveCreateRollbackDoesNotCrossRecreatedLineage(t *testing.T) {
 	for _, existing := range []bool{false, true} {
 		for _, ackStatus := range []string{routesync.AckAccepted, routesync.AckRejected} {

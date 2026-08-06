@@ -86,6 +86,9 @@ type Orchestrator struct {
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 
+	mmdsCapabilityMu     sync.RWMutex
+	mmdsRuntimeAvailable bool
+
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
@@ -190,13 +193,24 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	_, mmdsPresent := meta[sandboxcfg.NsMMDS]
 	_, meta, err = sandboxcfg.ExtractMMDS(meta, o.mmdsPolicy())
 	if err != nil {
 		var validationErr *sandboxcfg.MMDSValidationError
 		if errors.As(err, &validationErr) {
 			o.log.Warn("MMDS metadata rejected", "operation", "create", "err", validationErr.Diagnostic())
 		}
-		return nil, fmt.Errorf("%w: %w", api.ErrBadRequest, err)
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	// The static mmds.routes policy only says routes are configured to be
+	// admitted; it says nothing about whether this process can currently serve
+	// them (proxy.mode=external has no listener until an external proxy master
+	// registers with mmds_listen, and never will if proxy.yaml omits it). A
+	// standalone create has no other node to retry on, unlike cluster create
+	// (precheckCluster applies the same MMDSRuntimeAvailable check), so admitting
+	// here would persist and publish static routes nothing can ever serve.
+	if mmdsPresent && !o.MMDSRuntimeAvailable() {
+		return nil, fmt.Errorf("%w: MMDS is unavailable on this node", api.ErrBadRequest)
 	}
 
 	id, err := uuid.NewV7()
@@ -226,6 +240,16 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
+	// Reject before allocating directories or starting a process. Uses
+	// routeEntryWithMMDS (sb.Metadata's own value, already canonicalized by
+	// ExtractMMDS above) rather than routeEntry, which would otherwise pay a
+	// second, redundant ExtractMMDS pass via admittedMMDSMetadata for the
+	// identical result.
+	if mmdsPresent {
+		if err := validateMMDSRouteEntryTransport(o.routeEntryWithMMDS(sb, sb.Metadata[sandboxcfg.NsMMDS])); err != nil {
+			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
 		return nil, errors.Join(err, o.rollbackFailedCreate(sb))
 	}
@@ -244,6 +268,49 @@ func (o *Orchestrator) mmdsPolicy() sandboxcfg.MMDSPolicy {
 		MaxNamespaceBytes:     o.cfg.MMDS.Routes.MaxNamespaceBytes,
 		ReservedPathPrefixes:  o.cfg.MMDS.Routes.ReservedPathPrefixes,
 	}
+}
+
+// admittedMMDSMetadata returns sb.Metadata[NsMMDS] only if it still passes
+// admission, "" otherwise. Applied once at create/import time; a row read
+// back later -- Reconcile adopting a still-running sandbox after a restart,
+// or the external-mode route Range/publish snapshot reading straight from
+// the store -- never re-runs it on its own. Without this check, a
+// specification admitted under an older policy would keep being served
+// indefinitely after an upgrade or config change instead of being scrubbed.
+// Both callers (MMDSRoute for proxy_mode=internal, routeEntry for
+// proxy_mode=external) go through this so neither can independently drift.
+//
+// Cluster and standalone rows are treated identically: cluster has no
+// registry-owned policy of its own, so this node's own mmds.routes config is
+// the only policy either kind of row is ever validated against -- every node
+// in a cluster deployment is expected to run the same mmds.routes
+// configuration, since nothing else keeps them in sync.
+//
+// MMDSRuntimeAvailable() is a second, independent gate: admission (schema +
+// policy, checked below) only says the declaration is *permitted*, not that
+// this process can currently *serve* it. Runtime availability is dynamic --
+// internal mode only after its listener binds, external mode following the
+// proxy master's live registration lease -- and can go false without any
+// admission-relevant config changing (e.g. the master's lease lapses). A
+// cluster row in particular has no capability-aware placement steering to
+// lean on, so without this check a route already admitted once would keep
+// being published/served through a runtime outage instead of failing closed.
+func (o *Orchestrator) admittedMMDSMetadata(sb *types.Sandbox) string {
+	if _, present := sb.Metadata[sandboxcfg.NsMMDS]; !present {
+		return ""
+	}
+	if !o.MMDSRuntimeAvailable() {
+		return ""
+	}
+	_, canonical, err := sandboxcfg.ExtractMMDS(sb.Metadata, o.mmdsPolicy())
+	if err != nil {
+		var validationErr *sandboxcfg.MMDSValidationError
+		if errors.As(err, &validationErr) {
+			o.log.Warn("mmds: dropping metadata that no longer passes admission", "sid", sb.ID, "err", validationErr.Diagnostic())
+		}
+		return ""
+	}
+	return canonical[sandboxcfg.NsMMDS]
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
@@ -1262,15 +1329,25 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 // Decodes sb.Metadata on every call rather than maintaining a compiled index:
 // o.cache(sb) has many call sites and the persisted form (bounded by
 // mmds.routes.max_namespace_bytes, already canonicalized by ExtractMMDS) is
-// cheap to re-parse per request.
+// cheap to re-parse per request. Gated on running state like SandboxInfo: a
+// token minted before pause remains verifiable (MmdsSecret is not gated), so
+// without this check a paused sandbox's specified routes would still be
+// servable via a stale token instead of failing closed until resume.
+// admittedMMDSMetadata re-applies the *current* admission policy (not just
+// schema) so a specification that predates a restart/config change (e.g.
+// mmds.routes now disabled) can't keep being served either.
 func (o *Orchestrator) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool, error) {
 	o.mu.Lock()
 	sb, found := o.reg[sid]
 	o.mu.Unlock()
-	if !found {
+	if !found || sb.State != types.StateRunning {
 		return mmds.MMDSRoute{}, false, nil
 	}
-	route, ok := sandboxcfg.LookupMMDSRoute(sb.Metadata, path)
+	admitted := o.admittedMMDSMetadata(sb)
+	if admitted == "" {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	route, ok := sandboxcfg.LookupMMDSRoute(admitted, path)
 	if !ok {
 		return mmds.MMDSRoute{}, false, nil
 	}

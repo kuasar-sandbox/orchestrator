@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // defaultMMDSRPCTimeout is WorkerView's fallback when the caller passes
@@ -65,6 +66,32 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 // wired into an internal/mmdsrpc.Server per worker.
 func (v *MasterView) MMDSRoutes() *MMDSRoutes { return v.mmds }
 
+// MMDSRoute resolves sid's specified kuasar-sandbox.mmds route at path
+// (proxy_mode=external), the mmdsrpc-server-side counterpart of
+// Orchestrator.MMDSRoute (proxy_mode=internal). It re-checks v.table here
+// rather than relying solely on ApplyUpsert's write-time gating: ApplyUpsert
+// updates v.table and v.mmds in two separate steps, and this method runs on
+// the mmdsrpc server's goroutine, not the routesync subscriber goroutine that
+// calls ApplyUpsert, so a request can race into the narrow window between
+// those two steps (e.g. observing v.table already paused but v.mmds not yet
+// pruned, or the reverse just after resume) without this being the
+// authoritative check.
+func (v *MasterView) MMDSRoute(sid, path string) (mmds.MMDSRoute, bool) {
+	r, ok := v.table.Lookup(sid)
+	if !ok || r.State != routesync.StateRunning {
+		return mmds.MMDSRoute{}, false
+	}
+	canonical, ok := v.mmds.Get(sid)
+	if !ok {
+		return mmds.MMDSRoute{}, false
+	}
+	route, ok := sandboxcfg.LookupMMDSRoute(canonical, path)
+	if !ok {
+		return mmds.MMDSRoute{}, false
+	}
+	return mmds.MMDSRoute{Type: route.Type, ContentType: route.ContentType, Data: route.Data}, true
+}
+
 func (v *MasterView) BeginSync() {
 	v.table.BeginSync()
 	v.mmds.BeginSync()
@@ -72,13 +99,64 @@ func (v *MasterView) BeginSync() {
 }
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
-	if err := v.table.Upsert(r); err != nil {
+	// Pre-check exactly what Table.Upsert itself checks before ever mutating
+	// state (see its own field-order there) -- everything except capacity,
+	// which findSlot can only determine by actually attempting the write.
+	// This lets the MMDS heap write below run before the table row becomes
+	// visible as running without risking a mismatch: a table.Upsert failure
+	// on these grounds must never have touched the heap at all, exactly
+	// matching the pre-reorder behavior for a sid this call is not actually
+	// about to publish (in particular, a malformed update to an *existing*,
+	// already-running, already-mmds-populated sid must leave that existing
+	// heap entry untouched, not clobbered by a doomed write).
+	if v.table.readonly {
+		if v.log != nil {
+			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", "table is read-only")
+		}
+		return
+	}
+	if r.SandboxID == "" {
+		if v.log != nil {
+			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", "empty sandbox id")
+		}
+		return
+	}
+	if err := validateRoute(r); err != nil {
 		if v.log != nil {
 			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
 		}
 		return
 	}
-	v.mmds.Upsert(r.SandboxID, r.MMDSRoutes)
+	// Specified MMDS routes are only servable while running, like Table.SandboxInfo
+	// gates the built-in root instance-info path: a token minted before pause
+	// remains verifiable (Table.MmdsSecret is not state-gated), so without this the
+	// master would keep answering WorkerView.MMDSRoute for a paused sandbox instead
+	// of failing closed until resume re-upserts it as running.
+	//
+	// This heap write happens *before* the table row below becomes visible as
+	// running: MMDSRoute's read path checks table state first, then the heap
+	// store, so publishing the table row first would let a worker observe
+	// state=running (e.g. to satisfy a token PUT keyed off floating IP, which
+	// does not depend on the heap store) and immediately GET a declared
+	// static route before this write had run, spuriously 404ing a route
+	// that is about to exist.
+	if r.State == routesync.StateRunning {
+		v.mmds.Upsert(r.SandboxID, r.MMDSRoutes)
+	} else {
+		v.mmds.Delete(r.SandboxID)
+	}
+	if err := v.table.Upsert(r); err != nil {
+		// Only capacity ("table full") can still fail here, and only for a
+		// sid with no existing slot -- i.e. one findSlot's linear probe never
+		// finds already occupied by this same sid -- so this sid can never
+		// have had a legitimate pre-existing heap entry to preserve; deleting
+		// it is a clean rollback, not a loss of real data.
+		v.mmds.Delete(r.SandboxID)
+		if v.log != nil {
+			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
+		}
+		return
+	}
 	v.notify.Notify()
 }
 

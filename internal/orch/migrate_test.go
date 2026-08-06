@@ -121,10 +121,82 @@ func TestImportRejectsMMDSWhenPolicyDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	if _, err := o.ImportSandbox(ctx, apiKey, token, ""); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("import error = %v, want api.ErrBadRequest", err)
+	if _, err := o.ImportSandbox(ctx, apiKey, token, ""); err == nil {
+		t.Fatal("import accepted MMDS while policy is disabled")
+	} else {
+		assertMMDSBadRequestBoundary(t, err)
+		if !strings.Contains(err.Error(), "MMDS metadata: MMDS routes are disabled by policy") {
+			t.Fatalf("import error = %v, want actionable public MMDS validation detail", err)
+		}
 	}
 }
+
+// TestImportRejectsMMDSWhenRuntimeUnavailable proves a standalone (non-cluster)
+// import is rejected when the static mmds.routes policy admits the carried
+// declaration but this process has no actual MMDS serving capability (mirrors
+// TestCreateRejectsMMDSWhenRuntimeUnavailable; the cluster branch of the same
+// importSandboxWithKey already had this check -- see the `if cluster != nil`
+// branch just above the fix -- but the standalone branch did not).
+func TestImportRejectsMMDSWhenRuntimeUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.erofs")
+	if err := os.WriteFile(runtimePath, []byte("fake-runtime-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
+	cfg.MMDS.Enabled = true
+	cfg.MMDS.Routes = testMMDSRoutesConfig()
+	o := testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
+	// MMDSRuntimeAvailable deliberately left at its zero-value false.
+	ctx := context.Background()
+
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	pair := store.KeyPair{APISecret: apiSecret, ManifestKey: mk}
+	if _, err := o.st.AddKeyPair(ctx, pair, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	sid := "mmds-import-runtime-unavailable"
+	sb := migrationSandbox(t, dir, sid, mk, "manifest://"+strings.Repeat("b", 64))
+	sb.Metadata = map[string]string{sandboxcfg.NsMMDS: testMMDSSpec}
+	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	token, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	_, err = o.ImportSandbox(ctx, apiKey, token, "")
+	if err == nil {
+		t.Fatal("import accepted MMDS while the runtime cannot serve it")
+	}
+	assertMMDSBadRequestBoundary(t, err)
+	if !strings.Contains(err.Error(), "MMDS is unavailable on this node") {
+		t.Fatalf("import error = %v, want the runtime-unavailable detail", err)
+	}
+}
+
+// The import-time counterpart of validateMMDSRouteEntryTransport's Create-side
+// check (see migrate.go) has no equivalent round-trip test here: reaching the
+// canonical-form size that overflows RouteEntry once double-escaped requires
+// getting within a few dozen bytes of maxMMDSCanonicalBytes (512 KiB), which
+// is also exactly migrationtoken.MaxWireSize -- no real migration token can
+// carry a specification that large plus the rest of the sandbox record plus
+// encryption/framing overhead, so this path cannot be exercised through
+// ExportSandbox/ImportSandbox today. validateMMDSRouteEntryTransport's own
+// unit tests (mmds_transport_test.go) cover the size-detection logic directly;
+// the wiring in migrate.go stays as defense-in-depth against
+// migrationtoken.MaxWireSize and maxMMDSCanonicalBytes -- two constants in
+// unrelated packages with no enforced relationship -- drifting apart later.
 
 func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	dir := t.TempDir()
@@ -277,6 +349,115 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 	}
 	if _, found := imported.Metadata[sandboxcfg.NsCredentials]; found {
 		t.Fatal("credentials namespace re-entered cluster sandbox metadata")
+	}
+}
+
+// TestClusterImportKeepsWellFormedTokenMMDS proves a cluster import carries
+// forward the migration token's own well-formed kuasar-sandbox.mmds, checked
+// against this node's own mmds.routes policy -- the only admission cluster
+// mode has, registry forwards a declaration through unexamined on both
+// create and reconnect. There is no redeclaration mechanism to override it.
+func TestClusterImportKeepsWellFormedTokenMMDS(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	o.cfg.MMDS.Enabled = true
+	o.cfg.MMDS.Routes = testMMDSRoutesConfig()
+	o.SetMMDSRuntimeAvailable(true)
+	source := migrationSandbox(t, dir, "logical-g0", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	source.AuthSandboxIDValue = "logical"
+	source.Metadata = map[string]string{
+		"ordinary":        "preserved",
+		sandboxcfg.NsMMDS: testMMDSSpec,
+	}
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := sha256File(o.runtimeFileFor(source.Profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-1"}
+	imported, err := o.importSandboxWithKey(context.Background(), store.KeyPair{
+		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
+	}, token, "logical-g1", migrationtoken.Expectations{
+		AuthSandboxID: source.AuthSandboxID(),
+		TemplateID:    source.TemplateID,
+		Profile:       source.Profile,
+		RuntimeDigest: digest,
+		SnapshotRef:   source.SnapshotRef,
+	}, cluster, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Metadata["ordinary"] != "preserved" {
+		t.Fatal("ordinary migration metadata was not preserved")
+	}
+	got, found := imported.Metadata[sandboxcfg.NsMMDS]
+	if !found {
+		t.Fatal("the migration token's own MMDS metadata was dropped by import")
+	}
+	// ExtractMMDS canonicalizes (e.g. fills in the default content_type),
+	// so the stored value need not be byte-identical to testMMDSSpec.
+	if !strings.Contains(got, "/x") {
+		t.Fatalf("imported MMDS metadata = %q, want the token's own spec", got)
+	}
+}
+
+// TestClusterImportDropsMalformedTokenMMDSInsteadOfRejecting proves a cluster
+// import that finds an unparseable value under the token's own NsMMDS (a
+// migration token can come from a different cluster, a standalone node, or a
+// pre-MMDS-feature row, any of which might carry a value that is not valid
+// kuasar-sandbox.mmds JSON at all -- foreign schema, legacy reuse of the key,
+// plain garbage) drops it rather than failing the whole import: it's
+// carried-forward legacy state, not the tenant's fresh input for this
+// specific request, so a parse failure must never turn an otherwise fully
+// recoverable migration into a hard 400 over data nobody was ever going to
+// use.
+func TestClusterImportDropsMalformedTokenMMDSInsteadOfRejecting(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	o.cfg.MMDS.Enabled = true
+	o.cfg.MMDS.Routes = testMMDSRoutesConfig()
+	o.SetMMDSRuntimeAvailable(true)
+	source := migrationSandbox(t, dir, "logical-g0", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	source.AuthSandboxIDValue = "logical"
+	source.Metadata = map[string]string{
+		"ordinary":        "preserved",
+		sandboxcfg.NsMMDS: `not valid json at all`,
+	}
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := sha256File(o.runtimeFileFor(source.Profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-1"}
+	imported, err := o.importSandboxWithKey(context.Background(), store.KeyPair{
+		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
+	}, token, "logical-g1", migrationtoken.Expectations{
+		AuthSandboxID: source.AuthSandboxID(),
+		TemplateID:    source.TemplateID,
+		Profile:       source.Profile,
+		RuntimeDigest: digest,
+		SnapshotRef:   source.SnapshotRef,
+	}, cluster, 0)
+	if err != nil {
+		t.Fatalf("import with malformed MMDS metadata = %v, want success (the value fails ExtractMMDS and is dropped, not a hard failure)", err)
+	}
+	if imported.Metadata["ordinary"] != "preserved" {
+		t.Fatal("ordinary migration metadata was not preserved")
+	}
+	if _, found := imported.Metadata[sandboxcfg.NsMMDS]; found {
+		t.Fatal("malformed MMDS metadata was carried forward by import instead of being dropped")
 	}
 }
 

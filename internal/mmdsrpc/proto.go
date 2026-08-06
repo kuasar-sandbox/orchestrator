@@ -12,16 +12,16 @@
 // The namespace limit must leave headroom below maxFrame because a frame also
 // carries the JSON envelope, sandbox ID, token, and other protocol metadata.
 //
-// The wire is the same length-prefixed JSON framing idiom as
-// internal/routesync, but hand-rolled here rather than shared: routesync's
-// WriteMsg/ReadMsg are typed to routesync.Msg.
+// The wire is the same length-prefixed JSON framing internal/routesync uses
+// for its own, unrelated peers -- both share the codec in internal/framing.
 package mmdsrpc
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/framing"
 )
 
 // maxFrame bounds a single request/response frame. A response body is bounded
@@ -44,7 +44,7 @@ type EndpointRequest struct {
 // unspecified -- the worker's mmds.Source falls through exactly as the internal
 // implementation does. Found=true with an empty Type never happens; Type is
 // "static" (ContentType/Body populated), "secret", or "service" (their
-// backends land in a later phase; the worker maps those to 503, matching
+// backends are not yet implemented; the worker maps those to 503, matching
 // internal/mmds's getMeta dispatch).
 type EndpointResponse struct {
 	RequestID   uint64 `json:"id"`
@@ -55,33 +55,19 @@ type EndpointResponse struct {
 }
 
 func writeFrame(w io.Writer, v any) error {
-	b, err := json.Marshal(v)
+	b, err := framing.EncodeChecked(v, maxFrame)
+	if errors.Is(err, framing.ErrTooLarge) {
+		return errors.New("mmdsrpc: message too large")
+	}
 	if err != nil {
 		return err
 	}
-	if len(b) > maxFrame {
-		return errors.New("mmdsrpc: message too large")
-	}
-	var hdr [4]byte
-	binary.LittleEndian.PutUint32(hdr[:], uint32(len(b)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err = w.Write(b)
-	return err
+	return framing.WriteFrame(w, b)
 }
 
 func readFrame(r io.Reader, v any) error {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return err
-	}
-	n := binary.LittleEndian.Uint32(hdr[:])
-	if n == 0 || n > maxFrame {
-		return errors.New("mmdsrpc: bad frame length")
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
+	buf, err := framing.ReadFrame(r, maxFrame)
+	if err != nil {
 		return err
 	}
 	return json.Unmarshal(buf, v)

@@ -45,6 +45,19 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsUnknownFields proves a typo'd or stale YAML key fails Load
+// instead of being silently ignored (plain yaml.Unmarshal drops unknown
+// fields, which previously let e.g. a misspelled route_link.park_timeou
+// leave the intended park_timeout at its zero-value default with no
+// indication the operator's setting was never applied).
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.yaml")
+	os.WriteFile(path, []byte("route_link:\n  park_timeou: 30s\n"), 0o600)
+	if _, err := LoadRegistry(path); err == nil {
+		t.Fatal("expected an unknown-field error for park_timeou (typo of park_timeout)")
+	}
+}
+
 func TestLoadPlacerPartialAppliesDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "placer.yaml")
 	os.WriteFile(path, []byte("placement:\n  candidates: 3\n"), 0o600)

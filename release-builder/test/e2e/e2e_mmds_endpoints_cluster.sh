@@ -2,7 +2,12 @@
 #
 # MMDS endpoints E2E suite: clustered control plane, real node and real guest.
 #
-# Current scenario -- declared static route:
+# A declared kuasar-sandbox.mmds rides through the cluster control plane as
+# opaque config, unexamined by registry; the node's own mmds.routes policy
+# (ExtractMMDS, same mechanism standalone uses) is the only validation,
+# applied at dispatch -- cluster has no registry-owned policy of its own, so
+# every node in the cluster must run the same mmds.routes configuration.
+# Scenarios -- declared static route end to end:
 #   1. Run both registry-n1 and registry-redirect cluster cases.
 #   2. Create through router/placer with X-Kuasar-Sandbox-MMDS declaring
 #      /e2e/static; propagate the declaration over node-link to the real node.

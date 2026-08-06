@@ -947,8 +947,12 @@ func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	}
 	reg.projectRegisteredNode(ctx, registered)
 	found := false
+	dataEndpoint := ""
 	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
-		found = found || entry.NodeID == "n1"
+		if entry.NodeID == "n1" {
+			found = true
+			dataEndpoint = entry.DataEndpoint
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -960,13 +964,19 @@ func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	reg.addNode(&fakeConn{nodeID: "n1"})
 	reg.projectRegisteredNode(ctx, registered)
 	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
-		found = found || entry.NodeID == "n1"
+		if entry.NodeID == "n1" {
+			found = true
+			dataEndpoint = entry.DataEndpoint
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if !found {
 		t.Fatal("live registered node was not projected")
+	}
+	if dataEndpoint != "127.0.0.1:19001" {
+		t.Fatal("node_list projection dropped registered fields")
 	}
 }
 

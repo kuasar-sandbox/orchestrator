@@ -3,11 +3,31 @@ package routesync
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestValidateMessageUsesEncodedFrameLimit(t *testing.T) {
+	msg := &Msg{Type: TypeCommand, Cmd: &Command{
+		Kind: CmdCreate,
+		Config: map[string]string{
+			"mmds": strings.Repeat(`\\`, maxFrame/2),
+		},
+	}}
+	if err := ValidateMessage(msg); !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("ValidateMessage error = %v, want ErrMessageTooLarge", err)
+	}
+	var buf bytes.Buffer
+	if err := WriteMsg(&buf, msg); !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("WriteMsg error = %v, want ErrMessageTooLarge", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("WriteMsg emitted %d bytes for an oversized message", buf.Len())
+	}
+}
 
 func roundTrip(t *testing.T, m *Msg) *Msg {
 	t.Helper()

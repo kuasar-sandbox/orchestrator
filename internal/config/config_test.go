@@ -202,6 +202,49 @@ sandbox:
 	}
 }
 
+// TestLoadRejectsNegativeMMDSRouteLimits proves that an explicit negative
+// MMDS route limit fails Load instead of being silently replaced by the
+// default (only an omitted/zero value should be defaulted).
+func TestLoadRejectsNegativeMMDSRouteLimits(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	tests := []struct {
+		field string
+		yaml  string
+	}{
+		{"mmds.routes.max_routes_per_sandbox", "max_routes_per_sandbox: -1"},
+		{"mmds.routes.max_namespace_bytes", "max_namespace_bytes: -1"},
+		{"mmds.routes.static.max_body_bytes", "static: { max_body_bytes: -1 }"},
+		{"mmds.routes.secret.max_per_sandbox", "secret: { max_per_sandbox: -1 }"},
+		{"mmds.routes.service.max_per_sandbox", "service: { max_per_sandbox: -1 }"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			path := writeConfig(t, fmt.Sprintf(`
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  enabled: true
+  routes:
+    enabled: true
+    %s
+`, tt.yaml))
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load succeeded with a negative %s", tt.field)
+			}
+			if !strings.Contains(err.Error(), tt.field+" must be positive") {
+				t.Fatalf("error %q does not describe the invalid %s", err, tt.field)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsMMDSRoutesWithoutMMDSService(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
@@ -223,6 +266,48 @@ mmds:
 	}
 	if !strings.Contains(err.Error(), "mmds.routes.enabled=true requires mmds.enabled=true") {
 		t.Fatalf("error %q does not describe the MMDS dependency", err)
+	}
+}
+
+func TestLoadValidatesMMDSReservedPathPrefixes(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	tests := []struct {
+		prefix string
+		valid  bool
+	}{
+		{prefix: "", valid: false},
+		{prefix: "internal", valid: false},
+		{prefix: "/internal?", valid: false},
+		{prefix: "/internal#", valid: false},
+		{prefix: "/internal%", valid: false},
+		{prefix: "/", valid: true},
+		{prefix: "/internal", valid: true},
+		{prefix: "/internal/", valid: true},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("prefix=%q", tt.prefix), func(t *testing.T) {
+			path := writeConfig(t, fmt.Sprintf(`
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+mmds:
+  enabled: true
+  routes:
+    enabled: true
+    reserved_path_prefixes: [%q]
+`, tt.prefix))
+			_, err := Load(path)
+			if tt.valid && err != nil {
+				t.Fatalf("Load rejected valid prefix %q: %v", tt.prefix, err)
+			}
+			if !tt.valid && (err == nil || !strings.Contains(err.Error(), "mmds.routes.reserved_path_prefixes")) {
+				t.Fatalf("Load error for invalid prefix %q = %v", tt.prefix, err)
+			}
+		})
 	}
 }
 
@@ -527,6 +612,37 @@ func TestLoadProxyRejectsMalformedRPCTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "proxy_rpc_timeout") {
 		t.Fatalf("error %q does not mention proxy_rpc_timeout", err)
+	}
+}
+
+// TestLoadProxyRejectsNonpositiveTimeouts proves a zero or negative
+// park_timeout/proxy_rpc_timeout fails Load instead of parsing successfully
+// and then being silently replaced at runtime (ParkTimeoutDur/
+// ProxyRPCTimeoutDur both substitute their default for d<=0).
+func TestLoadProxyRejectsNonpositiveTimeouts(t *testing.T) {
+	for _, tt := range []struct {
+		field string
+		yaml  string
+	}{
+		{"park_timeout", "park_timeout: 0s"},
+		{"park_timeout", "park_timeout: -1s"},
+		{"proxy_rpc_timeout", "proxy_rpc_timeout: 0s"},
+		{"proxy_rpc_timeout", "proxy_rpc_timeout: -1s"},
+	} {
+		t.Run(tt.yaml, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "proxy.yaml")
+			if err := os.WriteFile(path, []byte("paths: { run_root: /run/sandbox }\n"+tt.yaml+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadProxy(path)
+			if err == nil {
+				t.Fatalf("LoadProxy accepted a nonpositive %s", tt.field)
+			}
+			if !strings.Contains(err.Error(), tt.field+" ") || !strings.Contains(err.Error(), "must be positive") {
+				t.Fatalf("error %q does not describe the invalid %s", err, tt.field)
+			}
+		})
 	}
 }
 

@@ -27,11 +27,11 @@
 package routesync
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/framing"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 )
 
@@ -168,6 +168,11 @@ type Register struct {
 	ResumeFrom string `json:"resume_from,omitempty"`
 }
 
+// ProxyPluginID is the reserved plugin identity used by node-ctl's external
+// proxy master. A matching ID alone is not a capability proof; consumers must
+// also validate the registration shape and its live stream lease.
+const ProxyPluginID = "proxy"
+
 // Subscribe selects the route-stream flavor.
 type Subscribe struct {
 	Kind string `json:"kind"` // KindRoute | KindRouteWake
@@ -208,39 +213,44 @@ type Event struct {
 
 const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake frame (no all-routes frame)
 
-// WriteMsg writes a length-prefixed JSON frame ([4B LE len][json]).
+// ErrMessageTooLarge is returned when a message's encoded JSON payload cannot
+// fit in one routesync frame.
+var ErrMessageTooLarge = errors.New("routesync: message too large")
+
+// ValidateMessage applies the same semantic and encoded-frame limits as
+// WriteMsg without writing anything. Callers use it to reject commands before
+// committing state or dispatching them to a node.
+func ValidateMessage(m *Msg) error {
+	_, err := encodeMessage(m)
+	return err
+}
+
+// WriteMsg writes a length-prefixed JSON frame ([4B LE len][json]) -- the
+// same framing internal/mmdsrpc uses for its own, unrelated peers (see
+// internal/framing).
 func WriteMsg(w io.Writer, m *Msg) error {
-	if err := validateMessageLimits(m); err != nil {
-		return err
-	}
-	b, err := json.Marshal(m)
+	b, err := encodeMessage(m)
 	if err != nil {
 		return err
 	}
-	if len(b) > maxFrame {
-		return errors.New("routesync: message too large")
+	return framing.WriteFrame(w, b)
+}
+
+func encodeMessage(m *Msg) ([]byte, error) {
+	if err := validateMessageLimits(m); err != nil {
+		return nil, err
 	}
-	var hdr [4]byte
-	binary.LittleEndian.PutUint32(hdr[:], uint32(len(b)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
+	b, err := framing.EncodeChecked(m, maxFrame)
+	if errors.Is(err, framing.ErrTooLarge) {
+		return nil, ErrMessageTooLarge
 	}
-	_, err = w.Write(b)
-	return err
+	return b, err
 }
 
 // ReadMsg reads one length-prefixed JSON frame.
 func ReadMsg(r io.Reader) (*Msg, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	n := binary.LittleEndian.Uint32(hdr[:])
-	if n == 0 || n > maxFrame {
-		return nil, errors.New("routesync: bad frame length")
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
+	buf, err := framing.ReadFrame(r, maxFrame)
+	if err != nil {
 		return nil, err
 	}
 	var m Msg

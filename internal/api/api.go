@@ -122,6 +122,15 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	return meta, nil
 }
 
+// mergeBuildConfigHeaders folds build-time headers into meta, including the
+// MMDS header: a build's own kuasar-sandbox.mmds (for its synthetic "MMDS
+// visibility" sandbox -- see runBuildUnit) is schema/policy-validated
+// downstream (newRegisteredBuild/TriggerBuild), not here, so presence (not a
+// non-empty value, unlike the generic headers folded by mergeConfigHeaders
+// above) is what defines an attempt: the header must be forwarded whenever
+// present, even empty, so that validation actually runs and rejects a
+// malformed/empty attempt with a real error instead of it being silently
+// misread as "no MMDS declared."
 func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]string {
 	meta = mergeConfigHeaders(meta, h)
 	if v := h.Get(builderHeader); v != "" {
@@ -129,6 +138,12 @@ func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]s
 			meta = map[string]string{}
 		}
 		meta[buildcfg.NsBuilder] = v
+	}
+	if _, present := h[http.CanonicalHeaderKey(mmdsHeader)]; present {
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[sandboxcfg.NsMMDS] = h.Get(mmdsHeader)
 	}
 	return meta
 }
@@ -150,6 +165,11 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // ErrBadRequest maps a Core-side validation failure (e.g. a COPY referencing
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
+
+// ErrTargetIncompatible reports that an otherwise valid cluster operation
+// cannot run on the selected node. Registry may retry the operation on another
+// node; it maps to HTTP 409 rather than a tenant validation failure.
+var ErrTargetIncompatible = errors.New("target environment incompatible")
 
 // ErrAlreadyExists is returned when a sandbox migration import target exists.
 var ErrAlreadyExists = errors.New("sandbox already exists")

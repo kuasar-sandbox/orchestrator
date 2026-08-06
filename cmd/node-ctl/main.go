@@ -140,6 +140,12 @@ func runConductor(args []string, log *slog.Logger) error {
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
+	plugins := configsock.NewRegistry()
+	if cfg.Proxy.Mode == config.ProxyExternal {
+		plugins.SetMMDSChangeHook(func() {
+			core.SetMMDSRuntimeAvailable(plugins.MMDSAvailable())
+		})
+	}
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
@@ -227,7 +233,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
 	// registrations (proxy master, route observers); the external-mode proxyForwarder
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
-	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider:      core,
 		Admin:         core,
@@ -317,8 +322,10 @@ func runConductor(args []string, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("mmds listen %s: %w", cfg.MMDS.Listen, err)
 		}
+		core.SetMMDSRuntimeAvailable(true)
 		log.Info("mmds metadata service", "listen", cfg.MMDS.Listen, "proxy_netns", cfg.Proxy.ProxyNetNS)
 		go func() {
+			defer core.SetMMDSRuntimeAvailable(false)
 			if err := mmds.New(core, cfg.ParkTimeoutDur(), log).Serve(ctx, mln); err != nil {
 				log.Error("mmds service", "err", err)
 			}

@@ -29,6 +29,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -121,9 +122,19 @@ func secureHeaders(next http.Handler) http.Handler {
 // trailing slash on a non-root path. r.URL.EscapedPath() is used throughout
 // (not r.URL.Path) specifically because Path is already percent-decoded --
 // checking it would let "/a%2Fb" silently match a specified "/a/b" route.
+//
+// It also rejects HEAD before the mux ever sees it: ServeMux's "GET "
+// patterns implicitly match HEAD too (the stdlib's documented convenience
+// behavior), which would otherwise dispatch straight into getMeta and return
+// 200, violating the exact-method contract that every non-PUT-token request
+// other than GET must be 405.
 func guardRawRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawFragment != "" {
+		if r.Method == http.MethodHead {
+			http.Error(w, "", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.ForceQuery || r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawFragment != "" {
 			http.Error(w, "", http.StatusBadRequest)
 			return
 		}
@@ -159,6 +170,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
+	if rejectRequestBody(w, r) {
+		return
+	}
 	ip := sourceIP(r.RemoteAddr)
 	sid, ok := s.resolve(r.Context(), ip)
 	if !ok {
@@ -186,6 +200,9 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusUnauthorized)
 		return
 	}
+	if rejectRequestBody(w, r) {
+		return
+	}
 	// The built-in instance-info document is served only at the exact root;
 	// every other path goes through specified-route dispatch, unspecified or
 	// not -- an unspecified path is 404, not a silent alias for "/".
@@ -209,7 +226,7 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		case "static":
 			w.Header().Set("Content-Type", route.ContentType)
 			_, _ = w.Write([]byte(route.Data))
-		default: // "secret" | "service" — backend lands in a later phase
+		default: // "secret" | "service" — backend not yet implemented
 			http.Error(w, "", http.StatusServiceUnavailable)
 		}
 		return
@@ -222,6 +239,27 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	b, _ := json.Marshal(opts{InstanceID: sid, EnvID: tid, AccessTokenHash: HashToken(token)})
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(b)
+}
+
+// rejectRequestBody enforces the MMDS v2 request shape before token creation
+// or metadata route resolution. http.NoBody covers the ordinary empty-body
+// cases (Content-Length: 0, or no Content-Length at all), but a chunked
+// request -- whose length is never known in advance -- always gets a real,
+// non-NoBody Body even when it turns out to carry nothing, so a bodyless
+// chunked request must be distinguished by actually peeking it rather than
+// rejected outright on that ground alone. The peek is bounded to one byte:
+// a real body is rejected the moment that byte is observed, so this can
+// never be used to smuggle an arbitrarily large body past the check.
+func rejectRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	var peek [1]byte
+	if n, err := r.Body.Read(peek[:]); n == 0 && err == io.EOF {
+		return false
+	}
+	http.Error(w, "", http.StatusBadRequest)
+	return true
 }
 
 // resolve parks (bounded by s.park) until a starting/running sandbox owns ip — reusing the

@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // Proxy modes select how the node serves sandbox data-plane traffic
@@ -275,28 +277,32 @@ type ProxyConfig struct {
 type MMDSConfig struct {
 	Enabled bool   `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
 	Listen  string `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
-	// Routes is the node policy for tenant-specified kuasar-sandbox.mmds routes --
-	// a separate tenant-facing feature from Enabled/Listen above (the built-in
-	// Firecracker-compat token/metadata service), grouped here only because
-	// both are MMDS-adjacent.
+	// Routes is this node's admission policy for tenant-specified
+	// kuasar-sandbox.mmds routes -- a separate tenant-facing feature from
+	// Enabled/Listen above (the built-in Firecracker-compat token/metadata
+	// service), grouped here only because both are MMDS-adjacent.
 	Routes MMDSRoutesConfig `yaml:"routes"`
 }
 
-// MMDSRoutesConfig is the node policy for tenant-specified MMDS route
-// namespaces (kuasar-sandbox.mmds). Disabled (default) => Create
-// requests carrying the namespace are rejected 400 before any tenant-supplied
-// JSON is parsed. Applies uniformly to standalone and cluster create, and to
-// both proxy.mode=internal and proxy.mode=external. Per-type policy (static/
+// MMDSRoutesConfig is this node's admission policy for tenant-specified MMDS
+// route namespaces (kuasar-sandbox.mmds). Disabled (default) => a create
+// request carrying the namespace is rejected 400 before any tenant-supplied
+// JSON is parsed -- standalone applies this directly, and a clustered create
+// goes through the same node-local check (registry has no admission policy
+// of its own; every node in a cluster deployment is expected to run the same
+// mmds.routes configuration). Applies to both proxy.mode=internal and proxy.mode=external. Per-type policy (static/
 // secret/service, matching the specification's own route taxonomy) is grouped
 // into the nested Static/Secret/Service structs below; only limits that apply
 // across every route type stay flat here.
 type MMDSRoutesConfig struct {
-	Enabled              bool     `yaml:"enabled"`
-	MaxRoutesPerSandbox  int      `yaml:"max_routes_per_sandbox"` // total routes[] cap, across all types
-	// MaxNamespaceBytes caps the complete raw kuasar-sandbox.mmds JSON,
-	// including static route bodies. Keep it comfortably below the transport
-	// frame limit because a frame also carries the JSON envelope, sandbox ID,
-	// token, and other protocol metadata.
+	Enabled             bool `yaml:"enabled"`
+	MaxRoutesPerSandbox int  `yaml:"max_routes_per_sandbox"` // total routes[] cap, across all types
+	// MaxNamespaceBytes caps both the raw kuasar-sandbox.mmds JSON and its
+	// canonical form (sandboxcfg.ExtractMMDS re-checks the latter, since
+	// JSON-escaping '<'/'>'/'&' can expand it), including static route
+	// bodies. Keep it comfortably below the transport frame limit because a
+	// frame also carries the JSON envelope, sandbox ID, token, and other
+	// protocol metadata.
 	MaxNamespaceBytes    int      `yaml:"max_namespace_bytes"`
 	ReservedPathPrefixes []string `yaml:"reserved_path_prefixes"`
 
@@ -313,16 +319,16 @@ type MMDSStaticRoutesConfig struct {
 }
 
 // MMDSSecretRoutesConfig is node policy specific to type:"secret" routes.
-// Only the specification-time count limit exists on this branch; the admin-PUT
-// value limit and guest-wait policy are a later phase's runtime backend, not
-// yet implemented.
+// Only the specification-time count limit exists here; the admin-PUT value
+// limit and guest-wait policy belong to the secret route's runtime backend,
+// not yet implemented.
 type MMDSSecretRoutesConfig struct {
 	MaxPerSandbox int `yaml:"max_per_sandbox"` // secrets[] cap in the specification
 }
 
 // MMDSServiceRoutesConfig is node policy specific to type:"service" routes.
-// Only the specification-time count limit exists on this branch; the service
-// backend is a later phase.
+// Only the specification-time count limit exists here; the service route's
+// runtime backend is not yet implemented.
 type MMDSServiceRoutesConfig struct {
 	MaxPerSandbox int `yaml:"max_per_sandbox"` // services[] cap in the specification
 }
@@ -644,19 +650,23 @@ func (c *Config) applyDefaults() {
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
-	if c.MMDS.Routes.MaxRoutesPerSandbox <= 0 {
+	// Only an omitted (zero) value gets the default -- a negative value is left
+	// as-is so validateProxy's positivity check below can reject it, rather
+	// than defaulting silently over what would otherwise be invalid operator
+	// configuration.
+	if c.MMDS.Routes.MaxRoutesPerSandbox == 0 {
 		c.MMDS.Routes.MaxRoutesPerSandbox = 32
 	}
-	if c.MMDS.Routes.Secret.MaxPerSandbox <= 0 {
+	if c.MMDS.Routes.Secret.MaxPerSandbox == 0 {
 		c.MMDS.Routes.Secret.MaxPerSandbox = 16
 	}
-	if c.MMDS.Routes.Service.MaxPerSandbox <= 0 {
+	if c.MMDS.Routes.Service.MaxPerSandbox == 0 {
 		c.MMDS.Routes.Service.MaxPerSandbox = 16
 	}
-	if c.MMDS.Routes.Static.MaxBodyBytes <= 0 {
+	if c.MMDS.Routes.Static.MaxBodyBytes == 0 {
 		c.MMDS.Routes.Static.MaxBodyBytes = 16 * 1024
 	}
-	if c.MMDS.Routes.MaxNamespaceBytes <= 0 {
+	if c.MMDS.Routes.MaxNamespaceBytes == 0 {
 		c.MMDS.Routes.MaxNamespaceBytes = 64 * 1024
 	}
 	if c.ResourceListen != nil {
@@ -805,6 +815,26 @@ func (c *Config) validateProxy() error {
 	if c.MMDS.Routes.Enabled && !c.MMDS.Enabled {
 		return fmt.Errorf("config: mmds.routes.enabled=true requires mmds.enabled=true (the MMDS service must be available to serve specified routes)")
 	}
+	if err := sandboxcfg.ValidateMMDSReservedPathPrefixes(c.MMDS.Routes.ReservedPathPrefixes); err != nil {
+		return fmt.Errorf("config: mmds.routes.reserved_path_prefixes contains %w", err)
+	}
+	// applyDefaults only fills an omitted (zero) limit; an explicit negative
+	// value survives to here and must fail startup rather than being admitted
+	// under a silently substituted default. This is the sole gate for these
+	// limits -- they are a standalone-only policy; a cluster row forwards
+	// kuasar-sandbox.mmds through registry unexamined instead.
+	limits := map[string]int{
+		"mmds.routes.max_routes_per_sandbox":  c.MMDS.Routes.MaxRoutesPerSandbox,
+		"mmds.routes.max_namespace_bytes":     c.MMDS.Routes.MaxNamespaceBytes,
+		"mmds.routes.static.max_body_bytes":   c.MMDS.Routes.Static.MaxBodyBytes,
+		"mmds.routes.secret.max_per_sandbox":  c.MMDS.Routes.Secret.MaxPerSandbox,
+		"mmds.routes.service.max_per_sandbox": c.MMDS.Routes.Service.MaxPerSandbox,
+	}
+	for name, value := range limits {
+		if value <= 0 {
+			return fmt.Errorf("config: %s must be positive", name)
+		}
+	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
 	}
@@ -906,11 +936,20 @@ func (p *ProxyFileConfig) validate() error {
 	default:
 		return fmt.Errorf("proxy config: auth %q (want off|log|enforce)", p.Auth)
 	}
-	if _, err := time.ParseDuration(p.ParkTimeout); err != nil {
+	// Parsing successfully is not enough: ParkTimeoutDur/ProxyRPCTimeoutDur
+	// below both silently substitute their default for a zero or negative
+	// duration, so without this check a nonpositive value would appear to
+	// load successfully while runtime behavior silently diverges from what
+	// the operator configured.
+	if d, err := time.ParseDuration(p.ParkTimeout); err != nil {
 		return fmt.Errorf("proxy config: park_timeout %q: %w", p.ParkTimeout, err)
+	} else if d <= 0 {
+		return fmt.Errorf("proxy config: park_timeout %q must be positive", p.ParkTimeout)
 	}
-	if _, err := time.ParseDuration(p.ProxyRPCTimeout); err != nil {
+	if d, err := time.ParseDuration(p.ProxyRPCTimeout); err != nil {
 		return fmt.Errorf("proxy config: proxy_rpc_timeout %q: %w", p.ProxyRPCTimeout, err)
+	} else if d <= 0 {
+		return fmt.Errorf("proxy config: proxy_rpc_timeout %q must be positive", p.ProxyRPCTimeout)
 	}
 	if p.Workers <= 0 {
 		return fmt.Errorf("proxy config: workers must be positive")
