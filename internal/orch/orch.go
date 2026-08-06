@@ -606,43 +606,37 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 }
 
 func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
-	var cleanupErr error
 	if p.unit != "" && !p.runnerStopped {
 		if err := o.lc.Stop(ctx, p.unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", p.unit, err))
-		} else {
-			p.runnerStopped = true
+			return fmt.Errorf("stop %s: %w", p.unit, err)
 		}
+		p.runnerStopped = true
 	}
 	if p.unit != "" && p.runnerStopped && !p.runnerReset {
 		if err := o.lc.ResetFailed(ctx, p.unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", p.unit, err))
-		} else {
-			p.runnerReset = true
+			return fmt.Errorf("reset %s: %w", p.unit, err)
 		}
+		p.runnerReset = true
 	}
 	if p.port != "" && !p.portDetached {
 		if err := o.vs.Detach(ctx, p.port); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", p.port, err))
-		} else {
-			p.portDetached = true
+			return fmt.Errorf("detach port %s: %w", p.port, err)
 		}
+		p.portDetached = true
 	}
 	if includeLocal && p.runDir != "" && !p.runDirRemoved {
 		if err := os.RemoveAll(p.runDir); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", p.runDir, err))
-		} else {
-			p.runDirRemoved = true
+			return fmt.Errorf("remove run dir %s: %w", p.runDir, err)
 		}
+		p.runDirRemoved = true
 	}
 	if includeLocal && p.baseDir != "" && !p.baseDirRemoved {
 		if err := os.RemoveAll(p.baseDir); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove base dir %s: %w", p.baseDir, err))
-		} else {
-			p.baseDirRemoved = true
+			return fmt.Errorf("remove base dir %s: %w", p.baseDir, err)
 		}
+		p.baseDirRemoved = true
 	}
-	return cleanupErr
+	return nil
 }
 
 func (o *Orchestrator) stepLaunchCleanup(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, includeLocal bool) error {
