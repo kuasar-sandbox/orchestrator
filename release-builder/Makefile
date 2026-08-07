@@ -66,7 +66,7 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-sandbox-working-set perf-density
 REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-repo-guest-runtime
 
-.PHONY: all build collect e2e-tools release verify-prebuilt vet test test-ci-tools test-release-tools test-perf-tools clean help demo \
+.PHONY: all build collect e2e-tools release verify-prebuilt vet test test-ci-tools test-release-tools test-perf-tools test-uffd-performance-gate clean help demo \
 	        bench test-e2e test-e2e-prebuilt perf dedup-report \
 	        $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
@@ -153,6 +153,7 @@ test-e2e-repo-guest-runtime:
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build e2e-tools
+	$(MAKE) test-uffd-performance-gate
 	$(MAKE) -j1 $(UMBRELLA_E2E_RUN)
 	$(MAKE) test-e2e-repo-accelerator
 	$(MAKE) -j2 test-e2e-repo-connector test-e2e-repo-guest-runtime
@@ -225,6 +226,10 @@ test-release-tools:
 
 test-perf-tools:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/perf -p '*_test.py'
+	bash test/perf/uffd_performance_gate_test.sh
+
+test-uffd-performance-gate:
+	$(CI_TIMED) perf/uffd-gate env ORG="$(ORG)" bash test/perf/uffd-performance-gate.sh
 
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
@@ -247,5 +252,6 @@ help:
 	@echo "  test-ci-tools validate BMS cache/timing helpers"
 	@echo "  test-release-tools validate release manifests, bundles, and preflight guards"
 	@echo "  test-perf-tools validate performance report generators"
+	@echo "  test-uffd-performance-gate enforce source UFFD A/B/C performance bounds"
 	@echo "  clean         clean every sub-repo + this repo's bin/ build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64  (exported to sub-makes)"

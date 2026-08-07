@@ -20,7 +20,7 @@
 #   6. restore manifest://     (hot L1)    — second+ restore (cache warm)
 #
 # Output:
-#   stats per iter via sandbox-ctl --stats-json (uffd batch shape, blk0
+#   stats per iter via sandbox-ctl --stats-json (UFFD source/urgent/tail shape, blk0
 #   load, Go memstats, lazy-load ratio, dedup chunks)
 #   final report aggregates median into a single table
 #
@@ -376,8 +376,22 @@ out = {
     "wall_exit_ms": t_exit_ms,
     "internal_ms": (r.get("wallclock") or {}).get("duration_ms"),
     "uffd_faults": u.get("faults_absent"),
-    "uffd_batch_avg": u.get("batch_avg_pages"),
-    "uffd_batch_max": u.get("batch_max_pages"),
+    "uffd_errors": u.get("errors"),
+    "uffd_queue_p95_us": (u.get("fault_queue_wait_p95") or 0) / 1000.0,
+    "uffd_queue_p99_us": (u.get("fault_queue_wait_p99") or 0) / 1000.0,
+    "uffd_source_calls": u.get("source_read_calls"),
+    "uffd_source_bytes": u.get("source_read_bytes"),
+    "uffd_source_ms": (u.get("source_read_ns") or 0) / 1e6,
+    "uffd_urgent_copy_calls": u.get("urgent_copy_calls"),
+    "uffd_urgent_zero_calls": u.get("urgent_zero_calls"),
+    "uffd_tail_submitted": u.get("tail_submitted"),
+    "uffd_tail_dropped": u.get("tail_dropped_busy"),
+    "uffd_tail_buffered": u.get("tail_buffered_data"),
+    "uffd_tail_deferred": u.get("tail_deferred_data"),
+    "uffd_tail_zero": u.get("tail_zero"),
+    "uffd_tail_completed": u.get("tail_pages_completed"),
+    "uffd_tail_conflicts": u.get("tail_conflicts"),
+    "uffd_tail_partial": u.get("tail_partial"),
     "uffd_pages_zeroed": u.get("pages_zeroed"),
     "uffd_pages_copied": u.get("pages_copied"),
     "uffd_total_pages": u.get("total_pages"),
@@ -691,13 +705,14 @@ if "wall_exit_ms" in keys:
     print(f"  wall T0→exit:         median={fmt(med('wall_exit_ms'),'ms')}")
     print(f"  internal sandbox-ctl: median={fmt(med('internal_ms'),'ms')}")
     fa = med('uffd_faults') or 0
-    bavg = med('uffd_batch_avg') or 0
-    bmax = med('uffd_batch_max') or 0
     z = med('uffd_pages_zeroed') or 0
     c = med('uffd_pages_copied') or 0
     t = med('uffd_total_pages') or 1
     rl = (med('lazy_load_ratio') or 0) * 100
-    print(f"  uffd faults:          median={int(fa)}  batch_avg={int(bavg)}  batch_max={int(bmax)}")
+    print(f"  uffd faults/errors:   faults={int(fa)} errors={int(med('uffd_errors') or 0)} queue_p95={fmt(med('uffd_queue_p95_us'),'µs')} queue_p99={fmt(med('uffd_queue_p99_us'),'µs')}")
+    print(f"  uffd source:          calls={int(med('uffd_source_calls') or 0)} bytes={int(med('uffd_source_bytes') or 0)} time={fmt(med('uffd_source_ms'),'ms')}")
+    print(f"  uffd urgent:          copy={int(med('uffd_urgent_copy_calls') or 0)} zero={int(med('uffd_urgent_zero_calls') or 0)}")
+    print(f"  uffd tail:            submitted={int(med('uffd_tail_submitted') or 0)} dropped={int(med('uffd_tail_dropped') or 0)} buffered/deferred/zero={int(med('uffd_tail_buffered') or 0)}/{int(med('uffd_tail_deferred') or 0)}/{int(med('uffd_tail_zero') or 0)} completed={int(med('uffd_tail_completed') or 0)} conflicts={int(med('uffd_tail_conflicts') or 0)} partial={int(med('uffd_tail_partial') or 0)}")
     print(f"  uffd lazy-load:       resident={int(z)+int(c)}/{int(t)} pages = {rl:.2f}%")
     print(f"  blk0 read:            reqs={int(med('blk0_reqs') or 0)} p50={fmt(med('blk0_p50_us'),'µs')} p99={fmt(med('blk0_p99_us'),'µs')} load_coverage={fmt(med('blk0_load_pct'),'%')}")
     print(f"  go runtime:           numGC={int(med('go_num_gc') or 0)} pause={fmt(med('go_gc_pause_ms'),'ms')} total_alloc={fmt(med('go_total_alloc_mb'),'MiB')}")

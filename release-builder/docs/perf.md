@@ -12,6 +12,7 @@
 ```bash
 make bench           # Go 微基准(各 Go 子仓)
 make perf            # 系统级 harness 全套:accelerator perf-cache + perf-sandbox/-manifest/-density
+make test-uffd-performance-gate
 make perf-sandbox
 make perf-sandbox-working-set
 make perf-density
@@ -189,7 +190,7 @@ manifest:// 唯一可量化的"成本"是 cold L1 状态下额外 ~330 ms 启动
 | restore 不依赖原 host 文件 | 否(必须 `<sha256>.overlay` + `<sid>.snapshot`) | 是,只需 manifest key |
 | sandbox snapshot 上传 → 别处 restore | 手工 rsync | 一条 manifest key |
 
-### 2.3 sandbox-ctl 内部断面
+### 2.3 改造前 sandbox-ctl 内部断面
 
 | 指标 | `file://` | `manifest://`(cache-ctl tiered:rocksdb L1 + store origin) |
 |---|---:|---:|
@@ -219,8 +220,9 @@ manifest:// 唯一可量化的"成本"是 cold L1 状态下额外 ~330 ms 启动
 - 解密走原地 XOR(`DecryptInPlace`),不为每个 chunk 分配新 plaintext 缓冲
 - wire 客户端通过 `cache.NewPool` 复用 ciphertext 缓冲区
 
-`make perf-sandbox` 把以下指标做成回归门:任意 PR 引入 `numGC > 8 /
-total_alloc > 30 MiB` 应被发现。
+本节是 fault-first 合入前的历史断面,用于解释原同步 full-batch 的读放大。
+当前自动门禁及其阈值见 §2.7;`make perf-sandbox` 继续生成描述性 cold-start
+报告,不单独承担 PR pass/fail 判定。
 
 ### 2.4 Snapshot 本地落盘(基线)
 
@@ -254,7 +256,7 @@ I/O,~10 s 量级。本设计的 sandbox-ctl 持有 memfd + SEEK_DATA/HOLE 扫驻
 进度 + 收尾吞吐 profile 行(见 `sandboxer/docs/sandbox.md` §2.3;发布包
 平铺名:`docs/sandbox.md`)。
 
-### 2.5 Restore 本地文件(基线)
+### 2.5 改造前 Restore 本地文件基线
 
 | 阶段 | 时间 |
 |---|---:|
@@ -335,35 +337,50 @@ backend。当前 cache/store pull-only info 接口
 不提供精确传输字节 delta，因此字节数明确记为 `N/A`，不为本报告
 引入新 metrics 协议。
 
-### 2.7 优化机会(按收益预估)
+### 2.7 UFFD 自动性能门禁
 
-**StreamSnapshotSource 提供 RunLength 接口**(中,~30%):现 `extendBatch`
-对每个候选页调一次 `IsZero(off)`,256 次 bit lookup。StreamSnapshotSource
-持有 `holeMap []uint64`,可以一次性算出"从 off 起同类连续多少页"
-(查 word 内 `bits.TrailingZeros64` / `LeadingZeros64`)。预计 restore 路径下
-batch_avg 从 96 提到 ~150-200。
+源码 BMS 的 `make test-e2e` 在真实 KVM 用例之前执行:
 
-**cache-ctl chunk 预取**(中,~30% manifest restore cold-L1):现
-ManifestSnapshotSource 一次 fault 拉一个 chunk(经 cache-ctl)。可以加
-sequential 预取:每次 fault 拿到 chunk N,在异步 prefetch chunk N+1, N+2。
-预计 manifest:// restore cold-L1 从 472 ms 降到 ~330 ms。
+```bash
+make test-uffd-performance-gate
+```
 
-**vhost-user-blk read 预取**(中,~20% 冷启动):blk0 的 manifest:// p99 ~3.9ms
-主要来自顺序 erofs 块读 + chunk 拉取叠加。加 `posix_fadvise(POSIX_FADV_WILLNEED)`
-或 manifest 路径下预取下一 chunk。
+该 target 对 `BenchmarkUFFDFaultStrategies` 的每个组合采集 5 个 200 ms 样本,
+取中位数。A 是同一进程内的同步 full-batch control,B 是 fault-first 无 tail,C
+是 fault-first + serial tail。相对阈值消除大部分机器速度差异,绝对阈值用于发现
+A/B/C 同时变慢的 common-mode stall。
 
-**启动期 backendVA prefault on madvise(MADV_POPULATE_READ)**(低):违背懒加载
-的核心收益,**不推荐**。
+| Fixture / pattern | B/A 上限 | C/A 上限 | B / C 绝对上限 |
+|---|---:|---:|---:|
+| ordinary/plaintext/encrypted, sequential 1 vCPU | 0.10 | 0.25 | 20 / 100 µs |
+| ordinary/plaintext/encrypted, random 2 vCPU | 0.25 | 0.50 | 30 / 150 µs |
+| manifest hit/cold-copy, sequential 1 vCPU | 1.50 | 1.50 | 5 / 5 ms |
+| manifest hit/cold-copy, random 2 vCPU | 1.75 | 1.75 | 8 / 8 ms |
+| Zero, sequential/random 2 vCPU | 2.0 / 3.0 | 2.0 / 3.0 | 10 / 20 µs |
 
-**reader 单 goroutine 拆分**(低):reader epoll 两个 fd 单线程。当前不是
-瓶颈。
+门禁同时约束 `source-B/op` 与 `uffd-B/op`:普通 Data 的 B 不得超过 4 KiB,C
+不得超过 68 KiB;manifest C 不得超过 1 MiB;Zero 的 source bytes 必须为 0。
+除必须精确为 0 的指标外,上限判定容许 1% 的 Go benchmark calibration 误差。
+因此仅让 wall time 偶然变快、但重新引入 full-batch 读放大也不能通过。
 
-**EEXIST 路径精确统计**(低):wakes=0,这条路径几乎不走。
+真实 KVM 门禁复用既有 correctness E2E,不另建简化 VM:
 
-**Quiesce 并行化**(低):pause 窗口已经很小(4-6 ms)。
+| 场景 | 硬上限 | 必须出现的执行证据 |
+|---|---:|---|
+| cold ZeroSource → `ready` | 2 s | urgent zero、zero tail、completed tail pages |
+| local file/tar restore → `ready` | 1.5 s | urgent copy、deferred-data tail |
+| manifest 1/2/3-layer restore → first continued TICK | 3 s | urgent copy、buffered-data tail |
 
-**batch 上限调优**(待定):提高到 512(2 MiB)/ 1024(4 MiB)可能进一步减少
-ioctl 数,但每个 ioctl 时延增长。需要参数 sweep。
+每个场景还要求 `errors=0`、`faults_absent>0`、`tail_pages_completed>0`。
+阈值不是业务 SLO:它们相对本地真实 KVM 烟测值保留约 2.5 倍以上余量,
+并将在 dedicated BMS 首次运行后以其 artifact 复核余量。门禁只阻止关键路径
+退回同步 full-batch、tail 完全失效或多秒级启动退化。更细的
+application-ready/首请求分布继续由 §2.6 的 canonical working-set matrix 描述,
+不把单样本 KVM 噪声变成窄阈值。
+
+失败和成功都会把原始 benchmark、阈值 JSON/Markdown 以及 KVM stats 摘要写入
+BMS `ci-metadata` artifact。聚合 Release 的 `test-e2e-prebuilt` 只运行真实 KVM
+二进制门禁,不会拿源码微基准替代已发布组件。
 
 ## 3. 沙箱密度与控制器
 
