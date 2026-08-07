@@ -229,7 +229,7 @@ test-perf-tools:
 	bash test/perf/uffd_performance_gate_test.sh
 
 test-uffd-performance-gate:
-	$(CI_TIMED) perf/uffd-gate bash test/perf/uffd-performance-gate.sh
+	$(CI_TIMED) perf/uffd-gate env ORG="$(ORG)" bash test/perf/uffd-performance-gate.sh
 
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done

@@ -60,6 +60,19 @@ def passing_output() -> str:
 
 
 class UffdBenchmarkGateTest(unittest.TestCase):
+    def test_parser_accepts_unsuffixed_single_cpu_name(self) -> None:
+        line = benchmark_line(
+            "OrdinaryData",
+            "Sequential1VCPU",
+            "A_SyncFullBatch",
+            100_000,
+            gate.MAX_TAIL_BYTES,
+            gate.MAX_TAIL_BYTES,
+        ).replace("A_SyncFullBatch-8", "A_SyncFullBatch")
+        samples = gate.parse(line)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].strategy, "A_SyncFullBatch")
+
     def test_complete_benchmark_passes(self) -> None:
         results, failures = gate.evaluate(gate.parse(passing_output()))
         self.assertFalse(failures)
@@ -98,6 +111,18 @@ class UffdBenchmarkGateTest(unittest.TestCase):
                 for failure in failures
             )
         )
+
+    def test_benchmark_failure_forces_failed_report(self) -> None:
+        results, failures = gate.evaluate(
+            gate.parse(passing_output()), benchmark_status=42
+        )
+        self.assertTrue(
+            any(
+                "benchmark command exited with status 42" in failure
+                for failure in failures
+            )
+        )
+        self.assertIn("Result: FAIL", gate.render_markdown(results, failures))
 
     def test_logical_read_amplification_fails(self) -> None:
         output = passing_output().replace(

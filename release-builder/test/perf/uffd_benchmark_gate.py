@@ -19,7 +19,7 @@ from pathlib import Path
 
 BENCHMARK_RE = re.compile(
     r"^BenchmarkUFFDFaultStrategies/"
-    r"(?P<fixture>[^/]+)/(?P<pattern>[^/]+)/(?P<strategy>[^-\s]+)-\d+\s+"
+    r"(?P<fixture>[^/]+)/(?P<pattern>[^/]+)/(?P<strategy>[^-\s]+)(?:-\d+)?\s+"
     r"\d+\s+(?P<ns>[0-9.]+)\s+ns/op"
     r".*?\s(?P<source>[0-9.]+)\s+source-B/op"
     r".*?\s(?P<uffd>[0-9.]+)\s+uffd-B/op"
@@ -136,12 +136,16 @@ def _median(samples: list[Sample], field: str) -> float:
     return float(statistics.median(getattr(sample, field) for sample in samples))
 
 
-def evaluate(samples: list[Sample]) -> tuple[list[Result], list[str]]:
+def evaluate(
+    samples: list[Sample], benchmark_status: int = 0
+) -> tuple[list[Result], list[str]]:
     grouped: dict[tuple[str, str, str], list[Sample]] = {}
     for sample in samples:
         grouped.setdefault((sample.fixture, sample.pattern, sample.strategy), []).append(sample)
 
     failures: list[str] = []
+    if benchmark_status != 0:
+        failures.append(f"benchmark command exited with status {benchmark_status}")
     results: list[Result] = []
     for fixture in FIXTURES:
         for pattern in PATTERNS:
@@ -266,10 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--markdown-output", type=Path, required=True)
+    parser.add_argument("--benchmark-status", type=int, default=0)
     args = parser.parse_args(argv)
 
     samples = parse(args.input.read_text(encoding="utf-8"))
-    results, failures = evaluate(samples)
+    results, failures = evaluate(samples, benchmark_status=args.benchmark_status)
     markdown = render_markdown(results, failures)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.markdown_output.parent.mkdir(parents=True, exist_ok=True)

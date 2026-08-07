@@ -50,4 +50,35 @@ grep -q $'^latency-fail\t5001\t5000\t' "$KUASAR_CI_DIR/uffd-e2e-gate.tsv"
 grep -q $'\tPASS$' "$KUASAR_CI_DIR/uffd-e2e-gate.tsv"
 grep -q $'\tFAIL$' "$KUASAR_CI_DIR/uffd-e2e-gate.tsv"
 
+mkdir -p "$WORK/bin" "$WORK/org/sandboxer" "$WORK/driver-artifact"
+cat >"$WORK/bin/go" <<'EOF'
+#!/usr/bin/env bash
+if [ "$PWD" != "${EXPECTED_PWD:?}" ]; then
+    echo "unexpected source root: $PWD" >&2
+    exit 43
+fi
+echo "synthetic benchmark failure" >&2
+exit 42
+EOF
+chmod +x "$WORK/bin/go"
+
+set +e
+PATH="$WORK/bin:$PATH" \
+    ORG="$WORK/org" \
+    EXPECTED_PWD="$WORK/org/sandboxer" \
+    KUASAR_CI_DIR="$WORK/driver-artifact" \
+    bash "$REPO_ROOT/test/perf/uffd-performance-gate.sh" \
+    >"$WORK/driver.log" 2>&1
+driver_status=$?
+set -e
+if [ "$driver_status" -ne 42 ]; then
+    echo "benchmark failure status = $driver_status, want 42" >&2
+    cat "$WORK/driver.log" >&2
+    exit 1
+fi
+jq -e '.passed == false and (.failures | length > 0)' \
+    "$WORK/driver-artifact/uffd-performance-gate.json" >/dev/null
+grep -q '^Result: FAIL$' "$WORK/driver-artifact/uffd-performance-gate.md"
+grep -q 'synthetic benchmark failure' "$WORK/driver-artifact/uffd-benchmark.txt"
+
 echo "uffd_performance_gate_test: PASS"
