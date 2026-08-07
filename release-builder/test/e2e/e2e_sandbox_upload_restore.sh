@@ -21,6 +21,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$REPO_ROOT/test/lib/tarstream.sh"
+. "$REPO_ROOT/test/lib/uffd_performance_gate.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 IMAGE="${IMAGE:-python:3.12-slim}"
 
@@ -283,6 +284,7 @@ T_RES_BEG=$(date +%s%N)
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
     --sandbox-id "$SID2" \
+    --stats-json "$WORK/stats2.json" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
 PIDS+=($SBPID2)
@@ -330,6 +332,8 @@ SNAP2_TICK=$(grep -oE "^TICK [0-9]+" "$LOG2" | tail -1 | awk '{print $2}')
 
 # --resume=false destroys sandbox; sandbox-ctl run2 returns.
 wait "$SBPID2" 2>/dev/null || true
+uffd_performance_gate "manifest-restore-1-layer" "$RESTORE_MS" 3000 \
+    "$WORK/stats2.json" buffered
 
 # ---- phase 4: restore from the CHAINED snapshot -------------------------
 # snap#2 was taken from the restored sandbox, so its snapshot.cfg has
@@ -421,6 +425,8 @@ SNAP3_TICK=$(grep -oE "^TICK [0-9]+" "$LOG3" | tail -1 | awk '{print $2}')
 echo "==> upload #3 OK; snap#3 key=$SNAP3_MKEY (frozen at TICK $SNAP3_TICK)"
 cat "$SNAP3_LOG" | sed 's/^/    /'
 wait "$SBPID3" 2>/dev/null || true  # snapshot --resume=false destroyed SID3
+uffd_performance_gate "manifest-restore-2-layer" "$RESTORE2_MS" 3000 \
+    "$WORK/stats3.json" buffered
 
 DIFF_RESTORE3="$WORK/runtime/blk1-restore3.diff"
 truncate -s 1G "$DIFF_RESTORE3"     # empty CoW upper; fs comes from the 3-layer overlay base
@@ -453,6 +459,7 @@ T_RES3_BEG=$(date +%s%N)
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
     --sandbox-id "$SID4" \
+    --stats-json "$WORK/stats4.json" \
     > "$LOG4" 2>&1 &
 SBPID4=$!
 PIDS+=($SBPID4)
@@ -475,6 +482,8 @@ RESTORE3_MS=$(( (T3_NS - T_RES3_BEG) / 1000000 ))
 echo "==> PASS: 3-layer chained restore reached TICK $WANT_TICK3 in ${RESTORE3_MS} ms (snap3→snap2→snap1; disk blk0 fall-through through 3 layers)"
 kill -TERM "$SBPID4" 2>/dev/null
 wait "$SBPID4" 2>/dev/null || true
+uffd_performance_gate "manifest-restore-3-layer" "$RESTORE3_MS" 3000 \
+    "$WORK/stats4.json" buffered
 
 # ---- perf summary --------------------------------------------------------
 
