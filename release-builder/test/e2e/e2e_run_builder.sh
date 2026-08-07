@@ -34,6 +34,8 @@
 # e2b-key-ctl connector-ctl vswitch cloud-hypervisor flatten-ctl manifest-ctl store-ctl
 # + vmlinux + sandbox-runtime{,-e2b,-builder}.erofs. Missing prerequisites →
 # exit 0 ("skipped") unless REQUIRE_BUILDER=1.
+# Build Register MMDS is also exercised by a real RUN guest, including Trigger
+# immutability, terminal secret cleanup, and artifact/log plaintext checks.
 
 set -euo pipefail
 
@@ -157,6 +159,7 @@ docker push "$PUSH_REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "
 echo "==> zot up (0.0.0.0:$ZOT_PORT); seeded $E2E_IMAGE → $PUSH_REF (guest pulls $PULL_REF)"
 
 # ---- vswitch (guest network for the build sandboxes) -----------------------
+MMDS_PORT="$(free_port)"
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS"
@@ -165,6 +168,7 @@ ip netns add "$SW_NETNS"
 "$BIN/connector-ctl" vswitch serve "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
     --floating-ip-base=100.100.112.0 --mode=tap \
     --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 \
+    --mgmt-service=$MGMT_VIP:80:$MGMT_VIP:$MMDS_PORT \
     --tapfd-listen="$TAPFD_SOCKET" --watch-interval=2s >"$WORK/vswitch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 100); do
@@ -241,6 +245,12 @@ PORT="$(free_port)"
 
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
+proxy: { mode: internal, auth: enforce }
+mmds:
+  enabled: true
+  listen: "$MGMT_VIP:$MMDS_PORT"
+  routes:
+    enabled: true
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -280,6 +290,7 @@ req() { # method path key [body]
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method"
                 -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
+    [ -n "${REQ_MMDS_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -378,6 +389,109 @@ else
     [ "$code" = "400" ] || fail "COPY trigger (no filesHash) = $code (want 400)"
     echo "==> PASS: COPY without a filesHash rejected (400); files-storage configured (B4 exercises it)"
 fi
+
+# ---- BM: Build Register MMDS in a real builder guest -----------------------
+echo "==> BM: Build Register MMDS routes/initial secret, Trigger immutability, real guest GET"
+MMDS_BUILD_SECRET=MMDS_BUILD_SECRET_GUEST_E2E
+REQ_MMDS_HEADER='{"secrets":{"build_secret":"MMDS_BUILD_SECRET_GUEST_E2E"},"routes":[{"path":"/e2e/build-static","data":"MMDS_BUILD_STATIC_GUEST_E2E"},{"path":"/e2e/build-secret","type":"secret","secret":"build_secret"},{"path":"/e2e/build-unresolved","type":"secret","secret":"build_unresolved"}]}'
+register e2e-mmds
+BM_TID="$TID"; BM_BID="$BID"
+
+# Both Trigger entry points are forbidden from replacing Register's MMDS.
+REQ_MMDS_HEADER='{"routes":[]}'
+code=$(req POST "/v2/templates/$BM_TID/builds/$BM_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = 400 ] || { cat "$WORK/resp.body"; fail "BM Trigger MMDS header override=$code (want 400)"; }
+unset REQ_MMDS_HEADER
+BM_OVERRIDE_BODY=$(python3 - "$PULL_REF" <<'PY'
+import json, sys
+print(json.dumps({
+    "fromImage": sys.argv[1],
+    "metadata": {"kuasar-sandbox.mmds": json.dumps({"routes": []})},
+}))
+PY
+)
+code=$(req POST "/v2/templates/$BM_TID/builds/$BM_BID" "$AK" "$BM_OVERRIDE_BODY")
+[ "$code" = 400 ] || { cat "$WORK/resp.body"; fail "BM Trigger MMDS metadata override=$code (want 400)"; }
+
+BM_SECRET_HASH="$(printf '%s' "$MMDS_BUILD_SECRET" | sha256sum | cut -d' ' -f1)"
+BM_RUN=$(python3 - "$BM_SECRET_HASH" <<'PY'
+import base64, sys
+expected_hash = sys.argv[1]
+program = f'''
+import hashlib, http.client
+
+def request(method, path, token=None):
+    conn = http.client.HTTPConnection("169.254.169.254", 80, timeout=10)
+    headers = {{}}
+    if method == "PUT":
+        headers["X-metadata-token-ttl-seconds"] = "60"
+    if token:
+        headers["X-metadata-token"] = token
+    conn.request(method, path, headers=headers)
+    response = conn.getresponse()
+    result = response.status, {{k.lower(): v for k, v in response.getheaders()}}, response.read()
+    conn.close()
+    return result
+
+status, headers, body = request("PUT", "/latest/api/token")
+assert status == 200, status
+token = body.decode()
+status, headers, body = request("GET", "/e2e/build-static", token)
+assert status == 200 and body == b"MMDS_BUILD_STATIC_GUEST_E2E", (status, body)
+assert headers.get("content-type") == "text/plain", headers
+status, headers, body = request("GET", "/e2e/build-secret", token)
+assert status == 200 and hashlib.sha256(body).hexdigest() == {expected_hash!r}, "build secret response mismatch"
+assert headers.get("content-type") == "text/plain", headers
+status, headers, body = request("GET", "/e2e/build-unresolved", token)
+assert status == 404, (status, body)
+print("MMDS_BUILD_GUEST_OK")
+'''
+encoded = base64.b64encode(program.encode()).decode()
+print("python3 -c 'import base64; exec(base64.b64decode(\"%s\"))'" % encoded)
+PY
+)
+BM_BODY=$(python3 - "$PULL_REF" "$BM_RUN" <<'PY'
+import json, sys
+print(json.dumps({"fromImage": sys.argv[1], "steps": [{"type": "RUN", "args": [sys.argv[2]]}]}))
+PY
+)
+code=$(req POST "/v2/templates/$BM_TID/builds/$BM_BID" "$AK" "$BM_BODY")
+[ "$code" = 202 ] || { cat "$WORK/resp.body"; fail "BM trigger=$code (want 202)"; }
+wait_ready "$BM_TID" "$BM_BID" BM
+BM_PERSIST="$PERSIST"
+case "$BM_PERSIST" in e2b-img-*) : ;; *) fail "BM persist=$BM_PERSIST (want e2b-img-…)";; esac
+
+journalctl KUASAR_BUILD_ID="$BM_BID" --no-pager --output=cat >"$WORK/bm-mmds.journal" 2>/dev/null || true
+grep -q 'MMDS_BUILD_GUEST_OK' "$WORK/bm-mmds.journal" \
+    || { diag "$BM_BID"; fail "BM real builder guest did not report MMDS_BUILD_GUEST_OK"; }
+python3 - "$WORK/lib/node-ctl.db" "$BM_BID" "$MMDS_BUILD_SECRET" <<'PY'
+import json, pathlib, sqlite3, sys
+db_path, build_id, secret = sys.argv[1:]
+with sqlite3.connect(db_path, timeout=5) as db:
+    row = db.execute("select metadata_json from builds where build_id=?", (build_id,)).fetchone()
+    secret_rows = db.execute(
+        "select count(*) from build_mmds_route_secret_values where build_id=?", (build_id,)
+    ).fetchone()[0]
+assert row is not None, "BM build row missing"
+metadata = json.loads(row[0])
+routes = metadata.get("kuasar-sandbox.mmds", "")
+assert routes and '"routes"' in routes and '"secrets"' not in routes, metadata
+assert secret not in row[0], "BM secret leaked into build metadata"
+assert secret_rows == 0, "BM terminal cleanup left a build secret row"
+for path in pathlib.Path(db_path).parent.glob(pathlib.Path(db_path).name + "*"):
+    assert secret.encode() not in path.read_bytes(), f"BM plaintext found in {path}"
+PY
+BM_REF=$(persist_ref "$BM_PERSIST") || fail "BM persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BM_REF" >"$WORK/bm-image.json" 2>"$WORK/bm-image.err" \
+    || { cat "$WORK/bm-image.err"; fail "flatten-ctl info BM image"; }
+for artifact in "$WORK/orch.log" "$WORK/bm-mmds.journal" "$WORK/bm-image.json" "$WORK/bm-image.err"; do
+    grep -a -F -q -- "$MMDS_BUILD_SECRET" "$artifact" \
+        && fail "Build Register MMDS secret plaintext appeared in $artifact"
+done
+grep -Fq 'kuasar-sandbox.mmds' "$WORK/bm-image.json" \
+    && fail "Build Register MMDS routes leaked into final image config"
+echo "==> PASS: BM real guest MMDS, Trigger immutability, terminal cleanup, and artifact/log secrecy"
 
 # ---- B1: fromImage → e2b-img -----------------------------------------------
 echo "==> B1: fromImage=$PULL_REF (in-guest pull + flatten)"

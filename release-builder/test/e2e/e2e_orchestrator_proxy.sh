@@ -9,7 +9,7 @@
 #   serve(proxy_mode=external)                          # control plane on :PORT
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
-#         # workers run in PROXY_NETNS, and mmds_listen is bound there
+#         # workers run in PROXY_NETNS; conductor policy supplies MMDS listen
 #   POST /sandboxes  -> durable starting acceptance; immediate ordinary and exec
 #                       requests park across route propagation, runner boot and init
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
@@ -29,6 +29,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 PROXY_PORT="${PROXY_PORT:-3443}"
@@ -76,11 +77,23 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 PROXY_SOCK="$WORK/run/proxy.sock"
 declare -a PIDS=()
 declare -a TAGS=()
+MMDS_ROUTES_CONFIG=""
+MMDS_SERVICES_CONFIG=""
+if [ "$MMDS_ROUTES_E2E" = 1 ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_service_guest.sh"
+    start_mmds_service_backend "$WORK" || fail "start MMDS service UDS backend"
+    MMDS_ROUTES_CONFIG="  routes:
+    enabled: true"
+    MMDS_SERVICES_CONFIG="  services:
+    $MMDS_SERVICE_NAME:
+      endpoint: unix://$MMDS_SERVICE_SOCKET"
+fi
 IMMEDIATE_EXEC_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
+    [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     [ -n "$IMMEDIATE_EXEC_PID" ] && kill "$IMMEDIATE_EXEC_PID" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
@@ -161,6 +174,9 @@ allow_proxy_forwarding() {
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
+    if [ "${REQ_ATTACH_MMDS:-0}" = 1 ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
+        args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -249,8 +265,12 @@ dp() {
     curl "${args[@]}" "http://127.0.0.1:$PROXY_PORT$path"
 }
 dump_logs() {
-    echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log" 2>/dev/null
-    echo "==> proxy log:";        sed 's/^/  prxy| /' "$WORK/proxy.log" 2>/dev/null
+    local log
+    for log in "$WORK"/orch*.log "$WORK"/proxy*.log; do
+        [ -f "$log" ] || continue
+        echo "==> $(basename "$log"):"
+        sed 's/^/  /' "$log"
+    done
 }
 
 # ---- store + zot ----------------------------------------------------------
@@ -352,7 +372,11 @@ truncate -s 2G "$BLD"
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: external, auth: enforce, park_timeout: 120s }
-mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
+mmds:
+  enabled: true
+  listen: "$PROXY_NS_IP:$MMDS_PORT"
+$MMDS_ROUTES_CONFIG
+$MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -382,7 +406,8 @@ done
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_PORT, workers=2)"
-# The master reads policy/endpoints from proxy.yaml, registers once, then supervises
+# The master reads local worker/bootstrap settings from proxy.yaml and receives
+# MMDS listen/services only from the conductor registration policy. It then supervises
 # workers that inherit listener fds and read the shared route table. h2c here (no tls),
 # matching serve's plain-http listener. proxy_netns exercises external direct mode:
 # workers run inside that netns, so floatingip TCP dials need its route table.
@@ -398,17 +423,17 @@ route_capacity: 1024
 workers: 2
 auth: enforce
 park_timeout: 120s
-mmds_listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
 "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 PROXY_MASTER_PID="${PIDS[-1]}"
+PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
 wait_mmds_listener
 wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
-echo "==> PASS: external proxy workers and mmds_listen are in proxy_netns=$PROXY_NETNS"
+echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
@@ -431,7 +456,9 @@ echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
+REQ_ATTACH_MMDS="$MMDS_ROUTES_E2E"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+unset REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
     SID=$(ls "$WORK/run" 2>/dev/null | grep -v proxy | head -1)
@@ -517,6 +544,29 @@ sys.stdout.flush()
 sys.stdout.buffer.write(out)
 sys.stdout.write("\nOUTPUT_END\n")
 PY
+
+restart_external_proxy_fresh() {
+    local log="$1" old_pid="$PROXY_MASTER_PID" old_workers worker stopped
+    old_workers="$(child_worker_pids "$old_pid")"
+    kill -TERM "$old_pid" 2>/dev/null || true
+    wait "$old_pid" 2>/dev/null || true
+    PIDS[$PROXY_MASTER_PID_SLOT]=""
+    for worker in $old_workers; do
+        stopped=""
+        for _ in $(seq 1 40); do
+            kill -0 "$worker" 2>/dev/null || { stopped=1; break; }
+            sleep 0.25
+        done
+        [ -n "$stopped" ] || return 1
+    done
+    "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$log" 2>&1 &
+    PROXY_MASTER_PID=$!
+    PIDS+=("$PROXY_MASTER_PID")
+    PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
+    wait_port 127.0.0.1 "$PROXY_PORT" proxy
+    wait_mmds_listener
+    wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+}
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
 ok=""
@@ -626,6 +676,34 @@ if [ "$code" = "204" ]; then
     else dump_logs; fail "auto-resume via proxy did not complete, last code=$code"; fi
 else dump_logs; fail "pause returned $code (want 204 before auto-resume check)"; fi
 unset EXEC_TOKEN
+
+if [ "$MMDS_ROUTES_E2E" = 1 ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
+    source "$REPO_ROOT/test/e2e/lib/mmds_secret_guest.sh"
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS static exact route"; }
+    mmds_secret_restart_proxy() {
+        echo "==> restart external proxy from an empty heap; wait for full route/value/service resync"
+        restart_external_proxy_fresh "$WORK/proxy-mmds-restart.log"
+    }
+    MMDS_SECRET_AFTER_UPDATE_HOOK=mmds_secret_restart_proxy
+    run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS initial/unresolved/update/resync/rotation/delete lifecycle"; }
+    unset MMDS_SECRET_AFTER_UPDATE_HOOK
+    run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
+        "$ENVD_TOKEN" "$WORK" external \
+        || { dump_logs; fail "external MMDS conductor-only service registry"; }
+    for value in MMDS_SECRET_INITIAL_GUEST_E2E MMDS_SECRET_UPDATED_GUEST_E2E MMDS_SECRET_ROTATED_GUEST_E2E; do
+        for artifact in "$WORK"/orch*.log "$WORK"/proxy*.log "$WORK"/mmds-*.out \
+            "$WORK"/mmds-service.requests "$WORK"/lib/node-ctl.db* "$WORK"/run/proxy-routes.shm; do
+            [ -f "$artifact" ] || continue
+            grep -a -F -q -- "$value" "$artifact" \
+                && fail "MMDS secret plaintext appeared in external E2E artifact $artifact"
+        done
+    done
+    echo "==> PASS: external real guest covered proxy restart/full resync, secret rotation/delete, and conductor-only service"
+fi
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || { dump_logs; fail "kill=$code (want 204)"; }
