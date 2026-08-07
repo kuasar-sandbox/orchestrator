@@ -13,8 +13,9 @@ make -C trusted/orchestrator/release-builder \
   ORG=/path/to/versioned-sources test-e2e-prebuilt
 ```
 
-两者运行同一套跨仓 E2E;前者先构建源码,后者要求 `bin/<arch>/` 已由六个组件包
-装配完成。仓库内 `scripts/ci-timed.sh` 只包裹 Makefile
+两者运行同一套真实 KVM 跨仓 E2E;前者先构建源码,并额外执行基于 sandboxer
+源码的 UFFD A/B/C 微基准门禁;后者要求 `bin/<arch>/` 已由六个组件包装配完成,
+不以源码微基准替代发布二进制验证。仓库内 `scripts/ci-timed.sh` 只包裹 Makefile
 中的单个构建或测试 recipe,向 `KUASAR_CI_TIMINGS` 追加耗时、CPU、最大 RSS 和
 文件系统 IO 数据;未设置该变量时直接 `exec` 原命令。
 
@@ -101,7 +102,14 @@ make -C orchestrator/release-builder test-release-tools
 - `revisions.tsv`:五仓精确 revision set;
 - `source-cache.tsv`:源码归档命中与摘要;
 - `native-cache.tsv`:原生制品 key、命中状态与等待/构建耗时;
-- `timings.tsv`:每个构建组件、umbrella E2E 和子仓 E2E 的资源数据。
+- `timings.tsv`:每个构建组件、umbrella E2E 和子仓 E2E 的资源数据;
+- `uffd-e2e-gate.tsv`:cold ZeroSource、file restore 与 manifest 1/2/3-layer
+  restore 的真实 KVM 时延和 tail 指标门禁结果。
+
+源码 BMS 还包含:
+
+- `uffd-benchmark.txt`、`uffd-performance-gate.json`、
+  `uffd-performance-gate.md`:同机 A/B/C 原始样本、中位数、相对/绝对阈值与结论。
 
 聚合发布 run 还包含 `release-resolved.json`,记录 mapping commit、六个组件 tag/commit、
 原始 archive 的 GitHub 资产 ID、大小和 SHA-256。该模式不运行 native build,

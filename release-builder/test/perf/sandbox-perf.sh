@@ -3,8 +3,8 @@
 # sandbox-perf.sh — track sandbox-ctl cold-start performance over time.
 #
 # Runs e2e_sandbox_cold (file://) and e2e_sandbox_cold_manifest (manifest://
-# via cache-ctl tiered) N iterations each. Median wallclock + uffd batch
-# shape + lazy-load ratio + Go runtime metrics aggregated into a
+# via cache-ctl tiered) N iterations each. Median wallclock + UFFD
+# source/urgent/tail shape + lazy-load ratio + Go runtime metrics aggregated into a
 # single comparable table so regressions surface immediately.
 #
 # Critical: binaries are cached into a Linux-native FS (/tmp/perf-bin)
@@ -75,8 +75,24 @@ out = {
     "wall_ms": float(wall) if wall else 0,
     "internal_ms": (r.get("wallclock") or {}).get("duration_ms"),
     "uffd_faults": u.get("faults_absent"),
-    "uffd_batch_avg": u.get("batch_avg_pages"),
-    "uffd_batch_max": u.get("batch_max_pages"),
+    "uffd_errors": u.get("errors"),
+    "uffd_queue_p95_us": (u.get("fault_queue_wait_p95") or 0) / 1000.0,
+    "uffd_queue_p99_us": (u.get("fault_queue_wait_p99") or 0) / 1000.0,
+    "uffd_source_calls": u.get("source_read_calls"),
+    "uffd_source_bytes": u.get("source_read_bytes"),
+    "uffd_source_ms": (u.get("source_read_ns") or 0) / 1e6,
+    "uffd_urgent_copy_calls": u.get("urgent_copy_calls"),
+    "uffd_urgent_copy_ms": (u.get("urgent_copy_ns") or 0) / 1e6,
+    "uffd_urgent_zero_calls": u.get("urgent_zero_calls"),
+    "uffd_urgent_zero_ms": (u.get("urgent_zero_ns") or 0) / 1e6,
+    "uffd_tail_submitted": u.get("tail_submitted"),
+    "uffd_tail_dropped": u.get("tail_dropped_busy"),
+    "uffd_tail_buffered": u.get("tail_buffered_data"),
+    "uffd_tail_deferred": u.get("tail_deferred_data"),
+    "uffd_tail_zero": u.get("tail_zero"),
+    "uffd_tail_completed": u.get("tail_pages_completed"),
+    "uffd_tail_conflicts": u.get("tail_conflicts"),
+    "uffd_tail_partial": u.get("tail_partial"),
     "uffd_pages_zeroed": u.get("pages_zeroed"),
     "uffd_pages_copied": u.get("pages_copied"),
     "uffd_total_pages": u.get("total_pages"),
@@ -124,7 +140,10 @@ print(f"  wallclock T0→exit:    median={med('wall_ms'):.0f}ms  min={min(r['wal
 internal = [r['internal_ms'] for r in rows if r.get('internal_ms') is not None]
 if internal:
     print(f"  sandbox-ctl internal: median={statistics.median(internal):.0f}ms (excl. bash + exec)")
-print(f"  uffd faults / batch:  faults={int(med('uffd_faults'))} batch_avg={int(med('uffd_batch_avg'))} batch_max={int(med('uffd_batch_max'))}")
+print(f"  uffd faults/errors:   faults={int(med('uffd_faults'))} errors={int(med('uffd_errors'))} queue_p95={med('uffd_queue_p95_us'):.1f}µs queue_p99={med('uffd_queue_p99_us'):.1f}µs")
+print(f"  uffd source:          calls={int(med('uffd_source_calls'))} bytes={int(med('uffd_source_bytes'))} time={med('uffd_source_ms'):.1f}ms")
+print(f"  uffd urgent:          copy={int(med('uffd_urgent_copy_calls'))}/{med('uffd_urgent_copy_ms'):.1f}ms zero={int(med('uffd_urgent_zero_calls'))}/{med('uffd_urgent_zero_ms'):.1f}ms")
+print(f"  uffd tail:            submitted={int(med('uffd_tail_submitted'))} dropped={int(med('uffd_tail_dropped'))} buffered/deferred/zero={int(med('uffd_tail_buffered'))}/{int(med('uffd_tail_deferred'))}/{int(med('uffd_tail_zero'))} completed={int(med('uffd_tail_completed'))} conflicts={int(med('uffd_tail_conflicts'))} partial={int(med('uffd_tail_partial'))}")
 zeroed = int(med('uffd_pages_zeroed'))
 copied = int(med('uffd_pages_copied'))
 total = int(med('uffd_total_pages')) or 1
@@ -148,8 +167,9 @@ run_scenario() {
         echo "$row" | python3 -c "
 import json, sys
 r = json.loads(sys.stdin.read())
-print('    wall={:.0f}ms internal={}ms faults={} batch_avg={} lazy={:.1f}% blk0_p50={:.1f}us gc={} alloc={:.1f}MiB'.format(
-    r['wall_ms'], r.get('internal_ms',0), r['uffd_faults'], r['uffd_batch_avg'],
+print('    wall={:.0f}ms internal={}ms faults={} errors={} tail={}/{} drop={} lazy={:.1f}% blk0_p50={:.1f}us gc={} alloc={:.1f}MiB'.format(
+    r['wall_ms'], r.get('internal_ms',0), r['uffd_faults'], r.get('uffd_errors',0),
+    r.get('uffd_tail_completed',0), r.get('uffd_tail_submitted',0), r.get('uffd_tail_dropped',0),
     r['lazy_load_ratio']*100, r['blk0_p50_us'], r['go_num_gc'], r['go_total_alloc_mb']))
 "
     done

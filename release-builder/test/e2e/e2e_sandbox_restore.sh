@@ -16,6 +16,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$REPO_ROOT/test/lib/tarstream.sh"
+. "$REPO_ROOT/test/lib/uffd_performance_gate.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 source "$REPO_ROOT/test/e2e/readiness_helpers.sh"
 
@@ -116,12 +117,14 @@ RUNTIME_ROOT="$WORK/runtime"
 mkdir -p "$RUNTIME_ROOT/$SID1"
 readiness_begin_capture "$WORK/cold.ready"
 COLD_READER_PID=$READY_READER_PID
+COLD_T0_NS=$(date +%s%N)
 "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID1" \
+    --stats-json "$WORK/cold-stats.json" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
 readiness_close_parent_writer
@@ -132,6 +135,7 @@ readiness_connect_ctl "$RUNTIME_ROOT/$SID1/ctl.sock" \
     || { echo "==> FAIL: cold ctl.sock not connectable at control_ready"; exit 1; }
 readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" \
     || { tail -60 "$LOG1"; exit 1; }
+COLD_READY_MS=$(( ($(date +%s%N) - COLD_T0_NS) / 1000000 ))
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$RUNTIME_ROOT" -- /bin/true \
     || { echo "==> FAIL: cold immediate exec after ready failed"; exit 1; }
 readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' \
@@ -164,6 +168,8 @@ mkdir -p "$OUT"
 # run1 returns naturally. wait() not kill().
 wait "$SBPID1" 2>/dev/null || true
 SBPID1=""
+uffd_performance_gate "cold-zero-ready" "$COLD_READY_MS" 2000 \
+    "$WORK/cold-stats.json" zero
 
 SNAP_FILE="$OUT/$SID1.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID1.snapshot"; ls -la "$OUT"; exit 1; }
@@ -201,6 +207,7 @@ SID2="r2-$$"
 mkdir -p "$RUNTIME_ROOT/$SID2"
 readiness_begin_capture "$WORK/restore.ready"
 RESTORE_READER_PID=$READY_READER_PID
+RESTORE_T0_NS=$(date +%s%N)
 "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" \
     --restore "$SNAP_FILE" \
@@ -208,6 +215,7 @@ RESTORE_READER_PID=$READY_READER_PID
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID2" \
+    --stats-json "$WORK/restore-stats.json" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
 readiness_close_parent_writer
@@ -218,6 +226,7 @@ readiness_connect_ctl "$RUNTIME_ROOT/$SID2/ctl.sock" \
     || { echo "==> FAIL: restore ctl.sock not connectable at control_ready"; exit 1; }
 readiness_wait_event "$WORK/restore.ready" 2 ready "$SBPID2" \
     || { tail -60 "$LOG2"; exit 1; }
+RESTORE_READY_MS=$(( ($(date +%s%N) - RESTORE_T0_NS) / 1000000 ))
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$RUNTIME_ROOT" -- /bin/true \
     || { echo "==> FAIL: restore immediate exec after ready failed"; exit 1; }
 readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' \
@@ -238,6 +247,8 @@ done
 kill -TERM "$SBPID2" 2>/dev/null || true
 wait "$SBPID2" 2>/dev/null || true
 SBPID2=""
+uffd_performance_gate "file-restore-ready" "$RESTORE_READY_MS" 1500 \
+    "$WORK/restore-stats.json" deferred
 
 if grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2"; then
     echo "==> PASS: restored sandbox continued counting (saw TICK $WANT_TICK)"
