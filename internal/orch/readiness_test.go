@@ -587,7 +587,7 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 
 func runFreshLaunchForTest(t *testing.T, o *Orchestrator, ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
 	t.Helper()
-	_, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	_, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl, nil)
 	if err != nil {
 		return err
 	}

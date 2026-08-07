@@ -71,3 +71,27 @@ func TestRegistryEvictsSameID(t *testing.T) {
 		t.Fatalf("after final remove targets = %v, want []", got)
 	}
 }
+
+func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
+	trusted := proxyCaps("/run/proxy.sock")
+	trusted.Mmds = true
+	if !isTrustedMMDSProxyRegistration(routesync.ProxyPluginID, trusted) {
+		t.Fatal("exact trusted registration rejected")
+	}
+	for _, mutation := range []func(*routesync.Register){
+		func(r *routesync.Register) { r.Subscribe.Kind = routesync.KindRoute },
+		func(r *routesync.Register) { r.Proxy = nil },
+		func(r *routesync.Register) { r.Mmds = false },
+	} {
+		candidate := trusted
+		subscribe := *trusted.Subscribe
+		candidate.Subscribe = &subscribe
+		mutation(&candidate)
+		if isTrustedMMDSProxyRegistration(routesync.ProxyPluginID, candidate) {
+			t.Fatal("non-proxy MMDS registration was trusted")
+		}
+	}
+	if isTrustedMMDSProxyRegistration("observer", trusted) {
+		t.Fatal("non-proxy plugin id was trusted")
+	}
+}

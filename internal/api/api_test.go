@@ -135,6 +135,52 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	}
 }
 
+func TestBuildRegisterCarriesMMDSHeaderSeparatelyFromMetadata(t *testing.T) {
+	var got RegisterSpec
+	core := &buildMMDSCoreStub{register: func(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
+		got = spec
+		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	body := `{"name":"mmds","metadata":{"kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/data\",\"data\":\"value\"}]}"}}`
+	headers := http.Header{}
+	headers.Set(mmdsHeader, `{"secrets":{}}`)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates", strings.NewReader(body), headers)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if got.MMDSHeader == nil || *got.MMDSHeader != `{"secrets":{}}` || got.Metadata[sandboxcfg.NsMMDS] == "" {
+		t.Fatal("Build Register did not preserve separate MMDS carriers")
+	}
+}
+
+func TestBuildTriggerRejectsMMDSBeforeCore(t *testing.T) {
+	called := false
+	core := &buildMMDSCoreStub{trigger: func(context.Context, string, string, string, TriggerSpec, BuildAuth) error {
+		called = true
+		return nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	for _, test := range []struct {
+		name    string
+		body    string
+		headers http.Header
+	}{
+		{name: "header", body: `{}`, headers: header(mmdsHeader, "")},
+		{name: "metadata", body: `{"metadata":{"kuasar-sandbox.mmds":"{\"routes\":[]}"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v2/templates/template/builds/build", strings.NewReader(test.body), test.headers)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d", response.Code)
+			}
+		})
+	}
+	if called {
+		t.Fatal("Build Trigger MMDS override reached Core")
+	}
+}
+
 func TestCreateCheckpointHeaderOverlaysMetadataPerField(t *testing.T) {
 	var got CreateReq
 	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
@@ -760,6 +806,31 @@ func TestConnectRejectsOversizedMigrationTokenHeader(t *testing.T) {
 	}
 }
 
+func TestStandaloneConnectExistingTargetIgnoresOversizedMigrationHeader(t *testing.T) {
+	called := false
+	core := &connectMMDSCoreStub{
+		migrationCoreStub: migrationCoreStub{connect: func(context.Context, string, string, string, int) (*types.Sandbox, error) {
+			t.Fatal("legacy Connect unexpectedly called")
+			return nil, nil
+		}},
+		connectMMDS: func(_ context.Context, id, _ string, token string, _ int, _ map[string]string, header *string) (*types.Sandbox, error) {
+			called = true
+			if len(token) <= migrationtoken.MaxWireSize || header == nil || *header != "not-json" {
+				t.Fatal("standalone input was changed before the existence-aware Core check")
+			}
+			return &types.Sandbox{ID: id, Profile: types.ProfileE2B}, nil
+		},
+	}
+	h, apiKey := newMigrationTestHandler(t, core)
+	headers := http.Header{}
+	headers.Set(MigrationTokenHeader, strings.Repeat("a", migrationtoken.MaxWireSize+1))
+	headers.Set(mmdsHeader, "not-json")
+	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/existing/connect", strings.NewReader(`{}`), headers)
+	if response.Code != http.StatusOK || !called {
+		t.Fatalf("status = %d, core called=%t", response.Code, called)
+	}
+}
+
 func TestCreateExecSessionPassesStrictRequestAndReturnsOnlyToken(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -914,6 +985,20 @@ type checkpointCoreStub struct {
 	pause  func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error
 }
 
+type buildMMDSCoreStub struct {
+	Core
+	register func(context.Context, string, RegisterSpec) (*types.Build, error)
+	trigger  func(context.Context, string, string, string, TriggerSpec, BuildAuth) error
+}
+
+func (c *buildMMDSCoreStub) RegisterBuild(ctx context.Context, apiKey string, spec RegisterSpec) (*types.Build, error) {
+	return c.register(ctx, apiKey, spec)
+}
+
+func (c *buildMMDSCoreStub) TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error {
+	return c.trigger(ctx, apiKey, templateID, buildID, spec, auth)
+}
+
 func (c *checkpointCoreStub) Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) {
 	return c.create(ctx, req)
 }
@@ -931,6 +1016,15 @@ type migrationCoreStub struct {
 	importSandbox func(context.Context, string, string, string) (string, error)
 	exportSandbox func(context.Context, string, string, bool, bool) (string, error)
 	connect       func(context.Context, string, string, string, int) (*types.Sandbox, error)
+}
+
+type connectMMDSCoreStub struct {
+	migrationCoreStub
+	connectMMDS func(context.Context, string, string, string, int, map[string]string, *string) (*types.Sandbox, error)
+}
+
+func (c *connectMMDSCoreStub) ConnectWithMMDS(ctx context.Context, id, apiKey, token string, timeout int, metadata map[string]string, header *string) (*types.Sandbox, error) {
+	return c.connectMMDS(ctx, id, apiKey, token, timeout, metadata, header)
 }
 
 type sandboxContractCoreStub struct {
