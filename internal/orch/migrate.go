@@ -180,6 +180,25 @@ func (o *Orchestrator) importSandboxWithKey(
 	cluster *types.ClusterSandboxContext,
 	deadlineOverride int64,
 ) (*types.Sandbox, error) {
+	return o.importSandboxWithKeyOptions(ctx, pair, token, targetID, expected, cluster, deadlineOverride, standaloneMMDSImport{})
+}
+
+type standaloneMMDSImport struct {
+	routesPresent bool
+	routesJSON    string
+	routesDigest  string
+	secretValues  store.MMDSRouteSecretValues
+}
+
+func (o *Orchestrator) importSandboxWithKeyOptions(
+	ctx context.Context,
+	pair store.KeyPair,
+	token, targetID string,
+	expected migrationtoken.Expectations,
+	cluster *types.ClusterSandboxContext,
+	deadlineOverride int64,
+	mmdsImport standaloneMMDSImport,
+) (*types.Sandbox, error) {
 	if targetID != "" && !types.ValidLocalSandboxID(targetID) {
 		return nil, fmt.Errorf("import-sandbox: invalid target sandbox ID: %w", api.ErrBadRequest)
 	}
@@ -213,6 +232,12 @@ func (o *Orchestrator) importSandboxWithKey(
 
 	var trustedCluster *types.ClusterSandboxContext
 	metadata := migrationSandboxMetadata(payload.Metadata)
+	if mmdsImport.routesPresent {
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata[sandboxcfg.NsMMDS] = mmdsImport.routesJSON
+	}
 	if cluster != nil {
 		trustedCluster = &types.ClusterSandboxContext{Group: cluster.Group, RouteKey: cluster.RouteKey}
 		metadata = clusterSandboxMetadata(metadata)
@@ -245,13 +270,89 @@ func (o *Orchestrator) importSandboxWithKey(
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	if err := o.st.InsertSandbox(ctx, sb); err != nil {
-		if errors.Is(err, store.ErrSandboxExists) {
+	if mmdsImport.routesPresent {
+		initial := &mmdsInitialRouteSecretValues{
+			routesDigest: mmdsImport.routesDigest,
+			values:       mmdsImport.secretValues,
+		}
+		if err := validateInitialMMDSRouteEntry(sb, initial); err != nil {
+			return nil, fmt.Errorf("import-sandbox: MMDS route projection: %w: %v", migrationtoken.ErrInvalidPayload, err)
+		}
+	}
+	var insertErr error
+	if mmdsImport.routesPresent {
+		insertErr = o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, sb, mmdsImport.routesDigest, mmdsImport.secretValues)
+	} else {
+		insertErr = o.st.InsertSandbox(ctx, sb)
+	}
+	if insertErr != nil {
+		if errors.Is(insertErr, store.ErrSandboxExists) {
 			return nil, fmt.Errorf("import-sandbox: %w", api.ErrAlreadyExists)
 		}
-		return nil, fmt.Errorf("import-sandbox: insert target %s: %w", targetID, err)
+		return nil, fmt.Errorf("import-sandbox: insert target %s: %w", targetID, insertErr)
 	}
 	return sb, nil
+}
+
+func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, apiKey, token string, requestMetadata map[string]string, header *string) (*types.Sandbox, error) {
+	pair, err := o.resolveAllowed(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	if pair.APISecret == "" {
+		return nil, fmt.Errorf("import-sandbox: credential pair is not installed: %w", api.ErrNotAllowed)
+	}
+	payload, err := migrationtoken.Open(
+		migrationtoken.KeyMaterial{APISecret: pair.APISecret, ManifestKey: pair.ManifestKey},
+		token,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: open migration token: %w", err)
+	}
+
+	var tokenRoutes []sandboxcfg.MMDSRoute
+	var routesJSON string
+	routesPresent := false
+	if raw, ok := payload.Metadata[sandboxcfg.NsMMDS]; ok {
+		tokenRoutes, routesJSON, err = sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
+		if err != nil {
+			return nil, fmt.Errorf("import-sandbox: token MMDS routes: %w: %v", migrationtoken.ErrInvalidPayload, err)
+		}
+		routesPresent = true
+	}
+	requestMMDS := map[string]string(nil)
+	if raw, ok := requestMetadata[sandboxcfg.NsMMDS]; ok {
+		requestMMDS = map[string]string{sandboxcfg.NsMMDS: raw}
+	}
+	values, err := sandboxcfg.ExtractMMDSImportSecrets(requestMMDS, header, tokenRoutes, o.mmdsPolicy())
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: request MMDS secrets: %w: %v", api.ErrBadRequest, err)
+	}
+
+	imported, err := o.importSandboxWithKeyOptions(
+		ctx, pair, token, id, migrationtoken.Expectations{}, nil, 0,
+		standaloneMMDSImport{
+			routesPresent: routesPresent,
+			routesJSON:    routesJSON,
+			routesDigest:  sandboxcfg.MMDSRoutesDigest(routesJSON),
+			secretValues:  store.MMDSRouteSecretValues(values),
+		},
+	)
+	if err != nil {
+		if !errors.Is(err, api.ErrAlreadyExists) {
+			return nil, err
+		}
+		// A concurrent import won. Its row and secret blob are authoritative;
+		// ignore this request's token and values from this point onward.
+		imported, err = o.st.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !ownsSandbox(imported, apiKey) {
+		return nil, api.ErrNotFound
+	}
+	return imported, nil
 }
 
 // migrationSandboxMetadata preserves ordinary portable metadata while ensuring

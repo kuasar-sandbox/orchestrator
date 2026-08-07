@@ -211,6 +211,15 @@ checkpoint:                                        # paused-state capture
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)
+#   routes:
+#     enabled: true
+#     max_routes_per_sandbox: 32
+#     max_namespace_bytes: 65536
+#     max_static_body_bytes: 16384
+#     max_secret_value_bytes: 16384
+#     reserved_path_prefixes: [/latest/api/, /internal/]
+#   services:
+#     external-mmds: { endpoint: unix:///run/kuasar/mmds/external-mmds.sock }
 # cluster:                                         # connect this node to registry node_link (node.md §10)
 #   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
@@ -232,7 +241,7 @@ config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= ser
 paths:
   run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
-# proxy_netns: sw0_mgmt                          # forwarding netns for workers' floatingip dials + mmds_listen; "" = current netns
+# proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + conductor MMDS listen; "" = current netns
 proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots
@@ -240,6 +249,5 @@ workers: 2                                       # worker processes supervised b
 tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }   # = serve's wildcard cert; omit = h2c
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
-# mmds_listen: 127.0.0.1:19254                    # FC MMDS addr workers share when serve has mmds.enabled
 # metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)
 `

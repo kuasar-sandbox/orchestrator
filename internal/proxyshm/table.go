@@ -24,7 +24,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 4
+	schema uint32 = 5
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -43,6 +43,7 @@ const (
 	maxAccessToken = 256
 	maxSnapLoc     = 32
 	maxMmdsSecret  = 128
+	maxRunID       = 128
 )
 
 var (
@@ -63,7 +64,8 @@ type mmapHeader struct {
 	PolicySeq    uint64
 	PolicyParkMS int64
 	PolicyAuth   [maxProfile]byte
-	_            [24]byte
+	MMDSSynced   uint32
+	_            [20]byte
 }
 
 type mmapRecord struct {
@@ -91,6 +93,7 @@ type mmapRecord struct {
 	ForwardAccessToken     [maxAccessToken]byte
 	SnapshotLocation       [maxSnapLoc]byte
 	MmdsSecret             [maxMmdsSecret]byte
+	RunID                  [maxRunID]byte
 }
 
 // mmapTerminalRecord is a bounded, credential-free correlation cache for
@@ -238,6 +241,22 @@ func (t *Table) Capacity() int { return int(atomic.LoadUint32(&t.header.Capacity
 func (t *Table) Rev() uint64   { return atomic.LoadUint64(&t.header.GlobalRev) }
 func (t *Table) Synced() bool  { return atomic.LoadUint32(&t.header.Synced) == 1 }
 
+// MMDSSynced is independent of the generic data-plane sync bit. The generic
+// table deliberately remains usable while route-sync reconnects, but MMDS must
+// fail closed because its confidential heap is discarded on every disconnect.
+func (t *Table) MMDSSynced() bool { return atomic.LoadUint32(&t.header.MMDSSynced) == 1 }
+
+func (t *Table) SetMMDSSynced(synced bool) {
+	if t.readonly {
+		return
+	}
+	var value uint32
+	if synced {
+		value = 1
+	}
+	atomic.StoreUint32(&t.header.MMDSSynced, value)
+}
+
 func (t *Table) BeginSync() {
 	if t.readonly {
 		return
@@ -316,6 +335,10 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	if err := validateRoute(in); err != nil {
 		return err
 	}
+	// Variable MMDS declarations and plaintext values are master-heap only.
+	// Clear them before any fixed-layout comparison or write.
+	in.MMDSRoutes = ""
+	in.MMDSRouteSecretValues = nil
 	startHeaderWrite(&t.header.TableSeq)
 	defer finishHeaderWrite(&t.header.TableSeq)
 	idx, ok := t.findSlot(in.SandboxID, true)
@@ -476,6 +499,14 @@ func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
 	return b, true
 }
 
+func (t *Table) Incarnation(sid string) (string, bool) {
+	route, ok := t.Lookup(sid)
+	if !ok || route.RunID == "" || (route.State != routesync.StateStarting && route.State != routesync.StateRunning) {
+		return "", false
+	}
+	return route.RunID, true
+}
+
 func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
@@ -545,6 +576,7 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
 				SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
 				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
+				RunID:                  fixedString(rec.RunID[:]),
 			},
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
@@ -589,6 +621,7 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	_ = putFixed(rec.ForwardAccessToken[:], snapshot.entry.ForwardAccessToken)
 	_ = putFixed(rec.SnapshotLocation[:], snapshot.entry.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], snapshot.entry.MmdsSecret)
+	_ = putFixed(rec.RunID[:], snapshot.entry.RunID)
 	finishWrite(rec)
 }
 
@@ -730,6 +763,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"forward_access_token", r.ForwardAccessToken, maxAccessToken},
 		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
+		{"run_id", r.RunID, maxRunID},
 	}
 	for _, c := range checks {
 		if len(c.val) > c.max {

@@ -44,6 +44,10 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDS(metadata, spec.MMDSHeader, o.mmdsPolicy())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -81,7 +85,23 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		Builder:     builderOpts,
 		CreatedUnix: time.Now().Unix(),
 	}
-	if err := o.st.PutBuild(ctx, b); err != nil {
+	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
+	if initialMMDS != nil {
+		transportRow := &types.Sandbox{
+			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
+			State: types.StateRunning, RunID: "build-registration-check",
+			APISecret: b.APISecret, ManifestKey: b.ManifestKey, Metadata: b.Metadata,
+		}
+		if err := validateInitialMMDSRouteEntry(transportRow, initialMMDS); err != nil {
+			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+	}
+	var routesDigest string
+	var secretValues store.MMDSRouteSecretValues
+	if initialMMDS != nil {
+		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
+	}
+	if err := o.st.InsertBuildWithMMDSRouteSecretValues(ctx, b, routesDigest, secretValues); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -97,6 +117,9 @@ func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey string, spec ap
 // image + steps + e2b start command and queue the build for the pool. Bare
 // builds reject start/ready commands and always produce an image.
 func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
+	if _, present := spec.Metadata[sandboxcfg.NsMMDS]; present {
+		return fmt.Errorf("%w: Build Trigger must not override MMDS configuration", api.ErrBadRequest)
+	}
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return err
@@ -511,7 +534,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// build), which the SDK is streaming — so reason.message stays generic
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
-		_ = o.st.PutBuild(ctx, b)
+		o.persistTerminalBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
 		return
@@ -520,14 +543,14 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// result), so there is NO build log for it — surface the orchestrator-
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
-		_ = o.st.PutBuild(ctx, b)
+		o.persistTerminalBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotRef != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
-		_ = o.st.PutBuild(ctx, b)
+		o.persistTerminalBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
@@ -540,13 +563,13 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Ref: res.ImageRef}.String()
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
-		_ = o.st.PutBuild(ctx, b)
+		o.persistTerminalBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
 	if _, err := types.ParseTemplateID(b.PersistID); err != nil {
 		b.Status, b.Reason = types.BuildError, "build produced invalid portable ref: "+err.Error()
-		_ = o.st.PutBuild(ctx, b)
+		o.persistTerminalBuild(ctx, b)
 		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
@@ -554,9 +577,15 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	b.Status = types.BuildReady
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
-	_ = o.st.PutBuild(ctx, b)
+	o.persistTerminalBuild(ctx, b)
 	o.publishBuildState(b.BuildID, "ready", b.PersistID, "")
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
+}
+
+func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Build) {
+	if err := o.st.PutBuildTerminal(ctx, build); err != nil {
+		o.log.Error("persist terminal build and clean MMDS route secrets", "bid", build.BuildID, "err", err)
+	}
 }
 
 func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*buildResult, error) {
@@ -615,30 +644,38 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		o.pendMu.Unlock()
 	}()
 
-	// MMDS visibility for the template phase: a synthetic running route
-	// (FC-mode envd resolves {id, token-hash} by its floating IP).
-	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
-		row := &types.Sandbox{
-			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
-			State: types.StateRunning, FloatingIP: port.FloatingIP,
-			EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
-			CreatedUnix: time.Now().Unix(),
-		}
-		o.cache(row)
-		o.publishUpsert(row)
-		defer func() {
-			o.uncache(row.ID)
-			o.publishDelete(row.ID)
-		}()
-	}
-
 	var unit string
+	var mmdsRow *types.Sandbox
 	if _, err := o.builderRunPool.Assign(ctx, b.BuildID, func(runID string) error {
 		b.RunID = runID
 		unit = o.builderUnit(runID)
-		return o.st.SetBuildRunID(ctx, b.BuildID, runID)
+		if err := o.st.SetBuildRunID(ctx, b.BuildID, runID); err != nil {
+			return err
+		}
+		// Publish only after the real run id is durably assigned. The worker
+		// cannot mint an unbound MMDSv2 token, and the builder's registered
+		// routes/values are now projected under the synthetic sandbox id.
+		if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
+			mmdsRow = &types.Sandbox{
+				ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
+				State: types.StateRunning, RunID: runID, FloatingIP: port.FloatingIP,
+				EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
+				Metadata: b.Metadata, CreatedUnix: time.Now().Unix(),
+			}
+			o.setMMDSBuildOwner(mmdsRow.ID, b.BuildID)
+			o.cache(mmdsRow)
+			o.publishUpsert(mmdsRow)
+		}
+		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if mmdsRow != nil {
+		defer func() {
+			o.uncache(mmdsRow.ID)
+			o.publishDelete(mmdsRow.ID)
+			o.setMMDSBuildOwner(mmdsRow.ID, "")
+		}()
 	}
 	defer func() { _ = o.lc.ResetFailed(context.Background(), unit) }()
 

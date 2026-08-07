@@ -27,6 +27,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -87,6 +89,13 @@ type Orchestrator struct {
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
+
+	// synthetic build sandbox id -> durable build owner id. Protected by mu
+	// alongside reg; never persisted or exported.
+	mmdsBuildOwners map[string]string
+	// Parsed once from conductor-owned mmds.services. Values are absolute Unix
+	// socket paths and never come from proxy.yaml or a tenant document.
+	mmdsServices mmdssvc.Registry
 }
 
 // clusterBuild is a registry-driven build's transient image-pull context. Cluster
@@ -97,6 +106,7 @@ type clusterBuild struct {
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
+	mmdsServices, _ := mmdssvc.BuildRegistry(cfg.MMDS.ServiceEndpoints())
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		sandboxReadyTimeout: 60 * time.Second,
@@ -108,6 +118,8 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		pend:                map[string]*pendingBuild{},
 		clusterBuilds:       map[string]*clusterBuild{},
 		buildEvents:         make(chan *routesync.BuildEvent, 64),
+		mmdsBuildOwners:     map[string]string{},
+		mmdsServices:        mmdsServices,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -167,6 +179,10 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		templateMetadata = tb.Metadata
 	}
 	meta := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
+	mmdsDoc, meta, err := sandboxcfg.ExtractMMDS(meta, req.MMDSHeader, o.mmdsPolicy())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	// Validate request-scoped policy before allocating an identity, minting
 	// credentials, creating directories, attaching networking, or starting a
 	// process. Normalization also gives every later trust boundary one canonical
@@ -220,7 +236,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	accepted, _, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
+	accepted, _, err := o.acceptFreshLaunch(ctx, sb, tmpl, initialMMDS)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +248,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 // acceptFreshLaunch is the common standalone/cluster create admission. The
 // lifecycle lock orders initial publication against a concurrent Delete; launch
 // ownership is claimed before the durable starting row becomes visible.
-func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*types.Sandbox, *launchAttempt, error) {
+func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID, initialMMDS *mmdsInitialRouteSecretValues) (*types.Sandbox, *launchAttempt, error) {
 	if sb == nil || sb.State != types.StateStarting {
 		return nil, nil, fmt.Errorf("orch: fresh launch requires a starting sandbox")
 	}
@@ -248,6 +265,9 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err := lifecycleCtx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
+	if err := validateInitialMMDSRouteEntry(sb, initialMMDS); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
@@ -259,7 +279,13 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		o.launches.Finish(attempt, err)
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
-	if err := o.st.InsertSandbox(ctx, cloneSandbox(sb)); err != nil {
+	var routesDigest string
+	var secretValues store.MMDSRouteSecretValues
+	if initialMMDS != nil {
+		routesDigest = initialMMDS.routesDigest
+		secretValues = initialMMDS.values
+	}
+	if err := o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, cloneSandbox(sb), routesDigest, secretValues); err != nil {
 		o.launches.Finish(attempt, err)
 		return nil, nil, err
 	}
@@ -973,6 +999,41 @@ func (o *Orchestrator) resolveCheckpointPolicy(metadata map[string]string, actio
 func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
 	_, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
 	if err != nil {
+		return nil, err
+	}
+	var requestedDeadline *int64
+	if timeoutSec > 0 {
+		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+		requestedDeadline = &deadline
+	}
+	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, func(current *types.Sandbox) error {
+		if !ownsSandbox(current, apiKey) {
+			return api.ErrNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cloneSandbox(sb), nil
+}
+
+// ConnectWithMMDS is the standalone-only CONNECT extension. Existing targets
+// are checked before the migration token or MMDS request is parsed and ignore
+// both completely. A real import admits routes only from the token and accepts
+// request-side initial secret values only.
+func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int, metadata map[string]string, header *string) (*types.Sandbox, error) {
+	existing, err := o.st.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil || migrationToken == "" {
+		return o.Connect(ctx, id, apiKey, "", timeoutSec)
+	}
+	if len(migrationToken) > migrationtoken.MaxWireSize {
+		return nil, migrationtoken.ErrTokenTooLarge
+	}
+	if _, err := o.prepareStandaloneTargetWithMMDS(ctx, id, apiKey, migrationToken, metadata, header); err != nil {
 		return nil, err
 	}
 	var requestedDeadline *int64

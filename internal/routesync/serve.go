@@ -86,20 +86,22 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 // Upserts, a Bookmark, and live deltas; concurrently it reads up-frames from body
 // and hands each to onUp. It returns when body hits EOF/error or ctx is cancelled.
 //
-// Two callers drive it: the proxy plane (ServeStream, w = the h2c ResponseWriter,
-// onUp = a Wake handler) and the cluster node-link (node.md §10, w = the request
-// body of the dialed registry connection — the node is the authority that DIALS,
-// onUp = a registry-command dispatcher). The frame codec and this loop are the
-// single shared engine; only the transport adapter and onUp differ.
+// The proxy plane reaches this through ServeStream. The cluster node-link calls
+// StreamAuthority directly and is therefore forced onto the non-MMDS projection.
 func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
 	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
 	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
 	// instead of Hello and calls StreamAuthority directly.
-	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: src.Policy()}}); err != nil {
+	includeMMDS := reg.Mmds && reg.Subscribe != nil && reg.Subscribe.Kind == KindRouteWake && reg.Proxy != nil
+	policy := src.Policy()
+	if !includeMMDS {
+		policy.MMDS = nil
+	}
+	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: policy}}); err != nil {
 		return
 	}
 	flush()
-	StreamAuthority(ctx, w, flush, body, src, reg, onUp, nil, log)
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, nil, includeMMDS, log)
 }
 
 // StreamAuthority runs the route-stream half of an authority connection WITHOUT
@@ -115,6 +117,14 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 // the node-link's command acks — so they serialize through this single writer
 // alongside the route deltas rather than racing it.
 func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, log *slog.Logger) {
+	// Direct callers are the cluster node-link transport. Even if a remote peer
+	// sets the generic Register.Mmds bit, this entry point never projects node-
+	// local MMDS routes or values. The config-socket proxy path above performs
+	// its own trusted registration check before opting in.
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, false, log)
+}
+
+func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, includeMMDS bool, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -148,11 +158,14 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	defer cancelSub()
 
 	resumed := false
-	if reg.ResumeFrom != "" {
+	// A trusted MMDS proxy always rebuilds its confidential heap from a full
+	// snapshot. The heap is deliberately discarded on disconnect, so an
+	// incremental replay cannot reconstruct unchanged routes or values.
+	if reg.ResumeFrom != "" && !includeMMDS {
 		if rs, ok := src.(ResumableSource); ok {
 			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
 				err := rs.Replay(sctx, after, func(ev Event) error {
-					return writeEvent(w, ev)
+					return writeEvent(w, ev, includeMMDS)
 				})
 				switch {
 				case err == nil:
@@ -167,6 +180,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	if !resumed {
 		if err := src.Range(sctx, func(r RouteEntry) error {
+			projectMMDSRoute(&r, includeMMDS)
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
@@ -187,7 +201,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev); err != nil {
+			if err := writeEvent(w, ev, includeMMDS); err != nil {
 				return
 			}
 			flush()
@@ -209,7 +223,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			if err := writeEvent(w, ev); err != nil {
+			if err := writeEvent(w, ev, includeMMDS); err != nil {
 				return
 			}
 			flush()
@@ -217,11 +231,12 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 }
 
-func writeEvent(w io.Writer, ev Event) error {
+func writeEvent(w io.Writer, ev Event, includeMMDS bool) error {
 	m := &Msg{Type: ev.Kind}
 	switch ev.Kind {
 	case TypeUpsert:
 		r := ev.Route
+		projectMMDSRoute(&r, includeMMDS)
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
@@ -229,4 +244,12 @@ func writeEvent(w io.Writer, ev Event) error {
 		return nil
 	}
 	return WriteMsg(w, m)
+}
+
+func projectMMDSRoute(route *RouteEntry, include bool) {
+	if route == nil || include {
+		return
+	}
+	route.MMDSRoutes = ""
+	route.MMDSRouteSecretValues = nil
 }

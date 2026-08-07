@@ -483,7 +483,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl)
+	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl, nil)
 	if err != nil {
 		return nil, nil, err
 	}

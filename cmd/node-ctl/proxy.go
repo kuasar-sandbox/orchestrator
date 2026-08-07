@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
@@ -27,14 +28,13 @@ import (
 )
 
 const (
-	proxyPluginID = "proxy"
-
 	envProxyDataFD    = "KUASAR_PROXY_DATA_FD"
 	envProxyForwardFD = "KUASAR_PROXY_FORWARD_FD"
 	envProxyMMDSFD    = "KUASAR_PROXY_MMDS_FD"
 	envProxyWakeFD    = "KUASAR_PROXY_WAKE_FD"
 	envProxyNotifyFD  = "KUASAR_PROXY_NOTIFY_FD"
 	envProxyMetricsFD = "KUASAR_PROXY_METRICS_FD"
+	envProxyMMDSRPCFD = "KUASAR_PROXY_MMDSRPC_FD"
 	envProxyWorkerID  = "KUASAR_PROXY_WORKER_ID"
 )
 
@@ -70,7 +70,21 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	defer os.Remove(cfg.ShmPath)
 
 	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), log)
-	view.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)})
+	if err := table.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)}); err != nil {
+		return fmt.Errorf("proxy: set bootstrap policy: %w", err)
+	}
+
+	// The external proxy always registers its trusted MMDS capability. The
+	// conductor Hello is the sole source for enabled/listen/services.
+	reg := routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
+		Mmds:      true,
+	}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
+	}
+	go routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(ctx)
 
 	proxyNS, err := openProxyNetNS(cfg.ProxyNetNS)
 	if err != nil {
@@ -96,10 +110,16 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	var mmdsLn net.Listener
-	if cfg.MMDSListen != "" {
-		mmdsLn, err = listenTCPInNetNS(proxyNS, cfg.MMDSListen)
+	mmdsPolicy, ok := view.WaitPolicy(ctx)
+	if !ok {
+		return nil
+	}
+	mmdsListen := ""
+	if mmdsPolicy != nil && mmdsPolicy.Enabled {
+		mmdsListen = mmdsPolicy.Listen
+		mmdsLn, err = listenTCPInNetNS(proxyNS, mmdsListen)
 		if err != nil {
-			return fmt.Errorf("proxy: listen mmds_listen %s: %w", cfg.MMDSListen, err)
+			return fmt.Errorf("proxy: listen conductor MMDS address %s: %w", mmdsListen, err)
 		}
 		defer mmdsLn.Close()
 	}
@@ -113,21 +133,11 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
 	}
 
-	reg := routesync.Register{
-		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
-		Mmds:      cfg.MMDSListen != "",
-	}
-	dial := func(ctx context.Context) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
-	}
-	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, view, log).Run(ctx)
-
 	log.Info("node-ctl proxy master serving",
 		"workers", cfg.Workers,
 		"data_listen", cfg.DataListen,
 		"proxy_socket", cfg.ProxySocket,
-		"mmds_listen", cfg.MMDSListen,
+		"mmds_listen", mmdsListen,
 		"proxy_netns", cfg.ProxyNetNS,
 		"config_socket", cfg.ConfigSocket,
 		"shm_path", cfg.ShmPath,
@@ -157,7 +167,12 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if wakes != nil {
 		wakeFn = wakes.Wake
 	}
-	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur())
+	var mmdsClient *mmdsrpc.Client
+	if fd := fdEnv(envProxyMMDSRPCFD); fd >= 0 {
+		mmdsClient = mmdsrpc.NewClient(os.NewFile(uintptr(fd), "proxy-mmdsrpc"))
+		defer mmdsClient.Close()
+	}
+	view := proxyshm.NewMMDSWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur(), mmdsClient)
 	authMode := func() string {
 		if m := view.Policy().AuthMode; m != "" {
 			return m
@@ -266,9 +281,15 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW))
 		return err
 	}
+	mmdsRPCMaster, mmdsRPCWorker, err := newSocketpair()
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW, metricsR, metricsW))
+		return err
+	}
 	removeNotify := view.RegisterNotifyWriter(notifyW)
 	go proxyshm.ReadWakeLoop(ctx, wakeR, view.Wake)
 	go readMetricsLoop(ctx, metricsR, mx)
+	go mmdsrpc.NewServer(mmdsRPCMaster, view.ResolveMMDS, log).Serve()
 
 	addFile(envProxyDataFD, dataFile)
 	addFile(envProxyForwardFD, forwardFile)
@@ -276,6 +297,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	addFile(envProxyWakeFD, wakeW)
 	addFile(envProxyNotifyFD, notifyR)
 	addFile(envProxyMetricsFD, metricsW)
+	addFile(envProxyMMDSRPCFD, mmdsRPCWorker)
 	env = append(env, envProxyWorkerID+"="+workerID)
 
 	cmd := exec.CommandContext(ctx, exe, "proxy", "serve", "--config", cfgPath, "--worker")
@@ -285,16 +307,29 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	cmd.Stderr = os.Stderr
 	if err := startCommandInNetNS(proxyNS, cmd); err != nil {
 		removeNotify()
+		_ = mmdsRPCMaster.Close()
 		closeFiles(files)
 		return err
 	}
 	closeFiles(files)
 	defer removeNotify()
+	defer mmdsRPCMaster.Close()
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return nil
 	}
 	return err
+}
+
+func newSocketpair() (master, worker *os.File, err error) {
+	// Only the explicitly passed worker endpoint may survive exec. Setting
+	// CLOEXEC atomically prevents a concurrently spawned worker from inheriting
+	// the master's endpoint before os.File.Close can run.
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(fds[0]), "mmdsrpc-master"), os.NewFile(uintptr(fds[1]), "mmdsrpc-worker"), nil
 }
 
 func listenUnix(path string) (net.Listener, error) {
