@@ -37,6 +37,7 @@ const (
 	NsRestore     = "kuasar-sandbox.restore"
 	NsCredentials = "kuasar-sandbox.credentials"
 	NsCheckpoint  = "kuasar-sandbox.checkpoint"
+	NsMMDS        = "kuasar-sandbox.mmds"
 )
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
@@ -264,7 +265,7 @@ func MergeMetadata(base, over map[string]string) map[string]string {
 // admitted for those values.
 func MergeCreateMetadata(defaults, request map[string]string) map[string]string {
 	out := mergeStr(defaults, request)
-	for _, ns := range []string{NsRestore, NsCredentials, NsCheckpoint} {
+	for _, ns := range []string{NsRestore, NsCredentials, NsCheckpoint, NsMMDS} {
 		delete(out, ns)
 		if raw, ok := request[ns]; ok {
 			if out == nil {

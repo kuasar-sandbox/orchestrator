@@ -97,6 +97,24 @@ CREATE INDEX IF NOT EXISTS idx_builds_ashash ON builds(api_secret_hash);
 CREATE INDEX IF NOT EXISTS idx_builds_ascandidate ON builds(substr(api_secret_hash,1,24));
 CREATE INDEX IF NOT EXISTS idx_builds_mkhash ON builds(manifest_key_hash);
 
+CREATE TABLE IF NOT EXISTS sandbox_mmds_route_secret_values (
+  sandbox_id        TEXT PRIMARY KEY,
+  routes_digest     TEXT NOT NULL,
+  revision          INTEGER NOT NULL,
+  ciphertext        TEXT NOT NULL,
+  updated_unix      INTEGER NOT NULL,
+  FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS build_mmds_route_secret_values (
+  build_id          TEXT PRIMARY KEY,
+  routes_digest     TEXT NOT NULL,
+  revision          INTEGER NOT NULL,
+  ciphertext        TEXT NOT NULL,
+  updated_unix      INTEGER NOT NULL,
+  FOREIGN KEY (build_id) REFERENCES builds(build_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS manifest_keys (
   api_secret_hash   TEXT PRIMARY KEY,
   api_secret_enc    TEXT NOT NULL,
@@ -114,7 +132,7 @@ CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_ke
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
@@ -739,35 +757,12 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	return &b, nil
 }
 
-// PutBuild upserts a build record. The credential pair is written only by the
-// initial insert; later build-state updates cannot rebind an existing build.
-func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
-	apiHash, apiEnc, err := s.encSecret("API secret", b.APISecret)
-	if err != nil {
-		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
-	}
-	manifestHash, manifestEnc, err := s.encSecret("manifest key", b.ManifestKey)
-	if err != nil {
-		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
-	}
-	var raEnc string
-	if b.RegistryAuth != "" {
-		if raEnc, err = s.box.EncryptString(b.RegistryAuth); err != nil {
-			return fmt.Errorf("store: put build %s: encrypt registry auth: %w", b.BuildID, err)
-		}
-	}
-	stepsJSON := "[]"
-	if len(b.Steps) > 0 {
-		sj, jerr := json.Marshal(b.Steps)
-		if jerr != nil {
-			return fmt.Errorf("store: put build %s: steps: %w", b.BuildID, jerr)
-		}
-		stepsJSON = string(sj)
-	}
-	_, err = s.db.ExecContext(ctx, `
+const buildInsertSQL = `
 	INSERT INTO builds (build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
 	  template_id=excluded.template_id, persist_id=excluded.persist_id,
 	  profile=excluded.profile, kind=excluded.kind, from_image=excluded.from_image,
@@ -776,9 +771,51 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 	  status=excluded.status, reason=excluded.reason, run_id=excluded.run_id,
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
 	  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
-	  builder_json=excluded.builder_json`,
+	  builder_json=excluded.builder_json`
+
+const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
+
+func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
+	if b == nil || b.BuildID == "" {
+		return nil, errors.New("build is required")
+	}
+	apiHash, apiEnc, err := s.encSecret("API secret", b.APISecret)
+	if err != nil {
+		return nil, fmt.Errorf("store: put build %s: %w", b.BuildID, err)
+	}
+	manifestHash, manifestEnc, err := s.encSecret("manifest key", b.ManifestKey)
+	if err != nil {
+		return nil, fmt.Errorf("store: put build %s: %w", b.BuildID, err)
+	}
+	var raEnc string
+	if b.RegistryAuth != "" {
+		if raEnc, err = s.box.EncryptString(b.RegistryAuth); err != nil {
+			return nil, fmt.Errorf("store: put build %s: encrypt registry auth: %w", b.BuildID, err)
+		}
+	}
+	stepsJSON := "[]"
+	if len(b.Steps) > 0 {
+		sj, jerr := json.Marshal(b.Steps)
+		if jerr != nil {
+			return nil, fmt.Errorf("store: put build %s: steps: %w", b.BuildID, jerr)
+		}
+		stepsJSON = string(sj)
+	}
+	return []any{
 		b.BuildID, b.TemplateID, b.PersistID, apiHash, apiEnc, manifestHash, manifestEnc, string(b.Profile), string(b.Kind),
-		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder))
+		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID,
+		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder),
+	}, nil
+}
+
+// PutBuild upserts a build record. The credential pair is written only by the
+// initial insert; later build-state updates cannot rebind an existing build.
+func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
+	args, err := s.prepareBuildWrite(b)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, buildUpsertSQL, args...)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
