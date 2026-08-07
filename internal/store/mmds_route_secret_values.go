@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -315,10 +316,23 @@ func (s *Store) DeleteBuildMMDSRouteSecretValues(ctx context.Context, buildID st
 }
 
 // PutBuildTerminal atomically persists a build's terminal state and removes
-// its confidential builder-only MMDS values. The build row remains as the
-// template/status registry; the value blob does not.
+// its builder-only MMDS routes and confidential values. The build row remains
+// as the template/status registry, but neither part of the builder MMDS input
+// can become template metadata.
 func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error {
-	args, err := s.prepareBuildWrite(build)
+	if build == nil {
+		return errors.New("build is required")
+	}
+	terminal := *build
+	if build.Metadata != nil {
+		terminal.Metadata = make(map[string]string, len(build.Metadata))
+		for key, value := range build.Metadata {
+			if key != sandboxcfg.NsMMDS {
+				terminal.Metadata[key] = value
+			}
+		}
+	}
+	args, err := s.prepareBuildWrite(&terminal)
 	if err != nil {
 		return err
 	}

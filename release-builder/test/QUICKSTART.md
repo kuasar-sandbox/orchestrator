@@ -123,7 +123,7 @@ bash test/e2e/run_all.sh
 |---|---|
 | `e2e_orchestrator.sh` | node-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI(纯用户态,无 root/systemd/KVM)|
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create;Build Register MMDS real guest、Trigger 禁止覆盖、终态 secret cleanup/制品隔离 |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create;Build Register MMDS real guest、Trigger 禁止覆盖、终态 routes/value cleanup/制品隔离 |
 | `e2e_execute.sh` | 启真实 microVM(KVM)→ local Pause 三态 policy(node/Create/Pause/reaper)→ B 本地恢复→`W -> local B`→独立 export/promote→portable W 恢复 + self-only prefetch→kill |
 | `e2e_sandbox_disks.sh` | `merge_ref=false` working-set:memory self/parent 分层,root + data disk 仍合并并可本地恢复 |
 | `e2e_orchestrator_proxy.sh` | external proxy(master routesync + shm route view + worker fd inheritance)+ 数据面 X-Access-Token + auto-resume |
@@ -141,9 +141,9 @@ bash test/e2e/run_all.sh
 > 未设置时允许跳过外,缺失前置都会失败。
 
 MMDS 两条 wrapper 的声明只使用最终 `{secrets:{...},routes:[...]}` schema。两者会扫描
-sqlite、proxy mmap 和测试日志中的固定 secret marker;Build 用例还检查终态 value row 已删除、
-final image config 无 MMDS namespace。它们不增加 cluster MMDS case;cluster 回归仍由现有
-`e2e_cluster_real.sh` 与源仓 cluster stub 承担。
+sqlite、proxy mmap 和测试日志中的固定 secret marker;Build 用例还检查终态 build metadata
+与 value row 均无 MMDS 状态、final image config 无 MMDS namespace。它们不增加 cluster MMDS
+case;cluster 回归仍由现有 `e2e_cluster_real.sh` 与源仓 cluster stub 承担。
 
 ## 5. perf / 分析脚本清单
 

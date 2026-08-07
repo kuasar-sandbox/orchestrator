@@ -232,11 +232,20 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 
 	var trustedCluster *types.ClusterSandboxContext
 	metadata := migrationSandboxMetadata(payload.Metadata)
-	if mmdsImport.routesPresent {
-		if metadata == nil {
-			metadata = map[string]string{}
+	if raw, present := metadata[sandboxcfg.NsMMDS]; present {
+		_, routesJSON, err := sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
+		if err != nil {
+			return nil, fmt.Errorf("import-sandbox: token MMDS routes: %w: %v", migrationtoken.ErrInvalidPayload, err)
 		}
-		metadata[sandboxcfg.NsMMDS] = mmdsImport.routesJSON
+		// Routes always come from the authenticated migration token. The
+		// standalone CONNECT path may add initial values, but it cannot replace
+		// this portable declaration or its digest.
+		metadata[sandboxcfg.NsMMDS] = routesJSON
+		mmdsImport.routesPresent = true
+		mmdsImport.routesJSON = routesJSON
+		mmdsImport.routesDigest = sandboxcfg.MMDSRoutesDigest(routesJSON)
+	} else if mmdsImport.routesPresent || len(mmdsImport.secretValues) != 0 {
+		return nil, fmt.Errorf("import-sandbox: request MMDS secrets without token routes: %w", migrationtoken.ErrInvalidPayload)
 	}
 	if cluster != nil {
 		trustedCluster = &types.ClusterSandboxContext{Group: cluster.Group, RouteKey: cluster.RouteKey}

@@ -192,6 +192,29 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner did not receive assignment")
 	}
+	var assignedRunID string
+	for index := 0; index < 3; index++ {
+		select {
+		case event := <-events:
+			if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
+				t.Fatalf("pre-init launch event %d = %+v, want starting upsert", index, event)
+			}
+			if index < 2 && event.Route.RunID != "" {
+				t.Fatalf("pre-assignment launch event %d has run ID %q", index, event.Route.RunID)
+			}
+			if index == 2 {
+				assignedRunID = event.Route.RunID
+				if assignedRunID == "" {
+					t.Fatal("assigned starting route did not publish its run ID before envd init")
+				}
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("missing pre-init starting upsert %d", index)
+		}
+	}
+	if incarnation, ok := o.Incarnation(sb.ID); !ok || incarnation != assignedRunID {
+		t.Fatalf("pre-init MMDS incarnation = %q ok=%v, want %q", incarnation, ok, assignedRunID)
+	}
 	requests := make(chan string, 4)
 	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.URL.Path
@@ -224,15 +247,13 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 		t.Fatalf("unexpected envd request after successful /init: %s", req)
 	default:
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StateRunning} {
-		select {
-		case event := <-events:
-			if event.Kind != routesync.TypeUpsert || event.Route.State != want {
-				t.Fatalf("successful launch event = %+v, want upsert %s", event, want)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("successful launch did not publish %s", want)
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateRunning || event.Route.RunID != assignedRunID {
+			t.Fatalf("successful launch event = %+v, want running upsert for %s", event, assignedRunID)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("successful launch did not publish running")
 	}
 	stored, err := o.st.Get(ctx, sb.ID)
 	if err != nil || stored == nil || stored.State != types.StateRunning {
@@ -461,7 +482,7 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	if lc.stops.Load() == 0 {
 		t.Fatal("failed create did not stop its runner")
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
 		select {
 		case event := <-events:
 			if want == routesync.TypeDelete {
@@ -568,7 +589,7 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("non-204 envd /init attempts = %d, want 1", got)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StatePaused} {
+	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused} {
 		select {
 		case event := <-events:
 			if event.Kind != routesync.TypeUpsert || event.Route.State != want {

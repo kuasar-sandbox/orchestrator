@@ -218,7 +218,10 @@ func TestBuildMMDSRouteSecretValuesTerminalCleanup(t *testing.T) {
 		BuildID: "mmds-build", TemplateID: "transient-mmds-build",
 		APISecret: strings.Repeat("2", 64), ManifestKey: strings.Repeat("3", 64),
 		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildRegistered, CreatedUnix: 1,
-		Metadata: map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`},
+		Metadata: map[string]string{
+			sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`,
+			"ordinary":        "preserved",
+		},
 	}
 	if err := st.InsertBuildWithMMDSRouteSecretValues(ctx, build, "digest", MMDSRouteSecretValues{"key": []byte("build-value")}); err != nil {
 		t.Fatal(err)
@@ -237,5 +240,11 @@ func TestBuildMMDSRouteSecretValuesTerminalCleanup(t *testing.T) {
 	got, err := st.GetBuild(ctx, build.BuildID)
 	if err != nil || got.Status != types.BuildError {
 		t.Fatalf("terminal build status mismatch: err=%v", err)
+	}
+	if _, present := got.Metadata[sandboxcfg.NsMMDS]; present {
+		t.Fatalf("terminal build retained builder-only MMDS routes: %+v", got.Metadata)
+	}
+	if got.Metadata["ordinary"] != "preserved" {
+		t.Fatalf("terminal build lost ordinary metadata: %+v", got.Metadata)
 	}
 }

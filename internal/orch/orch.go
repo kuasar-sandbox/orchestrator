@@ -493,7 +493,19 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		}
 		sb.RunID = runID
 		attempt.SetRunID(runID)
-		o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
+		bound := o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
+		if bound == nil {
+			// BindStartingRunner succeeded under the lifecycle fence, so no
+			// concurrent delete can own the row. Rebuild an unexpectedly missing
+			// cache entry rather than withholding the assigned incarnation from
+			// MMDS and route-sync until after envd initialization.
+			bound = cloneSandbox(sb)
+			o.cache(bound)
+		}
+		// Assignment is not visible to the runner until this callback returns.
+		// Publish the incarnation-bound starting route first so an external MMDS
+		// worker can mint tokens during mandatory envd initialization.
+		o.publishUpsert(bound)
 		commitFinished = time.Now()
 		return nil
 	})

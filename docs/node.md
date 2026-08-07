@@ -638,9 +638,9 @@ metadata:  {"routes":[{"path":"/data","data":"x"}]}
 ```
 
 `metadata["kuasar-sandbox.mmds"]` 绝不包含 `secrets`。Build Register 的 routes 只服务
-本次 synthetic builder sandbox;initial values 以 build owner 加密保存,终态和清理路径删除,
-既不进入普通 build metadata,也不进入最终 template/snapshot/image。Build Trigger 不接受
-MMDS 覆盖。
+本次 synthetic builder sandbox;initial values 以 build owner 加密保存。build 终态事务同时
+从 `builds.metadata_json` 删除 routes namespace 并删除 value blob,因此两者都不进入最终
+template/snapshot/image。Build Trigger 不接受 MMDS 覆盖。
 
 单 sandbox 显式启用的两种等价请求形态:
 
@@ -1475,9 +1475,9 @@ BuildSpec 全链路显式携带。register/trigger 在入队前校验最终 netw
 
 MMDS synthetic route 只在 real builder run-id 已持久化后发布,其 `RunID` 同样约束
 MMDSv2 token incarnation。流水线结束先撤销 route view;所有 ready/error/cleanup 终态再与
-build row 更新原子删除 encrypted value blob。Register 的 MMDS namespace 是 request-scoped,
-不会进入最终 template metadata、snapshot.cfg、镜像或后续从该模板创建的 Sandbox;
-Trigger 也不能重写它。
+build row 更新原子删除 MMDS routes namespace 和 encrypted value blob。Register 的 MMDS
+namespace 是 request-scoped,不会进入最终 template metadata、snapshot.cfg、镜像或后续从该
+模板创建的 Sandbox;Trigger 也不能重写它。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
 microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 pipe,通过
@@ -1762,7 +1762,7 @@ sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自
 |---|---|---|
 | `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;另以 Build Register initial routes/secrets 驱动真实 builder guest GET,验证 Trigger 不可覆盖、终态 value cleanup、日志/DB/image 隔离 | `test-e2e-run-builder` |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;另以 Build Register initial routes/secrets 驱动真实 builder guest GET,验证 Trigger 不可覆盖、终态 routes/value cleanup、日志/DB/image 隔离 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume;精确断言 all-unset argv,再覆盖 node/Create metadata+header/Pause body+header/reaper 的逐字段 policy,并验证 W 与 guest 状态可本地恢复;Builder argv 保持无新 flag | `test-e2e-execute` |
 | `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑,真实 guest 覆盖 internal static、initial/unresolved/PUT/rotate/DELETE secret、local UDS service 及 plaintext backstop | `test-e2e-mmds-routes-internal` |
 | `e2e_mmds_routes_external.sh` | 复用 external proxy 拓扑覆盖同一合同;proxy restart/full resync、rotation、conductor-only service registry(`proxy.yaml` 无 services) | `test-e2e-mmds-routes-external` |

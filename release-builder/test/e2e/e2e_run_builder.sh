@@ -474,8 +474,7 @@ with sqlite3.connect(db_path, timeout=5) as db:
     ).fetchone()[0]
 assert row is not None, "BM build row missing"
 metadata = json.loads(row[0])
-routes = metadata.get("kuasar-sandbox.mmds", "")
-assert routes and '"routes"' in routes and '"secrets"' not in routes, metadata
+assert "kuasar-sandbox.mmds" not in metadata, "BM terminal build retained builder-only MMDS routes"
 assert secret not in row[0], "BM secret leaked into build metadata"
 assert secret_rows == 0, "BM terminal cleanup left a build secret row"
 for path in pathlib.Path(db_path).parent.glob(pathlib.Path(db_path).name + "*"):

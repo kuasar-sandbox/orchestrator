@@ -115,6 +115,17 @@ func TestStandaloneImportRejectsInvalidTokenRoutesWithoutRows(t *testing.T) {
 	}
 }
 
+func TestImportSandboxValidatesTokenRoutesAgainstTargetPolicy(t *testing.T) {
+	o, _, apiKey, _, token := mmdsMigrationFixture(t)
+	o.cfg.MMDS.Routes.Enabled = false
+	if _, err := o.ImportSandbox(context.Background(), apiKey, token, "target"); !errors.Is(err, migrationtoken.ErrInvalidPayload) {
+		t.Fatalf("error = %v", err)
+	}
+	if target, err := o.st.Get(context.Background(), "target"); err != nil || target != nil {
+		t.Fatalf("policy-rejected import target cleanup mismatch: found=%t err=%v", target != nil, err)
+	}
+}
+
 func TestConnectExistingTargetIgnoresMMDSInputAndToken(t *testing.T) {
 	o, apiSecret, apiKey, source, _ := mmdsMigrationFixture(t)
 	source.ID = "existing"

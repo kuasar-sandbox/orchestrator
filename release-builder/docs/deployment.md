@@ -189,10 +189,11 @@ routes 可随 standalone migration token 的 portable metadata 移动,secret val
 目标已存在则 token 与 secret 输入都不解析。cluster CONNECT/node-link/placement 不扩展
 MMDS contract,也没有 cluster MMDS E2E。
 
-Build Register 的 routes/value 只供本次 builder sandbox。Trigger 不得覆盖;build 终态删除
-value blob,最终 image/template/snapshot 不包含该配置。宿主持久化不会主动把 value 写入
-snapshot,但 guest GET 后 plaintext 已进入 guest/application memory,包含内存的 Pause/snapshot
-可能捕获该普通 working set;此类制品仍须按敏感数据保护。
+Build Register 的 routes/value 只供本次 builder sandbox。Trigger 不得覆盖;build 终态事务
+同时从 build metadata 删除 routes namespace 并删除 value blob,最终 image/template/snapshot
+不包含该配置。宿主持久化不会主动把 value 写入 snapshot,但 guest GET 后 plaintext 已进入
+guest/application memory,包含内存的 Pause/snapshot 可能捕获该普通 working set;此类制品仍须
+按敏感数据保护。
 
 ## 3. L2 Cache Cluster
 
