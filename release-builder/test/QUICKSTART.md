@@ -123,10 +123,12 @@ bash test/e2e/run_all.sh
 |---|---|
 | `e2e_orchestrator.sh` | node-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI(纯用户态,无 root/systemd/KVM)|
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create;Build Register MMDS real guest、Trigger 禁止覆盖、终态 secret cleanup/制品隔离 |
 | `e2e_execute.sh` | 启真实 microVM(KVM)→ local Pause 三态 policy(node/Create/Pause/reaper)→ B 本地恢复→`W -> local B`→独立 export/promote→portable W 恢复 + self-only prefetch→kill |
 | `e2e_sandbox_disks.sh` | `merge_ref=false` working-set:memory self/parent 分层,root + data disk 仍合并并可本地恢复 |
 | `e2e_orchestrator_proxy.sh` | external proxy(master routesync + shm route view + worker fd inheritance)+ 数据面 X-Access-Token + auto-resume |
+| `e2e_mmds_routes_internal.sh` | 在 `e2e_execute.sh` 的真实 guest 上追加 internal static、initial/unresolved/PUT/rotate/DELETE secret 与 conductor local UDS service |
+| `e2e_mmds_routes_external.sh` | 在 external worker 真实 guest 上覆盖同一合同,并重启空 heap proxy 验证 full resync/fail-closed 恢复;`proxy.yaml` 无 services |
 | `e2e_cluster_real.sh` | cluster-ctl registry/router/placer + 真实 node-ctl + 真实 microVM;阶段一 N=1 registry,阶段二 N=3 registry + node-link redirect |
 
 > **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`docker`、
@@ -137,6 +139,11 @@ bash test/e2e/run_all.sh
 > (`pip install e2b e2b-code-interpreter`)、`openssl`、`sqlite3`、`iptables`。
 > `run_all.sh` 会打开所有 REQUIRE 标志,除 `e2e_obs.sh` 在 `OBS_E2E=1`
 > 未设置时允许跳过外,缺失前置都会失败。
+
+MMDS 两条 wrapper 的声明只使用最终 `{secrets:{...},routes:[...]}` schema。两者会扫描
+sqlite、proxy mmap 和测试日志中的固定 secret marker;Build 用例还检查终态 value row 已删除、
+final image config 无 MMDS namespace。它们不增加 cluster MMDS case;cluster 回归仍由现有
+`e2e_cluster_real.sh` 与源仓 cluster stub 承担。
 
 ## 5. perf / 分析脚本清单
 

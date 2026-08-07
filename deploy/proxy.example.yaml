@@ -19,8 +19,8 @@ paths:
 data_listen: ":443"
 
 # Forwarding plane netns. Set this to the connector --mgmt-extract netns so workers'
-# floatingip dials and mmds_listen live with the vswitch management plane. data_listen
-# stays in the master process's current netns.
+# floatingip dials and the conductor-projected MMDS listener live with the vswitch
+# management plane. data_listen stays in the master process's current netns.
 # proxy_netns: sw0_mgmt
 
 proxy_socket: /run/sandbox/proxy.sock
@@ -40,5 +40,4 @@ tls:
 auth: enforce
 park_timeout: 30s
 
-# mmds_listen: 127.0.0.1:19254   # FC MMDS addr workers share when serve has mmds.enabled
 # metrics_listen: 127.0.0.1:9095 # master metrics endpoint (aggregates worker counters)
