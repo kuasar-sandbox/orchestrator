@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -264,13 +266,46 @@ type ProxyConfig struct {
 // to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
 // enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
 // X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
-// (internal: serve binds Listen; external: proxy workers share the master's mmds_listen fd). envd
+// (internal: serve binds Listen; external: the proxy master receives Listen from
+// the conductor and shares that listener fd with workers). envd
 // hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
 // Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
 // mgmt dev.
 type MMDSConfig struct {
-	Enabled bool   `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
-	Listen  string `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
+	Enabled  bool                                `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
+	Listen   string                              `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
+	Routes   MMDSRoutesConfig                    `yaml:"routes"`
+	Services map[string]MMDSServiceRegistryEntry `yaml:"services"`
+}
+
+// MMDSRoutesConfig is the conductor-owned admission policy for tenant MMDS
+// routes. Defaults are applied only to omitted zero values; explicit negative
+// limits survive defaulting and fail validation.
+type MMDSRoutesConfig struct {
+	Enabled              bool     `yaml:"enabled"`
+	MaxRoutesPerSandbox  int      `yaml:"max_routes_per_sandbox"`
+	MaxNamespaceBytes    int      `yaml:"max_namespace_bytes"`
+	MaxStaticBodyBytes   int      `yaml:"max_static_body_bytes"`
+	MaxSecretValueBytes  int      `yaml:"max_secret_value_bytes"`
+	ReservedPathPrefixes []string `yaml:"reserved_path_prefixes"`
+}
+
+// MMDSServiceRegistryEntry names one operator-controlled local service. V1
+// accepts only unix:// absolute paths; request timeout and response bounds are
+// fixed implementation constants, not tenant or YAML policy.
+type MMDSServiceRegistryEntry struct {
+	Endpoint string `yaml:"endpoint"`
+}
+
+func (c MMDSConfig) ServiceEndpoints() map[string]string {
+	if len(c.Services) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.Services))
+	for name, service := range c.Services {
+		out[name] = service.Endpoint
+	}
+	return out
 }
 
 // PathsConfig holds node-local directories and sockets.
@@ -590,6 +625,21 @@ func (c *Config) applyDefaults() {
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
+	if c.MMDS.Routes.MaxRoutesPerSandbox == 0 {
+		c.MMDS.Routes.MaxRoutesPerSandbox = 32
+	}
+	if c.MMDS.Routes.MaxNamespaceBytes == 0 {
+		c.MMDS.Routes.MaxNamespaceBytes = 64 * 1024
+	}
+	if c.MMDS.Routes.MaxStaticBodyBytes == 0 {
+		c.MMDS.Routes.MaxStaticBodyBytes = 16 * 1024
+	}
+	if c.MMDS.Routes.MaxSecretValueBytes == 0 {
+		c.MMDS.Routes.MaxSecretValueBytes = 16 * 1024
+	}
+	if c.MMDS.Routes.ReservedPathPrefixes == nil {
+		c.MMDS.Routes.ReservedPathPrefixes = []string{"/latest/api/", "/internal/"}
+	}
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
@@ -692,7 +742,39 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: checkpoint.remote.ref_location_parent: %w", err)
 		}
 	}
+	if err := c.validateMMDSRoutes(); err != nil {
+		return err
+	}
 	return c.validateProxy()
+}
+
+func (c *Config) validateMMDSRoutes() error {
+	limits := []struct {
+		name  string
+		value int
+	}{
+		{"mmds.routes.max_routes_per_sandbox", c.MMDS.Routes.MaxRoutesPerSandbox},
+		{"mmds.routes.max_namespace_bytes", c.MMDS.Routes.MaxNamespaceBytes},
+		{"mmds.routes.max_static_body_bytes", c.MMDS.Routes.MaxStaticBodyBytes},
+		{"mmds.routes.max_secret_value_bytes", c.MMDS.Routes.MaxSecretValueBytes},
+	}
+	for _, limit := range limits {
+		if limit.value <= 0 {
+			return fmt.Errorf("config: %s must be positive", limit.name)
+		}
+	}
+	if err := sandboxcfg.ValidateMMDSReservedPathPrefixes(c.MMDS.Routes.ReservedPathPrefixes); err != nil {
+		return fmt.Errorf("config: mmds.routes.reserved_path_prefixes: %w", err)
+	}
+	for name, service := range c.MMDS.Services {
+		if name == "" {
+			return fmt.Errorf("config: mmds.services contains an empty service name")
+		}
+		if _, err := mmdssvc.UnixSocketPath(service.Endpoint); err != nil {
+			return fmt.Errorf("config: mmds.services[%q].endpoint: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func parseAbsoluteFileURI(raw string) (*url.URL, error) {
@@ -733,6 +815,9 @@ func (c *Config) validateProxy() error {
 	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
 		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
 	}
+	if c.MMDS.Routes.Enabled && !c.MMDS.Enabled {
+		return fmt.Errorf("config: mmds.routes.enabled=true requires mmds.enabled=true")
+	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
 	}
@@ -748,7 +833,7 @@ type ProxyFileConfig struct {
 	ConfigSocket  string           `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
 	Paths         ProxyPathsConfig `yaml:"paths"`          // node-local paths used directly by proxy workers
 	DataListen    string           `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
-	ProxyNetNS    string           `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
+	ProxyNetNS    string           `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and conductor-pushed MMDS listen
 	ProxySocket   string           `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
 	ShmPath       string           `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
 	RouteCapacity int              `yaml:"route_capacity"` // fixed shared route slots; default 65536
@@ -756,7 +841,6 @@ type ProxyFileConfig struct {
 	TLS           TLSConfig        `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
 	Auth          string           `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
 	ParkTimeout   string           `yaml:"park_timeout"`   // bootstrap fallback; default 30s
-	MMDSListen    string           `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
 	MetricsListen string           `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
 }
 

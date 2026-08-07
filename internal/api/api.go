@@ -42,7 +42,21 @@ const (
 	restoreHeader     = "X-Kuasar-Sandbox-Restore"
 	credentialsHeader = "X-Kuasar-Sandbox-Credentials"
 	checkpointHeader  = "X-Kuasar-Sandbox-Checkpoint"
+	mmdsHeader        = "X-Kuasar-Sandbox-MMDS"
 )
+
+func singleOptionalHeader(h http.Header, name string) (*string, error) {
+	canonical := http.CanonicalHeaderKey(name)
+	values, present := h[canonical]
+	if !present {
+		return nil, nil
+	}
+	if len(values) != 1 {
+		return nil, fmt.Errorf("%s must appear exactly once", name)
+	}
+	value := values[0]
+	return &value, nil
+}
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
 func pickInt(a, b int) int {
@@ -178,10 +192,11 @@ type BuildAuth struct {
 // is registered. The e2b-compatible HTTP boundary supplies ProfileE2B when the
 // request omits profile; downstream build records always carry it explicitly.
 type RegisterSpec struct {
-	Name     string
-	Tags     []string
-	Profile  types.Profile
-	Metadata map[string]string
+	Name       string
+	Tags       []string
+	Profile    types.Profile
+	Metadata   map[string]string
+	MMDSHeader *string
 }
 
 // TriggerSpec is the parsed build request (e2b TemplateBuildStartV2).
@@ -212,6 +227,7 @@ type CreateReq struct {
 	EnvVars    map[string]string `json:"envVars"`
 	Secure     bool              `json:"secure"`
 	APIKey     string            `json:"-"` // injected from X-API-KEY
+	MMDSHeader *string           `json:"-"` // nil = header absent; preserves top-level merge presence
 }
 
 // PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
@@ -261,6 +277,13 @@ type Core interface {
 	// one-line opaque kmt1 migration token; import restores a paused logical sandbox.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
+}
+
+// ConnectMMDSCore is the standalone-only extension for migration-time initial
+// MMDS secrets. Cluster router implementations intentionally do not implement
+// it, so no CONNECT config is added to node-link or cluster command schemas.
+type ConnectMMDSCore interface {
+	ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int, metadata map[string]string, header *string) (*types.Sandbox, error)
 }
 
 // Resources are the node-uniform VM resources surfaced in e2b list/get responses.
@@ -360,9 +383,14 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.APIKey = apiKeyFrom(r.Context())
+	var err error
+	req.MMDSHeader, err = singleOptionalHeader(r.Header, mmdsHeader)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Headers are an alternate config-injection surface; fold them into the e2b
 	// metadata (header wins) so the orchestrator sees one uniform carrier.
-	var err error
 	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -418,16 +446,32 @@ func (a *API) kill(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 	migrationToken := r.Header.Get(MigrationTokenHeader)
-	if len(migrationToken) > migrationtoken.MaxWireSize {
-		writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
-		return
-	}
 	var body struct {
-		Timeout int `json:"timeout"`
+		Timeout  int               `json:"timeout"`
+		Metadata map[string]string `json:"metadata"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	sb, err := a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout)
+	// CONNECT must let an already-existing target ignore MMDS input completely.
+	// Defer duplicate/value validation to the standalone import path; an empty
+	// sentinel is malformed if import really happens and harmless if ignored.
+	header := deferredOptionalHeader(r.Header, mmdsHeader)
+	var sb *types.Sandbox
+	var err error
+	if standalone, ok := a.core.(ConnectMMDSCore); ok {
+		sb, err = standalone.ConnectWithMMDS(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout, body.Metadata, header)
+	} else {
+		// Cluster remains intentionally unaware of CONNECT MMDS config.
+		if len(migrationToken) > migrationtoken.MaxWireSize {
+			writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+			return
+		}
+		sb, err = a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout)
+	}
 	if err != nil {
+		if errors.Is(err, migrationtoken.ErrTokenTooLarge) {
+			writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
+			return
+		}
 		if migrationToken != "" {
 			a.failMigrate(w, err) // surface the concrete import error (runtime mismatch, wrong tenant, …)
 		} else {
@@ -436,6 +480,18 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.sandboxResp(sb))
+}
+
+func deferredOptionalHeader(header http.Header, name string) *string {
+	values := header.Values(name)
+	if len(values) == 0 {
+		return nil
+	}
+	value := ""
+	if len(values) == 1 {
+		value = values[0]
+	}
+	return &value
 }
 
 func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
@@ -583,13 +639,14 @@ func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name       string   `json:"name"`
-		Tags       []string `json:"tags"`
-		Profile    string   `json:"profile"`
-		CPUCount   int      `json:"cpuCount"`
-		CPUCountSn int      `json:"cpu_count"`
-		MemoryMB   int      `json:"memoryMB"`
-		MemoryMBSn int      `json:"memory_mb"`
+		Name       string            `json:"name"`
+		Tags       []string          `json:"tags"`
+		Profile    string            `json:"profile"`
+		CPUCount   int               `json:"cpuCount"`
+		CPUCountSn int               `json:"cpu_count"`
+		MemoryMB   int               `json:"memoryMB"`
+		MemoryMBSn int               `json:"memory_mb"`
+		Metadata   map[string]string `json:"metadata"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	profile, err := requestedBuildProfile(body.Profile)
@@ -599,10 +656,15 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
 	// into the resource namespace (cpu/memory win over a resource header).
-	meta := mergeBuildConfigHeaders(nil, r.Header)
+	meta := mergeBuildConfigHeaders(body.Metadata, r.Header)
 	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	mmdsValue, err := singleOptionalHeader(r.Header, mmdsHeader)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
-		Name: body.Name, Tags: body.Tags, Profile: profile, Metadata: meta,
+		Name: body.Name, Tags: body.Tags, Profile: profile, Metadata: meta, MMDSHeader: mmdsValue,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -651,9 +713,18 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		CPUCountSn   int                  `json:"cpu_count"`
 		MemoryMB     int                  `json:"memoryMB"`
 		MemoryMBSn   int                  `json:"memory_mb"`
+		Metadata     map[string]string    `json:"metadata"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad body")
+		return
+	}
+	if _, present := r.Header[http.CanonicalHeaderKey(mmdsHeader)]; present {
+		writeErr(w, http.StatusBadRequest, "Build Trigger must not override MMDS configuration")
+		return
+	}
+	if _, present := body.Metadata[sandboxcfg.NsMMDS]; present {
+		writeErr(w, http.StatusBadRequest, "Build Trigger must not override MMDS configuration")
 		return
 	}
 	startCmd := body.StartCmd

@@ -27,8 +27,9 @@ node proxy worker
   conductor。
 - **单订阅 master,多 worker 数据面**:external 模式只有 proxy master 注册
   config-socket plugin;worker 不连接 conductor,不持独立 routesync 订阅。
-- **共享只读路由视图**:master 是唯一写者,把 routesync 更新写入共享内存;worker
-  mmap 只读,数据面请求零 RPC 查路由。
+- **分离路由视图**:固定长度的数据面字段写共享内存,worker mmap 只读;可变长的
+  `mmds_routes` 与 `mmds_route_secret_values` 只放 master 有界 heap,worker 经继承的
+  本机 socketpair RPC 按 exact path 查询。secret plaintext 不进入 mmap。
 - **listener fd 继承**:master 绑定 data/proxy/MMDS listener,把同一个 fd 传给所有
   worker;worker 执行 accept 和转发。后续可把 master bind 替换为 systemd socket
   activation,worker 模型不变。
@@ -62,7 +63,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
 | `paths.run_root` | (必填) | 本机 sandbox 运行目录根;external worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
-| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,`mmds_listen` 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
+| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
 | `route_capacity` | `65536` | 固定路由槽位数;满时新路由写入失败并告警 |
@@ -70,8 +71,10 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `tls` | 空 | 数据面 TLS `{cert,key}`;空 = h2c |
 | `auth` | `enforce` | routesync policy 到达前的数据面鉴权回退值 |
 | `park_timeout` | `30s` | routesync policy 到达前的 park 回退值 |
-| `mmds_listen` | 空 | external MMDS 监听;空 = 不启动 MMDS |
 | `metrics_listen` | 空 | master Prometheus 文本端点,聚合 worker 数据面计数 |
+
+`proxy.yaml` 不含 `mmds_listen` 或 `services`:两者唯一来源是 conductor
+`mmds.listen` / `mmds.services`,经可信 plugin registration 的 `Hello{Policy}` 下发。
 
 ## 3. 部署模式
 
@@ -91,12 +94,11 @@ external 拓扑:
                     Wake(sid) ▲     │ Hello / Upsert / Delete / Bookmark
                               │     ▼
 node-ctl conductor serve ─────┴── node-ctl proxy master
-        ▲ fallback CONNECT          │ single writer
-        │ via proxy_socket          ▼
-        │                   shared route mmap
-        │                          ▲
-        │                          │ read-only mmap
-client ─┴────────► inherited data listener ─► proxy worker[0..N)
+        ▲ fallback CONNECT          ├─ fixed route writer ─► shared route mmap
+        │ via proxy_socket          ├─ MMDS routes/values ─► bounded heap
+        │                           └─ inherited socketpair ──────┐
+client ─┴────────► inherited data/MMDS listener ─► proxy worker[0..N)
+                                                     ▲ mmap + MMDS RPC ──────┘
 ```
 
 要点:
@@ -107,6 +109,9 @@ client ─┴────────► inherited data listener ─► proxy wo
 - worker 不注册 plugin,不保存独立全量路由表;崩溃后由 master 重启,重启后直接读取
   当前共享表。
 - master 退出会带走其 worker;systemd 重启 master 后重新注册并重建共享表。
+- plugin id 必须精确为 `proxy`,且 registration 同时满足
+  `subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true`,conductor 才投影 MMDS policy、
+  routes 和 secret values;普通 observer 与 node-link 均收不到这些 confidential values。
 
 ## 4. routesync 与共享路由视图
 
@@ -128,6 +133,15 @@ master 把下行路由流投影到共享内存:
   `(sid, revision)`;
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
+
+MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
+heap entry 总数受 `route_capacity` 限制。`BeginSync`、routesync 断开和 worker/master 重启
+都会立即清空 heap 并标记 unavailable,只有完整 `Bookmark` 后才重新开放查询。service
+registry 由每次 `Hello{Policy}` 原子整表替换。running/starting Upsert 先更新 heap 再公开
+SHM route;paused/Delete 先撤销 heap 再更新 SHM,让已采样旧 active row 的 worker 也 fail closed,
+避免把新生命周期与旧 secret
+组合。`RunID` 进入固定表用于 MMDSv2 token 的 incarnation 绑定;routes/value plaintext
+绝不进入固定记录、metrics 或日志。
 
 本文中 `RouteEntry.SandboxID`、`sid` 和共享表 key 均是 node-local SandboxID.集群路径下,它们是
 Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公开稳定 SandboxID 转换为该值.
@@ -173,7 +187,7 @@ ManifestKey 原文不进入路由。节点 proxy 转发时只按目标选择 Env
 ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关及 e2b 数据面组件,
 不由 node 平台层消费.`AuthSandboxID + ServiceSecret` 用于验证 exec KAT,
 其中共享表 key 和本地运行目录仍只使用 NodeSandboxID.既有 `MmdsSecret` 独立服务于
-MMDS,不充当上述任一 token.
+MMDS token 签名,不等于 route secret values;后者仅经上述可信投影进入 master heap。
 
 初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
 state park,绝不尝试使用这些空字段。node 持久化 network ownership 并完成 YAML/ready.sock
@@ -294,29 +308,60 @@ EnvdAccessToken 验证 envd signature query;proxy 先验签再转发,envd 收到
 ## 7. MMDS
 
 `mmds.enabled=true` 时,envd 在 FC 模式下通过 Firecracker MMDS v2 获取当前身份的
-access-token hash。internal 模式由 conductor 进程内服务;external 模式由 proxy
-worker 层服务。配置 `proxy_netns` 时,`mmds.listen` / `mmds_listen` 在该 netns 绑定;
-external 模式由 master 绑定后把同一个 listener fd 传给所有 worker。
+access-token hash;`mmds.routes.enabled=true` 还开放显式声明的 static/secret/service
+exact route。internal 模式由 conductor 进程内 handler 直接读取 sqlite/service registry;
+external 模式由 worker 承载 HTTP,master 提供有界 route view。配置 `proxy_netns` 时,
+conductor 的 `mmds.listen` 在该 netns 绑定;external master 把同一个 listener fd 传给
+所有 worker,worker 不读取第二份 MMDS YAML。
 
 ```text
 guest envd
   │ 169.254.169.254:80
   ▼
 connector mgmt-extract
-  │ mmds_listen
+  │ conductor mmds.listen
   ▼
-proxy worker ─► shared route view
+proxy worker ─┬─► shared route view(token identity + RunID)
+              └─► master socketpair RPC(routes + values + service socket)
 ```
 
 两段式协议:
 
-1. `PUT /latest/api/token`:按请求源 IP 查 enriched starting/running route 的 floatingip;
-   初始 starting 尚无 FloatingIP,按 `park_timeout` 等待后续 route,超时 503。命中后返回
-   `<sid>.<hmac>` session token。
-2. `GET /`:校验 `X-metadata-token`,返回 `{instanceID, envID, accessTokenHash}`。
+1. `PUT /latest/api/token`:要求恰好一个 `X-metadata-token-ttl-seconds`,值为
+   `1..21600`;按请求源 IP 查 enriched starting/running route 的 floatingip。初始
+   starting 尚无 FloatingIP时仅此 token mint 路径可按 `park_timeout` 等待。返回的
+   HMAC token 绑定 sid、来源 IP、当前 `RunID`、`aud=mmds` 和 expiry。
+2. `GET /`:重新校验签名、来源、expiry、audience 与当前 `RunID`,返回
+   `{instanceID, envID, accessTokenHash}`。pause/resume 改变 incarnation,旧 token 立即失效。
+3. `GET <declared-path>`:完成相同认证后 exact lookup;未声明或声明但未配置的 secret
+   都返回 404,store/sync 不可用返回 503。static/secret 缺省 Content-Type 在响应时才取
+   `text/plain`,不写回配置。
 
 MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落到不同 worker
-仍能互相验证。
+仍能互相验证。请求 path 不清理、不重定向:query、fragment、percent escape、需
+percent-encode 的字符、空/dot segment、backslash、wildcard 和非 root trailing slash 均拒绝。GET 的非零/未知
+Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不读取一个 byte
+来探测 body。内置 root 只精确匹配 `/`;所有 guest 响应统一带
+`Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
+
+三类自定义 route:
+
+- `static`:直接返回声明的 UTF-8 `data`。
+- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换,DELETE 后立即 404,
+  不等待、不设 TTL,Content-Type 始终来自 route。
+- `service`:master/internal conductor 从唯一 registry 解析本机 Unix socket,worker/handler
+  构造全新 `GET <exact-path> HTTP/1.1`,`Host: mmds-service`,仅增加
+  `E2b-Sandbox-Id: <sid>` 与 `E2b-Sandbox-Service: <service>`。不发送 port,不透传 guest
+  Host/query/body/token/Authorization/Cookie 或任何 guest header。V1 只透传合法 status、
+  有界 body 和合法 Content-Type(缺省 `text/plain`),不跟随 redirect;超时/过大/非法响应
+  映射 504/502,service 缺失或 socket 不可达为 503。
+
+安全边界:routes 是 portable declaration,secret values 则只存在 sqlite ciphertext、internal
+conductor 内存或受信 external master 的有界 heap。它们不写普通 metadata、共享 mmap、
+日志、metrics、migration token、template 或构建产物,也不发送给 observer/node-link。
+但 guest 主动 GET 后,value 已进入 guest/application memory;随后执行包含内存的 Pause/snapshot
+可能把该副本作为普通 guest working set 捕获。平台不能在宿主侧从任意 guest 内存中擦除它,
+调用方应在应用侧缩短驻留时间,并把包含已消费 secret 的 snapshot 按敏感制品保护。
 
 ## 8. 可靠性
 
@@ -324,8 +369,9 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
   fd。崩溃 worker 上的已有连接断开。
 - **master 崩溃**:plugin 租约断开,conductor proxyForwarder 失去目标;systemd 重启
   master 后重新注册、重建共享表并启动 worker。已运行沙箱不受影响。
-- **routesync 断开**:master 指数退避重连;重连后重新同步。共享表在重同步期间保留旧
-  路由,Bookmark 后清除断连期间删除的记录。
+- **routesync 断开**:master 指数退避重连;固定数据面共享表沿用原有保留/Bookmark
+  收敛语义,但 MMDS routes/value/service authority 立即清空并返回 503,完整同步 Bookmark
+  前不服务旧 secret 或执行旧 service route。
 - **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;starting
   只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和当前 launch 的状态推进
   仍由 conductor 执行。
@@ -335,7 +381,8 @@ MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落
 
 ## 9. 性能
 
-- 数据面 route lookup 是 worker 本地 mmap hash 查找,不进 conductor,不跨进程 RPC。
+- 普通数据面 route lookup 是 worker 本地 mmap hash 查找,不进 conductor,不跨进程 RPC;
+  只有 guest 自定义 MMDS path 走同机 worker→master socketpair。
 - master 单写共享表;worker 只读,无 worker 间锁竞争。
 - 普通 HTTP 和 CONNECT 都不使用上游连接池,避免跨 sandbox/port 连接复用。
 - `route_capacity` 是固定容量保护阈值;容量不足时应调大配置并重启 proxy master。

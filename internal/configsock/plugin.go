@@ -95,6 +95,10 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad register frame", http.StatusBadRequest)
 		return
 	}
+	if reg.Mmds && !isTrustedMMDSProxyRegistration(id, reg) {
+		http.Error(w, "not authorized (mmds proxy)", http.StatusForbidden)
+		return
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	p := &Plugin{ID: id, Caps: reg, cancel: cancel}
@@ -103,6 +107,12 @@ func (s *Server) handlePluginRegister(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("plugin registered", "id", id, "subscribe", reg.SubscribeKind(), "proxy", reg.Proxy != nil, "mmds", reg.Mmds)
 	routesync.ServeStream(ctx, w, r.Body, s.deps.RouteSource, reg, s.log)
 	s.log.Info("plugin deregistered", "id", id)
+}
+
+func isTrustedMMDSProxyRegistration(id string, reg routesync.Register) bool {
+	return id == routesync.ProxyPluginID &&
+		reg.Subscribe != nil && reg.Subscribe.Kind == routesync.KindRouteWake &&
+		reg.Proxy != nil && reg.Mmds
 }
 
 // pluginAuthed gates the plugin plane: when plugin_pidfile is set the peer pid must

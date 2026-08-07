@@ -386,7 +386,8 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 			t.Fatalf("cluster connect ack = %+v", ack)
 		}
 		waitForLauncherStart(t, started)
-		waitClusterRouteStates(t, events, sid, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused)
+		waitClusterRouteStates(t, events, sid,
+			routesync.StateStarting, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused)
 		stored, err := o.st.Get(ctx, sid)
 		if err != nil || stored == nil || stored.State != types.StatePaused {
 			t.Fatalf("late resume failure row = %+v err=%v, want paused", stored, err)

@@ -34,7 +34,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
 | `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl;`proxy.mode=internal` 时还在本进程承载数据面 proxy | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
-| `node-ctl proxy`(`serve`,external 仅)| proxy master 经 config-socket 订阅路由、绑定独立数据入口并管理 worker;worker 共享继承的 listener fd 和只读路由视图,执行数据面鉴权、反代及 native exec gate | 1 master + `workers` 个 worker | systemd | 平台内,`orchestrator/docs/node-proxy.md` |
+| `node-ctl proxy`(`serve`,external 仅)| proxy master 经 config-socket 订阅路由与 conductor-owned MMDS policy、绑定独立数据/MMDS入口并管理 worker;worker 用 mmap 读取固定路由,经 master 本机 RPC 查询可变 MMDS route/value/service,执行数据面鉴权、反代及 native exec gate | 1 master + `workers` 个 worker | systemd | 平台内,`orchestrator/docs/node-proxy.md` |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 node-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
 | `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<run-id>` 单元(`run-sandbox`)assignment 后启动 | 平台内,`docs/sandbox.md` |
@@ -54,14 +54,18 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
 | `node-ctl`(`serve`) | `api.listen`,如 `:443` | HTTPS/h2 | **对外** e2b 控制面 API;`proxy.mode=internal` 时同一 handler 也承载沙箱数据面,`proxy.data_listen` 可另设数据入口 |
 | `node-ctl proxy`(`serve`,external 仅)| `proxy.yaml.data_listen` | HTTPS/h2 或 h2c | **独立数据入口**;master 绑定 listener 并把 fd 交给 workers,native exec 使用 `service=exec` + `X-Access-Token` CONNECT |
-| `node-ctl`(`serve`) | `/run/sandbox/node-ctl.socket` | UDS,framed JSON | config-socket(task/admin/plugin/api 四平面):`run-sandbox`/`run-builder` 取 LaunchSpec / BuildSpec(密钥经 env);external proxy master / 平台 agent 经 plugin 平面注册并同步路由(SO_PEERCRED + `<id>.pid` / pidfile 鉴别)|
+| `node-ctl`/external proxy | conductor `mmds.listen`,默认 `127.0.0.1:19254` | HTTP/1.1 | vswitch `--mgmt-service` 的目标;internal 由 conductor 绑定,external 由 master 从可信 Hello policy 取得后绑定并把 fd 交给 workers |
+| MMDS local service | `mmds.services.<name>.endpoint` | HTTP/1.1 over UDS | conductor-only registry;V1 为 `unix://` absolute path,internal 直拨,external worker 经 master 取得解析后的 socket path |
+| `node-ctl`(`serve`) | `/run/sandbox/node-ctl.socket` | UDS,HTTP/h2c + framed JSON stream | config-socket(run/task/admin/plugin/api 五平面):启动器取 LaunchSpec/BuildSpec;admin 管 manifest key 与 sandbox MMDS value;external proxy/platform agent 经 plugin 平面注册并同步受控路由(SO_PEERCRED + `<id>.pid`/pidfile 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。internal 模式下,conductor 进程内 proxy 与控制面共用 handler;
 external 模式下,`node-ctl proxy serve` 启动 1 个 master 和配置数量的 workers,正常数据面流量进入
 `proxy.yaml.data_listen`,而控制面仍由 conductor 的 `api.listen` 承载。external worker 使用自身
 `proxy.yaml` 中必填的 `paths.run_root` 定位 `<run_root>/<NodeSandboxID>/ctl.sock`;该值是节点本地部署配置,
-不经 routesync `Policy` 或共享内存路由视图传递。其余本机进程均使用 loopback/UDS。
+不经 routesync `Policy` 或共享内存路由视图传递。`proxy.yaml` 不配置 `mmds_listen` 或
+`services`;conductor 的 trusted `proxy + route_wake + mmds` registration 是这两项的唯一
+投影通道。其余本机进程均使用 loopback/UDS。
 `sandbox-ctl` 由 `node-ctl` 经 systemd **模板单元 `sandbox-runner@<run-id>.service`** 拉起
 (`StartUnit`/预启动 → 单元内 `run-sandbox` WaitAssignment 后 `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
 另走第二个模板单元 **`sandbox-builder@<run-id>.service`**(单元内 `run-builder` WaitAssignment 后
@@ -154,6 +158,42 @@ per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-c
   yaml 里的 endpoint 写 loopback
 - **不**走 env、不走全局默认:loader 要求显式 flag 指定路径(详见
   `docs/manifest.md` §3 loader 契约)
+
+### 2.6 MMDS Route 安全与部署边界
+
+MMDS custom route 只在 conductor `mmds.routes.enabled=true` 时受理。租户在 Sandbox
+Create 或 Build Register 通过 `X-Kuasar-Sandbox-MMDS`/metadata 声明 exact
+static/secret/service route;Header 与 metadata 按 `secrets`、`routes` 两个顶层 key 合并。
+admission 后普通 metadata 只保留 canonical routes,initial values 则按 sandbox/build owner
+加密存 sqlite。节点本地 admin UDS 可 PUT/DELETE 已声明 name,没有 cluster Secret API。
+
+```text
+                              trusted plugin stream
+                              routes + values + services
+                                      │
+guest ─► MMDS VIP ─► internal proxy ──┼─► conductor store + service registry
+                    or                │
+                    external worker ──┴─► master bounded heap ─► local UDS service
+                              MMDS RPC        ▲
+                                              └─ conductor-only config
+```
+
+service route 固定构造 `GET <exact-path>` over UDS,Host 为 `mmds-service`,只注入
+`E2b-Sandbox-Id` 与 `E2b-Sandbox-Service`;不透传 guest Header/query/body,不跟随
+redirect。internal 直接使用 conductor registry;external master 从受信 registration 的
+Hello policy 原子接收同一 registry,worker 不读第二份 YAML。routesync 断开时 external
+MMDS heap 立即 fail closed,完整 Bookmark 后才重新开放。
+
+routes 可随 standalone migration token 的 portable metadata 移动,secret value 不迁移。
+只有目标不存在且确实 import 时,standalone CONNECT 可额外注入 secrets-only MMDS 输入;
+目标已存在则 token 与 secret 输入都不解析。cluster CONNECT/node-link/placement 不扩展
+MMDS contract,也没有 cluster MMDS E2E。
+
+Build Register 的 routes/value 只供本次 builder sandbox。Trigger 不得覆盖;build 终态事务
+同时从 build metadata 删除 routes namespace 并删除 value blob,最终 image/template/snapshot
+不包含该配置。宿主持久化不会主动把 value 写入 snapshot,但 guest GET 后 plaintext 已进入
+guest/application memory,包含内存的 Pause/snapshot 可能捕获该普通 working set;此类制品仍须
+按敏感数据保护。
 
 ## 3. L2 Cache Cluster
 
@@ -263,6 +303,10 @@ named location 时发布到 manifest;配置 `checkpoint.remote.ref_location_pare
 node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` 的
 `CPUQuota`/`MemoryMax` 施加,并发由 `builder.max_concurrent` 准入。
 
+Build Register 的 MMDS initial values 是另一条独立 confidential flow:加密 blob 以 build
+owner 落库,运行期只向 synthetic builder Sandbox route 投影,不进 BuildSpec env、普通
+metadata、最终 image/snapshot/template;Build Trigger 不接受覆盖,ready/error/cleanup 删除 blob。
+
 ## 6. Cluster Control Plane (cluster-ctl)
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
@@ -317,6 +361,9 @@ cluster-ctl placer
   `api_secret`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
   只在 Reserve/Place 冷路径把请求转给 ready placer。凭据对分发是 create/build 前置条件;
   drop 或租约过期不修改已经复制到现有 sandbox/build 记录的凭据对。
+- **MMDS 范围**:cluster registry/router/placer/node-link 不新增 MMDS Secret API、CONNECT
+  config passthrough、placement 或 admission 语义。MMDS route/value/service 是 compute node
+  的 standalone/local proxy contract;通用 metadata 的偶然透传不构成 cluster 支持。
 - **成员关系**:registry 成员表由版本化配置分发,通过信号或 API reload。`memberlist` 复用 HTTP 控制面,
   只做 failure detection 和 meta 传播,不维护成员清单,不参与 `LocateN` 分片计算。
 - **成员变更**:registry 可同时持有 active / next membership。受影响的 group/node 逻辑 owner set 为
@@ -497,6 +544,8 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 | `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7100`(节点本机)| 源仓 `accelerator/docs/store.md` §3;发布包 `docs/store.md` |
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | 源仓 `accelerator/docs/cache.md` §3.4;发布包 `docs/cache.md` |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| 源仓 `accelerator/docs/cache.md` §3.3;发布包 `docs/cache.md` |
+| `node-ctl conductor serve` | `/etc/node-ctl/conductor.yaml` | `mmds.listen/routes/services` 是 MMDS 唯一配置源;service 仅 `unix://` absolute path | 源仓 `orchestrator/docs/node.md` §3/§4.6;`node-proxy.md` §7 |
+| `node-ctl proxy serve` | `/etc/node-ctl/proxy.yaml` | external data listener/worker/shm bootstrap;不重复配置 MMDS listen/services | 源仓 `orchestrator/docs/node-proxy.md` §2 |
 | `node-ctl conductor serve(resource_listen)` | `/etc/node-ctl/conductor.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | 源仓 `orchestrator/docs/node-resource.md` §3;发布包 `docs/node-resource.md` |
 | `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen`;`membership.active/versions[].members[].advertise/node_advertise/owners`;`node_link`、`route_link`、`node_list`、`placer_link` | 源仓 `orchestrator/docs/cluster.md`;发布包 `docs/cluster.md` |
 | `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | 源仓 `orchestrator/docs/cluster-router.md`;发布包 `docs/cluster-router.md` |

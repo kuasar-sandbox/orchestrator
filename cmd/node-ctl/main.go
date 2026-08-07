@@ -240,13 +240,15 @@ func runConductor(args []string, log *slog.Logger) error {
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
 	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
-		Provider:      core,
-		Admin:         core,
-		API:           apiH,
-		AdminPidfile:  cfg.Paths.AdminPidfile,
-		RouteSource:   core,
-		Plugins:       plugins,
-		PluginPidfile: cfg.Paths.PluginPidfile,
+		Provider:                     core,
+		Admin:                        core,
+		MMDSRouteSecretAdmin:         core,
+		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
+		API:                          apiH,
+		AdminPidfile:                 cfg.Paths.AdminPidfile,
+		RouteSource:                  core,
+		Plugins:                      plugins,
+		PluginPidfile:                cfg.Paths.PluginPidfile,
 	}, log)
 	configReady := make(chan struct{})
 	configDone := make(chan error, 1)
@@ -321,7 +323,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	// MMDS metadata service (mmds.enabled): re-keys envd (launched in FC mode) to fresh
 	// per-identity tokens at /init. Internal mode serves it here from the orchestrator's
 	// live sandbox set; external mode's proxy workers serve it from the shared
-	// route table on the master's mmds_listen. The host must redirect
+	// route table on the conductor-owned MMDS listen delivered to the master.
+	// The host must redirect
 	// 169.254.169.254:80 -> mmds.listen.
 	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
 		mln, err := listenTCPInNetNS(proxyNS, cfg.MMDS.Listen)

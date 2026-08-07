@@ -62,6 +62,26 @@ func TestRotation(t *testing.T) {
 	}
 }
 
+func TestAADBindingAndRotation(t *testing.T) {
+	oldKey, newKey := hexKey(t), hexKey(t)
+	oldBox, _ := NewFromColonHex(oldKey)
+	record, err := oldBox.EncryptAAD([]byte("opaque-value"), []byte("owner-a:revision-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldBox.DecryptAAD(record, []byte("owner-b:revision-1")); err == nil {
+		t.Fatal("ciphertext decrypted under substituted AAD")
+	}
+	rotated, err := NewFromColonHex(newKey + ":" + oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext, err := rotated.DecryptAAD(record, []byte("owner-a:revision-1"))
+	if err != nil || string(plaintext) != "opaque-value" {
+		t.Fatalf("rotated AAD decrypt mismatch: err=%v", err)
+	}
+}
+
 func TestBadKeys(t *testing.T) {
 	for _, s := range []string{"", "   ", "abc", hex.EncodeToString(make([]byte, 16)) /*16B*/} {
 		if _, err := NewFromColonHex(s); err == nil {

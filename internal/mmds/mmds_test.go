@@ -1,6 +1,7 @@
 package mmds
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,9 +10,15 @@ import (
 )
 
 type fakeSource struct {
-	fip  map[string]string    // floatingip -> sid
-	info map[string][2]string // sid -> {tid, token}
+	fip         map[string]string
+	info        map[string][2]string
+	routes      map[string]map[string]MMDSRoute
+	routeErr    error
+	incarnation map[string]string
+	unavailable bool
 }
+
+func (f fakeSource) MMDSAvailable() bool { return !f.unavailable }
 
 func (f fakeSource) ByFloatingIP(ip string) (string, bool) { sid, ok := f.fip[ip]; return sid, ok }
 func (f fakeSource) SandboxInfo(sid string) (string, string, bool) {
@@ -29,6 +36,25 @@ func (f fakeSource) MmdsSecret(sid string) ([]byte, bool) {
 	return []byte("secret-for-" + sid), true
 }
 
+func (f fakeSource) Incarnation(sid string) (string, bool) {
+	if f.incarnation != nil {
+		value, ok := f.incarnation[sid]
+		return value, ok
+	}
+	if _, ok := f.info[sid]; !ok {
+		return "", false
+	}
+	return "run-for-" + sid, true
+}
+
+func (f fakeSource) MMDSRoute(_ context.Context, sid, path string) (MMDSRoute, bool, error) {
+	if f.routeErr != nil {
+		return MMDSRoute{}, false, f.routeErr
+	}
+	route, ok := f.routes[sid][path]
+	return route, ok, nil
+}
+
 func TestPutGetFlow(t *testing.T) {
 	src := fakeSource{
 		fip:  map[string]string{"100.100.96.5": "sbx-1"},
@@ -39,6 +65,7 @@ func TestPutGetFlow(t *testing.T) {
 	// PUT from the sandbox's floating IP -> a session token.
 	req := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
 	req.RemoteAddr = "100.100.96.5:34567"
+	req.Header.Set("X-metadata-token-ttl-seconds", "60")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != 200 || w.Body.Len() == 0 {
@@ -46,11 +73,10 @@ func TestPutGetFlow(t *testing.T) {
 	}
 	token := w.Body.String()
 
-	// GET with the token -> the sandbox metadata; source IP is deliberately NOT the
-	// floating IP, proving the (untrusted) source is not re-read — the token is authoritative.
+	// GET with the token from the same source IP -> the sandbox metadata.
 	req = httptest.NewRequest("GET", "http://169.254.169.254/", nil)
 	req.Header.Set("X-metadata-token", token)
-	req.RemoteAddr = "9.9.9.9:1"
+	req.RemoteAddr = "100.100.96.5:1"
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -75,6 +101,7 @@ func TestPutGetFlow(t *testing.T) {
 	// PUT from an unregistered floating IP -> 503 after the park (envd's poll retries).
 	req = httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
 	req.RemoteAddr = "100.100.96.9:1"
+	req.Header.Set("X-metadata-token-ttl-seconds", "60")
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
