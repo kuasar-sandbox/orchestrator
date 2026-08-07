@@ -14,6 +14,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -23,10 +26,16 @@ var errExecActivationTimeout = errors.New("proxyshm: exec activation timed out")
 // MasterView is the proxy master's routesync sink and wake source.
 type MasterView struct {
 	table     *Table
+	mmds      *MMDSView
 	wakes     *WakeQueue
 	notify    *Broadcaster
 	defaultPk time.Duration
 	log       *slog.Logger
+
+	policyMu    sync.RWMutex
+	policyMMDS  *routesync.MMDSProxyPolicy
+	policyReady chan struct{}
+	policyOnce  sync.Once
 }
 
 func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *MasterView {
@@ -34,21 +43,41 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 		defaultPark = 30 * time.Second
 	}
 	return &MasterView{
-		table:     table,
-		wakes:     NewWakeQueue(4096),
-		notify:    NewBroadcaster(),
-		defaultPk: defaultPark,
-		log:       log,
+		table:       table,
+		mmds:        NewMMDSView(table.Capacity()),
+		wakes:       NewWakeQueue(4096),
+		notify:      NewBroadcaster(),
+		defaultPk:   defaultPark,
+		log:         log,
+		policyReady: make(chan struct{}),
 	}
 }
 
 func (v *MasterView) BeginSync() {
+	v.table.SetMMDSSynced(false)
 	v.table.BeginSync()
+	v.mmds.BeginSync()
 	v.notify.Notify()
 }
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
+	active := r.State == routesync.StateStarting || r.State == routesync.StateRunning
+	if active {
+		// Publish the heap view first. A worker that observes an active SHM row
+		// can then resolve either the new view or a conservative unavailable.
+		if err := v.mmds.Upsert(r); err != nil && v.log != nil {
+			v.log.Warn("proxyshm: apply MMDS route view", "sid", r.SandboxID, "err", err)
+		}
+	} else {
+		// Revoke the confidential view first. A worker that sampled the old
+		// active SHM row immediately before this update then fails closed at
+		// master lookup instead of receiving a value after pause/deletion.
+		v.mmds.Delete(r.SandboxID)
+	}
 	if err := v.table.Upsert(r); err != nil {
+		if active {
+			v.mmds.Delete(r.SandboxID)
+		}
 		if v.log != nil {
 			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
 		}
@@ -58,12 +87,17 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 }
 
 func (v *MasterView) ApplyDelete(sid string) {
+	v.mmds.Delete(sid)
 	v.table.Delete(sid)
 	v.notify.Notify()
 }
 
 func (v *MasterView) Bookmark() {
 	v.table.Bookmark()
+	v.mmds.Bookmark()
+	// Publish readiness only after both the fixed identity view and the
+	// confidential heap have completed the same full-sync generation.
+	v.table.SetMMDSSynced(true)
 	v.notify.Notify()
 }
 
@@ -74,7 +108,35 @@ func (v *MasterView) SetPolicy(p routesync.Policy) {
 	if err := v.table.SetPolicy(p); err != nil && v.log != nil {
 		v.log.Warn("proxyshm: set policy", "err", err)
 	}
+	var policyCopy *routesync.MMDSProxyPolicy
+	if p.MMDS != nil {
+		copy := *p.MMDS
+		copy.Services = cloneStringMap(p.MMDS.Services)
+		policyCopy = &copy
+		if err := v.mmds.SetServices(copy.Services); err != nil && v.log != nil {
+			v.log.Warn("proxyshm: reject MMDS service registry", "err", err)
+		}
+	} else {
+		_ = v.mmds.SetServices(nil)
+	}
+	v.policyMu.Lock()
+	v.policyMMDS = policyCopy
+	v.policyMu.Unlock()
+	v.policyOnce.Do(func() { close(v.policyReady) })
 	v.notify.Notify()
+}
+
+// InvalidateSync is called as soon as the route-sync session ends. The base
+// fixed SHM table retains its existing reconnect behavior; MMDS heap state is
+// cleared immediately because it contains plaintext and service authority.
+func (v *MasterView) InvalidateSync() {
+	v.table.SetMMDSSynced(false)
+	v.mmds.BeginSync()
+	v.notify.Notify()
+}
+
+func (v *MasterView) ResolveMMDS(sandboxID, exactPath string) mmdsrpc.EndpointResponse {
+	return v.mmds.Resolve(sandboxID, exactPath)
 }
 
 func (v *MasterView) NextWake(ctx context.Context) (string, bool) {
@@ -185,6 +247,8 @@ type WorkerView struct {
 	updates     *Updates
 	wake        func(string)
 	defaultPark time.Duration
+	mmdsClient  *mmdsrpc.Client
+	mmdsTimeout time.Duration
 }
 
 func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration) *WorkerView {
@@ -192,6 +256,15 @@ func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPar
 		defaultPark = 30 * time.Second
 	}
 	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark}
+}
+
+// NewMMDSWorkerView adds the inherited master RPC connection used only by an
+// external proxy worker. Existing non-MMDS callers retain NewWorkerView.
+func NewMMDSWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, client *mmdsrpc.Client) *WorkerView {
+	view := NewWorkerView(table, updates, wake, defaultPark)
+	view.mmdsClient = client
+	view.mmdsTimeout = 2 * time.Second
+	return view
 }
 
 func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
@@ -361,15 +434,69 @@ func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEn
 }
 
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
+	if !v.MMDSAvailable() {
+		return "", false
+	}
 	return v.table.ByFloatingIP(ip)
 }
 
 func (v *WorkerView) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
+	if !v.MMDSAvailable() {
+		return "", "", false
+	}
 	return v.table.SandboxInfo(sid)
 }
 
 func (v *WorkerView) MmdsSecret(sid string) ([]byte, bool) {
+	if !v.MMDSAvailable() {
+		return nil, false
+	}
 	return v.table.MmdsSecret(sid)
+}
+
+func (v *WorkerView) Incarnation(sid string) (string, bool) {
+	if !v.MMDSAvailable() {
+		return "", false
+	}
+	return v.table.Incarnation(sid)
+}
+
+func (v *WorkerView) MMDSAvailable() bool { return v.table.MMDSSynced() }
+
+func (v *WorkerView) MMDSRoute(ctx context.Context, sandboxID, exactPath string) (mmds.MMDSRoute, bool, error) {
+	if !v.MMDSAvailable() {
+		return mmds.MMDSRoute{}, false, errors.New("proxyshm: MMDS route sync unavailable")
+	}
+	entry, ok := v.table.Lookup(sandboxID)
+	if !ok || (entry.State != routesync.StateStarting && entry.State != routesync.StateRunning) {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	if v.mmdsClient == nil {
+		return mmds.MMDSRoute{}, false, errors.New("proxyshm: MMDS RPC unavailable")
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, v.mmdsTimeout)
+	defer cancel()
+	response, err := v.mmdsClient.Resolve(rpcCtx, sandboxID, exactPath)
+	if err != nil {
+		return mmds.MMDSRoute{}, false, err
+	}
+	if response.Unavailable {
+		return mmds.MMDSRoute{}, false, errors.New("proxyshm: MMDS route sync unavailable")
+	}
+	if !response.Found {
+		return mmds.MMDSRoute{}, false, nil
+	}
+	switch response.Type {
+	case "static":
+		return mmds.MMDSRoute{Type: response.Type, ContentType: response.ContentType, Body: response.Body}, true, nil
+	case "secret":
+		return mmds.MMDSRoute{Type: response.Type, ContentType: response.ContentType, Body: response.Body, Present: response.Present}, true, nil
+	case "service":
+		result := mmdssvc.Call(ctx, response.ServiceSocket, response.Service, exactPath, sandboxID)
+		return mmds.MMDSRoute{Type: response.Type, StatusCode: result.StatusCode, ContentType: result.ContentType, Body: result.Body}, true, nil
+	default:
+		return mmds.MMDSRoute{}, false, errors.New("proxyshm: invalid MMDS RPC response")
+	}
 }
 
 func (v *WorkerView) Policy() routesync.Policy {

@@ -161,10 +161,23 @@ checkpoint:
 #   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
 #     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
 #     translates the metadata VIP to the listener (connector-ctl vswitch start --mgmt-service ...).
-#     Requires proxy.mode != off; external mode serves it from proxy.yaml mmds_listen.
+#     Requires proxy.mode != off. In external mode the proxy master receives the
+#     listener and service registry over its trusted config-socket registration.
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254
+#   routes:
+#     enabled: true
+#     max_routes_per_sandbox: 32
+#     max_namespace_bytes: 65536
+#     max_static_body_bytes: 16384
+#     max_secret_value_bytes: 16384
+#     reserved_path_prefixes:
+#       - /latest/api/
+#       - /internal/
+#   services:
+#     external-mmds:
+#       endpoint: unix:///run/kuasar/mmds/external-mmds.sock
 
 # cluster: connect this node to a cluster-ctl registry over node_link (node.md §10).
 # Omitted = standalone single-node.

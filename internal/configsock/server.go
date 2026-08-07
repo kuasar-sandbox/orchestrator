@@ -9,11 +9,12 @@
 //   - task   (POST /internal/task/launchspec, /internal/task/buildspec):
 //     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
 //     SO_PEERCRED peer pid == the task pidfile (/run/sandbox/<id>/<id>.pid).
-//   - admin  (/internal/admin/manifest-keys): manifest-key allowlist management.
-//     Authed by SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the
-//     socket's 0600 permissions alone = same uid / root).
+//   - admin  (/internal/admin/manifest-keys and sandbox MMDS route-value paths):
+//     manifest-key allowlist management plus bounded secret PUT/DELETE. Authed by
+//     SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the socket's
+//     0600 permissions alone = same uid / root).
 //   - plugin (PUT /internal/plugin/{id}/register): a subscriber (an external proxy
-//     worker, or a route observer such as the platform agent) registers its
+//     master, or a route observer such as the platform agent) registers its
 //     capabilities and holds the connection open as its route stream + lease (see
 //     internal/routesync). Authed by SO_PEERCRED peer pid ∈ plugin_pidfile (or socket
 //     perms when unset).
@@ -29,7 +30,9 @@ package configsock
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,6 +42,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -50,11 +54,13 @@ import (
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
 // never uses); every other path falls through to the api handler.
 const (
-	PathTaskLaunchSpec   = "/internal/task/launchspec"
-	PathTaskBuildSpec    = "/internal/task/buildspec"
-	PathRunAssignment    = "/internal/run/assignment"
-	PathRunBuildResult   = "/internal/run/build-result"
-	PathAdminManifestKey = "/internal/admin/manifest-keys"
+	PathTaskLaunchSpec             = "/internal/task/launchspec"
+	PathTaskBuildSpec              = "/internal/task/buildspec"
+	PathRunAssignment              = "/internal/run/assignment"
+	PathRunBuildResult             = "/internal/run/build-result"
+	PathAdminManifestKey           = "/internal/admin/manifest-keys"
+	PathAdminMMDSRouteSecretPut    = "PUT /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
+	PathAdminMMDSRouteSecretDelete = "DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 )
 
 // journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
@@ -258,6 +264,13 @@ type Admin interface {
 	ListKeyPairs(ctx context.Context) ([]AdminKeyInfo, error)
 }
 
+// MMDSRouteSecretAdmin mutates sandbox-owned opaque values. Content type is
+// deliberately absent: it belongs to the immutable route declaration.
+type MMDSRouteSecretAdmin interface {
+	PutMMDSRouteSecretValue(ctx context.Context, sandboxID, name string, value []byte) error
+	DeleteMMDSRouteSecretValue(ctx context.Context, sandboxID, name string) error
+}
+
 // AdminKeyRequest / AdminKeyResponse are the admin-plane add/remove/check messages.
 type AdminKeyRequest struct {
 	Op           string `json:"op"` // add | remove | check
@@ -278,13 +291,15 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
-	Provider      Provider         // task plane (LaunchSpec by config-id)
-	Admin         Admin            // admin plane (manifest-key allowlist)
-	API           http.Handler     // api plane (e2b control plane + export/import); the fallback
-	AdminPidfile  string           // optional PID allowlist gating the admin plane ("" => socket perms only)
-	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
-	Plugins       *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
-	PluginPidfile string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
+	Provider                     Provider // task plane (LaunchSpec by config-id)
+	Admin                        Admin    // admin plane (manifest-key allowlist)
+	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
+	MaxMMDSRouteSecretValueBytes int
+	API                          http.Handler     // api plane (e2b control plane + export/import); the fallback
+	AdminPidfile                 string           // optional PID allowlist gating the admin plane ("" => socket perms only)
+	RouteSource                  routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
+	Plugins                      *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
+	PluginPidfile                string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
 }
 
 type Server struct {
@@ -356,6 +371,10 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.MMDSRouteSecretAdmin != nil {
+		mux.HandleFunc(PathAdminMMDSRouteSecretPut, s.handleAdminMMDSRouteSecretPut)
+		mux.HandleFunc(PathAdminMMDSRouteSecretDelete, s.handleAdminMMDSRouteSecretDelete)
+	}
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
 	}
@@ -568,6 +587,67 @@ func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResp
 		out.Error = "unknown op (want add|remove|check)"
 	}
 	return out
+}
+
+func (s *Server) handleAdminMMDSRouteSecretPut(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		http.Error(w, "not authorized", http.StatusForbidden)
+		return
+	}
+	sandboxID, name := r.PathValue("id"), r.PathValue("name")
+	if sandboxID == "" || name == "" || r.URL.RawQuery != "" || r.URL.ForceQuery {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	limit := s.deps.MaxMMDSRouteSecretValueBytes
+	if limit <= 0 {
+		limit = 16 * 1024
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
+	value, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err := s.deps.MMDSRouteSecretAdmin.PutMMDSRouteSecretValue(r.Context(), sandboxID, name, value); err != nil {
+		s.log.Warn("configsock admin MMDS route secret PUT", "peer", peer, "sandbox_id", sandboxID, "name", name, "err", err)
+		http.Error(w, "request failed", mmdsRouteSecretAdminErrorCode(err))
+		return
+	}
+	s.log.Info("configsock admin MMDS route secret PUT", "peer", peer, "sandbox_id", sandboxID, "name", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminMMDSRouteSecretDelete(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		http.Error(w, "not authorized", http.StatusForbidden)
+		return
+	}
+	sandboxID, name := r.PathValue("id"), r.PathValue("name")
+	if sandboxID == "" || name == "" || r.URL.RawQuery != "" || r.URL.ForceQuery {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.deps.MMDSRouteSecretAdmin.DeleteMMDSRouteSecretValue(r.Context(), sandboxID, name); err != nil {
+		s.log.Warn("configsock admin MMDS route secret DELETE", "peer", peer, "sandbox_id", sandboxID, "name", name, "err", err)
+		http.Error(w, "request failed", mmdsRouteSecretAdminErrorCode(err))
+		return
+	}
+	s.log.Info("configsock admin MMDS route secret DELETE", "peer", peer, "sandbox_id", sandboxID, "name", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func mmdsRouteSecretAdminErrorCode(err error) int {
+	switch {
+	case errors.Is(err, api.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, api.ErrBadRequest):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // adminAuthed gates the admin plane: when admin_pidfile is set the peer pid must be

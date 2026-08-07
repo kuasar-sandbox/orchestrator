@@ -451,6 +451,97 @@ func TestLoadProxyRejectsTopLevelRunRoot(t *testing.T) {
 	}
 }
 
+func TestLoadMMDSRoutesAndConductorServiceRegistry(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+proxy:
+  mode: internal
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/runtime.erofs
+mmds:
+  enabled: true
+  listen: 127.0.0.1:19254
+  routes:
+    enabled: true
+    max_routes_per_sandbox: 7
+    max_namespace_bytes: 8192
+    max_static_body_bytes: 1024
+    max_secret_value_bytes: 2048
+    reserved_path_prefixes: [/latest/api/, /internal/]
+  services:
+    external-mmds:
+      endpoint: unix:///run/kuasar/mmds/external.sock
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MMDS.Routes.Enabled || cfg.MMDS.Routes.MaxRoutesPerSandbox != 7 ||
+		cfg.MMDS.Services["external-mmds"].Endpoint != "unix:///run/kuasar/mmds/external.sock" {
+		t.Fatalf("MMDS config = %+v", cfg.MMDS)
+	}
+}
+
+func TestLoadMMDSRouteDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/runtime.erofs
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := cfg.MMDS.Routes
+	if routes.MaxRoutesPerSandbox != 32 || routes.MaxNamespaceBytes != 65536 ||
+		routes.MaxStaticBodyBytes != 16384 || routes.MaxSecretValueBytes != 16384 ||
+		len(routes.ReservedPathPrefixes) != 2 {
+		t.Fatalf("MMDS route defaults = %+v", routes)
+	}
+}
+
+func TestLoadRejectsInvalidMMDSServiceEndpoint(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/runtime.erofs
+mmds:
+  services:
+    remote:
+      endpoint: https://example.test/metadata
+`))
+	if err == nil || !strings.Contains(err.Error(), "mmds.services") {
+		t.Fatalf("Load error = %v", err)
+	}
+}
+
+func TestLoadProxyRejectsRemovedMMDSConfiguration(t *testing.T) {
+	for name, body := range map[string]string{
+		"mmds_listen": "paths: { run_root: /run/sandbox }\nmmds_listen: 127.0.0.1:19254\n",
+		"services":    "paths: { run_root: /run/sandbox }\nservices: {}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "proxy.yaml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadProxy(path); err == nil {
+				t.Fatalf("LoadProxy accepted removed %s configuration", name)
+			}
+		})
+	}
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "node.yaml")

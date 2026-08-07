@@ -41,6 +41,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
@@ -89,6 +90,18 @@ UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slic
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
+
+MMDS_ROUTES_CONFIG=""
+MMDS_SERVICES_CONFIG=""
+if [ "$MMDS_ROUTES_E2E" = 1 ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_service_guest.sh"
+    start_mmds_service_backend "$WORK" || fail "start MMDS service UDS backend"
+    MMDS_ROUTES_CONFIG="  routes:
+    enabled: true"
+    MMDS_SERVICES_CONFIG="  services:
+    $MMDS_SERVICE_NAME:
+      endpoint: unix://$MMDS_SERVICE_SOCKET"
+fi
 
 # Run conductor from a private sibling-bin directory so its normal binary
 # discovery reaches this transparent sandbox-ctl wrapper. The wrapper records
@@ -188,6 +201,7 @@ SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
+    [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
@@ -243,6 +257,9 @@ req() {
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "${REQ_CHECKPOINT_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Checkpoint: ${REQ_CHECKPOINT_HEADER}")
+    if [ "${REQ_ATTACH_MMDS:-0}" = 1 ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
+        args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -612,7 +629,11 @@ write_orchestrator_config() { # $1=unset|node-policy
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS, park_timeout: 120s }
-mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
+mmds:
+  enabled: true
+  listen: "$PROXY_NS_IP:$MMDS_PORT"
+$MMDS_ROUTES_CONFIG
+$MMDS_SERVICES_CONFIG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -806,8 +827,9 @@ print(json.dumps({
 PY
 )
 REQ_NET_HEADER="{\"hostname\":\"$CFG_HOST\"}"
+REQ_ATTACH_MMDS="$MMDS_ROUTES_E2E"
 code=$(req POST /sandboxes "$AK" "$CREATE_BASE_BODY")
-unset REQ_NET_HEADER
+unset REQ_NET_HEADER REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
@@ -1119,6 +1141,28 @@ MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$
 grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
     "$WORK/portable-w.journal" && fail "portable restore prefetched B memory lower"
 echo "==> PASS: portable W restored state; prefetch targeted W self only (not B or disk)"
+
+if [ "$MMDS_ROUTES_E2E" = 1 ]; then
+    source "$REPO_ROOT/test/e2e/lib/mmds_static_guest.sh"
+    source "$REPO_ROOT/test/e2e/lib/mmds_secret_guest.sh"
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS static exact route"
+    run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS initial/unresolved/update/delete lifecycle"
+    run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
+        "$ENVD_TOKEN" "$WORK" internal \
+        || fail "internal MMDS conductor-owned local service"
+    for value in MMDS_SECRET_INITIAL_GUEST_E2E MMDS_SECRET_UPDATED_GUEST_E2E MMDS_SECRET_ROTATED_GUEST_E2E; do
+        for artifact in "$WORK"/orch*.log "$WORK"/mmds-*.out "$WORK"/mmds-service.requests \
+            "$WORK"/lib/node-ctl.db*; do
+            [ -f "$artifact" ] || continue
+            grep -a -F -q -- "$value" "$artifact" \
+                && fail "MMDS secret plaintext appeared in internal E2E artifact $artifact"
+        done
+    done
+    echo "==> PASS: internal real guest covered static, initial/unresolved/rotated/deleted secret, and local service"
+fi
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
 unset EXEC_TOKEN

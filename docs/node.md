@@ -225,9 +225,10 @@ node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 run
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-策略与端点(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/`shm_path`/`workers`/`tls`/
-`auth`/`park_timeout`/`mmds_listen`)在 `proxy.yaml`;master 在 plugin 平面注册一次,
-维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
+进程端点与 bootstrap 策略(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/
+`shm_path`/`workers`/`tls`/`auth`/`park_timeout`)在 `proxy.yaml`;
+MMDS listen 与 service registry 只配置在 conductor。master 在 plugin 平面注册一次,
+由握手取得 MMDS policy,维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
 node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
@@ -394,6 +395,13 @@ node-ctl 同目录 → PATH"自动发现。
 | `checkpoint.remote.ref_location_parent` | 空 | remote 兼容字段:可选 absolute `file://` URI;非空时旧路径实际仍 local capture。portable publish 应在 local Pause 后独立执行 |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2,node-proxy.md §7):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
+| `mmds.routes.enabled` | `false` | 是否接受租户声明的 static/secret/service exact route;要求 `mmds.enabled=true` |
+| `mmds.routes.max_routes_per_sandbox` | `32` | 每个 Sandbox 或 Build 的 route 数量上限 |
+| `mmds.routes.max_namespace_bytes` | `65536` | Header 或 metadata 中单份 MMDS JSON 的字节上限 |
+| `mmds.routes.max_static_body_bytes` | `16384` | 单条 static `data` 的 UTF-8 字节上限 |
+| `mmds.routes.max_secret_value_bytes` | `16384` | initial secret string 或 admin PUT opaque body 的字节上限 |
+| `mmds.routes.reserved_path_prefixes` | `[/latest/api/, /internal/]` | 租户 route 禁止占用的 exact path 前缀;内置 `/` 也保留 |
+| `mmds.services` | 空 | conductor-only 本机 service registry:`name.endpoint`;V1 只接受 `unix://` absolute path,不在 `proxy.yaml` 复制 |
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
 | `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md) |
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
@@ -406,9 +414,10 @@ node-ctl 同目录 → PATH"自动发现。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
-proxy 组件)。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
-配置 `proxy_netns`。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,proxyForwarder
-按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
+proxy 组件);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service endpoint
+必须是 absolute Unix socket URI。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
+配置 `proxy_netns`。external 模式无须静态 worker 列表——proxy master 经 plugin 平面注册,
+proxyForwarder 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
 
 ## 4. e2b API 契约
@@ -425,7 +434,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);`X-Kuasar-Sandbox-MMDS`/`metadata["kuasar-sandbox.mmds"]` 可声明 routes 与 initial secrets(§4.6);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
@@ -484,8 +493,8 @@ credential 读取/签发或异步 resume 任务接受失败统一对外返回脱
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB}`;`profile∈{e2b,bare}`,省略按此 e2b 兼容端点语义取 `e2b`,注册后不可变;`X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, profile, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6) |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?}`;`profile∈{e2b,bare}`,省略按此 e2b 兼容端点语义取 `e2b`,注册后不可变;`X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);MMDS routes/initial secrets 只供本次 builder sandbox,secret 不进入模板;回 `{templateID: transient-<uuidv7>, buildID, profile, names, tags, aliases, public:false}` |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + 非 MMDS `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6)。Trigger 出现 MMDS Header 或 metadata key 直接拒绝,不能覆盖 Register 的 MMDS |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, profile, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile` |
@@ -567,6 +576,71 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
 | `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
+| `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
+
+MMDS 在 Sandbox Create 与 Build Register 共用以下外部 schema。Header 直接携 JSON;
+metadata 的 value 仍是一个 JSON string:
+
+```json
+{
+  "secrets": {
+    "key1": "data1",
+    "key2": "data2"
+  },
+  "routes": [
+    {
+      "path": "/path/to/secret",
+      "type": "secret",
+      "secret": "key1",
+      "content_type": "application/json"
+    },
+    {
+      "path": "/path/to/relay",
+      "type": "service",
+      "service": "external-mmds"
+    },
+    {
+      "path": "/path/to/data",
+      "data": "value",
+      "content_type": "application/json"
+    }
+  ]
+}
+```
+
+`type` 缺省表示 static。static 必须有 `path`,可有 `data`/`content_type`,禁止
+`secret`/`service`;secret 必须有 `path`/`secret`,可有 `content_type`,禁止
+`data`/`service`;service 必须有 `path`/`service`,禁止 `data`/`secret`/`content_type`。
+static/secret 未声明 Content-Type 时只在响应阶段取 `text/plain`;service 使用本机服务的
+受校验响应 Content-Type。Create/Register initial value 必须是 JSON string,每个 name
+至少由一条 secret route 引用;secret route 可以暂时没有 value。
+
+Header 与 metadata 分别严格解析为 partial document,再按顶层 key 合并:
+
+```text
+effective.secrets = Header.secrets if present, else metadata.secrets
+effective.routes  = Header.routes  if present, else metadata.routes
+```
+
+同 key 不拼接、不递归或按 path 深合并。显式 `"routes":[]` 与 `"secrets":{}` 也算
+present,会清空低层值。两份 JSON 均拒绝 unknown field、duplicate key、trailing value、
+malformed JSON 和超限输入。
+
+校验后立即分离 portable routes 与 confidential values。exact absolute path 必须能按原字节
+作为 HTTP request target 使用,禁止 query、fragment、percent escape、需 percent-encode 的字符、
+空/dot segment、backslash、trailing slash、wildcard、duplicate
+或 reserved path/prefix collision。持久化使用稳定最小 JSON:显式 `type:"static"` 被删除,
+输入缺省的 `type`/`content_type` 保持缺省,不写运行时默认值,不增加外部 version。例如:
+
+```text
+input:     {"routes":[{"path":"/data","type":"static","data":"x"}]}
+metadata:  {"routes":[{"path":"/data","data":"x"}]}
+```
+
+`metadata["kuasar-sandbox.mmds"]` 绝不包含 `secrets`。Build Register 的 routes 只服务
+本次 synthetic builder sandbox;initial values 以 build owner 加密保存。build 终态事务同时
+从 `builds.metadata_json` 删除 routes namespace 并删除 value blob,因此两者都不进入最终
+template/snapshot/image。Build Trigger 不接受 MMDS 覆盖。
 
 单 sandbox 显式启用的两种等价请求形态:
 
@@ -833,6 +907,20 @@ APISecret+ManifestKey 凭据对白名单管理(§7);响应和 list 只返回两�
 凭据对 `key_put` 写入 / 重发续租;未续租条目按 TTL 淘汰,`key_drop` 只作为
 best-effort 清理命令(§10)。
 
+同一 admin 平面还提供 sandbox-local MMDS route value 更新:
+
+```http
+PUT    /internal/admin/sandboxes/{id}/mmds/secrets/{name}
+DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}
+```
+
+`name` 必须被该 sandbox 当前的一条 secret route 引用。PUT body 是受
+`mmds.routes.max_secret_value_bytes` 限制的 opaque bytes,完整替换当前 value;DELETE
+幂等。成功均回 204,不返回 plaintext。API 不定义 TTL/expiration 参数或 header,不从请求
+Content-Type 派生 value metadata;响应 Content-Type 始终属于 route。store CAS 成功后才
+发布 Upsert 使 external proxy 收敛,失败时不发布伪状态。日志只记录 sid/name/outcome,
+绝不记录 body。鉴权仍是本 socket 的 0600 + SO_PEERCRED + 可选 admin pidfile。
+
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
 租约 + 路由流(routesync,线格式见 node-proxy.md §4).请求体首帧是 `register{caps}`,之后(route_wake)是
@@ -842,6 +930,13 @@ master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连�
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
 其中,未配则仅靠 socket 0600(同 admin)。external proxy master、平台 agent 均经此订阅。
 此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
+
+MMDS confidential 投影不是任意 plugin 自报的权限。只有 id 精确为 `proxy`,且同时满足
+`subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true` 的 registration 才收到 conductor
+MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 route observer
+两者均不收,node-link/cluster stream 也不收。伪装为其它 id 的 `mmds=true` registration
+被拒绝。external master 在完整 Bookmark 前 fail closed,断流即清空可变 route/value/service
+视图,不会无限期服务断连前的 secret。
 
 **④ api 平面** — 其余路径回落到 e2b 控制面 handler(与 TLS `api.listen` **同一个**
 `http.Handler`,含 export/import 扩展),明文 h2c、`X-API-KEY` 鉴权。
@@ -916,6 +1011,14 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   `MmdsSecret =
   HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
   密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md §7)。
+- **MMDS route value 独立存储**:`MmdsSecret` 只签名/验证 MMDSv2 token;
+  `MMDSRouteSecretValues` 才是 secret route 返回的敏感 value 集合。每个 sandbox/build
+  owner 各有一份 encrypted JSON blob,只编码实际 name→opaque bytes,不保存 version、
+  Content-Type、TTL 或 configured/wait 状态。AAD 至少绑定 owner kind、owner id、canonical
+  routes digest 与 revision;更新使用 CAS/revision,轮换密钥沿用 secretbox 活动键 + retained
+  decrypt keys。Create/Register 在一个 sqlite transaction 内写业务 row、routes-only metadata
+  与 initial blob;Sandbox 删除走 FK cascade,Build 终态/清理删除 blob。数据库中只出现
+  ciphertext,plaintext 只在受信 conductor/proxy heap 的有界生命周期内存在。
 
 ## 8. 生命周期与状态机
 
@@ -1079,7 +1182,9 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
 - **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`AuthSandboxID()`、Profile、
   template/canonical portable SnapshotRef/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
   以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
-  host absolute path、Group/RouteKey 或 generation。目标 node 从本地 key 表取得完整 pair,
+  MMDS route secret value、host absolute path、Group/RouteKey 或 generation。routes-only
+  `kuasar-sandbox.mmds` 可随 portable metadata 移动,但 secret plaintext 永不进入 migration
+  token、snapshot 或 template。目标 node 从本地 key 表取得完整 pair,
   校验 fingerprints/runtime/Profile/Forward KAT 后原样落库,不重新派生或生成 service credential。
 - **target 与冲突**:standalone import 省略 `sandboxID` 时复用 source NodeSandboxID;显式 target
   只替换本地 ID,保留 AuthSandboxID 与全部 credential。ID 使用 1..57 bytes 的 lowercase
@@ -1091,7 +1196,11 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
   decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
-  目标已存在时完全忽略 token。超过 512 KiB 的 Header 返回 431;独立 import body/token
+  standalone/node-local 请求可同时用 `X-Kuasar-Sandbox-MMDS` 或 metadata 只注入
+  `{secrets:{...}}`;routes 权威只能来自 token,请求只要出现 `routes` key(包括 `[]`)即 400,
+  每个 initial name 必须被 token 的 secret route 引用,业务 row/routes metadata/secret blob
+  原子写入。目标已存在时完全忽略 token 和 MMDS secret 输入,不解析、不校验、不更新。
+  超过 512 KiB 的 Header 返回 431;独立 import body/token
   超限返回 413。`import-sandbox` CLI 保留作显式预导入。
 - **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
   路由流下发(node-proxy.md §4);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
@@ -1099,6 +1208,11 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
   MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
 - 限制:token 不含 tenant raw root,但携带沙箱自有 env 与数据面 credential,按"沙箱级敏感"对待;
   快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
+
+上述 secrets-only 注入只属于 standalone CONNECT import。cluster CONNECT 不透传 MMDS
+config,node-link command schema、registry/router/placer 不理解 MMDS,本阶段也没有 cluster
+MMDS Secret API、placement/admission/retry 或 cluster MMDS E2E。现有通用 metadata 偶然携带
+routes 不构成 cluster 支持合同。
 
 ## 9. 数据面装配(serve 侧)
 
@@ -1138,6 +1252,13 @@ serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill �
 `RouteEntry` 字段(含驱动迁移的 `snap_loc`、MMDS 使用的 `mmds_secret`)见 node-proxy.md §4;
 plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
 把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
+
+广播前执行服务端投影:受信 MMDS proxy 的 Upsert 额外携 `mmds_routes` 与
+`mmds_route_secret_values`,二者在同一 event 中原子替换;普通 observer 不收到这些字段,
+cluster/node-link 也绝不收到 value。conductor-owned `mmds.services` 仅放在受信 proxy 的
+Hello policy,不广播给 route observer。internal proxy 直接读 conductor 内存 registry;
+external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 Unix socket endpoint,
+不读取 `proxy.yaml` 中的第二份配置。
 
 - **auto-resume launch owner**:数据面打到 paused 沙箱触发 resume——internal 在请求内完成
   durable acceptance 并等待,external 经 routesync `Wake` 上行;同一 sid 的 Connect/Wake/
@@ -1341,15 +1462,22 @@ plugin 平面,机群路由经 registry 聚合。
 
 **serve 侧(每构建一次)**:建 workdir → 配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经
 `connector-ctl vswitch attach` 分配一个网络槽(整个构建复用,各阶段顺序交接 tapfd)→
-铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
-让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → 从 builder pool 分配 run-id
-(无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
+铸 envd token → 从 builder pool 分配并持久化 run-id(无 idle 时按需 `StartUnit`)→
+(`mmds.enabled` 时)挂一行 synthetic sandbox route,让模板阶段 FC 模式的 envd 能按
+floatingip 自解析,并把 Register 时声明的 MMDS routes 及 build-owner initial values
+投影给本次 builder guest → run-builder WaitAssignment 取得 bid 后执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
 `img`,持久 id `<profile>-<kind>-<base64url(portable-ref)>` 写入 names/aliases。profile 从注册到
 BuildSpec 全链路显式携带。register/trigger 在入队前校验最终 network metadata;
 执行时只解析一次并补齐 profile/node 默认值,同一个 `NetworkSpec` 同时派生 host
 `vswitch.AttachReq` 与 guest `BuildNet`。`transit_*` 只在 host Attach 消费,不进入
 `BuildNet`;无 transit 时保持零值。
+
+MMDS synthetic route 只在 real builder run-id 已持久化后发布,其 `RunID` 同样约束
+MMDSv2 token incarnation。流水线结束先撤销 route view;所有 ready/error/cleanup 终态再与
+build row 更新原子删除 MMDS routes namespace 和 encrypted value blob。Register 的 MMDS
+namespace 是 request-scoped,不会进入最终 template metadata、snapshot.cfg、镜像或后续从该
+模板创建的 Sandbox;Trigger 也不能重写它。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
 microVM(`sandbox-ctl run` 直接子进程)。父进程为每个 phase 建匿名 pipe,通过
@@ -1541,7 +1669,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 
 ### 15.1 状态存储(sqlite)
 
-单文件 sqlite(`paths.db_path`,WAL,文件 0600),纯 Go 驱动。三张表:
+单文件 sqlite(`paths.db_path`,WAL,文件 0600),纯 Go 驱动。核心表:
 
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
@@ -1558,6 +1686,12 @@ builds         build_id PK, template_id(transient-…), persist_id(<profile>-<ki
                profile, kind, from_image,
                start_cmd, status(registered|waiting|building|ready|error), reason,
                names_json, aliases_json, registry_auth_enc, created_unix
+sandbox_mmds_route_secret_values
+               sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
+               routes_digest, revision, ciphertext, updated_unix
+build_mmds_route_secret_values
+               build_id PK/FK builds(build_id) ON DELETE CASCADE,
+               routes_digest, revision, ciphertext, updated_unix
 manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
                manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
@@ -1565,6 +1699,9 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
 `builds` 兼任模板登记(§4.4);`*_enc` 根凭据及 Sandbox service credential 均
 AES-256-GCM、两项 `*_hash` 均为
 完整 SHA-256。`substr(api_secret_hash,1,24)` 仅建候选预筛索引(§7)。
+两张 MMDS value 表每 owner 最多一行,只保存 secretbox ciphertext;AAD 与事务/CAS/cleanup
+语义见 §7。既有数据库在启动时用 `CREATE TABLE IF NOT EXISTS` 原地增加两表,无需
+plaintext 回填或兼容双写。
 
 ### 15.2 重启对账
 
@@ -1598,13 +1735,15 @@ serve 在开放 API、routesync、node-link 和数据面前先以
 | proxy worker 崩溃(external) | 该 worker 上的连接断;其余 worker 继续接新连接 | proxy master 重启该 worker;worker 重新读取共享路由视图 |
 | proxy master 崩溃(external) | external 数据面中断,plugin 租约断开 | systemd 重启 master → 重新注册、重建共享表、启动 worker |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
-| routesync 断流 | external 共享路由视图停更 | proxy master 指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,node-proxy.md §4) |
+| routesync 断流 | external 固定数据面视图停更;MMDS route/value/service 立即不可用 | proxy master 清空 confidential heap 并指数退避重连重注册,完整同步 bookmark 后才重新服务(node-proxy.md §4) |
 | node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
 ## 16. 测试
 
-单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
+单元测试:`make test`(MMDS strict parser/top-level merge/minimal persistence、route value
+encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
+external master/worker resync/rotation;handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
 proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession,H1/H2 `ctl.ProxyExec` gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
@@ -1623,8 +1762,10 @@ sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自
 |---|---|---|
 | `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);profile=bare fromImage → bare-img(拒绝 start、bare 网络、image-only);分别从 e2b-snp/bare-img create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;另以 Build Register initial routes/secrets 驱动真实 builder guest GET,验证 Trigger 不可覆盖、终态 routes/value cleanup、日志/DB/image 隔离 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume;精确断言 all-unset argv,再覆盖 node/Create metadata+header/Pause body+header/reaper 的逐字段 policy,并验证 W 与 guest 状态可本地恢复;Builder argv 保持无新 flag | `test-e2e-execute` |
+| `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑,真实 guest 覆盖 internal static、initial/unresolved/PUT/rotate/DELETE secret、local UDS service 及 plaintext backstop | `test-e2e-mmds-routes-internal` |
+| `e2e_mmds_routes_external.sh` | 复用 external proxy 拓扑覆盖同一合同;proxy restart/full resync、rotation、conductor-only service registry(`proxy.yaml` 无 services) | `test-e2e-mmds-routes-external` |
 | `e2e_sandbox_disks.sh` | root + 两类 data disk 的 snapshot/restore;第二代 `merge_ref=false` W 明确保留 memory parent,同时断言 root/data local parent 仍合并且 W 可恢复 | umbrella `run_all.sh` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入,key 分发,Reserve→READY→数据面转发,稳定 SandboxID 的 CmdConnect/ExecSession,KAT 拒绝和 exec 两跳 tunnel,稳定/Node SandboxID 转换,route cache,build_register,孤儿 route 清理,节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |

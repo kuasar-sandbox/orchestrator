@@ -48,6 +48,9 @@ const pluginPathPrefix = "/internal/plugin/"
 // PluginRegisterPath is the registration path for a given plugin id.
 func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/register" }
 
+// ProxyPluginID is the one trusted external proxy registration identity.
+const ProxyPluginID = "proxy"
+
 // Subscribe kinds (Register.Subscribe.Kind).
 const (
 	KindRoute     = "route"      // route stream only (observer)
@@ -106,14 +109,37 @@ type RouteEntry struct {
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
+	// RunID is the current launch/resume incarnation used by MMDSv2 tokens.
+	RunID string `json:"run_id,omitempty"`
+	// MMDSRoutes is the stable routes-only declaration. It remains outside the
+	// fixed-layout proxy SHM and is projected only to a trusted MMDS proxy.
+	MMDSRoutes string `json:"mmds_routes,omitempty"`
+	// MMDSRouteSecretValues contains the current opaque secret route values.
+	// A pointer to an empty map means the store was read successfully and no
+	// values exist; nil means unavailable/not projected. It is never written to SHM.
+	MMDSRouteSecretValues *MMDSRouteSecretValues `json:"mmds_route_secret_values,omitempty"`
 }
+
+// MMDSRouteSecretValues is pointer-wrapped in RouteEntry so RouteEntry remains
+// comparable for the fixed-layout route table while JSON still encodes the
+// field directly as an object: nil => omitted, pointer-to-empty-map => {}.
+type MMDSRouteSecretValues map[string][]byte
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
 // (central control: the proxy need not be told these locally).
 type Policy struct {
-	Domain        string `json:"domain,omitempty"`
-	AuthMode      string `json:"auth_mode,omitempty"`       // off | log | enforce
-	ParkTimeoutMS int    `json:"park_timeout_ms,omitempty"` // hold a request awaiting route/resume
+	Domain        string           `json:"domain,omitempty"`
+	AuthMode      string           `json:"auth_mode,omitempty"`       // off | log | enforce
+	ParkTimeoutMS int              `json:"park_timeout_ms,omitempty"` // hold a request awaiting route/resume
+	MMDS          *MMDSProxyPolicy `json:"mmds,omitempty"`
+}
+
+// MMDSProxyPolicy is conductor-owned external-proxy configuration delivered in
+// Hello. Services maps an operator name to its validated unix:// endpoint.
+type MMDSProxyPolicy struct {
+	Enabled  bool              `json:"enabled"`
+	Listen   string            `json:"listen,omitempty"`
+	Services map[string]string `json:"services,omitempty"`
 }
 
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
@@ -151,7 +177,7 @@ type Hello struct {
 type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
-	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
+	Mmds      bool       `json:"mmds,omitempty"`      // trusted proxy requests MMDS routes/values + policy projection
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
 	// string so a node owner can embed a source fingerprint and reject incremental
@@ -218,6 +244,23 @@ func WriteMsg(w io.Writer, m *Msg) error {
 	}
 	_, err = w.Write(b)
 	return err
+}
+
+// ValidateMessage applies the exact encoded frame limit without writing. It is
+// used at admission boundaries to avoid accepting an object whose route upsert
+// can never be published.
+func ValidateMessage(m *Msg) error {
+	if err := validateMessageLimits(m); err != nil {
+		return err
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if len(b) > maxFrame {
+		return errors.New("routesync: message too large")
+	}
+	return nil
 }
 
 // ReadMsg reads one length-prefixed JSON frame.

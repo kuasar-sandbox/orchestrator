@@ -26,6 +26,12 @@ type Sink interface {
 	SetPolicy(p Policy)
 }
 
+// InvalidatableSink optionally fails sensitive synchronized state closed as
+// soon as a session ends, including during reconnect backoff.
+type InvalidatableSink interface {
+	InvalidateSync()
+}
+
 // WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
 // blocks until a wake is available or ctx is done (ok=false on ctx done). A nil
 // WakeSource means the subscriber issues no wakes (a pure route observer).
@@ -84,6 +90,9 @@ func (s *Subscriber) Run(ctx context.Context) {
 func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if invalidatable, ok := s.sink.(InvalidatableSink); ok {
+		defer invalidatable.InvalidateSync()
+	}
 
 	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(sctx, http.MethodPut, "http://orch"+PluginRegisterPath(s.id), pr)

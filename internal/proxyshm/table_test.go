@@ -841,6 +841,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl.Bookmark()
+	tbl.SetMMDSSynced(true)
 	view := NewWorkerView(tbl, nil, nil, time.Second)
 	assertSource := func(state string) {
 		t.Helper()
