@@ -53,9 +53,10 @@ make test-e2e                   # 启动真实 registry/router/placer + node-stu
 ```
 
 `orchestrator` 自身通过 `Component Release` workflow 独立发布 `vX.Y.Z`。发布件
-`orchestrator-vX.Y.Z-linux-<arch>.tar.gz` 包含节点与集群控制面二进制、部署模板、
+`orchestrator-vX.Y.Z-linux-x86_64.tar.gz` 包含节点与集群控制面二进制、部署模板、
 本模块文档和 cluster stub e2e 入口。平台聚合版本 `release-vX.Y.Z` 由 `platform`
-仓选择各组件版本并发布,不从 `orchestrator/main` 推导组件组合。
+仓选择各组件版本并发布,不从 `orchestrator/main` 推导组件组合。当前 Release
+只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
 和 guest-runtime 构建出的 `sandbox-runtime.bundle`。
