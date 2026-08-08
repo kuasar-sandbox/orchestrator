@@ -1968,15 +1968,13 @@ func appendCheckpointPolicyArgs(args []string, policy sandboxcfg.CheckpointPolic
 // promote publishes a local checkpoint graph without booting it. The configured
 // publisher is either manifest storage or a named ref location.
 func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
-	args := []string{"upload-snapshot", "--quiet"}
+	args := []string{"upload-snapshot", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		uri, err := o.cfg.Checkpoint.RefLocationURI(sb.ID)
 		if err != nil {
 			return "", fmt.Errorf("orch: promote %s: %w", sb.ID, err)
 		}
 		args = append(args, "--to-ref-location", sb.ID+"="+uri)
-	} else {
-		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
 	}
 	args = append(args, localPath)
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
