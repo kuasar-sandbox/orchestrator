@@ -18,7 +18,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
   分别由 [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 与
   [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪。
 
-是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的北向入口、节点
+是 [kuasar-sandbox/platform](https://github.com/kuasar-sandbox/platform) 平台的北向入口、节点
 资源仲裁与集群编排器,独立演进。两类沙箱 profile:**e2b**(guest 内 envd,完整数据面)与
 **bare**(无 envd,仅 floatingip)。全部纯 Go,`CGO_ENABLED=0`,无 gRPC/protobuf(协议为
 帧化 JSON over h2c)。
@@ -54,8 +54,8 @@ make test-e2e                   # 启动真实 registry/router/placer + node-stu
 
 `orchestrator` 自身通过 `Component Release` workflow 独立发布 `vX.Y.Z`。发布件
 `orchestrator-vX.Y.Z-linux-<arch>.tar.gz` 包含节点与集群控制面二进制、部署模板、
-系统文档和跨仓测试入口。平台聚合版本 `release-vX.Y.Z` 使用另一条工作流和版本映射,
-不从 `orchestrator/main` 推导组件组合。
+本模块文档和 cluster stub e2e 入口。平台聚合版本 `release-vX.Y.Z` 由 `platform`
+仓选择各组件版本并发布,不从 `orchestrator/main` 推导组件组合。
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
 和 guest-runtime 构建出的 `sandbox-runtime.bundle`。

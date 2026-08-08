@@ -401,4 +401,4 @@ code interpreter、forward 业务端口或用户应用 health 已监听;业务 b
 - [node.md](node.md) — conductor 控制面、`proxy.mode` 装配、生命周期与密钥模型。
 - [cluster-router.md](cluster-router.md) — 集群入口如何转发到本节点数据面。
 - `connector/docs/vswitch.md` — mgmt-extract / MMDS VIP 转换。
-- `orchestrator/release-builder/docs/deployment.md` — 部署拓扑、端口与故障域。
+- `platform/docs/deployment.md` — 部署拓扑、端口与故障域。
