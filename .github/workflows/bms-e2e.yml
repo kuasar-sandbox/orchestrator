@@ -45,7 +45,7 @@ jobs:
        (!github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository)) &&
       (github.event_name != 'workflow_dispatch' ||
        inputs.confirm == (inputs.run_mode == 'working-set-perf' && 'run-working-set-perf' || 'run-full-e2e'))
-    uses: kuasar-sandbox/platform/.github/workflows/bms-e2e.yml@c0dbbbf1e0977257cb8e4eb5808deacbc69254e3
+    uses: kuasar-sandbox/platform/.github/workflows/bms-e2e.yml@51d424aca1b9fab8687ce917228a6542d6ce9832
     with:
       mode: source
       candidate_repository: ${{ github.repository }}
