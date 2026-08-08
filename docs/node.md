@@ -1754,7 +1754,7 @@ ExecAccessToken 签发,`service=exec` CONNECT 以及 guest 命令执行.该结�
 native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等其它阶段已一并验收.
 
 跨仓 e2e 集中在 umbrella
-`orchestrator/release-builder/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
+`platform/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
 sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自跳过
 (`REQUIRE_*=1` 改为硬失败):
 
@@ -1771,7 +1771,7 @@ sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入,key 分发,Reserve→READY→数据面转发,稳定 SandboxID 的 CmdConnect/ExecSession,KAT 拒绝和 exec 两跳 tunnel,稳定/Node SandboxID 转换,route cache,build_register,孤儿 route 清理,节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由
-`orchestrator/release-builder` umbrella 目录的 e2e 脚本聚合执行。
+`platform` umbrella 仓的 e2e 脚本聚合执行。
 
 ## 17. See Also
 
@@ -1790,5 +1790,5 @@ sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自
   `FLATTEN_REGISTRY_*`
 - `accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)
-- `orchestrator/release-builder/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
-- `orchestrator/release-builder/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示
+- `platform/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
+- `platform/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示
