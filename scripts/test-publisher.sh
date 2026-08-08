@@ -2,15 +2,15 @@
 
 set -euo pipefail
 
-[ "$#" -eq 4 ] || {
-  echo "usage: test-publisher.sh <publisher> <bundle> <repository> <tag>" >&2
+[ "$#" -eq 5 ] || {
+  echo "usage: test-publisher.sh <publisher> <bundle> <repository> <tag> <commit>" >&2
   exit 2
 }
 PUBLISHER="$1"
 BUNDLE="$2"
 REPOSITORY="$3"
 TAG="$4"
-COMMIT="$(jq -er '.commit // .mapping.commit' "$BUNDLE/release.json")"
+COMMIT="$5"
 EXPECTED_PRERELEASE=false
 EXPECTED_LATEST=true
 if [[ "$TAG" = *-preview.* ]]; then
@@ -35,13 +35,14 @@ not_found() {
   exit 1
 }
 
-release_json() {
-  local assets='[]'
+release_state() {
+  local assets='[]' draft prerelease
   [ ! -s "$state/assets.ndjson" ] || assets="$(jq -s '.' "$state/assets.ndjson")"
-  local draft prerelease
   draft="$(cat "$state/release-draft")"
   prerelease="$(cat "$state/release-prerelease" 2>/dev/null || printf false)"
-  jq -cn --arg tag "$tag" --arg commit "$commit" --argjson draft "$draft"     --argjson prerelease "$prerelease" --argjson assets "$assets"     '{id: 77, tag_name: $tag, target_commitish: $commit, draft: $draft,
+  jq -cn --arg tag "$tag" --arg commit "$commit" --argjson draft "$draft" \
+    --argjson prerelease "$prerelease" --argjson assets "$assets" \
+    '{id: 77, tag_name: $tag, target_commitish: $commit, draft: $draft,
       prerelease: $prerelease, assets: $assets}'
 }
 
@@ -87,7 +88,7 @@ if [ "${1:-}" = api ]; then
     "GET repos/$repository/releases/tags/$tag")
       [ -f "$state/release-draft" ] || not_found
       [ "$(cat "$state/release-draft")" = false ] || not_found
-      emit "$(release_json)" "$filter"
+      emit "$(release_state)" "$filter"
       ;;
     "GET repos/$repository/releases?per_page=100")
       if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
@@ -96,7 +97,7 @@ if [ "${1:-}" = api ]; then
           printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
           json='[]'
         else
-          json="[$(release_json)]"
+          json="[$(release_state)]"
         fi
       else
         json='[]'
@@ -115,7 +116,7 @@ if [ "${1:-}" = api ]; then
       jq -r '.prerelease' "$request" > "$state/release-prerelease"
       jq -er '.make_latest' "$request" > "$state/make-latest"
       printf 'false\n' > "$state/release-draft"
-      emit "$(release_json)" "$filter"
+      emit "$(release_state)" "$filter"
       ;;
     *)
       echo "fake gh: unsupported API call: $method $endpoint" >&2
@@ -136,7 +137,11 @@ if [ "${1:-}" = release ] && [ "${2:-}" = create ]; then
       --draft|--verify-tag) shift ;;
       *)
         file="$1"
-        jq -cn --arg name "$(basename "$file")"           --arg digest "sha256:$(sha256sum "$file" | awk '{print $1}')"           --argjson size "$(stat -c '%s' "$file")"           '{name: $name, digest: $digest, size: $size, state: "uploaded"}'           >> "$state/assets.ndjson"
+        jq -cn --arg name "$(basename "$file")" \
+          --arg digest "sha256:$(sha256sum "$file" | awk '{print $1}')" \
+          --argjson size "$(stat -c '%s' "$file")" \
+          '{name: $name, digest: $digest, size: $size, state: "uploaded"}' \
+          >> "$state/assets.ndjson"
         shift
         ;;
     esac
@@ -165,37 +170,26 @@ common_env=(
   FAKE_GH_COMMIT="$COMMIT"
 )
 
-env "${common_env[@]}" "$PUBLISHER" check "$TAG"
-if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1   "$PUBLISHER" publish "$BUNDLE" >/dev/null 2>&1; then
+env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
+if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1 \
+  "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" >/dev/null 2>&1; then
   echo "test-publisher: interrupted draft creation unexpectedly succeeded" >&2
   exit 1
 fi
-[ "$(cat "$TMP/state/release-draft")" = true ] || {
-  echo "test-publisher: interrupted publish did not leave a draft" >&2
-  exit 1
-}
-env "${common_env[@]}" "$PUBLISHER" publish "$BUNDLE"
-[ "$(cat "$TMP/state/delete-count")" = 1 ] || {
-  echo "test-publisher: retry did not replace the stale draft by release ID" >&2
-  exit 1
-}
-[ "$(cat "$TMP/state/tag")" = "$COMMIT" ] || {
-  echo "test-publisher: tag does not point to the bundle commit" >&2
-  exit 1
-}
-[ "$(cat "$TMP/state/release-draft")" = false ] || {
-  echo "test-publisher: release remains a draft" >&2
-  exit 1
-}
-[ "$(cat "$TMP/state/release-prerelease")" = "$EXPECTED_PRERELEASE" ] || {
-  echo "test-publisher: release has the wrong prerelease state" >&2
-  exit 1
-}
-[ "$(cat "$TMP/state/make-latest")" = "$EXPECTED_LATEST" ] || {
-  echo "test-publisher: release has the wrong latest policy" >&2
-  exit 1
-}
-if env "${common_env[@]}" "$PUBLISHER" check "$TAG" >/dev/null 2>&1; then
+[ "$(cat "$TMP/state/release-draft")" = true ] \
+  || { echo "test-publisher: interrupted publish did not leave a draft" >&2; exit 1; }
+env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE"
+[ "$(cat "$TMP/state/delete-count")" = 1 ] \
+  || { echo "test-publisher: retry did not replace the stale draft" >&2; exit 1; }
+[ "$(cat "$TMP/state/tag")" = "$COMMIT" ] \
+  || { echo "test-publisher: tag points to the wrong commit" >&2; exit 1; }
+[ "$(cat "$TMP/state/release-draft")" = false ] \
+  || { echo "test-publisher: release remains a draft" >&2; exit 1; }
+[ "$(cat "$TMP/state/release-prerelease")" = "$EXPECTED_PRERELEASE" ] \
+  || { echo "test-publisher: release has the wrong prerelease state" >&2; exit 1; }
+[ "$(cat "$TMP/state/make-latest")" = "$EXPECTED_LATEST" ] \
+  || { echo "test-publisher: release has the wrong latest policy" >&2; exit 1; }
+if env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64 >/dev/null 2>&1; then
   echo "test-publisher: preflight accepted an already published release" >&2
   exit 1
 fi

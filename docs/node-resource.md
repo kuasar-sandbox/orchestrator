@@ -661,7 +661,7 @@ controller (node-ctl conductor serve resource_listen)
 ### 9.1 agent-intermittent 模型
 
 agent 应用的运行剖面输入规范(实测在
-`orchestrator/release-builder/docs/perf.md`):
+`platform/docs/perf.md`):
 
 ```
 节点参数:
@@ -743,5 +743,5 @@ cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
   `allocatable_at_snapshot` 派生
 - `accelerator/docs/cache.md` / `accelerator/docs/store.md` —— 资源预留计入 host_reserved
   的两个组件
-- `orchestrator/release-builder/docs/perf.md` —— agent-intermittent 工作负载模型实测、密度调优
-- `orchestrator/release-builder/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位
+- `platform/docs/perf.md` —— agent-intermittent 工作负载模型实测、密度调优
+- `platform/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位

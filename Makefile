@@ -94,20 +94,12 @@ VERSION ?= v0.1.0
 
 release: build
 	@mkdir -p build
-	@{ \
-		printf 'repository\trequested_ref\tresolved_sha\trole\n'; \
-		printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tdependency\n' "$$(git -C ../accelerator rev-parse HEAD)"; \
-		printf 'kuasar-sandbox/connector\tHEAD\t%s\tdependency\n' "$$(git -C ../connector rev-parse HEAD)"; \
-		printf 'kuasar-sandbox/orchestrator\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)"; \
-		printf 'kuasar-sandbox/sandboxer\tHEAD\t%s\tdependency\n' "$$(git -C ../sandboxer rev-parse HEAD)"; \
-	} > build/revisions.tsv
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
-		bash release-builder/scripts/component-release.sh \
-		package "$(VERSION)" "$(TARGET_ARCH)" build/revisions.tsv build/release-bundle
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
 
 test-release:
-	bash release-builder/scripts/test-component-release.sh
+	bash scripts/test-release.sh
 
 help:
 	@echo "orchestrator. Targets:"
