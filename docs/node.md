@@ -1753,25 +1753,28 @@ Native exec 的真实 microVM 特性用例分别覆盖 standalone 和 cluster �
 ExecAccessToken 签发,`service=exec` CONNECT 以及 guest 命令执行.该结论只对上述
 native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等其它阶段已一并验收.
 
-跨仓 e2e 集中在 umbrella
-`platform/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
-sandbox-runtime.bundle 等),均已注册为 umbrella make 目标,缺前置则自跳过
-(`REQUIRE_*=1` 改为硬失败):
+编排特性的 E2E 与实现一起维护在 `orchestrator/test/e2e/`。轻量 cluster stub 与需要
+vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品的真实 microVM
+用例使用同一个 `run_all.sh`。本仓直接运行时通过 `BIN` 指向 platform 组装的二进制目录;
+组件 PR 的 BMS 则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
+跳过,完整门禁设置 `REQUIRE_*=1` 后硬失败。
 
-| 脚本 | 覆盖 | make 目标 |
-|---|---|---|
-| `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
-| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;另以 Build Register initial routes/secrets 驱动真实 builder guest GET,验证 Trigger 不可覆盖、终态 routes/value cleanup、日志/DB/image 隔离 | `test-e2e-run-builder` |
-| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume;精确断言 all-unset argv,再覆盖 node/Create metadata+header/Pause body+header/reaper 的逐字段 policy,并验证 W 与 guest 状态可本地恢复;Builder argv 保持无新 flag | `test-e2e-execute` |
-| `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑,真实 guest 覆盖 internal static、initial/unresolved/PUT/rotate/DELETE secret、local UDS service 及 plaintext backstop | `test-e2e-mmds-routes-internal` |
-| `e2e_mmds_routes_external.sh` | 复用 external proxy 拓扑覆盖同一合同;proxy restart/full resync、rotation、conductor-only service registry(`proxy.yaml` 无 services) | `test-e2e-mmds-routes-external` |
-| `e2e_sandbox_disks.sh` | root + 两类 data disk 的 snapshot/restore;第二代 `merge_ref=false` W 明确保留 memory parent,同时断言 root/data local parent 仍合并且 W 可恢复 | umbrella `run_all.sh` |
-| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
-| `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入,key 分发,Reserve→READY→数据面转发,稳定 SandboxID 的 CmdConnect/ExecSession,KAT 拒绝和 exec 两跳 tunnel,稳定/Node SandboxID 转换,route cache,build_register,孤儿 route 清理,节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
+| 脚本 | 覆盖 |
+|---|---|
+| `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
+| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;Build Register MMDS、终态 cleanup、日志/DB/image 隔离 |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume 与恢复策略 |
+| `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑覆盖 internal static、secret 生命周期与 local UDS service |
+| `e2e_mmds_routes_external.sh` | 复用 external proxy 拓扑覆盖同一合同及 full resync/fail-closed 恢复 |
+| `e2e_orchestrator_proxy.sh` | external proxy master/worker、路由同步、数据面鉴权、auto-resume 与 CONNECT relay |
+| `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,覆盖 node-link、Reserve、路由、稳定 SandboxID、ExecSession 与成员变更 |
+| `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry 和 node-link redirect |
+| `e2e_density.sh` | 节点资源准入、回收与密度行为 |
+| `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
 
-本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由
-`platform` umbrella 仓的 e2e 脚本聚合执行。
+`make test-e2e` 即执行 `test/e2e/run_all.sh`;platform 只提供统一环境、聚合入口及真正跨组件
+组合本身的用例,不复制上述脚本。
 
 ## 17. See Also
 

@@ -32,6 +32,9 @@ endif
 GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
+E2E_BIN        ?= $(abspath ../platform/bin/$(TARGET_ARCH))
+ZOT_BIN        ?= zot
+VGW_BIN        ?= versitygw
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -83,9 +86,11 @@ bench:
 clean:
 	rm -rf bin build
 
-# Self-contained cluster e2e: real registry/router/placer code with a node-link
-# stub. No KVM, systemd, root, or microVM artifacts required.
-test-e2e: build test-e2e-cluster-stub
+# Orchestrator owns both its self-contained cluster stub and the full node,
+# proxy, builder, and cluster integration cases. The latter use the assembled
+# platform binary set supplied by the platform BMS.
+test-e2e:
+	BIN="$(E2E_BIN)" ZOT_BIN="$(ZOT_BIN)" VGW_BIN="$(VGW_BIN)" bash test/e2e/run_all.sh
 
 test-e2e-cluster-stub:
 	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
@@ -108,7 +113,7 @@ help:
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e                   run real-process cluster e2e with node-stub-ctl"
+	@echo "  test-e2e                   run the orchestrator-owned E2E suite with E2E_BIN"
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

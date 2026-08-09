@@ -70,8 +70,8 @@ validate_archive_paths() {
   fi
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy|docs|test)\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/, docs/, or test/"
+    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// { exit 1 }
+  ' "$listing" || fail "$archive contains a file outside bin/ or deploy/"
 }
 
 validate_bundle() {
@@ -109,14 +109,11 @@ validate_bundle() {
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
   done
-  for file in docs/orchestrator.md docs/node.md docs/node-proxy.md \
-    docs/node-resource.md docs/cluster.md docs/cluster-router.md \
-    docs/cluster-placer.md deploy/node-ctl.service deploy/node-proxy.service \
+  for file in deploy/node-ctl.service deploy/node-proxy.service \
     deploy/cluster-registry.service deploy/cluster-router.service \
     deploy/cluster-placer.service deploy/conductor.example.yaml \
     deploy/proxy.example.yaml deploy/registry.example.yaml \
-    deploy/router.example.yaml deploy/placer.example.yaml \
-    test/orchestrator/e2e_cluster_stub.sh; do
+    deploy/router.example.yaml deploy/placer.example.yaml; do
     [ -f "$extract/$file" ] || fail "$archive is missing $file"
   done
 }
@@ -145,13 +142,6 @@ package_release() {
   check_go_binary "$STAGE/bin/cluster-ctl"
   check_go_binary "$STAGE/bin/node-stub-ctl"
   check_go_binary "$STAGE/bin/e2b-key-ctl"
-  copy_file README.md docs/orchestrator.md
-  copy_file docs/node.md docs/node.md
-  copy_file docs/node-proxy.md docs/node-proxy.md
-  copy_file docs/node-resource.md docs/node-resource.md
-  copy_file docs/cluster.md docs/cluster.md
-  copy_file docs/cluster-router.md docs/cluster-router.md
-  copy_file docs/cluster-placer.md docs/cluster-placer.md
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
   copy_file deploy/cluster-registry.service deploy/cluster-registry.service
@@ -162,7 +152,6 @@ package_release() {
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml
-  copy_root_executable test/e2e/e2e_cluster_stub.sh test/orchestrator/e2e_cluster_stub.sh
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
@@ -171,7 +160,7 @@ package_release() {
   cat > "$output/release-notes.md" <<EOF
 $NAME $version for Linux $arch.
 
-Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. GitHub provides the source archives for this tag automatically.
+Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
 EOF
   validate_bundle "$version" "$arch" "$output"
   echo "==> prepared $output for $version"
