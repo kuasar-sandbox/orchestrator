@@ -11,8 +11,14 @@ fail() {
   exit 1
 }
 
-[ "$(git -C "$ROOT" ls-files -s -- test/e2e/run_all.sh | awk '{print $1}')" = 100755 ] \
-  || fail "test/e2e/run_all.sh is not executable in the Git index"
+for entrypoint in test/e2e/e2e_cluster_real.sh test/e2e/e2e_cluster_stub.sh \
+  test/e2e/e2e_density.sh test/e2e/e2e_execute.sh \
+  test/e2e/e2e_orchestrator.sh test/e2e/e2e_orchestrator_proxy.sh \
+  test/e2e/e2e_run_builder.sh test/e2e/e2e_runtask.sh \
+  test/e2e/e2e_sandbox_cold_target.sh test/e2e/run_all.sh; do
+  [ "$(git -C "$ROOT" ls-files -s -- "$entrypoint" | awk '{print $1}')" = 100755 ] \
+    || fail "$entrypoint is not executable in the Git index"
+done
 
 mkdir -p "$TMP/bin" "$TMP/src"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
