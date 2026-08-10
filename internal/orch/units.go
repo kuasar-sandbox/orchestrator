@@ -67,12 +67,11 @@ Restart=no
 KillMode=control-group
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
-# Delegate the cgroup controllers to the unit so sandbox-ctl --cgroup-adopt can
-# write the sandbox's resource limits (cpu.max/memory.max) into this cgroup.
+# Keep the unit root empty for cgroup-v2 domain controllers. node-ctl and,
+# after exec, sandbox-ctl stay in ctl/; node-ctl creates vmm/ for CH.
 Delegate=yes
-# --cgroup-adopt (in the launch spec) makes THIS unit's cgroup the sandbox resource
-# cgroup: sandbox-ctl + cloud-hypervisor share it, sentinel manages it in place, and
-# KillMode=control-group SIGKILLs the whole group on StopUnit.
+DelegateSubgroup=ctl
+# KillMode=control-group recursively covers both delegated subgroups.
 `, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 

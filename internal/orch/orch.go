@@ -1565,7 +1565,6 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		"--config", o.sandboxConfigPath(sb),
 		"--manifest-config", o.cfg.ManifestConfig,
 		"--run-root", o.cfg.Paths.RunRoot,
-		"--cgroup-adopt",
 		// Route the sandbox's stdio + kernel dmesg to journald from this run-id
 		// unit. App stdout/stderr is tagged "sandbox" with KUASAR_SANDBOX_ID; guest
 		// dmesg is tagged "console" for host-only diagnostics.
@@ -1854,9 +1853,9 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 }
 
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
-	// The sandbox runs in its systemd unit's own cgroup (sandbox-ctl --cgroup-adopt),
-	// and the unit is KillMode=control-group, so StopUnit SIGKILLs every straggler
-	// (cloud-hypervisor included). No separate cgroup drain/rmdir is needed.
+	// The runner unit owns both ctl/ and vmm/ and uses KillMode=control-group,
+	// so StopUnit kills every straggler (cloud-hypervisor included). No separate
+	// cgroup drain/rmdir is needed.
 	var cleanupErr error
 	if sb.RunID != "" {
 		unit := o.runnerUnit(sb.RunID)

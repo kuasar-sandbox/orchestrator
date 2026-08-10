@@ -18,9 +18,9 @@ import (
 
 // launchTask locks+writes the pidfile, fetches the LaunchSpec for
 // "sandbox:<sid>" over the config-socket, applies its workdir/env, and
-// exec-replaces into the target (which inherits this PID and the unit cgroup).
-func launchTask(socket, configID, pidfile string, ready *os.File) error {
-	return launchTaskWith(socket, configID, pidfile, ready, taskLaunchOps{
+// exec-replaces into the target, passing the node-owned VMM cgroup capability.
+func launchTask(socket, configID, pidfile string, ready, vmmCgroup *os.File) error {
+	return launchTaskWith(socket, configID, pidfile, ready, vmmCgroup, taskLaunchOps{
 		lockPidfile: lockPidfile,
 		fetchSpec:   configsock.FetchLaunchSpec,
 		chdir:       os.Chdir,
@@ -35,7 +35,7 @@ type taskLaunchOps struct {
 	exec        func(string, []string, []string) error
 }
 
-func launchTaskWith(socket, configID, pidfile string, ready *os.File, ops taskLaunchOps) error {
+func launchTaskWith(socket, configID, pidfile string, ready, vmmCgroup *os.File, ops taskLaunchOps) error {
 	if pidfile != "" {
 		if err := ops.lockPidfile(pidfile); err != nil {
 			return err
@@ -48,12 +48,21 @@ func launchTaskWith(socket, configID, pidfile string, ready *os.File, ops taskLa
 	if spec.Exec == "" {
 		return fmt.Errorf("launch spec has no exec")
 	}
+	if vmmCgroup == nil || vmmCgroup.Fd() < 3 {
+		return fmt.Errorf("launch task has no inheritable vmm cgroup descriptor")
+	}
+	if arg, ok := launchSpecCgroupArg(spec.Args); ok {
+		return fmt.Errorf("launch spec must not set node-owned cgroup argument %q", arg)
+	}
+	if len(spec.Args) == 0 || spec.Args[0] != "run" {
+		return fmt.Errorf("launch spec must invoke sandbox-ctl run")
+	}
 	if spec.Workdir != "" {
 		if err := ops.chdir(spec.Workdir); err != nil {
 			return fmt.Errorf("chdir %s: %w", spec.Workdir, err)
 		}
 	}
-	argv := append([]string{spec.Exec}, spec.Args...)
+	argv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
 	if ready != nil {
 		fd := int(ready.Fd())
 		if fd < 3 {
@@ -61,10 +70,14 @@ func launchTaskWith(socket, configID, pidfile string, ready *os.File, ops taskLa
 		}
 		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
 	}
+	argv = append(argv, spec.Args[1:]...)
 	env := taskEnv(spec.Env)
+	// These are the last fallible operations before exec. If exec itself fails,
+	// runAssignedSandbox's defers close the now-inheritable descriptors.
+	if err := clearCloseOnExec(vmmCgroup); err != nil {
+		return fmt.Errorf("make vmm cgroup descriptor inheritable: %w", err)
+	}
 	if ready != nil {
-		// This is the last fallible operation before exec. If exec itself fails,
-		// runAssignedSandbox's defer closes the now-inheritable descriptor.
 		if err := clearCloseOnExec(ready); err != nil {
 			return err
 		}
@@ -72,13 +85,23 @@ func launchTaskWith(socket, configID, pidfile string, ready *os.File, ops taskLa
 	return ops.exec(spec.Exec, argv, env)
 }
 
+func launchSpecCgroupArg(args []string) (string, bool) {
+	for _, arg := range args {
+		if arg == "--cgroup-path" || strings.HasPrefix(arg, "--cgroup-path=") ||
+			arg == "--cgroup-adopt" || strings.HasPrefix(arg, "--cgroup-adopt=") {
+			return arg, true
+		}
+	}
+	return "", false
+}
+
 func clearCloseOnExec(f *os.File) error {
 	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
 	if err != nil {
-		return fmt.Errorf("get readiness fd flags: %w", err)
+		return fmt.Errorf("get descriptor flags: %w", err)
 	}
 	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
-		return fmt.Errorf("clear readiness fd close-on-exec: %w", err)
+		return fmt.Errorf("clear descriptor close-on-exec: %w", err)
 	}
 	return nil
 }
