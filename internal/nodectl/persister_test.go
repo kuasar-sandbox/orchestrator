@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -87,5 +88,38 @@ func TestPersisterAtomicWrite(t *testing.T) {
 	if loaded.NodeBudget.MemoryBytes != s2.NodeBudget.MemoryBytes {
 		t.Errorf("got = %d, want %d (latest)",
 			loaded.NodeBudget.MemoryBytes, s2.NodeBudget.MemoryBytes)
+	}
+}
+
+func TestPersisterConcurrentFlushesShareOneAtomicWriter(t *testing.T) {
+	p := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
+	const workers = 32
+	const flushesPerWorker = 20
+
+	start := make(chan struct{})
+	errs := make(chan error, workers*flushesPerWorker)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			state := makeState(uint64(100+worker)<<30, 16<<30)
+			<-start
+			for flush := 0; flush < flushesPerWorker; flush++ {
+				if err := p.Flush(state); err != nil {
+					errs <- err
+				}
+			}
+		}(worker)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent Flush failed: %v", err)
+	}
+	if _, err := p.Load(); err != nil {
+		t.Fatalf("final state is not valid JSON: %v", err)
 	}
 }
