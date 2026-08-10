@@ -559,6 +559,7 @@ RUN chmod +x /usr/bin/ionice /usr/bin/nice \
  && mkdir -p /home/user \
  && chown user:user /home/user \
  && id user >/dev/null
+CMD ["sleep", "86400"]
 EOF
 docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
 TAGS+=("$REF")
@@ -702,7 +703,7 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl"}')
+code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":2,"memoryMB":8192}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)
@@ -727,6 +728,104 @@ for ((i=0; i<BUILD_SNAPSHOT_COUNT; i++)); do
     assert_snapshot_has_no_policy_flags "$i" || fail "builder snapshot received Pause-only policy flags"
 done
 echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
+
+# ---- low-allocatable runner cgroup isolation regression --------------------
+# A snapshot restore preserves max(requested, snapshot-time allocatable), so the
+# snapshot template above cannot reproduce a 256 MiB startup floor. Build the
+# same OCI input as an image template (no startCmd), then cold boot it with the
+# complete 8 GiB / 256 MiB resource declaration from issue #152.
+code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":8192}')
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
+LOW_TID=$(json_field "$WORK/resp.body" templateID)
+LOW_BID=$(json_field "$WORK/resp.body" buildID)
+code=$(req POST "/v2/templates/$LOW_TID/builds/$LOW_BID" "$AK" \
+    "{\"fromImage\":\"$GUEST_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup trigger=$code"; }
+LOW_TEMPLATE=""
+for _ in $(seq 1 120); do
+    req GET "/templates/$LOW_TID/builds/$LOW_BID/status" "$AK" >/dev/null
+    st=$(json_field "$WORK/resp.body" status)
+    case "$st" in
+        ready) LOW_TEMPLATE=$(json_field "$WORK/resp.body" templateID); break;;
+        error) cat "$WORK/resp.body"; fail "low-cgroup build error";;
+    esac
+    sleep 1
+done
+[ -n "$LOW_TEMPLATE" ] || fail "low-cgroup image build did not become ready"
+case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_TEMPLATE (want e2b-img-...)";; esac
+
+LOW_CREATE_BODY=$(python3 - "$LOW_TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 120,
+    "metadata": {
+        "kuasar-sandbox.resource": json.dumps({
+            "capacity": {"cpu": 2, "memory": "8GiB"},
+            "allocatable": {"cpu": 2, "memory": "256MiB"},
+        }),
+    },
+}))
+PY
+)
+LOW_START_MS=$(date +%s%3N)
+code=$(req POST /sandboxes "$AK" "$LOW_CREATE_BODY")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "low-allocatable create=$code"; }
+LOW_SID=$(json_field "$WORK/resp.body" sandboxID)
+LOW_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+code=$(DP_MAX_TIME=65 dp "49983-$LOW_SID" /health "$LOW_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } || {
+    journalctl KUASAR_SANDBOX_ID="$LOW_SID" --no-pager -n 100 2>/dev/null || true
+    fail "low-allocatable health=$code"
+}
+LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
+[ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable startup took ${LOW_ELAPSED_MS}ms"
+wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable sandbox not running"
+LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
+[ -n "$LOW_RUN_ID" ] || fail "low-allocatable sandbox has no run_id"
+LOW_UNIT="sandbox-runner@$LOW_RUN_ID.service"
+LOW_CG=$(systemctl show "$LOW_UNIT" -p ControlGroup --value)
+LOW_CTL_PID=$(systemctl show "$LOW_UNIT" -p MainPID --value)
+[ -n "$LOW_CG" ] && [ "$LOW_CG" != "/" ] || fail "runner ControlGroup is invalid: $LOW_CG"
+[ "$LOW_CTL_PID" -gt 1 ] || fail "runner MainPID is invalid: $LOW_CTL_PID"
+LOW_CTL_CG=$(awk -F: '$1 == "0" {print $3}' "/proc/$LOW_CTL_PID/cgroup")
+[ "$LOW_CTL_CG" = "$LOW_CG/ctl" ] || fail "sandbox-ctl cgroup=$LOW_CTL_CG, want $LOW_CG/ctl"
+LOW_VMM_PROCS="/sys/fs/cgroup$LOW_CG/vmm/cgroup.procs"
+mapfile -t LOW_VMM_PIDS < "$LOW_VMM_PROCS"
+[ "${#LOW_VMM_PIDS[@]}" -gt 0 ] || fail "vmm cgroup has no process"
+LOW_VISIBLE_VMM_PIDS=0
+for pid in "${LOW_VMM_PIDS[@]}"; do
+    # A nested PID namespace may render an otherwise populated cgroup entry as
+    # zero. Validate every process visible to this test namespace.
+    [ "$pid" = 0 ] && continue
+    [ "$(basename "$(readlink -f "/proc/$pid/exe")")" = "cloud-hypervisor" ] \
+        || fail "vmm cgroup contains non-VMM pid=$pid"
+    LOW_VISIBLE_VMM_PIDS=$((LOW_VISIBLE_VMM_PIDS + 1))
+done
+[ "$LOW_VISIBLE_VMM_PIDS" -gt 0 ] || fail "vmm cgroup has no visible Cloud Hypervisor process"
+[ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
+    || fail "vmm memory.high is not 224MiB"
+[ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
+    || fail "vmm memory.max does not reflect 8GiB capacity + 32MiB overhead"
+[ "$(<"/sys/fs/cgroup$LOW_CG/ctl/memory.high")" = "max" ] \
+    || fail "ctl memory.high is constrained"
+code=$(req DELETE "/sandboxes/$LOW_SID" "$AK"); [ "$code" = "204" ] || fail "delete low-allocatable sandbox=$code"
+for _ in $(seq 1 50); do
+    [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] && break
+    sleep 0.1
+done
+[ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
+LOW_JOURNAL="$WORK/low-allocatable.journal"
+journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
+! grep -Fq 'mem_report: read: resource temporarily unavailable' "$LOW_JOURNAL" \
+    || fail "low-allocatable run stalled mem_report"
+grep -Fq '[sandbox-ctl] CH exited code=0' "$LOW_JOURNAL" \
+    || fail "low-allocatable run did not shut down CH cleanly"
+# KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
+# Clean exit, bounded shutdown and cgroup removal are the lifecycle contract.
+! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
+    || fail "low-allocatable run escalated shutdown to SIGKILL"
+echo "==> PASS: 8GiB/256MiB runner ready in ${LOW_ELAPSED_MS}ms; ctl/vmm isolated and cleaned"
 
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they

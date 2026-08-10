@@ -587,8 +587,7 @@ func (c *Config) applyDefaults() {
 	}
 	def(&c.Sandbox.Resources.Memory, "2GiB")
 	// Sandbox.Resources.ControlSocket is intentionally NOT defaulted: empty =
-	// static cgroup mode (the sandbox adopts its systemd unit's own cgroup via
-	// --cgroup-adopt). The node-ctl resource controller is opt-in.
+	// static VMM cgroup mode. The node-ctl resource controller is opt-in.
 	def(&c.Sandbox.Network.Switch, "sw0")
 	def(&c.Sandbox.Network.Hostname, "sandbox")
 	if len(c.Sandbox.Network.DNS) == 0 {

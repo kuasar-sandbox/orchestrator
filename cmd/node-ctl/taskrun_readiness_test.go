@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -21,6 +22,10 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer readyR.Close()
+	vmmCgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	flags, err := unix.FcntlInt(readyW.Fd(), unix.F_GETFD, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +45,16 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 			t.Fatalf("%s: close-on-exec=%t, want %t", stage, got, want)
 		}
 	}
+	assertCgroupCloseOnExec := func(stage string, want bool) {
+		t.Helper()
+		flags, err := unix.FcntlInt(vmmCgroup.Fd(), unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatalf("%s: cgroup F_GETFD: %v", stage, err)
+		}
+		if got := flags&unix.FD_CLOEXEC != 0; got != want {
+			t.Fatalf("%s: cgroup close-on-exec=%t, want %t", stage, got, want)
+		}
+	}
 
 	runRoot := filepath.Join(t.TempDir(), "run")
 	runPidfile := filepath.Join(runRoot, "runs", "run-1.pid")
@@ -51,6 +66,11 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 				t.Fatalf("run pidfile = %q", path)
 			}
 			return nil
+		},
+		prepareCgroup: func() (*os.File, error) {
+			order = append(order, "prepare cgroup")
+			assertCgroupCloseOnExec("prepare cgroup", true)
+			return vmmCgroup, nil
 		},
 		waitAssignment: func(_ context.Context, socket, kind, runID string) (string, error) {
 			order = append(order, "assignment")
@@ -67,13 +87,13 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 			assertCloseOnExec("connect", true)
 			return readyW, nil
 		},
-		launchTask: func(socket, configID, pidfile string, ready *os.File) error {
+		launchTask: func(socket, configID, pidfile string, ready, cgroup *os.File) error {
 			order = append(order, "launch task")
 			if socket != "/config.sock" || configID != "sandbox:sid-1" ||
-				pidfile != filepath.Join(runRoot, "sid-1", "sid-1.pid") || ready != readyW {
-				t.Fatalf("launchTask(%q, %q, %q, %v)", socket, configID, pidfile, ready)
+				pidfile != filepath.Join(runRoot, "sid-1", "sid-1.pid") || ready != readyW || cgroup != vmmCgroup {
+				t.Fatalf("launchTask(%q, %q, %q, %v, %v)", socket, configID, pidfile, ready, cgroup)
 			}
-			return launchTaskWith(socket, configID, pidfile, ready, taskLaunchOps{
+			return launchTaskWith(socket, configID, pidfile, ready, cgroup, taskLaunchOps{
 				lockPidfile: func(string) error {
 					order = append(order, "sandbox pidfile")
 					assertCloseOnExec("sandbox pidfile", true)
@@ -82,6 +102,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 				fetchSpec: func(string, string) (*configsock.LaunchSpec, error) {
 					order = append(order, "fetch spec")
 					assertCloseOnExec("fetch spec", true)
+					assertCgroupCloseOnExec("fetch spec", true)
 					return &configsock.LaunchSpec{
 						Exec: "/bin/sandbox-ctl", Args: []string{"run"}, Workdir: "/work",
 					}, nil
@@ -89,6 +110,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 				chdir: func(path string) error {
 					order = append(order, "chdir")
 					assertCloseOnExec("chdir", true)
+					assertCgroupCloseOnExec("chdir", true)
 					if path != "/work" {
 						t.Fatalf("chdir = %q", path)
 					}
@@ -97,9 +119,11 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 				exec: func(path string, argv, _ []string) error {
 					order = append(order, "exec")
 					assertCloseOnExec("exec", false)
+					assertCgroupCloseOnExec("exec", false)
 					wantArg := "--ready-fd=" + strconv.Itoa(int(readyW.Fd()))
-					if path != "/bin/sandbox-ctl" || len(argv) != 3 || argv[2] != wantArg {
-						t.Fatalf("exec path=%q argv=%q, want final %q", path, argv, wantArg)
+					wantCgroup := "--cgroup-path=fd=" + strconv.Itoa(int(vmmCgroup.Fd()))
+					if path != "/bin/sandbox-ctl" || len(argv) != 4 || argv[2] != wantCgroup || argv[3] != wantArg {
+						t.Fatalf("exec path=%q argv=%q, want injected %q, %q", path, argv, wantCgroup, wantArg)
 					}
 					return execErr
 				},
@@ -110,7 +134,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 		t.Fatalf("runAssignedSandbox error = %v", err)
 	}
 	wantOrder := []string{
-		"run pidfile", "assignment", "connect ready", "launch task",
+		"run pidfile", "prepare cgroup", "assignment", "connect ready", "launch task",
 		"sandbox pidfile", "fetch spec", "chdir", "exec",
 	}
 	if !reflect.DeepEqual(order, wantOrder) {
@@ -127,15 +151,20 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer readyR.Close()
+	vmmCgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	wantErr := errors.New("fetch failed")
 	err = runAssignedSandbox("/run/sandbox/runs/run.pid", "/config.sock", "run", runSandboxOps{
-		lockPidfile: func(string) error { return nil },
+		lockPidfile:   func(string) error { return nil },
+		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
 		waitAssignment: func(context.Context, string, string, string) (string, error) {
 			return "sid", nil
 		},
 		connectReady: func(string) (*os.File, error) { return readyW, nil },
-		launchTask: func(socket, configID, pidfile string, ready *os.File) error {
-			return launchTaskWith(socket, configID, pidfile, ready, taskLaunchOps{
+		launchTask: func(socket, configID, pidfile string, ready, cgroup *os.File) error {
+			return launchTaskWith(socket, configID, pidfile, ready, cgroup, taskLaunchOps{
 				lockPidfile: func(string) error { return nil },
 				fetchSpec:   func(string, string) (*configsock.LaunchSpec, error) { return nil, wantErr },
 				chdir:       func(string) error { return nil },
@@ -178,5 +207,30 @@ func TestConnectReadinessSocketKeepsCloseOnExec(t *testing.T) {
 	}
 	if flags&unix.FD_CLOEXEC == 0 {
 		t.Fatal("connected readiness fd does not have FD_CLOEXEC")
+	}
+}
+
+func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
+	for _, arg := range []string{"--cgroup-path", "--cgroup-path=/foreign", "--cgroup-adopt", "--cgroup-adopt=false"} {
+		t.Run(arg, func(t *testing.T) {
+			vmm, err := os.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vmm.Close()
+			err = launchTaskWith("/config.sock", "sandbox:sid", "", nil, vmm, taskLaunchOps{
+				fetchSpec: func(string, string) (*configsock.LaunchSpec, error) {
+					return &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run", arg}}, nil
+				},
+				chdir: func(string) error { return nil },
+				exec: func(string, []string, []string) error {
+					t.Fatal("exec called")
+					return nil
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "must not set") {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }

@@ -42,6 +42,7 @@ func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
 	if !hasArgPair(spec.Args, "--restore", "manifest://"+key) {
 		t.Fatalf("restore arg missing from %v", spec.Args)
 	}
+	assertNoCgroupArgs(t, spec.Args)
 }
 
 func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
@@ -75,6 +76,16 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 	}
 	if hasArg(spec.Args, "--restore") {
 		t.Fatalf("cold boot should not carry restore args: %v", spec.Args)
+	}
+	assertNoCgroupArgs(t, spec.Args)
+}
+
+func assertNoCgroupArgs(t *testing.T, args []string) {
+	t.Helper()
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--cgroup-path") || strings.HasPrefix(arg, "--cgroup-adopt") {
+			t.Fatalf("LaunchSpec contains node-owned cgroup argument %q: %v", arg, args)
+		}
 	}
 }
 
