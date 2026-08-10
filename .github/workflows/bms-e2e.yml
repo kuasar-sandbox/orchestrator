@@ -3,30 +3,6 @@ name: BMS E2E
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-  push:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      confirm:
-        description: Type run-full-e2e
-        required: true
-        type: string
-      pull_request_number:
-        description: Pull request number
-        required: true
-        type: string
-      candidate_sha:
-        description: Exact PR integration commit
-        required: true
-        type: string
-      base_sha:
-        description: Integration commit first parent
-        required: true
-        type: string
-      head_sha:
-        description: Integration commit second parent
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -36,11 +12,5 @@ permissions:
 jobs:
   bms:
     uses: kuasar-sandbox/platform/.github/workflows/bms-entry.yml@main
-    with:
-      confirm: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm || '' }}
-      pull_request_number: ${{ github.event_name == 'workflow_dispatch' && inputs.pull_request_number || '0' }}
-      candidate_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || '' }}
-      base_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.base_sha || '' }}
-      head_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || '' }}
     secrets:
       KUASAR_CI_APP_PRIVATE_KEY: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
