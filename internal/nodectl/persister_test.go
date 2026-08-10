@@ -1,7 +1,9 @@
 package nodectl
 
 import (
+	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -160,6 +162,77 @@ func TestPersisterFlushSnapshotsConcurrentStateUpdates(t *testing.T) {
 	}()
 	close(start)
 	wg.Wait()
+}
+
+func TestStateSnapshotForPersistenceCopiesAllPersistedFields(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	state := NewState(1, 2, 3, 4, Watermarks{
+		OperationalMarginFactor: 0.01,
+		HighFactor:              0.02,
+		LowFactor:               0.03,
+		EmergencyFactor:         0.04,
+		StartupFactor:           0.05,
+	})
+	state.Lock()
+	state.NodeBudget = Resources{MemoryBytes: 10, CPUMilli: 11}
+	state.HostReserved = Resources{MemoryBytes: 12, CPUMilli: 13}
+	state.OperationalMargin = Resources{MemoryBytes: 14, CPUMilli: 15}
+	state.AllocatablePool = Resources{MemoryBytes: 16, CPUMilli: 17}
+	state.Version = 18
+	reservation := &Reservation{
+		Token:                  "token",
+		SandboxID:              "sandbox",
+		SandboxCtlPID:          19,
+		CgroupPath:             "/cgroup/sandbox",
+		Capacity:               Resources{MemoryBytes: 20, CPUMilli: 21},
+		Floor:                  Resources{MemoryBytes: 22, CPUMilli: 23},
+		AllocatableNowMem:      24,
+		EffectiveStartupBudget: 25,
+		Stage:                  StageSettled,
+		StageEnteredAt:         time.Unix(26, 0).UTC(),
+		LastHeartbeatAt:        time.Unix(27, 0).UTC(),
+		OOMCount:               28,
+		LastReportedRSS:        29,
+		Conn:                   serverConn,
+	}
+	state.Reservations[reservation.Token] = reservation
+	state.Unlock()
+
+	wantJSON, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := state.snapshotForPersistence()
+	gotJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("snapshot JSON differs from source:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+
+	snapshotReservation := snapshot.Reservations[reservation.Token]
+	if snapshotReservation == reservation {
+		t.Fatal("snapshot retained source reservation pointer")
+	}
+	if snapshotReservation.Conn != nil {
+		t.Fatal("snapshot retained live connection")
+	}
+
+	state.Lock()
+	state.NodeBudget.MemoryBytes = 100
+	reservation.SandboxID = "changed"
+	delete(state.Reservations, reservation.Token)
+	state.Unlock()
+	if snapshot.NodeBudget.MemoryBytes != 10 {
+		t.Fatalf("snapshot node budget changed with source: got %d, want 10", snapshot.NodeBudget.MemoryBytes)
+	}
+	if snapshot.Reservations[reservation.Token].SandboxID != "sandbox" {
+		t.Fatalf("snapshot reservation changed with source: got %q, want sandbox", snapshot.Reservations[reservation.Token].SandboxID)
+	}
 }
 
 func benchmarkState(reservationCount int) *State {
