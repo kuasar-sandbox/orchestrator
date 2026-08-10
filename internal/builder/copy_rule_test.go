@@ -1,6 +1,19 @@
 package builder
 
-import "testing"
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+)
 
 // TestCopyRule covers the COPY (src,dst)+context-entries → flatten extract
 // rule mapping for the single-source forms the e2b SDK emits (arcnames rooted
@@ -64,5 +77,64 @@ func TestNormalizeCopySrc(t *testing.T) {
 		if got := normalizeCopySrc(in); got != want {
 			t.Errorf("normalizeCopySrc(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestApplyCopyPreservesGuestStderr(t *testing.T) {
+	var contextArchive bytes.Buffer
+	gz := gzip.NewWriter(&contextArchive)
+	tw := tar.NewWriter(gz)
+	body := []byte("hello\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "hello.txt", Mode: 0o644, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(contextArchive.Bytes())
+	}))
+	defer server.Close()
+
+	workdir := t.TempDir()
+	sandboxCtl := filepath.Join(workdir, "sandbox-ctl")
+	const diagnostic = "tar: chown /opt/ct2/hello.txt -> 1000:1000: operation not permitted"
+	script := `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--stderr-to" ]; then
+        shift
+        printf '%s\n' '` + diagnostic + `' > "$1"
+        break
+    fi
+    shift
+done
+exit 1
+`
+	if err := os.WriteFile(sandboxCtl, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &buildPipeline{
+		ctx: context.Background(),
+		spec: &configsock.BuildSpec{
+			Workdir:  workdir,
+			Paths:    configsock.BuildPaths{SandboxCtl: sandboxCtl},
+			Timeouts: configsock.BuildTimeouts{PullSec: 5, StepSec: 5},
+		},
+	}
+	sb := &phaseSandbox{p: p, sid: "copy-test", runRoot: workdir}
+	err := p.applyCopy(sb, &stepCtx{}, 1, configsock.BuildStep{
+		Args:      []string{"hello.txt", "/opt/ct2/", "1000:1000"},
+		FilesHash: "context",
+		FilesURL:  server.URL,
+	}, func(v string) string { return v })
+	if err == nil || !strings.Contains(err.Error(), "guest stderr: "+diagnostic) {
+		t.Fatalf("applyCopy error = %v", err)
 	}
 }

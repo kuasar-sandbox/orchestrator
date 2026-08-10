@@ -498,7 +498,32 @@ func (p *buildPipeline) applyCopy(sb *phaseSandbox, c *stepCtx, i int, st config
 	p.progress("step %d: COPY %s -> %s (owner %s)", i, st.Args[0], st.Args[1], owner)
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.StepSec)*time.Second)
 	defer cancel()
-	return sb.exec(ctx, execOpts{stdinFrom: rawTar, stderrTo: "journald=" + buildTag}, args...)
+	// Use a per-step file sink so sandbox-ctl drains guest stderr before it
+	// exits. Replay it into the build journal, and retain the first line in
+	// the returned error instead of losing it behind a journald-only sink.
+	stderrPath := filepath.Join(p.spec.Workdir, fmt.Sprintf("copy-%d.stderr", i))
+	_ = os.Remove(stderrPath)
+	execErr := sb.exec(ctx, execOpts{stdinFrom: rawTar, stderrTo: stderrPath}, args...)
+	stderr, readErr := os.ReadFile(stderrPath)
+	_ = os.Remove(stderrPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		if execErr != nil {
+			return fmt.Errorf("%w; read guest stderr: %v", execErr, readErr)
+		}
+		return fmt.Errorf("read guest stderr: %w", readErr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(stderr)), "\n") {
+		if line != "" {
+			p.progress("step %d: COPY: %s", i, line)
+		}
+	}
+	if execErr != nil {
+		if detail := firstLine(stderr); detail != "" {
+			return fmt.Errorf("%w; guest stderr: %s", execErr, detail)
+		}
+		return execErr
+	}
+	return nil
 }
 
 // fetchCopyContext downloads the gzipped context tar from the presigned GET
