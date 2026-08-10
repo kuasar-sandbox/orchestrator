@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -159,4 +160,59 @@ func TestPersisterFlushSnapshotsConcurrentStateUpdates(t *testing.T) {
 	}()
 	close(start)
 	wg.Wait()
+}
+
+func benchmarkState(reservationCount int) *State {
+	state := makeState(100<<30, 16<<30)
+	state.Lock()
+	defer state.Unlock()
+	for index := 0; index < reservationCount; index++ {
+		token := fmt.Sprintf("token-%d", index)
+		state.Reservations[token] = &Reservation{
+			Token:                  token,
+			SandboxID:              fmt.Sprintf("sandbox-%d", index),
+			Capacity:               Resources{MemoryBytes: 4 << 30, CPUMilli: 2000},
+			Floor:                  Resources{MemoryBytes: 128 << 20, CPUMilli: 100},
+			AllocatableNowMem:      256 << 20,
+			EffectiveStartupBudget: 512 << 20,
+			Stage:                  StageSettled,
+			StageEnteredAt:         time.Unix(int64(index), 0),
+			LastHeartbeatAt:        time.Unix(int64(index+1), 0),
+			LastReportedRSS:        192 << 20,
+		}
+	}
+	return state
+}
+
+func BenchmarkStateSnapshotForPersistence(b *testing.B) {
+	for _, reservationCount := range []int{0, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("reservations-%d", reservationCount), func(b *testing.B) {
+			state := benchmarkState(reservationCount)
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = state.snapshotForPersistence()
+			}
+		})
+	}
+}
+
+func BenchmarkPersisterFlushParallel(b *testing.B) {
+	state := benchmarkState(100)
+	p := &Persister{Path: filepath.Join(b.TempDir(), "state.json")}
+	var once sync.Once
+	var flushErr error
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := p.Flush(state); err != nil {
+				once.Do(func() { flushErr = err })
+				return
+			}
+		}
+	})
+	b.StopTimer()
+	if flushErr != nil {
+		b.Fatal(flushErr)
+	}
 }
