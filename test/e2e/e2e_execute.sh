@@ -599,6 +599,8 @@ done
 "$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1 \
     || { echo "vswitch not ready:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch not ready"; }
 SW_STARTED=1
+ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
+    || fail "configure management VIP on ${SWITCH}m0"
 allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
 echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; internal proxy_netns=$PROXY_NETNS reaches $FIP_CIDR)"
