@@ -20,8 +20,9 @@ type Persister struct {
 	mu   sync.Mutex
 }
 
-// Flush writes state to Path atomically. Caller must hold state lock
-// for a consistent snapshot.
+// Flush snapshots state and writes it to Path atomically. It is safe to call
+// concurrently. Callers must not hold the state lock because Flush acquires it
+// briefly while copying the persisted fields.
 func (p *Persister) Flush(s *State) error {
 	if p.Path == "" {
 		return nil
@@ -32,7 +33,8 @@ func (p *Persister) Flush(s *State) error {
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
 		return fmt.Errorf("persister: mkdir: %w", err)
 	}
-	data, err := json.MarshalIndent(s, "", "  ")
+	snapshot := s.snapshotForPersistence()
+	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return fmt.Errorf("persister: marshal: %w", err)
 	}

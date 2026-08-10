@@ -48,7 +48,6 @@ func (r *ActiveReclaimer) Run(ctx context.Context) {
 
 func (r *ActiveReclaimer) sweep() {
 	r.State.Lock()
-	defer r.State.Unlock()
 
 	zone := r.State.MemoryZone()
 	margin := r.SafetyMargin
@@ -87,6 +86,7 @@ func (r *ActiveReclaimer) sweep() {
 		res.AllocatableNowMem = target
 		any = true
 	}
+	r.State.Unlock()
 	if any {
 		if err := r.Persister.Flush(r.State); err != nil {
 			r.Logf("reclaim persist: %v", err)

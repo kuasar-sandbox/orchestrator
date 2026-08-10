@@ -123,3 +123,40 @@ func TestPersisterConcurrentFlushesShareOneAtomicWriter(t *testing.T) {
 		t.Fatalf("final state is not valid JSON: %v", err)
 	}
 }
+
+func TestPersisterFlushSnapshotsConcurrentStateUpdates(t *testing.T) {
+	p := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
+	state := makeState(100<<30, 16<<30)
+	const iterations = 200
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			state.Lock()
+			state.Reservations["moving"] = &Reservation{
+				Token: "moving", SandboxID: "sandbox", Stage: StageSettled,
+				AllocatableNowMem: uint64(i + 1),
+			}
+			if i%2 == 0 {
+				delete(state.Reservations, "moving")
+			}
+			state.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			if err := p.Flush(state); err != nil {
+				t.Errorf("Flush failed: %v", err)
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+}

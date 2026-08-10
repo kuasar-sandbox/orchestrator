@@ -272,7 +272,6 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 	ebudget := computeEffectiveStartupBudget(req)
 
 	s.State.Lock()
-	defer s.State.Unlock()
 
 	t := NewToken()
 	res := &Reservation{
@@ -289,11 +288,13 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 		Conn:                   conn,
 	}
 	if err := s.State.Insert(res); err != nil {
+		s.State.Unlock()
 		return nil, err
 	}
 	if token != nil {
 		*token = t
 	}
+	s.State.Unlock()
 
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
@@ -354,6 +355,7 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	res.Stage = StageSettled
 	res.StageEnteredAt = time.Now()
 	res.LastHeartbeatAt = time.Now()
+	sandboxID := res.SandboxID
 	s.State.Unlock()
 
 	// Wake the admission worker — main + startup pool both just got
@@ -363,7 +365,7 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
 	}
-	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, newAlloc)
+	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], sandboxID, req.CurrentRSS, newAlloc)
 	return &Message{Type: TypeAck}
 }
 
@@ -408,11 +410,12 @@ func (s *Server) handleRequestBudget(req *Message, token string) *Message {
 
 	// In red/critical zone, only urgency=high gets through.
 	if (zone == ZoneRed || zone == ZoneCritical) && urgency != UrgencyHigh {
+		newAllocatable := res.AllocatableNowMem
 		s.State.Unlock()
 		return &Message{
 			Type:           TypeBudgetResponse,
 			GrantedDelta:   0,
-			NewAllocatable: res.AllocatableNowMem,
+			NewAllocatable: newAllocatable,
 			CooldownMs:     500,
 		}
 	}
@@ -431,32 +434,37 @@ func (s *Server) handleRequestBudget(req *Message, token string) *Message {
 		NewAllocatable: res.AllocatableNowMem,
 		CooldownMs:     dec.CooldownMs,
 	}
+	sandboxID := res.SandboxID
+	newAllocatable := res.AllocatableNowMem
+	s.State.Unlock()
 	if dec.GrantedDelta > 0 {
 		if err := s.Persister.Flush(s.State); err != nil {
 			s.Logf("persister flush: %v", err)
 		}
 	}
-	s.State.Unlock()
 	if dec.GrantedDelta > 0 {
 		s.Logf("grant %s sid=%s +%d → %d (zone=%s urgency=%s)",
-			token[:8], res.SandboxID, dec.GrantedDelta, res.AllocatableNowMem, zone, urgency)
+			token[:8], sandboxID, dec.GrantedDelta, newAllocatable, zone, urgency)
 	}
 	return resp
 }
 
 func (s *Server) handleOOMReport(req *Message, token string) *Message {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.State.Lookup(token)
 	if res == nil {
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
 	res.OOMCount += req.OOMCount
+	sandboxID := res.SandboxID
+	oomCount := res.OOMCount
+	s.State.Unlock()
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
 	}
 	s.Logf("oom_report %s sid=%s count=%d killed_pid=%d",
-		token[:8], res.SandboxID, res.OOMCount, req.KilledPID)
+		token[:8], sandboxID, oomCount, req.KilledPID)
 	return &Message{Type: TypeAck}
 }
 
@@ -489,6 +497,8 @@ func (s *Server) handleRelease(req *Message, token string) {
 	// releases both. Wake admission so any short-term-blocked queued
 	// admit can re-evaluate against the freshly returned headroom.
 	wasPreSettled := IsPreSettled(res.Stage)
+	sandboxID := res.SandboxID
+	allocatableAtRelease := res.AllocatableNowMem
 	s.Allocator.CleanupHistory(token)
 	s.State.Remove(token)
 	s.State.Unlock()
@@ -499,10 +509,10 @@ func (s *Server) handleRelease(req *Message, token string) {
 		s.Logf("persister flush: %v", err)
 	}
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
-		token[:8], res.SandboxID, req.Reason, wasPreSettled)
+		token[:8], sandboxID, req.Reason, wasPreSettled)
 	if s.Auditor != nil {
 		s.Auditor.Logf("release token=%s sid=%s reason=%s alloc_at_release=%d pre_settled=%v",
-			token[:8], res.SandboxID, req.Reason, res.AllocatableNowMem, wasPreSettled)
+			token[:8], sandboxID, req.Reason, allocatableAtRelease, wasPreSettled)
 	}
 }
 
@@ -520,9 +530,9 @@ func (s *Server) handleAdminDrain(req *Message) *Message {
 // sandbox-ctl picks up the new allocatable on its next Heartbeat.
 func (s *Server) handleAdminGrant(req *Message) *Message {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.findBySandboxIDLocked(req.SandboxID)
 	if res == nil {
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
 	}
 	newAlloc := res.AllocatableNowMem + req.RequestedDelta
@@ -531,6 +541,7 @@ func (s *Server) handleAdminGrant(req *Message) *Message {
 	}
 	delta := newAlloc - res.AllocatableNowMem
 	res.AllocatableNowMem = newAlloc
+	s.State.Unlock()
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("admin grant persist: %v", err)
 	}
@@ -544,9 +555,9 @@ func (s *Server) handleAdminGrant(req *Message) *Message {
 // cgroup + balloon accordingly.
 func (s *Server) handleAdminReclaim(req *Message) *Message {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.findBySandboxIDLocked(req.SandboxID)
 	if res == nil {
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
 	}
 	target := req.TargetAllocatable
@@ -555,10 +566,12 @@ func (s *Server) handleAdminReclaim(req *Message) *Message {
 	}
 	if target > res.AllocatableNowMem {
 		// Reclaim is shrink-only — for grow use admin_grant.
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "target above current allocatable; use admin_grant to grow"}
 	}
 	delta := res.AllocatableNowMem - target
 	res.AllocatableNowMem = target
+	s.State.Unlock()
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("admin reclaim persist: %v", err)
 	}
@@ -655,7 +668,6 @@ func (i *IdleSweeper) Run(ctx context.Context) {
 func (i *IdleSweeper) sweep() {
 	now := time.Now()
 	i.State.Lock()
-	defer i.State.Unlock()
 
 	swept := false
 	for token, res := range i.State.Reservations {
@@ -680,6 +692,7 @@ func (i *IdleSweeper) sweep() {
 			swept = true
 		}
 	}
+	i.State.Unlock()
 	if swept {
 		// Headroom may have just opened up — wake admission worker.
 		i.Admission.PushWake()

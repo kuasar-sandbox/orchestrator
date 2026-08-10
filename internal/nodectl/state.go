@@ -140,6 +140,35 @@ func NewState(physicalMem uint64, physicalCPUMilli uint64,
 func (s *State) Lock()   { s.mu.Lock() }
 func (s *State) Unlock() { s.mu.Unlock() }
 
+// snapshotForPersistence returns a deep copy of every persisted field.
+// The state lock is held only while copying in-memory data; callers may
+// marshal or write the returned snapshot without blocking state updates.
+func (s *State) snapshotForPersistence() *State {
+	s.Lock()
+	defer s.Unlock()
+
+	reservations := make(map[string]*Reservation, len(s.Reservations))
+	for token, reservation := range s.Reservations {
+		if reservation == nil {
+			reservations[token] = nil
+			continue
+		}
+		copied := *reservation
+		copied.Conn = nil
+		reservations[token] = &copied
+	}
+
+	return &State{
+		NodeBudget:        s.NodeBudget,
+		HostReserved:      s.HostReserved,
+		OperationalMargin: s.OperationalMargin,
+		AllocatablePool:   s.AllocatablePool,
+		Wm:                s.Wm,
+		Reservations:      reservations,
+		Version:           s.Version,
+	}
+}
+
 // NodeAllocated computes the current allocated resources by summing
 // reservation budgets. Caller must hold the lock.
 func (s *State) NodeAllocated() Resources {
