@@ -345,6 +345,8 @@ ip netns add "$SW_NETNS" 2>/dev/null || true
     --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
     --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
 SW_STARTED=1
+ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
+    || fail "configure management VIP on ${SWITCH}m0"
 allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
 echo "==> vswitch up (build sandboxes pull $GUEST_REF; proxy_netns=$PROXY_NETNS reaches $FIP_CIDR via $PROXY_VETH_HOST)"

@@ -164,8 +164,8 @@ MMDS_PORT="$(free_port)"
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS"
-# --mgmt-extract puts $MGMT_VIP on host NIC $SW_MGMT and routes guest 0/0 to it;
-# that is the only path the builds need (zot on the host). No NAT required.
+# The extraction CIDRs classify guest traffic; this test owns the management
+# VIP address used to reach Zot and MMDS on the host. No NAT is required.
 "$BIN/connector-ctl" vswitch serve "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
     --floating-ip-base=100.100.112.0 --mode=tap \
     --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 \
@@ -181,6 +181,8 @@ for _ in $(seq 1 100); do
 done
 "$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1 \
     || { cat "$WORK/vswitch.log"; fail "vswitch not ready"; }
+ip addr replace "$MGMT_VIP/32" dev "$SW_MGMT" \
+    || fail "configure management VIP on $SW_MGMT"
 echo "==> vswitch up ($SWITCH; mgmt $SW_MGMT=$MGMT_VIP; tapfd_socket=$TAPFD_SOCKET)"
 
 # ---- manifest config + diff templates ---------------------------------------

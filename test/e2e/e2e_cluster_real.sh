@@ -427,6 +427,8 @@ EOF
         --mode=tap \
         --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 > >(tee "$WORK/vswitch-start.log" >&2) 2>&1 || fail "vswitch start"
     SW_STARTED=1
+    ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
+        || fail "configure management VIP on ${SWITCH}m0"
     GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/cluster-real:v1"
     step "vswitch up; build sandboxes pull $GUEST_REF"
 
