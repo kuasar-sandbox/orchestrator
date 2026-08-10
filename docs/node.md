@@ -847,6 +847,8 @@ cgroup 路径或 FD。
 sandbox-ctl 接收 FD 后立即恢复 CLOEXEC,写入资源上限,并以
 `clone3(CLONE_INTO_CGROUP)` 把 CH 原子创建到 `vmm/`。因此 `memory.high` 只限制
 VMM,sandbox-ctl 在 guest 压力下仍可处理 UFFD、vsock、信号和进程回收。
+节点要求 Linux 5.7+ 且 seccomp 允许 `clone3`;不满足时 sandbox 启动 fail closed,
+不回退到启动后迁移或共享 cgroup。
 
 `KillMode=control-group` 递归覆盖 `ctl/` 与 `vmm/`;StopUnit 后 systemd 回收整个委托
 子树,无需 serve 单独搬迁进程或 rmdir。任何委托、层次、controller 或 FD 校验失败均在
