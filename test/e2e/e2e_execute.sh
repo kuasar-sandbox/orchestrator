@@ -559,6 +559,7 @@ RUN chmod +x /usr/bin/ionice /usr/bin/nice \
  && mkdir -p /home/user \
  && chown user:user /home/user \
  && id user >/dev/null
+CMD ["sleep", "86400"]
 EOF
 docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
 TAGS+=("$REF")
@@ -729,15 +730,38 @@ done
 echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
 
 # ---- low-allocatable runner cgroup isolation regression --------------------
-# The template is pinned at 8 GiB capacity above. Override only the runtime
-# floor to 256 MiB so the initial balloon is 7936 MiB, matching issue #152.
-LOW_CREATE_BODY=$(python3 - "$TEMPLATE" <<'PY'
+# A snapshot restore preserves max(requested, snapshot-time allocatable), so the
+# snapshot template above cannot reproduce a 256 MiB startup floor. Build the
+# same OCI input as an image template (no startCmd), then cold boot it with the
+# complete 8 GiB / 256 MiB resource declaration from issue #152.
+code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":8192}')
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
+LOW_TID=$(json_field "$WORK/resp.body" templateID)
+LOW_BID=$(json_field "$WORK/resp.body" buildID)
+code=$(req POST "/v2/templates/$LOW_TID/builds/$LOW_BID" "$AK" \
+    "{\"fromImage\":\"$GUEST_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup trigger=$code"; }
+LOW_TEMPLATE=""
+for _ in $(seq 1 120); do
+    req GET "/templates/$LOW_TID/builds/$LOW_BID/status" "$AK" >/dev/null
+    st=$(json_field "$WORK/resp.body" status)
+    case "$st" in
+        ready) LOW_TEMPLATE=$(json_field "$WORK/resp.body" templateID); break;;
+        error) cat "$WORK/resp.body"; fail "low-cgroup build error";;
+    esac
+    sleep 1
+done
+[ -n "$LOW_TEMPLATE" ] || fail "low-cgroup image build did not become ready"
+case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_TEMPLATE (want e2b-img-...)";; esac
+
+LOW_CREATE_BODY=$(python3 - "$LOW_TEMPLATE" <<'PY'
 import json, sys
 print(json.dumps({
     "templateID": sys.argv[1],
     "timeout": 120,
     "metadata": {
         "kuasar-sandbox.resource": json.dumps({
+            "capacity": {"cpu": 2, "memory": "8GiB"},
             "allocatable": {"cpu": 2, "memory": "256MiB"},
         }),
     },
@@ -767,11 +791,18 @@ LOW_CTL_PID=$(systemctl show "$LOW_UNIT" -p MainPID --value)
 LOW_CTL_CG=$(awk -F: '$1 == "0" {print $3}' "/proc/$LOW_CTL_PID/cgroup")
 [ "$LOW_CTL_CG" = "$LOW_CG/ctl" ] || fail "sandbox-ctl cgroup=$LOW_CTL_CG, want $LOW_CG/ctl"
 LOW_VMM_PROCS="/sys/fs/cgroup$LOW_CG/vmm/cgroup.procs"
-[ -s "$LOW_VMM_PROCS" ] || fail "vmm cgroup has no process"
-while read -r pid; do
+mapfile -t LOW_VMM_PIDS < "$LOW_VMM_PROCS"
+[ "${#LOW_VMM_PIDS[@]}" -gt 0 ] || fail "vmm cgroup has no process"
+LOW_VISIBLE_VMM_PIDS=0
+for pid in "${LOW_VMM_PIDS[@]}"; do
+    # A nested PID namespace may render an otherwise populated cgroup entry as
+    # zero. Validate every process visible to this test namespace.
+    [ "$pid" = 0 ] && continue
     [ "$(basename "$(readlink -f "/proc/$pid/exe")")" = "cloud-hypervisor" ] \
         || fail "vmm cgroup contains non-VMM pid=$pid"
-done < "$LOW_VMM_PROCS"
+    LOW_VISIBLE_VMM_PIDS=$((LOW_VISIBLE_VMM_PIDS + 1))
+done
+[ "$LOW_VISIBLE_VMM_PIDS" -gt 0 ] || fail "vmm cgroup has no visible Cloud Hypervisor process"
 [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
     || fail "vmm memory.high is not 224MiB"
 [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
@@ -788,8 +819,12 @@ LOW_JOURNAL="$WORK/low-allocatable.journal"
 journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
 ! grep -Fq 'mem_report: read: resource temporarily unavailable' "$LOW_JOURNAL" \
     || fail "low-allocatable run stalled mem_report"
-! grep -Fq 'vCPU thread did not respond' "$LOW_JOURNAL" \
-    || fail "low-allocatable run stalled VMM shutdown"
+grep -Fq '[sandbox-ctl] CH exited code=0' "$LOW_JOURNAL" \
+    || fail "low-allocatable run did not shut down CH cleanly"
+! grep -Fq 'vmm.shutdown API failed' "$LOW_JOURNAL" \
+    || fail "low-allocatable vmm.shutdown API failed"
+! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
+    || fail "low-allocatable run escalated shutdown to SIGKILL"
 echo "==> PASS: 8GiB/256MiB runner ready in ${LOW_ELAPSED_MS}ms; ctl/vmm isolated and cleaned"
 
 # ---- async launch failure/kill gates --------------------------------------
