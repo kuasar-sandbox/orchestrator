@@ -32,6 +32,7 @@ func runSandbox(args []string, _ *slog.Logger) error {
 	}
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
 		lockPidfile:    lockPidfile,
+		prepareCgroup:  prepareRunnerCgroup,
 		waitAssignment: configsock.WaitAssignment,
 		connectReady:   connectReadinessSocket,
 		launchTask:     launchTask,
@@ -40,15 +41,21 @@ func runSandbox(args []string, _ *slog.Logger) error {
 
 type runSandboxOps struct {
 	lockPidfile    func(string) error
+	prepareCgroup  func() (*os.File, error)
 	waitAssignment func(context.Context, string, string, string) (string, error)
 	connectReady   func(string) (*os.File, error)
-	launchTask     func(string, string, string, *os.File) error
+	launchTask     func(string, string, string, *os.File, *os.File) error
 }
 
 func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error {
 	if err := ops.lockPidfile(pidfile); err != nil {
 		return err
 	}
+	vmmCgroup, err := ops.prepareCgroup()
+	if err != nil {
+		return fmt.Errorf("prepare runner cgroup: %w", err)
+	}
+	defer vmmCgroup.Close()
 	sid, err := ops.waitAssignment(context.Background(), socket, "sandbox", runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
@@ -62,7 +69,7 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	// chdir, argv, or exec failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
-	return ops.launchTask(socket, "sandbox:"+sid, filepath.Join(runRoot, sid, sid+".pid"), ready)
+	return ops.launchTask(socket, "sandbox:"+sid, filepath.Join(runRoot, sid, sid+".pid"), ready, vmmCgroup)
 }
 
 func connectReadinessSocket(path string) (*os.File, error) {

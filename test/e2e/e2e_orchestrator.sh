@@ -141,6 +141,7 @@ for u in sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice s
     [ -f "$UNIT_DIR/$u" ] || fail "unit $u was not generated into $UNIT_DIR"
 done
 grep -q "run-sandbox .*--run-id=%i" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit ExecStart is not run-id based"
+grep -q '^DelegateSubgroup=ctl$' "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not isolate ctl subgroup"
 grep -q "run-builder .*--run-id=%i" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-id based"
 grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not clean its run pidfile"
 grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit does not clean its run pidfile"

@@ -196,6 +196,5 @@ func (s *Sandbox) AuthSandboxID() string {
 }
 
 // PidFile is where sandbox-ctl writes its pid (config-socket auth reads it).
-// The unit-instance name lives in orch (configurable template names); cgroup paths
-// are no longer pre-created (sandbox-ctl --cgroup-adopt uses the unit's own cgroup).
+// The unit-instance name and its ctl/vmm cgroup topology are local launcher state.
 func (s *Sandbox) PidFile() string { return s.RunDir + "/" + s.ID + ".pid" }

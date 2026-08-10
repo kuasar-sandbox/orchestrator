@@ -8,8 +8,8 @@
 // truth — no hand-rolled schema to drift). The orchestrator builds the node-managed
 // base (boot / tapfd / control / capacity / resolved network) and overlays the
 // tenant-controllable SandboxSpec parsed from the kuasar-sandbox.<ns> metadata keys.
-// Deep validation stays in sandbox-ctl (which has the complete picture incl. the
-// --cgroup-adopt cgroup path + the snapshot); here we only format-check tenant input.
+// Deep validation stays in sandbox-ctl (which receives the node-owned VMM cgroup
+// FD plus the snapshot); here we only format-check tenant input.
 package sandboxcfg
 
 import (
@@ -365,7 +365,7 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 		}
 	}
 	if p.ControllerSocket != "" {
-		// cgroup_path + adopt are resolved by sandbox-ctl --cgroup-adopt at runtime.
+		// run-sandbox supplies cgroup_path as a node-owned inherited VMM FD.
 		c.Resources.Control.Controller = p.ControllerSocket
 	}
 

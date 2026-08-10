@@ -48,8 +48,8 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
    (node-resource.md),调参随 serve 配置内联。它仍是与 serve 的 api / 主机 / proxy
    逻辑解耦的可分离子系统。构建任务的资源池由 serve 自管(§12)。
 3. **进程管理交给 systemd**:runner/builder 模板单元以 run-id 为实例名,可预启动等待
-   config-socket 下发 assignment;分配后单元 cgroup 即沙箱/构建资源 cgroup
-   (`--cgroup-adopt`,§5.1),`StopUnit` 即完整回收;serve 不自己当进程监督者。
+   config-socket 下发 assignment;runner 单元下以 `ctl/vmm` 隔离监督进程与沙箱资源,
+   builder 仍按完整单元核算;`StopUnit` 即完整回收,serve 不自己当进程监督者。
 4. **密钥不落明文盘**:租户 APISecret+ManifestKey 凭据对在库内 AES-256-GCM 加密;
    运行期根凭据只存在于必要的内存、受保护路由投影和启动器 LaunchSpec 的 env 帧,
    ManifestKey 不进入 guest(§6、§7)。集群下经 node-link 下行的凭据对同样仅加密落盘(§10)。
@@ -709,8 +709,8 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 
 - **渲染**:serve 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
   网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
-  在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 经 `--cgroup-adopt`、base 经
-  快照填),这里只对租户网络做格式校验。
+  在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 由 run-sandbox 以继承 FD
+  覆盖、base 经快照填),这里只对租户网络做格式校验。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
   metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
   create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
@@ -765,7 +765,8 @@ Restart=no                  # 一进程一沙箱、有状态:崩 = 该沙箱已�
 KillMode=control-group      # StopUnit 连 cloud-hypervisor 一并 SIGKILL(§5.1)
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
-Delegate=yes                # 委派控制器,--cgroup-adopt 才能写 cpu.max/memory.max(§5.1)
+Delegate=yes                # 委派 cpu/memory controller(§5.1)
+DelegateSubgroup=ctl        # node-ctl / sandbox-ctl 留在不受沙箱水位限制的 ctl/
 ```
 
 **builder 单元**(`%i` = run-id,§12):
@@ -827,19 +828,29 @@ pool loop 唯一回复,每个请求恰有一次结果。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
   互不相干。
 
-### 5.1 cgroup(cgroup-adopt:单元自身 cgroup 即沙箱资源 cgroup)
+### 5.1 cgroup(ctl/vmm 隔离与 FD capability)
 
-serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
-**`--cgroup-adopt`**:它接管自己所在 systemd 单元的 cgroup 作为沙箱资源 cgroup——读
-`/proc/self/cgroup` 求出路径,cloud-hypervisor 与自身都留在其中。于是:
+runner unit 的 cgroup 根只作为委托边界,不放进程:
 
-- 一个已分配 runner 单元 = 一个沙箱 cgroup;资源控制器(配置了 `control_socket` 时)在该路径上原地
-  仲裁;`KillMode=control-group` 使 `StopUnit` 连 CH 一起 SIGKILL,无需 serve
-  排空/rmdir 安全网。
-- 单元必须 `Delegate=yes`:否则单元 cgroup 的控制器接口文件(`cpu.max`/`memory.max`)
-  非本进程可写,`--cgroup-adopt` 写资源上限会 `permission denied`。
-- 代价:sandbox-ctl 与 CH 同处受限 cgroup,`memory.high` 节流存在死锁风险(见
-  sandbox-runtime `pkg/sandbox/cgroup.go` 头注)。采纳此模型并照常设 `memory.high`。
+```text
+sandbox-runner@<run-id>.service/
+├── ctl/   node-ctl,exec 后为 sandbox-ctl
+└── vmm/   cloud-hypervisor
+```
+
+systemd 通过 `DelegateSubgroup=ctl` 从 exec 前即把 node-ctl 放入 `ctl/`。
+`node-ctl run-sandbox` 在等待 assignment 前验证该身份,于空的 unit 根启用 cpu/memory
+controller,幂等创建 `vmm/` 并以 CLOEXEC 打开目录 FD。取得 LaunchSpec 后,启动器在最终
+exec 前才使该 FD 可继承,本地追加 `--cgroup-path=fd=N`;LaunchSpec 自身不携带任何主机
+cgroup 路径或 FD。
+
+sandbox-ctl 接收 FD 后立即恢复 CLOEXEC,写入资源上限,并以
+`clone3(CLONE_INTO_CGROUP)` 把 CH 原子创建到 `vmm/`。因此 `memory.high` 只限制
+VMM,sandbox-ctl 在 guest 压力下仍可处理 UFFD、vsock、信号和进程回收。
+
+`KillMode=control-group` 递归覆盖 `ctl/` 与 `vmm/`;StopUnit 后 systemd 回收整个委托
+子树,无需 serve 单独搬迁进程或 rmdir。任何委托、层次、controller 或 FD 校验失败均在
+CH 启动前 fail closed。
 
 ### 5.2 日志:journald 单汇 + 标签词表
 
@@ -880,10 +891,11 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 - `POST /internal/task/launchspec`(run-sandbox;req `{config_id: "sandbox:<sid>"}`)
   → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
   `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
-  <shared> --run-root <run_root> --cgroup-adopt (--restore <ref>)
+  <shared> --run-root <run_root> (--restore <ref>)
   (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
-  pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
+  pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。node-ctl 在最终 exec
+  时另行强制追加本机 `--cgroup-path=fd=N`,不允许 LaunchSpec 覆盖。
 - `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
   → **BuildSpec(构建工作单)**:`{build_id, profile, workdir, from_image | from_template
   (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
@@ -1652,8 +1664,8 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --ready-fd=<fd> --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run --ready-fd=<pipe-fd>` 启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | readiness wire 固定为 `control_ready`→`ready`→EOF;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
-| 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
+| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … [--restore] [--connect]`;run-builder 以直接子进程 `run --ready-fd=<pipe-fd>` 启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
+| 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 每个 runner 的 `vmm/` 是沙箱资源 cgroup;不配 control_socket = 静态 cgroup,配了才进 SANDBOX_CONFIG `resources.control.controller` |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
