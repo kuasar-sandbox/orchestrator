@@ -11,6 +11,8 @@
 #   WL_RMIN_MIB   active phase minimum RSS to hold
 #   WL_RMAX_MIB   active phase maximum RSS to hold
 #   WL_SEED       deterministic seed
+#   WL_START_GATE optional path; wait for this file before starting pressure
+#   WL_START_GATE_TIMEOUT seconds to wait for the gate (default 60)
 #
 # cycles-mode env:
 #   WL_CYCLES     number of grow/rest cycles within DURATION
@@ -47,6 +49,21 @@ def env_float(name, default):
 
 def env_str(name, default):
     return os.environ.get(name, default)
+
+
+def wait_for_start_gate():
+    gate = env_str("WL_START_GATE", "")
+    if not gate:
+        return
+    timeout = env_float("WL_START_GATE_TIMEOUT", 60.0)
+    deadline = time.monotonic() + timeout
+    print(f"workload waiting for start gate {gate}", flush=True)
+    while not os.path.exists(gate):
+        if time.monotonic() >= deadline:
+            print(f"workload start gate timed out after {timeout}s", file=sys.stderr, flush=True)
+            sys.exit(3)
+        time.sleep(0.05)
+    print("workload start gate opened", flush=True)
 
 
 def grow_to(target_bytes, end):
@@ -106,6 +123,7 @@ def run_idle(duration):
 
 
 def main():
+    wait_for_start_gate()
     seed = env_int("WL_SEED", 42)
     random.seed(seed)
     duration = env_int("WL_DURATION", 20)
