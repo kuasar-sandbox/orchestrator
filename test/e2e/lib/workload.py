@@ -13,6 +13,9 @@
 #   WL_SEED       deterministic seed
 #   WL_START_GATE optional path; wait for this file before starting pressure
 #   WL_START_GATE_TIMEOUT seconds to wait for the gate (default 60)
+#   WL_DELIVERY_GATE optional path; cycles mode holds its first pressure
+#                    allocation until this file appears
+#   WL_DELIVERY_GATE_TIMEOUT seconds to wait while holding pressure (default 30)
 #
 # cycles-mode env:
 #   WL_CYCLES     number of grow/rest cycles within DURATION
@@ -51,19 +54,25 @@ def env_str(name, default):
     return os.environ.get(name, default)
 
 
-def wait_for_start_gate():
-    gate = env_str("WL_START_GATE", "")
+def wait_for_gate(gate, timeout, label):
     if not gate:
         return
-    timeout = env_float("WL_START_GATE_TIMEOUT", 60.0)
     deadline = time.monotonic() + timeout
-    print(f"workload waiting for start gate {gate}", flush=True)
+    print(f"workload waiting for {label} gate {gate}", flush=True)
     while not os.path.exists(gate):
         if time.monotonic() >= deadline:
-            print(f"workload start gate timed out after {timeout}s", file=sys.stderr, flush=True)
+            print(f"workload {label} gate timed out after {timeout}s", file=sys.stderr, flush=True)
             sys.exit(3)
         time.sleep(0.05)
-    print("workload start gate opened", flush=True)
+    print(f"workload {label} gate opened", flush=True)
+
+
+def wait_for_start_gate():
+    wait_for_gate(
+        env_str("WL_START_GATE", ""),
+        env_float("WL_START_GATE_TIMEOUT", 60.0),
+        "start",
+    )
 
 
 def grow_to(target_bytes, end):
@@ -76,7 +85,13 @@ def grow_to(target_bytes, end):
 
 
 def run_cycles(duration, rmin, rmax, cycles):
-    end = time.time() + duration
+    delivery_gate = env_str("WL_DELIVERY_GATE", "")
+    delivery_timeout = env_float("WL_DELIVERY_GATE_TIMEOUT", 30.0)
+    # A controlled first cycle gets a separate bounded probe budget. The
+    # requested workload duration begins only after the host verifies that a
+    # controller grant reached the guest, so runner scheduling cannot consume
+    # the decisive phase while the probe is deliberately blocked.
+    end = time.time() + (delivery_timeout if delivery_gate else duration)
     slot = max(1.0, duration / float(cycles))
     print(f"workload mode=cycles dur={duration}s rmin={rmin} rmax={rmax} cycles={cycles}", flush=True)
     for i in range(cycles):
@@ -86,6 +101,18 @@ def run_cycles(duration, rmin, rmax, cycles):
         target = r * 1024 * 1024
         print(f"cycle {i}: active r={r}MiB", flush=True)
         held = grow_to(target, end)
+        if i == 0 and delivery_gate:
+            if len(held) < target:
+                print(
+                    "workload pressure probe incomplete "
+                    f"rss={len(held)//(1024*1024)}MiB target={r}MiB",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                sys.exit(4)
+            print(f"workload pressure probe ready rss={r}MiB", flush=True)
+            wait_for_gate(delivery_gate, delivery_timeout, "delivery")
+            end = time.time() + duration
         rest = max(0.5, slot - 1.0)
         rest = min(rest, max(0.1, end - time.time()))
         if rest > 0:

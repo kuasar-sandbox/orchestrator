@@ -56,6 +56,7 @@ fi
 command -v docker >/dev/null 2>&1 || skip "docker not available"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH (host parser)"
+command -v curl >/dev/null 2>&1 || skip "curl not on PATH (CH balloon delivery probe)"
 
 for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl cloud-hypervisor; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build cloud-hypervisor'"
@@ -149,6 +150,12 @@ B_WORKLOAD_CYCLES=2
 B_WORKLOAD_RMIN_MIB=256
 B_WORKLOAD_RMAX_MIB=384
 B2_STARTUP_MIB=512
+B2_HEARTBEAT_SECONDS=5
+B2_BALLOON_RECONCILE_SECONDS=5
+B2_READY_TIMEOUT=$((3 * B2_HEARTBEAT_SECONDS + 5))
+B2_GRANT_TIMEOUT=$((2 * B2_HEARTBEAT_SECONDS + B2_BALLOON_RECONCILE_SECONDS + 5))
+B2_DELIVERY_TIMEOUT=$((2 * B2_BALLOON_RECONCILE_SECONDS + 5))
+B2_WORKLOAD_GATE_TIMEOUT=$((2 * B2_GRANT_TIMEOUT + B2_DELIVERY_TIMEOUT + 5))
 
 # ---------- helpers ----------
 
@@ -162,17 +169,20 @@ setup_sb() {
     mkfs.ext4 -q -F "$WORK/${sid}.diff"
 }
 
-# emit_yaml SID MODE FLOOR_MIB CAP_MIB BURST_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE START_GATE
+# emit_yaml SID MODE FLOOR_MIB CAP_MIB BURST_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE START_GATE DELIVERY_GATE
 #   MODE      = static | dynamic
 #   BURST_MIB = ignored when MODE=static (no startup section emitted)
 #   CYCLES    = number of grow/rest cycles within the duration
 #   DEFLATE   = true | false (allocatable.deflate_on_oom)
 #   START_GATE = optional guest path; workload waits for the host to create it
+#   DELIVERY_GATE = optional guest path; cycles mode holds its first pressure
+#                   allocation until the host verifies balloon delivery
 emit_yaml() {
     local sid="$1" mode="$2" floor_mib="$3" cap_mib="$4" burst_mib="$5"
     local wl_dur="$6" wl_cycles="$7" wl_rmin="$8" wl_rmax="$9"
     local deflate="${10:-true}"
     local start_gate="${11:-}"
+    local delivery_gate="${12:-}"
 
     {
         cat <<EOF
@@ -216,6 +226,10 @@ EOF
         if [ -n "$start_gate" ]; then
             echo "    WL_START_GATE: \"$start_gate\""
             echo '    WL_START_GATE_TIMEOUT: "60"'
+        fi
+        if [ -n "$delivery_gate" ]; then
+            echo "    WL_DELIVERY_GATE: \"$delivery_gate\""
+            echo "    WL_DELIVERY_GATE_TIMEOUT: \"$B2_WORKLOAD_GATE_TIMEOUT\""
         fi
         cat <<EOF
   restart: never
@@ -480,6 +494,7 @@ wait_for_b2_control_ready() {
         if grep -q "admit token=.* sid=$sid" "$WORK/audit.log" 2>/dev/null \
             && grep -q "settled .* sid=$sid " "$WORK/daemon.log" 2>/dev/null \
             && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'heartbeat: controller adjusted alloc ' "$WORK/$sid.log" 2>/dev/null \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
             return 0
         fi
@@ -490,13 +505,101 @@ wait_for_b2_control_ready() {
 }
 
 open_workload_gate() {
-    local sid="$1" gate="$2"
+    local sid="$1" gate="$2" label="${3:-start}"
     timeout -k 5s 20 "$BIN/sandbox-ctl" exec \
         --sandbox-id "$sid" \
         --run-root "$WORK/run" \
         -- /bin/sh -ceu 'touch "$1"' sh "$gate" \
-        >"$WORK/$sid-gate.log" 2>&1 \
-        || { sed 's/^/  gate| /' "$WORK/$sid-gate.log"; fail "$sid: open workload start gate"; }
+        >"$WORK/$sid-$label-gate.log" 2>&1 \
+        || { sed 's/^/  gate| /' "$WORK/$sid-$label-gate.log"; fail "$sid: open workload $label gate"; }
+}
+
+b2_timeline_event() {
+    local sid="$1" monotonic_ns
+    shift
+    monotonic_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+    printf '%s %s\n' "$monotonic_ns" "$*" >>"$WORK/$sid-timeline.log"
+}
+
+wait_for_b2_pressure_probe() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -q 'workload pressure probe ready rss=' "$WORK/$sid.log" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before pressure probe was ready"
+        sleep 0.1
+    done
+    fail "$sid: pressure probe was not ready within ${timeout}s"
+}
+
+wait_for_b2_sensor_grant() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -q 'sensor: granted +.*allocatable=' "$WORK/$sid.log" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before applying a sensor grant"
+        sleep 0.1
+    done
+    fail "$sid: sandbox-ctl did not apply a sensor grant within ${timeout}s"
+}
+
+latest_controller_grant_alloc() {
+    local sid="$1"
+    awk -v needle="sid=$sid" '
+        index($0, " grant ") && index($0, needle) {
+            n = split($0, sides, "→ ")
+            if (n > 1) {
+                split(sides[2], fields, " ")
+                alloc = fields[1]
+            }
+        }
+        END { if (alloc != "") print alloc }
+    ' "$WORK/daemon.log"
+}
+
+read_ch_balloon_state() {
+    local sid="$1" json
+    json=$(curl --silent --show-error --fail --max-time 2 \
+        --unix-socket "$WORK/run/$sid/ch.sock" \
+        http://localhost/api/v1/vm.info) || return 1
+    python3 -c '
+import json, sys
+info = json.load(sys.stdin)
+balloon = info.get("config", {}).get("balloon") or {}
+print(balloon.get("size", -1), info.get("memory_actual_size", -1))
+' <<<"$json"
+}
+
+wait_for_b2_guest_delivery() {
+    local sid="$1" pid="$2" granted_alloc="$3" timeout="$4" resize_baseline="$5"
+    local capacity=$((B_CAP_MIB * 1024 * 1024))
+    local max_balloon=$((capacity - granted_alloc))
+    local deadline=$((SECONDS + timeout)) state="" target=-1 actual=-1 resize_count=0
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        state=$(read_ch_balloon_state "$sid" 2>/dev/null) || state=""
+        resize_count=$(grep -c 'balloon: resized to ' "$WORK/$sid.log" 2>/dev/null) || resize_count=0
+        if [ "$resize_count" -gt "$resize_baseline" ] \
+            && read -r target actual <<<"$state" \
+            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
+            && [ "$target" -le "$max_balloon" ] && [ "$actual" -ge "$granted_alloc" ]; then
+            b2_timeline_event "$sid" \
+                "guest_delivery desired_balloon=$target memory_actual_size=$actual granted_alloc=$granted_alloc"
+            return 0
+        fi
+        if guest_self_cap_observed "$sid"; then
+            b2_timeline_event "$sid" "self_cap_before_guest_delivery"
+            fail "$sid: guest self-cap fired before controller grant delivery"
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before controller grant delivery"
+        sleep 0.25
+    done
+    b2_timeline_event "$sid" \
+        "guest_delivery_timeout desired_balloon=$target memory_actual_size=$actual granted_alloc=$granted_alloc"
+    fail "$sid: controller grant was not guest-visible within ${timeout}s (target=$target actual=$actual grant=$granted_alloc)"
 }
 
 memory_event_count() {
@@ -515,6 +618,21 @@ guest_self_cap_observed() {
     local sid="$1"
     grep -qE 'virtio_balloon: pressure at [0-9]+ pages -> cap [0-9]+ pages .*converging' \
         "$WORK/$sid.log" 2>/dev/null
+}
+
+wait_for_b2_workload() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if guest_self_cap_observed "$sid"; then
+            b2_timeline_event "$sid" "self_cap_after_guest_delivery"
+            fail "B2: guest self-cap fired before proactive control could absorb pressure"
+        fi
+        grep -q "workload done" "$WORK/$sid.log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before workload completed"
+        sleep 0.25
+    done
+    fail "$sid: workload did not complete within ${timeout}s"
 }
 
 wait_for_guest_self_cap() {
@@ -664,12 +782,14 @@ phase_b2_dynamic_control() {
 
     local sid=sb-B2-1
     local start_gate=/tmp/e2e-density-b2.start
+    local delivery_gate=/tmp/e2e-density-b2.delivery
     setup_sb "$sid"
     # The startup budget is part of dynamic admission, while the steady-state
     # floor, capacity, workload, and guest safety setting are identical to B1.
     emit_yaml "$sid" dynamic "$B_FLOOR_MIB" "$B_CAP_MIB" "$B2_STARTUP_MIB" \
         "$B_WORKLOAD_DURATION" "$B_WORKLOAD_CYCLES" \
-        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true "$start_gate"
+        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true \
+        "$start_gate" "$delivery_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -679,16 +799,40 @@ phase_b2_dynamic_control() {
         >"$WORK/$sid.log" 2>&1 &
     local pid=$!
     SANDBOX_PIDS+=("$pid")
+    b2_timeline_event "$sid" "sandbox_started pid=$pid"
 
-    # Hold the decisive pressure phase until the controller has admitted and
-    # settled the sandbox and sandbox-ctl has armed its pressure sensor. This
-    # removes the launch_ack→sensor goroutine scheduling race without weakening
-    # the semantic assertion below: once released, the same workload must still
-    # complete through proactive grants without guest self-cap/OOM.
-    wait_for_b2_control_ready "$sid" "$pid" 30
-    open_workload_gate "$sid" "$start_gate"
-    wait_for_controller_grant "$sid" "$pid" 30
-    wait_for_workload "$sid" "$pid" 45
+    # Synchronize past both launch and the first 5s heartbeat that collapses the
+    # startup budget to the controller's steady allocation. The first workload
+    # allocation then acts as a deterministic pressure probe and remains held
+    # until the sensor grant is reflected by CH's desired balloon and actual
+    # guest-visible memory. Only that verified delivery opens the decisive phase.
+    # Timeouts are derived from the heartbeat/reconcile cadences above.
+    wait_for_b2_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
+    b2_timeline_event "$sid" "control_ready admission=1 settled=1 sensor=1 steady_heartbeat=1"
+    local resize_baseline=0
+    resize_baseline=$(grep -c 'balloon: resized to ' "$WORK/$sid.log" 2>/dev/null) || resize_baseline=0
+    open_workload_gate "$sid" "$start_gate" start
+    b2_timeline_event "$sid" "start_gate_open"
+
+    wait_for_b2_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+    b2_timeline_event "$sid" "pressure_probe_ready"
+    wait_for_controller_grant "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+    wait_for_b2_sensor_grant "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+
+    local granted_alloc grant_line sensor_line
+    granted_alloc=$(latest_controller_grant_alloc "$sid")
+    [[ "$granted_alloc" =~ ^[0-9]+$ ]] \
+        || fail "$sid: could not parse controller grant allocation"
+    grant_line=$(grep -m1 " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grant_line="missing"
+    sensor_line=$(grep -m1 'sensor: granted +.*allocatable=' "$WORK/$sid.log" 2>/dev/null) || sensor_line="missing"
+    b2_timeline_event "$sid" "grant_decision alloc=$granted_alloc log=$grant_line"
+    b2_timeline_event "$sid" "grant_applied log=$sensor_line"
+
+    wait_for_b2_guest_delivery \
+        "$sid" "$pid" "$granted_alloc" "$B2_DELIVERY_TIMEOUT" "$resize_baseline"
+    open_workload_gate "$sid" "$delivery_gate" delivery
+    b2_timeline_event "$sid" "delivery_gate_open"
+    wait_for_b2_workload "$sid" "$pid" 45
 
     local oom=0 grants=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
@@ -704,10 +848,11 @@ phase_b2_dynamic_control() {
         fail "B2: guest log contains OOM or SIGKILL despite controller"
     fi
     if guest_self_cap_observed "$sid"; then
+        b2_timeline_event "$sid" "self_cap_after_guest_delivery"
         fail "B2: guest self-cap fired before proactive control could absorb pressure"
     fi
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
-    echo "  Phase B2: grants=$grants oom_count=0 workload_done=1"
+    echo "  Phase B2: grants=$grants oom_count=0 workload_done=1 delivery_verified=1"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
