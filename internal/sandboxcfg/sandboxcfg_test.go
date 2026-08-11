@@ -21,7 +21,7 @@ func TestParseSpecNamespaces(t *testing.T) {
 		NsNetwork:  `{"hostname":"h1","dns":["1.1.1.1","8.8.8.8"],"inner_ip":"10.0.0.5/30","nexthop":"10.0.0.4","transit_gateway_ip":"172.16.0.1","transit_geneve_vni":4242,"transit_mac":"02:00:00:00:00:09"}`,
 		NsResource: `{"capacity":{"cpu":4,"memory":"8GiB"}}`,
 		NsRestore:  `{"prefetch":"memory"}`,
-		NsLaunch:   `{"exec":"/app","args":["-x"],"restart":"always","stop_signal":"SIGINT","user":"1000:1000"}`,
+		NsLaunch:   `{"exec":"/app","args":["-x"],"restart":"always","stop_signal":"SIGINT","user":"1000:1000","cgroup_control":true}`,
 		NsMounts:   `[{"target":"/data","type":"tmpfs"}]`,
 		NsFiles:    `[{"path":"/etc/app.conf","content":"k=v","mode":"0644"}]`,
 		NsInit:     `[{"exec":"/bin/setup","args":["--once"]}]`,
@@ -43,7 +43,8 @@ func TestParseSpecNamespaces(t *testing.T) {
 		t.Fatalf("restore parsed wrong: %+v", s.Restore)
 	}
 	// stop_signal (snake_case) must bind via the runtime config's yaml tags.
-	if s.Launch == nil || s.Launch.Exec != "/app" || s.Launch.StopSignal != "SIGINT" || s.Launch.User != "1000:1000" {
+	if s.Launch == nil || s.Launch.Exec != "/app" || s.Launch.StopSignal != "SIGINT" ||
+		s.Launch.User != "1000:1000" || !s.Launch.CgroupControl {
 		t.Fatalf("launch parsed wrong: %+v", s.Launch)
 	}
 	if len(s.Mounts) != 1 || s.Mounts[0].Target != "/data" || s.Mounts[0].Type != "tmpfs" {
@@ -137,6 +138,46 @@ func TestBuildE2BForbidsLaunch(t *testing.T) {
 	pb.Spec.Launch = &rtconfig.LaunchConfig{Exec: "/app"}
 	if _, err := pb.BuildYAML(); err != nil {
 		t.Fatalf("bare launch override should be accepted: %v", err)
+	}
+}
+
+func TestBuildLaunchCgroupControl(t *testing.T) {
+	e2b := baseParams(types.ProfileE2B)
+	e2bConfig, err := e2b.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e2bConfig.Launch.CgroupControl {
+		t.Fatal("e2b launch.cgroup_control = false, want true")
+	}
+	if got := strings.Join(e2bConfig.Launch.Args, " "); got != "-isnotfc -port 49983" {
+		t.Fatalf("e2b envd args = %q", got)
+	}
+	e2b.MMDSEnabled = true
+	e2bConfig, err = e2b.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e2bConfig.Launch.CgroupControl || strings.Join(e2bConfig.Launch.Args, " ") != "-port 49983" {
+		t.Fatalf("MMDS e2b launch = %+v", e2bConfig.Launch)
+	}
+
+	bare := baseParams(types.ProfileBare)
+	bareConfig, err := bare.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bareConfig.Launch.CgroupControl {
+		t.Fatal("bare default launch.cgroup_control = true, want false")
+	}
+
+	bare.Spec.Launch = &rtconfig.LaunchConfig{CgroupControl: true}
+	bareConfig, err = bare.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bareConfig.Launch.CgroupControl {
+		t.Fatal("bare explicit launch.cgroup_control = false, want true")
 	}
 }
 

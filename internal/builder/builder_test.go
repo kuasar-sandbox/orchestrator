@@ -300,6 +300,41 @@ func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
 	}
 }
 
+func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{}}
+
+	stepsLaunch := p.stepsYAML()["launch"].(map[string]any)
+	if got := stepsLaunch["cgroup_control"]; got != true {
+		t.Fatalf("steps launch.cgroup_control = %#v, want true", got)
+	}
+	if got := stepsLaunch["args"]; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
+		t.Fatalf("steps envd args = %#v", got)
+	}
+
+	template, err := p.templateYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateLaunch := template["launch"].(map[string]any)
+	if got := templateLaunch["cgroup_control"]; got != true {
+		t.Fatalf("template launch.cgroup_control = %#v, want true", got)
+	}
+	if got := templateLaunch["args"]; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
+		t.Fatalf("template envd args = %#v", got)
+	}
+
+	p.spec.MMDSEnabled = true
+	template, err = p.templateYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateLaunch = template["launch"].(map[string]any)
+	if templateLaunch["cgroup_control"] != true ||
+		!reflect.DeepEqual(templateLaunch["args"], []string{"-port", "49983"}) {
+		t.Fatalf("MMDS template launch = %#v", templateLaunch)
+	}
+}
+
 // testCACertPEM is a self-signed X.509 certificate (CN=test-ca, RSA 2048,
 // 1-day validity) used to exercise CA-bundle projection and validation. It is
 // parseable by x509.AppendCertsFromPEM but trusts nothing in production.
