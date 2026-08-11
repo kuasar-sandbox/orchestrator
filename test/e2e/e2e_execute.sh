@@ -423,6 +423,8 @@ exec_through_connect() {
     local status
 
     printf 'stdin:%s\n' "$marker" >"$input"
+    : >"$output"
+    : >"$error_output"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
         --proxy "http://127.0.0.1:$PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
@@ -438,11 +440,24 @@ exec_through_connect() {
         status=$?
     fi
     grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; dump_exec_failure_context "$sid"; fail "native exec stdout/stdin mismatch"; }
     grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; dump_exec_failure_context "$sid"; fail "native exec stderr mismatch"; }
     [ "$status" = "47" ] \
-        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
+        || { sed 's/^/  client| /' "$diagnostics"; dump_exec_failure_context "$sid"; fail "native exec exit=$status (want guest status 47)"; }
+}
+
+dump_exec_failure_context() { # $1=sandbox id
+    local sid="$1" state run_id
+    state="$(sandbox_state "$sid")"
+    run_id="$(sandbox_run_id "$sid")"
+    echo "==> exec failure context: sid=$sid state=$state run_id=${run_id:-<empty>}" >&2
+    if [ -n "${ORCH_LOG:-}" ] && [ -f "$ORCH_LOG" ]; then
+        echo "==> matching node-ctl lifecycle log:" >&2
+        grep -F "sid=$sid" "$ORCH_LOG" | sed 's/^/  orch| /' >&2 || true
+    fi
+    echo "==> matching sandbox runner journal:" >&2
+    journalctl KUASAR_SANDBOX_ID="$sid" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
 }
 
 exec_pty_resize_through_connect() {
@@ -667,8 +682,10 @@ EOF
 }
 
 ORCH_PID=""
+ORCH_LOG=""
 start_orchestrator() { # $1=log path
     local log_path="$1" ready=""
+    ORCH_LOG="$log_path"
     "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
     ORCH_PID=$!
     PIDS+=("$ORCH_PID")
