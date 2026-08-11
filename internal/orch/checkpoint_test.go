@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -251,6 +252,92 @@ func TestSnapshotFailureLeavesSandboxRunning(t *testing.T) {
 	}
 }
 
+func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
+
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	o.SetLifecycleContext(serviceCtx)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("CHECKPOINT_STARTED_FILE", started)
+	t.Setenv("CHECKPOINT_RELEASE_FILE", release)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+	}()
+	waitForCheckpointFile(t, started)
+
+	// Neither the disconnected caller nor shutdown admission cancellation may
+	// kill a snapshot client after the runtime has accepted its request.
+	cancelRequest()
+	stopService()
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- o.DrainPauses(context.Background()) }()
+	assertCheckpointBlocked(t, pauseDone, "pause returned before snapshot completion")
+	assertCheckpointBlocked(t, drainDone, "shutdown drain returned before accepted pause completion")
+
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitCheckpointResult(t, pauseDone); err != nil {
+		t.Fatalf("Pause after cancellation: %v", err)
+	}
+	if err := waitCheckpointResult(t, drainDone); err != nil {
+		t.Fatalf("DrainPauses: %v", err)
+	}
+
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != types.StatePaused || stored.SnapshotRef != filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot") {
+		t.Fatalf("pause after cancellation was not committed: %+v", stored)
+	}
+	if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
+		t.Fatalf("stop/detach = %d/%d, want 1/1", launcher.stops.Load(), vs.detaches.Load())
+	}
+}
+
+func waitForCheckpointFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertCheckpointBlocked(t *testing.T, done <-chan error, message string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: %v", message, err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func waitCheckpointResult(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for checkpoint operation")
+		return nil
+	}
+}
+
 func TestCreateRejectsCheckpointPolicyBeforeLaunchSideEffects(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -341,6 +428,12 @@ if [ "${CHECKPOINT_FAIL:-}" = "1" ]; then
   echo "forced snapshot failure" >&2
   exit 1
 fi
+if [ -n "${CHECKPOINT_STARTED_FILE:-}" ]; then
+  : > "$CHECKPOINT_STARTED_FILE"
+  while [ ! -e "$CHECKPOINT_RELEASE_FILE" ]; do
+    sleep 0.01
+  done
+fi
 printf '%s\n' "${CHECKPOINT_STDOUT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 `
 	if err := os.WriteFile(filepath.Join(dir, config.BinSandboxCtl), []byte(script), 0o755); err != nil {
@@ -349,6 +442,8 @@ printf '%s\n' "${CHECKPOINT_STDOUT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CHECKPOINT_ARGS_FILE", argsPath)
 	t.Setenv("CHECKPOINT_FAIL", "")
+	t.Setenv("CHECKPOINT_STARTED_FILE", "")
+	t.Setenv("CHECKPOINT_RELEASE_FILE", "")
 	return argsPath
 }
 

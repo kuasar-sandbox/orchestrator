@@ -305,9 +305,9 @@ func (o *Orchestrator) ClusterNodeInfo() (capacity int, buildCap *routesync.Buil
 	return o.cfg.Sandbox.Capacity, buildCap, runtimeDigest
 }
 
-// SetLifecycleContext sets the common lifetime for every accepted standalone,
-// data-plane, exec, and cluster launch. node-ctl calls it unconditionally before
-// exposing any API or route surface.
+// SetLifecycleContext sets the common admission lifetime for standalone,
+// data-plane, exec, cluster launch, and pause work. node-ctl calls it
+// unconditionally before exposing any API or route surface.
 func (o *Orchestrator) SetLifecycleContext(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -337,6 +337,13 @@ func (o *Orchestrator) asyncCtx() context.Context             { return o.launchC
 // must be canceled before calling it so admission cannot add a successor.
 func (o *Orchestrator) DrainLaunches(ctx context.Context) error {
 	return o.launches.Drain(ctx)
+}
+
+// DrainPauses closes pause admission and waits for every accepted snapshot to
+// finish durable publication and resource cleanup. Accepted snapshots cannot be
+// canceled safely because the runtime continues after its ctl client exits.
+func (o *Orchestrator) DrainPauses(ctx context.Context) error {
+	return o.pauses.Drain(ctx)
 }
 
 func accept(cmd *routesync.Command) *routesync.CmdAck {

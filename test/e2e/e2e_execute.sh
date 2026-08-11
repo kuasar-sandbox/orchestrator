@@ -22,7 +22,8 @@
 #                                real sandbox-ctl HTTP CONNECT client against the
 #                                guest (stdio, PTY resize, exit status, pause wake).
 #   envd exec                  -> run a command in the guest via envd (incl. hostname).
-#   local Pause policy        -> all-unset keeps the legacy argv; then node,
+#   local Pause policy        -> all-unset keeps the legacy argv and commits
+#                                after its HTTP caller disconnects; then node,
 #                                Create metadata/header, Pause body/header, and
 #                                automatic reaper policy are layered fieldwise.
 #                                Captures are real local bundles and are restored
@@ -1059,14 +1060,29 @@ grep -q "$PERSIST" "$WORK/wr.out" || { sed 's/^/  guest| /' "$WORK/wr.out"; fail
 echo "==> wrote /home/user/persist.txt in the guest (as user)"
 
 UNSET_CALL=$(snapshot_argv_count)
-echo "==> local pause with node/metadata/action policy all unset: $SID"
-code=$(req POST "/sandboxes/$SID/pause" "$AK")
-[ "$code" = "204" ] || {
-    echo "==> pause=$code — snapshot error:"
+echo "==> local pause with all policy fields unset; disconnect caller after 0.5s: $SID"
+set +e
+code=$(curl -sS --noproxy '*' --max-time 0.5 \
+    -o "$WORK/pause-cancel.body" -w '%{http_code}' \
+    -X POST \
+    -H "Host: api.$DOMAIN" \
+    -H "X-API-KEY: $AK" \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    "http://127.0.0.1:$PORT/sandboxes/$SID/pause" \
+    2>"$WORK/pause-cancel.stderr")
+PAUSE_CURL_RC=$?
+set -e
+[ "$PAUSE_CURL_RC" = "28" ] || {
+    cat "$WORK/pause-cancel.stderr" >&2
+    fail "pause cancellation curl rc=$PAUSE_CURL_RC http=$code (want timeout rc=28)"
+}
+wait_sandbox_state "$SID" paused 1200 || {
+    echo "==> pause client timed out but durable state did not become paused:"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
     SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
-    fail "local all-unset pause=$code (want 204)"
+    fail "accepted local Pause did not commit after caller cancellation"
 }
 assert_snapshot_argv "$UNSET_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
@@ -1078,7 +1094,7 @@ B_ARTIFACT="$(readlink -f "$B_LOCAL")"
 B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
 "$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json" \
     || fail "all-unset local B is not a readable snapshot bundle"
-echo "==> PASS: all-unset local Pause produced B and passed no policy flags"
+echo "==> PASS: caller timed out, accepted all-unset Pause still committed B and passed no policy flags"
 
 echo "==> accept paused -> starting through POST /connect, then activate native exec immediately"
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113}')
