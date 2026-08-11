@@ -84,6 +84,59 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 	}
 }
 
+func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("pause-cas", 0)
+	sb.SnapshotRef = "snapshot-old"
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", "snapshot-stale"); err != nil || changed {
+		t.Fatalf("stale CommitRunningPaused = %v, %v; want CAS miss", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != types.StateRunning || got.SnapshotRef != "snapshot-old" {
+		t.Fatalf("CAS miss partially changed pause: %+v", got)
+	}
+	if _, err := st.db.Exec(`
+		CREATE TRIGGER fail_pause_commit BEFORE UPDATE OF state, snapshot_ref ON sandboxes
+		BEGIN SELECT RAISE(ABORT, 'forced pause commit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-failed"); err == nil || changed {
+		t.Fatalf("failed CommitRunningPaused = %v, %v; want propagated error", changed, err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != types.StateRunning || got.SnapshotRef != "snapshot-old" {
+		t.Fatalf("failed commit partially changed pause: %+v", got)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER fail_pause_commit`); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-current"); err != nil || !changed {
+		t.Fatalf("CommitRunningPaused = %v, %v", changed, err)
+	}
+	got, err = st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != types.StatePaused || got.SnapshotRef != "snapshot-current" || got.RunID != sb.RunID {
+		t.Fatalf("committed pause = %+v", got)
+	}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-late"); err != nil || changed {
+		t.Fatalf("late CommitRunningPaused = %v, %v; want CAS miss", changed, err)
+	}
+}
+
 func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -461,6 +461,20 @@ func (s *Store) CommitStartingRunning(ctx context.Context, id, runID string) (bo
 	return sandboxUpdateChanged("commit starting running", id, result)
 }
 
+// CommitRunningPaused publishes a completed snapshot only while the exact
+// runner that produced it still owns a running row. State and snapshot ref are
+// one atomic update so readers can never observe a partially committed pause.
+func (s *Store) CommitRunningPaused(ctx context.Context, id, runID, snapshotRef string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes SET state=?, snapshot_ref=?
+		 WHERE id=? AND state=? AND run_id=?`,
+		string(types.StatePaused), snapshotRef, id, string(types.StateRunning), runID)
+	if err != nil {
+		return false, fmt.Errorf("store: commit running paused sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("commit running paused", id, result)
+}
+
 func (s *Store) rollbackStarting(ctx context.Context, id, expectedRunID string, target types.State) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
