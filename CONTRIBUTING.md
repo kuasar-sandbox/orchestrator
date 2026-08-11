@@ -54,6 +54,17 @@ A pull request should:
 
 Draft pull requests are welcome for early feedback, but they are not merge candidates.
 
+## Licensing of contributions
+
+By submitting a contribution, you agree that it is licensed under the license
+that applies to the files being changed. New project files without a different
+explicit license declaration are contributed under the
+[Apache License 2.0](LICENSE).
+
+Only submit work that you have the right to contribute. Preserve applicable
+copyright, attribution, NOTICE, and SPDX declarations when modifying
+third-party or differently licensed material.
+
 ## CI and merge policy
 
 Fork pull requests must not execute untrusted code on the privileged self-hosted

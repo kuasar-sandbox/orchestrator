@@ -102,3 +102,8 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
   ExecSession Reserve,两跳转发与 CONNECT,stable/NodeSandboxID 改写和 KAT 双验.
 - [docs/cluster-placer.md](docs/cluster-placer.md) — 放置调度器:SandboxGroupProvider/Importer、
   placer memberlist、node_list WATCH_LIST、source lease、selector patch、PlaceSandbox / PlaceBuild。
+
+## License
+
+本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
+贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
