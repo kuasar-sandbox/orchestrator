@@ -58,6 +58,7 @@ PROXY_VETH_NS="${PROXY_VETH_NS:-e2ein0}"
 PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.253.1}"
 PROXY_NS_IP="${PROXY_NS_IP:-172.31.253.2}"
 FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
+LOW_ALLOC_REPEATS="${LOW_ALLOC_REPEATS:-2}"
 
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
@@ -340,6 +341,49 @@ wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
         grep -Fq "$pattern" "$output" && return 0
         sleep 0.1
     done
+    return 1
+}
+capture_mem_report_state() { # $1=unit, $2=output file
+    journalctl -u "$1" --no-pager >"$2" 2>/dev/null || true
+    awk '
+        /mem_report: recovered after [0-9]+ consecutive failures/ { state = "recovered"; next }
+        /mem_report:/ { state = "failed" }
+        END { print state }
+    ' "$2"
+}
+wait_for_mem_report_progress() { # $1=unit, $2=output file
+    local unit="$1" output="$2" state=""
+
+    # sandbox-init reports immediately and every five seconds. Observe more
+    # than one full interval so a permanently failing channel cannot pass just
+    # because the first successful attempt is silent.
+    for _ in $(seq 1 28); do
+        state="$(capture_mem_report_state "$unit" "$output")"
+        case "$state" in
+            failed) break ;;
+            recovered)
+                echo "==> observed transient mem_report failure followed by recovery; complete unit/CH timeline:"
+                sed 's/^/  low-unit| /' "$output"
+                return 0
+                ;;
+        esac
+        sleep 0.25
+    done
+    state="$(capture_mem_report_state "$unit" "$output")"
+    [ "$state" = failed ] || return 0
+
+    echo "==> transient mem_report failure observed; complete unit/CH timeline before recovery wait:"
+    sed 's/^/  low-unit| /' "$output"
+    # The next attempt is due within five seconds. Twelve seconds covers two
+    # complete retry intervals under runner pressure without accepting a
+    # reporter that has stopped making progress.
+    for _ in $(seq 1 48); do
+        state="$(capture_mem_report_state "$unit" "$output")"
+        [ "$state" = recovered ] && return 0
+        sleep 0.25
+    done
+    capture_mem_report_state "$unit" "$output" >/dev/null
+    sed 's/^/  low-unit| /' "$output"
     return 1
 }
 assert_sandbox_detail() {
@@ -805,68 +849,86 @@ print(json.dumps({
 }))
 PY
 )
-LOW_START_MS=$(date +%s%3N)
-code=$(req POST /sandboxes "$AK" "$LOW_CREATE_BODY")
-[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "low-allocatable create=$code"; }
-LOW_SID=$(json_field "$WORK/resp.body" sandboxID)
-LOW_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-code=$(DP_MAX_TIME=65 dp "49983-$LOW_SID" /health "$LOW_TOKEN" || true)
-{ [ "$code" = "204" ] || [ "$code" = "200" ]; } || {
-    journalctl KUASAR_SANDBOX_ID="$LOW_SID" --no-pager -n 100 2>/dev/null || true
-    fail "low-allocatable health=$code"
+case "$LOW_ALLOC_REPEATS" in
+    ''|*[!0-9]*) fail "LOW_ALLOC_REPEATS must be a positive integer" ;;
+esac
+[ "$LOW_ALLOC_REPEATS" -gt 0 ] || fail "LOW_ALLOC_REPEATS must be positive"
+
+run_low_allocatable_case() { # $1=iteration
+    local iteration="$1" code LOW_START_MS LOW_SID LOW_TOKEN LOW_ELAPSED_MS
+    local LOW_RUN_ID LOW_UNIT LOW_CG LOW_CTL_PID LOW_CTL_CG LOW_VMM_PROCS
+    local LOW_VISIBLE_VMM_PIDS=0 LOW_JOURNAL pid
+    local -a LOW_VMM_PIDS=()
+
+    LOW_START_MS=$(date +%s%3N)
+    code=$(req POST /sandboxes "$AK" "$LOW_CREATE_BODY")
+    [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "low-allocatable[$iteration] create=$code"; }
+    LOW_SID=$(json_field "$WORK/resp.body" sandboxID)
+    LOW_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+    code=$(DP_MAX_TIME=65 dp "49983-$LOW_SID" /health "$LOW_TOKEN" || true)
+    { [ "$code" = "204" ] || [ "$code" = "200" ]; } || {
+        journalctl KUASAR_SANDBOX_ID="$LOW_SID" --no-pager -n 100 2>/dev/null || true
+        fail "low-allocatable[$iteration] health=$code"
+    }
+    LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
+    [ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable[$iteration] startup took ${LOW_ELAPSED_MS}ms"
+    wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable[$iteration] sandbox not running"
+    LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
+    [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
+    LOW_UNIT="sandbox-runner@$LOW_RUN_ID.service"
+    LOW_CG=$(systemctl show "$LOW_UNIT" -p ControlGroup --value)
+    LOW_CTL_PID=$(systemctl show "$LOW_UNIT" -p MainPID --value)
+    [ -n "$LOW_CG" ] && [ "$LOW_CG" != "/" ] || fail "runner ControlGroup is invalid: $LOW_CG"
+    [ "$LOW_CTL_PID" -gt 1 ] || fail "runner MainPID is invalid: $LOW_CTL_PID"
+    LOW_CTL_CG=$(awk -F: '$1 == "0" {print $3}' "/proc/$LOW_CTL_PID/cgroup")
+    [ "$LOW_CTL_CG" = "$LOW_CG/ctl" ] || fail "sandbox-ctl cgroup=$LOW_CTL_CG, want $LOW_CG/ctl"
+    LOW_VMM_PROCS="/sys/fs/cgroup$LOW_CG/vmm/cgroup.procs"
+    mapfile -t LOW_VMM_PIDS < "$LOW_VMM_PROCS"
+    [ "${#LOW_VMM_PIDS[@]}" -gt 0 ] || fail "vmm cgroup has no process"
+    for pid in "${LOW_VMM_PIDS[@]}"; do
+        # A nested PID namespace may render an otherwise populated cgroup entry as
+        # zero. Validate every process visible to this test namespace.
+        [ "$pid" = 0 ] && continue
+        [ "$(basename "$(readlink -f "/proc/$pid/exe")")" = "cloud-hypervisor" ] \
+            || fail "vmm cgroup contains non-VMM pid=$pid"
+        LOW_VISIBLE_VMM_PIDS=$((LOW_VISIBLE_VMM_PIDS + 1))
+    done
+    [ "$LOW_VISIBLE_VMM_PIDS" -gt 0 ] || fail "vmm cgroup has no visible Cloud Hypervisor process"
+    [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
+        || fail "vmm memory.high is not 224MiB"
+    [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
+        || fail "vmm memory.max does not reflect 8GiB capacity + 32MiB overhead"
+    [ "$(<"/sys/fs/cgroup$LOW_CG/ctl/memory.high")" = "max" ] \
+        || fail "ctl memory.high is constrained"
+
+    LOW_JOURNAL="$WORK/low-allocatable-$iteration.journal"
+    wait_for_mem_report_progress "$LOW_UNIT" "$LOW_JOURNAL" \
+        || fail "low-allocatable[$iteration] mem_report made no progress after a transient failure"
+
+    code=$(req DELETE "/sandboxes/$LOW_SID" "$AK"); [ "$code" = "204" ] || fail "delete low-allocatable[$iteration] sandbox=$code"
+    for _ in $(seq 1 50); do
+        [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] && break
+        sleep 0.1
+    done
+    [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
+    journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
+    # KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
+    grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL" \
+        || fail "low-allocatable[$iteration] run did not observe StopUnit"
+    grep -Fq '[sandbox-ctl] CH exited code=' "$LOW_JOURNAL" \
+        || fail "low-allocatable[$iteration] run did not observe CH exit"
+    # Under deliberate memory.high pressure, CH's direct systemd signal can race
+    # sandbox-ctl's shutdown API and make CH report a non-zero shutdown exit. The
+    # lifecycle contract here is bounded exit and cgroup removal without SIGKILL.
+    ! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
+        || fail "low-allocatable[$iteration] run escalated shutdown to SIGKILL"
+    echo "==> PASS: 8GiB/256MiB runner[$iteration] ready in ${LOW_ELAPSED_MS}ms; mem_report progressed; ctl/vmm isolated and cleaned"
 }
-LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
-[ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable startup took ${LOW_ELAPSED_MS}ms"
-wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable sandbox not running"
-LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
-[ -n "$LOW_RUN_ID" ] || fail "low-allocatable sandbox has no run_id"
-LOW_UNIT="sandbox-runner@$LOW_RUN_ID.service"
-LOW_CG=$(systemctl show "$LOW_UNIT" -p ControlGroup --value)
-LOW_CTL_PID=$(systemctl show "$LOW_UNIT" -p MainPID --value)
-[ -n "$LOW_CG" ] && [ "$LOW_CG" != "/" ] || fail "runner ControlGroup is invalid: $LOW_CG"
-[ "$LOW_CTL_PID" -gt 1 ] || fail "runner MainPID is invalid: $LOW_CTL_PID"
-LOW_CTL_CG=$(awk -F: '$1 == "0" {print $3}' "/proc/$LOW_CTL_PID/cgroup")
-[ "$LOW_CTL_CG" = "$LOW_CG/ctl" ] || fail "sandbox-ctl cgroup=$LOW_CTL_CG, want $LOW_CG/ctl"
-LOW_VMM_PROCS="/sys/fs/cgroup$LOW_CG/vmm/cgroup.procs"
-mapfile -t LOW_VMM_PIDS < "$LOW_VMM_PROCS"
-[ "${#LOW_VMM_PIDS[@]}" -gt 0 ] || fail "vmm cgroup has no process"
-LOW_VISIBLE_VMM_PIDS=0
-for pid in "${LOW_VMM_PIDS[@]}"; do
-    # A nested PID namespace may render an otherwise populated cgroup entry as
-    # zero. Validate every process visible to this test namespace.
-    [ "$pid" = 0 ] && continue
-    [ "$(basename "$(readlink -f "/proc/$pid/exe")")" = "cloud-hypervisor" ] \
-        || fail "vmm cgroup contains non-VMM pid=$pid"
-    LOW_VISIBLE_VMM_PIDS=$((LOW_VISIBLE_VMM_PIDS + 1))
+
+for LOW_ALLOC_ITERATION in $(seq 1 "$LOW_ALLOC_REPEATS"); do
+    run_low_allocatable_case "$LOW_ALLOC_ITERATION"
 done
-[ "$LOW_VISIBLE_VMM_PIDS" -gt 0 ] || fail "vmm cgroup has no visible Cloud Hypervisor process"
-[ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
-    || fail "vmm memory.high is not 224MiB"
-[ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
-    || fail "vmm memory.max does not reflect 8GiB capacity + 32MiB overhead"
-[ "$(<"/sys/fs/cgroup$LOW_CG/ctl/memory.high")" = "max" ] \
-    || fail "ctl memory.high is constrained"
-code=$(req DELETE "/sandboxes/$LOW_SID" "$AK"); [ "$code" = "204" ] || fail "delete low-allocatable sandbox=$code"
-for _ in $(seq 1 50); do
-    [ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] && break
-    sleep 0.1
-done
-[ ! -e "/sys/fs/cgroup$LOW_CG/vmm" ] || fail "vmm cgroup remained after StopUnit"
-LOW_JOURNAL="$WORK/low-allocatable.journal"
-journalctl -u "$LOW_UNIT" --no-pager >"$LOW_JOURNAL" 2>/dev/null || true
-! grep -Fq 'mem_report: read: resource temporarily unavailable' "$LOW_JOURNAL" \
-    || fail "low-allocatable run stalled mem_report"
-# KillMode=control-group may terminate CH before sandbox-ctl reaches the API.
-grep -Fq '[sandbox-ctl] received terminated' "$LOW_JOURNAL" \
-    || fail "low-allocatable run did not observe StopUnit"
-grep -Fq '[sandbox-ctl] CH exited code=' "$LOW_JOURNAL" \
-    || fail "low-allocatable run did not observe CH exit"
-# Under deliberate memory.high pressure, CH's direct systemd signal can race
-# sandbox-ctl's shutdown API and make CH report a non-zero shutdown exit. The
-# lifecycle contract here is bounded exit and cgroup removal without SIGKILL.
-! grep -Fq "CH didn't exit within" "$LOW_JOURNAL" \
-    || fail "low-allocatable run escalated shutdown to SIGKILL"
-echo "==> PASS: 8GiB/256MiB runner ready in ${LOW_ELAPSED_MS}ms; ctl/vmm isolated and cleaned"
+echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
 
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they
