@@ -448,16 +448,33 @@ exec_through_connect() {
 }
 
 dump_exec_failure_context() { # $1=sandbox id
-    local sid="$1" state run_id
+    local sid="$1" state run_id failed_run_id=""
     state="$(sandbox_state "$sid")"
     run_id="$(sandbox_run_id "$sid")"
     echo "==> exec failure context: sid=$sid state=$state run_id=${run_id:-<empty>}" >&2
     if [ -n "${ORCH_LOG:-}" ] && [ -f "$ORCH_LOG" ]; then
         echo "==> matching node-ctl lifecycle log:" >&2
         grep -F "sid=$sid" "$ORCH_LOG" | sed 's/^/  orch| /' >&2 || true
+        failed_run_id="$(python3 - "$ORCH_LOG" "$sid" <<'PY'
+import re, sys
+last = ""
+for line in open(sys.argv[1], encoding="utf-8"):
+    if f"sid={sys.argv[2]}" not in line:
+        continue
+    match = re.search(r'\brun_id=(?:"([^"]*)"|(\S+))', line)
+    if match and (match.group(1) or match.group(2)):
+        last = match.group(1) or match.group(2)
+print(last)
+PY
+)"
     fi
-    echo "==> matching sandbox runner journal:" >&2
-    journalctl KUASAR_SANDBOX_ID="$sid" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+    if [ -n "$failed_run_id" ]; then
+        echo "==> failed runner unit journal: sandbox-runner@$failed_run_id.service" >&2
+        journalctl -u "sandbox-runner@$failed_run_id.service" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+    else
+        echo "==> matching sandbox runner journal:" >&2
+        journalctl KUASAR_SANDBOX_ID="$sid" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+    fi
 }
 
 exec_pty_resize_through_connect() {
