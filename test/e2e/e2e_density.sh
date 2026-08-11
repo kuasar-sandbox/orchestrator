@@ -162,15 +162,17 @@ setup_sb() {
     mkfs.ext4 -q -F "$WORK/${sid}.diff"
 }
 
-# emit_yaml SID MODE FLOOR_MIB CAP_MIB BURST_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE
+# emit_yaml SID MODE FLOOR_MIB CAP_MIB BURST_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE START_GATE
 #   MODE      = static | dynamic
 #   BURST_MIB = ignored when MODE=static (no startup section emitted)
 #   CYCLES    = number of grow/rest cycles within the duration
 #   DEFLATE   = true | false (allocatable.deflate_on_oom)
+#   START_GATE = optional guest path; workload waits for the host to create it
 emit_yaml() {
     local sid="$1" mode="$2" floor_mib="$3" cap_mib="$4" burst_mib="$5"
     local wl_dur="$6" wl_cycles="$7" wl_rmin="$8" wl_rmax="$9"
     local deflate="${10:-true}"
+    local start_gate="${11:-}"
 
     {
         cat <<EOF
@@ -210,6 +212,12 @@ launch:
     WL_RMIN_MIB: "${wl_rmin}"
     WL_RMAX_MIB: "${wl_rmax}"
     PYTHONUNBUFFERED: "1"
+EOF
+        if [ -n "$start_gate" ]; then
+            echo "    WL_START_GATE: \"$start_gate\""
+            echo '    WL_START_GATE_TIMEOUT: "60"'
+        fi
+        cat <<EOF
   restart: never
   args:
     - "-c"
@@ -454,17 +462,6 @@ wait_for_controller_activity() {
     fail "$sid: controller recorded neither a grant nor a reclaim within ${timeout}s"
 }
 
-wait_for_controller_admit() {
-    local sid="$1" pid="$2" timeout="$3"
-    local deadline=$((SECONDS + timeout))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        grep -q "admit token=.* sid=$sid" "$WORK/audit.log" 2>/dev/null && return 0
-        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before controller admission"
-        sleep 0.25
-    done
-    fail "$sid: controller did not admit the sandbox within ${timeout}s"
-}
-
 wait_for_controller_grant() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
@@ -474,6 +471,32 @@ wait_for_controller_grant() {
         sleep 0.25
     done
     fail "$sid: controller did not grant memory within ${timeout}s"
+}
+
+wait_for_b2_control_ready() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -q "admit token=.* sid=$sid" "$WORK/audit.log" 2>/dev/null \
+            && grep -q "settled .* sid=$sid " "$WORK/daemon.log" 2>/dev/null \
+            && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before controller/sensor readiness barrier"
+        sleep 0.1
+    done
+    fail "$sid: controller/sensor readiness barrier not reached within ${timeout}s"
+}
+
+open_workload_gate() {
+    local sid="$1" gate="$2"
+    timeout -k 5s 20 "$BIN/sandbox-ctl" exec \
+        --sandbox-id "$sid" \
+        --run-root "$WORK/run" \
+        -- /bin/sh -ceu 'touch "$1"' sh "$gate" \
+        >"$WORK/$sid-gate.log" 2>&1 \
+        || { sed 's/^/  gate| /' "$WORK/$sid-gate.log"; fail "$sid: open workload start gate"; }
 }
 
 memory_event_count() {
@@ -640,12 +663,13 @@ phase_b2_dynamic_control() {
     start_daemon "$WORK/node-ctl.yaml"
 
     local sid=sb-B2-1
+    local start_gate=/tmp/e2e-density-b2.start
     setup_sb "$sid"
     # The startup budget is part of dynamic admission, while the steady-state
     # floor, capacity, workload, and guest safety setting are identical to B1.
     emit_yaml "$sid" dynamic "$B_FLOOR_MIB" "$B_CAP_MIB" "$B2_STARTUP_MIB" \
         "$B_WORKLOAD_DURATION" "$B_WORKLOAD_CYCLES" \
-        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true
+        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true "$start_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -656,8 +680,13 @@ phase_b2_dynamic_control() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # Prove the proactive control path before checking terminal completion.
-    wait_for_controller_admit "$sid" "$pid" 15
+    # Hold the decisive pressure phase until the controller has admitted and
+    # settled the sandbox and sandbox-ctl has armed its pressure sensor. This
+    # removes the launch_ack→sensor goroutine scheduling race without weakening
+    # the semantic assertion below: once released, the same workload must still
+    # complete through proactive grants without guest self-cap/OOM.
+    wait_for_b2_control_ready "$sid" "$pid" 30
+    open_workload_gate "$sid" "$start_gate"
     wait_for_controller_grant "$sid" "$pid" 30
     wait_for_workload "$sid" "$pid" 45
 
