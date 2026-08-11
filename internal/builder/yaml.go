@@ -177,10 +177,11 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 			"root":    p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
 		},
 		"launch": map[string]any{
-			"exec":    "/opt/sandbox-runtime/bin/envd",
-			"args":    []string{"-isnotfc", "-port", "49983"},
-			"user":    "0:0",
-			"restart": "always",
+			"exec":           "/opt/sandbox-runtime/bin/envd",
+			"args":           []string{"-isnotfc", "-port", "49983"},
+			"user":           "0:0",
+			"restart":        "always",
+			"cgroup_control": true,
 			// Share sandbox-init's PID namespace (as production does) so orphaned
 			// descendants of RUN steps are reaped by PID 1 rather than zombie-ing
 			// under envd during the build.
@@ -222,10 +223,11 @@ func (p *buildPipeline) templateYAML() (map[string]any, error) {
 			"root":    p.rootDoc("file://" + s.Paths.OverlayDiffTpl),
 		},
 		"launch": map[string]any{
-			"exec":    "/opt/sandbox-runtime/bin/envd",
-			"args":    envdArgs,
-			"user":    "0:0",
-			"restart": "always",
+			"exec":           "/opt/sandbox-runtime/bin/envd",
+			"args":           envdArgs,
+			"user":           "0:0",
+			"restart":        "always",
+			"cgroup_control": true,
 			// Production e2b posture (matches sandboxcfg's launch config): envd is
 			// not a PID-1-style reaper, so share sandbox-init's PID namespace —
 			// PID 1 reaps orphaned descendants of guest commands instead of them

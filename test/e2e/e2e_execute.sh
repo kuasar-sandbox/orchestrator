@@ -1057,6 +1057,42 @@ if err is not None:
 sys.stdout.write("OUTPUT_BEGIN\n"); sys.stdout.flush()
 sys.stdout.buffer.write(out); sys.stdout.write("\nOUTPUT_END\n")
 PY
+cat > "$WORK/envd_start.py" <<'PY'
+import base64, http.client, json, socket, struct, sys
+
+sock_path, token, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+class UDS(http.client.HTTPConnection):
+    def __init__(s): super().__init__("envd")
+    def connect(s):
+        s.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.sock.connect(sock_path)
+
+req = {"process": {"cmd": "/bin/sh", "args": ["-c", "exec " + cmd], "cwd": "/home/user"}}
+body = json.dumps(req).encode()
+env = b"\x00" + struct.pack(">I", len(body)) + body
+c = UDS()
+c.request("POST", "/process.Process/Start", body=env, headers={
+    "Content-Type": "application/connect+json", "Connect-Protocol-Version": "1",
+    "Authorization": "Basic " + base64.b64encode(b"user:").decode(),
+    "X-Access-Token": token})
+r = c.getresponse()
+if r.status != 200:
+    raise SystemExit(f"envd start HTTP {r.status}: {r.read()!r}")
+while True:
+    header = r.read(5)
+    if len(header) != 5:
+        raise SystemExit("envd stream ended before start event")
+    flag, length = header[0], struct.unpack(">I", header[1:])[0]
+    message = r.read(length)
+    event = json.loads(message) if message else {}
+    if flag & 2:
+        raise SystemExit(f"envd stream error before start: {event!r}")
+    start = event.get("event", {}).get("start")
+    if start is not None:
+        print(start["pid"])
+        r.close()
+        c.close()
+        break
+PY
 MARK="HELLO_FROM_GUEST_$RANDOM"
 echo "==> exec in guest: sh -c 'hostname; id; echo $MARK; uname -sm'"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "hostname; id; echo $MARK; uname -sm" > "$WORK/exec.out" 2>&1 || true
@@ -1068,6 +1104,97 @@ echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
 # hostname. Best-effort (the main flow already passed); a note rather than a failure.
 if grep -q "$CFG_HOST" "$WORK/exec.out"; then echo "==> PASS: config injected (guest hostname=$CFG_HOST via X-Kuasar-Sandbox-Network)"
 else echo "    (note: guest hostname != $CFG_HOST; config-injection check inconclusive)"; fi
+
+# ---- delegated cgroup topology + long-lived envd-managed service ---------
+# The service stream is deliberately dropped after envd reports its start event;
+# envd owns the process from then on. Its in-memory counter and HTTP listener ride
+# both local snapshots below, covering the /app freezer recursively across
+# envd's /user subtree.
+FREEZE_SERVICE_B64=$(python3 - <<'PY'
+import base64
+program = r'''
+import os, pathlib, socket, time
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", 8001))
+listener.listen()
+listener.settimeout(0.05)
+counter = 0
+cgroup = pathlib.Path("/proc/self/cgroup").read_text().strip().splitlines()[0].split(":", 2)[2]
+while True:
+    counter += 1
+    try:
+        conn, _ = listener.accept()
+    except socket.timeout:
+        pass
+    else:
+        with conn:
+            conn.settimeout(0.2)
+            try:
+                conn.recv(4096)
+            except OSError:
+                pass
+            body = f"ENVD_FREEZE_SERVICE {counter} {os.getpid()} {cgroup}\n".encode()
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                         str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+    time.sleep(0.05)
+'''
+print(base64.b64encode(program.encode()).decode())
+PY
+)
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "python3 -c \"import base64; open('/home/user/freeze_service.py','wb').write(base64.b64decode('$FREEZE_SERVICE_B64'))\"" \
+    >"$WORK/install-freeze-service.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/install-freeze-service.out" \
+    || { sed 's/^/  envd| /' "$WORK/install-freeze-service.out"; fail "install envd freeze service"; }
+FREEZE_PID=$(python3 "$WORK/envd_start.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "python3 /home/user/freeze_service.py" 2>"$WORK/start-freeze-service.err") \
+    || { cat "$WORK/start-freeze-service.err"; fail "start envd freeze service"; }
+[[ "$FREEZE_PID" =~ ^[0-9]+$ ]] || fail "envd freeze service returned invalid pid: $FREEZE_PID"
+
+freeze_service_probe() {
+    local service_code
+    service_code=$(DP_MAX_TIME=8 dp "8001-$SID" / "$FORWARD_TOKEN" || true)
+    [ "$service_code" = "200" ] || return 1
+    read -r FREEZE_MARK FREEZE_COUNTER FREEZE_PROBE_PID FREEZE_CGROUP <"$WORK/dp.body"
+    [ "$FREEZE_MARK" = "ENVD_FREEZE_SERVICE" ] &&
+        [ "$FREEZE_PROBE_PID" = "$FREEZE_PID" ] &&
+        [[ "$FREEZE_COUNTER" =~ ^[0-9]+$ ]] &&
+        [[ "$FREEZE_CGROUP" == /user || "$FREEZE_CGROUP" == /user/* ]]
+}
+
+service_ready=""
+for _ in $(seq 1 40); do
+    freeze_service_probe && { service_ready=1; break; }
+    sleep 0.25
+done
+[ -n "$service_ready" ] || { cat "$WORK/dp.body" 2>/dev/null || true; fail "envd freeze service did not listen"; }
+
+"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/run" -- /bin/sh -ceu '
+pid=$1
+global=/proc/1/root/sys/fs/cgroup
+real=$global/app
+grep -qx "0::/init" /proc/self/cgroup
+test ! -s /sys/fs/cgroup/cgroup.procs
+test ! -s "$real/cgroup.procs"
+grep -qx "$$" "$real/init/cgroup.procs"
+service_path=$(cut -d: -f3 "/proc/$pid/cgroup")
+case "$service_path" in /user|/user/*) ;; *) exit 1 ;; esac
+grep -qx "$pid" "$real$service_path/cgroup.procs"
+for controller in cpu memory io; do
+    grep -qw "$controller" "$global/cgroup.subtree_control"
+    grep -qw "$controller" "$real/cgroup.subtree_control"
+done
+for group in init user ptys socats; do
+    test -d "$real/$group"
+    test -e "$real/$group/cpu.weight"
+    test -e "$real/$group/memory.max"
+    test -e "$real/$group/io.weight"
+done
+' sh "$FREEZE_PID" >"$WORK/cgroup-topology.out" 2>&1 \
+    || { sed 's/^/  cgroup| /' "$WORK/cgroup-topology.out"; fail "delegated envd cgroup topology"; }
+echo "==> PASS: real /app is empty; /init + envd user/ptys/socats and cpu/memory/io delegation verified"
 
 # ---- internal proxy_netns -> floatingip user port -------------------------
 USER_MARK="internal-proxy-netns-user-port-$RANDOM"
@@ -1092,6 +1219,8 @@ PERSIST="PERSIST_$MARK"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "echo $PERSIST > /home/user/persist.txt; cat /home/user/persist.txt" > "$WORK/wr.out" 2>&1 || true
 grep -q "$PERSIST" "$WORK/wr.out" || { sed 's/^/  guest| /' "$WORK/wr.out"; fail "could not write /home/user/persist.txt as the guest user (ownership not preserved?)"; }
 echo "==> wrote /home/user/persist.txt in the guest (as user)"
+freeze_service_probe || fail "envd freeze service disappeared before local pause"
+FREEZE_COUNTER_BEFORE_B=$FREEZE_COUNTER
 
 UNSET_CALL=$(snapshot_argv_count)
 echo "==> local pause with all policy fields unset; disconnect caller after 0.5s: $SID"
@@ -1118,6 +1247,10 @@ wait_sandbox_state "$SID" paused 1200 || {
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     fail "accepted local Pause did not commit after caller cancellation"
 }
+# Keep the sandbox durably paused for longer than several service counter ticks.
+# On restore the counter must resume from the frozen snapshot rather than track
+# this host wall-clock interval.
+sleep 3
 assert_snapshot_argv "$UNSET_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
     || fail "all-unset local Pause changed the legacy snapshot argv"
@@ -1149,7 +1282,16 @@ echo "==> PASS: Connect returned after durable starting acceptance (observed $CO
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
 sed 's/^/  guest2| /' "$WORK/exec2.out"
 grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after local restore"
-echo "==> PASS: all-unset B restored locally and preserved guest state"
+freeze_service_probe || fail "envd freeze service/listener missing after local B restore"
+FREEZE_COUNTER_AFTER_B=$FREEZE_COUNTER
+FREEZE_DELTA_B=$((FREEZE_COUNTER_AFTER_B - FREEZE_COUNTER_BEFORE_B))
+[ "$FREEZE_DELTA_B" -ge 0 ] && [ "$FREEZE_DELTA_B" -lt 100 ] \
+    || fail "envd service counter advanced across frozen local B window: before=$FREEZE_COUNTER_BEFORE_B after=$FREEZE_COUNTER_AFTER_B"
+sleep 1
+freeze_service_probe || fail "envd freeze service stopped after local B restore"
+[ "$FREEZE_COUNTER" -gt "$FREEZE_COUNTER_AFTER_B" ] \
+    || fail "envd freeze service did not resume counter after local B restore"
+echo "==> PASS: all-unset B restored envd-managed PID $FREEZE_PID + listener; frozen counter delta=$FREEZE_DELTA_B, then advanced"
 
 # ---- local B -> working-set W -> independent portable publication --------
 # The second local Pause keeps memory self separate while disks still merge.
@@ -1165,6 +1307,8 @@ grep -q 'EXIT_CODE 0' "$WORK/w-disk-write.out" \
 # B.snapshot as an opaque memory lower instead of recursively publishing B's
 # stale disk graph.
 PORTABLE_W_CALL=$(snapshot_argv_count)
+freeze_service_probe || fail "envd freeze service disappeared before portable W pause"
+FREEZE_COUNTER_BEFORE_W=$FREEZE_COUNTER
 PORTABLE_W_RUN_ID=$(sandbox_run_id "$SID")
 [ -n "$PORTABLE_W_RUN_ID" ] || fail "working-set source runner id is empty"
 code=$(req POST "/sandboxes/$SID/pause" "$AK" \
@@ -1275,6 +1419,15 @@ for _ in $(seq 1 90); do
     sleep 0.5
 done
 [ -n "$resumed" ] || fail "portable W did not restore"
+freeze_service_probe || fail "envd freeze service/listener missing after portable W restore"
+FREEZE_COUNTER_AFTER_W=$FREEZE_COUNTER
+FREEZE_DELTA_W=$((FREEZE_COUNTER_AFTER_W - FREEZE_COUNTER_BEFORE_W))
+[ "$FREEZE_DELTA_W" -ge 0 ] && [ "$FREEZE_DELTA_W" -lt 100 ] \
+    || fail "envd service counter advanced across frozen portable W window: before=$FREEZE_COUNTER_BEFORE_W after=$FREEZE_COUNTER_AFTER_W"
+sleep 1
+freeze_service_probe || fail "envd freeze service stopped after portable W restore"
+[ "$FREEZE_COUNTER" -gt "$FREEZE_COUNTER_AFTER_W" ] \
+    || fail "envd freeze service did not resume counter after portable W restore"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" \
     >"$WORK/portable-read.out" 2>&1 || true
 grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/portable-read.out"; fail "portable W lost guest state"; }
@@ -1296,7 +1449,7 @@ MANIFEST_PREFETCH_COUNT=$(grep -Fc 'memory prefetch started backend=manifest' "$
 [ "$MANIFEST_PREFETCH_COUNT" = "1" ] || fail "portable restore started $MANIFEST_PREFETCH_COUNT manifest prefetches, want W self only"
 grep -Fq "memory prefetch started backend=manifest parent_layers=$PORTABLE_PARENT_LAYERS key=$PORTABLE_B_KEY" \
     "$WORK/portable-w.journal" && fail "portable restore prefetched B memory lower"
-echo "==> PASS: portable W restored state; prefetch targeted W self only (not B or disk)"
+echo "==> PASS: portable W restored envd-managed PID/listener (frozen delta=$FREEZE_DELTA_W); prefetch targeted W self only"
 
 if [ "$MMDS_ROUTES_E2E" = 1 ]; then
     source "$SCRIPT_DIR/lib/mmds_static_guest.sh"

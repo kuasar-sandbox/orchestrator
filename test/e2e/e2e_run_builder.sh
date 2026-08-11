@@ -514,6 +514,7 @@ B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
    {"type":"RUN","args":["useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["grep -q '^0::/user/' /proc/self/cgroup && test ! -s /sys/fs/cgroup/cgroup.procs && for group in user ptys socats; do test -d /sys/fs/cgroup/\$group && test -e /sys/fs/cgroup/\$group/cpu.weight && test -e /sys/fs/cgroup/\$group/memory.max && test -e /sys/fs/cgroup/\$group/io.weight || exit 1; done"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},
    {"type":"WORKDIR","args":["/home/user"]}],
@@ -540,6 +541,12 @@ grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
+python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost launch.cgroup_control=true"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    cfg = json.load(source)
+assert cfg["Launch"]["CgroupControl"] is True, cfg["Launch"]
+PY
 B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
 [ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest:// (upload-snapshot did not rewrite?): $(cat "$WORK/b2.cfg.json")"
 MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
@@ -547,7 +554,7 @@ MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manif
     || { cat "$WORK/b2.img.err"; fail "flatten-ctl info manifest://$B2_IMG_HEX"; }
 grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
 grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
-echo "==> PASS: B2 artifacts — snapshot.cfg metadata + manifest:// base + merged ENV/WORKDIR"
+echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + manifest:// base + merged ENV/WORKDIR"
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"

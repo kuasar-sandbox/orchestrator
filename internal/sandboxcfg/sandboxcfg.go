@@ -444,7 +444,7 @@ func (p Params) buildLaunch(c *rtconfig.SandboxConfig) error {
 		// sandbox-init's PID namespace so PID 1 reaps the workload's orphans.
 		c.Launch = rtconfig.LaunchConfig{
 			Exec: "/opt/sandbox-runtime/bin/envd", Args: args, Env: p.EnvVars,
-			Restart: "always", User: "0:0", PIDNamespace: "shared",
+			Restart: "always", User: "0:0", PIDNamespace: "shared", CgroupControl: true,
 		}
 		return nil
 	}
@@ -469,6 +469,7 @@ func (p Params) buildLaunch(c *rtconfig.SandboxConfig) error {
 		if s.StopSignal != "" {
 			c.Launch.StopSignal = s.StopSignal
 		}
+		c.Launch.CgroupControl = s.CgroupControl
 		if len(s.Plugin) > 0 {
 			c.Launch.Plugin = s.Plugin
 		}
