@@ -39,6 +39,8 @@ type countingLauncher struct {
 	readinessNoSend    bool
 	readinessNoConnect bool
 	readinessErrors    chan<- error
+	stopEntered        chan<- struct{}
+	stopGate           <-chan struct{}
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -140,8 +142,21 @@ func (l *countingLauncher) reportReadinessError(err error) {
 	}
 }
 
-func (l *countingLauncher) Stop(context.Context, string) error {
+func (l *countingLauncher) Stop(ctx context.Context, _ string) error {
 	l.stops.Add(1)
+	if l.stopEntered != nil {
+		select {
+		case l.stopEntered <- struct{}{}:
+		default:
+		}
+	}
+	if l.stopGate != nil {
+		select {
+		case <-l.stopGate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -251,6 +252,206 @@ func TestSnapshotFailureLeavesSandboxRunning(t *testing.T) {
 	}
 }
 
+func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
+
+	serviceCtx, stopService := context.WithCancel(context.Background())
+	o.SetLifecycleContext(serviceCtx)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("CHECKPOINT_STARTED_FILE", started)
+	t.Setenv("CHECKPOINT_RELEASE_FILE", release)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+	}()
+	waitForCheckpointFile(t, started)
+
+	// Neither the disconnected caller nor shutdown admission cancellation may
+	// kill a snapshot client after the runtime has accepted its request.
+	cancelRequest()
+	stopService()
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- o.DrainPauses(context.Background()) }()
+	assertCheckpointBlocked(t, pauseDone, "pause returned before snapshot completion")
+	assertCheckpointBlocked(t, drainDone, "shutdown drain returned before accepted pause completion")
+
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitCheckpointResult(t, pauseDone); err != nil {
+		t.Fatalf("Pause after cancellation: %v", err)
+	}
+	if err := waitCheckpointResult(t, drainDone); err != nil {
+		t.Fatalf("DrainPauses: %v", err)
+	}
+
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != types.StatePaused || stored.SnapshotRef != filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot") {
+		t.Fatalf("pause after cancellation was not committed: %+v", stored)
+	}
+	if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
+		t.Fatalf("stop/detach = %d/%d, want 1/1", launcher.stops.Load(), vs.detaches.Load())
+	}
+}
+
+func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	shortDir := shortOrchestratorTestDir(t)
+	cfg.Paths.RunRoot = filepath.Join(shortDir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(shortDir, "base")
+	installCheckpointSandboxCtl(t)
+	stopEntered := make(chan struct{}, 1)
+	stopGate := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case stopGate <- struct{}{}:
+		default:
+		}
+	})
+	launcher := &countingLauncher{stopEntered: stopEntered, stopGate: stopGate}
+	o, lifecycleCtx := newAsyncConnectTestOrchestrator(t, cfg, launcher)
+
+	manifestKey := strings.Repeat("5", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	sb := &types.Sandbox{
+		ID: "pause-connect-fence", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("6", 64),
+		}.String(),
+		State: types.StateRunning, RunID: "pause-connect-old-run", VswitchPort: "pause-connect-old-port",
+		APISecret: apiSecret, ManifestKey: manifestKey,
+		RunDir:      filepath.Join(cfg.Paths.RunRoot, "pause-connect-fence"),
+		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "pause-connect-fence"),
+		CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(lifecycleCtx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("CHECKPOINT_STARTED_FILE", started)
+	t.Setenv("CHECKPOINT_RELEASE_FILE", release)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+	}()
+	waitForCheckpointFile(t, started)
+	cancelRequest()
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted pause did not reach post-commit runner cleanup")
+	}
+	stored, err := o.st.Get(lifecycleCtx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("sandbox at blocked cleanup = %+v, %v; want durable paused", stored, err)
+	}
+
+	type connectResult struct {
+		sb  *types.Sandbox
+		err error
+	}
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		connected, connectErr := o.Connect(lifecycleCtx, sb.ID, apiKey, "", 0)
+		connectDone <- connectResult{sb: connected, err: connectErr}
+	}()
+	select {
+	case result := <-connectDone:
+		t.Fatalf("Connect escaped pause cleanup fence: %+v, %v", result.sb, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	stopGate <- struct{}{}
+	if err := waitCheckpointResult(t, pauseDone); err != nil {
+		t.Fatalf("Pause after cancellation: %v", err)
+	}
+
+	var connected connectResult
+	select {
+	case connected = <-connectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connect did not continue after pause cleanup")
+	}
+	if connected.err != nil || connected.sb == nil ||
+		(connected.sb.State != types.StateStarting && connected.sb.State != types.StateRunning) {
+		t.Fatalf("Connect after canceled Pause = %+v, %v", connected.sb, connected.err)
+	}
+
+	identity, found, err := o.LookupExec(lifecycleCtx, sb.ID)
+	if err != nil || !found {
+		t.Fatalf("LookupExec after Connect = %+v, %v, %v", identity, found, err)
+	}
+	ready, found, err := o.ActivateExec(lifecycleCtx, sb.ID, identity)
+	if err != nil || !found || ready != identity {
+		current, getErr := o.st.Get(lifecycleCtx, sb.ID)
+		attempt, active := o.launches.Lookup(sb.ID)
+		var launchErr error
+		if active {
+			launchErr = attempt.result()
+		}
+		t.Fatalf("ActivateExec after Connect = %+v, %v, %v; current=%+v getErr=%v launchActive=%v launchErr=%v; want matching running identity",
+			ready, found, err, current, getErr, active, launchErr)
+	}
+	stored, err = o.st.Get(lifecycleCtx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after exec activation = %+v, %v; want running", stored, err)
+	}
+}
+
+func waitForCheckpointFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertCheckpointBlocked(t *testing.T, done <-chan error, message string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: %v", message, err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func waitCheckpointResult(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for checkpoint operation")
+		return nil
+	}
+}
+
 func TestCreateRejectsCheckpointPolicyBeforeLaunchSideEffects(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -341,6 +542,12 @@ if [ "${CHECKPOINT_FAIL:-}" = "1" ]; then
   echo "forced snapshot failure" >&2
   exit 1
 fi
+if [ -n "${CHECKPOINT_STARTED_FILE:-}" ]; then
+  : > "$CHECKPOINT_STARTED_FILE"
+  while [ ! -e "$CHECKPOINT_RELEASE_FILE" ]; do
+    sleep 0.01
+  done
+fi
 printf '%s\n' "${CHECKPOINT_STDOUT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 `
 	if err := os.WriteFile(filepath.Join(dir, config.BinSandboxCtl), []byte(script), 0o755); err != nil {
@@ -349,6 +556,8 @@ printf '%s\n' "${CHECKPOINT_STDOUT:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CHECKPOINT_ARGS_FILE", argsPath)
 	t.Setenv("CHECKPOINT_FAIL", "")
+	t.Setenv("CHECKPOINT_STARTED_FILE", "")
+	t.Setenv("CHECKPOINT_RELEASE_FILE", "")
 	return argsPath
 }
 

@@ -22,7 +22,8 @@
 #                                real sandbox-ctl HTTP CONNECT client against the
 #                                guest (stdio, PTY resize, exit status, pause wake).
 #   envd exec                  -> run a command in the guest via envd (incl. hostname).
-#   local Pause policy        -> all-unset keeps the legacy argv; then node,
+#   local Pause policy        -> all-unset keeps the legacy argv and commits
+#                                after its HTTP caller disconnects; then node,
 #                                Create metadata/header, Pause body/header, and
 #                                automatic reaper policy are layered fieldwise.
 #                                Captures are real local bundles and are restored
@@ -422,6 +423,8 @@ exec_through_connect() {
     local status
 
     printf 'stdin:%s\n' "$marker" >"$input"
+    : >"$output"
+    : >"$error_output"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
         --proxy "http://127.0.0.1:$PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
@@ -437,11 +440,41 @@ exec_through_connect() {
         status=$?
     fi
     grep -Fxq "stdout:$marker:stdin:$marker" "$output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; fail "native exec stdout/stdin mismatch"; }
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stdout| /' "$output" 2>/dev/null; dump_exec_failure_context "$sid"; fail "native exec stdout/stdin mismatch"; }
     grep -Fxq "stderr:$marker" "$error_output" 2>/dev/null \
-        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; fail "native exec stderr mismatch"; }
+        || { sed 's/^/  client| /' "$diagnostics"; sed 's/^/  stderr| /' "$error_output" 2>/dev/null; dump_exec_failure_context "$sid"; fail "native exec stderr mismatch"; }
     [ "$status" = "47" ] \
-        || { sed 's/^/  client| /' "$diagnostics"; fail "native exec exit=$status (want guest status 47)"; }
+        || { sed 's/^/  client| /' "$diagnostics"; dump_exec_failure_context "$sid"; fail "native exec exit=$status (want guest status 47)"; }
+}
+
+dump_exec_failure_context() { # $1=sandbox id
+    local sid="$1" state run_id failed_run_id=""
+    state="$(sandbox_state "$sid")"
+    run_id="$(sandbox_run_id "$sid")"
+    echo "==> exec failure context: sid=$sid state=$state run_id=${run_id:-<empty>}" >&2
+    if [ -n "${ORCH_LOG:-}" ] && [ -f "$ORCH_LOG" ]; then
+        echo "==> matching node-ctl lifecycle log:" >&2
+        grep -F "sid=$sid" "$ORCH_LOG" | sed 's/^/  orch| /' >&2 || true
+        failed_run_id="$(python3 - "$ORCH_LOG" "$sid" <<'PY'
+import re, sys
+last = ""
+for line in open(sys.argv[1], encoding="utf-8"):
+    if f"sid={sys.argv[2]}" not in line:
+        continue
+    match = re.search(r'\brun_id=(?:"([^"]*)"|(\S+))', line)
+    if match and (match.group(1) or match.group(2)):
+        last = match.group(1) or match.group(2)
+print(last)
+PY
+)"
+    fi
+    if [ -n "$failed_run_id" ]; then
+        echo "==> failed runner unit journal: sandbox-runner@$failed_run_id.service" >&2
+        journalctl -u "sandbox-runner@$failed_run_id.service" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+    else
+        echo "==> matching sandbox runner journal:" >&2
+        journalctl KUASAR_SANDBOX_ID="$sid" --no-pager 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+    fi
 }
 
 exec_pty_resize_through_connect() {
@@ -666,8 +699,10 @@ EOF
 }
 
 ORCH_PID=""
+ORCH_LOG=""
 start_orchestrator() { # $1=log path
     local log_path="$1" ready=""
+    ORCH_LOG="$log_path"
     "$ORCH_BIN_DIR/node-ctl" conductor serve --config "$WORK/config.yaml" >"$log_path" 2>&1 &
     ORCH_PID=$!
     PIDS+=("$ORCH_PID")
@@ -1059,14 +1094,29 @@ grep -q "$PERSIST" "$WORK/wr.out" || { sed 's/^/  guest| /' "$WORK/wr.out"; fail
 echo "==> wrote /home/user/persist.txt in the guest (as user)"
 
 UNSET_CALL=$(snapshot_argv_count)
-echo "==> local pause with node/metadata/action policy all unset: $SID"
-code=$(req POST "/sandboxes/$SID/pause" "$AK")
-[ "$code" = "204" ] || {
-    echo "==> pause=$code — snapshot error:"
+echo "==> local pause with all policy fields unset; disconnect caller after 0.5s: $SID"
+set +e
+code=$(curl -sS --noproxy '*' --max-time 0.5 \
+    -o "$WORK/pause-cancel.body" -w '%{http_code}' \
+    -X POST \
+    -H "Host: api.$DOMAIN" \
+    -H "X-API-KEY: $AK" \
+    -H 'Content-Type: application/json' \
+    --data '{}' \
+    "http://127.0.0.1:$PORT/sandboxes/$SID/pause" \
+    2>"$WORK/pause-cancel.stderr")
+PAUSE_CURL_RC=$?
+set -e
+[ "$PAUSE_CURL_RC" = "28" ] || {
+    cat "$WORK/pause-cancel.stderr" >&2
+    fail "pause cancellation curl rc=$PAUSE_CURL_RC http=$code (want timeout rc=28)"
+}
+wait_sandbox_state "$SID" paused 1200 || {
+    echo "==> pause client timed out but durable state did not become paused:"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
     SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
-    fail "local all-unset pause=$code (want 204)"
+    fail "accepted local Pause did not commit after caller cancellation"
 }
 assert_snapshot_argv "$UNSET_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
@@ -1078,7 +1128,7 @@ B_ARTIFACT="$(readlink -f "$B_LOCAL")"
 B_SNAPSHOT_BASENAME="$(basename "$B_ARTIFACT")"
 "$BIN/sandbox-ctl" info --json "$B_LOCAL" >"$WORK/b-local.json" \
     || fail "all-unset local B is not a readable snapshot bundle"
-echo "==> PASS: all-unset local Pause produced B and passed no policy flags"
+echo "==> PASS: caller timed out, accepted all-unset Pause still committed B and passed no policy flags"
 
 echo "==> accept paused -> starting through POST /connect, then activate native exec immediately"
 code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113}')

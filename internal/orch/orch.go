@@ -58,11 +58,12 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	launches  launchGroup    // sole process-local owner of create and resume attempts
-	lifecycle keyedLockGroup // serialize lifecycle mutations for one sid
+	launches  launchGroup            // sole process-local owner of create and resume attempts
+	pauses    acceptedOperationGroup // accepted snapshots survive caller cancellation and drain at shutdown
+	lifecycle keyedLockGroup         // serialize lifecycle mutations for one sid
 
 	lifecycleCtxMu sync.RWMutex
-	lifecycleCtx   context.Context // all accepted launch work; canceled on node shutdown
+	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
 
 	deadlineIntentMu sync.Mutex
 	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
@@ -918,28 +919,65 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if sb.State == types.StateStarting {
 		return api.ErrSandboxStarting
 	}
+	opCtx, finish, err := o.beginPauseOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
 		o.log.Info("checkpoint policy resolved",
 			"sid", sb.ID,
 			"merge_ref", checkpointPolicyValue(policy.MergeRef),
 			"drop_caches", checkpointPolicyValue(policy.DropCaches))
 	}
-	ref, err := o.snapshot(ctx, sb, policy)
+	ref, err := o.snapshot(opCtx, sb, policy)
 	if err != nil {
 		return err
 	}
-	sb.SnapshotRef = ref
-	sb.State = types.StatePaused
-	_ = o.st.SetSnapshotRef(ctx, sb.ID, ref)
-	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
-	o.cache(sb)
-	if sb.RunID != "" {
-		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
-		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
+	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, ref)
+	if err != nil {
+		return fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
-	_ = o.vs.Detach(ctx, sb.VswitchPort)
-	o.publishUpsert(sb) // proxies keep the (now paused) route so traffic triggers a Wake
+	if !changed {
+		return fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
+	}
+	paused := cloneSandbox(sb)
+	paused.SnapshotRef = ref
+	paused.State = types.StatePaused
+	o.cache(paused)
+
+	cleanupCtx, cancel := cleanupContext()
+	defer cancel()
+	if paused.RunID != "" {
+		if err := o.lc.Stop(cleanupCtx, o.runnerUnit(paused.RunID)); err != nil {
+			o.log.Warn("pause: stop runner", "sid", paused.ID, "run_id", paused.RunID, "err", err)
+		}
+		if err := o.lc.ResetFailed(cleanupCtx, o.runnerUnit(paused.RunID)); err != nil {
+			o.log.Warn("pause: reset runner", "sid", paused.ID, "run_id", paused.RunID, "err", err)
+		}
+	}
+	if err := o.vs.Detach(cleanupCtx, paused.VswitchPort); err != nil {
+		o.log.Warn("pause: detach vswitch port", "sid", paused.ID, "port", paused.VswitchPort, "err", err)
+	}
+	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	return nil
+}
+
+func (o *Orchestrator) beginPauseOperation(requestCtx context.Context) (context.Context, func(), error) {
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
+	if err := requestCtx.Err(); err != nil {
+		return nil, nil, err
+	}
+	finish, err := o.pauses.Begin(o.launchContext())
+	if err != nil {
+		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+	// A snapshot request is not canceled by closing its ctl.sock client. Once
+	// accepted, killing that client only loses the completion response while the
+	// runtime continues to commit the snapshot and destroy the VM.
+	return context.WithoutCancel(requestCtx), finish, nil
 }
 
 func checkpointPolicyValue(value *bool) string {
