@@ -570,7 +570,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 |---|---|
 | `resource` | `resources.{capacity,allocatable}`(不含 `control`,节点托管) |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
-| `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
+| `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
@@ -1440,12 +1440,19 @@ plugin 平面,机群路由经 registry 聚合。
   **补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor 报
   `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部 padding/ZIP 对 guest mount
   不可见)。
-- **零 sandbox-init 改动**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
+- **启动链**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
   guest 同名路径,envd 直接作 `launch.exec`:
   `/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`(`mmds.enabled` 时去
   `-isnotfc`,node-proxy.md §7),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
   `CAP_SETUID/SETGID` 才能按镜像配置的用户跑工作负载命令(镜像设了 `Config.User` 时
   非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
+- **cgroup 委托**:普通 e2b 创建、builder steps 和最终 snapshot template 均固定生成
+  `launch.cgroup_control: true`;不向 envd 增加 cgroup root 参数。真实
+  `/sys/fs/cgroup/app` 是 namespace/freezer root 且保持无直属进程,sandbox-init 长期管理的
+  envd、plugin 与 native exec 位于真实 `/app/init`;它们在 scoped cgroup namespace 中看到
+  `/init`,而 envd 仍按默认 `/sys/fs/cgroup` 在 namespace root 下创建 `user`、`ptys`、
+  `socats`(真实路径分别为 `/app/user`、`/app/ptys`、`/app/socats`)。bare profile 默认
+  `false`,可经 `kuasar-sandbox.launch.cgroup_control` 显式启用。
 - envd 是 **guest-runtime/native-deps** 的原生构建产物(与 vmlinux/mkfs.erofs
   并列):`make -C guest-runtime/native-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
   `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。`guest-runtime make
