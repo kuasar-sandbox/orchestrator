@@ -302,6 +302,120 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 	}
 }
 
+func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	shortDir := shortOrchestratorTestDir(t)
+	cfg.Paths.RunRoot = filepath.Join(shortDir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(shortDir, "base")
+	installCheckpointSandboxCtl(t)
+	stopEntered := make(chan struct{}, 1)
+	stopGate := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case stopGate <- struct{}{}:
+		default:
+		}
+	})
+	launcher := &countingLauncher{stopEntered: stopEntered, stopGate: stopGate}
+	o, lifecycleCtx := newAsyncConnectTestOrchestrator(t, cfg, launcher)
+
+	manifestKey := strings.Repeat("5", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	sb := &types.Sandbox{
+		ID: "pause-connect-fence", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("6", 64),
+		}.String(),
+		State: types.StateRunning, RunID: "pause-connect-old-run", VswitchPort: "pause-connect-old-port",
+		APISecret: apiSecret, ManifestKey: manifestKey,
+		RunDir:      filepath.Join(cfg.Paths.RunRoot, "pause-connect-fence"),
+		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "pause-connect-fence"),
+		CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(lifecycleCtx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("CHECKPOINT_STARTED_FILE", started)
+	t.Setenv("CHECKPOINT_RELEASE_FILE", release)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	pauseDone := make(chan error, 1)
+	go func() {
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+	}()
+	waitForCheckpointFile(t, started)
+	cancelRequest()
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted pause did not reach post-commit runner cleanup")
+	}
+	stored, err := o.st.Get(lifecycleCtx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused {
+		t.Fatalf("sandbox at blocked cleanup = %+v, %v; want durable paused", stored, err)
+	}
+
+	type connectResult struct {
+		sb  *types.Sandbox
+		err error
+	}
+	connectDone := make(chan connectResult, 1)
+	go func() {
+		connected, connectErr := o.Connect(lifecycleCtx, sb.ID, apiKey, "", 0)
+		connectDone <- connectResult{sb: connected, err: connectErr}
+	}()
+	select {
+	case result := <-connectDone:
+		t.Fatalf("Connect escaped pause cleanup fence: %+v, %v", result.sb, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	stopGate <- struct{}{}
+	if err := waitCheckpointResult(t, pauseDone); err != nil {
+		t.Fatalf("Pause after cancellation: %v", err)
+	}
+
+	var connected connectResult
+	select {
+	case connected = <-connectDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connect did not continue after pause cleanup")
+	}
+	if connected.err != nil || connected.sb == nil ||
+		(connected.sb.State != types.StateStarting && connected.sb.State != types.StateRunning) {
+		t.Fatalf("Connect after canceled Pause = %+v, %v", connected.sb, connected.err)
+	}
+
+	identity, found, err := o.LookupExec(lifecycleCtx, sb.ID)
+	if err != nil || !found {
+		t.Fatalf("LookupExec after Connect = %+v, %v, %v", identity, found, err)
+	}
+	ready, found, err := o.ActivateExec(lifecycleCtx, sb.ID, identity)
+	if err != nil || !found || ready != identity {
+		current, getErr := o.st.Get(lifecycleCtx, sb.ID)
+		attempt, active := o.launches.Lookup(sb.ID)
+		var launchErr error
+		if active {
+			launchErr = attempt.result()
+		}
+		t.Fatalf("ActivateExec after Connect = %+v, %v, %v; current=%+v getErr=%v launchActive=%v launchErr=%v; want matching running identity",
+			ready, found, err, current, getErr, active, launchErr)
+	}
+	stored, err = o.st.Get(lifecycleCtx, sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after exec activation = %+v, %v; want running", stored, err)
+	}
+}
+
 func waitForCheckpointFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
