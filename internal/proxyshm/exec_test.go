@@ -178,6 +178,48 @@ func TestWorkerLookupExecInitialDeleteEndsPromptly(t *testing.T) {
 	}
 }
 
+func TestWorkerLookupExecExistingTerminalReturnsImmediatelyWithoutWake(t *testing.T) {
+	tbl := newExecTable(t)
+	sid := "already-deleted"
+	if !tbl.Delete(sid) {
+		t.Fatal("delete returned false")
+	}
+	tbl.Bookmark()
+	if _, found, rev := tbl.LookupRevision(sid); found || rev == 0 {
+		t.Fatalf("terminal setup found=%v rev=%d, want absent with nonzero revision", found, rev)
+	}
+
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Minute)
+	type result struct {
+		identity proxy.ExecIdentity
+		found    bool
+		err      error
+	}
+	done := make(chan result, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		identity, found, err := view.LookupExec(ctx, sid)
+		done <- result{identity: identity, found: found, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil || got.found || got.identity != (proxy.ExecIdentity{}) {
+			t.Fatalf("LookupExec after terminal revision = %+v, %v, %v", got.identity, got.found, got.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		cancel()
+		<-done
+		t.Fatal("LookupExec consumed its park timeout after an existing terminal revision")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("terminal exec lookup emitted %d wakes", got)
+	}
+}
+
 func TestWorkerActivateExecWaitsForStartingWithoutWake(t *testing.T) {
 	tbl := newExecTable(t)
 	route := execWorkerRoute("starting", routesync.StateStarting)

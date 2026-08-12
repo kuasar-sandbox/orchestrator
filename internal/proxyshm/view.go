@@ -410,7 +410,7 @@ func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIden
 		}
 		// An observed route with no live, complete identity is authoritative.
 		// Only an initially missing route can still be in propagation.
-		if ok || routeRev != initialRouteRev {
+		if ok || initialRouteRev != 0 || routeRev != initialRouteRev {
 			return proxy.ExecIdentity{}, false, nil
 		}
 		if !v.waitChange(ctx, deadline, rev) {
