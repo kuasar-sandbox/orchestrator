@@ -81,6 +81,10 @@ type Reservation struct {
 	// by sandbox-ctl in a Heartbeat / Settled message. Used by the active
 	// reclaimer to size the working-set + safety-margin target.
 	LastReportedRSS uint64 `json:"last_reported_rss,omitempty"`
+	// LastReportAt is the time of the Settled/Heartbeat resource sample that
+	// supplied LastReportedRSS. LastHeartbeatAt remains reservation liveness and
+	// must not be exposed as a resource sample timestamp.
+	LastReportAt time.Time `json:"last_report_at,omitempty"`
 
 	// Conn is the live RPC connection. Not persisted; restored as nil
 	// after controller restart (sandbox-ctl reattaches on its own).
@@ -101,6 +105,9 @@ type Watermarks struct {
 // State is the in-memory snapshot mirrored to /run/node-ctl/state.json.
 type State struct {
 	mu sync.Mutex
+	// bySandboxID is a derived index rebuilt after persistence load. The
+	// reservation token remains the controller protocol's primary key.
+	bySandboxID map[string]string
 
 	NodeBudget        Resources               `json:"node_budget"`
 	HostReserved      Resources               `json:"host_reserved"`
@@ -132,6 +139,7 @@ func NewState(physicalMem uint64, physicalCPUMilli uint64,
 		AllocatablePool:   pool,
 		Wm:                wm,
 		Reservations:      make(map[string]*Reservation),
+		bySandboxID:       make(map[string]string),
 	}
 }
 
@@ -215,19 +223,99 @@ func (s *State) MemoryZone() Zone {
 
 // Insert adds a reservation under its token. Caller must hold lock.
 func (s *State) Insert(r *Reservation) error {
+	if r == nil || r.Token == "" || r.SandboxID == "" {
+		return fmt.Errorf("reservation token and sandbox id are required")
+	}
+	if s.bySandboxID == nil {
+		s.bySandboxID = make(map[string]string)
+	}
 	if _, dup := s.Reservations[r.Token]; dup {
 		return fmt.Errorf("token %q already exists", r.Token)
 	}
+	if token, dup := s.bySandboxID[r.SandboxID]; dup {
+		return fmt.Errorf("sandbox %q already has reservation %q", r.SandboxID, token)
+	}
 	s.Reservations[r.Token] = r
+	s.bySandboxID[r.SandboxID] = r.Token
 	return nil
 }
 
 // Remove deletes a reservation. Caller must hold lock.
 func (s *State) Remove(token string) {
+	if r := s.Reservations[token]; r != nil && s.bySandboxID[r.SandboxID] == token {
+		delete(s.bySandboxID, r.SandboxID)
+	}
 	delete(s.Reservations, token)
 }
 
 // Lookup returns the reservation, or nil. Caller must hold lock.
 func (s *State) Lookup(token string) *Reservation {
 	return s.Reservations[token]
+}
+
+// RestoreReservations replaces the persisted reservation set and rebuilds the
+// derived SID index. It is intended for controller startup before serving.
+func (s *State) RestoreReservations(reservations map[string]*Reservation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reservations == nil {
+		reservations = make(map[string]*Reservation)
+	}
+	s.Reservations = reservations
+	return s.rebuildSandboxIndexLocked()
+}
+
+// RebuildSandboxIndex rebuilds the non-persistent SID index. It is safe before
+// or during serving and rejects ambiguous persisted state.
+func (s *State) RebuildSandboxIndex() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rebuildSandboxIndexLocked()
+}
+
+func (s *State) rebuildSandboxIndexLocked() error {
+	index := make(map[string]string, len(s.Reservations))
+	for token, r := range s.Reservations {
+		if r == nil || token == "" || r.Token != token || r.SandboxID == "" {
+			return fmt.Errorf("invalid persisted reservation %q", token)
+		}
+		if previous, exists := index[r.SandboxID]; exists {
+			return fmt.Errorf("sandbox %q has reservations %q and %q", r.SandboxID, previous, token)
+		}
+		index[r.SandboxID] = token
+	}
+	s.bySandboxID = index
+	return nil
+}
+
+// SandboxResourceSnapshot is a lock-independent copy of the controller fields
+// used by the public resource stats API.
+type SandboxResourceSnapshot struct {
+	Capacity        Resources
+	CPUAllocatable  uint64
+	MemAllocatable  uint64
+	LastReportedRSS uint64
+	LastReportAt    time.Time
+}
+
+// SnapshotSandboxResource resolves a reservation by SID in O(1) and copies only
+// resource-controller state. Callers never receive the live Reservation pointer.
+func (s *State) SnapshotSandboxResource(sandboxID string) (SandboxResourceSnapshot, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token, found := s.bySandboxID[sandboxID]
+	if !found {
+		return SandboxResourceSnapshot{}, false
+	}
+	r := s.Reservations[token]
+	if r == nil || r.SandboxID != sandboxID {
+		return SandboxResourceSnapshot{}, false
+	}
+	return SandboxResourceSnapshot{
+		Capacity:        r.Capacity,
+		CPUAllocatable:  r.Floor.CPUMilli,
+		MemAllocatable:  r.AllocatableNowMem,
+		LastReportedRSS: r.LastReportedRSS,
+		LastReportAt:    r.LastReportAt,
+	}, true
 }

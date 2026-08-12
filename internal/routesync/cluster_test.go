@@ -115,3 +115,17 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		t.Fatalf("registry register round-trip: %+v", reg.Register)
 	}
 }
+
+func TestProxyStatsCapabilityRoundTrip(t *testing.T) {
+	got := roundTrip(t, &Msg{Type: TypeRegister, Register: &Register{
+		Subscribe: &Subscribe{Kind: KindRouteWake},
+		Proxy: &Proxy{
+			Socket:      Socket{Path: "/run/proxy.sock"},
+			StatsSocket: &Socket{Path: "/run/proxy-stats.sock"},
+		},
+	}})
+	if got.Register == nil || got.Register.Proxy == nil || got.Register.Proxy.StatsSocket == nil ||
+		got.Register.Proxy.StatsSocket.Path != "/run/proxy-stats.sock" {
+		t.Fatalf("proxy stats capability round-trip = %+v", got.Register)
+	}
+}

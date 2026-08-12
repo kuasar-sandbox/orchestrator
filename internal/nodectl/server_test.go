@@ -73,7 +73,7 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 }
 
 func TestServer_AdmitSettledRelease(t *testing.T) {
-	_, c, cleanup := startTestServer(t, 8<<30)
+	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
 	res, err := c.Admit(AdmitParams{
@@ -100,6 +100,10 @@ func TestServer_AdmitSettledRelease(t *testing.T) {
 
 	if err := c.Settled(120<<20, 0); err != nil {
 		t.Fatal(err)
+	}
+	if snapshot, found := srv.State.SnapshotSandboxResource("sb-1"); !found ||
+		snapshot.LastReportedRSS != 120<<20 || snapshot.LastReportAt.IsZero() {
+		t.Fatalf("settled resource report = %+v found=%v", snapshot, found)
 	}
 
 	if err := c.Release("normal"); err != nil {
@@ -204,6 +208,10 @@ func TestServer_OOMReportAndHeartbeat(t *testing.T) {
 		t.Errorf("oom_count = %d, want 2", r.OOMCount)
 	}
 	srv.State.Unlock()
+	snapshot, found := srv.State.SnapshotSandboxResource("sb-h")
+	if !found || snapshot.LastReportedRSS != 50<<20 || snapshot.LastReportAt.IsZero() {
+		t.Fatalf("heartbeat resource report = %+v found=%v", snapshot, found)
+	}
 }
 
 func TestServer_PersistAcrossRestart(t *testing.T) {
@@ -222,7 +230,9 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 		// Try to load any prior state.
 		persister := &Persister{Path: statePath}
 		if prev, err := persister.Load(); err == nil && prev != nil {
-			state.Reservations = prev.Reservations
+			if err := state.RestoreReservations(prev.Reservations); err != nil {
+				t.Fatal(err)
+			}
 		}
 		admission := NewAdmissionController(AdmissionPolicy{
 			Rate: 100, Burst: 100, StartupTTL: time.Minute,
@@ -278,4 +288,26 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 		t.Error("reservation lost across restart")
 	}
 	s2.State.Unlock()
+}
+
+func TestIdleSweeperRemovesSandboxIndex(t *testing.T) {
+	state := NewState(8<<30, 8000, 1<<30, 1000, Watermarks{})
+	state.Lock()
+	err := state.Insert(&Reservation{
+		Token: "12345678", SandboxID: "expired", Stage: StageCreating,
+		StageEnteredAt: time.Now().Add(-time.Hour), LastHeartbeatAt: time.Now(),
+	})
+	state.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sweeper := &IdleSweeper{
+		State: state, Admission: NewAdmissionController(AdmissionPolicy{}),
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{},
+		StartupTTL: time.Minute, Logf: t.Logf,
+	}
+	sweeper.sweep()
+	if _, found := state.SnapshotSandboxResource("expired"); found {
+		t.Fatal("sweeper retained expired SID index entry")
+	}
 }

@@ -21,6 +21,8 @@ func TestPersisterRoundTrip(t *testing.T) {
 		AllocatableNowMem: 256 << 20,
 		Capacity:          Resources{MemoryBytes: 4 << 30, CPUMilli: 2000},
 		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 100},
+		LastReportedRSS:   96 << 20,
+		LastReportAt:      time.Unix(1_800_000_000, 0).UTC(),
 	}
 	src.Unlock()
 
@@ -44,6 +46,10 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 	if r.SandboxID != "sb-1" || r.AllocatableNowMem != 256<<20 {
 		t.Errorf("reservation fields wrong: %+v", r)
+	}
+	if snapshot, found := loaded.SnapshotSandboxResource("sb-1"); !found ||
+		snapshot.LastReportedRSS != 96<<20 || snapshot.LastReportAt.Unix() != 1_800_000_000 {
+		t.Fatalf("loaded SID index/resource snapshot = %+v found=%v", snapshot, found)
 	}
 }
 

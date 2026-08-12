@@ -6,6 +6,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // authorized enforces the data-plane access token. The e2b SDK (secure sandboxes,
@@ -16,26 +17,46 @@ import (
 //
 // Exemptions: auth off and envd pre-signed /files URLs. The proxy verifies those
 // signatures before forwarding; envd then verifies the same URL again in-guest.
-func (p *Proxy) authorized(r *http.Request, route Route, port int) bool {
+func (p *Proxy) authorized(r *http.Request, binding RouteBinding) bool {
 	mode := p.authMode()
 	if mode == config.AuthOff {
 		return true
 	}
-	if route.AccessToken == "" {
+	if binding.ExpectedAccessToken == "" {
 		if mode == config.AuthLog {
-			p.log.Warn("data-plane route has no expected access token (log mode; forwarding anyway)",
-				"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path)
+			if p.log != nil {
+				p.log.Warn("data-plane route has no expected access token (log mode; forwarding anyway)",
+					"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path)
+			}
 			return true
 		}
 		return false
 	}
-	res := envdsign.CheckDataPlaneAuth(r, port, route.AccessToken, time.Now())
+	// Signed /files is an e2b legacy-envd exception only. Explicit logical
+	// services and bare port 49983 never inherit it. A non-empty X token remains
+	// authoritative because CheckDataPlaneAuth does not fall back after mismatch.
+	port := binding.Target.Port
+	if r.Header.Get(envdsign.AccessTokenHeader) == "" &&
+		envdsign.IsFileSignatureCandidate(r.Method, r.URL.Path, port) &&
+		(binding.Profile != types.ProfileE2B || binding.Target.Service != ConnectServiceLegacy) {
+		if mode == config.AuthLog {
+			if p.log != nil {
+				p.log.Warn("data-plane auth mismatch (log mode; forwarding anyway)",
+					"has_header", false, "path", r.URL.Path, "err", envdsign.ErrNotFileSignature)
+			}
+			return true
+		}
+		return false
+	}
+	res := envdsign.CheckDataPlaneAuth(r, port, binding.ExpectedAccessToken, time.Now())
 	if res.OK {
 		return true
 	}
 	if mode == config.AuthLog {
-		p.log.Warn("data-plane auth mismatch (log mode; forwarding anyway)",
-			"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path, "err", res.Err)
+		if p.log != nil {
+			p.log.Warn("data-plane auth mismatch (log mode; forwarding anyway)",
+				"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path, "err", res.Err)
+		}
 		return true
 	}
 	return false

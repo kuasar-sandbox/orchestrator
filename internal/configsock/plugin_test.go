@@ -72,6 +72,32 @@ func TestRegistryEvictsSameID(t *testing.T) {
 	}
 }
 
+func TestRegistryProxyStatsTargetFollowsRegistrationLease(t *testing.T) {
+	r := NewRegistry()
+	noop := func() {}
+	withoutStats := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: noop}
+	r.Add(withoutStats)
+	if path, found := r.ProxyStatsTarget(); found || path != "" {
+		t.Fatalf("stats target without capability = %q/%t", path, found)
+	}
+
+	withStatsCaps := proxyCaps("/run/proxy.sock")
+	withStatsCaps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/proxy-stats.sock"}
+	withStats := &Plugin{ID: routesync.ProxyPluginID, Caps: withStatsCaps, cancel: noop}
+	r.Add(withStats)
+	if path, found := r.ProxyStatsTarget(); !found || path != "/run/proxy-stats.sock" {
+		t.Fatalf("stats target = %q/%t", path, found)
+	}
+	r.Remove(withoutStats)
+	if path, found := r.ProxyStatsTarget(); !found || path != "/run/proxy-stats.sock" {
+		t.Fatalf("evicted lease removed successor target = %q/%t", path, found)
+	}
+	r.Remove(withStats)
+	if path, found := r.ProxyStatsTarget(); found || path != "" {
+		t.Fatalf("removed lease retained target = %q/%t", path, found)
+	}
+}
+
 func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
 	trusted := proxyCaps("/run/proxy.sock")
 	trusted.Mmds = true

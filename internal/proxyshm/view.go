@@ -19,9 +19,13 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-var errExecActivationTimeout = errors.New("proxyshm: exec activation timed out")
+var (
+	errExecActivationTimeout  = errors.New("proxyshm: exec activation timed out")
+	errRouteActivationTimeout = errors.New("proxyshm: route activation timed out")
+)
 
 // MasterView is the proxy master's routesync sink and wake source.
 type MasterView struct {
@@ -265,33 +269,122 @@ func NewMMDSWorkerView(table *Table, updates *Updates, wake func(string), defaul
 	return view
 }
 
-func (v *WorkerView) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
+// LookupRoute waits for initial sync and, for an initially missing SID, passive
+// route propagation. It never emits Wake or performs backend I/O.
+func (v *WorkerView) LookupRoute(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	if !v.waitSynced(ctx) {
-		return proxy.Route{Kind: proxy.KindNotFound}, nil
-	}
-	if current, found := v.table.Lookup(sid); found && current.State != routesync.StateDead {
-		selected := proxy.RouteForTarget(
-			current.Profile, current.EnvdUDS, current.CiUDS, current.FloatingIP,
-			current.EnvdAccessToken, current.ForwardAccessToken, target,
-		)
-		// Generic route resolution does not wake a paused sandbox for a target
-		// with no backend. Exec CONNECT is handled earlier by the authenticated
-		// LookupExec/ActivateExec path; direct Route callers remain fail-closed.
-		if selected.Kind == proxy.KindDeny {
-			return selected, nil
+		if err := ctx.Err(); err != nil {
+			return proxy.RouteBinding{}, false, err
 		}
-		if current.State == routesync.StateRunning {
-			return selected, nil
+		return proxy.RouteBinding{}, false, nil
+	}
+	deadline := time.Now().Add(v.parkTimeout())
+	_, _, initialRouteRev := v.table.LookupRevision(sid)
+	for {
+		rev := v.table.Rev()
+		r, found, routeRev := v.table.LookupRevision(sid)
+		binding, present := workerRouteBinding(r, found, target)
+		if present {
+			return binding, true, nil
+		}
+		// Once a record (including dead/malformed) or a terminal revision has
+		// been observed, absence is authoritative. Only the initial propagation
+		// gap is parked, without a Wake.
+		if found || initialRouteRev != 0 || routeRev != initialRouteRev {
+			return proxy.RouteBinding{}, false, nil
+		}
+		if !v.waitChange(ctx, deadline, rev) {
+			if err := ctx.Err(); err != nil {
+				return proxy.RouteBinding{}, false, err
+			}
+			return proxy.RouteBinding{}, false, nil
 		}
 	}
-	r, ok := v.Resolve(ctx, sid)
-	if !ok {
-		return proxy.Route{Kind: proxy.KindNotFound}, nil
+}
+
+// ActivateRoute revalidates the authorized binding before Wake and after every
+// shared-table revision. Only the final running record supplies the backend.
+func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBinding) (proxy.Route, bool, error) {
+	if !v.waitSynced(ctx) || expected.SandboxID == "" {
+		if err := ctx.Err(); err != nil {
+			return proxy.Route{}, false, err
+		}
+		return proxy.Route{}, false, nil
 	}
-	return proxy.RouteForTarget(
-		r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP,
+	r, found, _ := v.table.LookupRevision(expected.SandboxID)
+	binding, present := workerRouteBinding(r, found, expected.Target)
+	if !present || binding != expected {
+		return proxy.Route{}, false, nil
+	}
+	if r.State == routesync.StateRunning {
+		return workerDialRoute(r, expected), true, nil
+	}
+	seenStarting := r.State == routesync.StateStarting
+	woke := false
+	if r.State == routesync.StatePaused && v.wake != nil {
+		v.wake(expected.SandboxID)
+		woke = true
+	}
+	return v.waitRouteActivated(ctx, expected, woke, seenStarting)
+}
+
+func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.ConnectTarget) (proxy.RouteBinding, bool) {
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+		return proxy.RouteBinding{}, false
+	}
+	binding := proxy.BindRoute(
+		r.SandboxID, r.AuthSandboxID, types.Profile(r.Profile),
 		r.EnvdAccessToken, r.ForwardAccessToken, target,
-	), nil
+	)
+	if binding.SandboxID == "" || binding.AuthSandboxID == "" {
+		return proxy.RouteBinding{}, false
+	}
+	return binding, true
+}
+
+func workerDialRoute(r routesync.RouteEntry, expected proxy.RouteBinding) proxy.Route {
+	return proxy.RouteForTarget(types.Profile(r.Profile), r.EnvdUDS, r.CiUDS, r.FloatingIP, expected.Target)
+}
+
+func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.RouteBinding, woke, seenStarting bool) (proxy.Route, bool, error) {
+	deadline := time.Now().Add(v.parkTimeout())
+	for {
+		if err := ctx.Err(); err != nil {
+			return proxy.Route{}, false, err
+		}
+		rev := v.table.Rev()
+		r, found := v.table.Lookup(expected.SandboxID)
+		binding, present := workerRouteBinding(r, found, expected.Target)
+		if !present || binding != expected {
+			return proxy.Route{}, false, nil
+		}
+		switch r.State {
+		case routesync.StateRunning:
+			route := workerDialRoute(r, expected)
+			if route.Kind != expected.Kind {
+				return proxy.Route{}, false, nil
+			}
+			return route, true, nil
+		case routesync.StateStarting:
+			seenStarting = true
+		case routesync.StatePaused:
+			if seenStarting {
+				return proxy.Route{}, false, nil
+			}
+			if !woke && v.wake != nil {
+				v.wake(expected.SandboxID)
+				woke = true
+			}
+		default:
+			return proxy.Route{}, false, nil
+		}
+		if !v.waitChange(ctx, deadline, rev) {
+			if err := ctx.Err(); err != nil {
+				return proxy.Route{}, false, err
+			}
+			return proxy.Route{}, false, errRouteActivationTimeout
+		}
+	}
 }
 
 // LookupExec reads the node-local identity needed by the exec KAT gate. It is
@@ -403,34 +496,6 @@ func (v *WorkerView) waitExecRunning(
 	}
 }
 
-func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
-	if !v.waitSynced(ctx) {
-		return routesync.RouteEntry{}, false
-	}
-	r, found, initialRev := v.table.LookupRevision(sid)
-	woke := false
-	seenStarting := false
-	if found {
-		switch r.State {
-		case routesync.StateRunning:
-			return r, true
-		case routesync.StateStarting:
-			seenStarting = true
-		case routesync.StatePaused:
-			if v.wake != nil {
-				v.wake(sid)
-				woke = true
-			}
-		default:
-			return routesync.RouteEntry{}, false
-		}
-	} else if v.wake != nil {
-		v.wake(sid)
-		woke = true
-	}
-	return v.waitRouteRunning(ctx, sid, woke, seenStarting, initialRev)
-}
-
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
 	if !v.MMDSAvailable() {
 		return "", false
@@ -513,40 +578,6 @@ func (v *WorkerView) waitSynced(ctx context.Context) bool {
 	}
 }
 
-func (v *WorkerView) waitRouteRunning(ctx context.Context, sid string, woke, seenStarting bool, initialRev uint64) (routesync.RouteEntry, bool) {
-	deadline := time.Now().Add(v.parkTimeout())
-	for {
-		rev := v.table.Rev()
-		r, ok, routeRev := v.table.LookupRevision(sid)
-		if !ok {
-			if seenStarting || (woke && routeRev != initialRev) {
-				return routesync.RouteEntry{}, false
-			}
-		} else {
-			switch r.State {
-			case routesync.StateRunning:
-				return r, true
-			case routesync.StateStarting:
-				seenStarting = true
-			case routesync.StatePaused:
-				if seenStarting || (woke && routeRev != initialRev) {
-					return routesync.RouteEntry{}, false
-				}
-				if !woke && v.wake != nil {
-					v.wake(sid)
-					woke = true
-				}
-			default:
-				return routesync.RouteEntry{}, false
-			}
-		}
-		if !v.waitChange(ctx, deadline, rev) {
-			r, ok := v.table.Lookup(sid)
-			return r, ok && r.State == routesync.StateRunning
-		}
-	}
-}
-
 func (v *WorkerView) parkTimeout() time.Duration {
 	p := v.table.Policy()
 	if p.ParkTimeoutMS > 0 {
@@ -575,6 +606,7 @@ func (v *WorkerView) waitChange(ctx context.Context, deadline time.Time, rev uin
 	}
 }
 
+var _ proxy.Router = (*WorkerView)(nil)
 var _ proxy.ExecRouter = (*WorkerView)(nil)
 
 // Updates converts a notification pipe into local waitable revisions.

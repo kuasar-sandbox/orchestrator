@@ -30,6 +30,8 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	}
 	if !found {
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
+		// LookupExec is side-effect-free and no credential has been admitted, so a
+		// chained cluster router may safely treat this as a stale node-local route.
 		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
 		return
 	}
@@ -43,6 +45,11 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return
 	}
+	flow := p.traffic.BeginParking(identity.NodeSandboxID, ConnectServiceExec)
+	if flow == nil {
+		flow = noopTrafficFlow{}
+	}
+	defer flow.Close()
 
 	ready, found, err := execRouter.ActivateExec(r.Context(), sid, identity)
 	if err != nil {
@@ -52,14 +59,16 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	}
 	if !found {
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
+		// The KAT was admitted and parking has started, so this is not a
+		// pre-admission stale response that a cluster router may safely retry.
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
 		return
 	}
 	// ActivateExec must preserve the exact node-local and credential identity
 	// authorized above; a changed lineage cannot inherit this request.
 	if ready != identity {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
+		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorRouteError)
 		return
 	}
 
@@ -73,6 +82,7 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
 		return
 	}
+	ctlConn = flow.AttachBackend(ctlConn)
 
 	if r.ProtoMajor == 2 {
 		p.serveExecH2(w, r, ctlConn)

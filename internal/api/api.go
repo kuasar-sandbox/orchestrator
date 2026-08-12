@@ -155,6 +155,15 @@ var ErrSandboxStarting = errors.New("sandbox starting")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
+// Stats errors have deliberately coarse public mappings. Providers may carry
+// richer internal causes, but the API must not expose node topology or worker
+// state details.
+var (
+	ErrStatsUnsupported = errors.New("sandbox stats unsupported")
+	ErrStatsConflict    = errors.New("sandbox state has no applicable stats")
+	ErrStatsUnavailable = errors.New("sandbox stats temporarily unavailable")
+)
+
 // ErrNotAllowed is returned by Create/RegisterBuild when the API key does not
 // resolve to an APISecret/ManifestKey pair in the node allowlist (=> 403).
 var ErrNotAllowed = errors.New("credential pair not allowed to create")
@@ -254,6 +263,8 @@ type Core interface {
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error)
 	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
+	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
+	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
 
 	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
 	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
@@ -296,6 +307,36 @@ type Resources struct {
 	DiskMB   int
 }
 
+// ResourceStats is a sparse snapshot sourced exclusively from the node resource
+// controller. Pointer fields distinguish an observed zero from an unavailable
+// sample; JSON must not fabricate uncollected values.
+type ResourceStats struct {
+	TimestampUnix  *int64   `json:"timestampUnix,omitempty"`
+	CPUCount       *float64 `json:"cpuCount,omitempty"`
+	CPUAllocatable *float64 `json:"cpuAllocatable,omitempty"`
+	MemUsed        *uint64  `json:"memUsed,omitempty"`
+	MemTotal       *uint64  `json:"memTotal,omitempty"`
+	MemAllocatable *uint64  `json:"memAllocatable,omitempty"`
+}
+
+type TrafficInflight struct {
+	Parking uint64 `json:"parking"`
+	Egress  uint64 `json:"egress"`
+}
+
+type ServiceTrafficStats struct {
+	Parking   uint64     `json:"parking"`
+	Egress    uint64     `json:"egress"`
+	IdleSince *time.Time `json:"idleSince,omitempty"`
+}
+
+type TrafficStats struct {
+	State     string                         `json:"state"`
+	Inflight  TrafficInflight                `json:"inflight"`
+	IdleSince *time.Time                     `json:"idleSince,omitempty"`
+	Services  map[string]ServiceTrafficStats `json:"services"`
+}
+
 type API struct {
 	core   Core
 	domain string
@@ -313,6 +354,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
 	mux.HandleFunc("POST /sandboxes", a.auth(a.create))
 	mux.HandleFunc("GET /sandboxes/{id}", a.auth(a.get))
+	mux.HandleFunc("GET /sandboxes/{id}/stats/resource", a.auth(a.resourceStats))
+	mux.HandleFunc("GET /sandboxes/{id}/stats/traffic", a.auth(a.trafficStats))
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
@@ -411,6 +454,26 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.sandboxDetail(sb))
+}
+
+func (a *API) resourceStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	stats, err := a.core.ResourceStats(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
+	if err != nil {
+		a.failStats(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (a *API) trafficStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	stats, err := a.core.TrafficStats(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
+	if err != nil {
+		a.failStats(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func (a *API) list(w http.ResponseWriter, r *http.Request) {
@@ -1042,6 +1105,22 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")
+	}
+}
+
+func (a *API) failStats(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeErr(w, http.StatusNotFound, "not found")
+	case errors.Is(err, ErrStatsUnsupported):
+		writeErr(w, http.StatusNotImplemented, "stats unsupported")
+	case errors.Is(err, ErrStatsConflict):
+		writeErr(w, http.StatusConflict, "stats unavailable for sandbox state")
+	case errors.Is(err, ErrStatsUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, "stats temporarily unavailable")
+	default:
+		a.log.Warn("sandbox stats error", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
@@ -23,7 +24,32 @@ func (p resourceProbe) AllocatedBytes() int64 { return int64(p.state.NodeAllocat
 func (p resourceProbe) PoolBytes() int64      { return int64(p.state.AllocatablePool.MemoryBytes) }
 func (p resourceProbe) Draining() bool        { return p.admission.IsDrained() }
 
+func (p resourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats, bool) {
+	snapshot, found := p.state.SnapshotSandboxResource(sandboxID)
+	if !found {
+		return api.ResourceStats{}, false
+	}
+	cpuCount := float64(snapshot.Capacity.CPUMilli) / 1000
+	cpuAllocatable := float64(snapshot.CPUAllocatable) / 1000
+	memTotal := snapshot.Capacity.MemoryBytes
+	memAllocatable := snapshot.MemAllocatable
+	stats := api.ResourceStats{
+		CPUCount:       &cpuCount,
+		CPUAllocatable: &cpuAllocatable,
+		MemTotal:       &memTotal,
+		MemAllocatable: &memAllocatable,
+	}
+	if !snapshot.LastReportAt.IsZero() {
+		timestamp := snapshot.LastReportAt.Unix()
+		memUsed := snapshot.LastReportedRSS
+		stats.TimestampUnix = &timestamp
+		stats.MemUsed = &memUsed
+	}
+	return stats, true
+}
+
 var _ orch.ResourceProbe = resourceProbe{}
+var _ orch.SandboxResourceProvider = resourceProbe{}
 
 // startResourceController starts the in-process node resource controller — the
 // serve `resource_listen` sub-server (node-resource.md) — and runs it until ctx
@@ -47,7 +73,9 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	// Best-effort load; missing/corrupt state.json starts fresh — sandbox-ctl
 	// reattaches by token over RPC.
 	if prev, err := persister.Load(); err == nil && prev != nil {
-		state.Reservations = prev.Reservations
+		if err := state.RestoreReservations(prev.Reservations); err != nil {
+			return nil, err
+		}
 		log.Printf("[node-ctl resource] loaded %d reservations from %s", len(prev.Reservations), resolved.StatePath)
 	} else if err != nil {
 		log.Printf("[node-ctl resource] state load failed (continuing fresh): %v", err)

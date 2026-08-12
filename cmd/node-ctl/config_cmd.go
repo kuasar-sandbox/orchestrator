@@ -243,6 +243,7 @@ paths:
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + conductor MMDS listen; "" = current netns
 proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
+stats_socket: /run/sandbox/proxy-stats.sock      # master-only traffic stats UDS registered for conductor queries
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots
 workers: 2                                       # worker processes supervised by the master

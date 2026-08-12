@@ -90,7 +90,6 @@ func TestNodeAllocated_SumsReservations(t *testing.T) {
 func TestInsertRemoveLookup(t *testing.T) {
 	s := makeState(100<<30, 16<<30)
 	s.Lock()
-	defer s.Unlock()
 
 	r := &Reservation{Token: "x", SandboxID: "sb-x", Stage: StageAdmitted, StageEnteredAt: time.Now()}
 	if err := s.Insert(r); err != nil {
@@ -102,8 +101,21 @@ func TestInsertRemoveLookup(t *testing.T) {
 	if err := s.Insert(r); err == nil {
 		t.Error("duplicate Insert should error")
 	}
+	if err := s.Insert(&Reservation{Token: "y", SandboxID: "sb-x"}); err == nil {
+		t.Error("second reservation for the same sandbox should error")
+	}
+	s.Unlock()
+	snapshot, found := s.SnapshotSandboxResource("sb-x")
+	if !found || snapshot.Capacity != r.Capacity {
+		t.Fatalf("SnapshotSandboxResource = %+v found=%v", snapshot, found)
+	}
+	s.Lock()
 	s.Remove("x")
 	if s.Lookup("x") != nil {
 		t.Error("Lookup should return nil after Remove")
+	}
+	s.Unlock()
+	if _, found := s.SnapshotSandboxResource("sb-x"); found {
+		t.Error("SID index retained a removed reservation")
 	}
 }

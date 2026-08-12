@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -658,6 +660,76 @@ func TestControlForwardEvictsCurrentRouteOnNodeNotFound(t *testing.T) {
 	}
 	if got := rt.cachedRoute("/g", "rk", "sb-1"); got != nil {
 		t.Fatalf("stale route remained cached: %+v", got)
+	}
+}
+
+func TestControlForwardsTrafficStatsWithStableSIDRewrite(t *testing.T) {
+	var nodeHits int32
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&nodeHits, 1)
+		if r.URL.Path != "/sandboxes/sb-1-g0/stats/traffic" {
+			t.Fatalf("node path=%q", r.URL.Path)
+		}
+		if r.Header.Get(HeaderAPIKey) != "e2b_test" || r.Header.Get(HeaderAccessTok) != "" {
+			t.Fatalf("node credentials api=%q access=%q", r.Header.Get(HeaderAPIKey), r.Header.Get(HeaderAccessTok))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(w, `{"state":"paused","inflight":{"parking":1,"egress":0},"services":{"forward":{"parking":1,"egress":0},"exec":{"parking":0,"egress":0,"idleSince":"2026-08-12T12:00:00Z"}}}`)
+	}))
+	defer node.Close()
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
+	route.State = "paused"
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/verify-key":
+			w.WriteHeader(http.StatusOK)
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(route)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := httptest.NewServer(rt.Handler())
+	defer server.Close()
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/sandboxes/sb-1/stats/traffic", nil)
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
+	req.Header.Set(HeaderAccessTok, "must-not-forward")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Control") != "no-store" || !strings.Contains(string(body), `"parking":1`) {
+		t.Fatalf("stats response status=%d cache=%q body=%s", resp.StatusCode, resp.Header.Get("Cache-Control"), body)
+	}
+	if atomic.LoadInt32(&nodeHits) != 1 {
+		t.Fatalf("node hits=%d, want 1", nodeHits)
+	}
+}
+
+func TestStaleProxyResponseRequiresMatchingStatusAndType(t *testing.T) {
+	tests := []struct {
+		status int
+		kind   string
+		want   bool
+	}{
+		{status: http.StatusNotFound, kind: proxypkg.ProxyErrorNotFound, want: true},
+		{status: http.StatusUnauthorized, kind: proxypkg.ProxyErrorUnauthorized, want: true},
+		{status: http.StatusInternalServerError, kind: proxypkg.ProxyErrorNotFound},
+		{status: http.StatusNotFound, kind: proxypkg.ProxyErrorUnauthorized},
+		{status: http.StatusUnauthorized, kind: proxypkg.ProxyErrorRouteError},
+	}
+	for _, test := range tests {
+		if got := staleProxyResponse(test.status, test.kind); got != test.want {
+			t.Fatalf("staleProxyResponse(%d, %q)=%v, want %v", test.status, test.kind, got, test.want)
+		}
 	}
 }
 

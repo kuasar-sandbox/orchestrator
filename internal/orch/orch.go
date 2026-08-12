@@ -29,7 +29,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -85,7 +84,9 @@ type Orchestrator struct {
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
-	probe ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
+	probe         ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
+	resourceStats SandboxResourceProvider
+	trafficStats  SandboxTrafficProvider
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -1337,68 +1338,6 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		}
 	}
 	return true, nil
-}
-
-// --- proxy.Router (internal mode) ---
-
-// Route resolves a canonical target for the in-process proxy. A paused sandbox
-// first joins the common launch owner; concurrent control/data/exec activations
-// therefore collapse to one resume. The forwarding decision is shared with the
-// external route table via proxy.RouteForTarget.
-func (o *Orchestrator) Route(ctx context.Context, sandboxID string, target proxy.ConnectTarget) (proxy.Route, error) {
-	sb := o.lookup(sandboxID)
-	if sb == nil {
-		s, _ := o.st.Get(ctx, sandboxID)
-		if s == nil {
-			return proxy.Route{Kind: proxy.KindNotFound}, nil
-		}
-		sb = s
-		o.cache(sb)
-	}
-	selected := proxy.RouteForTarget(
-		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
-		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
-	)
-	// A recognized but unsupported logical service has no generic backend to
-	// activate. Exec CONNECT is handled earlier by the authenticated
-	// LookupExec/ActivateExec path; direct Route callers remain fail-closed.
-	if selected.Kind == proxy.KindDeny {
-		return selected, nil
-	}
-	switch sb.State {
-	case types.StateRunning:
-		// Ready to route below.
-	case types.StatePaused:
-		if _, _, err := o.ensureResumeAccepted(ctx, sandboxID, nil, nil); err != nil {
-			if errors.Is(err, api.ErrNotFound) {
-				return proxy.Route{Kind: proxy.KindNotFound}, nil
-			}
-			return proxy.Route{}, err
-		}
-		var err error
-		sb, err = o.waitLaunchState(ctx, sandboxID)
-		if err != nil {
-			return proxy.Route{}, err
-		}
-		if sb == nil || sb.State != types.StateRunning {
-			return proxy.Route{Kind: proxy.KindNotFound}, nil
-		}
-	case types.StateStarting:
-		var err error
-		sb, err = o.waitLaunchState(ctx, sandboxID)
-		if err != nil {
-			return proxy.Route{}, err
-		}
-		if sb == nil || sb.State != types.StateRunning {
-			return proxy.Route{Kind: proxy.KindNotFound}, nil
-		}
-	default:
-		return proxy.Route{Kind: proxy.KindNotFound}, nil
-	}
-	return proxy.RouteForTarget(
-		string(sb.Profile), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP,
-		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
-	), nil
 }
 
 // waitLaunchState waits only for the already-accepted owner and then reloads the

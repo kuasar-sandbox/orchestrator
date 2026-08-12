@@ -40,6 +40,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -172,6 +173,9 @@ func runConductor(args []string, log *slog.Logger) error {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
 		core.SetResourceProbe(probe) // cluster heartbeat reports this node's water level + drain
+		if provider, ok := probe.(orch.SandboxResourceProvider); ok {
+			core.SetSandboxResourceProvider(provider)
+		}
 	}
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
@@ -224,6 +228,43 @@ func runConductor(args []string, log *slog.Logger) error {
 		log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
 	}
 
+	// Traffic stats providers are wired before either API listener can accept a
+	// request. Internal mode uses the same WorkerStats→MasterStats absolute update
+	// path in-process; external mode queries the registered proxy master's cache.
+	plugins := configsock.NewRegistry()
+	mx := metrics.New()
+	var internalWorkerStats *proxystats.WorkerStats
+	switch cfg.Proxy.Mode {
+	case config.ProxyInternal:
+		internalWorkerStats = proxystats.NewWorkerStats()
+		masterStats := proxystats.NewMasterStats(mx, []string{"internal"})
+		if err := masterStats.BeginWorker("internal", 1); err != nil {
+			return err
+		}
+		senderDone, err := internalWorkerStats.StartSender(ctx, "internal", 1, func(frame proxystats.Frame) error {
+			return masterStats.Receive("internal", 1, frame)
+		})
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := <-senderDone; err != nil && ctx.Err() == nil {
+				log.Error("internal proxy stats sender", "err", err)
+			}
+		}()
+		routeExists := func(sandboxID string) bool {
+			_, found, err := core.LookupExec(ctx, sandboxID)
+			// A transient store failure must retain the entry; only a definitive
+			// route miss permits removal of its idle timestamp.
+			return err != nil || found
+		}
+		go internalWorkerStats.RunGC(ctx, routeExists, 5*time.Minute)
+		go masterStats.RunGC(ctx, routeExists, time.Minute)
+		core.SetSandboxTrafficProvider(masterStats)
+	case config.ProxyExternal:
+		core.SetSandboxTrafficProvider(&externalTrafficProvider{plugins: plugins})
+	}
+
 	// North api handler (e2b control plane + export/import). Built once and shared by
 	// the TLS listener below and the local control socket's api plane. The node-uniform
 	// VM resources (vcpu/memory from config; disk = writable overlay seed) are surfaced
@@ -242,7 +283,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
 	// registrations (proxy master, route observers); the external-mode proxyForwarder
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
-	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider:                     core,
 		Admin:                        core,
@@ -281,7 +321,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
 	// proxyForwarder to worker (external), or reject (off). External mode also
 	// starts the route-sync client that pushes the route table to each worker.
-	mx := metrics.New()
 	var proxyNS *netns.NetNS
 	if cfg.Proxy.Mode == config.ProxyInternal && cfg.Proxy.ProxyNetNS != "" {
 		proxyNS, err = openProxyNetNS(cfg.Proxy.ProxyNetNS)
@@ -291,7 +330,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		defer proxyNS.Close()
 		log.Info("node-ctl internal proxy forwarding netns", "proxy_netns", cfg.Proxy.ProxyNetNS)
 	}
-	dataH := buildDataPlane(cfg, core, plugins, mx, log, proxyNS)
+	dataH := buildDataPlane(cfg, core, plugins, mx, internalWorkerStats, log, proxyNS)
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +407,7 @@ func warnDeprecatedCheckpointMode(cfg *config.Config, log *slog.Logger) {
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.
-func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, log *slog.Logger, proxyNS *netns.NetNS) http.Handler {
+func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, workerStats *proxystats.WorkerStats, log *slog.Logger, proxyNS *netns.NetNS) http.Handler {
 	switch cfg.Proxy.Mode {
 	case config.ProxyOff:
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -381,6 +420,11 @@ func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *config
 		log.Info("external proxy mode: proxy master registers on the config socket")
 		return newProxyForwarder(plugins, mx, log)
 	default: // internal
-		return proxy.NewWithDialer(core, func() string { return cfg.Proxy.Auth }, log, mx, routeDialerInNetNS(proxyNS), cfg.Paths.RunRoot)
+		counter := proxy.Counter(mx)
+		if workerStats != nil {
+			counter = workerStats
+		}
+		return proxy.NewWithDialer(core, func() string { return cfg.Proxy.Auth }, log, counter, routeDialerInNetNS(proxyNS), cfg.Paths.RunRoot).
+			WithTrafficTracker(workerStats)
 	}
 }

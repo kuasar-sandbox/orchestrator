@@ -527,6 +527,36 @@ end
   超时即视为创建失败,释放 reservation
 - `queue_ttl = 30s`:Admit 排队太久无意义,上层调度器宁可换节点
 
+### 6.6 per-sandbox resource stats
+
+`GET /sandboxes/{sid}/stats/resource` 由 conductor 直接读取本进程 controller state,不发
+resource RPC、不访问 envd 或 guest `/metrics`,也不触发生命周期动作。controller 除 token
+主索引外维护派生 `sandbox_id → token` 索引;Insert、Release、IdleSweeper、重启 reload 和
+所有其它删除路径统一维护该索引,因此查询不需要线性扫描 reservation 表。
+
+Settled/Heartbeat 仅在 `CurrentRSS>0` 时同时更新:
+
+```text
+last_reported_rss = CurrentRSS
+last_report_at    = controller receive time
+```
+
+`last_heartbeat_at` 仍只表示 reservation liveness,不能冒充资源采样时间。公开 sparse 字段为:
+
+| 字段 | controller 来源 |
+|---|---|
+| `timestampUnix` | `last_report_at` |
+| `cpuCount` | `capacity.cpu_milli / 1000` |
+| `cpuAllocatable` | 当前 CPU budget/floor,单位 core |
+| `memUsed` | `last_reported_rss`(sandboxer cgroup `memory.current`) |
+| `memTotal` | `capacity.memory_bytes` |
+| `memAllocatable` | `allocatable_now_mem` |
+
+任何未采集字段都省略,不用零填充。controller disabled 返回 501;starting 有 reservation 可返回
+sparse 200;paused 无 live reservation 返回 409;running 缺 reservation 返回 503;reservation
+存在但尚无 RSS report 时省略 `timestampUnix`/`memUsed`。API ownership 与完整 JSON 例见
+[node.md](node.md) §4.1.1。
+
 ## 7. node-ctl 内部组织
 
 `node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl conductor serve` 起(配 `resource_listen`)。
@@ -538,6 +568,7 @@ controller (node-ctl conductor serve resource_listen)
 ├── Admission Controller     §6 准入与速率限制
 ├── Memory Allocator         §4.3 仲裁与 grant
 ├── Reclaim Scheduler        §4.2 settled 期主动收回
+├── SID Index / Stats View   §6.6 sparse resource snapshot
 └── State Persister          §8 /run/node-ctl/state.json 写
 ```
 
@@ -577,6 +608,8 @@ controller (node-ctl conductor serve resource_listen)
       "stage":              "settled",
       "stage_entered_at":   "2026-..-..T..",
       "last_heartbeat_at":  "2026-..-..T..",
+      "last_reported_rss":  536870912,
+      "last_report_at":     "2026-..-..T..",
       "oom_count":          0
     },
     ...
