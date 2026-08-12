@@ -290,7 +290,7 @@ func (v *WorkerView) LookupRoute(ctx context.Context, sid string, target proxy.C
 		// Once a record (including dead/malformed) or a terminal revision has
 		// been observed, absence is authoritative. Only the initial propagation
 		// gap is parked, without a Wake.
-		if found || routeRev != initialRouteRev {
+		if found || initialRouteRev != 0 || routeRev != initialRouteRev {
 			return proxy.RouteBinding{}, false, nil
 		}
 		if !v.waitChange(ctx, deadline, rev) {

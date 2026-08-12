@@ -578,6 +578,43 @@ func TestWorkerLookupRouteInitialMissTimesOutWithoutWake(t *testing.T) {
 	}
 }
 
+func TestWorkerLookupRouteExistingTerminalReturnsImmediatelyWithoutWake(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	updates := &Updates{ch: make(chan struct{})}
+	var wakes atomic.Int32
+	worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
+	tbl.BeginSync()
+	tbl.Delete("deleted")
+	tbl.Bookmark()
+
+	type lookupResult struct {
+		binding proxy.RouteBinding
+		found   bool
+		err     error
+	}
+	done := make(chan lookupResult, 1)
+	go func() {
+		binding, found, err := worker.LookupRoute(context.Background(), "deleted", proxy.LegacyTarget(49983))
+		done <- lookupResult{binding: binding, found: found, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || got.found || got.binding != (proxy.RouteBinding{}) {
+			t.Fatalf("LookupRoute after terminal revision = %+v, %v, %v", got.binding, got.found, got.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("LookupRoute consumed its park timeout after an existing terminal revision")
+	}
+	if got := wakes.Load(); got != 0 {
+		t.Fatalf("terminal route lookup emitted %d wakes", got)
+	}
+}
+
 func TestWorkerActivateRouteFailsClosedOnBindingChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)
