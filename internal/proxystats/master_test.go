@@ -144,6 +144,19 @@ func TestMasterFaultWindowExitAndReplacementReadiness(t *testing.T) {
 	}
 }
 
+func TestMasterCannotReenterReadyWithinAnEpoch(t *testing.T) {
+	master := NewMasterStats(metrics.New(), []string{"w0"})
+	readyWorker(t, master, "w0", 1)
+	readyAgain := Frame{Type: TypeReady, Version: Version, Epoch: 1, Sequence: 2}
+	if err := master.Receive("w0", 1, readyAgain); err == nil {
+		t.Fatal("second ready with a new sequence was accepted")
+	}
+	master.StreamFault("w0", 1)
+	if err := master.Receive("w0", 1, readyAgain); err == nil {
+		t.Fatal("faulted worker recovered without a new epoch")
+	}
+}
+
 func TestMasterAdvancesIdleBaselineOnRunAndWorkerEpochChanges(t *testing.T) {
 	master := NewMasterStats(metrics.New(), []string{"w0"})
 	base := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)

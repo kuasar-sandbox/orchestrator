@@ -145,9 +145,14 @@ func (m *MasterStats) Receive(workerID string, epoch uint64, frame Frame) error 
 	affected := make(map[string]struct{})
 	switch frame.Type {
 	case TypeReady:
+		if worker.ready || worker.faulted {
+			return errors.New("proxystats: unexpected ready frame")
+		}
 		worker.ready = true
-		worker.faulted = false
 	case TypeUpdate:
+		if !worker.ready || worker.faulted {
+			return errors.New("proxystats: update from unavailable worker")
+		}
 		if frame.Counters != nil {
 			for name := range worker.counters {
 				if _, present := frame.Counters[name]; !present {
@@ -173,6 +178,9 @@ func (m *MasterStats) Receive(workerID string, epoch uint64, frame Frame) error 
 			affected[snapshot.SandboxID] = struct{}{}
 		}
 	case TypeRemove:
+		if !worker.ready || worker.faulted {
+			return errors.New("proxystats: remove from unavailable worker")
+		}
 		for _, sandboxID := range frame.SandboxIDs {
 			delete(worker.traffic, sandboxID)
 			affected[sandboxID] = struct{}{}

@@ -67,11 +67,27 @@ func WriteFrame(w io.Writer, frame Frame) error {
 	}
 	var header [4]byte
 	binary.LittleEndian.PutUint32(header[:], uint32(len(payload)))
-	if _, err := w.Write(header[:]); err != nil {
+	if err := writeFrameBytes(w, header[:]); err != nil {
 		return err
 	}
-	_, err = w.Write(payload)
-	return err
+	return writeFrameBytes(w, payload)
+}
+
+func writeFrameBytes(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if n < 0 || n > len(payload) {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func ReadFrame(r io.Reader) (Frame, error) {

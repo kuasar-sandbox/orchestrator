@@ -3,6 +3,8 @@ package proxystats
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"reflect"
 	"testing"
 	"time"
@@ -31,6 +33,36 @@ func TestFrameRoundTripAndStrictBounds(t *testing.T) {
 		t.Fatal("oversized sandbox id was accepted")
 	}
 }
+
+type shortFrameWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortFrameWriter) Write(payload []byte) (int, error) {
+	if len(payload) > w.max {
+		payload = payload[:w.max]
+	}
+	return w.Buffer.Write(payload)
+}
+
+func TestWriteFrameCompletesShortWrites(t *testing.T) {
+	frame := Frame{Type: TypeReady, Version: Version, Epoch: 3, Sequence: 1}
+	wire := &shortFrameWriter{max: 3}
+	if err := WriteFrame(wire, frame); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadFrame(&wire.Buffer); err != nil || !reflect.DeepEqual(got, frame) {
+		t.Fatalf("short-write round trip = %#v err=%v", got, err)
+	}
+	if err := writeFrameBytes(zeroWriter{}, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("zero-progress write error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
 
 func TestFrameRejectsMalformedProtocolState(t *testing.T) {
 	now := time.Now().UTC()
