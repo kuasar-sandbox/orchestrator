@@ -770,8 +770,28 @@ truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 CHECKPOINT_DIR="$WORK/checkpoints"
-write_orchestrator_config() { # $1=unset|node-policy
+write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller (default controller)
     local policy_mode="$1"
+    local resource_mode="${2:-controller}"
+    local control_socket_line=""
+    local resource_controller_config=""
+    case "$resource_mode" in
+        static) ;;
+        controller)
+            control_socket_line="    control_socket: $WORK/sandbox-resource.sock"
+            resource_controller_config="resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/resource-state.json
+  audit_path: $WORK/resource-audit.log
+  resources:
+    physical_memory: auto
+    physical_cpu: auto
+    host_reserved: { memory: 1GiB, cpu: 0.5 }
+  admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }"
+            ;;
+        *) fail "unknown resource mode: $resource_mode" ;;
+    esac
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS, park_timeout: 120s }
@@ -789,7 +809,7 @@ sandbox:
   resources:
     vcpu: 2
     memory: 2GiB
-    control_socket: $WORK/sandbox-resource.sock
+$control_socket_line
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCKET
@@ -799,16 +819,7 @@ builder:
   diff_template: $BLD
   vcpu: 1
   memory: 1GiB
-resource_listen:
-  enabled: true
-  socket: $WORK/sandbox-resource.sock
-  state_path: $WORK/resource-state.json
-  audit_path: $WORK/resource-audit.log
-  resources:
-    physical_memory: auto
-    physical_cpu: auto
-    host_reserved: { memory: 1GiB, cpu: 0.5 }
-  admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }
+$resource_controller_config
 checkpoint:
   mode: local
   local_dir: $CHECKPOINT_DIR
@@ -855,7 +866,7 @@ stop_orchestrator() {
     ORCH_PID=""
 }
 
-write_orchestrator_config unset
+write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
 echo "==> node-ctl up (:$PORT)"
 wait_mmds_listener
@@ -1008,6 +1019,17 @@ for LOW_ALLOC_ITERATION in $(seq 1 "$LOW_ALLOC_REPEATS"); do
     run_low_allocatable_case "$LOW_ALLOC_ITERATION"
 done
 echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
+
+# Keep the pre-existing low-allocatable cgroup check in static mode: its exact
+# 224 MiB memory.high assertion is the launch-time value. A live controller may
+# legitimately grant memory before envd reaches ready. With no sandbox left from
+# that check, restart against the same store and attach subsequent sandboxes to
+# the controller for the resource stats and restore coverage below.
+stop_orchestrator
+write_orchestrator_config unset controller
+start_orchestrator "$WORK/orch.log"
+wait_mmds_listener
+echo "==> PASS: conductor restarted with the resource controller after static cgroup validation"
 
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they
