@@ -193,7 +193,8 @@ type Subscribe struct {
 // Proxy declares the UDS the orchestrator's proxyForwarder forwards
 // data-plane requests to (this subscriber serves them from its synced table).
 type Proxy struct {
-	Socket Socket `json:"socket"`
+	Socket      Socket  `json:"socket"`
+	StatsSocket *Socket `json:"stats_socket,omitempty"`
 }
 
 type Socket struct {
