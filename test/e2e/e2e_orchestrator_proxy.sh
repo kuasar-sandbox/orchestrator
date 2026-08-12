@@ -15,7 +15,7 @@
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
-#   GET <proxy> for an unknown sandbox -> wake -> 404 (orchestrator says gone)
+#   GET <proxy> for an unknown sandbox -> passive propagation wait, no Wake
 #   POST /sandboxes/<sid>/exec-sessions -> KAT; service=exec CONNECT through the
 #                                          external proxy -> real guest exec
 #   pause -> GET <proxy> -> wake -> auto-resume -> forwarded
@@ -678,10 +678,20 @@ done
 [ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; dump_logs; fail "user port via proxy_netns -> floatingip did not return marker"; }
 echo "==> PASS: proxy_netns worker reached sandbox floatingip:8000 (real user port, marker=$USER_MARK)"
 
-# ---- (2) unknown sandbox via proxy -> wake -> 404 -------------------------
-code=$(dp "49983-deadbeefdeadbeef" /health "$ENVD_TOKEN")
-if [ "$code" = "404" ]; then echo "==> PASS: unknown sandbox via proxy -> 404 (orchestrator resolved the wake as gone)"
-else dump_logs; fail "unknown sandbox via proxy = $code (want 404 after wake)"; fi
+# ---- (2) initially missing route waits passively without unauthorized Wake -
+# The full passive propagation window is 120s. Cancel this probe after two
+# seconds: the retired pre-#70 flow emitted Wake immediately, and OnWake's Delete
+# made the request return 404 well before this client deadline.
+UNKNOWN_SID="deadbeefdeadbeef"
+if code=$(DP_MAX_TIME=2 dp "49983-$UNKNOWN_SID" /health "$ENVD_TOKEN" 2>"$WORK/unknown-route.err"); then
+    dump_logs
+    fail "initially missing route returned $code before its passive propagation window"
+else
+    curl_status=$?
+fi
+[ "$curl_status" = "28" ] && [ "$code" = "000" ] \
+    || { cat "$WORK/unknown-route.err"; dump_logs; fail "initially missing route probe status=$curl_status code=$code (want client timeout without Wake)"; }
+echo "==> PASS: initially missing route waited passively without unauthorized Wake"
 
 # ---- (3) metrics ----------------------------------------------------------
 if curl -sS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null | grep -q 'data_requests_total'; then

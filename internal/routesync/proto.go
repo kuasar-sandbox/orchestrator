@@ -19,11 +19,13 @@
 // generation and, on the Bookmark, drops entries it did not see this stream (which
 // recovers deletions that happened while it was disconnected.
 //
-// On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting
-// Upsert flows back down, unparking the proxy's held request. The wire is
-// length-prefixed JSON frames (no gRPC/protobuf) — the same framing style as the rest
-// of internal/configsock, extended to a continuous stream. Transport is h2c so the
-// single request carries both directions full-duplex (golang.org/x/net/http2).
+// After admission, a Wake for a known paused route makes the orchestrator resume
+// the sandbox (single-flight) and the resulting Upsert flows back down, unparking
+// the proxy's held request. Missing routes only wait for passive propagation. The
+// wire is length-prefixed JSON frames (no gRPC/protobuf) — the same framing style
+// as the rest of internal/configsock, extended to a continuous stream. Transport
+// is h2c so the single request carries both directions full-duplex
+// (golang.org/x/net/http2).
 package routesync
 
 import (
@@ -78,7 +80,8 @@ const (
 
 // RouteEntry is the per-sandbox routing + auth state the orchestrator distributes
 // so a proxy can serve the data plane on its own (no per-request callback). State
-// "paused"/missing makes the proxy send a Wake; "running" lets it forward.
+// A credential-authorized "paused" route may make the proxy send a Wake;
+// "starting" waits passively and "running" lets it forward.
 type RouteEntry struct {
 	SandboxID  string `json:"sid"`
 	Profile    string `json:"profile"`               // "e2b" | "bare"
