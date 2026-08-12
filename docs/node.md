@@ -826,7 +826,6 @@ KillMode=control-group      # StopUnit 连 cloud-hypervisor 一并 SIGKILL(§5.1
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
 Delegate=yes                # 委派 cpu/memory controller(§5.1)
-DelegateSubgroup=ctl        # node-ctl / sandbox-ctl 留在不受沙箱水位限制的 ctl/
 ```
 
 **builder 单元**(`%i` = run-id,§12):
@@ -898,11 +897,13 @@ sandbox-runner@<run-id>.service/
 └── vmm/   cloud-hypervisor
 ```
 
-systemd 通过 `DelegateSubgroup=ctl` 从 exec 前即把 node-ctl 放入 `ctl/`。
-`node-ctl run-sandbox` 在等待 assignment 前验证该身份,于空的 unit 根启用 cpu/memory
-controller,幂等创建 `vmm/` 并以 CLOEXEC 打开目录 FD。取得 LaunchSpec 后,启动器在最终
-exec 前才使该 FD 可继承,本地追加 `--cgroup-path=fd=N`;LaunchSpec 自身不携带任何主机
-cgroup 路径或 FD。
+`node-ctl run-sandbox` 在等待 assignment 前只接受当前进程位于对应 run-id 的 runner
+unit 根或其 `ctl/`。前者创建 `ctl/` 并通过 `cgroup.procs` 将自身完整迁入,随后重读
+`/proc/self/cgroup` 验证身份;后者用于运维带外安装的已预置单元。两条路径统一验证 unit
+根无进程及 cpu/memory 委派,再于 unit 根启用 controller,幂等创建 `vmm/` 并以 CLOEXEC
+打开目录 FD。该方式只依赖 `Delegate=yes`,不要求 systemd v254 才提供的
+`DelegateSubgroup=`。取得 LaunchSpec 后,启动器在最终 exec 前才使该 FD 可继承,本地
+追加 `--cgroup-path=fd=N`;LaunchSpec 自身不携带任何主机 cgroup 路径或 FD。
 
 sandbox-ctl 接收 FD 后立即恢复 CLOEXEC,写入资源上限,并以
 `clone3(CLONE_INTO_CGROUP)` 把 CH 原子创建到 `vmm/`。因此 `memory.high` 只限制
