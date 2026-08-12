@@ -69,12 +69,24 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 	defer table.Close()
 	defer os.Remove(cfg.ShmPath)
+	masterCtx, cancelMaster := context.WithCancel(ctx)
+	var masterWG sync.WaitGroup
+	defer func() {
+		cancelMaster()
+		masterWG.Wait()
+	}()
+	startMasterTask := func(task func()) {
+		masterWG.Add(1)
+		go func() {
+			defer masterWG.Done()
+			task()
+		}()
+	}
 
 	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), log)
 	if err := table.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)}); err != nil {
 		return fmt.Errorf("proxy: set bootstrap policy: %w", err)
 	}
-
 	proxyNS, err := openProxyNetNS(cfg.ProxyNetNS)
 	if err != nil {
 		return err
@@ -110,10 +122,12 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 	mx := metrics.New()
 	masterStats := proxystats.NewMasterStats(mx, workerIDs)
-	go masterStats.RunGC(ctx, func(sandboxID string) bool {
-		_, found := table.Lookup(sandboxID)
-		return found
-	}, time.Minute)
+	startMasterTask(func() {
+		masterStats.RunGC(masterCtx, func(sandboxID string) bool {
+			_, found := table.Lookup(sandboxID)
+			return found
+		}, time.Minute)
+	})
 	statsServer := proxystats.NewStatsServer(masterStats, table.Synced, func(sandboxID string) (proxystats.RouteIdentity, bool) {
 		route, found := table.Lookup(sandboxID)
 		if !found {
@@ -121,11 +135,11 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		}
 		return proxystats.RouteIdentity{RunID: route.RunID, Profile: types.Profile(route.Profile), State: types.State(route.State)}, true
 	}, log)
-	go func() {
-		if err := statsServer.Serve(ctx, statsLn); err != nil && ctx.Err() == nil {
+	startMasterTask(func() {
+		if err := statsServer.Serve(masterCtx, statsLn); err != nil && masterCtx.Err() == nil {
 			log.Error("proxy stats socket", "err", err)
 		}
-	}()
+	})
 
 	// The external proxy always registers its trusted MMDS and stats
 	// capabilities. The conductor Hello is the sole source for MMDS policy.
@@ -140,10 +154,12 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
-	go routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(ctx)
+	startMasterTask(func() {
+		routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(masterCtx)
+	})
 
 	var mmdsLn net.Listener
-	mmdsPolicy, ok := view.WaitPolicy(ctx)
+	mmdsPolicy, ok := view.WaitPolicy(masterCtx)
 	if !ok {
 		return nil
 	}
@@ -158,16 +174,14 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	if cfg.MetricsListen != "" {
-		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
+		startMasterTask(func() { serveMetrics(masterCtx, cfg.MetricsListen, mx, log) })
 	}
 
-	var supervisors sync.WaitGroup
 	for i := 0; i < cfg.Workers; i++ {
-		supervisors.Add(1)
-		go func(index int) {
-			defer supervisors.Done()
-			superviseProxyWorker(ctx, index, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, masterStats, log)
-		}(i)
+		idx := i
+		startMasterTask(func() {
+			superviseProxyWorker(masterCtx, idx, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, masterStats, log)
+		})
 	}
 
 	log.Info("node-ctl proxy master serving",
@@ -181,11 +195,10 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"shm_path", cfg.ShmPath,
 		"route_capacity", cfg.RouteCapacity,
 	)
-	<-ctx.Done()
-	// A worker owns inherited listener and stats FDs until cmd.Wait confirms its
-	// exit. Do not let the master return (and become unable to reap children)
-	// while a supervisor is still terminating its current worker.
-	supervisors.Wait()
+	<-masterCtx.Done()
+	// The deferred cancellation/join keeps the route subscriber away from an
+	// unmapped table and reaps workers before their inherited listeners can outlive
+	// the master. It also runs on partial-startup errors, not only signal shutdown.
 	return nil
 }
 

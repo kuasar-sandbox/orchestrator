@@ -225,24 +225,22 @@ func (b *Broadcaster) Add(f *os.File) func() {
 		if b.files[fd] == f {
 			delete(b.files, fd)
 		}
-		b.mu.Unlock()
 		_ = f.Close()
+		b.mu.Unlock()
 	}
 }
 
 func (b *Broadcaster) Notify() {
+	// The pipes are nonblocking, so keep the lock through each write to serialize
+	// f.Fd() and unix.Write with the remover's delete-and-close operation.
 	b.mu.Lock()
-	files := make([]*os.File, 0, len(b.files))
 	for _, f := range b.files {
-		files = append(files, f)
-	}
-	b.mu.Unlock()
-	for _, f := range files {
 		_, err := unix.Write(int(f.Fd()), []byte{1})
 		if err == nil || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 			continue
 		}
 	}
+	b.mu.Unlock()
 }
 
 // WorkerView is a read-only proxy.Router and MMDS source backed by shared memory.
