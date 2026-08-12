@@ -172,6 +172,9 @@ func runConductor(args []string, log *slog.Logger) error {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
 		core.SetResourceProbe(probe) // cluster heartbeat reports this node's water level + drain
+		if provider, ok := probe.(orch.SandboxResourceProvider); ok {
+			core.SetSandboxResourceProvider(provider)
+		}
 	}
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:

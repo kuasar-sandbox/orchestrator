@@ -1050,6 +1050,58 @@ func newSandboxContractHandler(t *testing.T, core Core, resources Resources) (ht
 	return New(core, "example.test", resources, logger).Handler(), apiKey
 }
 
+type resourceStatsCoreStub struct {
+	Core
+	stats *ResourceStats
+	err   error
+}
+
+func (c *resourceStatsCoreStub) ResourceStats(context.Context, string, string) (*ResourceStats, error) {
+	return c.stats, c.err
+}
+
+func TestResourceStatsSparseJSONAndStatusMapping(t *testing.T) {
+	cpu := 2.0
+	handler, apiKey := newSandboxContractHandler(t, &resourceStatsCoreStub{
+		stats: &ResourceStats{CPUCount: &cpu},
+	}, Resources{})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/resource", nil)
+	req.Header.Set("X-API-KEY", apiKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response status=%d cache=%q", resp.Code, resp.Header().Get("Cache-Control"))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 1 || body["cpuCount"] == nil {
+		t.Fatalf("sparse resource JSON = %s", resp.Body.String())
+	}
+
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{ErrNotFound, http.StatusNotFound},
+		{ErrStatsUnsupported, http.StatusNotImplemented},
+		{ErrStatsConflict, http.StatusConflict},
+		{ErrStatsUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(http.StatusText(tc.want), func(t *testing.T) {
+			handler, apiKey := newSandboxContractHandler(t, &resourceStatsCoreStub{err: tc.err}, Resources{})
+			req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/resource", nil)
+			req.Header.Set("X-API-KEY", apiKey)
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != tc.want || resp.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d cache=%q, want %d/no-store", resp.Code, resp.Header().Get("Cache-Control"), tc.want)
+			}
+		})
+	}
+}
+
 func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }
