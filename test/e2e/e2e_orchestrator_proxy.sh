@@ -794,7 +794,8 @@ else dump_logs; fail "proxy master /metrics did not report data_requests_total";
 # A stats EOF/crash must make the aggregate unavailable until the replacement's
 # new epoch has completed hello+ready. The dead worker's contribution is removed
 # only after the supervisor has reaped it.
-CRASH_WORKER="$(child_worker_pids "$PROXY_MASTER_PID" | head -1)"
+mapfile -t CRASH_WORKERS < <(child_worker_pids "$PROXY_MASTER_PID")
+CRASH_WORKER="${CRASH_WORKERS[0]:-}"
 [ -n "$CRASH_WORKER" ] || fail "no external proxy worker available for crash test"
 kill -KILL "$CRASH_WORKER"
 SEEN_STATS_503=""
@@ -805,7 +806,7 @@ for _ in $(seq 1 120); do
 done
 [ -n "$SEEN_STATS_503" ] || { dump_logs; fail "worker crash did not create a traffic-stats 503 window"; }
 wait_traffic_stats "$SID" idle || { dump_logs; fail "traffic stats did not recover after replacement ready"; }
-wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+wait_external_proxy_ready "$PROXY_MASTER_PID"
 echo "==> PASS: worker crash returned 503 until replacement epoch was stats-ready"
 
 # ---- (3b) CONNECT tunnel THROUGH the proxy to envd control -----------------
