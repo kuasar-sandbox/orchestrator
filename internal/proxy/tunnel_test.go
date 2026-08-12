@@ -15,6 +15,7 @@ import (
 )
 
 func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
+	worker, master := newTrafficHarness(t)
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +53,7 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 	}()
 
 	handlerDone := make(chan struct{})
+	attached := make(chan struct{})
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(handlerDone)
 		backend, err := net.Dial("tcp", backendListener.Addr().String())
@@ -65,6 +67,10 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 			http.Error(w, "prefetch failed", http.StatusBadGateway)
 			return
 		}
+		flow := worker.BeginParking("node-s1", proxy.ConnectServiceForward)
+		backend = flow.AttachBackend(backend)
+		defer flow.Close()
+		close(attached)
 		proxy.TunnelBuffered(w, r, backend, reader)
 	}))
 	defer front.Close()
@@ -89,6 +95,12 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
 	}
+	select {
+	case <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("H1 backend was not attached")
+	}
+	waitInflight(t, master, 0, 1)
 	if err := tcpConn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -110,9 +122,11 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("half-closed tunnel handler did not finish")
 	}
+	waitInflight(t, master, 0, 0)
 }
 
 func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
+	worker, master := newTrafficHarness(t)
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -142,12 +156,17 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 		backendDone <- err
 	}()
 
+	attached := make(chan struct{})
 	front := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backend, err := net.Dial("tcp", backendListener.Addr().String())
 		if err != nil {
 			http.Error(w, "dial failed", http.StatusBadGateway)
 			return
 		}
+		flow := worker.BeginParking("node-s1", proxy.ConnectServiceForward)
+		backend = flow.AttachBackend(backend)
+		defer flow.Close()
+		close(attached)
 		proxy.Tunnel(w, r, backend)
 	}))
 	front.EnableHTTP2 = true
@@ -160,8 +179,10 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 	}
 	clientInput := []byte("h2-client-frame/mux-tail")
 	writeDone := make(chan error, 1)
+	releaseEOF := make(chan struct{})
 	go func() {
 		_, err := bodyWriter.Write(clientInput)
+		<-releaseEOF
 		if closeErr := bodyWriter.Close(); err == nil {
 			err = closeErr
 		}
@@ -175,6 +196,13 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
 		t.Fatalf("response = %s %d, want HTTP/2 200", resp.Proto, resp.StatusCode)
 	}
+	select {
+	case <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("H2 backend was not attached")
+	}
+	waitInflight(t, master, 0, 1)
+	close(releaseEOF)
 	output, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -191,6 +219,7 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 	if err := <-backendDone; err != nil {
 		t.Fatal(err)
 	}
+	waitInflight(t, master, 0, 0)
 }
 
 func TestTunnelH2CancellationClosesBackendAndHandler(t *testing.T) {

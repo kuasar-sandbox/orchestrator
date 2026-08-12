@@ -139,7 +139,7 @@ func TestStartingWithoutLaunchOwnerFailsClosed(t *testing.T) {
 	}
 	o.cache(sb)
 
-	route, err := o.Route(context.Background(), sb.ID, proxy.LegacyTarget(8080))
+	route, err := activateRouteForTest(context.Background(), o, sb.ID, proxy.LegacyTarget(8080))
 	if err != nil || route.Kind != proxy.KindNotFound {
 		t.Fatalf("ownerless starting route = %+v, %v; want fail-closed not found", route, err)
 	}
@@ -179,7 +179,7 @@ func TestStartingInternalRouteAndExecWaitHonorCallerCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if route, err := o.Route(ctx, sb.ID, proxy.LegacyTarget(8080)); !errors.Is(err, context.Canceled) || route != (proxy.Route{}) {
+	if route, err := activateRouteForTest(ctx, o, sb.ID, proxy.LegacyTarget(8080)); !errors.Is(err, context.Canceled) || route != (proxy.Route{}) {
 		t.Fatalf("canceled starting route = %+v, %v", route, err)
 	}
 	if identity, found, err := o.ActivateExec(ctx, sb.ID, execIdentity(sb)); !errors.Is(err, context.Canceled) || found || identity != (proxy.ExecIdentity{}) {

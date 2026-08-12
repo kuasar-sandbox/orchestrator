@@ -2,8 +2,9 @@
 
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
 不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
-Reserve operation,数据面 cache miss / fail-fast 先 Resolve,已知非 READY sandbox 再调用 data
-Reserve;热路径通过本地 route cache 直接转发到 node。
+Reserve operation;数据面 cache miss 先 Resolve。只要 route 已有 `NodeSandboxID + DataEndpoint`,
+即使 paused/starting 也直接连接最终 node proxy,由 node 负责鉴权后的 parking、Wake 和 backend
+建连。`Reserve(operation=data)` 只保留为 target 缺失、typed stale 或兼容 fallback。
 
 ## 1. 概述
 
@@ -14,14 +15,15 @@ client
   │ HTTPS e2b control/data
   ▼
 router
-  │ READY route cache hit
+  │ known NodeSandboxID + DataEndpoint (ready/paused/starting)
   ├────────────────────────────────────► node proxy
+  │                                      auth → parking → Activate/Wake → backend
   │
-  │ data cache miss / stale / fail-fast
+  │ data cache miss / missing target / typed stale
   ▼
 route_link owner
   │ Resolve
-  │ known non-READY route ──► operation=data Reserve
+  │ fallback only ──────────► operation=data Reserve
   ▼
 node owner / placer / node
 ```
@@ -31,12 +33,14 @@ node owner / placer / node
 1. **每个请求必须有 group**:`X-Kuasar-Sandbox-Group` 是 cluster 控制面和数据面的分片依据。
 2. **Reserve 操作显式分类**:create/data 只在 READY 时返回;connect/exec-session 在 node
    同步准备并返回 typed result 后完成,不等待异步 resume.router 不订阅 route watch.
-3. **热路径优先使用 route cache**:近期解析的 READY route 命中时,新请求不触发 Resolve/Reserve;
+3. **热路径优先使用 route cache**:近期解析且具有 node target 的 route 命中时,无论
+   ready/paused/starting,新请求都不触发 Resolve/Reserve;
    在途请求不作为新请求的路由来源。
-4. **fail-fast 失效**:node 返回 sandbox 不存在、token 不匹配、连接失败时,router 淘汰本地缓存并重新 Resolve;
-   只有已存在但非 READY 的 route 才继续 Reserve。
-5. **数据面字节不进 registry**:registry 只参与显式 create/connect/exec-session,已知 route 激活和
-   miss/fail-fast Resolve。
+4. **fail-fast 失效**:node 在接受内层请求前返回 typed not-found/unauthorized 时,router 淘汰
+   旧 target,经 ReserveData 重验同一 credential 并刷新 route 后只重试一次。连接失败仍淘汰,
+   后续请求重新 Resolve。
+5. **数据面字节不进 registry**:registry 只参与显式 create/connect/exec-session、cache miss Resolve,
+   以及 target 缺失或 typed stale 时的 data Reserve fallback。
 6. **根凭据用途分离**:create/connect/exec-session 由 Reserve 强制验证原始 API key;
    create 的 group admission 经 ready placer 使用 provider APISecret,connect/exec-session 使用
    Sandbox 记录已绑定的 APISecret.其它控制操作由 router 调 route owner 的 verify-key,
@@ -107,9 +111,9 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | connect | group + route_key + stable sandbox_id | 调用 `operation=connect` Reserve;registry 经 node-link 下发 CmdConnect,不 Resolve 或转发 node HTTP `/connect` |
 | exec session | group + route_key + stable sandbox_id | 调用 `operation=exec-session` Reserve;Registry 验证 API key,经 node-link 下发 CmdExecSession,只对外返回 ExecAccessToken |
-| get/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面 |
+| get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面;stats body 无 SID,无需响应身份适配 |
 | list/get | group | 读取 group 分片 |
-| data plane | group + route_key + stable sandbox_id + target | READY cache 命中后建立一次性 CONNECT;当前 target 是 legacy port 或显式 `service=exec` + 可选 port;cache 中已知非 READY route 调用 `operation=data` Reserve;miss 先 Resolve |
+| data plane | group + route_key + stable sandbox_id + target | 已知 NodeSandboxID/DataEndpoint 即直接建立一次性 node CONNECT,包括 paused/starting;target 缺失或 typed stale 才 fallback `operation=data`;miss 先 Resolve |
 | build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
@@ -145,19 +149,20 @@ connect/exec-session/data 中的 `sid` 均是客户期望的稳定 SandboxID,用
 ```text
 request
   │
-  ├─ READY route resolution cache hit
-  │     └─► forward to node
-  ├─ non-READY route resolution cache hit
+  ├─ cache hit with NodeSandboxID + DataEndpoint
+  │     └─► forward to node (ready/paused/starting)
+  ├─ cache hit without a complete node target
   │     └─► operation=data Reserve, then forward
   │
   └─ miss
         └─► Resolve via route owner
-              ├─ READY ──► cache route, then forward
-              └─ known non-READY ──► Reserve, cache route, then forward
+              ├─ complete node target ──► cache route, then forward
+              └─ missing node target ───► Reserve, cache route, then forward
 ```
 
-READY route resolution cache 是热路径优化,避免每个新 HTTP request 都打 registry。缓存命中
-非 READY route 时仍执行 data Reserve。router 不靠全量 route stream 保持一致。
+route resolution cache 是热路径优化,避免每个新 HTTP request 都打 registry。是否直接转发只取决于
+route 是否已有完整 `NodeSandboxID + DataEndpoint`,不取决于 ready/paused/starting 状态;最终 node
+负责 parking、Wake 和 backend 建连。router 不靠全量 route stream 保持一致。
 
 ### 6.2 route resolution cache
 
@@ -224,9 +229,9 @@ Resolve,不会隐式创建 sandbox。
 - node data_endpoint 连接失败。
 - route TTL 或 idle timeout 到期。
 
-握手成功后的 HTTP 401/403/404 是沙箱内应用或 envd 的响应,不淘汰 route。淘汰后下一次请求重新
-Resolve;若解析到已存在但非 READY 的 route,再 Reserve 激活。迁移/恢复时允许首个请求付出一次
-fail-fast 代价,不为此维护 router route 订阅。
+握手成功后的 HTTP 401/403/404 是沙箱内应用或 envd 的响应,不淘汰 route。带上述 typed error 的
+握手失败会淘汰旧 target,以同一请求 credential 调用 `ReserveData` 复验并取得 fresh route,然后只
+重试一次。普通连接失败只淘汰 cache,后续请求重新 Resolve;不为此维护 router route 订阅。
 
 ## 7. 控制面
 
@@ -312,16 +317,24 @@ NodeSandboxID;普通 HTTP 的内层 Host 也改为 `<port>-<node_sandbox_id>.<do
 `E2b-Sandbox-Id` 时把值替换为 NodeSandboxID,保留该 Header 供用户应用感知当前 node-local ID。
 
 对于不带 token 的 envd `/files` signature 请求,router 先使用受保护 route 中的 `EnvdAccessToken` 验签。
-该校验发生在已知非 READY sandbox 的 Reserve/激活之前;验签失败直接返回 401,不得唤醒 sandbox。
+该校验发生在任何 node CONNECT 或 Reserve/激活之前;验签失败直接返回 401,不得唤醒 sandbox。
 验证通过后,router 仅在到 node proxy 的外层 CONNECT 携带该 `EnvdAccessToken`,由 node proxy 完成最后一跳
 鉴权;隧道内 HTTP 请求保持原样且不注入 `X-Access-Token`,让 envd 使用原 URL 中的 signature 再次验证。
 普通 token 请求在外层 CONNECT 和隧道内 HTTP 请求中都保留客户端原始 `X-Access-Token`。
 
-已知 route 非 READY 时,Router 只在上述本地鉴权成功后调用 `operation=data` Reserve。普通请求
-把客户 token 传给 Registry;签名 `/files` 把已用于验签的受保护 EnvdAccessToken 传给 Registry。
-Registry 按当前 profile/端口再验证凭据,通过后才允许 CmdConnect 激活并等待 READY。
-`auth.data_plane=off` 只跳过 Router 对普通 READY 转发的本地 token 闸门,不取消 Reserve 激活的鉴权;
-带显式错误 token 的 `/files` 在任何 Router 鉴权模式下都不回退 signature。
+Router 完成本地鉴权后,若 route 已有 `NodeSandboxID + DataEndpoint`,不再按 state 在 Registry
+等待 READY:paused/starting 与 ready 一样立即建立一次性 node CONNECT。最终 node proxy 按
+`LookupRoute → authorize → BeginParking → ActivateRoute/Wake → fresh Route → dial` 处理等待,
+所以合法请求的 parking 只在最终 node 统计,cluster router/Registry 不重复计数。无效 token 或
+signature 在 node CONNECT/Reserve 之前失败,不会产生 Wake/Resume/parking/dial。
+
+只有 target 缺失时才先调用 `operation=data` fallback。普通请求把客户 token 传给 Registry;
+签名 `/files` 把已用于验签的受保护 EnvdAccessToken 传给 Registry。若已知 node 在接受内层
+请求前返回 typed `not_found`/`unauthorized`,Router 淘汰该 node-local target,调用同一
+ReserveData 让 Registry 对当前 lineage 复验 credential、取得 fresh route,然后只重试一次。
+fallback 返回不同 stable identity 或仍无完整 target 时 fail closed。`auth.data_plane=off` 只
+跳过 Router 对普通请求的本地 token 闸门;带显式错误 token 的 `/files` 在任何模式下都不回退
+signature。
 
 Exec CONNECT 使用单独的 KAT 合同:
 
@@ -330,21 +343,23 @@ client CONNECT
   stable SandboxID + service=exec + X-Access-Token=KAT
     ↓ side-effect-free cache/Resolve
 Router verifies stable AuthSandboxID + ServiceSecret
-    ↓ only when non-READY and already authorized
-Reserve(operation=data, same KAT + service=exec)
-    ↓ Registry re-verifies before CmdConnect
-current Route
-    ↓ rewrite only SID
+    ↓ known node target: direct even paused/starting
 node CONNECT
   current NodeSandboxID + service=exec + optional original port + same KAT
+    ↓ node KAT verify → parking → ActivateExec/Wake → ctl.sock
+
+missing/stale target only:
+  Reserve(operation=data, same KAT + service=exec)
+    ↓ Registry re-verifies and returns fresh current Route
+  retry one node CONNECT
 ```
 
 Exec 始终 enforce,不受 `auth.data_plane=off|log|enforce` 影响.EnvdAccessToken,
 ForwardAccessToken 或 TrafficAccessToken 不能代替 exec KAT.KAT 缺失,过期,签名错误,
-SID/audience 错误时返回 401,且不能触发 Router Reserve,Registry CmdConnect 或 Node resume.
-READY cache hot path 不增加 Registry 调用,但 Router 和 Node 仍验证同一 KAT.非 READY
-路径中,Registry 复验通过后才可以执行生命周期副作用;Reserve 后 Router 必须使用重读的
-current NodeSandboxID,不能复用验证前的旧 node target.
+SID/audience 错误时返回 401,且不能触发 Router Reserve,Registry CmdConnect、Node parking 或
+resume.已有 node target 的 paused/starting 路径不增加 Registry 调用,Router 和 Node 都验证
+同一 KAT,Wake/等待发生在 Node.只有 missing/stale fallback 由 Registry 复验;Reserve 后 Router
+必须使用重读的 current NodeSandboxID,不能复用旧 node target.
 
 最终 Node 从本地 route 再次校验 `AuthSandboxID + ServiceSecret`,授权成功后才连接
 `<run_root>/<NodeSandboxID>/ctl.sock`,回复 CONNECT 200 并进入 `ctl.ProxyExec` gate.Router 只做
@@ -363,15 +378,15 @@ CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连�
 | registry moved | 刷新 membership 并重试 |
 | registry owner 故障 | owner set 内按顺序 failover |
 | Reserve timeout | 返回 503/504;当前请求结束,Router 不保留 Reserve flight |
-| stale cache | fail-fast 淘汰并重试 |
+| typed stale cache | 淘汰旧 target,ReserveData 重验并刷新后只重试一次 |
 | node data endpoint 失败 | 淘汰 route cache,下一次请求重新 Resolve |
 | 旧代际迟到 | 低 RouteRevision 或同 revision 但不同 NodeSandboxID 不覆盖 cache;旧请求失败不驱逐新代际 |
 
 ## 10. 性能
 
-- READY route cache 命中:本地 route resolution + 一条新的 router→node CONNECT。
-- data miss:一次 registry Resolve;只有解析到已存在但非 READY 的 route 才增加 data Reserve
-  与 node 快照恢复/启动。
+- 已知 node target cache 命中:不论 ready/paused/starting,本地 route resolution + 一条新的
+  router→node CONNECT;parking/Wake 在 node 完成。
+- data miss:一次 registry Resolve;只有 target 缺失或 typed stale 才增加 data Reserve。
 - router 不因 group 总量增长而维护全量 route 流。
 - 控制面转发可使用 HTTP transport 连接池,连接池按 `data_endpoint` 隔离;数据面转发不使用 pooled transport。
 

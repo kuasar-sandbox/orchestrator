@@ -868,7 +868,7 @@ func TestServeDataPausedSignedFileUsesEnvdTokenOnlyOutside(t *testing.T) {
 	}
 }
 
-func TestServeDataDoesNotForwardNonReadyReserveRoute(t *testing.T) {
+func TestServeDataForwardsKnownTargetReturnedByFallbackReserve(t *testing.T) {
 	var nodeHits int32
 	node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nodeHits, 1)
@@ -906,11 +906,117 @@ func TestServeDataDoesNotForwardNonReadyReserveRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("non-ready reserve status=%d, want 503", resp.StatusCode)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("non-ready reserve status=%d, want 204", resp.StatusCode)
 	}
-	if hits := atomic.LoadInt32(&nodeHits); hits != 0 {
-		t.Fatalf("non-ready reserve reached node %d times", hits)
+	if hits := atomic.LoadInt32(&nodeHits); hits != 1 {
+		t.Fatalf("known target returned by reserve reached node %d times, want 1", hits)
+	}
+}
+
+func TestServeDataKnownNonReadyTargetSkipsReserve(t *testing.T) {
+	for _, state := range []string{"paused", "starting"} {
+		t.Run(state, func(t *testing.T) {
+			var reserveHits, nodeHits atomic.Int32
+			node := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				nodeHits.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			nodeHost := strings.TrimPrefix(node.URL, "http://")
+			route := routerTestRouteResolve(t, "sb-1", "/g", "rk", nodeHost, types.ProfileBare)
+			route.State = state
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/route-link/route":
+					_ = json.NewEncoder(w).Encode(route)
+				case "/route-link/reserve":
+					reserveHits.Add(1)
+					http.Error(w, "must not reserve a known target", http.StatusInternalServerError)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer control.Close()
+
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			rt.SetDataPlaneAuth("enforce")
+			srv := httptest.NewServer(rt.Handler())
+			defer srv.Close()
+
+			req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+			req.Host = "8080-sb-1.test.local"
+			req.Header.Set(HeaderGroup, "/g")
+			req.Header.Set(HeaderRouteKey, "rk")
+			req.Header.Set(HeaderAccessTok, route.ForwardAccessToken)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status=%d, want 204", resp.StatusCode)
+			}
+			if reserveHits.Load() != 0 || nodeHits.Load() != 1 {
+				t.Fatalf("reserve hits=%d node hits=%d, want 0/1", reserveHits.Load(), nodeHits.Load())
+			}
+		})
+	}
+}
+
+func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
+	var staleHits, reserveHits atomic.Int32
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		staleHits.Add(1)
+		w.Header().Set(proxypkg.HeaderProxyError, proxypkg.ProxyErrorNotFound)
+		http.Error(w, "stale node-local sandbox", http.StatusNotFound)
+	}))
+	defer stale.Close()
+	var innerSID string
+	fresh := newDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		innerSID = r.Header.Get(proxypkg.HeaderSandboxID)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	staleRoute := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(stale.URL, "http://"), types.ProfileBare)
+	staleRoute.State = "paused"
+	freshRoute := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
+	freshRoute.NodeSandboxID = "sb-1-g1"
+	freshRoute.RouteRevision = 2
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(staleRoute)
+		case "/route-link/reserve":
+			reserveHits.Add(1)
+			if r.URL.Query().Get("operation") != "data" || r.URL.Query().Get("port") != "8080" {
+				t.Fatalf("reserve query=%q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(reserveResult{Route: freshRoute})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetDataPlaneAuth("enforce")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+	req.Host = "8080-sb-1.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	req.Header.Set(HeaderAccessTok, staleRoute.ForwardAccessToken)
+	req.Header.Set(proxypkg.HeaderSandboxID, "sb-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d, want 204", resp.StatusCode)
+	}
+	if staleHits.Load() != 1 || reserveHits.Load() != 1 || innerSID != freshRoute.NodeSandboxID {
+		t.Fatalf("stale hits=%d reserve hits=%d inner sid=%q", staleHits.Load(), reserveHits.Load(), innerSID)
 	}
 }
 

@@ -834,6 +834,7 @@ type ProxyFileConfig struct {
 	DataListen    string           `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
 	ProxyNetNS    string           `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and conductor-pushed MMDS listen
 	ProxySocket   string           `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
+	StatsSocket   string           `yaml:"stats_socket"`   // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
 	ShmPath       string           `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
 	RouteCapacity int              `yaml:"route_capacity"` // fixed shared route slots; default 65536
 	Workers       int              `yaml:"workers"`        // worker processes supervised by this master; default 1
@@ -870,6 +871,9 @@ func (p *ProxyFileConfig) applyDefaults() {
 	if p.ProxySocket == "" {
 		p.ProxySocket = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy.sock")
 	}
+	if p.StatsSocket == "" {
+		p.StatsSocket = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy-stats.sock")
+	}
 	if p.ShmPath == "" {
 		p.ShmPath = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy-routes.shm")
 	}
@@ -904,6 +908,18 @@ func (p *ProxyFileConfig) validate() error {
 	}
 	if p.RouteCapacity <= 0 {
 		return fmt.Errorf("proxy config: route_capacity must be positive")
+	}
+	if !filepath.IsAbs(p.StatsSocket) {
+		return fmt.Errorf("proxy config: stats_socket must be an absolute path")
+	}
+	for name, path := range map[string]string{
+		"config_socket": p.ConfigSocket,
+		"proxy_socket":  p.ProxySocket,
+		"shm_path":      p.ShmPath,
+	} {
+		if filepath.Clean(path) == filepath.Clean(p.StatsSocket) {
+			return fmt.Errorf("proxy config: stats_socket conflicts with %s", name)
+		}
 	}
 	return nil
 }

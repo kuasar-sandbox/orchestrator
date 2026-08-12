@@ -24,6 +24,7 @@ data_listen: ":443"
 # proxy_netns: sw0_mgmt
 
 proxy_socket: /run/sandbox/proxy.sock
+stats_socket: /run/sandbox/proxy-stats.sock
 shm_path: /run/sandbox/proxy-routes.shm
 route_capacity: 65536
 workers: 2

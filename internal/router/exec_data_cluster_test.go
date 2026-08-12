@@ -215,6 +215,104 @@ func TestClusterExecReadyCacheRewritesOnlySIDAndPreservesTunnel(t *testing.T) {
 	}
 }
 
+func TestClusterExecKnownNonReadyTargetSkipsReserve(t *testing.T) {
+	for _, state := range []string{"paused", "starting"} {
+		t.Run(state, func(t *testing.T) {
+			node, observed, backendInput := newExecTunnelNode(t, "", "direct-tail")
+			defer node.Close()
+			route := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
+			route.State = state
+			var reserveHits atomic.Int32
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/route-link/route":
+					_ = json.NewEncoder(w).Encode(route)
+				case "/route-link/reserve":
+					reserveHits.Add(1)
+					http.Error(w, "must not reserve a known target", http.StatusInternalServerError)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer control.Close()
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+			front := httptest.NewServer(rt.Handler())
+			defer front.Close()
+			token, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, output := rawClusterExecConnect(t, front.Listener.Addr().String(), token, 0, nil)
+			if status != http.StatusOK || string(output) != "direct-tail" {
+				t.Fatalf("CONNECT status=%d output=%q", status, output)
+			}
+			if reserveHits.Load() != 0 {
+				t.Fatalf("reserve hits=%d, want 0", reserveHits.Load())
+			}
+			got := <-observed
+			if got.sid != route.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.token != token {
+				t.Fatalf("node CONNECT = %#v", got)
+			}
+			if gotInput := <-backendInput; len(gotInput) != 0 {
+				t.Fatalf("unexpected tunnel input %q", gotInput)
+			}
+		})
+	}
+}
+
+func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
+	var staleHits, reserveHits atomic.Int32
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		staleHits.Add(1)
+		w.Header().Set(proxypkg.HeaderProxyError, proxypkg.ProxyErrorNotFound)
+		http.Error(w, "stale node-local sandbox", http.StatusNotFound)
+	}))
+	defer stale.Close()
+	fresh, observed, backendInput := newExecTunnelNode(t, "", "fresh-tail")
+	defer fresh.Close()
+	staleRoute := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(stale.URL, "http://"), types.ProfileBare)
+	staleRoute.State = "starting"
+	freshRoute := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
+	freshRoute.NodeSandboxID = "stable-g1"
+	freshRoute.RouteRevision = 2
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(staleRoute)
+		case "/route-link/reserve":
+			reserveHits.Add(1)
+			if r.Header.Get(proxypkg.HeaderSandboxService) != string(proxypkg.ConnectServiceExec) {
+				t.Fatalf("reserve service=%q", r.Header.Get(proxypkg.HeaderSandboxService))
+			}
+			_ = json.NewEncoder(w).Encode(reserveResult{Route: freshRoute})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+	front := httptest.NewServer(rt.Handler())
+	defer front.Close()
+	token, err := keys.MintExecAccessToken(staleRoute.ServiceSecret, staleRoute.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, output := rawClusterExecConnect(t, front.Listener.Addr().String(), token, 0, nil)
+	if status != http.StatusOK || string(output) != "fresh-tail" {
+		t.Fatalf("CONNECT status=%d output=%q", status, output)
+	}
+	if staleHits.Load() != 1 || reserveHits.Load() != 1 {
+		t.Fatalf("stale hits=%d reserve hits=%d", staleHits.Load(), reserveHits.Load())
+	}
+	got := <-observed
+	if got.sid != freshRoute.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.token != token {
+		t.Fatalf("fresh node CONNECT = %#v", got)
+	}
+	if gotInput := <-backendInput; len(gotInput) != 0 {
+		t.Fatalf("unexpected tunnel input %q", gotInput)
+	}
+}
+
 func TestClusterExecPausedReserveRechecksKATAndUsesCurrentNode(t *testing.T) {
 	node, observed, backendInput := newExecTunnelNode(t, "", "resumed-tail")
 	defer node.Close()

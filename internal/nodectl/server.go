@@ -351,9 +351,14 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	// 2. startup-pool release: the stage transition itself (admitted →
 	//    settled) takes res out of the pre-settled set, so StartupInFlight
 	//    accounting (derived) auto-decrements by res.EffectiveStartupBudget.
+	now := time.Now()
 	res.Stage = StageSettled
-	res.StageEnteredAt = time.Now()
-	res.LastHeartbeatAt = time.Now()
+	res.StageEnteredAt = now
+	res.LastHeartbeatAt = now
+	if req.CurrentRSS > 0 {
+		res.LastReportedRSS = req.CurrentRSS
+		res.LastReportAt = now
+	}
 	s.State.Unlock()
 
 	// Wake the admission worker — main + startup pool both just got
@@ -467,9 +472,11 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	if res == nil {
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
-	res.LastHeartbeatAt = time.Now()
+	now := time.Now()
+	res.LastHeartbeatAt = now
 	if req.CurrentRSS > 0 {
 		res.LastReportedRSS = req.CurrentRSS
+		res.LastReportAt = now
 	}
 	// Sync allocatable_now to the client. If the active reclaimer or an
 	// admin command shrank it, the client picks up the new value here
@@ -665,7 +672,7 @@ func (i *IdleSweeper) sweep() {
 			i.Logf("sweep: token %s sid=%s exceeded startup TTL, releasing",
 				token[:8], res.SandboxID)
 			i.Allocator.CleanupHistory(token)
-			delete(i.State.Reservations, token)
+			i.State.Remove(token)
 			swept = true
 			continue
 		}
@@ -676,7 +683,7 @@ func (i *IdleSweeper) sweep() {
 			i.Logf("sweep: token %s sid=%s no heartbeat for %v, releasing",
 				token[:8], res.SandboxID, now.Sub(res.LastHeartbeatAt))
 			i.Allocator.CleanupHistory(token)
-			delete(i.State.Reservations, token)
+			i.State.Remove(token)
 			swept = true
 		}
 	}

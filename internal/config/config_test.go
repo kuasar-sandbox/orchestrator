@@ -419,6 +419,57 @@ func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	if got := cfg.Paths.RunRoot; got != "/run/sandbox" {
 		t.Fatalf("paths.run_root = %q", got)
 	}
+	if got := cfg.StatsSocket; got != "/run/sandbox/proxy-stats.sock" {
+		t.Fatalf("default stats_socket = %q", got)
+	}
+}
+
+func TestLoadProxyStatsSocketValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "explicit",
+			body: "paths: { run_root: /run/sandbox }\nconfig_socket: /tmp/config.sock\nstats_socket: /tmp/stats.sock\n",
+			want: "/tmp/stats.sock",
+		},
+		{
+			name: "relative",
+			body: "paths: { run_root: /run/sandbox }\nstats_socket: stats.sock\n",
+		},
+		{
+			name: "config conflict",
+			body: "paths: { run_root: /run/sandbox }\nconfig_socket: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
+		},
+		{
+			name: "proxy conflict",
+			body: "paths: { run_root: /run/sandbox }\nproxy_socket: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
+		},
+		{
+			name: "shm conflict",
+			body: "paths: { run_root: /run/sandbox }\nshm_path: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "proxy.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadProxy(path)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("LoadProxy accepted invalid stats_socket: %+v", cfg)
+				}
+				return
+			}
+			if err != nil || cfg.StatsSocket != test.want {
+				t.Fatalf("LoadProxy stats_socket=%q err=%v, want %q", cfg.StatsSocket, err, test.want)
+			}
+		})
+	}
 }
 
 func TestLoadProxyRequiresRunRoot(t *testing.T) {

@@ -38,6 +38,10 @@ node proxy worker
   netns dialer;external 模式让 worker 进程直接在该 netns 内运行。
 - **无上游连接池**:普通 HTTP 每请求拨一次后端并关闭;CONNECT 是一条请求绑定一条
   TCP/UDS 连接。不同 sandbox/port 不复用上游连接。
+- **鉴权先于生命周期副作用**:普通 HTTP 与 non-exec CONNECT 固定执行
+  `LookupRoute → authorize(RouteBinding) → ActivateRoute → fresh Route → dial`。
+  Lookup 不 Wake/Resume/park/dial;Activate 在生命周期副作用前后重验 binding。无效
+  credential 不能唤醒或占用 traffic parking。
 - **逻辑服务只影响 CONNECT**:普通 HTTP 不解析 `E2b-Sandbox-Service`,应用层
   Header 保持不变;CONNECT 中显式 service 是 backend 选择的权威输入.
 - **Exec 先鉴权后激活**:`service=exec` 始终验证绑定 `AuthSandboxID` 的 KAT;
@@ -65,6 +69,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
+| `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/proxy/SHM 路径冲突,权限 0600 |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
 | `route_capacity` | `65536` | 固定路由槽位数;满时新路由写入失败并告警 |
 | `workers` | `1` | worker 进程数 |
@@ -90,15 +95,18 @@ external 拓扑:
 
 ```text
                     config-socket plugin stream
-                    register(proxy_socket, route_wake)
+                    register(proxy_socket, stats_socket, route_wake)
                     Wake(sid) ▲     │ Hello / Upsert / Delete / Bookmark
                               │     ▼
 node-ctl conductor serve ─────┴── node-ctl proxy master
         ▲ fallback CONNECT          ├─ fixed route writer ─► shared route mmap
+        │ traffic GET ──────────────► cached aggregate
         │ via proxy_socket          ├─ MMDS routes/values ─► bounded heap
-        │                           └─ inherited socketpair ──────┐
+        │                           ├─ stats UDS (master only)
+        │                           └─ one stats socketpair / worker ◄────┐
 client ─┴────────► inherited data/MMDS listener ─► proxy worker[0..N)
-                                                     ▲ mmap + MMDS RPC ──────┘
+                                                     ├─ mmap + MMDS RPC
+                                                     └─ absolute counters + traffic ─┘
 ```
 
 要点:
@@ -106,6 +114,8 @@ client ─┴────────► inherited data/MMDS listener ─► pro
 - conductor 只看到一个 proxy plugin id,当前实现固定为 `proxy`。
 - `proxy_socket` 是 conductor fallback 的唯一注册目标;data-plane 请求误打到
   conductor 监听口时,proxyForwarder 通过这个 UDS 发 chained CONNECT。
+- `stats_socket` 只由 master 监听;conductor 的公开 traffic GET 经该 UDS 读 master
+  聚合缓存,不会查询时扇出 worker。
 - worker 不注册 plugin,不保存独立全量路由表;崩溃后由 master 重启,重启后直接读取
   当前共享表。
 - master 退出会带走其 worker;systemd 重启 master 后重新注册并重建共享表。
@@ -118,7 +128,7 @@ client ─┴────────► inherited data/MMDS listener ─► pro
 routesync 仍是帧化 JSON over h2c,由 proxy master 拨 conductor:
 
 ```text
-master → conductor : register{subscribe: route_wake, proxy{socket}, mmds}
+master → conductor : register{subscribe: route_wake, proxy{socket,stats_socket}, mmds}
 master → conductor : wake{sid}
 conductor → master : hello{policy}
 conductor → master : upsert* → bookmark → upsert/delete...
@@ -150,15 +160,16 @@ Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公�
 写中状态或版本变化会重试,不会看到半条路由。worker 只依赖共享表本地读取:
 
 ```text
-sid hash ─► record slot ─► RouteEntry
-                         ├─ running → 立即转发
-                         ├─ starting → MMDS 可见;数据面 park,不发 Wake;回滚即结束
-                         └─ missing/paused → wake pipe → park 等待共享表更新
+sid hash ─► record slot ─► RouteEntry (Lookup 只读)
+                         ├─ running → auth 后 Activate 重验并转发
+                         ├─ starting → auth 后 park,不发 Wake;回滚即结束
+                         └─ paused → auth 后才发 wake pipe 并 park
 ```
 
-worker 对 missing/paused sid 写 wake pipe 给 master;starting 已由 conductor launch owner
-推进,worker 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新立即结束
-starting 请求。master 去重后通过 routesync
+普通 route Lookup 对 missing/paused/starting 都不写 wake pipe;只有请求已按返回的
+`RouteBinding` 完成鉴权后,Activate 才可对 paused sid 写 wake pipe。starting 已由 conductor
+launch owner 推进,Activate 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新
+立即结束 starting 请求。master 去重后通过 routesync
 上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
 全局 revision/notify 只负责唤醒检查;worker 以该 SID 的 live 或终态 revision 判断 Wake
 是否已收到终态回应。live 路由、终态 cache 和 revision 在同一次 table seqlock snapshot
@@ -226,12 +237,14 @@ service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显�
 
 普通 HTTP:
 
-1. worker 从共享表解析 route;
+1. worker 只读共享表,得到不含 backend 的 `RouteBinding`;
 2. 按目标选择 EnvdAccessToken 或 ForwardAccessToken,校验 `X-Access-Token`;符合条件的
    `/files` 请求也可使用 EnvdAccessToken 验证 signature;
-3. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
+3. 鉴权成功后进入 `ActivateRoute`:在 Wake/等待前重验 binding,完成生命周期动作后再
+   重验一次,并从最新 running route 构造最终 backend;binding 改变时 fail closed;
+4. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
    netns 内拨号;
-4. 写入一条 HTTP 请求,流式复制响应,响应结束关闭后端连接。
+5. 写入一条 HTTP 请求,流式复制响应,响应结束关闭后端连接。
 
 CONNECT:
 
@@ -275,6 +288,9 @@ proxyForwarder:
 - 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid,可选 service/port,并原样携带
   客户端的 `X-Access-Token`;
 - 普通 HTTP 在该 CONNECT 隧道里发送一条请求;CONNECT 则继续隧道化到沙箱。
+
+proxyForwarder 和 cluster-router 的 chained CONNECT 都只是中继,不重复计数;traffic
+统计只发生在建立最终 sandbox backend 的 node worker。
 
 ## 6. 数据面鉴权
 
@@ -363,7 +379,78 @@ conductor 内存或受信 external master 的有界 heap。它们不写普通 me
 可能把该副本作为普通 guest working set 捕获。平台不能在宿主侧从任意 guest 内存中擦除它,
 调用方应在应用侧缩短驻留时间,并把包含已消费 secret 的 snapshot 按敏感制品保护。
 
-## 8. 可靠性
+## 8. per-sandbox traffic stats 与统一 worker stream
+
+公开接口为 `GET /sandboxes/{sid}/stats/traffic`。统计的是最终 node proxy 已鉴权接纳的
+逻辑 ingress,不是客户端物理 TCP 数:
+
+```text
+ingress = parking + egress
+
+parking: #70 鉴权成功后,ActivateRoute/ActivateExec 与最终 backend dial 尚未完成
+egress:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
+```
+
+service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
+bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
+成功时在同一 worker-local entry lock 中原子执行 `parking--/egress++`;activation 或 dial
+失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 egress;只有 tracked backend
+的最终 `Close` 以 `sync.Once` 结束 egress。
+
+空闲响应示例:
+
+```json
+{
+  "state": "running",
+  "inflight": {"parking": 0, "egress": 0},
+  "idleSince": "2026-08-12T14:03:21.123456789Z",
+  "services": {
+    "forward": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:03:21.123456789Z"},
+    "exec": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:00:00Z"}
+  }
+}
+```
+
+顶层 `idleSince` 仅在 state=running 且所有 inflight 为零时返回;starting/paused 即使零连接
+也不返回顶层时间。service 的 `idleSince` 也只在该 service 两项为零时出现。接口不返回
+`idle`、`idleForSeconds`、last-open/close、累计连接数、bytes、延迟、端口明细或 worker
+身份;`Cache-Control: no-store`。`proxy.mode=off` 返回 501;external route 未完成同步、
+RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与 conductor→master
+查询身份,避免 Pause 已提交但异步 route view 仍为 running 时返回旧的顶层 `idleSince`。
+
+external 模式用每 worker 一条 Unix socketpair 统一替换旧 lossy metrics pipe:
+
+```text
+worker hot path
+  update sharded local absolute state + revision
+  mark SID/counter dirty + nonblocking notify
+        │
+        ▼ async single sender
+[4-byte LE length][JSON hello/ready/update/remove/goodbye]
+        │ absolute Prometheus counters + absolute per-SID traffic
+        ▼
+master: workerID/epoch/sequence/contribution → per-SID aggregate cache
+        ├─ counter absolute delta → existing metrics.M
+        └─ stats UDS batchGet → conductor public GET
+```
+
+热路径不写 socket。sender 可合并任意中间变化,写成功后只在 revision 未再次变化时清 dirty;
+因此 notify 合并和背压不会丢最终绝对状态。frame 有 1 MiB、每帧 SID/counter 数和标识长度
+上限;同 epoch 的 sequence 回退/跳号/异内容重用、counter 回退/遗漏或 malformed frame 都是
+协议错误。
+
+master 查询只读持续维护的聚合 cache,不在 GET 时扇出 worker。它用 Linux boottime 比较
+`idleSince`,对外只输出 UTC wall time;有效值取 worker idle、当前 master/worker 集合可信起点
+和当前 RunID 首次被观察为 running 的时间的最大值。worker stats stream 断开后立即进入 503 窗口并终止
+worker;只有 `Wait` 确认进程退出、内核已关闭其 backend FD 后才删除该 worker 的全部贡献。
+replacement 以新 epoch 发 hello+ready,在 ready 前不开放 stats,并且 worker 也是在 stats ready
+后才开始 Serve 数据 listener。
+
+internal 模式复用同一 `WorkerStats → MasterStats` 状态机,只是 frame 在进程内应用;external
+模式经 socketpair 和 `stats_socket`;off 不提供统计。route SHM 仍是 master 单写、worker
+只读,没有 stats 区或 worker 写入。
+
+## 9. 可靠性
 
 - **worker 崩溃**:master 发现子进程退出并重启;其他 worker 继续 accept 同一 listener
   fd。崩溃 worker 上的已有连接断开。
@@ -372,22 +459,26 @@ conductor 内存或受信 external master 的有界 heap。它们不写普通 me
 - **routesync 断开**:master 指数退避重连;固定数据面共享表沿用原有保留/Bookmark
   收敛语义,但 MMDS routes/value/service authority 立即清空并返回 503,完整同步 Bookmark
   前不服务旧 secret 或执行旧 service route。
-- **park / wake**:worker 对 missing/paused sid 发送 wake 并等待共享表更新;starting
-  只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和当前 launch 的状态推进
-  仍由 conductor 执行。
+- **park / wake**:Lookup 不发送 Wake;已鉴权 Activate 才能对 paused sid 发 Wake 并等待
+  共享表更新。starting 只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和
+  当前 launch 的状态推进仍由 conductor 执行。
+- **stats stream**:任一 worker stream EOF、超时或协议错误都会停止该 worker;确认退出前
+  traffic GET 返回 503,确认后删除其贡献并等待 replacement ready。Prometheus counter 在
+  master 生命周期内保持单调,worker epoch 更换不会回退。
 - **失败码**:非法 target = 400;exec 的非 CONNECT method = 405;未知/未就绪 sid = 404;
   鉴权失败 = 401;已识别但 profile/当前 proxy 模式不支持的 service 或 off = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503.
 
-## 9. 性能
+## 10. 性能
 
 - 普通数据面 route lookup 是 worker 本地 mmap hash 查找,不进 conductor,不跨进程 RPC;
   只有 guest 自定义 MMDS path 走同机 worker→master socketpair。
 - master 单写共享表;worker 只读,无 worker 间锁竞争。
 - 普通 HTTP 和 CONNECT 都不使用上游连接池,避免跨 sandbox/port 连接复用。
 - `route_capacity` 是固定容量保护阈值;容量不足时应调大配置并重启 proxy master。
-- worker 数据面 metrics 经继承 pipe 上报给 master,`metrics_listen` 输出聚合后的
-  `data_requests_total{result=...}`;队列饱和时优先保护数据面,可能丢弃个别 metrics 增量。
+- worker 数据面 metrics 与 traffic 经统一 stats socketpair 异步上报绝对快照;
+  `metrics_listen` 由 master 对 counter 绝对值求差后继续输出既有
+  `data_requests_total{result=...}`。背压只合并中间 snapshot,不会永久丢失计数或当前 traffic。
 - MMDS 按 floatingip 反查当前实现为共享表线性扫描,该路径只在 envd 初始化时使用,
   不在高 QPS 数据面热路径。
 
@@ -396,7 +487,7 @@ code interpreter、forward 业务端口或用户应用 health 已监听;业务 b
 [#125](https://github.com/kuasar-sandbox/orchestrator/issues/125) 独立跟踪,proxy 不在本阶段
 增加通用 dial retry。
 
-## 10. See Also
+## 11. See Also
 
 - [node.md](node.md) — conductor 控制面、`proxy.mode` 装配、生命周期与密钥模型。
 - [cluster-router.md](cluster-router.md) — 集群入口如何转发到本节点数据面。

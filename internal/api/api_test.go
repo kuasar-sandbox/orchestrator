@@ -1050,6 +1050,126 @@ func newSandboxContractHandler(t *testing.T, core Core, resources Resources) (ht
 	return New(core, "example.test", resources, logger).Handler(), apiKey
 }
 
+type resourceStatsCoreStub struct {
+	Core
+	stats *ResourceStats
+	err   error
+}
+
+func (c *resourceStatsCoreStub) ResourceStats(context.Context, string, string) (*ResourceStats, error) {
+	return c.stats, c.err
+}
+
+type trafficStatsCoreStub struct {
+	Core
+	stats *TrafficStats
+	err   error
+}
+
+func (c *trafficStatsCoreStub) TrafficStats(context.Context, string, string) (*TrafficStats, error) {
+	return c.stats, c.err
+}
+
+func TestResourceStatsSparseJSONAndStatusMapping(t *testing.T) {
+	cpu := 2.0
+	handler, apiKey := newSandboxContractHandler(t, &resourceStatsCoreStub{
+		stats: &ResourceStats{CPUCount: &cpu},
+	}, Resources{})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/resource", nil)
+	req.Header.Set("X-API-KEY", apiKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response status=%d cache=%q", resp.Code, resp.Header().Get("Cache-Control"))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 1 || body["cpuCount"] == nil {
+		t.Fatalf("sparse resource JSON = %s", resp.Body.String())
+	}
+
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{ErrNotFound, http.StatusNotFound},
+		{ErrStatsUnsupported, http.StatusNotImplemented},
+		{ErrStatsConflict, http.StatusConflict},
+		{ErrStatsUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(http.StatusText(tc.want), func(t *testing.T) {
+			handler, apiKey := newSandboxContractHandler(t, &resourceStatsCoreStub{err: tc.err}, Resources{})
+			req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/resource", nil)
+			req.Header.Set("X-API-KEY", apiKey)
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != tc.want || resp.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d cache=%q, want %d/no-store", resp.Code, resp.Header().Get("Cache-Control"), tc.want)
+			}
+		})
+	}
+}
+
+func TestTrafficStatsCompactJSONAndStatusMapping(t *testing.T) {
+	idle := time.Date(2026, time.August, 12, 14, 3, 21, 123456789, time.UTC)
+	handler, apiKey := newSandboxContractHandler(t, &trafficStatsCoreStub{stats: &TrafficStats{
+		State:     string(types.StateRunning),
+		Inflight:  TrafficInflight{},
+		IdleSince: &idle,
+		Services: map[string]ServiceTrafficStats{
+			"forward": {IdleSince: &idle},
+			"exec":    {Parking: 1},
+		},
+	}}, Resources{})
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/traffic", nil)
+	req.Header.Set("X-API-KEY", apiKey)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response status=%d cache=%q", resp.Code, resp.Header().Get("Cache-Control"))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"idle", "idleForSeconds", "lastOpened", "lastClosed", "connectionsTotal", "requestsTotal", "workerID", "workerCount"} {
+		if _, present := body[forbidden]; present {
+			t.Fatalf("traffic response exposed %q: %s", forbidden, resp.Body.String())
+		}
+	}
+	var services map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(body["services"], &services); err != nil {
+		t.Fatal(err)
+	}
+	if len(services["forward"]) != 3 || services["forward"]["idleSince"] == nil ||
+		len(services["exec"]) != 2 || services["exec"]["idleSince"] != nil {
+		t.Fatalf("compact service JSON = %s", resp.Body.String())
+	}
+
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{ErrNotFound, http.StatusNotFound},
+		{ErrStatsUnsupported, http.StatusNotImplemented},
+		{ErrStatsConflict, http.StatusConflict},
+		{ErrStatsUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(http.StatusText(tc.want), func(t *testing.T) {
+			handler, apiKey := newSandboxContractHandler(t, &trafficStatsCoreStub{err: tc.err}, Resources{})
+			req := httptest.NewRequest(http.MethodGet, "/sandboxes/s1/stats/traffic", nil)
+			req.Header.Set("X-API-KEY", apiKey)
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != tc.want || resp.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d cache=%q, want %d/no-store", resp.Code, resp.Header().Get("Cache-Control"), tc.want)
+			}
+		})
+	}
+}
+
 func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }

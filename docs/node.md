@@ -78,7 +78,8 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 - 既可**独立运行**也可**接入集群**:控制面(create/pause/kill/模板构建)始终在本节点;
   接入集群仅多一条 node-link(§10),不改 e2b 契约。
 - 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.3)。
-- 不提供 sandbox metrics 端点(e2b API 的 `/sandboxes/{id}/metrics` 面)。
+- 不实现 e2b `/sandboxes/{id}/metrics` 时间序列或 envd metrics 采集;平台另提供只读的
+  `/sandboxes/{id}/stats/resource` 与 `/sandboxes/{id}/stats/traffic` 即时快照(§4.1.1)。
 - 构建不支持 server 端执行 Dockerfile steps:服务端只对一个已存在的镜像引用做拉取 +
   展平(§12)。
 - 节点本地:路由、存储、单元管理都是节点本地的;跨机快照/模板使用 canonical
@@ -226,7 +227,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
 进程端点与 bootstrap 策略(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/
-`shm_path`/`workers`/`tls`/`auth`/`park_timeout`)在 `proxy.yaml`;
+`stats_socket`/`shm_path`/`workers`/`tls`/`auth`/`park_timeout`)在 `proxy.yaml`;
 MMDS listen 与 service registry 只配置在 conductor。master 在 plugin 平面注册一次,
 由握手取得 MMDS policy,维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
 node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
@@ -436,6 +437,8 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 |---|---|---|
 | create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);`X-Kuasar-Sandbox-MMDS`/`metadata["kuasar-sandbox.mmds"]` 可声明 routes 与 initial secrets(§4.6);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
+| resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
+| traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
 | resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
@@ -485,6 +488,63 @@ paused 目标只接受异步 resume,响应不等待 READY.成功响应设置
 鉴权失败沿用现有 401/403,沙箱不存在或不属于调用方返回 404;同步 import,
 credential 读取/签发或异步 resume 任务接受失败统一对外返回脱敏 503,
 错误文本不包含 fingerprint,ServiceSecret,NodeSandboxID,socket path 或 KAT payload.
+
+#### 4.1.1 即时 resource / traffic stats
+
+两个接口都先读取 Sandbox 业务记录并验证 API key ownership;失败统一 404。它们是只读观察,
+不调用 Connect、Wake、Resume、Pause 或 envd,响应带 `Cache-Control: no-store`。
+
+`GET /sandboxes/{id}/stats/resource` 只消费 node-ctl 内置 resource controller 的当前
+reservation、预算和 sandbox-ctl 已上报样本。示例:
+
+```json
+{
+  "timestampUnix": 1786482600,
+  "cpuCount": 2,
+  "cpuAllocatable": 0.5,
+  "memUsed": 536870912,
+  "memTotal": 2147483648,
+  "memAllocatable": 1073741824
+}
+```
+
+每个字段都可省略:未采集就不序列化,不以零值伪造。`timestampUnix` 是最近一次携
+`CurrentRSS>0` 的 Settled/Heartbeat report 时间;`memUsed` 是 sandboxer 报告的 cgroup
+`memory.current`;capacity/allocatable 取 controller reservation。controller 未启用为 501;
+starting 且 reservation 已存在可返回 sparse 200;paused 无 live reservation 为 409;running
+但 reservation 缺失为 503。reservation 存在而尚无 RSS report 时仍返回其它可得字段。
+它不是 guest `/metrics` 的兼容实现。
+
+`GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已鉴权接纳的逻辑 ingress:
+
+```text
+ingress = parking + egress
+parking = 鉴权成功,但生命周期激活/最终 backend dial 尚未完成
+egress  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
+```
+
+```json
+{
+  "state": "running",
+  "inflight": {"parking": 0, "egress": 0},
+  "idleSince": "2026-08-12T14:03:21.123456789Z",
+  "services": {
+    "forward": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:03:21.123456789Z"},
+    "exec": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:00:00Z"}
+  }
+}
+```
+
+e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
+`forward/exec`。顶层 `inflight` 是各 service 求和。每个 service 仅在两项为零时附
+`idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
+starting/paused 返回 inflight 但不返回顶层 idle。V1 不返回 idle bool/duration、last
+open/close、累计连接数、bytes/延迟/端口明细或 worker 信息。
+
+internal proxy 在同进程聚合;external conductor 经当前 trusted proxy registration 的
+`stats_socket` 读取 master cache,查询时不扇出 worker。proxy mode=off 为 501;master 未注册、
+route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
+完整 worker-local 状态机、绝对快照 stream 和故障窗口见 [node-proxy.md](node-proxy.md) §8。
 
 ### 4.2 控制面:模板构建 API
 
@@ -1256,6 +1316,11 @@ external worker 使用自身 `proxy.yaml` 必填且与 conductor 一致的 `path
 cluster-ctl router 把数据面转发进本节点的
 数据端点(internal 的 `api.listen`/`data_listen` 或 external proxy master 的数据口),节点侧
 按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md),无须区分来源。
+
+两种 proxy mode 都使用相同的 traffic flow 状态机。external master 额外注册
+`stats_socket`,每个 worker 经独立 socketpair 推送 Prometheus counter 与 per-sandbox
+traffic 绝对值;serve 的 traffic API 只查询 master 聚合 cache。proxyForwarder 与 cluster
+第二跳只是内部中继,不重复计数,每条 logical ingress 只在最终 node worker 统计一次。
 
 ### 9.2 路由权威与广播
 

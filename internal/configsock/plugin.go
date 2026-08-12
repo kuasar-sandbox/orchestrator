@@ -75,6 +75,18 @@ func (r *Registry) ProxyTargets() []string {
 	return out
 }
 
+// ProxyStatsTarget returns the master-only stats endpoint from the current
+// trusted proxy registration. The registration connection remains its lease.
+func (r *Registry) ProxyStatsTarget() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	plugin := r.m[routesync.ProxyPluginID]
+	if plugin == nil || plugin.Caps.Proxy == nil || plugin.Caps.Proxy.StatsSocket == nil || plugin.Caps.Proxy.StatsSocket.Path == "" {
+		return "", false
+	}
+	return plugin.Caps.Proxy.StatsSocket.Path, true
+}
+
 // handlePluginRegister authenticates the subscriber (plugin_pidfile / socket perms),
 // reads its Register frame, registers it (evicting any same-id holder), then runs the
 // route stream until the connection drops — which deregisters it. The held h2c

@@ -77,5 +77,8 @@ func (p *Persister) Load() (*State, error) {
 	if s.Reservations == nil {
 		s.Reservations = make(map[string]*Reservation)
 	}
+	if err := s.rebuildSandboxIndexLocked(); err != nil {
+		return nil, fmt.Errorf("persister: rebuild sandbox index: %w", err)
+	}
 	return &s, nil
 }

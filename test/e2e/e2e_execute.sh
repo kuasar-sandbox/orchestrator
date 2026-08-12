@@ -200,12 +200,14 @@ chmod +x "$ORCH_BIN_DIR/sandbox-ctl"
 
 declare -a PIDS=()
 declare -a TAGS=()
+IMMEDIATE_DATA_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
     set +e
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
@@ -265,6 +267,79 @@ req() {
     fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+}
+wait_internal_traffic_stats() { # $1=sid, $2=parking|idle|paused
+    local sid="$1" mode="$2" code=""
+    for _ in $(seq 1 240); do
+        code="$(req GET "/sandboxes/$sid/stats/traffic" "$AK" || true)"
+        if [ "$code" = "200" ] && python3 - "$WORK/resp.body" "$mode" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+mode = sys.argv[2]
+if set(stats) - {"state", "inflight", "idleSince", "services"}:
+    raise SystemExit(1)
+inflight = stats.get("inflight", {})
+services = stats.get("services", {})
+if set(inflight) != {"parking", "egress"}:
+    raise SystemExit(1)
+if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
+    raise SystemExit(1)
+for item in services.values():
+    if set(item) - {"parking", "egress", "idleSince"} or not {"parking", "egress"} <= set(item):
+        raise SystemExit(1)
+    if (item["parking"] or item["egress"]) and "idleSince" in item:
+        raise SystemExit(1)
+if mode == "parking":
+    ok = inflight["parking"] >= 1 and "idleSince" not in stats
+elif mode == "idle":
+    ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+elif mode == "paused":
+    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "egress": 0} and "idleSince" not in stats
+else:
+    ok = False
+raise SystemExit(0 if ok else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "traffic stats sid=$sid mode=$mode last_status=$code body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
+}
+wait_resource_stats() { # $1=sid
+    local sid="$1" code=""
+    for _ in $(seq 1 240); do
+        code="$(req GET "/sandboxes/$sid/stats/resource" "$AK" || true)"
+        if [ "$code" = "200" ] && python3 - "$WORK/resp.body" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+allowed = {"timestampUnix", "cpuCount", "cpuAllocatable", "memUsed", "memTotal", "memAllocatable"}
+if not stats or set(stats) - allowed:
+    raise SystemExit(1)
+required = allowed
+if not required <= set(stats):
+    raise SystemExit(1)
+if any(stats[name] <= 0 for name in required):
+    raise SystemExit(1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "resource stats sid=$sid last_status=$code body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
+}
+wait_resource_status() { # $1=sid, $2=expected status
+    local sid="$1" expected="$2" code=""
+    for _ in $(seq 1 240); do
+        code="$(req GET "/sandboxes/$sid/stats/resource" "$AK" || true)"
+        [ "$code" = "$expected" ] && return 0
+        sleep 0.05
+    done
+    echo "resource stats sid=$sid last_status=$code want=$expected body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
 }
 
 snapshot_argv_count() {
@@ -705,8 +780,28 @@ truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 CHECKPOINT_DIR="$WORK/checkpoints"
-write_orchestrator_config() { # $1=unset|node-policy
+write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller (default controller)
     local policy_mode="$1"
+    local resource_mode="${2:-controller}"
+    local control_socket_line=""
+    local resource_controller_config=""
+    case "$resource_mode" in
+        static) ;;
+        controller)
+            control_socket_line="    control_socket: $WORK/sandbox-resource.sock"
+            resource_controller_config="resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/resource-state.json
+  audit_path: $WORK/resource-audit.log
+  resources:
+    physical_memory: auto
+    physical_cpu: auto
+    host_reserved: { memory: 1GiB, cpu: 0.5 }
+  admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }"
+            ;;
+        *) fail "unknown resource mode: $resource_mode" ;;
+    esac
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS, park_timeout: 120s }
@@ -721,6 +816,10 @@ paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ct
 units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
+  resources:
+    vcpu: 2
+    memory: 2GiB
+$control_socket_line
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCKET
@@ -730,6 +829,7 @@ builder:
   diff_template: $BLD
   vcpu: 1
   memory: 1GiB
+$resource_controller_config
 checkpoint:
   mode: local
   local_dir: $CHECKPOINT_DIR
@@ -776,7 +876,7 @@ stop_orchestrator() {
     ORCH_PID=""
 }
 
-write_orchestrator_config unset
+write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
 echo "==> node-ctl up (:$PORT)"
 wait_mmds_listener
@@ -930,6 +1030,17 @@ for LOW_ALLOC_ITERATION in $(seq 1 "$LOW_ALLOC_REPEATS"); do
 done
 echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
 
+# Keep the pre-existing low-allocatable cgroup check in static mode: its exact
+# 224 MiB memory.high assertion is the launch-time value. A live controller may
+# legitimately grant memory before envd reaches ready. With no sandbox left from
+# that check, restart against the same store and attach subsequent sandboxes to
+# the controller for the resource stats and restore coverage below.
+stop_orchestrator
+write_orchestrator_config unset controller
+start_orchestrator "$WORK/orch.log"
+wait_mmds_listener
+echo "==> PASS: conductor restarted with the resource controller after static cgroup validation"
+
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they
 # exercise the real conductor, sqlite store, run pool, systemd units, network,
@@ -1048,11 +1159,24 @@ CREATE_RETURN_STATE="$(sandbox_state "$SID")"
 case "$CREATE_RETURN_STATE" in starting|running) ;; *) fail "state immediately after 201=$CREATE_RETURN_STATE";; esac
 echo "==> PASS: Create 201 durably accepted sandbox $SID (observed state=$CREATE_RETURN_STATE)"
 echo "==> issue data request immediately after Create; starting must park until running"
-code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+(
+    code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+    printf '%s\n' "$code" >"$WORK/immediate-data.code"
+) &
+IMMEDIATE_DATA_PID=$!
+wait_internal_traffic_stats "$SID" parking \
+    || { sed 's/^/  orch| /' "$WORK/orch.log"; fail "immediate post-Create request was not reported as parking"; }
+immediate_data_status=0
+wait "$IMMEDIATE_DATA_PID" || immediate_data_status=$?
+IMMEDIATE_DATA_PID=""
+[ "$immediate_data_status" = 0 ] || fail "immediate post-Create data client exited $immediate_data_status"
+code=$(cat "$WORK/immediate-data.code")
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } \
     || { cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "immediate post-Create data request=$code"; }
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
-echo "==> PASS: post-Create data request parked through runner handoff/readiness/envd init (code=$code)"
+wait_internal_traffic_stats "$SID" idle || fail "internal traffic did not converge to idle"
+wait_resource_stats "$SID" || fail "controller resource stats were not reported"
+echo "==> PASS: post-Create data request was reported parking through readiness, then idle; resource stats are live (code=$code)"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
@@ -1309,6 +1433,11 @@ wait_sandbox_state "$SID" paused 1200 || {
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     fail "accepted local Pause did not commit after caller cancellation"
 }
+wait_internal_traffic_stats "$SID" paused || fail "paused traffic stats were not stable"
+# Pause commits the durable paused state before StopUnit makes sandboxer release
+# its live controller reservation. During that bounded cleanup window, returning
+# the still-real report is valid; the stable paused state must converge to 409.
+wait_resource_status "$SID" 409 || fail "paused resource stats did not converge to 409"
 # Keep the sandbox durably paused for longer than several service counter ticks.
 # On restore the counter must resume from the frozen snapshot rather than track
 # this host wall-clock interval.
@@ -1340,6 +1469,7 @@ for _ in $(seq 1 90); do
     sleep 0.5
 done
 [ -n "$resumed" ] || fail "envd did not become ready after local restore"
+wait_resource_stats "$SID" || fail "resource stats did not recover after restore"
 echo "==> PASS: Connect returned after durable starting acceptance (observed $CONNECT_RETURN_STATE); immediate native exec parked to running"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
 sed 's/^/  guest2| /' "$WORK/exec2.out"
