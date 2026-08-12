@@ -15,9 +15,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -285,7 +289,31 @@ type admissionRouter struct {
 	activateOK    bool
 	lookupCalls   atomic.Int32
 	activateCalls atomic.Int32
+	activateSeen  chan struct{}
+	activateWait  <-chan struct{}
 }
+
+type recordingTrafficTracker struct {
+	begins   atomic.Int32
+	attaches atomic.Int32
+	closes   atomic.Int32
+	service  proxy.ConnectService
+}
+
+func (t *recordingTrafficTracker) BeginParking(_ string, service proxy.ConnectService) proxy.TrafficFlow {
+	t.begins.Add(1)
+	t.service = service
+	return recordingTrafficFlow{tracker: t}
+}
+
+type recordingTrafficFlow struct{ tracker *recordingTrafficTracker }
+
+func (f recordingTrafficFlow) AttachBackend(conn net.Conn) net.Conn {
+	f.tracker.attaches.Add(1)
+	return conn
+}
+
+func (f recordingTrafficFlow) Close() { f.tracker.closes.Add(1) }
 
 func (r *admissionRouter) LookupRoute(_ context.Context, _ string, _ proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	r.lookupCalls.Add(1)
@@ -294,10 +322,184 @@ func (r *admissionRouter) LookupRoute(_ context.Context, _ string, _ proxy.Conne
 
 func (r *admissionRouter) ActivateRoute(_ context.Context, expected proxy.RouteBinding) (proxy.Route, bool, error) {
 	r.activateCalls.Add(1)
+	if r.activateSeen != nil {
+		select {
+		case r.activateSeen <- struct{}{}:
+		default:
+		}
+	}
+	if r.activateWait != nil {
+		<-r.activateWait
+	}
 	if expected != r.binding {
 		return proxy.Route{}, false, nil
 	}
 	return r.route, r.activateOK, nil
+}
+
+func waitTraffic(t *testing.T, master *proxystats.MasterStats, predicate func(*api.TrafficStats) bool) *api.TrafficStats {
+	return waitTrafficFor(t, master, "node-s1", types.ProfileE2B, types.StateRunning, predicate)
+}
+
+func waitTrafficFor(t *testing.T, master *proxystats.MasterStats, sandboxID string, profile types.Profile, state types.State, predicate func(*api.TrafficStats) bool) *api.TrafficStats {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats, err := master.SandboxTrafficStats(context.Background(), sandboxID, "run-1", profile, state)
+		if err == nil && predicate(stats) {
+			return stats
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("traffic stats did not reach expected state")
+	return nil
+}
+
+func newTrafficHarness(t *testing.T) (*proxystats.WorkerStats, *proxystats.MasterStats) {
+	t.Helper()
+	worker := proxystats.NewWorkerStats()
+	master := proxystats.NewMasterStats(metrics.New(), []string{"internal"})
+	if err := master.BeginWorker("internal", 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if _, err := worker.StartSender(ctx, "internal", 1, func(frame proxystats.Frame) error {
+		return master.Receive("internal", 1, frame)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return worker, master
+}
+
+func waitInflight(t *testing.T, master *proxystats.MasterStats, parking, egress uint64) *api.TrafficStats {
+	t.Helper()
+	return waitTraffic(t, master, func(stats *api.TrafficStats) bool {
+		return stats.Inflight.Parking == parking && stats.Inflight.Egress == egress
+	})
+}
+
+func waitInflightFor(t *testing.T, master *proxystats.MasterStats, sandboxID string, parking, egress uint64) *api.TrafficStats {
+	t.Helper()
+	return waitTrafficFor(t, master, sandboxID, types.ProfileE2B, types.StateRunning, func(stats *api.TrafficStats) bool {
+		return stats.Inflight.Parking == parking && stats.Inflight.Egress == egress
+	})
+}
+
+func TestAuthorizedRequestParksDuringActivationAndEndsOnDialFailure(t *testing.T) {
+	target := proxy.LegacyTarget(8080)
+	release := make(chan struct{})
+	router := &admissionRouter{
+		binding:      proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target),
+		route:        proxy.Route{Kind: proxy.KindTCP, Addr: "127.0.0.1:1"},
+		found:        true,
+		activateOK:   true,
+		activateSeen: make(chan struct{}, 1),
+		activateWait: release,
+	}
+	worker, master := newTrafficHarness(t)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) { return nil, fmt.Errorf("dial failed") }, "").
+		WithTrafficTracker(worker)
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox/", nil)
+	req.Header.Set(proxy.HeaderSandboxID, "node-s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "8080")
+	req.Header.Set(proxy.HeaderAccessToken, "forward")
+	resp := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		px.ServeHTTP(resp, req)
+		close(done)
+	}()
+	select {
+	case <-router.activateSeen:
+	case <-time.After(time.Second):
+		t.Fatal("request did not enter activation")
+	}
+	stats := waitTraffic(t, master, func(stats *api.TrafficStats) bool { return stats.Inflight.Parking == 1 })
+	if service := stats.Services[string(proxy.ConnectServiceForward)]; service.Parking != 1 || service.Egress != 0 {
+		t.Fatalf("parking service stats = %+v", service)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after activation release")
+	}
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.Code)
+	}
+	waitTraffic(t, master, func(stats *api.TrafficStats) bool {
+		return stats.Inflight.Parking == 0 && stats.Inflight.Egress == 0 && stats.IdleSince != nil
+	})
+}
+
+func TestOrdinaryHTTPSuccessTracksFinalBackendUntilClose(t *testing.T) {
+	target := proxy.LegacyTarget(8080)
+	router := &admissionRouter{
+		binding:    proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target),
+		route:      proxy.Route{Kind: proxy.KindTCP, Addr: "unused"},
+		found:      true,
+		activateOK: true,
+	}
+	worker, master := newTrafficHarness(t)
+	backend, proxySide := net.Pipe()
+	received := make(chan struct{})
+	release := make(chan struct{})
+	backendDone := make(chan error, 1)
+	go func() {
+		defer backend.Close()
+		request, err := http.ReadRequest(bufio.NewReader(backend))
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		request.Body.Close()
+		close(received)
+		<-release
+		_, err = io.WriteString(backend, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		backendDone <- err
+	}()
+	var dialed atomic.Bool
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			if !dialed.CompareAndSwap(false, true) {
+				return nil, fmt.Errorf("unexpected second dial")
+			}
+			return proxySide, nil
+		}, "").WithTrafficTracker(worker)
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox/health", nil)
+	req.Header.Set(proxy.HeaderSandboxID, "node-s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "8080")
+	req.Header.Set(proxy.HeaderAccessToken, "forward")
+	resp := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		px.ServeHTTP(resp, req)
+		close(done)
+	}()
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("backend did not receive HTTP request")
+	}
+	waitInflight(t, master, 0, 1)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request did not finish")
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status=%d, want 204", resp.Code)
+	}
+	stats := waitInflight(t, master, 0, 0)
+	if stats.IdleSince == nil {
+		t.Fatal("closed HTTP backend did not establish idleSince")
+	}
 }
 
 func TestOrdinaryAdmissionRejectsBeforeActivationAndDial(t *testing.T) {
@@ -311,11 +513,12 @@ func TestOrdinaryAdmissionRejectsBeforeActivationAndDial(t *testing.T) {
 				activateOK: true,
 			}
 			var dials atomic.Int32
+			traffic := &recordingTrafficTracker{}
 			px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
 				func(context.Context, proxy.Route) (net.Conn, error) {
 					dials.Add(1)
 					return nil, fmt.Errorf("unexpected dial")
-				}, "")
+				}, "").WithTrafficTracker(traffic)
 			var req *http.Request
 			if method == http.MethodConnect {
 				req = httptest.NewRequest(method, "http://sandbox", nil)
@@ -331,9 +534,9 @@ func TestOrdinaryAdmissionRejectsBeforeActivationAndDial(t *testing.T) {
 			if resp.Code != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401", resp.Code)
 			}
-			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 {
-				t.Fatalf("calls lookup=%d activate=%d dial=%d, want 1/0/0",
-					router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
+			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
+				t.Fatalf("calls lookup=%d activate=%d dial=%d parking=%d, want 1/0/0/0",
+					router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load(), traffic.begins.Load())
 			}
 		})
 	}
@@ -347,11 +550,12 @@ func TestOrdinaryAdmissionFailsClosedWhenActivationRejectsBinding(t *testing.T) 
 		found:   true,
 	}
 	var dials atomic.Int32
+	traffic := &recordingTrafficTracker{}
 	px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)
 			return nil, fmt.Errorf("unexpected dial")
-		}, "")
+		}, "").WithTrafficTracker(traffic)
 	req := httptest.NewRequest(http.MethodGet, "http://sandbox/", nil)
 	req.Header.Set(proxy.HeaderSandboxID, "node-s1")
 	req.Header.Set(proxy.HeaderSandboxPort, "8080")
@@ -361,8 +565,66 @@ func TestOrdinaryAdmissionFailsClosedWhenActivationRejectsBinding(t *testing.T) 
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.Code)
 	}
-	if router.activateCalls.Load() != 1 || dials.Load() != 0 {
-		t.Fatalf("calls activate=%d dial=%d, want 1/0", router.activateCalls.Load(), dials.Load())
+	if kind := resp.Header().Get(proxy.HeaderProxyError); kind != proxy.ProxyErrorRouteError {
+		t.Fatalf("post-admission proxy error = %q, want %q", kind, proxy.ProxyErrorRouteError)
+	}
+	if router.activateCalls.Load() != 1 || dials.Load() != 0 || traffic.begins.Load() != 1 || traffic.closes.Load() != 1 {
+		t.Fatalf("calls activate=%d dial=%d parking=%d close=%d, want 1/0/1/1",
+			router.activateCalls.Load(), dials.Load(), traffic.begins.Load(), traffic.closes.Load())
+	}
+}
+
+func TestTrafficServiceClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile types.Profile
+		target  proxy.ConnectTarget
+		method  string
+		want    proxy.ConnectService
+	}{
+		{name: "e2b legacy envd", profile: types.ProfileE2B, target: proxy.LegacyTarget(49983), method: http.MethodGet, want: proxy.ConnectServiceE2BEnvd},
+		{name: "e2b legacy interpreter", profile: types.ProfileE2B, target: proxy.LegacyTarget(49999), method: http.MethodGet, want: proxy.ConnectServiceE2BInterpreter},
+		{name: "e2b legacy forward", profile: types.ProfileE2B, target: proxy.LegacyTarget(8080), method: http.MethodGet, want: proxy.ConnectServiceForward},
+		{name: "bare reserved-looking port is forward", profile: types.ProfileBare, target: proxy.LegacyTarget(49983), method: http.MethodGet, want: proxy.ConnectServiceForward},
+		{name: "explicit forward", profile: types.ProfileE2B, target: proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, method: http.MethodConnect, want: proxy.ConnectServiceForward},
+		{name: "explicit envd", profile: types.ProfileE2B, target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, method: http.MethodConnect, want: proxy.ConnectServiceE2BEnvd},
+		{name: "explicit interpreter", profile: types.ProfileE2B, target: proxy.ConnectTarget{Service: proxy.ConnectServiceE2BInterpreter}, method: http.MethodConnect, want: proxy.ConnectServiceE2BInterpreter},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			binding := proxy.BindRoute("node-s1", "stable-s1", test.profile, "envd", "forward", test.target)
+			router := &admissionRouter{
+				binding: binding, route: proxy.Route{Kind: binding.Kind}, found: true, activateOK: true,
+			}
+			tracker := &recordingTrafficTracker{}
+			px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
+				func(context.Context, proxy.Route) (net.Conn, error) { return nil, fmt.Errorf("dial failed") }, "").
+				WithTrafficTracker(tracker)
+			authorityPort := 443
+			if test.target.Service == proxy.ConnectServiceLegacy || test.target.Service == proxy.ConnectServiceForward {
+				authorityPort = test.target.Port
+			}
+			authority := fmt.Sprintf("sandbox:%d", authorityPort)
+			req := httptest.NewRequest(test.method, "http://"+authority+"/", nil)
+			req.Host = authority
+			req.Header.Set(proxy.HeaderSandboxID, "node-s1")
+			if test.method == http.MethodGet || test.target.Port > 0 {
+				req.Header.Set(proxy.HeaderSandboxPort, fmt.Sprint(test.target.Port))
+			}
+			if test.target.Service != proxy.ConnectServiceLegacy {
+				req.Header.Set(proxy.HeaderSandboxService, string(test.target.Service))
+			}
+			req.Header.Set(proxy.HeaderAccessToken, binding.ExpectedAccessToken)
+			resp := httptest.NewRecorder()
+			px.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadGateway {
+				t.Fatalf("status=%d, want 502", resp.Code)
+			}
+			if tracker.begins.Load() != 1 || tracker.closes.Load() != 1 || tracker.attaches.Load() != 0 || tracker.service != test.want {
+				t.Fatalf("tracker begins=%d closes=%d attaches=%d service=%q, want %q",
+					tracker.begins.Load(), tracker.closes.Load(), tracker.attaches.Load(), tracker.service, test.want)
+			}
+		})
 	}
 }
 

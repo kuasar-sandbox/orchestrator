@@ -128,6 +128,25 @@ type noopCounter struct{}
 
 func (noopCounter) Inc(string) {}
 
+// TrafficTracker observes one authorized logical ingress. BeginParking is
+// called only after credential admission; the returned handle owns the
+// parking→egress→idle state transition for the final backend connection.
+type TrafficTracker interface {
+	BeginParking(sandboxID string, service ConnectService) TrafficFlow
+}
+
+type TrafficFlow interface {
+	AttachBackend(net.Conn) net.Conn
+	Close()
+}
+
+type noopTrafficTracker struct{}
+type noopTrafficFlow struct{}
+
+func (noopTrafficTracker) BeginParking(string, ConnectService) TrafficFlow { return noopTrafficFlow{} }
+func (noopTrafficFlow) AttachBackend(conn net.Conn) net.Conn               { return conn }
+func (noopTrafficFlow) Close()                                             {}
+
 // RouteDialer opens a backend connection for a resolved route.
 type RouteDialer func(context.Context, Route) (net.Conn, error)
 
@@ -208,6 +227,7 @@ type Proxy struct {
 	authMode    func() string // config.Auth* (off|log|enforce), read per-request so a
 	log         *slog.Logger  // pushed routesync policy can change it centrally
 	mx          Counter
+	traffic     TrafficTracker
 	dial        RouteDialer
 	execRunRoot string
 }
@@ -231,7 +251,17 @@ func NewWithDialer(router Router, authMode func() string, log *slog.Logger, mx C
 	if dial == nil {
 		dial = directDialRoute
 	}
-	return &Proxy{router: router, authMode: authMode, log: log, mx: mx, dial: dial, execRunRoot: execRunRoot}
+	return &Proxy{router: router, authMode: authMode, log: log, mx: mx, traffic: noopTrafficTracker{}, dial: dial, execRunRoot: execRunRoot}
+}
+
+// WithTrafficTracker installs per-sandbox traffic accounting and returns p for
+// construction-time chaining. A nil tracker restores the no-op implementation.
+func (p *Proxy) WithTrafficTracker(tracker TrafficTracker) *Proxy {
+	if tracker == nil {
+		tracker = noopTrafficTracker{}
+	}
+	p.traffic = tracker
+	return p
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -251,10 +281,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
+	route, flow, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
 	if !ok {
 		return
 	}
+	defer flow.Close()
 	switch route.Kind {
 	case KindUDS, KindTCP:
 		backend, err := p.dial(r.Context(), route)
@@ -263,6 +294,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
 			return
 		}
+		backend = flow.AttachBackend(backend)
 		defer backend.Close()
 		resp, err := ForwardHTTPOnce(r, backend, nil, nil)
 		if err != nil {
@@ -282,51 +314,76 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // admitRoute is the common ordinary HTTP/non-exec CONNECT admission sequence:
 // side-effect-free lookup, authorization, binding-revalidating activation, then
 // a freshly resolved dial route.
-func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, bool) {
+func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, TrafficFlow, bool) {
 	binding, found, err := p.router.LookupRoute(r.Context(), sid, target)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return Route{}, false
+		return Route{}, nil, false
 	}
 	if !found {
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
 		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
-		return Route{}, false
+		return Route{}, nil, false
 	}
 	switch binding.Kind {
 	case KindDeny:
 		p.mx.Inc(`data_requests_total{result="denied"}`)
 		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
-		return Route{}, false
+		return Route{}, nil, false
 	case KindUDS, KindTCP:
 	default:
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return Route{}, false
+		return Route{}, nil, false
 	}
 	if !p.authorized(r, binding) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
-		return Route{}, false
+		return Route{}, nil, false
+	}
+	flow := p.traffic.BeginParking(binding.SandboxID, trafficService(binding))
+	if flow == nil {
+		flow = noopTrafficFlow{}
 	}
 	route, found, err := p.router.ActivateRoute(r.Context(), binding)
 	if err != nil {
+		flow.Close()
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "sandbox activation failed", ProxyErrorRouteError)
-		return Route{}, false
+		return Route{}, nil, false
 	}
 	if !found {
+		flow.Close()
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
-		return Route{}, false
+		// Admission already entered parking. Keep the public status, but do not
+		// advertise a pre-admission typed stale error to a chained cluster router:
+		// retrying this same logical request would create a second ingress.
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
+		return Route{}, nil, false
 	}
 	if route.Kind != binding.Kind || (route.Kind != KindUDS && route.Kind != KindTCP) {
+		flow.Close()
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return Route{}, false
+		return Route{}, nil, false
 	}
-	return route, true
+	return route, flow, true
+}
+
+func trafficService(binding RouteBinding) ConnectService {
+	if binding.Target.Service != ConnectServiceLegacy {
+		return binding.Target.Service
+	}
+	if binding.Profile == types.ProfileE2B {
+		switch binding.Target.Port {
+		case 49983:
+			return ConnectServiceE2BEnvd
+		case 49999:
+			return ConnectServiceE2BInterpreter
+		}
+	}
+	return ConnectServiceForward
 }
 
 // ParseSandbox extracts (sid, port) from the Host header <port>-<sid>.<domain>,

@@ -48,16 +48,18 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		p.serveExecConnect(w, r, sid)
 		return
 	}
-	route, ok := p.admitRoute(w, r, sid, target)
+	route, flow, ok := p.admitRoute(w, r, sid, target)
 	if !ok {
 		return
 	}
+	defer flow.Close()
 	backend, err := p.dial(r.Context(), route)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
 		return
 	}
+	backend = flow.AttachBackend(backend)
 	p.mx.Inc(`data_requests_total{result="ok"}`)
 	Tunnel(w, r, backend)
 }

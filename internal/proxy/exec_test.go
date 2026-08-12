@@ -77,11 +77,12 @@ func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *test
 		activateResult: identity, activateFound: true,
 	}
 	var dials atomic.Int32
+	traffic := &recordingTrafficTracker{}
 	px := proxy.NewWithDialer(router, func() string { return "off" }, discardExecLogger(), nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)
 			return nil, fmt.Errorf("unexpected dial")
-		}, t.TempDir())
+		}, t.TempDir()).WithTrafficTracker(traffic)
 
 	t.Run("ordinary HTTP", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "http://sandbox/exec", nil)
@@ -109,9 +110,9 @@ func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *test
 		if resp.Code != http.StatusUnauthorized {
 			t.Fatalf("invalid KAT response = %d, want 401", resp.Code)
 		}
-		if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || router.routeCalls.Load() != 0 || dials.Load() != 0 {
-			t.Fatalf("invalid KAT caused lifecycle side effects: lookup=%d activate=%d route=%d dial=%d",
-				router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load(), dials.Load())
+		if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || router.routeCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
+			t.Fatalf("invalid KAT caused lifecycle side effects: lookup=%d activate=%d route=%d dial=%d parking=%d",
+				router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load(), dials.Load(), traffic.begins.Load())
 		}
 	})
 }
@@ -136,11 +137,12 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 		token            string
 		activateIdentity proxy.ExecIdentity
 		wantActivations  int32
+		wantProxyError   string
 	}{
-		{name: "forward audience", token: forwardToken, activateIdentity: identity, wantActivations: 0},
+		{name: "forward audience", token: forwardToken, activateIdentity: identity, wantActivations: 0, wantProxyError: proxy.ProxyErrorUnauthorized},
 		{name: "identity changed after activation", token: validToken, activateIdentity: proxy.ExecIdentity{
 			NodeSandboxID: "node-s1", AuthSandboxID: "other", ServiceSecret: execTestServiceSecret,
-		}, wantActivations: 1},
+		}, wantActivations: 1, wantProxyError: proxy.ProxyErrorRouteError},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			router := &execTestRouter{
@@ -162,6 +164,9 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 			px.ServeHTTP(resp, req)
 			if resp.Code != http.StatusUnauthorized {
 				t.Fatalf("response = %d, want 401", resp.Code)
+			}
+			if kind := resp.Header().Get(proxy.HeaderProxyError); kind != test.wantProxyError {
+				t.Fatalf("proxy error = %q, want %q", kind, test.wantProxyError)
 			}
 			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != test.wantActivations || router.routeCalls.Load() != 0 || dials.Load() != 0 {
 				t.Fatalf("calls lookup=%d activate=%d route=%d dial=%d",
@@ -186,11 +191,12 @@ func TestExecActivationFailureReturnsServiceUnavailableBeforeDial(t *testing.T) 
 		activateErr: fmt.Errorf("activation timed out"),
 	}
 	var dials atomic.Int32
+	traffic := &recordingTrafficTracker{}
 	px := proxy.NewWithDialer(router, func() string { return "off" }, discardExecLogger(), nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)
 			return nil, fmt.Errorf("unexpected dial")
-		}, t.TempDir())
+		}, t.TempDir()).WithTrafficTracker(traffic)
 	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
 	req.Host = "sandbox:443"
 	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
@@ -204,6 +210,10 @@ func TestExecActivationFailureReturnsServiceUnavailableBeforeDial(t *testing.T) 
 	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 1 || dials.Load() != 0 {
 		t.Fatalf("calls lookup=%d activate=%d dial=%d",
 			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
+	}
+	if traffic.begins.Load() != 1 || traffic.closes.Load() != 1 || traffic.attaches.Load() != 0 || traffic.service != proxy.ConnectServiceExec {
+		t.Fatalf("exec traffic begins=%d closes=%d attaches=%d service=%q",
+			traffic.begins.Load(), traffic.closes.Load(), traffic.attaches.Load(), traffic.service)
 	}
 }
 
@@ -220,7 +230,8 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 		activateResult: identity, activateFound: true,
 		activateCtx: make(chan context.Context, 1),
 	}
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot)
+	worker, master := newTrafficHarness(t)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(worker)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 
@@ -257,6 +268,7 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
 	}
+	waitInflightFor(t, master, identity.NodeSandboxID, 0, 1)
 	if err := tcpConn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +299,7 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 1 || router.routeCalls.Load() != 0 {
 		t.Fatalf("calls lookup=%d activate=%d route=%d", router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load())
 	}
+	waitInflightFor(t, master, identity.NodeSandboxID, 0, 0)
 }
 
 func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
@@ -301,7 +314,8 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot)
+	worker, master := newTrafficHarness(t)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(worker)
 	ts := httptest.NewUnstartedServer(px)
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
@@ -323,8 +337,10 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
 	req.Header.Set(proxy.HeaderAccessToken, token)
 	writeDone := make(chan error, 1)
+	releaseEOF := make(chan struct{})
 	go func() {
 		_, err := bodyWriter.Write(requestBytes)
+		<-releaseEOF
 		if closeErr := bodyWriter.Close(); err == nil {
 			err = closeErr
 		}
@@ -338,6 +354,8 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
 		t.Fatalf("response = %s %d, want HTTP/2 200", resp.Proto, resp.StatusCode)
 	}
+	waitInflightFor(t, master, identity.NodeSandboxID, 0, 1)
+	close(releaseEOF)
 	gotResponse, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -354,6 +372,7 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	if err := <-backendDone; err != nil {
 		t.Fatal(err)
 	}
+	waitInflightFor(t, master, identity.NodeSandboxID, 0, 0)
 }
 
 func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
