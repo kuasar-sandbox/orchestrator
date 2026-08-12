@@ -48,10 +48,23 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 	}
 	missingRun := query
 	missingRun.RunID = ""
-	if resp := do(missingRun); resp.Code != http.StatusBadRequest {
-		t.Fatalf("missing RunID status=%d, want 400", resp.Code)
+	if resp := do(missingRun); resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing RunID mismatch status=%d, want 503", resp.Code)
 	}
-	resp := do(query)
+	identity = RouteIdentity{Profile: types.ProfileBare, State: types.StateStarting}
+	resp := do(missingRun)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("pre-assignment starting status=%d, want 200: %s", resp.Code, resp.Body.String())
+	}
+	var startingResult BatchResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &startingResult); err != nil {
+		t.Fatal(err)
+	}
+	if got := startingResult.Sandboxes[0].Stats; got.State != string(types.StateStarting) || got.IdleSince != nil {
+		t.Fatalf("starting stats = %+v", got)
+	}
+	identity = RouteIdentity{RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused}
+	resp = do(query)
 	if resp.Code != http.StatusOK || resp.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("valid status=%d cache=%q body=%s", resp.Code, resp.Header().Get("Cache-Control"), resp.Body.String())
 	}

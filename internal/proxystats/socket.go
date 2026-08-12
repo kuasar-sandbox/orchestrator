@@ -99,7 +99,7 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 	}
 	response := BatchResponse{Sandboxes: make([]BatchResult, 0, len(request.Sandboxes))}
 	for _, query := range request.Sandboxes {
-		if !validSandboxID(query.SandboxID) || query.RunID == "" ||
+		if !validSandboxID(query.SandboxID) ||
 			(query.Profile != types.ProfileE2B && query.Profile != types.ProfileBare) {
 			writeSocketError(w, http.StatusBadRequest, "invalid traffic query")
 			return
