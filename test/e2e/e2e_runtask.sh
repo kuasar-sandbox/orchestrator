@@ -167,10 +167,11 @@ SRV_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { cat "$WORK/server.log"; fail "fake config socket did not come up"; }
 
-UNIT="e2e-runtask-$RANDOM-$$"
+UNIT="e2e-runtask@$RUN_ID"
 echo "==> run-sandbox: launch in delegated transient unit $UNIT"
 systemd-run --quiet --unit="$UNIT" --service-type=exec \
-    --property=Delegate=yes --property=DelegateSubgroup=ctl --property=KillMode=control-group \
+    --slice=sandbox-runner.slice \
+    --property=Delegate=yes --property=KillMode=control-group \
     --setenv="TASK_PIDFILE=$PIDFILE" --setenv="TASK_CONFIG_SOCKET=$SOCK" \
     --setenv="TASK_RUN_ID=$RUN_ID" --setenv=TASK_SANDBOX_ID=legacy \
     "$ORCH" run-sandbox
@@ -201,13 +202,20 @@ TASK_PIDF="$(tr -d '[:space:]' < "$TASK_PIDFILE")"
 [ "$TASK_PIDF" = "$RT_PID" ] || fail "sandbox pidfile did not preserve the launcher PID"
 [ "$(systemctl show "$UNIT.service" -p MainPID --value)" = "$RT_PID" ] \
     || fail "exec replacement did not preserve the unit MainPID"
+UNIT_CGROUP="$(systemctl show "$UNIT.service" -p ControlGroup --value)"
+RUNNER_CGROUP="$(awk -F: '$1 == "0" { print $3 }' "/proc/$RT_PID/cgroup")"
+[ "$RUNNER_CGROUP" = "$UNIT_CGROUP/ctl" ] \
+    || fail "runner cgroup=$RUNNER_CGROUP, want $UNIT_CGROUP/ctl"
+[ ! -s "/sys/fs/cgroup$UNIT_CGROUP/cgroup.procs" ] \
+    || fail "runner unit root still contains a process"
 kill -0 "$RT_PID" 2>/dev/null || fail "exec-replaced target is not alive"
-echo "==> PASS: delegated ctl/vmm handoff, exact readiness wire, and PID inheritance"
+echo "==> PASS: portable root-to-ctl placement, delegated ctl/vmm handoff, exact readiness wire, and PID inheritance"
 
-DUP_UNIT="$UNIT-duplicate"
+DUP_UNIT="e2e-runtask-duplicate@$RUN_ID"
 set +e
 systemd-run --quiet --wait --pipe --unit="$DUP_UNIT" --service-type=exec \
-    --property=Delegate=yes --property=DelegateSubgroup=ctl --property=KillMode=control-group \
+    --slice=sandbox-runner.slice \
+    --property=Delegate=yes --property=KillMode=control-group \
     --setenv="TASK_PIDFILE=$PIDFILE" --setenv="TASK_CONFIG_SOCKET=$SOCK" \
     --setenv="TASK_RUN_ID=$RUN_ID" "$ORCH" run-sandbox > "$WORK/dup.log" 2>&1
 DUP_RC=$?
@@ -215,5 +223,16 @@ set -e
 [ "$DUP_RC" -ne 0 ] || fail "second run-sandbox succeeded despite held pidfile lock"
 grep -qi 'lock' "$WORK/dup.log" || { sed 's/^/    /' "$WORK/dup.log"; fail "double-start error omitted lock"; }
 echo "==> PASS: double-start refused"
+
+systemctl stop "$UNIT.service"
+for _ in $(seq 1 50); do
+    [ ! -e "/sys/fs/cgroup$UNIT_CGROUP" ] && break
+    sleep 0.1
+done
+[ ! -e "/sys/fs/cgroup$UNIT_CGROUP" ] \
+    || fail "runner cgroup remained after StopUnit: $UNIT_CGROUP"
+systemctl reset-failed "$UNIT.service" >/dev/null 2>&1 || true
+UNIT=""
+echo "==> PASS: StopUnit removed the delegated ctl/vmm hierarchy"
 
 echo "==> e2e_runtask: OK"

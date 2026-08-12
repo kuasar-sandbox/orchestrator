@@ -32,7 +32,7 @@ func runSandbox(args []string, _ *slog.Logger) error {
 	}
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
 		lockPidfile:    lockPidfile,
-		prepareCgroup:  prepareRunnerCgroup,
+		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
 		waitAssignment: configsock.WaitAssignment,
 		connectReady:   connectReadinessSocket,
 		launchTask:     launchTask,

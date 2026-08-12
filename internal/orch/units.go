@@ -67,10 +67,9 @@ Restart=no
 KillMode=control-group
 TimeoutStopSec=20
 Slice=sandbox-runner.slice
-# Keep the unit root empty for cgroup-v2 domain controllers. node-ctl and,
-# after exec, sandbox-ctl stay in ctl/; node-ctl creates vmm/ for CH.
+# node-ctl moves itself into ctl/ before enabling cgroup-v2 domain controllers;
+# after exec, sandbox-ctl stays there while node-ctl creates vmm/ for CH.
 Delegate=yes
-DelegateSubgroup=ctl
 # KillMode=control-group recursively covers both delegated subgroups.
 `, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }

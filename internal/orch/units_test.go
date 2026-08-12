@@ -22,11 +22,13 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 		"ExecStopPost=/bin/rm -f /run/kuasar-test/runs/%i.pid",
 		"KillMode=control-group",
 		"Delegate=yes",
-		"DelegateSubgroup=ctl",
 	} {
 		if !strings.Contains(runner, want) {
 			t.Fatalf("runner unit missing %q:\n%s", want, runner)
 		}
+	}
+	if strings.Contains(runner, "DelegateSubgroup=") {
+		t.Fatalf("runner unit depends on non-portable DelegateSubgroup:\n%s", runner)
 	}
 
 	builder := o.builderUnitFile()
