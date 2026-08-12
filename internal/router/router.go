@@ -984,9 +984,9 @@ func rewriteSandboxIdentityResponse(resp *http.Response, sandboxID, nodeSandboxI
 // --- data plane ---
 
 // serveExecData handles the cluster-facing logical exec service. Route lookup is
-// read-only; a KAT must validate against the stable route identity before the
-// Router is allowed to call Reserve(data). The final node receives the same
-// service, optional port, and token with only the sandbox ID rewritten.
+// read-only; a KAT must validate against the stable route identity before any
+// fallback Reserve(data). A known node-local target is contacted directly even
+// while paused/starting, so the final node proxy owns parking and Wake.
 func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 	sid, target, ok := proxypkg.ParseConnect(r)
 	if !ok || target.Service != proxypkg.ConnectServiceExec {
@@ -1028,7 +1028,7 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rr.State != "ready" || rr.DataEndpoint == "" {
+	if !hasDirectNodeTarget(rr) {
 		res, err := rt.routeLinkReserve(
 			r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
 			map[string]string{
@@ -1048,11 +1048,37 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 		rt.rememberRoute(current)
 		rr = current
 	}
-	if rr.State != "ready" || rr.DataEndpoint == "" {
+	if !hasDirectNodeTarget(rr) {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
 	}
-	rt.forwardSandboxConnect(w, r, rr, sid, target, token)
+	if !rt.forwardSandboxConnect(w, r, rr, sid, target, token) {
+		return
+	}
+	// A typed stale response means the node rejected the cached node-local
+	// identity before accepting the logical ingress. Refresh through the existing
+	// ReserveData fallback, which re-authenticates the KAT against the current
+	// lineage, then retry the final node exactly once.
+	res, err := rt.routeLinkReserve(
+		r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
+		map[string]string{
+			HeaderAccessTok:               token,
+			proxypkg.HeaderSandboxService: string(target.Service),
+		},
+	)
+	if err != nil {
+		writeExecDataReserveError(w, err)
+		return
+	}
+	current := &res.Route
+	if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) || !hasDirectNodeTarget(current) {
+		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	rt.rememberRoute(current)
+	if rt.forwardSandboxConnect(w, r, current, sid, target, token) {
+		http.Error(w, "sandbox route is stale", http.StatusServiceUnavailable)
+	}
 }
 
 func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string) {
@@ -1150,12 +1176,11 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			rt.log.Warn("router: data-plane auth mismatch (log mode)", "sid", sid, "err", auth.Err)
 		}
 	}
-	// Not ready (paused / lagging): operation-aware Reserve authenticates this
-	// exact stable sandbox and prepares its current node route. A signed /files
-	// request has already been verified above, so its protected EnvdAccessToken is
-	// used only for Reserve and the outer CONNECT; the inner HTTP request remains
-	// unchanged.
-	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
+	// A known node-local target is authoritative even while paused/starting: the
+	// final node proxy performs authorized parking and Wake. Reserve(data) remains
+	// the missing-target fallback only. A signed /files request has already been
+	// verified above, so its protected token is used only for the outer CONNECT.
+	if !hasDirectNodeTarget(rr) && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
 			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
 			map[string]string{HeaderAccessTok: connectToken},
@@ -1170,14 +1195,43 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			rr = resumed
 		}
 	}
-	if rr.State != "ready" || rr.DataEndpoint == "" {
+	if !hasDirectNodeTarget(rr) {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
 	}
-	rt.forwardSandboxData(w, r, rr, sid, effectivePort, connectToken)
+	if !rt.forwardSandboxData(w, r, rr, sid, effectivePort, connectToken) {
+		return
+	}
+	// The final node rejected the cached node-local identity before the inner
+	// request was sent. ReserveData is the stale-route fallback and validates the
+	// same admitted credential against the Registry's current lineage.
+	res, err := rt.routeLinkReserve(
+		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
+		map[string]string{HeaderAccessTok: connectToken},
+	)
+	if err != nil {
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
+		return
+	}
+	current := &res.Route
+	if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) || !hasDirectNodeTarget(current) {
+		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	rt.rememberRoute(current)
+	if rt.forwardSandboxData(w, r, current, sid, effectivePort, connectToken) {
+		http.Error(w, "sandbox route is stale", http.StatusServiceUnavailable)
+	}
 }
 
-func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, target proxypkg.ConnectTarget, token string) {
+func hasDirectNodeTarget(route *routeResolve) bool {
+	return route != nil && route.NodeSandboxID != "" && route.DataEndpoint != ""
+}
+
+// forwardSandboxConnect returns true only when the node rejected the CONNECT
+// with a typed stale-route error before accepting the ingress. In that case it
+// has not written a client response, so the caller may safely refresh and retry.
+func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, target proxypkg.ConnectTarget, token string) bool {
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
@@ -1189,18 +1243,20 @@ func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, 
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return false
 	}
 	if resp.StatusCode != http.StatusOK {
 		backend.Close()
-		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
+		if staleProxyResponse(resp.StatusCode, resp.Header.Get(proxypkg.HeaderProxyError)) {
 			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+			return true
 		}
 		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
 		http.Error(w, "connect refused by node", resp.StatusCode)
-		return
+		return false
 	}
 	proxypkg.TunnelBuffered(w, r, backend, br)
+	return false
 }
 
 func expectedDataAccessToken(route *routeResolve, port int) string {
@@ -1219,7 +1275,10 @@ func expectedDataAccessToken(route *routeResolve, port int) string {
 // used only for the outer node CONNECT. Every ordinary HTTP request is written
 // unchanged inside that one-shot tunnel, apart from rewriting known identity carriers
 // to the current node-local identity.
-func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, port int, connectToken string) {
+// forwardSandboxData has the same stale return contract as
+// forwardSandboxConnect. DialSandboxConnect has not consumed the inner HTTP body
+// when the outer CONNECT is rejected, so a single refresh/retry is safe.
+func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, port int, connectToken string) bool {
 	nodeSandboxHost := fmt.Sprintf("%d-%s.%s", port, rr.NodeSandboxID, rt.domain)
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
@@ -1230,20 +1289,21 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return false
 	}
 	if resp.StatusCode != http.StatusOK {
 		backend.Close()
-		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
+		if staleProxyResponse(resp.StatusCode, resp.Header.Get(proxypkg.HeaderProxyError)) {
 			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
+			return true
 		}
 		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
 		http.Error(w, "connect refused by node", resp.StatusCode)
-		return
+		return false
 	}
 	if r.Method == http.MethodConnect {
 		proxypkg.TunnelBuffered(w, r, backend, br)
-		return
+		return false
 	}
 	defer backend.Close()
 	resp, err = proxypkg.ForwardHTTPOnce(r, backend, br, func(req *http.Request) {
@@ -1257,14 +1317,16 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sandboxID, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	proxypkg.WriteHTTPResponse(w, resp)
+	return false
 }
 
-func staleProxyError(kind string) bool {
-	return kind == proxypkg.ProxyErrorNotFound || kind == proxypkg.ProxyErrorUnauthorized
+func staleProxyResponse(status int, kind string) bool {
+	return (status == http.StatusNotFound && kind == proxypkg.ProxyErrorNotFound) ||
+		(status == http.StatusUnauthorized && kind == proxypkg.ProxyErrorUnauthorized)
 }
 
 func requestedDataPort(r *http.Request, hostPort int, hasHostPort bool) (int, bool, error) {
