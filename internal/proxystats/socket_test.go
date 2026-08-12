@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -119,5 +121,14 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stats server did not stop")
+	}
+}
+
+func TestQuerySocketTransportFailureIsUnavailable(t *testing.T) {
+	_, err := QuerySocket(context.Background(), filepath.Join(t.TempDir(), "missing.sock"), []TrafficQuery{{
+		SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning,
+	}})
+	if !errors.Is(err, api.ErrStatsUnavailable) {
+		t.Fatalf("transport failure error = %v, want ErrStatsUnavailable", err)
 	}
 }

@@ -154,7 +154,7 @@ func QuerySocket(ctx context.Context, socketPath string, queries []TrafficQuery)
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("query proxy stats: %w", err)
+		return nil, fmt.Errorf("%w: query proxy stats: %v", api.ErrStatsUnavailable, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
