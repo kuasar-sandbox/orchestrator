@@ -331,6 +331,16 @@ PY
     echo "resource stats sid=$sid last_status=$code body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
     return 1
 }
+wait_resource_status() { # $1=sid, $2=expected status
+    local sid="$1" expected="$2" code=""
+    for _ in $(seq 1 240); do
+        code="$(req GET "/sandboxes/$sid/stats/resource" "$AK" || true)"
+        [ "$code" = "$expected" ] && return 0
+        sleep 0.05
+    done
+    echo "resource stats sid=$sid last_status=$code want=$expected body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
+}
 
 snapshot_argv_count() {
     python3 - "$SNAPSHOT_ARGV_LOG" <<'PY'
@@ -1424,8 +1434,10 @@ wait_sandbox_state "$SID" paused 1200 || {
     fail "accepted local Pause did not commit after caller cancellation"
 }
 wait_internal_traffic_stats "$SID" paused || fail "paused traffic stats were not stable"
-code=$(req GET "/sandboxes/$SID/stats/resource" "$AK" || true)
-[ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "paused resource stats=$code (want 409)"; }
+# Pause commits the durable paused state before StopUnit makes sandboxer release
+# its live controller reservation. During that bounded cleanup window, returning
+# the still-real report is valid; the stable paused state must converge to 409.
+wait_resource_status "$SID" 409 || fail "paused resource stats did not converge to 409"
 # Keep the sandbox durably paused for longer than several service counter ticks.
 # On restore the counter must resume from the frozen snapshot rather than track
 # this host wall-clock interval.
