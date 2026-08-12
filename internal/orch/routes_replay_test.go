@@ -90,12 +90,12 @@ func TestInternalRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
 		{"bare", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, proxy.KindDeny, ""},
 	}
 	for _, tc := range tests {
-		route, err := o.Route(context.Background(), tc.sid, tc.target)
-		if err != nil {
-			t.Fatalf("Route(%s, %+v): %v", tc.sid, tc.target, err)
+		binding, found, err := o.LookupRoute(context.Background(), tc.sid, tc.target)
+		if err != nil || !found {
+			t.Fatalf("LookupRoute(%s, %+v): found=%v err=%v", tc.sid, tc.target, found, err)
 		}
-		if route.Kind != tc.wantKind || route.AccessToken != tc.wantToken {
-			t.Fatalf("Route(%s, %+v) = %+v, want kind=%v token=%q", tc.sid, tc.target, route, tc.wantKind, tc.wantToken)
+		if binding.Kind != tc.wantKind || binding.ExpectedAccessToken != tc.wantToken {
+			t.Fatalf("LookupRoute(%s, %+v) = %+v, want kind=%v token=%q", tc.sid, tc.target, binding, tc.wantKind, tc.wantToken)
 		}
 	}
 }
@@ -117,7 +117,7 @@ func TestStartingSandboxServesMMDSButNotDataPlane(t *testing.T) {
 	if secret, ok := o.MmdsSecret(sb.ID); !ok || len(secret) == 0 {
 		t.Fatalf("MmdsSecret(starting) = %x ok=%v", secret, ok)
 	}
-	route, err := o.Route(context.Background(), sb.ID, proxy.LegacyTarget(49983))
+	route, err := activateRouteForTest(context.Background(), o, sb.ID, proxy.LegacyTarget(49983))
 	if err != nil || route.Kind != proxy.KindNotFound {
 		t.Fatalf("Route(starting) = %+v err=%v, want not found until running", route, err)
 	}
@@ -150,9 +150,9 @@ func TestInternalKnownExecDoesNotResumePausedSandboxBeforeIssue64(t *testing.T) 
 	o := &Orchestrator{reg: map[string]*types.Sandbox{
 		"paused": {ID: "paused", Profile: types.ProfileBare, State: types.StatePaused},
 	}}
-	route, err := o.Route(context.Background(), "paused", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
-	if err != nil || route.Kind != proxy.KindDeny {
-		t.Fatalf("exec route = %+v err=%v, want deny without resume", route, err)
+	binding, found, err := o.LookupRoute(context.Background(), "paused", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
+	if err != nil || !found || binding.Kind != proxy.KindDeny {
+		t.Fatalf("exec binding = %+v found=%v err=%v, want deny without resume", binding, found, err)
 	}
 }
 

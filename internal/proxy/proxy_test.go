@@ -18,12 +18,25 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-type stubRouter struct{ r proxy.Route }
+type stubRouter struct {
+	r     proxy.Route
+	token string
+}
 
-func (s stubRouter) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
-	return s.r, nil
+func (s stubRouter) LookupRoute(_ context.Context, sid string, target proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
+	if s.r.Kind == proxy.KindNotFound {
+		return proxy.RouteBinding{}, false, nil
+	}
+	binding := proxy.BindRoute(sid, sid, types.ProfileE2B, s.token, s.token, target)
+	binding.Kind = s.r.Kind
+	return binding, true, nil
+}
+
+func (s stubRouter) ActivateRoute(_ context.Context, _ proxy.RouteBinding) (proxy.Route, bool, error) {
+	return s.r, s.r.Kind != proxy.KindNotFound, nil
 }
 
 type countingListener struct {
@@ -42,7 +55,7 @@ func (l *countingListener) Accept() (net.Conn, error) {
 func TestRouteForTarget(t *testing.T) {
 	tests := []struct {
 		name      string
-		profile   string
+		profile   types.Profile
 		target    proxy.ConnectTarget
 		wantKind  proxy.Kind
 		wantUDS   string
@@ -64,8 +77,9 @@ func TestRouteForTarget(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			route := proxy.RouteForTarget(tc.profile, "/e.sock", "/c.sock", "10.0.0.5", "envd", "forward", tc.target)
-			if route.Kind != tc.wantKind || route.UDS != tc.wantUDS || route.Addr != tc.wantAddr || route.AccessToken != tc.wantToken {
+			binding := proxy.BindRoute("node-s1", "stable-s1", tc.profile, "envd", "forward", tc.target)
+			route := proxy.RouteForTarget(tc.profile, "/e.sock", "/c.sock", "10.0.0.5", tc.target)
+			if route.Kind != tc.wantKind || route.UDS != tc.wantUDS || route.Addr != tc.wantAddr || binding.ExpectedAccessToken != tc.wantToken {
 				t.Fatalf("route = %+v, want kind=%v uds=%q addr=%q token=%q", route, tc.wantKind, tc.wantUDS, tc.wantAddr, tc.wantToken)
 			}
 		})
@@ -225,7 +239,8 @@ func TestOrdinaryHTTPIgnoresAndPreservesServiceHeader(t *testing.T) {
 
 	var routed proxy.ConnectTarget
 	router := &recordingRouter{
-		route:  proxy.Route{Kind: proxy.KindTCP, Addr: strings.TrimPrefix(backend.URL, "http://"), AccessToken: "tok"},
+		route:  proxy.Route{Kind: proxy.KindTCP, Addr: strings.TrimPrefix(backend.URL, "http://")},
+		token:  "tok",
 		target: &routed,
 	}
 	px := proxy.New(router, func() string { return "enforce" }, log, nil)
@@ -246,14 +261,109 @@ func TestOrdinaryHTTPIgnoresAndPreservesServiceHeader(t *testing.T) {
 
 type recordingRouter struct {
 	route  proxy.Route
+	token  string
 	target *proxy.ConnectTarget
 }
 
-func (r *recordingRouter) Route(_ context.Context, _ string, target proxy.ConnectTarget) (proxy.Route, error) {
+func (r *recordingRouter) LookupRoute(_ context.Context, sid string, target proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	if r.target != nil {
 		*r.target = target
 	}
-	return r.route, nil
+	binding := proxy.BindRoute(sid, sid, types.ProfileE2B, r.token, r.token, target)
+	binding.Kind = r.route.Kind
+	return binding, true, nil
+}
+
+func (r *recordingRouter) ActivateRoute(_ context.Context, _ proxy.RouteBinding) (proxy.Route, bool, error) {
+	return r.route, true, nil
+}
+
+type admissionRouter struct {
+	binding       proxy.RouteBinding
+	route         proxy.Route
+	found         bool
+	activateOK    bool
+	lookupCalls   atomic.Int32
+	activateCalls atomic.Int32
+}
+
+func (r *admissionRouter) LookupRoute(_ context.Context, _ string, _ proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
+	r.lookupCalls.Add(1)
+	return r.binding, r.found, nil
+}
+
+func (r *admissionRouter) ActivateRoute(_ context.Context, expected proxy.RouteBinding) (proxy.Route, bool, error) {
+	r.activateCalls.Add(1)
+	if expected != r.binding {
+		return proxy.Route{}, false, nil
+	}
+	return r.route, r.activateOK, nil
+}
+
+func TestOrdinaryAdmissionRejectsBeforeActivationAndDial(t *testing.T) {
+	target := proxy.LegacyTarget(8080)
+	for _, method := range []string{http.MethodGet, http.MethodConnect} {
+		t.Run(method, func(t *testing.T) {
+			router := &admissionRouter{
+				binding:    proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target),
+				route:      proxy.Route{Kind: proxy.KindTCP, Addr: "127.0.0.1:1"},
+				found:      true,
+				activateOK: true,
+			}
+			var dials atomic.Int32
+			px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
+				func(context.Context, proxy.Route) (net.Conn, error) {
+					dials.Add(1)
+					return nil, fmt.Errorf("unexpected dial")
+				}, "")
+			var req *http.Request
+			if method == http.MethodConnect {
+				req = httptest.NewRequest(method, "http://sandbox", nil)
+				req.Header.Set(proxy.HeaderSandboxPort, "8080")
+			} else {
+				req = httptest.NewRequest(method, "http://sandbox/", nil)
+				req.Header.Set(proxy.HeaderSandboxPort, "8080")
+			}
+			req.Header.Set(proxy.HeaderSandboxID, "node-s1")
+			req.Header.Set(proxy.HeaderAccessToken, "invalid")
+			resp := httptest.NewRecorder()
+			px.ServeHTTP(resp, req)
+			if resp.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.Code)
+			}
+			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 {
+				t.Fatalf("calls lookup=%d activate=%d dial=%d, want 1/0/0",
+					router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
+			}
+		})
+	}
+}
+
+func TestOrdinaryAdmissionFailsClosedWhenActivationRejectsBinding(t *testing.T) {
+	target := proxy.LegacyTarget(8080)
+	router := &admissionRouter{
+		binding: proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target),
+		route:   proxy.Route{Kind: proxy.KindTCP, Addr: "127.0.0.1:1"},
+		found:   true,
+	}
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}, "")
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox/", nil)
+	req.Header.Set(proxy.HeaderSandboxID, "node-s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "8080")
+	req.Header.Set(proxy.HeaderAccessToken, "forward")
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.Code)
+	}
+	if router.activateCalls.Load() != 1 || dials.Load() != 0 {
+		t.Fatalf("calls activate=%d dial=%d, want 1/0", router.activateCalls.Load(), dials.Load())
+	}
 }
 
 func TestProxyForwardAndAuth(t *testing.T) {
@@ -271,7 +381,7 @@ func TestProxyForwardAndAuth(t *testing.T) {
 	defer up.Close()
 
 	mode := "enforce"
-	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindUDS, UDS: upSock, AccessToken: "tok"}},
+	px := proxy.New(stubRouter{r: proxy.Route{Kind: proxy.KindUDS, UDS: upSock}, token: "tok"},
 		func() string { return mode }, log, nil)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
@@ -344,7 +454,7 @@ func TestProxyMissingExpectedTokenHonorsAuthMode(t *testing.T) {
 	defer up.Close()
 
 	mode := "enforce"
-	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindUDS, UDS: upSock}},
+	px := proxy.New(stubRouter{r: proxy.Route{Kind: proxy.KindUDS, UDS: upSock}},
 		func() string { return mode }, log, nil)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
@@ -389,7 +499,7 @@ func TestProxyDoesNotReuseBackendConnections(t *testing.T) {
 	go up.Serve(upLn)
 	defer up.Close()
 
-	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindUDS, UDS: upSock, AccessToken: "tok"}},
+	px := proxy.New(stubRouter{r: proxy.Route{Kind: proxy.KindUDS, UDS: upSock}, token: "tok"},
 		func() string { return "enforce" }, log, nil)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
@@ -440,7 +550,7 @@ func TestProxyUsesCustomDialerForHTTP(t *testing.T) {
 	}()
 
 	var dials atomic.Int32
-	px := proxy.NewWithDialer(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+	px := proxy.NewWithDialer(stubRouter{r: proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String()}, token: "tok"},
 		func() string { return "enforce" }, log, nil,
 		func(ctx context.Context, r proxy.Route) (net.Conn, error) {
 			dials.Add(1)
@@ -493,7 +603,7 @@ func TestConnectTunnel(t *testing.T) {
 	}()
 
 	var dials atomic.Int32
-	px := proxy.NewWithDialer(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+	px := proxy.NewWithDialer(stubRouter{r: proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String()}, token: "tok"},
 		func() string { return "enforce" }, log, nil,
 		func(ctx context.Context, r proxy.Route) (net.Conn, error) {
 			dials.Add(1)
@@ -559,8 +669,8 @@ func TestConnectTunnel(t *testing.T) {
 
 func TestProxyNotFoundAndDeny(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	nf := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindNotFound}}, nil, log, nil)
-	deny := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindDeny}}, nil, log, nil)
+	nf := proxy.New(stubRouter{r: proxy.Route{Kind: proxy.KindNotFound}}, nil, log, nil)
+	deny := proxy.New(stubRouter{r: proxy.Route{Kind: proxy.KindDeny}}, nil, log, nil)
 	for _, tc := range []struct {
 		px   *proxy.Proxy
 		want int

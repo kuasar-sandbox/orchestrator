@@ -48,30 +48,8 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		p.serveExecConnect(w, r, sid)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, target)
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return
-	}
-	switch route.Kind {
-	case KindNotFound:
-		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
-		return
-	case KindDeny:
-		p.mx.Inc(`data_requests_total{result="denied"}`)
-		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
-		return
-	case KindUDS, KindTCP:
-	default:
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return
-	}
-	if !p.authorized(r, route, target.Port) {
-		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
+	route, ok := p.admitRoute(w, r, sid, target)
+	if !ok {
 		return
 	}
 	backend, err := p.dial(r.Context(), route)

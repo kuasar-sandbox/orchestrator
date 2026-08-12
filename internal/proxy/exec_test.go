@@ -37,9 +37,14 @@ type execTestRouter struct {
 	activateCtx    chan context.Context
 }
 
-func (r *execTestRouter) Route(context.Context, string, proxy.ConnectTarget) (proxy.Route, error) {
+func (r *execTestRouter) LookupRoute(context.Context, string, proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	r.routeCalls.Add(1)
-	return proxy.Route{Kind: proxy.KindDeny}, nil
+	return proxy.RouteBinding{Kind: proxy.KindDeny}, true, nil
+}
+
+func (r *execTestRouter) ActivateRoute(context.Context, proxy.RouteBinding) (proxy.Route, bool, error) {
+	r.routeCalls.Add(1)
+	return proxy.Route{}, false, nil
 }
 
 func (r *execTestRouter) LookupExec(context.Context, string) (proxy.ExecIdentity, bool, error) {

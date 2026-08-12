@@ -18,18 +18,24 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type connectStubRouter struct {
 	r      proxy.Route
+	token  string
 	target *proxy.ConnectTarget
 }
 
-func (s connectStubRouter) Route(ctx context.Context, sid string, target proxy.ConnectTarget) (proxy.Route, error) {
+func (s connectStubRouter) LookupRoute(_ context.Context, sid string, target proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	if s.target != nil {
 		*s.target = target
 	}
-	return s.r, nil
+	return proxy.BindRoute(sid, sid, types.ProfileE2B, s.token, s.token, target), true, nil
+}
+
+func (s connectStubRouter) ActivateRoute(_ context.Context, _ proxy.RouteBinding) (proxy.Route, bool, error) {
+	return s.r, true, nil
 }
 
 // TestProxyForwarderConnectRelay drives a chained CONNECT end to end: client ->
@@ -63,7 +69,8 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 	defer wln.Close()
 	var workerTarget proxy.ConnectTarget
 	px := proxy.New(connectStubRouter{
-		r:      proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"},
+		r:      proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String()},
+		token:  "tok",
 		target: &workerTarget,
 	},
 		func() string { return "enforce" }, log, nil)

@@ -36,10 +36,22 @@ const (
 )
 
 type Route struct {
-	Kind        Kind
-	UDS         string // KindUDS
-	Addr        string // KindTCP, host:port
-	AccessToken string // expected token selected for this forwarding target
+	Kind Kind
+	UDS  string // KindUDS
+	Addr string // KindTCP, host:port
+}
+
+// RouteBinding is the stable credential subject and exact logical target that an
+// ordinary data-plane authorization covers. Lifecycle state, backend addresses,
+// run identity, and route revisions deliberately do not participate: they may
+// change during a legitimate activation.
+type RouteBinding struct {
+	SandboxID           string
+	AuthSandboxID       string
+	Profile             types.Profile
+	Target              ConnectTarget
+	Kind                Kind
+	ExpectedAccessToken string
 }
 
 const (
@@ -82,11 +94,12 @@ func LegacyTarget(port int) ConnectTarget {
 	return ConnectTarget{Service: ConnectServiceLegacy, Port: port}
 }
 
-// Router resolves a (sandboxID, target) to a Route. It may block to auto-resume a
-// paused sandbox or park while a starting sandbox completes, returning KindUDS/
-// KindTCP once running, or KindNotFound if it never came up.
+// Router separates side-effect-free ordinary route admission from the authorized
+// lifecycle transition. ActivateRoute must revalidate expected before and after
+// activation and return a Route built from the latest running record.
 type Router interface {
-	Route(ctx context.Context, sandboxID string, target ConnectTarget) (Route, error)
+	LookupRoute(ctx context.Context, sandboxID string, target ConnectTarget) (RouteBinding, bool, error)
+	ActivateRoute(ctx context.Context, expected RouteBinding) (Route, bool, error)
 }
 
 // ExecIdentity is the credential and node-local identity needed to authorize an
@@ -118,42 +131,75 @@ func (noopCounter) Inc(string) {}
 // RouteDialer opens a backend connection for a resolved route.
 type RouteDialer func(context.Context, Route) (net.Conn, error)
 
-// RouteForTarget builds the forwarding decision for a resolved sandbox. Explicit
-// CONNECT services are authoritative; the legacy service retains the profile +
-// raw-port mapping. Shared by internal and external node proxies.
-func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, envdAccessToken, forwardAccessToken string, target ConnectTarget) Route {
+// BindRoute selects the credential and logical backend kind for an exact target.
+// It intentionally contains no dial address.
+func BindRoute(sandboxID, authSandboxID string, profile types.Profile, envdAccessToken, forwardAccessToken string, target ConnectTarget) RouteBinding {
+	binding := RouteBinding{
+		SandboxID:     sandboxID,
+		AuthSandboxID: authSandboxID,
+		Profile:       profile,
+		Target:        target,
+		Kind:          routeKindForTarget(profile, target),
+	}
+	switch binding.Kind {
+	case KindUDS:
+		binding.ExpectedAccessToken = envdAccessToken
+	case KindTCP:
+		binding.ExpectedAccessToken = forwardAccessToken
+	}
+	return binding
+}
+
+func routeKindForTarget(profile types.Profile, target ConnectTarget) Kind {
+	if profile != types.ProfileE2B && profile != types.ProfileBare {
+		return KindDeny
+	}
 	switch target.Service {
 	case ConnectServiceLegacy:
-		if profile == string(types.ProfileE2B) && (target.Port == 49983 || target.Port == 49999) {
-			uds := envdUDS
-			if target.Port == 49999 {
-				uds = ciUDS
-			}
-			return Route{Kind: KindUDS, UDS: uds, AccessToken: envdAccessToken}
+		if profile == types.ProfileE2B && (target.Port == 49983 || target.Port == 49999) {
+			return KindUDS
 		}
 		// A bare sandbox has no reserved logical-service ports. In particular,
 		// 49983 and 49999 are ordinary guest TCP destinations.
-		return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, target.Port), AccessToken: forwardAccessToken}
+		return KindTCP
 	case ConnectServiceForward:
-		return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, target.Port), AccessToken: forwardAccessToken}
+		return KindTCP
 	case ConnectServiceE2BEnvd:
-		if profile != string(types.ProfileE2B) {
-			return Route{Kind: KindDeny}
+		if profile != types.ProfileE2B {
+			return KindDeny
 		}
-		return Route{Kind: KindUDS, UDS: envdUDS, AccessToken: envdAccessToken}
+		return KindUDS
 	case ConnectServiceE2BInterpreter:
-		if profile != string(types.ProfileE2B) {
-			return Route{Kind: KindDeny}
+		if profile != types.ProfileE2B {
+			return KindDeny
 		}
-		return Route{Kind: KindUDS, UDS: ciUDS, AccessToken: envdAccessToken}
+		return KindUDS
 	case ConnectServiceExec:
 		// Exec CONNECT is dispatched to the authenticated ctl.sock path before
 		// generic route lookup. Keep direct route-selection callers fail-closed.
-		return Route{Kind: KindDeny}
+		return KindDeny
 	default:
 		// HTTP parsing rejects unknown services before route lookup. Keep direct
 		// callers fail-closed as an unsupported target.
-		return Route{Kind: KindDeny}
+		return KindDeny
+	}
+}
+
+// RouteForTarget builds a dial target from a freshly read running sandbox.
+func RouteForTarget(profile types.Profile, envdUDS, ciUDS, floatingIP string, target ConnectTarget) Route {
+	kind := routeKindForTarget(profile, target)
+	switch kind {
+	case KindUDS:
+		uds := envdUDS
+		if target.Service == ConnectServiceE2BInterpreter ||
+			(target.Service == ConnectServiceLegacy && target.Port == 49999) {
+			uds = ciUDS
+		}
+		return Route{Kind: kind, UDS: uds}
+	case KindTCP:
+		return Route{Kind: kind, Addr: fmt.Sprintf("%s:%d", floatingIP, target.Port)}
+	default:
+		return Route{Kind: kind}
 	}
 }
 
@@ -205,25 +251,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, LegacyTarget(port))
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+	route, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
+	if !ok {
 		return
 	}
 	switch route.Kind {
-	case KindNotFound:
-		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
-	case KindDeny:
-		p.mx.Inc(`data_requests_total{result="denied"}`)
-		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
 	case KindUDS, KindTCP:
-		if !p.authorized(r, route, port) {
-			p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-			writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
-			return
-		}
 		backend, err := p.dial(r.Context(), route)
 		if err != nil {
 			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
@@ -240,10 +273,60 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer resp.Body.Close()
 		p.mx.Inc(`data_requests_total{result="ok"}`)
 		WriteHTTPResponse(w, resp)
-	default:
+	default: // ActivateRoute returned a non-dialable route despite admission.
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 	}
+}
+
+// admitRoute is the common ordinary HTTP/non-exec CONNECT admission sequence:
+// side-effect-free lookup, authorization, binding-revalidating activation, then
+// a freshly resolved dial route.
+func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, bool) {
+	binding, found, err := p.router.LookupRoute(r.Context(), sid, target)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+		return Route{}, false
+	}
+	if !found {
+		p.mx.Inc(`data_requests_total{result="notfound"}`)
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
+		return Route{}, false
+	}
+	switch binding.Kind {
+	case KindDeny:
+		p.mx.Inc(`data_requests_total{result="denied"}`)
+		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
+		return Route{}, false
+	case KindUDS, KindTCP:
+	default:
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+		return Route{}, false
+	}
+	if !p.authorized(r, binding) {
+		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
+		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
+		return Route{}, false
+	}
+	route, found, err := p.router.ActivateRoute(r.Context(), binding)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "sandbox activation failed", ProxyErrorRouteError)
+		return Route{}, false
+	}
+	if !found {
+		p.mx.Inc(`data_requests_total{result="notfound"}`)
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
+		return Route{}, false
+	}
+	if route.Kind != binding.Kind || (route.Kind != KindUDS && route.Kind != KindTCP) {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+		return Route{}, false
+	}
+	return route, true
 }
 
 // ParseSandbox extracts (sid, port) from the Host header <port>-<sid>.<domain>,

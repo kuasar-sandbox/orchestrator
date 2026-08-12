@@ -242,7 +242,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := o.Route(ctx, sid, proxy.LegacyTarget(49983))
+			_, err := activateRouteForTest(ctx, o, sid, proxy.LegacyTarget(49983))
 			errs <- err
 		}()
 	}
@@ -258,7 +258,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		})
 	}
 	timer := time.AfterFunc(100*time.Millisecond, releaseStart)
-	_, routeErr := o.Route(ctx, sid, proxy.LegacyTarget(49983))
+	_, routeErr := activateRouteForTest(ctx, o, sid, proxy.LegacyTarget(49983))
 	returnedBeforeRelease := timer.Stop()
 	if returnedBeforeRelease {
 		releaseStart()
