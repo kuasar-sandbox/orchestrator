@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -36,9 +37,15 @@ type trafficShard struct {
 
 type trafficEntry struct {
 	mu          sync.Mutex
+	generation  uint64
 	revision    uint64
 	lastChanged timePoint
 	services    map[string]serviceState
+}
+
+type trafficVersion struct {
+	generation uint64
+	revision   uint64
 }
 
 type serviceState struct {
@@ -50,13 +57,17 @@ type serviceState struct {
 type WorkerStats struct {
 	shards [trafficShardCount]trafficShard
 	now    func() timePoint
+	// nextGeneration prevents an entry recreated after GC from reusing the
+	// identity captured by an older in-flight batch acknowledgement. It advances
+	// only on entry creation; hot-path state changes retain per-entry revisions.
+	nextGeneration atomic.Uint64
 
 	counterMu       sync.Mutex
 	counters        map[string]uint64
 	counterRevision uint64
 
 	dirtyMu          sync.Mutex
-	dirtyTraffic     map[string]uint64
+	dirtyTraffic     map[string]trafficVersion
 	dirtyCountersRev uint64
 	removed          map[string]uint64
 	removeRevision   uint64
@@ -67,7 +78,7 @@ func NewWorkerStats() *WorkerStats {
 	w := &WorkerStats{
 		now:          currentTimePoint,
 		counters:     make(map[string]uint64),
-		dirtyTraffic: make(map[string]uint64),
+		dirtyTraffic: make(map[string]trafficVersion),
 		removed:      make(map[string]uint64),
 		notify:       make(chan struct{}, 1),
 	}
@@ -106,9 +117,9 @@ func (w *WorkerStats) BeginParking(sandboxID string, service proxy.ConnectServic
 	entry.services[serviceName] = state
 	entry.revision++
 	entry.lastChanged = w.now()
-	revision := entry.revision
+	version := trafficVersion{generation: entry.generation, revision: entry.revision}
 	entry.mu.Unlock()
-	w.markTraffic(sandboxID, revision)
+	w.markTraffic(sandboxID, version)
 	return &trafficFlow{worker: w, sandboxID: sandboxID, service: serviceName, entry: entry, stage: flowParking}
 }
 
@@ -117,7 +128,11 @@ func (w *WorkerStats) lockEntry(sandboxID string, create bool) *trafficEntry {
 	shard.mu.Lock()
 	entry := shard.entries[sandboxID]
 	if entry == nil && create {
-		entry = &trafficEntry{services: make(map[string]serviceState), lastChanged: w.now()}
+		entry = &trafficEntry{
+			generation:  w.nextGeneration.Add(1),
+			services:    make(map[string]serviceState),
+			lastChanged: w.now(),
+		}
 		shard.entries[sandboxID] = entry
 	}
 	if entry != nil {
@@ -136,11 +151,13 @@ func shardIndex(s string) int {
 	return int(hash % trafficShardCount)
 }
 
-func (w *WorkerStats) markTraffic(sandboxID string, revision uint64) {
+func (w *WorkerStats) markTraffic(sandboxID string, version trafficVersion) {
 	w.dirtyMu.Lock()
 	delete(w.removed, sandboxID)
-	if revision > w.dirtyTraffic[sandboxID] {
-		w.dirtyTraffic[sandboxID] = revision
+	current, found := w.dirtyTraffic[sandboxID]
+	if !found || version.generation > current.generation ||
+		(version.generation == current.generation && version.revision > current.revision) {
+		w.dirtyTraffic[sandboxID] = version
 	}
 	w.dirtyMu.Unlock()
 	w.signal()
@@ -198,11 +215,11 @@ func (f *trafficFlow) AttachBackend(conn net.Conn) net.Conn {
 	f.entry.services[f.service] = state
 	f.entry.revision++
 	f.entry.lastChanged = f.worker.now()
-	revision := f.entry.revision
+	version := trafficVersion{generation: f.entry.generation, revision: f.entry.revision}
 	f.entry.mu.Unlock()
 	f.stage = flowEgress
 	f.mu.Unlock()
-	f.worker.markTraffic(f.sandboxID, revision)
+	f.worker.markTraffic(f.sandboxID, version)
 	return &trackedConn{Conn: conn, flow: f}
 }
 
@@ -225,11 +242,11 @@ func (f *trafficFlow) Close() {
 	f.entry.services[f.service] = state
 	f.entry.revision++
 	f.entry.lastChanged = f.worker.now()
-	revision := f.entry.revision
+	version := trafficVersion{generation: f.entry.generation, revision: f.entry.revision}
 	f.entry.mu.Unlock()
 	f.stage = flowClosed
 	f.mu.Unlock()
-	f.worker.markTraffic(f.sandboxID, revision)
+	f.worker.markTraffic(f.sandboxID, version)
 }
 
 func (f *trafficFlow) finishEgress() {
@@ -249,11 +266,11 @@ func (f *trafficFlow) finishEgress() {
 	f.entry.services[f.service] = state
 	f.entry.revision++
 	f.entry.lastChanged = f.worker.now()
-	revision := f.entry.revision
+	version := trafficVersion{generation: f.entry.generation, revision: f.entry.revision}
 	f.entry.mu.Unlock()
 	f.stage = flowClosed
 	f.mu.Unlock()
-	f.worker.markTraffic(f.sandboxID, revision)
+	f.worker.markTraffic(f.sandboxID, version)
 }
 
 type trackedConn struct {
@@ -293,7 +310,7 @@ func (inertFlow) Close()                               {}
 type pendingBatch struct {
 	frame           Frame
 	counterRevision uint64
-	trafficRevision map[string]uint64
+	trafficRevision map[string]trafficVersion
 	removeRevision  map[string]uint64
 }
 
@@ -319,7 +336,7 @@ func (w *WorkerStats) nextBatch(epoch, sequence uint64) (pendingBatch, bool) {
 	}
 	batch := pendingBatch{
 		frame:           Frame{Type: TypeUpdate, Version: Version, Epoch: epoch, Sequence: sequence},
-		trafficRevision: make(map[string]uint64, len(dirtySIDs)),
+		trafficRevision: make(map[string]trafficVersion, len(dirtySIDs)),
 	}
 	if dirtyCounters != 0 {
 		w.counterMu.Lock()
@@ -333,7 +350,7 @@ func (w *WorkerStats) nextBatch(epoch, sequence uint64) (pendingBatch, bool) {
 			continue
 		}
 		batch.frame.Traffic = append(batch.frame.Traffic, snapshotEntry(sid, entry))
-		batch.trafficRevision[sid] = entry.revision
+		batch.trafficRevision[sid] = trafficVersion{generation: entry.generation, revision: entry.revision}
 		entry.mu.Unlock()
 	}
 	if len(batch.frame.Counters) == 0 && len(batch.frame.Traffic) == 0 {

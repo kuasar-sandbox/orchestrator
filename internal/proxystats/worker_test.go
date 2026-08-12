@@ -277,3 +277,41 @@ func TestGCRouteLookupDoesNotBlockTrafficAndRechecksEntry(t *testing.T) {
 	}
 	active.Close()
 }
+
+func TestOldBatchAckPreservesRecreatedEntryDirtyState(t *testing.T) {
+	worker := NewWorkerStats()
+	point := timePoint{wall: time.Now().UTC(), bootNS: 100}
+	worker.now = func() timePoint { return point }
+
+	oldFlow := worker.BeginParking("s1", proxy.ConnectServiceForward)
+	oldFlow.Close()
+	oldBatch, ok := worker.nextBatch(1, 2)
+	if !ok || len(oldBatch.frame.Traffic) != 1 {
+		t.Fatalf("old pending batch = %+v, present=%v", oldBatch, ok)
+	}
+
+	point = timePoint{wall: point.wall.Add(time.Hour), bootNS: int64(time.Hour)}
+	worker.gc(func(string) bool { return false }, time.Minute)
+	if entry := worker.lockEntry("s1", false); entry != nil {
+		entry.mu.Unlock()
+		t.Fatal("GC did not remove the old idle entry")
+	}
+
+	// Recreate enough state to reuse the old entry-local revision. The old
+	// implementation assigned revision 2 to both states, so acknowledging the
+	// stale idle batch erased this parking update.
+	first := worker.BeginParking("s1", proxy.ConnectServiceForward)
+	second := worker.BeginParking("s1", proxy.ConnectServiceForward)
+	worker.ack(oldBatch)
+
+	newBatch, ok := worker.nextBatch(1, 3)
+	if !ok || len(newBatch.frame.Traffic) != 1 {
+		t.Fatalf("recreated entry update was cleared by old ack: %+v, present=%v", newBatch, ok)
+	}
+	state := newBatch.frame.Traffic[0].Services[string(proxy.ConnectServiceForward)]
+	if state.Parking != 2 || state.Egress != 0 {
+		t.Fatalf("recreated entry snapshot = %+v, want parking=2 egress=0", state)
+	}
+	first.Close()
+	second.Close()
+}
