@@ -35,12 +35,12 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
                                └────────────── placer consumes one owner
 ```
 
-稳态数据面不经过 registry.只有显式 create/connect/exec-session,已知 route 激活和
-cache miss/fail-fast 路径需要 registry:
+稳态数据面不经过 registry.只有显式 create/connect/exec-session,以及数据面 target 缺失或
+typed stale fallback 路径需要 registry:
 
 - `POST /route-link/reserve` 以 `operation=create|connect|exec-session|data` 区分四种操作.create 直接
-  Reserve;connect/exec-session 由 registry 经 node-link 完成;data 在 cache miss/fail-fast 时先 `Resolve`,只对已知
-  非 READY route 做 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
+  Reserve;connect/exec-session 由 registry 经 node-link 完成;data 只在 route 缺少完整 node target 或
+  node proxy 返回 typed stale 时 Reserve。未知 route 不会隐式创建 sandbox。显式 build register 调用
   `ReserveBuild`。
 - registry 调 placer `PlaceSandbox` / `PlaceBuild`。
 - registry 经 node owner 下发 create/connect/exec_session/delete/build/key 命令.
@@ -862,14 +862,17 @@ router 是无状态北向入口,但持本地缓存:
 ```text
 request(group, route_key, sandbox_id)
   │
-  ├─ READY route cache hit ────────► node proxy
-  ├─ non-READY route cache hit ────► data Reserve ──► node proxy
+  ├─ cache hit with node target ───► node proxy (ready/paused/starting)
+  ├─ cache hit without target ─────► data Reserve ──► node proxy
   │
-  └─ miss/fail-fast ───────────────► route owner Resolve
+  └─ miss ─────────────────────────► route owner Resolve
                                       │
-                                      ├─ READY ─────────────► node proxy
-                                      └─ known non-READY ───► Reserve ──► node proxy
+                                      ├─ complete target ───► node proxy
+                                      └─ missing target ────► Reserve ──► node proxy
 ```
+
+node proxy 在 CONNECT 握手返回 typed `not_found`/`unauthorized` 时,Router 淘汰旧 target,以同一
+credential 调用一次 `ReserveData` 复验并刷新 route,然后只重试一次。普通连接失败只淘汰 cache。
 
 未知 route 的数据面请求在 Resolve 后返回 not found,不会触发 sandbox 创建。
 命中 route 后,Router 在 node 边界把公开 SandboxID 转换为 NodeSandboxID:控制面重写路径,
@@ -920,9 +923,10 @@ Node 负责以本地受信 profile 完成最终 backend 选择;特别地,bare �
 
 `service=exec` 只接受 CONNECT 并始终 enforce KAT.Router 先做无副作用 Resolve/cache
 lookup,以 stable `AuthSandboxID + ServiceSecret` 验证原始 `X-Access-Token`.无效 token
-立即返回 401,不得进入 Reserve.非 READY route 在 Router 鉴权通过后才可以调用
+立即返回 401,不得进入 node CONNECT 或 Reserve。已有完整 node target 时,不论
+ready/paused/starting 都直接连接 node proxy;target 缺失或 node 返回 typed stale 时才调用
 `Reserve(operation=data)`,Registry 以同一 stable subject 和 ServiceSecret 复验后才能下发
-CmdConnect.Router 随后重读 current route,构造第二跳 CONNECT:
+CmdConnect。Router 随后使用 fresh route 构造第二跳 CONNECT:
 
 ```text
 E2b-Sandbox-Id:      <current NodeSandboxID>
@@ -933,7 +937,7 @@ X-Access-Token:      <same KAT>
 
 两跳之间只重写 stable SID 为 NodeSandboxID,service/port/token 值和 token Header 都不变;
 最终 node 以本地 route 再次验证同一 KAT,之后才能 resume 和连接 `ctl.sock`.
-READY cache hot path 不增加 Registry RPC,但 Router/node 两层验证仍保留.
+完整 target 的 cache hot path 不增加 Registry RPC,但 Router/node 两层验证仍保留.
 KAT 绑定 stable AuthSandboxID 而不绑定 NodeSandboxID/generation,因此同一逻辑沙箱的同节点
 resume,跨节点迁移或 re-place 不要求客户端重签;新 CONNECT 始终进入当前 NodeSandboxID.
 
@@ -1073,7 +1077,7 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 
 ## 15. 性能
 
-- 数据面热路径:router READY route cache 命中后直转 node,不访问 registry。
+- 数据面热路径:router 命中完整 node target 后直转 node,包括 paused/starting,不访问 registry。
 - Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 在线校验/admission；失败候选排除后重选。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
