@@ -47,6 +47,7 @@ PROXY_VETH_NS="${PROXY_VETH_NS:-e2epn0}"
 PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.254.1}"
 PROXY_NS_IP="${PROXY_NS_IP:-172.31.254.2}"
 FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
+PROXY_WORKERS=2
 
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
@@ -92,12 +93,21 @@ fi
 IMMEDIATE_EXEC_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
+PROXY_TIMELINE_START_MS=""
 cleanup() {
     set +e
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     [ -n "$IMMEDIATE_EXEC_PID" ] && kill "$IMMEDIATE_EXEC_PID" 2>/dev/null
-    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    [ -n "$IMMEDIATE_EXEC_PID" ] && wait "$IMMEDIATE_EXEC_PID" 2>/dev/null
+    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
+        p="${PIDS[$i]}"
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+    done
+    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
+        p="${PIDS[$i]}"
+        [ -n "$p" ] && wait "$p" 2>/dev/null
+    done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null
@@ -114,14 +124,18 @@ trap cleanup EXIT
 
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; sleep 0.5; done; fail "$3 did not open $1:$2"; }
-wait_mmds_listener() {
-    local hex
-    hex="$(printf '%04X' "$MMDS_PORT")"
-    for _ in $(seq 1 60); do
-        ip netns exec "$PROXY_NETNS" awk -v p=":$hex" '$2 ~ p && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null && return 0
-        sleep 0.5
-    done
-    fail "mmds listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
+monotonic_ms() { awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime; }
+proxy_timeline() {
+    local now elapsed
+    now="$(monotonic_ms)"
+    elapsed=$((now - ${PROXY_TIMELINE_START_MS:-now}))
+    printf '==> proxy-startup +%dms: %s\n' "$elapsed" "$*"
+}
+process_live() {
+    local state
+    [ -r "/proc/$1/stat" ] || return 1
+    state="$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null || true)"
+    [ -n "$state" ] && [ "$state" != Z ] && [ "$state" != X ]
 }
 child_worker_pids() {
     local parent="$1" p stat ppid cmd
@@ -135,19 +149,88 @@ child_worker_pids() {
         case "$cmd" in *"node-ctl proxy serve"*"--worker"*) printf '%s\n' "$p";; esac
     done
 }
-wait_proxy_workers_in_netns() {
-    local master="$1" target workers got
-    target="$(stat -Lc '%i' "/var/run/netns/$PROXY_NETNS")"
-    for _ in $(seq 1 60); do
+dump_proxy_startup_state() {
+    local pid workers
+    proxy_timeline "capturing failed readiness state"
+    workers="$(child_worker_pids "${PROXY_MASTER_PID:-0}" | tr '\n' ' ')"
+    echo "==> proxy startup processes:"
+    for pid in "${CONDUCTOR_PID:-}" "${PROXY_MASTER_PID:-}" $workers; do
+        [ -n "$pid" ] || continue
+        ps -o pid=,ppid=,stat=,lstart=,etime=,cmd= -p "$pid" 2>/dev/null || true
+    done
+    echo "==> network namespaces:"
+    ip netns list 2>&1 || true
+    echo "==> proxy host link:"
+    ip -details link show "$PROXY_VETH_HOST" 2>&1 || true
+    echo "==> host data listener:"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntp "sport = :$PROXY_PORT" 2>&1 || true
+    else
+        cat /proc/net/tcp 2>&1 || true
+    fi
+    echo "==> proxy namespace links:"
+    ip netns exec "$PROXY_NETNS" ip -br link 2>&1 || true
+    echo "==> proxy namespace addresses:"
+    ip netns exec "$PROXY_NETNS" ip -br address 2>&1 || true
+    echo "==> proxy namespace routes:"
+    ip netns exec "$PROXY_NETNS" ip route 2>&1 || true
+    echo "==> proxy namespace IPv4 listeners:"
+    ip netns exec "$PROXY_NETNS" cat /proc/net/tcp 2>&1 || true
+    echo "==> proxy namespace IPv6 listeners:"
+    ip netns exec "$PROXY_NETNS" cat /proc/net/tcp6 2>&1 || true
+    dump_logs
+}
+fail_proxy_startup() {
+    dump_proxy_startup_state
+    fail "$*"
+}
+wait_external_proxy_ready() {
+    local master="$1" deadline now endpoint target data_ready mmds_ready workers_ready
+    local workers worker_count worker_ns wp got state last_state=""
+    endpoint="$(python3 - "$PROXY_NS_IP" "$MMDS_PORT" <<'PY'
+import socket, sys
+print(f"{socket.inet_aton(sys.argv[1])[::-1].hex().upper()}:{int(sys.argv[2]):04X}")
+PY
+)"
+    target="$(stat -Lc '%i' "/var/run/netns/$PROXY_NETNS" 2>/dev/null || true)"
+    [ -n "$target" ] || fail_proxy_startup "proxy_netns=$PROXY_NETNS disappeared before readiness"
+    deadline=$(($(monotonic_ms) + 30000))
+    data_ready=0
+    mmds_ready=0
+    workers_ready=0
+    while :; do
+        process_live "$master" || fail_proxy_startup "proxy master pid $master exited before readiness"
+        data_ready=0
+        (exec 3<>"/dev/tcp/127.0.0.1/$PROXY_PORT") 2>/dev/null && data_ready=1
+        mmds_ready=0
+        # shellcheck disable=SC2016 # endpoint is supplied to awk through -v.
+        ip netns exec "$PROXY_NETNS" awk -v e="$endpoint" \
+            '$2 == e && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' \
+            /proc/net/tcp 2>/dev/null && mmds_ready=1
         workers="$(child_worker_pids "$master" | tr '\n' ' ')"
-        [ -n "$workers" ] && break
-        sleep 0.5
+        worker_count=0
+        worker_ns=1
+        for wp in $workers; do
+            worker_count=$((worker_count + 1))
+            got="$(stat -Lc '%i' "/proc/$wp/ns/net" 2>/dev/null || true)"
+            [ "$got" = "$target" ] || worker_ns=0
+        done
+        workers_ready=0
+        [ "$worker_count" -eq "$PROXY_WORKERS" ] && [ "$worker_ns" -eq 1 ] && workers_ready=1
+        state="data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns"
+        if [ "$state" != "$last_state" ]; then
+            proxy_timeline "readiness progress: $state"
+            last_state="$state"
+        fi
+        if [ "$data_ready" -eq 1 ] && [ "$mmds_ready" -eq 1 ] && [ "$workers_ready" -eq 1 ]; then
+            proxy_timeline "master pid=$master registered; data and MMDS listeners ready; workers=[$workers] in proxy_netns=$PROXY_NETNS"
+            return 0
+        fi
+        now="$(monotonic_ms)"
+        [ "$now" -lt "$deadline" ] || break
+        sleep 0.1
     done
-    [ -n "${workers:-}" ] || fail "proxy workers did not start under master pid $master"
-    for wp in $workers; do
-        got="$(stat -Lc '%i' "/proc/$wp/ns/net" 2>/dev/null || true)"
-        [ "$got" = "$target" ] || fail "proxy worker $wp netns inode=$got, want proxy_netns inode=$target"
-    done
+    fail_proxy_startup "external proxy readiness timed out after 30s (master=$master data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns)"
 }
 setup_proxy_netns() {
     ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
@@ -336,7 +419,10 @@ echo "==> store-ctl + zot up; built+seeded $REF"
 # needs a network slot and reaches zot via the mgmt VIP.
 MGMT_VIP="169.254.169.254"
 MMDS_PORT="$(free_port)"
+PROXY_TIMELINE_START_MS="$(monotonic_ms)"
+proxy_timeline "setting up proxy_netns=$PROXY_NETNS"
 setup_proxy_netns
+proxy_timeline "proxy_netns=$PROXY_NETNS links, address, and route configured"
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true; ip netns del "$SWITCH" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
@@ -401,12 +487,15 @@ EOF
 echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
+CONDUCTOR_PID="${PIDS[-1]}"
+proxy_timeline "conductor pid=$CONDUCTOR_PID launched"
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { dump_logs; skip "orchestrator exited"; }
     sleep 0.5
 done
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
+proxy_timeline "conductor health and config socket ready"
 
 echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_PORT, workers=2)"
 # The master reads local worker/bootstrap settings from proxy.yaml and receives
@@ -423,7 +512,7 @@ proxy_netns: $PROXY_NETNS
 proxy_socket: $PROXY_SOCK
 shm_path: $WORK/run/proxy-routes.shm
 route_capacity: 1024
-workers: 2
+workers: $PROXY_WORKERS
 auth: enforce
 park_timeout: 120s
 metrics_listen: 127.0.0.1:$METRICS_PORT
@@ -432,9 +521,8 @@ EOF
 PIDS+=($!)
 PROXY_MASTER_PID="${PIDS[-1]}"
 PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
-wait_port 127.0.0.1 "$PROXY_PORT" proxy
-wait_mmds_listener
-wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+proxy_timeline "master pid=$PROXY_MASTER_PID launched"
+wait_external_proxy_ready "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
 echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
 
@@ -549,26 +637,23 @@ sys.stdout.write("\nOUTPUT_END\n")
 PY
 
 restart_external_proxy_fresh() {
-    local log="$1" old_pid="$PROXY_MASTER_PID" old_workers worker stopped
+    local log="$1" old_pid="$PROXY_MASTER_PID" old_workers worker
+    PROXY_TIMELINE_START_MS="$(monotonic_ms)"
     old_workers="$(child_worker_pids "$old_pid")"
+    proxy_timeline "terminating master pid=$old_pid with workers=[$(printf '%s' "$old_workers" | tr '\n' ' ')]"
     kill -TERM "$old_pid" 2>/dev/null || true
     wait "$old_pid" 2>/dev/null || true
     PIDS[$PROXY_MASTER_PID_SLOT]=""
     for worker in $old_workers; do
-        stopped=""
-        for _ in $(seq 1 40); do
-            kill -0 "$worker" 2>/dev/null || { stopped=1; break; }
-            sleep 0.25
-        done
-        [ -n "$stopped" ] || return 1
+        process_live "$worker" && fail_proxy_startup "proxy worker $worker survived master pid $old_pid shutdown"
     done
+    proxy_timeline "master pid=$old_pid exited and inherited listeners were released"
     "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$log" 2>&1 &
     PROXY_MASTER_PID=$!
     PIDS+=("$PROXY_MASTER_PID")
     PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
-    wait_port 127.0.0.1 "$PROXY_PORT" proxy
-    wait_mmds_listener
-    wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+    proxy_timeline "replacement master pid=$PROXY_MASTER_PID launched after pid=$old_pid exited"
+    wait_external_proxy_ready "$PROXY_MASTER_PID"
 }
 
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
