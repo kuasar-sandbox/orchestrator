@@ -9,6 +9,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
@@ -373,4 +374,44 @@ func (m *MasterStats) WorkerIDs() []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// RunGC bounds query-created run markers for sandboxes that never produced a
+// worker traffic entry (and therefore cannot later emit a remove frame). Route
+// lookup runs without the aggregate lock; a delete/recreate race can only drop a
+// marker and make the next idle boundary more conservative.
+func (m *MasterStats) RunGC(ctx context.Context, routeExists func(string) bool, interval time.Duration) {
+	if routeExists == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.pruneRunMarkers(routeExists)
+		}
+	}
+}
+
+func (m *MasterStats) pruneRunMarkers(routeExists func(string) bool) {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.runSince))
+	for sandboxID := range m.runSince {
+		ids = append(ids, sandboxID)
+	}
+	m.mu.Unlock()
+	for _, sandboxID := range ids {
+		if routeExists(sandboxID) {
+			continue
+		}
+		m.mu.Lock()
+		delete(m.runSince, sandboxID)
+		m.mu.Unlock()
+	}
 }

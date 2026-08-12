@@ -109,6 +109,10 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 	mx := metrics.New()
 	masterStats := proxystats.NewMasterStats(mx, workerIDs)
+	go masterStats.RunGC(ctx, func(sandboxID string) bool {
+		_, found := table.Lookup(sandboxID)
+		return found
+	}, time.Minute)
 	statsServer := proxystats.NewStatsServer(masterStats, table.Synced, func(sandboxID string) (proxystats.RouteIdentity, bool) {
 		route, found := table.Lookup(sandboxID)
 		if !found {

@@ -252,12 +252,14 @@ func runConductor(args []string, log *slog.Logger) error {
 				log.Error("internal proxy stats sender", "err", err)
 			}
 		}()
-		go internalWorkerStats.RunGC(ctx, func(sandboxID string) bool {
+		routeExists := func(sandboxID string) bool {
 			_, found, err := core.LookupExec(ctx, sandboxID)
 			// A transient store failure must retain the entry; only a definitive
 			// route miss permits removal of its idle timestamp.
 			return err != nil || found
-		}, 5*time.Minute)
+		}
+		go internalWorkerStats.RunGC(ctx, routeExists, 5*time.Minute)
+		go masterStats.RunGC(ctx, routeExists, time.Minute)
 		core.SetSandboxTrafficProvider(masterStats)
 	case config.ProxyExternal:
 		core.SetSandboxTrafficProvider(&externalTrafficProvider{plugins: plugins})

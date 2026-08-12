@@ -213,3 +213,34 @@ func TestMasterRunBaselineStartsOnlyWhenObservedRunning(t *testing.T) {
 		t.Fatalf("running baseline = %+v err=%v, want >= %s", running, err, point.wall)
 	}
 }
+
+func TestMasterPrunesQueryOnlyRunMarkersWithoutHoldingLockAcrossLookup(t *testing.T) {
+	master := NewMasterStats(metrics.New(), []string{"w0"})
+	readyWorker(t, master, "w0", 1)
+	if _, err := master.SandboxTrafficStats(context.Background(), "deleted", "run-1", types.ProfileBare, types.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	lookupEntered := make(chan struct{})
+	releaseLookup := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		master.pruneRunMarkers(func(string) bool {
+			close(lookupEntered)
+			<-releaseLookup
+			return false
+		})
+		close(done)
+	}()
+	<-lookupEntered
+	if !master.Available() {
+		t.Fatal("route lookup held the master aggregate lock")
+	}
+	close(releaseLookup)
+	<-done
+	master.mu.Lock()
+	_, retained := master.runSince["deleted"]
+	master.mu.Unlock()
+	if retained {
+		t.Fatal("query-only deleted run marker was retained")
+	}
+}
