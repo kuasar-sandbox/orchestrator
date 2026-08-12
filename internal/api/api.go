@@ -264,6 +264,7 @@ type Core interface {
 	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
+	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
 
 	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
 	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
@@ -318,6 +319,24 @@ type ResourceStats struct {
 	MemAllocatable *uint64  `json:"memAllocatable,omitempty"`
 }
 
+type TrafficInflight struct {
+	Parking uint64 `json:"parking"`
+	Egress  uint64 `json:"egress"`
+}
+
+type ServiceTrafficStats struct {
+	Parking   uint64     `json:"parking"`
+	Egress    uint64     `json:"egress"`
+	IdleSince *time.Time `json:"idleSince,omitempty"`
+}
+
+type TrafficStats struct {
+	State     string                         `json:"state"`
+	Inflight  TrafficInflight                `json:"inflight"`
+	IdleSince *time.Time                     `json:"idleSince,omitempty"`
+	Services  map[string]ServiceTrafficStats `json:"services"`
+}
+
 type API struct {
 	core   Core
 	domain string
@@ -336,6 +355,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes", a.auth(a.create))
 	mux.HandleFunc("GET /sandboxes/{id}", a.auth(a.get))
 	mux.HandleFunc("GET /sandboxes/{id}/stats/resource", a.auth(a.resourceStats))
+	mux.HandleFunc("GET /sandboxes/{id}/stats/traffic", a.auth(a.trafficStats))
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
@@ -439,6 +459,16 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 func (a *API) resourceStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	stats, err := a.core.ResourceStats(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
+	if err != nil {
+		a.failStats(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (a *API) trafficStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	stats, err := a.core.TrafficStats(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()))
 	if err != nil {
 		a.failStats(w, err)
 		return

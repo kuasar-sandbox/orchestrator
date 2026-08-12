@@ -14,10 +14,18 @@ type SandboxResourceProvider interface {
 	SandboxResourceStats(sandboxID string) (api.ResourceStats, bool)
 }
 
+type SandboxTrafficProvider interface {
+	SandboxTrafficStats(ctx context.Context, sandboxID, runID string, profile types.Profile, state types.State) (*api.TrafficStats, error)
+}
+
 // SetSandboxResourceProvider wires the controller hosted by node-ctl serve.
 // A nil provider represents the static-cgroup/controller-disabled mode.
 func (o *Orchestrator) SetSandboxResourceProvider(provider SandboxResourceProvider) {
 	o.resourceStats = provider
+}
+
+func (o *Orchestrator) SetSandboxTrafficProvider(provider SandboxTrafficProvider) {
+	o.trafficStats = provider
 }
 
 // ResourceStats authenticates ownership before consulting node-local controller
@@ -44,4 +52,18 @@ func (o *Orchestrator) ResourceStats(ctx context.Context, id, apiKey string) (*a
 	default:
 		return nil, api.ErrStatsConflict
 	}
+}
+
+func (o *Orchestrator) TrafficStats(ctx context.Context, id, apiKey string) (*api.TrafficStats, error) {
+	sb, err := o.st.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ownsSandbox(sb, apiKey) {
+		return nil, api.ErrNotFound
+	}
+	if o.trafficStats == nil {
+		return nil, api.ErrStatsUnsupported
+	}
+	return o.trafficStats.SandboxTrafficStats(ctx, sb.ID, sb.RunID, sb.Profile, sb.State)
 }

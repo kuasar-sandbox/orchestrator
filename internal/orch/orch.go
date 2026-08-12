@@ -86,6 +86,7 @@ type Orchestrator struct {
 
 	probe         ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 	resourceStats SandboxResourceProvider
+	trafficStats  SandboxTrafficProvider
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
