@@ -30,9 +30,9 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	}
 	if !found {
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		// The KAT was admitted and parking has started, so this is not a
-		// pre-admission stale response that a cluster router may safely retry.
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
+		// LookupExec is side-effect-free and no credential has been admitted, so a
+		// chained cluster router may safely treat this as a stale node-local route.
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
 		return
 	}
 
@@ -59,7 +59,9 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	}
 	if !found {
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
+		// The KAT was admitted and parking has started, so this is not a
+		// pre-admission stale response that a cluster router may safely retry.
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
 		return
 	}
 	// ActivateExec must preserve the exact node-local and credential identity
