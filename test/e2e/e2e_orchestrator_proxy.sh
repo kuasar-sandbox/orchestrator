@@ -615,12 +615,14 @@ sys.stdout.buffer.write(out)
 sys.stdout.write("\nOUTPUT_END\n")
 PY
 
-restart_external_proxy_fresh() {
-    local log="$1" old_pid="$PROXY_MASTER_PID" old_workers worker stopped
+stop_external_proxy() {
+    local old_pid="$PROXY_MASTER_PID" old_workers worker stopped
+    [ -n "$old_pid" ] || return 0
     old_workers="$(child_worker_pids "$old_pid")"
     kill -TERM "$old_pid" 2>/dev/null || true
     wait "$old_pid" 2>/dev/null || true
     PIDS[$PROXY_MASTER_PID_SLOT]=""
+    PROXY_MASTER_PID=""
     for worker in $old_workers; do
         stopped=""
         for _ in $(seq 1 40); do
@@ -629,6 +631,11 @@ restart_external_proxy_fresh() {
         done
         [ -n "$stopped" ] || return 1
     done
+}
+
+restart_external_proxy_fresh() {
+    local log="$1"
+    stop_external_proxy || return 1
     "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$log" 2>&1 &
     PROXY_MASTER_PID=$!
     PIDS+=("$PROXY_MASTER_PID")
@@ -813,5 +820,7 @@ fi
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || { dump_logs; fail "kill=$code (want 204)"; }
 echo "==> PASS: sandbox killed"
+stop_external_proxy || { dump_logs; fail "proxy master shutdown left a worker alive"; }
+echo "==> PASS: proxy master shutdown reaped all worker processes"
 echo
 echo "==> e2e_orchestrator_proxy: OK   (template $TEMPLATE, sandbox $SID, external proxy on :$PROXY_PORT)"

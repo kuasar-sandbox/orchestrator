@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -160,8 +161,13 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
 	}
 
+	var supervisors sync.WaitGroup
 	for i := 0; i < cfg.Workers; i++ {
-		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, masterStats, log)
+		supervisors.Add(1)
+		go func(index int) {
+			defer supervisors.Done()
+			superviseProxyWorker(ctx, index, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, masterStats, log)
+		}(i)
 	}
 
 	log.Info("node-ctl proxy master serving",
@@ -176,6 +182,10 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"route_capacity", cfg.RouteCapacity,
 	)
 	<-ctx.Done()
+	// A worker owns inherited listener and stats FDs until cmd.Wait confirms its
+	// exit. Do not let the master return (and become unable to reap children)
+	// while a supervisor is still terminating its current worker.
+	supervisors.Wait()
 	return nil
 }
 
