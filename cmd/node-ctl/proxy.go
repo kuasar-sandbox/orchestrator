@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -68,6 +69,19 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 	defer table.Close()
 	defer os.Remove(cfg.ShmPath)
+	masterCtx, cancelMaster := context.WithCancel(ctx)
+	var masterWG sync.WaitGroup
+	defer func() {
+		cancelMaster()
+		masterWG.Wait()
+	}()
+	startMasterTask := func(task func()) {
+		masterWG.Add(1)
+		go func() {
+			defer masterWG.Done()
+			task()
+		}()
+	}
 
 	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), log)
 	if err := table.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)}); err != nil {
@@ -84,7 +98,9 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
-	go routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(ctx)
+	startMasterTask(func() {
+		routesync.NewSubscriber(dial, routesync.ProxyPluginID, reg, view, view, log).Run(masterCtx)
+	})
 
 	proxyNS, err := openProxyNetNS(cfg.ProxyNetNS)
 	if err != nil {
@@ -110,7 +126,7 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	var mmdsLn net.Listener
-	mmdsPolicy, ok := view.WaitPolicy(ctx)
+	mmdsPolicy, ok := view.WaitPolicy(masterCtx)
 	if !ok {
 		return nil
 	}
@@ -126,11 +142,14 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 
 	mx := metrics.New()
 	if cfg.MetricsListen != "" {
-		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
+		startMasterTask(func() { serveMetrics(masterCtx, cfg.MetricsListen, mx, log) })
 	}
 
 	for i := 0; i < cfg.Workers; i++ {
-		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
+		idx := i
+		startMasterTask(func() {
+			superviseProxyWorker(masterCtx, idx, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
+		})
 	}
 
 	log.Info("node-ctl proxy master serving",
@@ -143,7 +162,10 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"shm_path", cfg.ShmPath,
 		"route_capacity", cfg.RouteCapacity,
 	)
-	<-ctx.Done()
+	<-masterCtx.Done()
+	// The deferred cancellation/join keeps the route subscriber away from an
+	// unmapped table and reaps workers before their inherited listeners can outlive
+	// the master. It also runs on partial-startup errors, not only signal shutdown.
 	return nil
 }
 
