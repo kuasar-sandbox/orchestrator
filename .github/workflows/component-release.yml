@@ -231,11 +231,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -t artifact_ids < <(
-            gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
-              --jq '.artifacts[].id'
-          )
+          artifact_id_lines=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[].id')
+          artifact_ids=()
+          if [[ -n "$artifact_id_lines" ]]; then
+            mapfile -t artifact_ids <<< "$artifact_id_lines"
+          fi
           for artifact_id in "${artifact_ids[@]}"; do
             [[ "$artifact_id" =~ ^[0-9]+$ ]]
             gh api --method DELETE \
