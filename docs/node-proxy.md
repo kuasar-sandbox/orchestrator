@@ -415,7 +415,8 @@ bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻
 也不返回顶层时间。service 的 `idleSince` 也只在该 service 两项为零时出现。接口不返回
 `idle`、`idleForSeconds`、last-open/close、累计连接数、bytes、延迟、端口明细或 worker
 身份;`Cache-Control: no-store`。`proxy.mode=off` 返回 501;external route 未完成同步、
-RunID 不匹配或 worker 集不可信时返回 503。
+RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与 conductor→master
+查询身份,避免 Pause 已提交但异步 route view 仍为 running 时返回旧的顶层 `idleSince`。
 
 external 模式用每 worker 一条 Unix socketpair 统一替换旧 lossy metrics pipe:
 

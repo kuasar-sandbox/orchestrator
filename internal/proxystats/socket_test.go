@@ -36,7 +36,7 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 		server.Handler().ServeHTTP(resp, req)
 		return resp
 	}
-	query := TrafficQuery{SandboxID: "s1", RunID: "run-1", Profile: types.ProfileBare}
+	query := TrafficQuery{SandboxID: "s1", RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused}
 	if resp := do(query); resp.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unsynced status=%d, want 503", resp.Code)
 	}
@@ -52,6 +52,7 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 		t.Fatalf("missing RunID mismatch status=%d, want 503", resp.Code)
 	}
 	identity = RouteIdentity{Profile: types.ProfileBare, State: types.StateStarting}
+	missingRun.State = types.StateStarting
 	resp := do(missingRun)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("pre-assignment starting status=%d, want 200: %s", resp.Code, resp.Body.String())
@@ -64,6 +65,11 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 		t.Fatalf("starting stats = %+v", got)
 	}
 	identity = RouteIdentity{RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused}
+	staleState := query
+	staleState.State = types.StateRunning
+	if resp := do(staleState); resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("state mismatch status=%d, want 503", resp.Code)
+	}
 	resp = do(query)
 	if resp.Code != http.StatusOK || resp.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("valid status=%d cache=%q body=%s", resp.Code, resp.Header().Get("Cache-Control"), resp.Body.String())
@@ -97,7 +103,7 @@ func TestQuerySocketRoundTrip(t *testing.T) {
 	go func() { done <- server.Serve(ctx, listener) }()
 
 	results, err := QuerySocket(context.Background(), socket, []TrafficQuery{{
-		SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B,
+		SandboxID: "s1", RunID: "run-1", Profile: types.ProfileE2B, State: types.StateRunning,
 	}})
 	if err != nil {
 		t.Fatal(err)

@@ -41,7 +41,7 @@ func TestExternalTrafficProviderUsesRegisteredMasterCache(t *testing.T) {
 			return
 		}
 		query := request.Sandboxes[0]
-		if query.SandboxID != "s1" || query.RunID != "run-1" || query.Profile != types.ProfileBare {
+		if query.SandboxID != "s1" || query.RunID != "run-1" || query.Profile != types.ProfileBare || query.State != types.StateRunning {
 			http.Error(w, "identity mismatch", http.StatusServiceUnavailable)
 			return
 		}

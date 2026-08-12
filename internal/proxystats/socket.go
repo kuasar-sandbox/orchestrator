@@ -27,6 +27,7 @@ type TrafficQuery struct {
 	SandboxID string        `json:"sandboxID"`
 	RunID     string        `json:"runID"`
 	Profile   types.Profile `json:"profile"`
+	State     types.State   `json:"state"`
 }
 
 type BatchRequest struct {
@@ -100,16 +101,17 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 	response := BatchResponse{Sandboxes: make([]BatchResult, 0, len(request.Sandboxes))}
 	for _, query := range request.Sandboxes {
 		if !validSandboxID(query.SandboxID) ||
-			(query.Profile != types.ProfileE2B && query.Profile != types.ProfileBare) {
+			(query.Profile != types.ProfileE2B && query.Profile != types.ProfileBare) ||
+			(query.State != types.StateStarting && query.State != types.StateRunning && query.State != types.StatePaused) {
 			writeSocketError(w, http.StatusBadRequest, "invalid traffic query")
 			return
 		}
 		identity, found := s.lookup(query.SandboxID)
-		if !found || identity.RunID != query.RunID || identity.Profile != query.Profile {
+		if !found || identity.RunID != query.RunID || identity.Profile != query.Profile || identity.State != query.State {
 			writeSocketError(w, http.StatusServiceUnavailable, "route identity unavailable")
 			return
 		}
-		stats, err := s.master.SandboxTrafficStats(r.Context(), query.SandboxID, query.RunID, query.Profile, identity.State)
+		stats, err := s.master.SandboxTrafficStats(r.Context(), query.SandboxID, query.RunID, query.Profile, query.State)
 		if err != nil {
 			status := http.StatusServiceUnavailable
 			if errors.Is(err, api.ErrStatsConflict) {

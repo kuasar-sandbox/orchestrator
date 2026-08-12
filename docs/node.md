@@ -543,7 +543,7 @@ open/close、累计连接数、bytes/延迟/端口明细或 worker 信息。
 
 internal proxy 在同进程聚合;external conductor 经当前 trusted proxy registration 的
 `stats_socket` 读取 master cache,查询时不扇出 worker。proxy mode=off 为 501;master 未注册、
-route 未完成同步、RunID/profile 不匹配、worker stream 故障或 replacement 未 ready 为 503。
+route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
 完整 worker-local 状态机、绝对快照 stream 和故障窗口见 [node-proxy.md](node-proxy.md) §8。
 
 ### 4.2 控制面:模板构建 API

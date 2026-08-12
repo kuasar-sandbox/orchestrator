@@ -13,7 +13,7 @@ type externalTrafficProvider struct {
 	plugins *configsock.Registry
 }
 
-func (p *externalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandboxID, runID string, profile types.Profile, _ types.State) (*api.TrafficStats, error) {
+func (p *externalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandboxID, runID string, profile types.Profile, state types.State) (*api.TrafficStats, error) {
 	if p == nil || p.plugins == nil {
 		return nil, api.ErrStatsUnavailable
 	}
@@ -22,7 +22,7 @@ func (p *externalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandb
 		return nil, api.ErrStatsUnavailable
 	}
 	results, err := proxystats.QuerySocket(ctx, socket, []proxystats.TrafficQuery{{
-		SandboxID: sandboxID, RunID: runID, Profile: profile,
+		SandboxID: sandboxID, RunID: runID, Profile: profile, State: state,
 	}})
 	if err != nil {
 		return nil, err
