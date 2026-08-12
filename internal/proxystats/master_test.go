@@ -88,6 +88,29 @@ func TestMasterAggregatesWorkersAndDuplicateAbsoluteFrames(t *testing.T) {
 	if err := master.Receive("w0", 1, omission); err == nil {
 		t.Fatal("partial absolute counter snapshot was accepted")
 	}
+
+	invalidMixedSnapshot := Frame{
+		Type: TypeUpdate, Version: Version, Epoch: 1, Sequence: 3,
+		Counters: map[string]uint64{
+			"requests_total": 4,
+			"overflow_total": uint64(^uint64(0)>>1) + 1,
+		},
+	}
+	if err := master.Receive("w0", 1, invalidMixedSnapshot); err == nil {
+		t.Fatal("mixed valid and overflowing counter snapshot was accepted")
+	}
+	master.mu.Lock()
+	requests := master.workers["w0"].counters["requests_total"]
+	_, retainedOverflow := master.workers["w0"].counters["overflow_total"]
+	master.mu.Unlock()
+	if requests != 3 || retainedOverflow {
+		t.Fatalf("rejected counter snapshot partially changed contribution: requests=%d overflow=%v", requests, retainedOverflow)
+	}
+	recorder = httptest.NewRecorder()
+	mx.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(recorder.Body.String(), "requests_total 7") || strings.Contains(recorder.Body.String(), "overflow_total") {
+		t.Fatalf("rejected counter snapshot partially changed metrics:\n%s", recorder.Body.String())
+	}
 }
 
 func TestMasterFaultWindowExitAndReplacementReadiness(t *testing.T) {

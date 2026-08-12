@@ -154,21 +154,28 @@ func (m *MasterStats) Receive(workerID string, epoch uint64, frame Frame) error 
 		if !worker.ready || worker.faulted {
 			return errors.New("proxystats: update from unavailable worker")
 		}
+		// Validate the complete absolute counter snapshot before changing either
+		// the worker contribution or the process-wide Prometheus counters. A
+		// rejected frame must not leave a prefix of map-iteration-order deltas
+		// applied, because the worker is terminated after a stream fault and
+		// cumulative Prometheus counters cannot be rolled back on exit.
 		if frame.Counters != nil {
 			for name := range worker.counters {
 				if _, present := frame.Counters[name]; !present {
 					return fmt.Errorf("proxystats: counter snapshot omitted %q", name)
 				}
 			}
+			for name, value := range frame.Counters {
+				if value > math.MaxInt64 {
+					return fmt.Errorf("proxystats: counter %q exceeds supported range", name)
+				}
+				if value < worker.counters[name] {
+					return fmt.Errorf("proxystats: counter %q regressed", name)
+				}
+			}
 		}
 		for name, value := range frame.Counters {
-			if value > math.MaxInt64 {
-				return fmt.Errorf("proxystats: counter %q exceeds supported range", name)
-			}
 			previous := worker.counters[name]
-			if value < previous {
-				return fmt.Errorf("proxystats: counter %q regressed", name)
-			}
 			if delta := value - previous; delta != 0 {
 				m.metrics.Add(name, int64(delta))
 			}
