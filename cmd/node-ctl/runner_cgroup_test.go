@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,21 +10,36 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestPrepareRunnerCgroupAt(t *testing.T) {
-	root := t.TempDir()
-	unit := filepath.Join(root, "sandbox-runner.slice", "runner.service")
-	mustMkdirAll(t, filepath.Join(unit, "ctl"))
-	mustMkdirAll(t, filepath.Join(unit, "vmm"))
-	mustWrite(t, filepath.Join(unit, "cgroup.controllers"), "cpuset cpu io memory pids\n")
-	mustWrite(t, filepath.Join(unit, "cgroup.subtree_control"), "cpu\n")
-	mustWrite(t, filepath.Join(unit, "cgroup.procs"), "")
-	mustWrite(t, filepath.Join(unit, "vmm", "cgroup.procs"), "")
+const testRunnerRunID = "sr-00000000-0000-7000-8000-000000000001"
 
-	f, err := prepareRunnerCgroupAt(root, []byte("0::/sandbox-runner.slice/runner.service/ctl\n"), func(*os.File) error { return nil })
+func TestPrepareRunnerCgroupAtMovesServiceRootToCtl(t *testing.T) {
+	root, unit, unitRel := newRunnerCgroupFixture(t, "cpuset cpu io memory pids\n", "4242\n", false)
+	identity := "0::" + unitRel + "\n"
+	moves := 0
+
+	f, err := prepareRunnerCgroupAt(
+		root,
+		testRunnerRunID,
+		func() ([]byte, error) { return []byte(identity), nil },
+		func(path string) error {
+			moves++
+			if want := filepath.Join(unit, "ctl", "cgroup.procs"); path != want {
+				t.Fatalf("move path = %q, want %q", path, want)
+			}
+			mustWrite(t, path, "4242\n")
+			mustWrite(t, filepath.Join(unit, "cgroup.procs"), "")
+			identity = "0::" + filepath.Join(unitRel, "ctl") + "\n"
+			return nil
+		},
+		func(*os.File) error { return nil },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
+	if moves != 1 {
+		t.Fatalf("move count = %d, want 1", moves)
+	}
 	if flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
 		t.Fatalf("vmm descriptor CLOEXEC flags=%d err=%v", flags, err)
 	}
@@ -35,30 +51,122 @@ func TestPrepareRunnerCgroupAt(t *testing.T) {
 	}
 }
 
-func TestPrepareRunnerCgroupAtFailsClosed(t *testing.T) {
+func TestPrepareRunnerCgroupAtAcceptsAlreadyPlacedCtl(t *testing.T) {
+	root, _, unitRel := newRunnerCgroupFixture(t, "cpu memory\n", "", true)
+	f, err := prepareRunnerCgroupAt(
+		root,
+		testRunnerRunID,
+		func() ([]byte, error) { return []byte("0::" + filepath.Join(unitRel, "ctl") + "\n"), nil },
+		func(string) error { return errors.New("move must not be called") },
+		func(*os.File) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+}
+
+func TestPrepareRunnerCgroupAtRejectsRemainingRootProcess(t *testing.T) {
+	root, unit, unitRel := newRunnerCgroupFixture(t, "cpu memory\n", "4242\n9999\n", false)
+	identity := "0::" + unitRel + "\n"
+	_, err := prepareRunnerCgroupAt(
+		root,
+		testRunnerRunID,
+		func() ([]byte, error) { return []byte(identity), nil },
+		func(path string) error {
+			mustWrite(t, path, "4242\n")
+			mustWrite(t, filepath.Join(unit, "cgroup.procs"), "9999\n")
+			identity = "0::" + filepath.Join(unitRel, "ctl") + "\n"
+			return nil
+		},
+		func(*os.File) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "contains existing processes") {
+		t.Fatalf("error = %v, want remaining root process rejection", err)
+	}
+}
+
+func TestPrepareRunnerCgroupAtRejectsMissingDelegation(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		identity    string
 		controllers string
-		rootProcs   string
 		want        string
 	}{
-		{name: "not ctl", identity: "0::/slice/runner.service\n", controllers: "cpu memory", want: "not the delegated ctl"},
-		{name: "missing memory", identity: "0::/slice/runner.service/ctl\n", controllers: "cpu", want: "does not delegate memory"},
-		{name: "root occupied", identity: "0::/slice/runner.service/ctl\n", controllers: "cpu memory", rootProcs: "123\n", want: "contains existing processes"},
+		{name: "cpu", controllers: "memory", want: "does not delegate cpu"},
+		{name: "memory", controllers: "cpu", want: "does not delegate memory"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			unit := filepath.Join(root, "slice", "runner.service")
-			mustMkdirAll(t, filepath.Join(unit, "ctl"))
-			mustWrite(t, filepath.Join(unit, "cgroup.controllers"), tc.controllers)
-			mustWrite(t, filepath.Join(unit, "cgroup.subtree_control"), "")
-			mustWrite(t, filepath.Join(unit, "cgroup.procs"), tc.rootProcs)
-			_, err := prepareRunnerCgroupAt(root, []byte(tc.identity), func(*os.File) error { return nil })
+			root, _, unitRel := newRunnerCgroupFixture(t, tc.controllers, "", true)
+			_, err := prepareRunnerCgroupAt(
+				root,
+				testRunnerRunID,
+				func() ([]byte, error) { return []byte("0::" + filepath.Join(unitRel, "ctl") + "\n"), nil },
+				func(string) error { return errors.New("move must not be called") },
+				func(*os.File) error { return nil },
+			)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPrepareRunnerCgroupAtRejectsFailedMove(t *testing.T) {
+	root, unit, unitRel := newRunnerCgroupFixture(t, "cpu memory", "4242\n", false)
+	_, err := prepareRunnerCgroupAt(
+		root,
+		testRunnerRunID,
+		func() ([]byte, error) { return []byte("0::" + unitRel + "\n"), nil },
+		func(string) error { return errors.New("write denied") },
+		func(*os.File) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "move runner process to ctl subgroup: write denied") {
+		t.Fatalf("error = %v, want move failure", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(unit, "ctl")); !os.IsNotExist(statErr) {
+		t.Fatalf("failed move retained ctl subgroup: %v", statErr)
+	}
+}
+
+func TestPrepareRunnerCgroupAtRejectsPostMoveIdentityMismatch(t *testing.T) {
+	root, unit, unitRel := newRunnerCgroupFixture(t, "cpu memory", "4242\n", false)
+	identity := "0::" + unitRel + "\n"
+	_, err := prepareRunnerCgroupAt(
+		root,
+		testRunnerRunID,
+		func() ([]byte, error) { return []byte(identity), nil },
+		func(path string) error {
+			mustWrite(t, path, "4242\n")
+			mustWrite(t, filepath.Join(unit, "cgroup.procs"), "")
+			identity = "0::" + filepath.Join(unitRel, "other") + "\n"
+			return nil
+		},
+		func(*os.File) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "after ctl placement") {
+		t.Fatalf("error = %v, want post-move identity rejection", err)
+	}
+}
+
+func TestRunnerUnitCgroupRequiresExactRunAndSlice(t *testing.T) {
+	validRoot := "/sandbox.slice/sandbox-runner.slice/custom-runner@" + testRunnerRunID + ".service"
+	for _, path := range []string{validRoot, validRoot + "/ctl"} {
+		if _, _, err := runnerUnitCgroup(path, testRunnerRunID); err != nil {
+			t.Fatalf("valid runner cgroup %q rejected: %v", path, err)
+		}
+	}
+	for _, path := range []string{
+		"/sandbox.slice/sandbox-runner.slice/custom-runner@sr-other.service",
+		"/sandbox.slice/other.slice/custom-runner@" + testRunnerRunID + ".service",
+		"/other.slice/sandbox-runner.slice/custom-runner@" + testRunnerRunID + ".service",
+		"/nested/sandbox.slice/sandbox-runner.slice/custom-runner@" + testRunnerRunID + ".service",
+		validRoot + "/vmm",
+		validRoot + "/ctl/nested",
+		"/",
+	} {
+		if _, _, err := runnerUnitCgroup(path, testRunnerRunID); err == nil {
+			t.Fatalf("unexpected runner cgroup %q accepted", path)
+		}
 	}
 }
 
@@ -96,4 +204,21 @@ func mustWrite(t *testing.T, path, value string) {
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func newRunnerCgroupFixture(t *testing.T, controllers, rootProcs string, withCtl bool) (string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	unitRel := "/sandbox.slice/sandbox-runner.slice/custom-runner@" + testRunnerRunID + ".service"
+	unit := filepath.Join(root, strings.TrimPrefix(unitRel, "/"))
+	mustMkdirAll(t, filepath.Join(unit, "vmm"))
+	mustWrite(t, filepath.Join(unit, "cgroup.controllers"), controllers)
+	mustWrite(t, filepath.Join(unit, "cgroup.subtree_control"), "cpu\n")
+	mustWrite(t, filepath.Join(unit, "cgroup.procs"), rootProcs)
+	mustWrite(t, filepath.Join(unit, "vmm", "cgroup.procs"), "")
+	if withCtl {
+		mustMkdirAll(t, filepath.Join(unit, "ctl"))
+		mustWrite(t, filepath.Join(unit, "ctl", "cgroup.procs"), "4242\n")
+	}
+	return root, unit, unitRel
 }

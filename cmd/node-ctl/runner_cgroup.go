@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -15,33 +16,70 @@ const (
 	selfCgroupFile = "/proc/self/cgroup"
 )
 
-func prepareRunnerCgroup() (*os.File, error) {
-	identity, err := os.ReadFile(selfCgroupFile)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", selfCgroupFile, err)
-	}
-	return prepareRunnerCgroupAt(hostCgroupRoot, identity, validateCgroup2FD)
+func prepareRunnerCgroup(runID string) (*os.File, error) {
+	return prepareRunnerCgroupAt(
+		hostCgroupRoot,
+		runID,
+		func() ([]byte, error) { return os.ReadFile(selfCgroupFile) },
+		func(path string) error { return writeExistingFile(path, strconv.Itoa(os.Getpid())) },
+		validateCgroup2FD,
+	)
 }
 
-func prepareRunnerCgroupAt(root string, identity []byte, validate func(*os.File) error) (*os.File, error) {
+func prepareRunnerCgroupAt(
+	root, runID string,
+	readIdentity func() ([]byte, error),
+	moveSelf func(string) error,
+	validate func(*os.File) error,
+) (*os.File, error) {
+	identity, err := readIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("read runner cgroup identity: %w", err)
+	}
 	self, err := unifiedCgroupPath(identity)
 	if err != nil {
 		return nil, err
 	}
-	if filepath.Base(self) != "ctl" {
-		return nil, fmt.Errorf("runner process cgroup %q is not the delegated ctl subgroup", self)
-	}
-	unitRel := filepath.Dir(self)
-	if unitRel == "/" || unitRel == "." {
-		return nil, fmt.Errorf("runner unit cgroup root is not isolated: %q", unitRel)
+	unitRel, alreadyPlaced, err := runnerUnitCgroup(self, runID)
+	if err != nil {
+		return nil, err
 	}
 	unitRoot := filepath.Join(root, strings.TrimPrefix(unitRel, "/"))
 	if err := ensurePathWithin(root, unitRoot); err != nil {
 		return nil, err
 	}
-	ctlInfo, err := os.Stat(filepath.Join(unitRoot, "ctl"))
-	if err != nil || !ctlInfo.IsDir() {
-		return nil, fmt.Errorf("runner ctl subgroup is unavailable")
+	ctlPath := filepath.Join(unitRoot, "ctl")
+	if alreadyPlaced {
+		ctlInfo, err := os.Stat(ctlPath)
+		if err != nil || !ctlInfo.IsDir() {
+			return nil, fmt.Errorf("runner ctl subgroup is unavailable")
+		}
+	} else {
+		if err := os.Mkdir(ctlPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create runner ctl subgroup: %w", err)
+		}
+		placementComplete := false
+		defer func() {
+			if !placementComplete {
+				_ = os.Remove(ctlPath)
+			}
+		}()
+		if err := moveSelf(filepath.Join(ctlPath, "cgroup.procs")); err != nil {
+			return nil, fmt.Errorf("move runner process to ctl subgroup: %w", err)
+		}
+		identity, err = readIdentity()
+		if err != nil {
+			return nil, fmt.Errorf("re-read runner cgroup identity: %w", err)
+		}
+		self, err = unifiedCgroupPath(identity)
+		if err != nil {
+			return nil, fmt.Errorf("validate runner cgroup after ctl placement: %w", err)
+		}
+		want := filepath.Join(unitRel, "ctl")
+		if self != want {
+			return nil, fmt.Errorf("runner process cgroup after ctl placement is %q, want %q", self, want)
+		}
+		placementComplete = true
 	}
 	if err := requireEmptyCgroup(unitRoot); err != nil {
 		return nil, fmt.Errorf("runner unit root: %w", err)
@@ -97,6 +135,28 @@ func prepareRunnerCgroupAt(root string, identity []byte, validate func(*os.File)
 		}
 	}
 	return f, nil
+}
+
+func runnerUnitCgroup(self, runID string) (string, bool, error) {
+	alreadyPlaced := filepath.Base(self) == "ctl"
+	unitRel := self
+	if alreadyPlaced {
+		unitRel = filepath.Dir(self)
+	}
+	if unitRel == "/" || unitRel == "." {
+		return "", false, fmt.Errorf("runner unit cgroup root is not isolated: %q", unitRel)
+	}
+	unitName := filepath.Base(unitRel)
+	instanceSuffix := "@" + runID + ".service"
+	prefix := strings.TrimSuffix(unitName, instanceSuffix)
+	if prefix == unitName || prefix == "" || strings.Contains(prefix, "@") {
+		return "", false, fmt.Errorf("runner process cgroup %q does not match run id %q", self, runID)
+	}
+	runnerSlice := filepath.Dir(unitRel)
+	if runnerSlice != "/sandbox.slice/sandbox-runner.slice" {
+		return "", false, fmt.Errorf("runner process cgroup %q is outside sandbox-runner.slice", self)
+	}
+	return unitRel, alreadyPlaced, nil
 }
 
 func requireEmptyCgroup(path string) error {
