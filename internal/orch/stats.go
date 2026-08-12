@@ -65,5 +65,8 @@ func (o *Orchestrator) TrafficStats(ctx context.Context, id, apiKey string) (*ap
 	if o.trafficStats == nil {
 		return nil, api.ErrStatsUnsupported
 	}
+	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
+		return nil, api.ErrStatsConflict
+	}
 	return o.trafficStats.SandboxTrafficStats(ctx, sb.ID, sb.RunID, sb.Profile, sb.State)
 }

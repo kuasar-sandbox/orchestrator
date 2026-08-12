@@ -143,3 +143,23 @@ func TestTrafficStatsDisabledAndProviderErrors(t *testing.T) {
 		t.Fatalf("provider error = %v", err)
 	}
 }
+
+func TestTrafficStatsTerminalStateConflictsBeforeProvider(t *testing.T) {
+	o := testOrch(t)
+	sb := &types.Sandbox{
+		ID: "traffic-dead", RunID: "run-1", Profile: types.ProfileBare, State: types.StateDead,
+		APISecret: strings.Repeat("b", 64), ManifestKey: strings.Repeat("c", 64),
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	provider := &trafficStatsProviderStub{}
+	o.SetSandboxTrafficProvider(provider)
+	if _, err := o.TrafficStats(context.Background(), sb.ID, mintTestAPIKey(t, sb.APISecret)); !errors.Is(err, api.ErrStatsConflict) {
+		t.Fatalf("terminal state error = %v, want ErrStatsConflict", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("terminal state reached provider %d times", provider.calls)
+	}
+}

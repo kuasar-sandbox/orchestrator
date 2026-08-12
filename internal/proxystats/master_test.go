@@ -224,13 +224,20 @@ func TestMasterRunBaselineStartsOnlyWhenObservedRunning(t *testing.T) {
 	master.trustSince = point
 	readyWorker(t, master, "w0", 1)
 
-	point = timePoint{wall: base.Add(time.Minute), bootNS: 200}
-	starting, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateStarting)
-	if err != nil || starting.IdleSince != nil {
-		t.Fatalf("starting stats = %+v err=%v", starting, err)
+	for i, state := range []types.State{types.StateStarting, types.StatePaused} {
+		point = timePoint{wall: base.Add(time.Duration(i+1) * time.Minute), bootNS: int64(200 + i*100)}
+		stats, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, state)
+		if err != nil || stats.IdleSince != nil {
+			t.Fatalf("%s stats = %+v err=%v", state, stats, err)
+		}
+		for service, item := range stats.Services {
+			if item.IdleSince == nil || item.IdleSince.Before(point.wall) {
+				t.Fatalf("%s service %s idle baseline = %+v, want >= %s", state, service, item.IdleSince, point.wall)
+			}
+		}
 	}
 
-	point = timePoint{wall: base.Add(2 * time.Minute), bootNS: 300}
+	point = timePoint{wall: base.Add(3 * time.Minute), bootNS: 400}
 	running, err := master.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateRunning)
 	if err != nil || running.IdleSince == nil || running.IdleSince.Before(point.wall) {
 		t.Fatalf("running baseline = %+v err=%v, want >= %s", running, err, point.wall)

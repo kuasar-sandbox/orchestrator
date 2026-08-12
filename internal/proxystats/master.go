@@ -321,12 +321,13 @@ func (m *MasterStats) SandboxTrafficStats(_ context.Context, sandboxID, runID st
 			marker = runMarker{runID: runID, since: now}
 			m.runSince[sandboxID] = marker
 		}
-	} else if marker.runID != runID {
+	} else if marker.runID != runID || marker.since.bootNS == 0 {
 		// starting/paused observations cannot establish when this run became
-		// running. Drop an older run marker and let the first running query set
-		// the conservative lower bound.
+		// running. Drop an older run marker and use this observation as the local
+		// response baseline without retaining it as a running marker. The first
+		// running query will establish that run's durable lower bound.
 		delete(m.runSince, sandboxID)
-		marker = runMarker{}
+		marker = runMarker{since: now}
 	}
 	baseline := laterPoint(m.trustSince, marker.since)
 	aggregate := m.traffic[sandboxID]
