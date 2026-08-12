@@ -120,11 +120,13 @@ mkdir -p "$WORK/r" "$WORK/l" "$WORK/s" "$WORK/z/d" "$WORK/g" "$WORK/br" "$WORK/b
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
+CLUSTER_EXEC_PID=""
 
 cleanup() {
     set +e
     rm -f "$WORK/create.credentials"
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    [ -n "$CLUSTER_EXEC_PID" ] && kill "$CLUSTER_EXEC_PID" 2>/dev/null
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         p="${PIDS[$i]}"
         [ -n "$p" ] && kill "$p" 2>/dev/null
@@ -280,6 +282,44 @@ router_req() {
     [ -n "$route_key" ] && args+=(-H "X-Kuasar-Route-Key: $route_key")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
+}
+
+wait_cluster_traffic_stats() { # $1=sid, $2=parking|idle
+    local sid="$1" mode="$2" code=""
+    for _ in $(seq 1 240); do
+        code="$(router_req GET "/sandboxes/$sid/stats/traffic" "$CLUSTER_API_KEY" "$ROUTE_KEY" || true)"
+        if [ "$code" = "200" ] && python3 - "$WORK/router-resp.body" "$mode" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+mode = sys.argv[2]
+if set(stats) - {"state", "inflight", "idleSince", "services"}:
+    raise SystemExit(1)
+inflight = stats.get("inflight", {})
+services = stats.get("services", {})
+if set(inflight) != {"parking", "egress"}:
+    raise SystemExit(1)
+if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
+    raise SystemExit(1)
+for item in services.values():
+    if set(item) - {"parking", "egress", "idleSince"} or not {"parking", "egress"} <= set(item):
+        raise SystemExit(1)
+    if (item["parking"] or item["egress"]) and "idleSince" in item:
+        raise SystemExit(1)
+if mode == "parking":
+    ok = inflight["parking"] >= 1 and "idleSince" not in stats
+elif mode == "idle":
+    ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+else:
+    ok = False
+raise SystemExit(0 if ok else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.05
+    done
+    step "traffic stats sid=$sid mode=$mode last_status=$code body=$(cat "$WORK/router-resp.body" 2>/dev/null)"
+    return 1
 }
 
 create_sandbox() {
@@ -768,15 +808,29 @@ run_cluster_flow() {
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
     local resume_mark="CLUSTER_NATIVE_EXEC_RESUME_$RANDOM"
-    exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark" 40
+    exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark" 40 &
+    CLUSTER_EXEC_PID=$!
+    wait_cluster_traffic_stats "$sid" parking \
+        || fail "paused cluster exec was not reported as parking by the final node"
+    local cluster_exec_status=0
+    wait "$CLUSTER_EXEC_PID" || cluster_exec_status=$?
+    CLUSTER_EXEC_PID=""
+    [ "$cluster_exec_status" = 0 ] || fail "paused cluster exec exited $cluster_exec_status"
+    wait_cluster_traffic_stats "$sid" idle \
+        || fail "cluster exec traffic did not converge to idle"
     unset exec_token
-    step "PASS: real sandbox-ctl used stable SID through exec CONNECT, then the same KAT resumed the paused sandbox"
+    step "PASS: paused stable-SID exec went directly to the final node, where traffic transitioned parking -> idle"
 
     step "checking SID-addressed envd data request with X-Access-Token"
     code="$(retry_data_by_sid "$sid" "$envd_token" || true)"
     unset envd_token
     [ "$code" = "204" ] || [ "$code" = "200" ] || fail "data-plane /health returned $code"
+    wait_cluster_traffic_stats "$sid" idle || fail "cluster data traffic did not remain single-counted and idle"
     step "PASS: explicit create -> SID route -> real envd /health ($code)"
+
+    code="$(router_req GET "/sandboxes/$sid/stats/resource" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
+    [ "$code" = "501" ] || { cat "$WORK/router-resp.body"; fail "disabled cluster resource controller stats=$code (want 501)"; }
+    step "PASS: cluster stats control path reached the node (resource controller disabled -> 501)"
 
     step "checking group-local sandbox list through router"
     code="$(router_req GET /v2/sandboxes "$CLUSTER_API_KEY")"

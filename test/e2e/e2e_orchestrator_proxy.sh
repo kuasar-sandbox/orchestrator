@@ -90,6 +90,7 @@ if [ "$MMDS_ROUTES_E2E" = 1 ]; then
       endpoint: unix://$MMDS_SERVICE_SOCKET"
 fi
 IMMEDIATE_EXEC_PID=""
+IMMEDIATE_DATA_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
@@ -97,6 +98,7 @@ cleanup() {
     [ "$MMDS_ROUTES_E2E" = 1 ] && stop_mmds_service_backend
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     [ -n "$IMMEDIATE_EXEC_PID" ] && kill "$IMMEDIATE_EXEC_PID" 2>/dev/null
+    [ -n "$IMMEDIATE_DATA_PID" ] && kill "$IMMEDIATE_DATA_PID" 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
@@ -180,6 +182,53 @@ req() {
     fi
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+}
+wait_traffic_stats() { # $1=sid, $2=parking|idle
+    local sid="$1" mode="$2" code=""
+    for _ in $(seq 1 240); do
+        code="$(req GET "/sandboxes/$sid/stats/traffic" "$AK" || true)"
+        if [ "$code" = "200" ] && python3 - "$WORK/resp.body" "$mode" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+mode = sys.argv[2]
+if set(stats) - {"state", "inflight", "idleSince", "services"}:
+    raise SystemExit(1)
+inflight = stats.get("inflight", {})
+if set(inflight) != {"parking", "egress"}:
+    raise SystemExit(1)
+services = stats.get("services", {})
+if set(services) != {"forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
+    raise SystemExit(1)
+for item in services.values():
+    if set(item) - {"parking", "egress", "idleSince"} or not {"parking", "egress"} <= set(item):
+        raise SystemExit(1)
+    busy = item["parking"] or item["egress"]
+    if busy and "idleSince" in item:
+        raise SystemExit(1)
+if mode == "parking":
+    ok = inflight["parking"] >= 1 and inflight["egress"] >= 0 and "idleSince" not in stats
+elif mode == "idle":
+    ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+else:
+    ok = False
+raise SystemExit(0 if ok else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "traffic stats sid=$sid mode=$mode last_status=$code body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
+}
+traffic_idle_since() { # $1=sid
+    local code
+    code="$(req GET "/sandboxes/$1/stats/traffic" "$AK")"
+    [ "$code" = "200" ] || return 1
+    python3 - "$WORK/resp.body" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("idleSince", ""))
+PY
 }
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
@@ -484,8 +533,20 @@ IMMEDIATE_NATIVE_MARK="EXTERNAL_PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
 ) &
 IMMEDIATE_EXEC_PID=$!
 echo "==> request envd immediately through external proxy; missing/starting must park to running"
-code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
-{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+(
+    code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+    printf '%s\n' "$code" >"$WORK/immediate-data.code"
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+) &
+IMMEDIATE_DATA_PID=$!
+wait_traffic_stats "$SID" parking \
+    || { dump_logs; fail "external starting request was not visible as parking"; }
+echo "==> PASS: external master cache observed authorized starting ingress as parking"
+immediate_data_status=0
+wait "$IMMEDIATE_DATA_PID" || immediate_data_status=$?
+IMMEDIATE_DATA_PID=""
+code="$(<"$WORK/immediate-data.code")"
+[ "$immediate_data_status" = "0" ] \
     || { cat "$WORK/dp.body"; dump_logs; fail "immediate external proxy request=$code"; }
 echo "==> PASS: external proxy parked post-Create request through starting to running (code=$code)"
 immediate_exec_status=0
@@ -493,6 +554,12 @@ wait "$IMMEDIATE_EXEC_PID" || immediate_exec_status=$?
 IMMEDIATE_EXEC_PID=""
 [ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate external native exec did not park to running"; }
 echo "==> PASS: external native exec parked post-Create CONNECT through route propagation and starting"
+wait_traffic_stats "$SID" idle || { dump_logs; fail "external traffic did not converge to idle"; }
+echo "==> PASS: external master cache converged parking/egress to idle"
+
+code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
+[ "$code" = "501" ] || { cat "$WORK/resp.body"; fail "disabled resource controller stats=$code (want 501)"; }
+echo "==> PASS: resource stats reports 501 when the controller is disabled"
 
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
@@ -581,6 +648,9 @@ done
 [ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; dump_logs; fail "envd /health via proxy with token = $code (want 200/204)"; }
 echo "==> PASS: route-synced + data plane forwarded through the proxy to real envd (X-Access-Token accepted)"
 
+wait_traffic_stats "$SID" idle || { dump_logs; fail "traffic did not return idle before auth rejection checks"; }
+IDLE_BEFORE_INVALID="$(traffic_idle_since "$SID")"
+[ -n "$IDLE_BEFORE_INVALID" ] || fail "running idle traffic stats omitted idleSince"
 code=$(dp "49983-$SID" /health "")
 [ "$code" = "401" ] || { dump_logs; fail "envd /health via proxy WITHOUT token = $code (want 401 enforce)"; }
 echo "==> PASS: proxy enforces X-Access-Token (missing -> 401)"
@@ -588,6 +658,11 @@ echo "==> PASS: proxy enforces X-Access-Token (missing -> 401)"
 code=$(dp "49983-$SID" /health "wrong-token")
 [ "$code" = "401" ] || { dump_logs; fail "envd /health via proxy with WRONG token = $code (want 401)"; }
 echo "==> PASS: proxy rejects a wrong token (401)"
+wait_traffic_stats "$SID" idle || { dump_logs; fail "invalid credentials changed traffic inflight"; }
+IDLE_AFTER_INVALID="$(traffic_idle_since "$SID")"
+[ "$IDLE_AFTER_INVALID" = "$IDLE_BEFORE_INVALID" ] \
+    || fail "invalid credentials changed idleSince ($IDLE_BEFORE_INVALID -> $IDLE_AFTER_INVALID)"
+echo "==> PASS: invalid credentials caused no parking/egress and did not refresh idleSince"
 
 USER_MARK="proxy-netns-user-port-$RANDOM"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
@@ -612,6 +687,23 @@ else dump_logs; fail "unknown sandbox via proxy = $code (want 404 after wake)"; 
 if curl -sS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null | grep -q 'data_requests_total'; then
     echo "==> PASS: proxy master /metrics reports aggregated worker data_requests_total"
 else dump_logs; fail "proxy master /metrics did not report data_requests_total"; fi
+
+# A stats EOF/crash must make the aggregate unavailable until the replacement's
+# new epoch has completed hello+ready. The dead worker's contribution is removed
+# only after the supervisor has reaped it.
+CRASH_WORKER="$(child_worker_pids "$PROXY_MASTER_PID" | head -1)"
+[ -n "$CRASH_WORKER" ] || fail "no external proxy worker available for crash test"
+kill -KILL "$CRASH_WORKER"
+SEEN_STATS_503=""
+for _ in $(seq 1 120); do
+    code="$(req GET "/sandboxes/$SID/stats/traffic" "$AK" || true)"
+    [ "$code" = "503" ] && { SEEN_STATS_503=1; break; }
+    sleep 0.01
+done
+[ -n "$SEEN_STATS_503" ] || { dump_logs; fail "worker crash did not create a traffic-stats 503 window"; }
+wait_traffic_stats "$SID" idle || { dump_logs; fail "traffic stats did not recover after replacement ready"; }
+wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
+echo "==> PASS: worker crash returned 503 until replacement epoch was stats-ready"
 
 # ---- (3b) CONNECT tunnel THROUGH the proxy to envd control -----------------
 # Drive CONNECT with raw TCP so the test does not depend on curl proxy-header
