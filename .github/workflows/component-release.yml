@@ -184,7 +184,7 @@ jobs:
           name: orchestrator-release-${{ needs.preflight.outputs.version }}-${{ github.run_id }}
           path: src/orchestrator/release-bundle
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   publish:
     needs:
@@ -218,3 +218,30 @@ jobs:
           set -euo pipefail
           bash scripts/publish-release.sh publish \
             "$VERSION" "$TARGET_ARCH" "$GITHUB_SHA" release-bundle
+
+  cleanup:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete release workflow artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_id_lines=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[].id')
+          artifact_ids=()
+          if [[ -n "$artifact_id_lines" ]]; then
+            mapfile -t artifact_ids <<< "$artifact_id_lines"
+          fi
+          for artifact_id in "${artifact_ids[@]}"; do
+            [[ "$artifact_id" =~ ^[0-9]+$ ]]
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
+              --silent
+          done
+          echo "deleted ${#artifact_ids[@]} release workflow artifact(s)"
