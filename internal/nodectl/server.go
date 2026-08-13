@@ -37,6 +37,9 @@ type Server struct {
 
 	mu      sync.Mutex
 	stopped bool
+
+	// phaseHook is test-only fault injection. Production leaves it nil.
+	phaseHook func(string)
 }
 
 // Listen binds the UDS. Must be called before Serve. Removes any
@@ -211,12 +214,18 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 			queuedSID = req.SandboxID
 		}
 		if resp != nil {
+			if s.phaseHook != nil {
+				s.phaseHook("before_response:" + req.Type)
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := WriteMessage(conn, resp); err != nil {
 				s.Logf("write: %v", err)
 				return
 			}
 			_ = conn.SetWriteDeadline(time.Time{})
+			if s.phaseHook != nil {
+				s.phaseHook("after_response:" + req.Type)
+			}
 		}
 	}
 }
