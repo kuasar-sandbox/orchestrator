@@ -56,6 +56,70 @@ func TestSyncAtomicallyReplacesProvisionalAndPriorSession(t *testing.T) {
 	}
 }
 
+func TestSyncRejectsLiveCgroupCollisionWithoutDroppingEitherConsumer(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "owner-token", SandboxID: "owner", PeerPID: 100,
+		CgroupPath: "/cg/shared", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, InitialAllocatable: 512 << 20,
+		EffectiveStartupBudget: 512 << 20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "claimant", PeerPID: 200, Capacity: Resources{MemoryBytes: 1 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, MemoryCharge: 1 << 30,
+		StartupCharge: 1 << 30, RecoverySource: RecoveryLease, RecoveryKey: "lease:claimant",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "claimant-token", SandboxID: "claimant", PeerPID: 200,
+		CgroupPath: "/cg/shared", Capacity: Resources{MemoryBytes: 1 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20,
+	}); err == nil {
+		t.Fatal("StateSync evicted a different live cgroup owner")
+	}
+	after := s.ResourceSnapshot()
+	if after != before {
+		t.Fatalf("failed StateSync changed aggregates: before=%+v after=%+v", before, after)
+	}
+	if _, found := s.Heartbeat("owner-token", 0, time.Now()); !found {
+		t.Fatal("failed StateSync removed the original session")
+	}
+	if got := reservationForTest(t, s, "claimant"); !got.Provisional {
+		t.Fatalf("failed StateSync replaced claimant provisional: %+v", got)
+	}
+}
+
+func TestSyncMergesOrphanCgroupProvisional(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "synced-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20, Settled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Allocated.MemoryBytes != 256<<20 {
+		t.Fatalf("merged orphan snapshot = %+v", snapshot)
+	}
+	if _, found := s.SnapshotSandboxResource("orphan"); found {
+		t.Fatal("orphan synthetic SID remained after StateSync")
+	}
+}
+
 func TestStateAggregatesAcrossThousandReservations(t *testing.T) {
 	s := makeState(64<<30, 0)
 	const count = 1000

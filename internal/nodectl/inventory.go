@@ -31,6 +31,10 @@ type LiveLease struct {
 	OwnerPID int
 }
 
+func (i *Inventory) LeasePath(sid string) string {
+	return resource.LeasePath(i.ControllerSocket, sid)
+}
+
 func (i *Inventory) defaults() {
 	if i.Logf == nil {
 		i.Logf = func(string, ...any) {}
@@ -214,15 +218,31 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 		seen[root] = true
 		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
-				if os.IsNotExist(walkErr) || os.IsPermission(walkErr) {
+				if os.IsNotExist(walkErr) {
 					return nil
 				}
 				return walkErr
 			}
-			if !entry.IsDir() || !cgroupPopulated(path) || state.HasCgroup(path) {
+			if !entry.IsDir() {
 				return nil
 			}
-			pids := readCgroupPIDs(path)
+			populated, err := readCgroupPopulated(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if !populated || state.HasCgroup(path) {
+				return nil
+			}
+			pids, err := readCgroupPIDs(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
 			if len(pids) == 0 {
 				return nil
 			}
@@ -257,7 +277,7 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 }
 
 func (i *Inventory) LookupLiveLease(sid string) (LiveLease, error) {
-	path := resource.LeasePath(i.ControllerSocket, sid)
+	path := i.LeasePath(sid)
 	owner, locked, err := resource.LeaseLockOwner(path)
 	if err != nil {
 		return LiveLease{}, err
@@ -372,36 +392,57 @@ func (i *Inventory) ConsumerLive(r Reservation) bool {
 			}
 		}
 	}
-	return r.CgroupPath != "" && cgroupPopulated(r.CgroupPath)
+	if r.CgroupPath == "" {
+		return false
+	}
+	populated, err := readCgroupPopulated(r.CgroupPath)
+	if err != nil {
+		// Disappearance is positive evidence that this consumer is gone. Any
+		// other inspection failure is unknown and must retain the charge.
+		return !os.IsNotExist(err)
+	}
+	return populated
 }
 
-func cgroupPopulated(path string) bool {
+func readCgroupPopulated(path string) (bool, error) {
 	b, err := os.ReadFile(filepath.Join(path, "cgroup.events"))
 	if err != nil {
-		return false
+		return false, err
 	}
 	s := bufio.NewScanner(strings.NewReader(string(b)))
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
 		if len(fields) == 2 && fields[0] == "populated" {
-			return fields[1] == "1"
+			switch fields[1] {
+			case "0":
+				return false, nil
+			case "1":
+				return true, nil
+			default:
+				return false, fmt.Errorf("cgroup %s has invalid populated value %q", path, fields[1])
+			}
 		}
 	}
-	return false
+	if err := s.Err(); err != nil {
+		return false, err
+	}
+	return false, fmt.Errorf("cgroup %s has no populated event", path)
 }
 
-func readCgroupPIDs(path string) []int {
+func readCgroupPIDs(path string) ([]int, error) {
 	b, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []int
 	for _, field := range strings.Fields(string(b)) {
-		if pid, err := strconv.Atoi(field); err == nil && pid > 0 {
-			out = append(out, pid)
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			return nil, fmt.Errorf("cgroup %s has invalid pid %q", path, field)
 		}
+		out = append(out, pid)
 	}
-	return out
+	return out, nil
 }
 
 func readMemoryMax(path string) uint64 {

@@ -270,7 +270,7 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 
 	case OutcomeShortTermBlock:
-		entry, ok := s.Admission.Enqueue(req, conn)
+		entry, ok := s.Admission.Enqueue(req, conn, peerPID)
 		if !ok {
 			return &Message{
 				Type:   TypeAdmitResponse,
@@ -279,7 +279,6 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 				Msg:    "admission queue at capacity",
 			}
 		}
-		entry.peerPID = peerPID
 		if s.Auditor != nil {
 			s.Auditor.Logf("admit_queued sid=%s pos=%d block=%d",
 				req.SandboxID, entry.queuedPos, int(oc.Block))
@@ -315,21 +314,18 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 		if s.Inventory == nil {
 			return nil, fmt.Errorf("state-sync client requires lease inventory")
 		}
-		live, err := s.Inventory.LookupLiveLease(req.SandboxID)
-		if err != nil {
-			return nil, fmt.Errorf("admit lease: %w", err)
+		// Lease creation is the client's pre-Admit lifecycle barrier. Do not
+		// reopen or decode it on the normal RPC path: recovery scans validate
+		// immutable content, and StateSync performs the strict live-lock,
+		// SO_PEERCRED and managed pidfile/YAML cross-check. Initial Admit stays
+		// pure in-memory after the peer credential captured at accept time.
+		if peerPID <= 0 {
+			return nil, fmt.Errorf("admit peer credentials unavailable")
 		}
-		if err := s.Inventory.ValidateManaged(live, peerPID); err != nil {
-			return nil, fmt.Errorf("admit identity: %w", err)
+		if !s.Inventory.cgroupAllowed(req.CgroupPath) {
+			return nil, fmt.Errorf("admit cgroup is outside configured recovery roots")
 		}
-		l := live.Lease
-		if req.CapacityMemoryBytes != l.CapacityMemory || uint64(req.CapacityCPU)*1000 != l.CapacityCPUMilli ||
-			req.FloorMemoryBytes != l.FloorMemory || uint64(req.FloorCPU*1000) != l.FloorCPUMilli ||
-			req.StartupBudgetMemory != l.StartupMemory || req.CgroupPath != l.CgroupPath {
-			return nil, fmt.Errorf("admit request does not match immutable lease")
-		}
-		peerPID = live.OwnerPID
-		leasePath = live.Path
+		leasePath = s.Inventory.LeasePath(req.SandboxID)
 	}
 
 	t := NewToken()

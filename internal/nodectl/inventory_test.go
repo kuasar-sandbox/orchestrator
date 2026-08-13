@@ -211,9 +211,24 @@ func writeFakeCgroup(t *testing.T, path, max string, pid int) {
 	}
 }
 
+func writeFakeCgroupRoot(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cgroup.events": "populated 1\nfrozen 0\n", "cgroup.procs": "", "memory.max": "max\n",
+	} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	dir := t.TempDir()
 	socket, root := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups")
+	writeFakeCgroupRoot(t, root)
 	validCG := filepath.Join(root, "valid")
 	writeFakeCgroup(t, validCG, strconv.FormatUint(testLeaseCapacity, 10), 424242)
 	valid := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+socket, "NODECTL_SID=valid", "NODECTL_CGROUP="+validCG)
@@ -251,6 +266,7 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 
 func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cgroups")
+	writeFakeCgroupRoot(t, root)
 	writeFakeCgroup(t, filepath.Join(root, "finite"), strconv.FormatUint(300<<20, 10), 101)
 	writeFakeCgroup(t, filepath.Join(root, "unbounded"), "max", 102)
 	state := NewState(2<<30, 2000, 0, 0, Watermarks{StartupFactor: .5})
@@ -297,6 +313,7 @@ func TestSweeperRetainsLiveCgroupAcrossStartupAndHeartbeatTimeouts(t *testing.T)
 func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 	dir := t.TempDir()
 	socket, root, runRoot := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), filepath.Join(dir, "run")
+	writeFakeCgroupRoot(t, root)
 	sid, cgroup := "managed-sandbox", filepath.Join(root, "consumer")
 	writeFakeCgroup(t, cgroup, strconv.FormatUint(testLeaseCapacity, 10), 333)
 	managedDir := filepath.Join(runRoot, sid)
@@ -361,6 +378,7 @@ func TestStateSyncRejectsAllocationOutsideLease(t *testing.T) {
 	// real Unix connection in the managed test helper.
 	dir := t.TempDir()
 	socket, root, sid := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), "direct-bad"
+	writeFakeCgroupRoot(t, root)
 	cgroup := filepath.Join(root, "consumer")
 	writeFakeCgroup(t, cgroup, strconv.FormatUint(testLeaseCapacity, 10), 444)
 	client := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+socket, "NODECTL_SID="+sid, "NODECTL_CGROUP="+cgroup)
@@ -380,4 +398,30 @@ func TestStateSyncRejectsAllocationOutsideLease(t *testing.T) {
 	client.send("stop")
 	cancel()
 	<-done
+}
+
+func TestInventoryCgroupInspectionFailureFailsClosed(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cgroups")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cgroup.events"), []byte("populated unknown\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := makeState(2<<30, 0)
+	inventory := &Inventory{
+		ControllerSocket: filepath.Join(t.TempDir(), "controller.sock"),
+		CgroupScanPaths:  []string{root}, Pool: state.AllocatablePool,
+	}
+	if err := inventory.Recover(state); err == nil || !strings.Contains(err.Error(), "invalid populated value") {
+		t.Fatalf("Recover did not fail closed on invalid cgroup inventory: %v", err)
+	}
+
+	installReservationForTest(t, state, Reservation{
+		Token: "inspection-unknown", SandboxID: "inspection-unknown",
+		CgroupPath: root, Stage: StageSettled, AllocatableNowMem: 512 << 20,
+	})
+	if !inventory.ConsumerLive(reservationForTest(t, state, "inspection-unknown")) {
+		t.Fatal("unknown cgroup liveness was treated as dead")
+	}
 }

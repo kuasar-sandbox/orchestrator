@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"context"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -70,6 +71,38 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 		<-srvDone
 	}
 	return srv, c, cleanup
+}
+
+func TestFeatureAdmitDoesNotOpenLifecycleLease(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "cgroups")
+	state := makeState(8<<30, 0)
+	srv := &Server{
+		State: state, Inventory: &Inventory{
+			ControllerSocket: filepath.Join(dir, "missing-controller.sock"),
+			CgroupScanPaths:  []string{root},
+		},
+		Admission: NewAdmissionController(AdmissionPolicy{}),
+		Allocator: NewAllocator(AllocatorPolicy{}), Logf: t.Logf,
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	token := ""
+	resp, err := srv.buildAdmitOK(server, 4242, &Message{
+		Type: TypeAdmit, SandboxID: "no-lease-read",
+		CapacityMemoryBytes: 1 << 30, CapacityCPU: 1,
+		FloorMemoryBytes: 128 << 20, FloorCPU: .5,
+		StartupBudgetMemory: 256 << 20,
+		CgroupPath:          filepath.Join(root, "target"),
+		ClientFeatures:      []string{FeatureStateSyncV1},
+	}, &token)
+	if err != nil {
+		t.Fatalf("feature Admit consulted absent lease: %v", err)
+	}
+	if resp.Status != StatusAdmitted || token == "" {
+		t.Fatalf("Admit response = %+v token=%q", resp, token)
+	}
 }
 
 func TestServer_AdmitSettledRelease(t *testing.T) {

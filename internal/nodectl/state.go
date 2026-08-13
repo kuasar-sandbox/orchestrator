@@ -396,8 +396,26 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 		if !existing.Provisional && (spec.PeerPID == 0 || existing.PeerPID != spec.PeerPID) {
 			return Reservation{}, nil, fmt.Errorf("sandbox %q already admitted", spec.SandboxID)
 		}
+		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
+			return Reservation{}, nil, fmt.Errorf("sandbox %q provisional owner mismatch", spec.SandboxID)
+		}
 		oldConn = existing.Conn
+	}
+	if sid := s.tokenToSID[spec.Token]; sid != "" && sid != spec.SandboxID {
+		return Reservation{}, nil, fmt.Errorf("token already belongs to sandbox %q", sid)
+	}
+	otherSID := s.cgroupToSID[spec.CgroupPath]
+	if otherSID != "" && otherSID != spec.SandboxID {
+		other := s.bySID[otherSID]
+		if other == nil || !other.Provisional || other.RecoverySource != RecoveryCgroup {
+			return Reservation{}, nil, fmt.Errorf("cgroup %q already belongs to live sandbox %q", spec.CgroupPath, otherSID)
+		}
+	}
+	if s.bySID[spec.SandboxID] != nil {
 		s.deleteLocked(spec.SandboxID)
+	}
+	if otherSID != "" && otherSID != spec.SandboxID {
+		s.deleteLocked(otherSID)
 	}
 	r := &Reservation{
 		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
@@ -442,15 +460,31 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	defer s.mu.Unlock()
 	var oldConns []net.Conn
 	if existing := s.bySID[spec.SandboxID]; existing != nil {
+		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
+			return Reservation{}, nil, fmt.Errorf("sandbox %q owner mismatch", spec.SandboxID)
+		}
 		if existing.Conn != nil && existing.Conn != spec.Conn {
 			oldConns = append(oldConns, existing.Conn)
 		}
-		s.deleteLocked(spec.SandboxID)
 	}
-	if otherSID := s.cgroupToSID[spec.CgroupPath]; otherSID != "" && otherSID != spec.SandboxID {
-		if other := s.deleteLocked(otherSID); other != nil && other.Conn != nil && other.Conn != spec.Conn {
+	if sid := s.tokenToSID[spec.Token]; sid != "" && sid != spec.SandboxID {
+		return Reservation{}, nil, fmt.Errorf("token already belongs to sandbox %q", sid)
+	}
+	otherSID := s.cgroupToSID[spec.CgroupPath]
+	if otherSID != "" && otherSID != spec.SandboxID {
+		other := s.bySID[otherSID]
+		if other == nil || !other.Provisional || other.RecoverySource != RecoveryCgroup {
+			return Reservation{}, nil, fmt.Errorf("cgroup %q already belongs to live sandbox %q", spec.CgroupPath, otherSID)
+		}
+		if other.Conn != nil && other.Conn != spec.Conn {
 			oldConns = append(oldConns, other.Conn)
 		}
+	}
+	if s.bySID[spec.SandboxID] != nil {
+		s.deleteLocked(spec.SandboxID)
+	}
+	if otherSID != "" && otherSID != spec.SandboxID {
+		s.deleteLocked(otherSID)
 	}
 	stage := StageStartup
 	startup := spec.StartupMemory

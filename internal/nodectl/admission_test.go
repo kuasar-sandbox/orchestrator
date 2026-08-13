@@ -239,12 +239,15 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	entry, ok := a.Enqueue(req, serverConn)
+	entry, ok := a.Enqueue(req, serverConn, 4242)
 	if !ok {
 		t.Fatal("Enqueue failed")
 	}
 	if a.QueueDepth() != 1 {
 		t.Errorf("queue depth=%d, want 1", a.QueueDepth())
+	}
+	if entry.peerPID != 4242 {
+		t.Fatalf("queued peer PID = %d, want 4242", entry.peerPID)
 	}
 	// Production cancels via TTL or worker WriteMessage failure; here
 	// we invoke cancel() directly to drive the canceled-entry sweep.
@@ -271,13 +274,13 @@ func TestAdmission_QueueAtCap(t *testing.T) {
 		FloorMemoryBytes:    64 << 20,
 		StartupBudgetMemory: 64 << 20,
 	}
-	if _, ok := a.Enqueue(req, c1); !ok {
+	if _, ok := a.Enqueue(req, c1, 0); !ok {
 		t.Fatal("enqueue 1 failed")
 	}
-	if _, ok := a.Enqueue(req, c2); !ok {
+	if _, ok := a.Enqueue(req, c2, 0); !ok {
 		t.Fatal("enqueue 2 failed")
 	}
-	if _, ok := a.Enqueue(req, c3); ok {
+	if _, ok := a.Enqueue(req, c3, 0); ok {
 		t.Error("enqueue 3 should have failed (queue at cap)")
 	}
 }

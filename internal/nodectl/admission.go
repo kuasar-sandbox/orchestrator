@@ -515,7 +515,7 @@ func (a *AdmissionController) ConsumeToken() bool {
 // Enqueue inserts a pending admit at the tail. Caller is responsible
 // for arranging conn-EOF monitoring (the goroutine that calls
 // PendingAdmit.cancel on read EOF). Returns false if queue is at cap.
-func (a *AdmissionController) Enqueue(req *Message, conn net.Conn) (*PendingAdmit, bool) {
+func (a *AdmissionController) Enqueue(req *Message, conn net.Conn, peerPID int) (*PendingAdmit, bool) {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 	if a.queue.Len() >= a.policy.QueueMaxDepth {
@@ -524,6 +524,7 @@ func (a *AdmissionController) Enqueue(req *Message, conn net.Conn) (*PendingAdmi
 	p := &PendingAdmit{
 		req:       req,
 		conn:      conn,
+		peerPID:   peerPID,
 		queuedAt:  time.Now(),
 		queuedPos: a.queue.Len(),
 		cancelCh:  make(chan struct{}),
