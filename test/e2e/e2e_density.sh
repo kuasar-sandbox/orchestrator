@@ -650,8 +650,14 @@ wait_for_guest_self_cap() {
 }
 
 reservation_count() {
-    python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("reservations", {})))' \
-        "$WORK/state.json" 2>/dev/null || echo 0
+    local reservations
+    if ! reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null); then
+        echo 0
+        return
+    fi
+    python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' \
+        <<<"$reservations" 2>/dev/null || echo 0
 }
 
 wait_for_reservations() {
