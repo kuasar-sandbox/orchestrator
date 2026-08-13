@@ -632,26 +632,31 @@ controller (node-ctl conductor serve resource_listen)
 
 控制器进程重启(systemd 自动 restart 或运维主动)但 host 未重启时:
 
-1. **读 /run/node-ctl/state.json**:成功则得到上次写入时的 reservations 快照;
-   失败或不存在则 reservations = []
-2. **扫描已知父 cgroup**:控制器 yaml 配置一个或多个 `cgroup_scan_paths`
-   (典型 `/sys/fs/cgroup/sandboxes/`),遍历得到当前 host 上活的沙箱 cgroup
-   列表
-3. **交叉对账**:对每个 cgroup:
-   - 在 state.json 找到对应 reservation:状态有效,标记待重连
-   - 不在 state.json:**孤儿 cgroup**——通过 cgroup.procs 找 sandbox-ctl pid,
-     通过 `/proc/<pid>/cmdline` 验证是 sandbox-ctl,通过启动参数读到
-     sandbox.yaml 路径取得 sandbox sid + capacity,**临时收纳**为新
-     reservation,等其重连
-   - state.json 有但 cgroup 不存在:沙箱已死,丢弃 reservation
-4. **等待重连**:已知的活 reservation 暂无连接(`Conn=nil`),收到
-   sandbox-ctl 的 `Reattach(token)` 后回 `Ack(new_allocatable)` 重新绑定;
-   超过心跳过期阈值仍无重连的由 IdleSweeper 视为死亡丢弃
-5. **服务恢复**:期间控制器接受新 Admit 申请,但水位计算包含已知活沙箱的
-   reservation(可能短暂超估,优先保守)
+1. 取得 owner lock,此时尚未删除或 bind UDS。
+2. 扫描 `<controller-socket>.leases/` 并用 `F_GETLK` 判活:
+   - 正常 live lease:memory/startup 按 capacity、CPU 按 immutable floor 保守计费;
+   - live 但 JSON/身份损坏:安装 unknown provisional,至少占满整个 allocatable pool;
+   - stale unlocked lease:删除残留,不计费。
+3. 扫描 managed run root。没有新 lease 的旧 managed sandbox 由 locked pidfile、
+   YAML 合同和 `/proc/<pid>/cgroup` 推出 VMM cgroup,按 capacity provisional 计费;
+   若 live pidfile 对应的 YAML/cgroup 尚不能可信恢复(包括 Admit→cgroup 窗口),
+   以该 SID 按整个 pool 建 unknown provisional,绝不跳过。
+4. 扫描 `cgroup_scan_paths`。无 lease/managed 记录但 populated 且有消费者进程的
+   cgroup 按 `memory.max` 计费;无法读、为 `max` 或超过 pool 时占满 pool。
+   State 的规范化 cgroup 索引保证 lease/managed/cgroup 同一消费者不重复计费。
+5. inventory 全部安装到 State 后才删除 stale UDS、bind 并对外服务。因此任何
+   新 Admit 都先看到全部 provisional 安全上界。
+6. sandbox-ctl 重连 StateSync。controller 用 `SO_PEERCRED` 验证 peer PID 等于
+   lease lock owner,验证 controller socket/cgroup root、额度范围;managed 模式
+   再交叉核对 pidfile lock/PID 与 YAML 的 capacity/floor/startup/controller。
+   managed YAML 不包含最终 cgroup path——runner 在 `exec` 时通过 node-owned FD
+   注入——因此还从 `/proc/<peer-pid>/cgroup` 推导 sibling `vmm` 并与 lease 比较。
+   成功后在一个 State 临界区以实际 applied reservation 替换 provisional、更新
+   全部聚合差值并签发新 session token。
 
-**关键不变量**:**cgroup 是真相之源,state.json 是性能优化**。state.json
-损坏不导致功能失败,只是恢复期 + 30 s 等所有沙箱重连。
+**兼容阶段不变量**:live lease、managed pidfile 与 populated cgroup 是恢复真相;
+`state.json` 仅作为旧 token/诊断的额外兼容输入。文件缺失或损坏不影响上述
+安全上界恢复,也不会让控制器以空 State 对外服务。
 
 ### 8.3 故障域处理
 

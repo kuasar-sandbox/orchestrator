@@ -56,7 +56,7 @@ func TestNodeCtlProcessHelper(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, _ = rawLease.WriteString("{not-json\n")
-		} else {
+		} else if os.Getenv("NODECTL_NO_LEASE") != "1" {
 			var err error
 			leaseHandle, err = resource.CreateLease(resource.Lease{
 				Version: resource.LeaseVersion, SandboxID: sid, PID: os.Getpid(),
@@ -278,6 +278,47 @@ func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {
 	if snapshot.ReservationCount != 2 || snapshot.Allocated.MemoryBytes != 300<<20+state.AllocatablePool.MemoryBytes {
 		t.Fatalf("orphan snapshot = %+v", snapshot)
 	}
+}
+
+func TestInventoryOldManagedBeforeCgroupUsesFullPoolUpperBound(t *testing.T) {
+	dir := t.TempDir()
+	socket, root, runRoot, sid := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), filepath.Join(dir, "run"), "legacy-starting"
+	writeFakeCgroupRoot(t, root)
+	managedDir := filepath.Join(runRoot, sid)
+	if err := os.MkdirAll(managedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := fmt.Sprintf(`resources:
+  capacity: {cpu: 1, memory: 512MiB}
+  allocatable: {cpu: 0.5, memory: 128MiB}
+  control: {controller: %q}
+  startup: {memory: 256MiB}
+`, socket)
+	if err := os.WriteFile(filepath.Join(managedDir, sid+".yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_NO_LEASE=1",
+		"NODECTL_SOCKET="+socket, "NODECTL_SID="+sid, "NODECTL_CGROUP="+filepath.Join(root, "not-created"),
+		"NODECTL_PIDFILE="+filepath.Join(managedDir, sid+".pid"))
+	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5})
+	inventory := &Inventory{
+		ControllerSocket: socket, CgroupScanPaths: []string{root}, ManagedRunRoot: runRoot,
+		Pool: state.AllocatablePool, processVMMCgroup: func(int) string { return "" }, Logf: t.Logf,
+	}
+	if err := inventory.Recover(state); err != nil {
+		t.Fatal(err)
+	}
+	res := reservationForTest(t, state, sid)
+	if !res.Provisional || res.RecoverySource != RecoveryUnknownManaged ||
+		res.AllocatableNowMem != state.AllocatablePool.MemoryBytes {
+		t.Fatalf("legacy pre-cgroup reservation = %+v", res)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.UnknownCount != 1 ||
+		snapshot.StartupInFlight != state.AllocatablePool.MemoryBytes {
+		t.Fatalf("legacy pre-cgroup snapshot = %+v", snapshot)
+	}
+	client.send("stop")
 }
 
 func TestSweeperRetainsLiveCgroupAcrossStartupAndHeartbeatTimeouts(t *testing.T) {

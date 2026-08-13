@@ -25,6 +25,7 @@ const (
 	RecoveryManagedPIDFile = "managed-pidfile"
 	RecoveryCgroup         = "cgroup"
 	RecoveryUnknownLease   = "unknown-lease"
+	RecoveryUnknownManaged = "unknown-managed"
 	RecoverySynced         = "synced"
 	RecoveryPersisted      = "persisted-compat"
 )
@@ -237,7 +238,7 @@ func (s *State) addAggregatesLocked(r *Reservation) {
 	if r.Provisional {
 		s.provisionalCount++
 	}
-	if r.RecoverySource == RecoveryUnknownLease {
+	if r.RecoverySource == RecoveryUnknownLease || r.RecoverySource == RecoveryUnknownManaged {
 		s.unknownCount++
 	}
 }
@@ -259,7 +260,7 @@ func (s *State) removeAggregatesLocked(r *Reservation) {
 	if r.Provisional && s.provisionalCount > 0 {
 		s.provisionalCount--
 	}
-	if r.RecoverySource == RecoveryUnknownLease && s.unknownCount > 0 {
+	if (r.RecoverySource == RecoveryUnknownLease || r.RecoverySource == RecoveryUnknownManaged) && s.unknownCount > 0 {
 		s.unknownCount--
 	}
 }
@@ -297,12 +298,16 @@ func (s *State) insertLocked(r *Reservation) error {
 		if _, exists := s.tokenToSID[r.Token]; exists {
 			return fmt.Errorf("token already exists")
 		}
-		s.tokenToSID[r.Token] = r.SandboxID
 	}
 	if r.CgroupPath != "" {
 		if sid, exists := s.cgroupToSID[r.CgroupPath]; exists && sid != r.SandboxID {
 			return fmt.Errorf("cgroup %q already belongs to %q", r.CgroupPath, sid)
 		}
+	}
+	if r.Token != "" {
+		s.tokenToSID[r.Token] = r.SandboxID
+	}
+	if r.CgroupPath != "" {
 		s.cgroupToSID[r.CgroupPath] = r.SandboxID
 	}
 	s.bySID[r.SandboxID] = r
@@ -377,6 +382,29 @@ type AdmitSpec struct {
 	ClientFeatures         []string
 	Conn                   net.Conn
 	Now                    time.Time
+}
+
+// CanReplayAdmit reports whether an Admit is replacing an already-accounted
+// recovery upper bound or replaying an ACK-lost, not-yet-advanced session. It
+// never authorizes a new consumer: identity and immutable resource contract
+// must match exactly, and Admit performs the same checks again atomically.
+func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
+	if spec.SandboxID == "" || spec.PeerPID <= 0 || spec.InitialAllocatable < spec.Floor.MemoryBytes ||
+		spec.InitialAllocatable > spec.Capacity.MemoryBytes {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.bySID[spec.SandboxID]
+	if r == nil || r.PeerPID != spec.PeerPID || r.CgroupPath != spec.CgroupPath ||
+		r.Capacity != spec.Capacity || r.Floor != spec.Floor {
+		return false
+	}
+	if r.Provisional {
+		return true
+	}
+	return r.Stage == StageAdmitted && r.AllocatableNowMem == spec.InitialAllocatable &&
+		r.EffectiveStartupBudget == spec.EffectiveStartupBudget
 }
 
 // Admit atomically replaces a matching provisional reservation or creates a

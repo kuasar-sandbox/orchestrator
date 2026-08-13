@@ -83,21 +83,25 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		owner, locked, err := resource.LeaseLockOwner(path)
+		lease, owner, locked, err := resource.InspectLease(path)
 		if err != nil {
+			if locked {
+				controlPIDs[owner] = true
+				i.installUnknownLease(state, path, owner, err)
+				continue
+			}
 			return fmt.Errorf("inspect lease %s: %w", path, err)
 		}
 		if !locked {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if _, err := resource.RemoveUnlockedLease(path); err != nil {
 				return fmt.Errorf("remove stale lease %s: %w", path, err)
 			}
 			continue
 		}
 		controlPIDs[owner] = true
-		lease, err := resource.ReadLease(path)
-		if err != nil || lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
+		if lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
 			entry.Name() != resource.LeaseFilename(lease.SandboxID) || !i.cgroupAllowed(lease.CgroupPath) {
-			i.installUnknownLease(state, path, owner, err)
+			i.installUnknownLease(state, path, owner, nil)
 			continue
 		}
 		err = state.InstallProvisional(ProvisionalSpec{
@@ -153,35 +157,50 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 		if !ok {
 			continue
 		}
-		if _, err := os.Stat(pidPath); err != nil {
-			continue
-		}
-		if _, err := os.Stat(yamlPath); err != nil {
-			continue
-		}
 		owner, locked, err := resource.LeaseLockOwner(pidPath)
-		if err != nil || !locked || controlPIDs[owner] {
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("inspect managed pidfile %s: %w", pidPath, err)
+		}
+		if !locked {
 			continue
 		}
+		if controlPIDs[owner] {
+			continue
+		}
+		controlPIDs[owner] = true
 		pid, err := readPIDFile(pidPath)
 		if err != nil || pid != owner {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "pidfile identity"); err != nil {
+				return err
+			}
 			continue
 		}
 		cfg, err := rtconfig.LoadMerged([]string{yamlPath})
 		if err != nil || cfg.Resources.Control.Controller != i.ControllerSocket {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "managed yaml"); err != nil {
+				return err
+			}
 			continue
 		}
 		capMem, capErr := cfg.CapacityMemoryBytes()
 		floorMem, floorErr := cfg.AllocatableMemoryBytes()
 		startupMem, startupErr := cfg.StartupBytes()
 		if capErr != nil || floorErr != nil || startupErr != nil {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "resource bounds"); err != nil {
+				return err
+			}
 			continue
 		}
 		cgroupPath := i.vmmCgroup(owner)
 		if cgroupPath == "" || !i.cgroupAllowed(cgroupPath) {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "vmm cgroup identity"); err != nil {
+				return err
+			}
 			continue
 		}
-		controlPIDs[owner] = true
 		if err := state.InstallProvisional(ProvisionalSpec{
 			SandboxID: sid, PeerPID: owner, CgroupPath: cgroupPath,
 			Capacity:     Resources{MemoryBytes: capMem, CPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000},
@@ -194,6 +213,16 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 		_ = startupMem // validated against the immutable YAML; provisional startup charges capacity.
 	}
 	return nil
+}
+
+func (i *Inventory) installUnknownManaged(state *State, sid string, owner int, pidPath, reason string) error {
+	i.Logf("live managed sandbox %s has incomplete %s; charging full pool", sid, reason)
+	return state.InstallProvisional(ProvisionalSpec{
+		SandboxID: sid, PeerPID: owner,
+		Capacity: i.Pool, Floor: Resources{CPUMilli: i.Pool.CPUMilli},
+		MemoryCharge: i.Pool.MemoryBytes, StartupCharge: i.Pool.MemoryBytes,
+		RecoverySource: RecoveryUnknownManaged, RecoveryKey: "unknown-managed:" + pidPath,
+	})
 }
 
 func managedVMMCgroup(pid int) string {
@@ -291,16 +320,12 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 
 func (i *Inventory) LookupLiveLease(sid string) (LiveLease, error) {
 	path := i.LeasePath(sid)
-	owner, locked, err := resource.LeaseLockOwner(path)
+	lease, owner, locked, err := resource.InspectLease(path)
 	if err != nil {
 		return LiveLease{}, err
 	}
 	if !locked {
 		return LiveLease{}, fmt.Errorf("lease is not locked")
-	}
-	lease, err := resource.ReadLease(path)
-	if err != nil {
-		return LiveLease{}, err
 	}
 	if lease.SandboxID != sid || lease.PID != owner || lease.ControllerSocket != i.ControllerSocket || !i.cgroupAllowed(lease.CgroupPath) {
 		return LiveLease{}, fmt.Errorf("lease immutable identity mismatch")
@@ -402,7 +427,7 @@ func (i *Inventory) ConsumerLive(r Reservation) bool {
 			return true
 		}
 	}
-	if r.RecoverySource == RecoveryManagedPIDFile {
+	if r.RecoverySource == RecoveryManagedPIDFile || r.RecoverySource == RecoveryUnknownManaged {
 		pidPath, _, ok := i.managedPaths(r.SandboxID)
 		if ok {
 			_, locked, err := resource.LeaseLockOwner(pidPath)

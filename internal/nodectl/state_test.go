@@ -131,6 +131,14 @@ func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
 	if _, _, err := s.Admit(spec); err != nil {
 		t.Fatal(err)
 	}
+	if !s.CanReplayAdmit(spec) {
+		t.Fatal("matching admitted session was not replayable")
+	}
+	wrongOwner := spec
+	wrongOwner.PeerPID++
+	if s.CanReplayAdmit(wrongOwner) {
+		t.Fatal("different owner could replay Admit")
+	}
 	retry := spec
 	retry.Token = "retry-token"
 	if _, _, err := s.Admit(retry); err != nil {
@@ -149,9 +157,35 @@ func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
 	if _, ok := s.SetSettled(retry.Token, 256<<20, time.Now()); !ok {
 		t.Fatal("settle failed")
 	}
+	if s.CanReplayAdmit(retry) {
+		t.Fatal("advanced reservation remained replayable")
+	}
 	retry.Token = "late-token"
 	if _, _, err := s.Admit(retry); err == nil {
 		t.Fatal("Admit retry replaced an advanced reservation")
+	}
+}
+
+func TestProvisionalAdmitReplayIsAlreadyAccounted(t *testing.T) {
+	s := makeState(530<<20, 0)
+	spec := AdmitSpec{
+		SandboxID: "recovering", PeerPID: 100, CgroupPath: "/cg/recovering",
+		Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: spec.SandboxID, PeerPID: spec.PeerPID, CgroupPath: spec.CgroupPath,
+		Capacity: spec.Capacity, Floor: spec.Floor, MemoryCharge: spec.Capacity.MemoryBytes,
+		StartupCharge: spec.Capacity.MemoryBytes, RecoverySource: RecoveryLease, RecoveryKey: "lease:recovering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if zone := s.ResourceSnapshot().Zone; zone != ZoneCritical {
+		t.Fatalf("provisional did not make test pool critical: %s", zone)
+	}
+	if !s.CanReplayAdmit(spec) {
+		t.Fatal("critical provisional could not be replayed")
 	}
 }
 
