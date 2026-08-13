@@ -87,7 +87,9 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 		if err != nil {
 			if locked {
 				controlPIDs[owner] = true
-				i.installUnknownLease(state, path, owner, err)
+				if installErr := i.installUnknownLease(state, path, owner, err); installErr != nil {
+					return installErr
+				}
 				continue
 			}
 			return fmt.Errorf("inspect lease %s: %w", path, err)
@@ -101,7 +103,9 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 		controlPIDs[owner] = true
 		if lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
 			entry.Name() != resource.LeaseFilename(lease.SandboxID) || !i.cgroupAllowed(lease.CgroupPath) {
-			i.installUnknownLease(state, path, owner, nil)
+			if err := i.installUnknownLease(state, path, owner, nil); err != nil {
+				return err
+			}
 			continue
 		}
 		err = state.InstallProvisional(ProvisionalSpec{
@@ -119,22 +123,23 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 	return nil
 }
 
-func (i *Inventory) installUnknownLease(state *State, path string, owner int, parseErr error) {
-	name := strings.TrimSuffix(filepath.Base(path), ".json")
-	if len(name) > 16 {
-		name = name[:16]
-	}
+func (i *Inventory) installUnknownLease(state *State, path string, owner int, parseErr error) error {
+	digest := sha256.Sum256([]byte(path))
+	name := hex.EncodeToString(digest[:])
 	if parseErr == nil {
 		parseErr = errors.New("immutable lease identity validation failed")
 	}
 	i.Logf("live lease %s is invalid; charging full pool: %v", path, parseErr)
-	_ = state.InstallProvisional(ProvisionalSpec{
+	if err := state.InstallProvisional(ProvisionalSpec{
 		SandboxID: "unknown-lease-" + name, PeerPID: owner,
 		Capacity: i.Pool, Floor: Resources{CPUMilli: i.Pool.CPUMilli},
 		MemoryCharge: i.Pool.MemoryBytes, StartupCharge: i.Pool.MemoryBytes,
 		RecoverySource: RecoveryUnknownLease, RecoveryKey: "unknown:" + path,
 		LeasePath: path,
-	})
+	}); err != nil {
+		return fmt.Errorf("install invalid live lease %s: %w", path, err)
+	}
+	return nil
 }
 
 func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {

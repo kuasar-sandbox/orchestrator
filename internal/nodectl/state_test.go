@@ -120,6 +120,22 @@ func TestSyncMergesOrphanCgroupProvisional(t *testing.T) {
 	}
 }
 
+func TestSyncRequiresRecoveredConsumer(t *testing.T) {
+	s := makeState(8<<30, 0)
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "untracked-token", SandboxID: "untracked", PeerPID: 200,
+		CgroupPath: "/cg/untracked", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20, Settled: true,
+	}); err == nil {
+		t.Fatal("StateSync created a reservation without recovered state")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("rejected StateSync changed state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
 	s := makeState(8<<30, 0)
 	spec := AdmitSpec{
@@ -329,5 +345,20 @@ func TestNamedAdmitReleaseAndSIDIndex(t *testing.T) {
 	}
 	if _, found := s.SnapshotSandboxResource("sb-x"); found {
 		t.Error("SID index retained a removed reservation")
+	}
+}
+
+func TestAdmitRejectsAllocationAboveCapacity(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "over-cap", SandboxID: "over-cap",
+		Capacity:           Resources{MemoryBytes: 128 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 64 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}); err == nil {
+		t.Fatal("Admit accepted allocation above capacity")
+	}
+	if got := s.ResourceSnapshot(); got.ReservationCount != 0 || got.Allocated.MemoryBytes != 0 {
+		t.Fatalf("failed Admit changed aggregates: %+v", got)
 	}
 }

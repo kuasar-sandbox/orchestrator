@@ -3,6 +3,7 @@ package nodectl
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -57,29 +58,29 @@ func (r Resources) Add(other Resources) Resources {
 // Reservation is controller-owned mutable state. State methods return copies;
 // no caller receives a pointer stored in the maps.
 type Reservation struct {
-	Token             string
-	SandboxID         string
-	PeerPID           int
-	CgroupPath        string
-	Capacity          Resources
-	Floor             Resources
-	AllocatableNowMem uint64
+	Token             string    `json:"token"`
+	SandboxID         string    `json:"sandbox_id"`
+	PeerPID           int       `json:"sandbox_ctl_pid,omitempty"`
+	CgroupPath        string    `json:"cgroup_path,omitempty"`
+	Capacity          Resources `json:"capacity"`
+	Floor             Resources `json:"floor"`
+	AllocatableNowMem uint64    `json:"allocatable_now_mem"`
 
-	EffectiveStartupBudget uint64
-	Stage                  string
-	StageEnteredAt         time.Time
-	LastHeartbeatAt        time.Time
-	OOMCount               uint64
-	LastReportedRSS        uint64
-	LastReportAt           time.Time
+	EffectiveStartupBudget uint64    `json:"effective_startup_budget,omitempty"`
+	Stage                  string    `json:"stage"`
+	StageEnteredAt         time.Time `json:"stage_entered_at"`
+	LastHeartbeatAt        time.Time `json:"last_heartbeat_at"`
+	OOMCount               uint64    `json:"oom_count"`
+	LastReportedRSS        uint64    `json:"last_reported_rss,omitempty"`
+	LastReportAt           time.Time `json:"last_report_at,omitempty"`
 
-	Provisional    bool
-	RecoverySource string
-	RecoveryKey    string
-	LeasePath      string
-	StartupExpired bool
-	ClientFeatures []string
-	Conn           net.Conn
+	Provisional    bool     `json:"provisional,omitempty"`
+	RecoverySource string   `json:"recovery_source,omitempty"`
+	RecoveryKey    string   `json:"recovery_key,omitempty"`
+	LeasePath      string   `json:"lease_path,omitempty"`
+	StartupExpired bool     `json:"startup_expired,omitempty"`
+	ClientFeatures []string `json:"client_features,omitempty"`
+	Conn           net.Conn `json:"-"`
 }
 
 func (r Reservation) identity() string {
@@ -291,6 +292,10 @@ func (s *State) insertLocked(r *Reservation) error {
 	if r == nil || r.SandboxID == "" {
 		return fmt.Errorf("reservation sandbox id is required")
 	}
+	if r.AllocatableNowMem > r.Capacity.MemoryBytes || r.Floor.MemoryBytes > r.Capacity.MemoryBytes ||
+		r.Floor.CPUMilli > r.Capacity.CPUMilli || r.EffectiveStartupBudget > r.Capacity.MemoryBytes {
+		return fmt.Errorf("reservation resources exceed capacity")
+	}
 	if _, exists := s.bySID[r.SandboxID]; exists {
 		return fmt.Errorf("sandbox %q already has a reservation", r.SandboxID)
 	}
@@ -397,7 +402,8 @@ func (s *State) CanReplayAdmit(spec AdmitSpec) bool {
 	defer s.mu.Unlock()
 	r := s.bySID[spec.SandboxID]
 	if r == nil || r.PeerPID != spec.PeerPID || r.CgroupPath != spec.CgroupPath ||
-		r.Capacity != spec.Capacity || r.Floor != spec.Floor {
+		r.Capacity != spec.Capacity || r.Floor != spec.Floor ||
+		!slices.Equal(r.ClientFeatures, spec.ClientFeatures) {
 		return false
 	}
 	if r.Provisional {
@@ -501,7 +507,8 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var oldConns []net.Conn
-	if existing := s.bySID[spec.SandboxID]; existing != nil {
+	existing := s.bySID[spec.SandboxID]
+	if existing != nil {
 		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
 			return Reservation{}, nil, fmt.Errorf("sandbox %q owner mismatch", spec.SandboxID)
 		}
@@ -513,6 +520,9 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 		return Reservation{}, nil, fmt.Errorf("token already belongs to sandbox %q", sid)
 	}
 	otherSID := s.cgroupToSID[spec.CgroupPath]
+	if existing == nil && otherSID == "" {
+		return Reservation{}, nil, fmt.Errorf("state sync has no recovered reservation")
+	}
 	if otherSID != "" && otherSID != spec.SandboxID {
 		other := s.bySID[otherSID]
 		if other == nil || !other.Provisional || other.RecoverySource != RecoveryCgroup {
@@ -633,7 +643,11 @@ func (s *State) Grant(token string, requested uint64, urgency string, allocator 
 			headroom = 0
 		}
 	}
-	if capRoom := r.Capacity.MemoryBytes - r.AllocatableNowMem; headroom > capRoom {
+	capRoom := uint64(0)
+	if r.Capacity.MemoryBytes > r.AllocatableNowMem {
+		capRoom = r.Capacity.MemoryBytes - r.AllocatableNowMem
+	}
+	if headroom > capRoom {
 		headroom = capRoom
 	}
 	decision := allocator.Grant(token, requested, headroom, urgency)

@@ -238,6 +238,16 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *string) *Message {
+	// A recovered provisional or ACK-lost Admit is already charged. Let the
+	// matching lease owner atomically replace that charge before applying gates
+	// intended only for a new consumer.
+	if s.State.CanReplayAdmit(admitSpecFromRequest(conn, peerPID, req)) {
+		resp, err := s.buildAdmitOK(conn, peerPID, req, token)
+		if err != nil {
+			return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error()}
+		}
+		return resp
+	}
 	oc := s.Admission.AnalyzeRequest(req)
 	switch oc.Status {
 	case OutcomeAdmitted:
@@ -308,7 +318,7 @@ func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
 // buildAdmitOK builds the Reservation, inserts it into State, returns
 // the AdmitResponse message. Caller has already token-consumed.
 func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
-	ebudget := computeEffectiveStartupBudget(req)
+	spec := admitSpecFromRequest(conn, peerPID, req)
 	leasePath := ""
 	if slices.Contains(req.ClientFeatures, FeatureStateSyncV1) {
 		if s.Inventory == nil {
@@ -329,14 +339,9 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 	}
 
 	t := NewToken()
-	_, oldConn, err := s.State.Admit(AdmitSpec{
-		Token: t, SandboxID: req.SandboxID, PeerPID: peerPID,
-		CgroupPath:         req.CgroupPath,
-		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
-		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
-		InitialAllocatable: ebudget, EffectiveStartupBudget: ebudget,
-		LeasePath: leasePath, ClientFeatures: req.ClientFeatures, Conn: conn,
-	})
+	spec.Token = t
+	spec.LeasePath = leasePath
+	_, oldConn, err := s.State.Admit(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -354,18 +359,29 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 	}
 
 	s.Logf("admit %s sid=%s initial_alloc=%d",
-		t[:8], req.SandboxID, ebudget)
+		t[:8], req.SandboxID, spec.InitialAllocatable)
 	if s.Auditor != nil {
 		s.Auditor.Logf("admit token=%s sid=%s initial_alloc=%d cap_mem=%d floor_mem=%d effective_startup=%d",
-			t[:8], req.SandboxID, ebudget,
-			req.CapacityMemoryBytes, req.FloorMemoryBytes, ebudget)
+			t[:8], req.SandboxID, spec.InitialAllocatable,
+			req.CapacityMemoryBytes, req.FloorMemoryBytes, spec.EffectiveStartupBudget)
 	}
 	return &Message{
 		Type:                TypeAdmitResponse,
 		Token:               t,
 		Status:              StatusAdmitted,
-		GrantedInitialAlloc: ebudget,
+		GrantedInitialAlloc: spec.InitialAllocatable,
 	}, nil
+}
+
+func admitSpecFromRequest(conn net.Conn, peerPID int, req *Message) AdmitSpec {
+	ebudget := computeEffectiveStartupBudget(req)
+	return AdmitSpec{
+		SandboxID: req.SandboxID, PeerPID: peerPID, CgroupPath: req.CgroupPath,
+		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU * 1000)},
+		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
+		InitialAllocatable: ebudget, EffectiveStartupBudget: ebudget,
+		ClientFeatures: req.ClientFeatures, Conn: conn,
+	}
 }
 
 // handleReattach re-binds a connection to an existing reservation

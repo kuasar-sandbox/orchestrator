@@ -105,6 +105,47 @@ func TestFeatureAdmitDoesNotOpenLifecycleLease(t *testing.T) {
 	}
 }
 
+func TestRecoveredAdmitReplayBypassesNewConsumerGates(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "cgroups")
+	cgroup := filepath.Join(root, "recovering")
+	state := makeState(530<<20, 0)
+	features := []string{FeatureStateSyncV1}
+	if err := state.InstallProvisional(ProvisionalSpec{
+		SandboxID: "recovering", PeerPID: 4242, CgroupPath: cgroup,
+		Capacity:     Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		Floor:        Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		MemoryCharge: 512 << 20, StartupCharge: 512 << 20,
+		RecoverySource: RecoveryLease, RecoveryKey: "lease:recovering", ClientFeatures: features,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admission := NewAdmissionController(AdmissionPolicy{Rate: 1, Burst: 1})
+	admission.state = state
+	admission.SetDrained(true)
+	srv := &Server{
+		State: state, Admission: admission, Logf: t.Logf,
+		Inventory: &Inventory{ControllerSocket: filepath.Join(dir, "controller.sock"), CgroupScanPaths: []string{root}},
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	token := ""
+	resp := srv.handleAdmit(server, 4242, &Message{
+		Type: TypeAdmit, SandboxID: "recovering", CgroupPath: cgroup,
+		CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
+		FloorMemoryBytes: 128 << 20, FloorCPU: .5,
+		StartupBudgetMemory: 256 << 20, ClientFeatures: features,
+	}, &token)
+	if resp == nil || resp.Status != StatusAdmitted || token == "" {
+		t.Fatalf("replayed Admit = %+v token=%q", resp, token)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Allocated.MemoryBytes != 256<<20 {
+		t.Fatalf("replayed Admit snapshot = %+v", snapshot)
+	}
+}
+
 func TestServer_AdmitSettledRelease(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()

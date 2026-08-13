@@ -46,7 +46,11 @@ func TestNodeCtlProcessHelper(t *testing.T) {
 			if err := os.MkdirAll(resource.LeaseDir(socket), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			fd, err := unix.Open(resource.LeasePath(socket, sid), unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
+			leasePath := resource.LeasePath(socket, sid)
+			if override := os.Getenv("NODECTL_LEASE_PATH"); override != "" {
+				leasePath = override
+			}
+			fd, err := unix.Open(leasePath, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -262,6 +266,36 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	}
 	valid.send("stop")
 	corrupt.send("stop")
+}
+
+func TestInventoryChargesEveryInvalidLiveLeaseWithDistinctIdentity(t *testing.T) {
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "controller.sock")
+	leaseDir := resource.LeaseDir(socket)
+	if err := os.MkdirAll(leaseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	firstPath := filepath.Join(leaseDir, "same-prefix-0000-a.json")
+	secondPath := filepath.Join(leaseDir, "same-prefix-0000-b.json")
+	first := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_CORRUPT=1", "NODECTL_SOCKET="+socket,
+		"NODECTL_SID=first", "NODECTL_CGROUP=/unused", "NODECTL_LEASE_PATH="+firstPath)
+	second := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_CORRUPT=1", "NODECTL_SOCKET="+socket,
+		"NODECTL_SID=second", "NODECTL_CGROUP=/unused", "NODECTL_LEASE_PATH="+secondPath)
+
+	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5})
+	inventory := &Inventory{ControllerSocket: socket, Pool: state.AllocatablePool, Logf: t.Logf}
+	if err := inventory.Recover(state); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 2 || snapshot.ProvisionalCount != 2 || snapshot.UnknownCount != 2 {
+		t.Fatalf("invalid lease snapshot = %+v", snapshot)
+	}
+	if snapshot.Allocated.MemoryBytes != 2*state.AllocatablePool.MemoryBytes {
+		t.Fatalf("invalid leases were not charged independently: %+v", snapshot)
+	}
+	first.send("stop")
+	second.send("stop")
 }
 
 func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {

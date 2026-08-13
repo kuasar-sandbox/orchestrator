@@ -7,6 +7,19 @@ func installReservationForTest(t *testing.T, state *State, r Reservation) {
 	if r.SandboxID == "" {
 		r.SandboxID = "sid-" + r.Token
 	}
+	minimumCapacity := r.AllocatableNowMem
+	if r.EffectiveStartupBudget > minimumCapacity {
+		minimumCapacity = r.EffectiveStartupBudget
+	}
+	if r.Floor.MemoryBytes > minimumCapacity {
+		minimumCapacity = r.Floor.MemoryBytes
+	}
+	if r.Capacity.MemoryBytes < minimumCapacity {
+		r.Capacity.MemoryBytes = minimumCapacity
+	}
+	if r.Capacity.CPUMilli < r.Floor.CPUMilli {
+		r.Capacity.CPUMilli = r.Floor.CPUMilli
+	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	copy := cloneReservation(&r)
