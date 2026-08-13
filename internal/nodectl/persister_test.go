@@ -1,7 +1,9 @@
 package nodectl
 
 import (
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -88,5 +90,68 @@ func TestPersisterAtomicWrite(t *testing.T) {
 	if loaded.NodeBudget.MemoryBytes != s2.NodeBudget.MemoryBytes {
 		t.Errorf("got = %d, want %d (latest)",
 			loaded.NodeBudget.MemoryBytes, s2.NodeBudget.MemoryBytes)
+	}
+}
+
+func TestPersisterLoadsLegacyReservationFieldNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	payload := `{
+  "version": 1,
+  "node_budget": {"memory_bytes": 1073741824, "cpu_milli": 1000},
+  "host_reserved": {"memory_bytes": 0, "cpu_milli": 0},
+  "operational_margin": {"memory_bytes": 0, "cpu_milli": 0},
+  "allocatable_pool": {"memory_bytes": 1073741824, "cpu_milli": 1000},
+  "watermarks": {},
+  "reservations": {
+    "legacy-token": {
+      "token": "legacy-token",
+      "sandbox_id": "legacy-sid",
+      "sandbox_ctl_pid": 1234,
+      "cgroup_path": "/sys/fs/cgroup/legacy",
+      "capacity": {"memory_bytes": 536870912, "cpu_milli": 1000},
+      "floor": {"memory_bytes": 134217728, "cpu_milli": 500},
+      "allocatable_now_mem": 268435456,
+      "effective_startup_budget": 0,
+      "stage": "settled",
+      "stage_entered_at": "2026-01-01T00:00:00Z",
+      "last_heartbeat_at": "2026-01-01T00:00:00Z",
+      "oom_count": 0
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := reservationByTokenForTest(t, loaded, "legacy-token")
+	if r.SandboxID != "legacy-sid" || r.PeerPID != 1234 || r.CgroupPath != "/sys/fs/cgroup/legacy" {
+		t.Fatalf("legacy reservation = %+v", r)
+	}
+}
+
+func TestPersisterSerializesConcurrentFlushes(t *testing.T) {
+	p := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
+	states := []*State{makeState(100<<30, 16<<30), makeState(200<<30, 16<<30)}
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for n := 0; n < 32; n++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			errs <- p.Flush(states[index%len(states)])
+		}(n)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := p.Load(); err != nil {
+		t.Fatalf("concurrent flush left invalid snapshot: %v", err)
 	}
 }

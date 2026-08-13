@@ -87,19 +87,21 @@ persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
 ### 2.3 `node-ctl resource status`
 
 ```
-node-ctl resource status [--state /run/node-ctl/state.json]
+node-ctl resource status [--socket /run/sandbox-resource.sock]
 ```
 
-读 state 文件,打印水位区、节点预算、host 预留、运维容差、已分配量、利用率与
-reservation 数。只读,可与运行中的控制器共存。
+通过 live controller UDS 一次读取一致的内存快照,打印水位区、节点预算、host
+预留、运维容差、已分配量、利用率以及 precise/provisional/connected reservation
+数量。命令只读;controller 不可用时明确失败,不读取可能过期的 state 文件。
 
 ### 2.4 `node-ctl resource list`
 
 ```
-node-ctl resource list [--state /run/node-ctl/state.json]
+node-ctl resource list [--socket /run/sandbox-resource.sock]
 ```
 
-把 reservation 表导出为 JSON。只读。
+通过 live controller UDS 把 reservation 表导出为 JSON,包含 provisional、
+connected 与 recovery source 等恢复诊断字段。查询不读取 state 文件。
 
 ### 2.5 `node-ctl resource drain`
 

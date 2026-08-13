@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // Persister snapshots State to a single JSON file. /run is tmpfs by
@@ -16,6 +17,7 @@ import (
 // §11.2).
 type Persister struct {
 	Path string
+	mu   sync.Mutex
 }
 
 type persistedState struct {
@@ -34,6 +36,8 @@ func (p *Persister) Flush(s *State) error {
 	if p.Path == "" {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
 		return fmt.Errorf("persister: mkdir: %w", err)
 	}
