@@ -408,7 +408,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
-| `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
+| `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),`state_path` 仅旧 YAML 解析兼容且 deprecated/ignored;`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
 远程内存 Prefetch 没有节点统一开关。是否请求 Prefetch 由每个 sandbox 的
 `kuasar-sandbox.restore` 命名空间决定(§4.6)。

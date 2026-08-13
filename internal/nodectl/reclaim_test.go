@@ -1,14 +1,12 @@
 package nodectl
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
-	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
 	// Pre-load a settled reservation with allocatable far above the
 	// reported working set. The reclaimer should shrink it toward
@@ -26,7 +24,6 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 
 	r := &ActiveReclaimer{
 		State:        state,
-		Persister:    persister,
 		SafetyMargin: 1.25,
 		Logf:         t.Logf,
 	}
@@ -41,7 +38,6 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 
 func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
-	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
 	installReservationForTest(t, state, Reservation{
 		Token:             "b",
@@ -53,7 +49,7 @@ func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 		Capacity:          Resources{MemoryBytes: 4 << 30},
 	})
 
-	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
+	r := &ActiveReclaimer{State: state, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
 	got := reservationForTest(t, state, "sb-b").AllocatableNowMem
@@ -64,7 +60,6 @@ func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 
 func TestActiveReclaimer_SkipsNonSettled(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
-	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
 	installReservationForTest(t, state, Reservation{
 		Token:             "c",
@@ -76,7 +71,7 @@ func TestActiveReclaimer_SkipsNonSettled(t *testing.T) {
 		Capacity:          Resources{MemoryBytes: 4 << 30},
 	})
 
-	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
+	r := &ActiveReclaimer{State: state, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
 	got := reservationForTest(t, state, "sb-c").AllocatableNowMem
@@ -87,7 +82,6 @@ func TestActiveReclaimer_SkipsNonSettled(t *testing.T) {
 
 func TestActiveReclaimer_TighterMarginInRedZone(t *testing.T) {
 	state := makeState(2<<30, 256<<20) // small node so red zone is reachable
-	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
 	pool := state.AllocatablePool.MemoryBytes
 	// Two settled reservations totaling > 90% of pool to put node in red.
@@ -106,7 +100,7 @@ func TestActiveReclaimer_TighterMarginInRedZone(t *testing.T) {
 		Capacity:          Resources{MemoryBytes: 2 << 30},
 	})
 
-	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
+	r := &ActiveReclaimer{State: state, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
 	// In red zone the margin is 1.05 → target ≈ 525 MiB.
