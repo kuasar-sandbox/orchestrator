@@ -25,8 +25,9 @@ type (
 
 // Protocol constants.
 const (
-	DefaultSocket   = resource.DefaultSocket
-	MaxMessageBytes = resource.MaxMessageBytes
+	DefaultSocket            = resource.DefaultSocket
+	MaxMessageBytes          = resource.MaxMessageBytes
+	DefaultAdminListPageSize = resource.DefaultAdminListPageSize
 
 	TypeAdmit          = resource.TypeAdmit
 	TypeAdmitResponse  = resource.TypeAdmitResponse
