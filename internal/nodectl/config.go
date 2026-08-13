@@ -3,6 +3,7 @@ package nodectl
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -50,6 +51,10 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	listen := c.Socket
 	if listen == "" {
 		listen = DefaultSocket
+	}
+	listen, err := canonicalControllerSocket(listen)
+	if err != nil {
+		return nil, fmt.Errorf("controller socket: %w", err)
 	}
 	out := &Resolved{
 		Listen:          listen,
@@ -146,6 +151,10 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	}
 
 	return out, nil
+}
+
+func canonicalControllerSocket(socket string) (string, error) {
+	return filepath.Abs(socket)
 }
 
 func readMemTotalBytes() (uint64, error) {

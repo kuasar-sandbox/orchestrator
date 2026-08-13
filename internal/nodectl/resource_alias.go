@@ -1,6 +1,6 @@
 // Package nodectl is the reference node-level resource controller — the
 // "sentinel" daemon's brains: admission, allocation, per-sandbox state,
-// budget reclaim, persistence and audit.
+// budget reclaim, rebuildable recovery inventory and audit.
 //
 // The wire protocol and the client it speaks are defined once in
 // sandboxer/pkg/resource (sandbox-ctl is the client). This file
@@ -19,6 +19,8 @@ type (
 	AdmitResult       = resource.AdmitResult
 	HeartbeatResult   = resource.HeartbeatResult
 	AdminStatusResult = resource.AdminStatusResult
+	ResourcesView     = resource.ResourcesView
+	ReservationView   = resource.ReservationView
 )
 
 // Protocol constants.
@@ -36,11 +38,15 @@ const (
 	TypeRelease        = resource.TypeRelease
 	TypeAck            = resource.TypeAck
 	TypeReattach       = resource.TypeReattach
+	TypeStateSync      = resource.TypeStateSync
 	TypeError          = resource.TypeError
 	TypeAdminDrain     = resource.TypeAdminDrain
 	TypeAdminGrant     = resource.TypeAdminGrant
 	TypeAdminReclaim   = resource.TypeAdminReclaim
 	TypeAdminStatus    = resource.TypeAdminStatus
+	TypeAdminList      = resource.TypeAdminList
+
+	FeatureStateSyncV1 = resource.FeatureStateSyncV1
 
 	StatusAdmitted = resource.StatusAdmitted
 	StatusQueued   = resource.StatusQueued

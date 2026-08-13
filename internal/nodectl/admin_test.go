@@ -83,12 +83,10 @@ func TestAdmin_GrantOverridesPool(t *testing.T) {
 	}
 
 	// Server-side reservation should reflect new allocation.
-	srv.State.Lock()
-	r := srv.findBySandboxIDLocked("sb-grant")
-	if r == nil || r.AllocatableNowMem != newAlloc {
+	r := reservationForTest(t, srv.State, "sb-grant")
+	if r.AllocatableNowMem != newAlloc {
 		t.Errorf("reservation alloc=%v, want %d", r, newAlloc)
 	}
-	srv.State.Unlock()
 }
 
 func TestAdmin_ReclaimShrinksReservation(t *testing.T) {
@@ -175,10 +173,9 @@ func TestHeartbeat_ReturnsAllocatable(t *testing.T) {
 
 	// Server-side admin reclaim shrinks; next heartbeat surfaces the
 	// new value to the client.
-	srv.State.Lock()
-	r := srv.findBySandboxIDLocked("sb-hb")
-	r.AllocatableNowMem = 128 << 20
-	srv.State.Unlock()
+	if _, err := srv.State.AdminReclaim("sb-hb", 128<<20); err != nil {
+		t.Fatal(err)
+	}
 
 	res, err = c.Heartbeat(120<<20, 0, 0, 0)
 	if err != nil {

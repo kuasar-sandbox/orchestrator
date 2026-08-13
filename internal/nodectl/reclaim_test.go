@@ -13,8 +13,7 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 	// Pre-load a settled reservation with allocatable far above the
 	// reported working set. The reclaimer should shrink it toward
 	// rss * SafetyMargin = working set + 25%.
-	state.Lock()
-	state.Reservations["a"] = &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token:             "a",
 		SandboxID:         "sb-a",
 		Stage:             StageSettled,
@@ -23,8 +22,7 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 		AllocatableNowMem: 1 << 30,
 		Floor:             Resources{MemoryBytes: 64 << 20},
 		Capacity:          Resources{MemoryBytes: 4 << 30},
-	}
-	state.Unlock()
+	})
 
 	r := &ActiveReclaimer{
 		State:        state,
@@ -34,9 +32,7 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 	}
 	r.sweep()
 
-	state.Lock()
-	got := state.Reservations["a"].AllocatableNowMem
-	state.Unlock()
+	got := reservationForTest(t, state, "sb-a").AllocatableNowMem
 	want := uint64(float64(200<<20) * 1.25)
 	if got != want {
 		t.Errorf("after sweep alloc=%d, want %d", got, want)
@@ -47,8 +43,7 @@ func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
 	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
-	state.Lock()
-	state.Reservations["b"] = &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token:             "b",
 		SandboxID:         "sb-b",
 		Stage:             StageSettled,
@@ -56,15 +51,12 @@ func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 		AllocatableNowMem: 1 << 30,
 		Floor:             Resources{MemoryBytes: 128 << 20}, // 128 MiB floor
 		Capacity:          Resources{MemoryBytes: 4 << 30},
-	}
-	state.Unlock()
+	})
 
 	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
-	state.Lock()
-	got := state.Reservations["b"].AllocatableNowMem
-	state.Unlock()
+	got := reservationForTest(t, state, "sb-b").AllocatableNowMem
 	if got != 128<<20 {
 		t.Errorf("alloc=%d, want floor 128 MiB", got)
 	}
@@ -74,8 +66,7 @@ func TestActiveReclaimer_SkipsNonSettled(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
 	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
-	state.Lock()
-	state.Reservations["c"] = &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token:             "c",
 		SandboxID:         "sb-c",
 		Stage:             StageStartup, // not settled yet
@@ -83,15 +74,12 @@ func TestActiveReclaimer_SkipsNonSettled(t *testing.T) {
 		AllocatableNowMem: 1 << 30,
 		Floor:             Resources{MemoryBytes: 64 << 20},
 		Capacity:          Resources{MemoryBytes: 4 << 30},
-	}
-	state.Unlock()
+	})
 
 	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
-	state.Lock()
-	got := state.Reservations["c"].AllocatableNowMem
-	state.Unlock()
+	got := reservationForTest(t, state, "sb-c").AllocatableNowMem
 	if got != 1<<30 {
 		t.Errorf("non-settled reservation should be untouched, got alloc=%d", got)
 	}
@@ -102,35 +90,31 @@ func TestActiveReclaimer_TighterMarginInRedZone(t *testing.T) {
 	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}
 
 	pool := state.AllocatablePool.MemoryBytes
-	state.Lock()
 	// Two settled reservations totaling > 90% of pool to put node in red.
-	state.Reservations["d"] = &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token: "d", SandboxID: "sb-d", Stage: StageSettled,
 		LastReportedRSS:   500 << 20,
 		AllocatableNowMem: uint64(float64(pool) * 0.45),
 		Floor:             Resources{MemoryBytes: 64 << 20},
 		Capacity:          Resources{MemoryBytes: 2 << 30},
-	}
-	state.Reservations["e"] = &Reservation{
+	})
+	installReservationForTest(t, state, Reservation{
 		Token: "e", SandboxID: "sb-e", Stage: StageSettled,
 		LastReportedRSS:   500 << 20,
 		AllocatableNowMem: uint64(float64(pool) * 0.50),
 		Floor:             Resources{MemoryBytes: 64 << 20},
 		Capacity:          Resources{MemoryBytes: 2 << 30},
-	}
-	state.Unlock()
+	})
 
 	r := &ActiveReclaimer{State: state, Persister: persister, SafetyMargin: 1.25, Logf: t.Logf}
 	r.sweep()
 
 	// In red zone the margin is 1.05 → target ≈ 525 MiB.
-	state.Lock()
-	defer state.Unlock()
-	for _, k := range []string{"d", "e"} {
-		got := state.Reservations[k].AllocatableNowMem
+	for _, sid := range []string{"sb-d", "sb-e"} {
+		got := reservationForTest(t, state, sid).AllocatableNowMem
 		want := uint64(float64(500<<20) * 1.05)
 		if got != want {
-			t.Errorf("%s alloc=%d, want %d (red-zone tight margin)", k, got, want)
+			t.Errorf("%s alloc=%d, want %d (red-zone tight margin)", sid, got, want)
 		}
 	}
 }

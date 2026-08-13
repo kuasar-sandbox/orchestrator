@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // Persister snapshots State to a single JSON file. /run is tmpfs by
@@ -16,6 +17,17 @@ import (
 // §11.2).
 type Persister struct {
 	Path string
+	mu   sync.Mutex
+}
+
+type persistedState struct {
+	Version           int                     `json:"version"`
+	NodeBudget        Resources               `json:"node_budget"`
+	HostReserved      Resources               `json:"host_reserved"`
+	OperationalMargin Resources               `json:"operational_margin"`
+	AllocatablePool   Resources               `json:"allocatable_pool"`
+	Wm                Watermarks              `json:"watermarks"`
+	Reservations      map[string]*Reservation `json:"reservations"`
 }
 
 // Flush writes state to Path atomically. Caller must hold state lock
@@ -24,10 +36,17 @@ func (p *Persister) Flush(s *State) error {
 	if p.Path == "" {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
 		return fmt.Errorf("persister: mkdir: %w", err)
 	}
-	data, err := json.MarshalIndent(s, "", "  ")
+	snapshot := persistedState{
+		Version: 1, NodeBudget: s.NodeBudget, HostReserved: s.HostReserved,
+		OperationalMargin: s.OperationalMargin, AllocatablePool: s.AllocatablePool,
+		Wm: s.Wm, Reservations: s.PersistenceReservations(),
+	}
+	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return fmt.Errorf("persister: marshal: %w", err)
 	}
@@ -70,15 +89,18 @@ func (p *Persister) Load() (*State, error) {
 		}
 		return nil, fmt.Errorf("persister: read: %w", err)
 	}
-	var s State
-	if err := json.Unmarshal(data, &s); err != nil {
+	var persisted persistedState
+	if err := json.Unmarshal(data, &persisted); err != nil {
 		return nil, fmt.Errorf("persister: unmarshal: %w", err)
 	}
-	if s.Reservations == nil {
-		s.Reservations = make(map[string]*Reservation)
+	s := &State{
+		NodeBudget: persisted.NodeBudget, HostReserved: persisted.HostReserved,
+		OperationalMargin: persisted.OperationalMargin, AllocatablePool: persisted.AllocatablePool,
+		Wm: persisted.Wm, bySID: make(map[string]*Reservation),
+		tokenToSID: make(map[string]string), cgroupToSID: make(map[string]string),
 	}
-	if err := s.rebuildSandboxIndexLocked(); err != nil {
+	if err := s.RestoreReservations(persisted.Reservations); err != nil {
 		return nil, fmt.Errorf("persister: rebuild sandbox index: %w", err)
 	}
-	return &s, nil
+	return s, nil
 }

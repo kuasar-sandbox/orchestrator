@@ -123,11 +123,15 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 // sets it (an adapter over the resource controller) when resource_listen is on;
 // nil = no controller (static cgroup), then zone/water are reported as their
 // zero-load defaults and only the sandbox count + build alloc carry signal.
+type ResourceProbeSnapshot struct {
+	Zone      string
+	Allocated int64
+	Pool      int64
+	Draining  bool
+}
+
 type ResourceProbe interface {
-	Zone() string          // green | yellow | red | critical
-	AllocatedBytes() int64 // memory currently reserved
-	PoolBytes() int64      // allocatable memory pool
-	Draining() bool        // node-side drain set (node-resource.md §2.5)
+	Snapshot() ResourceProbeSnapshot
 }
 
 // SetResourceProbe wires the node water-level source for the cluster heartbeat.
@@ -250,10 +254,8 @@ func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	o.mu.Unlock()
 	hb := &routesync.Heartbeat{Counts: count, Zone: string(nodectlZoneGreen), BuildAlloc: o.buildAlloc()}
 	if p := o.probe; p != nil {
-		hb.Zone = p.Zone()
-		hb.Allocated = p.AllocatedBytes()
-		hb.Pool = p.PoolBytes()
-		hb.Draining = p.Draining()
+		snapshot := p.Snapshot()
+		hb.Zone, hb.Allocated, hb.Pool, hb.Draining = snapshot.Zone, snapshot.Allocated, snapshot.Pool, snapshot.Draining
 	}
 	return hb
 }

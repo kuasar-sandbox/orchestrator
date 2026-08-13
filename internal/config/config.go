@@ -91,7 +91,7 @@ type ResourceListenConfig struct {
 	Socket          string                   `yaml:"socket"`            // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
 	StatePath       string                   `yaml:"state_path"`        // restart fast-recovery state (tmpfs); default /run/node-ctl/state.json
 	AuditPath       string                   `yaml:"audit_path"`        // audit log (tmpfs); default /run/node-ctl/audit.log
-	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // (reserved) restart reconcile roots
+	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // restart reconcile roots; default managed runner slice
 	Resources       ResourceHostConfig       `yaml:"resources"`         // node physical capacity + host reservation
 	Watermarks      ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
 	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
@@ -155,7 +155,7 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 		r.AuditPath = "/run/node-ctl/audit.log"
 	}
 	if len(r.CgroupScanPaths) == 0 {
-		r.CgroupScanPaths = []string{"/sys/fs/cgroup/sandboxes"}
+		r.CgroupScanPaths = []string{"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice"}
 	}
 	if r.Resources.PhysicalMemory == "" {
 		r.Resources.PhysicalMemory = "auto"

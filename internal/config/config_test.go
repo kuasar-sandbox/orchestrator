@@ -9,6 +9,15 @@ import (
 	"testing"
 )
 
+func TestResourceListenDefaultsScanManagedRunnerSlice(t *testing.T) {
+	var cfg ResourceListenConfig
+	cfg.ApplyDefaults()
+	want := "/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice"
+	if len(cfg.CgroupScanPaths) != 1 || cfg.CgroupScanPaths[0] != want {
+		t.Fatalf("cgroup scan paths = %v, want [%s]", cfg.CgroupScanPaths, want)
+	}
+}
+
 func TestCheckpointRefLocationURI(t *testing.T) {
 	c := CheckpointConfig{Remote: CheckpointRemoteConfig{RefLocationParent: "file:///mnt/shared/snapshots"}}
 	name := "0198f7a1-1234"

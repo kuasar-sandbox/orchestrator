@@ -47,47 +47,19 @@ func (r *ActiveReclaimer) Run(ctx context.Context) {
 }
 
 func (r *ActiveReclaimer) sweep() {
-	r.State.Lock()
-	defer r.State.Unlock()
-
-	zone := r.State.MemoryZone()
-	margin := r.SafetyMargin
-	switch zone {
-	case ZoneYellow:
-		margin = 1.10
-	case ZoneRed:
-		margin = 1.05
-	case ZoneCritical:
-		margin = 1.00
-	}
-
-	any := false
-	for _, res := range r.State.Reservations {
-		if res.Stage != StageSettled {
-			continue
-		}
-		ws := res.LastReportedRSS
-		if ws == 0 {
-			ws = res.Floor.MemoryBytes
-		}
-		target := uint64(float64(ws) * margin)
-		if target < res.Floor.MemoryBytes {
-			target = res.Floor.MemoryBytes
-		}
-		if target >= res.AllocatableNowMem {
-			continue
-		}
-		delta := res.AllocatableNowMem - target
+	zone := r.State.ResourceSnapshot().Zone
+	events := r.State.ReclaimSettled(r.SafetyMargin)
+	for _, event := range events {
+		res := event.After
+		delta := event.Before.AllocatableNowMem - res.AllocatableNowMem
 		r.Logf("reclaim sid=%s zone=%s rss=%d alloc=%d → %d (-%d)",
-			res.SandboxID, zone, ws, res.AllocatableNowMem, target, delta)
+			res.SandboxID, zone, res.LastReportedRSS, event.Before.AllocatableNowMem, res.AllocatableNowMem, delta)
 		if r.Auditor != nil {
 			r.Auditor.Logf("reclaim sid=%s zone=%s rss=%d alloc=%d→%d delta=%d",
-				res.SandboxID, zone, ws, res.AllocatableNowMem, target, delta)
+				res.SandboxID, zone, res.LastReportedRSS, event.Before.AllocatableNowMem, res.AllocatableNowMem, delta)
 		}
-		res.AllocatableNowMem = target
-		any = true
 	}
-	if any {
+	if len(events) > 0 && r.Persister != nil {
 		if err := r.Persister.Flush(r.State); err != nil {
 			r.Logf("reclaim persist: %v", err)
 		}

@@ -44,9 +44,9 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
-	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -345,7 +345,7 @@ func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 		// every request on the connection can be authorized by peer pid.
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if uc, ok := c.(*net.UnixConn); ok {
-				if pid, err := peerPID(uc); err == nil {
+				if pid, err := unixcred.PeerPID(uc); err == nil {
 					return context.WithValue(ctx, peerPIDKey{}, pid)
 				}
 			}
@@ -676,25 +676,6 @@ func statusWord(b bool, yes, no string) string {
 }
 
 // --- shared helpers ---
-
-// peerPID returns the connecting process's pid via SO_PEERCRED.
-func peerPID(c *net.UnixConn) (int, error) {
-	raw, err := c.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	var ucred *unix.Ucred
-	var serr error
-	if cerr := raw.Control(func(fd uintptr) {
-		ucred, serr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); cerr != nil {
-		return 0, cerr
-	}
-	if serr != nil {
-		return 0, serr
-	}
-	return int(ucred.Pid), nil
-}
 
 func readPID(path string) (int, error) {
 	b, err := os.ReadFile(path)
