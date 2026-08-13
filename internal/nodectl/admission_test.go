@@ -92,8 +92,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 
 	// Simulate the State accepting the reservation so startup_in_flight
 	// grows to reflect the just-admitted budget.
-	state.Lock()
-	res1 := &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token:                  "t1",
 		SandboxID:              "sb-1",
 		Capacity:               Resources{MemoryBytes: 4 << 30},
@@ -101,9 +100,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 		AllocatableNowMem:      3 << 30,
 		EffectiveStartupBudget: 3 << 30,
 		Stage:                  StageAdmitted,
-	}
-	_ = state.Insert(res1)
-	state.Unlock()
+	})
 
 	// Second admit: startup_pool full (3GiB in flight, 5GiB cap, head=3GiB
 	// fits 5-3=2GiB headroom → no fit).
@@ -122,9 +119,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 	}
 
 	// Transition res1 → settled releases startup_in_flight; second admit fits.
-	state.Lock()
-	res1.Stage = StageSettled
-	state.Unlock()
+	mutateReservationForTest(t, state, "sb-1", func(r *Reservation) { r.Stage = StageSettled })
 	oc = a.AnalyzeRequest(req2)
 	if oc.Status != OutcomeAdmitted {
 		t.Errorf("after settled, admit 2 status=%d, want admitted", oc.Status)
@@ -224,8 +219,7 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 		QueueMaxDepth: 4,
 	}, state)
 	// Force a short-term block by filling main pool with one big reservation.
-	state.Lock()
-	_ = state.Insert(&Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token: "filler", SandboxID: "filler",
 		Capacity:               Resources{MemoryBytes: 1 << 30},
 		Floor:                  Resources{MemoryBytes: 1 << 30},
@@ -233,7 +227,6 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 		EffectiveStartupBudget: 900 << 20,
 		Stage:                  StageAdmitted,
 	})
-	state.Unlock()
 
 	req := &Message{
 		SandboxID:           "sb-q",
@@ -246,12 +239,15 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	entry, ok := a.Enqueue(req, serverConn)
+	entry, ok := a.Enqueue(req, serverConn, 4242)
 	if !ok {
 		t.Fatal("Enqueue failed")
 	}
 	if a.QueueDepth() != 1 {
 		t.Errorf("queue depth=%d, want 1", a.QueueDepth())
+	}
+	if entry.peerPID != 4242 {
+		t.Fatalf("queued peer PID = %d, want 4242", entry.peerPID)
 	}
 	// Production cancels via TTL or worker WriteMessage failure; here
 	// we invoke cancel() directly to drive the canceled-entry sweep.
@@ -278,14 +274,50 @@ func TestAdmission_QueueAtCap(t *testing.T) {
 		FloorMemoryBytes:    64 << 20,
 		StartupBudgetMemory: 64 << 20,
 	}
-	if _, ok := a.Enqueue(req, c1); !ok {
+	if _, ok := a.Enqueue(req, c1, 0); !ok {
 		t.Fatal("enqueue 1 failed")
 	}
-	if _, ok := a.Enqueue(req, c2); !ok {
+	if _, ok := a.Enqueue(req, c2, 0); !ok {
 		t.Fatal("enqueue 2 failed")
 	}
-	if _, ok := a.Enqueue(req, c3); ok {
+	if _, ok := a.Enqueue(req, c3, 0); ok {
 		t.Error("enqueue 3 should have failed (queue at cap)")
+	}
+}
+
+func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
+	state := newTestState(t, 8<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
+	})
+	a.state = state
+	a.processFn = func(p *PendingAdmit) (*Message, error) {
+		token := "queued-token"
+		_, _, err := state.Admit(AdmitSpec{
+			Token: token, SandboxID: p.req.SandboxID, PeerPID: p.peerPID,
+			Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+			Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+			InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+			Conn: p.conn,
+		})
+		return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted, Token: token}, err
+	}
+	client, server := net.Pipe()
+	req := &Message{
+		SandboxID: "queued-disconnect", CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
+		FloorMemoryBytes: 128 << 20, FloorCPU: .5, StartupBudgetMemory: 256 << 20,
+	}
+	if _, ok := a.Enqueue(req, server, 4242); !ok {
+		t.Fatal("enqueue failed")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a.processQueue()
+	defer server.Close()
+	got := reservationForTest(t, state, req.SandboxID)
+	if got.Conn != nil {
+		t.Fatal("failed queued response retained a closed connection as liveness evidence")
 	}
 }
 

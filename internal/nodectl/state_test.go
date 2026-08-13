@@ -1,6 +1,8 @@
 package nodectl
 
 import (
+	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -12,6 +14,438 @@ func makeState(physMem, hostMem uint64) *State {
 		LowFactor:               0.70,
 		EmergencyFactor:         0.05,
 	})
+}
+
+func TestCPUMilliCeilPreservesPositiveFloors(t *testing.T) {
+	for _, tc := range []struct {
+		cpu  float64
+		want uint64
+	}{{0, 0}, {0.0005, 1}, {0.001, 1}, {0.0011, 2}, {0.5, 500}} {
+		if got := cpuMilliCeil(tc.cpu); got != tc.want {
+			t.Fatalf("cpuMilliCeil(%g) = %d, want %d", tc.cpu, got, tc.want)
+		}
+	}
+}
+
+func TestSyncAtomicallyReplacesProvisionalAndPriorSession(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryLease, RecoveryKey: "lease:sync",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstClient, firstServer := net.Pipe()
+	defer firstClient.Close()
+	defer firstServer.Close()
+	if _, old, err := s.Sync(SyncSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Token: "token-1",
+		Capacity: Resources{MemoryBytes: 2 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		StartupMemory: 512 << 20, AppliedMemory: 512 << 20, Conn: firstServer,
+	}); err != nil || len(old) != 0 {
+		t.Fatalf("first sync old=%d err=%v", len(old), err)
+	}
+	if got := s.ResourceSnapshot(); got.Allocated.MemoryBytes != 512<<20 || got.StartupInFlight != 512<<20 || got.ProvisionalCount != 0 {
+		t.Fatalf("first sync snapshot = %+v", got)
+	}
+	secondClient, secondServer := net.Pipe()
+	defer secondClient.Close()
+	defer secondServer.Close()
+	if _, old, err := s.Sync(SyncSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Token: "token-2",
+		Capacity: Resources{MemoryBytes: 2 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		StartupMemory: 512 << 20, AppliedMemory: 256 << 20, Settled: true, Conn: secondServer,
+	}); err != nil || len(old) != 1 || old[0] != firstServer {
+		t.Fatalf("second sync old=%v err=%v", old, err)
+	}
+	if got := s.ResourceSnapshot(); got.Allocated.MemoryBytes != 256<<20 || got.StartupInFlight != 0 || got.ReservationCount != 1 {
+		t.Fatalf("second sync snapshot = %+v", got)
+	}
+	if _, found := s.Heartbeat("token-1", 0, time.Now()); found {
+		t.Fatal("old token remained valid after sync")
+	}
+}
+
+func TestSyncRejectsLiveCgroupCollisionWithoutDroppingEitherConsumer(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "owner-token", SandboxID: "owner", PeerPID: 100,
+		CgroupPath: "/cg/shared", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, InitialAllocatable: 512 << 20,
+		EffectiveStartupBudget: 512 << 20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "claimant", PeerPID: 200, Capacity: Resources{MemoryBytes: 1 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, MemoryCharge: 1 << 30,
+		StartupCharge: 1 << 30, RecoverySource: RecoveryLease, RecoveryKey: "lease:claimant",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "claimant-token", SandboxID: "claimant", PeerPID: 200,
+		CgroupPath: "/cg/shared", Capacity: Resources{MemoryBytes: 1 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20,
+	}); err == nil {
+		t.Fatal("StateSync evicted a different live cgroup owner")
+	}
+	after := s.ResourceSnapshot()
+	if after != before {
+		t.Fatalf("failed StateSync changed aggregates: before=%+v after=%+v", before, after)
+	}
+	if _, found := s.Heartbeat("owner-token", 0, time.Now()); !found {
+		t.Fatal("failed StateSync removed the original session")
+	}
+	if got := reservationForTest(t, s, "claimant"); !got.Provisional {
+		t.Fatalf("failed StateSync replaced claimant provisional: %+v", got)
+	}
+}
+
+func TestSyncMergesOrphanCgroupProvisional(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "synced-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20, Settled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Allocated.MemoryBytes != 256<<20 {
+		t.Fatalf("merged orphan snapshot = %+v", snapshot)
+	}
+	if _, found := s.SnapshotSandboxResource("orphan"); found {
+		t.Fatal("orphan synthetic SID remained after StateSync")
+	}
+}
+
+func TestSyncRequiresRecoveredConsumer(t *testing.T) {
+	s := makeState(8<<30, 0)
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "untracked-token", SandboxID: "untracked", PeerPID: 200,
+		CgroupPath: "/cg/untracked", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20, Settled: true,
+	}); err == nil {
+		t.Fatal("StateSync created a reservation without recovered state")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("rejected StateSync changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestInvalidSyncDoesNotDropRecoveredCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "invalid-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor: Resources{MemoryBytes: 128 << 20, CPUMilli: 2000}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20,
+	}); err == nil {
+		t.Fatal("StateSync accepted a CPU floor above capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("invalid StateSync changed recovered charge: before=%+v after=%+v", before, after)
+	}
+	if got := reservationForTest(t, s, "orphan"); !got.Provisional || got.RecoverySource != RecoveryCgroup {
+		t.Fatalf("invalid StateSync replaced recovered cgroup: %+v", got)
+	}
+}
+
+func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
+	s := makeState(8<<30, 0)
+	spec := AdmitSpec{
+		Token: "first-token", SandboxID: "retry", PeerPID: 100,
+		CgroupPath: "/cg/retry", Capacity: Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 512 << 20, EffectiveStartupBudget: 512 << 20,
+	}
+	if _, _, err := s.Admit(spec); err != nil {
+		t.Fatal(err)
+	}
+	if !s.CanReplayAdmit(spec) {
+		t.Fatal("matching admitted session was not replayable")
+	}
+	wrongOwner := spec
+	wrongOwner.PeerPID++
+	if s.CanReplayAdmit(wrongOwner) {
+		t.Fatal("different owner could replay Admit")
+	}
+	retry := spec
+	retry.Token = "retry-token"
+	if _, _, err := s.Admit(retry); err != nil {
+		t.Fatalf("identical Admit ACK-loss retry failed: %v", err)
+	}
+	before := s.ResourceSnapshot()
+	changed := retry
+	changed.Token = "changed-token"
+	changed.Capacity.MemoryBytes++
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit retry changed immutable capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("failed Admit retry changed aggregates: before=%+v after=%+v", before, after)
+	}
+	if _, ok := s.SetSettled(retry.Token, 256<<20, time.Now()); !ok {
+		t.Fatal("settle failed")
+	}
+	if s.CanReplayAdmit(retry) {
+		t.Fatal("advanced reservation remained replayable")
+	}
+	retry.Token = "late-token"
+	if _, _, err := s.Admit(retry); err == nil {
+		t.Fatal("Admit retry replaced an advanced reservation")
+	}
+}
+
+func TestProvisionalAdmitReplayIsAlreadyAccounted(t *testing.T) {
+	s := makeState(530<<20, 0)
+	spec := AdmitSpec{
+		SandboxID: "recovering", PeerPID: 100, CgroupPath: "/cg/recovering",
+		Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: spec.SandboxID, PeerPID: spec.PeerPID, CgroupPath: spec.CgroupPath,
+		Capacity: spec.Capacity, Floor: spec.Floor, MemoryCharge: spec.Capacity.MemoryBytes,
+		StartupCharge: spec.Capacity.MemoryBytes, RecoverySource: RecoveryLease, RecoveryKey: "lease:recovering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if zone := s.ResourceSnapshot().Zone; zone != ZoneCritical {
+		t.Fatalf("provisional did not make test pool critical: %s", zone)
+	}
+	if !s.CanReplayAdmit(spec) {
+		t.Fatal("critical provisional could not be replayed")
+	}
+}
+
+func TestAdmitReplacementRequiresSameClientFeatures(t *testing.T) {
+	s := makeState(8<<30, 0)
+	features := []string{FeatureStateSyncV1}
+	base := AdmitSpec{
+		Token: "new-token", SandboxID: "recovering", PeerPID: 100, CgroupPath: "/cg/recovering",
+		Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+		ClientFeatures: features,
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: base.SandboxID, PeerPID: base.PeerPID, CgroupPath: base.CgroupPath,
+		Capacity: base.Capacity, Floor: base.Floor, MemoryCharge: base.Capacity.MemoryBytes,
+		StartupCharge: base.Capacity.MemoryBytes, RecoverySource: RecoveryLease,
+		RecoveryKey: "lease:recovering", ClientFeatures: features,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changed := base
+	changed.ClientFeatures = nil
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit replaced provisional with different client features")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("feature-mismatched provisional replay changed state: before=%+v after=%+v", before, after)
+	}
+	if _, _, err := s.Admit(base); err != nil {
+		t.Fatal(err)
+	}
+	changed.Token = "retry-token"
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit replaced ACK-lost session with different client features")
+	}
+	if _, found := s.Heartbeat("new-token", 0, time.Now()); !found {
+		t.Fatal("feature-mismatched retry invalidated original session")
+	}
+}
+
+func TestInvalidAdmitDoesNotDropRecoveredCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "invalid-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 128 << 20},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}); err == nil {
+		t.Fatal("Admit accepted allocation above capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("invalid Admit changed recovered charge: before=%+v after=%+v", before, after)
+	}
+	if got := reservationForTest(t, s, "orphan"); !got.Provisional || got.RecoverySource != RecoveryCgroup {
+		t.Fatalf("invalid Admit replaced recovered cgroup: %+v", got)
+	}
+}
+
+func TestMergePersistedAttachesTokenWithoutReducingManagedUpperBound(t *testing.T) {
+	s := makeState(8<<30, 0)
+	capacity := Resources{MemoryBytes: 2 << 30, CPUMilli: 1000}
+	floor := Resources{MemoryBytes: 128 << 20, CPUMilli: 500}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "legacy", PeerPID: 101, CgroupPath: "/cg/legacy",
+		Capacity: capacity, Floor: floor, MemoryCharge: capacity.MemoryBytes,
+		StartupCharge: capacity.MemoryBytes, RecoverySource: RecoveryManagedPIDFile,
+		RecoveryKey: "pidfile:legacy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "legacy", PeerPID: 101, CgroupPath: "/cg/legacy",
+		Capacity: capacity, Floor: floor, AllocatableNowMem: 256 << 20,
+		EffectiveStartupBudget: 512 << 20, Stage: StageStartup,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	got := reservationForTest(t, s, "legacy")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != capacity.MemoryBytes ||
+		got.EffectiveStartupBudget != capacity.MemoryBytes {
+		t.Fatalf("merged managed reservation = %+v", got)
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 1 ||
+		snapshot.Allocated.MemoryBytes != capacity.MemoryBytes || snapshot.StartupInFlight != capacity.MemoryBytes {
+		t.Fatalf("legacy token reduced recovery upper bound: %+v", snapshot)
+	}
+	if _, _, found := s.Reattach("legacy-token", nil); !found {
+		t.Fatal("corroborated legacy token could not reattach")
+	}
+}
+
+func TestMergePersistedAttachesTokenAndNamesOrphanWithoutReducingCharge(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "real-sid", PeerPID: 101, CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 4 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		AllocatableNowMem: 256 << 20, EffectiveStartupBudget: 512 << 20, Stage: StageStartup,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := s.SnapshotSandboxResource("orphan"); found {
+		t.Fatal("synthetic orphan SID remained after legacy identity was corroborated")
+	}
+	got := reservationForTest(t, s, "real-sid")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != 2<<30 {
+		t.Fatalf("merged orphan reservation = %+v", got)
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != 2<<30 {
+		t.Fatalf("legacy token reduced orphan cgroup charge: %+v", snapshot)
+	}
+}
+
+func TestMergePersistedAttachesEarlyLegacyTokenToUnknownManagedUpperBound(t *testing.T) {
+	s := makeState(8<<30, 0)
+	pool := s.AllocatablePool.MemoryBytes
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "legacy-starting", PeerPID: 101,
+		Capacity: s.AllocatablePool, Floor: Resources{CPUMilli: s.AllocatablePool.CPUMilli},
+		MemoryCharge: pool, StartupCharge: pool, RecoverySource: RecoveryUnknownManaged,
+		RecoveryKey: "unknown-managed:/run/legacy-starting.pid",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "legacy-starting",
+		Capacity:          Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		AllocatableNowMem: 256 << 20, EffectiveStartupBudget: 512 << 20, Stage: StageAdmitted,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	got := reservationForTest(t, s, "legacy-starting")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != pool {
+		t.Fatalf("merged early managed reservation = %+v", got)
+	}
+	if _, _, found := s.Reattach("legacy-token", nil); !found {
+		t.Fatal("early pre-feature sandbox could not reattach")
+	}
+}
+
+func TestInstallProvisionalRejectsDifferentLeaseOnSameCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	first := ProvisionalSpec{
+		SandboxID: "first", PeerPID: 100, CgroupPath: "/cg/shared",
+		Capacity: Resources{MemoryBytes: 1 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		MemoryCharge: 1 << 30, StartupCharge: 1 << 30,
+		RecoverySource: RecoveryLease, RecoveryKey: "lease:first",
+	}
+	if err := s.InstallProvisional(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.SandboxID, second.PeerPID, second.RecoveryKey = "second", 200, "lease:second"
+	if err := s.InstallProvisional(second); err == nil {
+		t.Fatal("two live leases sharing one cgroup were silently deduplicated")
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != 1<<30 {
+		t.Fatalf("failed provisional collision changed state: %+v", snapshot)
+	}
+}
+
+func TestStateAggregatesAcrossThousandReservations(t *testing.T) {
+	s := makeState(64<<30, 0)
+	const count = 1000
+	for n := 0; n < count; n++ {
+		token := "token-" + strconv.Itoa(n)
+		if _, _, err := s.Admit(AdmitSpec{
+			Token: token, SandboxID: "sandbox-" + strconv.Itoa(n),
+			Capacity:           Resources{MemoryBytes: 64 << 20, CPUMilli: 1000},
+			Floor:              Resources{MemoryBytes: 16 << 20, CPUMilli: 100},
+			InitialAllocatable: 32 << 20, EffectiveStartupBudget: 32 << 20,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != count || snapshot.Allocated.MemoryBytes != count*(32<<20) || snapshot.Allocated.CPUMilli != count*100 || snapshot.StartupInFlight != count*(32<<20) {
+		t.Fatalf("aggregate snapshot = %+v", snapshot)
+	}
+	for n := 0; n < count; n++ {
+		if _, found := s.Release("token-" + strconv.Itoa(n)); !found {
+			t.Fatalf("release %d failed", n)
+		}
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 0 || snapshot.Allocated != (Resources{}) || snapshot.StartupInFlight != 0 {
+		t.Fatalf("final aggregate = %+v", snapshot)
+	}
 }
 
 func TestNewState_DerivedPool(t *testing.T) {
@@ -42,43 +476,38 @@ func TestMemoryZone(t *testing.T) {
 	pool := s.AllocatablePool.MemoryBytes
 
 	// Empty: green
-	s.Lock()
-	defer s.Unlock()
-	if z := s.MemoryZone(); z != ZoneGreen {
+	if z := s.ResourceSnapshot().Zone; z != ZoneGreen {
 		t.Errorf("empty state zone = %s, want green", z)
 	}
 
 	// Add a reservation that pushes into yellow.
-	s.Reservations["a"] = &Reservation{
-		Token:             "a",
+	installReservationForTest(t, s, Reservation{
+		Token: "a", SandboxID: "a",
 		AllocatableNowMem: uint64(float64(pool) * 0.75),
-	}
-	if z := s.MemoryZone(); z != ZoneYellow {
+	})
+	if z := s.ResourceSnapshot().Zone; z != ZoneYellow {
 		t.Errorf("75%% allocated zone = %s, want yellow", z)
 	}
 
 	// Bump into red.
-	s.Reservations["a"].AllocatableNowMem = uint64(float64(pool) * 0.90)
-	if z := s.MemoryZone(); z != ZoneRed {
+	mutateReservationForTest(t, s, "a", func(r *Reservation) { r.AllocatableNowMem = uint64(float64(pool) * 0.90) })
+	if z := s.ResourceSnapshot().Zone; z != ZoneRed {
 		t.Errorf("90%% allocated zone = %s, want red", z)
 	}
 
 	// Push into critical (within emergency_pool).
-	s.Reservations["a"].AllocatableNowMem = uint64(float64(pool) * 0.97)
-	if z := s.MemoryZone(); z != ZoneCritical {
+	mutateReservationForTest(t, s, "a", func(r *Reservation) { r.AllocatableNowMem = uint64(float64(pool) * 0.97) })
+	if z := s.ResourceSnapshot().Zone; z != ZoneCritical {
 		t.Errorf("97%% allocated zone = %s, want critical", z)
 	}
 }
 
 func TestNodeAllocated_SumsReservations(t *testing.T) {
 	s := makeState(100<<30, 16<<30)
-	s.Lock()
-	defer s.Unlock()
+	installReservationForTest(t, s, Reservation{Token: "a", SandboxID: "a", AllocatableNowMem: 1 << 30, Floor: Resources{CPUMilli: 100}})
+	installReservationForTest(t, s, Reservation{Token: "b", SandboxID: "b", AllocatableNowMem: 2 << 30, Floor: Resources{CPUMilli: 500}})
 
-	s.Reservations["a"] = &Reservation{Token: "a", AllocatableNowMem: 1 << 30, Floor: Resources{CPUMilli: 100}}
-	s.Reservations["b"] = &Reservation{Token: "b", AllocatableNowMem: 2 << 30, Floor: Resources{CPUMilli: 500}}
-
-	got := s.NodeAllocated()
+	got := s.ResourceSnapshot().Allocated
 	if got.MemoryBytes != 3<<30 {
 		t.Errorf("MemoryBytes = %d, want 3 GiB", got.MemoryBytes)
 	}
@@ -87,35 +516,42 @@ func TestNodeAllocated_SumsReservations(t *testing.T) {
 	}
 }
 
-func TestInsertRemoveLookup(t *testing.T) {
+func TestNamedAdmitReleaseAndSIDIndex(t *testing.T) {
 	s := makeState(100<<30, 16<<30)
-	s.Lock()
-
-	r := &Reservation{Token: "x", SandboxID: "sb-x", Stage: StageAdmitted, StageEnteredAt: time.Now()}
-	if err := s.Insert(r); err != nil {
+	res, _, err := s.Admit(AdmitSpec{
+		Token: "x", SandboxID: "sb-x", InitialAllocatable: 1,
+		Capacity: Resources{MemoryBytes: 2}, Floor: Resources{MemoryBytes: 1},
+		EffectiveStartupBudget: 1, Now: time.Now(),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Lookup("x") != r {
-		t.Error("Lookup did not return the inserted reservation")
-	}
-	if err := s.Insert(r); err == nil {
-		t.Error("duplicate Insert should error")
-	}
-	if err := s.Insert(&Reservation{Token: "y", SandboxID: "sb-x"}); err == nil {
+	if _, _, err := s.Admit(AdmitSpec{Token: "y", SandboxID: "sb-x", InitialAllocatable: 1}); err == nil {
 		t.Error("second reservation for the same sandbox should error")
 	}
-	s.Unlock()
 	snapshot, found := s.SnapshotSandboxResource("sb-x")
-	if !found || snapshot.Capacity != r.Capacity {
+	if !found || snapshot.Capacity != res.Capacity {
 		t.Fatalf("SnapshotSandboxResource = %+v found=%v", snapshot, found)
 	}
-	s.Lock()
-	s.Remove("x")
-	if s.Lookup("x") != nil {
-		t.Error("Lookup should return nil after Remove")
+	if _, found := s.Release("x"); !found {
+		t.Fatal("Release did not find token")
 	}
-	s.Unlock()
 	if _, found := s.SnapshotSandboxResource("sb-x"); found {
 		t.Error("SID index retained a removed reservation")
+	}
+}
+
+func TestAdmitRejectsAllocationAboveCapacity(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "over-cap", SandboxID: "over-cap",
+		Capacity:           Resources{MemoryBytes: 128 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 64 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}); err == nil {
+		t.Fatal("Admit accepted allocation above capacity")
+	}
+	if got := s.ResourceSnapshot(); got.ReservationCount != 0 || got.Allocated.MemoryBytes != 0 {
+		t.Fatalf("failed Admit changed aggregates: %+v", got)
 	}
 }

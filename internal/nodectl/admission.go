@@ -65,13 +65,16 @@ type Outcome struct {
 type PendingAdmit struct {
 	req       *Message // the full Admit request
 	conn      net.Conn
+	peerPID   int
 	queuedAt  time.Time
 	queuedPos int // queue depth at insertion (informational, for metadata)
 
 	// Closed by the per-entry TTL timer. Worker checks on each sweep.
 	// Client-side disconnect is detected lazily: the worker's response
-	// WriteMessage fails with EPIPE, the conn is closed, and the just-
-	// inserted reservation (if any) is reaped by IdleSweeper StartupTTL.
+	// WriteMessage fails with EPIPE, clears the just-inserted reservation's
+	// connection, and closes the conn. A disconnect after a successful response
+	// is cleared by serveConn's queued-SID fallback until the first token-bearing
+	// request arrives.
 	// Proactive EOF read here is unsafe: it shares the conn with the
 	// post-admit serveConn read loop and would race for bytes.
 	cancelCh   chan struct{}
@@ -84,9 +87,8 @@ func (p *PendingAdmit) cancel() {
 }
 
 // AdmissionController owns the token bucket, the drain switch, and the
-// server-side FIFO queue + worker. State.Lock + queueMu must be acquired
-// in a strict order to avoid deadlock: callers either (a) hold queueMu
-// only, or (b) hold queueMu THEN state.Lock — never the reverse.
+// server-side FIFO queue + worker. When both are involved, queueMu precedes a
+// State method; State never calls back into AdmissionController.
 type AdmissionController struct {
 	policy AdmissionPolicy
 
@@ -248,9 +250,11 @@ func (a *AdmissionController) processQueue() {
 			resp.QueuePosAtIn = int64(head.queuedPos)
 			if err := WriteMessage(head.conn, resp); err != nil {
 				// Client gave up while queued; the reservation was just
-				// inserted by processFn. Close the conn so serveConn's
-				// reader path won't see it, and IdleSweeper's StartupTTL
-				// reaps the orphaned reservation.
+				// inserted by processFn. Clear its connection before closing
+				// so a stale pointer is not treated as liveness evidence.
+				if a.state != nil {
+					a.state.DropSandboxConnection(head.req.SandboxID, head.conn)
+				}
 				_ = head.conn.Close()
 				if a.auditor != nil {
 					a.auditor.Logf("admit_queue_write_failed sid=%s err=%q",
@@ -418,14 +422,13 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 		}
 	}
 
-	a.state.Lock()
-	pool := a.state.AllocatablePool.MemoryBytes
-	startupPool := a.state.StartupPoolBytes()
-	emerg := uint64(float64(pool) * a.state.Wm.EmergencyFactor)
-	mainAllocated := a.state.NodeAllocated().MemoryBytes
-	startupInFlight := a.state.StartupInFlightLocked()
-	zone := a.state.MemoryZone()
-	a.state.Unlock()
+	snapshot := a.state.AdmissionSnapshot()
+	pool := snapshot.Pool.MemoryBytes
+	startupPool := snapshot.StartupPool
+	emerg := snapshot.EmergencyMemory
+	mainAllocated := snapshot.Allocated.MemoryBytes
+	startupInFlight := snapshot.StartupInFlight
+	zone := snapshot.Zone
 
 	// 3. pre-check absolute capacity
 	if ebudget > pool {
@@ -516,7 +519,7 @@ func (a *AdmissionController) ConsumeToken() bool {
 // Enqueue inserts a pending admit at the tail. Caller is responsible
 // for arranging conn-EOF monitoring (the goroutine that calls
 // PendingAdmit.cancel on read EOF). Returns false if queue is at cap.
-func (a *AdmissionController) Enqueue(req *Message, conn net.Conn) (*PendingAdmit, bool) {
+func (a *AdmissionController) Enqueue(req *Message, conn net.Conn, peerPID int) (*PendingAdmit, bool) {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 	if a.queue.Len() >= a.policy.QueueMaxDepth {
@@ -525,6 +528,7 @@ func (a *AdmissionController) Enqueue(req *Message, conn net.Conn) (*PendingAdmi
 	p := &PendingAdmit{
 		req:       req,
 		conn:      conn,
+		peerPID:   peerPID,
 		queuedAt:  time.Now(),
 		queuedPos: a.queue.Len(),
 		cancelCh:  make(chan struct{}),

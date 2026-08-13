@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -365,8 +366,12 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 		}
 	}
 	if p.ControllerSocket != "" {
+		controllerSocket, err := filepath.Abs(p.ControllerSocket)
+		if err != nil {
+			return nil, fmt.Errorf("resolve resource controller socket: %w", err)
+		}
 		// run-sandbox supplies cgroup_path as a node-owned inherited VMM FD.
-		c.Resources.Control.Controller = p.ControllerSocket
+		c.Resources.Control.Controller = controllerSocket
 	}
 
 	// --- boot ---
