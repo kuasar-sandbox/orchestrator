@@ -16,7 +16,6 @@ import (
 // is recovered faster.
 type ActiveReclaimer struct {
 	State        *State
-	Persister    *Persister
 	Interval     time.Duration // 10s default
 	SafetyMargin float64       // 1.25 default (working set + 25%)
 	Logf         func(string, ...any)
@@ -57,11 +56,6 @@ func (r *ActiveReclaimer) sweep() {
 		if r.Auditor != nil {
 			r.Auditor.Logf("reclaim sid=%s zone=%s rss=%d alloc=%d→%d delta=%d",
 				res.SandboxID, zone, res.LastReportedRSS, event.Before.AllocatableNowMem, res.AllocatableNowMem, delta)
-		}
-	}
-	if len(events) > 0 && r.Persister != nil {
-		if err := r.Persister.Flush(r.State); err != nil {
-			r.Logf("reclaim persist: %v", err)
 		}
 	}
 }

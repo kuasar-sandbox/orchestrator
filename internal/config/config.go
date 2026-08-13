@@ -89,9 +89,9 @@ type Config struct {
 type ResourceListenConfig struct {
 	Enabled         bool                     `yaml:"enabled"`
 	Socket          string                   `yaml:"socket"`            // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
-	StatePath       string                   `yaml:"state_path"`        // restart fast-recovery state (tmpfs); default /run/node-ctl/state.json
+	StatePath       string                   `yaml:"state_path"`        // deprecated and ignored; retained only so older YAML still parses
 	AuditPath       string                   `yaml:"audit_path"`        // audit log (tmpfs); default /run/node-ctl/audit.log
-	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // restart reconcile roots; default managed runner slice
+	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // restart recovery roots for populated sandbox cgroups
 	Resources       ResourceHostConfig       `yaml:"resources"`         // node physical capacity + host reservation
 	Watermarks      ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
 	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
@@ -148,9 +148,6 @@ type ResourceDampeningConfig struct {
 // owns that protocol constant. Exported so nodectl.Resolve can default a config
 // block built outside config.Load (e.g. in tests).
 func (r *ResourceListenConfig) ApplyDefaults() {
-	if r.StatePath == "" {
-		r.StatePath = "/run/node-ctl/state.json"
-	}
 	if r.AuditPath == "" {
 		r.AuditPath = "/run/node-ctl/audit.log"
 	}
