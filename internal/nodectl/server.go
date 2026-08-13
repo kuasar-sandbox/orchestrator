@@ -147,12 +147,15 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 	defer conn.Close()
 
 	var (
-		token string
+		token     string
+		queuedSID string
 	)
 
 	defer func() {
 		if token != "" {
 			s.handleConnDrop(token, conn)
+		} else if queuedSID != "" {
+			s.handleQueuedConnDrop(queuedSID, conn)
 		}
 	}()
 
@@ -180,6 +183,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 			token = req.Token
 		}
 		resp := s.dispatch(conn, peerPID, req, &token)
+		if req.Type == TypeAdmit && resp == nil {
+			queuedSID = req.SandboxID
+		}
 		if resp != nil {
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := WriteMessage(conn, resp); err != nil {
@@ -633,6 +639,14 @@ func (s *Server) handleConnDrop(token string, conn net.Conn) {
 	}
 	s.Logf("conn dropped for %s sid=%s (reservation pending reattach)",
 		token[:8], res.SandboxID)
+}
+
+func (s *Server) handleQueuedConnDrop(sid string, conn net.Conn) {
+	res, changed := s.State.DropSandboxConnection(sid, conn)
+	if !changed {
+		return
+	}
+	s.Logf("conn dropped for queued sid=%s (reservation pending reattach)", res.SandboxID)
 }
 
 // filepathDir replicates filepath.Dir without importing path/filepath

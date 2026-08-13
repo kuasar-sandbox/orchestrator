@@ -42,7 +42,7 @@ func TestNodeCtlProcessHelper(t *testing.T) {
 		socket, sid, cgroup := os.Getenv("NODECTL_SOCKET"), os.Getenv("NODECTL_SID"), os.Getenv("NODECTL_CGROUP")
 		var leaseHandle *resource.LeaseHandle
 		var rawLease *os.File
-		if os.Getenv("NODECTL_CORRUPT") == "1" {
+		if os.Getenv("NODECTL_CORRUPT") == "1" || os.Getenv("NODECTL_INVALID_BOUNDS") == "1" {
 			if err := os.MkdirAll(resource.LeaseDir(socket), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +59,20 @@ func TestNodeCtlProcessHelper(t *testing.T) {
 			if err := unix.FcntlFlock(rawLease.Fd(), unix.F_SETLK, &lock); err != nil {
 				t.Fatal(err)
 			}
-			_, _ = rawLease.WriteString("{not-json\n")
+			if os.Getenv("NODECTL_INVALID_BOUNDS") == "1" {
+				payload, err := json.Marshal(resource.Lease{
+					Version: resource.LeaseVersion, SandboxID: sid, PID: os.Getpid(),
+					ControllerSocket: socket, CgroupPath: cgroup,
+					CapacityMemory: testLeaseCapacity, CapacityCPUMilli: 1000,
+					FloorMemory: testLeaseFloor, FloorCPUMilli: 2000, StartupMemory: testLeaseStartup,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = rawLease.Write(append(payload, '\n'))
+			} else {
+				_, _ = rawLease.WriteString("{not-json\n")
+			}
 		} else if os.Getenv("NODECTL_NO_LEASE") != "1" {
 			var err error
 			leaseHandle, err = resource.CreateLease(resource.Lease{
@@ -303,6 +316,24 @@ func TestInventoryChargesEveryInvalidLiveLeaseWithDistinctIdentity(t *testing.T)
 	}
 	first.send("stop")
 	second.send("stop")
+}
+
+func TestInventoryChargesSemanticallyInvalidLiveLease(t *testing.T) {
+	dir := t.TempDir()
+	socket, root := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups")
+	invalid := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_INVALID_BOUNDS=1",
+		"NODECTL_SOCKET="+socket, "NODECTL_SID=invalid-bounds", "NODECTL_CGROUP="+filepath.Join(root, "invalid"))
+	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5})
+	inventory := &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{root}, Pool: state.AllocatablePool, Logf: t.Logf}
+	if err := inventory.Recover(state); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.UnknownCount != 1 ||
+		snapshot.Allocated.MemoryBytes != state.AllocatablePool.MemoryBytes {
+		t.Fatalf("invalid semantic lease was not charged full pool: %+v", snapshot)
+	}
+	invalid.send("stop")
 }
 
 func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {

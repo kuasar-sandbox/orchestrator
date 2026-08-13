@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -143,6 +144,86 @@ func TestRecoveredAdmitReplayBypassesNewConsumerGates(t *testing.T) {
 	snapshot := state.ResourceSnapshot()
 	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Allocated.MemoryBytes != 256<<20 {
 		t.Fatalf("replayed Admit snapshot = %+v", snapshot)
+	}
+}
+
+func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing.T) {
+	dir := t.TempDir()
+	state := NewState(8<<30, 8000, 0, 0, Watermarks{
+		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: .5,
+	})
+	installReservationForTest(t, state, Reservation{
+		Token: "filler-token", SandboxID: "filler",
+		Capacity:          Resources{MemoryBytes: 4 << 30, CPUMilli: 1000},
+		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		AllocatableNowMem: 128 << 20, EffectiveStartupBudget: 4 << 30,
+		Stage: StageAdmitted, StageEnteredAt: time.Now(), LastHeartbeatAt: time.Now(),
+	})
+	admission := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Minute, QueueMaxDepth: 4,
+	})
+	srv := &Server{
+		Path: filepath.Join(dir, "controller.sock"), State: state, Admission: admission,
+		Allocator: NewAllocator(AllocatorPolicy{}), Logf: t.Logf,
+	}
+	admission.SetWiring(state, nil, t.Logf, srv.BuildAdmitOKFromQueue)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	admission.Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = srv.Serve(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+		admission.Stop()
+	}()
+
+	client := &Client{SocketPath: srv.Path}
+	if err := client.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		res, err := client.Admit(AdmitParams{
+			SandboxID: "queued", CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
+			FloorMemoryBytes: 128 << 20, FloorCPU: .5, StartupBudgetMemory: 256 << 20,
+		})
+		if err == nil && res.Status != StatusAdmitted {
+			err = fmt.Errorf("queued Admit status=%s msg=%s", res.Status, res.Msg)
+		}
+		result <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for admission.QueueDepth() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if admission.QueueDepth() != 1 {
+		t.Fatal("Admit did not enter queue")
+	}
+	if _, found := state.Release("filler-token"); !found {
+		t.Fatal("failed to release startup-pool filler")
+	}
+	admission.PushWake()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := reservationForTest(t, state, "queued"); got.Conn == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := reservationForTest(t, state, "queued"); got.Conn != nil {
+		t.Fatal("queued Admit EOF retained a closed connection as liveness evidence")
 	}
 }
 

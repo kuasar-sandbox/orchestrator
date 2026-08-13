@@ -285,6 +285,42 @@ func TestAdmission_QueueAtCap(t *testing.T) {
 	}
 }
 
+func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
+	state := newTestState(t, 8<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
+	})
+	a.state = state
+	a.processFn = func(p *PendingAdmit) (*Message, error) {
+		token := "queued-token"
+		_, _, err := state.Admit(AdmitSpec{
+			Token: token, SandboxID: p.req.SandboxID, PeerPID: p.peerPID,
+			Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+			Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+			InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+			Conn: p.conn,
+		})
+		return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted, Token: token}, err
+	}
+	client, server := net.Pipe()
+	req := &Message{
+		SandboxID: "queued-disconnect", CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
+		FloorMemoryBytes: 128 << 20, FloorCPU: .5, StartupBudgetMemory: 256 << 20,
+	}
+	if _, ok := a.Enqueue(req, server, 4242); !ok {
+		t.Fatal("enqueue failed")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a.processQueue()
+	defer server.Close()
+	got := reservationForTest(t, state, req.SandboxID)
+	if got.Conn != nil {
+		t.Fatal("failed queued response retained a closed connection as liveness evidence")
+	}
+}
+
 func TestNewToken_Format(t *testing.T) {
 	t1 := NewToken()
 	t2 := NewToken()

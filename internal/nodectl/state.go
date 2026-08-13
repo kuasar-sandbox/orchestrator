@@ -459,11 +459,15 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 			if existing.Floor != (Resources{}) && existing.Floor != spec.Floor {
 				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional floor mismatch", spec.SandboxID)
 			}
+			if !slices.Equal(existing.ClientFeatures, spec.ClientFeatures) {
+				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional client features mismatch", spec.SandboxID)
+			}
 		} else if existing.Stage != StageAdmitted || existing.PeerPID == 0 ||
 			existing.PeerPID != spec.PeerPID || existing.CgroupPath != spec.CgroupPath ||
 			existing.Capacity != spec.Capacity || existing.Floor != spec.Floor ||
 			existing.AllocatableNowMem != spec.InitialAllocatable ||
-			existing.EffectiveStartupBudget != spec.EffectiveStartupBudget {
+			existing.EffectiveStartupBudget != spec.EffectiveStartupBudget ||
+			!slices.Equal(existing.ClientFeatures, spec.ClientFeatures) {
 			return Reservation{}, nil, fmt.Errorf("sandbox %q already admitted with a different session contract", spec.SandboxID)
 		}
 		oldConn = existing.Conn
@@ -719,6 +723,21 @@ func (s *State) DropConnection(token string, conn net.Conn) (Reservation, bool) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.byTokenLocked(token)
+	if r == nil || r.Conn != conn {
+		return Reservation{}, false
+	}
+	r.Conn = nil
+	return cloneReservation(r), true
+}
+
+// DropSandboxConnection clears a queued Admit connection before the client has
+// had an opportunity to send its new token. SID lookup and the connection
+// identity check keep this transition O(1) and prevent an old queue goroutine
+// from detaching a replacement session.
+func (s *State) DropSandboxConnection(sid string, conn net.Conn) (Reservation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.bySID[sid]
 	if r == nil || r.Conn != conn {
 		return Reservation{}, false
 	}

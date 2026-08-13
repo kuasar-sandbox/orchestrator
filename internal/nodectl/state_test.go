@@ -231,6 +231,45 @@ func TestProvisionalAdmitReplayIsAlreadyAccounted(t *testing.T) {
 	}
 }
 
+func TestAdmitReplacementRequiresSameClientFeatures(t *testing.T) {
+	s := makeState(8<<30, 0)
+	features := []string{FeatureStateSyncV1}
+	base := AdmitSpec{
+		Token: "new-token", SandboxID: "recovering", PeerPID: 100, CgroupPath: "/cg/recovering",
+		Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+		ClientFeatures: features,
+	}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: base.SandboxID, PeerPID: base.PeerPID, CgroupPath: base.CgroupPath,
+		Capacity: base.Capacity, Floor: base.Floor, MemoryCharge: base.Capacity.MemoryBytes,
+		StartupCharge: base.Capacity.MemoryBytes, RecoverySource: RecoveryLease,
+		RecoveryKey: "lease:recovering", ClientFeatures: features,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changed := base
+	changed.ClientFeatures = nil
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit replaced provisional with different client features")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("feature-mismatched provisional replay changed state: before=%+v after=%+v", before, after)
+	}
+	if _, _, err := s.Admit(base); err != nil {
+		t.Fatal(err)
+	}
+	changed.Token = "retry-token"
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit replaced ACK-lost session with different client features")
+	}
+	if _, found := s.Heartbeat("new-token", 0, time.Now()); !found {
+		t.Fatal("feature-mismatched retry invalidated original session")
+	}
+}
+
 func TestInvalidAdmitDoesNotDropRecoveredCgroup(t *testing.T) {
 	s := makeState(8<<30, 0)
 	if err := s.InstallProvisional(ProvisionalSpec{

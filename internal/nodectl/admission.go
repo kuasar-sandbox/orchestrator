@@ -71,8 +71,10 @@ type PendingAdmit struct {
 
 	// Closed by the per-entry TTL timer. Worker checks on each sweep.
 	// Client-side disconnect is detected lazily: the worker's response
-	// WriteMessage fails with EPIPE, the conn is closed, and the just-
-	// inserted reservation (if any) is reaped by IdleSweeper StartupTTL.
+	// WriteMessage fails with EPIPE, clears the just-inserted reservation's
+	// connection, and closes the conn. A disconnect after a successful response
+	// is cleared by serveConn's queued-SID fallback until the first token-bearing
+	// request arrives.
 	// Proactive EOF read here is unsafe: it shares the conn with the
 	// post-admit serveConn read loop and would race for bytes.
 	cancelCh   chan struct{}
@@ -248,9 +250,11 @@ func (a *AdmissionController) processQueue() {
 			resp.QueuePosAtIn = int64(head.queuedPos)
 			if err := WriteMessage(head.conn, resp); err != nil {
 				// Client gave up while queued; the reservation was just
-				// inserted by processFn. Close the conn so serveConn's
-				// reader path won't see it, and IdleSweeper's StartupTTL
-				// reaps the orphaned reservation.
+				// inserted by processFn. Clear its connection before closing
+				// so a stale pointer is not treated as liveness evidence.
+				if a.state != nil {
+					a.state.DropSandboxConnection(head.req.SandboxID, head.conn)
+				}
 				_ = head.conn.Close()
 				if a.auditor != nil {
 					a.auditor.Logf("admit_queue_write_failed sid=%s err=%q",
