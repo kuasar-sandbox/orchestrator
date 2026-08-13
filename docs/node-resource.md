@@ -183,7 +183,7 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `false` | 置 `true` 才在 serve 内起控制器;否则沙箱用静态 cgroup |
-| `socket` | `pkg/resource` 默认 | UDS,sandbox-ctl 拨号目标;`""` = 协议默认(与 sandbox-ctl 一致) |
+| `socket` | `pkg/resource` 默认 | 文件系统 UDS 的 bind/dial 路径;`""` = 协议默认。保留配置中的绝对路径作为 endpoint,另把父目录 symlink 解析成 owner/lease canonical identity,因此短 alias 仍可规避 AF_UNIX 路径长度限制 |
 | `state_path` | 无 | **deprecated/ignored**;仅保留旧 YAML 可解析,不会打开、读取或写入 |
 | `audit_path` | `/run/node-ctl/audit.log` | tmpfs;后台 goroutine 异步 best-effort 写,资源 RPC 不等待文件 I/O |
 | `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]` | lease/cgroup 身份边界和重启对账扫描根；默认覆盖 orchestrator-managed runner 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
@@ -632,7 +632,10 @@ tenant SID 不进入目录拼接。`F_GETLK` 返回锁 owner PID;JSON 中自报 
 
 controller 在删除旧 UDS 或 bind 前先非阻塞取得稳定
 `<controller-socket>.owner` 的 POSIX write lock。第二实例在动到 live UDS 前
-失败,owner FD 持有到 server 完整退出。
+失败,owner FD 持有到 server 完整退出。这里的 `<controller-socket>` 是 canonical
+inventory identity,不是必须用于 AF_UNIX bind/dial 的原始 spelling:父目录 symlink
+会解析;endpoint 最终组件 symlink、dangling parent 和多 hard-link socket 因无法
+得到唯一 identity 而 fail closed。
 
 ### 8.2 控制器进程重启恢复
 
@@ -662,7 +665,8 @@ controller 在删除旧 UDS 或 bind 前先非阻塞取得稳定
 
 旧 sandbox-ctl 在新 controller 中由 managed/cgroup provisional 保守计费;
 新 sandbox-ctl 对不认识 StateSync 的旧 controller 回退 Reattach。滚动升级期间
-允许暂时多记,任何混用路径都不能少记。
+controller 会先规范化旧 lease 内保存的等价 parent-alias socket identity,因此可
+继续精确 StateSync;其它旧客户端则允许暂时多记,任何混用路径都不能少记。
 
 ### 8.3 故障域处理
 
