@@ -36,7 +36,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 )
 
-// Version is the protocol version exchanged in Hello/Register.
+// Version is the protocol version announced by the authority in Hello.
 const Version = 2
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)

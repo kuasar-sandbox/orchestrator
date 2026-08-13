@@ -620,8 +620,8 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
-- routesync(external proxy / 路由观察者):版本 1,帧 `[4B LE len][JSON]`,消息
-  `register|hello|upsert|delete|bookmark|wake`,路径
+- routesync(external proxy / 路由观察者):版本 2,帧 `[4B LE len][JSON]`,消息
+  `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
 ### 4.6 沙箱配置传递链

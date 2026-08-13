@@ -3,6 +3,8 @@ package orch
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +202,43 @@ func TestExternalCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) {
+	o := testOrch(t)
+	manifestKey := strings.Repeat("a", 64)
+	sb := &types.Sandbox{
+		ID: "retry-pre-launch-delete", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
+		State:      types.StateStarting,
+		APISecret:  deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := o.st.InsertSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+
+	attempts := 0
+	err := o.rollbackPreLaunchAdmissionWith(sb.ID, func() (context.Context, context.CancelFunc) {
+		attempts++
+		ctx, cancel := context.WithCancel(context.Background())
+		if attempts == 1 {
+			cancel()
+		}
+		return ctx, cancel
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("rollback error = %v, want retained first transient error", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("cleanup context attempts = %d, want 2", attempts)
+	}
+	stored, getErr := o.st.Get(context.Background(), sb.ID)
+	if getErr != nil || stored != nil || o.lookup(sb.ID) != nil {
+		t.Fatalf("pre-launch rollback retained state: store=%+v cache=%+v err=%v", stored, o.lookup(sb.ID), getErr)
 	}
 }
 
