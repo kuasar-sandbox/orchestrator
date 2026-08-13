@@ -306,7 +306,7 @@ Admit            (sandbox_id, capacity, floor, startup_budget_memory,
                    reason:rejected 时分类(§6.4)
                    queued_for_ms / queue_pos_at_in:命中队列时回填的诊断元数据
                  # sandbox_id 用作 admin 动词(grant/reclaim)的 O(1) 索引键;
-                 # 新客户端的不可变请求字段必须与其 live lease 一致
+                 # 新客户端发出的不可变字段必须等于其 Admit 前写入的 lease
 
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
@@ -379,8 +379,8 @@ StateSync 并取得新 token。Reattach 仅为旧 server/client 的滚动升级�
 1. 动态模式 sandbox-ctl 在第一次 Admit 前创建 immutable lease 并持有 POSIX
    write lock;文件名是 SID 的 SHA-256,内容只写一次
 2. sandbox-ctl 拨 UDS,发 `Admit`
-3. 控制器以 `SO_PEERCRED` 验证 peer PID = lease lock owner;managed 模式还
-   交叉验证 `<run-root>/<sid>/<sid>.pid` 的 lock/PID 和 `<sid>.yaml`;再评估请求:
+3. 控制器在 accept 时取得 `SO_PEERCRED`,并以内存中的 pool/State 与配置好的
+   cgroup root 评估请求;Admit 热路径不 reopen/解析 lease、pidfile 或 YAML:
    - 通过 → 立即回 `status=admitted`
    - 长期失败(drain / zone red/critical / 超 pool / 超 startup_pool)→ `status=rejected`
    - 短期阻塞(token / main_headroom / startup_headroom)→ **不回应**,
@@ -402,7 +402,8 @@ StateSync 并取得新 token。Reattach 仅为旧 server/client 的滚动升级�
   `applied_allocatable`,暂停正向 budget 请求,由唯一 reconnect loop 按带 jitter
   的指数退避重新 Connect
 - 新 server:发送 `StateSync(sid, applied, settled, rss, previous_token?)`。controller
-  验证 lease、peer、managed 元数据和 `floor ≤ applied ≤ capacity`,再原子替换
+  验证 lease lock owner = `SO_PEERCRED` peer、managed 元数据和
+  `floor ≤ applied ≤ capacity`,再原子替换
   provisional 并签发新 token
 - 不支持 StateSync 的旧 server:回退 `Reattach(previous_token)`;旧 server 回带的
   allocatable 仍须成功落地后才成为新的 `applied_allocatable`
