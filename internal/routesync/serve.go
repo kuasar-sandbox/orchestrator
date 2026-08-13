@@ -73,7 +73,8 @@ func ReadRegister(r io.Reader) (Register, error) {
 
 // ServeStream runs the proxy/observer route authority on an already-accepted h2c
 // request whose Register frame has already been read (reg). It is a thin HTTP
-// adapter over ServeAuthority — the proxy plane's only up-frame is a Wake.
+// adapter over ServeAuthority; the proxy plane sends Wake and RouteBarrierAck
+// up-frames through this path.
 func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src Source, reg Register, hooks *StreamHooks, log *slog.Logger) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
