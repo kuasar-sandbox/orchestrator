@@ -3,6 +3,7 @@ package routesync
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,7 +18,7 @@ type Sink interface {
 	// BeginSync marks the start of a fresh sync stream: entries from a prior stream
 	// are tentatively stale until re-applied via ApplyUpsert before the Bookmark.
 	BeginSync()
-	ApplyUpsert(r RouteEntry)
+	ApplyUpsert(r RouteEntry) error
 	ApplyDelete(sid string)
 	// Bookmark marks the initial route stream complete: the table is synced, and
 	// entries not seen since the matching BeginSync are dropped (deleted while
@@ -85,8 +86,8 @@ func (s *Subscriber) Run(ctx context.Context) {
 }
 
 // session runs one registration: it PUTs the register stream (request body =
-// Register then Wakes) and applies the down stream (response body = Hello, Upserts,
-// Bookmark, deltas), full-duplex.
+// Register then Wakes/RouteBarrierAcks) and applies the down stream (response body
+// = Hello, Upserts, Bookmark, deltas/barriers), full-duplex.
 func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -100,9 +101,14 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 		return err
 	}
 
-	// Writer goroutine: Register frame, then (route_wake) Wake frames. Closing pw
-	// ends the request.
-	go func() { pw.CloseWithError(s.writeUp(sctx, pw)) }()
+	// One writer owns the request body after Register. Wake production and
+	// barrier application both enqueue frames here, so they can never race writes
+	// to the length-prefixed stream.
+	up := make(chan *Msg)
+	if s.wakes != nil {
+		go s.forwardWakes(sctx, up)
+	}
+	go func() { pw.CloseWithError(s.writeUp(sctx, pw, up)) }()
 
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
@@ -117,33 +123,55 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 		if err != nil {
 			return err
 		}
-		s.apply(m)
-	}
-}
-
-// writeUp sends the Register frame, then forwards Wakes (route_wake) until ctx ends.
-// With no WakeSource it holds the request body open (the down stream is what matters).
-func (s *Subscriber) writeUp(ctx context.Context, w io.Writer) error {
-	r := s.reg
-	if err := WriteMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
-		return err
-	}
-	if s.wakes == nil {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	for {
-		sid, ok := s.wakes.NextWake(ctx)
-		if !ok {
-			return ctx.Err()
-		}
-		if err := WriteMsg(w, &Msg{Type: TypeWake, SID: sid}); err != nil {
+		if err := s.apply(sctx, m, up); err != nil {
 			return err
 		}
 	}
 }
 
-func (s *Subscriber) apply(m *Msg) {
+// writeUp is the session's sole up-stream writer. It sends Register first, then
+// serializes Wake and RouteBarrierAck frames until the session ends.
+func (s *Subscriber) writeUp(ctx context.Context, w io.Writer, up <-chan *Msg) error {
+	r := s.reg
+	if err := WriteMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case m := <-up:
+			if m != nil {
+				if err := WriteMsg(w, m); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+func (s *Subscriber) forwardWakes(ctx context.Context, up chan<- *Msg) {
+	for {
+		sid, ok := s.wakes.NextWake(ctx)
+		if !ok {
+			return
+		}
+		if !enqueueUp(ctx, up, &Msg{Type: TypeWake, SID: sid}) {
+			return
+		}
+	}
+}
+
+func enqueueUp(ctx context.Context, up chan<- *Msg, m *Msg) bool {
+	select {
+	case up <- m:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Subscriber) apply(ctx context.Context, m *Msg, up chan<- *Msg) error {
 	switch m.Type {
 	case TypeHello:
 		if m.Hello != nil {
@@ -151,13 +179,26 @@ func (s *Subscriber) apply(m *Msg) {
 		}
 	case TypeUpsert:
 		if m.Route != nil {
-			s.sink.ApplyUpsert(*m.Route)
+			if err := s.sink.ApplyUpsert(*m.Route); err != nil {
+				return fmt.Errorf("routesync: apply upsert %s: %w", m.Route.SandboxID, err)
+			}
 		}
 	case TypeDelete:
 		s.sink.ApplyDelete(m.SID)
 	case TypeBookmark:
 		s.sink.Bookmark()
+	case TypeRouteBarrier:
+		if m.BarrierID == "" {
+			return fmt.Errorf("routesync: empty route barrier id")
+		}
+		if !s.reg.handlesWake() {
+			return nil
+		}
+		if !enqueueUp(ctx, up, &Msg{Type: TypeRouteBarrierAck, BarrierID: m.BarrierID}) {
+			return ctx.Err()
+		}
 	default:
 		s.log.Warn("routesync: unknown message", "type", m.Type)
 	}
+	return nil
 }

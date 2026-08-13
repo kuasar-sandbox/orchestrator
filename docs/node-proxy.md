@@ -71,7 +71,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/proxy/SHM 路径冲突,权限 0600 |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
-| `route_capacity` | `65536` | 固定路由槽位数;满时新路由写入失败并告警 |
+| `route_capacity` | `65536` | 固定路由槽位数;满时 Upsert 失败并终止当前 routesync session,等待该 route 的 Create 返回 503 |
 | `workers` | `1` | worker 进程数 |
 | `tls` | 空 | 数据面 TLS `{cert,key}`;空 = h2c |
 | `auth` | `enforce` | routesync policy 到达前的数据面鉴权回退值 |
@@ -96,7 +96,7 @@ external 拓扑:
 ```text
                     config-socket plugin stream
                     register(proxy_socket, stats_socket, route_wake)
-                    Wake(sid) ▲     │ Hello / Upsert / Delete / Bookmark
+         Wake / BarrierAck(sid/id) ▲ │ Hello / Upsert / Delete / Bookmark / Barrier
                               │     ▼
 node-ctl conductor serve ─────┴── node-ctl proxy master
         ▲ fallback CONNECT          ├─ fixed route writer ─► shared route mmap
@@ -129,9 +129,9 @@ routesync 仍是帧化 JSON over h2c,由 proxy master 拨 conductor:
 
 ```text
 master → conductor : register{subscribe: route_wake, proxy{socket,stats_socket}, mmds}
-master → conductor : wake{sid}
+master → conductor : wake{sid} / route_barrier_ack{barrier_id}
 conductor → master : hello{policy}
-conductor → master : upsert* → bookmark → upsert/delete...
+conductor → master : upsert* → bookmark → upsert/delete/route_barrier...
 ```
 
 master 把下行路由流投影到共享内存:
@@ -143,6 +143,24 @@ master 把下行路由流投影到共享内存:
   `(sid, revision)`;
 - `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
 - `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
+
+external Create 使用同一有序 stream 建立 route-applied barrier:
+
+```text
+conductor: Upsert(initial starting) → route_barrier{id}
+master:    ApplyUpsert succeeds → notify workers → route_barrier_ack{id}
+```
+
+master 的 ACK 只表示 parking 所需的 `starting RouteBinding` 已进入共享表,不表示 sandbox
+已 running、backend 可拨或 envd 已完成 `/init`。Wake 与 BarrierAck 由一个上行 writer 串行
+写帧。任一先行 Upsert 写表失败时,subscriber 不发送 ACK并终止 session;conductor 将等待中的
+Create 回滚并返回 503。barrier id 只存在于本次内存协调,不进入 route changelog、共享表、
+Sandbox schema 或日志字段。
+
+当前只有固定 plugin id `proxy` 的一个 master participant。Create 在 ACK 后再次核验该
+registration epoch 仍为当前租约;断连、同 id replacement、迟到或旧 session ACK 都不能完成
+barrier。完成规则内部按 all-of participant set 实现,不采用 quorum;若以后显式配置多个
+traffic-serving master,必须全部 ACK 后才能返回 201。
 
 MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
 heap entry 总数受 `route_capacity` 限制。`BeginSync`、routesync 断开和 worker/master 重启
@@ -458,14 +476,16 @@ internal 模式复用同一 `WorkerStats → MasterStats` 状态机,只是 frame
   master 后重新注册、重建共享表并启动 worker。已运行沙箱不受影响。
 - **routesync 断开**:master 指数退避重连;固定数据面共享表沿用原有保留/Bookmark
   收敛语义,但 MMDS routes/value/service authority 立即清空并返回 503,完整同步 Bookmark
-  前不服务旧 secret 或执行旧 service route。
+  前不服务旧 secret 或执行旧 service route。断连同时使尚未返回的 Create barrier 失败;
+  已 ACK并完成 201 commit 后的断连按正常运行期 availability failure 处理。
 - **park / wake**:Lookup 不发送 Wake;已鉴权 Activate 才能对 paused sid 发 Wake 并等待
   共享表更新。starting 只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和
   当前 launch 的状态推进仍由 conductor 执行。
 - **stats stream**:任一 worker stream EOF、超时或协议错误都会停止该 worker;确认退出前
   traffic GET 返回 503,确认后删除其贡献并等待 replacement ready。Prometheus counter 在
   master 生命周期内保持单调,worker epoch 更换不会回退。
-- **失败码**:非法 target = 400;exec 的非 CONNECT method = 405;未知/未就绪 sid = 404;
+- **失败码**:external Create 无可用 proxy route stream、barrier 超时/断连或 route apply
+  失败 = 503;非法 target = 400;exec 的非 CONNECT method = 405;未知/已删除 sid = 404;
   鉴权失败 = 401;已识别但 profile/当前 proxy 模式不支持的 service 或 off = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503.
 

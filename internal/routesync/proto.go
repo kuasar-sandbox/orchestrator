@@ -4,9 +4,8 @@
 // PUT /internal/plugin/{id}/register — and that single long-lived, bidirectional
 // h2c request carries the stream both ways:
 //
-//	subscriber -> orchestrator :  Register(caps) -> Wake(sid)          (route_wake only: data-plane
-//	                                                                    traffic for a missing/paused sandbox)
-//	orchestrator -> subscriber :  Hello(policy)  -> Upsert* -> Bookmark -> Upsert/Delete (live deltas)
+//	subscriber -> orchestrator :  Register(caps) -> Wake/RouteBarrierAck
+//	orchestrator -> subscriber :  Hello(policy) -> Upsert* -> Bookmark -> Upsert/Delete/RouteBarrier
 //
 // The orchestrator is the route authority and the connection responder: it no longer
 // dials anyone. The subscriber (the proxy master, or an observer) is the dialer +
@@ -38,7 +37,7 @@ import (
 )
 
 // Version is the protocol version exchanged in Hello/Register.
-const Version = 1
+const Version = 2
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -76,6 +75,11 @@ const (
 	TypeDelete   = "delete"   // orchestrator -> subscriber (one route removed)
 	TypeBookmark = "bookmark" // orchestrator -> subscriber (initial route stream complete; synced)
 	TypeWake     = "wake"     // subscriber -> orchestrator (resume this sandbox)
+	// RouteBarrier follows one or more route mutations on the same ordered down
+	// stream. The subscriber ACKs it only after every preceding Upsert has been
+	// applied successfully to its serving view.
+	TypeRouteBarrier    = "route_barrier"     // orchestrator -> subscriber
+	TypeRouteBarrierAck = "route_barrier_ack" // subscriber -> orchestrator
 )
 
 // RouteEntry is the per-sandbox routing + auth state the orchestrator distributes
@@ -148,11 +152,12 @@ type MMDSProxyPolicy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
-	Type     string      `json:"type"`
-	Hello    *Hello      `json:"hello,omitempty"`    // hello (orchestrator -> subscriber)
-	Register *Register   `json:"register,omitempty"` // register (subscriber -> orchestrator, first up-frame)
-	Route    *RouteEntry `json:"route,omitempty"`    // upsert
-	SID      string      `json:"sid,omitempty"`      // delete | wake | command target
+	Type      string      `json:"type"`
+	Hello     *Hello      `json:"hello,omitempty"`      // hello (orchestrator -> subscriber)
+	Register  *Register   `json:"register,omitempty"`   // register (subscriber -> orchestrator, first up-frame)
+	Route     *RouteEntry `json:"route,omitempty"`      // upsert
+	SID       string      `json:"sid,omitempty"`        // delete | wake | command target
+	BarrierID string      `json:"barrier_id,omitempty"` // route_barrier | route_barrier_ack
 	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
 	NodeReg  *NodeRegister `json:"node_register,omitempty"`
@@ -222,9 +227,12 @@ func (r Register) SubscribeKind() string {
 // Event is a route change the orchestrator publishes to the route-sync client,
 // which fans it out to every connected proxy as an Upsert/Delete.
 type Event struct {
-	Kind  string     // TypeUpsert | TypeDelete
+	Kind  string     // TypeUpsert | TypeDelete | TypeRouteBarrier
 	Route RouteEntry // Upsert
 	SID   string     // Delete
+	// BarrierID is ephemeral stream coordination. It is never appended to the
+	// durable route changelog or projected into a RouteEntry.
+	BarrierID string // RouteBarrier
 }
 
 const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake frame (no all-routes frame)

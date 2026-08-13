@@ -64,13 +64,16 @@ func (v *MasterView) BeginSync() {
 	v.notify.Notify()
 }
 
-func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
+func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
 	active := r.State == routesync.StateStarting || r.State == routesync.StateRunning
 	if active {
 		// Publish the heap view first. A worker that observes an active SHM row
 		// can then resolve either the new view or a conservative unavailable.
-		if err := v.mmds.Upsert(r); err != nil && v.log != nil {
-			v.log.Warn("proxyshm: apply MMDS route view", "sid", r.SandboxID, "err", err)
+		if err := v.mmds.Upsert(r); err != nil {
+			if v.log != nil {
+				v.log.Warn("proxyshm: apply MMDS route view", "sid", r.SandboxID, "err", err)
+			}
+			return err
 		}
 	} else {
 		// Revoke the confidential view first. A worker that sampled the old
@@ -85,9 +88,10 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 		if v.log != nil {
 			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
 		}
-		return
+		return err
 	}
 	v.notify.Notify()
+	return nil
 }
 
 func (v *MasterView) ApplyDelete(sid string) {

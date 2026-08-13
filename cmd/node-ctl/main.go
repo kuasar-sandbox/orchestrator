@@ -136,12 +136,14 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 	defer lc.Close()
 
+	plugins := configsock.NewRegistry()
 	core := orch.New(cfg, st, lc, vswitch.New(
 		cfg.ConnectorCtl(),
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
 	core.SetLifecycleContext(ctx)
+	core.SetProxyRouteBarrierCoordinator(plugins)
 	// This defer is registered after the store and launcher closes, so it runs
 	// first on every conductor exit path. Cancel lifecycle admission and
 	// cancellable launch work, then keep dependencies open until every accepted
@@ -231,7 +233,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	// Traffic stats providers are wired before either API listener can accept a
 	// request. Internal mode uses the same WorkerStats→MasterStats absolute update
 	// path in-process; external mode queries the registered proxy master's cache.
-	plugins := configsock.NewRegistry()
 	mx := metrics.New()
 	var internalWorkerStats *proxystats.WorkerStats
 	switch cfg.Proxy.Mode {

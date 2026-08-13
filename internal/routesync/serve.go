@@ -47,6 +47,16 @@ type RevisionSource interface {
 	CurrentRevToken() string
 }
 
+// StreamHooks bind proxy-specific lease coordination to the generic route
+// stream without making observers or cluster node-links barrier participants.
+type StreamHooks struct {
+	// RouteStreamReady fires after the live event subscription is installed and
+	// before the initial snapshot is streamed. A barrier published after this
+	// callback is therefore buffered behind the snapshot rather than lost.
+	RouteStreamReady func()
+	RouteBarrierAck  func(barrierID string)
+}
+
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
 // config-socket plugin handler calls this before ServeAuthority so it can register
 // the subscriber (and its proxy target) before streaming.
@@ -64,20 +74,27 @@ func ReadRegister(r io.Reader) (Register, error) {
 // ServeStream runs the proxy/observer route authority on an already-accepted h2c
 // request whose Register frame has already been read (reg). It is a thin HTTP
 // adapter over ServeAuthority — the proxy plane's only up-frame is a Wake.
-func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src Source, reg Register, log *slog.Logger) {
+func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src Source, reg Register, hooks *StreamHooks, log *slog.Logger) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "plugin stream needs a flushable (h2c) writer", http.StatusInternalServerError)
 		return
 	}
 	onUp := func(uctx context.Context, m *Msg) {
-		if m.Type == TypeWake && m.SID != "" && reg.handlesWake() {
+		switch {
+		case m.Type == TypeWake && m.SID != "" && reg.handlesWake():
 			// A wake's resume can be slow; handle it off the read loop
 			// (single-flight in the source dedupes duplicate sids).
 			go src.OnWake(uctx, m.SID)
+		case m.Type == TypeRouteBarrierAck && m.BarrierID != "" && hooks != nil && hooks.RouteBarrierAck != nil:
+			hooks.RouteBarrierAck(m.BarrierID)
 		}
 	}
-	ServeAuthority(ctx, w, flusher.Flush, body, src, reg, onUp, log)
+	var onSubscribed func()
+	if hooks != nil {
+		onSubscribed = hooks.RouteStreamReady
+	}
+	serveAuthority(ctx, w, flusher.Flush, body, src, reg, onUp, onSubscribed, log)
 }
 
 // ServeAuthority runs the route-authority side of one bidirectional stream over a
@@ -89,6 +106,10 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 // The proxy plane reaches this through ServeStream. The cluster node-link calls
 // StreamAuthority directly and is therefore forced onto the non-MMDS projection.
 func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
+	serveAuthority(ctx, w, flush, body, src, reg, onUp, nil, log)
+}
+
+func serveAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), onSubscribed func(), log *slog.Logger) {
 	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
 	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
 	// instead of Hello and calls StreamAuthority directly.
@@ -101,7 +122,7 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 		return
 	}
 	flush()
-	streamAuthority(ctx, w, flush, body, src, reg, onUp, nil, includeMMDS, log)
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, nil, onSubscribed, includeMMDS, log)
 }
 
 // StreamAuthority runs the route-stream half of an authority connection WITHOUT
@@ -121,10 +142,10 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	// sets the generic Register.Mmds bit, this entry point never projects node-
 	// local MMDS routes or values. The config-socket proxy path above performs
 	// its own trusted registration check before opting in.
-	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, false, log)
+	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, nil, false, log)
 }
 
-func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, includeMMDS bool, log *slog.Logger) {
+func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, onSubscribed func(), includeMMDS bool, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -156,6 +177,9 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	// and replayed as idempotent upserts.
 	ch, cancelSub := src.Subscribe()
 	defer cancelSub()
+	if onSubscribed != nil {
+		onSubscribed()
+	}
 
 	resumed := false
 	// A trusted MMDS proxy always rebuilds its confidential heap from a full
@@ -240,6 +264,11 @@ func writeEvent(w io.Writer, ev Event, includeMMDS bool) error {
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
+	case TypeRouteBarrier:
+		if ev.BarrierID == "" {
+			return errors.New("routesync: empty route barrier id")
+		}
+		m.BarrierID = ev.BarrierID
 	default:
 		return nil
 	}
