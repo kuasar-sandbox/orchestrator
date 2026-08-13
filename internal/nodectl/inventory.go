@@ -210,8 +210,15 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 			continue
 		}
 		cfg, err := rtconfig.LoadMerged([]string{yamlPath})
-		if err != nil || cfg.Resources.Control.Controller != i.ControllerSocket {
+		if err != nil {
 			if err := i.installUnknownManaged(state, sid, owner, pidPath, "managed yaml"); err != nil {
+				return err
+			}
+			continue
+		}
+		controllerSocket, socketErr := canonicalControllerSocket(cfg.Resources.Control.Controller)
+		if socketErr != nil || controllerSocket != i.ControllerSocket {
+			if err := i.installUnknownManaged(state, sid, owner, pidPath, "managed controller socket"); err != nil {
 				return err
 			}
 			continue
@@ -234,8 +241,8 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 		}
 		if err := state.InstallProvisional(ProvisionalSpec{
 			SandboxID: sid, PeerPID: owner, CgroupPath: cgroupPath,
-			Capacity:     Resources{MemoryBytes: capMem, CPUMilli: uint64(cfg.Resources.Capacity.CPU) * 1000},
-			Floor:        Resources{MemoryBytes: floorMem, CPUMilli: uint64(cfg.Resources.Allocatable.CPU * 1000)},
+			Capacity:     Resources{MemoryBytes: capMem, CPUMilli: cpuMilliCeil(float64(cfg.Resources.Capacity.CPU))},
+			Floor:        Resources{MemoryBytes: floorMem, CPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU)},
 			MemoryCharge: capMem, StartupCharge: capMem,
 			RecoverySource: RecoveryManagedPIDFile, RecoveryKey: "pidfile:" + pidPath,
 		}); err != nil {
@@ -413,10 +420,14 @@ func (i *Inventory) ValidateManaged(live LiveLease, peerPID int) error {
 	if actual := i.vmmCgroup(peerPID); actual == "" || actual != l.CgroupPath {
 		return fmt.Errorf("managed process cgroup does not match lease")
 	}
-	if cfg.Resources.Control.Controller != i.ControllerSocket || capMem != l.CapacityMemory ||
+	controllerSocket, err := canonicalControllerSocket(cfg.Resources.Control.Controller)
+	if err != nil {
+		return fmt.Errorf("managed yaml controller socket: %w", err)
+	}
+	if controllerSocket != i.ControllerSocket || capMem != l.CapacityMemory ||
 		floorMem != l.FloorMemory || startupMem != l.StartupMemory ||
 		uint64(cfg.Resources.Capacity.CPU)*1000 != l.CapacityCPUMilli ||
-		uint64(cfg.Resources.Allocatable.CPU*1000) != l.FloorCPUMilli {
+		cpuMilliCeil(cfg.Resources.Allocatable.CPU) != l.FloorCPUMilli {
 		return fmt.Errorf("managed yaml does not match lease")
 	}
 	return nil

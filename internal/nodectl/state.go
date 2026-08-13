@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"slices"
 	"sort"
@@ -34,6 +35,16 @@ const (
 type Resources struct {
 	MemoryBytes uint64 `json:"memory_bytes"`
 	CPUMilli    uint64 `json:"cpu_milli"`
+}
+
+// cpuMilliCeil keeps resource accounting on the conservative side and maps
+// every positive CPU floor to a non-zero protocol value. sandboxer's cgroup
+// policy likewise maps sub-millicore allocations to the minimum CPU weight.
+func cpuMilliCeil(cpu float64) uint64 {
+	if cpu <= 0 {
+		return 0
+	}
+	return uint64(math.Ceil(cpu * 1000))
 }
 
 func (r Resources) Sub(other Resources) Resources {

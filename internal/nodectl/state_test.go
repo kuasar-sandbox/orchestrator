@@ -16,6 +16,17 @@ func makeState(physMem, hostMem uint64) *State {
 	})
 }
 
+func TestCPUMilliCeilPreservesPositiveFloors(t *testing.T) {
+	for _, tc := range []struct {
+		cpu  float64
+		want uint64
+	}{{0, 0}, {0.0005, 1}, {0.001, 1}, {0.0011, 2}, {0.5, 500}} {
+		if got := cpuMilliCeil(tc.cpu); got != tc.want {
+			t.Fatalf("cpuMilliCeil(%g) = %d, want %d", tc.cpu, got, tc.want)
+		}
+	}
+}
+
 func TestSyncAtomicallyReplacesProvisionalAndPriorSession(t *testing.T) {
 	s := makeState(8<<30, 0)
 	if err := s.InstallProvisional(ProvisionalSpec{

@@ -383,8 +383,8 @@ func admitSpecFromRequest(conn net.Conn, peerPID int, req *Message) AdmitSpec {
 	ebudget := computeEffectiveStartupBudget(req)
 	return AdmitSpec{
 		SandboxID: req.SandboxID, PeerPID: peerPID, CgroupPath: req.CgroupPath,
-		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU * 1000)},
-		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
+		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: cpuMilliCeil(float64(req.CapacityCPU))},
+		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: cpuMilliCeil(req.FloorCPU)},
 		InitialAllocatable: ebudget, EffectiveStartupBudget: ebudget,
 		ClientFeatures: req.ClientFeatures, Conn: conn,
 	}

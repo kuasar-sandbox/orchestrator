@@ -426,6 +426,10 @@ func TestSweeperRetainsLiveCgroupAcrossStartupAndHeartbeatTimeouts(t *testing.T)
 func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 	dir := t.TempDir()
 	socket, root, runRoot := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), filepath.Join(dir, "run")
+	if err := os.MkdirAll(filepath.Join(dir, "intermediate"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlSocket := filepath.Join(dir, "intermediate", "..", "controller.sock")
 	writeFakeCgroupRoot(t, root)
 	sid, cgroup := "managed-sandbox", filepath.Join(root, "consumer")
 	writeFakeCgroup(t, cgroup, strconv.FormatUint(testLeaseCapacity, 10), 333)
@@ -438,7 +442,7 @@ func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
   allocatable: {cpu: 0.5, memory: 128MiB}
   control: {controller: %q}
   startup: {memory: 256MiB}
-`, socket)
+`, yamlSocket)
 	if err := os.WriteFile(filepath.Join(managedDir, sid+".yaml"), []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}

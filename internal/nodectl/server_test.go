@@ -147,6 +147,16 @@ func TestRecoveredAdmitReplayBypassesNewConsumerGates(t *testing.T) {
 	}
 }
 
+func TestAdmitSpecRoundsPositiveCPUFloorUp(t *testing.T) {
+	spec := admitSpecFromRequest(nil, 1, &Message{
+		SandboxID: "sub-millicore", CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
+		FloorMemoryBytes: 128 << 20, FloorCPU: 0.0005, StartupBudgetMemory: 256 << 20,
+	})
+	if spec.Floor.CPUMilli != 1 {
+		t.Fatalf("Admit floor CPU = %d millicores, want 1", spec.Floor.CPUMilli)
+	}
+}
+
 func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing.T) {
 	dir := t.TempDir()
 	state := NewState(8<<30, 8000, 0, 0, Watermarks{

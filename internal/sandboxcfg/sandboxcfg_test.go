@@ -1,6 +1,7 @@
 package sandboxcfg
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -178,6 +179,20 @@ func TestBuildLaunchCgroupControl(t *testing.T) {
 	}
 	if !bareConfig.Launch.CgroupControl {
 		t.Fatal("bare explicit launch.cgroup_control = false, want true")
+	}
+}
+
+func TestBuildCanonicalizesControllerSocket(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	p := baseParams(types.ProfileE2B)
+	p.ControllerSocket = "./controller.sock"
+	cfg, err := p.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "controller.sock"); cfg.Resources.Control.Controller != want {
+		t.Fatalf("controller socket = %q, want %q", cfg.Resources.Control.Controller, want)
 	}
 }
 
