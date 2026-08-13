@@ -22,6 +22,12 @@
 #             but the 5th sandbox-ctl run is rejected at admit time.
 #             Real sandbox-ctl run for all five.
 #
+#   Phase D   stateless controller restart
+#             SIGKILL/restart node-ctl around a live dynamic sandbox, with a
+#             corrupt deprecated state_path. Verifies StateSync converges to
+#             one precise reservation while sandbox-ctl and CH keep the same
+#             process identities and guest exec remains available.
+#
 # Requires /dev/kvm + root + docker + cloud-hypervisor + vmlinux.
 # Skips cleanly otherwise (REQUIRE_KVM=1 turns skip into failure).
 
@@ -282,7 +288,11 @@ start_daemon() {
     "$BIN/node-ctl" conductor serve --config "$cfg" >"$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
     for _ in $(seq 1 60); do
-        [ -S "$WORK/sandbox-resource.sock" ] && return 0
+        if [ -S "$WORK/sandbox-resource.sock" ] \
+            && "$BIN/node-ctl" resource status \
+                --socket "$WORK/sandbox-resource.sock" >/dev/null 2>&1; then
+            return 0
+        fi
         kill -0 "$DAEMON_PID" 2>/dev/null || { cat "$WORK/daemon.log"; fail "node-ctl conductor serve exited before binding the resource socket"; }
         sleep 0.25
     done
@@ -938,12 +948,108 @@ phase_c() {
     echo "Phase C: PASS"
 }
 
+# ---------- Phase D: stateless controller restart ----------
+
+wait_for_log_pattern() {
+    local path="$1" pattern="$2" timeout="$3" subject="$4"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -qE "$pattern" "$path" 2>/dev/null && return 0
+        sleep 0.25
+    done
+    fail "$subject not observed within ${timeout}s"
+}
+
+process_start_time() {
+    local pid="$1"
+    awk '{print $22}' "/proc/$pid/stat"
+}
+
+phase_d_controller_restart() {
+    echo
+    echo "==> Phase D: controller SIGKILL/restart recovers from lease + StateSync"
+    write_default_config
+    start_daemon "$WORK/node-ctl.yaml"
+
+    local sid=sb-D-1 start_gate=/tmp/e2e-density-d.start
+    setup_sb "$sid"
+    emit_yaml "$sid" dynamic 128 512 256 60 1 32 64 true "$start_gate"
+
+    "$BIN/sandbox-ctl" run \
+        --config "$WORK/$sid.yaml" \
+        --sandbox-id "$sid" \
+        --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$WORK/run" \
+        >"$WORK/$sid.log" 2>&1 &
+    local sandbox_pid=$!
+    SANDBOX_PIDS+=("$sandbox_pid")
+
+    wait_for_log_pattern "$WORK/daemon.log" "settled .* sid=$sid " 20 "$sid initial Settled"
+    wait_for_reservations 1 10 >/dev/null
+    wait_for_log_pattern "$WORK/$sid.log" 'CH started pid=[0-9]+' 10 "$sid CH pid"
+
+    local ch_pid sandbox_started ch_started
+    ch_pid=$(sed -nE 's/.*CH started pid=([0-9]+).*/\1/p' "$WORK/$sid.log" | tail -1)
+    [[ "$ch_pid" =~ ^[0-9]+$ ]] || fail "D: could not parse CH pid"
+    sandbox_started=$(process_start_time "$sandbox_pid")
+    ch_started=$(process_start_time "$ch_pid")
+
+    # Simulate abrupt controller loss. The stale UDS remains; replacement must
+    # acquire the owner lock before removing it. state_path is deliberately
+    # corrupt and must remain untouched because recovery is inventory-driven.
+    kill -KILL "$DAEMON_PID"
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    printf '{corrupt-state\n' >"$WORK/state.json"
+    start_daemon "$WORK/node-ctl.yaml"
+
+    wait_for_log_pattern "$WORK/$sid.log" 'controller state sync restored token=' 20 "$sid StateSync"
+    kill -0 "$sandbox_pid" 2>/dev/null || fail "D: sandbox-ctl exited across controller restart"
+    kill -0 "$ch_pid" 2>/dev/null || fail "D: CH exited across controller restart"
+    [ "$(process_start_time "$sandbox_pid")" = "$sandbox_started" ] \
+        || fail "D: sandbox-ctl process identity changed"
+    [ "$(process_start_time "$ch_pid")" = "$ch_started" ] \
+        || fail "D: CH process identity changed"
+
+    local reservations
+    reservations=$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock") \
+        || fail "D: live reservation query failed after restart"
+    if ! SID="$sid" RESERVATIONS_JSON="$reservations" python3 - <<'PY'
+import json, os
+sid = os.environ["SID"]
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+assert len(rows) == 1, rows
+row = rows[0]
+assert row["sandbox_id"] == sid, row
+assert row["connected"] is True, row
+assert row["provisional"] is False, row
+assert row["recovery_source"] == "synced", row
+PY
+    then
+        fail "D: reservation did not converge to one connected precise StateSync view"
+    fi
+
+    timeout -k 5s 20 "$BIN/sandbox-ctl" exec \
+        --sandbox-id "$sid" --run-root "$WORK/run" -- /bin/true \
+        >"$WORK/$sid-restart-exec.log" 2>&1 \
+        || { sed 's/^/  exec| /' "$WORK/$sid-restart-exec.log"; fail "D: guest exec failed after controller restart"; }
+    grep -qx '{corrupt-state' "$WORK/state.json" \
+        || fail "D: deprecated state_path was read/replaced by controller"
+
+    echo "  Phase D: sandbox_pid=$sandbox_pid ch_pid=$ch_pid reservations=1 state_sync=1"
+    shutdown_sandbox "$sandbox_pid" "$sid"
+    cleanup_sb "$sid"
+    stop_daemon
+    echo "Phase D: PASS"
+}
+
 # ---------- run all phases ----------
 
 phase_a
 phase_b1_static_self_cap
 phase_b2_dynamic_control
 phase_c
+phase_d_controller_restart
 
 echo
 echo "==> e2e_density: PASS"
@@ -951,3 +1057,4 @@ echo "    Phase A: auto resource allocation (1 sandbox, controller-driven)"
 echo "    Phase B1: static → guest self-cap convergence + workload liveness"
 echo "    Phase B2: dynamic + same floor/workload → proactive grant, no self-cap/OOM"
 echo "    Phase C: 4 admits ok, 5th rejected by water mark"
+echo "    Phase D: controller SIGKILL → lease/provisional/StateSync, VM identity unchanged"
