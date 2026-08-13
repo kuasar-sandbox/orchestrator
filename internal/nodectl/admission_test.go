@@ -92,8 +92,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 
 	// Simulate the State accepting the reservation so startup_in_flight
 	// grows to reflect the just-admitted budget.
-	state.Lock()
-	res1 := &Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token:                  "t1",
 		SandboxID:              "sb-1",
 		Capacity:               Resources{MemoryBytes: 4 << 30},
@@ -101,9 +100,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 		AllocatableNowMem:      3 << 30,
 		EffectiveStartupBudget: 3 << 30,
 		Stage:                  StageAdmitted,
-	}
-	_ = state.Insert(res1)
-	state.Unlock()
+	})
 
 	// Second admit: startup_pool full (3GiB in flight, 5GiB cap, head=3GiB
 	// fits 5-3=2GiB headroom → no fit).
@@ -122,9 +119,7 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 	}
 
 	// Transition res1 → settled releases startup_in_flight; second admit fits.
-	state.Lock()
-	res1.Stage = StageSettled
-	state.Unlock()
+	mutateReservationForTest(t, state, "sb-1", func(r *Reservation) { r.Stage = StageSettled })
 	oc = a.AnalyzeRequest(req2)
 	if oc.Status != OutcomeAdmitted {
 		t.Errorf("after settled, admit 2 status=%d, want admitted", oc.Status)
@@ -224,8 +219,7 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 		QueueMaxDepth: 4,
 	}, state)
 	// Force a short-term block by filling main pool with one big reservation.
-	state.Lock()
-	_ = state.Insert(&Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token: "filler", SandboxID: "filler",
 		Capacity:               Resources{MemoryBytes: 1 << 30},
 		Floor:                  Resources{MemoryBytes: 1 << 30},
@@ -233,7 +227,6 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 		EffectiveStartupBudget: 900 << 20,
 		Stage:                  StageAdmitted,
 	})
-	state.Unlock()
 
 	req := &Message{
 		SandboxID:           "sb-q",

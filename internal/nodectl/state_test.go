@@ -1,6 +1,8 @@
 package nodectl
 
 import (
+	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -12,6 +14,74 @@ func makeState(physMem, hostMem uint64) *State {
 		LowFactor:               0.70,
 		EmergencyFactor:         0.05,
 	})
+}
+
+func TestSyncAtomicallyReplacesProvisionalAndPriorSession(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Capacity: Resources{MemoryBytes: 2 << 30},
+		Floor: Resources{MemoryBytes: 128 << 20}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryLease, RecoveryKey: "lease:sync",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstClient, firstServer := net.Pipe()
+	defer firstClient.Close()
+	defer firstServer.Close()
+	if _, old, err := s.Sync(SyncSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Token: "token-1",
+		Capacity: Resources{MemoryBytes: 2 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		StartupMemory: 512 << 20, AppliedMemory: 512 << 20, Conn: firstServer,
+	}); err != nil || len(old) != 0 {
+		t.Fatalf("first sync old=%d err=%v", len(old), err)
+	}
+	if got := s.ResourceSnapshot(); got.Allocated.MemoryBytes != 512<<20 || got.StartupInFlight != 512<<20 || got.ProvisionalCount != 0 {
+		t.Fatalf("first sync snapshot = %+v", got)
+	}
+	secondClient, secondServer := net.Pipe()
+	defer secondClient.Close()
+	defer secondServer.Close()
+	if _, old, err := s.Sync(SyncSpec{
+		SandboxID: "sync", CgroupPath: "/cg/sync", Token: "token-2",
+		Capacity: Resources{MemoryBytes: 2 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		StartupMemory: 512 << 20, AppliedMemory: 256 << 20, Settled: true, Conn: secondServer,
+	}); err != nil || len(old) != 1 || old[0] != firstServer {
+		t.Fatalf("second sync old=%v err=%v", old, err)
+	}
+	if got := s.ResourceSnapshot(); got.Allocated.MemoryBytes != 256<<20 || got.StartupInFlight != 0 || got.ReservationCount != 1 {
+		t.Fatalf("second sync snapshot = %+v", got)
+	}
+	if _, found := s.Heartbeat("token-1", 0, time.Now()); found {
+		t.Fatal("old token remained valid after sync")
+	}
+}
+
+func TestStateAggregatesAcrossThousandReservations(t *testing.T) {
+	s := makeState(64<<30, 0)
+	const count = 1000
+	for n := 0; n < count; n++ {
+		token := "token-" + strconv.Itoa(n)
+		if _, _, err := s.Admit(AdmitSpec{
+			Token: token, SandboxID: "sandbox-" + strconv.Itoa(n),
+			Capacity:           Resources{MemoryBytes: 64 << 20, CPUMilli: 1000},
+			Floor:              Resources{MemoryBytes: 16 << 20, CPUMilli: 100},
+			InitialAllocatable: 32 << 20, EffectiveStartupBudget: 32 << 20,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != count || snapshot.Allocated.MemoryBytes != count*(32<<20) || snapshot.Allocated.CPUMilli != count*100 || snapshot.StartupInFlight != count*(32<<20) {
+		t.Fatalf("aggregate snapshot = %+v", snapshot)
+	}
+	for n := 0; n < count; n++ {
+		if _, found := s.Release("token-" + strconv.Itoa(n)); !found {
+			t.Fatalf("release %d failed", n)
+		}
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 0 || snapshot.Allocated != (Resources{}) || snapshot.StartupInFlight != 0 {
+		t.Fatalf("final aggregate = %+v", snapshot)
+	}
 }
 
 func TestNewState_DerivedPool(t *testing.T) {
@@ -42,43 +112,38 @@ func TestMemoryZone(t *testing.T) {
 	pool := s.AllocatablePool.MemoryBytes
 
 	// Empty: green
-	s.Lock()
-	defer s.Unlock()
-	if z := s.MemoryZone(); z != ZoneGreen {
+	if z := s.ResourceSnapshot().Zone; z != ZoneGreen {
 		t.Errorf("empty state zone = %s, want green", z)
 	}
 
 	// Add a reservation that pushes into yellow.
-	s.Reservations["a"] = &Reservation{
-		Token:             "a",
+	installReservationForTest(t, s, Reservation{
+		Token: "a", SandboxID: "a",
 		AllocatableNowMem: uint64(float64(pool) * 0.75),
-	}
-	if z := s.MemoryZone(); z != ZoneYellow {
+	})
+	if z := s.ResourceSnapshot().Zone; z != ZoneYellow {
 		t.Errorf("75%% allocated zone = %s, want yellow", z)
 	}
 
 	// Bump into red.
-	s.Reservations["a"].AllocatableNowMem = uint64(float64(pool) * 0.90)
-	if z := s.MemoryZone(); z != ZoneRed {
+	mutateReservationForTest(t, s, "a", func(r *Reservation) { r.AllocatableNowMem = uint64(float64(pool) * 0.90) })
+	if z := s.ResourceSnapshot().Zone; z != ZoneRed {
 		t.Errorf("90%% allocated zone = %s, want red", z)
 	}
 
 	// Push into critical (within emergency_pool).
-	s.Reservations["a"].AllocatableNowMem = uint64(float64(pool) * 0.97)
-	if z := s.MemoryZone(); z != ZoneCritical {
+	mutateReservationForTest(t, s, "a", func(r *Reservation) { r.AllocatableNowMem = uint64(float64(pool) * 0.97) })
+	if z := s.ResourceSnapshot().Zone; z != ZoneCritical {
 		t.Errorf("97%% allocated zone = %s, want critical", z)
 	}
 }
 
 func TestNodeAllocated_SumsReservations(t *testing.T) {
 	s := makeState(100<<30, 16<<30)
-	s.Lock()
-	defer s.Unlock()
+	installReservationForTest(t, s, Reservation{Token: "a", SandboxID: "a", AllocatableNowMem: 1 << 30, Floor: Resources{CPUMilli: 100}})
+	installReservationForTest(t, s, Reservation{Token: "b", SandboxID: "b", AllocatableNowMem: 2 << 30, Floor: Resources{CPUMilli: 500}})
 
-	s.Reservations["a"] = &Reservation{Token: "a", AllocatableNowMem: 1 << 30, Floor: Resources{CPUMilli: 100}}
-	s.Reservations["b"] = &Reservation{Token: "b", AllocatableNowMem: 2 << 30, Floor: Resources{CPUMilli: 500}}
-
-	got := s.NodeAllocated()
+	got := s.ResourceSnapshot().Allocated
 	if got.MemoryBytes != 3<<30 {
 		t.Errorf("MemoryBytes = %d, want 3 GiB", got.MemoryBytes)
 	}
@@ -87,34 +152,26 @@ func TestNodeAllocated_SumsReservations(t *testing.T) {
 	}
 }
 
-func TestInsertRemoveLookup(t *testing.T) {
+func TestNamedAdmitReleaseAndSIDIndex(t *testing.T) {
 	s := makeState(100<<30, 16<<30)
-	s.Lock()
-
-	r := &Reservation{Token: "x", SandboxID: "sb-x", Stage: StageAdmitted, StageEnteredAt: time.Now()}
-	if err := s.Insert(r); err != nil {
+	res, _, err := s.Admit(AdmitSpec{
+		Token: "x", SandboxID: "sb-x", InitialAllocatable: 1,
+		Capacity: Resources{MemoryBytes: 2}, Floor: Resources{MemoryBytes: 1},
+		EffectiveStartupBudget: 1, Now: time.Now(),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Lookup("x") != r {
-		t.Error("Lookup did not return the inserted reservation")
-	}
-	if err := s.Insert(r); err == nil {
-		t.Error("duplicate Insert should error")
-	}
-	if err := s.Insert(&Reservation{Token: "y", SandboxID: "sb-x"}); err == nil {
+	if _, _, err := s.Admit(AdmitSpec{Token: "y", SandboxID: "sb-x", InitialAllocatable: 1}); err == nil {
 		t.Error("second reservation for the same sandbox should error")
 	}
-	s.Unlock()
 	snapshot, found := s.SnapshotSandboxResource("sb-x")
-	if !found || snapshot.Capacity != r.Capacity {
+	if !found || snapshot.Capacity != res.Capacity {
 		t.Fatalf("SnapshotSandboxResource = %+v found=%v", snapshot, found)
 	}
-	s.Lock()
-	s.Remove("x")
-	if s.Lookup("x") != nil {
-		t.Error("Lookup should return nil after Remove")
+	if _, found := s.Release("x"); !found {
+		t.Fatal("Release did not find token")
 	}
-	s.Unlock()
 	if _, found := s.SnapshotSandboxResource("sb-x"); found {
 		t.Error("SID index retained a removed reservation")
 	}

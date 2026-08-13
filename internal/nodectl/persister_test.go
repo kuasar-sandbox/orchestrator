@@ -11,8 +11,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	p := &Persister{Path: filepath.Join(dir, "state.json")}
 
 	src := makeState(100<<30, 16<<30)
-	src.Lock()
-	src.Reservations["t1"] = &Reservation{
+	installReservationForTest(t, src, Reservation{
 		Token:             "t1",
 		SandboxID:         "sb-1",
 		Stage:             StageSettled,
@@ -23,8 +22,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 100},
 		LastReportedRSS:   96 << 20,
 		LastReportAt:      time.Unix(1_800_000_000, 0).UTC(),
-	}
-	src.Unlock()
+	})
 
 	if err := p.Flush(src); err != nil {
 		t.Fatal(err)
@@ -40,10 +38,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 		t.Errorf("NodeBudget mismatch: got %d, want %d",
 			loaded.NodeBudget.MemoryBytes, src.NodeBudget.MemoryBytes)
 	}
-	r := loaded.Reservations["t1"]
-	if r == nil {
-		t.Fatal("reservation t1 missing")
-	}
+	r := reservationByTokenForTest(t, loaded, "t1")
 	if r.SandboxID != "sb-1" || r.AllocatableNowMem != 256<<20 {
 		t.Errorf("reservation fields wrong: %+v", r)
 	}

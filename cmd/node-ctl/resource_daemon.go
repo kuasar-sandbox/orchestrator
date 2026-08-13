@@ -19,10 +19,13 @@ type resourceProbe struct {
 	admission *nodectl.AdmissionController
 }
 
-func (p resourceProbe) Zone() string          { return string(p.state.MemoryZone()) }
-func (p resourceProbe) AllocatedBytes() int64 { return int64(p.state.NodeAllocated().MemoryBytes) }
-func (p resourceProbe) PoolBytes() int64      { return int64(p.state.AllocatablePool.MemoryBytes) }
-func (p resourceProbe) Draining() bool        { return p.admission.IsDrained() }
+func (p resourceProbe) Snapshot() orch.ResourceProbeSnapshot {
+	snapshot := p.state.ResourceSnapshot()
+	return orch.ResourceProbeSnapshot{
+		Zone: string(snapshot.Zone), Allocated: int64(snapshot.Allocated.MemoryBytes),
+		Pool: int64(snapshot.AllocatablePool.MemoryBytes), Draining: p.admission.IsDrained(),
+	}
+}
 
 func (p resourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats, bool) {
 	snapshot, found := p.state.SnapshotSandboxResource(sandboxID)
@@ -58,7 +61,7 @@ var _ orch.SandboxResourceProvider = resourceProbe{}
 // defaults). It returns once the listener is bound (the controller serves in a
 // background goroutine), or an error if setup fails. When resource_listen is
 // absent/disabled serve never calls this and sandboxes fall back to static cgroup.
-func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, slogger *slog.Logger) (orch.ResourceProbe, error) {
+func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, managedRunRoot string, slogger *slog.Logger) (orch.ResourceProbe, error) {
 	resolved, err := nodectl.Resolve(rcfg)
 	if err != nil {
 		return nil, err
@@ -70,15 +73,12 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 		resolved.Watermarks)
 
 	persister := &nodectl.Persister{Path: resolved.StatePath}
-	// Best-effort load; missing/corrupt state.json starts fresh — sandbox-ctl
-	// reattaches by token over RPC.
-	if prev, err := persister.Load(); err == nil && prev != nil {
-		if err := state.RestoreReservations(prev.Reservations); err != nil {
-			return nil, err
-		}
-		log.Printf("[node-ctl resource] loaded %d reservations from %s", len(prev.Reservations), resolved.StatePath)
-	} else if err != nil {
-		log.Printf("[node-ctl resource] state load failed (continuing fresh): %v", err)
+	var legacyReservations map[string]*nodectl.Reservation
+	if previous, loadErr := persister.Load(); loadErr == nil && previous != nil {
+		legacyReservations = previous.PersistenceReservations()
+		log.Printf("[node-ctl resource] loaded %d legacy reservations; live inventory remains authoritative", len(legacyReservations))
+	} else if loadErr != nil {
+		log.Printf("[node-ctl resource] legacy state load failed (inventory recovery continues): %v", loadErr)
 	}
 
 	admission := nodectl.NewAdmissionController(resolved.Admission)
@@ -90,13 +90,19 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	}
 
 	srv := &nodectl.Server{
-		Path:      resolved.Listen,
-		State:     state,
-		Admission: admission,
-		Allocator: allocator,
-		Persister: persister,
-		Auditor:   auditor,
-		Logf:      func(f string, a ...any) { log.Printf("[node-ctl resource] "+f, a...) },
+		Path:               resolved.Listen,
+		State:              state,
+		Admission:          admission,
+		Allocator:          allocator,
+		Persister:          persister,
+		LegacyReservations: legacyReservations,
+		Inventory: &nodectl.Inventory{
+			ControllerSocket: resolved.Listen, CgroupScanPaths: resolved.CgroupScanPaths,
+			ManagedRunRoot: managedRunRoot, Pool: state.AllocatablePool,
+			Logf: func(f string, a ...any) { log.Printf("[node-ctl resource inventory] "+f, a...) },
+		},
+		Auditor: auditor,
+		Logf:    func(f string, a ...any) { log.Printf("[node-ctl resource] "+f, a...) },
 	}
 	if err := srv.Listen(); err != nil {
 		auditor.Close()
@@ -115,6 +121,7 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 
 	sweeper := &nodectl.IdleSweeper{
 		State: state, Admission: admission, Allocator: allocator, Persister: persister,
+		Inventory:  srv.Inventory,
 		StartupTTL: resolved.Admission.StartupTTL, Heartbeat: 30 * time.Second, Interval: 10 * time.Second,
 		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource sweep] "+f, a...) },
 	}

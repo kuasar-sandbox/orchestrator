@@ -12,10 +12,9 @@ type stubProbe struct {
 	draining    bool
 }
 
-func (p stubProbe) Zone() string          { return p.zone }
-func (p stubProbe) AllocatedBytes() int64 { return p.alloc }
-func (p stubProbe) PoolBytes() int64      { return p.pool }
-func (p stubProbe) Draining() bool        { return p.draining }
+func (p stubProbe) Snapshot() ResourceProbeSnapshot {
+	return ResourceProbeSnapshot{Zone: p.zone, Allocated: p.alloc, Pool: p.pool, Draining: p.draining}
+}
 
 func TestHeartbeatTelemetry(t *testing.T) {
 	o := testOrch(t)

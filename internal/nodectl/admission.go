@@ -65,6 +65,7 @@ type Outcome struct {
 type PendingAdmit struct {
 	req       *Message // the full Admit request
 	conn      net.Conn
+	peerPID   int
 	queuedAt  time.Time
 	queuedPos int // queue depth at insertion (informational, for metadata)
 
@@ -84,9 +85,8 @@ func (p *PendingAdmit) cancel() {
 }
 
 // AdmissionController owns the token bucket, the drain switch, and the
-// server-side FIFO queue + worker. State.Lock + queueMu must be acquired
-// in a strict order to avoid deadlock: callers either (a) hold queueMu
-// only, or (b) hold queueMu THEN state.Lock — never the reverse.
+// server-side FIFO queue + worker. When both are involved, queueMu precedes a
+// State method; State never calls back into AdmissionController.
 type AdmissionController struct {
 	policy AdmissionPolicy
 
@@ -418,14 +418,13 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 		}
 	}
 
-	a.state.Lock()
-	pool := a.state.AllocatablePool.MemoryBytes
-	startupPool := a.state.StartupPoolBytes()
-	emerg := uint64(float64(pool) * a.state.Wm.EmergencyFactor)
-	mainAllocated := a.state.NodeAllocated().MemoryBytes
-	startupInFlight := a.state.StartupInFlightLocked()
-	zone := a.state.MemoryZone()
-	a.state.Unlock()
+	snapshot := a.state.AdmissionSnapshot()
+	pool := snapshot.Pool.MemoryBytes
+	startupPool := snapshot.StartupPool
+	emerg := snapshot.EmergencyMemory
+	mainAllocated := snapshot.Allocated.MemoryBytes
+	startupInFlight := snapshot.StartupInFlight
+	zone := snapshot.Zone
 
 	// 3. pre-check absolute capacity
 	if ebudget > pool {

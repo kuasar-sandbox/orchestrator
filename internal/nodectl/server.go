@@ -8,8 +8,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
 )
 
 // Server is the controller daemon's RPC face. It accepts UDS
@@ -21,8 +24,13 @@ type Server struct {
 	Admission *AdmissionController
 	Allocator *Allocator
 	Persister *Persister
-	Auditor   *Auditor // optional
-	Logf      func(string, ...any)
+	Inventory *Inventory
+	Owner     *OwnerLock
+	// LegacyReservations is temporary rolling-upgrade compatibility. Inventory
+	// is installed first and always wins over these state.json records.
+	LegacyReservations map[string]*Reservation
+	Auditor            *Auditor // optional
+	Logf               func(string, ...any)
 
 	listener net.Listener
 
@@ -36,21 +44,41 @@ func (s *Server) Listen() error {
 	if s.Logf == nil {
 		s.Logf = func(string, ...any) {}
 	}
-	_ = os.Remove(s.Path)
 	if err := os.MkdirAll(filepathDir(s.Path), 0o755); err != nil {
 		return fmt.Errorf("server: mkdir: %w", err)
 	}
+	if s.Owner == nil {
+		s.Owner = &OwnerLock{Path: s.Path + ".owner"}
+	}
+	if err := s.Owner.Acquire(); err != nil {
+		return err
+	}
+	fail := func(err error) error {
+		_ = s.Owner.Close()
+		return err
+	}
+	if s.Inventory != nil {
+		if err := s.Inventory.Recover(s.State); err != nil {
+			return fail(fmt.Errorf("server: recover inventory: %w", err))
+		}
+	}
+	if err := s.State.MergePersistedReservations(s.LegacyReservations); err != nil {
+		return fail(fmt.Errorf("server: merge legacy state: %w", err))
+	}
+	// Only the owner may remove a stale socket. A second live controller fails
+	// above and never reaches this unlink.
+	_ = os.Remove(s.Path)
 	addr, err := net.ResolveUnixAddr("unix", s.Path)
 	if err != nil {
-		return fmt.Errorf("server: resolve: %w", err)
+		return fail(fmt.Errorf("server: resolve: %w", err))
 	}
 	l, err := net.ListenUnix("unix", addr)
 	if err != nil {
-		return fmt.Errorf("server: listen %s: %w", s.Path, err)
+		return fail(fmt.Errorf("server: listen %s: %w", s.Path, err))
 	}
 	if err := os.Chmod(s.Path, 0o660); err != nil {
 		l.Close()
-		return fmt.Errorf("server: chmod: %w", err)
+		return fail(fmt.Errorf("server: chmod: %w", err))
 	}
 	s.listener = l
 	s.Logf("controller listening on %s", s.Path)
@@ -62,6 +90,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.listener == nil {
 		return errors.New("server: not listening")
 	}
+	defer func() {
+		_ = s.Owner.Close()
+	}()
 	go func() {
 		<-ctx.Done()
 		_ = s.listener.Close()
@@ -88,7 +119,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			s.serveConn(ctx, c)
+			peerPID := 0
+			if uc, ok := c.(*net.UnixConn); ok {
+				peerPID, _ = unixcred.PeerPID(uc)
+			}
+			s.serveConn(ctx, c, peerPID)
 		}(conn)
 	}
 }
@@ -108,7 +143,7 @@ func (s *Server) Stop() error {
 // serveConn runs the per-connection message loop. The connection is
 // associated with at most one Reservation (after Admit / Reattach
 // succeeds), discovered by the Token field on incoming messages.
-func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 	defer conn.Close()
 
 	var (
@@ -117,7 +152,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 
 	defer func() {
 		if token != "" {
-			s.handleConnDrop(token)
+			s.handleConnDrop(token, conn)
 		}
 	}()
 
@@ -144,7 +179,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		if token == "" && req.Token != "" {
 			token = req.Token
 		}
-		resp := s.dispatch(conn, req, &token)
+		resp := s.dispatch(conn, peerPID, req, &token)
 		if resp != nil {
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := WriteMessage(conn, resp); err != nil {
@@ -158,12 +193,14 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 
 // dispatch routes one request to the appropriate handler and returns
 // the response (or nil if the message has no reply).
-func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
+func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *string) *Message {
 	switch req.Type {
 	case TypeAdmit:
-		return s.handleAdmit(conn, req, token)
+		return s.handleAdmit(conn, peerPID, req, token)
 	case TypeReattach:
 		return s.handleReattach(conn, req, token)
+	case TypeStateSync:
+		return s.handleStateSync(conn, peerPID, req, token)
 	case TypeSettled:
 		return s.handleSettled(req, *token)
 	case TypeRequestBudget:
@@ -185,6 +222,8 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 		return s.handleAdminReclaim(req)
 	case TypeAdminStatus:
 		return s.handleAdminStatus()
+	case TypeAdminList:
+		return s.handleAdminList()
 	default:
 		return &Message{Type: TypeError, Msg: "unknown type: " + req.Type}
 	}
@@ -198,7 +237,7 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 // connection stays open and the admission worker is responsible for the
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
-func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Message {
+func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *string) *Message {
 	oc := s.Admission.AnalyzeRequest(req)
 	switch oc.Status {
 	case OutcomeAdmitted:
@@ -212,7 +251,7 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 	switch oc.Status {
 	case OutcomeAdmitted:
 		// Token already consumed above (or admit didn't need a token recheck).
-		resp, err := s.buildAdmitOK(conn, req, token)
+		resp, err := s.buildAdmitOK(conn, peerPID, req, token)
 		if err != nil {
 			return &Message{
 				Type:   TypeAdmitResponse,
@@ -240,6 +279,7 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 				Msg:    "admission queue at capacity",
 			}
 		}
+		entry.peerPID = peerPID
 		if s.Auditor != nil {
 			s.Auditor.Logf("admit_queued sid=%s pos=%d block=%d",
 				req.SandboxID, entry.queuedPos, int(oc.Block))
@@ -263,40 +303,58 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 // PendingAdmit-shaped argument to the per-request buildAdmitOK path so
 // queued and synchronous admits build reservations identically.
 func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
-	return s.buildAdmitOK(p.conn, p.req, nil)
+	return s.buildAdmitOK(p.conn, p.peerPID, p.req, nil)
 }
 
 // buildAdmitOK builds the Reservation, inserts it into State, returns
 // the AdmitResponse message. Caller has already token-consumed.
-func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Message, error) {
+func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *string) (*Message, error) {
 	ebudget := computeEffectiveStartupBudget(req)
-
-	s.State.Lock()
-	defer s.State.Unlock()
+	leasePath := ""
+	if slices.Contains(req.ClientFeatures, FeatureStateSyncV1) {
+		if s.Inventory == nil {
+			return nil, fmt.Errorf("state-sync client requires lease inventory")
+		}
+		live, err := s.Inventory.LookupLiveLease(req.SandboxID)
+		if err != nil {
+			return nil, fmt.Errorf("admit lease: %w", err)
+		}
+		if err := s.Inventory.ValidateManaged(live, peerPID); err != nil {
+			return nil, fmt.Errorf("admit identity: %w", err)
+		}
+		l := live.Lease
+		if req.CapacityMemoryBytes != l.CapacityMemory || uint64(req.CapacityCPU)*1000 != l.CapacityCPUMilli ||
+			req.FloorMemoryBytes != l.FloorMemory || uint64(req.FloorCPU*1000) != l.FloorCPUMilli ||
+			req.StartupBudgetMemory != l.StartupMemory || req.CgroupPath != l.CgroupPath {
+			return nil, fmt.Errorf("admit request does not match immutable lease")
+		}
+		peerPID = live.OwnerPID
+		leasePath = live.Path
+	}
 
 	t := NewToken()
-	res := &Reservation{
-		Token:                  t,
-		SandboxID:              req.SandboxID,
-		CgroupPath:             req.CgroupPath,
-		Capacity:               Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
-		Floor:                  Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
-		AllocatableNowMem:      ebudget,
-		EffectiveStartupBudget: ebudget,
-		Stage:                  StageAdmitted,
-		StageEnteredAt:         time.Now(),
-		LastHeartbeatAt:        time.Now(),
-		Conn:                   conn,
-	}
-	if err := s.State.Insert(res); err != nil {
+	_, oldConn, err := s.State.Admit(AdmitSpec{
+		Token: t, SandboxID: req.SandboxID, PeerPID: peerPID,
+		CgroupPath:         req.CgroupPath,
+		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
+		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
+		InitialAllocatable: ebudget, EffectiveStartupBudget: ebudget,
+		LeasePath: leasePath, ClientFeatures: req.ClientFeatures, Conn: conn,
+	})
+	if err != nil {
 		return nil, err
+	}
+	if oldConn != nil && oldConn != conn {
+		_ = oldConn.Close()
 	}
 	if token != nil {
 		*token = t
 	}
 
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("persister flush: %v", err)
+		}
 	}
 
 	s.Logf("admit %s sid=%s initial_alloc=%d",
@@ -317,131 +375,95 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 // handleReattach re-binds a connection to an existing reservation
 // (after sandbox-ctl reconnect or controller restart).
 func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-
-	res := s.State.Lookup(req.Token)
-	if res == nil {
+	res, oldConn, found := s.State.Reattach(req.Token, conn)
+	if !found {
 		return &Message{Type: TypeError, Msg: "unknown token"}
 	}
-	res.Conn = conn
+	if oldConn != nil && oldConn != conn {
+		_ = oldConn.Close()
+	}
 	*token = req.Token
 	s.Logf("reattach %s sid=%s stage=%s", req.Token[:8], res.SandboxID, res.Stage)
 	return &Message{Type: TypeAck, Token: req.Token, NewAllocatable: res.AllocatableNowMem}
 }
 
+func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token *string) *Message {
+	if s.Inventory == nil {
+		return &Message{Type: TypeError, Msg: "state sync inventory unavailable"}
+	}
+	live, err := s.Inventory.LookupLiveLease(req.SandboxID)
+	if err != nil {
+		return &Message{Type: TypeError, Msg: "state sync lease: " + err.Error()}
+	}
+	if !live.Lease.Supports(FeatureStateSyncV1) {
+		return &Message{Type: TypeError, Msg: "lease does not advertise state_sync_v1"}
+	}
+	if err := s.Inventory.ValidateManaged(live, peerPID); err != nil {
+		return &Message{Type: TypeError, Msg: "state sync identity: " + err.Error()}
+	}
+	l := live.Lease
+	if req.AppliedAllocatableMemory < l.FloorMemory || req.AppliedAllocatableMemory > l.CapacityMemory {
+		return &Message{Type: TypeError, Msg: "state sync applied allocatable outside floor/capacity"}
+	}
+	newToken := NewToken()
+	res, oldConns, err := s.State.Sync(SyncSpec{
+		Token: newToken, SandboxID: l.SandboxID, PeerPID: live.OwnerPID,
+		CgroupPath:    l.CgroupPath,
+		Capacity:      Resources{MemoryBytes: l.CapacityMemory, CPUMilli: l.CapacityCPUMilli},
+		Floor:         Resources{MemoryBytes: l.FloorMemory, CPUMilli: l.FloorCPUMilli},
+		StartupMemory: l.StartupMemory, AppliedMemory: req.AppliedAllocatableMemory,
+		Settled: req.Settled, CurrentRSS: req.CurrentRSS,
+		LeasePath: live.Path, ClientFeatures: l.ClientFeatures, Conn: conn,
+	})
+	if err != nil {
+		return &Message{Type: TypeError, Msg: "state sync: " + err.Error()}
+	}
+	for _, old := range oldConns {
+		_ = old.Close()
+	}
+	*token = newToken
+	s.Logf("state sync sid=%s pid=%d settled=%v alloc=%d", res.SandboxID, res.PeerPID, req.Settled, res.AllocatableNowMem)
+	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.AllocatableNowMem}
+}
+
 func (s *Server) handleSettled(req *Message, token string) *Message {
-	s.State.Lock()
-	res := s.State.Lookup(token)
-	if res == nil {
-		s.State.Unlock()
+	res, found := s.State.SetSettled(token, req.CurrentRSS, time.Now())
+	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
 
-	// 1. main-pool release: collapse AllocatableNowMem from the elevated
-	//    startup budget down to max(current_rss, floor). Steady-state grant
-	//    paths will pump it back up if needed.
-	floor := res.Floor.MemoryBytes
-	newAlloc := req.CurrentRSS
-	if newAlloc < floor {
-		newAlloc = floor
-	}
-	res.AllocatableNowMem = newAlloc
-
-	// 2. startup-pool release: the stage transition itself (admitted →
-	//    settled) takes res out of the pre-settled set, so StartupInFlight
-	//    accounting (derived) auto-decrements by res.EffectiveStartupBudget.
-	now := time.Now()
-	res.Stage = StageSettled
-	res.StageEnteredAt = now
-	res.LastHeartbeatAt = now
-	if req.CurrentRSS > 0 {
-		res.LastReportedRSS = req.CurrentRSS
-		res.LastReportAt = now
-	}
-	s.State.Unlock()
-
-	// Wake the admission worker — main + startup pool both just got
-	// headroom back, queued admits may now fit.
 	s.Admission.PushWake()
 
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("persister flush: %v", err)
+		}
 	}
-	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, newAlloc)
+	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, res.AllocatableNowMem)
 	return &Message{Type: TypeAck}
 }
 
 func (s *Server) handleRequestBudget(req *Message, token string) *Message {
-	s.State.Lock()
-	res := s.State.Lookup(token)
-	if res == nil {
-		s.State.Unlock()
-		return &Message{Type: TypeError, Msg: "no reservation"}
-	}
-
-	zone := s.State.MemoryZone()
-	pool := s.State.AllocatablePool.MemoryBytes
-	emerg := uint64(float64(pool) * s.State.Wm.EmergencyFactor)
-	allocated := s.State.NodeAllocated().MemoryBytes
-
 	urgency := req.Urgency
 	if urgency == "" {
 		urgency = UrgencyNormal
 	}
-
-	// Headroom: emergency_pool excluded for normal/low urgency.
-	var headroom uint64
-	if pool > allocated {
-		headroom = pool - allocated
+	result, found := s.State.Grant(token, req.RequestedDelta, urgency, s.Allocator)
+	if !found {
+		return &Message{Type: TypeError, Msg: "no precise reservation"}
 	}
-	if urgency != UrgencyHigh {
-		if pool > allocated+emerg {
-			headroom = pool - allocated - emerg
-		} else {
-			headroom = 0
-		}
-	}
-	// Cap by per-sandbox capacity.
-	maxByCap := uint64(0)
-	if res.Capacity.MemoryBytes > res.AllocatableNowMem {
-		maxByCap = res.Capacity.MemoryBytes - res.AllocatableNowMem
-	}
-	if headroom > maxByCap {
-		headroom = maxByCap
-	}
-
-	// In red/critical zone, only urgency=high gets through.
-	if (zone == ZoneRed || zone == ZoneCritical) && urgency != UrgencyHigh {
-		s.State.Unlock()
-		return &Message{
-			Type:           TypeBudgetResponse,
-			GrantedDelta:   0,
-			NewAllocatable: res.AllocatableNowMem,
-			CooldownMs:     500,
-		}
-	}
-
-	dec := s.Allocator.Grant(token, req.RequestedDelta, headroom, urgency)
-	res.AllocatableNowMem += dec.GrantedDelta
-	if dec.GrantedDelta > 0 {
-		if res.Stage != StageBurst {
-			res.Stage = StageBurst
-			res.StageEnteredAt = time.Now()
-		}
-	}
+	res, dec, zone := result.Reservation, result.Decision, result.Zone
 	resp := &Message{
 		Type:           TypeBudgetResponse,
 		GrantedDelta:   dec.GrantedDelta,
 		NewAllocatable: res.AllocatableNowMem,
 		CooldownMs:     dec.CooldownMs,
 	}
-	if dec.GrantedDelta > 0 {
+	if dec.GrantedDelta > 0 && s.Persister != nil {
 		if err := s.Persister.Flush(s.State); err != nil {
 			s.Logf("persister flush: %v", err)
 		}
 	}
-	s.State.Unlock()
 	if dec.GrantedDelta > 0 {
 		s.Logf("grant %s sid=%s +%d → %d (zone=%s urgency=%s)",
 			token[:8], res.SandboxID, dec.GrantedDelta, res.AllocatableNowMem, zone, urgency)
@@ -450,15 +472,14 @@ func (s *Server) handleRequestBudget(req *Message, token string) *Message {
 }
 
 func (s *Server) handleOOMReport(req *Message, token string) *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-	res := s.State.Lookup(token)
-	if res == nil {
+	res, found := s.State.RecordOOM(token, req.OOMCount)
+	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
-	res.OOMCount += req.OOMCount
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("persister flush: %v", err)
+		}
 	}
 	s.Logf("oom_report %s sid=%s count=%d killed_pid=%d",
 		token[:8], res.SandboxID, res.OOMCount, req.KilledPID)
@@ -466,17 +487,9 @@ func (s *Server) handleOOMReport(req *Message, token string) *Message {
 }
 
 func (s *Server) handleHeartbeat(req *Message, token string) *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-	res := s.State.Lookup(token)
-	if res == nil {
+	res, found := s.State.Heartbeat(token, req.CurrentRSS, time.Now())
+	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
-	}
-	now := time.Now()
-	res.LastHeartbeatAt = now
-	if req.CurrentRSS > 0 {
-		res.LastReportedRSS = req.CurrentRSS
-		res.LastReportAt = now
 	}
 	// Sync allocatable_now to the client. If the active reclaimer or an
 	// admin command shrank it, the client picks up the new value here
@@ -485,10 +498,8 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 }
 
 func (s *Server) handleRelease(req *Message, token string) {
-	s.State.Lock()
-	res := s.State.Lookup(token)
-	if res == nil {
-		s.State.Unlock()
+	res, found := s.State.Release(token)
+	if !found {
 		return
 	}
 	// Both main-pool and startup-pool accounting are derived from
@@ -497,13 +508,13 @@ func (s *Server) handleRelease(req *Message, token string) {
 	// admit can re-evaluate against the freshly returned headroom.
 	wasPreSettled := IsPreSettled(res.Stage)
 	s.Allocator.CleanupHistory(token)
-	s.State.Remove(token)
-	s.State.Unlock()
 
 	s.Admission.PushWake()
 
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("persister flush: %v", err)
+		}
 	}
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
 		token[:8], res.SandboxID, req.Reason, wasPreSettled)
@@ -526,23 +537,17 @@ func (s *Server) handleAdminDrain(req *Message) *Message {
 // SandboxID. Bypasses water-mark + rate-limit (admin override). The
 // sandbox-ctl picks up the new allocatable on its next Heartbeat.
 func (s *Server) handleAdminGrant(req *Message) *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-	res := s.findBySandboxIDLocked(req.SandboxID)
-	if res == nil {
+	res, delta, found := s.State.AdminGrant(req.SandboxID, req.RequestedDelta)
+	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
 	}
-	newAlloc := res.AllocatableNowMem + req.RequestedDelta
-	if newAlloc > res.Capacity.MemoryBytes {
-		newAlloc = res.Capacity.MemoryBytes
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("admin grant persist: %v", err)
+		}
 	}
-	delta := newAlloc - res.AllocatableNowMem
-	res.AllocatableNowMem = newAlloc
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("admin grant persist: %v", err)
-	}
-	s.Logf("admin grant sid=%s +%d → %d", req.SandboxID, delta, newAlloc)
-	return &Message{Type: TypeAck, GrantedDelta: delta, NewAllocatable: newAlloc}
+	s.Logf("admin grant sid=%s +%d → %d", req.SandboxID, delta, res.AllocatableNowMem)
+	return &Message{Type: TypeAck, GrantedDelta: delta, NewAllocatable: res.AllocatableNowMem}
 }
 
 // handleAdminReclaim sets allocatable_now down to req.TargetAllocatable
@@ -550,67 +555,70 @@ func (s *Server) handleAdminGrant(req *Message) *Message {
 // sandbox-ctl picks up the new value on its next Heartbeat and shrinks
 // cgroup + balloon accordingly.
 func (s *Server) handleAdminReclaim(req *Message) *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-	res := s.findBySandboxIDLocked(req.SandboxID)
-	if res == nil {
-		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
+	res, err := s.State.AdminReclaim(req.SandboxID, req.TargetAllocatable)
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
 	}
-	target := req.TargetAllocatable
-	if target < res.Floor.MemoryBytes {
-		target = res.Floor.MemoryBytes
+	if s.Persister != nil {
+		if err := s.Persister.Flush(s.State); err != nil {
+			s.Logf("admin reclaim persist: %v", err)
+		}
 	}
-	if target > res.AllocatableNowMem {
-		// Reclaim is shrink-only — for grow use admin_grant.
-		return &Message{Type: TypeError, Msg: "target above current allocatable; use admin_grant to grow"}
-	}
-	delta := res.AllocatableNowMem - target
-	res.AllocatableNowMem = target
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("admin reclaim persist: %v", err)
-	}
-	s.Logf("admin reclaim sid=%s -%d → %d", req.SandboxID, delta, target)
-	return &Message{Type: TypeAck, NewAllocatable: target}
+	s.Logf("admin reclaim sid=%s → %d", req.SandboxID, res.AllocatableNowMem)
+	return &Message{Type: TypeAck, NewAllocatable: res.AllocatableNowMem}
 }
 
 // handleAdminStatus returns a summary of node state without requiring
 // the caller to read state.json directly.
 func (s *Server) handleAdminStatus() *Message {
-	s.State.Lock()
-	defer s.State.Unlock()
-	allocated := s.State.NodeAllocated()
+	snapshot := s.State.ResourceSnapshot()
 	return &Message{
-		Type:             TypeAck,
-		Zone:             string(s.State.MemoryZone()),
-		NodeAllocated:    allocated.MemoryBytes,
-		AllocatablePool:  s.State.AllocatablePool.MemoryBytes,
-		ReservationCount: len(s.State.Reservations),
-		Drained:          s.Admission.IsDrained(),
+		Type: TypeAck, Zone: string(snapshot.Zone),
+		NodeAllocated:    snapshot.Allocated.MemoryBytes,
+		AllocatablePool:  snapshot.AllocatablePool.MemoryBytes,
+		ReservationCount: snapshot.ReservationCount,
+		ProvisionalCount: snapshot.ProvisionalCount, UnknownCount: snapshot.UnknownCount,
+		Drained:    s.Admission.IsDrained(),
+		NodeBudget: resourceView(snapshot.NodeBudget), HostReserved: resourceView(snapshot.HostReserved),
+		OperationalMargin: resourceView(snapshot.OperationalMargin),
+		Allocated:         resourceView(snapshot.Allocated), Pool: resourceView(snapshot.AllocatablePool),
+		StartupInFlight: snapshot.StartupInFlight,
 	}
 }
 
-// findBySandboxIDLocked searches the reservation map for a sandbox by
-// id. Caller holds State.Lock. Returns nil if not found.
-func (s *Server) findBySandboxIDLocked(sid string) *Reservation {
-	for _, r := range s.State.Reservations {
-		if r.SandboxID == sid {
-			return r
+func resourceView(r Resources) ResourcesView {
+	return ResourcesView{MemoryBytes: r.MemoryBytes, CPUMilli: r.CPUMilli}
+}
+
+func (s *Server) handleAdminList() *Message {
+	reservations := s.State.ReservationViews()
+	views := make([]ReservationView, 0, len(reservations))
+	for _, r := range reservations {
+		lastReport := int64(0)
+		if !r.LastReportAt.IsZero() {
+			lastReport = r.LastReportAt.Unix()
 		}
+		views = append(views, ReservationView{
+			SandboxID: r.SandboxID, PeerPID: r.PeerPID, CgroupPath: r.CgroupPath,
+			Capacity: resourceView(r.Capacity), Floor: resourceView(r.Floor),
+			AllocatableMemory:     r.AllocatableNowMem,
+			EffectiveStartupBytes: r.EffectiveStartupBudget, Stage: r.Stage,
+			CurrentRSS: r.LastReportedRSS, LastReportUnix: lastReport,
+			Connected: r.Conn != nil, Provisional: r.Provisional,
+			RecoverySource: r.RecoverySource, StartupExpired: r.StartupExpired,
+		})
 	}
-	return nil
+	return &Message{Type: TypeAck, Reservations: views}
 }
 
 // handleConnDrop is invoked by the connection goroutine after EOF /
 // network error. Reservation is NOT immediately released — sandbox-ctl
 // may reconnect within the reattach window.
-func (s *Server) handleConnDrop(token string) {
-	s.State.Lock()
-	defer s.State.Unlock()
-	res := s.State.Lookup(token)
-	if res == nil {
+func (s *Server) handleConnDrop(token string, conn net.Conn) {
+	res, changed := s.State.DropConnection(token, conn)
+	if !changed {
 		return
 	}
-	res.Conn = nil
 	s.Logf("conn dropped for %s sid=%s (reservation pending reattach)",
 		token[:8], res.SandboxID)
 }
@@ -634,6 +642,7 @@ type IdleSweeper struct {
 	Admission  *AdmissionController
 	Allocator  *Allocator
 	Persister  *Persister
+	Inventory  *Inventory
 	StartupTTL time.Duration
 	Heartbeat  time.Duration
 	Interval   time.Duration
@@ -661,18 +670,24 @@ func (i *IdleSweeper) Run(ctx context.Context) {
 
 func (i *IdleSweeper) sweep() {
 	now := time.Now()
-	i.State.Lock()
-	defer i.State.Unlock()
-
 	swept := false
-	for token, res := range i.State.Reservations {
+	for _, res := range i.State.SweepSnapshot() {
+		live := res.Conn != nil
+		if !live && i.Inventory != nil {
+			live = i.Inventory.ConsumerLive(res)
+		}
 		// Creating-stage TTL.
 		if IsPreSettled(res.Stage) &&
 			now.Sub(res.StageEnteredAt) > i.StartupTTL {
-			i.Logf("sweep: token %s sid=%s exceeded startup TTL, releasing",
-				token[:8], res.SandboxID)
-			i.Allocator.CleanupHistory(token)
-			i.State.Remove(token)
+			i.State.MarkStartupExpired(res.SandboxID, res.identity())
+			if live {
+				i.Logf("sweep: sid=%s exceeded startup TTL but consumer is live; retaining charge", res.SandboxID)
+				continue
+			}
+			i.Logf("sweep: sid=%s exceeded startup TTL and consumer is gone, releasing", res.SandboxID)
+			if removed, ok := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); ok {
+				i.Allocator.CleanupHistory(removed.Token)
+			}
 			swept = true
 			continue
 		}
@@ -680,10 +695,14 @@ func (i *IdleSweeper) sweep() {
 		// timestamp fresh enough).
 		if res.Conn == nil && i.Heartbeat > 0 &&
 			now.Sub(res.LastHeartbeatAt) > 3*i.Heartbeat {
-			i.Logf("sweep: token %s sid=%s no heartbeat for %v, releasing",
-				token[:8], res.SandboxID, now.Sub(res.LastHeartbeatAt))
-			i.Allocator.CleanupHistory(token)
-			i.State.Remove(token)
+			if live {
+				i.Logf("sweep: sid=%s heartbeat stale but consumer is live; retaining charge", res.SandboxID)
+				continue
+			}
+			i.Logf("sweep: sid=%s heartbeat stale and consumer is gone, releasing", res.SandboxID)
+			if removed, ok := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); ok {
+				i.Allocator.CleanupHistory(removed.Token)
+			}
 			swept = true
 		}
 	}
@@ -691,7 +710,9 @@ func (i *IdleSweeper) sweep() {
 		// Headroom may have just opened up — wake admission worker.
 		i.Admission.PushWake()
 	}
-	if err := i.Persister.Flush(i.State); err != nil {
-		log.Printf("[node-ctl] sweep persist: %v", err)
+	if i.Persister != nil {
+		if err := i.Persister.Flush(i.State); err != nil {
+			log.Printf("[node-ctl] sweep persist: %v", err)
+		}
 	}
 }

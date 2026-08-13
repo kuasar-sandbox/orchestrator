@@ -144,15 +144,13 @@ func TestServer_BurstGrantAndRecover(t *testing.T) {
 	}
 
 	// Server-side reservation should reflect the new allocatable.
-	srv.State.Lock()
-	r := srv.State.Lookup(c.Token())
-	if r == nil || r.AllocatableNowMem != newAlloc {
+	r := reservationByTokenForTest(t, srv.State, c.Token())
+	if r.AllocatableNowMem != newAlloc {
 		t.Errorf("reservation alloc=%v, want %d", r, newAlloc)
 	}
-	if r != nil && r.Stage != StageBurst {
+	if r.Stage != StageBurst {
 		t.Errorf("stage=%s, want burst", r.Stage)
 	}
-	srv.State.Unlock()
 }
 
 func TestServer_RejectInRedZone(t *testing.T) {
@@ -160,13 +158,11 @@ func TestServer_RejectInRedZone(t *testing.T) {
 	defer cleanup()
 
 	// Pre-load reservations totalling > 85% of pool to push into red.
-	srv.State.Lock()
 	pool := srv.State.AllocatablePool.MemoryBytes
-	srv.State.Reservations["dummy"] = &Reservation{
-		Token:             "dummy",
+	installReservationForTest(t, srv.State, Reservation{
+		Token: "dummy", SandboxID: "dummy",
 		AllocatableNowMem: uint64(float64(pool) * 0.90),
-	}
-	srv.State.Unlock()
+	})
 
 	res, err := c.Admit(AdmitParams{
 		SandboxID:           "sb-r",
@@ -202,12 +198,10 @@ func TestServer_OOMReportAndHeartbeat(t *testing.T) {
 	if err := c.OOMReport(2, 12345, 60<<20); err != nil {
 		t.Fatal(err)
 	}
-	srv.State.Lock()
-	r := srv.State.Lookup(c.Token())
+	r := reservationByTokenForTest(t, srv.State, c.Token())
 	if r.OOMCount != 2 {
 		t.Errorf("oom_count = %d, want 2", r.OOMCount)
 	}
-	srv.State.Unlock()
 	snapshot, found := srv.State.SnapshotSandboxResource("sb-h")
 	if !found || snapshot.LastReportedRSS != 50<<20 || snapshot.LastReportAt.IsZero() {
 		t.Fatalf("heartbeat resource report = %+v found=%v", snapshot, found)
@@ -230,7 +224,7 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 		// Try to load any prior state.
 		persister := &Persister{Path: statePath}
 		if prev, err := persister.Load(); err == nil && prev != nil {
-			if err := state.RestoreReservations(prev.Reservations); err != nil {
+			if err := state.RestoreReservations(prev.PersistenceReservations()); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -283,24 +277,15 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 		cancel2()
 		<-done2
 	}()
-	s2.State.Lock()
-	if s2.State.Lookup(tok) == nil {
-		t.Error("reservation lost across restart")
-	}
-	s2.State.Unlock()
+	_ = reservationByTokenForTest(t, s2.State, tok)
 }
 
 func TestIdleSweeperRemovesSandboxIndex(t *testing.T) {
 	state := NewState(8<<30, 8000, 1<<30, 1000, Watermarks{})
-	state.Lock()
-	err := state.Insert(&Reservation{
+	installReservationForTest(t, state, Reservation{
 		Token: "12345678", SandboxID: "expired", Stage: StageCreating,
 		StageEnteredAt: time.Now().Add(-time.Hour), LastHeartbeatAt: time.Now(),
 	})
-	state.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
 	sweeper := &IdleSweeper{
 		State: state, Admission: NewAdmissionController(AdmissionPolicy{}),
 		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{},
