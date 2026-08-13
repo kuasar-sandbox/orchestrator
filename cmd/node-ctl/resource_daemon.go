@@ -91,13 +91,14 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 
 	srv := &nodectl.Server{
 		Path:               resolved.Listen,
+		Identity:           resolved.SocketIdentity,
 		State:              state,
 		Admission:          admission,
 		Allocator:          allocator,
 		Persister:          persister,
 		LegacyReservations: legacyReservations,
 		Inventory: &nodectl.Inventory{
-			ControllerSocket: resolved.Listen, CgroupScanPaths: resolved.CgroupScanPaths,
+			ControllerSocket: resolved.SocketIdentity, CgroupScanPaths: resolved.CgroupScanPaths,
 			ManagedRunRoot: managedRunRoot, Pool: state.AllocatablePool,
 			Logf: func(f string, a ...any) { log.Printf("[node-ctl resource inventory] "+f, a...) },
 		},

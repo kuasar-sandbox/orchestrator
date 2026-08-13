@@ -20,6 +20,7 @@ import (
 // allocator / state, and persists state on every change.
 type Server struct {
 	Path      string
+	Identity  string
 	State     *State
 	Admission *AdmissionController
 	Allocator *Allocator
@@ -47,8 +48,19 @@ func (s *Server) Listen() error {
 	if err := os.MkdirAll(filepathDir(s.Path), 0o755); err != nil {
 		return fmt.Errorf("server: mkdir: %w", err)
 	}
+	identity, err := canonicalControllerSocket(s.Path)
+	if err != nil {
+		return fmt.Errorf("server: controller socket identity: %w", err)
+	}
+	if s.Identity != "" && s.Identity != identity {
+		return fmt.Errorf("server: controller socket identity changed: configured %s, current %s", s.Identity, identity)
+	}
+	s.Identity = identity
+	ownerPath := s.Identity + ".owner"
 	if s.Owner == nil {
-		s.Owner = &OwnerLock{Path: s.Path + ".owner"}
+		s.Owner = &OwnerLock{Path: ownerPath}
+	} else if s.Owner.Path != ownerPath {
+		return fmt.Errorf("server: owner identity %s does not match %s", s.Owner.Path, ownerPath)
 	}
 	if err := s.Owner.Acquire(); err != nil {
 		return err
@@ -58,6 +70,18 @@ func (s *Server) Listen() error {
 		return err
 	}
 	if s.Inventory != nil {
+		inventoryIdentity := s.Identity
+		if s.Inventory.ControllerSocket != "" {
+			var err error
+			inventoryIdentity, err = canonicalControllerSocket(s.Inventory.ControllerSocket)
+			if err != nil {
+				return fail(fmt.Errorf("server: inventory socket identity: %w", err))
+			}
+		}
+		if inventoryIdentity != s.Identity {
+			return fail(fmt.Errorf("server: inventory socket identity %s does not match %s", inventoryIdentity, s.Identity))
+		}
+		s.Inventory.ControllerSocket = s.Identity
 		if err := s.Inventory.Recover(s.State); err != nil {
 			return fail(fmt.Errorf("server: recover inventory: %w", err))
 		}

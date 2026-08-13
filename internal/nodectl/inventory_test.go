@@ -214,6 +214,113 @@ func TestOwnerLockPreventsSecondControllerWithoutUnlink(t *testing.T) {
 	}
 }
 
+func TestOwnerLockUsesCanonicalIdentityAcrossParentAlias(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	aliasSocket := filepath.Join(alias, "controller.sock")
+	realSocket := filepath.Join(realDir, "controller.sock")
+	h := startHelper(t, "NODECTL_TEST_HELPER=owner", "NODECTL_SOCKET="+aliasSocket)
+	before, err := os.Lstat(realSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &Server{Path: realSocket, State: makeState(4<<30, 0)}
+	if err := second.Listen(); err == nil {
+		t.Fatal("second controller acquired owner through equivalent socket spelling")
+	}
+	after, err := os.Lstat(realSocket)
+	if err != nil {
+		t.Fatalf("failed second controller removed live UDS: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("live UDS was replaced")
+	}
+	h.send("stop")
+	if err := h.cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerBindsShortAliasWithLongCanonicalIdentity(t *testing.T) {
+	root := t.TempDir()
+	realDir := root
+	for len(filepath.Join(realDir, "controller.sock")) <= 120 {
+		realDir = filepath.Join(realDir, "deep-component")
+	}
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "short")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	bindPath := filepath.Join(alias, "controller.sock")
+	identity := filepath.Join(realDir, "controller.sock")
+	srv := &Server{Path: bindPath, Identity: identity, State: makeState(4<<30, 0)}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("bind through short alias: %v", err)
+	}
+	defer srv.Stop()
+	if srv.Identity != identity || srv.Owner.Path != identity+".owner" {
+		t.Fatalf("server identity=%q owner=%q, want %q / %q", srv.Identity, srv.Owner.Path, identity, identity+".owner")
+	}
+	client := &resource.Client{SocketPath: bindPath}
+	if err := client.Connect(); err != nil {
+		t.Fatalf("dial short alias: %v", err)
+	}
+	_ = client.Close()
+}
+
+func TestInventoryAcceptsLiveLeaseWithEquivalentLegacySocket(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	legacySocket := filepath.Join(alias, "controller.sock")
+	identity := filepath.Join(realDir, "controller.sock")
+	cgroupRoot := filepath.Join(root, "cgroups")
+	cgroup := filepath.Join(cgroupRoot, "vmm")
+	writeFakeCgroupRoot(t, cgroupRoot)
+	writeFakeCgroup(t, cgroup, "536870912", os.Getpid())
+	const sid = "legacy-alias"
+	h := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+legacySocket,
+		"NODECTL_SID="+sid, "NODECTL_CGROUP="+cgroup)
+
+	state := makeState(4<<30, 0)
+	inventory := &Inventory{ControllerSocket: identity, CgroupScanPaths: []string{cgroupRoot}, Pool: state.AllocatablePool, Logf: t.Logf}
+	if err := inventory.Recover(state); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 1 || snapshot.UnknownCount != 0 ||
+		snapshot.Allocated.MemoryBytes != testLeaseCapacity {
+		t.Fatalf("legacy alias recovery = %+v", snapshot)
+	}
+	live, err := inventory.LookupLiveLease(sid)
+	if err != nil {
+		t.Fatalf("lookup equivalent legacy lease: %v", err)
+	}
+	if live.Lease.ControllerSocket != identity {
+		t.Fatalf("normalized lease socket = %q, want %q", live.Lease.ControllerSocket, identity)
+	}
+	h.send("stop")
+	if err := h.cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeFakeCgroup(t *testing.T, path, max string, pid int) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
