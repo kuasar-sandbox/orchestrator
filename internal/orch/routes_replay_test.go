@@ -167,6 +167,10 @@ func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	if token != "fp-test:1" {
 		t.Fatalf("token=%q, want fp-test:1", token)
 	}
+	o.publishRouteBarrier("ephemeral")
+	if got := o.CurrentRevToken(); got != token {
+		t.Fatalf("route barrier advanced replay token to %q, want %q", got, token)
+	}
 	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: "s1"})
 
 	var got []routesync.Event

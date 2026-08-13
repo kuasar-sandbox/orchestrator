@@ -10,8 +10,8 @@
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
 #         # workers run in PROXY_NETNS; conductor policy supplies MMDS listen
-#   POST /sandboxes  -> durable starting acceptance; immediate ordinary and exec
-#                       requests park across route propagation, runner boot and init
+#   POST /sandboxes  -> durable starting + proxy route ACK; immediate ordinary and
+#                       exec requests park across runner boot and init without retry
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
@@ -612,7 +612,7 @@ FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
     || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID durably accepted (tokens captured; no default exec token)"
+echo "==> PASS: sandbox $SID durably accepted after external route ACK (tokens captured; no default exec token)"
 echo "==> issue native exec capability immediately and park its external CONNECT from starting"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue immediate native exec capability"
 rm -f "$WORK/exec-session.secret"
@@ -621,7 +621,7 @@ IMMEDIATE_NATIVE_MARK="EXTERNAL_PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
     exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$IMMEDIATE_NATIVE_MARK" 1 130
 ) &
 IMMEDIATE_EXEC_PID=$!
-echo "==> request envd immediately through external proxy; missing/starting must park to running"
+echo "==> request envd immediately through external proxy; ACKed starting route must park to running"
 (
     code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
     printf '%s\n' "$code" >"$WORK/immediate-data.code"
@@ -642,7 +642,7 @@ immediate_exec_status=0
 wait "$IMMEDIATE_EXEC_PID" || immediate_exec_status=$?
 IMMEDIATE_EXEC_PID=""
 [ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate external native exec did not park to running"; }
-echo "==> PASS: external native exec parked post-Create CONNECT through route propagation and starting"
+echo "==> PASS: external native exec parked post-Create CONNECT from ACKed starting to running"
 wait_traffic_stats "$SID" idle || { dump_logs; fail "external traffic did not converge to idle"; }
 echo "==> PASS: external master cache converged parking/egress to idle"
 

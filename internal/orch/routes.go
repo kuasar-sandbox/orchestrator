@@ -276,10 +276,21 @@ func (o *Orchestrator) publishDelete(sid string) {
 	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
 }
 
+// publishRouteBarrier fans out an ephemeral ordered fence without adding it to
+// the durable route changelog. It shares the exact subscriber channels used by
+// publishUpsert, so each stream observes Upsert before its barrier.
+func (o *Orchestrator) publishRouteBarrier(barrierID string) {
+	o.fanout(routesync.Event{Kind: routesync.TypeRouteBarrier, BarrierID: barrierID})
+}
+
 // publish fans an event out to every subscriber. A full subscriber is dropped +
 // closed (it reconnects and re-snapshots) rather than blocking the caller.
 func (o *Orchestrator) publish(ev routesync.Event) {
 	o.appendRouteLog(ev)
+	o.fanout(ev)
+}
+
+func (o *Orchestrator) fanout(ev routesync.Event) {
 	o.subsMu.Lock()
 	defer o.subsMu.Unlock()
 	for id, ch := range o.subs {
