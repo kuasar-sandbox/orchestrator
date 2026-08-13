@@ -380,6 +380,8 @@ func clusterCommandRejection(err error) (int, string) {
 		return http.StatusConflict, "target environment incompatible"
 	case errors.Is(err, migrationtoken.ErrTokenTooLarge):
 		return http.StatusRequestEntityTooLarge, migrationtoken.ErrTokenTooLarge.Error()
+	case errors.Is(err, api.ErrProxyUnavailable):
+		return http.StatusServiceUnavailable, api.ErrProxyUnavailable.Error()
 	default:
 		return 0, err.Error()
 	}

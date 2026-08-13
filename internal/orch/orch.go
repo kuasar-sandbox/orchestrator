@@ -70,6 +70,9 @@ type Orchestrator struct {
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
 	subSeq int
+	// routeBarriers is wired before any API or node-link listener starts. It is
+	// consulted only for external-mode fresh Create admission.
+	routeBarriers routesync.RouteBarrierCoordinator
 
 	routeLogMu sync.Mutex
 	routeFP    string
@@ -145,6 +148,12 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 		return fmt.Errorf("start builder pool: %w", err)
 	}
 	return nil
+}
+
+// SetProxyRouteBarrierCoordinator wires the external proxy registration lease
+// registry into Create admission. Wiring is immutable after serve starts.
+func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierCoordinator) {
+	o.routeBarriers = c
 }
 
 // --- api.Core ---
@@ -271,6 +280,23 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 
+	var barrier routesync.RouteBarrier
+	if o.cfg.Proxy.Mode == config.ProxyExternal {
+		barrierStarted := time.Now()
+		if o.routeBarriers == nil {
+			err := configsock.ErrProxyRouteUnavailable
+			o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
+			return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
+		}
+		var err error
+		barrier, err = o.routeBarriers.BeginProxyRouteBarrier()
+		if err != nil {
+			o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
+			return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
+		}
+		defer barrier.Cancel()
+	}
+
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
 	attempt, err := o.launches.Claim(lifecycleCtx, sb.ID, launchCreate)
@@ -295,11 +321,92 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	initial := cloneSandbox(sb)
 	o.cache(initial)
 	o.publishUpsert(initial)
+	if barrier != nil {
+		barrierStarted := time.Now()
+		o.publishRouteBarrier(barrier.ID())
+		// The barrier is bounded by proxy policy, caller cancellation, and node
+		// lifecycle shutdown. Its cleanup below deliberately uses an independent
+		// background context after any of these cancellation sources fires.
+		barrierCtx, cancelBarrier := context.WithTimeout(attempt.Context(), o.cfg.ParkTimeoutDur())
+		stopRequestCancel := context.AfterFunc(ctx, cancelBarrier)
+		barrierErr := barrier.Wait(barrierCtx)
+		stopRequestCancel()
+		cancelBarrier()
+		if barrierErr == nil {
+			barrierErr = barrier.Commit()
+		}
+		if barrierErr == nil {
+			if err := ctx.Err(); err != nil {
+				barrierErr = err
+			} else if err := attempt.Context().Err(); err != nil {
+				barrierErr = err
+			}
+		}
+		o.logProxyRouteBarrier(sb.ID, barrierErr, time.Since(barrierStarted))
+		if barrierErr != nil {
+			admissionErr := errors.Join(api.ErrProxyUnavailable, barrierErr)
+			rollbackErr := o.rollbackPreLaunchAdmission(sb.ID)
+			terminalErr := errors.Join(admissionErr, rollbackErr)
+			o.launches.Finish(attempt, terminalErr)
+			return nil, nil, terminalErr
+		}
+	}
 	work := cloneSandbox(sb)
 	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
 		return o.runLaunch(launchCtx, current, work, tmpl)
 	})
 	return cloneSandbox(initial), attempt, nil
+}
+
+func (o *Orchestrator) rollbackPreLaunchAdmission(sid string) error {
+	return o.rollbackPreLaunchAdmissionWith(sid, cleanupContext)
+}
+
+func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupContext func() (context.Context, context.CancelFunc)) error {
+	delay := launchCleanupRetryMin
+	var firstErr error
+	for {
+		ctx, cancel := newCleanupContext()
+		changed, err := o.st.DeletePreLaunchStarting(ctx, sid)
+		cancel()
+		if err == nil {
+			if !changed {
+				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
+			}
+			o.uncache(sid)
+			o.publishDelete(sid)
+			return firstErr
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		o.log.Error("sandbox pre-launch rollback failed; retrying", "sid", sid, "retry_in", delay, "err", err)
+		waitLaunchCleanupRetry(delay)
+		delay = nextLaunchCleanupRetry(delay)
+	}
+}
+
+func (o *Orchestrator) logProxyRouteBarrier(sid string, err error, duration time.Duration) {
+	result := "ok"
+	switch {
+	case errors.Is(err, context.Canceled):
+		result = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		result = "timeout"
+	case errors.Is(err, configsock.ErrProxyRouteDisconnected):
+		result = "disconnect"
+	case errors.Is(err, configsock.ErrProxyRouteLeaseChanged):
+		result = "lease_changed"
+	case errors.Is(err, configsock.ErrProxyRouteUnavailable):
+		result = "no_proxy"
+	case err != nil:
+		result = "error"
+	}
+	o.log.Info("sandbox proxy route barrier",
+		"sid", sid,
+		"result", result,
+		"proxy_route_ack_duration", duration,
+		"err", err)
 }
 
 type launchStageError struct {

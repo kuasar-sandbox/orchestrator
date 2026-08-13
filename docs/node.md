@@ -119,9 +119,13 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 ```
 
 create 同步受理流程只做请求校验/纯解析、身份和 token 生成、进程内 launch ownership claim,
-然后 insert `starting, run_id=""`(网络字段为空)、cache/publish starting 并调度后台 launch。
-此时即返回 HTTP 201;它表示资源已被持久接受,不表示 runner 已分配、runtime 已 ready 或
-e2b `/init` 已完成。后台流程再建 `<run_root>/<sid>/`(tmpfs)+
+然后 insert `starting, run_id=""`(网络字段为空)并 cache/publish starting。internal 模式可立即
+调度后台 launch;external 模式还在同一有序 routesync 下发 `route_barrier`,等待当前 proxy
+master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才调度 launch并返回 HTTP
+201。201 表示资源已被持久接受,且 external proxy 已具备用该 starting identity 鉴权并
+parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
+已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
+`starting,run_id=""` 行并发布 Delete。后台流程再建 `<run_root>/<sid>/`(tmpfs)+
 `<base_root>/<sid>/`(disk)→检查 snapshot→配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、
 否则经 `connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` 并先以 CAS 持久化网络
 ownership→写非密配置 `<sid>.yaml`、绑定 `ready.sock`、发布 enriched starting→从 runner
@@ -616,8 +620,8 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
-- routesync(external proxy / 路由观察者):版本 1,帧 `[4B LE len][JSON]`,消息
-  `register|hello|upsert|delete|bookmark|wake`,路径
+- routesync(external proxy / 路由观察者):版本 2,帧 `[4B LE len][JSON]`,消息
+  `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
 ### 4.6 沙箱配置传递链
@@ -999,7 +1003,9 @@ Content-Type 派生 value metadata;响应 Content-Type 始终属于 route。stor
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
 租约 + 路由流(routesync,线格式见 node-proxy.md §4).请求体首帧是 `register{caps}`,之后(route_wake)是
-`wake` 上行;响应体下行 `hello(policy) → upsert* → bookmark → upsert/delete`。能力相互
+`wake` 或 `route_barrier_ack` 上行;响应体下行
+`hello(policy) → upsert* → bookmark → upsert/delete/route_barrier`。Wake 与 barrier ACK
+经同一个上行 writer 串行发送。能力相互
 **独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
 (声明 serve proxyForwarder 转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
@@ -1117,13 +1123,18 @@ starting ──success──► running ──pause / TTL──► paused
   集群下,这些操作另由 node-link 命令触发(create/connect/exec_session/delete,§10),并把
   状态变化作为事件上报 registry。
 - `starting` 是一个持久业务生命周期状态,不是 runner 状态或 e2b readiness。它从请求已被
-  durable acceptance 开始,连续覆盖资源/snapshot/network/YAML/ready.sock 准备、runner pool
+  durable insert 开始,连续覆盖资源/snapshot/network/YAML/ready.sock 准备、runner pool
   排队和分配、sandbox-ctl/VMM 启动、runtime readiness 与 mandatory `/init`;对外不增加
   queued/assigned/booting/initializing。初始行为 `starting,run_id=""`,pool commit callback
   以 `state=starting AND run_id=''` 绑定 run-id;最终 running commit 和分配后 rollback 均要求
   exact run-id,分配前 rollback 则要求空 run-id。create 失败到 dead 并发布 Delete;resume
   失败清空本次 runner/network ownership、回到 paused 并发布 paused Upsert。默认 list 隐藏
   starting/dead,显式 state 过滤仍可用于诊断。
+- external fresh Create 的 initial starting 在成为 durable acceptance 前还必须通过
+  route-applied barrier。barrier waiter 在 Upsert 发布前注册,master 只有成功写共享表并通知
+  worker 后才 ACK;ACK 绑定当前 registration epoch。失败时后台 launch 尚未开始,store 仅在
+  `state=starting AND run_id=''` 且网络 ownership 全空时删除,cache 清除并发布 Delete,API/cluster
+  admission 返回 503。当前 participant set 为单 master,完成算法仍是 all-of而非 quorum。
 - 所有 fresh Create、snapshot-template Create、paused resume、KMT restore、cluster
   Create/Connect、data Wake 与 native exec activation 共用一个进程内 launch group。每个 SID
   在 starting 持久化/发布前先 claim 唯一 owner;Kill/Delete 的 Cancel 只发取消信号,claim
@@ -1177,7 +1188,8 @@ starting ──success──► running ──pause / TTL──► paused
     后续数据面的无效 KAT 也不能触发本地恢复.
 - **phase timing**:launch 以低基数 `kind=create|resume`、`profile=e2b|bare`、
   `result=success|failure` 和 bounded `failure_stage` 记录 admission/prepare/runner_wait/
-  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration。sandbox ID 和
+  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration;external Create
+  另记录 `proxy_route_ack_duration` 与 bounded result。sandbox ID 和
   run ID 只进入结构化日志字段,不作为 metric label。`runner_wait` 从调用 Assign 到 commit
   callback 首次拿到 run-id,`runner_commit` 只计窄 Bind/cache,`runtime_ready` 从 handoff 完成
   到 readiness wire 完整成功,`starting_total` 从 durable starting 到终态 commit。
@@ -1346,7 +1358,10 @@ external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 
 - **starting 投影**:初始 `starting,run_id=""` durable insert 后即广播,此时没有 FloatingIP
   或可用 endpoint;network ownership 已 CAS 持久化且 YAML/ready.sock 已准备后再广播 enriched
   starting,供 internal/external MMDS 完成 envd `/init`。starting 不开放普通数据面,也不触发
-  Wake。launch 成功广播 running;create 失败广播 Delete,resume 失败广播 paused。
+  Wake。external Create 在初始 Upsert 后发送 ordered route barrier;master apply+ACK且 lease
+  复核成功后才返回 201并启动 launch,因此 201 后的首个合法请求应直接看到 starting并
+  parking,不再把正常 route propagation gap 当作 missing。launch 成功广播 running;create
+  失败广播 Delete,resume 失败广播 paused。
 - **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
   是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
   `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -109,6 +110,7 @@ func TestClusterCommandRejectMapsMigrationErrors(t *testing.T) {
 		{name: "fingerprint", err: migrationtoken.ErrCredentialMismatch, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
 		{name: "incompatible", err: migrationtoken.ErrIncompatible, wantStatus: http.StatusConflict, wantReason: "target environment incompatible"},
 		{name: "too large", err: migrationtoken.ErrTokenTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantReason: migrationtoken.ErrTokenTooLarge.Error()},
+		{name: "proxy unavailable", err: api.ErrProxyUnavailable, wantStatus: http.StatusServiceUnavailable, wantReason: api.ErrProxyUnavailable.Error()},
 		{name: "unclassified", err: errors.New("ordinary rejection"), wantReason: "private-detail: ordinary rejection"},
 	}
 	for _, tc := range tests {

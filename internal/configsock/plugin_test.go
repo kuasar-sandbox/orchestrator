@@ -1,7 +1,10 @@
 package configsock
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -10,6 +13,111 @@ func proxyCaps(path string) routesync.Register {
 	return routesync.Register{
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
 		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: path}},
+	}
+}
+
+func addReadyPlugin(r *Registry, id, path string) *Plugin {
+	p := &Plugin{ID: id, Caps: proxyCaps(path), cancel: func() {}}
+	r.Add(p)
+	r.markRouteStreamReady(p)
+	return p
+}
+
+func TestProxyRouteBarrierRequiresCurrentReadyTrustedLease(t *testing.T) {
+	r := NewRegistry()
+	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
+		t.Fatalf("barrier without proxy = %v", err)
+	}
+	p := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: func() {}}
+	r.Add(p)
+	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
+		t.Fatalf("barrier before route subscription = %v", err)
+	}
+	r.markRouteStreamReady(p)
+	b, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+	r.routeBarrierAck(p, b.ID())
+	if err := b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
+	r := NewRegistry()
+	first := addReadyPlugin(r, "proxy-a", "/run/a.sock")
+	second := addReadyPlugin(r, "proxy-b", "/run/b.sock")
+	r.mu.Lock()
+	b, err := r.beginRouteBarrierLocked([]*Plugin{first, second})
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+
+	r.routeBarrierAck(first, b.ID())
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := b.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("one-of-two ACK completed barrier: %v", err)
+	}
+	r.routeBarrierAck(first, b.ID()) // duplicate is idempotent
+	r.routeBarrierAck(second, b.ID())
+	if err := b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyRouteBarrierFailsOnDisconnectAndReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fail func(*Registry, *Plugin)
+		want error
+	}{
+		{name: "disconnect", fail: func(r *Registry, p *Plugin) { r.Remove(p) }, want: ErrProxyRouteDisconnected},
+		{name: "replacement", fail: func(r *Registry, _ *Plugin) {
+			r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/new.sock"), cancel: func() {}})
+		}, want: ErrProxyRouteLeaseChanged},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := NewRegistry()
+			p := addReadyPlugin(r, routesync.ProxyPluginID, "/run/proxy.sock")
+			b, err := r.BeginProxyRouteBarrier()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Cancel()
+			test.fail(r, p)
+			if err := b.Wait(context.Background()); !errors.Is(err, test.want) {
+				t.Fatalf("Wait = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestProxyRouteBarrierCommitRevalidatesAckedLease(t *testing.T) {
+	r := NewRegistry()
+	p := addReadyPlugin(r, routesync.ProxyPluginID, "/run/proxy.sock")
+	b, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Cancel()
+	r.routeBarrierAck(p, b.ID())
+	if err := b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/new.sock"), cancel: func() {}})
+	if err := b.Commit(); !errors.Is(err, ErrProxyRouteLeaseChanged) {
+		t.Fatalf("Commit after replacement = %v", err)
 	}
 }
 
