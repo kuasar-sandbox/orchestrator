@@ -23,6 +23,7 @@ type fakeSink struct {
 	del   chan string
 	book  chan struct{}
 	pol   chan routesync.Policy
+	fail  string
 }
 
 func newFakeSink() *fakeSink {
@@ -35,11 +36,17 @@ func newFakeSink() *fakeSink {
 	}
 }
 
-func (f *fakeSink) BeginSync()                         { f.begin <- struct{}{} }
-func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry) { f.up <- r }
-func (f *fakeSink) ApplyDelete(sid string)             { f.del <- sid }
-func (f *fakeSink) Bookmark()                          { f.book <- struct{}{} }
-func (f *fakeSink) SetPolicy(p routesync.Policy)       { f.pol <- p }
+func (f *fakeSink) BeginSync() { f.begin <- struct{}{} }
+func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry) error {
+	f.up <- r
+	if r.SandboxID == f.fail {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (f *fakeSink) ApplyDelete(sid string)       { f.del <- sid }
+func (f *fakeSink) Bookmark()                    { f.book <- struct{}{} }
+func (f *fakeSink) SetPolicy(p routesync.Policy) { f.pol <- p }
 
 type fakeWakes struct{ ch chan string }
 
@@ -116,13 +123,18 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 		woke: make(chan string, 4),
 		pol:  routesync.Policy{Domain: "d", AuthMode: "enforce", ParkTimeoutMS: 1234},
 	}
+	streamReady := make(chan struct{}, 1)
+	barrierAcks := make(chan string, 4)
 	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reg, err := routesync.ReadRegister(r.Body)
 		if err != nil {
 			http.Error(w, "bad register", http.StatusBadRequest)
 			return
 		}
-		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, &routesync.StreamHooks{
+			RouteStreamReady: func() { streamReady <- struct{}{} },
+			RouteBarrierAck:  func(id string) { barrierAcks <- id },
+		}, log)
 	}), &http2.Server{})}
 	go httpSrv.Serve(ln)
 	defer httpSrv.Close()
@@ -150,6 +162,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 		t.Fatalf("initial upsert = %+v", r)
 	}
 	recv(t, sink.book, "bookmark")
+	recv(t, streamReady, "route stream ready")
 
 	// A delta published by the source is delivered as an upsert.
 	src.sub <- routesync.Event{Kind: routesync.TypeUpsert, Route: routesync.RouteEntry{SandboxID: "s2", State: routesync.StateRunning}}
@@ -163,10 +176,63 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 		t.Fatalf("delete = %q", del)
 	}
 
+	// The barrier follows prior mutations on the same down stream and its ACK
+	// shares the one request-body writer with Wake.
+	src.sub <- routesync.Event{Kind: routesync.TypeRouteBarrier, BarrierID: "barrier-1"}
+	if got := recv(t, barrierAcks, "route barrier ack"); got != "barrier-1" {
+		t.Fatalf("barrier ack = %q", got)
+	}
+
 	// A wake from the proxy reaches the source's OnWake.
 	wakes.ch <- "s9"
 	if got := recv(t, src.woke, "wake"); got != "s9" {
 		t.Fatalf("wake = %q", got)
+	}
+}
+
+func TestRouteSyncApplyFailurePreventsBarrierAck(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	src := &fakeSource{sub: make(chan routesync.Event, 4), woke: make(chan string, 1)}
+	barrierAcks := make(chan string, 1)
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reg, err := routesync.ReadRegister(r.Body)
+		if err != nil {
+			return
+		}
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, &routesync.StreamHooks{
+			RouteBarrierAck: func(id string) { barrierAcks <- id },
+		}, log)
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	sink := newFakeSink()
+	sink.fail = "bad"
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go routesync.NewSubscriber(dial, "proxy", reg, sink, nil, log).Run(ctx)
+	recv(t, sink.up, "initial upsert")
+	recv(t, sink.book, "initial bookmark")
+	src.sub <- routesync.Event{Kind: routesync.TypeUpsert, Route: routesync.RouteEntry{SandboxID: "bad", State: routesync.StateStarting}}
+	src.sub <- routesync.Event{Kind: routesync.TypeRouteBarrier, BarrierID: "must-not-ack"}
+	if got := recv(t, sink.up, "failing upsert"); got.SandboxID != "bad" {
+		t.Fatalf("failing upsert = %+v", got)
+	}
+	select {
+	case got := <-barrierAcks:
+		t.Fatalf("apply failure ACKed barrier %q", got)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 
@@ -194,7 +260,7 @@ func TestRouteSyncResumeReplay(t *testing.T) {
 			http.Error(w, "bad register", http.StatusBadRequest)
 			return
 		}
-		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, nil, log)
 	}), &http2.Server{})}
 	go httpSrv.Serve(ln)
 	defer httpSrv.Close()
@@ -242,7 +308,7 @@ func TestRouteSyncResumeFingerprintMismatchFallsBack(t *testing.T) {
 			http.Error(w, "bad register", http.StatusBadRequest)
 			return
 		}
-		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, nil, log)
 	}), &http2.Server{})}
 	go httpSrv.Serve(ln)
 	defer httpSrv.Close()

@@ -1170,6 +1170,18 @@ func TestTrafficStatsCompactJSONAndStatusMapping(t *testing.T) {
 	}
 }
 
+func TestFailMapsProxyUnavailableToServiceUnavailable(t *testing.T) {
+	a := &API{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	response := httptest.NewRecorder()
+	a.fail(response, errors.Join(ErrProxyUnavailable, errors.New("private route session detail")))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if got := response.Body.String(); got != "{\"message\":\"external proxy temporarily unavailable\"}\n" {
+		t.Fatalf("public response = %q", got)
+	}
+}
+
 func (c *migrationCoreStub) ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error) {
 	return c.importSandbox(ctx, apiKey, token, targetID)
 }

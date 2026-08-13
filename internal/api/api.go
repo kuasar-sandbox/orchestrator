@@ -155,6 +155,10 @@ var ErrSandboxStarting = errors.New("sandbox starting")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
+// ErrProxyUnavailable means external Create could not establish its route-applied
+// barrier. It is a temporary admission failure, not an accepted sandbox.
+var ErrProxyUnavailable = errors.New("external proxy temporarily unavailable")
+
 // Stats errors have deliberately coarse public mappings. Providers may carry
 // richer internal causes, but the API must not expose node topology or worker
 // state details.
@@ -1102,6 +1106,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "credential pair not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
+	case errors.Is(err, ErrProxyUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrProxyUnavailable.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

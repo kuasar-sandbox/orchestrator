@@ -76,6 +76,24 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	}
 }
 
+func TestMasterViewApplyUpsertReturnsTableFailure(t *testing.T) {
+	table, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	view := NewMasterView(table, time.Second, nil)
+	if err := view.ApplyUpsert(routesync.RouteEntry{SandboxID: "s1", State: routesync.StateStarting}); err != nil {
+		t.Fatal(err)
+	}
+	if err := view.ApplyUpsert(routesync.RouteEntry{SandboxID: "s2", State: routesync.StateStarting}); err == nil {
+		t.Fatal("full route table ApplyUpsert succeeded")
+	}
+	if _, found := table.Lookup("s2"); found {
+		t.Fatal("failed route remained visible in shared table")
+	}
+}
+
 func TestTableLookupRevisionTracksLiveAndDeletedSnapshots(t *testing.T) {
 	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 16)
 	if err != nil {
