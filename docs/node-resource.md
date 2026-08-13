@@ -103,7 +103,9 @@ node-ctl resource list [--socket /run/sandbox-resource.sock]
 ```
 
 经 live UDS 把 token-free reservation 视图导出为 JSON,包含 `provisional`、
-`connected`、`recovery_source`、cgroup、额度和报告字段。查询不读取恢复文件。
+`connected`、`recovery_source`、cgroup、额度和报告字段。客户端通过 SID 游标自动
+聚合受 64 KiB protocol frame 限制的有界分页,查询不读取恢复文件。旧客户端的
+单帧请求仅在完整结果可容纳时继续工作;超限时控制器明确要求升级,不会静默截断。
 
 ### 2.5 `node-ctl resource drain`
 
@@ -350,9 +352,11 @@ AdminStatus      ()                                             # node-ctl 经 R
                         reservation_count, provisional_count,
                         unknown_count, startup_in_flight, drained)
 
-AdminList        ()
+AdminList        (list_after?, list_limit?)                     # SID exclusive cursor
                  → Ack (reservations=[... connected, provisional,
-                                      recovery_source ...])
+                                      recovery_source ...], list_next?)
+                 # 新客户端 list_limit=128 并自动聚合;server 可为 64 KiB frame
+                 # 返回更少条目。list_limit=0 是旧客户端单帧请求,超限明确 Error
 
 AdminDrain       (drain)                                        # 背后 node-ctl resource drain
                  → Ack (drained)

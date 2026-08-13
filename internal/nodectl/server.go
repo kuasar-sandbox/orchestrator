@@ -254,7 +254,7 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 	case TypeAdminStatus:
 		return s.handleAdminStatus()
 	case TypeAdminList:
-		return s.handleAdminList()
+		return s.handleAdminList(req)
 	default:
 		return &Message{Type: TypeError, Msg: "unknown type: " + req.Type}
 	}
@@ -597,7 +597,9 @@ func resourceView(r Resources) ResourcesView {
 	return ResourcesView{MemoryBytes: r.MemoryBytes, CPUMilli: r.CPUMilli}
 }
 
-func (s *Server) handleAdminList() *Message {
+const maxAdminListPageEntries = 1024
+
+func (s *Server) handleAdminList(req *Message) *Message {
 	reservations := s.State.ReservationViews()
 	views := make([]ReservationView, 0, len(reservations))
 	for _, r := range reservations {
@@ -615,7 +617,54 @@ func (s *Server) handleAdminList() *Message {
 			RecoverySource: r.RecoverySource, StartupExpired: r.StartupExpired,
 		})
 	}
-	return &Message{Type: TypeAck, Reservations: views}
+
+	if req.ListLimit < 0 {
+		return &Message{Type: TypeError, Msg: "admin_list list_limit must not be negative"}
+	}
+	if req.ListLimit == 0 {
+		// Pre-pagination clients send no limit. Preserve their one-frame response
+		// while it fits, but fail explicitly instead of truncating or letting the
+		// transport close on WriteMessage's frame-size check.
+		resp := &Message{Type: TypeAck, Reservations: views}
+		if err := WriteMessage(io.Discard, resp); err != nil {
+			return &Message{Type: TypeError, Msg: "admin_list response exceeds protocol frame; upgrade client for pagination"}
+		}
+		return resp
+	}
+
+	start := 0
+	for start < len(views) && views[start].SandboxID <= req.ListAfter {
+		start++
+	}
+	limit := req.ListLimit
+	if limit > maxAdminListPageEntries {
+		limit = maxAdminListPageEntries
+	}
+	capacity := len(views) - start
+	if capacity > limit {
+		capacity = limit
+	}
+	page := make([]ReservationView, 0, capacity)
+	for start+len(page) < len(views) && len(page) < limit {
+		candidate := append(page, views[start+len(page)])
+		next := ""
+		if start+len(candidate) < len(views) {
+			next = candidate[len(candidate)-1].SandboxID
+		}
+		probe := &Message{Type: TypeAck, Reservations: candidate, ListNext: next}
+		if err := WriteMessage(io.Discard, probe); err != nil {
+			if len(page) == 0 {
+				return &Message{Type: TypeError, Msg: "admin_list reservation exceeds protocol frame"}
+			}
+			break
+		}
+		page = candidate
+	}
+	next := ""
+	if start+len(page) < len(views) {
+		next = page[len(page)-1].SandboxID
+	}
+	return &Message{Type: TypeAck, Reservations: page, ListNext: next}
 }
 
 // handleConnDrop is invoked by the connection goroutine after EOF /
