@@ -359,12 +359,16 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 }
 
 func (o *Orchestrator) rollbackPreLaunchAdmission(sid string) error {
-	ctx, cancel := cleanupContext()
-	defer cancel()
+	return o.rollbackPreLaunchAdmissionWith(sid, cleanupContext)
+}
+
+func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupContext func() (context.Context, context.CancelFunc)) error {
 	delay := launchCleanupRetryMin
 	var firstErr error
 	for {
+		ctx, cancel := newCleanupContext()
 		changed, err := o.st.DeletePreLaunchStarting(ctx, sid)
+		cancel()
 		if err == nil {
 			if !changed {
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
@@ -377,13 +381,7 @@ func (o *Orchestrator) rollbackPreLaunchAdmission(sid string) error {
 			firstErr = err
 		}
 		o.log.Error("sandbox pre-launch rollback failed; retrying", "sid", sid, "retry_in", delay, "err", err)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return errors.Join(firstErr, ctx.Err())
-		case <-timer.C:
-		}
+		waitLaunchCleanupRetry(delay)
 		delay = nextLaunchCleanupRetry(delay)
 	}
 }
