@@ -125,13 +125,15 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 				continue
 			}
 			controlPIDs[owner] = true
-			if lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
+			controllerSocket, socketErr := canonicalControllerSocket(lease.ControllerSocket)
+			if lease.PID != owner || socketErr != nil || controllerSocket != i.ControllerSocket ||
 				entry.Name() != resource.LeaseFilename(lease.SandboxID) || !i.cgroupAllowed(lease.CgroupPath) {
 				if err := i.installUnknownLease(state, path, owner, nil); err != nil {
 					return err
 				}
 				break
 			}
+			lease.ControllerSocket = controllerSocket
 			err = state.InstallProvisional(ProvisionalSpec{
 				SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
 				Capacity:     Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
@@ -365,9 +367,11 @@ func (i *Inventory) LookupLiveLease(sid string) (LiveLease, error) {
 	if !locked {
 		return LiveLease{}, fmt.Errorf("lease is not locked")
 	}
-	if lease.SandboxID != sid || lease.PID != owner || lease.ControllerSocket != i.ControllerSocket || !i.cgroupAllowed(lease.CgroupPath) {
+	controllerSocket, socketErr := canonicalControllerSocket(lease.ControllerSocket)
+	if lease.SandboxID != sid || lease.PID != owner || socketErr != nil || controllerSocket != i.ControllerSocket || !i.cgroupAllowed(lease.CgroupPath) {
 		return LiveLease{}, fmt.Errorf("lease immutable identity mismatch")
 	}
+	lease.ControllerSocket = controllerSocket
 	return LiveLease{Lease: lease, Path: path, OwnerPID: owner}, nil
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/util"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resource"
 )
 
 // Resolved is the post-default, post-parse form of the resource controller's
@@ -18,7 +19,8 @@ import (
 // standalone daemon and no separate config file — the tuning is inlined in serve's
 // config and consumed directly here.
 type Resolved struct {
-	Listen          string
+	Listen          string // absolute bind/dial path; may retain a short parent alias
+	SocketIdentity  string // canonical owner/lease inventory identity
 	StatePath       string
 	CgroupScanPaths []string
 
@@ -52,12 +54,17 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	if listen == "" {
 		listen = DefaultSocket
 	}
-	listen, err := canonicalControllerSocket(listen)
+	identity, err := canonicalControllerSocket(listen)
 	if err != nil {
 		return nil, fmt.Errorf("controller socket: %w", err)
 	}
+	listen, err = filepath.Abs(listen)
+	if err != nil {
+		return nil, fmt.Errorf("controller socket bind path: %w", err)
+	}
 	out := &Resolved{
 		Listen:          listen,
+		SocketIdentity:  identity,
 		StatePath:       c.StatePath,
 		CgroupScanPaths: c.CgroupScanPaths,
 		LogLevel:        c.LogLevel,
@@ -154,7 +161,7 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 }
 
 func canonicalControllerSocket(socket string) (string, error) {
-	return filepath.Abs(socket)
+	return resource.CanonicalSocketPath(socket)
 }
 
 func readMemTotalBytes() (uint64, error) {
