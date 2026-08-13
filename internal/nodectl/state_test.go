@@ -120,6 +120,63 @@ func TestSyncMergesOrphanCgroupProvisional(t *testing.T) {
 	}
 }
 
+func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
+	s := makeState(8<<30, 0)
+	spec := AdmitSpec{
+		Token: "first-token", SandboxID: "retry", PeerPID: 100,
+		CgroupPath: "/cg/retry", Capacity: Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		InitialAllocatable: 512 << 20, EffectiveStartupBudget: 512 << 20,
+	}
+	if _, _, err := s.Admit(spec); err != nil {
+		t.Fatal(err)
+	}
+	retry := spec
+	retry.Token = "retry-token"
+	if _, _, err := s.Admit(retry); err != nil {
+		t.Fatalf("identical Admit ACK-loss retry failed: %v", err)
+	}
+	before := s.ResourceSnapshot()
+	changed := retry
+	changed.Token = "changed-token"
+	changed.Capacity.MemoryBytes++
+	if _, _, err := s.Admit(changed); err == nil {
+		t.Fatal("Admit retry changed immutable capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("failed Admit retry changed aggregates: before=%+v after=%+v", before, after)
+	}
+	if _, ok := s.SetSettled(retry.Token, 256<<20, time.Now()); !ok {
+		t.Fatal("settle failed")
+	}
+	retry.Token = "late-token"
+	if _, _, err := s.Admit(retry); err == nil {
+		t.Fatal("Admit retry replaced an advanced reservation")
+	}
+}
+
+func TestInstallProvisionalRejectsDifferentLeaseOnSameCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	first := ProvisionalSpec{
+		SandboxID: "first", PeerPID: 100, CgroupPath: "/cg/shared",
+		Capacity: Resources{MemoryBytes: 1 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		MemoryCharge: 1 << 30, StartupCharge: 1 << 30,
+		RecoverySource: RecoveryLease, RecoveryKey: "lease:first",
+	}
+	if err := s.InstallProvisional(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.SandboxID, second.PeerPID, second.RecoveryKey = "second", 200, "lease:second"
+	if err := s.InstallProvisional(second); err == nil {
+		t.Fatal("two live leases sharing one cgroup were silently deduplicated")
+	}
+	snapshot := s.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != 1<<30 {
+		t.Fatalf("failed provisional collision changed state: %+v", snapshot)
+	}
+}
+
 func TestStateAggregatesAcrossThousandReservations(t *testing.T) {
 	s := makeState(64<<30, 0)
 	const count = 1000

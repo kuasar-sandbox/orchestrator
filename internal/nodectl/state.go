@@ -341,8 +341,8 @@ func (s *State) InstallProvisional(spec ProvisionalSpec) error {
 		return fmt.Errorf("sandbox %q already reserved", spec.SandboxID)
 	}
 	if spec.CgroupPath != "" {
-		if _, exists := s.cgroupToSID[spec.CgroupPath]; exists {
-			return nil
+		if sid, exists := s.cgroupToSID[spec.CgroupPath]; exists {
+			return fmt.Errorf("cgroup %q already belongs to %q", spec.CgroupPath, sid)
 		}
 	}
 	r := &Reservation{
@@ -393,11 +393,25 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	defer s.mu.Unlock()
 	var oldConn net.Conn
 	if existing := s.bySID[spec.SandboxID]; existing != nil {
-		if !existing.Provisional && (spec.PeerPID == 0 || existing.PeerPID != spec.PeerPID) {
-			return Reservation{}, nil, fmt.Errorf("sandbox %q already admitted", spec.SandboxID)
-		}
-		if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
-			return Reservation{}, nil, fmt.Errorf("sandbox %q provisional owner mismatch", spec.SandboxID)
+		if existing.Provisional {
+			if existing.PeerPID > 0 && spec.PeerPID > 0 && existing.PeerPID != spec.PeerPID {
+				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional owner mismatch", spec.SandboxID)
+			}
+			if existing.CgroupPath != "" && existing.CgroupPath != spec.CgroupPath {
+				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional cgroup mismatch", spec.SandboxID)
+			}
+			if existing.Capacity != (Resources{}) && existing.Capacity != spec.Capacity {
+				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional capacity mismatch", spec.SandboxID)
+			}
+			if existing.Floor != (Resources{}) && existing.Floor != spec.Floor {
+				return Reservation{}, nil, fmt.Errorf("sandbox %q provisional floor mismatch", spec.SandboxID)
+			}
+		} else if existing.Stage != StageAdmitted || existing.PeerPID == 0 ||
+			existing.PeerPID != spec.PeerPID || existing.CgroupPath != spec.CgroupPath ||
+			existing.Capacity != spec.Capacity || existing.Floor != spec.Floor ||
+			existing.AllocatableNowMem != spec.InitialAllocatable ||
+			existing.EffectiveStartupBudget != spec.EffectiveStartupBudget {
+			return Reservation{}, nil, fmt.Errorf("sandbox %q already admitted with a different session contract", spec.SandboxID)
 		}
 		oldConn = existing.Conn
 	}

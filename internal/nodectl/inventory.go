@@ -23,6 +23,12 @@ type Inventory struct {
 	ManagedRunRoot   string
 	Pool             Resources
 	Logf             func(string, ...any)
+
+	// processVMMCgroup is overridden only by tests. Managed production
+	// identity is derived from /proc/<lease-owner>/cgroup because the runner
+	// injects the node-owned VMM cgroup by FD at exec time; it is not stored in
+	// the node-owned YAML.
+	processVMMCgroup func(int) string
 }
 
 type LiveLease struct {
@@ -171,7 +177,7 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 		if capErr != nil || floorErr != nil || startupErr != nil {
 			continue
 		}
-		cgroupPath := managedVMMCgroup(owner)
+		cgroupPath := i.vmmCgroup(owner)
 		if cgroupPath == "" || !i.cgroupAllowed(cgroupPath) {
 			continue
 		}
@@ -206,6 +212,13 @@ func managedVMMCgroup(pid int) string {
 		return filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(filepath.Dir(rel), "/"), "vmm")
 	}
 	return ""
+}
+
+func (i *Inventory) vmmCgroup(pid int) string {
+	if i.processVMMCgroup != nil {
+		return i.processVMMCgroup(pid)
+	}
+	return managedVMMCgroup(pid)
 }
 
 func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
@@ -341,6 +354,9 @@ func (i *Inventory) ValidateManaged(live LiveLease, peerPID int) error {
 		return err
 	}
 	l := live.Lease
+	if actual := i.vmmCgroup(peerPID); actual == "" || actual != l.CgroupPath {
+		return fmt.Errorf("managed process cgroup does not match lease")
+	}
 	if cfg.Resources.Control.Controller != i.ControllerSocket || capMem != l.CapacityMemory ||
 		floorMem != l.FloorMemory || startupMem != l.StartupMemory ||
 		uint64(cfg.Resources.Capacity.CPU)*1000 != l.CapacityCPUMilli ||
@@ -378,16 +394,22 @@ func (i *Inventory) cgroupAllowed(path string) bool {
 
 func (i *Inventory) ConsumerLive(r Reservation) bool {
 	if r.LeasePath != "" {
-		owner, locked, err := resource.LeaseLockOwner(r.LeasePath)
-		if err == nil && locked && (r.PeerPID == 0 || owner == r.PeerPID) {
+		_, locked, err := resource.LeaseLockOwner(r.LeasePath)
+		if err != nil && !os.IsNotExist(err) {
+			return true
+		}
+		if err == nil && locked {
 			return true
 		}
 	}
 	if r.RecoverySource == RecoveryManagedPIDFile {
 		pidPath, _, ok := i.managedPaths(r.SandboxID)
 		if ok {
-			owner, locked, err := resource.LeaseLockOwner(pidPath)
-			if err == nil && locked && (r.PeerPID == 0 || owner == r.PeerPID) {
+			_, locked, err := resource.LeaseLockOwner(pidPath)
+			if err != nil && !os.IsNotExist(err) {
+				return true
+			}
+			if err == nil && locked {
 				return true
 			}
 		}

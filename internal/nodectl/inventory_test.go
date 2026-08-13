@@ -332,7 +332,11 @@ func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 	client := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+socket,
 		"NODECTL_SID="+sid, "NODECTL_CGROUP="+cgroup, "NODECTL_PIDFILE="+filepath.Join(managedDir, sid+".pid"))
 	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5, HighFactor: .85, LowFactor: .7, EmergencyFactor: .05})
-	inventory := &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{root}, ManagedRunRoot: runRoot, Pool: state.AllocatablePool, Logf: t.Logf}
+	inventory := &Inventory{
+		ControllerSocket: socket, CgroupScanPaths: []string{root}, ManagedRunRoot: runRoot,
+		Pool: state.AllocatablePool, Logf: t.Logf,
+		processVMMCgroup: func(int) string { return cgroup },
+	}
 	admission := NewAdmissionController(AdmissionPolicy{Rate: 10, Burst: 10})
 	allocator := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1 << 30})
 	srv := &Server{Path: socket, State: state, Admission: admission, Allocator: allocator, Inventory: inventory, Logf: t.Logf}
@@ -343,6 +347,15 @@ func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 	if before.Allocated.MemoryBytes != testLeaseCapacity || before.ProvisionalCount != 1 {
 		t.Fatalf("before sync = %+v", before)
 	}
+	live, err := inventory.LookupLiveLease(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory.processVMMCgroup = func(int) string { return filepath.Join(root, "different-vmm") }
+	if err := inventory.ValidateManaged(live, client.cmd.Process.Pid); err == nil || !strings.Contains(err.Error(), "process cgroup") {
+		t.Fatalf("managed cgroup mismatch accepted: %v", err)
+	}
+	inventory.processVMMCgroup = func(int) string { return cgroup }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = srv.Serve(ctx); close(done) }()
@@ -400,6 +413,42 @@ func TestStateSyncRejectsAllocationOutsideLease(t *testing.T) {
 	<-done
 }
 
+func TestDirectStateSyncUsesLeaseWithoutManagedFiles(t *testing.T) {
+	dir := t.TempDir()
+	socket, root, sid := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), "direct-ok"
+	writeFakeCgroupRoot(t, root)
+	cgroup := filepath.Join(root, "consumer")
+	writeFakeCgroup(t, cgroup, strconv.FormatUint(testLeaseCapacity, 10), 555)
+	client := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+socket,
+		"NODECTL_SID="+sid, "NODECTL_CGROUP="+cgroup)
+	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5})
+	inventory := &Inventory{
+		ControllerSocket: socket, CgroupScanPaths: []string{root},
+		ManagedRunRoot: filepath.Join(dir, "run"), Pool: state.AllocatablePool,
+	}
+	srv := &Server{
+		Path: socket, State: state, Admission: NewAdmissionController(AdmissionPolicy{}),
+		Allocator: NewAllocator(AllocatorPolicy{}), Inventory: inventory,
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = srv.Serve(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	client.send("sync")
+	if line := client.next(t); line != "sync-ok" {
+		t.Fatalf("direct sync = %s", line)
+	}
+	res := reservationForTest(t, state, sid)
+	if res.Provisional || res.RecoverySource != RecoverySynced || res.PeerPID != client.cmd.Process.Pid {
+		t.Fatalf("direct synced reservation = %+v", res)
+	}
+	client.send("stop")
+}
+
 func TestInventoryCgroupInspectionFailureFailsClosed(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cgroups")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -424,4 +473,27 @@ func TestInventoryCgroupInspectionFailureFailsClosed(t *testing.T) {
 	if !inventory.ConsumerLive(reservationForTest(t, state, "inspection-unknown")) {
 		t.Fatal("unknown cgroup liveness was treated as dead")
 	}
+}
+
+func TestConsumerLivenessRetainsUnknownOrChangedLeaseOwner(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad-lease")
+	if err := os.Symlink("missing-target", badPath); err != nil {
+		t.Fatal(err)
+	}
+	inventory := &Inventory{}
+	if !inventory.ConsumerLive(Reservation{LeasePath: badPath, CgroupPath: filepath.Join(dir, "missing-cgroup")}) {
+		t.Fatal("lease inspection error released an unknown consumer")
+	}
+
+	socket := filepath.Join(dir, "controller.sock")
+	helper := startHelper(t, "NODECTL_TEST_HELPER=lease", "NODECTL_SOCKET="+socket,
+		"NODECTL_SID=owner-changed", "NODECTL_CGROUP="+filepath.Join(dir, "cgroup"))
+	if !inventory.ConsumerLive(Reservation{
+		LeasePath: resource.LeasePath(socket, "owner-changed"), PeerPID: helper.cmd.Process.Pid + 1,
+		CgroupPath: filepath.Join(dir, "missing-cgroup"),
+	}) {
+		t.Fatal("live lock with changed owner released a consumer")
+	}
+	helper.send("stop")
 }

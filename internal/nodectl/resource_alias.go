@@ -1,6 +1,6 @@
 // Package nodectl is the reference node-level resource controller — the
 // "sentinel" daemon's brains: admission, allocation, per-sandbox state,
-// budget reclaim, persistence and audit.
+// budget reclaim, rebuildable recovery inventory and audit.
 //
 // The wire protocol and the client it speaks are defined once in
 // sandboxer/pkg/resource (sandbox-ctl is the client). This file
