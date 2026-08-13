@@ -9,14 +9,11 @@ import (
 	"time"
 )
 
-// startTestServer spins up a controller daemon backed by a tmpdir-based
-// UDS socket and persistence file. The returned cleanup stops the
-// server and waits for goroutines.
+// startTestServer spins up a controller daemon backed by a tmpdir UDS.
 func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "ctl.sock")
-	statePath := filepath.Join(dir, "state.json")
 
 	state := NewState(physMem, 8000, 1<<30, 1500, Watermarks{
 		OperationalMarginFactor: 0.10,
@@ -39,14 +36,11 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 		MinGrantStep:           1 << 20,
 		MaxGrantStep:           1 << 30,
 	})
-	persister := &Persister{Path: statePath}
-
 	srv := &Server{
 		Path:      sock,
 		State:     state,
 		Admission: admission,
 		Allocator: allocator,
-		Persister: persister,
 		Logf:      t.Logf,
 	}
 	if err := srv.Listen(); err != nil {
@@ -373,78 +367,6 @@ func TestServer_OOMReportAndHeartbeat(t *testing.T) {
 	}
 }
 
-func TestServer_PersistAcrossRestart(t *testing.T) {
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "ctl.sock")
-	statePath := filepath.Join(dir, "state.json")
-
-	build := func() (*Server, *Client, context.CancelFunc, chan struct{}) {
-		state := NewState(8<<30, 8000, 1<<30, 1500, Watermarks{
-			OperationalMarginFactor: 0.10,
-			HighFactor:              0.85,
-			LowFactor:               0.70,
-			EmergencyFactor:         0.05,
-			StartupFactor:           0.50,
-		})
-		// Try to load any prior state.
-		persister := &Persister{Path: statePath}
-		if prev, err := persister.Load(); err == nil && prev != nil {
-			if err := state.RestoreReservations(prev.PersistenceReservations()); err != nil {
-				t.Fatal(err)
-			}
-		}
-		admission := NewAdmissionController(AdmissionPolicy{
-			Rate: 100, Burst: 100, StartupTTL: time.Minute,
-			QueueTTL: 60 * time.Second, QueueMaxDepth: 256,
-		})
-		admission.SetWiring(state, nil, t.Logf,
-			func(p *PendingAdmit) (*Message, error) { return nil, nil })
-		allocator := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1 << 30, MinGrantStep: 1 << 20, MaxGrantStep: 1 << 30})
-		s := &Server{
-			Path: sock, State: state,
-			Admission: admission, Allocator: allocator, Persister: persister,
-			Logf: t.Logf,
-		}
-		if err := s.Listen(); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() { _ = s.Serve(ctx); close(done) }()
-		c := &Client{SocketPath: sock}
-		if err := c.Connect(); err != nil {
-			cancel()
-			t.Fatal(err)
-		}
-		return s, c, cancel, done
-	}
-
-	s1, c1, cancel1, done1 := build()
-	res, _ := c1.Admit(AdmitParams{
-		SandboxID:           "sb-p",
-		CapacityMemoryBytes: 256 << 20,
-		FloorMemoryBytes:    64 << 20,
-		StartupBudgetMemory: 64 << 20,
-	})
-	if res.Status != StatusAdmitted {
-		t.Fatal("admit failed")
-	}
-	tok := c1.Token()
-	_ = c1.Close()
-	cancel1()
-	<-done1
-	_ = s1
-
-	// "Restart": new server reads persisted state.
-	s2, c2, cancel2, done2 := build()
-	defer func() {
-		_ = c2.Close()
-		cancel2()
-		<-done2
-	}()
-	_ = reservationByTokenForTest(t, s2.State, tok)
-}
-
 func TestIdleSweeperRemovesSandboxIndex(t *testing.T) {
 	state := NewState(8<<30, 8000, 1<<30, 1000, Watermarks{})
 	installReservationForTest(t, state, Reservation{
@@ -453,7 +375,7 @@ func TestIdleSweeperRemovesSandboxIndex(t *testing.T) {
 	})
 	sweeper := &IdleSweeper{
 		State: state, Admission: NewAdmissionController(AdmissionPolicy{}),
-		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{},
+		Allocator:  NewAllocator(AllocatorPolicy{}),
 		StartupTTL: time.Minute, Logf: t.Logf,
 	}
 	sweeper.sweep()

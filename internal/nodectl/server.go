@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"slices"
@@ -17,21 +16,17 @@ import (
 
 // Server is the controller daemon's RPC face. It accepts UDS
 // connections from sandbox-ctl, dispatches messages to admission /
-// allocator / state, and persists state on every change.
+// allocator / state. State is memory-only and rebuilt from live inventory.
 type Server struct {
 	Path      string
 	Identity  string
 	State     *State
 	Admission *AdmissionController
 	Allocator *Allocator
-	Persister *Persister
 	Inventory *Inventory
 	Owner     *OwnerLock
-	// LegacyReservations is temporary rolling-upgrade compatibility. Inventory
-	// is installed first and always wins over these state.json records.
-	LegacyReservations map[string]*Reservation
-	Auditor            *Auditor // optional
-	Logf               func(string, ...any)
+	Auditor   *Auditor // optional
+	Logf      func(string, ...any)
 
 	listener net.Listener
 
@@ -88,9 +83,6 @@ func (s *Server) Listen() error {
 		if err := s.Inventory.Recover(s.State); err != nil {
 			return fail(fmt.Errorf("server: recover inventory: %w", err))
 		}
-	}
-	if err := s.State.MergePersistedReservations(s.LegacyReservations); err != nil {
-		return fail(fmt.Errorf("server: merge legacy state: %w", err))
 	}
 	// Only the owner may remove a stale socket. A second live controller fails
 	// above and never reaches this unlink.
@@ -391,12 +383,6 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 		*token = t
 	}
 
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("persister flush: %v", err)
-		}
-	}
-
 	s.Logf("admit %s sid=%s initial_alloc=%d",
 		t[:8], req.SandboxID, spec.InitialAllocatable)
 	if s.Auditor != nil {
@@ -485,11 +471,6 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 
 	s.Admission.PushWake()
 
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("persister flush: %v", err)
-		}
-	}
 	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, res.AllocatableNowMem)
 	return &Message{Type: TypeAck}
 }
@@ -510,11 +491,6 @@ func (s *Server) handleRequestBudget(req *Message, token string) *Message {
 		NewAllocatable: res.AllocatableNowMem,
 		CooldownMs:     dec.CooldownMs,
 	}
-	if dec.GrantedDelta > 0 && s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("persister flush: %v", err)
-		}
-	}
 	if dec.GrantedDelta > 0 {
 		s.Logf("grant %s sid=%s +%d → %d (zone=%s urgency=%s)",
 			token[:8], res.SandboxID, dec.GrantedDelta, res.AllocatableNowMem, zone, urgency)
@@ -526,11 +502,6 @@ func (s *Server) handleOOMReport(req *Message, token string) *Message {
 	res, found := s.State.RecordOOM(token, req.OOMCount)
 	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
-	}
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("persister flush: %v", err)
-		}
 	}
 	s.Logf("oom_report %s sid=%s count=%d killed_pid=%d",
 		token[:8], res.SandboxID, res.OOMCount, req.KilledPID)
@@ -562,11 +533,6 @@ func (s *Server) handleRelease(req *Message, token string) {
 
 	s.Admission.PushWake()
 
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("persister flush: %v", err)
-		}
-	}
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
 		token[:8], res.SandboxID, req.Reason, wasPreSettled)
 	if s.Auditor != nil {
@@ -592,11 +558,6 @@ func (s *Server) handleAdminGrant(req *Message) *Message {
 	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
 	}
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("admin grant persist: %v", err)
-		}
-	}
 	s.Logf("admin grant sid=%s +%d → %d", req.SandboxID, delta, res.AllocatableNowMem)
 	return &Message{Type: TypeAck, GrantedDelta: delta, NewAllocatable: res.AllocatableNowMem}
 }
@@ -610,17 +571,12 @@ func (s *Server) handleAdminReclaim(req *Message) *Message {
 	if err != nil {
 		return &Message{Type: TypeError, Msg: err.Error()}
 	}
-	if s.Persister != nil {
-		if err := s.Persister.Flush(s.State); err != nil {
-			s.Logf("admin reclaim persist: %v", err)
-		}
-	}
 	s.Logf("admin reclaim sid=%s → %d", req.SandboxID, res.AllocatableNowMem)
 	return &Message{Type: TypeAck, NewAllocatable: res.AllocatableNowMem}
 }
 
-// handleAdminStatus returns a summary of node state without requiring
-// the caller to read state.json directly.
+// handleAdminStatus returns one consistent snapshot of the live in-memory
+// node state over the controller UDS.
 func (s *Server) handleAdminStatus() *Message {
 	snapshot := s.State.ResourceSnapshot()
 	return &Message{
@@ -700,7 +656,6 @@ type IdleSweeper struct {
 	State      *State
 	Admission  *AdmissionController
 	Allocator  *Allocator
-	Persister  *Persister
 	Inventory  *Inventory
 	StartupTTL time.Duration
 	Heartbeat  time.Duration
@@ -768,10 +723,5 @@ func (i *IdleSweeper) sweep() {
 	if swept {
 		// Headroom may have just opened up — wake admission worker.
 		i.Admission.PushWake()
-	}
-	if i.Persister != nil {
-		if err := i.Persister.Flush(i.State); err != nil {
-			log.Printf("[node-ctl] sweep persist: %v", err)
-		}
 	}
 }

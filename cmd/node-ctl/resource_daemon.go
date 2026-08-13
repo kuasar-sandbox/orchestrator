@@ -62,6 +62,9 @@ var _ orch.SandboxResourceProvider = resourceProbe{}
 // background goroutine), or an error if setup fails. When resource_listen is
 // absent/disabled serve never calls this and sandboxes fall back to static cgroup.
 func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, managedRunRoot string, slogger *slog.Logger) (orch.ResourceProbe, error) {
+	if rcfg.StatePath != "" {
+		slogger.Warn("resource_listen.state_path is deprecated and ignored", "state_path", rcfg.StatePath)
+	}
 	resolved, err := nodectl.Resolve(rcfg)
 	if err != nil {
 		return nil, err
@@ -72,15 +75,6 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 		resolved.HostReserved.MemoryBytes, resolved.HostReserved.CPUMilli,
 		resolved.Watermarks)
 
-	persister := &nodectl.Persister{Path: resolved.StatePath}
-	var legacyReservations map[string]*nodectl.Reservation
-	if previous, loadErr := persister.Load(); loadErr == nil && previous != nil {
-		legacyReservations = previous.PersistenceReservations()
-		log.Printf("[node-ctl resource] loaded %d legacy reservations; live inventory remains authoritative", len(legacyReservations))
-	} else if loadErr != nil {
-		log.Printf("[node-ctl resource] legacy state load failed (inventory recovery continues): %v", loadErr)
-	}
-
 	admission := nodectl.NewAdmissionController(resolved.Admission)
 	allocator := nodectl.NewAllocator(resolved.Allocator)
 
@@ -90,13 +84,11 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	}
 
 	srv := &nodectl.Server{
-		Path:               resolved.Listen,
-		Identity:           resolved.SocketIdentity,
-		State:              state,
-		Admission:          admission,
-		Allocator:          allocator,
-		Persister:          persister,
-		LegacyReservations: legacyReservations,
+		Path:      resolved.Listen,
+		Identity:  resolved.SocketIdentity,
+		State:     state,
+		Admission: admission,
+		Allocator: allocator,
 		Inventory: &nodectl.Inventory{
 			ControllerSocket: resolved.SocketIdentity, CgroupScanPaths: resolved.CgroupScanPaths,
 			ManagedRunRoot: managedRunRoot, Pool: state.AllocatablePool,
@@ -121,7 +113,7 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	admission.Run()
 
 	sweeper := &nodectl.IdleSweeper{
-		State: state, Admission: admission, Allocator: allocator, Persister: persister,
+		State: state, Admission: admission, Allocator: allocator,
 		Inventory:  srv.Inventory,
 		StartupTTL: resolved.Admission.StartupTTL, Heartbeat: 30 * time.Second, Interval: 10 * time.Second,
 		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource sweep] "+f, a...) },
@@ -129,7 +121,7 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	go sweeper.Run(ctx)
 
 	reclaimer := &nodectl.ActiveReclaimer{
-		State: state, Persister: persister, Interval: 10 * time.Second, SafetyMargin: 1.25, Auditor: auditor,
+		State: state, Interval: 10 * time.Second, SafetyMargin: 1.25, Auditor: auditor,
 		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource reclaim] "+f, a...) },
 	}
 	go reclaimer.Run(ctx)

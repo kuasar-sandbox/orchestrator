@@ -106,9 +106,10 @@ type GrantDecision struct {
 	CooldownMs   int64
 }
 
-// Grant computes the allowed delta for a RequestBudget. The caller has
-// already classified urgency and held State.Lock to compute headroom;
-// this function only enforces the rate limiter.
+// Grant computes the allowed delta for a RequestBudget. State.Grant calls it
+// while holding State's private mutex after computing headroom; external
+// callers never lock or mutate State directly. This function only enforces
+// the rate limiter.
 //
 // Returns a GrantDecision; GrantedDelta == 0 means "denied this round,
 // retry after CooldownMs". Reservation.AllocatableNowMem is updated

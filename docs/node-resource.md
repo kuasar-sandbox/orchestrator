@@ -41,10 +41,12 @@ conductor.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统�
    CPU 维度的动态控制环;只有内存有 burst/recover 状态机
 3. **per-sandbox-ctl 进程模型不破**:sandbox-ctl 仍是 runc-style 一次启动
    一个沙箱;控制器是它的协调对端,不是监督者
-4. **状态全部在 /run**:控制器状态进 tmpfs,host 下电即清空——下电后所有
-   沙箱都不存在,无任何有效信息需要跨重启留存
-5. **故障域边界清晰**:控制器状态意外丢失后能从 cgroup 与 sandbox-ctl 重建;
-   sandbox-ctl 崩溃自动通知控制器释放预留;两者无需强一致
+4. **State 纯内存且可重建**:控制器不写 checkpoint/WAL;`/run` 中只有每个
+   sandbox 生命周期写一次的 immutable lease。host 下电后进程、lock、cgroup
+   一并消失,不跨 host reboot 恢复
+5. **恢复先取安全上界**:控制器重启先从 live lease、managed pidfile/YAML 和
+   populated cgroup 建 provisional reservation,再由 sandbox-ctl 的 StateSync
+   原子替换成精确状态。恢复可短暂多记,绝不能漏记存活消费者
 6. **事件驱动而非定时**:settled 等关键状态转换以 launch protocol 消息为
    触发,不依赖定时器估计
 
@@ -52,10 +54,10 @@ conductor.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统�
 
 | 故障 | 直接影响 | 规避 / 自愈 |
 |------|---------|-------------|
-| controller 崩溃 | sandbox-ctl 长连断开;新沙箱 admit 失败 | systemd 重启;sandbox-ctl 退化无控制器继续跑 |
-| controller 状态文件损坏 | 重启时无法恢复 reservation 记账 | 从空状态起,预算按 yaml 重算,等 sandbox-ctl 重连(§8.2) |
-| sandbox-ctl 崩溃 | 沙箱按既有规则销毁 | controller 检测连接断 → 保留 reservation 等 Reattach,心跳静默 90 s 后释放 |
-| controller ↔ sandbox-ctl 网络抖动 | RPC 超时 | 退避重连;期间 sandbox-ctl 用最近一次 grant 继续跑 |
+| controller 崩溃 | sandbox-ctl 长连断开;新沙箱 admit 暂停 | systemd 重启;sandbox-ctl 保持最后已应用额度并持续退避重连;controller 在 listen 前保守重建(§8.2) |
+| 旧 `state.json` 缺失/损坏 | 无影响 | `state_path` 已弃用且忽略;恢复不读取共享 State 文件 |
+| sandbox-ctl 崩溃 | 沙箱按既有规则销毁 | lease lock 随进程自动释放;仅在 lease 不 live 且 cgroup 不 populated 后释放记账 |
+| controller ↔ sandbox-ctl 网络抖动 | RPC 失败 | 单一 jitter 指数退避 reconnect loop;期间保持最后已应用额度、不回退 floor、不销毁正常 VM |
 | 单沙箱 OOM | guest 内进程被 kill;deflate_on_oom 释放 balloon | 非平台级故障;controller 计 OOM 事件 |
 | host 物理 OOM | 内核 OOM killer 选目标 | 水位机制保证 node_allocated 始终 ≤ 物理可用,正常情况不应触发 |
 
@@ -68,7 +70,7 @@ conductor.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统�
 
 | 子命令 | 用途 |
 |---|---|
-| `serve`(配 `resource_listen`) | 在该 UDS 起控制器:RPC server + admission + allocator + reclaimer + persister(node.md §2.2) |
+| `serve`(配 `resource_listen`) | 在该 UDS 起控制器:RPC server + inventory recovery + admission + allocator + reclaimer(node.md §2.2) |
 | `resource status` | 节点预算快照(只读) |
 | `resource list` | 列举当前 reservation(只读) |
 | `resource drain` | 进入排空状态(运维) |
@@ -78,8 +80,8 @@ conductor.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统�
 ### 2.2 控制器启动(`node-ctl conductor serve` 内置)
 
 控制器随 `node-ctl conductor serve` 起:配 `resource_listen`(§3)即在该 UDS 起 RPC server、
-admission worker、memory allocator、active reclaimer、idle sweeper 与 state
-persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
+inventory recovery、admission worker、memory allocator、active reclaimer 与 idle
+sweeper(§7)。`resource_listen` 的子字段(`socket` / deprecated `state_path` /
 `cgroup_scan_paths` / `resources` / `watermarks` / …)是内联在 conductor.yaml 里的控制器调参(§3)。
 集群下,控制器上报的节点水位(zone / allocated / pool)经 serve 的 node-link 心跳喂
 集群 P2C 放置(node.md §10、cluster.md / cluster-placer.md)。
@@ -90,9 +92,9 @@ persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
 node-ctl resource status [--socket /run/sandbox-resource.sock]
 ```
 
-通过 live controller UDS 一次读取一致的内存快照,打印水位区、节点预算、host
-预留、运维容差、已分配量、利用率以及 precise/provisional/connected reservation
-数量。命令只读;controller 不可用时明确失败,不读取可能过期的 state 文件。
+经 live UDS 读取一次加锁的一致快照,打印水位区、节点预算、host 预留、运维
+容差、已分配量、startup、reservation/provisional/unknown 数。控制器不在线时
+明确失败,不返回陈旧文件。
 
 ### 2.4 `node-ctl resource list`
 
@@ -100,8 +102,8 @@ node-ctl resource status [--socket /run/sandbox-resource.sock]
 node-ctl resource list [--socket /run/sandbox-resource.sock]
 ```
 
-通过 live controller UDS 把 reservation 表导出为 JSON,包含 provisional、
-connected 与 recovery source 等恢复诊断字段。查询不读取 state 文件。
+经 live UDS 把 token-free reservation 视图导出为 JSON,包含 `provisional`、
+`connected`、`recovery_source`、cgroup、额度和报告字段。查询不读取恢复文件。
 
 ### 2.5 `node-ctl resource drain`
 
@@ -142,9 +144,9 @@ conductor.yaml 里(无独立配置文件);`enabled: true` 即在其 `socket` 起
 ```yaml
 enabled: true
 socket: /run/sandbox-resource.sock     # "" = pkg/resource 默认(与 sandbox-ctl 一致)
-state_path: /run/node-ctl/state.json   # tmpfs
-audit_path: /run/node-ctl/audit.log    # tmpfs;高频审计不写磁盘
-cgroup_scan_paths:                      # 重启对账扫描根
+state_path: /run/node-ctl/state.json   # deprecated/ignored;仅兼容旧 YAML 解析
+audit_path: /run/node-ctl/audit.log    # tmpfs;异步 best-effort 审计,不阻塞 RPC
+cgroup_scan_paths:                     # 重启时扫描 populated sandbox cgroup
   - /sys/fs/cgroup/sandbox.slice/sandbox-runner.slice
 
 resources:
@@ -182,9 +184,9 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
 |---|---|---|
 | `enabled` | `false` | 置 `true` 才在 serve 内起控制器;否则沙箱用静态 cgroup |
 | `socket` | `pkg/resource` 默认 | UDS,sandbox-ctl 拨号目标;`""` = 协议默认(与 sandbox-ctl 一致) |
-| `state_path` | `/run/node-ctl/state.json` | tmpfs,控制器重启快速恢复用 |
-| `audit_path` | `/run/node-ctl/audit.log` | tmpfs;高频审计不写磁盘 |
-| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]` | 重启对账扫描根；默认覆盖 orchestrator-managed runner 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
+| `state_path` | 无 | **deprecated/ignored**;仅保留旧 YAML 可解析,不会打开、读取或写入 |
+| `audit_path` | `/run/node-ctl/audit.log` | tmpfs;后台 goroutine 异步 best-effort 写,资源 RPC 不等待文件 I/O |
+| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]` | lease/cgroup 身份边界和重启对账扫描根；默认覆盖 orchestrator-managed runner 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
 | `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
 | `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
 | `resources.host_reserved.memory` | `16GiB` | host 自身预留(kernel + cache-ctl + store-ctl + monitoring),按节点实测覆盖(§10.2) |
@@ -197,7 +199,7 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
 | `rate_limits.memory_grant_per_sec_factor` | 0.05 | 内存仲裁限速:每秒总扩展量 ≤ allocatable_pool × 此值 |
 | `admission.rate` | 4 | Admit 速率,token bucket 装填速率(/s) |
 | `admission.burst` | 16 | Admit token bucket 容量 |
-| `admission.startup_ttl` | 30s | sandbox-ctl 必须在此时间内进入 settled,否则 IdleSweeper 释放 reservation |
+| `admission.startup_ttl` | 30s | sandbox-ctl 应在此时间内进入 settled;超时标记诊断状态,但 live lease 或 populated cgroup 仍在时不释放记账 |
 | `admission.queue_ttl` | 30s | 短期阻塞排队最长等待,超时 → reject `queue_canceled` |
 | `admission.queue_max_depth` | 256 | 队列容量,超即立 reject `queue_full` |
 | `dampening.recover_duration` | 60s | burst → settled 观察期 |
@@ -294,7 +296,7 @@ UDS,长度前缀(4 字节 LE uint32)+ JSON 消息——简单、调试友好、�
 
 ```
 Admit            (sandbox_id, capacity, floor, startup_budget_memory,
-                  allocatable_at_snapshot?, cgroup_path)
+                  allocatable_at_snapshot?, cgroup_path, client_features?)
                  → AdmitResponse (status, token, granted_initial_alloc,
                                   reason?, queued_for_ms, queue_pos_at_in)
                    status ∈ {admitted, rejected}
@@ -303,8 +305,8 @@ Admit            (sandbox_id, capacity, floor, startup_budget_memory,
                                                allocatable_at_snapshot)
                    reason:rejected 时分类(§6.4)
                    queued_for_ms / queue_pos_at_in:命中队列时回填的诊断元数据
-                 # sandbox_id 用作 admin 动词(grant/reclaim)的索引键;
-                 # cgroup_path 存入 reservation 并随 state.json 持久化
+                 # sandbox_id 用作 admin 动词(grant/reclaim)的 O(1) 索引键;
+                 # 新客户端的不可变请求字段必须与其 live lease 一致
 
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
@@ -331,6 +333,13 @@ Release          (token, reason)                                # reason ∈ {no
 Reattach         (token)                                        # 断线重连后重新绑定(§5.3)
                  → Ack (new_allocatable)                        # 成功:回带当前 allocatable_now
                  → Error "unknown token"                        # token 不存在
+
+StateSync        (sandbox_id, applied_allocatable_memory, settled,
+                  current_rss, previous_token?)
+                 → Ack (token=new_session_token,
+                        new_allocatable=applied_allocatable_memory)
+                 # previous_token 仅兼容/诊断;认证来自 SO_PEERCRED + live lease lock
+                 # provisional charge 以同一个 State 临界区原子替换为精确 reservation
 ```
 
 admin 动词(运维 CLI 发,控制器答;以 sandbox_id 而非 token 定位目标):
@@ -338,8 +347,12 @@ admin 动词(运维 CLI 发,控制器答;以 sandbox_id 而非 token 定位目�
 ```
 AdminStatus      ()                                             # node-ctl 经 RPC 查实时态
                  → Ack (zone, node_allocated, allocatable_pool,
-                        reservation_count, drained)
-                   # state.json 不可直接访问时(如跨主机巡检)用
+                        reservation_count, provisional_count,
+                        unknown_count, startup_in_flight, drained)
+
+AdminList        ()
+                 → Ack (reservations=[... connected, provisional,
+                                      recovery_source ...])
 
 AdminDrain       (drain)                                        # 背后 node-ctl resource drain
                  → Ack (drained)
@@ -351,8 +364,9 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
                  → Ack (new_allocatable)                        # shrink-only,clamp 到 floor
 ```
 
-`token`:Admit 时由控制器生成的随机字符串,作为后续所有 RPC 的认证 + 索引。
-重连时 sandbox-ctl 重发 token,控制器验证后绑定到现有 reservation。
+`token`:Admit 或 StateSync 时由控制器生成的 session 随机字符串,作为后续 RPC
+的认证 + 索引。controller 重启后 token 可失效;新客户端以 lease 身份执行
+StateSync 并取得新 token。Reattach 仅为旧 server/client 的滚动升级兼容。
 
 `reason` 字段是字符串枚举,用于审计与调试。
 
@@ -362,15 +376,18 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
 
 **首次建连**:
 
-1. sandbox-ctl 拨 UDS,发 `Admit`
-2. 控制器评估请求:
+1. 动态模式 sandbox-ctl 在第一次 Admit 前创建 immutable lease 并持有 POSIX
+   write lock;文件名是 SID 的 SHA-256,内容只写一次
+2. sandbox-ctl 拨 UDS,发 `Admit`
+3. 控制器以 `SO_PEERCRED` 验证 peer PID = lease lock owner;managed 模式还
+   交叉验证 `<run-root>/<sid>/<sid>.pid` 的 lock/PID 和 `<sid>.yaml`;再评估请求:
    - 通过 → 立即回 `status=admitted`
    - 长期失败(drain / zone red/critical / 超 pool / 超 startup_pool)→ `status=rejected`
    - 短期阻塞(token / main_headroom / startup_headroom)→ **不回应**,
      conn 入服务端 FIFO queue;worker 在条件满足时回 `admitted`,
      queue_ttl 超时回 `rejected`
-3. status=admitted:sandbox-ctl 持有 token,继续启动流程
-4. status=rejected:sandbox-ctl 退出非零(上层调度决定 retry / 换节点)
+4. status=admitted:sandbox-ctl 持有 token,继续启动流程
+5. status=rejected:sandbox-ctl 退出非零(上层调度决定 retry / 换节点)
 
 **长连维持**:
 
@@ -381,24 +398,28 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
 
 **重连**:
 
-- 连接断开,sandbox-ctl 退避重试(1s, 2s, 5s, 10s, 10s, ...)
-- 重连成功后发 `Reattach(token)`,控制器验证 token 找到 reservation 后回
-  `Ack(new_allocatable)`,重新绑定连接;token 不存在则回 `Error "unknown token"`
-- 重连期间 sandbox-ctl 用最近一次 grant 状态继续运行(cgroup 不变、balloon
-  不变),不主动调整资源
+- 任意 EOF/reset/broken pipe 后保留最后成功落地到 `memory.high` 和 balloon 的
+  `applied_allocatable`,暂停正向 budget 请求,由唯一 reconnect loop 按带 jitter
+  的指数退避重新 Connect
+- 新 server:发送 `StateSync(sid, applied, settled, rss, previous_token?)`。controller
+  验证 lease、peer、managed 元数据和 `floor ≤ applied ≤ capacity`,再原子替换
+  provisional 并签发新 token
+- 不支持 StateSync 的旧 server:回退 `Reattach(previous_token)`;旧 server 回带的
+  allocatable 仍须成功落地后才成为新的 `applied_allocatable`
+- 所有 RPC、连接替换和同步共享一个 session 串行化边界,每个 sandbox 最多一个
+  outstanding request
 
-**断连降级**:
+**controller 不可用期间**:
 
-- 持续 60s 重连失败,sandbox-ctl 切到无控制器模式继续——保持当前
-  allocatable 不变,接管 cgroup memory.high 设置,不再申请 burst
-- 此时即使有新压力,只能靠 cgroup PSI 反压 + deflate_on_oom 兜底
-- 重连成功后自动恢复联动
+- sandbox-ctl 保持最后已经实际应用的额度,不回退 floor,不销毁正常运行的 VM
+- sensor 暂停新的正向 budget 请求;Heartbeat 和 budget 在同步成功后恢复
+- cgroup 与 balloon 保持原值;不能因重连耗时切换成另一套无 controller 状态机
 
 **沙箱退出**:
 
-- sandbox-ctl 退出前发 `Release`;控制器收到后释放 reservation
-- sandbox-ctl 异常退出(无 Release):控制器检测连接 EOF/RST → 视沙箱可能
-  死亡;通过 cgroup 路径检查交叉验证
+- sandbox-ctl 正常退出前发 `Release`,再在仍持 lock 时 unlink lease并关闭 FD
+- sandbox-ctl 异常退出无 Release时 lock 自动释放;控制器只有确认 lease 不 live
+  且 cgroup 不 populated 后才能移除 reservation
 
 ## 6. 创建期管控
 
@@ -409,12 +430,12 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
 ```
 T0  sandbox-ctl run --config xx.yaml
 T1  parse config, compute (capacity, floor, startup.memory)
-    若 control.controller 为空 → 跳过 admit,跳到 T5
-T2  dial controller, send Admit
-T3  block read AdmitResponse(可能立即,也可能在 queue 中等待)
-T4  if rejected: exit 2(上层调度决定 retry / 换节点)
-T4' if admitted: continue(可能伴随 queued_for_ms > 0,仅作 log 用)
-T5  cgroup join(静态 cgroup / 动态控制模式写限制;无 cgroup 模式跳过)
+    若 control.controller 为空 → 跳过 lease/admit,跳到 T5
+T2  创建并锁定 immutable lifecycle lease(每生命周期只写一次)
+T3  dial controller,send Admit;block read response(可能在 queue 中等待)
+T4  if rejected:unlink lease,exit 2(上层调度决定 retry / 换节点)
+T4' if admitted:保存 session token,continue(queued_for_ms 仅诊断)
+T5  cgroup setup(静态/动态模式写限制;CH 通过 CLONE_INTO_CGROUP 原子出生在目标中)
 T6  ... 启动序列继续(详见 `sandboxer/docs/sandbox.md` §冷启动数据流)
 ```
 
@@ -479,7 +500,7 @@ budget 自然 throttle:每个 sandbox admission 占 `effective_startup_budget`
 | **one-shot token refill** | head 阻于 token bucket 时,worker 末尾 `AfterFunc(eta, pushWake)` |
 
 worker 处理:严格 FIFO。head 不通过即停,直到 wake 重试。worker 入口先取
-`queueMu`,再取 `State.Lock`(锁顺序固定避免死锁)。
+`queueMu`,再调用内部加锁的 State 具名转换(锁顺序固定避免死锁;调用方不接触 State mutex)。
 
 ### 6.4 reject reason 分类
 
@@ -499,12 +520,12 @@ worker 处理:严格 FIFO。head 不通过即停,直到 wake 重试。worker 入
 
 ```
 Admit (admitted)
- │  reservation 占用 effective_startup_budget,token 生成
+ │  lease 已锁定;reservation 占用 effective_startup_budget,token 生成
  │
  ▼
 sandbox-ctl 启动 CH(cgroup join → memfd → ...)
  │  若 sandbox-ctl 在 startup_ttl(默认 30s)内不发 Settled
- │   → 控制器视为创建失败,自动 release reservation
+ │   → 标记 startup_expired;live lease/populated cgroup 仍在则保留安全上界记账
  ▼
 launch hello(冷启动)/ restore_ack(恢复)
  │
@@ -518,7 +539,8 @@ sandbox-ctl 发 Settled(token, current_rss, current_cpu_usec)
  │
  ▼
 sandbox-ctl 发 Release 或连接断开
- │  控制器释放 reservation
+ │  Release 正常释放;仅断连则保留并等待 StateSync/Reattach
+ │  正常退出 unlink lease;异常退出由 lock 自动释放
  ▼
 end
 ```
@@ -526,14 +548,14 @@ end
 **TTL 设计依据**:
 
 - `startup_ttl = 30s`:覆盖典型冷启动(大镜像 + 慢网络下 manifest 恢复)。
-  超时即视为创建失败,释放 reservation
+  超时用于诊断和清理已消失消费者;live lease/populated cgroup 永远优先于 TTL
 - `queue_ttl = 30s`:Admit 排队太久无意义,上层调度器宁可换节点
 
 ### 6.6 per-sandbox resource stats
 
 `GET /sandboxes/{sid}/stats/resource` 由 conductor 直接读取本进程 controller state,不发
-resource RPC、不访问 envd 或 guest `/metrics`,也不触发生命周期动作。controller 除 token
-主索引外维护派生 `sandbox_id → token` 索引;Insert、Release、IdleSweeper、重启 reload 和
+resource RPC、不访问 envd 或 guest `/metrics`,也不触发生命周期动作。controller 以 SID
+为主索引,另维护 token/cgroup 派生索引;Admit、StateSync、Release、IdleSweeper 和
 所有其它删除路径统一维护该索引,因此查询不需要线性扫描 reservation 表。
 
 Settled/Heartbeat 仅在 `CurrentRSS>0` 时同时更新:
@@ -562,73 +584,54 @@ sparse 200;paused 无 live reservation 返回 409;running 缺 reservation 返回
 ## 7. node-ctl 内部组织
 
 `node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl conductor serve` 起(配 `resource_listen`)。
-它内部组织成四个角色,共享 in-memory state 与 /run 持久化:
+它内部角色共享一个纯内存、可重建的 State:
 
 ```
 controller (node-ctl conductor serve resource_listen)
-├── RPC server               处理协议消息
+├── Owner lock               <controller-socket>.owner 生命周期独占
+├── Inventory                live lease + managed metadata + populated cgroup
+├── RPC server               SO_PEERCRED、StateSync 与协议消息
 ├── Admission Controller     §6 准入与速率限制
 ├── Memory Allocator         §4.3 仲裁与 grant
 ├── Reclaim Scheduler        §4.2 settled 期主动收回
-├── SID Index / Stats View   §6.6 sparse resource snapshot
-└── State Persister          §8 /run/node-ctl/state.json 写
+└── State                    SID 主索引 + token/cgroup 索引 + O(1) aggregates
 ```
+
+State 的 `allocatedMem`、`allocatedCPU`、`startupInFlight`、provisional/unknown
+计数随具名转换方法同步维护。Admit/Settled/Heartbeat/Grant/Reclaim/Release/OOM
+不做 State 快照、JSON 编码、`open/write/fsync/rename` 或等待持久化锁。
+`ResourceSnapshot` 在一次 State 加锁内同时读取水位所需的全部聚合值,不会无锁
+遍历 map 或拼接跨时刻字段。周期 reclaimer/sweeper 可以扫描诊断视图,但正常
+RPC 的聚合与水位判断是 O(1)。`queueMu` 涉及 State 时顺序固定为先 queue、再
+调用内部自行加锁的 State 转换;调用方不直接 Lock/Unlock 或改 map。
 
 这些角色在协议规范中是隐式的——其他实现可以选择不同的内部组织。本文档其余
 部分(§可靠性、§admission)以该控制器行为为准描述。
 
 ## 8. 可靠性
 
-### 8.1 状态全部在 /run
+### 8.1 真相来源与 inventory
 
-控制器状态分两类,**全部 tmpfs,无任何磁盘持久化**:
+控制器不保存共享 checkpoint、WAL、append log 或每沙箱动态状态文件。真相按
+职责拆分:
 
-**进程内**:
+| 信息 | 权威来源 |
+|---|---|
+| 消费者是否仍活 | lease 的 POSIX write lock;managed pidfile lock;populated cgroup |
+| SID/controller/cgroup/capacity/floor/startup/features | `<controller-socket>.leases/<sha256(sid)>.json` immutable lease |
+| 当前实际应用内存额度、settled、RSS | sandbox-ctl 内存状态,重连经 StateSync 上报 |
+| session token、heartbeat、OOM/cooldown | 当前 controller 进程内短期状态 |
+| 节点聚合 | State 具名转换维护的 O(1) 计数器 |
 
-- 当前 RPC 连接表
-- 速率限制 token bucket 状态
-- 短期统计(1 分钟窗口的 grant 次数等)
+lease 由 sandbox-ctl 在第一次 Admit 前创建、写一次并锁定,正常退出时 unlink;
+SIGKILL 时内核释放 lock,残留文件下次扫描清理。文件名只使用 SID SHA-256,
+tenant SID 不进入目录拼接。`F_GETLK` 返回锁 owner PID;JSON 中自报 PID 不能
+单独证明存活。lease 只在 sandbox 生命周期边界产生文件 I/O,不在任何资源 RPC
+热路径更新。
 
-**`/run/node-ctl/state.json`**:
-
-```
-{
-  "version": 1,
-  "node_budget":         { "memory_bytes": ..., "cpu_milli": ... },
-  "host_reserved":       { "memory_bytes": ..., "cpu_milli": ... },
-  "operational_margin":  { "memory_bytes": ..., "cpu_milli": ... },
-  "watermarks":          { "high_factor": 0.85, "low_factor": 0.70, "emergency_factor": 0.05 },
-  "reservations": [
-    {
-      "token":              "...",
-      "sandbox_id":         "...",
-      "sandbox_ctl_pid":    12345,
-      "cgroup_path":        "/sys/fs/cgroup/sandboxes/sb-001",
-      "capacity":           { "memory_bytes": ..., "cpu_milli": ... },
-      "floor":              { "memory_bytes": ..., "cpu_milli": ... },
-      "allocatable_now_mem":  ...,    # 仅内存有运行时值
-      "stage":              "settled",
-      "stage_entered_at":   "2026-..-..T..",
-      "last_heartbeat_at":  "2026-..-..T..",
-      "last_reported_rss":  536870912,
-      "last_report_at":     "2026-..-..T..",
-      "oom_count":          0
-    },
-    ...
-  ]
-}
-```
-
-写入策略:
-
-- **关键事件即时写**:Admit grant、Release、Reclaim 完成等改变 reservations
-  数组的事件
-- **状态变化批量写**:Heartbeat 更新 last_heartbeat_at 等高频但非关键的更新
-  按 5 秒批量 flush
-- **原子写**:`write to state.json.tmp + fsync + rename` 防截断
-
-`/run` 是 tmpfs,host 重启即丢——这正是想要的:host 重启时所有沙箱的 CH
-进程都已死,没有任何活沙箱需要恢复 reservation。
+controller 在删除旧 UDS 或 bind 前先非阻塞取得稳定
+`<controller-socket>.owner` 的 POSIX write lock。第二实例在动到 live UDS 前
+失败,owner FD 持有到 server 完整退出。
 
 ### 8.2 控制器进程重启恢复
 
@@ -656,45 +659,41 @@ controller (node-ctl conductor serve resource_listen)
    成功后在一个 State 临界区以实际 applied reservation 替换 provisional、更新
    全部聚合差值并签发新 session token。
 
-**兼容阶段不变量**:live lease、managed pidfile 与 populated cgroup 是恢复真相;
-`state.json` 仅作为旧 token/诊断的额外兼容输入。文件缺失或损坏不影响上述
-安全上界恢复,也不会让控制器以空 State 对外服务。
+旧 sandbox-ctl 在新 controller 中由 managed/cgroup provisional 保守计费;
+新 sandbox-ctl 对不认识 StateSync 的旧 controller 回退 Reattach。滚动升级期间
+允许暂时多记,任何混用路径都不能少记。
 
 ### 8.3 故障域处理
 
-**sandbox-ctl 崩溃**:
-
-- 控制器通过 RPC 连接 EOF 检测
-- 立即将 reservation 标记 `pending_release`,5 s 内交叉检查 cgroup:
-  - cgroup 还在 → 沙箱可能仍在跑(sandbox-ctl 异常但 CH 还活):pending,
-    最长等 60 s,期间不接受该 sid 重连(必须新 Admit)
-  - cgroup 已消失 → 真死,释放 reservation
-
-**sandbox-ctl 网络断 + 自身仍活**:
-
-- 同上,但 60 s 后 cgroup 仍在
-- 此时 sandbox-ctl 已经走降级流程,继续无控制器运行
-- 控制器把 reservation 转 `presumed_no_controller`:仍计入 node_allocated,
-  但不再接受其 RPC(token 失效,需要 sandbox-ctl 主动重 Admit)
+- **连接断开**:只清当前 connection contribution,不删 reservation。live lease、
+  locked managed pidfile 或 populated cgroup 任一成立都保留记账。
+- **heartbeat timeout/startup TTL**:同样先验证 inventory liveness;live 消费者只
+  标记 `startup_expired` 等诊断字段,不释放额度。
+- **sandbox-ctl 崩溃**:lease lock 自动释放;若 CH/cgroup 也已消失则 sweeper
+  才移除。若 cgroup 仍 populated,继续按现有 reservation或 orphan 上界计费。
 
 **控制器自身崩溃**:
 
-- systemd 重启
-- 重启过程中所有 sandbox-ctl 退化无控制器
-- 控制器起来后走重建流程,sandbox-ctl 重连后恢复联动
+- owner lock 随进程退出释放,systemd 可启动 replacement
+- sandbox-ctl/VM 不重启,保持最后已应用额度并持续 reconnect
+- replacement 先建安全上界、再 listen;StateSync 后恢复精确联动
+- `state.json` 缺失、损坏或旧配置指向任意路径均不影响该流程
 
 **全节点 OOM(host 级)**:
 
 - 不应发生(水位机制保证)。若发生,kernel OOM killer 选目标。controller 与
   cache-ctl 等 host 进程优先级低于 sandbox(由 systemd OOM score 设置),
   先被杀
-- 控制器重启后走重建流程,期间沙箱继续运行(降级)
+- 控制器重启后走重建流程,期间沙箱保持最后已应用额度继续运行
 
 **host 重启**:
 
 - 所有沙箱与控制器同时消失
-- /run/ 清空,无任何状态留存
+- `/run`、lease、进程和 cgroup 同时清空
 - 重新启动后从空状态开始,等上层调度器重新发沙箱
+
+该方案只保证**无 host reboot 的 controller 异常重启恢复**。它不是共享
+checkpoint/WAL,也不提供跨节点 HA/共识;host reboot 后没有存活消费者需要恢复。
 
 ## 9. 工作负载模型与基线
 

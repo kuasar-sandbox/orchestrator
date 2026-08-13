@@ -602,6 +602,37 @@ func TestLoadProxyRejectsRemovedMMDSConfiguration(t *testing.T) {
 	}
 }
 
+func TestResourceStatePathRemainsParseOnlyCompatibility(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/runtime.erofs
+resource_listen:
+  enabled: true
+  state_path: /run/legacy-resource-state.json
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ResourceListen == nil || cfg.ResourceListen.StatePath != "/run/legacy-resource-state.json" {
+		t.Fatalf("deprecated state_path did not remain parse-compatible: %+v", cfg.ResourceListen)
+	}
+	if got := cfg.ResourceListen.CgroupScanPaths; len(got) != 1 ||
+		got[0] != "/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice" {
+		t.Fatalf("cgroup recovery defaults = %v", got)
+	}
+
+	var omitted ResourceListenConfig
+	omitted.ApplyDefaults()
+	if omitted.StatePath != "" {
+		t.Fatalf("state_path still has an active default: %q", omitted.StatePath)
+	}
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "node.yaml")

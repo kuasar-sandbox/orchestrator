@@ -21,7 +21,6 @@ import (
 type Resolved struct {
 	Listen          string // absolute bind/dial path; may retain a short parent alias
 	SocketIdentity  string // canonical owner/lease inventory identity
-	StatePath       string
 	CgroupScanPaths []string
 
 	PhysicalMemory uint64
@@ -65,7 +64,6 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	out := &Resolved{
 		Listen:          listen,
 		SocketIdentity:  identity,
-		StatePath:       c.StatePath,
 		CgroupScanPaths: c.CgroupScanPaths,
 		LogLevel:        c.LogLevel,
 		AuditPath:       c.AuditPath,

@@ -196,8 +196,9 @@ builder:                                           # builds run INSIDE build san
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
 #   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
-#   # state_path: /run/node-ctl/state.json
+#   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
+#   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandboxes]
 #   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
 #   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
