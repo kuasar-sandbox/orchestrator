@@ -144,8 +144,8 @@ enabled: true
 socket: /run/sandbox-resource.sock     # "" = pkg/resource 默认(与 sandbox-ctl 一致)
 state_path: /run/node-ctl/state.json   # tmpfs
 audit_path: /run/node-ctl/audit.log    # tmpfs;高频审计不写磁盘
-cgroup_scan_paths:                      # (预留)重启对账扫描根
-  - /sys/fs/cgroup/sandboxes
+cgroup_scan_paths:                      # 重启对账扫描根
+  - /sys/fs/cgroup/sandbox.slice/sandbox-runner.slice
 
 resources:
   physical_memory: auto                # auto = 读 /proc/meminfo MemTotal
@@ -184,7 +184,7 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
 | `socket` | `pkg/resource` 默认 | UDS,sandbox-ctl 拨号目标;`""` = 协议默认(与 sandbox-ctl 一致) |
 | `state_path` | `/run/node-ctl/state.json` | tmpfs,控制器重启快速恢复用 |
 | `audit_path` | `/run/node-ctl/audit.log` | tmpfs;高频审计不写磁盘 |
-| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandboxes]` | (预留)重启对账扫描根 |
+| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]` | 重启对账扫描根；默认覆盖 orchestrator-managed runner 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
 | `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
 | `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
 | `resources.host_reserved.memory` | `16GiB` | host 自身预留(kernel + cache-ctl + store-ctl + monitoring),按节点实测覆盖(§10.2) |

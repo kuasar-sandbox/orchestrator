@@ -289,12 +289,8 @@ func (s *State) deleteLocked(sid string) *Reservation {
 }
 
 func (s *State) insertLocked(r *Reservation) error {
-	if r == nil || r.SandboxID == "" {
-		return fmt.Errorf("reservation sandbox id is required")
-	}
-	if r.AllocatableNowMem > r.Capacity.MemoryBytes || r.Floor.MemoryBytes > r.Capacity.MemoryBytes ||
-		r.Floor.CPUMilli > r.Capacity.CPUMilli || r.EffectiveStartupBudget > r.Capacity.MemoryBytes {
-		return fmt.Errorf("reservation resources exceed capacity")
+	if err := validateReservation(r); err != nil {
+		return err
 	}
 	if _, exists := s.bySID[r.SandboxID]; exists {
 		return fmt.Errorf("sandbox %q already has a reservation", r.SandboxID)
@@ -317,6 +313,17 @@ func (s *State) insertLocked(r *Reservation) error {
 	}
 	s.bySID[r.SandboxID] = r
 	s.addAggregatesLocked(r)
+	return nil
+}
+
+func validateReservation(r *Reservation) error {
+	if r == nil || r.SandboxID == "" {
+		return fmt.Errorf("reservation sandbox id is required")
+	}
+	if r.AllocatableNowMem > r.Capacity.MemoryBytes || r.Floor.MemoryBytes > r.Capacity.MemoryBytes ||
+		r.Floor.CPUMilli > r.Capacity.CPUMilli || r.EffectiveStartupBudget > r.Capacity.MemoryBytes {
+		return fmt.Errorf("reservation resources exceed capacity")
+	}
 	return nil
 }
 
@@ -423,6 +430,18 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	if spec.Now.IsZero() {
 		spec.Now = time.Now()
 	}
+	r := &Reservation{
+		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
+		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, Floor: spec.Floor,
+		AllocatableNowMem:      spec.InitialAllocatable,
+		EffectiveStartupBudget: spec.EffectiveStartupBudget,
+		Stage:                  StageAdmitted, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
+		RecoverySource: RecoveryAdmit, LeasePath: spec.LeasePath,
+		ClientFeatures: append([]string(nil), spec.ClientFeatures...), Conn: spec.Conn,
+	}
+	if err := validateReservation(r); err != nil {
+		return Reservation{}, nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var oldConn net.Conn
@@ -465,15 +484,6 @@ func (s *State) Admit(spec AdmitSpec) (Reservation, net.Conn, error) {
 	if otherSID != "" && otherSID != spec.SandboxID {
 		s.deleteLocked(otherSID)
 	}
-	r := &Reservation{
-		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
-		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, Floor: spec.Floor,
-		AllocatableNowMem:      spec.InitialAllocatable,
-		EffectiveStartupBudget: spec.EffectiveStartupBudget,
-		Stage:                  StageAdmitted, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
-		RecoverySource: RecoveryAdmit, LeasePath: spec.LeasePath,
-		ClientFeatures: append([]string(nil), spec.ClientFeatures...), Conn: spec.Conn,
-	}
 	if err := s.insertLocked(r); err != nil {
 		return Reservation{}, oldConn, err
 	}
@@ -503,6 +513,33 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	}
 	if spec.Now.IsZero() {
 		spec.Now = time.Now()
+	}
+	stage := StageStartup
+	startup := spec.StartupMemory
+	if startup < spec.Floor.MemoryBytes {
+		startup = spec.Floor.MemoryBytes
+	}
+	if startup < spec.AppliedMemory {
+		startup = spec.AppliedMemory
+	}
+	if spec.Settled {
+		stage = StageSettled
+		startup = 0
+	}
+	r := &Reservation{
+		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
+		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, Floor: spec.Floor,
+		AllocatableNowMem: spec.AppliedMemory, EffectiveStartupBudget: startup,
+		Stage: stage, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
+		RecoverySource: RecoverySynced, LeasePath: spec.LeasePath,
+		ClientFeatures: append([]string(nil), spec.ClientFeatures...), Conn: spec.Conn,
+	}
+	if spec.CurrentRSS > 0 {
+		r.LastReportedRSS = spec.CurrentRSS
+		r.LastReportAt = spec.Now
+	}
+	if err := validateReservation(r); err != nil {
+		return Reservation{}, nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -537,30 +574,6 @@ func (s *State) Sync(spec SyncSpec) (Reservation, []net.Conn, error) {
 	}
 	if otherSID != "" && otherSID != spec.SandboxID {
 		s.deleteLocked(otherSID)
-	}
-	stage := StageStartup
-	startup := spec.StartupMemory
-	if startup < spec.Floor.MemoryBytes {
-		startup = spec.Floor.MemoryBytes
-	}
-	if startup < spec.AppliedMemory {
-		startup = spec.AppliedMemory
-	}
-	if spec.Settled {
-		stage = StageSettled
-		startup = 0
-	}
-	r := &Reservation{
-		Token: spec.Token, SandboxID: spec.SandboxID, PeerPID: spec.PeerPID,
-		CgroupPath: spec.CgroupPath, Capacity: spec.Capacity, Floor: spec.Floor,
-		AllocatableNowMem: spec.AppliedMemory, EffectiveStartupBudget: startup,
-		Stage: stage, StageEnteredAt: spec.Now, LastHeartbeatAt: spec.Now,
-		RecoverySource: RecoverySynced, LeasePath: spec.LeasePath,
-		ClientFeatures: append([]string(nil), spec.ClientFeatures...), Conn: spec.Conn,
-	}
-	if spec.CurrentRSS > 0 {
-		r.LastReportedRSS = spec.CurrentRSS
-		r.LastReportAt = spec.Now
 	}
 	if err := s.insertLocked(r); err != nil {
 		return Reservation{}, oldConns, err
@@ -897,8 +910,9 @@ func (s *State) PersistenceReservations() map[string]*Reservation {
 }
 
 // MergePersistedReservations is temporary rolling-upgrade compatibility. Safe
-// inventory wins: a persisted record is admitted only when neither its SID nor
-// cgroup was discovered from a live lease/pidfile/cgroup.
+// inventory always supplies the charge. A corroborated legacy record may add
+// only its token to that provisional upper bound so an old client can Reattach;
+// it never replaces or reduces inventory accounting.
 func (s *State) MergePersistedReservations(reservations map[string]*Reservation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -906,10 +920,17 @@ func (s *State) MergePersistedReservations(reservations map[string]*Reservation)
 		if input == nil || token == "" || input.Token != token || input.SandboxID == "" {
 			return fmt.Errorf("invalid persisted reservation %q", token)
 		}
-		if s.bySID[input.SandboxID] != nil {
+		if existing := s.bySID[input.SandboxID]; existing != nil {
+			if _, err := s.attachPersistedTokenLocked(existing, input); err != nil {
+				return err
+			}
 			continue
 		}
 		if input.CgroupPath != "" && s.cgroupToSID[input.CgroupPath] != "" {
+			existing := s.bySID[s.cgroupToSID[input.CgroupPath]]
+			if _, err := s.attachPersistedTokenLocked(existing, input); err != nil {
+				return err
+			}
 			continue
 		}
 		copy := cloneReservation(input)
@@ -921,4 +942,60 @@ func (s *State) MergePersistedReservations(reservations map[string]*Reservation)
 		}
 	}
 	return nil
+}
+
+func (s *State) attachPersistedTokenLocked(live, persisted *Reservation) (bool, error) {
+	if live == nil || !live.Provisional || live.Token != "" || persisted == nil || persisted.Token == "" {
+		return false, nil
+	}
+	corroborated := false
+	if live.SandboxID == persisted.SandboxID &&
+		(live.RecoverySource == RecoveryManagedPIDFile || live.RecoverySource == RecoveryUnknownManaged) {
+		// Managed inventory derives this SID from the node-owned run directory
+		// and a locked pidfile. This is also the only evidence available for a
+		// pre-feature sandbox persisted before its VMM cgroup existed.
+		corroborated = true
+	}
+	if live.RecoverySource != RecoveryCgroup && persisted.PeerPID > 0 {
+		if live.PeerPID <= 0 || live.PeerPID != persisted.PeerPID {
+			return false, nil
+		}
+		corroborated = true
+	}
+	if persisted.CgroupPath != "" && live.CgroupPath != "" {
+		if live.CgroupPath != persisted.CgroupPath {
+			return false, nil
+		}
+		corroborated = true
+	}
+	if !corroborated {
+		return false, nil
+	}
+	if live.RecoverySource != RecoveryCgroup && live.RecoverySource != RecoveryUnknownManaged {
+		if live.Capacity != persisted.Capacity || live.Floor != persisted.Floor {
+			return false, nil
+		}
+	}
+	newSID := live.SandboxID
+	if live.RecoverySource == RecoveryCgroup {
+		newSID = persisted.SandboxID
+	}
+	if sid := s.tokenToSID[persisted.Token]; sid != "" && sid != live.SandboxID && sid != newSID {
+		return false, fmt.Errorf("persisted token already belongs to sandbox %q", sid)
+	}
+	if newSID != live.SandboxID {
+		if s.bySID[newSID] != nil {
+			return false, nil
+		}
+		oldSID := live.SandboxID
+		delete(s.bySID, oldSID)
+		live.SandboxID = newSID
+		s.bySID[newSID] = live
+		if live.CgroupPath != "" && s.cgroupToSID[live.CgroupPath] == oldSID {
+			s.cgroupToSID[live.CgroupPath] = newSID
+		}
+	}
+	live.Token = persisted.Token
+	s.tokenToSID[persisted.Token] = live.SandboxID
+	return true, nil
 }

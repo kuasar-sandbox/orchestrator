@@ -249,6 +249,10 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	if err := os.WriteFile(stale, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	malformed := filepath.Join(resource.LeaseDir(socket), "malformed-stale.json")
+	if err := os.WriteFile(malformed, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	state := NewState(4<<30, 4000, 0, 0, Watermarks{StartupFactor: .5, HighFactor: .85, LowFactor: .7, EmergencyFactor: .05})
 	inventory := &Inventory{ControllerSocket: socket, CgroupScanPaths: []string{root}, Pool: state.AllocatablePool, Logf: t.Logf}
 	if err := inventory.Recover(state); err != nil {
@@ -263,6 +267,9 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale lease not removed: %v", err)
+	}
+	if _, err := os.Stat(malformed); !os.IsNotExist(err) {
+		t.Fatalf("malformed stale lease not removed: %v", err)
 	}
 	valid.send("stop")
 	corrupt.send("stop")

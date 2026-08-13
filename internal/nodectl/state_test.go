@@ -136,6 +136,32 @@ func TestSyncRequiresRecoveredConsumer(t *testing.T) {
 	}
 }
 
+func TestInvalidSyncDoesNotDropRecoveredCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Sync(SyncSpec{
+		Token: "invalid-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor: Resources{MemoryBytes: 128 << 20, CPUMilli: 2000}, StartupMemory: 256 << 20,
+		AppliedMemory: 256 << 20,
+	}); err == nil {
+		t.Fatal("StateSync accepted a CPU floor above capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("invalid StateSync changed recovered charge: before=%+v after=%+v", before, after)
+	}
+	if got := reservationForTest(t, s, "orphan"); !got.Provisional || got.RecoverySource != RecoveryCgroup {
+		t.Fatalf("invalid StateSync replaced recovered cgroup: %+v", got)
+	}
+}
+
 func TestAdmitRetryRequiresSameUnadvancedContract(t *testing.T) {
 	s := makeState(8<<30, 0)
 	spec := AdmitSpec{
@@ -202,6 +228,123 @@ func TestProvisionalAdmitReplayIsAlreadyAccounted(t *testing.T) {
 	}
 	if !s.CanReplayAdmit(spec) {
 		t.Fatal("critical provisional could not be replayed")
+	}
+}
+
+func TestInvalidAdmitDoesNotDropRecoveredCgroup(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ResourceSnapshot()
+	if _, _, err := s.Admit(AdmitSpec{
+		Token: "invalid-token", SandboxID: "real-sid", PeerPID: 200,
+		CgroupPath: "/cg/orphan", Capacity: Resources{MemoryBytes: 128 << 20},
+		InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
+	}); err == nil {
+		t.Fatal("Admit accepted allocation above capacity")
+	}
+	if after := s.ResourceSnapshot(); after != before {
+		t.Fatalf("invalid Admit changed recovered charge: before=%+v after=%+v", before, after)
+	}
+	if got := reservationForTest(t, s, "orphan"); !got.Provisional || got.RecoverySource != RecoveryCgroup {
+		t.Fatalf("invalid Admit replaced recovered cgroup: %+v", got)
+	}
+}
+
+func TestMergePersistedAttachesTokenWithoutReducingManagedUpperBound(t *testing.T) {
+	s := makeState(8<<30, 0)
+	capacity := Resources{MemoryBytes: 2 << 30, CPUMilli: 1000}
+	floor := Resources{MemoryBytes: 128 << 20, CPUMilli: 500}
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "legacy", PeerPID: 101, CgroupPath: "/cg/legacy",
+		Capacity: capacity, Floor: floor, MemoryCharge: capacity.MemoryBytes,
+		StartupCharge: capacity.MemoryBytes, RecoverySource: RecoveryManagedPIDFile,
+		RecoveryKey: "pidfile:legacy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "legacy", PeerPID: 101, CgroupPath: "/cg/legacy",
+		Capacity: capacity, Floor: floor, AllocatableNowMem: 256 << 20,
+		EffectiveStartupBudget: 512 << 20, Stage: StageStartup,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	got := reservationForTest(t, s, "legacy")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != capacity.MemoryBytes ||
+		got.EffectiveStartupBudget != capacity.MemoryBytes {
+		t.Fatalf("merged managed reservation = %+v", got)
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 1 ||
+		snapshot.Allocated.MemoryBytes != capacity.MemoryBytes || snapshot.StartupInFlight != capacity.MemoryBytes {
+		t.Fatalf("legacy token reduced recovery upper bound: %+v", snapshot)
+	}
+	if _, _, found := s.Reattach("legacy-token", nil); !found {
+		t.Fatal("corroborated legacy token could not reattach")
+	}
+}
+
+func TestMergePersistedAttachesTokenAndNamesOrphanWithoutReducingCharge(t *testing.T) {
+	s := makeState(8<<30, 0)
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "orphan", CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 2 << 30}, MemoryCharge: 2 << 30,
+		StartupCharge: 2 << 30, RecoverySource: RecoveryCgroup, RecoveryKey: "cgroup:/cg/orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "real-sid", PeerPID: 101, CgroupPath: "/cg/orphan",
+		Capacity: Resources{MemoryBytes: 4 << 30}, Floor: Resources{MemoryBytes: 128 << 20},
+		AllocatableNowMem: 256 << 20, EffectiveStartupBudget: 512 << 20, Stage: StageStartup,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := s.SnapshotSandboxResource("orphan"); found {
+		t.Fatal("synthetic orphan SID remained after legacy identity was corroborated")
+	}
+	got := reservationForTest(t, s, "real-sid")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != 2<<30 {
+		t.Fatalf("merged orphan reservation = %+v", got)
+	}
+	if snapshot := s.ResourceSnapshot(); snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != 2<<30 {
+		t.Fatalf("legacy token reduced orphan cgroup charge: %+v", snapshot)
+	}
+}
+
+func TestMergePersistedAttachesEarlyLegacyTokenToUnknownManagedUpperBound(t *testing.T) {
+	s := makeState(8<<30, 0)
+	pool := s.AllocatablePool.MemoryBytes
+	if err := s.InstallProvisional(ProvisionalSpec{
+		SandboxID: "legacy-starting", PeerPID: 101,
+		Capacity: s.AllocatablePool, Floor: Resources{CPUMilli: s.AllocatablePool.CPUMilli},
+		MemoryCharge: pool, StartupCharge: pool, RecoverySource: RecoveryUnknownManaged,
+		RecoveryKey: "unknown-managed:/run/legacy-starting.pid",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &Reservation{
+		Token: "legacy-token", SandboxID: "legacy-starting",
+		Capacity:          Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		AllocatableNowMem: 256 << 20, EffectiveStartupBudget: 512 << 20, Stage: StageAdmitted,
+	}
+	if err := s.MergePersistedReservations(map[string]*Reservation{"legacy-token": persisted}); err != nil {
+		t.Fatal(err)
+	}
+	got := reservationForTest(t, s, "legacy-starting")
+	if !got.Provisional || got.Token != "legacy-token" || got.AllocatableNowMem != pool {
+		t.Fatalf("merged early managed reservation = %+v", got)
+	}
+	if _, _, found := s.Reattach("legacy-token", nil); !found {
+		t.Fatal("early pre-feature sandbox could not reattach")
 	}
 }
 

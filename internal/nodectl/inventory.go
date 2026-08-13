@@ -83,41 +83,67 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		lease, owner, locked, err := resource.InspectLease(path)
-		if err != nil {
-			if locked {
-				controlPIDs[owner] = true
-				if installErr := i.installUnknownLease(state, path, owner, err); installErr != nil {
-					return installErr
+		for {
+			lease, owner, locked, err := resource.InspectLease(path)
+			if err != nil {
+				if locked {
+					controlPIDs[owner] = true
+					if installErr := i.installUnknownLease(state, path, owner, err); installErr != nil {
+						return installErr
+					}
+					break
+				}
+				removed, removeErr := resource.RemoveUnlockedLease(path)
+				if removeErr != nil {
+					return fmt.Errorf("remove malformed stale lease %s: %w", path, removeErr)
+				}
+				if removed {
+					break
+				}
+				if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+					break
+				} else if statErr != nil {
+					return fmt.Errorf("restat malformed lease %s: %w", path, statErr)
+				}
+				// The pathname changed or gained an owner between InspectLease and
+				// cleanup. Re-inspect until it is either charged or safely removed.
+				continue
+			}
+			if !locked {
+				removed, removeErr := resource.RemoveUnlockedLease(path)
+				if removeErr != nil {
+					return fmt.Errorf("remove stale lease %s: %w", path, removeErr)
+				}
+				if removed {
+					break
+				}
+				if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+					break
+				} else if statErr != nil {
+					return fmt.Errorf("restat stale lease %s: %w", path, statErr)
 				}
 				continue
 			}
-			return fmt.Errorf("inspect lease %s: %w", path, err)
-		}
-		if !locked {
-			if _, err := resource.RemoveUnlockedLease(path); err != nil {
-				return fmt.Errorf("remove stale lease %s: %w", path, err)
+			controlPIDs[owner] = true
+			if lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
+				entry.Name() != resource.LeaseFilename(lease.SandboxID) || !i.cgroupAllowed(lease.CgroupPath) {
+				if err := i.installUnknownLease(state, path, owner, nil); err != nil {
+					return err
+				}
+				break
 			}
-			continue
-		}
-		controlPIDs[owner] = true
-		if lease.PID != owner || lease.ControllerSocket != i.ControllerSocket ||
-			entry.Name() != resource.LeaseFilename(lease.SandboxID) || !i.cgroupAllowed(lease.CgroupPath) {
-			if err := i.installUnknownLease(state, path, owner, nil); err != nil {
-				return err
+			err = state.InstallProvisional(ProvisionalSpec{
+				SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
+				Capacity:     Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
+				Floor:        Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
+				MemoryCharge: lease.CapacityMemory, StartupCharge: lease.CapacityMemory,
+				RecoverySource: RecoveryLease, RecoveryKey: "lease:" + entry.Name(),
+				LeasePath: path, ClientFeatures: lease.ClientFeatures,
+			})
+			if err != nil {
+				return fmt.Errorf("install lease %s: %w", path, err)
 			}
-			continue
-		}
-		err = state.InstallProvisional(ProvisionalSpec{
-			SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
-			Capacity:     Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
-			Floor:        Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
-			MemoryCharge: lease.CapacityMemory, StartupCharge: lease.CapacityMemory,
-			RecoverySource: RecoveryLease, RecoveryKey: "lease:" + entry.Name(),
-			LeasePath: path, ClientFeatures: lease.ClientFeatures,
-		})
-		if err != nil {
-			return fmt.Errorf("install lease %s: %w", path, err)
+			break
 		}
 	}
 	return nil
