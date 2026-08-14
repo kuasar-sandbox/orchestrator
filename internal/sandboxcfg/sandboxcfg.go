@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -55,14 +54,6 @@ type NetworkSpec struct {
 	TransitMAC       string   `json:"transit_mac,omitempty" yaml:"transit_mac,omitempty"`
 }
 
-// ResourceSpec is the tenant resource override. Capacity is honored only for img
-// templates; snp restore pins capacity to the snapshot (the runtime refuses a
-// mismatch), so the caller drops a snp capacity override.
-type ResourceSpec struct {
-	Capacity    *rtconfig.CapacityConfig    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
-	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
-}
-
 // RestoreSpec is the tenant-selectable restore prefetch request.
 type RestoreSpec struct {
 	Prefetch string `json:"prefetch,omitempty"`
@@ -89,7 +80,7 @@ func (t TapFD) runtime() rtconfig.TapFDConfig {
 // kuasar-sandbox.<ns> metadata keys. It excludes node-managed fields (boot,
 // resources.control, network.tapfd) — those are the orchestrator's.
 type SandboxSpec struct {
-	Resource ResourceSpec
+	Resource ResourcePatch
 	Network  NetworkSpec
 	Restore  RestoreSpec
 	Launch   *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
@@ -116,8 +107,12 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 		}
 		return nil
 	}
-	if err := dec(NsResource, &s.Resource); err != nil {
-		return s, err
+	if raw, present := meta[NsResource]; present {
+		var err error
+		s.Resource, err = ParseResourcePatch(raw)
+		if err != nil {
+			return s, err
+		}
 	}
 	if err := dec(NsNetwork, &s.Network); err != nil {
 		return s, err
@@ -218,54 +213,55 @@ func parseRestore(raw string) (RestoreSpec, error) {
 	return restore, nil
 }
 
-// capacityJSON is the canonical snake_case JSON shape for the resource capacity,
-// matching the config yaml tags (rtconfig.CapacityConfig has no json tags). Used to
-// emit a well-formed kuasar-sandbox.resource value from register/trigger cpu/memory.
-type capacityJSON struct {
-	CPU    int    `json:"cpu,omitempty"`
-	Memory string `json:"memory,omitempty"`
-}
-
-// SetCapacity folds an e2b register/trigger cpuCount/memoryMB into meta as the
-// resource namespace capacity (it wins over a resource header — the capacity-only
-// resource overwrites any prior resource value). Zero cpu and memory => no-op.
-// memoryMiB is treated as MiB (the config size unit). Returns the merged map.
-func SetCapacity(meta map[string]string, cpu, memoryMiB int) map[string]string {
-	if cpu <= 0 && memoryMiB <= 0 {
-		return meta
-	}
-	var cap capacityJSON
-	if cpu > 0 {
-		cap.CPU = cpu
-	}
-	if memoryMiB > 0 {
-		cap.Memory = fmt.Sprintf("%dMiB", memoryMiB)
-	}
-	b, err := json.Marshal(struct {
-		Capacity capacityJSON `json:"capacity"`
-	}{cap})
-	if err != nil {
-		return meta
-	}
-	if meta == nil {
-		meta = map[string]string{}
-	}
-	meta[NsResource] = string(b)
-	return meta
-}
-
 // MergeMetadata overlays over onto base per key (over wins) — used to layer a
-// create's config namespaces over a template's. Returns nil when both are empty.
-func MergeMetadata(base, over map[string]string) map[string]string {
-	return mergeStr(base, over)
+// Resource is the sole exception: its validated leaves are overlaid independently
+// and persisted as canonical JSON. Both layers are parsed before overlay so an
+// invalid lower-priority value cannot be hidden by a valid higher-priority one.
+func MergeMetadata(base, over map[string]string) (map[string]string, error) {
+	out := mergeStr(base, over)
+	baseRaw, basePresent := base[NsResource]
+	overRaw, overPresent := over[NsResource]
+	if !basePresent && !overPresent {
+		return out, nil
+	}
+	var basePatch, overPatch ResourcePatch
+	var err error
+	if basePresent {
+		basePatch, err = ParseResourcePatch(baseRaw)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if overPresent {
+		overPatch, err = ParseResourcePatch(overRaw)
+		if err != nil {
+			return nil, err
+		}
+	}
+	merged, err := MergeResourcePatch(basePatch, overPatch)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := MarshalResourcePatch(merged)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = map[string]string{}
+	}
+	out[NsResource] = canonical
+	return out, nil
 }
 
 // MergeCreateMetadata layers request configuration over template, group, or
 // placement defaults while keeping restore policy, credentials, and checkpoint
 // policy request-scoped. Only namespaces explicitly present in request are
 // admitted for those values.
-func MergeCreateMetadata(defaults, request map[string]string) map[string]string {
-	out := mergeStr(defaults, request)
+func MergeCreateMetadata(defaults, request map[string]string) (map[string]string, error) {
+	out, err := MergeMetadata(defaults, request)
+	if err != nil {
+		return nil, err
+	}
 	for _, ns := range []string{NsRestore, NsCredentials, NsCheckpoint, NsMMDS} {
 		delete(out, ns)
 		if raw, ok := request[ns]; ok {
@@ -275,7 +271,7 @@ func MergeCreateMetadata(defaults, request map[string]string) map[string]string 
 			out[ns] = raw
 		}
 	}
-	return out
+	return out, nil
 }
 
 // validate format-checks the tenant network fields (CIDR / IP / MAC).
@@ -308,19 +304,17 @@ func (n NetworkSpec) IsZero() bool {
 // Params is everything needed to render one sandbox's config: the node-managed base
 // inputs plus the resolved logical network and the parsed tenant Spec.
 type Params struct {
-	Sandbox          *types.Sandbox
-	Template         types.TemplateID
-	Runtime          string // erofs path (file path, no scheme)
-	Kernel           string // vmlinux path
-	OverlayDiffTpl   string // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
-	TapFD            TapFD
-	EnvVars          map[string]string // create-time launch env
-	VCPU             int               // resources.capacity.cpu (already resolved: snapshot-pinned for restore)
-	Memory           string            // resources.capacity.memory
-	ControllerSocket string            // resources.control.controller (sentinel UDS; "" = static cgroup)
-	Network          NetworkSpec       // RESOLVED logical network (create ?? snapshot ?? defaults)
-	MMDSEnabled      bool
-	Spec             SandboxSpec // parsed tenant override (launch[bare]/init/mounts/files/metadata/resource)
+	Sandbox        *types.Sandbox
+	Template       types.TemplateID
+	Runtime        string // erofs path (file path, no scheme)
+	Kernel         string // vmlinux path
+	OverlayDiffTpl string // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
+	TapFD          TapFD
+	EnvVars        map[string]string        // create-time launch env
+	Resources      rtconfig.ResourcesConfig // fully resolved node + tenant + restore policy
+	Network        NetworkSpec              // RESOLVED logical network (create ?? snapshot ?? defaults)
+	MMDSEnabled    bool
+	Spec           SandboxSpec // parsed tenant override except resources, resolved above
 }
 
 // WriteYAML renders the SANDBOX_CONFIG and writes it to path (0600).
@@ -344,35 +338,10 @@ func (p Params) BuildYAML() ([]byte, error) {
 func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	c := &rtconfig.SandboxConfig{}
 
-	// --- resources ---
-	c.Resources.Capacity = rtconfig.CapacityConfig{CPU: p.VCPU, Memory: p.Memory}
-	// Capacity override applies only to img cold boot; snp restore pins to the
-	// snapshot (the caller already drops a snp override before reaching here).
-	if p.Template.Kind == types.KindImg && p.Spec.Resource.Capacity != nil {
-		if cap := p.Spec.Resource.Capacity; cap.CPU > 0 {
-			c.Resources.Capacity.CPU = cap.CPU
-		}
-		if p.Spec.Resource.Capacity.Memory != "" {
-			c.Resources.Capacity.Memory = p.Spec.Resource.Capacity.Memory
-		}
-	}
-	c.Resources.Allocatable = rtconfig.AllocatableConfig{CPU: float64(c.Resources.Capacity.CPU), Memory: c.Resources.Capacity.Memory}
-	if a := p.Spec.Resource.Allocatable; a != nil {
-		if a.CPU > 0 {
-			c.Resources.Allocatable.CPU = a.CPU
-		}
-		if a.Memory != "" {
-			c.Resources.Allocatable.Memory = a.Memory
-		}
-	}
-	if p.ControllerSocket != "" {
-		controllerSocket, err := filepath.Abs(p.ControllerSocket)
-		if err != nil {
-			return nil, fmt.Errorf("resolve resource controller socket: %w", err)
-		}
-		// run-sandbox supplies cgroup_path as a node-owned inherited VMM FD.
-		c.Resources.Control.Controller = controllerSocket
-	}
+	// Resources were resolved and cross-validated before any network attach or
+	// runner assignment. The renderer installs that single authoritative value;
+	// run-sandbox adds only the inherited cgroup capability at exec time.
+	c.Resources = p.Resources
 
 	// --- boot ---
 	c.Boot.Kernel = "file://" + p.Kernel

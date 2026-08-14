@@ -771,7 +771,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if binding != nil && string(template.Profile) != binding.Profile {
 			return errors.New("registry: replacement profile mismatch")
 		}
-		config := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
+		config, err := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
 		config, err = attachCreateCredentials(config, template.Profile, selectedCredentials)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
@@ -914,6 +917,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 // are parsed once and removed from ordinary config at this boundary.
 func normalizeSandboxReserveConfig(config map[string]string) (map[string]string, *sandboxcfg.Credentials, error) {
 	config, err := sandboxcfg.NormalizeRestoreMetadata(config)
+	if err != nil {
+		return nil, nil, err
+	}
+	config, err = sandboxcfg.NormalizeResourceMetadata(config)
 	if err != nil {
 		return nil, nil, err
 	}

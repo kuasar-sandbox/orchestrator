@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func TestResourceListenDefaultsScanManagedRunnerSlice(t *testing.T) {
@@ -15,6 +17,208 @@ func TestResourceListenDefaultsScanManagedRunnerSlice(t *testing.T) {
 	want := "/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice"
 	if len(cfg.CgroupScanPaths) != 1 || cfg.CgroupScanPaths[0] != want {
 		t.Fatalf("cgroup scan paths = %v, want [%s]", cfg.CgroupScanPaths, want)
+	}
+}
+
+func TestLoadNestedSandboxResourcePolicyAndDefaults(t *testing.T) {
+	base := `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`
+	defaults, err := Load(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := defaults.Sandbox.Resources.Policy()
+	if policy.Capacity.CPU != 2 || policy.Capacity.Memory != "2GiB" ||
+		policy.Allocatable.CPU != nil || policy.Allocatable.Memory != "256MiB" ||
+		policy.Startup != nil || policy.Overhead.Memory != "32MiB" {
+		t.Fatalf("resource defaults = %+v", policy)
+	}
+
+	configured, err := Load(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+resource_listen:
+  enabled: true
+sandbox:
+  resources:
+    capacity:
+      cpu: 4
+      memory: 8GiB
+    allocatable:
+      cpu: 1.5
+      memory: 512MiB
+    startup:
+      memory: 1GiB
+    overhead:
+      memory: 64MiB
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy = configured.Sandbox.Resources.Policy()
+	if policy.Capacity.CPU != 4 || policy.Capacity.Memory != "8GiB" ||
+		policy.Allocatable.CPU == nil || *policy.Allocatable.CPU != 1.5 ||
+		policy.Allocatable.Memory != "512MiB" || policy.Startup == nil ||
+		policy.Startup.Memory != "1GiB" || policy.Overhead.Memory != "64MiB" {
+		t.Fatalf("configured resource policy = %+v", policy)
+	}
+}
+
+func TestLoadRejectsOldAndRuntimeOwnedSandboxResourceFields(t *testing.T) {
+	base := `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  resources:
+%s
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`
+	tests := map[string]string{
+		"vcpu":           "    vcpu: 2",
+		"memory":         "    memory: 2GiB",
+		"control_socket": "    control_socket: /run/controller.sock",
+		"control":        "    control: {}",
+		"watermark":      "    watermark_high: {}",
+		"sensor":         "    sensor: {}",
+		"deflate":        "    allocatable:\n      deflate_on_oom: false",
+		"unknown":        "    future: {}",
+	}
+	for name, fields := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, fmt.Sprintf(base, fields)))
+			if err == nil {
+				t.Fatalf("Load error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadValidatesSandboxResourcePolicyBeforeServe(t *testing.T) {
+	base := `
+api:
+  domain: example.test
+encryption_key: test-key
+%s
+sandbox:
+  resources:
+%s
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.bundle
+`
+	tests := map[string]struct {
+		resourceListen string
+		resources      string
+		path           string
+	}{
+		"static startup":      {resources: "    startup:\n      memory: 1GiB", path: "startup"},
+		"bad capacity memory": {resources: "    capacity:\n      memory: nope", path: "capacity.memory"},
+		"zero alloc memory":   {resources: "    allocatable:\n      memory: 0", path: "allocatable.memory"},
+		"alloc memory above capacity": {
+			resources: "    capacity:\n      memory: 128MiB\n    allocatable:\n      memory: 256MiB", path: "allocatable.memory",
+		},
+		"alloc cpu above capacity": {
+			resources: "    capacity:\n      cpu: 1\n    allocatable:\n      cpu: 2", path: "allocatable.cpu",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, fmt.Sprintf(base, test.resourceListen, test.resources)))
+			if err == nil || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("Load error = %v, want %q", err, test.path)
+			}
+		})
+	}
+}
+
+func TestLoadAllowsNodeStartupToBeNormalizedPerFinalSandbox(t *testing.T) {
+	for name, startup := range map[string]string{"below floor": "512MiB", "above capacity": "4GiB"} {
+		t.Run(name, func(t *testing.T) {
+			loaded, err := Load(writeConfig(t, `
+api: { domain: example.test }
+encryption_key: test-key
+resource_listen: { enabled: true }
+sandbox:
+  resources:
+    allocatable: { memory: 1GiB }
+    startup: { memory: `+startup+` }
+  boot: { kernel: /kernel, runtime: /runtime }
+`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
+				Node: loaded.Sandbox.Resources.Policy(), Dynamic: true,
+				ControllerSocketIdentity: "/run/resource.sock",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "1GiB"
+			if name == "above capacity" {
+				want = "2GiB"
+			}
+			if resources.Startup == nil || resources.Startup.Memory != want {
+				t.Fatalf("normalized startup = %+v, want %s", resources.Startup, want)
+			}
+		})
+	}
+}
+
+func TestLoadDistinguishesInheritedAndExplicitFloorAboveNodeCapacity(t *testing.T) {
+	base := `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  resources:
+    capacity: { cpu: 1, memory: 128MiB }
+%s
+  boot: { kernel: /kernel, runtime: /runtime }
+`
+	inherited, err := Load(writeConfig(t, fmt.Sprintf(base, "")))
+	if err != nil {
+		t.Fatalf("omitted inherited floor: %v", err)
+	}
+	resolved, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
+		Node: inherited.Sandbox.Resources.Policy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Allocatable.Memory != "128MiB" {
+		t.Fatalf("inherited floor = %s, want capacity 128MiB", resolved.Allocatable.Memory)
+	}
+	patch, err := sandboxcfg.ParseResourcePatch(`{"capacity":{"memory":"512MiB"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raised, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
+		Node: inherited.Sandbox.Resources.Policy(), Patch: patch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raised.Allocatable.Memory != "256MiB" {
+		t.Fatalf("inherited default was permanently clamped: %s", raised.Allocatable.Memory)
+	}
+
+	_, err = Load(writeConfig(t, fmt.Sprintf(base, "    allocatable: { memory: 256MiB }")))
+	if err == nil || !strings.Contains(err.Error(), "allocatable.memory") {
+		t.Fatalf("explicit floor above node capacity error = %v", err)
 	}
 }
 

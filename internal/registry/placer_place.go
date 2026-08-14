@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +77,9 @@ func (p *HTTPPlacer) Place(ctx context.Context, req PlaceRequest) (*Placement, e
 			return placement, nil
 		}
 		if err != nil {
+			if errors.Is(err, errInvalidSandboxConfig) {
+				return nil, err
+			}
 			last = err
 		}
 	}
@@ -124,6 +128,9 @@ func (p *HTTPPlacer) placeOne(ctx context.Context, peer PlacerPeer, req PlaceReq
 		return nil, err
 	}
 	if out.Error != "" {
+		if out.InvalidConfig {
+			return nil, fmt.Errorf("%w: %s", errInvalidSandboxConfig, out.Error)
+		}
 		return nil, fmt.Errorf("placer_link place: %s", out.Error)
 	}
 	if out.NoNode || out.NodeID == "" {

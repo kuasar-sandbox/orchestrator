@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,6 +70,7 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
+	cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.MaterializedNodeResourcePolicy(cfg.Sandbox.Resources.Policy()))
 	if resolve && cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
 		r, rerr := nodectl.Resolve(cfg.ResourceListen)
 		if rerr != nil {
@@ -139,10 +141,12 @@ paths:
 sandbox:                                          # sandbox-instance defaults
   timeout_sec: 300
   resources:
-    vcpu: 2
-    memory: 2GiB
-    # control_socket: /run/sandbox-resource.sock  # resource-controller UDS (opt-in); omit = static cgroup.
-    #                                              # Set this to resource_listen.socket when hosting the controller below.
+    capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
+    allocatable:
+      # cpu: 2                                    # omitted => follows final capacity.cpu
+      memory: 256MiB                              # steady-state floor
+    # startup: { memory: 512MiB }                 # dynamic only; omitted => final capacity.memory
+    overhead: { memory: 32MiB }                   # node-owned VMM/control-plane headroom
   network:
     switch: sw0
     # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # persistent TAPFD/1 PREPARE/OPEN/RELEASE; connector: vswitch serve --tapfd-listen <same path>
@@ -189,13 +193,14 @@ builder:                                           # builds run INSIDE build san
   #   access_key: ""                                        # empty → AWS default chain
   #   secret_key: ""
 # resource_listen: optional in-process node resource controller (admission / budget /
-# density; sandbox-ctl dials its socket). Absent/disabled = static cgroup. The tuning
+# density; socket is the sole endpoint and its canonical identity is injected into
+# sandbox YAML + lease/inventory). Absent/disabled = static cgroup. The tuning
 # is inlined here (no separate file). Inspect / operate with:
 # node-ctl resource {status|list|drain|grant|reclaim}.
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
-#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
+#   # Advanced tuning — all defaulted (node-resource.md §3.3); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandboxes]

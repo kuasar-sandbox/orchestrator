@@ -8,6 +8,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -58,7 +59,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if !req.Profile.Valid() {
 		return nil, fmt.Errorf("registry: unknown build profile %q", req.Profile)
 	}
-	metadata, err := clusterstate.WithObjectLocation(req.Metadata, clusterstate.ObjectLocation{Group: req.Group})
+	metadata, err := sandboxcfg.NormalizeResourceMetadata(req.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+	}
+	metadata, err = clusterstate.WithObjectLocation(metadata, clusterstate.ObjectLocation{Group: req.Group})
 	if err != nil {
 		return nil, err
 	}

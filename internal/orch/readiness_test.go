@@ -508,7 +508,7 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	}
 }
 
-func TestFailedCreateBeforeAssignmentRollsBackToDead(t *testing.T) {
+func TestFailedCreatePreflightHasNoDurableOrRunnerSideEffects(t *testing.T) {
 	lc := &countingLauncher{}
 	cfg := &config.Config{}
 	cfg.Sandbox.Network.Bare.InnerIP = "invalid"
@@ -519,8 +519,11 @@ func TestFailedCreateBeforeAssignmentRollsBackToDead(t *testing.T) {
 		t.Fatal("launch with invalid network succeeded")
 	}
 	stored, err := o.st.Get(ctx, sb.ID)
-	if err != nil || stored == nil || stored.State != types.StateDead || stored.RunID != "" {
-		t.Fatalf("pre-assignment failure = %+v, %v; want unassigned dead", stored, err)
+	if err != nil || stored != nil {
+		t.Fatalf("preflight failure persisted sandbox = %+v, %v", stored, err)
+	}
+	if lc.starts.Load() != 0 {
+		t.Fatalf("preflight failure started %d runners", lc.starts.Load())
 	}
 }
 

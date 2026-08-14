@@ -38,11 +38,12 @@ var configHeaderNs = []struct{ header, metaKey string }{
 }
 
 const (
-	builderHeader     = "X-Kuasar-Sandbox-Builder"
-	restoreHeader     = "X-Kuasar-Sandbox-Restore"
-	credentialsHeader = "X-Kuasar-Sandbox-Credentials"
-	checkpointHeader  = "X-Kuasar-Sandbox-Checkpoint"
-	mmdsHeader        = "X-Kuasar-Sandbox-MMDS"
+	builderHeader      = "X-Kuasar-Sandbox-Builder"
+	clusterGroupHeader = "X-Kuasar-Sandbox-Group"
+	restoreHeader      = "X-Kuasar-Sandbox-Restore"
+	credentialsHeader  = "X-Kuasar-Sandbox-Credentials"
+	checkpointHeader   = "X-Kuasar-Sandbox-Checkpoint"
+	mmdsHeader         = "X-Kuasar-Sandbox-MMDS"
 )
 
 func singleOptionalHeader(h http.Header, name string) (*string, error) {
@@ -66,25 +67,45 @@ func pickInt(a, b int) int {
 	return b
 }
 
-// mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta, the header
-// overriding an e2b metadata key of the same namespace. Returns the merged map
-// (allocating one only if a header is present and meta was nil).
-func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string {
+// mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta. Resource
+// leaves merge independently; every other namespace retains whole-value header
+// precedence. Presence is checked explicitly so an empty resource header fails
+// strict parsing instead of disappearing.
+func mergeConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
+	out, err := sandboxcfg.MergeMetadata(nil, meta)
+	if err != nil {
+		return nil, err
+	}
 	for _, m := range configHeaderNs {
-		v := h.Get(m.header)
-		if v == "" {
+		values, present := h[http.CanonicalHeaderKey(m.header)]
+		if !present {
 			continue
 		}
-		if meta == nil {
-			meta = map[string]string{}
+		value := h.Get(m.header)
+		if m.metaKey == sandboxcfg.NsResource {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("%s must appear exactly once", m.header)
+			}
+			value = values[0]
+		} else if value == "" {
+			// Preserve the existing whole-namespace header behavior outside
+			// resource: an empty generic config header is absent.
+			continue
 		}
-		meta[m.metaKey] = v
+		out, err = sandboxcfg.MergeMetadata(out, map[string]string{m.metaKey: value})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", m.header, err)
+		}
 	}
-	return meta
+	return out, nil
 }
 
 func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
-	meta = mergeConfigHeaders(meta, h)
+	var err error
+	meta, err = mergeConfigHeaders(meta, h)
+	if err != nil {
+		return nil, err
+	}
 	for _, item := range []struct{ header, metaKey string }{
 		{restoreHeader, sandboxcfg.NsRestore},
 		{credentialsHeader, sandboxcfg.NsCredentials},
@@ -134,15 +155,19 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	return meta, nil
 }
 
-func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]string {
-	meta = mergeConfigHeaders(meta, h)
+func mergeBuildConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
+	var err error
+	meta, err = mergeConfigHeaders(meta, h)
+	if err != nil {
+		return nil, err
+	}
 	if v := h.Get(builderHeader); v != "" {
 		if meta == nil {
 			meta = map[string]string{}
 		}
 		meta[buildcfg.NsBuilder] = v
 	}
-	return meta
+	return meta, nil
 }
 
 // ErrAlreadyPaused is returned by Core.Pause when the sandbox is already paused.
@@ -219,8 +244,8 @@ type TriggerSpec struct {
 	Steps        []types.TemplateStep
 	StartCmd     string
 	ReadyCmd     string
-	// Metadata is the trigger-time template config (kuasar-sandbox.<ns> keys from
-	// cpu/memory + X-Kuasar-Sandbox-* headers); it overrides the register-time config.
+	// Metadata carries only the temporary E2B capacity leaves and build-only
+	// namespace still owned by #97. Generic trigger-time sandbox config is rejected.
 	Metadata map[string]string
 }
 
@@ -517,7 +542,10 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 		Timeout  int               `json:"timeout"`
 		Metadata map[string]string `json:"metadata"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
 	// CONNECT must let an already-existing target ignore MMDS input completely.
 	// Defer duplicate/value validation to the standalone import path; an empty
 	// sentinel is malformed if import really happens and harmless if ignored.
@@ -723,8 +751,16 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
 	// into the resource namespace (cpu/memory win over a resource header).
-	meta := mergeBuildConfigHeaders(body.Metadata, r.Header)
-	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	meta, err := mergeBuildConfigHeaders(body.Metadata, r.Header)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, err = sandboxcfg.ApplyCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	mmdsValue, err := singleOptionalHeader(r.Header, mmdsHeader)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -786,12 +822,8 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad body")
 		return
 	}
-	if _, present := r.Header[http.CanonicalHeaderKey(mmdsHeader)]; present {
-		writeErr(w, http.StatusBadRequest, "Build Trigger must not override MMDS configuration")
-		return
-	}
-	if _, present := body.Metadata[sandboxcfg.NsMMDS]; present {
-		writeErr(w, http.StatusBadRequest, "Build Trigger must not override MMDS configuration")
+	if len(body.Metadata) != 0 || hasTriggerSandboxConfigHeader(r.Header) {
+		writeErr(w, http.StatusBadRequest, "trigger-time sandbox metadata is deprecated; configure template metadata at registration")
 		return
 	}
 	startCmd := body.StartCmd
@@ -810,10 +842,19 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		RegistryUsername: body.FromImageRegistry.Username,
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
-	// Trigger-time template config overrides register: headers + e2b cpu/memory.
-	meta := mergeBuildConfigHeaders(nil, r.Header)
-	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
-	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
+	// Generic trigger-time sandbox config is rejected above. Keep only the
+	// build-only header owned by #97 and E2B's temporary first-class capacity
+	// leaves; TriggerBuild leaf-merges those with registration metadata.
+	var meta map[string]string
+	if v := r.Header.Get(builderHeader); v != "" {
+		meta = map[string]string{buildcfg.NsBuilder: v}
+	}
+	meta, err := sandboxcfg.ApplyCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	err = a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
 		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
 			FromImage:    body.FromImage,
 			FromTemplate: body.FromTemplate,
@@ -834,6 +875,17 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(202)
+}
+
+func hasTriggerSandboxConfigHeader(header http.Header) bool {
+	for name := range header {
+		if strings.HasPrefix(strings.ToLower(name), "x-kuasar-sandbox-") &&
+			!strings.EqualFold(name, builderHeader) &&
+			!strings.EqualFold(name, clusterGroupHeader) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildFiles is the e2b v2 build-files endpoint (COPY contexts by hash): the
