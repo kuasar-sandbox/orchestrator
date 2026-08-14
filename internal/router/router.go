@@ -41,6 +41,7 @@ import (
 const (
 	HeaderGroup       = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
+	HeaderResource    = "X-Kuasar-Sandbox-Resource"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
 	HeaderCheckpoint  = "X-Kuasar-Sandbox-Checkpoint"
@@ -368,11 +369,11 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// createSandboxMetadata selects request-scoped restore, credential, and
-// checkpoint objects from the cluster create request. Restore and credential
-// headers replace their whole body objects. Checkpoint is overlaid fieldwise.
-// The body is still decoded when present so malformed lower-priority checkpoint
-// metadata cannot bypass the shared strict parser.
+// createSandboxMetadata selects portable resource plus request-scoped restore,
+// credential, and checkpoint objects from the cluster create request. Resource
+// headers overlay leaves; restore and credential headers replace whole objects;
+// checkpoint is overlaid fieldwise. The body is always decoded and validated so
+// a valid higher-priority header cannot hide malformed lower-priority metadata.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
@@ -405,6 +406,17 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 		}
 	}
 	selected := map[string]string{}
+	var bodyResource map[string]string
+	if raw, ok := body.Metadata[sandboxcfg.NsResource]; ok {
+		bodyResource = map[string]string{sandboxcfg.NsResource: raw}
+	}
+	mergedResource, err := mergeResourceHeader(bodyResource, r.Header)
+	if err != nil {
+		return nil, err
+	}
+	if raw, ok := mergedResource[sandboxcfg.NsResource]; ok {
+		selected[sandboxcfg.NsResource] = raw
+	}
 	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
 		selected[sandboxcfg.NsRestore] = raw
 	}
@@ -443,7 +455,7 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	if len(selected) == 0 {
 		return nil, nil
 	}
-	selected, err := sandboxcfg.NormalizeRestoreMetadata(selected)
+	selected, err = sandboxcfg.NormalizeRestoreMetadata(selected)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +478,21 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 		cleaned[sandboxcfg.NsCredentials] = string(canonical)
 	}
 	return cleaned, nil
+}
+
+func mergeResourceHeader(metadata map[string]string, header http.Header) (map[string]string, error) {
+	values, present := header[http.CanonicalHeaderKey(HeaderResource)]
+	if !present {
+		return sandboxcfg.MergeMetadata(nil, metadata)
+	}
+	if len(values) != 1 {
+		return nil, fmt.Errorf("%s must appear exactly once", HeaderResource)
+	}
+	merged, err := sandboxcfg.MergeMetadata(metadata, map[string]string{sandboxcfg.NsResource: values[0]})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", HeaderResource, err)
+	}
+	return merged, nil
 }
 
 func createHeaderValue(header http.Header, name string) (string, bool) {
@@ -500,13 +527,19 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name     string   `json:"name"`
-		Tags     []string `json:"tags"`
-		Profile  string   `json:"profile"`
-		CPUCount int      `json:"cpuCount"`
-		MemoryMB int      `json:"memoryMB"`
+		Name       string            `json:"name"`
+		Tags       []string          `json:"tags"`
+		Profile    string            `json:"profile"`
+		CPUCount   int               `json:"cpuCount"`
+		CPUCountSn int               `json:"cpu_count"`
+		MemoryMB   int               `json:"memoryMB"`
+		MemoryMBSn int               `json:"memory_mb"`
+		Metadata   map[string]string `json:"metadata"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "bad body", http.StatusBadRequest)
+		return
+	}
 	profile := types.ProfileE2B
 	if body.Profile != "" {
 		var err error
@@ -516,14 +549,33 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var resources *buildResources
-	if body.CPUCount > 0 || body.MemoryMB > 0 {
-		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
+	cpuCount, memoryMB := body.CPUCount, body.MemoryMB
+	if cpuCount == 0 {
+		cpuCount = body.CPUCountSn
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources)
+	if memoryMB == 0 {
+		memoryMB = body.MemoryMBSn
+	}
+	var resourceMetadata map[string]string
+	if raw, present := body.Metadata[sandboxcfg.NsResource]; present {
+		resourceMetadata = map[string]string{sandboxcfg.NsResource: raw}
+	}
+	resourceMetadata, err := mergeResourceHeader(resourceMetadata, r.Header)
+	if err == nil {
+		resourceMetadata, err = sandboxcfg.ApplyCapacity(resourceMetadata, cpuCount, memoryMB)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var resources *buildResources
+	if cpuCount > 0 || memoryMB > 0 {
+		resources = &buildResources{CPU: cpuCount * 1000, Mem: int64(memoryMB) << 20}
+	}
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, resourceMetadata)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
 		return
 	}
 	rt.buildsMu.Lock()
@@ -1555,9 +1607,9 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata map[string]string) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources,
+		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources, "metadata": metadata,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
@@ -1566,7 +1618,10 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("route_link reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &routeLinkCallError{
+			status: resp.StatusCode, path: registry.RouteLinkReserveBuildPath,
+			response: resp.Status, body: strings.TrimSpace(string(b)),
+		}
 	}
 	var res buildReserveResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {

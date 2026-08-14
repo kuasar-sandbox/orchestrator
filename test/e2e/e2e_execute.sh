@@ -342,6 +342,107 @@ wait_resource_status() { # $1=sid, $2=expected status
     return 1
 }
 
+assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup|-, $4=controller|-, $5=floor(default 256MiB), $6=deflate(default true)|-
+    local floor_memory="${5:-256MiB}"
+    local deflate="${6:-true}"
+    python3 - "$1" "$2" "$3" "$4" "$floor_memory" "$deflate" <<'PY'
+import re
+import sys
+
+path, capacity_memory, startup_memory, controller, floor_memory, deflate = sys.argv[1:]
+values = {}
+stack = []
+for raw in open(path, encoding="utf-8"):
+    line = raw.split("#", 1)[0].rstrip()
+    if not line.strip() or line.lstrip().startswith("-") or ":" not in line:
+        continue
+    indent = len(line) - len(line.lstrip(" "))
+    key, value = line.strip().split(":", 1)
+    while stack and indent <= stack[-1][0]:
+        stack.pop()
+    dotted = ".".join([entry[1] for entry in stack] + [key])
+    value = value.strip().strip('"').strip("'")
+    if value:
+        values[dotted] = value
+    else:
+        stack.append((indent, key))
+
+expected = {
+    "resources.capacity.cpu": "2",
+    "resources.allocatable.cpu": "2",
+}
+for key, want in expected.items():
+    if values.get(key) != want:
+        raise SystemExit(f"{path}: {key}={values.get(key)!r}, want {want!r}; values={values}")
+
+units = {
+    "B": 1,
+    "KiB": 1 << 10,
+    "MiB": 1 << 20,
+    "GiB": 1 << 30,
+    "TiB": 1 << 40,
+}
+def size_bytes(field, value):
+    match = re.fullmatch(r"([1-9][0-9]*)(B|KiB|MiB|GiB|TiB)", value or "")
+    if not match:
+        raise SystemExit(f"{path}: {field} has invalid size {value!r}; values={values}")
+    return int(match.group(1)) * units[match.group(2)]
+
+memory_expected = {
+    "resources.capacity.memory": capacity_memory,
+    "resources.allocatable.memory": floor_memory,
+    "resources.overhead.memory": "32MiB",
+}
+for key, want in memory_expected.items():
+    got = values.get(key)
+    if size_bytes(key, got) != size_bytes(key, want):
+        raise SystemExit(f"{path}: {key}={got!r}, want {want!r}; values={values}")
+if deflate == "-":
+    if "resources.allocatable.deflate_on_oom" in values:
+        raise SystemExit(f"{path}: no-balloon config rendered deflate_on_oom: {values}")
+elif values.get("resources.allocatable.deflate_on_oom") != deflate:
+    raise SystemExit(f"{path}: deflate_on_oom={values.get('resources.allocatable.deflate_on_oom')!r}, want {deflate!r}")
+if startup_memory == "-":
+    if any(key.startswith("resources.startup") for key in values):
+        raise SystemExit(f"{path}: static config rendered startup: {values}")
+else:
+    got = values.get("resources.startup.memory")
+    if size_bytes("resources.startup.memory", got) != size_bytes("resources.startup.memory", startup_memory):
+        raise SystemExit(f"{path}: startup={got!r}, want {startup_memory!r}")
+if controller == "-":
+    if "resources.control.controller" in values:
+        raise SystemExit(f"{path}: static config rendered controller: {values}")
+elif values.get("resources.control.controller") != controller:
+    raise SystemExit(f"{path}: controller={values.get('resources.control.controller')!r}, want {controller!r}")
+for forbidden in ("resources.control.cgroup_path", "resources.watermark_high.memory",
+                  "resources.control.sensor.mode"):
+    if forbidden in values:
+        raise SystemExit(f"{path}: renderer fixed runtime-owned {forbidden}: {values}")
+PY
+}
+
+assert_resource_lease() { # $1=sid, $2=capacity bytes, $3=floor bytes, $4=startup bytes
+    python3 - "$WORK/sandbox-resource.sock" "$1" "$2" "$3" "$4" <<'PY'
+import hashlib, json, pathlib, sys
+
+socket, sid, capacity, floor, startup = sys.argv[1:]
+lease = pathlib.Path(socket + ".leases") / (hashlib.sha256(sid.encode()).hexdigest() + ".json")
+row = json.loads(lease.read_text())
+expected = {
+    "sandbox_id": sid,
+    "controller_socket": socket,
+    "capacity_memory": int(capacity),
+    "capacity_cpu_milli": 2000,
+    "floor_memory": int(floor),
+    "floor_cpu_milli": 2000,
+    "startup_memory": int(startup),
+}
+for key, want in expected.items():
+    if row.get(key) != want:
+        raise SystemExit(f"lease {lease}: {key}={row.get(key)!r}, want {want!r}; row={row}")
+PY
+}
+
 snapshot_argv_count() {
     python3 - "$SNAPSHOT_ARGV_LOG" <<'PY'
 import json, os, sys
@@ -783,12 +884,10 @@ CHECKPOINT_DIR="$WORK/checkpoints"
 write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller (default controller)
     local policy_mode="$1"
     local resource_mode="${2:-controller}"
-    local control_socket_line=""
     local resource_controller_config=""
     case "$resource_mode" in
         static) ;;
         controller)
-            control_socket_line="    control_socket: $WORK/sandbox-resource.sock"
             resource_controller_config="resource_listen:
   enabled: true
   socket: $WORK/sandbox-resource.sock
@@ -817,9 +916,7 @@ units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
   resources:
-    vcpu: 2
-    memory: 2GiB
-$control_socket_line
+    capacity: { cpu: 2, memory: 2GiB }
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCKET
@@ -915,7 +1012,7 @@ echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to build
 # snapshot template above cannot reproduce a 256 MiB startup floor. Build the
 # same OCI input as an image template (no startCmd), then cold boot it with the
 # complete 8 GiB / 256 MiB resource declaration from issue #152.
-code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":8192}')
+code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup"}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
 LOW_TID=$(json_field "$WORK/resp.body" templateID)
 LOW_BID=$(json_field "$WORK/resp.body" buildID)
@@ -934,6 +1031,29 @@ for _ in $(seq 1 120); do
 done
 [ -n "$LOW_TEMPLATE" ] || fail "low-cgroup image build did not become ready"
 case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_TEMPLATE (want e2b-img-...)";; esac
+
+# A bare image lets the capacity<256MiB case validate a real KVM launch without
+# paying envd's steady workload. It carries no resource patch, so the create
+# request below proves inherited 256MiB floor normalization.
+code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare"}')
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "small-capacity register=$code"; }
+SMALL_TID=$(json_field "$WORK/resp.body" templateID)
+SMALL_BID=$(json_field "$WORK/resp.body" buildID)
+code=$(req POST "/v2/templates/$SMALL_TID/builds/$SMALL_BID" "$AK" \
+    "{\"fromImage\":\"$GUEST_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "small-capacity trigger=$code"; }
+SMALL_TEMPLATE=""
+for _ in $(seq 1 120); do
+    req GET "/templates/$SMALL_TID/builds/$SMALL_BID/status" "$AK" >/dev/null
+    st=$(json_field "$WORK/resp.body" status)
+    case "$st" in
+        ready) SMALL_TEMPLATE=$(json_field "$WORK/resp.body" templateID); break ;;
+        error) cat "$WORK/resp.body"; fail "small-capacity build error" ;;
+    esac
+    sleep 1
+done
+[ -n "$SMALL_TEMPLATE" ] || fail "small-capacity bare image build did not become ready"
+case "$SMALL_TEMPLATE" in bare-img-*) : ;; *) fail "small-capacity build produced $SMALL_TEMPLATE (want bare-img-...)" ;; esac
 
 LOW_CREATE_BODY=$(python3 - "$LOW_TEMPLATE" <<'PY'
 import json, sys
@@ -973,6 +1093,8 @@ run_low_allocatable_case() { # $1=iteration
     LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
     [ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable[$iteration] startup took ${LOW_ELAPSED_MS}ms"
     wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable[$iteration] sandbox not running"
+    assert_resolved_resource_yaml "$WORK/run/$LOW_SID/$LOW_SID.yaml" 8GiB - - \
+        || fail "low-allocatable[$iteration] static resolved resource YAML"
     LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
     [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
     LOW_UNIT="sandbox-runner@$LOW_RUN_ID.service"
@@ -1040,6 +1162,83 @@ write_orchestrator_config unset controller
 start_orchestrator "$WORK/orch.log"
 wait_mmds_listener
 echo "==> PASS: conductor restarted with the resource controller after static cgroup validation"
+
+# ---- default managed resource policy: cold boot + exec + pause/resume -------
+# LOW_TEMPLATE carries no request/template resource patch. This makes the real
+# managed launch exercise conductor defaults rather than merely asserting an
+# explicit 256MiB request.
+DEFAULT_CREATE_BODY=$(python3 - "$LOW_TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({"templateID": sys.argv[1], "timeout": 180}))
+PY
+)
+code=$(req POST /sandboxes "$AK" "$DEFAULT_CREATE_BODY")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "default-policy create=$code"; }
+DEFAULT_SID=$(json_field "$WORK/resp.body" sandboxID)
+DEFAULT_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+code=$(DP_MAX_TIME=65 dp "49983-$DEFAULT_SID" /health "$DEFAULT_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; fail "default-policy cold health=$code"; }
+wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy cold sandbox not running"
+assert_resolved_resource_yaml "$WORK/run/$DEFAULT_SID/$DEFAULT_SID.yaml" \
+    2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy dynamic resolved resource YAML"
+wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing"
+assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
+    || fail "default-policy lease did not match generated YAML"
+DEFAULT_EXEC_TOKEN="$(issue_exec_session "$DEFAULT_SID" "$AK")" || fail "default-policy exec session"
+exec_through_connect "$DEFAULT_SID" "$DEFAULT_EXEC_TOKEN" "DEFAULT_COLD_$RANDOM"
+
+code=$(req POST "/sandboxes/$DEFAULT_SID/pause" "$AK")
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "default-policy pause=$code"; }
+wait_sandbox_state "$DEFAULT_SID" paused 1200 || fail "default-policy sandbox did not pause"
+code=$(req POST "/sandboxes/$DEFAULT_SID/connect" "$AK" '{"timeout":180}')
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "default-policy resume=$code"; }
+default_resumed=""
+for _ in $(seq 1 240); do
+    code=$(DP_MAX_TIME=5 dp "49983-$DEFAULT_SID" /health "$DEFAULT_TOKEN" || true)
+    case "$code" in 200|204) default_resumed=1; break ;; esac
+    sleep 0.25
+done
+[ -n "$default_resumed" ] || fail "default-policy envd did not recover after resume"
+wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy resumed sandbox not running"
+assert_resolved_resource_yaml "$WORK/run/$DEFAULT_SID/$DEFAULT_SID.yaml" \
+    2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy restore resource YAML"
+wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing after resume"
+assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
+    || fail "default-policy restored lease did not match generated YAML"
+exec_through_connect "$DEFAULT_SID" "$DEFAULT_EXEC_TOKEN" "DEFAULT_RESUME_$RANDOM"
+code=$(req DELETE "/sandboxes/$DEFAULT_SID" "$AK")
+[ "$code" = "204" ] || fail "default-policy delete=$code"
+echo "==> PASS: default 2GiB capacity / 256MiB floor cold boot, envd, exec, pause/resume, YAML and lease inventory"
+
+SMALL_CREATE_BODY=$(python3 - "$SMALL_TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 120,
+    "metadata": {
+        "kuasar-sandbox.resource": json.dumps({"capacity": {"memory": "192MiB"}}),
+    },
+}))
+PY
+)
+code=$(req POST /sandboxes "$AK" "$SMALL_CREATE_BODY")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "small-capacity create=$code"; }
+SMALL_SID=$(json_field "$WORK/resp.body" sandboxID)
+wait_sandbox_state "$SMALL_SID" running 600 || {
+    journalctl KUASAR_SANDBOX_ID="$SMALL_SID" --no-pager -n 120 2>/dev/null || true
+    fail "small-capacity bare sandbox did not reach running"
+}
+assert_resolved_resource_yaml "$WORK/run/$SMALL_SID/$SMALL_SID.yaml" \
+    192MiB 192MiB "$WORK/sandbox-resource.sock" 192MiB - \
+    || fail "capacity<256MiB did not normalize inherited floor"
+assert_resource_lease "$SMALL_SID" 201326592 201326592 201326592 \
+    || fail "small-capacity lease did not match normalized YAML"
+SMALL_EXEC_TOKEN="$(issue_exec_session "$SMALL_SID" "$AK")" || fail "small-capacity exec session"
+exec_through_connect "$SMALL_SID" "$SMALL_EXEC_TOKEN" "SMALL_CAPACITY_$RANDOM"
+code=$(req DELETE "/sandboxes/$SMALL_SID" "$AK")
+[ "$code" = "204" ] || fail "small-capacity delete=$code"
+echo "==> PASS: real bare KVM launch normalized inherited 256MiB floor to 192MiB capacity"
 
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they
@@ -1176,6 +1375,10 @@ code=$(cat "$WORK/immediate-data.code")
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
 wait_internal_traffic_stats "$SID" idle || fail "internal traffic did not converge to idle"
 wait_resource_stats "$SID" || fail "controller resource stats were not reported"
+assert_resolved_resource_yaml "$WORK/run/$SID/$SID.yaml" 8GiB 8GiB "$WORK/sandbox-resource.sock" \
+    || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
+assert_resource_lease "$SID" 8589934592 268435456 8589934592 \
+    || fail "snapshot restore lease did not match generated YAML"
 echo "==> PASS: post-Create data request was reported parking through readiness, then idle; resource stats are live (code=$code)"
 
 # ---- list -----------------------------------------------------------------

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"log/slog"
 	"time"
@@ -57,17 +58,17 @@ var _ orch.SandboxResourceProvider = resourceProbe{}
 // startResourceController starts the in-process node resource controller — the
 // serve `resource_listen` sub-server (node-resource.md) — and runs it until ctx
 // is cancelled. rcfg is the inlined controller config from serve's config
-// (config.Config.ResourceListen); its tuning is resolved here (auto-detect +
-// defaults). It returns once the listener is bound (the controller serves in a
-// background goroutine), or an error if setup fails. When resource_listen is
-// absent/disabled serve never calls this and sandboxes fall back to static cgroup.
-func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, managedRunRoot string, slogger *slog.Logger) (orch.ResourceProbe, error) {
+// (config.Config.ResourceListen); resolved is computed once during conductor
+// preflight and shared with the launch renderer. It returns once the listener is
+// bound (the controller serves in a background goroutine), or an error if setup
+// fails. When resource_listen is absent/disabled serve never calls this and
+// sandboxes fall back to static cgroup.
+func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, resolved *nodectl.Resolved, managedRunRoot string, slogger *slog.Logger) (orch.ResourceProbe, error) {
 	if rcfg.StatePath != "" {
 		slogger.Warn("resource_listen.state_path is deprecated and ignored", "state_path", rcfg.StatePath)
 	}
-	resolved, err := nodectl.Resolve(rcfg)
-	if err != nil {
-		return nil, err
+	if resolved == nil {
+		return nil, fmt.Errorf("resolved resource_listen configuration is required")
 	}
 
 	state := nodectl.NewState(

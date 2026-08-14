@@ -1,7 +1,6 @@
 package sandboxcfg
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -37,7 +36,8 @@ func TestParseSpecNamespaces(t *testing.T) {
 		s.Network.TransitGeneveVNI != 4242 || s.Network.TransitMAC != "02:00:00:00:00:09" {
 		t.Fatalf("network parsed wrong: %+v", s.Network)
 	}
-	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU != 4 || s.Resource.Capacity.Memory != "8GiB" {
+	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU == nil || *s.Resource.Capacity.CPU != 4 ||
+		s.Resource.Capacity.Memory == nil || *s.Resource.Capacity.Memory != "8GiB" {
 		t.Fatalf("resource parsed wrong: %+v", s.Resource)
 	}
 	if s.Restore.Prefetch != "memory" {
@@ -124,7 +124,11 @@ func baseParams(profile types.Profile) Params {
 	return Params{
 		Sandbox:  &types.Sandbox{ID: "s1", TemplateID: tmpl.String(), InnerIP: "10.0.0.5/30", PortMAC: "02:00:00:00:00:01"},
 		Template: tmpl, Runtime: "/r/sandbox-runtime.bundle", Kernel: "/r/vmlinux",
-		VCPU: 2, Memory: "2GiB",
+		Resources: rtconfig.ResourcesConfig{
+			Capacity:    rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: rtconfig.AllocatableConfig{CPU: 2, Memory: "256MiB", DeflateOnOOM: boolPtr(true)},
+			Overhead:    &rtconfig.OverheadConfig{Memory: "32MiB"},
+		},
 	}
 }
 
@@ -182,17 +186,19 @@ func TestBuildLaunchCgroupControl(t *testing.T) {
 	}
 }
 
-func TestBuildCanonicalizesControllerSocket(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
+func TestBuildUsesResolvedControllerIdentity(t *testing.T) {
 	p := baseParams(types.ProfileE2B)
-	p.ControllerSocket = "./controller.sock"
+	p.Resources.Control.Controller = "/real/run/controller.sock"
+	p.Resources.Startup = &rtconfig.StartupConfig{Memory: "2GiB"}
 	cfg, err := p.build()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(dir, "controller.sock"); cfg.Resources.Control.Controller != want {
-		t.Fatalf("controller socket = %q, want %q", cfg.Resources.Control.Controller, want)
+	if cfg.Resources.Control.Controller != "/real/run/controller.sock" {
+		t.Fatalf("controller socket = %q", cfg.Resources.Control.Controller)
+	}
+	if cfg.Resources.Control.CgroupPath != "" || cfg.Resources.Control.CgroupFD != 0 {
+		t.Fatalf("renderer injected cgroup capability: %+v", cfg.Resources.Control)
 	}
 }
 
@@ -276,17 +282,21 @@ func TestBuildRendersPrefetchOnlyForRestore(t *testing.T) {
 	}
 }
 
-func TestSetCapacityRoundTrip(t *testing.T) {
+func TestApplyCapacityRoundTrip(t *testing.T) {
 	// cpu/memory fold into a well-formed resource namespace ParseSpec reads back.
-	meta := SetCapacity(nil, 4, 8192)
+	meta, err := ApplyCapacity(nil, 4, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := ParseSpec(meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU != 4 || s.Resource.Capacity.Memory != "8192MiB" {
+	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU == nil || *s.Resource.Capacity.CPU != 4 ||
+		s.Resource.Capacity.Memory == nil || *s.Resource.Capacity.Memory != "8192MiB" {
 		t.Fatalf("capacity round-trip: %+v", s.Resource.Capacity)
 	}
-	if SetCapacity(nil, 0, 0) != nil {
+	if got, err := ApplyCapacity(nil, 0, 0); err != nil || got != nil {
 		t.Fatal("zero cpu/memory must be a no-op")
 	}
 }
@@ -307,7 +317,10 @@ func TestMergeNetworkExplicitWins(t *testing.T) {
 func TestMergeMetadataOverWins(t *testing.T) {
 	base := map[string]string{NsNetwork: "from-template", NsLaunch: "tmpl-launch"}
 	over := map[string]string{NsNetwork: "from-create"}
-	m := MergeMetadata(base, over)
+	m, err := MergeMetadata(base, over)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m[NsNetwork] != "from-create" || m[NsLaunch] != "tmpl-launch" {
 		t.Fatalf("create should win per namespace, template fills the rest: %+v", m)
 	}
@@ -317,27 +330,38 @@ func TestMergeCreateMetadataKeepsRestoreRequestScoped(t *testing.T) {
 	defaults := map[string]string{
 		NsNetwork: "from-defaults", NsRestore: `{"prefetch":"memory"}`,
 	}
-	withoutRestore := MergeCreateMetadata(defaults, map[string]string{NsLaunch: "from-request"})
+	withoutRestore, err := MergeCreateMetadata(defaults, map[string]string{NsLaunch: "from-request"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if withoutRestore[NsNetwork] != "from-defaults" || withoutRestore[NsLaunch] != "from-request" {
 		t.Fatalf("normal create metadata did not merge: %+v", withoutRestore)
 	}
 	if _, ok := withoutRestore[NsRestore]; ok {
 		t.Fatalf("restore leaked from defaults: %+v", withoutRestore)
 	}
-	withRestore := MergeCreateMetadata(defaults, map[string]string{NsRestore: `{"prefetch":"off"}`})
+	withRestore, err := MergeCreateMetadata(defaults, map[string]string{NsRestore: `{"prefetch":"off"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if withRestore[NsRestore] != `{"prefetch":"off"}` {
 		t.Fatalf("explicit create restore did not win: %+v", withRestore)
 	}
 }
 
-func TestBuildImgCapacityOverride(t *testing.T) {
+func TestBuildInstallsResolvedResources(t *testing.T) {
 	p := baseParams(types.ProfileBare)
-	p.Spec.Resource.Capacity = &rtconfig.CapacityConfig{CPU: 8, Memory: "16GiB"}
+	p.Resources.Capacity = rtconfig.CapacityConfig{CPU: 8, Memory: "16GiB"}
 	b, err := p.BuildYAML()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(b), "cpu: 8") || !strings.Contains(string(b), "16GiB") {
 		t.Fatalf("img capacity override not applied:\n%s", b)
+	}
+	for _, forbidden := range []string{"controller:", "startup:", "cgroup_path:", "watermark_high:", "sensor:"} {
+		if strings.Contains(string(b), forbidden) {
+			t.Fatalf("static renderer emitted %q:\n%s", forbidden, b)
+		}
 	}
 }

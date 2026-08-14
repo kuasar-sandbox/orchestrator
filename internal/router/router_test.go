@@ -88,6 +88,42 @@ func TestCreateSandboxMetadataCredentialsHeaderWinsAsWholeObject(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxMetadataResourceHeaderMergesLeaves(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"cpu\":4,\"memory\":\"8GiB\"},\"allocatable\":{\"cpu\":0.5}}"}}`,
+	))
+	req.Header.Set(HeaderResource, `{"capacity":{"memory":"4GiB"},"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"capacity":{"cpu":4,"memory":"4GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`
+	if got[sandboxcfg.NsResource] != want {
+		t.Fatalf("cluster create resource = %s, want %s", got[sandboxcfg.NsResource], want)
+	}
+}
+
+func TestCreateSandboxMetadataResourceHeaderCannotHideInvalidBody(t *testing.T) {
+	for name, body := range map[string]string{
+		"node owned": `{"metadata":{"kuasar-sandbox.resource":"{\"control\":{}}"}}`,
+		"duplicate":  `{"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"cpu\":1,\"cpu\":2}}"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+			req.Header.Set(HeaderResource, `{"capacity":{"cpu":8,"memory":"8GiB"},"allocatable":{"memory":"512MiB"}}`)
+			if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
+				t.Fatal("valid resource header hid invalid body resource")
+			}
+		})
+	}
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
+	req.Header[http.CanonicalHeaderKey(HeaderResource)] = []string{`{}`, `{}`}
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("duplicate resource header values were accepted")
+	}
+}
+
 func TestCreateSandboxMetadataRejectsInvalidCredentials(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
 	req.Header.Set(HeaderCredentials, `{"forward_access_token":"forbidden"}`)
@@ -465,7 +501,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,6 +887,7 @@ func textResponse(code int, body string) *http.Response {
 func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
 	var reserveProfiles []string
+	var reserveResource string
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/templates"):
@@ -881,6 +918,9 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 				return
 			}
 			reserveProfiles = append(reserveProfiles, profile)
+			if metadata, ok := body["metadata"].(map[string]any); ok {
+				reserveResource, _ = metadata[sandboxcfg.NsResource].(string)
+			}
 			_ = json.NewEncoder(w).Encode(buildReserveResult{
 				BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost, Profile: types.ProfileE2B,
 			})
@@ -908,12 +948,27 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	if badResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
 		t.Fatalf("invalid profile status=%d reserveProfiles=%v", badResp.StatusCode, reserveProfiles)
 	}
+	negativeReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"cpuCount":-1}`))
+	negativeReq.Host = "api.test.local"
+	negativeReq.Header.Set(HeaderGroup, "/g")
+	negativeReq.Header.Set(HeaderAPIKey, "e2b_test")
+	negativeResp, err := http.DefaultClient.Do(negativeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	negativeResp.Body.Close()
+	if negativeResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+		t.Fatalf("negative capacity status=%d reserveProfiles=%v", negativeResp.StatusCode, reserveProfiles)
+	}
 
 	// register a build via the router (control plane: Host api.<domain> + group).
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", nil)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
+		`{"cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}"}}`,
+	))
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderAPIKey, "e2b_test")
+	req.Header.Set(HeaderResource, `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -926,6 +981,9 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	resp.Body.Close()
 	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
 		t.Fatalf("register result=%+v reserveProfiles=%v", reg, reserveProfiles)
+	}
+	if want := `{"capacity":{"cpu":4,"memory":"8192MiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`; reserveResource != want {
+		t.Fatalf("cluster build resource = %s, want %s", reserveResource, want)
 	}
 
 	// a trigger for b1 (no group header) must route to the recorded node.
@@ -943,6 +1001,38 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}
 	if triggeredBuild != "b1" {
 		t.Fatalf("node saw build %q, want b1 (router build-id routing)", triggeredBuild)
+	}
+}
+
+func TestBuildRegisterPropagatesNodeResourceRejection(t *testing.T) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/verify-key":
+			w.WriteHeader(http.StatusOK)
+		case "/route-link/reserve-build":
+			http.Error(w, "allocatable.memory exceeds capacity.memory", http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.Default())
+	server := httptest.NewServer(rt.Handler())
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v3/templates", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"128MiB\"},\"allocatable\":{\"memory\":\"256MiB\"}}"}}`,
+	))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", resp.StatusCode)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const testAPISecret = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
@@ -53,6 +54,81 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 	page, err := src.Range(ctx, "", 10)
 	if err != nil || len(page.Groups) != 1 || page.Groups[0] != "/g" {
 		t.Fatalf("range=%+v err=%v", page, err)
+	}
+}
+
+func TestFileGroupSourceValidatesAndCanonicalizesResourcePatch(t *testing.T) {
+	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
+		Group:       "/g",
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Config: map[string]string{
+			sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" } } `,
+		},
+	})
+	group, found, err := src.Get(context.Background(), "/g")
+	if err != nil || !found {
+		t.Fatalf("Get found=%v err=%v", found, err)
+	}
+	if got, want := group.Config[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"}}`; got != want {
+		t.Fatalf("canonical resource = %q, want %q", got, want)
+	}
+
+	bad := testGroupSource(t, clusterstate.SandboxGroupRecord{
+		Group:       "/bad",
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Config: map[string]string{
+			sandboxcfg.NsResource: `{"overhead":{"memory":"64MiB"}}`,
+		},
+	})
+	if _, _, err := bad.Get(context.Background(), "/bad"); err == nil || !strings.Contains(err.Error(), "not request-configurable") {
+		t.Fatalf("invalid group resource error = %v", err)
+	}
+}
+
+func TestMergeConfigUsesResourceLeavesAndDoesNotHideInvalidGroup(t *testing.T) {
+	group := map[string]string{
+		sandboxcfg.NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5}}`,
+		sandboxcfg.NsNetwork:  `{"hostname":"group"}`,
+	}
+	create := map[string]string{
+		sandboxcfg.NsResource: `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
+		sandboxcfg.NsNetwork:  `{"hostname":"create"}`,
+	}
+	got, err := mergeConfig(group, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`; got[sandboxcfg.NsResource] != want {
+		t.Fatalf("resource config = %s, want %s", got[sandboxcfg.NsResource], want)
+	}
+	if got[sandboxcfg.NsNetwork] != create[sandboxcfg.NsNetwork] {
+		t.Fatalf("non-resource namespace did not retain whole-value precedence: %+v", got)
+	}
+
+	group[sandboxcfg.NsResource] = `{"allocatable":{"deflate_on_oom":false}}`
+	if _, err := mergeConfig(group, create); err == nil || !strings.Contains(err.Error(), "node-managed") {
+		t.Fatalf("valid create config hid invalid group resource: %v", err)
+	}
+}
+
+func TestAnswerMarksCrossLayerResourceConflictAsInvalidConfig(t *testing.T) {
+	svc := testServiceWithGroups(t, clusterstate.SandboxGroupRecord{
+		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		APISecret:   clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAPISecret},
+		TemplateRef: "tmpl",
+		Config: map[string]string{
+			sandboxcfg.NsResource: `{"capacity":{"memory":"128MiB"}}`,
+		},
+	})
+	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1"})
+	res := svc.answer(context.Background(), &routesync.PlaceReq{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb-1", ExcludeNodeIDs: []string{"n1"},
+		Config: map[string]string{
+			sandboxcfg.NsResource: `{"allocatable":{"memory":"256MiB"}}`,
+		},
+	})
+	if !res.InvalidConfig || res.Error == "" || res.NodeID != "" {
+		t.Fatalf("cross-layer resource conflict = %+v", res)
 	}
 }
 

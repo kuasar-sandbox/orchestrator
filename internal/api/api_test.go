@@ -45,7 +45,7 @@ func TestRequestedBuildProfile(t *testing.T) {
 
 func TestMergeConfigHeaders(t *testing.T) {
 	// No headers => no allocation.
-	if m := mergeConfigHeaders(nil, http.Header{}); m != nil {
+	if m := mustMergeConfigHeaders(t, nil, http.Header{}); m != nil {
 		t.Fatalf("no headers should not allocate: %v", m)
 	}
 
@@ -55,7 +55,7 @@ func TestMergeConfigHeaders(t *testing.T) {
 	h.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`)
 	h.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"memory"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"envd"}`)
-	m := mergeConfigHeaders(nil, h)
+	m := mustMergeConfigHeaders(t, nil, h)
 	if m[sandboxcfg.NsNetwork] != `{"hostname":"h1"}` || m[sandboxcfg.NsResource] != `{"capacity":{"cpu":4}}` {
 		t.Fatalf("headers not normalized: %+v", m)
 	}
@@ -71,7 +71,7 @@ func TestMergeConfigHeaders(t *testing.T) {
 
 	// Header wins over an e2b metadata key of the same namespace.
 	meta := map[string]string{sandboxcfg.NsNetwork: `{"hostname":"from-metadata"}`}
-	got := mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-Network", `{"hostname":"from-header"}`))
+	got := mustMergeConfigHeaders(t, meta, header("X-Kuasar-Sandbox-Network", `{"hostname":"from-header"}`))
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"from-header"}` {
 		t.Fatalf("header should win over metadata: %+v", got)
 	}
@@ -99,10 +99,43 @@ func TestMergeConfigHeaders(t *testing.T) {
 	}
 
 	// Builder is build-only and is not folded by the generic sandbox header path.
-	got = mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`))
+	got = mustMergeConfigHeaders(t, nil, header("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`))
 	if got != nil {
 		t.Fatalf("builder header should not enter sandbox metadata: %+v", got)
 	}
+}
+
+func TestMergeConfigHeadersMergesOnlyResourceLeaves(t *testing.T) {
+	metadata := map[string]string{
+		sandboxcfg.NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"1GiB"}}`,
+		sandboxcfg.NsNetwork:  `{"hostname":"metadata"}`,
+	}
+	headers := http.Header{}
+	headers.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4},"allocatable":{"memory":"512MiB"}}`)
+	headers.Set("X-Kuasar-Sandbox-Network", `{"hostname":"header"}`)
+	got := mustMergeConfigHeaders(t, metadata, headers)
+	want := `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`
+	if got[sandboxcfg.NsResource] != want {
+		t.Fatalf("resource header merge = %s, want %s", got[sandboxcfg.NsResource], want)
+	}
+	if got[sandboxcfg.NsNetwork] != `{"hostname":"header"}` {
+		t.Fatalf("non-resource header was not whole-namespace: %+v", got)
+	}
+	if _, err := mergeConfigHeaders(
+		map[string]string{sandboxcfg.NsResource: `{"control":{}}`},
+		header("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`),
+	); err == nil || !strings.Contains(err.Error(), "control") {
+		t.Fatalf("valid header hid invalid metadata resource: %v", err)
+	}
+}
+
+func mustMergeConfigHeaders(t *testing.T, meta map[string]string, headers http.Header) map[string]string {
+	t.Helper()
+	got, err := mergeConfigHeaders(meta, headers)
+	if err != nil {
+		t.Fatalf("mergeConfigHeaders: %v", err)
+	}
+	return got
 }
 
 func mustMergeCreateConfigHeaders(t *testing.T, meta map[string]string, headers http.Header) map[string]string {
@@ -120,7 +153,10 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"build"}`)
 	h.Set("X-Kuasar-Sandbox-Credentials", `{"envd_access_token":"must-not-enter-build"}`)
 	h.Set(checkpointHeader, `{"merge_ref":false}`)
-	got := mergeBuildConfigHeaders(nil, h)
+	got, err := mergeBuildConfigHeaders(nil, h)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got[buildcfg.NsBuilder] != `{"referer":{"enabled":false}}` {
 		t.Fatalf("builder header not normalized: %+v", got)
 	}
@@ -154,6 +190,72 @@ func TestBuildRegisterCarriesMMDSHeaderSeparatelyFromMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildRegisterCapacityLeavesPreserveResourceHeader(t *testing.T) {
+	var got RegisterSpec
+	core := &buildMMDSCoreStub{register: func(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
+		got = spec
+		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	headers := http.Header{}
+	headers.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"memory":"1GiB"},"allocatable":{"memory":"256MiB"},"startup":{"memory":"512MiB"}}`)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
+		strings.NewReader(`{"name":"resources","cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"cpu\":2},\"allocatable\":{\"cpu\":0.5}}"}}`), headers)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	want := `{"capacity":{"cpu":4,"memory":"8192MiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"512MiB"}}`
+	if got.Metadata[sandboxcfg.NsResource] != want {
+		t.Fatalf("registered resource = %s, want %s", got.Metadata[sandboxcfg.NsResource], want)
+	}
+}
+
+func TestBuildRegisterDoesNotDropMalformedResourceMetadata(t *testing.T) {
+	called := false
+	core := &buildMMDSCoreStub{register: func(context.Context, string, RegisterSpec) (*types.Build, error) {
+		called = true
+		return &types.Build{}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
+		strings.NewReader(`{"metadata":{"kuasar-sandbox.resource":[]}}`), nil)
+	if response.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%t body=%s", response.Code, called, response.Body.String())
+	}
+}
+
+func TestBuildFirstClassCapacityRejectsNegativeValues(t *testing.T) {
+	for _, endpoint := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "register cpu", path: "/v3/templates", body: `{"name":"bad","cpuCount":-1}`},
+		{name: "register memory", path: "/v3/templates", body: `{"name":"bad","memoryMB":-1}`},
+		{name: "trigger cpu", path: "/v2/templates/template/builds/build", body: `{"cpuCount":-1}`},
+		{name: "trigger memory", path: "/v2/templates/template/builds/build", body: `{"memoryMB":-1}`},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			called := false
+			core := &buildMMDSCoreStub{
+				register: func(context.Context, string, RegisterSpec) (*types.Build, error) {
+					called = true
+					return &types.Build{}, nil
+				},
+				trigger: func(context.Context, string, string, string, TriggerSpec, BuildAuth) error {
+					called = true
+					return nil
+				},
+			}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, endpoint.path, strings.NewReader(endpoint.body), nil)
+			if response.Code != http.StatusBadRequest || called {
+				t.Fatalf("status=%d called=%t body=%s", response.Code, called, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestBuildTriggerRejectsMMDSBeforeCore(t *testing.T) {
 	called := false
 	core := &buildMMDSCoreStub{trigger: func(context.Context, string, string, string, TriggerSpec, BuildAuth) error {
@@ -178,6 +280,48 @@ func TestBuildTriggerRejectsMMDSBeforeCore(t *testing.T) {
 	}
 	if called {
 		t.Fatal("Build Trigger MMDS override reached Core")
+	}
+}
+
+func TestBuildTriggerRejectsGenericConfigButKeepsBuilderAndCapacity(t *testing.T) {
+	called := false
+	var got TriggerSpec
+	core := &buildMMDSCoreStub{trigger: func(_ context.Context, _ string, _ string, _ string, spec TriggerSpec, _ BuildAuth) error {
+		called = true
+		got = spec
+		return nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	for _, test := range []struct {
+		name    string
+		body    string
+		headers http.Header
+	}{
+		{name: "body metadata", body: `{"metadata":{"kuasar-sandbox.resource":"{}"}}`},
+		{name: "resource header", body: `{}`, headers: header("X-Kuasar-Sandbox-Resource", `{}`)},
+		{name: "restore header", body: `{}`, headers: header(restoreHeader, `{}`)},
+		{name: "unknown sandbox config header", body: `{}`, headers: header("X-Kuasar-Sandbox-Future", `{}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v2/templates/template/builds/build", strings.NewReader(test.body), test.headers)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "deprecated") {
+				t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if called {
+		t.Fatal("deprecated trigger config reached Core")
+	}
+
+	headers := header(builderHeader, `{"referer":{"enabled":false}}`)
+	headers.Set(clusterGroupHeader, "/g")
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v2/templates/template/builds/build",
+		strings.NewReader(`{"cpuCount":4,"memoryMB":8192}`), headers)
+	if response.Code != http.StatusAccepted || !called {
+		t.Fatalf("compatible trigger status = %d, called=%t, body=%s", response.Code, called, response.Body.String())
+	}
+	if got.Metadata[buildcfg.NsBuilder] == "" || got.Metadata[sandboxcfg.NsResource] != `{"capacity":{"cpu":4,"memory":"8192MiB"}}` {
+		t.Fatalf("compatible trigger metadata = %+v", got.Metadata)
 	}
 }
 

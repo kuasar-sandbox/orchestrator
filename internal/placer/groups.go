@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 const defaultGroupPageLimit = 1024
@@ -311,6 +312,10 @@ func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
 	if rec.Group == "" {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: group is required", path)
 	}
+	rec.Config, err = sandboxcfg.NormalizeResourceMetadata(rec.Config)
+	if err != nil {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: sandbox_config: %w", path, err)
+	}
 	return rec, nil
 }
 
@@ -560,18 +565,8 @@ func verifyAPIKey(apiSecretHex, encoded string) bool {
 	return apikey.Verify(p, raw)
 }
 
-func mergeConfig(group, create map[string]string) map[string]string {
-	if len(group) == 0 {
-		return cloneStringMap(create)
-	}
-	merged := make(map[string]string, len(group)+len(create))
-	for k, v := range group {
-		merged[k] = v
-	}
-	for k, v := range create {
-		merged[k] = v
-	}
-	return merged
+func mergeConfig(group, create map[string]string) (map[string]string, error) {
+	return sandboxcfg.MergeMetadata(group, create)
 }
 
 func cloneGroupRecord(in clusterstate.SandboxGroupRecord) clusterstate.SandboxGroupRecord {

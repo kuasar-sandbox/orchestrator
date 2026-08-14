@@ -39,6 +39,7 @@ type PlaceResult struct {
 	NodeID               string            `json:"node_id,omitempty"`
 	NoNode               bool              `json:"no_node,omitempty"`
 	Error                string            `json:"error,omitempty"`
+	InvalidConfig        bool              `json:"invalid_config,omitempty"`
 	TemplateRef          string            `json:"template_ref,omitempty"`
 	TargetPort           int               `json:"target_port,omitempty"`
 	Config               map[string]string `json:"config,omitempty"`

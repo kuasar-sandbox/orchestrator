@@ -119,6 +119,10 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: manifest key fingerprint: %w", err)
 	}
+	metadata, err := sandboxcfg.NormalizeResourceMetadata(sb.Metadata)
+	if err != nil {
+		return "", fmt.Errorf("mint migration token: portable resource metadata: %w", err)
+	}
 	return migrationtoken.Seal(
 		migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey},
 		migrationtoken.MigrationTokenPayloadV1{
@@ -132,7 +136,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 			RuntimeDigest:          dig,
 			SnapshotRef:            ref,
 			Env:                    sb.Env,
-			Metadata:               sb.Metadata,
+			Metadata:               metadata,
 			CreatedUnix:            sb.CreatedUnix,
 			DeadlineUnix:           sb.DeadlineUnix,
 			ServiceSecret:          sb.ServiceSecret,
@@ -231,7 +235,10 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	}
 
 	var trustedCluster *types.ClusterSandboxContext
-	metadata := migrationSandboxMetadata(payload.Metadata)
+	metadata, err := migrationSandboxMetadata(payload.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: token resource metadata: %w: %v", migrationtoken.ErrInvalidPayload, err)
+	}
 	if raw, present := metadata[sandboxcfg.NsMMDS]; present {
 		_, routesJSON, err := sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
 		if err != nil {
@@ -368,9 +375,9 @@ func (o *Orchestrator) prepareStandaloneTargetWithMMDS(ctx context.Context, id, 
 // the request-only credentials carrier can never re-enter metadata_json. The
 // service credentials restored from KMT1 come only from their typed payload
 // fields and are validated separately.
-func migrationSandboxMetadata(metadata map[string]string) map[string]string {
+func migrationSandboxMetadata(metadata map[string]string) (map[string]string, error) {
 	if metadata == nil {
-		return nil
+		return nil, nil
 	}
 	cleaned := make(map[string]string, len(metadata))
 	for key, value := range metadata {
@@ -378,7 +385,7 @@ func migrationSandboxMetadata(metadata map[string]string) map[string]string {
 			cleaned[key] = value
 		}
 	}
-	return cleaned
+	return sandboxcfg.NormalizeResourceMetadata(cleaned)
 }
 
 // runtimeFileFor returns the guest runtime erofs path.

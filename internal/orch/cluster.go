@@ -153,9 +153,16 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
-	meta, builderOpts, err := buildcfg.Extract(cmd.Config)
+	config, err := sandboxcfg.NormalizeResourceMetadata(cmd.Config)
+	if err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
+	}
+	meta, builderOpts, err := buildcfg.Extract(config)
 	if err != nil {
 		return err
+	}
+	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
@@ -370,6 +377,8 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 
 func clusterCommandRejection(err error) (int, string) {
 	switch {
+	case errors.Is(err, api.ErrBadRequest):
+		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, migrationtoken.ErrMalformedToken),
 		errors.Is(err, migrationtoken.ErrInvalidPayload):
 		return http.StatusBadRequest, "invalid migration token"
@@ -444,6 +453,10 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	config, err := sandboxcfg.NormalizeRestoreMetadata(cmd.Config)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	config, err = sandboxcfg.NormalizeResourceMetadata(config)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
 	}
 	config, err = sandboxcfg.NormalizeCheckpointMetadata(config)
 	if err != nil {

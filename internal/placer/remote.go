@@ -431,6 +431,15 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 		res.Error = err.Error()
 		return res
 	}
+	var sandboxConfig map[string]string
+	if !req.Build {
+		sandboxConfig, err = mergeConfig(g.group.Config, req.Config)
+		if err != nil {
+			res.Error = fmt.Sprintf("placer: group %q sandbox config: %v", req.Group, err)
+			res.InvalidConfig = true
+			return res
+		}
+	}
 	p := placeParams{
 		group: req.Group, nodes: s.nodes.values(), selectors: g.hint.NodeSelectors,
 		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
@@ -463,7 +472,7 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 		} else {
 			res.TemplateRef = g.group.TemplateRef
 			res.TargetPort = g.group.TargetPort
-			res.Config = mergeConfig(g.group.Config, req.Config)
+			res.Config = sandboxConfig
 		}
 	}
 	return res

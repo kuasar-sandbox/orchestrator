@@ -193,11 +193,17 @@ func TestExtractCredentialsRejectsUnknownFields(t *testing.T) {
 func TestCredentialsHeaderNamespaceWinsAsWholeObject(t *testing.T) {
 	metadataObject := `{"service_secret":"` + strings.Repeat("1", 64) + `","envd_access_token":"metadata"}`
 	headerObject := `{"traffic_access_token":"header"}`
-	request := MergeMetadata(
+	request, err := MergeMetadata(
 		map[string]string{NsCredentials: metadataObject},
 		map[string]string{NsCredentials: headerObject},
 	)
-	merged := MergeCreateMetadata(nil, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := MergeCreateMetadata(nil, request)
+	if err != nil {
+		t.Fatal(err)
+	}
 	credentials, cleaned, err := ExtractCredentials(merged)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +218,10 @@ func TestCredentialsHeaderNamespaceWinsAsWholeObject(t *testing.T) {
 
 func TestMergeCreateMetadataKeepsCredentialsRequestScoped(t *testing.T) {
 	defaults := map[string]string{NsCredentials: `{"envd_access_token":"default"}`, NsNetwork: "network"}
-	withoutCredentials := MergeCreateMetadata(defaults, map[string]string{NsLaunch: "launch"})
+	withoutCredentials, err := MergeCreateMetadata(defaults, map[string]string{NsLaunch: "launch"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := withoutCredentials[NsCredentials]; ok {
 		t.Fatalf("credentials leaked from defaults: %+v", withoutCredentials)
 	}
@@ -221,7 +230,10 @@ func TestMergeCreateMetadataKeepsCredentialsRequestScoped(t *testing.T) {
 	}
 
 	requestObject := `{"envd_access_token":"request"}`
-	withCredentials := MergeCreateMetadata(defaults, map[string]string{NsCredentials: requestObject})
+	withCredentials, err := MergeCreateMetadata(defaults, map[string]string{NsCredentials: requestObject})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if withCredentials[NsCredentials] != requestObject {
 		t.Fatalf("explicit request credentials did not win: %+v", withCredentials)
 	}

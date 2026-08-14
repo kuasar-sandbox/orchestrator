@@ -107,14 +107,14 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 
 | 请求 | 必需身份 | 行为 |
 |---|---|---|
-| create | group + route_key(可缺省生成) | 提取并校验本次请求的 `kuasar-sandbox.restore` 与 `kuasar-sandbox.credentials`,定位 route owner 后随 `ReserveSandbox` 传递 |
+| create | group + route_key(可缺省生成) | 提取并校验 resource patch 及本次请求的 restore/credentials/checkpoint,定位 route owner 后随 `ReserveSandbox` 传递 |
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | connect | group + route_key + stable sandbox_id | 调用 `operation=connect` Reserve;registry 经 node-link 下发 CmdConnect,不 Resolve 或转发 node HTTP `/connect` |
 | exec session | group + route_key + stable sandbox_id | 调用 `operation=exec-session` Reserve;Registry 验证 API key,经 node-link 下发 CmdExecSession,只对外返回 ExecAccessToken |
 | get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面;stats body 无 SID,无需响应身份适配 |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + stable sandbox_id + target | 已知 NodeSandboxID/DataEndpoint 即直接建立一次性 node CONNECT,包括 paused/starting;target 缺失或 typed stale 才 fallback `operation=data`;miss 先 Resolve |
-| build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
+| build register | group + build_id | 生成稳定 id,将 register resource body/Header 与 `cpuCount/memoryMB` 逐 leaf 合并后调用 `ReserveBuild` |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
 `route_key` 是 group 内 route 定位键,`sandbox_id` 是稳定公开身份。Registry 在首次 create 时生成
@@ -122,16 +122,17 @@ SandboxID;同节点 resume、跨节点迁移和 re-place 不改变它。受保�
 `node_sandbox_id=<sandbox_id>-g<N>`。Router 使用稳定 SandboxID 寻址,只在 node 边界替换为
 NodeSandboxID;公开响应不暴露 NodeSandboxID。
 
-create 可在 body metadata 中携 `kuasar-sandbox.restore` / `kuasar-sandbox.credentials`,或使用
-对应的 `X-Kuasar-Sandbox-Restore` / `X-Kuasar-Sandbox-Credentials`;每个 Header 只覆盖同名
-metadata object,credentials 不做字段级 merge。router 只提取并严格校验这两个请求级
-namespace。未提供 restore、`{}` 与显式 `off` 均为关闭;只有本次 create 显式提供
-`memory` 才启用。两个 namespace 都由 Header 提供时无需读取 body;否则 create body
-上限为 16 MiB,超限返回 **413**。
+create 可在 body metadata 中携 `kuasar-sandbox.resource`、restore、credentials 与 checkpoint。
+`X-Kuasar-Sandbox-Resource` 只覆盖明确出现的 resource leaf;resource 的公开面严格限制为
+capacity/allocatable/startup,并与 group defaults 使用同一 merge helper。restore/credentials
+Header 覆盖同名完整 object,checkpoint Header 按字段覆盖。router 始终解析并严格校验 body,
+所以合法 Header 不能隐藏非法低优先级 resource/checkpoint。未提供 restore、`{}` 与显式
+`off` 均为关闭;只有本次 create 显式提供 `memory` 才启用。create body 上限为 16 MiB,
+超限返回 **413**。
 
 Router 调用同一 `POST /route-link/reserve` 时按 operation 组装不同请求:
 
-- `create`:query 为 `operation=create&group=&route_key=`,Header 携 `X-API-KEY`,body 只携上述 create config。
+- `create`:query 为 `operation=create&group=&route_key=`,Header 携 `X-API-KEY`,body只携上述 portable/request-scoped create config。
 - `connect`:query 为 `operation=connect&group=&route_key=&sid=[&timeout=]`,Header 携 `X-API-KEY`
   和可选 `X-Kuasar-Migration-Token`,body 为空。
 - `exec-session`:query 为 `operation=exec-session&group=&route_key=&sid=[&ttl_seconds=]`,Header 携
@@ -243,13 +244,13 @@ provider APISecret,connect/exec-session 使用 Sandbox 业务记录已绑定的 
 
 | 操作 | 行为 |
 |---|---|
-| create | 调用 `operation=create` Reserve,传递请求级 restore policy 与 credentials object;credentials 在写普通 metadata 前分离 |
+| create | 调用 `operation=create` Reserve,传递 leaf-merged resource 与请求级 restore/credentials/checkpoint;credentials 在写普通 metadata 前分离 |
 | kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
 | connect | 调用 `operation=connect` Reserve;Registry 对当前 NodeSandboxID 下发 CmdConnect,验证 typed ConnectResult 后返回;Router 不 Resolve,不二次转发 node HTTP `/connect` |
 | exec session | 严格解析 64 KiB body,调用 `operation=exec-session` Reserve;Registry 验证原始 API key 并下发 CmdExecSession;Router 只投影 ExecAccessToken |
 | get/pause/timeout/export | Resolve 当前 route,把公开 SandboxID 路径替换为 NodeSandboxID 后转发;typed get 响应重写回稳定 SandboxID |
 | get/list | 读 group route_link |
-| build register | 生成稳定 build_id/template_id 后调 ReserveBuild |
+| build register | 生成稳定 build_id/template_id,严格合并 register resource body/Header/E2B capacity leaf 后调 ReserveBuild;node 在保存 build 前再次校验 |
 | build status/files | 按 group+build_id 定位 node 后转发 |
 
 connect 的 Node Ack 只投影 NodeSandboxID、TemplateID、Profile 和 Envd/Traffic/ForwardAccessToken;不返回

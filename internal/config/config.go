@@ -343,17 +343,27 @@ type SandboxConfig struct {
 	Boot       BootConfig      `yaml:"boot"`        // boot artifacts (kernel / guest runtime / overlay)
 }
 
-// ResourcesConfig is per-sandbox capacity + resource-control wiring.
-type ResourcesConfig struct {
-	VCPU          int    `yaml:"vcpu"`           // default 2
-	Memory        string `yaml:"memory"`         // default "2GiB"
-	ControlSocket string `yaml:"control_socket"` // sentinel resource-controller UDS; "" = static cgroup mode
+// ResourcesConfig is the conductor-owned sandbox resource policy. Its
+// underlying schema is shared with sandboxcfg's resolver but deliberately does
+// not expose sandboxer's runtime control, deflate, watermark, or sensor fields.
+type ResourcesConfig sandboxcfg.NodeResourcePolicy
+
+func (r *ResourcesConfig) applyDefaults() {
+	policy := sandboxcfg.NodeResourcePolicy(*r)
+	policy.ApplyDefaults()
+	*r = ResourcesConfig(policy)
+}
+
+// Policy returns the resolver input without introducing a second resource
+// schema in internal/config.
+func (r ResourcesConfig) Policy() sandboxcfg.NodeResourcePolicy {
+	return sandboxcfg.NodeResourcePolicy(r)
 }
 
 // MemoryMiB parses Memory ("2GiB", "512MiB", "2G", "512M", or a plain byte count)
 // into whole MiB, for surfacing the VM's memory in e2b list/get responses. Returns
 // 0 if unset or unparseable (the value is informational, not an allocation knob).
-func (r ResourcesConfig) MemoryMiB() int { return parseMiB(r.Memory) }
+func (r ResourcesConfig) MemoryMiB() int { return parseMiB(r.Policy().Capacity.Memory) }
 
 // MemoryMiB parses the build sandbox's memory into whole MiB (cluster build pool).
 func (b BuilderConfig) MemoryMiB() int { return parseMiB(b.Memory) }
@@ -579,12 +589,7 @@ func (c *Config) applyDefaults() {
 	if c.Sandbox.TimeoutSec == 0 {
 		c.Sandbox.TimeoutSec = 300
 	}
-	if c.Sandbox.Resources.VCPU == 0 {
-		c.Sandbox.Resources.VCPU = 2
-	}
-	def(&c.Sandbox.Resources.Memory, "2GiB")
-	// Sandbox.Resources.ControlSocket is intentionally NOT defaulted: empty =
-	// static VMM cgroup mode. The node-ctl resource controller is opt-in.
+	c.Sandbox.Resources.applyDefaults()
 	def(&c.Sandbox.Network.Switch, "sw0")
 	def(&c.Sandbox.Network.Hostname, "sandbox")
 	if len(c.Sandbox.Network.DNS) == 0 {
@@ -695,6 +700,10 @@ func (c *Config) validate() error {
 	}
 	if c.Sandbox.Boot.Runtime == "" {
 		return fmt.Errorf("config: sandbox.boot.runtime is required")
+	}
+	dynamicResources := c.ResourceListen != nil && c.ResourceListen.Enabled
+	if err := sandboxcfg.ValidateNodeResourcePolicy(c.Sandbox.Resources.Policy(), dynamicResources); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 	if c.Sandbox.Network.TapFDSocket != "" && !filepath.IsAbs(c.Sandbox.Network.TapFDSocket) {
 		return fmt.Errorf("config: sandbox.network.tapfd_socket must be absolute")

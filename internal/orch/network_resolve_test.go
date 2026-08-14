@@ -22,6 +22,8 @@ type capturingNetworkVS struct {
 	req vswitch.AttachReq
 }
 
+func intPointer(value int) *int { return &value }
+
 func (v *capturingNetworkVS) Attach(_ context.Context, req vswitch.AttachReq) (*vswitch.Port, error) {
 	v.req = req
 	return &vswitch.Port{
@@ -167,6 +169,7 @@ func TestRestoreNetworkPrecedenceFeedsAttachAndGuestFromSameSpec(t *testing.T) {
 		types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)},
 		sandboxcfg.SandboxSpec{},
 		network,
+		rtconfig.ResourcesConfig{},
 	)
 	if !reflect.DeepEqual(params.Network, network) {
 		t.Fatalf("guest network = %+v, want %+v", params.Network, network)
@@ -295,8 +298,8 @@ func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 		network:         runtimeNetwork,
 		templateNetwork: templateNetwork,
 		spec: sandboxcfg.SandboxSpec{
-			Resource: sandboxcfg.ResourceSpec{
-				Capacity: &rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
+			Resource: sandboxcfg.ResourcePatch{
+				Capacity: &sandboxcfg.CapacityPatch{CPU: intPointer(4), Memory: stringPointer("8GiB")},
 			},
 		},
 	}
