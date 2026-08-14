@@ -64,7 +64,18 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o := New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	installDefaultSnapshotInspector(o)
+	return o
+}
+
+func installDefaultSnapshotInspector(o *Orchestrator) {
+	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
+		var description snapshotDescription
+		description.Resources.Capacity.CPU = 2
+		description.Resources.Capacity.Memory = "2GiB"
+		return description, nil
+	}
 }
 
 // TestResolveBuildCreds verifies the precedence: pull token > fromImageRegistry

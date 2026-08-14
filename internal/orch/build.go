@@ -48,6 +48,10 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -198,7 +202,10 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	mergedMetadata := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	mergedMetadata, err := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register leaves
+	if err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	if _, err := sandboxcfg.ParseSpec(mergedMetadata); err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -779,11 +786,11 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	// pins snapshot.cfg.resources.capacity, which a snp-template create inherits.
 	vcpu, mem := o.cfg.Builder.VCPU, o.cfg.Builder.Memory
 	if capacity := pend.spec.Resource.Capacity; capacity != nil {
-		if capacity.CPU > 0 {
-			vcpu = capacity.CPU
+		if capacity.CPU != nil {
+			vcpu = *capacity.CPU
 		}
-		if capacity.Memory != "" {
-			mem = capacity.Memory
+		if capacity.Memory != nil {
+			mem = *capacity.Memory
 		}
 	}
 	importReferer, err := o.effectiveImportReferer(b)

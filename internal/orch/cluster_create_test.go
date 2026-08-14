@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,31 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestClusterCreateRejectsInvalidResourcePatchBeforeSideEffects(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	vs := &resourcePreflightVS{}
+	o.vs = vs
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterCreateCommand(fingerprint, "invalid-resource")
+	cmd.Config = map[string]string{
+		sandboxcfg.NsResource: `{"control":{}}`,
+	}
+
+	ack := o.HandleCommand(ctx, cmd)
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest ||
+		!strings.Contains(ack.Reason, "node-managed") {
+		t.Fatalf("cluster create ack = %+v", ack)
+	}
+	if vs.attaches.Load() != 0 || lc.starts.Load() != 0 {
+		t.Fatalf("invalid command caused side effects: attaches=%d starts=%d", vs.attaches.Load(), lc.starts.Load())
+	}
+	if stored, err := o.st.Get(ctx, cmd.SID); err != nil || stored != nil {
+		t.Fatalf("invalid command stored sandbox = %+v, err=%v", stored, err)
+	}
+}
 
 func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
 	return &routesync.Command{

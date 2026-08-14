@@ -76,10 +76,12 @@ paths:
 sandbox:
   timeout_sec: 300                                # default TTL
   resources:
-    vcpu: 2
-    memory: 2GiB
-    # control_socket: /run/sandbox-resource.sock  # resource-controller UDS (opt-in); omit = static cgroup.
-    #                                              # Set to resource_listen.socket below when hosting the controller.
+    capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B cpuCount,memoryMB
+    allocatable:
+      # cpu: 2                                    # omitted => follows final capacity.cpu
+      memory: 256MiB                              # steady-state floor
+    # startup: { memory: 512MiB }                 # dynamic only; omitted => final capacity.memory
+    overhead: { memory: 32MiB }                   # node-owned VMM/control-plane headroom
   network:
     switch: sw0
     # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # enables persistent tapfd; connector must run `vswitch serve --tapfd-listen` on this path
@@ -128,13 +130,14 @@ builder:
   #   secret_key: ""
 
 # Optional in-process node resource controller (admission / budget / density;
-# sandbox-ctl dials its socket). Absent/disabled = static cgroup. The tuning is
+# socket is the sole controller endpoint; node-ctl derives the canonical identity
+# used by sandbox YAML + lease/inventory. Absent/disabled = static cgroup. The tuning is
 # inlined here — there is no separate file. Inspect / operate with:
 # node-ctl resource {status|list|drain|grant|reclaim}.
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
-#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
+#   # Advanced tuning — all defaulted (node-resource.md §3.3); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]

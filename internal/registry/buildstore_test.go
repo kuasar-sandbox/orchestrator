@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -98,6 +100,17 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
 	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+wantLease {
 		t.Fatalf("released=%v, want n1/%q", admitter.released, wantLease)
+	}
+}
+
+func TestReserveBuildRejectsRuntimeOwnedResourceBeforePlacement(t *testing.T) {
+	reg := testReg(t)
+	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{
+		Group: "/g", Profile: types.ProfileE2B,
+		Metadata: map[string]string{sandboxcfg.NsResource: `{"allocatable":{"deflate_on_oom":false}}`},
+	})
+	if !errors.Is(err, errInvalidSandboxConfig) || !strings.Contains(err.Error(), "node-managed") {
+		t.Fatalf("ReserveBuild error = %v", err)
 	}
 }
 

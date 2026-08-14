@@ -264,18 +264,18 @@ env(systemd `%i` 接线用)。
 
 ### 2.5 `node-ctl config`
 
-配置诊断 + 生成工具,**按角色**(`serve` / `proxy`,各自独立文件与 schema):
+配置诊断 + 生成工具,**按角色**(`conductor` / `proxy`,各自独立文件与 schema):
 
 ```
-node-ctl config <serve|proxy> --template            # 输出该角色带注释骨架
-node-ctl config <serve|proxy> --config <file>       # 加载(补默认 + 校验)后重排输出
-node-ctl config <serve|proxy> --config <file> --resolve   # 再展开 auto/派生(实际生效形态)
+node-ctl config <conductor|proxy> --template            # 输出该角色带注释骨架
+node-ctl config <conductor|proxy> --config <file>       # 加载(补默认 + 校验)后重排输出
+node-ctl config <conductor|proxy> --config <file> --resolve   # 再展开 auto/派生(实际生效形态)
                               -o <file>             # 写文件(默认 stdout)
 ```
 
-角色作首参以消歧 schema:`serve` 对应 `conductor.yaml`(§3),`proxy` 对应 `proxy.yaml`
-(node-proxy.md §2)。`--resolve` 对 `serve` 额外展开 `resource_listen` 的 `auto` 内存/CPU
-(并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{serve,proxy}.example.yaml` 对应。
+角色作首参以消歧 schema:`conductor` 对应 `conductor.yaml`(§3),`proxy` 对应 `proxy.yaml`
+(node-proxy.md §2)。`--resolve` 对 `conductor` 额外展开 `resource_listen` 的 `auto` 内存/CPU
+(并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{conductor,proxy}.example.yaml` 对应。
 
 ### 2.6 `node-ctl manifest-key`
 
@@ -375,8 +375,10 @@ node-ctl 同目录 → PATH"自动发现。
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
-| `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
-| `sandbox.resources.control_socket` | 空 | 资源控制器 UDS,**opt-in**;空 = 静态 cgroup(单元自身,§5.1);非空指向内置控制器(`resource_listen`,通常即其 `socket`,node-resource.md) |
+| `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 capacity,不是 steady floor。img 冷启可由 request/template 覆盖;restore 容量由 snapshot 固定 |
+| `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / `256MiB` | 稳态保证/floor;继承值超过最终 capacity 时收敛到 capacity,request 显式越界则拒绝 |
+| `sandbox.resources.startup.memory` | 未配置 | 仅 dynamic 模式可显式配置;未配置时每个沙箱取最终 capacity.memory,不会随 256MiB floor 一同降低 |
+| `sandbox.resources.overhead.memory` | `32MiB` | node-owned VMM/control-plane cgroup headroom;request/template 不可覆盖 |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
@@ -412,7 +414,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
-| `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),`state_path` 仅旧 YAML 解析兼容且 deprecated/ignored;`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
+| `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
 
 远程内存 Prefetch 没有节点统一开关。是否请求 Prefetch 由每个 sandbox 的
 `kuasar-sandbox.restore` 命名空间决定(§4.6)。
@@ -423,7 +425,10 @@ proxy 组件);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service e
 必须是 absolute Unix socket URI。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
 配置 `proxy_netns`。external 模式无须静态 worker 列表——proxy master 经 plugin 平面注册,
 proxyForwarder 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
-`resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
+`resource_listen.enabled=true` 时 node-ctl 在启动阶段解析一次 canonical controller
+identity并自动写入每个 sandbox YAML;没有第二个 `sandbox.resources.control_socket` 配置源。
+node policy 显式 `startup` 但 controller 未启用会在 daemon 产生 socket、网络或 runner
+副作用前失败。
 
 ## 4. e2b API 契约
 
@@ -443,7 +448,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
-| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
+| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,绝不改成 allocatable floor)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
 | resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,可选 `ttlSeconds` 和 `X-Kuasar-Migration-Token`;不创建 guest process |
@@ -558,7 +563,7 @@ route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?}`;`profile∈{e2b,bare}`,省略按此 e2b 兼容端点语义取 `e2b`,注册后不可变;`X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);MMDS routes/initial secrets 只供本次 builder sandbox,secret 不进入模板;回 `{templateID: transient-<uuidv7>, buildID, profile, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + 非 MMDS `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6)。Trigger 出现 MMDS Header 或 metadata key 直接拒绝,不能覆盖 Register 的 MMDS |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做)。Trigger-time 通用 `metadata`、restore/credentials/checkpoint/MMDS 入口及通用 `X-Kuasar-Sandbox-*` header 已废弃并返回 400;暂保留的 `cpu_count`/`memory_mb` 只覆盖 register resource 的 capacity leaf,`X-Kuasar-Sandbox-Builder` 仍由 #97 收敛 |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, profile, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile` |
@@ -632,7 +637,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 
 | 命名空间 | 去向 |
 |---|---|
-| `resource` | `resources.{capacity,allocatable}`(不含 `control`,节点托管) |
+| `resource` | 严格 partial patch:`resources.{capacity.{cpu,memory},allocatable.{cpu,memory},startup.memory}` |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
@@ -641,6 +646,48 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
 | `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
 | `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
+
+`resource` 是唯一按 leaf 合并而不是整段 namespace 覆盖的配置。公开 JSON 只允许:
+
+```json
+{
+  "capacity": {"cpu": 2, "memory": "8GiB"},
+  "allocatable": {"cpu": 0.5, "memory": "256MiB"},
+  "startup": {"memory": "1GiB"}
+}
+```
+
+整个值必须是单个 JSON object。unknown、`null`、数组/scalar、trailing JSON、显式
+零/负 CPU、空/非法/非正 memory 均返回 400,错误带完整
+`kuasar-sandbox.resource.<path>`。request/template/group/header/migration token 都不能
+携带 `allocatable.deflate_on_oom`、`overhead`、`watermark_high`、`control` 或
+`sensor`:overhead/deflate/controller/cgroup 属于 node/runtime,watermark/sensor 继续
+使用 sandboxer 默认。合法 patch 持久化为 compact canonical JSON。
+
+固定的 leaf priority 是:
+
+```text
+node resource policy
+  < template / group defaults
+  < create / reserve body resource
+  < X-Kuasar-Sandbox-Resource
+  < E2B first-class cpuCount / memoryMB (只覆盖 capacity 对应 leaf)
+  < restore snapshot capacity constraint
+```
+
+五个 leaf 独立 overlay;例如 template 只设 `capacity.memory`,create 只设
+`allocatable.memory` 时两者同时保留。其它 namespace 仍由高层整段覆盖。每一层都先
+严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
+registration 共用同一 helper。
+
+最终 resolver 先确定 capacity,再解析 allocatable/startup,最后添加 node-only
+overhead/deflate/controller。继承的 allocatable 超过最终 capacity 可安全收敛;
+request 显式越界拒绝。dynamic 下 request 显式 startup 必须位于
+`allocatable.memory..capacity.memory`;node 显式 startup 取
+`min(max(nodeStartup,effectiveAllocatable),finalCapacity)`,双方都未显式设置则取最终
+capacity。static 不渲染 startup/controller,任何 request startup 都在生命周期副作用前
+拒绝。有 balloon(`capacity.memory > allocatable.memory`)时最终 YAML 保证
+`deflate_on_oom: true`。
 
 MMDS 在 Sandbox Create 与 Build Register 共用以下外部 schema。Header 直接携 JSON;
 metadata 的 value 仍是一个 JSON string:
@@ -771,23 +818,30 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 它只控制本次模板构建的 import referer 行为,解析后从模板 sandbox metadata 中剥离,
 持久化到 `builds.builder_json`;不会随模板 create/resume 进入运行时配置。
 
-- **渲染**:serve 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
-  网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
-  在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 由 run-sandbox 以继承 FD
-  覆盖、base 经快照填),这里只对租户网络做格式校验。
+- **渲染**:serve 在任何 network Attach/runner Assign 前用一个纯 resolver 生成完整
+  `ResourcesConfig`,renderer 直接安装该对象,不再逐字段重解释。YAML 不含
+  `control.cgroup_path`;run-sandbox 最后以继承 cgroup FD 注入该 capability。
+  dynamic `control.controller` 只取启动时解析的 `resource_listen.SocketIdentity`;
+  `watermark_high`/sensor 保持 omitted。其它 boot/tapfd/已解析 network 与租户子集再经
+  config-socket 交 sandbox-ctl。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
-  metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
+  metadata,resource 按 leaf 取 header 优先、其它 namespace 整段取 header 优先)。create
+  与模板 register 支持通用配置;trigger 明确拒绝非空通用 metadata/header;
   create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
   `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
   `restore`、`credentials`、`checkpoint` 是 request-scoped 例外:只接受 create 请求,
   不从模板继承;checkpoint header 不进入模板构建。
   集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
-- **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
-  经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
-  register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
-  phase-C 构建 VM 容量。
+- **优先级**:resource 使用上面的固定 leaf chain;非 resource 继续
+  `节点默认 ⊕ 模板配置 ⊕ create 配置` 的 whole-namespace 行为。模板 portable patch
+  来自 `builds.metadata_json`;trigger 暂保留的 `cpuCount`/`memoryMB` 只作为 register
+  resource capacity leaf overlay。现有 build path 仍用最终 capacity leaf 选择 build VM
+  capacity;builder 自身的独立 quota/pool 资源模型未由本功能重构。
 - **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
-  快照**(runtime 拒容量不等)。
+  快照**。request 显式相同 capacity 可作为 assertion,任一 leaf 不同则 400。无法可靠
+  probe snapshot capacity 时直接失败,且此时尚未 Attach network、Assign runner、创建
+  controller reservation/cgroup/VM;绝不回退 node defaults。snapshot 中已有
+  `allocatable_at_snapshot` 仍由既有 resource protocol 提高 initial grant。
 - **network 随快照**:普通 sandbox 渲染时把已解析逻辑网络注入
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore
   继承;restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。
@@ -1755,7 +1809,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | 对象 | 方式 | 说明 |
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … [--restore] [--connect]`;run-builder 以直接子进程 `run --ready-fd=<pipe-fd>` 启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
-| 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 每个 runner 的 `vmm/` 是沙箱资源 cgroup;不配 control_socket = 静态 cgroup,配了才进 SANDBOX_CONFIG `resources.control.controller` |
+| 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);dynamic sandbox 自动使用同一 canonical `SocketIdentity` 拨号(`pkg/resource` 协议) | `resource_listen` 是唯一 endpoint 来源;每个 runner 的 `vmm/` 是沙箱资源 cgroup,FD 由 run-sandbox 注入;controller disabled = static cgroup |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
@@ -1882,8 +1936,8 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 
 - [node-proxy.md](node-proxy.md) —— 数据面转发层:路由判定 / 部署模式(internal/external/off)/
   routesync / 数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 装配的转发层实现,集群下 router 转发进入)
-- [node-resource.md](node-resource.md) —— 节点资源控制协议(`sandbox.resources.control_socket`
-  的对端)与控制器内部组织(serve 经 `resource_listen` 内置,调参内联)
+- [node-resource.md](node-resource.md) —— 节点资源控制协议、sandbox resource policy
+  与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,
   Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口,[cluster-placer.md](cluster-placer.md)
   放置与密钥分发

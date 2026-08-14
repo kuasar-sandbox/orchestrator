@@ -34,6 +34,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // vsClient is the vswitch surface the orchestrator uses; the production impl is
@@ -90,6 +91,11 @@ type Orchestrator struct {
 	probe         ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 	resourceStats SandboxResourceProvider
 	trafficStats  SandboxTrafficProvider
+	// Set once from nodectl.Resolved.SocketIdentity before any API or node-link
+	// listener starts. The raw resource_listen socket is never a sandbox policy
+	// source.
+	resourceControllerSocketIdentity string
+	snapshotInspector                func(context.Context, string, string) (snapshotDescription, error)
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -156,6 +162,12 @@ func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierC
 	o.routeBarriers = c
 }
 
+// SetResourceControllerSocketIdentity wires the canonical controller/lease
+// identity resolved by nodectl. It must be called before launch admission.
+func (o *Orchestrator) SetResourceControllerSocketIdentity(identity string) {
+	o.resourceControllerSocketIdentity = identity
+}
+
 // --- api.Core ---
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
@@ -189,7 +201,10 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
 		templateMetadata = tb.Metadata
 	}
-	meta := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
+	meta, err := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	mmdsDoc, meta, err := sandboxcfg.ExtractMMDS(meta, req.MMDSHeader, o.mmdsPolicy())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -266,9 +281,6 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if sb.RunID != "" || sb.FloatingIP != "" || sb.VswitchPort != "" || sb.InnerIP != "" || sb.PortMAC != "" {
 		return nil, nil, fmt.Errorf("orch: fresh launch admission requires empty runner and network ownership")
 	}
-	if _, err := sandboxcfg.ParseSpec(sb.Metadata); err != nil {
-		return nil, nil, err
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -278,6 +290,10 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	}
 	if err := validateInitialMMDSRouteEntry(sb, initialMMDS); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	preparation, err := o.prepareSandboxLaunch(ctx, sb, tmpl)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var barrier routesync.RouteBarrier
@@ -353,7 +369,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	}
 	work := cloneSandbox(sb)
 	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
-		return o.runLaunch(launchCtx, current, work, tmpl)
+		return o.runLaunch(launchCtx, current, work, tmpl, preparation)
 	})
 	return cloneSandbox(initial), attempt, nil
 }
@@ -446,8 +462,8 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
 		"duration", duration)
 }
 
-func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID) error {
-	err := o.launchSandbox(ctx, attempt, sb, tmpl)
+func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
+	err := o.launchSandbox(ctx, attempt, sb, tmpl, preparation)
 	result := "success"
 	failureStage := ""
 	if err != nil {
@@ -476,9 +492,12 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 // launchSandbox prepares all runner handoff inputs, then spends separate runner
 // assignment and runtime readiness budgets. The durable starting row already
 // exists and is never replaced by a stale whole-row Put.
-func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID) error {
+func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
 	if sb == nil || attempt == nil || sb.State != types.StateStarting || sb.ID != attempt.SID() {
 		return launchFailed("prepare", fmt.Errorf("orch: launch requires its claimed starting sandbox"))
+	}
+	if preparation == nil {
+		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
 	prepareStarted := time.Now()
 	prepareLogged := false
@@ -500,24 +519,8 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
 		return launchFailed("prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
 	}
-	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
-	if err != nil {
-		return launchFailed("prepare", err)
-	}
-	// Restore (resume / snp-template create / migration import): inherit the
-	// snapshot's logical network for fields the create config left unset (point 7 —
-	// explicit create config wins, the snapshot fills the rest), and pin capacity to
-	// the snapshot (the runtime refuses a mismatch). Read before attach so an
-	// inherited inner_ip / transit_* reaches resolveNetwork + attachNetwork.
-	var snap snapInfo
-	if ref := sandboxcfg.RestoreRefFor(sb, tmpl); ref != "" {
-		snap = o.snapshotConfig(ctx, sb, ref)
-		spec.Network = sandboxcfg.MergeNetwork(snap.Network, spec.Network)
-	}
-	network, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname)
-	if err != nil {
-		return launchFailed("prepare", err)
-	}
+	spec := preparation.Spec
+	network := preparation.Network
 	port, err := o.attachNetwork(ctx, network)
 	if err != nil {
 		return launchFailed("network", err)
@@ -547,13 +550,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		return launchFailed("resources", ownershipErr)
 	}
 
-	p := o.sandboxParams(sb, tmpl, spec, network)
-	// Pin capacity to the snapshot the runtime froze (read above). Template
-	// snapshots are self-describing and may have been taken at a different budget
-	// than this node's create defaults (e.g. the build pipeline's builder.vcpu/memory).
-	if snap.HasCapacity {
-		p.VCPU, p.Memory = snap.CapCPU, snap.CapMem
-	}
+	p := o.sandboxParams(sb, tmpl, spec, network, preparation.Resources)
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return launchFailed("config", err)
 	}
@@ -1365,7 +1362,8 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 		if err != nil {
 			return nil, nil, err
 		}
-		if _, err := sandboxcfg.ParseSpec(sb.Metadata); err != nil {
+		launchPreparation, err := o.prepareSandboxLaunch(ctx, sb, tmpl)
+		if err != nil {
 			return nil, nil, err
 		}
 		lifecycleCtx := o.launchContext()
@@ -1411,7 +1409,7 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 		o.publishUpsert(starting)
 		work := cloneSandbox(starting)
 		o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
-			return o.runLaunch(launchCtx, current, work, tmpl)
+			return o.runLaunch(launchCtx, current, work, tmpl, launchPreparation)
 		})
 		o.logLaunchPhase(attempt, starting, "admission_duration", time.Since(admissionStarted))
 		return cloneSandbox(starting), attempt, nil
@@ -1474,10 +1472,61 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 // kuasar-sandbox.network key the orchestrator injected into the snapshot's metadata),
 // used to fill create-config network fields left unset (point 7).
 type snapInfo struct {
-	Network     sandboxcfg.NetworkSpec
-	CapCPU      int
-	CapMem      string
-	HasCapacity bool
+	Network  sandboxcfg.NetworkSpec
+	Capacity rtconfig.CapacityConfig
+}
+
+// launchPreparation contains every pure, fallible input needed after launch
+// acceptance. It is built before route publication, network attach, resource
+// controller admission, cgroup creation, or runner assignment.
+type launchPreparation struct {
+	Spec      sandboxcfg.SandboxSpec
+	Network   sandboxcfg.NetworkSpec
+	Resources rtconfig.ResourcesConfig
+}
+
+func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*launchPreparation, error) {
+	if sb == nil {
+		return nil, errors.New("orch: sandbox launch preflight requires a sandbox")
+	}
+	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
+	var snapshotCapacity *rtconfig.CapacityConfig
+	var snapshotNetwork sandboxcfg.NetworkSpec
+	if restoreRef != "" {
+		snapshot, err := o.snapshotConfig(ctx, sb, restoreRef)
+		if err != nil {
+			return nil, err
+		}
+		snapshotCapacity = &snapshot.Capacity
+		snapshotNetwork = snapshot.Network
+	}
+	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if restoreRef != "" {
+		spec.Network = sandboxcfg.MergeNetwork(snapshotNetwork, spec.Network)
+	}
+	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
+	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
+		Node:                     o.cfg.Sandbox.Resources.Policy(),
+		Patch:                    spec.Resource,
+		Restore:                  restoreRef != "",
+		SnapshotCapacity:         snapshotCapacity,
+		Dynamic:                  dynamic,
+		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
+	})
+	if err != nil {
+		if errors.Is(err, sandboxcfg.ErrInvalidResourceRequest) {
+			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+		return nil, fmt.Errorf("orch: resolve sandbox resources: %w", err)
+	}
+	network, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname)
+	if err != nil {
+		return nil, err
+	}
+	return &launchPreparation{Spec: spec, Network: network, Resources: resources}, nil
 }
 
 // snapshotDescription is the subset of `sandbox-ctl info --json` consumed by
@@ -1515,25 +1564,29 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
 	return cfg, nil
 }
 
-// snapshotConfig reads resources.capacity + the kuasar-sandbox.network metadata from a
-// snapshot ref's embedded snapshot.cfg (`sandbox-ctl info --json`; reads only the
-// trailing ZIP, a few KB even via manifest://). Best-effort: any probe/parse failure
-// yields a zero snapInfo and the launch proceeds with node defaults (the runtime
-// stays the capacity enforcer).
-func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) snapInfo {
+// snapshotConfig reads resources.capacity + logical network from snapshot.cfg.
+// Capacity is mandatory for every managed restore; network metadata retains its
+// historical best-effort behavior and is independently overlaid by request data.
+func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) (snapInfo, error) {
 	var info snapInfo
-	cfg, err := o.inspectSnapshotConfig(ctx, sb.ManifestKey, ref)
-	if err != nil {
-		o.log.Warn("snapshot config probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
-		return info
+	inspect := o.inspectSnapshotConfig
+	if o.snapshotInspector != nil {
+		inspect = o.snapshotInspector
 	}
-	if cfg.Resources.Capacity.CPU > 0 && cfg.Resources.Capacity.Memory != "" {
-		info.CapCPU, info.CapMem, info.HasCapacity = cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory, true
+	cfg, err := inspect(ctx, sb.ManifestKey, ref)
+	if err != nil {
+		return info, err
+	}
+	info.Capacity = rtconfig.CapacityConfig{
+		CPU: cfg.Resources.Capacity.CPU, Memory: cfg.Resources.Capacity.Memory,
+	}
+	if info.Capacity.CPU <= 0 || info.Capacity.Memory == "" {
+		return snapInfo{}, fmt.Errorf("snapshot config %q has no usable resources.capacity", ref)
 	}
 	if nraw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork]); nraw != "" {
 		_ = json.Unmarshal([]byte(nraw), &info.Network) // best-effort; malformed -> zero network
 	}
-	return info
+	return info, nil
 }
 
 // --- configsock.Provider ---
@@ -1543,14 +1596,14 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 	return sb.RunDir + "/" + sb.ID + ".yaml"
 }
 
-func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec, network sandboxcfg.NetworkSpec) sandboxcfg.Params {
+func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec, network sandboxcfg.NetworkSpec, resources rtconfig.ResourcesConfig) sandboxcfg.Params {
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
 		Runtime:        o.cfg.Sandbox.Boot.Runtime,
 		Kernel:         o.cfg.Sandbox.Boot.Kernel,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
-		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
+		Resources:   resources,
 		Network:     network,
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		Spec:        spec,
@@ -1639,7 +1692,7 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	}
 	// The fully resolved network was already rendered by launch before the unit
 	// requests this spec. LaunchSpec only needs Params for restore/connect args.
-	p := o.sandboxParams(sb, tmpl, cfgSpec, sandboxcfg.NetworkSpec{})
+	p := o.sandboxParams(sb, tmpl, cfgSpec, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{})
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
 	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to

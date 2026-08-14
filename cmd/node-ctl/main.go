@@ -37,6 +37,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -113,6 +114,17 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// Resolve the dynamic controller endpoint and all resource policy before
+	// opening the durable store or touching systemd. The exact canonical socket
+	// identity is then shared by the controller's owner/inventory state and
+	// sandbox YAML; Listen remains the bind path selected by nodectl.Resolve.
+	var resolvedResources *nodectl.Resolved
+	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
+		resolvedResources, err = nodectl.Resolve(cfg.ResourceListen)
+		if err != nil {
+			return fmt.Errorf("resource_listen: %w", err)
+		}
+	}
 	warnDeprecatedCheckpointMode(cfg, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -144,6 +156,9 @@ func runConductor(args []string, log *slog.Logger) error {
 	), log)
 	core.SetLifecycleContext(ctx)
 	core.SetProxyRouteBarrierCoordinator(plugins)
+	if resolvedResources != nil {
+		core.SetResourceControllerSocketIdentity(resolvedResources.SocketIdentity)
+	}
 	// This defer is registered after the store and launcher closes, so it runs
 	// first on every conductor exit path. Cancel lifecycle admission and
 	// cancellable launch work, then keep dependencies open until every accepted
@@ -170,7 +185,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
 	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		probe, err := startResourceController(ctx, cfg.ResourceListen, cfg.Paths.RunRoot, log)
+		probe, err := startResourceController(ctx, cfg.ResourceListen, resolvedResources, cfg.Paths.RunRoot, log)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
@@ -274,7 +289,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	if fi, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
 		diskMB = int(fi.Size() >> 20)
 	}
-	res := api.Resources{VCPU: cfg.Sandbox.Resources.VCPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
+	res := api.Resources{VCPU: cfg.Sandbox.Resources.Policy().Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
 	apiH := api.New(core, cfg.API.Domain, res, log).Handler()
 
 	// Local control socket: one UDS multiplexes run assignment/result, task specs,

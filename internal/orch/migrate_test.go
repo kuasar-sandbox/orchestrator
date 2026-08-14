@@ -94,6 +94,98 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(sb))
 }
 
+func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	sb := migrationSandbox(t, dir, "portable-resource", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	sb.Metadata = map[string]string{
+		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" } } `,
+		"ordinary":            "preserved",
+	}
+
+	token, err := o.mintSandboxToken(sb, sb.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := migrationtoken.Open(migrationtoken.KeyMaterial{
+		APISecret: sb.APISecret, ManifestKey: sb.ManifestKey,
+	}, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := payload.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"startup":{"memory":"1GiB"}}`; got != want {
+		t.Fatalf("portable resource metadata = %q, want %q", got, want)
+	}
+	if payload.Metadata["ordinary"] != "preserved" {
+		t.Fatal("ordinary portable metadata was dropped")
+	}
+
+	sb.Metadata[sandboxcfg.NsResource] = `{"control":{"controller":"/run/foreign.sock"}}`
+	if _, err := o.mintSandboxToken(sb, sb.SnapshotRef); err == nil || !strings.Contains(err.Error(), "node-managed") {
+		t.Fatalf("node-owned migration resource error = %v", err)
+	}
+}
+
+func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	o.cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
+	o.cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.NodeResourcePolicy{
+		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "128MiB"},
+		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "64MiB"},
+	})
+	o.cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	o.cfg.Sandbox.Network.E2B.Nexthop = "169.254.0.22"
+	o.SetResourceControllerSocketIdentity("/target/resource.sock")
+	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
+		var description snapshotDescription
+		description.Resources.Capacity.CPU = 2
+		description.Resources.Capacity.Memory = "8GiB"
+		return description, nil
+	}
+
+	manifestKey := strings.Repeat("7", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	if _, err := o.st.AddKeyPair(context.Background(), store.KeyPair{
+		APISecret: apiSecret, ManifestKey: manifestKey,
+	}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	source := migrationSandbox(t, dir, "source-resource", manifestKey, "manifest://"+strings.Repeat("c", 64))
+	source.Metadata = map[string]string{
+		sandboxcfg.NsResource: `{"capacity":{"cpu":2,"memory":"8GiB"},"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
+	}
+	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := o.ImportSandbox(context.Background(), apiKey, token, "target-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := o.st.Get(context.Background(), targetID)
+	if err != nil || target == nil {
+		t.Fatalf("imported target = %+v, err=%v", target, err)
+	}
+	template, err := types.ParseTemplateID(target.TemplateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparation, err := o.prepareSandboxLaunch(context.Background(), target, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := preparation.Resources
+	if resources.Capacity.CPU != 2 || resources.Capacity.Memory != "8GiB" ||
+		resources.Allocatable.CPU != 2 || resources.Allocatable.Memory != "512MiB" ||
+		resources.Startup == nil || resources.Startup.Memory != "1GiB" ||
+		resources.Overhead == nil || resources.Overhead.Memory != "64MiB" ||
+		resources.Control.Controller != "/target/resource.sock" ||
+		resources.Allocatable.DeflateOnOOM == nil || !*resources.Allocatable.DeflateOnOOM {
+		t.Fatalf("target-resolved migration resources = %+v", resources)
+	}
+}
+
 func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))

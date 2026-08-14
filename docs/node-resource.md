@@ -137,7 +137,74 @@ node-ctl resource reclaim <sid> --memory <target> [--socket /run/sandbox-resourc
 
 ## 3. 配置
 
-### 3.1 resource_listen 配置块
+### 3.1 managed sandbox resource policy
+
+Conductor 对普通 managed sandbox 使用以下 node-owned policy(builder sandbox 有独立模型,
+不在本节):
+
+```yaml
+sandbox:
+  resources:
+    capacity: { cpu: 2, memory: 2GiB }
+    allocatable:
+      # cpu: 2                  # 省略 => 跟随最终 capacity.cpu
+      memory: 256MiB
+    # startup: { memory: 512MiB } # 仅 dynamic;省略 => 最终 capacity.memory
+    overhead: { memory: 32MiB }
+```
+
+- `capacity` 是 guest VM 上限/SKU;E2B `cpuCount`/`memoryMB` 仍表示它。
+- `allocatable` 是 steady floor。默认场景因此是 `memoryMB=2048`,floor=256MiB;
+  dynamic 当前 grant 可在 `256MiB..2GiB` 变化。
+- `startup` 是 admission/pre-settled 启动预算。dynamic 中 request/node 都未显式设置
+  时取每个 sandbox 的最终 capacity,所以新的 256MiB floor 不会把启动预算一同降为
+  256MiB。node 显式值按最终 floor/capacity 夹住;request 显式值越界直接拒绝。
+- `overhead` 只来自 node,缺省 32MiB。`deflate_on_oom` 由 node-ctl 在实际有 balloon
+  时固定 true。request/template/group/header/migration 都不能配置这两项。
+- `watermark_high` 与 `control.sensor` 不渲染,继续使用 sandboxer 当前默认。
+
+request/template 的 `kuasar-sandbox.resource` 只允许 capacity/allocatable/startup 的
+五个 leaf,严格 JSON 解析并逐 leaf 合并。优先级是 node < template/group < create/reserve
+body < resource header < E2B capacity leaf < restore snapshot capacity。任何低层非法 JSON
+都会失败,不能由合法高层隐藏。request 不能携 control/cgroup/controller/deflate/
+overhead/watermark/sensor。
+
+static(`resource_listen` absent/disabled) 最终资源形态:
+
+```yaml
+resources:
+  capacity: { cpu: 2, memory: 2GiB }
+  allocatable: { cpu: 2, memory: 256MiB, deflate_on_oom: true }
+  overhead: { memory: 32MiB }
+```
+
+它不渲染 startup/controller;request 显式 startup 与 node policy startup 都在产生
+运行副作用前失败。dynamic 另外渲染:
+
+```yaml
+resources:
+  startup: { memory: 2GiB }
+  control:
+    controller: /canonical/parent/sandbox-resource.sock
+```
+
+`resource_listen.socket` 是 endpoint 的唯一配置源。node-ctl 用绝对 `Listen` 路径 bind;
+父目录 symlink 由 sandboxer `CanonicalSocketPath` 规范化成 `SocketIdentity`,controller
+owner lock、lease inventory 和 sandbox YAML/client dial 都使用这一 identity 并指向同一
+socket inode。最终 socket symlink、
+dangling/ambiguous alias fail closed。`control.cgroup_path/CgroupFD` 不进 YAML,仍由
+run-sandbox 通过继承 FD 注入。
+
+img cold boot capacity 可由 portable patch 覆盖。snp create、paused resume、migration
+restore 必须先读出 snapshot capacity;request 同值可作 assertion,不同即拒绝。probe
+失败绝不回退 node defaults,且发生在 network Attach、runner Assign、resource Admit/cgroup/VM
+之前。snapshot balloon 的 `allocatable_at_snapshot` 仍按既有 wire protocol参与 initial grant。
+
+旧 `sandbox.resources.vcpu/memory/control_socket` schema 不再接受,没有兼容别名或第二
+controller 优先级。trigger-time 通用 metadata/config header 同样已废弃并返回 400;
+暂保留的 trigger `cpuCount/memoryMB` 只覆盖 capacity leaf。
+
+### 3.2 resource_listen 配置块
 
 控制器配置是 `node-ctl conductor serve` 配置(node.md §3)的 `resource_listen` 块,内联在
 conductor.yaml 里(无独立配置文件);`enabled: true` 即在其 `socket` 起控制器。字段
@@ -180,7 +247,7 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
   cooldown_periods: 10                 # × 100ms,burst → recover 判定门槛
 ```
 
-### 3.2 字段语义
+### 3.3 字段语义
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -445,7 +512,9 @@ T6  ... 启动序列继续(详见 `sandboxer/docs/sandbox.md` §冷启动数据�
 ```
 
 sandbox.yaml `resources.startup.memory` 是 sandbox 期望的 startup 阶段
-budget;默认 = allocatable.memory。admission 实际给出 `granted_initial_alloc
+budget。sandboxer 裸配置的内部 fallback 仍是 allocatable,但 orchestrator-managed
+dynamic sandbox 总是按 §3.1 显式解析并渲染:request/node 都未配置时为最终 capacity,
+不会因默认 256MiB floor 降低启动预算。admission 实际给出 `granted_initial_alloc
 = max(startup.memory, allocatable.memory, allocatable_at_snapshot)`,即
 三者最大,无降级。
 

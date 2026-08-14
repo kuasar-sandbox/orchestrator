@@ -368,6 +368,45 @@ print("\t".join(fields[:2]))
 PY
 }
 
+assert_cluster_resource_yaml() { # $1=node-local generated sandbox YAML
+    python3 - "$1" <<'PY'
+import sys
+
+path = sys.argv[1]
+values, stack = {}, []
+for raw in open(path, encoding="utf-8"):
+    line = raw.split("#", 1)[0].rstrip()
+    if not line.strip() or line.lstrip().startswith("-") or ":" not in line:
+        continue
+    indent = len(line) - len(line.lstrip(" "))
+    key, value = line.strip().split(":", 1)
+    while stack and indent <= stack[-1][0]:
+        stack.pop()
+    dotted = ".".join([item[1] for item in stack] + [key])
+    value = value.strip().strip('"').strip("'")
+    if value:
+        values[dotted] = value
+    else:
+        stack.append((indent, key))
+expected = {
+    "resources.capacity.cpu": "2",
+    "resources.capacity.memory": "2GiB",
+    "resources.allocatable.cpu": "2",
+    "resources.allocatable.memory": "256MiB",
+    "resources.allocatable.deflate_on_oom": "true",
+    "resources.overhead.memory": "32MiB",
+}
+for key, want in expected.items():
+    if values.get(key) != want:
+        raise SystemExit(f"{path}: {key}={values.get(key)!r}, want {want!r}; values={values}")
+for forbidden in ("resources.startup.memory", "resources.control.controller",
+                  "resources.control.cgroup_path", "resources.watermark_high.memory",
+                  "resources.control.sensor.mode"):
+    if forbidden in values:
+        raise SystemExit(f"{path}: static cluster YAML contains {forbidden}: {values}")
+PY
+}
+
 data_by_sid_code() {
     local out="$1" sid="$2" envd_token="$3"
     http_code "$out" \
@@ -804,6 +843,10 @@ run_cluster_flow() {
     rm -f "$WORK/exec-session.secret"
     native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
+    local node_yaml
+    node_yaml="$(find "$WORK/cr" -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | head -1)"
+    [ -n "$node_yaml" ] || fail "cluster node generated no sandbox YAML"
+    assert_cluster_resource_yaml "$node_yaml" || fail "cluster cold-create resource policy differs from standalone"
     step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
@@ -818,6 +861,7 @@ run_cluster_flow() {
     [ "$cluster_exec_status" = 0 ] || fail "paused cluster exec exited $cluster_exec_status"
     wait_cluster_traffic_stats "$sid" idle \
         || fail "cluster exec traffic did not converge to idle"
+    assert_cluster_resource_yaml "$node_yaml" || fail "cluster restore resource policy differs from cold create"
     unset exec_token
     step "PASS: paused stable-SID exec went directly to the final node, where traffic transitioned parking -> idle"
 

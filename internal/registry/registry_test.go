@@ -1344,6 +1344,78 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 }
 
+func TestReserveSandboxLeafMergesPlacementAndRequestResources(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	basePlacer := placementWithToken("n1")
+	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
+		placement, err := basePlacer.Place(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		placement.Config[sandboxcfg.NsResource] = `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":0.5}}`
+		return placement, nil
+	}))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	var command *routesync.Command
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		copy := *cmd
+		copy.Config = cloneStringMap(cmd.Config)
+		command = &copy
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		go reg.applyRoute(context.Background(), "n1", &route)
+	}})
+
+	_, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "resource-leaves", map[string]string{
+		sandboxcfg.NsResource: `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command == nil {
+		t.Fatal("create command not sent")
+	}
+	patch, err := sandboxcfg.ParseResourcePatch(command.Config[sandboxcfg.NsResource])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patch.Capacity == nil || patch.Capacity.CPU == nil || *patch.Capacity.CPU != 4 ||
+		patch.Capacity.Memory == nil || *patch.Capacity.Memory != "8GiB" ||
+		patch.Allocatable == nil || patch.Allocatable.CPU == nil || *patch.Allocatable.CPU != 0.5 ||
+		patch.Allocatable.Memory == nil || *patch.Allocatable.Memory != "512MiB" ||
+		patch.Startup == nil || patch.Startup.Memory == nil || *patch.Startup.Memory != "1GiB" {
+		t.Fatalf("merged resource patch = %+v", patch)
+	}
+}
+
+func TestReserveSandboxDoesNotHideInvalidPlacementResourceWithRequest(t *testing.T) {
+	reg := testReg(t)
+	commands := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		return &Placement{
+			NodeID: "n1", TemplateRef: testTemplateRef, APISecretFingerprint: testAPIFingerprint,
+			Config: map[string]string{sandboxcfg.NsResource: `{"control":{}}`},
+		}, nil
+	}))
+	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commands++ }})
+
+	_, err := reg.ReserveSandbox(context.Background(), testCreateReserve("/g", "invalid-placement-resource", map[string]string{
+		sandboxcfg.NsResource: `{"capacity":{"cpu":8,"memory":"16GiB"},"allocatable":{"memory":"1GiB"}}`,
+	}))
+	if !errors.Is(err, errInvalidSandboxConfig) || !strings.Contains(err.Error(), "node-managed") {
+		t.Fatalf("ReserveSandbox error = %v", err)
+	}
+	if commands != 0 {
+		t.Fatalf("invalid lower-priority resource sent %d commands", commands)
+	}
+}
+
 func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	placements := 0
 	reg := testReg(t)
@@ -3999,6 +4071,20 @@ func TestHTTPPlacerHonorsMinReadyPlacers(t *testing.T) {
 	}
 	if _, err := reg.VerifyAPIKeyWithMinReady(ctx, "/g", "key", 1, 2, 100*time.Millisecond); err != ErrNoNode {
 		t.Fatalf("VerifyAPIKey with one ready placer and min_ready=2 err=%v, want ErrNoNode", err)
+	}
+}
+
+func TestHTTPPlacerPreservesInvalidSandboxConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(routesync.PlaceResult{
+			Error: "resource leaves conflict", InvalidConfig: true,
+		})
+	}))
+	defer server.Close()
+	placer := &HTTPPlacer{timeout: time.Second, client: server.Client()}
+	_, err := placer.placeOne(context.Background(), PlacerPeer{Advertise: server.URL}, PlaceRequest{Group: "/g"})
+	if !errors.Is(err, errInvalidSandboxConfig) {
+		t.Fatalf("placeOne error = %v, want invalid sandbox config", err)
 	}
 }
 

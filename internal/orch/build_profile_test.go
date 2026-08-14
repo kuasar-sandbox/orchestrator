@@ -112,6 +112,9 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	cmd := &routesync.Command{
 		BuildID: "bare-cluster-build", TemplateRef: "transient-bare",
 		Profile: string(types.ProfileBare), APISecretFingerprint: fingerprint,
+		Config: map[string]string{
+			sandboxcfg.NsResource: ` { "capacity" : { "memory" : "8GiB" }, "allocatable" : { "memory" : "512MiB" } } `,
+		},
 	}
 	if err := o.registerClusterBuild(ctx, cmd); err != nil {
 		t.Fatalf("registerClusterBuild: %v", err)
@@ -119,6 +122,9 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	stored, err := o.st.GetBuild(ctx, cmd.BuildID)
 	if err != nil || stored == nil || stored.Profile != types.ProfileBare {
 		t.Fatalf("cluster build = %+v, err=%v", stored, err)
+	}
+	if got, want := stored.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"allocatable":{"memory":"512MiB"}}`; got != want {
+		t.Fatalf("cluster build resource = %s, want %s", got, want)
 	}
 	if err := o.registerClusterBuild(ctx, cmd); err != nil {
 		t.Fatalf("idempotent build_register replay: %v", err)
@@ -131,5 +137,17 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	stored, err = o.st.GetBuild(ctx, cmd.BuildID)
 	if err != nil || stored == nil || stored.Profile != types.ProfileBare || stored.Status != types.BuildRegistered {
 		t.Fatalf("conflicting replay changed build = %+v, err=%v", stored, err)
+	}
+
+	invalid := &routesync.Command{
+		BuildID: "invalid-cluster-resource", TemplateRef: "transient-invalid",
+		Profile: string(types.ProfileBare), APISecretFingerprint: fingerprint,
+		Config: map[string]string{sandboxcfg.NsResource: `{"control":{}}`},
+	}
+	if err := o.registerClusterBuild(ctx, invalid); !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "node-managed") {
+		t.Fatalf("invalid cluster resource error = %v", err)
+	}
+	if stored, err := o.st.GetBuild(ctx, invalid.BuildID); err != nil || stored != nil {
+		t.Fatalf("invalid cluster build stored = %+v, err=%v", stored, err)
 	}
 }

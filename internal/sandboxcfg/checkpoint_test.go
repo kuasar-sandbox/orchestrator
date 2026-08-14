@@ -141,12 +141,18 @@ func TestMarshalAndNormalizeCheckpointMetadata(t *testing.T) {
 
 func TestCheckpointMetadataIsCreateScopedAndHostOnly(t *testing.T) {
 	defaults := map[string]string{NsCheckpoint: `{"merge_ref":true}`, NsNetwork: `{"hostname":"template"}`}
-	withoutRequest := MergeCreateMetadata(defaults, nil)
+	withoutRequest, err := MergeCreateMetadata(defaults, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := withoutRequest[NsCheckpoint]; ok {
 		t.Fatalf("template checkpoint policy leaked into Create: %+v", withoutRequest)
 	}
 	requestRaw := `{"drop_caches":false}`
-	withRequest := MergeCreateMetadata(defaults, map[string]string{NsCheckpoint: requestRaw})
+	withRequest, err := MergeCreateMetadata(defaults, map[string]string{NsCheckpoint: requestRaw})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if withRequest[NsCheckpoint] != requestRaw {
 		t.Fatalf("explicit Create policy was not retained: %+v", withRequest)
 	}
