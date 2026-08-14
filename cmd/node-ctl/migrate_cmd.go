@@ -11,8 +11,8 @@ import (
 
 // exportSandboxCmd implements `node-ctl export-sandbox <sid>` as a client of
 // the running serve daemon's api plane (POST /sandboxes/{id}/export over the local
-// control socket). With --to-template it promotes the paused sandbox's snapshot to a
-// remote manifest and prints the persist template id (fork; usable via `e2b sandbox
+// control socket). With --to-template it publishes the paused sandbox's snapshot as
+// a portable ref and prints the reusable template id (usable via `e2b sandbox
 // create`). Otherwise it prints a one-line opaque kmt1 migration token for
 // `import-sandbox` on another node (the import reuses the source node-local id by
 // default). Auth: E2B_API_KEY env (must own the sandbox).
@@ -20,8 +20,8 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	sid, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)
 	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
-	toTemplate := fs.Bool("to-template", false, "promote + print the persist template id (fork) instead of a migration token")
-	keepSource := fs.Bool("keep-source", false, "keep the source sandbox (copy) instead of relinquishing it (move)")
+	toTemplate := fs.Bool("to-template", false, "publish + print a reusable snapshot template id instead of a migration token")
+	keepSource := fs.Bool("keep-source", false, "retain the paused source after successful export finalization (default: delete it)")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}

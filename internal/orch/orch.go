@@ -58,9 +58,10 @@ type Orchestrator struct {
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
 
-	launches  launchGroup            // sole process-local owner of create and resume attempts
-	pauses    acceptedOperationGroup // accepted snapshots survive caller cancellation and drain at shutdown
-	lifecycle keyedLockGroup         // serialize lifecycle mutations for one sid
+	launches    launchGroup            // sole process-local owner of create and resume attempts
+	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
+	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
 
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
@@ -96,6 +97,7 @@ type Orchestrator struct {
 	// source.
 	resourceControllerSocketIdentity string
 	snapshotInspector                func(context.Context, string, string) (snapshotDescription, error)
+	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -932,7 +934,10 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 }
 
 func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error) {
-	unlock := o.lifecycle.Lock(id)
+	unlock, err := o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return false, err
+	}
 	defer unlock()
 
 	sb, err := o.st.Get(ctx, id)
@@ -971,7 +976,10 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
-	unlock := o.lifecycle.Lock(id)
+	unlock, err := o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	sb, err := o.st.Get(ctx, id)
@@ -994,7 +1002,10 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
 // and the reaper's auto-suspend (no api key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
-	unlock := o.lifecycle.Lock(sb.ID)
+	unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	current, err := o.st.Get(ctx, sb.ID)
@@ -1075,7 +1086,7 @@ func (o *Orchestrator) beginPauseOperation(requestCtx context.Context) (context.
 	if err := requestCtx.Err(); err != nil {
 		return nil, nil, err
 	}
-	finish, err := o.pauses.Begin(o.launchContext())
+	finish, err := o.acceptedOps.Begin(o.launchContext())
 	if err != nil {
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
@@ -1393,6 +1404,15 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 			o.launches.Finish(attempt, errLaunchOwnershipLost)
 			return nil, nil, errLaunchOwnershipLost
 		}
+		if exportState, found := o.exports.ResumeAccepted(sid, api.ErrExportPreempted); found {
+			outcome := "preempted"
+			kind := "kmt"
+			if exportState == exportDetached {
+				outcome = "detached"
+				kind = "template"
+			}
+			o.log.Info("resume won export finalization", "sid", sid, "export_kind", kind, "outcome", outcome)
+		}
 		if requestedDeadline != nil {
 			o.markDeadlineIntent(sid)
 		}
@@ -1419,7 +1439,10 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {
-	unlock := o.lifecycle.Lock(id)
+	unlock, err := o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return false, err
+	}
 	defer unlock()
 
 	sb, err := o.st.Get(ctx, id)
@@ -1817,7 +1840,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 			target = types.StatePaused
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
-		if err := o.teardownReconcile(ctx, sb); err != nil {
+		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
 		}
 		if target == types.StateDead {
@@ -1846,7 +1869,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		if err := o.teardownReconcile(ctx, sb); err != nil {
+		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
 		}
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
@@ -2015,12 +2038,12 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
 	return cleanupErr
 }
 
-// teardownReconcile releases persisted ownership in dependency order. Unlike
-// the best-effort API teardown above, Reconcile has no live attempt to retain
-// per-step retry progress: on any failure it leaves later resources untouched,
-// preserves the durable row, and fails node startup so the next invocation can
-// retry safely before an API or data-plane surface opens.
-func (o *Orchestrator) teardownReconcile(ctx context.Context, sb *types.Sandbox) error {
+// teardownPersistedOwnership releases resources in dependency order without
+// mutating the durable row. On failure it leaves later resources and the cache
+// untouched so the caller can preserve the row and retry. On success the caller
+// must immediately commit its terminal state or restore the cache if that write
+// fails.
+func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types.Sandbox) error {
 	progress := launchCleanupProgress{
 		port:   sb.VswitchPort,
 		runDir: sb.RunDir,

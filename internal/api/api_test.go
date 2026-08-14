@@ -821,6 +821,20 @@ func TestExportSandboxMapsTokenTooLarge(t *testing.T) {
 	}
 }
 
+func TestExportSandboxMapsPreemptedResumeToConflict(t *testing.T) {
+	core := &migrationCoreStub{exportSandbox: func(context.Context, string, string, bool, bool) (string, error) {
+		return "", fmt.Errorf("private export detail: %w", ErrExportPreempted)
+	}}
+	h, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/export", strings.NewReader(`{}`), nil)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), ErrExportPreempted.Error()) || strings.Contains(response.Body.String(), "private export detail") {
+		t.Fatalf("preempted export response was not stable and redacted: %s", response.Body.String())
+	}
+}
+
 func TestImportSandboxMapsAlreadyExistsToConflict(t *testing.T) {
 	core := &migrationCoreStub{importSandbox: func(context.Context, string, string, string) (string, error) {
 		return "", fmt.Errorf("target occupied: %w", ErrAlreadyExists)
