@@ -346,6 +346,7 @@ assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup|-, $4=con
     local floor_memory="${5:-256MiB}"
     local deflate="${6:-true}"
     python3 - "$1" "$2" "$3" "$4" "$floor_memory" "$deflate" <<'PY'
+import re
 import sys
 
 path, capacity_memory, startup_memory, controller, floor_memory, deflate = sys.argv[1:]
@@ -368,14 +369,34 @@ for raw in open(path, encoding="utf-8"):
 
 expected = {
     "resources.capacity.cpu": "2",
-    "resources.capacity.memory": capacity_memory,
     "resources.allocatable.cpu": "2",
-    "resources.allocatable.memory": floor_memory,
-    "resources.overhead.memory": "32MiB",
 }
 for key, want in expected.items():
     if values.get(key) != want:
         raise SystemExit(f"{path}: {key}={values.get(key)!r}, want {want!r}; values={values}")
+
+units = {
+    "B": 1,
+    "KiB": 1 << 10,
+    "MiB": 1 << 20,
+    "GiB": 1 << 30,
+    "TiB": 1 << 40,
+}
+def size_bytes(field, value):
+    match = re.fullmatch(r"([1-9][0-9]*)(B|KiB|MiB|GiB|TiB)", value or "")
+    if not match:
+        raise SystemExit(f"{path}: {field} has invalid size {value!r}; values={values}")
+    return int(match.group(1)) * units[match.group(2)]
+
+memory_expected = {
+    "resources.capacity.memory": capacity_memory,
+    "resources.allocatable.memory": floor_memory,
+    "resources.overhead.memory": "32MiB",
+}
+for key, want in memory_expected.items():
+    got = values.get(key)
+    if size_bytes(key, got) != size_bytes(key, want):
+        raise SystemExit(f"{path}: {key}={got!r}, want {want!r}; values={values}")
 if deflate == "-":
     if "resources.allocatable.deflate_on_oom" in values:
         raise SystemExit(f"{path}: no-balloon config rendered deflate_on_oom: {values}")
@@ -385,8 +406,9 @@ if startup_memory == "-":
     if any(key.startswith("resources.startup") for key in values):
         raise SystemExit(f"{path}: static config rendered startup: {values}")
 else:
-    if values.get("resources.startup.memory") != startup_memory:
-        raise SystemExit(f"{path}: startup={values.get('resources.startup.memory')!r}, want {startup_memory!r}")
+    got = values.get("resources.startup.memory")
+    if size_bytes("resources.startup.memory", got) != size_bytes("resources.startup.memory", startup_memory):
+        raise SystemExit(f"{path}: startup={got!r}, want {startup_memory!r}")
 if controller == "-":
     if "resources.control.controller" in values:
         raise SystemExit(f"{path}: static config rendered controller: {values}")
