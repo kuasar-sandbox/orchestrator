@@ -1,4 +1,5 @@
-// Package proxyshm stores the external proxy route view in shared memory.
+// Package proxyshm stores the external proxy route view and its floating-IP
+// lookup index in shared memory.
 //
 // The proxy master is the only writer. Worker processes mmap the same file
 // read-only and resolve routes locally on the data path. Each record is protected
@@ -10,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -24,10 +24,14 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 5
+	schema uint32 = 6
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
+
+	floatingEmpty   uint32 = 0
+	floatingPresent uint32 = 1
+	floatingDeleted uint32 = 2
 
 	defaultCapacity      = 65536
 	maxTerminalRevisions = 4096
@@ -65,7 +69,8 @@ type mmapHeader struct {
 	PolicyParkMS int64
 	PolicyAuth   [maxProfile]byte
 	MMDSSynced   uint32
-	_            [20]byte
+	FloatingCap  uint32
+	_            [16]byte
 }
 
 type mmapRecord struct {
@@ -107,6 +112,19 @@ type mmapTerminalRecord struct {
 	SandboxID [maxSandboxID]byte
 }
 
+// mmapFloatingRecord is a secondary open-addressed index for active route
+// floating IPs. It stores no credentials; the SID is resolved through the
+// primary table after a hit. Tombstones preserve probe chains across route
+// deletion and are reused on subsequent inserts.
+type mmapFloatingRecord struct {
+	Seq        uint64
+	Hash       uint64
+	Status     uint32
+	_          uint32
+	FloatingIP [maxFloatingIP]byte
+	SandboxID  [maxSandboxID]byte
+}
+
 // Table is a memory-mapped fixed-capacity route table.
 type Table struct {
 	path      string
@@ -114,6 +132,7 @@ type Table struct {
 	header    *mmapHeader
 	records   []mmapRecord
 	terminals []mmapTerminalRecord
+	floating  []mmapFloatingRecord
 	readonly  bool
 }
 
@@ -147,6 +166,7 @@ func Create(path string, capacity int) (*Table, error) {
 	t.header.Schema = schema
 	t.header.Capacity = uint32(capacity)
 	t.header.TerminalCap = uint32(terminalCapacity(capacity))
+	t.header.FloatingCap = uint32(floatingCapacity(capacity))
 	return t, nil
 }
 
@@ -176,13 +196,13 @@ func Open(path string) (*Table, error) {
 	return t, nil
 }
 
-// Size returns the mmap size for capacity live records plus the bounded,
-// credential-free terminal revision cache.
+// Size returns the mmap size for capacity live records, the bounded
+// credential-free terminal revision cache, and the floating-IP index.
 func Size(capacity int) int {
 	if capacity <= 0 {
 		capacity = defaultCapacity
 	}
-	return mappedSize(capacity, terminalCapacity(capacity))
+	return mappedSize(capacity, terminalCapacity(capacity), floatingCapacity(capacity))
 }
 
 func terminalCapacity(capacity int) int {
@@ -195,8 +215,21 @@ func terminalCapacity(capacity int) int {
 	return capacity
 }
 
-func mappedSize(capacity, terminalCap int) int {
-	return headerSize + capacity*recordSize + terminalCap*terminalRecordSize
+func floatingCapacity(capacity int) int {
+	if capacity <= 0 {
+		capacity = defaultCapacity
+	}
+	// Keep the index at <=50% load for bounded linear probing. The extra
+	// slots are cheap compared with the credential-bearing primary table and
+	// avoid a full-index condition after a burst of route churn. At the
+	// default capacity of 65536 the index maps 2*65536 records of 216 bytes
+	// (~27 MiB) into the shared file: budget for that when running many
+	// proxy masters on one host.
+	return capacity * 2
+}
+
+func mappedSize(capacity, terminalCap, floatingCap int) int {
+	return headerSize + capacity*recordSize + terminalCap*terminalRecordSize + floatingCap*int(unsafe.Sizeof(mmapFloatingRecord{}))
 }
 
 func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int) (*Table, error) {
@@ -206,7 +239,7 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 	h := (*mmapHeader)(unsafe.Pointer(&data[0]))
 	terminalCap := terminalCapacity(expectedCapacity)
 	if expectedCapacity == 0 {
-		if h.Magic != magic || h.Schema != schema || h.Capacity == 0 || h.TerminalCap == 0 {
+		if h.Magic != magic || h.Schema != schema || h.Capacity == 0 || h.TerminalCap == 0 || h.FloatingCap == 0 {
 			return nil, fmt.Errorf("proxyshm: invalid header in %s", path)
 		}
 		expectedCapacity = int(h.Capacity)
@@ -214,8 +247,16 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 		if terminalCap != terminalCapacity(expectedCapacity) {
 			return nil, fmt.Errorf("proxyshm: invalid terminal capacity %d in %s", terminalCap, path)
 		}
+		floatingCap := int(h.FloatingCap)
+		if floatingCap != floatingCapacity(expectedCapacity) {
+			return nil, fmt.Errorf("proxyshm: invalid floating capacity %d in %s", floatingCap, path)
+		}
 	}
-	expectedSize := mappedSize(expectedCapacity, terminalCap)
+	floatingCap := floatingCapacity(expectedCapacity)
+	if expectedCapacity != 0 && h.FloatingCap != 0 {
+		floatingCap = int(h.FloatingCap)
+	}
+	expectedSize := mappedSize(expectedCapacity, terminalCap, floatingCap)
 	if len(data) < expectedSize {
 		return nil, fmt.Errorf("proxyshm: mmap size %d smaller than expected %d", len(data), expectedSize)
 	}
@@ -224,7 +265,10 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 	terminalOffset := headerSize + expectedCapacity*recordSize
 	terminalFirst := unsafe.Pointer(&data[terminalOffset])
 	terminals := unsafe.Slice((*mmapTerminalRecord)(terminalFirst), terminalCap)
-	return &Table{path: path, data: data, header: h, records: records, terminals: terminals, readonly: readonly}, nil
+	floatingOffset := terminalOffset + terminalCap*terminalRecordSize
+	floatingFirst := unsafe.Pointer(&data[floatingOffset])
+	floating := unsafe.Slice((*mmapFloatingRecord)(floatingFirst), floatingCap)
+	return &Table{path: path, data: data, header: h, records: records, terminals: terminals, floating: floating, readonly: readonly}, nil
 }
 
 // Close unmaps the table.
@@ -271,22 +315,31 @@ func (t *Table) Bookmark() {
 	startHeaderWrite(&t.header.TableSeq)
 	defer finishHeaderWrite(&t.header.TableSeq)
 	gen := atomic.LoadUint64(&t.header.SyncGen)
-	stale := make([]string, 0)
+	stale := make([]recordSnapshot, 0)
 	for i := range t.records {
 		snapshot, ok := readRecordSnapshot(&t.records[i])
 		if ok && snapshot.status == statusPresent && snapshot.syncGen != gen {
-			stale = append(stale, snapshot.entry.SandboxID)
+			stale = append(stale, snapshot)
 		}
 	}
-	for _, sid := range stale {
+	for _, snapshot := range stale {
+		sid := snapshot.entry.SandboxID
 		idx, found := t.findSlot(sid, false)
 		if !found {
 			continue
 		}
 		rev := atomic.AddUint64(&t.header.GlobalRev, 1)
 		t.writeTerminal(sid, rev)
+		t.removeFloatingRoute(snapshot.entry)
 		t.deleteLiveRecord(idx)
 	}
+	// Rebuild the floating-IP index from the authoritative primary table on
+	// every completed sync. Duplicate floating IPs (control-plane bug or a
+	// crash-cleanup port-reuse race) can strand an overwritten route, and an
+	// identical replay early-returns without re-indexing, so this full-sync
+	// barrier is the self-heal point. It runs off the hot path, once per
+	// reconnect.
+	t.rebuildFloatingIndex()
 	atomic.StoreUint32(&t.header.Synced, 1)
 	atomic.AddUint64(&t.header.GlobalRev, 1)
 }
@@ -347,7 +400,8 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	}
 	rec := &t.records[idx]
 	gen := atomic.LoadUint64(&t.header.SyncGen)
-	if current, stable := readRecordSnapshot(rec); stable && current.status == statusPresent &&
+	current, stable := readRecordSnapshot(rec)
+	if stable && current.status == statusPresent &&
 		current.hash == hashSID(in.SandboxID) && current.entry == in {
 		// Replay during Subscribe-before-Range synchronization still adopts the
 		// route into the current generation, but an identical business record is
@@ -358,7 +412,23 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		}
 		return nil
 	}
+	if stable && current.status == statusPresent {
+		t.removeFloatingRoute(current.entry)
+	}
 	t.writeRoute(rec, in, gen, atomic.AddUint64(&t.header.GlobalRev, 1))
+	if err := t.addFloatingRoute(in); err != nil {
+		// Restore the exact pre-upsert state: an active primary route that
+		// ByFloatingIP can no longer resolve would wedge MMDS token minting.
+		// Unreachable while floatingCapacity stays 2 x capacity; defended so
+		// the invariant is enforced rather than assumed.
+		if stable && current.status == statusPresent {
+			writeRecordSnapshot(rec, current)
+			_ = t.addFloatingRoute(current.entry)
+		} else {
+			t.deleteLiveRecord(idx)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -372,6 +442,9 @@ func (t *Table) Delete(sid string) bool {
 	t.writeTerminal(sid, rev)
 	idx, ok := t.findSlot(sid, false)
 	if ok {
+		if snapshot, stable := readRecordSnapshot(&t.records[idx]); stable && snapshot.status == statusPresent {
+			t.removeFloatingRoute(snapshot.entry)
+		}
 		t.deleteLiveRecord(idx)
 	}
 	return true
@@ -448,7 +521,7 @@ func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
 }
 
 func (t *Table) ByFloatingIP(ip string) (string, bool) {
-	if ip == "" {
+	if ip == "" || len(t.floating) == 0 {
 		return "", false
 	}
 	for {
@@ -457,19 +530,15 @@ func (t *Table) ByFloatingIP(ip string) (string, bool) {
 			runtime.Gosched()
 			continue
 		}
-		var sid string
-		for i := 0; i < len(t.records); i++ {
-			entry, st, ok := readRecord(&t.records[i])
-			if !ok {
-				i--
-				runtime.Gosched()
-				continue
-			}
-			if st == statusPresent &&
-				(entry.State == routesync.StateStarting || entry.State == routesync.StateRunning) &&
-				entry.FloatingIP == ip {
-				sid = entry.SandboxID
-				break
+		sid := t.lookupFloatingIP(ip)
+		if sid != "" {
+			// Keep the primary-table check as a defensive guard against a stale
+			// secondary entry after a failed/restarted sync. It is one SID probe,
+			// instead of the old full-capacity scan, and preserves the original
+			// active-state/FIP validation contract.
+			entry, found := t.Lookup(sid)
+			if !found || !activeRoute(entry) || entry.FloatingIP != ip {
+				sid = ""
 			}
 		}
 		seq2 := atomic.LoadUint64(&t.header.TableSeq)
@@ -477,6 +546,162 @@ func (t *Table) ByFloatingIP(ip string) (string, bool) {
 			return sid, sid != ""
 		}
 	}
+}
+
+func (t *Table) lookupFloatingIP(ip string) string {
+	h := hashSID(ip)
+	start := int(h % uint64(len(t.floating)))
+	for i := 0; i < len(t.floating); i++ {
+		rec := &t.floating[(start+i)%len(t.floating)]
+		for spin := 0; spin < 64; spin++ {
+			seq1 := atomic.LoadUint64(&rec.Seq)
+			if seq1&1 == 1 {
+				runtime.Gosched()
+				continue
+			}
+			status := atomic.LoadUint32(&rec.Status)
+			if status == floatingEmpty {
+				seq2 := atomic.LoadUint64(&rec.Seq)
+				if seq1 == seq2 && seq2&1 == 0 {
+					return ""
+				}
+				continue
+			}
+			found := status == floatingPresent &&
+				atomic.LoadUint64(&rec.Hash) == h &&
+				fixedEqual(rec.FloatingIP[:], ip)
+			var sid string
+			if found {
+				sid = fixedString(rec.SandboxID[:])
+			}
+			seq2 := atomic.LoadUint64(&rec.Seq)
+			if seq1 == seq2 && seq2&1 == 0 {
+				if found {
+					return sid
+				}
+				break
+			}
+		}
+		runtime.Gosched()
+	}
+	return ""
+}
+
+func (t *Table) addFloatingRoute(entry routesync.RouteEntry) error {
+	if !activeRoute(entry) || entry.FloatingIP == "" {
+		return nil
+	}
+	if t.floatingIndexUpsert(entry.FloatingIP, entry.SandboxID) {
+		return nil
+	}
+	// Deletions leave tombstones so probe chains stay valid. Rebuild only when
+	// a pathological churn pattern exhausts the secondary table.
+	t.rebuildFloatingIndex()
+	if t.floatingIndexUpsert(entry.FloatingIP, entry.SandboxID) {
+		return nil
+	}
+	return errors.New("proxyshm: floating IP index full")
+}
+
+func (t *Table) removeFloatingRoute(entry routesync.RouteEntry) {
+	if !activeRoute(entry) || entry.FloatingIP == "" || entry.SandboxID == "" {
+		return
+	}
+	t.floatingIndexRemove(entry.FloatingIP, entry.SandboxID)
+}
+
+// floatingIndexUpsert maps ip to sid. A present entry for the same ip under a
+// different sid is overwritten: connector allocates unique floating IPs per
+// switch, so two simultaneously-active routes on one ip can only mean a
+// control-plane bug or a crash-cleanup race where the dying sandbox's Delete
+// has not landed yet. Overwrite lets the new sandbox win that race (its Delete
+// counterpart is a no-op because the SID no longer matches); rejecting here
+// instead would drop the new route until the next full resync. The cost is
+// that deleting the surviving SID leaves the overwritten route unindexed, an
+// already-broken state that the primary-table validation cannot repair.
+func (t *Table) floatingIndexUpsert(ip, sid string) bool {
+	if ip == "" || sid == "" || len(t.floating) == 0 {
+		return true
+	}
+	h := hashSID(ip)
+	start := int(h % uint64(len(t.floating)))
+	firstDeleted := -1
+	for i := 0; i < len(t.floating); i++ {
+		idx := (start + i) % len(t.floating)
+		rec := &t.floating[idx]
+		status := atomic.LoadUint32(&rec.Status)
+		switch status {
+		case floatingEmpty:
+			if firstDeleted >= 0 {
+				rec = &t.floating[firstDeleted]
+			}
+			writeFloatingRecord(rec, ip, sid, h, floatingPresent)
+			return true
+		case floatingDeleted:
+			if firstDeleted < 0 {
+				firstDeleted = idx
+			}
+		case floatingPresent:
+			if atomic.LoadUint64(&rec.Hash) == h && fixedEqual(rec.FloatingIP[:], ip) {
+				writeFloatingRecord(rec, ip, sid, h, floatingPresent)
+				return true
+			}
+		}
+	}
+	if firstDeleted >= 0 {
+		writeFloatingRecord(&t.floating[firstDeleted], ip, sid, h, floatingPresent)
+		return true
+	}
+	return false
+}
+
+func (t *Table) floatingIndexRemove(ip, sid string) {
+	if ip == "" || sid == "" || len(t.floating) == 0 {
+		return
+	}
+	h := hashSID(ip)
+	start := int(h % uint64(len(t.floating)))
+	for i := 0; i < len(t.floating); i++ {
+		rec := &t.floating[(start+i)%len(t.floating)]
+		status := atomic.LoadUint32(&rec.Status)
+		if status == floatingEmpty {
+			return
+		}
+		if status == floatingPresent && atomic.LoadUint64(&rec.Hash) == h &&
+			fixedEqual(rec.FloatingIP[:], ip) && fixedEqual(rec.SandboxID[:], sid) {
+			writeFloatingRecord(rec, "", "", h, floatingDeleted)
+			return
+		}
+	}
+}
+
+func (t *Table) rebuildFloatingIndex() {
+	for i := range t.floating {
+		writeFloatingRecord(&t.floating[i], "", "", 0, floatingEmpty)
+	}
+	for i := range t.records {
+		snapshot, ok := readRecordSnapshot(&t.records[i])
+		if ok && snapshot.status == statusPresent && activeRoute(snapshot.entry) {
+			_ = t.floatingIndexUpsert(snapshot.entry.FloatingIP, snapshot.entry.SandboxID)
+		}
+	}
+}
+
+func writeFloatingRecord(rec *mmapFloatingRecord, ip, sid string, hash uint64, status uint32) {
+	seq := atomic.LoadUint64(&rec.Seq)
+	if seq&1 == 1 {
+		seq++
+	}
+	atomic.StoreUint64(&rec.Seq, seq+1)
+	rec.Hash = hash
+	rec.Status = status
+	_ = putFixed(rec.FloatingIP[:], ip)
+	_ = putFixed(rec.SandboxID[:], sid)
+	atomic.StoreUint64(&rec.Seq, seq+2)
+}
+
+func activeRoute(entry routesync.RouteEntry) bool {
+	return entry.State == routesync.StateStarting || entry.State == routesync.StateRunning
 }
 
 func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
@@ -799,10 +1024,35 @@ func fixedString(src []byte) string {
 	return string(src[:n])
 }
 
-func hashSID(sid string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(sid))
-	return h.Sum64()
+func fixedEqual(src []byte, want string) bool {
+	if len(want) > len(src) {
+		return false
+	}
+	for i := range want {
+		if src[i] != want[i] {
+			return false
+		}
+	}
+	if len(want) == len(src) {
+		return true
+	}
+	return src[len(want)] == 0
+}
+
+// hashSID is an inline FNV-1a 64-bit over key, avoiding a per-lookup hash
+// object allocation on the worker data path. It must stay identical to
+// fnv.New64a() so probes land in the same slots across schema versions.
+func hashSID(key string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= prime64
+	}
+	return h
 }
 
 func alignSize(n, a int) int {

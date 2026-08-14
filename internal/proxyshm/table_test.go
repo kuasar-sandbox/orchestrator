@@ -1,6 +1,7 @@
 package proxyshm
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -119,6 +120,414 @@ func TestTableLookupRevisionTracksLiveAndDeletedSnapshots(t *testing.T) {
 	running, found, runningRev := tbl.LookupRevision(route.SandboxID)
 	if !found || running.State != routesync.StateRunning || runningRev <= deletedRev {
 		t.Fatalf("running snapshot = %+v, found=%v rev=%d; deleted rev=%d", running, found, runningRev, deletedRev)
+	}
+}
+
+func TestTableByFloatingIPUsesActiveRoutesOnly(t *testing.T) {
+	tests := []struct {
+		name    string
+		state   string
+		routeIP string
+		queryIP string
+		wantSID string
+		wantOK  bool
+	}{
+		{name: "starting", state: routesync.StateStarting, routeIP: "100.100.0.2", queryIP: "100.100.0.2", wantSID: "starting", wantOK: true},
+		{name: "running", state: routesync.StateRunning, routeIP: "100.100.0.3", queryIP: "100.100.0.3", wantSID: "running", wantOK: true},
+		{name: "paused", state: routesync.StatePaused, routeIP: "100.100.0.4", queryIP: "100.100.0.4", wantOK: false},
+		{name: "missing", state: routesync.StateRunning, routeIP: "100.100.0.5", queryIP: "100.100.0.99", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			if err := tbl.Upsert(routesync.RouteEntry{
+				SandboxID: tc.name, State: tc.state, FloatingIP: tc.routeIP,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			gotSID, gotOK := tbl.ByFloatingIP(tc.queryIP)
+			if gotSID != tc.wantSID || gotOK != tc.wantOK {
+				t.Fatalf("ByFloatingIP(%q) = %q, %v; want %q, %v", tc.queryIP, gotSID, gotOK, tc.wantSID, tc.wantOK)
+			}
+			if gotSID, gotOK := tbl.ByFloatingIP(""); gotSID != "" || gotOK {
+				t.Fatalf("ByFloatingIP(empty) = %q, %v; want empty, false", gotSID, gotOK)
+			}
+		})
+	}
+}
+
+func TestTableFloatingIPIndexLifecycle(t *testing.T) {
+	const capacity = 8
+	byBucket := make(map[uint64]string)
+	var ip1, ip2 string
+	for i := 2; i < 255 && ip2 == ""; i++ {
+		ip := fmt.Sprintf("100.100.0.%d", i)
+		bucket := hashSID(ip) % (capacity * 2)
+		if prior, ok := byBucket[bucket]; ok {
+			ip1, ip2 = prior, ip
+			break
+		}
+		byBucket[bucket] = ip
+	}
+	if ip1 == "" || ip2 == "" {
+		t.Fatal("failed to find floating-IP hash collision")
+	}
+
+	tests := []struct {
+		name       string
+		updated    routesync.RouteEntry
+		queryIP    string
+		wantOld    bool
+		wantNewSID string
+		deleteSID  string
+		wantRemain string
+	}{
+		{
+			name:       "state transition removes mapping",
+			updated:    routesync.RouteEntry{SandboxID: "s1", State: routesync.StatePaused, FloatingIP: ip1},
+			queryIP:    ip2,
+			wantOld:    false,
+			wantNewSID: "s2",
+			wantRemain: "s2",
+		},
+		{
+			name:       "IP change replaces mapping",
+			updated:    routesync.RouteEntry{SandboxID: "s1", State: routesync.StateRunning, FloatingIP: "100.100.1.1"},
+			queryIP:    "100.100.1.1",
+			wantOld:    false,
+			wantNewSID: "s1",
+			wantRemain: "s2",
+		},
+		{
+			name:       "delete leaves collision chain",
+			updated:    routesync.RouteEntry{SandboxID: "s1", State: routesync.StateRunning, FloatingIP: ip1},
+			queryIP:    ip1,
+			wantOld:    false,
+			deleteSID:  "s1",
+			wantRemain: "s2",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "routes.shm")
+			tbl, err := Create(path, capacity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			for _, route := range []routesync.RouteEntry{
+				{SandboxID: "s1", State: routesync.StateRunning, FloatingIP: ip1},
+				{SandboxID: "s2", State: routesync.StateRunning, FloatingIP: ip2},
+			} {
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			}
+			worker, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Close()
+
+			if err := tbl.Upsert(tc.updated); err != nil {
+				t.Fatal(err)
+			}
+			if tc.deleteSID != "" && !tbl.Delete(tc.deleteSID) {
+				t.Fatalf("Delete(%q) returned false", tc.deleteSID)
+			}
+			gotOld, oldOK := worker.ByFloatingIP(ip1)
+			if oldOK != tc.wantOld || (oldOK && gotOld != "s1") {
+				t.Fatalf("old IP = %q, %v; want s1, %v", gotOld, oldOK, tc.wantOld)
+			}
+			gotNew, newOK := worker.ByFloatingIP(tc.queryIP)
+			if (tc.wantNewSID == "") != !newOK || (newOK && gotNew != tc.wantNewSID) {
+				t.Fatalf("updated IP = %q, %v; want %q", gotNew, newOK, tc.wantNewSID)
+			}
+			gotRemain, remainOK := worker.ByFloatingIP(ip2)
+			if !remainOK || gotRemain != tc.wantRemain {
+				t.Fatalf("remaining collision IP = %q, %v; want %q, true", gotRemain, remainOK, tc.wantRemain)
+			}
+		})
+	}
+}
+
+// TestTableUpsertDuplicateFloatingIP documents the overwrite contract for two
+// active routes sharing a floating IP. connector allocates unique IPs per
+// switch, so this only happens on a control-plane bug or a crash-cleanup race;
+// see the floatingIndexUpsert comment for why overwrite is preferred over
+// rejecting the second route.
+func TestTableUpsertDuplicateFloatingIP(t *testing.T) {
+	const ip = "100.100.0.9"
+	tests := []struct {
+		name        string
+		retireFirst bool
+		sameSID     bool
+		wantSID     string
+	}{
+		{name: "overwrite while original active", wantSID: "s2"},
+		{name: "original paused first", retireFirst: true, wantSID: "s2"},
+		{name: "same sandbox replay", sameSID: true, wantSID: "s1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			route := routesync.RouteEntry{SandboxID: "s1", State: routesync.StateRunning, FloatingIP: ip}
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.sameSID {
+				route.State = routesync.StateStarting
+				if err := tbl.Upsert(route); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if tc.retireFirst {
+					route.State = routesync.StatePaused
+					if err := tbl.Upsert(route); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := tbl.Upsert(routesync.RouteEntry{
+					SandboxID: "s2", State: routesync.StateRunning, FloatingIP: ip,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, ok := tbl.ByFloatingIP(ip); !ok || got != tc.wantSID {
+				t.Fatalf("ByFloatingIP(%q) = %q, %v; want %q", ip, got, ok, tc.wantSID)
+			}
+
+			if !tc.sameSID {
+				// Deleting the overwriter leaves the overwritten original
+				// unindexed: the documented consequence of the duplicate.
+				if !tbl.Delete("s2") {
+					t.Fatal("Delete(s2) returned false")
+				}
+				if got, ok := tbl.ByFloatingIP(ip); ok || got != "" {
+					t.Fatalf("post-delete ByFloatingIP(%q) = %q, %v; want miss", ip, got, ok)
+				}
+			}
+		})
+	}
+}
+
+// TestTableUpsertRollsBackWhenFloatingIndexFull forces the defended index-full
+// failure that the 2x-capacity sizing makes unreachable through the public
+// API: the in-process index is replaced by a single slot holding one route,
+// and the second sandbox is chosen to rebuild after the first, so the retry
+// after rebuild is guaranteed to find the index full.
+func TestTableUpsertRollsBackWhenFloatingIndexFull(t *testing.T) {
+	// Pick two SIDs whose primary home slots order first before second: the
+	// rebuild scans records in slot order, so first wins the only index slot
+	// and second deterministically fails both the initial probe and the retry.
+	first, second := "first", "second"
+	for i := 0; hashSID(first)%8 > hashSID(second)%8; i++ {
+		first, second = fmt.Sprintf("first-%d", i), fmt.Sprintf("second-%d", i)
+	}
+	ip1, ip2 := "100.100.0.2", "100.100.0.3"
+
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: first, State: routesync.StateRunning, FloatingIP: ip1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	full := tbl.floating
+	writeFloatingRecord(&full[0], ip1, first, hashSID(ip1), floatingPresent)
+	tbl.floating = full[:1]
+	err = tbl.Upsert(routesync.RouteEntry{
+		SandboxID: second, State: routesync.StateRunning, FloatingIP: ip2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "floating IP index full") {
+		t.Fatalf("Upsert error = %v; want floating IP index full", err)
+	}
+	if _, found := tbl.Lookup(second); found {
+		t.Fatalf("%s primary record must be rolled back", second)
+	}
+	if got, ok := tbl.ByFloatingIP(ip1); !ok || got != first {
+		t.Fatalf("ByFloatingIP(%q) = %q, %v; want %q", ip1, got, ok, first)
+	}
+
+	// With the real index capacity restored the same upsert succeeds.
+	tbl.floating = full
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: second, State: routesync.StateRunning, FloatingIP: ip2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := tbl.ByFloatingIP(ip2); !ok || got != second {
+		t.Fatalf("restored ByFloatingIP = %q, %v; want %q", got, ok, second)
+	}
+}
+
+// TestBookmarkRebuildsFloatingIndexAfterDuplicateStrand covers the
+// self-heal path: a duplicate floating IP whose overwriter is deleted strands
+// the original route, an identical replay does not re-index it, and the
+// full-sync Bookmark rebuilds the index from the primary table.
+func TestBookmarkRebuildsFloatingIndexAfterDuplicateStrand(t *testing.T) {
+	const ip = "100.100.0.9"
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	first := routesync.RouteEntry{SandboxID: "s1", State: routesync.StateRunning, FloatingIP: ip}
+	for _, route := range []routesync.RouteEntry{
+		first,
+		{SandboxID: "s2", State: routesync.StateRunning, FloatingIP: ip},
+	} {
+		if err := tbl.Upsert(route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !tbl.Delete("s2") {
+		t.Fatal("Delete(s2) returned false")
+	}
+	if _, found := tbl.Lookup("s1"); !found {
+		t.Fatal("s1 must remain active in the primary table")
+	}
+	if _, ok := tbl.ByFloatingIP(ip); ok {
+		t.Fatal("expected stranded miss after duplicate overwrite and delete")
+	}
+
+	// An identical replay adopts the route into the new generation but must
+	// not heal the index; only the Bookmark rebuild does.
+	tbl.BeginSync()
+	if err := tbl.Upsert(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.ByFloatingIP(ip); ok {
+		t.Fatal("identical replay must not re-index the stranded route")
+	}
+
+	tbl.Bookmark()
+	if got, ok := tbl.ByFloatingIP(ip); !ok || got != "s1" {
+		t.Fatalf("post-Bookmark ByFloatingIP(%q) = %q, %v; want s1", ip, got, ok)
+	}
+}
+
+// TestMasterViewApplyUpsertRestoresMMDSOnRollback forces the defended
+// index-full failure through MasterView.ApplyUpsert and asserts the MMDS heap
+// view of the rolled-back route survives: the variable MMDS routes live only
+// in the heap, not in shared memory.
+func TestMasterViewApplyUpsertRestoresMMDSOnRollback(t *testing.T) {
+	// Order the helper's primary home slot before the target's so the
+	// post-rebuild index retry deterministically finds the index full.
+	helper, target := "helper", "target"
+	for i := 0; hashSID(helper)%8 > hashSID(target)%8; i++ {
+		helper, target = fmt.Sprintf("helper-%d", i), fmt.Sprintf("target-%d", i)
+	}
+	ip1, ip2 := "100.100.0.2", "100.100.0.3"
+
+	tbl, err := Create(filepath.Join(t.TempDir(), "routes.shm"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	mv := NewMasterView(tbl, time.Second, nil)
+
+	route := routesync.RouteEntry{
+		SandboxID: target, State: routesync.StateRunning, FloatingIP: ip1, RunID: "run-1",
+		MMDSRoutes: testMMDSRoutes, MMDSRouteSecretValues: routeValues(map[string][]byte{"key": {0, 1, 2}}),
+	}
+	mv.ApplyUpsert(route)
+	mv.ApplyUpsert(routesync.RouteEntry{SandboxID: helper, State: routesync.StateRunning, FloatingIP: ip2})
+	mv.Bookmark()
+
+	full := tbl.floating
+	writeFloatingRecord(&full[0], ip2, helper, hashSID(ip2), floatingPresent)
+	tbl.floating = full[:1]
+
+	updated := route
+	updated.RunID = "run-2"
+	mv.ApplyUpsert(updated)
+
+	if got, found := tbl.Lookup(target); !found || got.RunID != "run-1" || got.FloatingIP != ip1 {
+		t.Fatalf("rolled-back route = %+v found=%v; want run-1 on %s", got, found, ip1)
+	}
+	secret := mv.mmds.Resolve(target, "/secret")
+	if !secret.Found || !secret.Present || !bytes.Equal(secret.Body, []byte{0, 1, 2}) {
+		t.Fatalf("heap view after rollback = %+v; want the pre-update secret route", secret)
+	}
+}
+
+func BenchmarkTableByFloatingIPMissing(b *testing.B) {
+	tbl, err := Create(filepath.Join(b.TempDir(), "routes.shm"), defaultCapacity)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tbl.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if sid, ok := tbl.ByFloatingIP("100.100.255.254"); ok || sid != "" {
+			b.Fatalf("missing lookup = %q, %v", sid, ok)
+		}
+	}
+}
+
+func BenchmarkTableByFloatingIPHit(b *testing.B) {
+	tbl, err := Create(filepath.Join(b.TempDir(), "routes.shm"), defaultCapacity)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tbl.Close()
+	const routes = 16384
+	for i := 0; i < routes; i++ {
+		if err := tbl.Upsert(routesync.RouteEntry{
+			SandboxID:  fmt.Sprintf("bench-sid-%d", i),
+			State:      routesync.StateRunning,
+			FloatingIP: fmt.Sprintf("10.0.%d.%d", i/253, i%253+1),
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	idx := routes / 2
+	ip := fmt.Sprintf("10.0.%d.%d", idx/253, idx%253+1)
+	want := fmt.Sprintf("bench-sid-%d", idx)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if sid, ok := tbl.ByFloatingIP(ip); !ok || sid != want {
+			b.Fatalf("hit lookup = %q, %v; want %q", sid, ok, want)
+		}
+	}
+}
+
+func BenchmarkTableFloatingIndexChurn(b *testing.B) {
+	tbl, err := Create(filepath.Join(b.TempDir(), "routes.shm"), 256)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tbl.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sid := fmt.Sprintf("churn-%d", i)
+		ip := fmt.Sprintf("10.1.%d.%d", i/253, i%253+1)
+		if err := tbl.Upsert(routesync.RouteEntry{
+			SandboxID: sid, State: routesync.StateRunning, FloatingIP: ip,
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if !tbl.Delete(sid) {
+			b.Fatalf("Delete(%q) returned false", sid)
+		}
 	}
 }
 
@@ -853,5 +1262,51 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 	}
 	if tid, tok, ok := view.SandboxInfo(route.SandboxID); ok || tid != "" || tok != "" {
 		t.Fatalf("paused SandboxInfo = %q %q ok=%v", tid, tok, ok)
+	}
+}
+
+func TestMMDSSourceFloatingIPReflectsRouteUpdates(t *testing.T) {
+	tests := []struct {
+		name        string
+		initial     string
+		wantInitial bool
+		updated     string
+		wantUpdate  bool
+	}{
+		{name: "active to paused", initial: routesync.StateStarting, wantInitial: true, updated: routesync.StatePaused, wantUpdate: false},
+		{name: "running remains active", initial: routesync.StateRunning, wantInitial: true, updated: routesync.StateRunning, wantUpdate: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "routes.shm")
+			tbl, err := Create(path, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tbl.Close()
+			tbl.BeginSync()
+			route := routesync.RouteEntry{
+				SandboxID: "s1", State: tc.initial, TemplateID: "tmpl",
+				FloatingIP: "100.100.0.3", EnvdAccessToken: "envd", MmdsSecret: "736563726574",
+			}
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+			tbl.Bookmark()
+			tbl.SetMMDSSynced(true)
+			view := NewWorkerView(tbl, nil, nil, time.Second)
+
+			if sid, ok := view.ByFloatingIP(route.FloatingIP); ok != tc.wantInitial || (ok && sid != route.SandboxID) {
+				t.Fatalf("initial ByFloatingIP = %q ok=%v, want found=%v", sid, ok, tc.wantInitial)
+			}
+
+			route.State = tc.updated
+			if err := tbl.Upsert(route); err != nil {
+				t.Fatal(err)
+			}
+			if sid, ok := view.ByFloatingIP(route.FloatingIP); ok != tc.wantUpdate || (ok && sid != route.SandboxID) {
+				t.Fatalf("updated ByFloatingIP = %q ok=%v, want found=%v", sid, ok, tc.wantUpdate)
+			}
+		})
 	}
 }

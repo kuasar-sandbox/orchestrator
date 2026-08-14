@@ -66,7 +66,22 @@ func (v *MasterView) BeginSync() {
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 	active := r.State == routesync.StateStarting || r.State == routesync.StateRunning
+	var prevHeap mmdsEntry
+	hadHeap := false
 	if active {
+		// connector allocates unique floating IPs per switch. Another active
+		// route on the same IP means a control-plane bug or a crash-cleanup
+		// race; the new route deliberately wins the index slot, but the
+		// violation of the uniqueness invariant is worth surfacing.
+		if r.FloatingIP != "" && v.log != nil {
+			if other, ok := v.table.ByFloatingIP(r.FloatingIP); ok && other != r.SandboxID {
+				v.log.Warn("proxyshm: duplicate floating IP",
+					"ip", r.FloatingIP, "existing_sid", other, "sid", r.SandboxID)
+			}
+		}
+		// Snapshot the heap entry so a failed table update can restore it:
+		// the variable MMDS routes live only here, not in shared memory.
+		prevHeap, hadHeap = v.mmds.snapshotMMDSRoute(r.SandboxID)
 		// Publish the heap view first. A worker that observes an active SHM row
 		// can then resolve either the new view or a conservative unavailable.
 		if err := v.mmds.Upsert(r); err != nil && v.log != nil {
@@ -79,8 +94,14 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 		v.mmds.Delete(r.SandboxID)
 	}
 	if err := v.table.Upsert(r); err != nil {
+		// The table rolled back to its previous record; mirror that state in
+		// the MMDS heap so a restored active route keeps its variable routes.
 		if active {
-			v.mmds.Delete(r.SandboxID)
+			if prev, found := v.table.Lookup(r.SandboxID); found && activeRoute(prev) && hadHeap {
+				v.mmds.restoreMMDSRoute(r.SandboxID, prevHeap)
+			} else {
+				v.mmds.Delete(r.SandboxID)
+			}
 		}
 		if v.log != nil {
 			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
@@ -497,9 +518,11 @@ func (v *WorkerView) waitExecRunning(
 }
 
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
-	if !v.MMDSAvailable() {
+	if !v.MMDSAvailable() || ip == "" {
 		return "", false
 	}
+	// The shared table's secondary floating-IP index makes this an O(1)
+	// seqlock-protected probe; no worker-side memoization is needed.
 	return v.table.ByFloatingIP(ip)
 }
 

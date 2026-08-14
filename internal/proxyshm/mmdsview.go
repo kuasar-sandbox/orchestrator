@@ -83,6 +83,23 @@ func (v *MMDSView) Delete(sandboxID string) {
 	v.mu.Unlock()
 }
 
+// snapshotMMDSRoute returns the current heap entry for sandboxID so a failed
+// table update can restore it. Entries are replaced wholesale and never
+// mutated in place, so sharing the underlying slices and maps is safe.
+func (v *MMDSView) snapshotMMDSRoute(sandboxID string) (mmdsEntry, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	entry, ok := v.byID[sandboxID]
+	return entry, ok
+}
+
+// restoreMMDSRoute puts a snapshotted entry back after a rolled-back update.
+func (v *MMDSView) restoreMMDSRoute(sandboxID string, entry mmdsEntry) {
+	v.mu.Lock()
+	v.byID[sandboxID] = entry
+	v.mu.Unlock()
+}
+
 // SetServices atomically replaces the complete conductor-projected registry.
 // Invalid input yields an empty registry and an error, making every configured
 // service route return 503 until a valid policy arrives.
