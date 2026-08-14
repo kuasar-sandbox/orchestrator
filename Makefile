@@ -76,6 +76,7 @@ node-stub-ctl:
 
 test:
 	CGO_ENABLED=0 $(GO) test ./...
+	bash test/e2e/vmm_cgroup_test.sh
 
 vet:
 	CGO_ENABLED=0 $(GO) vet ./...

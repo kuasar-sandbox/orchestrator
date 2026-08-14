@@ -42,6 +42,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/lib/vmm_cgroup.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -1077,8 +1078,7 @@ esac
 run_low_allocatable_case() { # $1=iteration
     local iteration="$1" code LOW_START_MS LOW_SID LOW_TOKEN LOW_ELAPSED_MS
     local LOW_RUN_ID LOW_UNIT LOW_CG LOW_CTL_PID LOW_CTL_CG LOW_VMM_PROCS
-    local LOW_VISIBLE_VMM_PIDS=0 LOW_JOURNAL pid
-    local -a LOW_VMM_PIDS=()
+    local LOW_JOURNAL VMM_MEMBERS_ERROR
 
     LOW_START_MS=$(date +%s%3N)
     code=$(req POST /sandboxes "$AK" "$LOW_CREATE_BODY")
@@ -1105,17 +1105,9 @@ run_low_allocatable_case() { # $1=iteration
     LOW_CTL_CG=$(awk -F: '$1 == "0" {print $3}' "/proc/$LOW_CTL_PID/cgroup")
     [ "$LOW_CTL_CG" = "$LOW_CG/ctl" ] || fail "sandbox-ctl cgroup=$LOW_CTL_CG, want $LOW_CG/ctl"
     LOW_VMM_PROCS="/sys/fs/cgroup$LOW_CG/vmm/cgroup.procs"
-    mapfile -t LOW_VMM_PIDS < "$LOW_VMM_PROCS"
-    [ "${#LOW_VMM_PIDS[@]}" -gt 0 ] || fail "vmm cgroup has no process"
-    for pid in "${LOW_VMM_PIDS[@]}"; do
-        # A nested PID namespace may render an otherwise populated cgroup entry as
-        # zero. Validate every process visible to this test namespace.
-        [ "$pid" = 0 ] && continue
-        [ "$(basename "$(readlink -f "/proc/$pid/exe")")" = "cloud-hypervisor" ] \
-            || fail "vmm cgroup contains non-VMM pid=$pid"
-        LOW_VISIBLE_VMM_PIDS=$((LOW_VISIBLE_VMM_PIDS + 1))
-    done
-    [ "$LOW_VISIBLE_VMM_PIDS" -gt 0 ] || fail "vmm cgroup has no visible Cloud Hypervisor process"
+    if ! VMM_MEMBERS_ERROR=$(e2e_assert_vmm_cgroup_members /proc "$LOW_VMM_PROCS" 2>&1); then
+        fail "low-allocatable[$iteration] $VMM_MEMBERS_ERROR"
+    fi
     [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
         || fail "vmm memory.high is not 224MiB"
     [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
