@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   bms:
-    uses: kuasar-sandbox/platform/.github/workflows/bms-entry.yml@main
+    uses: kuasar-sandbox/kuasar-sandbox/.github/workflows/bms-entry.yml@main
     secrets:
       KUASAR_CI_APP_PRIVATE_KEY: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
