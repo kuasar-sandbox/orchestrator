@@ -325,6 +325,44 @@ func TestBuildTriggerRejectsGenericConfigButKeepsBuilderAndCapacity(t *testing.T
 	}
 }
 
+func TestBuildTriggerStateConflictResponse(t *testing.T) {
+	states := []types.BuildState{
+		types.BuildWaiting,
+		types.BuildBuilding,
+		types.BuildReady,
+		types.BuildError,
+	}
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			called := false
+			core := &buildMMDSCoreStub{trigger: func(context.Context, string, string, string, TriggerSpec, BuildAuth) error {
+				called = true
+				return &BuildStateConflictError{State: state}
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost,
+				"/v2/templates/template/builds/build", strings.NewReader(`{"force":true}`), nil)
+			if !called {
+				t.Fatal("trigger did not reach Core")
+			}
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			wantMessage := "build cannot be triggered from state " + string(state)
+			if len(body) != 2 || body["message"] != wantMessage || body["state"] != string(state) {
+				t.Fatalf("response = %#v, want message=%q state=%q", body, wantMessage, state)
+			}
+		})
+	}
+}
+
 func TestCreateCheckpointHeaderOverlaysMetadataPerField(t *testing.T) {
 	var got CreateReq
 	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {

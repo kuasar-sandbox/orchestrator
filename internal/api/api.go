@@ -205,6 +205,17 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
 
+// BuildStateConflictError reports the exact internal state that prevents a
+// one-shot build trigger. It is handled only by the trigger endpoint; SDKStatus
+// deliberately collapses in-progress states and is not precise enough here.
+type BuildStateConflictError struct {
+	State types.BuildState
+}
+
+func (e *BuildStateConflictError) Error() string {
+	return fmt.Sprintf("build cannot be triggered from state %s", e.State)
+}
+
 // ErrAlreadyExists is returned when a sandbox migration import target exists.
 var ErrAlreadyExists = errors.New("sandbox already exists")
 
@@ -868,7 +879,13 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			Metadata:     meta,
 		}, auth)
 	if err != nil {
+		var stateConflict *BuildStateConflictError
 		switch {
+		case errors.As(err, &stateConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"message": stateConflict.Error(),
+				"state":   string(stateConflict.State),
+			})
 		case errors.Is(err, ErrFilesUnsupported):
 			writeErr(w, 501, err.Error())
 		case errors.Is(err, ErrBadRequest):
