@@ -24,7 +24,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 5
+	schema uint32 = 6
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -50,22 +50,25 @@ var (
 	headerSize         = alignSize(int(unsafe.Sizeof(mmapHeader{})), 8)
 	recordSize         = int(unsafe.Sizeof(mmapRecord{}))
 	terminalRecordSize = int(unsafe.Sizeof(mmapTerminalRecord{}))
+	mmdsSourceSlotSize = int(unsafe.Sizeof(mmapMMDSSourceSlot{}))
 )
 
 type mmapHeader struct {
-	Magic        uint64
-	Schema       uint32
-	Capacity     uint32
-	Synced       uint32
-	TerminalCap  uint32
-	GlobalRev    uint64
-	SyncGen      uint64
-	TableSeq     uint64
-	PolicySeq    uint64
-	PolicyParkMS int64
-	PolicyAuth   [maxProfile]byte
-	MMDSSynced   uint32
-	_            [20]byte
+	Magic         uint64
+	Schema        uint32
+	Capacity      uint32
+	Synced        uint32
+	TerminalCap   uint32
+	GlobalRev     uint64
+	SyncGen       uint64
+	TableSeq      uint64
+	PolicySeq     uint64
+	PolicyParkMS  int64
+	PolicyAuth    [maxProfile]byte
+	MMDSSourceSeq uint64
+	MMDSSynced    uint32
+	MMDSSourceCap uint32
+	_             [8]byte
 }
 
 type mmapRecord struct {
@@ -109,12 +112,13 @@ type mmapTerminalRecord struct {
 
 // Table is a memory-mapped fixed-capacity route table.
 type Table struct {
-	path      string
-	data      []byte
-	header    *mmapHeader
-	records   []mmapRecord
-	terminals []mmapTerminalRecord
-	readonly  bool
+	path        string
+	data        []byte
+	header      *mmapHeader
+	records     []mmapRecord
+	terminals   []mmapTerminalRecord
+	mmdsSources []mmapMMDSSourceSlot
+	readonly    bool
 }
 
 // Create replaces path with a zeroed route table of capacity records.
@@ -147,6 +151,7 @@ func Create(path string, capacity int) (*Table, error) {
 	t.header.Schema = schema
 	t.header.Capacity = uint32(capacity)
 	t.header.TerminalCap = uint32(terminalCapacity(capacity))
+	t.header.MMDSSourceCap = uint32(mmdsSourceSlotCount)
 	return t, nil
 }
 
@@ -161,7 +166,7 @@ func Open(path string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	if st.Size() < int64(headerSize+recordSize) {
+	if st.Size() < int64(headerSize) {
 		return nil, fmt.Errorf("proxyshm: %s too small", path)
 	}
 	data, err := unix.Mmap(int(f.Fd()), 0, int(st.Size()), unix.PROT_READ, unix.MAP_SHARED)
@@ -176,8 +181,8 @@ func Open(path string) (*Table, error) {
 	return t, nil
 }
 
-// Size returns the mmap size for capacity live records plus the bounded,
-// credential-free terminal revision cache.
+// Size returns the mmap size for capacity live records, the bounded
+// credential-free terminal revision cache, and the fixed MMDS source region.
 func Size(capacity int) int {
 	if capacity <= 0 {
 		capacity = defaultCapacity
@@ -196,7 +201,7 @@ func terminalCapacity(capacity int) int {
 }
 
 func mappedSize(capacity, terminalCap int) int {
-	return headerSize + capacity*recordSize + terminalCap*terminalRecordSize
+	return headerSize + capacity*recordSize + terminalCap*terminalRecordSize + mmdsSourceSlotCount*mmdsSourceSlotSize
 }
 
 func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int) (*Table, error) {
@@ -206,8 +211,20 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 	h := (*mmapHeader)(unsafe.Pointer(&data[0]))
 	terminalCap := terminalCapacity(expectedCapacity)
 	if expectedCapacity == 0 {
-		if h.Magic != magic || h.Schema != schema || h.Capacity == 0 || h.TerminalCap == 0 {
-			return nil, fmt.Errorf("proxyshm: invalid header in %s", path)
+		if h.Magic != magic {
+			return nil, fmt.Errorf("proxyshm: invalid magic in %s", path)
+		}
+		if h.Schema != schema {
+			return nil, fmt.Errorf("proxyshm: unsupported schema %d in %s", h.Schema, path)
+		}
+		if h.Capacity == 0 {
+			return nil, fmt.Errorf("proxyshm: invalid primary capacity 0 in %s", path)
+		}
+		if h.TerminalCap == 0 {
+			return nil, fmt.Errorf("proxyshm: invalid terminal capacity 0 in %s", path)
+		}
+		if h.MMDSSourceCap != uint32(mmdsSourceSlotCount) {
+			return nil, fmt.Errorf("proxyshm: invalid MMDS source capacity %d in %s", h.MMDSSourceCap, path)
 		}
 		expectedCapacity = int(h.Capacity)
 		terminalCap = int(h.TerminalCap)
@@ -224,7 +241,13 @@ func tableFromMmap(path string, data []byte, readonly bool, expectedCapacity int
 	terminalOffset := headerSize + expectedCapacity*recordSize
 	terminalFirst := unsafe.Pointer(&data[terminalOffset])
 	terminals := unsafe.Slice((*mmapTerminalRecord)(terminalFirst), terminalCap)
-	return &Table{path: path, data: data, header: h, records: records, terminals: terminals, readonly: readonly}, nil
+	mmdsSourceOffset := terminalOffset + terminalCap*terminalRecordSize
+	mmdsSourceFirst := unsafe.Pointer(&data[mmdsSourceOffset])
+	mmdsSources := unsafe.Slice((*mmapMMDSSourceSlot)(mmdsSourceFirst), mmdsSourceSlotCount)
+	return &Table{
+		path: path, data: data, header: h, records: records, terminals: terminals,
+		mmdsSources: mmdsSources, readonly: readonly,
+	}, nil
 }
 
 // Close unmaps the table.
@@ -445,38 +468,6 @@ func (t *Table) RouteRev(sid string) uint64 {
 func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
 	entry, found, _ := t.LookupRevision(sid)
 	return entry, found
-}
-
-func (t *Table) ByFloatingIP(ip string) (string, bool) {
-	if ip == "" {
-		return "", false
-	}
-	for {
-		seq1 := atomic.LoadUint64(&t.header.TableSeq)
-		if seq1&1 == 1 {
-			runtime.Gosched()
-			continue
-		}
-		var sid string
-		for i := 0; i < len(t.records); i++ {
-			entry, st, ok := readRecord(&t.records[i])
-			if !ok {
-				i--
-				runtime.Gosched()
-				continue
-			}
-			if st == statusPresent &&
-				(entry.State == routesync.StateStarting || entry.State == routesync.StateRunning) &&
-				entry.FloatingIP == ip {
-				sid = entry.SandboxID
-				break
-			}
-		}
-		seq2 := atomic.LoadUint64(&t.header.TableSeq)
-		if seq1 == seq2 && seq2&1 == 0 {
-			return sid, sid != ""
-		}
-	}
 }
 
 func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {

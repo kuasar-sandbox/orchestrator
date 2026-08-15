@@ -29,6 +29,11 @@ type mmdsEntry struct {
 	available bool
 }
 
+type mmdsEntrySnapshot struct {
+	entry mmdsEntry
+	found bool
+}
+
 func NewMMDSView(limit int) *MMDSView {
 	if limit <= 0 {
 		limit = 1
@@ -81,6 +86,30 @@ func (v *MMDSView) Delete(sandboxID string) {
 	v.mu.Lock()
 	delete(v.byID, sandboxID)
 	v.mu.Unlock()
+}
+
+func (v *MMDSView) snapshotEntry(sandboxID string) mmdsEntrySnapshot {
+	v.mu.RLock()
+	entry, found := v.byID[sandboxID]
+	snapshot := mmdsEntrySnapshot{entry: cloneMMDSEntry(entry), found: found}
+	v.mu.RUnlock()
+	return snapshot
+}
+
+func (v *MMDSView) restoreEntry(sandboxID string, snapshot mmdsEntrySnapshot) {
+	v.mu.Lock()
+	if snapshot.found {
+		v.byID[sandboxID] = cloneMMDSEntry(snapshot.entry)
+	} else {
+		delete(v.byID, sandboxID)
+	}
+	v.mu.Unlock()
+}
+
+func cloneMMDSEntry(entry mmdsEntry) mmdsEntry {
+	entry.routes = append([]sandboxcfg.MMDSRoute(nil), entry.routes...)
+	entry.values = cloneBytesMap(entry.values)
+	return entry
 }
 
 // SetServices atomically replaces the complete conductor-projected registry.
