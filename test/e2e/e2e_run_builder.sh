@@ -310,14 +310,14 @@ failed_unit_count() { # $1=unit pattern; list-units does not load missing instan
 wait_unit_collected() { # $1=exact unit
     local unit="$1" loaded
     for _ in $(seq 1 100); do
-        loaded=$(systemctl list-units --all --state=failed --type=service --no-legend --no-pager "$unit" 2>/dev/null) \
+        loaded=$(systemctl list-units --all --type=service --no-legend --no-pager "$unit" 2>/dev/null) \
             || return 1
         if ! grep -Fq -- "$unit" <<<"$loaded"; then
             return 0
         fi
         sleep 0.1
     done
-    systemctl list-units --all --state=failed --type=service --no-legend --no-pager "$unit" >&2 || true
+    systemctl list-units --all --type=service --no-legend --no-pager "$unit" >&2 || true
     return 1
 }
 wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
