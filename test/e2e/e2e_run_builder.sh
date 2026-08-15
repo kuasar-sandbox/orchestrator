@@ -337,6 +337,32 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 print(row[0] if row else "")
 PY
 }
+build_trigger_signature() { # $1=build id
+    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute(
+        """select kind, from_image, from_template, start_cmd, ready_cmd,
+                  steps_json, registry_auth_enc, metadata_json, builder_json,
+                  status, reason, run_id
+             from builds where build_id=?""",
+        (sys.argv[2],),
+    ).fetchone()
+assert row is not None, "build row missing"
+print(json.dumps(row, separators=(",", ":")))
+PY
+}
+assert_trigger_conflict() { # $1=exact internal state
+    python3 - "$WORK/resp.body" "$1" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+state = sys.argv[2]
+assert body == {
+    "message": f"build cannot be triggered from state {state}",
+    "state": state,
+}, body
+PY
+}
 wait_running() { # sid
     local sid="$1" code state=""
     for _ in $(seq 1 180); do
@@ -580,6 +606,20 @@ code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$
 wait_ready "$B1_TID" "$B1_BID" B1
 B1_PERSIST="$PERSIST"
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
+B1_BEFORE_RETRY=$(build_trigger_signature "$B1_BID")
+code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\",\"force\":true}")
+[ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "B1 second trigger = $code (want 409)"; }
+assert_trigger_conflict ready || fail "B1 second trigger did not report exact ready state"
+[ "$(build_trigger_signature "$B1_BID")" = "$B1_BEFORE_RETRY" ] \
+    || fail "B1 second trigger changed the terminal build row"
+code=$(req GET /templates "$AK")
+[ "$code" = "200" ] || fail "template list after B1 conflict = $code (want 200)"
+python3 - "$WORK/resp.body" "$B1_BID" "$B1_PERSIST" <<'PY'
+import json, sys
+items = json.load(open(sys.argv[1]))
+assert any(item.get("buildID") == sys.argv[2] and item.get("templateID") == sys.argv[3] for item in items), items
+PY
 echo "==> PASS: B1 ready → $B1_PERSIST"
 
 # ---- BF: deterministic business failure → API error + collected unit -------
@@ -606,14 +646,23 @@ wait_unit_collected "$BF_UNIT" || fail "$BF_UNIT remained loaded and failed"
 code=$(req GET "/templates/$BF_TID/builds/$BF_BID/status" "$AK")
 [ "$code" = "200" ] && [ "$(json_field "$WORK/resp.body" status)" = "error" ] \
     || fail "BF API did not retain terminal error status"
+BF_BEFORE_RETRY=$(build_trigger_signature "$BF_BID")
+code=$(req POST "/v2/templates/$BF_TID/builds/$BF_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\",\"force\":true}")
+[ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "BF second trigger = $code (want 409)"; }
+assert_trigger_conflict error || fail "BF second trigger did not report exact error state"
+[ "$(build_trigger_signature "$BF_BID")" = "$BF_BEFORE_RETRY" ] \
+    || fail "BF second trigger changed the terminal build row"
 [ "$(failed_unit_count 'sandbox-builder@*.service')" = "$BUILDER_FAILED_BASE" ] \
     || fail "BF increased the failed builder unit count"
+echo "==> PASS: ready/error build ids reject force retries without mutation; ready remains listed"
 echo "==> PASS: BF status=error, journal retained, sandbox-builder instance collected"
 
 # ---- B2: fromTemplate(img) + steps + startCmd/readyCmd → e2b-snp ------------
 echo "==> B2: fromTemplate=$B1_PERSIST + steps + startCmd/readyCmd"
 register e2e-tpl
 B2_TID="$TID"; B2_BID="$BID"
+[ "$B2_BID" != "$B1_BID" ] || fail "new registration reused B1 build id"
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
