@@ -66,7 +66,7 @@ jobs:
           client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
           private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
           owner: kuasar-sandbox
-          repositories: accelerator,orchestrator,sandboxer
+          repositories: accelerator,connector,orchestrator,sandboxer
           permission-contents: read
           skip-token-revoke: true
 
@@ -109,6 +109,27 @@ jobs:
           repository: kuasar-sandbox/accelerator
           ref: main
           path: src/accelerator
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Check out connector dependency
+        id: checkout-connector
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/connector
+          ref: main
+          path: src/connector
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Retry connector dependency checkout
+        if: steps.checkout-connector.outcome == 'failure'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/connector
+          ref: main
+          path: src/connector
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
 
@@ -157,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f go.work go.work.sum
-          go work init ./src/accelerator ./src/orchestrator ./src/sandboxer
+          go work init ./src/accelerator ./src/connector ./src/orchestrator ./src/sandboxer
 
       - name: Build and test orchestrator
         working-directory: src/orchestrator

@@ -832,17 +832,17 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tbl.Close()
+	master := NewMasterView(tbl, time.Second, nil)
 	secret := []byte("secret")
-	tbl.BeginSync()
+	master.BeginSync()
 	route := routesync.RouteEntry{
 		SandboxID: "s1", State: routesync.StateStarting, TemplateID: "tmpl",
 		FloatingIP: "100.100.0.3", EnvdAccessToken: "envd", MmdsSecret: hex.EncodeToString(secret),
 	}
-	if err := tbl.Upsert(route); err != nil {
+	if err := master.ApplyUpsert(route); err != nil {
 		t.Fatal(err)
 	}
-	tbl.Bookmark()
-	tbl.SetMMDSSynced(true)
+	master.Bookmark()
 	view := NewWorkerView(tbl, nil, nil, time.Second)
 	assertSource := func(state string) {
 		t.Helper()
@@ -855,7 +855,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 	}
 	assertSource(routesync.StateStarting)
 	route.State = routesync.StateRunning
-	if err := tbl.Upsert(route); err != nil {
+	if err := master.ApplyUpsert(route); err != nil {
 		t.Fatal(err)
 	}
 	assertSource(routesync.StateRunning)
@@ -863,7 +863,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatalf("MmdsSecret = %x ok=%v", got, ok)
 	}
 	route.State = routesync.StatePaused
-	if err := tbl.Upsert(route); err != nil {
+	if err := master.ApplyUpsert(route); err != nil {
 		t.Fatal(err)
 	}
 	if sid, ok := view.ByFloatingIP(route.FloatingIP); ok || sid != "" {
