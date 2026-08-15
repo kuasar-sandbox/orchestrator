@@ -53,6 +53,7 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 func (o *Orchestrator) runnerUnitFile() string {
 	return fmt.Sprintf(`[Unit]
 Description=kuasar sandbox runner %%i
+CollectMode=inactive-or-failed
 # %%i is a run-id, not a sandbox id. node-ctl run-sandbox waits on the config
 # socket until this run-id is assigned a sandbox id, then fetches the sandbox's
 # LaunchSpec and exec-replaces into sandbox-ctl.
@@ -77,6 +78,7 @@ Delegate=yes
 func (o *Orchestrator) builderUnitFile() string {
 	return fmt.Sprintf(`[Unit]
 Description=kuasar image build runner %%i
+CollectMode=inactive-or-failed
 # %%i is a run-id, not a build id. node-ctl run-builder waits on the config
 # socket until this run-id is assigned a build id, then fetches the BuildSpec,
 # runs one build, posts the result back over the socket, and exits.
