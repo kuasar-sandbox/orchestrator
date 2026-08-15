@@ -107,3 +107,5 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
 贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<!-- Validation-only change for the post-rename BMS gate in project issue #44; this PR will not be merged. -->
