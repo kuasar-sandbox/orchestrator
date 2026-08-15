@@ -18,7 +18,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
   分别由 [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 与
   [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪。
 
-是 [kuasar-sandbox/platform](https://github.com/kuasar-sandbox/platform) 平台的北向入口、节点
+是 [Kuasar Sandbox 项目](https://github.com/kuasar-sandbox/kuasar-sandbox) 的北向入口、节点
 资源仲裁与集群编排器,独立演进。两类沙箱 profile:**e2b**(guest 内 envd,完整数据面)与
 **bare**(无 envd,仅 floatingip)。全部纯 Go,`CGO_ENABLED=0`,无 gRPC/protobuf(协议为
 帧化 JSON over h2c)。
@@ -49,14 +49,14 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 make build                      # bin/<arch>/{node-ctl,cluster-ctl,node-stub-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make test                       # 单元测试
-make test-e2e                   # 运行 test/e2e/run_all.sh;重型用例使用 platform 完整 BIN
+make test-e2e                   # 运行 test/e2e/run_all.sh;重型用例使用项目主仓组装的完整 BIN
 ```
 
 `orchestrator` 自身通过 `Component Release` workflow 独立发布 `vX.Y.Z`。发布件
 `orchestrator-vX.Y.Z-linux-x86_64.tar.gz` 包含节点与集群控制面二进制、部署模板、
-不重复包含文档或 E2E。本模块文档与 `test/e2e/` 由 platform 从所选 tag 聚合进
-platform 包。平台聚合版本 `release-vX.Y.Z` 由 `platform`
-仓选择各组件版本并发布,不从 `orchestrator/main` 推导组件组合。当前 Release
+不重复包含文档或 E2E。本模块文档与 `test/e2e/` 由项目主仓从所选 tag 聚合进
+platform 包。平台聚合版本 `release-vX.Y.Z` 由项目主仓选择各组件版本并发布,
+不从 `orchestrator/main` 推导组件组合。当前 Release
 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
