@@ -208,6 +208,10 @@ var ErrBadRequest = errors.New("bad request")
 // ErrAlreadyExists is returned when a sandbox migration import target exists.
 var ErrAlreadyExists = errors.New("sandbox already exists")
 
+// ErrExportPreempted is returned when a durable sandbox resume wins before an
+// instance export enters source finalization.
+var ErrExportPreempted = errors.New("sandbox export preempted by resume")
+
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
 const PullTokenHeader = "X-Kuasar-Pull-Token"
 
@@ -312,9 +316,9 @@ type Core interface {
 	// ErrFilesUnsupported when builder.files_storage is unconfigured.
 	FilesUpload(ctx context.Context, apiKey, templateID, hash string) (present bool, url string, err error)
 
-	// Sandbox export/import (orchestrator extension to the e2b surface). Export turns
-	// a paused sandbox's remote snapshot into a reusable template (toTemplate) or a
-	// one-line opaque kmt1 migration token; import restores a paused logical sandbox.
+	// Sandbox export/import (orchestrator extension to the e2b surface). Export
+	// publishes a paused snapshot as a reusable template (toTemplate) or an opaque
+	// kmt1 migration token; keepSource independently controls source finalization.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
@@ -1053,6 +1057,8 @@ func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
 // credential material, token fragments, or other internal diagnostics.
 func (a *API) failMigrate(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrExportPreempted):
+		writeErr(w, http.StatusConflict, ErrExportPreempted.Error())
 	case errors.Is(err, ErrAlreadyExists):
 		writeErr(w, http.StatusConflict, "target sandbox already exists")
 	case errors.Is(err, migrationtoken.ErrIncompatible):

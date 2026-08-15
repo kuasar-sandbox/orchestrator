@@ -5,10 +5,10 @@ import (
 	"sync"
 )
 
-// acceptedOperationGroup tracks lifecycle operations that cannot be safely
-// abandoned once their runtime request has been accepted. Drain closes
-// admission before waiting, so no operation can race in after shutdown has
-// observed an empty group.
+// acceptedOperationGroup tracks lifecycle operations whose goroutines may keep
+// using shared dependencies after admission. Drain closes admission before
+// waiting, so no operation can race in after shutdown has observed an empty
+// group.
 type acceptedOperationGroup struct {
 	mu      sync.Mutex
 	active  int

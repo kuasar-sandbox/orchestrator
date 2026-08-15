@@ -41,6 +41,9 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	}
 	sb.EnvdAccessToken = "source-envd-token"
 	sb.TrafficAccessToken = "source-traffic-token"
+	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{
 		EnvdAccessToken: sb.EnvdAccessToken, TrafficAccessToken: sb.TrafficAccessToken,
 	}); err != nil {
@@ -77,6 +80,9 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	}
 	if s := o.lookup(sid); s != nil {
 		t.Fatal("move export should uncache the source row")
+	}
+	if _, err := os.Stat(sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("move export retained source run directory: %v", err)
 	}
 	// Standalone import defaults to the source NodeSandboxID after a move.
 	imported, err := o.ImportSandbox(ctx, apiKey, tok, "")
@@ -256,7 +262,7 @@ func TestImportExplicitTargetPreservesAuthSubjectAndCredentials(t *testing.T) {
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(source))
 	if retained, err := o.st.Get(ctx, source.ID); err != nil || retained == nil {
-		t.Fatalf("copy export removed source: %v", err)
+		t.Fatalf("retained-source export removed source: %v", err)
 	}
 }
 
@@ -555,8 +561,9 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	mk := strings.Repeat("9", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "sbx-delete-fail"
-	mref := "manifest://" + strings.Repeat("e", 64)
-	sb := migrationSandbox(t, dir, sid, mk, mref)
+	localRef := makeLocalSnapshot(t, dir, sid)
+	installPromoteStub(t, "manifest://"+strings.Repeat("e", 64))
+	sb := migrationSandbox(t, dir, sid, mk, localRef)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +577,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 		t.Fatalf("move export returned the wrong token/error state: %v", err)
 	}
 	stored, getErr := o.st.Get(ctx, sid)
-	if getErr != nil || stored == nil {
+	if getErr != nil || stored == nil || stored.SnapshotRef != localRef {
 		t.Fatalf("source row lost after failed delete: %v", getErr)
 	}
 	if cached := o.lookup(sid); cached == nil {
@@ -580,6 +587,9 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	case <-events:
 		t.Fatal("unexpected route event after failed delete")
 	default:
+	}
+	if _, err := os.Stat(localRef); err != nil {
+		t.Fatalf("local snapshot removed after failed source delete: %v", err)
 	}
 }
 

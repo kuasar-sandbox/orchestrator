@@ -18,7 +18,10 @@ func (o *Orchestrator) DeleteMMDSRouteSecretValue(ctx context.Context, sandboxID
 }
 
 func (o *Orchestrator) mutateMMDSRouteSecretValue(ctx context.Context, sandboxID, name string, value []byte, deleteValue bool) error {
-	unlock := o.lifecycle.Lock(sandboxID)
+	unlock, err := o.lockLifecycleMutation(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	sb, err := o.st.Get(ctx, sandboxID)

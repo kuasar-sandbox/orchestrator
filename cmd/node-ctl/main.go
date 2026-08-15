@@ -162,8 +162,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	// This defer is registered after the store and launcher closes, so it runs
 	// first on every conductor exit path. Cancel lifecycle admission and
 	// cancellable launch work, then keep dependencies open until every accepted
-	// launch and non-cancelable pause has finished terminal publication and
-	// cleanup. The service manager remains the outer bound for a permanently
+	// launch and accepted pause/export operation has stopped using the store and
+	// launcher. The service manager remains the outer bound for a permanently
 	// unavailable dependency.
 	defer func() {
 		stop()
@@ -171,7 +171,7 @@ func runConductor(args []string, log *slog.Logger) error {
 			log.Error("drain sandbox launches", "err", err)
 		}
 		if err := core.DrainPauses(context.Background()); err != nil {
-			log.Error("drain sandbox pauses", "err", err)
+			log.Error("drain accepted sandbox operations", "err", err)
 		}
 	}()
 	if err := core.InstallUnits(ctx); err != nil {

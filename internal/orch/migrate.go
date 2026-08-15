@@ -23,75 +23,215 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// ExportSandbox authorizes apiKey against the paused sandbox, ensures its snapshot
-// is remote (promoting a local checkpoint if needed), then either returns the
-// derived persist template id (toTemplate; fork) or a one-line opaque kmt1
-// token (default). A move relinquishes the source row unless
-// keepSource (copy) — the remote snapshot persists either way.
+// ExportSandbox publishes a paused sandbox snapshot, then returns either a
+// reusable template id or an opaque kmt1 migration token. Publish does not hold
+// the source lifecycle lock: an accepted resume may preempt a KMT export or
+// detach a template export before the short source finalizer begins.
 func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
-	unlock := o.lifecycle.Lock(sid)
-	defer unlock()
-
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if apiKey == "" {
 		return "", fmt.Errorf("export-sandbox: API key is required: %w", api.ErrNotAllowed)
 	}
-	sb, err := o.st.Get(ctx, sid)
+	lifecycleCtx := o.launchContext()
+	finishOperation, err := o.acceptedOps.Begin(lifecycleCtx)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
-	if !ownsSandbox(sb, apiKey) {
-		return "", api.ErrNotFound
-	}
-	if sb.State != types.StatePaused || sb.SnapshotRef == "" {
-		return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
-	}
-	tmpl, err := types.ParseTemplateID(sb.TemplateID)
-	if err != nil {
-		return "", err
-	}
-	if sb.Profile != tmpl.Profile {
-		return "", fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
-	}
-	// Ensure the snapshot is portable. A local checkpoint is published through
-	// the configured manifest or named-location publisher and then repointed.
-	ref := sb.SnapshotRef
-	if !types.IsPortableRef(ref) {
-		localRef := ref
-		portableRef, err := o.promote(ctx, sb, localRef)
+	opCtx, cancelUpload := context.WithCancelCause(ctx)
+	stopLifecycle := context.AfterFunc(lifecycleCtx, func() {
+		cancelUpload(context.Cause(lifecycleCtx))
+	})
+
+	var (
+		source  *types.Sandbox
+		tmpl    types.TemplateID
+		attempt *exportAttempt
+	)
+	defer func() {
+		stopLifecycle()
+		cancelUpload(nil)
+		o.exports.Finish(attempt)
+		finishOperation()
+	}()
+	for {
+		unlock, err := o.lockLifecycleMutation(opCtx, sid)
 		if err != nil {
+			return "", context.Cause(opCtx)
+		}
+		sb, err := o.st.Get(opCtx, sid)
+		if err != nil {
+			unlock()
 			return "", err
 		}
-		if err := o.st.SetSnapshotRef(ctx, sid, portableRef); err != nil {
-			return "", fmt.Errorf("export-sandbox: persist promoted snapshot ref for %s: %w", sid, err)
+		if !ownsSandbox(sb, apiKey) {
+			unlock()
+			return "", api.ErrNotFound
 		}
-		sb.SnapshotRef, ref = portableRef, portableRef
-		o.cache(sb)
-		o.publishUpsert(sb)
-		if err := os.RemoveAll(filepath.Dir(localRef)); err != nil {
-			o.log.Warn("export-sandbox: remove redundant local snapshot", "sid", sid, "path", filepath.Dir(localRef), "err", err)
+		if sb.State != types.StatePaused || sb.SnapshotRef == "" {
+			unlock()
+			return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
-	}
-	if toTemplate {
-		id := types.TemplateID{Profile: tmpl.Profile, Kind: types.KindSnp, Ref: ref}.String()
-		if _, err := types.ParseTemplateID(id); err != nil {
-			return "", fmt.Errorf("export-sandbox: snapshot template: %w", err)
+		tmpl, err = types.ParseTemplateID(sb.TemplateID)
+		if err != nil {
+			unlock()
+			return "", err
 		}
-		return id, nil
+		if sb.Profile != tmpl.Profile {
+			unlock()
+			return "", fmt.Errorf("export-sandbox: sandbox profile %q does not match template profile %q", sb.Profile, tmpl.Profile)
+		}
+
+		source = cloneSandbox(sb)
+		var started bool
+		attempt, started = o.exports.Begin(sid, source.SnapshotRef, toTemplate, cancelUpload)
+		unlock()
+		if started {
+			break
+		}
 	}
 
-	tok, err := o.mintSandboxToken(sb, ref)
+	// Phase one only publishes and prepares the immutable result. It never
+	// mutates the source row, cache, route, or local checkpoint.
+	ref := source.SnapshotRef
+	localRef := ""
+	if !types.IsPortableRef(ref) {
+		localRef = ref
+		publish := o.promote
+		if o.snapshotPublisher != nil {
+			publish = o.snapshotPublisher
+		}
+		portableRef, err := publish(opCtx, source, localRef)
+		if err != nil {
+			if o.exports.State(attempt) == exportPreempted {
+				return "", exportPreemptedError(sid)
+			}
+			return "", err
+		}
+		ref = portableRef
+	}
+
+	if o.exports.State(attempt) == exportPreempted {
+		return "", exportPreemptedError(sid)
+	}
+	if err := opCtx.Err(); err != nil {
+		return "", context.Cause(opCtx)
+	}
+	var result string
+	if toTemplate {
+		result = types.TemplateID{Profile: tmpl.Profile, Kind: types.KindSnp, Ref: ref}.String()
+		if _, err := types.ParseTemplateID(result); err != nil {
+			return "", fmt.Errorf("export-sandbox: snapshot template: %w", err)
+		}
+	} else {
+		var err error
+		result, err = o.mintSandboxToken(source, ref)
+		if err != nil {
+			if o.exports.State(attempt) == exportPreempted {
+				return "", exportPreemptedError(sid)
+			}
+			return "", err
+		}
+	}
+
+	// A detached template result no longer owns source finalization. Returning it
+	// directly also keeps accepted resume launch commits independent of upload.
+	switch o.exports.State(attempt) {
+	case exportPreempted:
+		return "", exportPreemptedError(sid)
+	}
+	if err := lifecycleCtx.Err(); err != nil {
+		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+	if err := opCtx.Err(); err != nil {
+		return "", context.Cause(opCtx)
+	}
+	if o.exports.State(attempt) == exportDetached {
+		return result, nil
+	}
+
+	// Phase two has one short linearization point against Resume. Once this lock
+	// is held and BeginFinalize succeeds, Resume waits for the durable source
+	// mutation and local cleanup attempt to finish.
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+	if o.exports.State(attempt) == exportPreempted {
+		return "", exportPreemptedError(sid)
+	}
+	if err := lifecycleCtx.Err(); err != nil {
+		return "", fmt.Errorf("orch: lifecycle is stopping: %w", err)
+	}
+	if err := opCtx.Err(); err != nil {
+		return "", context.Cause(opCtx)
+	}
+	switch o.exports.BeginFinalize(attempt) {
+	case exportPreempted:
+		return "", exportPreemptedError(sid)
+	case exportDetached:
+		return result, nil
+	case exportFinalizing:
+	default:
+		return "", fmt.Errorf("export-sandbox: invalid export attempt state")
+	}
+
+	// Request/lifecycle cancellation may abandon export before BeginFinalize,
+	// but it cannot split an already-won durable source commit. Preserve context
+	// values while finishing this bounded local critical section.
+	finalizeCtx := context.WithoutCancel(opCtx)
+	current, err := o.st.Get(finalizeCtx, sid)
 	if err != nil {
 		return "", err
 	}
-	if !keepSource {
-		if err := o.st.Delete(ctx, sid); err != nil { // move: remote snapshot persists
+	if current == nil || current.State != types.StatePaused || current.SnapshotRef != attempt.sourceRef ||
+		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
+		current.AuthSandboxID() != source.AuthSandboxID() {
+		return "", exportPreemptedError(sid)
+	}
+	exportKind := "kmt"
+	if toTemplate {
+		exportKind = "template"
+	}
+	o.log.Info("export won source finalization", "sid", sid, "export_kind", exportKind, "keep_source", keepSource)
+
+	if keepSource {
+		if localRef != "" {
+			if err := o.st.SetSnapshotRef(finalizeCtx, sid, ref); err != nil {
+				return "", fmt.Errorf("export-sandbox: persist promoted snapshot ref for %s: %w", sid, err)
+			}
+			current.SnapshotRef = ref
+			o.cache(current)
+			o.publishUpsert(current)
+		}
+	} else {
+		cleanupCtx, cancelCleanup := cleanupContext()
+		cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current)
+		cancelCleanup()
+		if cleanupErr != nil {
+			return "", fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
+		}
+		if err := o.st.Delete(finalizeCtx, sid); err != nil {
+			o.cache(current)
 			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 		}
 		o.uncache(sid)
 		o.clearDeadlineIntent(sid)
 		o.publishDelete(sid)
 	}
-	return tok, nil
+	if localRef != "" {
+		localDir := filepath.Dir(localRef)
+		if err := os.RemoveAll(localDir); err != nil {
+			o.log.Warn("export-sandbox: remove finalized local snapshot", "sid", sid, "path", localDir, "err", err)
+		}
+	}
+	return result, nil
+}
+
+func exportPreemptedError(sid string) error {
+	return fmt.Errorf("export-sandbox: resume accepted for %s: %w", sid, api.ErrExportPreempted)
 }
 
 // mintSandboxToken seals a complete portable sandbox record. There is no API-key

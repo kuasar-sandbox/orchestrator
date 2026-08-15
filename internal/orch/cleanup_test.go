@@ -132,7 +132,7 @@ func TestReconcileCleanupStopsBeforeLaterOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := o.teardownReconcile(context.Background(), sb); !errors.Is(err, stopErr) {
+	if err := o.teardownPersistedOwnership(context.Background(), sb); !errors.Is(err, stopErr) {
 		t.Fatalf("reconcile cleanup error = %v, want stop failure", err)
 	}
 	if lc.resetCalls.Load() != 0 || vs.detachCalls.Load() != 0 {
