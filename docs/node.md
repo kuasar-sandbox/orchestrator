@@ -1931,7 +1931,7 @@ native exec 路径负责,不表示同一聚合脚本的后续 pause/resume 等�
 
 编排特性的 E2E 与实现一起维护在 `orchestrator/test/e2e/`。轻量 cluster stub 与需要
 vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品的真实 microVM
-用例使用同一个 `run_all.sh`。本仓直接运行时通过 `BIN` 指向 platform 组装的二进制目录;
+用例使用同一个 `run_all.sh`。本仓直接运行时通过 `BIN` 指向项目主仓组装的二进制目录;
 组件 PR 的 BMS 则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
 跳过,完整门禁设置 `REQUIRE_*=1` 后硬失败。
 
@@ -1949,7 +1949,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 | `e2e_density.sh` | 节点资源准入、回收与密度行为 |
 | `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
 
-`make test-e2e` 即执行 `test/e2e/run_all.sh`;platform 只提供统一环境、聚合入口及真正跨组件
+`make test-e2e` 即执行 `test/e2e/run_all.sh`;项目主仓只提供统一环境、聚合入口及真正跨组件
 组合本身的用例,不复制上述脚本。
 
 ## 17. See Also
@@ -1969,5 +1969,5 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
   `FLATTEN_REGISTRY_*`
 - `accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)
-- `platform/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
-- `platform/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示
+- `kuasar-sandbox/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
+- `kuasar-sandbox/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示

@@ -32,7 +32,7 @@ endif
 GO             := go
 GO_BUILD_FLAGS := -trimpath
 BINDIR         := bin/$(TARGET_ARCH)
-E2E_BIN        ?= $(abspath ../platform/bin/$(TARGET_ARCH))
+E2E_BIN        ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 ZOT_BIN        ?= zot
 VGW_BIN        ?= versitygw
 
