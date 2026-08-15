@@ -35,6 +35,9 @@ type MasterView struct {
 	notify    *Broadcaster
 	defaultPk time.Duration
 	log       *slog.Logger
+	// upsertPrimary is table.Upsert in production. Keeping the transaction's
+	// fallible commit point explicit lets tests inject every rollback shape.
+	upsertPrimary func(routesync.RouteEntry) error
 
 	policyMu    sync.RWMutex
 	policyMMDS  *routesync.MMDSProxyPolicy
@@ -46,7 +49,7 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 	if defaultPark <= 0 {
 		defaultPark = 30 * time.Second
 	}
-	return &MasterView{
+	view := &MasterView{
 		table:       table,
 		mmds:        NewMMDSView(table.Capacity()),
 		wakes:       NewWakeQueue(4096),
@@ -55,21 +58,44 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 		log:         log,
 		policyReady: make(chan struct{}),
 	}
+	view.upsertPrimary = table.Upsert
+	return view
 }
 
 func (v *MasterView) BeginSync() {
 	v.table.SetMMDSSynced(false)
 	v.table.BeginSync()
 	v.mmds.BeginSync()
+	v.table.clearAllMMDSSources()
 	v.notify.Notify()
 }
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
+	if err := validateRoute(r); err != nil {
+		return err
+	}
+	oldRoute, oldFound := v.table.Lookup(r.SandboxID)
+	heapSnapshot := v.mmds.snapshotEntry(r.SandboxID)
+	affectedIPv4s := make([]uint32, 0, 2)
+	if oldFound && activeMMDSSourceRoute(oldRoute) {
+		if ipv4, ok := parseMMDSSourceIPv4(oldRoute.FloatingIP); ok {
+			affectedIPv4s = append(affectedIPv4s, ipv4)
+		}
+	}
 	active := r.State == routesync.StateStarting || r.State == routesync.StateRunning
+	incomingIPv4Valid := false
+	if active {
+		if ipv4, ok := parseMMDSSourceIPv4(r.FloatingIP); ok {
+			affectedIPv4s = append(affectedIPv4s, ipv4)
+			incomingIPv4Valid = true
+		}
+	}
+	sourceSnapshots := v.table.snapshotMMDSSourceSlots(affectedIPv4s...)
 	if active {
 		// Publish the heap view first. A worker that observes an active SHM row
 		// can then resolve either the new view or a conservative unavailable.
 		if err := v.mmds.Upsert(r); err != nil {
+			v.mmds.restoreEntry(r.SandboxID, heapSnapshot)
 			if v.log != nil {
 				v.log.Warn("proxyshm: apply MMDS route view", "sid", r.SandboxID, "err", err)
 			}
@@ -81,27 +107,37 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
 		// master lookup instead of receiving a value after pause/deletion.
 		v.mmds.Delete(r.SandboxID)
 	}
-	if err := v.table.Upsert(r); err != nil {
-		if active {
-			v.mmds.Delete(r.SandboxID)
-		}
+	conflict, sourceOwnerReplaced := v.table.updateMMDSSources(oldRoute, oldFound, r)
+	if err := v.upsertPrimary(r); err != nil {
+		v.table.restoreMMDSSourceSlots(sourceSnapshots)
+		v.mmds.restoreEntry(r.SandboxID, heapSnapshot)
 		if v.log != nil {
 			v.log.Warn("proxyshm: apply route", "sid", r.SandboxID, "err", err)
 		}
 		return err
+	}
+	if active && r.FloatingIP != "" && !incomingIPv4Valid && v.log != nil {
+		v.log.Warn("proxyshm: active route has invalid MMDS source IPv4",
+			"sid", r.SandboxID, "floating_ip", r.FloatingIP)
+	}
+	if sourceOwnerReplaced {
+		logMMDSSourceConflict(v.log, conflict)
 	}
 	v.notify.Notify()
 	return nil
 }
 
 func (v *MasterView) ApplyDelete(sid string) {
+	oldRoute, oldFound := v.table.Lookup(sid)
 	v.mmds.Delete(sid)
+	v.table.removeRouteMMDSSource(oldRoute, oldFound)
 	v.table.Delete(sid)
 	v.notify.Notify()
 }
 
 func (v *MasterView) Bookmark() {
 	v.table.Bookmark()
+	v.table.rebuildMMDSSources(v.log)
 	v.mmds.Bookmark()
 	// Publish readiness only after both the fixed identity view and the
 	// confidential heap have completed the same full-sync generation.
@@ -504,7 +540,11 @@ func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
 	if !v.MMDSAvailable() {
 		return "", false
 	}
-	return v.table.ByFloatingIP(ip)
+	ipv4, ok := parseMMDSSourceIPv4(ip)
+	if !ok {
+		return "", false
+	}
+	return v.table.lookupMMDSSource(ipv4)
 }
 
 func (v *WorkerView) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
