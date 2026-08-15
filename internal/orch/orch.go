@@ -88,6 +88,10 @@ type Orchestrator struct {
 	builderRunPool *runPool
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
+	// commitBuildTrigger is the registered -> waiting linearization point. Keeping
+	// it explicit also lets concurrency tests stop both callers immediately
+	// before the database CAS without weakening the production store contract.
+	commitBuildTrigger func(context.Context, *types.Build) (bool, error)
 
 	probe         ResourceProbe // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 	resourceStats SandboxResourceProvider
@@ -133,6 +137,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		buildEvents:         make(chan *routesync.BuildEvent, 64),
 		mmdsBuildOwners:     map[string]string{},
 		mmdsServices:        mmdsServices,
+		commitBuildTrigger:  st.CommitBuildTrigger,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))

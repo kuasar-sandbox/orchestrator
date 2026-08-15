@@ -851,6 +851,49 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 	return nil
 }
 
+// CommitBuildTrigger atomically publishes the complete trigger-owned work
+// order and transitions a registered build to waiting. The builder pool must
+// never observe waiting before every work-order field is visible.
+func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, error) {
+	if b == nil || b.BuildID == "" {
+		return false, errors.New("build is required")
+	}
+	if b.Status != types.BuildWaiting {
+		return false, fmt.Errorf("store: commit build trigger %s: status must be waiting", b.BuildID)
+	}
+	stepsJSON := "[]"
+	if len(b.Steps) > 0 {
+		encoded, err := json.Marshal(b.Steps)
+		if err != nil {
+			return false, fmt.Errorf("store: commit build trigger %s: steps: %w", b.BuildID, err)
+		}
+		stepsJSON = string(encoded)
+	}
+	registryAuthEnc := ""
+	if b.RegistryAuth != "" {
+		encrypted, err := s.box.EncryptString(b.RegistryAuth)
+		if err != nil {
+			return false, fmt.Errorf("store: commit build trigger %s: encrypt registry auth: %w", b.BuildID, err)
+		}
+		registryAuthEnc = encrypted
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE builds SET
+		kind=?, from_image=?, from_template=?, start_cmd=?, ready_cmd=?, steps_json=?,
+		registry_auth_enc=?, metadata_json=?, builder_json=?, status=?
+		WHERE build_id=? AND status=?`,
+		string(b.Kind), b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
+		registryAuthEnc, mj(b.Metadata), mb(b.Builder), string(types.BuildWaiting),
+		b.BuildID, string(types.BuildRegistered))
+	if err != nil {
+		return false, fmt.Errorf("store: commit build trigger %s: %w", b.BuildID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: commit build trigger %s rows affected: %w", b.BuildID, err)
+	}
+	return n == 1, nil
+}
+
 // GetBuild returns the build or (nil, nil) if not found.
 func (s *Store) GetBuild(ctx context.Context, buildID string) (*types.Build, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE build_id=?`, buildID)

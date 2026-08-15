@@ -121,15 +121,18 @@ func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey string, spec ap
 // image + steps + e2b start command and queue the build for the pool. Bare
 // builds reject start/ready commands and always produce an image.
 func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
-	if _, present := spec.Metadata[sandboxcfg.NsMMDS]; present {
-		return fmt.Errorf("%w: Build Trigger must not override MMDS configuration", api.ErrBadRequest)
-	}
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return err
 	}
 	if !ownsBuild(b, apiKey) || b.TemplateID != tid {
 		return api.ErrNotFound
+	}
+	if b.Status != types.BuildRegistered {
+		return &api.BuildStateConflictError{State: b.Status}
+	}
+	if _, present := spec.Metadata[sandboxcfg.NsMMDS]; present {
+		return fmt.Errorf("%w: Build Trigger must not override MMDS configuration", api.ErrBadRequest)
 	}
 	if !b.Profile.Valid() {
 		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
@@ -232,7 +235,18 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return err
 	}
 	b.Status = types.BuildWaiting
-	return o.st.PutBuild(ctx, b)
+	committed, err := o.commitBuildTrigger(ctx, b)
+	if err != nil || committed {
+		return err
+	}
+	current, err := o.st.GetBuild(ctx, bid)
+	if err != nil {
+		return err
+	}
+	if !ownsBuild(current, apiKey) || current.TemplateID != tid {
+		return api.ErrNotFound
+	}
+	return &api.BuildStateConflictError{State: current.Status}
 }
 
 func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplate bool) error {
