@@ -348,11 +348,11 @@ func (o *Orchestrator) DrainLaunches(ctx context.Context) error {
 	return o.launches.Drain(ctx)
 }
 
-// DrainPauses closes pause admission and waits for every accepted snapshot to
-// finish durable publication and resource cleanup. Accepted snapshots cannot be
-// canceled safely because the runtime continues after its ctl client exits.
+// DrainPauses closes admission and waits for accepted pause and export work to
+// stop using shared dependencies. Accepted snapshots finish durable publication;
+// exports cancel publication unless their source finalizer already won.
 func (o *Orchestrator) DrainPauses(ctx context.Context) error {
-	return o.pauses.Drain(ctx)
+	return o.acceptedOps.Drain(ctx)
 }
 
 func accept(cmd *routesync.Command) *routesync.CmdAck {
@@ -751,7 +751,10 @@ func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
-	unlock := o.lifecycle.Lock(sb.ID)
+	unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	o.launches.Cancel(sb.ID)
 

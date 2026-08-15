@@ -318,9 +318,13 @@ node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]
 node-ctl import-sandbox <token> [--socket S]
 ```
 
-- `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token(默认 move,回收源行;
-  `--keep-source` = copy)。
-- `export-sandbox <sid> --to-template`:晋升为远程快照并打印持久 templateID(扇出用)。
+- `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token.成功进入 source
+  finalizer 后默认删除源沙箱;`--keep-source` 保留 paused source.
+- `export-sandbox <sid> --to-template`:发布远程快照并打印持久 templateID(扇出用).
+  `--keep-source` 使用相同的 source retention 语义;未指定时同样删除源沙箱.
+- local snapshot 上传期间统一允许 Resume,不增加额外开关。Resume 先受理时,KMT
+  Export 取消上传并返回 409;Template Export 继续上传并返回 templateID。两者都放弃
+  source finalizer,不更新/删除 source,也不删除 local snapshot.
 - `import-sandbox <token>`:缺省复用 token 中的 source NodeSandboxID,以 insert-only 方式
   写入 paused 行并打印 sid;目标已存在返回 409。API body 可通过可选 `sandboxID` 指定另一
   个 node-local target,但不会改变逻辑认证主体或既有 service credential。随后调用
@@ -1302,8 +1306,10 @@ location URI = <parent>/<hash[0:2]>/<hash[2:4]>/<location-name>
 
 随后用 `upload-snapshot --to-ref-location` 发布,得到
 `file://<digest>.snapshot@location:<source-sid>`。没有 parent 时仍发布到 manifest。
-两者都是 canonical portable ref;数据库成功重指后才 best-effort 删除明确的本机
-checkpoint,located 目录绝不进入本机 cleanup。没有 parent 时独立发布到 manifest。
+两者都是 canonical portable ref.第一阶段只读 local checkpoint 并产生 portable ref,
+不改变 source row/cache/route 或本机文件;第二阶段取得 lifecycle finalizer 后才提交
+source retention 并删除明确的本机 checkpoint。located 目录绝不进入本机 cleanup。
+没有 parent 时独立发布到 manifest。
 全部基于现有 sandbox-ctl 原语(`snapshot --output`、`upload-snapshot`、`run --restore`);
 legacy remote 的 `snapshot --upload` 只作兼容回归。
 
@@ -1314,12 +1320,25 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
 
 - **晋升 / 转模板**(`--to-template`,须 paused):确保 portable 后,把完整 SnapshotRef
   以 base64url-no-padding 编进 `<profile>-snp-<payload>`(不写 builds 表)。之后
-  `e2b sandbox create <id>` 即从该快照扇出新沙箱(新 sid)。
+  `e2b sandbox create <id>` 即从该快照创建新身份沙箱(新 sid)。`keepSource` 与输出类型
+  独立:无 Resume 时 `false` 删除 source,`true` 保留并把权威 ref 切换为 portable.
 - **迁移 token**:`export-sandbox <sid>` 确保 portable 后导出
   `kmt1.<base64url-no-padding(nonce|ciphertext)>`。ManifestKey 经
   `HMAC-SHA256(decodeHex(ManifestKey),"kuasar-migration-token-v1")` 派生 AES-256-GCM
   key,每次 export 使用随机 12-byte nonce。完整 wire 上限 512 KiB,旧 plain-base64
   token 不再接受。
+- **Export / Resume 并发**:local publish 不持有长 lifecycle lock。`BeginResume` 成功提交
+  `paused -> starting` 是 Resume 获胜点;Export finalizer 在同一 per-SID lock 内完成
+  exact attempt、paused state 与原 SnapshotRef 校验是另一个获胜点。Resume 先获胜时,
+  KMT publish 被取消且 Export 返回 409;Template publish 保持运行并返回 templateID,但
+  两者都跳过 source/local 收尾。finalizer 先获胜时,Resume 只等待短收尾:`keepSource=true`
+  随后从 portable ref 恢复,`keepSource=false` 因 source 已删除返回 404。其他 source
+  lifecycle mutation 继续等待 active Export;Resume launch 的内部 commit/rollback 不等待
+  detached Template upload。node lifecycle shutdown 同步关闭新 Export admission 并取消仍在
+  第一阶段的 publish;已经赢得 source finalizer 的 Export 继续完成有界收尾。conductor 在
+  关闭 store/launcher 前 drain 全部已受理 Export。`keepSource=false` 在删除 row 前按
+  Stop/Reset/detach/RunDir 顺序回收持久 ownership;任一步失败都保留 row、cache 与 local
+  snapshot 供重试,不制造无法由 Reconcile 发现的 orphan unit/port。
 - **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`AuthSandboxID()`、Profile、
   template/canonical portable SnapshotRef/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
   以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
@@ -1346,7 +1365,8 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
 - **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
   路由流下发(node-proxy.md §4);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
   沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
-  MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
+  MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据;`keepSource=false` 且 finalizer 获胜时
+  会回收源行,故按需铸造、绝不随路由广播。
 - 限制:token 不含 tenant raw root,但携带沙箱自有 env 与数据面 credential,按"沙箱级敏感"对待;
   快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
 
