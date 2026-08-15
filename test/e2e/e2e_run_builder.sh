@@ -6,7 +6,8 @@
 # network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
-# as an envd-managed process. One orchestrator, five builds + three creates:
+# as an envd-managed process. One orchestrator, five successful builds, one
+# deterministic failed build, and three creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -21,6 +22,8 @@
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
 #   B5  profile=bare + fromImage                            → bare-img template
 #       rejects start/ready, uses bare build network, and remains image-only
+#   BF  fromTemplate(B1) + failing RUN                     → error
+#       preserves journal logs while its failed systemd instance is collected
 #   create from B3, B1 and B5 → 201 → wait running → kill  (snapshot + e2b/bare cold boot)
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
@@ -300,6 +303,40 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
+failed_unit_count() { # $1=unit pattern; list-units does not load missing instances
+    systemctl list-units --all --state=failed --type=service --no-legend --no-pager "$1" 2>/dev/null \
+        | awk 'NF { count++ } END { print count + 0 }'
+}
+wait_unit_collected() { # $1=exact unit
+    local unit="$1" loaded
+    for _ in $(seq 1 100); do
+        loaded=$(systemctl list-units --all --state=failed --type=service --no-legend --no-pager "$unit" 2>/dev/null) \
+            || return 1
+        if ! grep -Fq -- "$unit" <<<"$loaded"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    systemctl list-units --all --state=failed --type=service --no-legend --no-pager "$unit" >&2 || true
+    return 1
+}
+wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
+    local unit="$1" pattern="$2" output="$3"
+    for _ in $(seq 1 100); do
+        journalctl -u "$unit" --no-pager --output=cat >"$output" 2>/dev/null || true
+        grep -Fq -- "$pattern" "$output" && return 0
+        sleep 0.1
+    done
+    return 1
+}
+build_run_id() { # $1=build id
+    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select run_id from builds where build_id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "")
+PY
+}
 wait_running() { # sid
     local sid="$1" code state=""
     for _ in $(seq 1 180); do
@@ -374,6 +411,45 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(
     done
     diag "$bid"; fail "$label did not reach ready (last status=$status)"
 }
+wait_error() { # tid bid label
+    local tid="$1" bid="$2" label="$3" status="" code
+    for _ in $(seq 1 240); do
+        code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
+        [ "$code" = "200" ] || fail "$label status = $code (want 200)"
+        status=$(json_field "$WORK/resp.body" status)
+        case "$status" in
+            error) return 0 ;;
+            ready) fail "$label unexpectedly reached ready" ;;
+        esac
+        sleep 0.5
+    done
+    diag "$bid"; fail "$label did not reach error (last status=$status)"
+}
+
+# Exercise the installed templates without going through orchestrator cleanup:
+# an unknown run id reaches the real launcher, fails WaitAssignment, and exits
+# non-zero. CollectMode must unload each failed instance while journald retains
+# its diagnostics. Repetition proves the failed-unit set does not accumulate.
+RUNNER_FAILED_BASE=$(failed_unit_count 'sandbox-runner@*.service')
+BUILDER_FAILED_BASE=$(failed_unit_count 'sandbox-builder@*.service')
+for kind in runner builder; do
+    case "$kind" in
+        runner) failed_before="$RUNNER_FAILED_BASE" ;;
+        builder) failed_before="$BUILDER_FAILED_BASE" ;;
+    esac
+    for attempt in 1 2 3; do
+        run_id="issue178-$kind-$RANDOM-$attempt"
+        unit="sandbox-$kind@$run_id.service"
+        systemctl start "$unit" >"$WORK/$run_id.start" 2>&1 || true
+        wait_unit_journal_contains "$unit" "wait assignment" "$WORK/$run_id.journal" \
+            || { cat "$WORK/$run_id.start" "$WORK/$run_id.journal" >&2; fail "$unit journal was not retained"; }
+        wait_unit_collected "$unit" || fail "$unit remained loaded and failed"
+    done
+    failed_after=$(failed_unit_count "sandbox-$kind@*.service")
+    [ "$failed_after" = "$failed_before" ] \
+        || fail "failed $kind units grew from $failed_before to $failed_after"
+done
+echo "==> PASS: repeated runner/builder pre-assignment failures were collected; journals remained queryable"
 
 # ---- negative surface: COPY gating depends on files_storage posture ---------
 register neg
@@ -505,6 +581,34 @@ wait_ready "$B1_TID" "$B1_BID" B1
 B1_PERSIST="$PERSIST"
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
 echo "==> PASS: B1 ready → $B1_PERSIST"
+
+# ---- BF: deterministic business failure → API error + collected unit -------
+echo "==> BF: deterministic RUN failure keeps API/journal evidence without a failed unit"
+register issue178-failed-build
+BF_TID="$TID"; BF_BID="$BID"
+BF_BODY=$(python3 - "$B1_PERSIST" <<'PY'
+import json, sys
+print(json.dumps({
+    "fromTemplate": sys.argv[1],
+    "steps": [{"type": "RUN", "args": ["echo ISSUE178_BUILDER_FAILURE >&2; exit 78"]}],
+}))
+PY
+)
+code=$(req POST "/v2/templates/$BF_TID/builds/$BF_BID" "$AK" "$BF_BODY")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "BF trigger = $code (want 202)"; }
+wait_error "$BF_TID" "$BF_BID" BF
+BF_RUN_ID=$(build_run_id "$BF_BID")
+[ -n "$BF_RUN_ID" ] || fail "BF error record lost its run id"
+BF_UNIT="sandbox-builder@$BF_RUN_ID.service"
+wait_unit_journal_contains "$BF_UNIT" ISSUE178_BUILDER_FAILURE "$WORK/bf.journal" \
+    || { diag "$BF_BID"; fail "BF journal was not retained after the business failure"; }
+wait_unit_collected "$BF_UNIT" || fail "$BF_UNIT remained loaded and failed"
+code=$(req GET "/templates/$BF_TID/builds/$BF_BID/status" "$AK")
+[ "$code" = "200" ] && [ "$(json_field "$WORK/resp.body" status)" = "error" ] \
+    || fail "BF API did not retain terminal error status"
+[ "$(failed_unit_count 'sandbox-builder@*.service')" = "$BUILDER_FAILED_BASE" ] \
+    || fail "BF increased the failed builder unit count"
+echo "==> PASS: BF status=error, journal retained, sandbox-builder instance collected"
 
 # ---- B2: fromTemplate(img) + steps + startCmd/readyCmd → e2b-snp ------------
 echo "==> B2: fromTemplate=$B1_PERSIST + steps + startCmd/readyCmd"

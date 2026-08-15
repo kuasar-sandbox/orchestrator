@@ -684,8 +684,6 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 			o.setMMDSBuildOwner(mmdsRow.ID, "")
 		}()
 	}
-	defer func() { _ = o.lc.ResetFailed(context.Background(), unit) }()
-
 	timeout := time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
