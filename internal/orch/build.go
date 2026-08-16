@@ -1184,6 +1184,9 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	if !found || kind != "build" {
 		return nil, "", false, nil
 	}
+	if err := o.waitBuildRecoveryReady(ctx); err != nil {
+		return nil, "", false, err
+	}
 	o.pendMu.Lock()
 	pend := o.pend[bid]
 	o.pendMu.Unlock()

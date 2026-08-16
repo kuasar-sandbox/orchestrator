@@ -438,7 +438,15 @@ PY
 }
 valid_persist_id() { persist_ref "$1" >/dev/null; }
 phase_sandbox_id() { # $1=phase, $2=opaque build id
-    printf 'bp-%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-32)"
+    python3 - "$1" "$2" <<'PY'
+import base64
+import hashlib
+import sys
+
+digest = hashlib.sha256(sys.argv[2].encode()).digest()[:12]
+encoded = base64.b32hexencode(digest).decode().rstrip("=").lower()
+print(f"bp-{sys.argv[1]}-{encoded}")
+PY
 }
 wait_phase_audit() { # $1=phase, $2=build id
     local sid
@@ -474,6 +482,7 @@ assert_active_build_accounting() { # $1=tid, $2=bid
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK" || true)
         if [ "$code" = "200" ]; then
+            phase="" sid="" run_id=""
             read -r phase sid run_id < <(python3 - "$WORK/resp.body" <<'PY'
 import json, sys
 status = json.load(open(sys.argv[1]))
@@ -481,7 +490,7 @@ phase = status.get("phase") or {}
 if phase.get("name") and phase.get("sandboxID") and status.get("runID"):
     print(phase["name"], phase["sandboxID"], status["runID"])
 PY
-)
+) || true
             [ -n "$phase" ] && break
         fi
         sleep 0.25

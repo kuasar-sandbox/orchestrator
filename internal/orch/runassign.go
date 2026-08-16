@@ -36,7 +36,7 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 }
 
 func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID string, result configsock.BuildResult) error {
-	if err := o.waitBuildReportsReady(ctx); err != nil {
+	if err := o.waitBuildRecoveryReady(ctx); err != nil {
 		return err
 	}
 	o.pendMu.Lock()
@@ -59,7 +59,7 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 }
 
 func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error {
-	if err := o.waitBuildReportsReady(ctx); err != nil {
+	if err := o.waitBuildRecoveryReady(ctx); err != nil {
 		return err
 	}
 	o.pendMu.Lock()
@@ -79,15 +79,15 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	return nil
 }
 
-func (o *Orchestrator) waitBuildReportsReady(ctx context.Context) error {
+func (o *Orchestrator) waitBuildRecoveryReady(ctx context.Context) error {
 	// A nil channel belongs only to small unit-test Orchestrator literals and
 	// preserves their historical direct-call behavior. New always installs the
 	// startup gate.
-	if o.buildReportsReady == nil {
+	if o.buildRecoveryReady == nil {
 		return nil
 	}
 	select {
-	case <-o.buildReportsReady:
+	case <-o.buildRecoveryReady:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

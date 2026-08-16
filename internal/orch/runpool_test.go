@@ -581,6 +581,66 @@ func TestRunPoolDoesNotBindUnrelatedStartFailureToPendingTask(t *testing.T) {
 	}
 }
 
+func TestRunPoolBoundsAllFailedPrestartsForPendingTask(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	firstGate := make(chan struct{})
+	startErr := errors.New("injected persistent start failure")
+	starts := 0
+	lc.startFn = func(ctx context.Context, unit string) error {
+		select {
+		case lc.started <- unit:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		starts++
+		if starts == 1 {
+			select {
+			case <-firstGate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return startErr
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 1, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-lc.started: // baseline prestart is now blocked inside launcher.Start
+	case <-time.After(time.Second):
+		t.Fatal("baseline prestart did not begin")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(ctx, "build-with-no-startable-unit", func(string) error {
+			t.Error("commit ran although every finite start attempt failed")
+			return nil
+		})
+		done <- err
+	}()
+	// This loop request is a barrier proving the pending assignment was recorded
+	// and its demand-created start attempt was added before the first failure.
+	if _, _, err := p.WaitAssignment(ctx, "not-a-real-run"); err == nil {
+		t.Fatal("barrier WaitAssignment unexpectedly succeeded")
+	}
+	close(firstGate)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, startErr) {
+			t.Fatalf("Assign error = %v, want persistent start failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement failures extended the pending assignment forever")
+	}
+}
+
 func TestRunPoolWaitTimeoutStopsAndRefills(t *testing.T) {
 	lc := newRunPoolTestLauncher()
 	ctx, cancel := context.WithCancel(context.Background())

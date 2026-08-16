@@ -36,6 +36,12 @@ type runConsumeReq struct {
 	commit     func(runID string) error
 	resp       chan runConsumeResp
 	stopCancel func() bool
+	// startAttempts is the finite wave of already in-flight or demand-created
+	// units that may satisfy this request. Replacements created after a failed
+	// wave can still win the race and become idle, but they do not extend the
+	// request forever when systemd cannot start any builder unit.
+	startAttempts map[string]struct{}
+	lastStartErr  error
 }
 
 type runConsumeResp struct {
@@ -162,16 +168,66 @@ func (p *runPool) loop(ctx context.Context) {
 		req.resp <- resp
 	}
 
-	ensure := func() {
+	ensure := func() []string {
 		need := p.size + len(pending) - len(idle) - len(starting)
+		created := make([]string, 0, max(need, 0))
 		for ; need > 0; need-- {
 			runID, err := newRunID(p.kind)
 			if err != nil {
 				p.log.Error("run pool: new run id", "kind", p.kind, "err", err)
-				return
+				return created
 			}
 			starting[runID] = startingRun{}
+			created = append(created, runID)
 			queueControl(runControlReq{op: "start", runID: runID})
+		}
+		return created
+	}
+	addStartAttempts := func(reqs []*runConsumeReq, runIDs []string) {
+		for _, req := range reqs {
+			if req.startAttempts == nil {
+				continue
+			}
+			for _, runID := range runIDs {
+				req.startAttempts[runID] = struct{}{}
+			}
+		}
+	}
+	initializeStartAttempts := func(req *runConsumeReq) {
+		req.startAttempts = make(map[string]struct{}, len(starting))
+		for runID := range starting {
+			req.startAttempts[runID] = struct{}{}
+		}
+		if len(req.startAttempts) == 0 {
+			req.lastStartErr = fmt.Errorf("run pool: no unit start attempt available")
+		}
+	}
+	removeStartAttempt := func(runID string, startErr error) {
+		for _, req := range pending {
+			if req.startAttempts == nil {
+				continue
+			}
+			if _, tracked := req.startAttempts[runID]; !tracked {
+				continue
+			}
+			delete(req.startAttempts, runID)
+			if startErr != nil {
+				req.lastStartErr = startErr
+			}
+		}
+	}
+	failExhausted := func() {
+		for i := len(pending) - 1; i >= 0; i-- {
+			req := pending[i]
+			if req.startAttempts == nil || len(req.startAttempts) != 0 {
+				continue
+			}
+			err := req.lastStartErr
+			if err == nil {
+				err = fmt.Errorf("run pool: all unit start attempts exited before assignment")
+			}
+			pending = slices.Delete(pending, i, i+1)
+			replyConsume(req, runConsumeResp{err: err})
 		}
 	}
 
@@ -183,8 +239,10 @@ func (p *runPool) loop(ctx context.Context) {
 			}
 			delete(starting, runID)
 			p.log.Warn("run pool: wait assignment timeout", "kind", p.kind, "run_id", runID)
+			removeStartAttempt(runID, fmt.Errorf("run pool: run %s exceeded wait timeout", runID))
 			queueControl(runControlReq{op: "stop", runID: runID})
 		}
+		failExhausted()
 		idle = slices.DeleteFunc(idle, func(w idleRun) bool {
 			if w.req.ctx.Err() == nil {
 				return false
@@ -299,7 +357,14 @@ func (p *runPool) loop(ctx context.Context) {
 			pending = append(pending, req)
 			assign()
 			trimIdle()
-			ensure()
+			created := ensure()
+			// Existing requests may use starts created by newly arrived demand,
+			// while this request takes one finite snapshot of the resulting wave.
+			addStartAttempts(pending, created)
+			if slices.Contains(pending, req) {
+				initializeStartAttempts(req)
+				failExhausted()
+			}
 		case req := <-p.waitCh:
 			req.stopCancel = context.AfterFunc(req.ctx, func() {
 				select {
@@ -315,6 +380,8 @@ func (p *runPool) loop(ctx context.Context) {
 			if !st.started.IsZero() && time.Since(st.started) > p.waitTimeout {
 				delete(starting, req.runID)
 				replyWait(req, runWaitResp{err: fmt.Errorf("run %s exceeded wait timeout", req.runID)})
+				removeStartAttempt(req.runID, fmt.Errorf("run pool: run %s exceeded wait timeout", req.runID))
+				failExhausted()
 				queueControl(runControlReq{op: "stop", runID: req.runID})
 				ensure()
 				continue
@@ -322,12 +389,18 @@ func (p *runPool) loop(ctx context.Context) {
 			delete(starting, req.runID)
 			if req.ctx.Err() != nil {
 				replyWait(req, runWaitResp{err: req.ctx.Err()})
+				removeStartAttempt(req.runID, req.ctx.Err())
+				failExhausted()
 				queueControl(runControlReq{op: "stop", runID: req.runID})
 				ensure()
 				continue
 			}
 			idle = append(idle, idleRun{runID: req.runID, req: req})
 			assign()
+			// Give the ready worker to the oldest request before retiring this
+			// start from the finite waves of all remaining requests.
+			removeStartAttempt(req.runID, nil)
+			failExhausted()
 			trimIdle()
 			ensure()
 		case req := <-p.consumeCancelCh:
@@ -360,22 +433,12 @@ func (p *runPool) loop(ctx context.Context) {
 			if done.err != nil {
 				delete(starting, done.runID)
 				p.log.Warn("run pool: start failed", "kind", p.kind, "run_id", done.runID, "err", done.err)
+				startErr := fmt.Errorf("run pool: start %s: %w", p.unitName(done.runID), done.err)
+				removeStartAttempt(done.runID, startErr)
+				failExhausted()
 				queueControl(runControlReq{op: "stop", runID: done.runID})
-				for len(pending) > len(idle)+len(starting) {
-					// A start failure is not bound to a pending task. Attribute it
-					// only when pending demand now exceeds all available/in-flight
-					// capacity. Preserve FIFO by keeping the oldest requests for that
-					// surviving capacity and failing the newest unsatisfied request.
-					last := len(pending) - 1
-					req := pending[last]
-					pending = pending[:last]
-					if req.ctx.Err() != nil {
-						replyConsume(req, runConsumeResp{err: req.ctx.Err()})
-						continue
-					}
-					replyConsume(req, runConsumeResp{err: fmt.Errorf("run pool: start %s: %w", p.unitName(done.runID), done.err)})
-					break
-				}
+				// Keep replenishing the configured pool for future requests, but
+				// do not add replacements to an existing request's finite wave.
 				ensure()
 			} else {
 				if st.started.IsZero() {

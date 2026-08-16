@@ -151,12 +151,33 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return fmt.Errorf("build_register: %w", err)
 	}
-	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+	// An exact retry after an ambiguous/lost ACK is identified from the durable
+	// Build before consulting the mutable allowlist. Key withdrawal must prevent
+	// new ownership, but it cannot convert already accepted ownership into a
+	// definitive no-side-effect rejection that lets the Registry place the same
+	// BuildID on another node.
+	existing, err := o.st.GetBuild(ctx, cmd.BuildID)
 	if err != nil {
-		if errors.Is(err, errClusterCredentialPairNotInstalled) {
-			return fmt.Errorf("%w: build_register credential: %v", api.ErrBadRequest, err)
-		}
 		return err
+	}
+	var pair store.KeyPair
+	if existing != nil {
+		fingerprint, err := store.APISecretHash(existing.APISecret)
+		if err != nil {
+			return fmt.Errorf("build_register: verify durable credential: %w", err)
+		}
+		if fingerprint != cmd.APISecretFingerprint {
+			return fmt.Errorf("build_register: %w: credential fingerprint differs", store.ErrBuildRegistrationConflict)
+		}
+		pair = store.KeyPair{APISecret: existing.APISecret, ManifestKey: existing.ManifestKey}
+	} else {
+		pair, err = o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
+		if err != nil {
+			if errors.Is(err, errClusterCredentialPairNotInstalled) {
+				return fmt.Errorf("%w: build_register credential: %v", api.ErrBadRequest, err)
+			}
+			return err
+		}
 	}
 	resources := cmd.BuildResources.Types()
 	if err := resources.ValidateRequired(); err != nil {
@@ -212,10 +233,6 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	// A tightened execution policy rejects only new registration ownership. An
 	// exact retry after an ambiguous/lost ACK must still reach the store's
 	// transactional immutable comparison and return the persisted result.
-	existing, err := o.st.GetBuild(ctx, cmd.BuildID)
-	if err != nil {
-		return err
-	}
 	if existing == nil {
 		executionLimit, err := o.cfg.Builder.ExecutionLimit()
 		if err != nil {
@@ -243,6 +260,13 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	}
 	o.refreshBuildAdmissionGauges(ctx)
 	if registered.Status == types.BuildReady || registered.Status == types.BuildError {
+		templateID := ""
+		if registered.Status == types.BuildReady {
+			templateID = registered.PersistID
+		}
+		if err := o.publishBuildStateRequired(ctx, registered.BuildID, string(registered.Status), templateID, registered.Reason); err != nil {
+			return fmt.Errorf("build_register: republish durable terminal state: %w", err)
+		}
 		return nil
 	}
 	o.clusterBuildMu.Lock()
@@ -258,10 +282,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 // (nodelink.Node); the client streams them to the registry (§5.1).
 func (o *Orchestrator) BuildEvents() <-chan *routesync.BuildEvent { return o.buildEvents }
 
-// publishBuildState emits a build event for a cluster build (no-op for a non-
-// cluster, e.g. single-node, build). Non-blocking: a full buffer drops the event
-// (the registry reconverges from the next transition / the router's status).
-func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
+// buildStateEvent constructs an event only for a cluster-owned Build. The
+// process-local map is a fast path; durable ClusterGroup is authoritative after
+// restart and after terminal cleanup removed transient credentials.
+func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, templateID, reason string) (*routesync.BuildEvent, bool) {
 	o.clusterBuildMu.Lock()
 	cb := o.clusterBuilds[buildID]
 	o.clusterBuildMu.Unlock()
@@ -269,23 +293,57 @@ func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason stri
 		// The process-local entry is only a fast path. Cluster ownership is a
 		// dedicated durable Build field, so controller restart cannot suppress
 		// building/terminal events or lose registration accounting convergence.
-		build, err := o.st.GetBuild(context.Background(), buildID)
+		build, err := o.st.GetBuild(ctx, buildID)
 		if err != nil || build == nil {
-			return
+			return nil, false
 		}
 		if build.ClusterGroup == "" {
-			return // direct-node build
+			return nil, false // direct-node build
 		}
 	}
-	ev := &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}
+	return &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true
+}
+
+func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
+	if state != string(types.BuildReady) && state != string(types.BuildError) {
+		return
+	}
+	o.clusterBuildMu.Lock()
+	delete(o.clusterBuilds, buildID) // terminal: drop the transient creds
+	o.clusterBuildMu.Unlock()
+}
+
+// publishBuildState emits a build event for a cluster build (no-op for a non-
+// cluster, e.g. single-node, build). Ordinary lifecycle transitions remain
+// non-blocking: a full buffer drops the event and a later transition/status
+// replay reconverges the Registry.
+func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
+	ev, ok := o.buildStateEvent(context.Background(), buildID, state, templateID, reason)
+	if !ok {
+		return
+	}
 	select {
 	case o.buildEvents <- ev:
 	default:
 	}
-	if state == "ready" || state == "error" {
-		o.clusterBuildMu.Lock()
-		delete(o.clusterBuilds, buildID) // terminal: drop the transient creds
-		o.clusterBuildMu.Unlock()
+	o.forgetTerminalClusterBuild(buildID, state)
+}
+
+// publishBuildStateRequired queues the durable terminal result before an exact
+// BuildRegister replay is acknowledged. If the node-link cannot drain events,
+// returning without an ACK keeps the Registry pinned to this node; a later
+// identical retry can safely repeat the event.
+func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, state, templateID, reason string) error {
+	ev, ok := o.buildStateEvent(ctx, buildID, state, templateID, reason)
+	if !ok {
+		return nil
+	}
+	select {
+	case o.buildEvents <- ev:
+		o.forgetTerminalClusterBuild(buildID, state)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

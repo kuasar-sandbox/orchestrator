@@ -304,9 +304,18 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	if err := o.ReconcileSandboxes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID); err != nil || ok {
-		t.Fatalf("build was adopted before the report socket readiness boundary: ok %v err %v", ok, err)
+	type buildSpecResult struct {
+		ok  bool
+		err error
 	}
+	specStarted := make(chan struct{})
+	specDone := make(chan buildSpecResult, 1)
+	go func() {
+		close(specStarted)
+		_, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID)
+		specDone <- buildSpecResult{ok: ok, err: err}
+	}()
+	<-specStarted
 	imageRef := "manifest://" + strings.Repeat("b", 64)
 	postStarted := make(chan struct{})
 	postDone := make(chan error, 1)
@@ -316,6 +325,11 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	}()
 	<-postStarted
 	select {
+	case result := <-specDone:
+		t.Fatalf("build spec crossed startup gate before adoption: %+v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
 	case err := <-postDone:
 		t.Fatalf("build report crossed startup gate before adoption: %v", err)
 	case <-time.After(50 * time.Millisecond):
@@ -323,8 +337,8 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	if err := o.ReconcileBuilds(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID); err != nil || !ok {
-		t.Fatalf("recovered BuildSpec = ok %v err %v", ok, err)
+	if result := <-specDone; result.err != nil || !result.ok {
+		t.Fatalf("recovered BuildSpec = ok %v err %v", result.ok, result.err)
 	}
 
 	// The recovered process has already run the pipeline. Posting its result must

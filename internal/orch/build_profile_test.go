@@ -29,6 +29,23 @@ func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKe
 	return apiKey, manifestKey, fingerprint
 }
 
+func clusterBuildRegisterCommand(buildID, fingerprint string) *routesync.Command {
+	return &routesync.Command{
+		CmdID:                "register-" + buildID,
+		Kind:                 routesync.CmdBuildRegister,
+		BuildID:              buildID,
+		TemplateRef:          "transient-" + buildID,
+		Profile:              string(types.ProfileE2B),
+		APISecretFingerprint: fingerprint,
+		BuildResources:       routesync.BuildResourcesFromTypes(testBuildResources()),
+		ImageRepo:            "registry.test/repo",
+		RegistryAuth:         `{"auths":{"registry.test":{"auth":"opaque"}}}`,
+		Config: map[string]string{
+			clusterstate.ObjectMetadataKey: `{"group":"/test"}`,
+		},
+	}
+}
+
 func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
@@ -253,6 +270,104 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	if err := o.registerClusterBuild(ctx, &duplicateAuthority); !errors.Is(err, api.ErrBadRequest) ||
 		!strings.Contains(err.Error(), "must be normalized into build_resources") {
 		t.Fatalf("duplicate Build resource authority error = %v", err)
+	}
+}
+
+func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("durable-credential-replay", fingerprint)
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("initial BuildRegister ack = %+v", ack)
+	}
+	select {
+	case event := <-o.buildEvents:
+		if event.BuildID != cmd.BuildID || event.State != string(types.BuildRegistered) {
+			t.Fatalf("initial BuildEvent = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial registered event was not published")
+	}
+	if err := o.dropClusterKey(ctx, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+
+	// A lost ACK replay remains accepted from the durable Build identity even
+	// after the mutable node allowlist no longer contains the key.
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("exact replay after key withdrawal ack = %+v", ack)
+	}
+	usage, err := o.st.BuildUsage(ctx)
+	if err != nil || usage.RegistrationBuilds != 1 {
+		t.Fatalf("replay registration usage = %+v, err=%v", usage, err)
+	}
+
+	mismatch := *cmd
+	mismatch.CmdID = "register-mismatched-fingerprint"
+	mismatch.APISecretFingerprint = strings.Repeat("f", 64)
+	if mismatch.APISecretFingerprint == fingerprint {
+		mismatch.APISecretFingerprint = strings.Repeat("e", 64)
+	}
+	ack := o.HandleCommand(ctx, &mismatch)
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusConflict {
+		t.Fatalf("credential-mismatched replay ack = %+v, want 409", ack)
+	}
+}
+
+func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		state      types.BuildState
+		templateID string
+		reason     string
+	}{
+		{name: "ready", state: types.BuildReady, templateID: "e2b:img:manifest://ready"},
+		{name: "error", state: types.BuildError, reason: "registration expired"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := testOrch(t)
+			ctx := context.Background()
+			_, _, fingerprint := allowlistedBuildIdentity(t, o)
+			cmd := clusterBuildRegisterCommand("terminal-replay-"+tc.name, fingerprint)
+			if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+				t.Fatalf("initial BuildRegister ack = %+v", ack)
+			}
+			select {
+			case <-o.buildEvents: // registered
+			case <-time.After(time.Second):
+				t.Fatal("initial registered event was not published")
+			}
+			stored, err := o.st.GetBuild(ctx, cmd.BuildID)
+			if err != nil || stored == nil {
+				t.Fatalf("GetBuild = %+v, %v", stored, err)
+			}
+			stored.Status, stored.PersistID, stored.Reason = tc.state, tc.templateID, tc.reason
+			if err := o.st.PutBuild(ctx, stored); err != nil {
+				t.Fatal(err)
+			}
+			o.clusterBuildMu.Lock()
+			delete(o.clusterBuilds, cmd.BuildID) // terminal cleanup or controller restart
+			o.clusterBuildMu.Unlock()
+			if err := o.dropClusterKey(ctx, fingerprint); err != nil {
+				t.Fatal(err)
+			}
+
+			// Simulate the terminal event being lost with the original ACK. The
+			// next exact Register replay must queue the durable result before ACK.
+			if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+				t.Fatalf("terminal BuildRegister replay ack = %+v", ack)
+			}
+			select {
+			case event := <-o.buildEvents:
+				if event.BuildID != cmd.BuildID || event.State != string(tc.state) ||
+					event.TemplateID != tc.templateID || event.Reason != tc.reason {
+					t.Fatalf("terminal replay BuildEvent = %+v", event)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("terminal replay did not republish durable state")
+			}
+		})
 	}
 }
 

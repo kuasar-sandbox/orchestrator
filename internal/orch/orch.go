@@ -85,11 +85,12 @@ type Orchestrator struct {
 
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
-	// buildReportsReady closes only after every live builder has an adopted
-	// pendingBuild owner. The config socket may bind first, but phase/result
-	// reports wait here instead of failing in the bind-to-adoption window.
-	buildReportsReady     chan struct{}
-	buildReportsReadyOnce sync.Once
+	// buildRecoveryReady closes only after every live builder has an adopted
+	// pendingBuild owner. The config socket may bind first, but build-spec,
+	// phase, and result requests wait here instead of failing in the
+	// bind-to-adoption window.
+	buildRecoveryReady     chan struct{}
+	buildRecoveryReadyOnce sync.Once
 	// networkAllocationMu serializes connector allocation with the Build-only
 	// detach -> durable ownership clear sequence. A detached-but-not-cleared
 	// port blocks new allocations so a crash/retry cannot detach a reused slot.
@@ -154,7 +155,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		subs:                      map[int]chan routesync.Event{},
 		routeFP:                   uuid.NewString(),
 		pend:                      map[string]*pendingBuild{},
-		buildReportsReady:         make(chan struct{}),
+		buildRecoveryReady:        make(chan struct{}),
 		detachedBuildPortsPending: map[string]struct{}{},
 		clusterBuilds:             map[string]*clusterBuild{},
 		buildEvents:               make(chan *routesync.BuildEvent, 64),
@@ -1941,9 +1942,9 @@ func (o *Orchestrator) ReconcileBuilds(ctx context.Context) error {
 	if err := o.reconcileBuilds(ctx); err != nil {
 		return err
 	}
-	o.buildReportsReadyOnce.Do(func() {
-		if o.buildReportsReady != nil {
-			close(o.buildReportsReady)
+	o.buildRecoveryReadyOnce.Do(func() {
+		if o.buildRecoveryReady != nil {
+			close(o.buildRecoveryReady)
 		}
 	})
 	return nil
