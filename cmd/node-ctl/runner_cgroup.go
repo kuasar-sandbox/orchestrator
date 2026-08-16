@@ -17,9 +17,21 @@ const (
 )
 
 func prepareRunnerCgroup(runID string) (*os.File, error) {
-	return prepareRunnerCgroupAt(
+	return prepareTaskCgroupAt(
 		hostCgroupRoot,
 		runID,
+		"/sandbox.slice/sandbox-runner.slice",
+		func() ([]byte, error) { return os.ReadFile(selfCgroupFile) },
+		func(path string) error { return writeExistingFile(path, strconv.Itoa(os.Getpid())) },
+		validateCgroup2FD,
+	)
+}
+
+func prepareBuilderCgroup(runID string) (*os.File, error) {
+	return prepareTaskCgroupAt(
+		hostCgroupRoot,
+		runID,
+		"/sandbox.slice/sandbox-builder.slice",
 		func() ([]byte, error) { return os.ReadFile(selfCgroupFile) },
 		func(path string) error { return writeExistingFile(path, strconv.Itoa(os.Getpid())) },
 		validateCgroup2FD,
@@ -32,6 +44,15 @@ func prepareRunnerCgroupAt(
 	moveSelf func(string) error,
 	validate func(*os.File) error,
 ) (*os.File, error) {
+	return prepareTaskCgroupAt(root, runID, "/sandbox.slice/sandbox-runner.slice", readIdentity, moveSelf, validate)
+}
+
+func prepareTaskCgroupAt(
+	root, runID, expectedSlice string,
+	readIdentity func() ([]byte, error),
+	moveSelf func(string) error,
+	validate func(*os.File) error,
+) (*os.File, error) {
 	identity, err := readIdentity()
 	if err != nil {
 		return nil, fmt.Errorf("read runner cgroup identity: %w", err)
@@ -40,7 +61,7 @@ func prepareRunnerCgroupAt(
 	if err != nil {
 		return nil, err
 	}
-	unitRel, alreadyPlaced, err := runnerUnitCgroup(self, runID)
+	unitRel, alreadyPlaced, err := taskUnitCgroup(self, runID, expectedSlice)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +159,10 @@ func prepareRunnerCgroupAt(
 }
 
 func runnerUnitCgroup(self, runID string) (string, bool, error) {
+	return taskUnitCgroup(self, runID, "/sandbox.slice/sandbox-runner.slice")
+}
+
+func taskUnitCgroup(self, runID, expectedSlice string) (string, bool, error) {
 	alreadyPlaced := filepath.Base(self) == "ctl"
 	unitRel := self
 	if alreadyPlaced {
@@ -153,8 +178,8 @@ func runnerUnitCgroup(self, runID string) (string, bool, error) {
 		return "", false, fmt.Errorf("runner process cgroup %q does not match run id %q", self, runID)
 	}
 	runnerSlice := filepath.Dir(unitRel)
-	if runnerSlice != "/sandbox.slice/sandbox-runner.slice" {
-		return "", false, fmt.Errorf("runner process cgroup %q is outside sandbox-runner.slice", self)
+	if runnerSlice != expectedSlice {
+		return "", false, fmt.Errorf("task process cgroup %q is outside %s", self, filepath.Base(expectedSlice))
 	}
 	return unitRel, alreadyPlaced, nil
 }

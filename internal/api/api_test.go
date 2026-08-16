@@ -169,6 +169,12 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	if _, ok := got[sandboxcfg.NsCheckpoint]; ok {
 		t.Fatalf("checkpoint header entered build metadata: %+v", got)
 	}
+	if _, err := mergeBuildConfigHeaders(
+		map[string]string{buildcfg.NsBuilder: `{"resources":{"cpu":2},"future":true}`},
+		header(builderHeader, `{"resources":{"cpu":2,"memory":"2GiB"}}`),
+	); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("valid Builder header hid invalid metadata definition: %v", err)
+	}
 }
 
 func TestBuildRegisterCarriesMMDSHeaderSeparatelyFromMetadata(t *testing.T) {
@@ -178,7 +184,7 @@ func TestBuildRegisterCarriesMMDSHeaderSeparatelyFromMetadata(t *testing.T) {
 		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
 	}}
 	handler, apiKey := newMigrationTestHandler(t, core)
-	body := `{"name":"mmds","metadata":{"kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/data\",\"data\":\"value\"}]}"}}`
+	body := `{"name":"mmds","cpuCount":2,"memoryMB":2048,"metadata":{"kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/data\",\"data\":\"value\"}]}"}}`
 	headers := http.Header{}
 	headers.Set(mmdsHeader, `{"secrets":{}}`)
 	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates", strings.NewReader(body), headers)
@@ -190,7 +196,7 @@ func TestBuildRegisterCarriesMMDSHeaderSeparatelyFromMetadata(t *testing.T) {
 	}
 }
 
-func TestBuildRegisterCapacityLeavesPreserveResourceHeader(t *testing.T) {
+func TestBuildRegisterResourcesRemainIndependentFromSandboxResourceHeader(t *testing.T) {
 	var got RegisterSpec
 	core := &buildMMDSCoreStub{register: func(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
 		got = spec
@@ -204,9 +210,93 @@ func TestBuildRegisterCapacityLeavesPreserveResourceHeader(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
 	}
-	want := `{"capacity":{"cpu":4,"memory":"8192MiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"512MiB"}}`
+	want := `{"capacity":{"cpu":2,"memory":"1GiB"},"allocatable":{"cpu":0.5,"memory":"256MiB"},"startup":{"memory":"512MiB"}}`
 	if got.Metadata[sandboxcfg.NsResource] != want {
 		t.Fatalf("registered resource = %s, want %s", got.Metadata[sandboxcfg.NsResource], want)
+	}
+	if got.Resources.CPU != 4000 || got.Resources.Memory != 8192<<20 {
+		t.Fatalf("build resources = %+v", got.Resources)
+	}
+}
+
+func TestBuildRegisterCanonicalizesAliasesAndAssertsBuilderHeader(t *testing.T) {
+	var got RegisterSpec
+	core := &buildMMDSCoreStub{register: func(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
+		got = spec
+		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	headers := header(builderHeader, `{"resources":{"cpu":2,"memory":"2GiB","storage":"64GiB"},"referer":{"enabled":false}}`)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
+		strings.NewReader(`{"cpuCount":2,"cpu_count":2.0,"memoryMB":2048,"memory_mb":2048,"extension":null}`), headers)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got.Resources != (types.BuildResources{CPU: 2000, Memory: 2 << 30, Storage: 64 << 30}) {
+		t.Fatalf("canonical resources = %+v", got.Resources)
+	}
+	if got.Builder.Resources != nil || got.Builder.Referer == nil {
+		t.Fatalf("builder resources were not extracted from build-only options: %+v", got.Builder)
+	}
+	if _, exists := got.Metadata[buildcfg.NsBuilder]; exists {
+		t.Fatalf("builder namespace leaked into template metadata: %+v", got.Metadata)
+	}
+}
+
+func TestBuildRegisterStrictResourceBoundaryRejectsBeforeCore(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		headers http.Header
+	}{
+		{name: "duplicate body key", body: `{"cpuCount":2,"cpuCount":3,"memoryMB":2048}`},
+		{name: "null body leaf", body: `{"cpuCount":null,"memoryMB":2048}`},
+		{name: "array body", body: `[]`},
+		{name: "scalar body", body: `1`},
+		{name: "trailing body", body: `{"cpuCount":2,"memoryMB":2048} {}`},
+		{name: "zero body CPU", body: `{"cpuCount":0,"memoryMB":2048}`},
+		{name: "zero body memory", body: `{"cpuCount":2,"memoryMB":0}`},
+		{name: "alias CPU conflict", body: `{"cpuCount":2,"cpu_count":3,"memoryMB":2048}`},
+		{name: "alias memory conflict", body: `{"cpuCount":2,"memoryMB":2048,"memory_mb":1024}`},
+		{name: "body header CPU conflict", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `{"resources":{"cpu":3}}`)},
+		{name: "body header memory conflict", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `{"resources":{"memory":"1GiB"}}`)},
+		{name: "empty builder header", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, ``)},
+		{name: "null builder header", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `null`)},
+		{name: "unknown builder field", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `{"future":true}`)},
+		{name: "duplicate builder leaf", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `{"resources":{"cpu":2,"cpu":2}}`)},
+		{name: "null builder leaf", body: `{"cpuCount":2,"memoryMB":2048}`, headers: header(builderHeader, `{"resources":{"storage":null}}`)},
+		{name: "nonfinite JSON CPU", body: `{"cpuCount":NaN,"memoryMB":2048}`},
+		{name: "overflow CPU", body: `{"cpuCount":1e9999,"memoryMB":2048}`},
+		{name: "overflow memory", body: `{"cpuCount":2,"memoryMB":999999999999999999999999999999}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			core := &buildMMDSCoreStub{register: func(context.Context, string, RegisterSpec) (*types.Build, error) {
+				called = true
+				return &types.Build{}, nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
+				strings.NewReader(test.body), test.headers)
+			if response.Code != http.StatusBadRequest || called {
+				t.Fatalf("status=%d called=%t body=%s", response.Code, called, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestBuildRegisterPreservesEstablishedUnknownEnvelopeCompatibility(t *testing.T) {
+	called := false
+	core := &buildMMDSCoreStub{register: func(context.Context, string, RegisterSpec) (*types.Build, error) {
+		called = true
+		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
+		strings.NewReader(`{"cpuCount":2,"memoryMB":2048,"team_id":"existing-sdk-envelope"}`), nil)
+	if response.Code != http.StatusAccepted || !called {
+		t.Fatalf("status=%d called=%t body=%s", response.Code, called, response.Body.String())
 	}
 }
 
@@ -283,7 +373,7 @@ func TestBuildTriggerRejectsMMDSBeforeCore(t *testing.T) {
 	}
 }
 
-func TestBuildTriggerRejectsGenericConfigButKeepsBuilderAndCapacity(t *testing.T) {
+func TestBuildTriggerRejectsGenericConfigButKeepsResourceAssertions(t *testing.T) {
 	called := false
 	var got TriggerSpec
 	core := &buildMMDSCoreStub{trigger: func(_ context.Context, _ string, _ string, _ string, spec TriggerSpec, _ BuildAuth) error {
@@ -299,6 +389,7 @@ func TestBuildTriggerRejectsGenericConfigButKeepsBuilderAndCapacity(t *testing.T
 	}{
 		{name: "body metadata", body: `{"metadata":{"kuasar-sandbox.resource":"{}"}}`},
 		{name: "resource header", body: `{}`, headers: header("X-Kuasar-Sandbox-Resource", `{}`)},
+		{name: "builder header", body: `{}`, headers: header(builderHeader, `{"referer":{"enabled":false}}`)},
 		{name: "restore header", body: `{}`, headers: header(restoreHeader, `{}`)},
 		{name: "unknown sandbox config header", body: `{}`, headers: header("X-Kuasar-Sandbox-Future", `{}`)},
 	} {
@@ -313,15 +404,16 @@ func TestBuildTriggerRejectsGenericConfigButKeepsBuilderAndCapacity(t *testing.T
 		t.Fatal("deprecated trigger config reached Core")
 	}
 
-	headers := header(builderHeader, `{"referer":{"enabled":false}}`)
+	headers := make(http.Header)
 	headers.Set(clusterGroupHeader, "/g")
 	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v2/templates/template/builds/build",
 		strings.NewReader(`{"cpuCount":4,"memoryMB":8192}`), headers)
 	if response.Code != http.StatusAccepted || !called {
 		t.Fatalf("compatible trigger status = %d, called=%t, body=%s", response.Code, called, response.Body.String())
 	}
-	if got.Metadata[buildcfg.NsBuilder] == "" || got.Metadata[sandboxcfg.NsResource] != `{"capacity":{"cpu":4,"memory":"8192MiB"}}` {
-		t.Fatalf("compatible trigger metadata = %+v", got.Metadata)
+	if got.ResourceAssertion.CPU == nil || *got.ResourceAssertion.CPU != 4000 ||
+		got.ResourceAssertion.Memory == nil || *got.ResourceAssertion.Memory != 8192<<20 {
+		t.Fatalf("compatible trigger assertion = %+v", got.ResourceAssertion)
 	}
 }
 
@@ -1187,12 +1279,67 @@ type buildMMDSCoreStub struct {
 	trigger  func(context.Context, string, string, string, TriggerSpec, BuildAuth) error
 }
 
+type buildStatusCoreStub struct {
+	Core
+	build *types.Build
+	logs  []BuildLogEntry
+}
+
+func (c *buildStatusCoreStub) BuildStatus(context.Context, string, string, string) (*types.Build, error) {
+	return c.build, nil
+}
+
+func (c *buildStatusCoreStub) BuildLogs(context.Context, string, string, string, int) ([]BuildLogEntry, error) {
+	return c.logs, nil
+}
+
 func (c *buildMMDSCoreStub) RegisterBuild(ctx context.Context, apiKey string, spec RegisterSpec) (*types.Build, error) {
 	return c.register(ctx, apiKey, spec)
 }
 
 func (c *buildMMDSCoreStub) TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error {
 	return c.trigger(ctx, apiKey, templateID, buildID, spec, auth)
+}
+
+func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
+	handler, apiKey := newMigrationTestHandler(t, &buildStatusCoreStub{build: &types.Build{
+		BuildID: "build-observed", TemplateID: "template-observed", Profile: types.ProfileE2B,
+		Status: types.BuildBuilding, Resources: types.BuildResources{
+			CPU: 2500, Memory: 3 << 30, Storage: 64 << 30,
+		},
+		ExecutionClaimed: true, RunID: "br-observed", EnforcementStatus: "cpu,memory",
+		Phase: "b", PhaseSandboxID: "build-build-observed-b",
+	}})
+	response := migrationRequest(t, handler, apiKey, http.MethodGet,
+		"/templates/template-observed/builds/build-observed/status", nil, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Resources struct {
+			CPUMilli     int64 `json:"cpuMilli"`
+			MemoryBytes  int64 `json:"memoryBytes"`
+			StorageBytes int64 `json:"storageBytes"`
+		} `json:"resources"`
+		ExecutionClaimed   bool   `json:"executionClaimed"`
+		RunID              string `json:"runID"`
+		SystemdEnforcement string `json:"systemdEnforcement"`
+		StorageEnforcement string `json:"storageEnforcement"`
+		Phase              struct {
+			Name      string `json:"name"`
+			SandboxID string `json:"sandboxID"`
+		} `json:"phase"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Resources.CPUMilli != 2500 || body.Resources.MemoryBytes != 3<<30 ||
+		body.Resources.StorageBytes != 64<<30 || !body.ExecutionClaimed ||
+		body.RunID != "br-observed" || body.SystemdEnforcement != "cpu,memory" ||
+		body.StorageEnforcement != "admission-only" || body.Phase.Name != "b" ||
+		body.Phase.SandboxID != "build-build-observed-b" {
+		t.Fatalf("build status observation = %+v; body=%s", body, response.Body.String())
+	}
 }
 
 func (c *checkpointCoreStub) Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) {

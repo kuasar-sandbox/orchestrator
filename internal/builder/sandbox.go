@@ -3,6 +3,7 @@ package builder
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,7 +37,7 @@ type phaseSandbox struct {
 // direct child (this unit's cgroup). connect lists optional UDS forwards.
 func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect []string) (*phaseSandbox, error) {
 	s := p.spec
-	sid := "bp-" + phase + "-" + shortBID(s.BuildID)
+	sid := phaseSandboxID(phase, s.BuildID)
 	runRoot := filepath.Join(s.Workdir, "run")
 	if err := os.MkdirAll(filepath.Join(runRoot, sid), 0o700); err != nil {
 		return nil, err
@@ -63,6 +65,12 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		args = append(args, "--connect", c)
 	}
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
+	if p.vmmCgroup == nil || p.vmmCgroup.Fd() < 3 {
+		return nil, fmt.Errorf("phase %s has no trusted VMM cgroup descriptor", phase)
+	}
+	cgroupChildFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, p.vmmCgroup)
+	cmd.Args = append(cmd.Args, fmt.Sprintf("--cgroup-path=fd=%d", cgroupChildFD))
 	readyR, readyW, _, err := attachReadinessPipe(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("create readiness pipe: %w", err)
@@ -96,6 +104,16 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	}()
 	p.log.Info("phase sandbox up", "phase", phase, "sid", sid)
 	return sb, nil
+}
+
+func phaseSandboxID(phase, buildID string) string {
+	// Build IDs are opaque at this boundary (cluster registrations are not
+	// required to be UUIDs). Hash the complete identity so it cannot inject a
+	// path and Builds sharing a short prefix still receive distinct ordinary
+	// Sandbox IDs. The 128-bit prefix keeps the DNS-label-safe SID well below the
+	// node's 57-byte limit.
+	sum := sha256.Sum256([]byte(buildID))
+	return fmt.Sprintf("bp-%s-%x", phase, sum[:16])
 }
 
 // attachReadinessPipe gives the writer the next os/exec child descriptor. The
@@ -250,4 +268,45 @@ func (sb *phaseSandbox) teardown() {
 		<-sb.done
 	}
 	sb.p.log.Info("phase sandbox down", "sid", sb.sid)
+}
+
+// requirePhaseVMMCgroupEmpty proves that the ordinary sandbox has fully left
+// the delegated VMM cgroup before the build can publish phase completion and
+// start the next phase. cgroup.events' populated bit covers the complete
+// subtree, unlike cgroup.procs which lists only direct processes. The directory
+// descriptor is the same trusted cgroup FD handed to sandbox-ctl; no
+// tenant-controlled path is resolved here.
+func (p *buildPipeline) requirePhaseVMMCgroupEmpty() error {
+	if p.vmmCgroup == nil {
+		// Tests that exercise only phase reporting do not spawn a sandbox. The
+		// production entry point rejects a missing descriptor before Run.
+		return nil
+	}
+	fd, err := unix.Openat(int(p.vmmCgroup.Fd()), "cgroup.events", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("verify phase VMM cgroup cleanup: open cgroup.events: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "phase-vmm-cgroup.events")
+	if f == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("verify phase VMM cgroup cleanup: adopt cgroup.events descriptor")
+	}
+	defer f.Close()
+	events, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("verify phase VMM cgroup cleanup: read cgroup.events: %w", err)
+	}
+	fields := bytes.Fields(events)
+	for index := 0; index+1 < len(fields); index += 2 {
+		if bytes.Equal(fields[index], []byte("populated")) {
+			if bytes.Equal(fields[index+1], []byte("0")) {
+				return nil
+			}
+			if bytes.Equal(fields[index+1], []byte("1")) {
+				return fmt.Errorf("verify phase VMM cgroup cleanup: cgroup subtree is still populated")
+			}
+			break
+		}
+	}
+	return fmt.Errorf("verify phase VMM cgroup cleanup: malformed cgroup.events")
 }

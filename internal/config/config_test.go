@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,9 +15,12 @@ import (
 func TestResourceListenDefaultsScanManagedRunnerSlice(t *testing.T) {
 	var cfg ResourceListenConfig
 	cfg.ApplyDefaults()
-	want := "/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice"
-	if len(cfg.CgroupScanPaths) != 1 || cfg.CgroupScanPaths[0] != want {
-		t.Fatalf("cgroup scan paths = %v, want [%s]", cfg.CgroupScanPaths, want)
+	want := []string{
+		"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice",
+		"/sys/fs/cgroup/sandbox.slice/sandbox-builder.slice",
+	}
+	if !reflect.DeepEqual(cfg.CgroupScanPaths, want) {
+		t.Fatalf("cgroup scan paths = %v, want %v", cfg.CgroupScanPaths, want)
 	}
 }
 
@@ -72,6 +76,116 @@ sandbox:
 		policy.Allocatable.Memory != "512MiB" || policy.Startup == nil ||
 		policy.Startup.Memory != "1GiB" || policy.Overhead.Memory != "64MiB" {
 		t.Fatalf("configured resource policy = %+v", policy)
+	}
+}
+
+func TestBuilderAdmissionDefaultsAndExplicitIndependence(t *testing.T) {
+	base := `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+`
+	defaults, err := Load(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := defaults.Builder.ExecutionLimit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, err := defaults.Builder.RegistrationLimit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.MaxBuilds != 2 || registration != execution {
+		t.Fatalf("default limits: registration=%+v execution=%+v", registration, execution)
+	}
+
+	configured, err := Load(writeConfig(t, base+`
+builder:
+  admission:
+    execution:
+      max_builds: 4
+      resources: { cpu: 8, memory: 32GiB, storage: 1TiB }
+    registration:
+      resources: { memory: 64GiB }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, _ = configured.Builder.RegistrationLimit()
+	execution, _ = configured.Builder.ExecutionLimit()
+	if registration.MaxBuilds != 0 || registration.Resources.CPU != 0 || registration.Resources.Storage != 0 || registration.Resources.Memory != 64<<30 {
+		t.Fatalf("explicit registration inherited hidden fields: %+v", registration)
+	}
+	if execution.MaxBuilds != 4 || execution.Resources.CPU != 8000 || execution.Resources.Memory != 32<<30 || execution.Resources.Storage != 1<<40 {
+		t.Fatalf("execution = %+v", execution)
+	}
+}
+
+func TestBuilderAdmissionStrictValidation(t *testing.T) {
+	base := `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+builder:
+  admission:
+%s
+`
+	tests := map[string]struct {
+		body string
+		want string
+	}{
+		"null execution":       {"    execution: null", "builder.admission.execution must not be null"},
+		"null resources":       {"    execution:\n      resources: null", "builder.admission.execution.resources must not be null"},
+		"null leaf":            {"    execution:\n      resources: { cpu: null }", "builder.admission.execution.resources.cpu must not be null"},
+		"zero max":             {"    execution: { max_builds: 0 }", "max_builds must be > 0"},
+		"negative max":         {"    execution: { max_builds: -1 }", "max_builds must be > 0"},
+		"zero cpu":             {"    execution:\n      resources: { cpu: 0 }", "resources.cpu must be a positive"},
+		"NaN cpu":              {"    execution:\n      resources: { cpu: .nan }", "resources.cpu must be a positive"},
+		"Inf cpu":              {"    execution:\n      resources: { cpu: .inf }", "resources.cpu must be a positive"},
+		"empty memory":         {"    execution:\n      resources: { memory: \"\" }", "resources.memory must be a non-empty"},
+		"unknown field":        {"    execution: { future: 1 }", "field future not found"},
+		"duplicate resource":   {"    execution:\n      resources: { cpu: 1, cpu: 2 }", "mapping key \"cpu\" already defined"},
+		"old max_concurrent":   {"    execution: { max_builds: 2 }\n  max_concurrent: 2", "field max_concurrent not found"},
+		"old cpu_quota":        {"    execution: { max_builds: 2 }\n  cpu_quota: 2", "field cpu_quota not found"},
+		"old memory_max":       {"    execution: { max_builds: 2 }\n  memory_max: 2GiB", "field memory_max not found"},
+		"old vcpu":             {"    execution: { max_builds: 2 }\n  vcpu: 2", "field vcpu not found"},
+		"old memory":           {"    execution: { max_builds: 2 }\n  memory: 2GiB", "field memory not found"},
+		"registration smaller": {"    execution: { max_builds: 4 }\n    registration: { max_builds: 3 }", "registration.max_builds must be >="},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, fmt.Sprintf(base, test.body)))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBuilderAdmissionCPUPreservesDecimalForConservativeRounding(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+builder:
+  admission:
+    execution:
+      resources: { cpu: 1.0000000000000001 }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit, err := cfg.Builder.ExecutionLimit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit.Resources.CPU != 1001 {
+		t.Fatalf("conservatively rounded CPU = %d, want 1001 milli-CPU", limit.Resources.CPU)
 	}
 }
 
@@ -825,8 +939,11 @@ resource_listen:
 	if cfg.ResourceListen == nil || cfg.ResourceListen.StatePath != "/run/legacy-resource-state.json" {
 		t.Fatalf("deprecated state_path did not remain parse-compatible: %+v", cfg.ResourceListen)
 	}
-	if got := cfg.ResourceListen.CgroupScanPaths; len(got) != 1 ||
-		got[0] != "/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice" {
+	wantCgroupRoots := []string{
+		"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice",
+		"/sys/fs/cgroup/sandbox.slice/sandbox-builder.slice",
+	}
+	if got := cfg.ResourceListen.CgroupScanPaths; !reflect.DeepEqual(got, wantCgroupRoots) {
 		t.Fatalf("cgroup recovery defaults = %v", got)
 	}
 

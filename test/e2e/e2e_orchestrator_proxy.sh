@@ -527,8 +527,6 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-  vcpu: 1
-  memory: 1GiB
 checkpoint: { mode: remote }
 EOF
 
@@ -577,7 +575,7 @@ echo "==> control plane up; proxy master registered on the config-socket plugin 
 echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
+code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl","cpuCount":1,"memoryMB":1024}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)

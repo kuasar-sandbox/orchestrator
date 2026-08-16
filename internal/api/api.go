@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -57,14 +58,6 @@ func singleOptionalHeader(h http.Header, name string) (*string, error) {
 	}
 	value := values[0]
 	return &value, nil
-}
-
-// pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
-func pickInt(a, b int) int {
-	if a != 0 {
-		return a
-	}
-	return b
 }
 
 // mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta. Resource
@@ -161,13 +154,44 @@ func mergeBuildConfigHeaders(meta map[string]string, h http.Header) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	if v := h.Get(builderHeader); v != "" {
+	if values, present := h[http.CanonicalHeaderKey(builderHeader)]; present {
+		if len(values) != 1 {
+			return nil, fmt.Errorf("%s must appear exactly once", builderHeader)
+		}
+		// Builder keeps the existing whole-namespace header precedence, but an
+		// invalid lower-priority definition must not disappear behind a valid
+		// header. Strict registration input is validated independently at every
+		// supplied layer before the selected definition is extracted below.
+		if _, supplied := meta[buildcfg.NsBuilder]; supplied {
+			if _, _, err := buildcfg.Extract(meta); err != nil {
+				return nil, err
+			}
+		}
 		if meta == nil {
 			meta = map[string]string{}
 		}
-		meta[buildcfg.NsBuilder] = v
+		meta[buildcfg.NsBuilder] = values[0]
 	}
 	return meta, nil
+}
+
+const maxBuildRequestBytes = 1 << 20
+
+func decodeBuildRequest(r io.Reader, out any) error {
+	raw, err := io.ReadAll(io.LimitReader(r, maxBuildRequestBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxBuildRequestBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxBuildRequestBytes)
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '{' {
+		return errors.New("request body must be a JSON object")
+	}
+	if err := strictjson.DecodeAllowUnknown(raw, out); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ErrAlreadyPaused is returned by Core.Pause when the sandbox is already paused.
@@ -200,6 +224,11 @@ var ErrNotAllowed = errors.New("credential pair not allowed to create")
 // ErrFilesUnsupported is returned by FilesUpload / TriggerBuild when a COPY
 // step is used but builder.files_storage is unconfigured (=> 501).
 var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.files_storage not configured)")
+
+// ErrBuildAdmission means the node cannot accept another durable Build
+// definition under its registration limits. It is a definitive no-side-effect
+// rejection and maps to 429 for direct callers.
+var ErrBuildAdmission = errors.New("builder registration admission capacity exceeded")
 
 // ErrBadRequest maps a Core-side validation failure (e.g. a COPY referencing
 // an unuploaded context) to 400.
@@ -248,7 +277,9 @@ type RegisterSpec struct {
 	Name       string
 	Tags       []string
 	Profile    types.Profile
+	Resources  types.BuildResources
 	Metadata   map[string]string
+	Builder    types.BuildOptions
 	MMDSHeader *string
 }
 
@@ -259,9 +290,9 @@ type TriggerSpec struct {
 	Steps        []types.TemplateStep
 	StartCmd     string
 	ReadyCmd     string
-	// Metadata carries only the temporary E2B capacity leaves and build-only
-	// namespace still owned by #97. Generic trigger-time sandbox config is rejected.
-	Metadata map[string]string
+	// ResourceAssertion is the optional legacy E2B cpuCount/memoryMB assertion.
+	// It is compared with the immutable registration resources and never merged.
+	ResourceAssertion buildcfg.ResourcePatch
 }
 
 // BuildLogEntry is one build-progress line surfaced to the SDK (e2b BuildLogEntry:
@@ -752,37 +783,61 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		Name       string            `json:"name"`
 		Tags       []string          `json:"tags"`
 		Profile    string            `json:"profile"`
-		CPUCount   int               `json:"cpuCount"`
-		CPUCountSn int               `json:"cpu_count"`
-		MemoryMB   int               `json:"memoryMB"`
-		MemoryMBSn int               `json:"memory_mb"`
+		CPUCount   json.RawMessage   `json:"cpuCount"`
+		CPUCountSn json.RawMessage   `json:"cpu_count"`
+		MemoryMB   json.RawMessage   `json:"memoryMB"`
+		MemoryMBSn json.RawMessage   `json:"memory_mb"`
 		Metadata   map[string]string `json:"metadata"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := decodeBuildRequest(r.Body, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
 	profile, err := requestedBuildProfile(body.Profile)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
-	// into the resource namespace (cpu/memory win over a resource header).
+	// Template/phase sandbox configuration remains independent from the E2B
+	// first-class Build resource fields.
 	meta, err := mergeBuildConfigHeaders(body.Metadata, r.Header)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	meta, err = sandboxcfg.ApplyCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	meta, builderOpts, err := buildcfg.Extract(meta)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	bodyResources, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	headerResources := buildcfg.ResourcePatch{}
+	if builderOpts.Resources != nil {
+		headerResources = buildcfg.PatchFromResources(*builderOpts.Resources)
+	}
+	mergedResources, err := buildcfg.MergeResourcePatches(bodyResources, headerResources)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resources, err := buildcfg.ResolveResources(mergedResources)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	builderOpts.Resources = nil
 	mmdsValue, err := singleOptionalHeader(r.Header, mmdsHeader)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
-		Name: body.Name, Tags: body.Tags, Profile: profile, Metadata: meta, MMDSHeader: mmdsValue,
+		Name: body.Name, Tags: body.Tags, Profile: profile, Resources: resources,
+		Metadata: meta, Builder: builderOpts, MMDSHeader: mmdsValue,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -827,14 +882,18 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		ReadyCmdE2B  string               `json:"ready_cmd"`
 		Dockerfile   string               `json:"dockerfile"`
 		TemplateName string               `json:"template_name"`
-		CPUCount     int                  `json:"cpuCount"`
-		CPUCountSn   int                  `json:"cpu_count"`
-		MemoryMB     int                  `json:"memoryMB"`
-		MemoryMBSn   int                  `json:"memory_mb"`
+		CPUCount     json.RawMessage      `json:"cpuCount"`
+		CPUCountSn   json.RawMessage      `json:"cpu_count"`
+		MemoryMB     json.RawMessage      `json:"memoryMB"`
+		MemoryMBSn   json.RawMessage      `json:"memory_mb"`
 		Metadata     map[string]string    `json:"metadata"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, 400, "bad body")
+	if err := decodeBuildRequest(r.Body, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
+	if _, present := r.Header[http.CanonicalHeaderKey(builderHeader)]; present {
+		writeErr(w, http.StatusBadRequest, "trigger-time builder configuration is deprecated; configure it at registration")
 		return
 	}
 	if len(body.Metadata) != 0 || hasTriggerSandboxConfigHeader(r.Header) {
@@ -857,26 +916,19 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		RegistryUsername: body.FromImageRegistry.Username,
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
-	// Generic trigger-time sandbox config is rejected above. Keep only the
-	// build-only header owned by #97 and E2B's temporary first-class capacity
-	// leaves; TriggerBuild leaf-merges those with registration metadata.
-	var meta map[string]string
-	if v := r.Header.Get(builderHeader); v != "" {
-		meta = map[string]string{buildcfg.NsBuilder: v}
-	}
-	meta, err := sandboxcfg.ApplyCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	resourceAssertion, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	err = a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
 		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
-			FromImage:    body.FromImage,
-			FromTemplate: body.FromTemplate,
-			Steps:        body.Steps,
-			StartCmd:     startCmd,
-			ReadyCmd:     readyCmd,
-			Metadata:     meta,
+			FromImage:         body.FromImage,
+			FromTemplate:      body.FromTemplate,
+			Steps:             body.Steps,
+			StartCmd:          startCmd,
+			ReadyCmd:          readyCmd,
+			ResourceAssertion: resourceAssertion,
 		}, auth)
 	if err != nil {
 		var stateConflict *BuildStateConflictError
@@ -901,7 +953,6 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 func hasTriggerSandboxConfigHeader(header http.Header) bool {
 	for name := range header {
 		if strings.HasPrefix(strings.ToLower(name), "x-kuasar-sandbox-") &&
-			!strings.EqualFold(name, builderHeader) &&
 			!strings.EqualFold(name, clusterGroupHeader) {
 			return true
 		}
@@ -966,6 +1017,18 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 		"status":     b.Status.SDKStatus(),
 		"logs":       logs,
 		"logEntries": logEntries,
+		"resources": map[string]any{
+			"cpuMilli":     b.Resources.CPU,
+			"memoryBytes":  b.Resources.Memory,
+			"storageBytes": b.Resources.Storage,
+		},
+		"executionClaimed":   b.ExecutionClaimed,
+		"runID":              b.RunID,
+		"systemdEnforcement": b.EnforcementStatus,
+		"storageEnforcement": "admission-only",
+	}
+	if b.Phase != "" {
+		resp["phase"] = map[string]any{"name": b.Phase, "sandboxID": b.PhaseSandboxID}
 	}
 	if b.Reason != "" {
 		resp["reason"] = map[string]any{"message": b.Reason}
@@ -1181,6 +1244,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "credential pair not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
+	case errors.Is(err, ErrBuildAdmission):
+		writeErr(w, http.StatusTooManyRequests, ErrBuildAdmission.Error())
 	case errors.Is(err, ErrProxyUnavailable):
 		writeErr(w, http.StatusServiceUnavailable, ErrProxyUnavailable.Error())
 	default:

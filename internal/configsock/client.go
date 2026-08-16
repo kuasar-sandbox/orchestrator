@@ -78,6 +78,30 @@ func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
 	return nil
 }
 
+func PostBuildPhase(socket, runID, buildID, phase, sandboxID, state string) error {
+	body, _ := json.Marshal(BuildPhaseRequest{
+		RunID: runID, BuildID: buildID, Phase: phase, SandboxID: sandboxID, State: state,
+	})
+	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathRunBuildPhase, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClient(socket).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out BuildPhaseResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("configsock: decode build phase: %w", err)
+	}
+	if out.Error != "" {
+		return errors.New(out.Error)
+	}
+	return nil
+}
+
 // FetchLaunchSpec dials the config-socket and pulls the LaunchSpec for configID.
 // The caller (node-ctl run-sandbox / run-builder) must have written its pidfile first so the
 // server's SO_PEERCRED check matches the connecting pid.

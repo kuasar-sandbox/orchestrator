@@ -95,10 +95,6 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err := client.DropKeyPair(ctx, "n1", apiFP); err != nil {
 		t.Fatal(err)
 	}
-	if !client.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
-		t.Fatal("admit build returned false")
-	}
-	client.ReleaseBuild(ctx, "n1", "b1")
 	node, found, err := client.Runtime(ctx, "n1")
 	if err != nil || !found || node.DataEndpoint == "" {
 		t.Fatalf("runtime node=%+v found=%v err=%v", node, found, err)
@@ -114,7 +110,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 		t.Fatalf("send wait ack=%+v err=%v", ack, err)
 	}
 	wantOps := []string{
-		"connected:n1", "put:n1:" + apiFP, "drop:n1:" + apiFP, "admit:n1:b1",
+		"connected:n1", "put:n1:" + apiFP, "drop:n1:" + apiFP,
 		"delete:n1:sb1:" + strings.Repeat("a", 64), "send:n1:delete", "wait:n1:create",
 	}
 	if len(owner.ops) != len(wantOps) {
@@ -124,9 +120,6 @@ func TestHTTPNodeOwner(t *testing.T) {
 		if owner.ops[i] != wantOps[i] {
 			t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 		}
-	}
-	if len(owner.released) != 1 || owner.released[0] != "n1:b1" {
-		t.Fatalf("released=%v", owner.released)
 	}
 }
 

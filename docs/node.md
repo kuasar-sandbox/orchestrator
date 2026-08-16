@@ -390,14 +390,15 @@ node-ctl 同目录 → PATH"自动发现。
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime bundle;offset-zero EROFS + digest marker ZIP,内置 envd、flatten-ctl、mkfs.erofs(§11) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
-| `builder.max_concurrent` | `2` | 构建池并发(serve 内计数信号量,§12) |
-| `builder.cpu_quota` / `.memory_max` | 空 | 施加到 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` |
+| `builder.admission.execution.max_builds` | `2` | 同时持有 durable execution claim 的 Build 上限 |
+| `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合资源向量;CPU/memory 同时施加到 `sandbox-builder.slice`,storage V1 仅准入记账 |
+| `builder.admission.registration` | 完整继承 resolved execution | 所有非终态 Build 的注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
+| `builder.registration_ttl` / `.queue_ttl` | `1h` / `30m` | 未 Trigger 的 registered Build 与 waiting Build 的持久超时;终态可查询并释放 registration usage |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§12) |
 | `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用(§4.6、§12) |
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
-| `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
 | `checkpoint.mode` | `local` | 暂停态 capture:`local` = 本机 working-set bundle;`remote` 仅保留旧部署兼容且已废弃(§8.1) |
@@ -419,6 +420,18 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
+
+Builder 配置为未发布 schema 的直接切换,不保留 alias:
+
+```text
+builder.max_concurrent -> builder.admission.execution.max_builds
+builder.cpu_quota      -> builder.admission.execution.resources.cpu
+builder.memory_max     -> builder.admission.execution.resources.memory
+builder.vcpu/memory    -> 删除;phase Sandbox 使用 sandbox.resources
+```
+
+若显式配置 registration,它不会从 execution 隐式继承省略维度;若整块省略则完整继承
+resolved execution。现有开发数据库按当前 schema 直接重建,没有旧/新字段双读或迁移 fallback。
 
 远程内存 Prefetch 没有节点统一开关。是否请求 Prefetch 由每个 sandbox 的
 `kuasar-sandbox.restore` 命名空间决定(§4.6)。
@@ -566,9 +579,9 @@ route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?}`;`profile∈{e2b,bare}`,省略按此 e2b 兼容端点语义取 `e2b`,注册后不可变;`X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);MMDS routes/initial secrets 只供本次 builder sandbox,secret 不进入模板;回 `{templateID: transient-<uuidv7>, buildID, profile, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做)。Trigger-time 通用 `metadata`、restore/credentials/checkpoint/MMDS 入口及通用 `X-Kuasar-Sandbox-*` header 已废弃并返回 400;暂保留的 `cpu_count`/`memory_mb` 只覆盖 register resource 的 capacity leaf,`X-Kuasar-Sandbox-Builder` 仍由 #97 收敛 |
-| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, profile, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB, metadata?}`;CPU/memory 只定义不可变 **Build.Resources**,绝不改 Sandbox capacity。`X-Kuasar-Sandbox-Builder.resources` 可声明同值并补 storage;同维度不等即 400。`X-Kuasar-Sandbox-Resource` 独立保存为 A/B/C phase patch。`profile∈{e2b,bare}`,省略取 `e2b`;MMDS initial secrets 只供本次 phase,不进入模板 |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}`;只允许一次 `registered→waiting`。兼容的 `cpuCount/memoryMB` 仅可断言等于注册值,放大或缩小均在 credential/COPY/queue 副作用前 400。Trigger-time metadata、Builder/Resource 及其它通用配置 header 全部拒绝;execution 不足时留在固定节点 FIFO waiting |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回基本 SDK 字段及规范化 `resources{cpuMilli,memoryBytes,storageBytes}`、`executionClaimed`、`runID`、`systemdEnforcement`、`storageEnforcement` 和当前 `phase{name,sandboxID}`;进行中 SDK status 仍统一为 `building`,内部 phase/claim 不丢失 |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile` |
 
@@ -806,8 +819,8 @@ Header 按字段覆盖 metadata;`null`/缺失表示不覆盖,而不是清除低�
 `X-Kuasar-Sandbox-Checkpoint` 也不是 Build header。remote mode 下非空 policy 在 Create
 副作用前拒绝,应迁移节点为 `checkpoint.mode=local`。
 
-`kuasar-sandbox.cluster` 不属于上述租户配置命名空间。构建任务仍用该 metadata 字段携带
-cluster 自有的 group;普通 sandbox 的 `Profile`、`Group`、`RouteKey` 和可选
+`kuasar-sandbox.cluster` 不属于上述租户配置命名空间。cluster Build 的 group 使用独立
+持久系统字段,不会进入 portable template metadata;普通 sandbox 的 `Profile`、`Group`、`RouteKey` 和可选
 `AuthSandboxID` 则通过 node-link 的结构化系统上下文下发并独立持久化,不进入用户
 metadata。node 不在事件中回传 Registry 自有的 group、route key 或认证主体;Registry
 通过节点归属记录恢复这些信息。
@@ -816,10 +829,10 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 `X-Kuasar-Sandbox-Builder`,当前形态:
 
 ```json
-{"referer":{"enabled":false,"writeback":false}}
+{"resources":{"cpu":4,"memory":"8GiB","storage":"64GiB"},"referer":{"enabled":false,"writeback":false}}
 ```
 
-它只控制本次模板构建的 import referer 行为,解析后从模板 sandbox metadata 中剥离,
+其中 `resources` 只定义 Build resources,referer/registry 只控制本次模板构建。解析后均从模板 metadata 中剥离,
 持久化到 `builds.builder_json`;不会随模板 create/resume 进入运行时配置。
 
 - **渲染**:serve 在任何 network Attach/runner Assign 前用一个纯 resolver 生成完整
@@ -838,9 +851,8 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
 - **优先级**:resource 使用上面的固定 leaf chain;非 resource 继续
   `节点默认 ⊕ 模板配置 ⊕ create 配置` 的 whole-namespace 行为。模板 portable patch
-  来自 `builds.metadata_json`;trigger 暂保留的 `cpuCount`/`memoryMB` 只作为 register
-  resource capacity leaf overlay。现有 build path 仍用最终 capacity leaf 选择 build VM
-  capacity;builder 自身的独立 quota/pool 资源模型未由本功能重构。
+  来自 `builds.metadata_json`。Build resources 与该 patch 完全独立,不互相默认、比较或推导;
+  trigger 的 `cpuCount`/`memoryMB` 只可断言不可变 Build resources。
 - **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
   快照**。request 显式相同 capacity 可作为 assertion,任一 leaf 不同则 400。无法可靠
   probe snapshot capacity 时直接失败,且此时尚未 Attach network、Assign runner、创建
@@ -903,7 +915,8 @@ ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/runs/%i.pid \
           --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
 ExecStopPost=/bin/rm -f /run/sandbox/runs/%i.pid
 KillMode=control-group
-Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory_max)
+Slice=sandbox-builder.slice   # execution aggregate CPU/memory 防御性硬限制
+Delegate=yes                  # phase ctl/vmm 子 cgroup 与可信 VMM cgroup FD
 ```
 
 两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
@@ -1023,7 +1036,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   时另行强制追加本机 `--cgroup-path=fd=N`,不允许 LaunchSpec 覆盖。
 - `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
   → **BuildSpec(构建工作单)**:`{build_id, profile, workdir, from_image | from_template
-  (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
+  (+kind), steps[], start_cmd, ready_cmd, env, paths, net, resources,
   mmds_enabled, envd_token, insecure, platform, timeouts}`——`env` 含
   `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据;`paths` 是宿主侧工件与工具
   (kernel / runtime / 两个 diff template / sandbox-ctl /
@@ -1484,7 +1497,8 @@ register{
   node_id,
   labels,
   capacity,
-  build_capacity,
+  build_registration_capacity,
+  build_execution_capacity,
   data_endpoint,
   runtime_digest,
   accept_redirect
@@ -1500,10 +1514,13 @@ register{
 节点周期发送:
 
 ```text
-heartbeat{zone, allocated, pool, build_alloc, counts, draining}
+heartbeat{zone, allocated, pool, build_registration_usage,
+          build_execution_usage, counts, draining}
 ```
 
-沙箱水位取自资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧
+两级 Build capacity 在首个 `register` frame 中发送；沙箱水位取自资源控制器
+(node-resource.md)。两级 Build usage 由节点 SQLite 中每条
+非终态 Build.Resources / execution claim 精确求和,不是 active count × 默认向量。`draining` 由节点侧
 资源 drain 或维护策略置位。普通 heartbeat 只更新 node_link profile 中的 liveness 和本地水位，不更新
 node_list；首次注册和 draining 变化驱动低频目录投影。registry node owner 持有的当前连接是 placement
 提交时唯一的存活判断。
@@ -1557,7 +1574,7 @@ CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network own
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.校验通过后生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后异步 resume,不等待 READY |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按完整 APISecret 指纹解析凭据对、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
+  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 节点以同一 canonical Build.Resources 做最终、事务化 registration admission;phase ResourcePatch、portable metadata 与 cluster group 分开持久化。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。
@@ -1792,10 +1809,19 @@ registry TLS 是**单次 Build 的信任策略**,经 register-time 的 `X-Kuasar
   `--config /run/kuasar-build/flatten/config.yaml`;flatten-ctl 据此把 CA **追加到系统根证书池**
   (非替换)后构建带 CA 的 TLS transport。不进最终模板 metadata,不被其他 Build 继承。
 
-**资源池**:`builder.max_concurrent`(默认 2)= serve 内计数信号量准入;
-`waiting → building` 用 builds 表 CAS 抢占(重启/多实例安全);CPU/内存上限经
-`sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加(整条流水线都在单元 cgroup
-内,上限对阶段 VM 生效)。
+**两级准入与强制**:Register 在 SQLite 同一事务内按 count/CPU/memory/storage 检查
+`builder.admission.registration`,插入 immutable definition 并占用;Trigger 只做
+`registered→waiting`。scheduler 按 `(waiting_unix,build_id)` 稳定 FIFO,在单条持久
+事务中按 `builder.admission.execution` 建 claim;不足保持 waiting,到 `queue_ttl` 后持久终态。
+claim 后先设置并回读 `sandbox-builder@<run-id>` 的 CPUQuota/MemoryMax,再绑定 run-id、最后
+发布 assignment。execution CPU/memory 同时施加到 `sandbox-builder.slice`;storage V1 为
+admission-only。`node-ctl builder status` 和 metrics 暴露配置、持久用量、headroom、队列与
+拒绝/过期计数。旧 `max_concurrent/cpu_quota/memory_max/vcpu/memory` 配置直接拒绝。
+
+每个 A/B/C phase 使用独立 SID,从节点 `sandbox.resources` 与注册时 phase ResourcePatch 经
+同一 `ResolveResources` 得到完整 Sandbox resources,通过普通 `sandbox-ctl run` 的 controller
+Admit/heartbeat/Release,并在 teardown/Release 完成后才进入下一阶段。Build.Resources 不进入
+nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在双重记账。
 
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 
@@ -1859,9 +1885,16 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                created_unix
 builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<base64url-ref>),
                api_secret_hash, api_secret_enc, manifest_key_hash, manifest_key_enc,
-               profile, kind, from_image,
-               start_cmd, status(registered|waiting|building|ready|error), reason,
-               names_json, aliases_json, registry_auth_enc, created_unix
+               profile, kind, from_image, from_template, start_cmd, ready_cmd, steps_json,
+               status(registered|waiting|building|ready|error), reason, run_id,
+               names_json, aliases_json, registry_auth_enc,
+               registration_image_repo, registration_registry_auth_enc, cluster_group,
+               resources_cpu(milli-CPU), resources_memory(bytes), resources_storage(bytes),
+               phase_resource_json, metadata_json, builder_json,
+               waiting_unix, execution_claimed, execution_claimed_unix,
+               enforcement_status, phase, phase_sandbox_id,
+               runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
+               runtime_envd_access_token_enc, created_unix
 sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -1872,7 +1905,11 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
                manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
 
-`builds` 兼任模板登记(§4.4);`*_enc` 根凭据及 Sandbox service credential 均
+`builds` 兼任模板登记(§4.4),也是 registration/execution 两级准入的持久真相。
+`resources_*` 是不可变 Build resources;`phase_resource_json` 是 A/B/C 普通 Sandbox 的独立
+ResourcePatch;二者不互相推导。`execution_claimed` 及 runtime/phase 字段使重启后可重建
+用量并先收敛活单元再释放 claim。项目尚未发布,本 schema 直接切换;旧开发数据库
+需重建,不保留旧 Builder 字段的双读/双写兼容。`*_enc` 根凭据及 Sandbox service credential 均
 AES-256-GCM、两项 `*_hash` 均为
 完整 SHA-256。`substr(api_secret_hash,1,24)` 仅建候选预筛索引(§7)。
 两张 MMDS value 表每 owner 最多一行,只保存 secretbox ciphertext;AAD 与事务/CAS/cleanup

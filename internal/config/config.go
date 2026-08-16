@@ -10,6 +10,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -19,8 +20,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -152,7 +155,10 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 		r.AuditPath = "/run/node-ctl/audit.log"
 	}
 	if len(r.CgroupScanPaths) == 0 {
-		r.CgroupScanPaths = []string{"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice"}
+		r.CgroupScanPaths = []string{
+			"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice",
+			"/sys/fs/cgroup/sandbox.slice/sandbox-builder.slice",
+		}
 	}
 	if r.Resources.PhysicalMemory == "" {
 		r.Resources.PhysicalMemory = "auto"
@@ -365,9 +371,6 @@ func (r ResourcesConfig) Policy() sandboxcfg.NodeResourcePolicy {
 // 0 if unset or unparseable (the value is informational, not an allocation knob).
 func (r ResourcesConfig) MemoryMiB() int { return parseMiB(r.Policy().Capacity.Memory) }
 
-// MemoryMiB parses the build sandbox's memory into whole MiB (cluster build pool).
-func (b BuilderConfig) MemoryMiB() int { return parseMiB(b.Memory) }
-
 func parseMiB(s string) int {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -422,17 +425,18 @@ type BootConfig struct {
 	OverlayDiffTemplate string `yaml:"overlay_diff_template"` // pre-formatted ext4 seeding the cold-boot overlay upper
 }
 
-// BuilderConfig is the build-instance settings. Concurrency is admitted in
-// node-ctl; the CPU/memory ceiling is applied to sandbox-builder.slice.
+// BuilderConfig is the build-instance settings. Durable registration/execution
+// admission uses each immutable BuildResources vector; execution CPU/memory are
+// additionally enforced on the aggregate slice and each builder service.
 // Builds run INSIDE build sandboxes (tenant network + isolation): import and
 // step execution happen in microVMs booted from the same guest runtime; only artifact
 // streaming and the final uploads run on the host (run-builder).
 type BuilderConfig struct {
-	MaxConcurrent    int    `yaml:"max_concurrent"`    // default 2
-	CPUQuota         string `yaml:"cpu_quota"`         // e.g. "200%"; "" = unset
-	MemoryMax        string `yaml:"memory_max"`        // e.g. "8G"; "" = unset
-	InsecureRegistry bool   `yaml:"insecure_registry"` // pull base images over plain HTTP (dev/local registry)
-	Platform         string `yaml:"platform"`          // e.g. "linux/amd64"; "" = host default
+	Admission        BuilderAdmissionConfig `yaml:"admission"`
+	RegistrationTTL  string                 `yaml:"registration_ttl"`  // default 1h
+	QueueTTL         string                 `yaml:"queue_ttl"`         // default 30m
+	InsecureRegistry bool                   `yaml:"insecure_registry"` // pull base images over plain HTTP (dev/local registry)
+	Platform         string                 `yaml:"platform"`          // e.g. "linux/amd64"; "" = host default
 	// ImageURIMask is the image the e2b CLI pushes its client-built rootfs to,
 	// with {templateID}/{buildID} tokens (must match the CLI's E2B_IMAGE_URI_MASK,
 	// AND be reachable from inside a build sandbox — the pull runs in the guest);
@@ -445,9 +449,6 @@ type BuilderConfig struct {
 	// writable disk (pull cache + steps delta + export scratch): size it
 	// 2-3x the largest expected image (the ext4 size is fixed at mkfs).
 	DiffTemplate string `yaml:"diff_template"`
-	// VCPU / Memory are the build sandbox's capacity (defaults 2 / "4GiB").
-	VCPU   int    `yaml:"vcpu"`
-	Memory string `yaml:"memory"`
 	// Phase timeouts (seconds): image pull+flatten, one RUN step, the
 	// readyCmd poll budget, and the whole build. Defaults 600/600/120/1800.
 	PullTimeoutSec  int `yaml:"pull_timeout_sec"`
@@ -461,6 +462,122 @@ type BuilderConfig struct {
 	// Unset → COPY steps are rejected (501). For local/single-node without a
 	// cloud object store, point it at a versitygw gateway. (§11)
 	FilesStorage *FilesStorageConfig `yaml:"files_storage"`
+}
+
+type BuilderAdmissionConfig struct {
+	Registration *BuildAdmissionLimitConfig `yaml:"registration,omitempty"`
+	Execution    *BuildAdmissionLimitConfig `yaml:"execution,omitempty"`
+}
+
+type BuildAdmissionLimitConfig struct {
+	MaxBuilds *int64                        `yaml:"max_builds,omitempty"`
+	Resources BuildAdmissionResourcesConfig `yaml:"resources,omitempty"`
+}
+
+type BuildAdmissionResourcesConfig struct {
+	CPU     *CPUCores `yaml:"cpu,omitempty"`
+	Memory  *string   `yaml:"memory,omitempty"`
+	Storage *string   `yaml:"storage,omitempty"`
+}
+
+// CPUCores preserves the exact YAML decimal so conversion to milli-CPU can
+// conservatively round upward instead of first passing through float64.
+type CPUCores string
+
+func (c *CPUCores) UnmarshalYAML(node *yaml.Node) error {
+	if node == nil || node.Kind != yaml.ScalarNode || (node.Tag != "!!int" && node.Tag != "!!float") {
+		return fmt.Errorf("CPU cores must be a numeric scalar")
+	}
+	*c = CPUCores(node.Value)
+	return nil
+}
+
+func (c CPUCores) MarshalYAML() (any, error) {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: string(c)}, nil
+}
+
+func (c BuildAdmissionLimitConfig) Resolved(path string) (types.BuildAdmissionLimit, error) {
+	var out types.BuildAdmissionLimit
+	if c.MaxBuilds != nil {
+		if *c.MaxBuilds <= 0 {
+			return out, fmt.Errorf("%s.max_builds must be > 0", path)
+		}
+		out.MaxBuilds = *c.MaxBuilds
+	}
+	if c.Resources.CPU != nil {
+		number := json.Number(*c.Resources.CPU)
+		value, err := buildcfg.CPUCoresToMilli(path+".resources.cpu", number)
+		if err != nil {
+			return out, err
+		}
+		out.Resources.CPU = value
+	}
+	for _, size := range []struct {
+		name string
+		raw  *string
+		dst  *int64
+	}{
+		{"memory", c.Resources.Memory, &out.Resources.Memory},
+		{"storage", c.Resources.Storage, &out.Resources.Storage},
+	} {
+		if size.raw == nil {
+			continue
+		}
+		value, err := buildcfg.SizeBytes(path+".resources."+size.name, *size.raw)
+		if err != nil {
+			return out, err
+		}
+		*size.dst = value
+	}
+	return out, nil
+}
+
+func cloneBuildAdmissionLimit(in *BuildAdmissionLimitConfig) *BuildAdmissionLimitConfig {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.MaxBuilds != nil {
+		value := *in.MaxBuilds
+		out.MaxBuilds = &value
+	}
+	if in.Resources.CPU != nil {
+		value := *in.Resources.CPU
+		out.Resources.CPU = &value
+	}
+	if in.Resources.Memory != nil {
+		value := *in.Resources.Memory
+		out.Resources.Memory = &value
+	}
+	if in.Resources.Storage != nil {
+		value := *in.Resources.Storage
+		out.Resources.Storage = &value
+	}
+	return &out
+}
+
+func (b BuilderConfig) RegistrationLimit() (types.BuildAdmissionLimit, error) {
+	if b.Admission.Registration == nil {
+		return types.BuildAdmissionLimit{}, fmt.Errorf("builder.admission.registration is unresolved")
+	}
+	return b.Admission.Registration.Resolved("builder.admission.registration")
+}
+
+func (b BuilderConfig) ExecutionLimit() (types.BuildAdmissionLimit, error) {
+	if b.Admission.Execution == nil {
+		return types.BuildAdmissionLimit{}, fmt.Errorf("builder.admission.execution is unresolved")
+	}
+	return b.Admission.Execution.Resolved("builder.admission.execution")
+}
+
+func (b BuilderConfig) RegistrationTTLDur() time.Duration {
+	d, _ := time.ParseDuration(b.RegistrationTTL)
+	return d
+}
+
+func (b BuilderConfig) QueueTTLDur() time.Duration {
+	d, _ := time.ParseDuration(b.QueueTTL)
+	return d
 }
 
 type BuilderRefererConfig struct {
@@ -548,12 +665,77 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
+	if err := rejectBuilderAdmissionNulls(b); err != nil {
+		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
 	var c Config
 	if err := decodeKnownYAML(b, &c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	c.applyDefaults()
 	return &c, c.validate()
+}
+
+// rejectBuilderAdmissionNulls preserves the distinction between an omitted
+// admission block/leaf and an explicitly null one. yaml.v3 otherwise maps both
+// forms to nil pointers, which would incorrectly turn invalid operator input
+// into defaults or an unlimited resource dimension.
+func rejectBuilderAdmissionNulls(raw []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		return err
+	}
+	if len(document.Content) == 0 {
+		return nil
+	}
+	var walk func(*yaml.Node, string) error
+	walk = func(node *yaml.Node, path string) error {
+		if node.Kind == yaml.AliasNode {
+			node = node.Alias
+		}
+		if node.Tag == "!!null" {
+			return fmt.Errorf("%s must not be null", path)
+		}
+		if node.Kind != yaml.MappingNode {
+			return nil
+		}
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, value := node.Content[i], node.Content[i+1]
+			childPath := key.Value
+			if path != "" {
+				childPath = path + "." + key.Value
+			}
+			if err := walk(value, childPath); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "builder" {
+			continue
+		}
+		builder := root.Content[i+1]
+		if builder.Kind == yaml.AliasNode {
+			builder = builder.Alias
+		}
+		if builder.Tag == "!!null" {
+			return fmt.Errorf("builder must not be null")
+		}
+		if builder.Kind != yaml.MappingNode {
+			return nil
+		}
+		for j := 0; j+1 < len(builder.Content); j += 2 {
+			if builder.Content[j].Value == "admission" {
+				return walk(builder.Content[j+1], "builder.admission")
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -599,10 +781,15 @@ func (c *Config) applyDefaults() {
 	def(&c.Sandbox.Network.E2B.Nexthop, "169.254.0.22")
 	def(&c.Sandbox.Network.Bare.InnerIP, "169.254.1.1/31")
 	def(&c.Sandbox.Network.Bare.Nexthop, "169.254.1.0")
-	def(&c.Builder.Memory, "4GiB")
-	if c.Builder.VCPU <= 0 {
-		c.Builder.VCPU = 2
+	if c.Builder.Admission.Execution == nil {
+		defaultMax := int64(2)
+		c.Builder.Admission.Execution = &BuildAdmissionLimitConfig{MaxBuilds: &defaultMax}
 	}
+	if c.Builder.Admission.Registration == nil {
+		c.Builder.Admission.Registration = cloneBuildAdmissionLimit(c.Builder.Admission.Execution)
+	}
+	def(&c.Builder.RegistrationTTL, "1h")
+	def(&c.Builder.QueueTTL, "30m")
 	if c.Builder.PullTimeoutSec <= 0 {
 		c.Builder.PullTimeoutSec = 600
 	}
@@ -614,9 +801,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Builder.TotalTimeoutSec <= 0 {
 		c.Builder.TotalTimeoutSec = 1800
-	}
-	if c.Builder.MaxConcurrent <= 0 {
-		c.Builder.MaxConcurrent = 2
 	}
 	defBool(&c.Builder.Referer.Fallback, true)
 	defBool(&c.Builder.Referer.Writeback, true)
@@ -707,6 +891,37 @@ func (c *Config) validate() error {
 	}
 	if c.Sandbox.Network.TapFDSocket != "" && !filepath.IsAbs(c.Sandbox.Network.TapFDSocket) {
 		return fmt.Errorf("config: sandbox.network.tapfd_socket must be absolute")
+	}
+	registration, err := c.Builder.RegistrationLimit()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	execution, err := c.Builder.ExecutionLimit()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	for _, dimension := range []struct {
+		name         string
+		registration int64
+		execution    int64
+	}{
+		{"max_builds", registration.MaxBuilds, execution.MaxBuilds},
+		{"resources.cpu", registration.Resources.CPU, execution.Resources.CPU},
+		{"resources.memory", registration.Resources.Memory, execution.Resources.Memory},
+		{"resources.storage", registration.Resources.Storage, execution.Resources.Storage},
+	} {
+		if dimension.registration > 0 && dimension.execution > 0 && dimension.registration < dimension.execution {
+			return fmt.Errorf("config: builder.admission.registration.%s must be >= builder.admission.execution.%s", dimension.name, dimension.name)
+		}
+	}
+	for name, raw := range map[string]string{
+		"builder.registration_ttl": c.Builder.RegistrationTTL,
+		"builder.queue_ttl":        c.Builder.QueueTTL,
+	} {
+		duration, err := time.ParseDuration(raw)
+		if err != nil || duration <= 0 {
+			return fmt.Errorf("config: %s must be a positive duration", name)
+		}
 	}
 	if c.Builder.Referer.Enabled && c.Builder.Referer.Desc == "" {
 		return fmt.Errorf("config: builder.referer.desc is required when builder.referer.enabled=true")

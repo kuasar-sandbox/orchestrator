@@ -262,6 +262,9 @@ manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
+  resources:
+    capacity: { cpu: 2, memory: 2GiB }
+    allocatable: { cpu: 1, memory: 256MiB }
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCKET
@@ -270,15 +273,31 @@ sandbox:
     runtime: $BIN/sandbox-runtime.bundle
     overlay_diff_template: $OVL
 builder:
+  admission:
+    registration:
+      max_builds: 16
+      resources: { cpu: 32, memory: 96GiB, storage: 128GiB }
+    execution:
+      max_builds: 2
+      resources: { cpu: 4, memory: 12GiB, storage: 16GiB }
+  registration_ttl: 1h
+  queue_ttl: 30m
   insecure_registry: true
   diff_template: $BLDDIFF
-  vcpu: 1
-  memory: 1GiB
   pull_timeout_sec: 300
   step_timeout_sec: 180
   ready_timeout_sec: 60
   total_timeout_sec: 1200
 $FILES_STORAGE_YAML
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  audit_path: $WORK/resource-audit.log
+  resources:
+    physical_memory: auto
+    physical_cpu: auto
+    host_reserved: { memory: 1GiB, cpu: 0.5 }
+  admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }
 checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
@@ -297,6 +316,8 @@ req() { # method path key [body]
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method"
                 -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
     [ -n "${REQ_MMDS_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
+    [ -n "${REQ_BUILDER_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Builder: ${REQ_BUILDER_HEADER}")
+    [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -377,6 +398,23 @@ wait_running() { # sid
     echo "sandbox $sid state=$state, want running" >&2
     return 1
 }
+wait_resource_capacity() { # $1=sid, $2=expected memTotal bytes
+    local sid="$1" expected="$2" code=""
+    for _ in $(seq 1 240); do
+        code=$(req GET "/sandboxes/$sid/stats/resource" "$AK" || true)
+        if [ "$code" = "200" ] && python3 - "$WORK/resp.body" "$expected" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+assert stats.get("memTotal") == int(sys.argv[2]), stats
+PY
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "resource stats sid=$sid status=$code expected memTotal=$expected body=$(cat "$WORK/resp.body" 2>/dev/null)" >&2
+    return 1
+}
 persist_ref() {
     python3 - "$1" <<'PY'
 import base64
@@ -399,18 +437,163 @@ print(ref)
 PY
 }
 valid_persist_id() { persist_ref "$1" >/dev/null; }
+phase_sandbox_id() { # $1=phase, $2=opaque build id
+    printf 'bp-%s-%s\n' "$1" "$(printf '%s' "$2" | sha256sum | cut -c1-32)"
+}
+wait_phase_audit() { # $1=phase, $2=build id
+    local sid
+    sid=$(phase_sandbox_id "$1" "$2")
+    for _ in $(seq 1 120); do
+        if grep -Eq "admit .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null &&
+            grep -Eq "release .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    tail -100 "$WORK/resource-audit.log" >&2 2>/dev/null || true
+    return 1
+}
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
-    body="{\"name\":\"$1\"}"
-    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\"}"
+    body="{\"name\":\"$1\",\"cpuCount\":2,\"memoryMB\":6144}"
+    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":2,\"memoryMB\":6144}"
+    REQ_BUILDER_HEADER='{"resources":{"cpu":2,"memory":"6GiB","storage":"4GiB"}}'
+    REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
     code=$(req POST /v3/templates "$AK" "$body")
+    unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
     TID=$(json_field "$WORK/resp.body" templateID)
     BID=$(json_field "$WORK/resp.body" buildID)
     got_profile=$(json_field "$WORK/resp.body" profile)
     [ "$got_profile" = "$expected_profile" ] \
         || fail "register $1 profile=$got_profile (want $expected_profile)"
+}
+assert_active_build_accounting() { # $1=tid, $2=bid
+    local tid="$1" bid="$2" code="" phase="" sid="" run_id="" reservation_json=""
+    for _ in $(seq 1 240); do
+        code=$(req GET "/templates/$tid/builds/$bid/status" "$AK" || true)
+        if [ "$code" = "200" ]; then
+            read -r phase sid run_id < <(python3 - "$WORK/resp.body" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1]))
+phase = status.get("phase") or {}
+if phase.get("name") and phase.get("sandboxID") and status.get("runID"):
+    print(phase["name"], phase["sandboxID"], status["runID"])
+PY
+)
+            [ -n "$phase" ] && break
+        fi
+        sleep 0.25
+    done
+    [ -n "$phase" ] || fail "build $bid never exposed an active phase"
+
+    python3 - "$WORK/resp.body" <<'PY' || fail "active Build status resources/enforcement"
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status["resources"] == {
+    "cpuMilli": 2000,
+    "memoryBytes": 6 << 30,
+    "storageBytes": 4 << 30,
+}, status
+assert status["executionClaimed"] is True, status
+assert status["systemdEnforcement"] == "cpu,memory", status
+assert status["storageEnforcement"] == "admission-only", status
+PY
+
+    for _ in $(seq 1 120); do
+        if "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >"$WORK/phase-reservations.json" 2>/dev/null &&
+            SID="$sid" python3 - "$WORK/phase-reservations.json" <<'PY'
+import json, os, sys
+rows = json.load(open(sys.argv[1]))
+assert len(rows) == 1, rows
+row = rows[0]
+assert row["sandbox_id"] == os.environ["SID"], row
+assert row["capacity"] == {"memory_bytes": 3 << 30, "cpu_milli": 2000}, row
+assert row["floor"] == {"memory_bytes": 512 << 20, "cpu_milli": 1000}, row
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+assert row["cgroup_path"].endswith("/vmm"), row
+assert row["sandbox_ctl_pid"] > 0, row
+PY
+        then
+            reservation_json=$(cat "$WORK/phase-reservations.json")
+            break
+        fi
+        sleep 0.25
+    done
+    [ -n "$reservation_json" ] || fail "phase $phase/$sid did not become the sole precise nodectl reservation"
+
+    "$BIN/node-ctl" builder status --socket "$WORK/node-ctl.socket" >"$WORK/builder-status.json" \
+        || fail "node-ctl builder status"
+    python3 - "$WORK/builder-status.json" <<'PY' || fail "durable Builder admission status"
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status["registration"]["configured"] == {
+    "max_builds": 16,
+    "resources": {"cpu": 32000, "memory": 96 << 30, "storage": 128 << 30},
+}, status
+assert status["execution"]["configured"] == {
+    "max_builds": 2,
+    "resources": {"cpu": 4000, "memory": 12 << 30, "storage": 16 << 30},
+}, status
+# The deliberately untriggered negative-test registration and this active
+# Build both consume registration admission. Only this Build consumes execution.
+assert status["registration"]["used_builds"] == 2, status
+assert status["registration"]["used_resources"] == {
+    "cpu": 4000, "memory": 12 << 30, "storage": 8 << 30,
+}, status
+assert status["execution"]["used_builds"] == 1, status
+assert status["execution"]["used_resources"] == {
+    "cpu": 2000, "memory": 6 << 30, "storage": 4 << 30,
+}, status
+PY
+
+    local build_pid sandbox_ctl_pid vmm_path ctl_path unit_path slice_path
+    build_pid=$(cat "$WORK/run/runs/$run_id.pid")
+    sandbox_ctl_pid=$(python3 - "$WORK/phase-reservations.json" "$sid" <<'PY'
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row["sandbox_id"] == sys.argv[2]:
+        print(row["sandbox_ctl_pid"])
+        break
+PY
+)
+    vmm_path=$(python3 - "$WORK/phase-reservations.json" "$sid" <<'PY'
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row["sandbox_id"] == sys.argv[2]:
+        print(row["cgroup_path"])
+        break
+PY
+)
+    ctl_path="$(dirname "$vmm_path")/ctl"
+    unit_path=$(dirname "$vmm_path")
+    slice_path=$(dirname "$unit_path")
+    grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$build_pid/cgroup" \
+        || fail "run-builder pid $build_pid is not in its ctl subgroup"
+    grep -Eq '/sandbox-builder.slice/.+/ctl$' "/proc/$sandbox_ctl_pid/cgroup" \
+        || fail "phase sandbox-ctl pid $sandbox_ctl_pid is not in its ctl subgroup"
+    [ ! -s "$unit_path/cgroup.procs" ] || fail "builder service cgroup root has direct processes"
+    grep -qw cpu "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable cpu controller"
+    grep -qw memory "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable memory controller"
+    [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
+    [ "$(cat "$vmm_path/memory.high")" != "max" ] || fail "phase VMM did not receive controller memory.high"
+    python3 - "$unit_path" "$slice_path" <<'PY' || fail "effective per-Build/aggregate cgroup limits"
+import pathlib, sys
+
+def assert_cpu(path, milli):
+    quota, period = (path / "cpu.max").read_text().split()
+    assert quota != "max", (path, quota, period)
+    assert int(quota) * 1000 == int(period) * milli, (path, quota, period, milli)
+
+unit, pool = map(pathlib.Path, sys.argv[1:])
+assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
+assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
+assert_cpu(unit, 2000)
+assert_cpu(pool, 4000)
+PY
+    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified"
 }
 diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
@@ -666,7 +849,7 @@ B2_TID="$TID"; B2_BID="$BID"
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
-   {"type":"RUN","args":["useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["sleep 20; useradd -m -d /home/user user || adduser -D user"]},
    {"type":"RUN","args":["grep -Eq '^0::/user(/|$)' /proc/self/cgroup && test ! -s /sys/fs/cgroup/cgroup.procs && for group in user ptys socats; do test -d /sys/fs/cgroup/\$group && test -e /sys/fs/cgroup/\$group/cpu.weight && test -e /sys/fs/cgroup/\$group/memory.max && test -e /sys/fs/cgroup/\$group/io.weight || exit 1; done"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},
@@ -677,6 +860,7 @@ EOF
 )
 code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
+assert_active_build_accounting "$B2_TID" "$B2_BID"
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
@@ -694,11 +878,16 @@ grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
-python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost launch.cgroup_control=true"
+python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost phase resources or launch.cgroup_control=true"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     cfg = json.load(source)
 assert cfg["Launch"]["CgroupControl"] is True, cfg["Launch"]
+resources = cfg["Resources"]
+assert resources["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, resources
+assert resources["Allocatable"]["CPU"] == 1, resources
+assert resources["Allocatable"]["Memory"] == "512MiB", resources
+assert resources["Startup"]["Memory"] == "3GiB", resources
 PY
 B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
 [ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest:// (upload-snapshot did not rewrite?): $(cat "$WORK/b2.cfg.json")"
@@ -708,6 +897,10 @@ MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manif
 grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
 grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
 echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + manifest:// base + merged ENV/WORKDIR"
+wait_phase_audit a "$B1_BID" || fail "B1 phase A lacked ordinary nodectl Admit/Release"
+wait_phase_audit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit/Release"
+wait_phase_audit c "$B2_BID" || fail "B2 phase C lacked ordinary nodectl Admit/Release"
+echo "==> PASS: A/B/C phase sandboxes each completed ordinary nodectl Admit/Release"
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"
@@ -811,6 +1004,8 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60
 SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$SID" ] || fail "create returned no sandboxID"
 wait_running "$SID" || { diag "$B3_BID"; fail "snapshot-template sandbox did not reach running"; }
+wait_resource_capacity "$SID" "$((3 << 30))" \
+    || fail "snapshot Create did not preserve the phase-C snapshot capacity"
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code (want 200)"
 grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"
@@ -822,6 +1017,8 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B1_PERSIST\",\"timeout\":60
 E2B_COLD_SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$E2B_COLD_SID" ] || fail "e2b cold create returned no sandboxID"
 wait_running "$E2B_COLD_SID" || { diag "$B1_BID"; fail "e2b cold sandbox did not reach running"; }
+wait_resource_capacity "$E2B_COLD_SID" "$((2 << 30))" \
+    || fail "IMG Create inherited the build node's phase patch instead of target node policy"
 code=$(req DELETE "/sandboxes/$E2B_COLD_SID" "$AK"); [ "$code" = "204" ] || fail "e2b cold kill = $code (want 204)"
 echo "==> PASS: e2b image cold Create reached running and cleaned up"
 

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // --- plane stubs ---
@@ -59,7 +61,28 @@ func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, 
 	return os.ErrNotExist
 }
 
+func (s stubProvider) PostBuildPhase(_ context.Context, runID, buildID, phase, sandboxID, state string) error {
+	if runID == "br-test" && buildID == "x" && phase == "a" && sandboxID == "bp-a-x" && state == "starting" {
+		return nil
+	}
+	return os.ErrNotExist
+}
+
 type stubAdmin struct{ pairs map[string]AdminKeyInfo }
+
+type stubBuilderAdmissionAdmin struct{}
+
+func (stubBuilderAdmissionAdmin) BuilderAdmissionStatus(context.Context) (BuilderAdmissionStatus, error) {
+	available := int64(3)
+	return BuilderAdmissionStatus{
+		Registration: BuildAdmissionLevelStatus{
+			Configured: types.BuildAdmissionLimit{MaxBuilds: 4}, UsedBuilds: 1,
+			Used:      types.BuildResources{CPU: 1500, Memory: 2 << 30},
+			Available: BuildAdmissionHeadroom{MaxBuilds: &available},
+		},
+		WaitingBuilds: 1,
+	}, nil
+}
 
 func stubKeyPair(manifestKey, apiSecret string) (string, string, string) {
 	if apiSecret == "" {
@@ -185,6 +208,9 @@ func TestRunPlane(t *testing.T) {
 	if err := PostBuildResult(sock, "br-test", "x", BuildResult{ImageRef: "image"}); err != nil {
 		t.Fatalf("PostBuildResult: %v", err)
 	}
+	if err := PostBuildPhase(sock, "br-test", "x", "a", "bp-a-x", "starting"); err != nil {
+		t.Fatalf("PostBuildPhase: %v", err)
+	}
 	if _, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-missing"); err == nil {
 		t.Fatal("unknown run should fail assignment")
 	}
@@ -195,6 +221,9 @@ func TestRunPlane(t *testing.T) {
 	}
 	if err := PostBuildResult(sock, "br-test", "x", BuildResult{}); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("wrong pid build-result error = %v, want not authorized", err)
+	}
+	if err := PostBuildPhase(sock, "br-test", "x", "a", "bp-a-x", "starting"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("wrong pid build-phase error = %v, want not authorized", err)
 	}
 }
 
@@ -221,6 +250,23 @@ func TestAdminPlane(t *testing.T) {
 	}
 	if r := adminPost(t, client, AdminKeyRequest{Op: "remove", ManifestKey: req.ManifestKey, APISecret: req.APISecret}); r.Status != "removed" {
 		t.Fatalf("remove: %+v", r)
+	}
+}
+
+func TestBuilderAdmissionAdminStatus(t *testing.T) {
+	_, client := startTestServer(t, Deps{BuilderAdmissionAdmin: stubBuilderAdmissionAdmin{}})
+	code, body := rawGet(t, client, PathAdminBuilderAdmission)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", code, body)
+	}
+	var status BuilderAdmissionStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Registration.Configured.MaxBuilds != 4 || status.Registration.UsedBuilds != 1 ||
+		status.Registration.Used.CPU != 1500 || status.Registration.Available.MaxBuilds == nil ||
+		*status.Registration.Available.MaxBuilds != 3 || status.WaitingBuilds != 1 {
+		t.Fatalf("builder admission status = %+v", status)
 	}
 }
 

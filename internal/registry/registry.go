@@ -63,6 +63,7 @@ type PlaceRequest struct {
 	SandboxID           string
 	Config              map[string]string
 	Build               bool
+	BuildResources      *routesync.BuildResources
 	TargetRuntimeDigest string
 	ExcludeNodeIDs      []string
 }
@@ -1600,7 +1601,8 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	rec, _, err := r.updateNodeProfile(ctx, nr.NodeID, true, func(rec *NodeRecord) {
 		rec.Labels = nr.Labels
 		rec.Capacity = nr.Capacity
-		rec.BuildCapacity = nr.BuildCapacity
+		rec.BuildRegistrationCapacity = nr.BuildRegistrationCapacity
+		rec.BuildExecutionCapacity = nr.BuildExecutionCapacity
 		rec.DataEndpoint = nr.DataEndpoint
 		rec.RuntimeDigest = nr.RuntimeDigest
 		rec.LastHeartbeatUnix = time.Now().Unix()
@@ -1625,7 +1627,8 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	rec, found, err := r.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
 		oldDraining = rec.Draining
 		rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
-		rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
+		rec.BuildRegistrationUsage, rec.BuildExecutionUsage = hb.BuildRegistrationUsage, hb.BuildExecutionUsage
+		rec.Counts, rec.Draining = hb.Counts, hb.Draining
 		rec.LastHeartbeatUnix = time.Now().Unix()
 	})
 	if err != nil || !found {
@@ -1817,7 +1820,8 @@ func (r *Registry) clearPendingNodeListProjection(entry clusterstate.NodeListEnt
 
 func cloneNodeListProjection(entry clusterstate.NodeListEntry) clusterstate.NodeListEntry {
 	entry.Labels = cloneStringMap(entry.Labels)
-	entry.BuildCapacity = cloneBuildResources(entry.BuildCapacity)
+	entry.BuildRegistrationCapacity = cloneBuildAdmissionLimit(entry.BuildRegistrationCapacity)
+	entry.BuildExecutionCapacity = cloneBuildAdmissionLimit(entry.BuildExecutionCapacity)
 	return entry
 }
 
@@ -2069,7 +2073,6 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			if _, ok, err := r.stores.casRouteBuildShard(ctx, plan.record, plan.revision); err != nil || !ok {
 				continue
 			}
-			r.releaseBuildAdmission(nodeID, plan.record.Group, plan.record.BuildID)
 			deadBuilds++
 		}
 		if !plan.removeRef {

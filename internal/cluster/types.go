@@ -46,26 +46,28 @@ const (
 )
 
 type NodeRecord struct {
-	Meta              RecordMeta                `json:"meta"`
-	NodeID            string                    `json:"node_id"`
-	State             NodeState                 `json:"state"`
-	Labels            map[string]string         `json:"labels,omitempty"`
-	Capacity          int                       `json:"capacity,omitempty"`
-	BuildCapacity     *routesync.BuildResources `json:"build_capacity,omitempty"`
-	DataEndpoint      string                    `json:"data_endpoint,omitempty"`
-	RuntimeDigest     string                    `json:"runtime_digest,omitempty"`
-	Zone              string                    `json:"zone,omitempty"`
-	Allocated         int64                     `json:"allocated,omitempty"`
-	Pool              int64                     `json:"pool,omitempty"`
-	BuildAlloc        *routesync.BuildResources `json:"build_alloc,omitempty"`
-	Counts            int                       `json:"counts,omitempty"`
-	Draining          bool                      `json:"draining,omitempty"`
-	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
-	ResumeToken       string                    `json:"resume_token,omitempty"`
-	LinkOwner         string                    `json:"link_owner,omitempty"`
-	KeyPairs          []NodeKeyPair             `json:"key_pairs,omitempty"`
-	Sandboxes         []NodeSandboxRef          `json:"sandboxes,omitempty"`
-	Builds            []NodeBuildRef            `json:"builds,omitempty"`
+	Meta                      RecordMeta                     `json:"meta"`
+	NodeID                    string                         `json:"node_id"`
+	State                     NodeState                      `json:"state"`
+	Labels                    map[string]string              `json:"labels,omitempty"`
+	Capacity                  int                            `json:"capacity,omitempty"`
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
+	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
+	Zone                      string                         `json:"zone,omitempty"`
+	Allocated                 int64                          `json:"allocated,omitempty"`
+	Pool                      int64                          `json:"pool,omitempty"`
+	BuildRegistrationUsage    *routesync.BuildAdmissionUsage `json:"build_registration_usage,omitempty"`
+	BuildExecutionUsage       *routesync.BuildAdmissionUsage `json:"build_execution_usage,omitempty"`
+	Counts                    int                            `json:"counts,omitempty"`
+	Draining                  bool                           `json:"draining,omitempty"`
+	LastHeartbeatUnix         int64                          `json:"last_heartbeat_unix,omitempty"`
+	ResumeToken               string                         `json:"resume_token,omitempty"`
+	LinkOwner                 string                         `json:"link_owner,omitempty"`
+	KeyPairs                  []NodeKeyPair                  `json:"key_pairs,omitempty"`
+	Sandboxes                 []NodeSandboxRef               `json:"sandboxes,omitempty"`
+	Builds                    []NodeBuildRef                 `json:"builds,omitempty"`
 }
 
 // NodeKeyPair is the node_link desired lease for one tenant credential pair.
@@ -102,22 +104,24 @@ type NodeBuildRef struct {
 // NodeListEntry is the low-frequency WATCH_LIST catalog consumed by placer.
 // Liveness and high-frequency load remain authoritative at the node owner.
 type NodeListEntry struct {
-	Meta          RecordMeta                `json:"meta"`
-	SourceMeta    RecordMeta                `json:"source_meta,omitempty"`
-	NodeID        string                    `json:"node_id"`
-	Labels        map[string]string         `json:"labels,omitempty"`
-	Capacity      int                       `json:"capacity,omitempty"`
-	BuildCapacity *routesync.BuildResources `json:"build_capacity,omitempty"`
-	DataEndpoint  string                    `json:"data_endpoint,omitempty"`
-	RuntimeDigest string                    `json:"runtime_digest,omitempty"`
-	Draining      bool                      `json:"draining,omitempty"`
-	Deleted       bool                      `json:"deleted,omitempty"`
+	Meta                      RecordMeta                     `json:"meta"`
+	SourceMeta                RecordMeta                     `json:"source_meta,omitempty"`
+	NodeID                    string                         `json:"node_id"`
+	Labels                    map[string]string              `json:"labels,omitempty"`
+	Capacity                  int                            `json:"capacity,omitempty"`
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
+	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
+	Draining                  bool                           `json:"draining,omitempty"`
+	Deleted                   bool                           `json:"deleted,omitempty"`
 }
 
 func ProjectNodeList(n NodeRecord) NodeListEntry {
 	return NodeListEntry{
 		SourceMeta: n.Meta, NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
-		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity), DataEndpoint: n.DataEndpoint,
 		RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}
 }
@@ -127,6 +131,15 @@ func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources
 		return nil
 	}
 	out := *in
+	return &out
+}
+
+func cloneBuildAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
 	return &out
 }
 

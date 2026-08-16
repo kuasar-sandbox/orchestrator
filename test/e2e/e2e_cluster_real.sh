@@ -546,8 +546,6 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-  vcpu: 1
-  memory: 1GiB
 checkpoint: { mode: remote }
 EOF
     step "starting temporary standalone node-ctl for template build (:${BUILD_PORT})"
@@ -558,7 +556,7 @@ EOF
     "$BIN/node-ctl" manifest-key add --socket "$WORK/bn.sock" "$MANIFEST_KEY" >/dev/null || fail "temporary manifest-key add"
 
     local code tid bid status
-    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl"}')"
+    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl","cpuCount":1,"memoryMB":1024}')"
     [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template register returned $code"; }
     tid="$(json_field "$WORK/node-resp.body" templateID)"
     bid="$(json_field "$WORK/node-resp.body" buildID)"
@@ -777,8 +775,6 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-  vcpu: 1
-  memory: 1GiB
 checkpoint: { mode: remote }
 cluster:
   node_link: { endpoint: "127.0.0.1:$CONTROL_PORT" }

@@ -361,6 +361,20 @@ func (p *runPool) loop(ctx context.Context) {
 				delete(starting, done.runID)
 				p.log.Warn("run pool: start failed", "kind", p.kind, "run_id", done.runID, "err", done.err)
 				queueControl(runControlReq{op: "stop", runID: done.runID})
+				for len(pending) > 0 {
+					// A demand-created unit failed before a worker could call
+					// WaitAssignment. Fail the oldest task instead of holding its
+					// durable execution ownership forever while replacements loop.
+					req := pending[0]
+					pending = pending[1:]
+					if req.ctx.Err() != nil {
+						replyConsume(req, runConsumeResp{err: req.ctx.Err()})
+						continue
+					}
+					replyConsume(req, runConsumeResp{err: fmt.Errorf("run pool: start %s: %w", p.unitName(done.runID), done.err)})
+					break
+				}
+				ensure()
 			} else {
 				if st.started.IsZero() {
 					st.started = time.Now()

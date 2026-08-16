@@ -159,13 +159,19 @@ sandbox:                                          # sandbox-instance defaults
     runtime: /opt/sandbox/runtime/v1/sandbox-runtime.bundle
     # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
     overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
-builder:                                           # builds run INSIDE build sandboxes
-  max_concurrent: 2
+builder:                                           # Build resources are separate from phase sandbox.resources
+  admission:
+    registration:                                 # all non-terminal Build definitions; omitted => resolved execution
+      max_builds: 16
+      resources: { cpu: 64, memory: 256GiB, storage: 1TiB }
+    execution:                                    # concurrently executing Build units; omitted => max_builds: 2
+      max_builds: 4
+      resources: { cpu: 16, memory: 64GiB, storage: 256GiB }
+  registration_ttl: 1h                           # registered but never triggered
+  queue_ttl: 30m                                  # waiting for execution admission
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4  # build VM writable disk (pull cache + export scratch)
-  # vcpu: 2                                       # per build-sandbox capacity
-  # memory: 4GiB
-  # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
-  # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
+  # Build CPU/memory also enforce each builder service; execution aggregate CPU/memory enforce sandbox-builder.slice.
+  # storage is admission-only until a filesystem quota backend is configured in a future change.
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64
   # pull_timeout_sec: 600                         # in-guest pull+flatten | one RUN step |
@@ -203,7 +209,7 @@ builder:                                           # builds run INSIDE build san
 #   # Advanced tuning — all defaulted (node-resource.md §3.3); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
-#   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandboxes]
+#   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]
 #   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
 #   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }

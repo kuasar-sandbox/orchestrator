@@ -100,6 +100,7 @@ func (p *HTTPPlacer) placeOne(ctx context.Context, peer PlacerPeer, req PlaceReq
 		SandboxID:           req.SandboxID,
 		Config:              req.Config,
 		Build:               req.Build,
+		BuildResources:      req.BuildResources,
 		TargetRuntimeDigest: req.TargetRuntimeDigest,
 		ExcludeNodeIDs:      req.ExcludeNodeIDs,
 	})

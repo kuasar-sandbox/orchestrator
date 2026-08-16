@@ -2,11 +2,10 @@ package orch
 
 import (
 	"context"
-	"crypto/hmac"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -107,9 +106,10 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		return accept(cmd)
 	case routesync.CmdBuildRegister:
 		// Pre-provision a registry-assigned build (cluster.md): create the build
-		// record with the registry's ids + resolved key, stash the image-pull creds
-		// for this build, and report `registered` up. The e2b trigger (router-
-		// forwarded) then runs it; state flows back as build events.
+		// record with the registry's ids + resolved key, durably retain encrypted
+		// registration image-pull credentials for exact replay, and report
+		// `registered` up. The e2b trigger (router-forwarded) then runs it; state
+		// flows back as build events.
 		if err := o.registerClusterBuild(ctx, cmd); err != nil {
 			return reject(cmd, err)
 		}
@@ -122,7 +122,8 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 // ResourceProbe surfaces the node's water level for the cluster heartbeat. serve
 // sets it (an adapter over the resource controller) when resource_listen is on;
 // nil = no controller (static cgroup), then zone/water are reported as their
-// zero-load defaults and only the sandbox count + build alloc carry signal.
+// zero-load defaults and only sandbox count + durable build admission usage
+// carry load signals.
 type ResourceProbeSnapshot struct {
 	Zone      string
 	Allocated int64
@@ -139,8 +140,9 @@ func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
 
 // registerClusterBuild pre-provisions a build the registry assigned + placed here
 // (cluster.md): resolve the tenant key by the predistributed fingerprint,
-// create the build record under the registry's ids, stash the transient image-pull
-// creds, and report `registered` up the node-link.
+// create the build record under the registry's ids, protect the immutable
+// registration image-pull credentials for exact retries and restart recovery,
+// and report `registered` up the node-link.
 func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return fmt.Errorf("build_register: missing build_id / template_id")
@@ -153,6 +155,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
+	resources := cmd.BuildResources.Types()
+	if err := resources.ValidateRequired(); err != nil {
+		return fmt.Errorf("%w: build_register resources: %v", api.ErrBadRequest, err)
+	}
 	config, err := sandboxcfg.NormalizeResourceMetadata(cmd.Config)
 	if err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
@@ -161,55 +167,88 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
+	if builderOpts.Resources != nil {
+		return fmt.Errorf("%w: build_register %s.resources must be normalized into build_resources", api.ErrBadRequest, buildcfg.NsBuilder)
+	}
+	location, err := clusterstate.ObjectLocationFromMetadata(meta)
+	if err != nil {
+		return fmt.Errorf("%w: build_register cluster ownership: %v", api.ErrBadRequest, err)
+	}
+	meta = cloneStringMapWithout(meta, clusterstate.ObjectMetadataKey)
 	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
 	}
+	phaseResourcePatch := meta[sandboxcfg.NsResource]
+	if phaseResourcePatch != "" {
+		meta = cloneStringMapWithout(meta, sandboxcfg.NsResource)
+	}
+	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
+		return err
+	}
+	b := &types.Build{
+		BuildID:                  cmd.BuildID,
+		TemplateID:               cmd.TemplateRef,
+		APISecret:                pair.APISecret,
+		ManifestKey:              pair.ManifestKey,
+		Profile:                  profile,
+		Kind:                     types.KindImg,
+		Status:                   types.BuildRegistered,
+		FromImage:                o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
+		Resources:                resources,
+		RegistrationImageRepo:    cmd.ImageRepo,
+		RegistrationRegistryAuth: cmd.RegistryAuth,
+		ClusterGroup:             location.Group,
+		PhaseResourcePatch:       phaseResourcePatch,
+		Metadata:                 meta,
+		Builder:                  builderOpts,
+		CreatedUnix:              time.Now().Unix(),
+	}
+	// A tightened execution policy rejects only new registration ownership. An
+	// exact retry after an ambiguous/lost ACK must still reach the store's
+	// transactional immutable comparison and return the persisted result.
 	existing, err := o.st.GetBuild(ctx, cmd.BuildID)
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		if existing.TemplateID != cmd.TemplateRef || existing.Profile != profile ||
-			!sameRootPair(existing.APISecret, existing.ManifestKey, pair) {
-			return fmt.Errorf("build_register: build %s conflicts with existing identity", cmd.BuildID)
+	if existing == nil {
+		executionLimit, err := o.cfg.Builder.ExecutionLimit()
+		if err != nil {
+			return err
 		}
-		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
-			o.clusterBuildMu.Lock()
-			o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
-			o.clusterBuildMu.Unlock()
+		if !executionLimit.AllowsOne(resources) {
+			o.recordRegistrationRejection("execution_fit")
+			return fmt.Errorf("%w: build resources cannot fit builder.admission.execution", api.ErrBadRequest)
 		}
-		return nil
 	}
-	b := &types.Build{
-		BuildID:     cmd.BuildID,
-		TemplateID:  cmd.TemplateRef,
-		APISecret:   pair.APISecret,
-		ManifestKey: pair.ManifestKey,
-		Profile:     profile,
-		Kind:        types.KindImg,
-		Status:      types.BuildRegistered,
-		FromImage:   o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
-		Metadata:    meta,
-		Builder:     builderOpts,
-		CreatedUnix: time.Now().Unix(),
-	}
-	if err := o.st.PutBuild(ctx, b); err != nil {
+	registrationLimit, err := o.cfg.Builder.RegistrationLimit()
+	if err != nil {
 		return err
+	}
+	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, "", nil)
+	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
+		o.recordRegistrationRejection("capacity")
+		return fmt.Errorf("%w: %v", api.ErrBuildAdmission, err)
+	}
+	if errors.Is(err, store.ErrBuildRegistrationConflict) {
+		return fmt.Errorf("build_register: %w", err)
+	}
+	if err != nil {
+		return err
+	}
+	o.refreshBuildAdmissionGauges(ctx)
+	if registered.Status == types.BuildReady || registered.Status == types.BuildError {
+		return nil
 	}
 	o.clusterBuildMu.Lock()
 	o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
 	o.clusterBuildMu.Unlock()
-	o.publishBuildState(cmd.BuildID, "registered", "", "")
+	if inserted {
+		o.publishBuildState(cmd.BuildID, "registered", "", "")
+	}
 	return nil
-}
-
-func sameRootPair(apiSecret, manifestKey string, pair store.KeyPair) bool {
-	apiEqual := hmac.Equal([]byte(apiSecret), []byte(pair.APISecret))
-	manifestEqual := hmac.Equal([]byte(manifestKey), []byte(pair.ManifestKey))
-	return apiEqual && manifestEqual
 }
 
 // BuildEvents is the node-link client's source of build state transitions
@@ -224,7 +263,16 @@ func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason stri
 	cb := o.clusterBuilds[buildID]
 	o.clusterBuildMu.Unlock()
 	if cb == nil {
-		return // not a cluster-driven build
+		// The process-local entry is only a fast path. Cluster ownership is a
+		// dedicated durable Build field, so controller restart cannot suppress
+		// building/terminal events or lose registration accounting convergence.
+		build, err := o.st.GetBuild(context.Background(), buildID)
+		if err != nil || build == nil {
+			return
+		}
+		if build.ClusterGroup == "" {
+			return // direct-node build
+		}
 	}
 	ev := &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}
 	select {
@@ -238,28 +286,51 @@ func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason stri
 	}
 }
 
-// clusterBuildCreds returns a cluster build's transient image-pull creds (registry
-// auth) if it is registry-driven, so resolveBuildCreds uses them instead of the
-// node's stored registry_auth_enc (cluster.md: creds are not persisted here).
-func (o *Orchestrator) clusterBuildCreds(buildID string) (string, bool) {
-	o.clusterBuildMu.Lock()
-	defer o.clusterBuildMu.Unlock()
-	cb := o.clusterBuilds[buildID]
-	if cb == nil {
+// clusterBuildCreds returns a cluster build's image-pull credentials. The
+// process-local copy is a fast path; the encrypted immutable registration field
+// in the Build row remains authoritative across controller restart and delayed
+// registration retries. Trigger writes its separate work-order credential.
+func (o *Orchestrator) clusterBuildCreds(build *types.Build) (string, bool) {
+	if build == nil {
 		return "", false
 	}
-	return cb.registryAuth, true
+	o.clusterBuildMu.Lock()
+	cb := o.clusterBuilds[build.BuildID]
+	o.clusterBuildMu.Unlock()
+	if cb != nil {
+		return cb.registryAuth, true
+	}
+	if build.ClusterGroup == "" {
+		return "", false
+	}
+	// Registration auth is encrypted with the rest of the Build row and never
+	// enters portable template metadata. Trigger copies the resolved value into
+	// its separately encrypted work-order field without mutating this definition.
+	return build.RegistrationRegistryAuth, true
 }
 
-// Heartbeat reports the node's water level for the registry (nodelink.Node):
-// sandbox count + (when resource_listen is on) zone/allocated/pool/draining, and
-// the in-flight build resource alloc. The cluster placer (cluster-placer.md)
-// excludes draining nodes, filters by zone, and ranks by the water level / count.
+// Heartbeat reports durable registration and execution usage. The SQLite Build
+// rows are authoritative; a read failure is advertised as fully occupied so a
+// registry can never infer unsafe headroom.
 func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	o.mu.Lock()
 	count := len(o.reg)
 	o.mu.Unlock()
-	hb := &routesync.Heartbeat{Counts: count, Zone: string(nodectlZoneGreen), BuildAlloc: o.buildAlloc()}
+	hb := &routesync.Heartbeat{Counts: count, Zone: string(nodectlZoneGreen)}
+	if usage, err := o.st.BuildUsage(context.Background()); err == nil {
+		hb.BuildRegistrationUsage = &routesync.BuildAdmissionUsage{
+			Builds: usage.RegistrationBuilds, Resources: routesync.BuildResourcesFromTypes(usage.Registration),
+			Waiting: usage.WaitingBuilds, OldestWaitingUnix: usage.OldestWaitingUnix,
+		}
+		hb.BuildExecutionUsage = &routesync.BuildAdmissionUsage{
+			Builds: usage.ExecutionBuilds, Resources: routesync.BuildResourcesFromTypes(usage.Execution),
+			Waiting: usage.WaitingBuilds, OldestWaitingUnix: usage.OldestWaitingUnix,
+		}
+	} else {
+		o.log.Error("build admission usage unavailable; advertising no headroom", "err", err)
+		hb.BuildRegistrationUsage = saturatedBuildUsage()
+		hb.BuildExecutionUsage = saturatedBuildUsage()
+	}
 	if p := o.probe; p != nil {
 		snapshot := p.Snapshot()
 		hb.Zone, hb.Allocated, hb.Pool, hb.Draining = snapshot.Zone, snapshot.Allocated, snapshot.Pool, snapshot.Draining
@@ -267,51 +338,35 @@ func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	return hb
 }
 
+func saturatedBuildUsage() *routesync.BuildAdmissionUsage {
+	// Saturate every dimension, including configured-unlimited dimensions. The
+	// checked admission arithmetic treats MaxInt64 + any positive request as an
+	// overflow, so a failed durable usage read can never be mistaken for empty
+	// headroom merely because the corresponding configured limit is zero.
+	return &routesync.BuildAdmissionUsage{
+		Builds: math.MaxInt64,
+		Resources: routesync.BuildResourcesFromTypes(types.BuildResources{
+			CPU: math.MaxInt64, Memory: math.MaxInt64, Storage: math.MaxInt64,
+		}),
+	}
+}
+
 // nodectlZoneGreen is the default zone reported when no resource controller is
 // present (a static-cgroup node is never "hot" from the cluster's view).
 const nodectlZoneGreen = "green"
 
-// buildAlloc is the in-flight build resource usage: live builds × the per-build
-// pool (builder vcpu/memory + diff_template scratch). Feeds resource-aware build
-// placement (cluster-placer.md); nil when no builds are running.
-func (o *Orchestrator) buildAlloc() *routesync.BuildResources {
-	o.pendMu.Lock()
-	n := int64(len(o.pend))
-	o.pendMu.Unlock()
-	if n == 0 {
-		return nil
-	}
-	per := o.perBuildResources()
-	return &routesync.BuildResources{CPU: per.CPU * int(n), Mem: per.Mem * n, Storage: per.Storage * n}
-}
-
-// perBuildResources is one build sandbox's resource footprint from builder config.
-func (o *Orchestrator) perBuildResources() routesync.BuildResources {
-	storage := int64(0)
-	if fi, err := os.Stat(o.cfg.Builder.DiffTemplate); err == nil {
-		storage = fi.Size()
-	}
-	return routesync.BuildResources{
-		CPU:     o.cfg.Builder.VCPU * 1000, // milli-cores
-		Mem:     int64(o.cfg.Builder.MemoryMiB()) << 20,
-		Storage: storage,
-	}
-}
-
 // ClusterNodeInfo builds the static node-register fields for node-link (cluster.md
-// §5.1): max sandbox capacity (0 = unbounded), the build resource pool, and this
-// node's guest runtime digest for placement runtime matching.
-func (o *Orchestrator) ClusterNodeInfo() (capacity int, buildCap *routesync.BuildResources, runtimeDigest string) {
-	per := o.perBuildResources()
-	mc := o.cfg.Builder.MaxConcurrent
-	if mc <= 0 {
-		mc = 1
-	}
-	buildCap = &routesync.BuildResources{CPU: per.CPU * mc, Mem: per.Mem * int64(mc), Storage: per.Storage * int64(mc)}
+// §5.1): sandbox capacity, both build admission limits, and the guest runtime
+// identity used by placement.
+func (o *Orchestrator) ClusterNodeInfo() (capacity int, registration, execution *routesync.BuildAdmissionLimit, runtimeDigest string) {
+	registrationLimit, _ := o.cfg.Builder.RegistrationLimit()
+	executionLimit, _ := o.cfg.Builder.ExecutionLimit()
+	registration = routesync.BuildAdmissionLimitFromTypes(registrationLimit)
+	execution = routesync.BuildAdmissionLimitFromTypes(executionLimit)
 	if dig, err := sha256File(o.runtimeFileFor(types.ProfileE2B)); err == nil {
 		runtimeDigest = dig
 	}
-	return o.cfg.Sandbox.Capacity, buildCap, runtimeDigest
+	return o.cfg.Sandbox.Capacity, registration, execution, runtimeDigest
 }
 
 // SetLifecycleContext sets the common admission lifetime for standalone,
@@ -379,6 +434,10 @@ func clusterCommandRejection(err error) (int, string) {
 	switch {
 	case errors.Is(err, api.ErrBadRequest):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, api.ErrBuildAdmission):
+		return http.StatusTooManyRequests, api.ErrBuildAdmission.Error()
+	case errors.Is(err, store.ErrBuildRegistrationConflict):
+		return http.StatusConflict, store.ErrBuildRegistrationConflict.Error()
 	case errors.Is(err, migrationtoken.ErrMalformedToken),
 		errors.Is(err, migrationtoken.ErrInvalidPayload):
 		return http.StatusBadRequest, "invalid migration token"

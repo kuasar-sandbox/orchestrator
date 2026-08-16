@@ -760,49 +760,15 @@ func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
 	if err := reg.nodeOwner.PutKeyPair(ctx, "n1", pair); err != nil {
 		t.Fatalf("PutKeyPair: %v", err)
 	}
-	if !reg.nodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1}) {
-		t.Fatal("AdmitBuild returned false")
-	}
 	if err := reg.nodeOwner.DeleteSandbox(ctx, "n1", "sb1", pair.APISecretFingerprint); err != nil {
 		t.Fatalf("DeleteSandbox: %v", err)
 	}
-	reg.nodeOwner.ReleaseBuild(ctx, "n1", "b1")
 
 	if len(remote.keys) != 1 || remote.keys[0] != "n1/"+pair.APISecretFingerprint {
 		t.Fatalf("remote keys=%v", remote.keys)
 	}
-	if len(remote.admitted) != 1 || remote.admitted[0] != "n1/b1" {
-		t.Fatalf("remote admitted=%v", remote.admitted)
-	}
 	if len(remote.deleted) != 1 || remote.deleted[0] != "n1/sb1" {
 		t.Fatalf("remote deleted=%v", remote.deleted)
-	}
-	if len(remote.released) != 1 || remote.released[0] != "n1/b1" {
-		t.Fatalf("remote released=%v", remote.released)
-	}
-}
-
-func TestRoutingNodeOwnerReleasesBuildFromEveryPossibleAdmittingOwner(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LinkOwner: "new-owner"}); err != nil {
-		t.Fatal(err)
-	}
-	oldOwner := &routingNodeOwnerRecorder{}
-	newOwner := &routingNodeOwnerRecorder{}
-	reg.SetRemoteNodeOwners(map[string]NodeOwner{
-		"old-owner": oldOwner,
-		"new-owner": newOwner,
-	})
-
-	reg.nodeOwner.ReleaseBuild(ctx, "n1", "b1")
-	for name, owner := range map[string]*routingNodeOwnerRecorder{
-		"old": oldOwner,
-		"new": newOwner,
-	} {
-		if len(owner.released) != 1 || owner.released[0] != "n1/b1" {
-			t.Fatalf("%s owner releases=%v, want n1/b1", name, owner.released)
-		}
 	}
 }
 
@@ -813,8 +779,8 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	nodeID := nodeNotOwnedBy(t, view, "a")
 	if err := cluster["b"].PutNode(ctx, &NodeRecord{
 		NodeID: nodeID, LinkOwner: "remote", Capacity: 10,
-		BuildCapacity: &routesync.BuildResources{CPU: 1000},
-		DataEndpoint:  "127.0.0.1:12345",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 1000}},
+		DataEndpoint:              "127.0.0.1:12345",
 	}); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -834,12 +800,6 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 	remote := &routingNodeOwnerRecorder{allow: true}
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": remote})
-	if !reg.nodeOwner.AdmitBuild(ctx, nodeID, "b1", &routesync.BuildResources{CPU: 1}) {
-		t.Fatal("routed AdmitBuild returned false")
-	}
-	if len(remote.admitted) != 1 || remote.admitted[0] != nodeID+"/b1" {
-		t.Fatalf("remote admitted=%v", remote.admitted)
-	}
 }
 
 func TestRoutingNodeOwnerProbesShardOwnerWhenProfileReadFails(t *testing.T) {

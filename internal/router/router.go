@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
@@ -34,6 +35,7 @@ import (
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -42,6 +44,7 @@ const (
 	HeaderGroup       = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderResource    = "X-Kuasar-Sandbox-Resource"
+	HeaderBuilder     = "X-Kuasar-Sandbox-Builder"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
 	HeaderCheckpoint  = "X-Kuasar-Sandbox-Checkpoint"
@@ -512,11 +515,12 @@ type buildReserveResult struct {
 	Profile      types.Profile `json:"profile"`
 }
 
-// handleBuildRegister reserves + pre-provisions a build via the registry (which
-// assigns the ids, resource-aware-places it, RESERVES the node's build pool, and
-// sends build_register with the image-pull creds, §7.5), then synthesizes the e2b
-// register response from the registry's ids — it does NOT forward the register to
-// the node (the node already holds the build).
+// handleBuildRegister asks the registry to assign identities and choose an
+// eligible node from configured registration capacity. The registry may use
+// its node-owner's latest usage as a hint, but the selected node atomically
+// performs the authoritative durable admission when it handles build_register.
+// The router synthesizes the e2b response from those assigned ids; it does not
+// send a second register request to the node.
 func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
@@ -530,14 +534,23 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		Name       string            `json:"name"`
 		Tags       []string          `json:"tags"`
 		Profile    string            `json:"profile"`
-		CPUCount   int               `json:"cpuCount"`
-		CPUCountSn int               `json:"cpu_count"`
-		MemoryMB   int               `json:"memoryMB"`
-		MemoryMBSn int               `json:"memory_mb"`
+		CPUCount   json.RawMessage   `json:"cpuCount"`
+		CPUCountSn json.RawMessage   `json:"cpu_count"`
+		MemoryMB   json.RawMessage   `json:"memoryMB"`
+		MemoryMBSn json.RawMessage   `json:"memory_mb"`
 		Metadata   map[string]string `json:"metadata"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	rawBody, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+	if err != nil || len(rawBody) > 1<<20 {
 		http.Error(w, "bad body", http.StatusBadRequest)
+		return
+	}
+	if trimmed := bytes.TrimSpace(rawBody); len(trimmed) == 0 || trimmed[0] != '{' {
+		http.Error(w, "bad body: request body must be a JSON object", http.StatusBadRequest)
+		return
+	}
+	if err := strictjson.DecodeAllowUnknown(rawBody, &body); err != nil {
+		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	profile := types.ProfileE2B
@@ -549,30 +562,65 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cpuCount, memoryMB := body.CPUCount, body.MemoryMB
-	if cpuCount == 0 {
-		cpuCount = body.CPUCountSn
-	}
-	if memoryMB == 0 {
-		memoryMB = body.MemoryMBSn
-	}
-	var resourceMetadata map[string]string
-	if raw, present := body.Metadata[sandboxcfg.NsResource]; present {
-		resourceMetadata = map[string]string{sandboxcfg.NsResource: raw}
-	}
-	resourceMetadata, err := mergeResourceHeader(resourceMetadata, r.Header)
-	if err == nil {
-		resourceMetadata, err = sandboxcfg.ApplyCapacity(resourceMetadata, cpuCount, memoryMB)
-	}
+	metadata, err := mergeResourceHeader(body.Metadata, r.Header)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var resources *buildResources
-	if cpuCount > 0 || memoryMB > 0 {
-		resources = &buildResources{CPU: cpuCount * 1000, Mem: int64(memoryMB) << 20}
+	if values, present := r.Header[http.CanonicalHeaderKey(HeaderBuilder)]; present {
+		if len(values) != 1 {
+			http.Error(w, HeaderBuilder+" must appear exactly once", http.StatusBadRequest)
+			return
+		}
+		// Preserve whole-namespace header precedence while still rejecting an
+		// invalid lower-priority Builder definition instead of hiding it.
+		if _, supplied := metadata[buildcfg.NsBuilder]; supplied {
+			if _, _, err := buildcfg.Extract(metadata); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata[buildcfg.NsBuilder] = values[0]
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, resourceMetadata)
+	metadata, builderOpts, err := buildcfg.Extract(metadata)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	bodyResources, err := buildcfg.ParseFirstClassResourceJSON(body.CPUCount, body.CPUCountSn, body.MemoryMB, body.MemoryMBSn)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	headerResources := buildcfg.ResourcePatch{}
+	if builderOpts.Resources != nil {
+		headerResources = buildcfg.PatchFromResources(*builderOpts.Resources)
+	}
+	mergedResources, err := buildcfg.MergeResourcePatches(bodyResources, headerResources)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	canonicalResources, err := buildcfg.ResolveResources(mergedResources)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	builderOpts.Resources = nil
+	if builderJSON, marshalErr := buildcfg.Marshal(builderOpts); marshalErr != nil {
+		http.Error(w, marshalErr.Error(), http.StatusBadRequest)
+		return
+	} else if builderJSON != "{}" {
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata[buildcfg.NsBuilder] = builderJSON
+	}
+	resources := &buildResources{CPU: canonicalResources.CPU, Memory: canonicalResources.Memory, Storage: canonicalResources.Storage}
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, metadata)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -592,8 +640,8 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 
 // buildResources mirrors routesync.BuildResources for the control request body.
 type buildResources struct {
-	CPU     int   `json:"cpu,omitempty"`
-	Mem     int64 `json:"mem,omitempty"`
+	CPU     int64 `json:"cpu,omitempty"`
+	Memory  int64 `json:"memory,omitempty"`
 	Storage int64 `json:"storage,omitempty"`
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,11 @@ type recordingNodeOwner struct {
 	ackErr       error
 	commands     []*routesync.Command
 	deleted      []string
+	runtime      map[string]*NodeRecord
+}
+
+func testWireBuildResources() *routesync.BuildResources {
+	return &routesync.BuildResources{CPU: 2000, Memory: 2 << 30}
 }
 
 func (a *recordingNodeOwner) Connected(context.Context, string) error { return a.connectedErr }
@@ -46,6 +52,10 @@ func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID s
 }
 
 func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	if a.runtime != nil {
+		node, found := a.runtime[nodeID]
+		return node, found, nil
+	}
 	return &NodeRecord{NodeID: nodeID}, true, nil
 }
 
@@ -77,7 +87,7 @@ func buildAckConn(reg *Registry, nodeID string) *fakeConn {
 	}}
 }
 
-func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
+func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
@@ -86,20 +96,15 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	admitter := &recordingNodeOwner{allow: true}
 	reg.SetNodeOwner(admitter)
 
-	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileBare, Resources: &routesync.BuildResources{CPU: 2000}})
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileBare, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatalf("reserve build: %v", err)
-	}
-	wantLease := buildAdmissionID("/g", res.BuildID)
-	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+wantLease {
-		t.Fatalf("admitted=%v, want n1/%q", admitter.admitted, wantLease)
 	}
 	if res.Profile != types.ProfileBare || len(admitter.commands) != 1 || admitter.commands[0].Profile != string(types.ProfileBare) {
 		t.Fatalf("profile did not reach build_register: result=%q commands=%+v", res.Profile, admitter.commands)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
-	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+wantLease {
-		t.Fatalf("released=%v, want n1/%q", admitter.released, wantLease)
+	if got := admitter.commands[0].BuildResources; got == nil || got.CPU != 2000 || got.Memory != 2<<30 {
+		t.Fatalf("build resources did not reach node authority: %+v", got)
 	}
 }
 
@@ -114,25 +119,6 @@ func TestReserveBuildRejectsRuntimeOwnedResourceBeforePlacement(t *testing.T) {
 	}
 }
 
-func TestBuildAdmissionIsNodeScoped(t *testing.T) {
-	m := newBuildAdmissionManager()
-	cap := &routesync.BuildResources{CPU: 1000}
-	want := &routesync.BuildResources{CPU: 1000}
-	if !m.admit("n1", "same-build", cap, want) || !m.admit("n2", "same-build", cap, want) {
-		t.Fatal("same build id on different nodes should have independent admission")
-	}
-	if m.admit("n1", "other-build", cap, want) || m.admit("n2", "other-build", cap, want) {
-		t.Fatal("node-local capacity was not enforced")
-	}
-	m.release("n1", "same-build")
-	if !m.admit("n1", "other-build", cap, want) {
-		t.Fatal("releasing n1 did not free n1 capacity")
-	}
-	if m.admit("n2", "other-build", cap, want) {
-		t.Fatal("releasing n1 incorrectly freed n2 capacity")
-	}
-}
-
 func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -141,7 +127,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	reg.SetNodeOwner(owner)
 
 	const buildID = "shared-build"
-	first, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g1", BuildID: buildID, Profile: types.ProfileE2B})
+	first, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g1", BuildID: buildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatalf("first reserve: %v", err)
 	}
@@ -149,7 +135,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 		t.Fatalf("first placement=%+v", first)
 	}
 	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)})
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B}); !errors.Is(err, errNodeBuildIDConflict) {
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()}); !errors.Is(err, errNodeBuildIDConflict) {
 		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
 	}
 
@@ -159,13 +145,6 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	}
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", buildID); err != nil || found {
 		t.Fatalf("conflicting build record remained: found=%v err=%v", found, err)
-	}
-	wantReleased := []string{
-		"n1/" + buildAdmissionID("/g1", buildID),
-		"n1/" + buildAdmissionID("/g2", buildID),
-	}
-	if len(owner.released) != len(wantReleased) || owner.released[0] != wantReleased[0] || owner.released[1] != wantReleased[1] {
-		t.Fatalf("released=%q, want %q", owner.released, wantReleased)
 	}
 }
 
@@ -245,32 +224,49 @@ func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 	}
 }
 
-func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
+func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
 	owner := &recordingNodeOwner{allow: true, ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
 
-	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+	req := BuildReserveReq{
 		Group: "/g", BuildID: "bld-fixed", TemplateID: "transient-fixed", Profile: types.ProfileE2B,
-		Resources: &routesync.BuildResources{CPU: 2000},
-	})
-	if err != nil {
-		t.Fatalf("reserve build should return the committed build on ack timeout: %v", err)
+		Resources: testWireBuildResources(), Metadata: map[string]string{"kuasar-sandbox.launch": `{}`},
 	}
-	if res.BuildID != "bld-fixed" || res.TemplateID != "transient-fixed" || res.NodeID != "n1" {
-		t.Fatalf("reserve result=%+v", res)
+	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
+		t.Fatalf("ack timeout result=%+v err=%v, want ambiguous error", res, err)
 	}
 	rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed")
 	if err != nil || !found {
 		t.Fatalf("build record found=%v err=%v", found, err)
 	}
-	if rec.State != BuildRegistered || rec.TemplateID != "transient-fixed" {
+	if rec.State != BuildStarting || rec.TemplateID != "transient-fixed" {
 		t.Fatalf("build record after timeout=%+v", rec)
 	}
-	if len(owner.released) != 0 {
-		t.Fatalf("ack timeout should not release an ambiguous build admission: %v", owner.released)
+	if rec.RegistrationImageRepo != "repo" || rec.RegistrationRegistryAuth != "auth-json" {
+		t.Fatalf("ambiguous registration lost its replay envelope: %+v", rec)
+	}
+	if _, found := reg.ResolveBuild(ctx, "/g", "bld-fixed"); found {
+		t.Fatal("ambiguous build became routable before durable node acceptance")
+	}
+	owner.ackErr = nil
+	res, err := reg.ReserveBuild(ctx, req)
+	if err != nil || res == nil || res.BuildID != "bld-fixed" || res.TemplateID != "transient-fixed" || res.NodeID != "n1" {
+		t.Fatalf("same-node retry result=%+v err=%v", res, err)
+	}
+	if len(owner.commands) != 2 || owner.commands[0].BuildID != owner.commands[1].BuildID ||
+		owner.commands[0].TemplateRef != owner.commands[1].TemplateRef ||
+		owner.commands[0].Config["kuasar-sandbox.launch"] != owner.commands[1].Config["kuasar-sandbox.launch"] ||
+		owner.commands[0].ImageRepo != owner.commands[1].ImageRepo ||
+		owner.commands[0].RegistryAuth != owner.commands[1].RegistryAuth {
+		t.Fatalf("retry did not replay the exact registration: %+v", owner.commands)
+	}
+	accepted, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed")
+	if err != nil || !found || accepted.State != BuildRegistered ||
+		accepted.RegistrationImageRepo != "" || accepted.RegistrationRegistryAuth != "" {
+		t.Fatalf("accepted registration retained transient credentials: build=%+v found=%v err=%v", accepted, found, err)
 	}
 }
 
@@ -286,28 +282,34 @@ func TestReserveBuildKeepsCommittedBuildAfterAmbiguousCommandError(t *testing.T)
 	owner := &recordingNodeOwner{allow: true, ackErr: ackErr}
 	reg.SetNodeOwner(owner)
 
-	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileE2B})
-	if err != nil {
-		t.Fatalf("ReserveBuild: %v", err)
+	req := BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
+	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
+		t.Fatalf("ambiguous ReserveBuild result=%+v err=%v", res, err)
 	}
-	if res == nil || res.BuildID != "bld-fixed" || res.NodeID != "n1" {
-		t.Fatalf("ReserveBuild result=%+v", res)
+	if placements != 1 || len(owner.commands) != 1 {
+		t.Fatalf("ambiguous build changed placement: placements=%d commands=%d", placements, len(owner.commands))
 	}
-	if placements != 1 || len(owner.admitted) != 1 {
-		t.Fatalf("ambiguous build was retried: placements=%d admitted=%v", placements, owner.admitted)
+	if rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed"); err != nil || !found || rec.State != BuildStarting {
+		t.Fatalf("build record=%+v found=%v err=%v, want pinned STARTING", rec, found, err)
 	}
-	if rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed"); err != nil || !found || rec.State != BuildRegistered {
-		t.Fatalf("build record=%+v found=%v err=%v, want committed REGISTERED", rec, found, err)
+	owner.ackErr = nil
+	res, err := reg.ReserveBuild(ctx, req)
+	if err != nil || res == nil || res.NodeID != "n1" || placements != 1 || len(owner.commands) != 2 {
+		t.Fatalf("stable build replay result=%+v err=%v placements=%d commands=%d", res, err, placements, len(owner.commands))
 	}
-	if len(owner.released) != 0 {
-		t.Fatalf("ambiguous build admission was released: %v", owner.released)
-	}
-	res, err = reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileE2B})
-	if err != nil || res == nil || res.NodeID != "n1" || placements != 1 || len(owner.admitted) != 1 {
-		t.Fatalf("stable build replay result=%+v err=%v placements=%d admitted=%v", res, err, placements, owner.admitted)
-	}
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileBare}); err == nil {
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileBare, Resources: testWireBuildResources()}); err == nil {
 		t.Fatal("stable build replay accepted a different profile")
+	}
+	differentResources := testWireBuildResources()
+	differentResources.Memory++
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileE2B, Resources: differentResources}); err == nil {
+		t.Fatal("stable build replay accepted different resources")
+	}
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", BuildID: "bld-fixed", Profile: types.ProfileE2B,
+		Resources: testWireBuildResources(), Metadata: map[string]string{"kuasar-sandbox.launch": `{"pid_namespace":"private"}`},
+	}); err == nil {
+		t.Fatal("stable build replay accepted different phase metadata")
 	}
 }
 
@@ -326,7 +328,7 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 	}))
 	for _, nodeID := range []string{"stale", "live"} {
 		if err := reg.stores.PutNode(ctx, &NodeRecord{
-			NodeID: nodeID, BuildCapacity: &routesync.BuildResources{CPU: 2000},
+			NodeID: nodeID, BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -334,13 +336,60 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 	reg.addNode(buildAckConn(reg, "live"))
 
 	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
-		Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 1000},
+		Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
 	})
 	if err != nil {
 		t.Fatalf("ReserveBuild: %v", err)
 	}
 	if res.NodeID != "live" || !sawExclusion {
 		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
+	}
+}
+
+func TestReserveBuildFiltersByHolderRegistrationHeadroom(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	var sawFullExclusion bool
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		for _, nodeID := range req.ExcludeNodeIDs {
+			if nodeID == "full" {
+				sawFullExclusion = true
+				return &Placement{NodeID: "free", APISecretFingerprint: testAPIFingerprint}, nil
+			}
+		}
+		return &Placement{NodeID: "full", APISecretFingerprint: testAPIFingerprint}, nil
+	}))
+	owner := &recordingNodeOwner{runtime: map[string]*NodeRecord{
+		"full": {
+			NodeID: "full",
+			BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+				MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 2000, Memory: 2 << 30},
+			},
+			BuildRegistrationUsage: &routesync.BuildAdmissionUsage{
+				Builds: 1, Resources: &routesync.BuildResources{CPU: 2000, Memory: 2 << 30},
+			},
+		},
+		"free": {
+			NodeID: "free",
+			BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+				MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 2000, Memory: 2 << 30},
+			},
+			BuildRegistrationUsage: &routesync.BuildAdmissionUsage{},
+		},
+	}}
+	reg.SetNodeOwner(owner)
+
+	result, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NodeID != "free" || !sawFullExclusion {
+		t.Fatalf("result=%+v saw full exclusion=%v", result, sawFullExclusion)
+	}
+	if len(owner.commands) != 1 || owner.commands[0].BuildID != result.BuildID {
+		t.Fatalf("commands after headroom filtering = %+v", owner.commands)
 	}
 }
 
@@ -355,11 +404,11 @@ func TestReserveBuildDoesNotExcludeOnConnectionCheckError(t *testing.T) {
 	owner := &recordingNodeOwner{allow: true, connectedErr: checkErr}
 	reg.SetNodeOwner(owner)
 
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B}); !errors.Is(err, checkErr) {
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources()}); !errors.Is(err, checkErr) {
 		t.Fatalf("ReserveBuild err=%v, want connection check error", err)
 	}
-	if placements != 1 || len(owner.admitted) != 0 {
-		t.Fatalf("connection check error retried/admitted: placements=%d admitted=%v", placements, owner.admitted)
+	if placements != 1 || len(owner.commands) != 0 {
+		t.Fatalf("connection check error retried/dispatched: placements=%d commands=%d", placements, len(owner.commands))
 	}
 }
 
@@ -367,22 +416,16 @@ func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{
-		NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000},
+		NodeID: "n1", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if node, found, err := reg.localNodeOwner.Runtime(ctx, "n1"); !errors.Is(err, ErrNodeGone) || found || node != nil {
 		t.Fatalf("disconnected Runtime node=%+v found=%v err=%v", node, found, err)
 	}
-	if reg.localNodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
-		t.Fatal("disconnected node was admitted for build")
-	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
 	if node, found, err := reg.localNodeOwner.Runtime(ctx, "n1"); err != nil || !found || node == nil {
 		t.Fatalf("connected Runtime node=%+v found=%v err=%v", node, found, err)
-	}
-	if !reg.localNodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
-		t.Fatal("connected node was not admitted for build")
 	}
 }
 
@@ -409,57 +452,11 @@ func TestLocalNodeOwnerConnectedDoesNotRequireProfile(t *testing.T) {
 	}
 }
 
-// TestReserveBuildResourceAware drives the §7.5 core: a build reserves its node's
-// build pool IMMEDIATELY (RESERVED occupies), a second build that would
-// oversubscribe is refused, and a terminal build event releases the pool.
-func TestReserveBuildResourceAware(t *testing.T) {
-	ctx := context.Background()
+func TestReserveBuildRequiresCanonicalResources(t *testing.T) {
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
-	// n1 has a 2-core build pool.
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000, Mem: 8 << 30, Storage: 100 << 30}})
-	reg.addNode(buildAckConn(reg, "n1"))
-
-	// First build (1.5 cores) fits + is committed RESERVED on n1.
-	r1, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 1500}})
-	if err != nil || r1.NodeID != "n1" || r1.BuildID == "" {
-		t.Fatalf("first build: %+v err=%v", r1, err)
-	}
-	if rec, found, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); !found || rec.State != BuildRegistered || !rec.occupies() {
-		t.Fatalf("first build not RESERVED in BuildStore: %+v found=%v", rec, found)
-	}
-
-	// Second build (1.5 cores) would oversubscribe (1.5+1.5 > 2.0) → refused now,
-	// before any heartbeat — RESERVED occupies immediately (the user's invariant).
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 1500}}); err != ErrNoNode {
-		t.Fatalf("oversubscribing build should be refused (ErrNoNode), got %v", err)
-	}
-
-	// The first build finishes → releases the pool → a second build now fits.
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, State: "ready", TemplateID: "e2b-img-x"})
-	if rec, _, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); rec.occupies() {
-		t.Fatal("a ready build should not occupy the pool")
-	}
-	if r3, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 1500}}); err != nil || r3.NodeID != "n1" {
-		t.Fatalf("after release, build should fit: %+v err=%v", r3, err)
-	}
-}
-
-// TestReserveBuildDefaultResources: an unspecified request uses the default pool
-// footprint (cluster.md "不指定则使用默认").
-func TestReserveBuildDefaultResources(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}) // no declared build pool → unconstrained
-	reg.addNode(buildAckConn(reg, "n1"))
-	r1, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B})
-	if err != nil || r1.BuildID == "" || r1.TemplateID == "" {
-		t.Fatalf("default-resources build: %+v err=%v", r1, err)
-	}
-	rec, found, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID)
-	if !found || rec.Resources == nil || rec.Resources.CPU != defaultBuildResources.CPU {
-		t.Fatalf("default resources not applied: %+v", rec)
+	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{Group: "/g", Profile: types.ProfileE2B})
+	if err == nil || !strings.Contains(err.Error(), "resources are required") {
+		t.Fatalf("missing resources error = %v", err)
 	}
 }
 
@@ -471,7 +468,7 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 
 	if err := stores.PutBuild(ctx, &BuildRecord{
 		Group: "/g", BuildID: "bld-1", NodeID: "n1", Profile: types.ProfileBare, State: BuildRegistered,
-		Resources: &routesync.BuildResources{CPU: 1000}, CreatedU: 123,
+		Resources: testWireBuildResources(), CreatedU: 123,
 	}); err != nil {
 		t.Fatalf("PutBuild: %v", err)
 	}
@@ -493,26 +490,30 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 	}
 
 	got, found, err := stores.GetBuildInGroup(ctx, "/g", "bld-1")
-	if err != nil || !found || got.Profile != types.ProfileBare || got.Resources == nil || got.Resources.CPU != 1000 || got.CreatedU != 123 {
+	if err != nil || !found || got.Profile != types.ProfileBare || got.Resources == nil || got.Resources.CPU != 2000 || got.CreatedU != 123 {
 		t.Fatalf("GetBuildInGroup=%+v found=%v err=%v", got, found, err)
 	}
 }
 
-func TestReserveBuildReleasesAdmissionOnDefinitiveSendFailure(t *testing.T) {
+func TestReserveBuildPinsConnectionLossToSameNode(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1", err: ErrNodeGone})
+	req := BuildReserveReq{Group: "/g", BuildID: "bld-fixed", TemplateID: "transient-fixed", Profile: types.ProfileE2B, Resources: testWireBuildResources()}
 
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000}}); err == nil {
-		t.Fatal("first build should fail when the node is gone")
+	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
+		t.Fatalf("connection loss result=%+v err=%v, want pinned ambiguity", res, err)
+	}
+	if rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", req.BuildID); err != nil || !found || rec.State != BuildStarting || rec.NodeID != "n1" {
+		t.Fatalf("pinned record=%+v found=%v err=%v", rec, found, err)
 	}
 
 	reg.addNode(buildAckConn(reg, "n1"))
-	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000}})
+	res, err := reg.ReserveBuild(ctx, req)
 	if err != nil || res.NodeID != "n1" {
-		t.Fatalf("admission lease was not released after definitive send failure: res=%+v err=%v", res, err)
+		t.Fatalf("same-node retry after reconnect: res=%+v err=%v", res, err)
 	}
 }
 
@@ -520,27 +521,40 @@ func TestReserveBuildReleasesAdmissionOnRejectedAck(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reject := true
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdBuildRegister {
 			return
 		}
-		status, reason := routesync.AckAccepted, ""
+		status, reason, httpStatus := routesync.AckAccepted, "", 0
 		if reject {
-			status, reason = routesync.AckRejected, "no budget"
+			status, reason, httpStatus = routesync.AckRejected, "no budget", http.StatusTooManyRequests
 		}
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason})
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus})
 	}})
 
-	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000}}); err == nil {
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources()}); err == nil {
 		t.Fatal("rejected build_register should fail")
 	} else if fmt.Sprint(err) == "" {
 		t.Fatal("expected non-empty rejection error")
 	}
 	reject = false
-	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: &routesync.BuildResources{CPU: 2000}})
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources()})
 	if err != nil || res.NodeID != "n1" {
 		t.Fatalf("admission lease was not released after rejected ack: res=%+v err=%v", res, err)
+	}
+}
+
+func TestBuildRegistrationConflictIsDefinitive(t *testing.T) {
+	if !definitiveBuildRegistrationRejection(&routesync.CmdAck{
+		Status: routesync.AckRejected, HTTPStatus: http.StatusConflict,
+	}) {
+		t.Fatal("immutable node conflict was treated as ambiguous")
+	}
+	if definitiveBuildRegistrationRejection(&routesync.CmdAck{
+		Status: routesync.AckRejected, HTTPStatus: http.StatusInternalServerError,
+	}) {
+		t.Fatal("node internal error was treated as definitive")
 	}
 }

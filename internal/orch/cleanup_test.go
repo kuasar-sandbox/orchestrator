@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
@@ -19,6 +21,7 @@ type orderedCleanupLauncher struct {
 	resetCalls atomic.Int32
 	stopErr    error
 	resetErr   error
+	resources  launcher.ResourceProperties
 }
 
 func (*orderedCleanupLauncher) Start(context.Context, string) error { return nil }
@@ -38,7 +41,14 @@ func (*orderedCleanupLauncher) List(context.Context, string) ([]launcher.Unit, e
 	return nil, nil
 }
 func (*orderedCleanupLauncher) Reload(context.Context) error { return nil }
-func (*orderedCleanupLauncher) Close() error                 { return nil }
+func (l *orderedCleanupLauncher) SetResources(_ context.Context, _ string, p launcher.ResourceProperties) error {
+	l.resources = p
+	return nil
+}
+func (l *orderedCleanupLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
+	return l.resources, nil
+}
+func (*orderedCleanupLauncher) Close() error { return nil }
 
 type orderedCleanupVS struct {
 	detachCalls atomic.Int32
@@ -55,6 +65,78 @@ func (v *orderedCleanupVS) Detach(context.Context, string) error {
 	return nil
 }
 func (*orderedCleanupVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
+
+type serializedBuildCleanupVS struct {
+	detachStarted chan struct{}
+	allowDetach   chan struct{}
+	attachStarted chan struct{}
+}
+
+func (v *serializedBuildCleanupVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	close(v.attachStarted)
+	return &vswitch.Port{Port: "18"}, nil
+}
+func (v *serializedBuildCleanupVS) Detach(context.Context, string) error {
+	close(v.detachStarted)
+	<-v.allowDetach
+	return nil
+}
+func (*serializedBuildCleanupVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
+
+func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
+	o := testOrch(t)
+	vs := &serializedBuildCleanupVS{
+		detachStarted: make(chan struct{}),
+		allowDetach:   make(chan struct{}),
+		attachStarted: make(chan struct{}),
+	}
+	o.vs = vs
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000208")
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, t.TempDir(), true)
+	}()
+	<-vs.detachStarted
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"})
+		attachDone <- err
+	}()
+
+	select {
+	case <-vs.attachStarted:
+		t.Fatal("new connector allocation crossed detach-to-durable-clear fence")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(vs.allowDetach)
+	select {
+	case err := <-cleanupDone:
+		if err != nil {
+			t.Fatalf("cleanupBuildRuntime: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("build cleanup did not finish")
+	}
+	select {
+	case <-vs.attachStarted:
+	case <-time.After(time.Second):
+		t.Fatal("connector allocation did not resume after durable clear")
+	}
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RuntimeVswitchPort != "" {
+		t.Fatalf("new allocation began before runtime ownership cleared: %+v", stored)
+	}
+	if err := <-attachDone; err != nil {
+		t.Fatalf("attachNetwork: %v", err)
+	}
+}
 
 func TestLaunchCleanupRetriesInOwnershipOrder(t *testing.T) {
 	stopErr := errors.New("injected stop failure")

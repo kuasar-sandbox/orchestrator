@@ -101,12 +101,18 @@ sandbox:
 # isolation): image pull and step execution happen in microVMs booted from the
 # same guest runtime; only artifact relay and the final uploads run on the host.
 builder:
-  max_concurrent: 2
+  admission:
+    registration:                                 # all non-terminal Build definitions; omitted => resolved execution
+      max_builds: 16
+      resources: { cpu: 64, memory: 256GiB, storage: 1TiB }
+    execution:                                    # concurrently executing Build units; omitted => max_builds: 2
+      max_builds: 4
+      resources: { cpu: 16, memory: 64GiB, storage: 256GiB }
+  registration_ttl: 1h
+  queue_ttl: 30m
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4
-  # vcpu: 2
-  # memory: 4GiB
-  # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
-  # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
+  # Build CPU/memory enforce each builder service and sandbox-builder.slice.
+  # storage participates in admission only (no V1 filesystem hard quota).
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64
   # pull_timeout_sec: 600
@@ -140,7 +146,7 @@ builder:
 #   # Advanced tuning — all defaulted (node-resource.md §3.3); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
-#   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]
+#   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]
 #   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
 #   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }

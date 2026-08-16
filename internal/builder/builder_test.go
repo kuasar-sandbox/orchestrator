@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +19,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
@@ -65,6 +70,84 @@ func TestValidateBuildProfile(t *testing.T) {
 				t.Fatalf("validateBuildProfile() = %q, %v; want %q, error=%t", got, err, tt.want, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestRunPhaseReportsBeforeWorkAndAfterTeardown(t *testing.T) {
+	var events []string
+	p := &buildPipeline{
+		spec: &configsock.BuildSpec{BuildID: "build-observable"},
+		report: func(phase, sid, state string) error {
+			events = append(events, phase+":"+sid+":"+state)
+			return nil
+		},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := p.runPhase("a", func() error {
+		events = append(events, "work")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantSID := phaseSandboxID("a", p.spec.BuildID)
+	want := []string{"a:" + wantSID + ":starting", "work", "a:" + wantSID + ":finished"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("phase events = %#v, want %#v", events, want)
+	}
+}
+
+func TestRunPhaseFailsClosedWhenStartingReportFails(t *testing.T) {
+	wantErr := errors.New("controller unavailable")
+	workRan := false
+	p := &buildPipeline{
+		spec:   &configsock.BuildSpec{BuildID: "build-fail-closed"},
+		report: func(_, _, _ string) error { return wantErr },
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	err := p.runPhase("a", func() error { workRan = true; return nil })
+	if !errors.Is(err, wantErr) || workRan {
+		t.Fatalf("runPhase = %v, workRan=%v", err, workRan)
+	}
+}
+
+func TestRunPhaseFailsClosedUntilVMMCgroupIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "cgroup.events")
+	if err := os.WriteFile(eventsPath, []byte("populated 1\nfrozen 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	vmmCgroup, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmmCgroup.Close()
+
+	var states []string
+	p := &buildPipeline{
+		spec:      &configsock.BuildSpec{BuildID: "build-cgroup-fence"},
+		vmmCgroup: vmmCgroup,
+		report: func(_, _, state string) error {
+			states = append(states, state)
+			return nil
+		},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := p.runPhase("a", func() error { return nil }); err == nil || !strings.Contains(err.Error(), "still populated") {
+		t.Fatalf("runPhase with live VMM processes = %v", err)
+	}
+	if want := []string{"starting", "failed"}; !reflect.DeepEqual(states, want) {
+		t.Fatalf("states with live VMM processes = %v, want %v", states, want)
+	}
+
+	if err := os.WriteFile(eventsPath, []byte("populated 0\nfrozen 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	states = nil
+	if err := p.runPhase("b", func() error { return nil }); err != nil {
+		t.Fatalf("runPhase after VMM cleanup: %v", err)
+	}
+	if want := []string{"starting", "finished"}; !reflect.DeepEqual(states, want) {
+		t.Fatalf("states after VMM cleanup = %v, want %v", states, want)
 	}
 }
 
@@ -332,6 +415,54 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 	if templateLaunch["cgroup_control"] != true ||
 		!reflect.DeepEqual(templateLaunch["args"], []string{"-port", "49983"}) {
 		t.Fatalf("MMDS template launch = %#v", templateLaunch)
+	}
+}
+
+func TestEveryPhaseYAMLUsesTheCompleteResolvedSandboxResources(t *testing.T) {
+	deflate := true
+	resources := rtconfig.ResourcesConfig{
+		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
+		Allocatable: rtconfig.AllocatableConfig{
+			CPU: 1.5, Memory: "256MiB", DeflateOnOOM: &deflate,
+		},
+		Startup:  &rtconfig.StartupConfig{Memory: "8GiB"},
+		Overhead: &rtconfig.OverheadConfig{Memory: "32MiB"},
+		Control:  rtconfig.ControlConfig{Controller: "/run/sandbox-resource.sock"},
+	}
+	p := &buildPipeline{spec: &configsock.BuildSpec{Resources: resources}}
+	phaseA, err := p.importYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	phaseB := p.stepsYAML()
+	phaseC, err := p.templateYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for phase, doc := range map[string]map[string]any{"a": phaseA, "b": phaseB, "c": phaseC} {
+		got, ok := doc["resources"].(rtconfig.ResourcesConfig)
+		if !ok || !reflect.DeepEqual(got, resources) {
+			t.Fatalf("phase %s resources = %#v, want %#v", phase, doc["resources"], resources)
+		}
+	}
+}
+
+func TestPhaseSandboxIDsUseCompleteOpaqueBuildIdentity(t *testing.T) {
+	first := phaseSandboxID("a", "same-prefix-build-one")
+	second := phaseSandboxID("a", "same-prefix-build-two")
+	if first == second {
+		t.Fatalf("distinct Build IDs produced the same phase Sandbox ID %q", first)
+	}
+	if first == phaseSandboxID("b", "same-prefix-build-one") {
+		t.Fatalf("distinct phases produced the same Sandbox ID %q", first)
+	}
+	for _, sid := range []string{first, second} {
+		if !types.ValidLocalSandboxID(sid) {
+			t.Fatalf("phase Sandbox ID %q is not node-local safe", sid)
+		}
+	}
+	if got, want := phaseSandboxID("a", "same-prefix-build-one"), first; got != want {
+		t.Fatalf("phase Sandbox ID is not deterministic: got %q want %q", got, want)
 	}
 }
 

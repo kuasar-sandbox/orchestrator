@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -178,10 +181,7 @@ func (s *Store) InsertBuildWithMMDSRouteSecretValues(ctx context.Context, build 
 		return fmt.Errorf("store: insert build %s: %w", build.BuildID, err)
 	}
 	inserted, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: insert build %s: %w", build.BuildID, err)
-	}
-	if inserted == 0 {
+	if err != nil || inserted != 1 {
 		return fmt.Errorf("store: insert build %s: build already exists", build.BuildID)
 	}
 	if err := s.insertInitialMMDSRouteSecretValuesTx(ctx, tx, MMDSRouteSecretOwnerBuild, build.BuildID, routesDigest, values); err != nil {
@@ -191,6 +191,141 @@ func (s *Store) InsertBuildWithMMDSRouteSecretValues(ctx context.Context, build 
 		return fmt.Errorf("store: insert build %s: %w", build.BuildID, err)
 	}
 	return nil
+}
+
+var (
+	ErrBuildRegistrationConflict = errors.New("build registration conflicts with existing immutable definition")
+	ErrBuildRegistrationCapacity = errors.New("build registration admission capacity exceeded")
+)
+
+// RegisterBuildWithMMDSRouteSecretValues atomically checks registration
+// headroom, inserts the complete immutable Build definition, and creates its
+// optional confidential MMDS values. An exact BuildID replay returns the
+// original row without consuming capacity again.
+func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, limit types.BuildAdmissionLimit, routesDigest string, values MMDSRouteSecretValues) (*types.Build, bool, error) {
+	args, err := s.prepareBuildWrite(build)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := build.Resources.ValidateRequired(); err != nil {
+		return nil, false, fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	defer tx.Rollback()
+	existing, err := scanBuildTx(s, tx.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE build_id=?`, build.BuildID))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("store: register build %s lookup: %w", build.BuildID, err)
+	}
+	if err == nil {
+		sameMMDS, compareErr := s.sameInitialBuildMMDSRouteSecretValuesTx(ctx, tx, build.BuildID, routesDigest, values)
+		if compareErr != nil {
+			return nil, false, compareErr
+		}
+		if !sameImmutableBuild(existing, build) || !sameMMDS {
+			return nil, false, fmt.Errorf("%w: %s", ErrBuildRegistrationConflict, build.BuildID)
+		}
+		return existing, false, nil
+	}
+	// Limits govern new ownership only. An exact retry of an existing durable
+	// definition must return its original result even if operator configuration
+	// was tightened after the first ACCEPTED response (or that response was
+	// lost). The immutable comparison above still rejects a different request.
+	if !limit.AllowsOne(build.Resources) {
+		return nil, false, fmt.Errorf("%w: build %s cannot fit configured registration limits", ErrBuildRegistrationCapacity, build.BuildID)
+	}
+
+	// INSERT ... SELECT evaluates the aggregate predicates while holding the
+	// SQLite writer lock. Concurrent registrations therefore cannot both pass a
+	// stale pre-check and oversubscribe the durable ledger.
+	insertSelect := strings.Replace(buildInsertSQL, "\n\tVALUES (", "\n\tSELECT ", 1)
+	insertSelect = strings.TrimSuffix(insertSelect, ")") + `
+	WHERE (?=0 OR (SELECT COUNT(*) FROM builds WHERE status NOT IN (?,?)) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_cpu) FROM builds WHERE status NOT IN (?,?)),0) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_memory) FROM builds WHERE status NOT IN (?,?)),0) <= ?)
+	  AND (?=0 OR COALESCE((SELECT SUM(resources_storage) FROM builds WHERE status NOT IN (?,?)),0) <= ?)`
+	headroom := func(configured, requested int64) int64 {
+		if configured == 0 {
+			return 0
+		}
+		return configured - requested
+	}
+	args = append(args,
+		limit.MaxBuilds, string(types.BuildReady), string(types.BuildError), headroom(limit.MaxBuilds, 1),
+		limit.Resources.CPU, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.CPU, build.Resources.CPU),
+		limit.Resources.Memory, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.Memory, build.Resources.Memory),
+		limit.Resources.Storage, string(types.BuildReady), string(types.BuildError), headroom(limit.Resources.Storage, build.Resources.Storage),
+	)
+	result, err := tx.ExecContext(ctx, insertSelect, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	if inserted == 0 {
+		return nil, false, fmt.Errorf("%w: build %s", ErrBuildRegistrationCapacity, build.BuildID)
+	}
+	if err := s.insertInitialMMDSRouteSecretValuesTx(ctx, tx, MMDSRouteSecretOwnerBuild, build.BuildID, routesDigest, values); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	return build, true, nil
+}
+
+func (s *Store) sameInitialBuildMMDSRouteSecretValuesTx(ctx context.Context, tx *sql.Tx, buildID, routesDigest string, values MMDSRouteSecretValues) (bool, error) {
+	var storedDigest string
+	var revision int64
+	var ciphertext string
+	err := tx.QueryRowContext(ctx, `SELECT routes_digest,revision,ciphertext FROM build_mmds_route_secret_values WHERE build_id=?`, buildID).
+		Scan(&storedDigest, &revision, &ciphertext)
+	if errors.Is(err, sql.ErrNoRows) {
+		return len(values) == 0, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: compare build %s initial MMDS values: %w", buildID, err)
+	}
+	if storedDigest != routesDigest || len(values) == 0 {
+		return false, nil
+	}
+	stored, err := s.decryptMMDSRouteSecretValues(MMDSRouteSecretOwnerBuild, buildID, storedDigest, revision, ciphertext)
+	if err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(stored, values), nil
+}
+
+func scanBuildTx(s *Store, row *sql.Row) (*types.Build, error) { return s.scanBuild(row) }
+
+func sameImmutableBuild(a, b *types.Build) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	// Trigger and finalization intentionally mutate kind, work-order fields,
+	// names/aliases, and status. A delayed retry of the original registration
+	// must therefore compare only the registration-owned definition. These
+	// fields remain immutable for the lifetime of the Build row.
+	return a.BuildID == b.BuildID && a.TemplateID == b.TemplateID && a.Profile == b.Profile &&
+		a.Resources == b.Resources && a.ClusterGroup == b.ClusterGroup &&
+		a.RegistrationImageRepo == b.RegistrationImageRepo &&
+		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
+		a.PhaseResourcePatch == b.PhaseResourcePatch && equalEmptyCollections(a.Metadata, b.Metadata) &&
+		reflect.DeepEqual(a.Builder, b.Builder) &&
+		hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
+}
+
+func equalEmptyCollections(a, b any) bool {
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	if av.IsValid() && bv.IsValid() && (av.Kind() == reflect.Map || av.Kind() == reflect.Slice) &&
+		av.Kind() == bv.Kind() && av.Len() == 0 && bv.Len() == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 type rawMMDSRouteSecretRow struct {
@@ -332,17 +467,29 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 			}
 		}
 	}
-	args, err := s.prepareBuildWrite(&terminal)
-	if err != nil {
-		return err
+	if terminal.Status != types.BuildReady && terminal.Status != types.BuildError {
+		return fmt.Errorf("store: finish build %s: status %s is not terminal", build.BuildID, terminal.Status)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, buildUpsertSQL, args...); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE builds SET
+		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id=?,
+		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
+		execution_claimed_unix=0,phase='',phase_sandbox_id='',
+		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc=''
+		WHERE build_id=? AND status=? AND execution_claimed=1`,
+		terminal.PersistID, string(terminal.Kind), terminal.StartCmd, terminal.ReadyCmd,
+		string(terminal.Status), terminal.Reason, terminal.RunID, mjs(terminal.Names), mjs(terminal.Aliases),
+		mj(terminal.Metadata), terminal.BuildID, string(types.BuildBuilding))
+	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return fmt.Errorf("store: finish build %s: execution ownership lost", build.BuildID)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM build_mmds_route_secret_values WHERE build_id=?`, build.BuildID); err != nil {
 		return fmt.Errorf("store: finish build %s MMDS cleanup: %w", build.BuildID, err)

@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -60,6 +61,7 @@ type Orchestrator struct {
 
 	launches    launchGroup            // sole process-local owner of create and resume attempts
 	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
 	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
 	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
 
@@ -83,6 +85,11 @@ type Orchestrator struct {
 
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
+	// networkAllocationMu serializes connector allocation with the Build-only
+	// detach -> durable ownership clear sequence. A detached-but-not-cleared
+	// port blocks new allocations so a crash/retry cannot detach a reused slot.
+	networkAllocationMu       sync.Mutex
+	detachedBuildPortsPending map[string]struct{}
 
 	runnerPool     *runPool
 	builderRunPool *runPool
@@ -112,7 +119,16 @@ type Orchestrator struct {
 	mmdsBuildOwners map[string]string
 	// Parsed once from conductor-owned mmds.services. Values are absolute Unix
 	// socket paths and never come from proxy.yaml or a tenant document.
-	mmdsServices mmdssvc.Registry
+	mmdsServices   mmdssvc.Registry
+	buildAdmission buildAdmissionObservability
+	mx             *metrics.M
+}
+
+// DrainBuilds prevents new execution work and waits for every claimed or
+// recovered Build goroutine to finish cleanup/persistence while dependencies
+// remain open.
+func (o *Orchestrator) DrainBuilds(ctx context.Context) error {
+	return o.buildOps.Drain(ctx)
 }
 
 // clusterBuild is a registry-driven build's transient image-pull context. Cluster
@@ -126,18 +142,19 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 	mmdsServices, _ := mmdssvc.BuildRegistry(cfg.MMDS.ServiceEndpoints())
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		sandboxReadyTimeout: 60 * time.Second,
-		reg:                 map[string]*types.Sandbox{},
-		lifecycleCtx:        context.Background(),
-		deadlineIntents:     map[string]struct{}{},
-		subs:                map[int]chan routesync.Event{},
-		routeFP:             uuid.NewString(),
-		pend:                map[string]*pendingBuild{},
-		clusterBuilds:       map[string]*clusterBuild{},
-		buildEvents:         make(chan *routesync.BuildEvent, 64),
-		mmdsBuildOwners:     map[string]string{},
-		mmdsServices:        mmdsServices,
-		commitBuildTrigger:  st.CommitBuildTrigger,
+		sandboxReadyTimeout:       60 * time.Second,
+		reg:                       map[string]*types.Sandbox{},
+		lifecycleCtx:              context.Background(),
+		deadlineIntents:           map[string]struct{}{},
+		subs:                      map[int]chan routesync.Event{},
+		routeFP:                   uuid.NewString(),
+		pend:                      map[string]*pendingBuild{},
+		detachedBuildPortsPending: map[string]struct{}{},
+		clusterBuilds:             map[string]*clusterBuild{},
+		buildEvents:               make(chan *routesync.BuildEvent, 64),
+		mmdsBuildOwners:           map[string]string{},
+		mmdsServices:              mmdsServices,
+		commitBuildTrigger:        st.CommitBuildTrigger,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -1677,6 +1694,11 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	if err != nil {
 		return nil, fmt.Errorf("orch: inner_ip %q: %w", network.InnerIP, err)
 	}
+	o.networkAllocationMu.Lock()
+	defer o.networkAllocationMu.Unlock()
+	if len(o.detachedBuildPortsPending) != 0 {
+		return nil, fmt.Errorf("orch: network allocation blocked while detached build ownership awaits durable cleanup")
+	}
 	return o.vs.Attach(ctx, vswitch.AttachReq{
 		InnerIP:          ip.String(),
 		TransitGatewayIP: network.TransitGatewayIP,
@@ -1891,7 +1913,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		_ = o.lc.Stop(ctx, u.Name)
 		_ = o.lc.ResetFailed(ctx, u.Name)
 	}
-	return nil
+	return o.reconcileBuilds(ctx)
 }
 
 func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
@@ -1904,11 +1926,20 @@ func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
 		return true
 	}
 	for _, u := range units {
-		if u.Name == unit && (u.ActiveState == "active" || u.ActiveState == "activating") {
+		if u.Name == unit && builderUnitMayHaveProcesses(u.ActiveState) {
 			return true
 		}
 	}
 	return false
+}
+
+func builderUnitMayHaveProcesses(state string) bool {
+	switch state {
+	case "active", "activating", "reloading", "deactivating":
+		return true
+	default:
+		return false
+	}
 }
 
 // --- helpers ---

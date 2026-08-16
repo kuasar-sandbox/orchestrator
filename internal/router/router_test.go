@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -888,6 +889,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
 	var reserveProfiles []string
 	var reserveResource string
+	var reserveBuildResources routesync.BuildResources
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/templates"):
@@ -920,6 +922,10 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 			reserveProfiles = append(reserveProfiles, profile)
 			if metadata, ok := body["metadata"].(map[string]any); ok {
 				reserveResource, _ = metadata[sandboxcfg.NsResource].(string)
+			}
+			if resources, ok := body["resources"].(map[string]any); ok {
+				reserveBuildResources.CPU = int64(resources["cpu"].(float64))
+				reserveBuildResources.Memory = int64(resources["memory"].(float64))
 			}
 			_ = json.NewEncoder(w).Encode(buildReserveResult{
 				BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost, Profile: types.ProfileE2B,
@@ -960,6 +966,21 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	if negativeResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
 		t.Fatalf("negative capacity status=%d reserveProfiles=%v", negativeResp.StatusCode, reserveProfiles)
 	}
+	hiddenInvalidReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
+		`{"cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.builder":"{\"future\":true}"}}`,
+	))
+	hiddenInvalidReq.Host = "api.test.local"
+	hiddenInvalidReq.Header.Set(HeaderGroup, "/g")
+	hiddenInvalidReq.Header.Set(HeaderAPIKey, "e2b_test")
+	hiddenInvalidReq.Header.Set(HeaderBuilder, `{"resources":{"cpu":4,"memory":"8GiB"}}`)
+	hiddenInvalidResp, err := http.DefaultClient.Do(hiddenInvalidReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hiddenInvalidResp.Body.Close()
+	if hiddenInvalidResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+		t.Fatalf("hidden invalid Builder status=%d reserveProfiles=%v", hiddenInvalidResp.StatusCode, reserveProfiles)
+	}
 
 	// register a build via the router (control plane: Host api.<domain> + group).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
@@ -982,8 +1003,11 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
 		t.Fatalf("register result=%+v reserveProfiles=%v", reg, reserveProfiles)
 	}
-	if want := `{"capacity":{"cpu":4,"memory":"8192MiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`; reserveResource != want {
+	if want := `{"capacity":{"memory":"4GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`; reserveResource != want {
 		t.Fatalf("cluster build resource = %s, want %s", reserveResource, want)
+	}
+	if reserveBuildResources.CPU != 4000 || reserveBuildResources.Memory != 8192<<20 {
+		t.Fatalf("cluster build resources = %+v", reserveBuildResources)
 	}
 
 	// a trigger for b1 (no group header) must route to the recorded node.

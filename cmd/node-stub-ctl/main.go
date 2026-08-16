@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -107,9 +109,12 @@ func runServe(args []string, log *slog.Logger) error {
 	adminListen := fs.String("admin-listen", "127.0.0.1:0", "admin API listen address")
 	dataListen := fs.String("data-listen", "127.0.0.1:0", "data-plane stub listen address")
 	capacity := fs.Int("capacity", 100, "sandbox capacity per node")
-	buildCPU := fs.Int("build-cpu", 4000, "build CPU capacity in milli-cores")
-	buildMem := fs.Int64("build-mem-bytes", 4<<30, "build memory capacity in bytes")
-	buildStorage := fs.Int64("build-storage-bytes", 0, "build storage capacity in bytes")
+	registrationBuildCPU := fs.Int("registration-build-cpu", 4000, "registration Build CPU capacity in milli-cores")
+	registrationBuildMem := fs.Int64("registration-build-mem-bytes", 4<<30, "registration Build memory capacity in bytes")
+	registrationBuildStorage := fs.Int64("registration-build-storage-bytes", 0, "registration Build storage capacity in bytes")
+	executionBuildCPU := fs.Int("execution-build-cpu", 4000, "execution Build CPU capacity in milli-cores")
+	executionBuildMem := fs.Int64("execution-build-mem-bytes", 4<<30, "execution Build memory capacity in bytes")
+	executionBuildStorage := fs.Int64("execution-build-storage-bytes", 0, "execution Build storage capacity in bytes")
 	heartbeat := fs.Duration("heartbeat", time.Second, "node heartbeat interval")
 	runtimeDigest := fs.String("runtime-digest", "runtime-stub", "runtime digest reported by each node")
 	strictKeys := fs.Bool("strict-keys", true, "reject builds when the referenced key is not installed; creates always require inline API secret material")
@@ -168,12 +173,17 @@ func runServe(args []string, log *slog.Logger) error {
 			labels["slot"] = strconv.Itoa(i)
 		}
 		node := newStubNode(stubNodeOptions{
-			ID:                fmt.Sprintf("%s-%d", *prefix, i),
-			NodeLink:          *nodeLink,
-			DataEndpoint:      svc.dataEndpoint,
-			Labels:            labels,
-			Capacity:          *capacity,
-			BuildCapacity:     &routesync.BuildResources{CPU: *buildCPU, Mem: *buildMem, Storage: *buildStorage},
+			ID:           fmt.Sprintf("%s-%d", *prefix, i),
+			NodeLink:     *nodeLink,
+			DataEndpoint: svc.dataEndpoint,
+			Labels:       labels,
+			Capacity:     *capacity,
+			BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{
+				CPU: int64(*registrationBuildCPU), Memory: *registrationBuildMem, Storage: *registrationBuildStorage,
+			}},
+			BuildExecutionCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{
+				CPU: int64(*executionBuildCPU), Memory: *executionBuildMem, Storage: *executionBuildStorage,
+			}},
 			RuntimeDigest:     *runtimeDigest,
 			StrictKeys:        *strictKeys,
 			HeartbeatInterval: *heartbeat,
@@ -627,17 +637,18 @@ func (s *service) findSandbox(sid string) (*stubNode, *stubSandbox) {
 }
 
 type stubNodeOptions struct {
-	ID                string
-	NodeLink          string
-	DataEndpoint      string
-	Labels            map[string]string
-	Capacity          int
-	BuildCapacity     *routesync.BuildResources
-	RuntimeDigest     string
-	StrictKeys        bool
-	HeartbeatInterval time.Duration
-	CreateDelay       time.Duration
-	BuildDelay        time.Duration
+	ID                        string
+	NodeLink                  string
+	DataEndpoint              string
+	Labels                    map[string]string
+	Capacity                  int
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit
+	RuntimeDigest             string
+	StrictKeys                bool
+	HeartbeatInterval         time.Duration
+	CreateDelay               time.Duration
+	BuildDelay                time.Duration
 }
 
 type stubNode struct {
@@ -696,7 +707,9 @@ func (n *stubNode) start(parent context.Context) {
 	n.session++
 	identity := routesync.NodeRegister{
 		NodeID: n.ID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
-		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		DataEndpoint:              n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
 	}
 	n.mu.Unlock()
 
@@ -1091,31 +1104,62 @@ func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
-		return ack(cmd, routesync.AckRejected, "build_id and template_ref are required")
+		return ackHTTP(cmd, routesync.AckRejected, "build_id and template_ref are required", http.StatusBadRequest)
 	}
 	if !types.Profile(cmd.Profile).Valid() {
-		return ack(cmd, routesync.AckRejected, "valid profile is required")
+		return ackHTTP(cmd, routesync.AckRejected, "valid profile is required", http.StatusBadRequest)
+	}
+	resources := cmd.BuildResources.Types()
+	if err := resources.ValidateRequired(); err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
 	}
 	if n.StrictKeys && !n.hasKeyPair(cmd.APISecretFingerprint) {
-		return ack(cmd, routesync.AckRejected, "credential pair not installed")
+		return ackHTTP(cmd, routesync.AckRejected, "credential pair not installed", http.StatusBadRequest)
 	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
 	if beh.BuildResult == "reject" {
-		return ack(cmd, routesync.AckRejected, "stub build rejected")
+		return ackHTTP(cmd, routesync.AckRejected, "stub build rejected", http.StatusTooManyRequests)
 	}
 	b := &stubBuild{
 		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
+		RegistrationImageRepo: cmd.ImageRepo, RegistrationRegistryAuth: cmd.RegistryAuth,
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
-		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.APISecretFingerprint != b.APISecretFingerprint
+		conflict := !sameStubBuildRegistration(existing, b)
 		n.mu.Unlock()
 		if conflict {
-			return ack(cmd, routesync.AckRejected, "build identity conflicts with existing build")
+			return ackHTTP(cmd, routesync.AckRejected, "build immutable definition conflicts with existing build", http.StatusConflict)
 		}
 		return ack(cmd, routesync.AckAccepted, "")
+	}
+	if !stubAdmissionLimit(n.BuildExecutionCapacity).AllowsOne(resources) {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "build resources cannot fit execution admission", http.StatusBadRequest)
+	}
+	var usedBuilds int64
+	var used types.BuildResources
+	for _, existing := range n.builds {
+		if existing.State != "registered" && existing.State != "building" {
+			continue
+		}
+		if usedBuilds == math.MaxInt64 {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "registration admission usage overflow", http.StatusTooManyRequests)
+		}
+		usedBuilds++
+		var err error
+		used, err = used.Add(existing.Resources.Types())
+		if err != nil {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "registration admission usage overflow", http.StatusTooManyRequests)
+		}
+	}
+	if !stubAdmissionLimit(n.BuildRegistrationCapacity).AllowsAdd(usedBuilds, used, resources) {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "registration admission capacity exceeded", http.StatusTooManyRequests)
 	}
 	n.builds[b.BuildID] = b
 	n.mu.Unlock()
@@ -1134,11 +1178,34 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 	return ack(cmd, routesync.AckAccepted, "")
 }
 
+func sameStubBuildRegistration(a, b *stubBuild) bool {
+	if a == nil || b == nil || a.Resources == nil || b.Resources == nil {
+		return false
+	}
+	return a.Profile == b.Profile && a.TemplateID == b.TemplateID &&
+		a.APISecretFingerprint == b.APISecretFingerprint && *a.Resources == *b.Resources &&
+		maps.Equal(a.Metadata, b.Metadata) && a.RegistrationImageRepo == b.RegistrationImageRepo &&
+		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth))
+}
+
+func stubAdmissionLimit(limit *routesync.BuildAdmissionLimit) types.BuildAdmissionLimit {
+	if limit == nil {
+		return types.BuildAdmissionLimit{}
+	}
+	out := types.BuildAdmissionLimit{MaxBuilds: limit.MaxBuilds}
+	if limit.Resources != nil {
+		out.Resources = limit.Resources.Types()
+	}
+	return out
+}
+
 func (n *stubNode) Heartbeat() *routesync.Heartbeat {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	var counts int
-	var alloc routesync.BuildResources
+	var registration, execution routesync.BuildAdmissionUsage
+	registration.Resources = &routesync.BuildResources{}
+	execution.Resources = &routesync.BuildResources{}
 	for _, sb := range n.sandboxes {
 		if sb.State == routesync.StateRunning || sb.State == routesync.StatePaused || sb.State == "creating" {
 			counts++
@@ -1146,11 +1213,17 @@ func (n *stubNode) Heartbeat() *routesync.Heartbeat {
 	}
 	for _, b := range n.builds {
 		if b.State == "registered" || b.State == "building" {
-			addBuildResources(&alloc, b.Resources)
+			registration.Builds++
+			addBuildResourcesFailClosed(registration.Resources, b.Resources)
+		}
+		if b.State == "building" {
+			execution.Builds++
+			addBuildResourcesFailClosed(execution.Resources, b.Resources)
 		}
 	}
 	zone := n.Labels["zone"]
-	return &routesync.Heartbeat{Zone: zone, Counts: counts, Draining: n.draining, BuildAlloc: &alloc}
+	return &routesync.Heartbeat{Zone: zone, Counts: counts, Draining: n.draining,
+		BuildRegistrationUsage: &registration, BuildExecutionUsage: &execution}
 }
 
 func (n *stubNode) BuildEvents() <-chan *routesync.BuildEvent { return n.buildEvents }
@@ -1575,16 +1648,18 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
-	BuildID              string                    `json:"build_id"`
-	Profile              string                    `json:"profile"`
-	APISecretFingerprint string                    `json:"-"`
-	Metadata             map[string]string         `json:"metadata,omitempty"`
-	State                string                    `json:"state"`
-	TemplateID           string                    `json:"template_id,omitempty"`
-	Reason               string                    `json:"reason,omitempty"`
-	Resources            *routesync.BuildResources `json:"resources,omitempty"`
-	Behavior             stubBehavior              `json:"behavior,omitempty"`
-	CreatedAt            string                    `json:"created_at,omitempty"`
+	BuildID                  string                    `json:"build_id"`
+	Profile                  string                    `json:"profile"`
+	APISecretFingerprint     string                    `json:"-"`
+	Metadata                 map[string]string         `json:"metadata,omitempty"`
+	State                    string                    `json:"state"`
+	TemplateID               string                    `json:"template_id,omitempty"`
+	Reason                   string                    `json:"reason,omitempty"`
+	Resources                *routesync.BuildResources `json:"resources,omitempty"`
+	RegistrationImageRepo    string                    `json:"-"`
+	RegistrationRegistryAuth string                    `json:"-"`
+	Behavior                 stubBehavior              `json:"behavior,omitempty"`
+	CreatedAt                string                    `json:"created_at,omitempty"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
@@ -1841,6 +1916,10 @@ func ack(cmd *routesync.Command, status, reason string) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason}
 }
 
+func ackHTTP(cmd *routesync.Command, status, reason string, httpStatus int) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus}
+}
+
 func sidFromHost(host string) string {
 	left := host
 	if i := strings.IndexByte(left, '.'); i >= 0 {
@@ -1904,13 +1983,29 @@ func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources
 	return &cp
 }
 
-func addBuildResources(dst *routesync.BuildResources, src *routesync.BuildResources) {
+func cloneBuildAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
+}
+
+func addBuildResourcesFailClosed(dst *routesync.BuildResources, src *routesync.BuildResources) {
 	if src == nil {
 		return
 	}
-	dst.CPU += src.CPU
-	dst.Mem += src.Mem
-	dst.Storage += src.Storage
+	next, err := dst.Types().Add(src.Types())
+	if err != nil {
+		// The stub feeds the same placement path as a real node. Never let a
+		// malformed test fixture or arithmetic wrap advertise false headroom.
+		dst.CPU = math.MaxInt64
+		dst.Memory = math.MaxInt64
+		dst.Storage = math.MaxInt64
+		return
+	}
+	*dst = *routesync.BuildResourcesFromTypes(next)
 }
 
 func randHex(n int) string {

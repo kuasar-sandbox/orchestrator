@@ -66,6 +66,11 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if err := lockPidfile(*pidfile); err != nil {
 		return err
 	}
+	vmmCgroup, err := prepareBuilderCgroup(*runID)
+	if err != nil {
+		return fmt.Errorf("prepare builder cgroup: %w", err)
+	}
+	defer vmmCgroup.Close()
 	bid, err := configsock.WaitAssignment(context.Background(), *socket, "build", *runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
@@ -88,7 +93,10 @@ func runBuilder(args []string, log *slog.Logger) error {
 		}
 	}
 
-	res := builder.Run(spec, log)
+	reportPhase := func(phase, sandboxID, state string) error {
+		return configsock.PostBuildPhase(*socket, *runID, bid, phase, sandboxID, state)
+	}
+	res := builder.Run(spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,

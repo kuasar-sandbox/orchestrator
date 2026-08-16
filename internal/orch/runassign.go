@@ -54,3 +54,21 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 		return fmt.Errorf("build %s result already posted", buildID)
 	}
 }
+
+func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error {
+	o.pendMu.Lock()
+	pend := o.pend[buildID]
+	o.pendMu.Unlock()
+	if pend == nil {
+		return fmt.Errorf("unknown build %s", buildID)
+	}
+	if pend.build.RunID != runID {
+		return fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID)
+	}
+	if err := o.st.SetBuildPhase(ctx, buildID, phase, sandboxID, state); err != nil {
+		return err
+	}
+	o.log.Info("build phase", "bid", buildID, "run_id", runID, "phase", phase,
+		"sandbox_id", sandboxID, "state", state)
+	return nil
+}

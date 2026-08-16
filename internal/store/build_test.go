@@ -62,9 +62,7 @@ func buildTriggerCandidate(base *types.Build, label string) *types.Build {
 	candidate.ReadyCmd = "ready-" + label
 	candidate.Steps = []types.TemplateStep{{Type: "RUN", Args: []string{"steps-" + label}, Force: true}}
 	candidate.Metadata = map[string]string{"metadata": label}
-	candidate.Builder = types.BuildOptions{Referer: &types.BuildRefererOptions{
-		Enabled: &disabled,
-	}}
+	candidate.Builder = types.BuildOptions{Referer: &types.BuildRefererOptions{Enabled: &disabled}}
 	candidate.Status = types.BuildWaiting
 	return &candidate
 }
@@ -77,8 +75,6 @@ func applyTriggerWorkOrder(dst, src *types.Build) {
 	dst.StartCmd = src.StartCmd
 	dst.ReadyCmd = src.ReadyCmd
 	dst.Steps = src.Steps
-	dst.Metadata = src.Metadata
-	dst.Builder = src.Builder
 	dst.Status = types.BuildWaiting
 }
 

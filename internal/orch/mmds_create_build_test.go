@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +71,7 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 	header := `{"secrets":{"key":"build-initial"}}`
 	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Profile:    types.ProfileE2B,
+		Resources:  testBuildResources(),
 		Metadata:   map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`},
 		MMDSHeader: &header,
 	})
@@ -93,13 +93,6 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 
 	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
 		FromImage: "registry.example/base:latest",
-		Metadata:  map[string]string{sandboxcfg.NsMMDS: `{"routes":[]}`},
-	}, api.BuildAuth{}); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("MMDS override error = %v", err)
-	}
-	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
-		FromImage: "registry.example/base:latest",
-		Metadata:  map[string]string{"ordinary": "trigger"},
 	}, api.BuildAuth{}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +109,7 @@ func TestBuildMMDSRouteIsIncludedInFullSync(t *testing.T) {
 	header := `{"secrets":{"key":"build-full-sync"}}`
 	build, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Profile:    types.ProfileE2B,
+		Resources:  testBuildResources(),
 		Metadata:   map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`},
 		MMDSHeader: &header,
 	})

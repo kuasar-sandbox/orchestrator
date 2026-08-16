@@ -15,18 +15,20 @@ import (
 )
 
 type runPoolTestLauncher struct {
-	started chan string
-	stopped chan string
-	reset   chan string
-	startFn func(context.Context, string) error
-	stopFn  func(context.Context, string) error
+	started   chan string
+	stopped   chan string
+	reset     chan string
+	startFn   func(context.Context, string) error
+	stopFn    func(context.Context, string) error
+	resources map[string]launcher.ResourceProperties
 }
 
 func newRunPoolTestLauncher() *runPoolTestLauncher {
 	l := &runPoolTestLauncher{
-		started: make(chan string, 512),
-		stopped: make(chan string, 512),
-		reset:   make(chan string, 512),
+		started:   make(chan string, 512),
+		stopped:   make(chan string, 512),
+		reset:     make(chan string, 512),
+		resources: make(map[string]launcher.ResourceProperties),
 	}
 	l.startFn = func(ctx context.Context, unit string) error {
 		select {
@@ -63,7 +65,14 @@ func (l *runPoolTestLauncher) List(context.Context, string) ([]launcher.Unit, er
 	return nil, nil
 }
 func (l *runPoolTestLauncher) Reload(context.Context) error { return nil }
-func (l *runPoolTestLauncher) Close() error                 { return nil }
+func (l *runPoolTestLauncher) SetResources(_ context.Context, unit string, p launcher.ResourceProperties) error {
+	l.resources[unit] = p
+	return nil
+}
+func (l *runPoolTestLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
+	return l.resources[unit], nil
+}
+func (l *runPoolTestLauncher) Close() error { return nil }
 
 func testRunUnit(runID string) string { return "sandbox-runner@" + runID + ".service" }
 
@@ -454,6 +463,37 @@ func TestRunPoolStartFailureIsCleanedAndRefilled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("failed pool slot was not replenished")
+	}
+}
+
+func TestRunPoolDemandStartFailureReleasesAssignment(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	startErr := errors.New("injected demand start failure")
+	lc.startFn = func(context.Context, string) error { return startErr }
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 0, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(ctx, "build-with-failed-unit", func(string) error {
+			t.Error("commit ran for a unit that failed to start")
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, startErr) {
+			t.Fatalf("Assign error = %v, want start failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed demand-created unit left assignment pending")
 	}
 }
 

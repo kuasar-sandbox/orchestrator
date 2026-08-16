@@ -20,8 +20,6 @@ type nodeOwnerRequest struct {
 	NodeID               string                    `json:"node_id,omitempty"`
 	KeyPair              *clusterstate.NodeKeyPair `json:"key_pair,omitempty"`
 	APISecretFingerprint string                    `json:"api_secret_fingerprint,omitempty"`
-	BuildID              string                    `json:"build_id,omitempty"`
-	Resources            *routesync.BuildResources `json:"resources,omitempty"`
 	SID                  string                    `json:"sid,omitempty"`
 	Command              *routesync.Command        `json:"command,omitempty"`
 	TimeoutMS            int64                     `json:"timeout_ms,omitempty"`
@@ -61,11 +59,6 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	case "drop_key_pair":
 		err = owner.DropKeyPair(req.Context(), in.NodeID, in.APISecretFingerprint)
 		out.OK = err == nil
-	case "admit_build":
-		out.OK = owner.AdmitBuild(req.Context(), in.NodeID, in.BuildID, in.Resources)
-	case "release_build":
-		owner.ReleaseBuild(req.Context(), in.NodeID, in.BuildID)
-		out.OK = true
 	case "runtime":
 		out.Node, out.Found, err = owner.Runtime(req.Context(), in.NodeID)
 		out.OK = err == nil
@@ -119,15 +112,6 @@ func (o *HTTPNodeOwner) PutKeyPair(ctx context.Context, nodeID string, pair clus
 func (o *HTTPNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error {
 	_, err := o.call(ctx, nodeOwnerRequest{Op: "drop_key_pair", NodeID: nodeID, APISecretFingerprint: apiSecretFingerprint})
 	return err
-}
-
-func (o *HTTPNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
-	out, err := o.call(ctx, nodeOwnerRequest{Op: "admit_build", NodeID: nodeID, BuildID: buildID, Resources: want})
-	return err == nil && out.OK
-}
-
-func (o *HTTPNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
-	_, _ = o.call(ctx, nodeOwnerRequest{Op: "release_build", NodeID: nodeID, BuildID: buildID})
 }
 
 func (o *HTTPNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {

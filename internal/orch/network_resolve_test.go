@@ -51,8 +51,6 @@ func buildNetworkTestConfig() *config.Config {
 		InnerIP: "169.254.1.1/31",
 		Nexthop: "169.254.1.0",
 	}
-	cfg.Builder.VCPU = 2
-	cfg.Builder.Memory = "4GiB"
 	return cfg
 }
 
@@ -283,7 +281,12 @@ printf '%s' '{"Metadata":{"kuasar-sandbox.network":"{\"hostname\":\"source\",\"i
 
 func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 	o := testOrchCfg(t, buildNetworkTestConfig())
-	b := &types.Build{BuildID: "build-spec", Profile: types.ProfileE2B}
+	b := &types.Build{
+		BuildID: "build-spec", Profile: types.ProfileE2B,
+		// The outer Build demand is deliberately unrelated to the phase sandbox
+		// document carried below.
+		Resources: types.BuildResources{CPU: 9000, Memory: 16 << 30},
+	}
 	runtimeNetwork := sandboxcfg.NetworkSpec{
 		Hostname: "build-spec",
 		DNS:      []string{"8.8.8.8"},
@@ -297,10 +300,9 @@ func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 		workdir:         t.TempDir(),
 		network:         runtimeNetwork,
 		templateNetwork: templateNetwork,
-		spec: sandboxcfg.SandboxSpec{
-			Resource: sandboxcfg.ResourcePatch{
-				Capacity: &sandboxcfg.CapacityPatch{CPU: intPointer(4), Memory: stringPointer("8GiB")},
-			},
+		resources: rtconfig.ResourcesConfig{
+			Capacity:    rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
+			Allocatable: rtconfig.AllocatableConfig{CPU: 4, Memory: "8GiB"},
 		},
 	}
 	spec, _, found, err := o.BuildSpecFor(context.Background(), "build:"+b.BuildID)
@@ -320,8 +322,8 @@ func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 	if strings.Contains(string(netJSON), "transit") {
 		t.Fatalf("guest BuildNet contains host-only transit fields: %s", netJSON)
 	}
-	if spec.VCPU != 4 || spec.Memory != "8GiB" {
-		t.Fatalf("capacity = %d/%q", spec.VCPU, spec.Memory)
+	if spec.Resources.Capacity.CPU != 4 || spec.Resources.Capacity.Memory != "8GiB" {
+		t.Fatalf("capacity = %+v", spec.Resources.Capacity)
 	}
 }
 
@@ -330,7 +332,8 @@ func TestRegisterAndTriggerRejectInvalidNetworkMetadata(t *testing.T) {
 	ctx := context.Background()
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
 	_, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
-		Profile: types.ProfileE2B,
+		Profile:   types.ProfileE2B,
+		Resources: testBuildResources(),
 		Metadata: map[string]string{
 			sandboxcfg.NsNetwork: `{"inner_ip":"not-a-cidr"}`,
 		},
@@ -339,17 +342,12 @@ func TestRegisterAndTriggerRejectInvalidNetworkMetadata(t *testing.T) {
 		t.Fatalf("register error = %v, want ErrBadRequest", err)
 	}
 
-	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Profile: types.ProfileE2B})
+	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Profile: types.ProfileE2B, Resources: testBuildResources()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
-		FromImage: "registry.test/base:latest",
-		Metadata: map[string]string{
-			sandboxcfg.NsNetwork: `{"nexthop":"not-an-ip"}`,
-		},
-	}, api.BuildAuth{})
-	if !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("trigger error = %v, want ErrBadRequest", err)
+	err = o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{FromImage: "registry.test/base:latest"}, api.BuildAuth{})
+	if err != nil {
+		t.Fatalf("sealed registered network should trigger unchanged: %v", err)
 	}
 }

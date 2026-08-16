@@ -45,10 +45,12 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
@@ -58,7 +60,9 @@ const (
 	PathTaskBuildSpec              = "/internal/task/buildspec"
 	PathRunAssignment              = "/internal/run/assignment"
 	PathRunBuildResult             = "/internal/run/build-result"
+	PathRunBuildPhase              = "/internal/run/build-phase"
 	PathAdminManifestKey           = "/internal/admin/manifest-keys"
+	PathAdminBuilderAdmission      = "/internal/admin/builder-admission"
 	PathAdminMMDSRouteSecretPut    = "PUT /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 	PathAdminMMDSRouteSecretDelete = "DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 )
@@ -117,6 +121,18 @@ type BuildResultResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+type BuildPhaseRequest struct {
+	RunID     string `json:"run_id"`
+	BuildID   string `json:"build_id"`
+	Phase     string `json:"phase"`
+	SandboxID string `json:"sandbox_id"`
+	State     string `json:"state"`
+}
+
+type BuildPhaseResponse struct {
+	Error string `json:"error,omitempty"`
+}
+
 // LaunchSpec is the generic launch config the launcher applies and then exec-replaces
 // into: the absolute target binary, its args (after argv0), the working dir, and
 // env added to the inherited environment (secrets — e.g. MANIFEST_KEY — ride here,
@@ -140,6 +156,7 @@ type Provider interface {
 	RunPidFile(kind, runID string) (pidFile string, ok bool)
 	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
 	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
+	PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error
 }
 
 // BuildSpec is the work order node-ctl run-builder fetches for
@@ -147,29 +164,28 @@ type Provider interface {
 // template snapshot) needs. Secrets (manifest key, tenant registry
 // creds) ride here over the socket, never on disk.
 type BuildSpec struct {
-	BuildID          string                 `json:"build_id"`
-	Profile          string                 `json:"profile"`
-	RunID            string                 `json:"run_id,omitempty"`
-	Workdir          string                 `json:"workdir"` // build scratch dir (artifacts, run roots)
-	FromImage        string                 `json:"from_image,omitempty"`
-	FromTemplateRef  string                 `json:"from_template_ref,omitempty"`
-	FromTemplateKind string                 `json:"from_template_kind,omitempty"`
-	RefLocations     map[string]string      `json:"ref_locations,omitempty"`
-	ToRefLocation    string                 `json:"to_ref_location,omitempty"`
-	Steps            []BuildStep            `json:"steps,omitempty"`
-	StartCmd         string                 `json:"start_cmd,omitempty"`
-	ReadyCmd         string                 `json:"ready_cmd,omitempty"`
-	Env              map[string]string      `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
-	Paths            BuildPaths             `json:"paths"`
-	Net              BuildNet               `json:"net"`
-	TemplateNetwork  sandboxcfg.NetworkSpec `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
-	VCPU             int                    `json:"vcpu"`
-	Memory           string                 `json:"memory"`
-	MMDSEnabled      bool                   `json:"mmds_enabled"`
-	EnvdToken        string                 `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure         bool                   `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform         string                 `json:"platform,omitempty"`
-	ImportReferer    BuildImportReferer     `json:"import_referer,omitempty"`
+	BuildID          string                   `json:"build_id"`
+	Profile          string                   `json:"profile"`
+	RunID            string                   `json:"run_id,omitempty"`
+	Workdir          string                   `json:"workdir"` // build scratch dir (artifacts, run roots)
+	FromImage        string                   `json:"from_image,omitempty"`
+	FromTemplateRef  string                   `json:"from_template_ref,omitempty"`
+	FromTemplateKind string                   `json:"from_template_kind,omitempty"`
+	RefLocations     map[string]string        `json:"ref_locations,omitempty"`
+	ToRefLocation    string                   `json:"to_ref_location,omitempty"`
+	Steps            []BuildStep              `json:"steps,omitempty"`
+	StartCmd         string                   `json:"start_cmd,omitempty"`
+	ReadyCmd         string                   `json:"ready_cmd,omitempty"`
+	Env              map[string]string        `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
+	Paths            BuildPaths               `json:"paths"`
+	Net              BuildNet                 `json:"net"`
+	TemplateNetwork  sandboxcfg.NetworkSpec   `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
+	Resources        rtconfig.ResourcesConfig `json:"resources"`
+	MMDSEnabled      bool                     `json:"mmds_enabled"`
+	EnvdToken        string                   `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure         bool                     `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform         string                   `json:"platform,omitempty"`
+	ImportReferer    BuildImportReferer       `json:"import_referer,omitempty"`
 	// RegistryTLS carries the per-build registry TLS trust (inline CA bundle
 	// PEM and/or skip-verify) projected into the Phase A import sandbox as a
 	// flatten-ctl config YAML. Nil = use system root CAs. Register-time only;
@@ -271,6 +287,38 @@ type MMDSRouteSecretAdmin interface {
 	DeleteMMDSRouteSecretValue(ctx context.Context, sandboxID, name string) error
 }
 
+// BuilderAdmissionAdmin exposes a single consistent snapshot of the durable
+// registration/execution ledgers. It contains no tenant credentials or host
+// paths and is restricted by the same local admin gate as manifest-key status.
+type BuilderAdmissionAdmin interface {
+	BuilderAdmissionStatus(ctx context.Context) (BuilderAdmissionStatus, error)
+}
+
+type BuildAdmissionHeadroom struct {
+	MaxBuilds *int64 `json:"max_builds,omitempty"`
+	CPU       *int64 `json:"cpu_milli,omitempty"`
+	Memory    *int64 `json:"memory_bytes,omitempty"`
+	Storage   *int64 `json:"storage_bytes,omitempty"`
+}
+
+type BuildAdmissionLevelStatus struct {
+	Configured types.BuildAdmissionLimit `json:"configured"`
+	UsedBuilds int64                     `json:"used_builds"`
+	Used       types.BuildResources      `json:"used_resources"`
+	Available  BuildAdmissionHeadroom    `json:"available"`
+}
+
+type BuilderAdmissionStatus struct {
+	Registration        BuildAdmissionLevelStatus `json:"registration"`
+	Execution           BuildAdmissionLevelStatus `json:"execution"`
+	WaitingBuilds       int64                     `json:"waiting_builds"`
+	OldestWaitAgeSec    int64                     `json:"oldest_wait_age_seconds,omitempty"`
+	RegistrationReject  map[string]int64          `json:"registration_rejections,omitempty"`
+	ExecutionWouldWait  int64                     `json:"execution_would_wait"`
+	RegistrationExpired int64                     `json:"registration_expired"`
+	QueueExpired        int64                     `json:"queue_expired"`
+}
+
 // AdminKeyRequest / AdminKeyResponse are the admin-plane add/remove/check messages.
 type AdminKeyRequest struct {
 	Op           string `json:"op"` // add | remove | check
@@ -294,6 +342,7 @@ type Deps struct {
 	Provider                     Provider // task plane (LaunchSpec by config-id)
 	Admin                        Admin    // admin plane (manifest-key allowlist)
 	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
+	BuilderAdmissionAdmin        BuilderAdmissionAdmin
 	MaxMMDSRouteSecretValueBytes int
 	API                          http.Handler     // api plane (e2b control plane + export/import); the fallback
 	AdminPidfile                 string           // optional PID allowlist gating the admin plane ("" => socket perms only)
@@ -370,7 +419,11 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
+	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.BuilderAdmissionAdmin != nil {
+		mux.HandleFunc("GET "+PathAdminBuilderAdmission, s.handleAdminBuilderAdmission)
+	}
 	if s.deps.MMDSRouteSecretAdmin != nil {
 		mux.HandleFunc(PathAdminMMDSRouteSecretPut, s.handleAdminMMDSRouteSecretPut)
 		mux.HandleFunc(PathAdminMMDSRouteSecretDelete, s.handleAdminMMDSRouteSecretDelete)
@@ -508,6 +561,38 @@ func (s *Server) handleBuildResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &BuildResultResponse{})
 }
 
+func (s *Server) handleBuildPhase(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &BuildPhaseResponse{Error: "no peer credentials"})
+		return
+	}
+	var req BuildPhaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		req.RunID == "" || req.BuildID == "" || req.SandboxID == "" ||
+		(req.Phase != "a" && req.Phase != "b" && req.Phase != "c") ||
+		(req.State != "starting" && req.State != "finished" && req.State != "failed") {
+		writeJSON(w, http.StatusBadRequest, &BuildPhaseResponse{Error: "bad request"})
+		return
+	}
+	pidFile, ok := s.deps.Provider.RunPidFile("build", req.RunID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &BuildPhaseResponse{Error: "unknown run"})
+		return
+	}
+	if !s.taskAuthed("build-phase:"+req.RunID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &BuildPhaseResponse{Error: "not authorized"})
+		return
+	}
+	if err := s.deps.Provider.PostBuildPhase(r.Context(), req.RunID, req.BuildID, req.Phase, req.SandboxID, req.State); err != nil {
+		s.log.Warn("configsock build phase", "run_id", req.RunID, "build_id", req.BuildID,
+			"phase", req.Phase, "state", req.State, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildPhaseResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &BuildPhaseResponse{})
+}
+
 // taskAuthed verifies the connecting pid matches the id's pidfile (SO_PEERCRED).
 func (s *Server) taskAuthed(id, pidFile string, peer int) bool {
 	want, err := readPID(pidFile)
@@ -554,6 +639,21 @@ func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, &AdminKeyResponse{Error: "method not allowed"})
 	}
+}
+
+func (s *Server) handleAdminBuilderAdmission(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not authorized (admin)"})
+		return
+	}
+	status, err := s.deps.BuilderAdmissionAdmin.BuilderAdmissionStatus(r.Context())
+	if err != nil {
+		s.log.Warn("configsock builder admission status", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResponse {

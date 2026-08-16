@@ -3263,9 +3263,12 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	lastBeat := time.Now().Unix()
 	reg.stores.PutNode(ctx, &NodeRecord{
 		NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10,
-		BuildCapacity: &routesync.BuildResources{CPU: 2000},
-		DataEndpoint:  "10.0.0.1:8443", RuntimeDigest: "rt1", LastHeartbeatUnix: lastBeat,
-		Allocated: 99, Pool: 100, Counts: 7, BuildAlloc: &routesync.BuildResources{CPU: 1000},
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{MaxBuilds: 16, Resources: &routesync.BuildResources{CPU: 64000}},
+		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{MaxBuilds: 4, Resources: &routesync.BuildResources{CPU: 16000}},
+		DataEndpoint:              "10.0.0.1:8443", RuntimeDigest: "rt1", LastHeartbeatUnix: lastBeat,
+		Allocated: 99, Pool: 100, Counts: 7,
+		BuildRegistrationUsage: &routesync.BuildAdmissionUsage{Builds: 3},
+		BuildExecutionUsage:    &routesync.BuildAdmissionUsage{Builds: 2},
 	})
 
 	mux := http.NewServeMux()
@@ -3292,10 +3295,10 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	if raw["node_id"] != "n1" || raw["data_endpoint"] == "" || raw["runtime_digest"] != "rt1" {
 		t.Fatalf("node_list value = %v", raw)
 	}
-	if _, ok := raw["build_capacity"].(map[string]any); !ok {
-		t.Fatalf("node_list missing build_capacity: %v", raw)
+	if _, ok := raw["build_registration_capacity"].(map[string]any); !ok {
+		t.Fatalf("node_list missing build registration capacity: %v", raw)
 	}
-	for _, field := range []string{"last_heartbeat_unix", "allocated", "pool", "counts", "build_alloc"} {
+	for _, field := range []string{"last_heartbeat_unix", "allocated", "pool", "counts", "build_registration_usage", "build_execution_usage"} {
 		if _, ok := raw[field]; ok {
 			t.Fatalf("node_list exposed high-frequency field %q: %v", field, raw)
 		}
@@ -4052,10 +4055,6 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 		if ref, found, err := reg.stores.GetNodeBuildRef(ctx, "dead", buildID); err != nil || found {
 			t.Fatalf("stale ref %s=%+v found=%v err=%v", buildID, ref, found, err)
 		}
-	}
-	wantRelease := "dead/" + buildAdmissionID("/g", "active")
-	if len(owner.released) != 1 || owner.released[0] != wantRelease {
-		t.Fatalf("released=%q, want [%q]", owner.released, wantRelease)
 	}
 }
 

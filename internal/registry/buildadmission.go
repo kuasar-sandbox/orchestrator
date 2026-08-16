@@ -3,7 +3,6 @@ package registry
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -14,8 +13,6 @@ type NodeOwner interface {
 	Connected(ctx context.Context, nodeID string) error
 	PutKeyPair(ctx context.Context, nodeID string, pair clusterstate.NodeKeyPair) error
 	DropKeyPair(ctx context.Context, nodeID, apiSecretFingerprint string) error
-	AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool
-	ReleaseBuild(ctx context.Context, nodeID, buildID string)
 	Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error)
 	DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error
 	SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error
@@ -23,12 +20,11 @@ type NodeOwner interface {
 }
 
 type localNodeOwner struct {
-	reg    *Registry
-	leases *buildAdmissionManager
+	reg *Registry
 }
 
 func newLocalNodeOwner(reg *Registry) *localNodeOwner {
-	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager()}
+	return &localNodeOwner{reg: reg}
 }
 
 func (o *localNodeOwner) Connected(ctx context.Context, nodeID string) error {
@@ -93,18 +89,6 @@ func (o *localNodeOwner) RefreshKeyPairs(ctx context.Context, nodeID string, pai
 				"node", nodeID, "cmd_id", cmd.CmdID)
 		}
 	}
-}
-
-func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
-	node, found, err := o.Runtime(ctx, nodeID)
-	if err != nil || !found {
-		return false
-	}
-	return o.leases.admit(nodeID, buildID, node.BuildCapacity, want)
-}
-
-func (o *localNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
-	o.leases.release(nodeID, buildID)
 }
 
 func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -263,17 +247,6 @@ func (o *routingNodeOwner) DropKeyPair(ctx context.Context, nodeID, apiSecretFin
 	return o.ownerFor(ctx, nodeID).DropKeyPair(ctx, nodeID, apiSecretFingerprint)
 }
 
-func (o *routingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
-	return o.ownerFor(ctx, nodeID).AdmitBuild(ctx, nodeID, buildID, want)
-}
-
-func (o *routingNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
-	o.local.ReleaseBuild(ctx, nodeID, buildID)
-	for _, remote := range o.remotes {
-		remote.ReleaseBuild(ctx, nodeID, buildID)
-	}
-}
-
 func (o *routingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
 	return o.ownerFor(ctx, nodeID).Runtime(ctx, nodeID)
 }
@@ -302,12 +275,6 @@ func (o missingNodeOwner) PutKeyPair(context.Context, string, clusterstate.NodeK
 
 func (o missingNodeOwner) DropKeyPair(context.Context, string, string) error { return o.err() }
 
-func (o missingNodeOwner) AdmitBuild(context.Context, string, string, *routesync.BuildResources) bool {
-	return false
-}
-
-func (o missingNodeOwner) ReleaseBuild(context.Context, string, string) {}
-
 func (o missingNodeOwner) Runtime(context.Context, string) (*NodeRecord, bool, error) {
 	return nil, false, o.err()
 }
@@ -324,77 +291,28 @@ func (o missingNodeOwner) SendCommandAndWait(context.Context, string, *routesync
 	return nil, o.err()
 }
 
-// buildAdmissionManager is the local node owner build-budget state.
-// It is intentionally volatile: a node/registry restart clears execution leases,
-// matching the cluster rule that node execution state is not restored from disk.
-type buildAdmissionManager struct {
-	mu     sync.Mutex
-	byNode map[string]map[string]*routesync.BuildResources
-}
-
-func newBuildAdmissionManager() *buildAdmissionManager {
-	return &buildAdmissionManager{
-		byNode: map[string]map[string]*routesync.BuildResources{},
-	}
-}
-
-func (m *buildAdmissionManager) admit(nodeID, buildID string, cap, want *routesync.BuildResources) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if nodeID == "" || buildID == "" {
-		return false
-	}
-	if _, exists := m.byNode[nodeID][buildID]; exists {
-		return true
-	}
-	if cap != nil {
-		var used routesync.BuildResources
-		for _, r := range m.byNode[nodeID] {
-			addBuildResources(&used, r)
-		}
-		addBuildResources(&used, want)
-		if exceedsBuildResources(&used, cap) {
-			return false
-		}
-	}
-	if m.byNode[nodeID] == nil {
-		m.byNode[nodeID] = map[string]*routesync.BuildResources{}
-	}
-	m.byNode[nodeID][buildID] = cloneBuildResources(want)
-	return true
-}
-
-func (m *buildAdmissionManager) release(nodeID, buildID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if nodeID == "" || buildID == "" {
-		return
-	}
-	delete(m.byNode[nodeID], buildID)
-	if len(m.byNode[nodeID]) == 0 {
-		delete(m.byNode, nodeID)
-	}
-}
-
-func addBuildResources(dst *routesync.BuildResources, src *routesync.BuildResources) {
-	if src == nil {
-		return
-	}
-	dst.CPU += src.CPU
-	dst.Mem += src.Mem
-	dst.Storage += src.Storage
-}
-
-func exceedsBuildResources(used, cap *routesync.BuildResources) bool {
-	return (cap.CPU > 0 && used.CPU > cap.CPU) ||
-		(cap.Mem > 0 && used.Mem > cap.Mem) ||
-		(cap.Storage > 0 && used.Storage > cap.Storage)
-}
-
 func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources {
 	if in == nil {
 		return nil
 	}
 	cp := *in
 	return &cp
+}
+
+func cloneBuildAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
+}
+
+func cloneBuildAdmissionUsage(in *routesync.BuildAdmissionUsage) *routesync.BuildAdmissionUsage {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
 }
