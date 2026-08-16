@@ -153,6 +153,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	}
 	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
 	if err != nil {
+		if errors.Is(err, errClusterCredentialPairNotInstalled) {
+			return fmt.Errorf("%w: build_register credential: %v", api.ErrBadRequest, err)
+		}
 		return err
 	}
 	resources := cmd.BuildResources.Types()
@@ -584,16 +587,18 @@ func clusterSandboxMetadata(config map[string]string) map[string]string {
 	return metadata
 }
 
+var errClusterCredentialPairNotInstalled = errors.New("cluster credential pair is not installed")
+
 func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (store.KeyPair, error) {
 	if fp == "" {
-		return store.KeyPair{}, fmt.Errorf("cluster: empty API secret fingerprint")
+		return store.KeyPair{}, fmt.Errorf("%w: empty API secret fingerprint", errClusterCredentialPairNotInstalled)
 	}
 	pair, found, err := o.st.AllowedKeyPairByAPISecretFingerprint(ctx, fp)
 	if err != nil {
 		return store.KeyPair{}, err
 	}
 	if !found {
-		return store.KeyPair{}, fmt.Errorf("cluster: credential pair is not installed")
+		return store.KeyPair{}, errClusterCredentialPairNotInstalled
 	}
 	return pair, nil
 }

@@ -558,3 +558,22 @@ func TestBuildRegistrationConflictIsDefinitive(t *testing.T) {
 		t.Fatal("node internal error was treated as definitive")
 	}
 }
+
+func TestBuildRegistrationDefinitiveRejectionPreservesHTTPStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusConflict,
+		http.StatusTooManyRequests,
+	} {
+		err := buildRegistrationRejectionError(&routesync.CmdAck{
+			Status: routesync.AckRejected, HTTPStatus: status, Reason: "node rejected build registration",
+		})
+		if got := routeLinkStatus(err); got != status {
+			t.Fatalf("routeLinkStatus(build rejection %d) = %d", status, got)
+		}
+		var rejected *nodeCommandRejection
+		if !errors.As(err, &rejected) || rejected.reason != "node rejected build registration" {
+			t.Fatalf("typed rejection for %d = %#v (%v)", status, rejected, err)
+		}
+	}
+}

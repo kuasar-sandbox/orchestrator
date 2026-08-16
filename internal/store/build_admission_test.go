@@ -170,9 +170,9 @@ func TestExecutionAdmissionVectorClaimAndFIFO(t *testing.T) {
 	ctx := context.Background()
 	resources := types.BuildResources{CPU: 2000, Memory: 2 << 30, Storage: 8 << 30}
 	first := admissionBuild("fifo-first", resources)
-	first.Status, first.WaitingUnix = types.BuildWaiting, 10
+	first.Status, first.WaitingUnix, first.WaitingSequence = types.BuildWaiting, 10, 1
 	second := admissionBuild("fifo-second", resources)
-	second.Status, second.WaitingUnix = types.BuildWaiting, 20
+	second.Status, second.WaitingUnix, second.WaitingSequence = types.BuildWaiting, 20, 2
 	if err := st.PutBuild(ctx, second); err != nil {
 		t.Fatal(err)
 	}

@@ -177,7 +177,7 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 	if !errors.Is(runErr, errBuildCleanupPending) {
 		cleanupErr := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, pend.workdir, true)
 		if cleanupErr != nil {
-			runErr = errors.Join(errBuildCleanupPending, runErr, cleanupErr)
+			runErr = &buildCleanupPendingError{cause: runErr, cleanup: cleanupErr}
 		}
 	}
 	o.completeBuild(ctx, build, result, runErr)
@@ -192,7 +192,7 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 	if remaining <= 0 {
 		timeoutErr := fmt.Errorf("build: recovered execution exceeded total timeout")
 		if err := o.stopBuilderUnit(unit); err != nil {
-			return nil, errors.Join(errBuildCleanupPending, timeoutErr, err)
+			return nil, &buildCleanupPendingError{cause: timeoutErr, cleanup: err}
 		}
 		return nil, timeoutErr
 	}
@@ -205,19 +205,19 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 		case result := <-pend.result:
 			if err := o.waitBuilderUnitExit(ctx, unit, 20*time.Second); err != nil {
 				if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-					return nil, errors.Join(errBuildCleanupPending, err, stopErr)
+					return nil, &buildCleanupPendingError{cause: err, cleanup: stopErr}
 				}
 				return nil, err
 			}
 			return &result, nil
 		case <-ctx.Done():
 			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, errors.Join(errBuildCleanupPending, ctx.Err(), err)
+				return nil, &buildCleanupPendingError{cause: ctx.Err(), cleanup: err}
 			}
 			return nil, ctx.Err()
 		case <-timer.C:
 			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, errors.Join(errBuildCleanupPending, fmt.Errorf("build: recovered execution timed out"), err)
+				return nil, &buildCleanupPendingError{cause: fmt.Errorf("build: recovered execution timed out"), cleanup: err}
 			}
 			return nil, fmt.Errorf("build: recovered execution timed out")
 		case <-ticker.C:

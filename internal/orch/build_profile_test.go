@@ -159,6 +159,18 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 			clusterstate.ObjectMetadataKey: `{"group":"/test"}`,
 		},
 	}
+	missingCredential := *cmd
+	missingCredential.BuildID = "missing-cluster-credential"
+	missingCredential.TemplateRef = "transient-missing-credential"
+	missingCredential.APISecretFingerprint = strings.Repeat("f", 64)
+	if err := o.registerClusterBuild(ctx, &missingCredential); err == nil {
+		t.Fatal("build_register accepted a missing credential pair")
+	} else if status, _ := clusterCommandRejection(err); status != http.StatusBadRequest {
+		t.Fatalf("missing credential rejection status = %d, want 400", status)
+	}
+	if stored, err := o.st.GetBuild(ctx, missingCredential.BuildID); err != nil || stored != nil {
+		t.Fatalf("missing credential rejection stored build = %+v, err=%v", stored, err)
+	}
 	if err := o.registerClusterBuild(ctx, cmd); err != nil {
 		t.Fatalf("registerClusterBuild: %v", err)
 	}

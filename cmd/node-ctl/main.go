@@ -185,10 +185,9 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
-	if err := core.Reconcile(ctx); err != nil {
-		return fmt.Errorf("reconcile: %w", err)
+	if err := core.ReconcileSandboxes(ctx); err != nil {
+		return fmt.Errorf("reconcile sandboxes: %w", err)
 	}
-	go core.Reaper(ctx, 5*time.Second)
 
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
@@ -205,6 +204,7 @@ func runConductor(args []string, log *slog.Logger) error {
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
 	// the node streams its sandbox routes up + executes the registry's commands.
+	var startNodeLink func()
 	if cfg.Cluster.NodeLink.Endpoint != "" {
 		nodeID := cfg.Cluster.NodeID
 		if nodeID == "" {
@@ -250,8 +250,10 @@ func runConductor(args []string, log *slog.Logger) error {
 			},
 			core, hbInterval, clientTLS, log, true,
 		)
-		go nl.Run(ctx)
-		log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		startNodeLink = func() {
+			go nl.Run(ctx)
+			log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		}
 	}
 
 	// Traffic stats providers are wired before either API listener can accept a
@@ -338,10 +340,21 @@ func runConductor(args []string, log *slog.Logger) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// A live builder can finish immediately after it is adopted. Bring the
+	// authenticated phase/result endpoint up first, then attach recovery
+	// monitors, and only then expose this node to cluster dispatch or admit new
+	// run-pool work.
+	if err := core.ReconcileBuilds(ctx); err != nil {
+		return fmt.Errorf("reconcile builds: %w", err)
+	}
+	go core.Reaper(ctx, 5*time.Second)
 	if err := core.StartRunPools(ctx); err != nil {
 		return err
 	}
 	go core.BuildPool(ctx, 2*time.Second)
+	if startNodeLink != nil {
+		startNodeLink()
+	}
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
 	// proxyForwarder to worker (external), or reject (off). External mode also

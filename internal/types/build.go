@@ -130,6 +130,7 @@ type Build struct {
 	// Durable execution ownership and timestamps make both admission ledgers
 	// reconstructable from SQLite after a controller restart.
 	WaitingUnix          int64
+	WaitingSequence      int64
 	ExecutionClaimed     bool
 	ExecutionClaimedUnix int64
 	EnforcementStatus    string

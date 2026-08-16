@@ -301,7 +301,26 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := o.Reconcile(ctx); err != nil {
+	if err := o.ReconcileSandboxes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID); err != nil || ok {
+		t.Fatalf("build was adopted before the report socket readiness boundary: ok %v err %v", ok, err)
+	}
+	imageRef := "manifest://" + strings.Repeat("b", 64)
+	postStarted := make(chan struct{})
+	postDone := make(chan error, 1)
+	go func() {
+		close(postStarted)
+		postDone <- o.PostBuildResult(ctx, runID, build.BuildID, configsock.BuildResult{ImageRef: imageRef})
+	}()
+	<-postStarted
+	select {
+	case err := <-postDone:
+		t.Fatalf("build report crossed startup gate before adoption: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := o.ReconcileBuilds(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID); err != nil || !ok {
@@ -311,8 +330,7 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	// The recovered process has already run the pipeline. Posting its result must
 	// finalize that same claim; no scheduler/assignment path is involved.
 	lc.setUnitState(unit, "inactive")
-	imageRef := "manifest://" + strings.Repeat("b", 64)
-	if err := o.PostBuildResult(ctx, runID, build.BuildID, configsock.BuildResult{ImageRef: imageRef}); err != nil {
+	if err := <-postDone; err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)

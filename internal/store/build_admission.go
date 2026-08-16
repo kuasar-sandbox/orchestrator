@@ -2,11 +2,18 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+// ErrBuildExecutionUnfit means a waiting Build can never fit the currently
+// configured execution vector. It is distinct from temporary aggregate
+// pressure so the FIFO scheduler can terminally reject the row instead of
+// blocking every smaller Build behind it.
+var ErrBuildExecutionUnfit = errors.New("build cannot fit configured execution limits")
 
 type BuildAdmissionUsage struct {
 	RegistrationBuilds int64
@@ -72,7 +79,7 @@ func (s *Store) ClaimBuildExecution(ctx context.Context, buildID string, limit t
 		return false, nil
 	}
 	if !limit.AllowsOne(b.Resources) {
-		return false, fmt.Errorf("build %s cannot fit configured execution limits", buildID)
+		return false, fmt.Errorf("%w: %s", ErrBuildExecutionUnfit, buildID)
 	}
 	headroom := func(configured, requested int64) int64 {
 		if configured == 0 {

@@ -272,10 +272,15 @@ func definitiveBuildRegistrationRejection(ack *routesync.CmdAck) bool {
 
 func buildRegistrationRejectionError(ack *routesync.CmdAck) error {
 	reason := ""
+	status := 0
 	if ack != nil {
 		reason = ack.Reason
+		status = ack.HTTPStatus
 	}
-	return fmt.Errorf("registry: build_register definitively rejected: %s", reason)
+	if reason == "" {
+		reason = http.StatusText(status)
+	}
+	return &nodeCommandRejection{status: status, reason: reason}
 }
 
 func ambiguousBuildRegistrationError(nodeID string, ack *routesync.CmdAck) error {

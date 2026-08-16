@@ -361,12 +361,14 @@ func (p *runPool) loop(ctx context.Context) {
 				delete(starting, done.runID)
 				p.log.Warn("run pool: start failed", "kind", p.kind, "run_id", done.runID, "err", done.err)
 				queueControl(runControlReq{op: "stop", runID: done.runID})
-				for len(pending) > 0 {
-					// A demand-created unit failed before a worker could call
-					// WaitAssignment. Fail the oldest task instead of holding its
-					// durable execution ownership forever while replacements loop.
-					req := pending[0]
-					pending = pending[1:]
+				for len(pending) > len(idle)+len(starting) {
+					// A start failure is not bound to a pending task. Attribute it
+					// only when pending demand now exceeds all available/in-flight
+					// capacity. Preserve FIFO by keeping the oldest requests for that
+					// surviving capacity and failing the newest unsatisfied request.
+					last := len(pending) - 1
+					req := pending[last]
+					pending = pending[:last]
 					if req.ctx.Err() != nil {
 						replyConsume(req, runConsumeResp{err: req.ctx.Err()})
 						continue

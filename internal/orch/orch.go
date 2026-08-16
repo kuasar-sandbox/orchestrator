@@ -85,6 +85,11 @@ type Orchestrator struct {
 
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
+	// buildReportsReady closes only after every live builder has an adopted
+	// pendingBuild owner. The config socket may bind first, but phase/result
+	// reports wait here instead of failing in the bind-to-adoption window.
+	buildReportsReady     chan struct{}
+	buildReportsReadyOnce sync.Once
 	// networkAllocationMu serializes connector allocation with the Build-only
 	// detach -> durable ownership clear sequence. A detached-but-not-cleared
 	// port blocks new allocations so a crash/retry cannot detach a reused slot.
@@ -149,6 +154,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		subs:                      map[int]chan routesync.Event{},
 		routeFP:                   uuid.NewString(),
 		pend:                      map[string]*pendingBuild{},
+		buildReportsReady:         make(chan struct{}),
 		detachedBuildPortsPending: map[string]struct{}{},
 		clusterBuilds:             map[string]*clusterBuild{},
 		buildEvents:               make(chan *routesync.BuildEvent, 64),
@@ -1819,11 +1825,23 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Reconcile adopts/cleans sandboxes after an orchestrator restart, using the
-// systemd unit set as the liveness authority. A starting row is never adopted:
-// launch completion was not committed, so an interrupted resume returns to its
-// durable paused snapshot and an interrupted fresh create becomes dead.
+// Reconcile is the complete restart path used by tests and embedded callers.
+// The conductor starts its config socket between ReconcileSandboxes and
+// ReconcileBuilds so an already-running builder can never finish into an absent
+// result endpoint during adoption.
 func (o *Orchestrator) Reconcile(ctx context.Context) error {
+	if err := o.ReconcileSandboxes(ctx); err != nil {
+		return err
+	}
+	return o.ReconcileBuilds(ctx)
+}
+
+// ReconcileSandboxes adopts/cleans sandboxes after an orchestrator restart,
+// using the systemd unit set as the liveness authority. A starting row is never
+// adopted: launch completion was not committed, so an interrupted resume
+// returns to its durable paused snapshot and an interrupted fresh create
+// becomes dead.
+func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	units, err := o.lc.List(ctx, o.runnerPattern())
 	if err != nil {
 		return err
@@ -1913,7 +1931,22 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		_ = o.lc.Stop(ctx, u.Name)
 		_ = o.lc.ResetFailed(ctx, u.Name)
 	}
-	return o.reconcileBuilds(ctx)
+	return nil
+}
+
+// ReconcileBuilds adopts live builder units only after the local config socket
+// is accepting phase/result reports. It must run before new Build work is
+// admitted to the run pool.
+func (o *Orchestrator) ReconcileBuilds(ctx context.Context) error {
+	if err := o.reconcileBuilds(ctx); err != nil {
+		return err
+	}
+	o.buildReportsReadyOnce.Do(func() {
+		if o.buildReportsReady != nil {
+			close(o.buildReportsReady)
+		}
+	})
+	return nil
 }
 
 func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {

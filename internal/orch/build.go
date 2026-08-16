@@ -543,7 +543,9 @@ func (o *Orchestrator) templateBuild(ctx context.Context, apiKey, ref string) *t
 // BuildPool is a wakeup loop only; SQLite is the registration/execution
 // authority. Waiting rows are considered in stable FIFO order and a conditional
 // DB transition claims their complete resource vector before any unit side
-// effect. A head-of-line Build that does not fit stops this pass.
+// effect. Temporary aggregate pressure stops the pass; a Build that can never
+// fit the current configuration is terminally rejected so it cannot block the
+// FIFO head forever after an operator tightens limits.
 func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 	executionLimit, err := o.cfg.Builder.ExecutionLimit()
 	if err != nil {
@@ -568,11 +570,25 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			won, err := o.st.ClaimBuildExecution(ctx, candidate.BuildID, executionLimit, now)
 			if err != nil {
 				finish()
+				if errors.Is(err, store.ErrBuildExecutionUnfit) {
+					reason := "build resources no longer fit configured execution limits"
+					expired, expireErr := o.st.ExpireBuild(ctx, candidate.BuildID, types.BuildWaiting, reason)
+					if expireErr != nil {
+						o.log.Warn("reject permanently unfit build", "bid", candidate.BuildID, "err", expireErr)
+						return
+					}
+					if expired {
+						o.recordExecutionRejection("configuration")
+						o.refreshBuildAdmissionGauges(ctx)
+						o.publishBuildState(candidate.BuildID, "error", "", reason)
+					}
+					continue
+				}
 				o.log.Warn("build execution admission", "bid", candidate.BuildID, "err", err)
 				return
 			}
 			if !won {
-				o.recordExecutionWouldWait()
+				o.recordExecutionWouldWait(ctx)
 				finish()
 				return
 			}
@@ -644,6 +660,26 @@ type buildResult = configsock.BuildResult
 
 var errBuildCleanupPending = errors.New("build runtime cleanup remains pending")
 
+type buildCleanupPendingError struct {
+	cause   error
+	cleanup error
+}
+
+func (e *buildCleanupPendingError) Error() string {
+	return errors.Join(errBuildCleanupPending, e.cause, e.cleanup).Error()
+}
+
+func (e *buildCleanupPendingError) Unwrap() []error {
+	errList := []error{errBuildCleanupPending}
+	if e.cause != nil {
+		errList = append(errList, e.cause)
+	}
+	if e.cleanup != nil {
+		errList = append(errList, e.cleanup)
+	}
+	return errList
+}
+
 // pendingBuild is the per-execution state BuildSpecFor serves while the
 // build run-id unit executes: the pre-attached network slot, the resolved
 // temporary-VM and persistent-template network roles, minted envd token, and
@@ -684,13 +720,18 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 }
 
 func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *buildResult, err error) {
+	var cleanupPending *buildCleanupPendingError
+	if errors.As(err, &cleanupPending) {
+		var cleanupErr error
+		err, cleanupErr = o.retryBuildCleanup(ctx, b, cleanupPending.cause)
+		if cleanupErr != nil {
+			// The execution claim remains durable. A live controller keeps retrying;
+			// cancellation hands the exact same ownership to startup reconciliation.
+			o.log.Error("build cleanup incomplete; execution claim retained", "bid", b.BuildID, "err", cleanupErr)
+			return
+		}
+	}
 	switch {
-	case errors.Is(err, errBuildCleanupPending):
-		// Retain the durable execution claim. Reconcile will retry exact host
-		// ownership cleanup; releasing here could admit a successor while an old
-		// builder unit or connector port is still live.
-		o.log.Error("build cleanup incomplete; execution claim retained", "bid", b.BuildID, "err", err)
-		return
 	case err == nil && res != nil && res.Error != "":
 		// The pipeline ran and reported its own failure. run-builder's fail()
 		// already wrote "build failed: <detail>" to the build log stream (tag
@@ -804,7 +845,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	cleanupSafe := true
 	defer func() {
 		if !cleanupSafe {
-			retErr = errors.Join(errBuildCleanupPending, retErr)
+			retErr = &buildCleanupPendingError{cause: retErr}
 			return
 		}
 		portID := ""
@@ -813,7 +854,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		}
 		cleanupErr := o.cleanupBuildRuntime(b, portID, dir, runtimePersisted)
 		if cleanupErr != nil {
-			retErr = errors.Join(errBuildCleanupPending, retErr, cleanupErr)
+			retErr = &buildCleanupPendingError{cause: retErr, cleanup: cleanupErr}
 		}
 	}()
 	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, b)
@@ -1042,6 +1083,44 @@ func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, per
 		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove build workdir: %w", err))
 	}
 	return cleanupErr
+}
+
+// retryBuildCleanup keeps a live controller making progress after a transient
+// unit, connector, store, or filesystem cleanup failure. It never releases the
+// durable execution claim until the unit is fenced and all exact runtime
+// ownership is gone. Cancellation leaves the row for startup reconciliation.
+func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, cause error) (error, error) {
+	delay := 20 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		var cleanupErr error
+		if b.RunID != "" {
+			cleanupErr = o.stopBuilderUnit(o.builderUnit(b.RunID))
+		}
+		if cleanupErr == nil {
+			port := b.RuntimeVswitchPort
+			cleanupErr = o.cleanupBuildRuntime(b, port,
+				filepath.Join(o.cfg.Paths.RunRoot, b.BuildID), port != "")
+		}
+		if cleanupErr == nil {
+			return cause, nil
+		}
+		if attempt == 1 {
+			o.log.Warn("retry retained build cleanup", "bid", b.BuildID, "err", cleanupErr)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return cause, &buildCleanupPendingError{cause: cause, cleanup: cleanupErr}
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
 }
 
 func builderResourceProperties(resources types.BuildResources) (launcher.ResourceProperties, error) {

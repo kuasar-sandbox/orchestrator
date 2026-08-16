@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS builds (
   metadata_json     TEXT NOT NULL DEFAULT '{}',
   builder_json      TEXT NOT NULL DEFAULT '{}',
   waiting_unix      INTEGER NOT NULL DEFAULT 0,
+  waiting_sequence  INTEGER NOT NULL DEFAULT 0,
   execution_claimed INTEGER NOT NULL DEFAULT 0,
   execution_claimed_unix INTEGER NOT NULL DEFAULT 0,
   enforcement_status TEXT NOT NULL DEFAULT '',
@@ -774,7 +775,7 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
   registration_image_repo,registration_registry_auth_enc,cluster_group,
   resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
-  waiting_unix,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
   runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
@@ -786,7 +787,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
-		&b.WaitingUnix, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
+		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
 		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc); err != nil {
 		return nil, err
 	}
@@ -829,9 +830,9 @@ const buildInsertSQL = `
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
 	  registration_image_repo,registration_registry_auth_enc,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
-	  waiting_unix,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
 	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -845,7 +846,8 @@ const buildUpsertSQL = buildInsertSQL + `
 	  resources_cpu=excluded.resources_cpu, resources_memory=excluded.resources_memory,
 	  resources_storage=excluded.resources_storage, phase_resource_json=excluded.phase_resource_json,
 	  metadata_json=excluded.metadata_json, builder_json=excluded.builder_json,
-	  waiting_unix=excluded.waiting_unix, execution_claimed=excluded.execution_claimed,
+	  waiting_unix=excluded.waiting_unix, waiting_sequence=excluded.waiting_sequence,
+	  execution_claimed=excluded.execution_claimed,
 	  execution_claimed_unix=excluded.execution_claimed_unix,
 	  enforcement_status=excluded.enforcement_status, phase=excluded.phase,
 	  phase_sandbox_id=excluded.phase_sandbox_id,
@@ -900,7 +902,8 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc,
 		b.RegistrationImageRepo, registrationRAEnc, b.ClusterGroup,
 		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage, b.PhaseResourcePatch,
-		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
+		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
+		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
 		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc,
 	}, nil
@@ -955,7 +958,10 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, e
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET
 		kind=?, from_image=?, from_template=?, start_cmd=?, ready_cmd=?, steps_json=?,
-		registry_auth_enc=?, status=?, waiting_unix=?
+		registry_auth_enc=?, status=?, waiting_unix=?,
+		waiting_sequence=(SELECT CASE
+			WHEN COALESCE(MAX(waiting_sequence),0) >= 9223372036854775807 THEN NULL
+			ELSE COALESCE(MAX(waiting_sequence),0)+1 END FROM builds)
 		WHERE build_id=? AND status=?`,
 		string(b.Kind), b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
 		registryAuthEnc, string(types.BuildWaiting), b.WaitingUnix,
@@ -1003,7 +1009,7 @@ func (s *Store) GetBuildByTemplateID(ctx context.Context, templateID string) (*t
 func (s *Store) BuildsByStatus(ctx context.Context, status types.BuildState) ([]*types.Build, error) {
 	order := "created_unix ASC, build_id ASC"
 	if status == types.BuildWaiting {
-		order = "waiting_unix ASC, build_id ASC"
+		order = "waiting_sequence ASC"
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds WHERE status=? ORDER BY `+order, string(status))
 	if err != nil {

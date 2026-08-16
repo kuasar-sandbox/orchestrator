@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -135,6 +136,42 @@ func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 	}
 	if err := <-attachDone; err != nil {
 		t.Fatalf("attachNetwork: %v", err)
+	}
+}
+
+func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	detachErr := errors.New("injected transient build detach failure")
+	vs := &orderedCleanupVS{detachErr: detachErr}
+	o.vs = vs
+	o.lc = &orderedCleanupLauncher{}
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000209")
+	build.BuildID = "cleanup-retry-without-restart"
+	workdir := filepath.Join(o.cfg.Paths.RunRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	o.completeBuild(context.Background(), build, &buildResult{
+		ImageRef: "manifest://" + strings.Repeat("d", 64),
+	}, &buildCleanupPendingError{cleanup: errors.New("initial cleanup attempt failed")})
+
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildReady || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
+		t.Fatalf("cleanup retry did not converge terminal ownership: %+v", stored)
+	}
+	if got := vs.detachCalls.Load(); got != 2 {
+		t.Fatalf("detach attempts = %d, want transient failure plus retry", got)
+	}
+	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleanup retry retained workdir: %v", err)
 	}
 }
 

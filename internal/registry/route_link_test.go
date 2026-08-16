@@ -79,6 +79,32 @@ func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	}
 }
 
+func TestServeReserveBuildPreservesDefinitiveNodeStatus(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusConflict, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			reg := testReg(t)
+			reg.SetPlacer(placementWithToken("n1"))
+			reg.SetNodeOwner(&recordingNodeOwner{allow: true, ack: &routesync.CmdAck{
+				Status: routesync.AckRejected, HTTPStatus: status, Reason: "definitive node rejection",
+			}})
+			mux := http.NewServeMux()
+			reg.ServeRouteLink(mux)
+			body, err := json.Marshal(BuildReserveReq{
+				Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, RouteLinkReserveBuildPath, bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != status || !strings.Contains(rec.Body.String(), "definitive node rejection") {
+				t.Fatalf("response = %d %q, want %d with node reason", rec.Code, rec.Body.String(), status)
+			}
+		})
+	}
+}
+
 func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 	mux := http.NewServeMux()
 	reg := New(NewStores(), nil, 0, nil)

@@ -497,6 +497,90 @@ func TestRunPoolDemandStartFailureReleasesAssignment(t *testing.T) {
 	}
 }
 
+func TestRunPoolDoesNotBindUnrelatedStartFailureToPendingTask(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	firstGate := make(chan struct{})
+	startErr := errors.New("injected baseline start failure")
+	starts := 0
+	lc.startFn = func(ctx context.Context, unit string) error {
+		select {
+		case lc.started <- unit:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		starts++
+		if starts == 1 {
+			select {
+			case <-firstGate:
+				return startErr
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 1, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	firstUnit := <-lc.started
+	req := &runConsumeReq{
+		taskID: "build-survives-baseline-failure", ctx: ctx,
+		commit: func(string) error { return nil }, resp: make(chan runConsumeResp, 1),
+	}
+	enqueued := make(chan struct{})
+	go func() {
+		p.consumeCh <- req
+		close(enqueued)
+	}()
+	<-enqueued
+	// A second loop request is a barrier: it cannot be answered until the
+	// pending task has caused ensure() to register another in-flight start.
+	if _, _, err := p.WaitAssignment(ctx, "not-a-real-run"); err == nil {
+		t.Fatal("barrier WaitAssignment unexpectedly succeeded")
+	}
+	close(firstGate)
+
+	var secondUnit string
+	select {
+	case secondUnit = <-lc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement/demand unit was not started")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		if stopped != firstUnit {
+			t.Fatalf("stopped unit = %q, want failed baseline %q", stopped, firstUnit)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed baseline unit was not cleaned")
+	}
+	select {
+	case result := <-req.resp:
+		t.Fatalf("unrelated baseline failure completed pending task: %+v", result)
+	default:
+	}
+
+	secondRunID := strings.TrimSuffix(strings.TrimPrefix(secondUnit, "sandbox-builder@"), ".service")
+	taskID, ok, err := p.WaitAssignment(ctx, secondRunID)
+	if err != nil || !ok || taskID != req.taskID {
+		t.Fatalf("replacement assignment = task %q ok %t err %v", taskID, ok, err)
+	}
+	select {
+	case result := <-req.resp:
+		if result.err != nil || result.runID != secondRunID {
+			t.Fatalf("pending task result = %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending task did not use surviving capacity")
+	}
+}
+
 func TestRunPoolWaitTimeoutStopsAndRefills(t *testing.T) {
 	lc := newRunPoolTestLauncher()
 	ctx, cancel := context.WithCancel(context.Background())

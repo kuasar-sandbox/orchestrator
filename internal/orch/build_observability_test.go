@@ -21,8 +21,17 @@ func TestBuilderAdmissionStatusUsesDurableUsageAndReportsHeadroom(t *testing.T) 
 
 	mx := metrics.New()
 	o.SetMetrics(mx)
+	// Move the row after SetMetrics so recordExecutionWouldWait must refresh the
+	// durable queue gauges instead of inheriting a current snapshot.
+	b.Status = types.BuildWaiting
+	b.WaitingUnix = 1
+	b.WaitingSequence = 1
+	if err := o.st.PutBuild(ctx, b); err != nil {
+		t.Fatal(err)
+	}
 	o.recordRegistrationRejection("capacity")
-	o.recordExecutionWouldWait()
+	o.recordExecutionRejection("configuration")
+	o.recordExecutionWouldWait(ctx)
 	status, err := o.BuilderAdmissionStatus(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -30,6 +39,7 @@ func TestBuilderAdmissionStatusUsesDurableUsageAndReportsHeadroom(t *testing.T) 
 	if status.Registration.UsedBuilds != 1 || status.Registration.Used != b.Resources ||
 		status.Registration.Available.MaxBuilds == nil || *status.Registration.Available.MaxBuilds != 1 ||
 		status.Execution.UsedBuilds != 0 || status.RegistrationReject["capacity"] != 1 ||
+		status.ExecutionReject["configuration"] != 1 ||
 		status.ExecutionWouldWait != 1 {
 		t.Fatalf("builder admission status = %+v", status)
 	}
@@ -42,6 +52,8 @@ func TestBuilderAdmissionStatusUsesDurableUsageAndReportsHeadroom(t *testing.T) 
 		"builder_registration_used_cpu_milli 2000",
 		"builder_registration_rejections_total{reason=\"capacity\"} 1",
 		"builder_execution_would_wait_total 1",
+		"builder_execution_rejections_total{reason=\"configuration\"} 1",
+		"builder_execution_waiting_builds 1",
 	} {
 		if !strings.Contains(text, metric) {
 			t.Fatalf("metrics missing %q:\n%s", metric, text)

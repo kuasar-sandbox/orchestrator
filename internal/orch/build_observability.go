@@ -16,6 +16,7 @@ import (
 type buildAdmissionObservability struct {
 	mu                  sync.Mutex
 	registrationRejects map[string]int64
+	executionRejects    map[string]int64
 	executionWouldWait  atomic.Int64
 	registrationExpired atomic.Int64
 	queueExpired        atomic.Int64
@@ -49,6 +50,10 @@ func (o *Orchestrator) BuilderAdmissionStatus(ctx context.Context) (configsock.B
 	for reason, count := range o.buildAdmission.registrationRejects {
 		rejections[reason] = count
 	}
+	executionRejections := make(map[string]int64, len(o.buildAdmission.executionRejects))
+	for reason, count := range o.buildAdmission.executionRejects {
+		executionRejections[reason] = count
+	}
 	o.buildAdmission.mu.Unlock()
 	oldestAge := int64(0)
 	if usage.OldestWaitingUnix > 0 {
@@ -62,6 +67,7 @@ func (o *Orchestrator) BuilderAdmissionStatus(ctx context.Context) (configsock.B
 		Execution:     admissionLevelStatus(execution, usage.ExecutionBuilds, usage.Execution),
 		WaitingBuilds: usage.WaitingBuilds, OldestWaitAgeSec: oldestAge,
 		RegistrationReject:  rejections,
+		ExecutionReject:     executionRejections,
 		ExecutionWouldWait:  o.buildAdmission.executionWouldWait.Load(),
 		RegistrationExpired: o.buildAdmission.registrationExpired.Load(),
 		QueueExpired:        o.buildAdmission.queueExpired.Load(),
@@ -103,9 +109,22 @@ func (o *Orchestrator) recordRegistrationRejection(reason string) {
 	o.mx.Inc(`builder_registration_rejections_total{reason="` + reason + `"}`)
 }
 
-func (o *Orchestrator) recordExecutionWouldWait() {
+func (o *Orchestrator) recordExecutionWouldWait(ctx context.Context) {
 	o.buildAdmission.executionWouldWait.Add(1)
 	o.mx.Inc("builder_execution_would_wait_total")
+	o.refreshBuildAdmissionGauges(ctx)
+}
+
+func (o *Orchestrator) recordExecutionRejection(reason string) {
+	o.buildAdmission.mu.Lock()
+	if o.buildAdmission.executionRejects == nil {
+		o.buildAdmission.executionRejects = make(map[string]int64)
+	}
+	if o.buildAdmission.executionRejects[reason] < math.MaxInt64 {
+		o.buildAdmission.executionRejects[reason]++
+	}
+	o.buildAdmission.mu.Unlock()
+	o.mx.Inc(`builder_execution_rejections_total{reason="` + reason + `"}`)
 }
 
 func (o *Orchestrator) recordBuildExpired(state types.BuildState) {

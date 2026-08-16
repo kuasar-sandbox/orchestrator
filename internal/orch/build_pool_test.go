@@ -156,6 +156,80 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 	}
 }
 
+func TestBuildPoolTerminallyRejectsPermanentlyUnfitFIFOHead(t *testing.T) {
+	maxBuilds := int64(1)
+	executionCPU := config.CPUCores("1")
+	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{
+		Admission: config.BuilderAdmissionConfig{
+			Registration: &config.BuildAdmissionLimitConfig{MaxBuilds: &maxBuilds},
+			Execution: &config.BuildAdmissionLimitConfig{
+				MaxBuilds: &maxBuilds,
+				Resources: config.BuildAdmissionResourcesConfig{CPU: &executionCPU},
+			},
+		},
+	}})
+	o.vs = failingCreateVS{err: errors.New("stop after execution claim")}
+	manifestKey := strings.Repeat("e", 64)
+	apiSecret := deriveTestAPISecret(t, manifestKey)
+	for i, build := range []*types.Build{
+		{
+			BuildID: "fifo-unfit", TemplateID: "transient-fifo-unfit",
+			APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileBare,
+			Kind: types.KindImg, Status: types.BuildWaiting,
+			Resources:   types.BuildResources{CPU: 2000, Memory: 1 << 30},
+			WaitingUnix: time.Now().Unix(), WaitingSequence: 1, CreatedUnix: time.Now().Unix(),
+		},
+		{
+			BuildID: "fifo-fit", TemplateID: "transient-fifo-fit",
+			APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileBare,
+			Kind: types.KindImg, Status: types.BuildWaiting,
+			Resources:   types.BuildResources{CPU: 1000, Memory: 1 << 30},
+			WaitingUnix: time.Now().Unix(), WaitingSequence: 2, CreatedUnix: time.Now().Unix(),
+		},
+	} {
+		if err := o.st.PutBuild(context.Background(), build); err != nil {
+			t.Fatalf("put build %d: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		o.BuildPool(ctx, time.Hour)
+		close(done)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		unfit, err := o.st.GetBuild(context.Background(), "fifo-unfit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fit, err := o.st.GetBuild(context.Background(), "fifo-fit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unfit.Status == types.BuildError && fit.Status != types.BuildWaiting {
+			if !strings.Contains(unfit.Reason, "no longer fit") {
+				t.Fatalf("unfit terminal reason = %q", unfit.Reason)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduler remained blocked: unfit=%+v fit=%+v", unfit, fit)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("BuildPool did not stop")
+	}
+	if err := o.DrainBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTerminalPersistenceFailureRetainsClaimAndRetriesSafely(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "terminal-failure.db")
 	o := testOrchCfgAt(t, &config.Config{}, dbPath)

@@ -314,6 +314,7 @@ type BuilderAdmissionStatus struct {
 	WaitingBuilds       int64                     `json:"waiting_builds"`
 	OldestWaitAgeSec    int64                     `json:"oldest_wait_age_seconds,omitempty"`
 	RegistrationReject  map[string]int64          `json:"registration_rejections,omitempty"`
+	ExecutionReject     map[string]int64          `json:"execution_rejections,omitempty"`
 	ExecutionWouldWait  int64                     `json:"execution_would_wait"`
 	RegistrationExpired int64                     `json:"registration_expired"`
 	QueueExpired        int64                     `json:"queue_expired"`
