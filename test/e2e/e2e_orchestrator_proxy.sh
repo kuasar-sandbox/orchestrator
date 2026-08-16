@@ -575,7 +575,9 @@ echo "==> control plane up; proxy master registered on the config-socket plugin 
 echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl","cpuCount":1,"memoryMB":1024}')
+# The 6GiB Build limit is independent of the phase Sandbox's node-default 2GiB
+# capacity and leaves room for its VMM plus the build toolchain.
+code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl","cpuCount":2,"memoryMB":6144}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)
