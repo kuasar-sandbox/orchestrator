@@ -330,6 +330,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 			ctx := context.Background()
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
 			cmd := clusterBuildRegisterCommand("terminal-replay-"+tc.name, fingerprint)
+			cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","data":"registered"}]}`
 			if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 				t.Fatalf("initial BuildRegister ack = %+v", ack)
 			}
@@ -342,9 +343,20 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 			if err != nil || stored == nil {
 				t.Fatalf("GetBuild = %+v, %v", stored, err)
 			}
-			stored.Status, stored.PersistID, stored.Reason = tc.state, tc.templateID, tc.reason
+			stored.Status, stored.ExecutionClaimed = types.BuildBuilding, true
 			if err := o.st.PutBuild(ctx, stored); err != nil {
 				t.Fatal(err)
+			}
+			stored.Status, stored.PersistID, stored.Reason = tc.state, tc.templateID, tc.reason
+			if err := o.st.PutBuildTerminal(ctx, stored); err != nil {
+				t.Fatal(err)
+			}
+			terminal, err := o.st.GetBuild(ctx, cmd.BuildID)
+			if err != nil || terminal == nil {
+				t.Fatalf("terminal GetBuild = %+v, %v", terminal, err)
+			}
+			if _, present := terminal.Metadata[sandboxcfg.NsMMDS]; present || terminal.RegistrationMMDSRoutesDigest == "" {
+				t.Fatalf("terminal Build retained MMDS routes or lost identity: %+v", terminal)
 			}
 			o.clusterBuildMu.Lock()
 			delete(o.clusterBuilds, cmd.BuildID) // terminal cleanup or controller restart
@@ -366,6 +378,17 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("terminal replay did not republish durable state")
+			}
+
+			changed := *cmd
+			changed.CmdID = cmd.CmdID + "-changed-mmds"
+			changed.Config = make(map[string]string, len(cmd.Config))
+			for key, value := range cmd.Config {
+				changed.Config[key] = value
+			}
+			changed.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","data":"changed"}]}`
+			if ack := o.HandleCommand(ctx, &changed); ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusConflict {
+				t.Fatalf("terminal MMDS-mismatched replay ack = %+v, want 409", ack)
 			}
 		})
 	}

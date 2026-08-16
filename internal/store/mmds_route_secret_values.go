@@ -314,9 +314,33 @@ func sameImmutableBuild(a, b *types.Build) bool {
 		a.Resources == b.Resources && a.ClusterGroup == b.ClusterGroup &&
 		a.RegistrationImageRepo == b.RegistrationImageRepo &&
 		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
-		a.PhaseResourcePatch == b.PhaseResourcePatch && equalEmptyCollections(a.Metadata, b.Metadata) &&
+		a.RegistrationMMDSRoutesDigest == b.RegistrationMMDSRoutesDigest &&
+		a.PhaseResourcePatch == b.PhaseResourcePatch && equalRegistrationMetadata(a, b) &&
 		reflect.DeepEqual(a.Builder, b.Builder) &&
 		hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
+}
+
+func equalRegistrationMetadata(a, b *types.Build) bool {
+	// Terminal persistence deliberately removes builder-only MMDS routes from
+	// portable template metadata. Cluster registration retains their immutable
+	// digest separately, so an exact delayed replay can still prove identity
+	// without retaining those routes or their confidential values indefinitely.
+	if a.RegistrationMMDSRoutesDigest == "" && b.RegistrationMMDSRoutesDigest == "" {
+		return equalEmptyCollections(a.Metadata, b.Metadata)
+	}
+	withoutMMDS := func(in map[string]string) map[string]string {
+		if _, present := in[sandboxcfg.NsMMDS]; !present {
+			return in
+		}
+		out := make(map[string]string, len(in)-1)
+		for key, value := range in {
+			if key != sandboxcfg.NsMMDS {
+				out[key] = value
+			}
+		}
+		return out
+	}
+	return equalEmptyCollections(withoutMMDS(a.Metadata), withoutMMDS(b.Metadata))
 }
 
 func equalEmptyCollections(a, b any) bool {

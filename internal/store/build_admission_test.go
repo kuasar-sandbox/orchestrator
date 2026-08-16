@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -258,7 +259,10 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 	definition := admissionBuild("terminal-replay", types.BuildResources{CPU: 1000, Memory: 1 << 30})
 	definition.RegistrationImageRepo = "registry.test/repo"
 	definition.RegistrationRegistryAuth = `{"auths":{"registry.test":{"auth":"immutable"}}}`
-	registered, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, limit, "", nil)
+	mmdsRoutes := `{"routes":[{"path":"/identity","data":"registered"}]}`
+	definition.Metadata = map[string]string{sandboxcfg.NsMMDS: mmdsRoutes, "ordinary": "preserved"}
+	definition.RegistrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(mmdsRoutes)
+	registered, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, limit, definition.RegistrationMMDSRoutesDigest, nil)
 	if err != nil || !inserted {
 		t.Fatalf("register: inserted=%v err=%v", inserted, err)
 	}
@@ -273,6 +277,14 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 	if err := st.PutBuildTerminal(ctx, &terminal); err != nil {
 		t.Fatal(err)
 	}
+	terminalStored, err := st.GetBuild(ctx, definition.BuildID)
+	if err != nil || terminalStored == nil {
+		t.Fatalf("terminal GetBuild = %+v, %v", terminalStored, err)
+	}
+	if _, present := terminalStored.Metadata[sandboxcfg.NsMMDS]; present ||
+		terminalStored.RegistrationMMDSRoutesDigest != definition.RegistrationMMDSRoutesDigest {
+		t.Fatalf("terminal registration identity = metadata %+v digest %q", terminalStored.Metadata, terminalStored.RegistrationMMDSRoutesDigest)
+	}
 
 	// Tightening both count and resource limits after acceptance must not turn a
 	// delayed exact retry into a new admission decision.
@@ -280,12 +292,18 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 		MaxBuilds: 1,
 		Resources: types.BuildResources{CPU: 1, Memory: 1, Storage: 1},
 	}
-	replayed, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, tightened, "", nil)
+	replayed, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, tightened, definition.RegistrationMMDSRoutesDigest, nil)
 	if err != nil || inserted {
 		t.Fatalf("terminal replay: inserted=%v err=%v", inserted, err)
 	}
 	if replayed.Status != types.BuildError || replayed.Reason != terminal.Reason {
 		t.Fatalf("terminal replay = %+v", replayed)
+	}
+	changed := *definition
+	changed.Metadata = map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/identity","data":"changed"}]}`, "ordinary": "preserved"}
+	changed.RegistrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(changed.Metadata[sandboxcfg.NsMMDS])
+	if _, _, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, &changed, tightened, changed.RegistrationMMDSRoutesDigest, nil); !errors.Is(err, ErrBuildRegistrationConflict) {
+		t.Fatalf("terminal MMDS identity conflict = %v", err)
 	}
 	usage, err := st.BuildUsage(ctx)
 	if err != nil {

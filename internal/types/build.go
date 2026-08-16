@@ -103,14 +103,18 @@ type Build struct {
 	// is encrypted at rest independently from the trigger work order above.
 	RegistrationImageRepo    string
 	RegistrationRegistryAuth string
-	StartCmd                 string // e2b only; non-empty => snapshot build (kind=snp)
-	ReadyCmd                 string // e2b only; readiness probe run after StartCmd (poll until exit 0)
-	Steps                    []TemplateStep
-	Status                   BuildState
-	Reason                   string   // error detail
-	RunID                    string   // current systemd builder runner instance id
-	Names                    []string // user-supplied name(s) + persist id (when ready)
-	Aliases                  []string // user-supplied alias(es) + persist id (when ready)
+	// RegistrationMMDSRoutesDigest retains the immutable registration identity
+	// of builder-only MMDS routes after terminal cleanup removes those routes and
+	// their confidential values from the portable template record.
+	RegistrationMMDSRoutesDigest string
+	StartCmd                     string // e2b only; non-empty => snapshot build (kind=snp)
+	ReadyCmd                     string // e2b only; readiness probe run after StartCmd (poll until exit 0)
+	Steps                        []TemplateStep
+	Status                       BuildState
+	Reason                       string   // error detail
+	RunID                        string   // current systemd builder runner instance id
+	Names                        []string // user-supplied name(s) + persist id (when ready)
+	Aliases                      []string // user-supplied alias(es) + persist id (when ready)
 	// Resources is the immutable outer Build demand used by registration and
 	// execution admission plus systemd enforcement. It never becomes sandbox
 	// capacity/allocatable/startup and never enters a snapshot.

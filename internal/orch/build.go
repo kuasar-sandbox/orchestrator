@@ -131,6 +131,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if initialMMDS != nil {
 		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
 	}
+	b.RegistrationMMDSRoutesDigest = routesDigest
 	registrationLimit, err := o.cfg.Builder.RegistrationLimit()
 	if err != nil {
 		return nil, err

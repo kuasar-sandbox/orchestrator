@@ -209,26 +209,31 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if phaseResourcePatch != "" {
 		meta = cloneStringMapWithout(meta, sandboxcfg.NsResource)
 	}
+	registrationMMDSRoutesDigest := ""
+	if raw, present := meta[sandboxcfg.NsMMDS]; present {
+		registrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(raw)
+	}
 	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
 		return err
 	}
 	b := &types.Build{
-		BuildID:                  cmd.BuildID,
-		TemplateID:               cmd.TemplateRef,
-		APISecret:                pair.APISecret,
-		ManifestKey:              pair.ManifestKey,
-		Profile:                  profile,
-		Kind:                     types.KindImg,
-		Status:                   types.BuildRegistered,
-		FromImage:                o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
-		Resources:                resources,
-		RegistrationImageRepo:    cmd.ImageRepo,
-		RegistrationRegistryAuth: cmd.RegistryAuth,
-		ClusterGroup:             location.Group,
-		PhaseResourcePatch:       phaseResourcePatch,
-		Metadata:                 meta,
-		Builder:                  builderOpts,
-		CreatedUnix:              time.Now().Unix(),
+		BuildID:                      cmd.BuildID,
+		TemplateID:                   cmd.TemplateRef,
+		APISecret:                    pair.APISecret,
+		ManifestKey:                  pair.ManifestKey,
+		Profile:                      profile,
+		Kind:                         types.KindImg,
+		Status:                       types.BuildRegistered,
+		FromImage:                    o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
+		Resources:                    resources,
+		RegistrationImageRepo:        cmd.ImageRepo,
+		RegistrationRegistryAuth:     cmd.RegistryAuth,
+		RegistrationMMDSRoutesDigest: registrationMMDSRoutesDigest,
+		ClusterGroup:                 location.Group,
+		PhaseResourcePatch:           phaseResourcePatch,
+		Metadata:                     meta,
+		Builder:                      builderOpts,
+		CreatedUnix:                  time.Now().Unix(),
 	}
 	// A tightened execution policy rejects only new registration ownership. An
 	// exact retry after an ambiguous/lost ACK must still reach the store's
