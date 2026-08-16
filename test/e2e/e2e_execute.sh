@@ -262,6 +262,7 @@ req() {
     # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
+    [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")
     [ -n "${REQ_CHECKPOINT_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Checkpoint: ${REQ_CHECKPOINT_HEADER}")
     if [ "${REQ_ATTACH_MMDS:-0}" = 1 ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
         args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
@@ -980,7 +981,12 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":2,"memoryMB":8192}')
+# Registration cpuCount/memoryMB are Build resources only. The independent
+# Resource header gives phases A/B/C a 2 CPU / 8 GiB Sandbox capacity, which the
+# phase-C snapshot must preserve on restore below.
+REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
+code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":1,"memoryMB":8192}')
+unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)
