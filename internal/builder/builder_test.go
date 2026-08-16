@@ -21,6 +21,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"golang.org/x/sys/unix"
 )
 
 func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
@@ -463,6 +464,16 @@ func TestPhaseSandboxIDsUseCompleteOpaqueBuildIdentity(t *testing.T) {
 	}
 	if got, want := phaseSandboxID("a", "same-prefix-build-one"), first; got != want {
 		t.Fatalf("phase Sandbox ID is not deterministic: got %q want %q", got, want)
+	}
+
+	// Keep the current real-E2E workdir shape below Linux sockaddr_un.sun_path.
+	// This caught the 128-bit hex encoding whose otherwise-valid SID pushed
+	// sandboxer's uffd.sock path beyond the kernel ABI limit.
+	workdir := filepath.Join("/tmp/e2e-cr-XXXXXX", "br", strings.Repeat("b", 36))
+	socket := filepath.Join(workdir, "run", first, "uffd.sock")
+	if len(socket) >= len(unix.RawSockaddrUnix{}.Path) {
+		t.Fatalf("phase runtime socket path is %d bytes, want less than sun_path %d: %s",
+			len(socket), len(unix.RawSockaddrUnix{}.Path), socket)
 	}
 }
 

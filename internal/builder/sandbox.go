@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -106,14 +108,19 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	return sb, nil
 }
 
+const phaseSandboxDigestBytes = 12
+
+var phaseSandboxIDEncoding = base32.HexEncoding.WithPadding(base32.NoPadding)
+
 func phaseSandboxID(phase, buildID string) string {
 	// Build IDs are opaque at this boundary (cluster registrations are not
 	// required to be UUIDs). Hash the complete identity so it cannot inject a
 	// path and Builds sharing a short prefix still receive distinct ordinary
-	// Sandbox IDs. The 128-bit prefix keeps the DNS-label-safe SID well below the
-	// node's 57-byte limit.
+	// Sandbox IDs. A 96-bit digest remains collision-resistant while its compact
+	// base32 form leaves room for sandbox runtime UDS names under sun_path.
 	sum := sha256.Sum256([]byte(buildID))
-	return fmt.Sprintf("bp-%s-%x", phase, sum[:16])
+	digest := phaseSandboxIDEncoding.EncodeToString(sum[:phaseSandboxDigestBytes])
+	return fmt.Sprintf("bp-%s-%s", phase, strings.ToLower(digest))
 }
 
 // attachReadinessPipe gives the writer the next os/exec child descriptor. The

@@ -1011,9 +1011,7 @@ echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to build
 # snapshot template above cannot reproduce a 256 MiB startup floor. Build the
 # same OCI input as an image template (no startCmd), then cold boot it with the
 # complete 8 GiB / 256 MiB resource declaration from issue #152.
-# These are Build resources, not the capacity exercised by the later creates.
-# Keep the outer builder unit large enough for the independent 2GiB phase VM.
-code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":6144}')
+code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":1,"memoryMB":1024}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
 LOW_TID=$(json_field "$WORK/resp.body" templateID)
 LOW_BID=$(json_field "$WORK/resp.body" buildID)
@@ -1036,7 +1034,7 @@ case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_
 # A bare image lets the capacity<256MiB case validate a real KVM launch without
 # paying envd's steady workload. It carries no resource patch, so the create
 # request below proves inherited 256MiB floor normalization.
-code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare","cpuCount":2,"memoryMB":6144}')
+code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare","cpuCount":1,"memoryMB":1024}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "small-capacity register=$code"; }
 SMALL_TID=$(json_field "$WORK/resp.body" templateID)
 SMALL_BID=$(json_field "$WORK/resp.body" buildID)

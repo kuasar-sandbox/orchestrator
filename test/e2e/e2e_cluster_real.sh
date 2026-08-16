@@ -555,11 +555,8 @@ EOF
     wait_api_health "$BUILD_PORT" "temporary node-ctl"
     "$BIN/node-ctl" manifest-key add --socket "$WORK/bn.sock" "$MANIFEST_KEY" >/dev/null || fail "temporary manifest-key add"
 
-    local code tid bid status
-    # Build memory is the outer builder-unit limit, independent of the phase
-    # Sandbox's node-default 2GiB capacity. Leave room for the VMM and build
-    # toolchain without turning either value into a default for the other.
-    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl","cpuCount":2,"memoryMB":6144}')"
+    local code tid bid status run_id
+    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl","cpuCount":1,"memoryMB":1024}')"
     [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template register returned $code"; }
     tid="$(json_field "$WORK/node-resp.body" templateID)"
     bid="$(json_field "$WORK/node-resp.body" buildID)"
@@ -576,6 +573,12 @@ EOF
                 break
                 ;;
             error)
+                run_id="$(json_field "$WORK/node-resp.body" runID)"
+                if [ -n "$run_id" ]; then
+                    echo "---- journal sandbox-builder@${run_id}.service ----" >&2
+                    journalctl -u "sandbox-builder@${run_id}.service" --no-pager -n 100 2>/dev/null \
+                        | sed 's/^/  builder| /' >&2 || true
+                fi
                 cat "$WORK/node-resp.body"
                 fail "template build error"
                 ;;
