@@ -63,11 +63,23 @@ type fakeNode struct {
 
 type replayingFakeNode struct {
 	*fakeNode
-	replays chan struct{}
+	replays        chan struct{}
+	replayMu       sync.Mutex
+	replayFailures int
 }
 
-func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(context.Context) error {
-	n.replays <- struct{}{}
+func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(ctx context.Context) error {
+	select {
+	case n.replays <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	n.replayMu.Lock()
+	defer n.replayMu.Unlock()
+	if n.replayFailures > 0 {
+		n.replayFailures--
+		return errors.New("transient durable scan failure")
+	}
 	return nil
 }
 
@@ -378,6 +390,61 @@ func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T)
 		case <-time.After(3 * time.Second):
 			t.Fatalf("terminal replay calls=%d, want at least 2 established sessions", i)
 		}
+	}
+}
+
+func TestNodeLinkRetriesTerminalBuildReplayWithinEstablishedSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sessions int
+	var sessionsMu sync.Mutex
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		sessionsMu.Lock()
+		sessions++
+		sessionsMu.Unlock()
+		msg, err := routesync.ReadMsg(req.Body)
+		if err != nil || msg.Type != routesync.TypeNodeRegister {
+			http.Error(w, "bad node register", http.StatusBadRequest)
+			return
+		}
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-req.Context().Done()
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer func() {
+		cancel()
+		srv.Close()
+	}()
+
+	node := &replayingFakeNode{
+		fakeNode:       newFakeNode(),
+		replays:        make(chan struct{}, 4),
+		replayFailures: 1,
+	}
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	go client.Run(ctx)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-node.replays:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("terminal replay calls=%d, want retry after transient scan failure", i)
+		}
+	}
+	sessionsMu.Lock()
+	gotSessions := sessions
+	sessionsMu.Unlock()
+	if gotSessions != 1 {
+		t.Fatalf("node-link sessions=%d, want replay retry within one established session", gotSessions)
 	}
 }
 

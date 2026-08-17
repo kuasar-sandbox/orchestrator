@@ -53,6 +53,11 @@ type buildTerminalReplayer interface {
 	ReplayClusterBuildTerminalStates(context.Context) error
 }
 
+const (
+	buildTerminalReplayInitialBackoff = 200 * time.Millisecond
+	buildTerminalReplayMaxBackoff     = 5 * time.Second
+)
+
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
@@ -263,14 +268,37 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	// the node's durable store after every established session so a reset after
 	// the connection-local outbox consumed an event cannot lose it forever.
 	if replayer, ok := c.node.(buildTerminalReplayer); ok {
-		go func() {
-			if err := replayer.ReplayClusterBuildTerminalStates(sctx); err != nil && sctx.Err() == nil {
-				c.log.Error("node-link: replay terminal build states", "err", err)
-			}
-		}()
+		go runBuildTerminalReplay(sctx, replayer, c.log)
 	}
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
+}
+
+// runBuildTerminalReplay retries the durable terminal scan within the current
+// session. A transient SQLite read failure must not leave Registry state stale
+// until an otherwise-unnecessary node-link reconnect.
+func runBuildTerminalReplay(ctx context.Context, replayer buildTerminalReplayer, log *slog.Logger) {
+	backoff := buildTerminalReplayInitialBackoff
+	for ctx.Err() == nil {
+		if err := replayer.ReplayClusterBuildTerminalStates(ctx); err == nil {
+			return
+		} else if ctx.Err() == nil {
+			log.Error("node-link: replay terminal build states; retrying", "err", err, "backoff", backoff)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, buildTerminalReplayMaxBackoff)
+	}
 }
 
 func runNodeLinkOutbox(
