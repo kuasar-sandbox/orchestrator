@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -1298,7 +1297,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			TotalSec: o.cfg.Builder.TotalTimeoutSec,
 		},
 	}
-	return spec, filepath.Join(pend.workdir, "builder.pid"), true, nil
+	return spec, configsock.BuildPidfile(o.cfg.Paths.RunRoot, b.BuildID), true, nil
 }
 
 // resolveBuildNetworks derives two roles from the same merged logical network:

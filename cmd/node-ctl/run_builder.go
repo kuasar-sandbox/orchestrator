@@ -75,8 +75,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
-	runRoot := filepath.Dir(filepath.Dir(*pidfile))
-	if err := lockPidfile(filepath.Join(runRoot, bid, bid+".pid")); err != nil {
+	if err := lockPidfile(builderAssignmentPidfile(*pidfile, bid)); err != nil {
 		return err
 	}
 	spec, err := configsock.FetchBuildSpec(*socket, "build:"+bid)
@@ -108,4 +107,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+func builderAssignmentPidfile(runPidfile, buildID string) string {
+	runRoot := filepath.Dir(filepath.Dir(runPidfile))
+	return configsock.BuildPidfile(runRoot, buildID)
 }
