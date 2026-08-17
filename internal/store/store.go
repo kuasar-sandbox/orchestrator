@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS builds (
   runtime_vswitch_port TEXT NOT NULL DEFAULT '',
   runtime_floating_ip TEXT NOT NULL DEFAULT '',
   runtime_port_mac TEXT NOT NULL DEFAULT '',
-  runtime_envd_access_token_enc TEXT NOT NULL DEFAULT ''
+  runtime_envd_access_token_enc TEXT NOT NULL DEFAULT '',
+  execution_result_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_ashash ON builds(api_secret_hash);
@@ -777,19 +778,19 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc`
+  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
 	var profile, kind, status, names, aliases, apiHash, apiEnc, manifestHash, manifestEnc, raEnc, registrationRAEnc, steps, meta, builder string
-	var runtimeEnvdAccessTokenEnc string
+	var runtimeEnvdAccessTokenEnc, executionResultJSON string
 	var executionClaimed int
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &apiHash, &apiEnc, &manifestHash, &manifestEnc, &profile, &kind,
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
-		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc); err != nil {
+		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &executionResultJSON); err != nil {
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
@@ -821,6 +822,13 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 			return nil, fmt.Errorf("store: decrypt runtime envd access token for build %s: %w", b.BuildID, err)
 		}
 	}
+	if executionResultJSON != "" {
+		var result types.BuildResult
+		if err := json.Unmarshal([]byte(executionResultJSON), &result); err != nil {
+			return nil, fmt.Errorf("store: decode execution result for build %s: %w", b.BuildID, err)
+		}
+		b.ExecutionResult = &result
+	}
 	b.Profile, b.Kind, b.Status = types.Profile(profile), types.Kind(kind), types.BuildState(status)
 	b.Names, b.Aliases = ujs(names), ujs(aliases)
 	return &b, nil
@@ -832,8 +840,8 @@ const buildInsertSQL = `
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -855,7 +863,8 @@ const buildUpsertSQL = buildInsertSQL + `
 	  runtime_vswitch_port=excluded.runtime_vswitch_port,
 	  runtime_floating_ip=excluded.runtime_floating_ip,
 	  runtime_port_mac=excluded.runtime_port_mac,
-	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc`
+	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc,
+	  execution_result_json=excluded.execution_result_json`
 
 const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
 
@@ -889,6 +898,14 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 			return nil, fmt.Errorf("store: put build %s: encrypt runtime envd access token: %w", b.BuildID, err)
 		}
 	}
+	executionResultJSON := ""
+	if b.ExecutionResult != nil {
+		encoded, err := json.Marshal(b.ExecutionResult)
+		if err != nil {
+			return nil, fmt.Errorf("store: put build %s: execution result: %w", b.BuildID, err)
+		}
+		executionResultJSON = string(encoded)
+	}
 	stepsJSON := "[]"
 	if len(b.Steps) > 0 {
 		sj, jerr := json.Marshal(b.Steps)
@@ -906,7 +923,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
-		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc,
+		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, executionResultJSON,
 	}, nil
 }
 

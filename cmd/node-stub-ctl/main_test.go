@@ -239,6 +239,47 @@ func TestStubExecutionAdmissionQueuesFIFOByAggregateResources(t *testing.T) {
 	}
 }
 
+func TestStubExecutionAdmissionFIFOUsesTriggerOrder(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := newService("", log)
+	node := newStubNode(stubNodeOptions{
+		ID: "n1",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 3, Resources: &routesync.BuildResources{CPU: 3000, Memory: 3 << 30},
+		},
+		BuildExecutionCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		},
+	}, service)
+	for _, id := range []string{"blocker", "registered-first", "triggered-first"} {
+		cmd := &routesync.Command{
+			CmdID: "register-" + id, Kind: routesync.CmdBuildRegister,
+			BuildID: id, TemplateRef: "transient-" + id, Profile: "bare",
+			BuildResources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+			Config:         map[string]string{"stub.build_result": "timeout"},
+		}
+		if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+			t.Fatalf("register %s = %+v", id, got)
+		}
+	}
+	for _, id := range []string{"blocker", "triggered-first", "registered-first"} {
+		if err := node.requestBuildExecution(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := node.setBuildState("blocker", "ready", "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	triggeredState := node.builds["triggered-first"].State
+	registeredState := node.builds["registered-first"].State
+	node.mu.Unlock()
+	if triggeredState != "building" || registeredState != "registered" {
+		t.Fatalf("execution FIFO followed registration rather than trigger order: triggered-first=%s registered-first=%s",
+			triggeredState, registeredState)
+	}
+}
+
 func TestAddBuildResourcesFailClosedOnOverflow(t *testing.T) {
 	dst := &routesync.BuildResources{CPU: math.MaxInt64 - 1, Memory: 1, Storage: 1}
 	addBuildResourcesFailClosed(dst, &routesync.BuildResources{CPU: 2, Memory: 1, Storage: 1})

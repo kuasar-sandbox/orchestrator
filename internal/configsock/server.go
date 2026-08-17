@@ -103,13 +103,10 @@ type AssignmentResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type BuildResult struct {
-	ImageRef    string `json:"image_ref,omitempty"`
-	SnapshotRef string `json:"snapshot_ref,omitempty"`
-	StartCmd    string `json:"start_cmd,omitempty"`
-	ReadyCmd    string `json:"ready_cmd,omitempty"`
-	Error       string `json:"error,omitempty"`
-}
+// BuildResult is the config-socket wire representation of the durable core
+// result. Keeping this an alias prevents the report and recovery paths from
+// acquiring subtly different schemas.
+type BuildResult = types.BuildResult
 
 type BuildResultRequest struct {
 	RunID   string      `json:"run_id"`

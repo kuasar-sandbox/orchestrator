@@ -661,8 +661,11 @@ type buildResult = configsock.BuildResult
 var errBuildCleanupPending = errors.New("build runtime cleanup remains pending")
 
 type buildCleanupPendingError struct {
-	cause   error
-	cleanup error
+	cause     error
+	cleanup   error
+	port      string
+	dir       string
+	persisted bool
 }
 
 func (e *buildCleanupPendingError) Error() string {
@@ -723,7 +726,7 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 	var cleanupPending *buildCleanupPendingError
 	if errors.As(err, &cleanupPending) {
 		var cleanupErr error
-		err, cleanupErr = o.retryBuildCleanup(ctx, b, cleanupPending.cause)
+		err, cleanupErr = o.retryBuildCleanup(ctx, b, cleanupPending)
 		if cleanupErr != nil {
 			// The execution claim remains durable. A live controller keeps retrying;
 			// cancellation hands the exact same ownership to startup reconciliation.
@@ -809,6 +812,7 @@ func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Bu
 		if err == nil {
 			build.ExecutionClaimed = false
 			build.ExecutionClaimedUnix = 0
+			build.ExecutionResult = nil
 			o.refreshBuildAdmissionGauges(context.Background())
 			return true
 		}
@@ -844,17 +848,22 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	runtimePersisted := false
 	cleanupSafe := true
 	defer func() {
-		if !cleanupSafe {
-			retErr = &buildCleanupPendingError{cause: retErr}
-			return
-		}
 		portID := ""
 		if port != nil {
 			portID = port.Port
 		}
+		if !cleanupSafe {
+			retErr = &buildCleanupPendingError{
+				cause: retErr, port: portID, dir: dir, persisted: runtimePersisted,
+			}
+			return
+		}
 		cleanupErr := o.cleanupBuildRuntime(b, portID, dir, runtimePersisted)
 		if cleanupErr != nil {
-			retErr = &buildCleanupPendingError{cause: retErr, cleanup: cleanupErr}
+			retErr = &buildCleanupPendingError{
+				cause: retErr, cleanup: cleanupErr,
+				port: portID, dir: dir, persisted: runtimePersisted,
+			}
 		}
 	}()
 	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, b)
@@ -1089,7 +1098,18 @@ func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, per
 // unit, connector, store, or filesystem cleanup failure. It never releases the
 // durable execution claim until the unit is fenced and all exact runtime
 // ownership is gone. Cancellation leaves the row for startup reconciliation.
-func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, cause error) (error, error) {
+func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pending *buildCleanupPendingError) (error, error) {
+	cause := pending.cause
+	port := pending.port
+	dir := pending.dir
+	persisted := pending.persisted
+	if dir == "" {
+		dir = buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
+	}
+	if port == "" && b.RuntimeVswitchPort != "" {
+		port = b.RuntimeVswitchPort
+		persisted = true
+	}
 	delay := 20 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		var cleanupErr error
@@ -1097,9 +1117,7 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, ca
 			cleanupErr = o.stopBuilderUnit(o.builderUnit(b.RunID))
 		}
 		if cleanupErr == nil {
-			port := b.RuntimeVswitchPort
-			cleanupErr = o.cleanupBuildRuntime(b, port,
-				buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID), port != "")
+			cleanupErr = o.cleanupBuildRuntime(b, port, dir, persisted)
 		}
 		if cleanupErr == nil {
 			return cause, nil
@@ -1111,7 +1129,10 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, ca
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return cause, &buildCleanupPendingError{cause: cause, cleanup: cleanupErr}
+			return cause, &buildCleanupPendingError{
+				cause: cause, cleanup: cleanupErr,
+				port: port, dir: dir, persisted: persisted,
+			}
 		case <-timer.C:
 		}
 		if delay < time.Second {

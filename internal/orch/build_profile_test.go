@@ -343,7 +343,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 		{name: "error", state: types.BuildError, reason: "registration expired"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			o := testOrch(t)
+			o := testOrchCfg(t, mmdsFeatureConfig())
 			ctx := context.Background()
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
 			cmd := clusterBuildRegisterCommand("terminal-replay-"+tc.name, fingerprint)

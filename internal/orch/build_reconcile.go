@@ -60,6 +60,12 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 			}
 			_ = o.lc.ResetFailed(ctx, unit)
 		}
+		if build.ExecutionResult != nil {
+			if err := o.finishRecoveredBuildResult(ctx, build); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := o.failInterruptedBuild(ctx, build, "build unit was not live after controller restart"); err != nil {
 			return err
 		}
@@ -126,6 +132,9 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
 		result: make(chan configsock.BuildResult, 1),
 	}
+	if build.ExecutionResult != nil {
+		pend.result <- *build.ExecutionResult
+	}
 	o.pendMu.Lock()
 	if o.pend[build.BuildID] != nil {
 		o.pendMu.Unlock()
@@ -141,6 +150,22 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		defer finish()
 		o.monitorRecoveredBuild(ctx, build, pend, unit, mmdsRow)
 	}()
+	return nil
+}
+
+func (o *Orchestrator) finishRecoveredBuildResult(ctx context.Context, build *types.Build) error {
+	if build.ExecutionResult == nil {
+		return fmt.Errorf("reconcile build %s: missing accepted result", build.BuildID)
+	}
+	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort,
+		buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
+		return fmt.Errorf("reconcile build %s accepted-result cleanup: %w", build.BuildID, err)
+	}
+	result := *build.ExecutionResult
+	o.completeBuild(ctx, build, &result, nil)
+	if build.ExecutionClaimed {
+		return fmt.Errorf("reconcile build %s: accepted result remained nonterminal", build.BuildID)
+	}
 	return nil
 }
 

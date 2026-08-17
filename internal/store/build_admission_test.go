@@ -392,6 +392,45 @@ func TestBuildUsageFailsClosedOnOverflow(t *testing.T) {
 	}
 }
 
+func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	b := admissionBuild("durable-result", types.BuildResources{CPU: 1000, Memory: 1 << 30})
+	b.Status, b.ExecutionClaimed, b.RunID = types.BuildBuilding, true, "br-durable-result"
+	if err := st.PutBuild(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	result := types.BuildResult{
+		ImageRef: "manifest://result", StartCmd: "start", ReadyCmd: "ready",
+	}
+	if inserted, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, result); err != nil || !inserted {
+		t.Fatalf("first result acceptance = inserted %v err %v", inserted, err)
+	}
+	if inserted, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, result); err != nil || inserted {
+		t.Fatalf("idempotent result replay = inserted %v err %v", inserted, err)
+	}
+	changed := result
+	changed.ImageRef = "manifest://different"
+	if _, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, changed); !errors.Is(err, ErrBuildResultConflict) {
+		t.Fatalf("conflicting result replay error = %v", err)
+	}
+	if _, err := st.AcceptBuildResult(ctx, b.BuildID, "br-wrong-owner", result); !errors.Is(err, ErrBuildExecutionOwnership) {
+		t.Fatalf("wrong-run result error = %v", err)
+	}
+	loaded, err := st.GetBuild(ctx, b.BuildID)
+	if err != nil || loaded.ExecutionResult == nil || *loaded.ExecutionResult != result {
+		t.Fatalf("durable result = %+v, err=%v", loaded, err)
+	}
+	loaded.Status = types.BuildReady
+	if err := st.PutBuildTerminal(ctx, loaded); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := st.GetBuild(ctx, b.BuildID)
+	if err != nil || terminal.ExecutionResult != nil || terminal.ExecutionClaimed {
+		t.Fatalf("terminal result cleanup = %+v, err=%v", terminal, err)
+	}
+}
+
 func TestBuildPhaseTransitionsFenceStaleReports(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -405,6 +444,9 @@ func TestBuildPhaseTransitionsFenceStaleReports(t *testing.T) {
 	}
 	if err := st.SetBuildPhase(ctx, b.BuildID, "a", "bp-a-owner", "finished"); err != nil {
 		t.Fatal(err)
+	}
+	if err := st.SetBuildPhase(ctx, b.BuildID, "a", "bp-a-owner", "finished"); err != nil {
+		t.Fatalf("idempotent finished replay: %v", err)
 	}
 	if err := st.SetBuildPhase(ctx, b.BuildID, "b", "bp-b-owner", "starting"); err != nil {
 		t.Fatal(err)

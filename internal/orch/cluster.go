@@ -199,6 +199,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		return fmt.Errorf("%w: build_register cluster ownership: %v", api.ErrBadRequest, err)
 	}
 	meta = cloneStringMapWithout(meta, clusterstate.ObjectMetadataKey)
+	mmdsDoc, meta, err := sandboxcfg.ExtractMMDS(meta, nil, o.mmdsPolicy())
+	if err != nil {
+		return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
+	}
 	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
@@ -209,31 +213,38 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if phaseResourcePatch != "" {
 		meta = cloneStringMapWithout(meta, sandboxcfg.NsResource)
 	}
-	registrationMMDSRoutesDigest := ""
-	if raw, present := meta[sandboxcfg.NsMMDS]; present {
-		registrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(raw)
-	}
 	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
 		return err
 	}
 	b := &types.Build{
-		BuildID:                      cmd.BuildID,
-		TemplateID:                   cmd.TemplateRef,
-		APISecret:                    pair.APISecret,
-		ManifestKey:                  pair.ManifestKey,
-		Profile:                      profile,
-		Kind:                         types.KindImg,
-		Status:                       types.BuildRegistered,
-		FromImage:                    o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
-		Resources:                    resources,
-		RegistrationImageRepo:        cmd.ImageRepo,
-		RegistrationRegistryAuth:     cmd.RegistryAuth,
-		RegistrationMMDSRoutesDigest: registrationMMDSRoutesDigest,
-		ClusterGroup:                 location.Group,
-		PhaseResourcePatch:           phaseResourcePatch,
-		Metadata:                     meta,
-		Builder:                      builderOpts,
-		CreatedUnix:                  time.Now().Unix(),
+		BuildID:                  cmd.BuildID,
+		TemplateID:               cmd.TemplateRef,
+		APISecret:                pair.APISecret,
+		ManifestKey:              pair.ManifestKey,
+		Profile:                  profile,
+		Kind:                     types.KindImg,
+		Status:                   types.BuildRegistered,
+		FromImage:                o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
+		Resources:                resources,
+		RegistrationImageRepo:    cmd.ImageRepo,
+		RegistrationRegistryAuth: cmd.RegistryAuth,
+		ClusterGroup:             location.Group,
+		PhaseResourcePatch:       phaseResourcePatch,
+		Metadata:                 meta,
+		Builder:                  builderOpts,
+		CreatedUnix:              time.Now().Unix(),
+	}
+	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
+	if initialMMDS != nil {
+		transportRow := &types.Sandbox{
+			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
+			State: types.StateRunning, RunID: "build-registration-check",
+			APISecret: b.APISecret, ManifestKey: b.ManifestKey, Metadata: b.Metadata,
+		}
+		if err := validateInitialMMDSRouteEntry(transportRow, initialMMDS); err != nil {
+			return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
+		}
+		b.RegistrationMMDSRoutesDigest = initialMMDS.routesDigest
 	}
 	// A tightened execution policy rejects only new registration ownership. An
 	// exact retry after an ambiguous/lost ACK must still reach the store's
@@ -252,7 +263,12 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
-	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, "", nil)
+	var routesDigest string
+	var secretValues store.MMDSRouteSecretValues
+	if initialMMDS != nil {
+		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
+	}
+	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
 		return fmt.Errorf("%w: %v", api.ErrBuildAdmission, err)

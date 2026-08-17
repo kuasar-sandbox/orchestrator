@@ -56,21 +56,38 @@ func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, er
 	return out.TaskID, nil
 }
 
+type reportTransportError struct{ err error }
+
+func (e *reportTransportError) Error() string { return e.err.Error() }
+func (e *reportTransportError) Unwrap() error { return e.err }
+
+// IsReportTransportError identifies a report whose request or response was
+// interrupted by config-socket replacement. run-builder may safely retry these
+// because phase and result reports are idempotent at the durable provider.
+func IsReportTransportError(err error) bool {
+	var transport *reportTransportError
+	return errors.As(err, &transport)
+}
+
 func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
+	return PostBuildResultContext(context.Background(), socket, runID, buildID, result)
+}
+
+func PostBuildResultContext(ctx context.Context, socket, runID, buildID string, result BuildResult) error {
 	body, _ := json.Marshal(BuildResultRequest{RunID: runID, BuildID: buildID, Result: result})
-	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathRunBuildResult, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunBuildResult, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClient(socket).Do(req)
 	if err != nil {
-		return err
+		return &reportTransportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out BuildResultResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("configsock: decode build result: %w", err)
+		return &reportTransportError{err: fmt.Errorf("configsock: decode build result: %w", err)}
 	}
 	if out.Error != "" {
 		return errors.New(out.Error)
@@ -79,22 +96,26 @@ func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
 }
 
 func PostBuildPhase(socket, runID, buildID, phase, sandboxID, state string) error {
+	return PostBuildPhaseContext(context.Background(), socket, runID, buildID, phase, sandboxID, state)
+}
+
+func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, sandboxID, state string) error {
 	body, _ := json.Marshal(BuildPhaseRequest{
 		RunID: runID, BuildID: buildID, Phase: phase, SandboxID: sandboxID, State: state,
 	})
-	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathRunBuildPhase, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunBuildPhase, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClient(socket).Do(req)
 	if err != nil {
-		return err
+		return &reportTransportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out BuildPhaseResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("configsock: decode build phase: %w", err)
+		return &reportTransportError{err: fmt.Errorf("configsock: decode build phase: %w", err)}
 	}
 	if out.Error != "" {
 		return errors.New(out.Error)

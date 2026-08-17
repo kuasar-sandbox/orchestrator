@@ -48,14 +48,18 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 	if pend.build.RunID != runID {
 		return fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID)
 	}
+	if _, err := o.st.AcceptBuildResult(ctx, buildID, runID, result); err != nil {
+		return err
+	}
 	select {
 	case pend.result <- result:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+		// The in-memory notification is only a wakeup. SQLite above is the
+		// durable authority and is committed before this report is acknowledged.
 	default:
-		return fmt.Errorf("build %s result already posted", buildID)
+		// Identical retries are idempotent and may find the first notification
+		// still buffered (or a recovered result preloaded during reconciliation).
 	}
+	return nil
 }
 
 func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error {

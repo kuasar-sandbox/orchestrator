@@ -102,6 +102,35 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 	}
 }
 
+func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) {
+	o := testOrchCfg(t, mmdsFeatureConfig())
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("cluster-mmds-secret", fingerprint)
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"cluster-initial"}}`
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster BuildRegister ack = %+v", ack)
+	}
+	stored, err := o.st.GetBuild(ctx, cmd.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored cluster build = %+v, err=%v", stored, err)
+	}
+	raw := stored.Metadata[sandboxcfg.NsMMDS]
+	if raw != `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}` ||
+		strings.Contains(raw, "cluster-initial") || strings.Contains(raw, `"secrets"`) {
+		t.Fatalf("cluster build persisted noncanonical or plaintext MMDS metadata: %s", raw)
+	}
+	digest := sandboxcfg.MMDSRoutesDigest(raw)
+	if stored.RegistrationMMDSRoutesDigest != digest {
+		t.Fatalf("cluster registration MMDS digest = %q, want %q", stored.RegistrationMMDSRoutesDigest, digest)
+	}
+	values, _, found, err := o.st.GetMMDSRouteSecretValues(
+		ctx, store.MMDSRouteSecretOwnerBuild, cmd.BuildID, digest)
+	if err != nil || !found || string(values["key"]) != "cluster-initial" {
+		t.Fatalf("cluster build MMDS values = %+v, found=%v err=%v", values, found, err)
+	}
+}
+
 func TestBuildMMDSRouteIsIncludedInFullSync(t *testing.T) {
 	o := testOrchCfg(t, mmdsFeatureConfig())
 	ctx := context.Background()

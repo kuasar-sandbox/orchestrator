@@ -666,6 +666,7 @@ type stubNode struct {
 	sandboxes    map[string]*stubSandbox
 	builds       map[string]*stubBuild
 	buildSeq     int64
+	executionSeq int64
 	keyPairs     map[string]stubKeyPair
 	commands     []commandLog
 	cmdSeq       int64
@@ -1399,7 +1400,15 @@ func (n *stubNode) requestBuildExecution(buildID string) error {
 		n.mu.Unlock()
 		return nil
 	}
-	b.ExecutionReady = true
+	if !b.ExecutionReady {
+		if n.executionSeq == math.MaxInt64 {
+			n.mu.Unlock()
+			return fmt.Errorf("build execution sequence overflow")
+		}
+		n.executionSeq++
+		b.ExecutionReady = true
+		b.ExecutionSeq = n.executionSeq
+	}
 	n.mu.Unlock()
 	n.scheduleBuildExecutions()
 	return nil
@@ -1433,10 +1442,10 @@ func (n *stubNode) scheduleBuildExecutions() {
 		}
 	}
 	sort.Slice(queued, func(i, j int) bool {
-		if queued[i].RegistrationSeq == queued[j].RegistrationSeq {
+		if queued[i].ExecutionSeq == queued[j].ExecutionSeq {
 			return queued[i].BuildID < queued[j].BuildID
 		}
-		return queued[i].RegistrationSeq < queued[j].RegistrationSeq
+		return queued[i].ExecutionSeq < queued[j].ExecutionSeq
 	})
 	events := make([]*routesync.BuildEvent, 0, len(queued))
 	for _, b := range queued {
@@ -1778,6 +1787,7 @@ type stubBuild struct {
 	CreatedAt                string                    `json:"created_at,omitempty"`
 	RegistrationSeq          int64                     `json:"-"`
 	ExecutionReady           bool                      `json:"-"`
+	ExecutionSeq             int64                     `json:"-"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {

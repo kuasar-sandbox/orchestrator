@@ -85,6 +85,18 @@ type BuildRegistryTLSOptions struct {
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 }
 
+// BuildResult is the immutable pipeline result accepted from run-builder. It
+// is persisted while the execution claim is still held so a controller restart
+// can finish unit/runtime cleanup without losing a successful result. None of
+// these fields contains tenant credentials.
+type BuildResult struct {
+	ImageRef    string `json:"image_ref,omitempty"`
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
+	StartCmd    string `json:"start_cmd,omitempty"`
+	ReadyCmd    string `json:"ready_cmd,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
 // Build is one template build, doubling as the template record.
 type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
@@ -148,6 +160,10 @@ type Build struct {
 	RuntimeFloatingIP      string
 	RuntimePortMAC         string
 	RuntimeEnvdAccessToken string
+	// ExecutionResult is set atomically before the config-socket acknowledges
+	// run-builder's report. Terminal persistence clears it together with the
+	// execution claim after the unit and host runtime have been reclaimed.
+	ExecutionResult *BuildResult
 
 	CreatedUnix int64
 }

@@ -376,6 +376,96 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	}
 }
 
+func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("9", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runRoot := filepath.Join(t.TempDir(), "run")
+	runID := "br-00000000-0000-7000-8000-000000000211"
+	build := buildReconcileRow(t, runID)
+	workdir := buildRuntimeDir(runRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	imageRef := "manifest://" + strings.Repeat("f", 64)
+	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
+		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		t.Fatalf("persist accepted result = %v, %v", accepted, err)
+	}
+
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(runRoot), st, &reconcileLauncher{}, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("terminal build = %+v, %v", stored, err)
+	}
+	wantPersistID := types.TemplateID{Profile: build.Profile, Kind: types.KindImg, Ref: imageRef}.String()
+	if stored.Status != types.BuildReady || stored.PersistID != wantPersistID ||
+		stored.ExecutionClaimed || stored.ExecutionResult != nil || stored.RuntimeVswitchPort != "" {
+		t.Fatalf("accepted result was not recovered exactly: %+v", stored)
+	}
+	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
+		t.Fatalf("recovered accepted-result ports = %v", vs.detached)
+	}
+	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted-result workdir remains: %v", err)
+	}
+}
+
+func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000212"
+	build := buildReconcileRow(t, runID)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	pend := &pendingBuild{build: build, result: make(chan configsock.BuildResult, 1)}
+	o.pend[build.BuildID] = pend
+	result := configsock.BuildResult{ImageRef: "manifest://accepted"}
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, result); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.ExecutionResult == nil || *stored.ExecutionResult != result {
+		t.Fatalf("acknowledged result was not durable: %+v, err=%v", stored, err)
+	}
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, result); err != nil {
+		t.Fatalf("identical result replay: %v", err)
+	}
+	conflict := result
+	conflict.ImageRef = "manifest://conflict"
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, conflict); !errors.Is(err, store.ErrBuildResultConflict) {
+		t.Fatalf("conflicting result replay = %v", err)
+	}
+	select {
+	case got := <-pend.result:
+		if got != result {
+			t.Fatalf("result notification = %+v, want %+v", got, result)
+		}
+	default:
+		t.Fatal("durable result did not notify the live monitor")
+	}
+	select {
+	case duplicate := <-pend.result:
+		t.Fatalf("idempotent replay queued a duplicate notification: %+v", duplicate)
+	default:
+	}
+}
+
 func TestReconcileRetainsExecutionClaimUntilInterruptedCleanupSucceeds(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("2", 64))
 	if err != nil {

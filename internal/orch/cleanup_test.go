@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,16 +55,27 @@ func (*orderedCleanupLauncher) Close() error { return nil }
 type orderedCleanupVS struct {
 	detachCalls atomic.Int32
 	detachErr   error
+	mu          sync.Mutex
+	ports       []string
 }
 
 func (*orderedCleanupVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
 	return nil, nil
 }
-func (v *orderedCleanupVS) Detach(context.Context, string) error {
+func (v *orderedCleanupVS) Detach(_ context.Context, port string) error {
+	v.mu.Lock()
+	v.ports = append(v.ports, port)
+	v.mu.Unlock()
 	if v.detachCalls.Add(1) == 1 {
 		return v.detachErr
 	}
 	return nil
+}
+
+func (v *orderedCleanupVS) detachedPorts() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.ports...)
 }
 func (*orderedCleanupVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
@@ -172,6 +184,39 @@ func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cleanup retry retained workdir: %v", err)
+	}
+}
+
+func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	vs := &orderedCleanupVS{detachErr: errors.New("injected first detach failure")}
+	o.vs = vs
+	o.lc = &orderedCleanupLauncher{}
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000210")
+	build.BuildID = "cleanup-retry-unpersisted-port"
+	build.RuntimeVswitchPort = ""
+	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	o.completeBuild(context.Background(), build, &buildResult{
+		ImageRef: "manifest://" + strings.Repeat("e", 64),
+	}, &buildCleanupPendingError{
+		cleanup: errors.New("ownership persistence and initial detach failed"),
+		port:    "local-port-21", dir: workdir,
+	})
+
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.Status != types.BuildReady || stored.ExecutionClaimed {
+		t.Fatalf("cleanup retry terminal build = %+v, err=%v", stored, err)
+	}
+	if got := vs.detachedPorts(); len(got) != 2 || got[0] != "local-port-21" || got[1] != "local-port-21" {
+		t.Fatalf("cleanup retries lost local port ownership: %v", got)
 	}
 }
 

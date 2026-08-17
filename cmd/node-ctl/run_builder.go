@@ -46,6 +46,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -80,7 +81,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 	spec, err := configsock.FetchBuildSpec(*socket, "build:"+bid)
 	if err != nil {
-		postErr := configsock.PostBuildResult(*socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		postErr := retryBuildReport(context.Background(), log, "result", func(ctx context.Context) error {
+			return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		})
 		if postErr != nil {
 			return fmt.Errorf("fetch build spec: %w (post result: %v)", err, postErr)
 		}
@@ -93,20 +96,53 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 
 	reportPhase := func(phase, sandboxID, state string) error {
-		return configsock.PostBuildPhase(*socket, *runID, bid, phase, sandboxID, state)
+		return retryBuildReport(context.Background(), log, "phase", func(ctx context.Context) error {
+			return configsock.PostBuildPhaseContext(ctx, *socket, *runID, bid, phase, sandboxID, state)
+		})
 	}
 	res := builder.Run(spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
-	if err := configsock.PostBuildResult(*socket, *runID, bid, post); err != nil {
+	if err := retryBuildReport(context.Background(), log, "result", func(ctx context.Context) error {
+		return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, post)
+	}); err != nil {
 		return fmt.Errorf("post build result: %w", err)
 	}
 	if res.Error != "" {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+func retryBuildReport(ctx context.Context, log *slog.Logger, kind string, post func(context.Context) error) error {
+	delay := 20 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err := post(ctx)
+		if err == nil {
+			return nil
+		}
+		if !configsock.IsReportTransportError(err) {
+			return err
+		}
+		if attempt == 1 {
+			log.Warn("builder report interrupted; retrying", "kind", kind, "err", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
 }
 
 func builderAssignmentPidfile(runPidfile, buildID string) string {

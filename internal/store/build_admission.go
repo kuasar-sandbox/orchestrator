@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -15,6 +16,15 @@ import (
 // pressure so the FIFO scheduler can terminally reject the row instead of
 // blocking every smaller Build behind it.
 var ErrBuildExecutionUnfit = errors.New("build cannot fit configured execution limits")
+
+var (
+	// ErrBuildExecutionOwnership means a worker report no longer belongs to a
+	// live claimed execution.
+	ErrBuildExecutionOwnership = errors.New("build execution ownership lost")
+	// ErrBuildResultConflict means the worker replayed a different result after
+	// one immutable result had already been accepted.
+	ErrBuildResultConflict = errors.New("build result conflicts with accepted result")
+)
 
 type BuildAdmissionUsage struct {
 	RegistrationBuilds int64
@@ -126,6 +136,54 @@ func (s *Store) BindBuildRun(ctx context.Context, buildID, runID, enforcementSta
 	return changed == 1, err
 }
 
+// AcceptBuildResult is the result-report linearization point. It persists the
+// immutable result while status=building and the execution claim/runtime
+// ownership are still retained. An identical retry is accepted idempotently;
+// a different replay fails closed. Terminal persistence clears the result only
+// after the unit and host runtime have been reclaimed.
+func (s *Store) AcceptBuildResult(ctx context.Context, buildID, runID string, result types.BuildResult) (bool, error) {
+	if buildID == "" || runID == "" {
+		return false, fmt.Errorf("store: accept build result: build and run id are required")
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return false, fmt.Errorf("store: accept build %s result: %w", buildID, err)
+	}
+	canonical := string(encoded)
+	updated, err := s.db.ExecContext(ctx, `UPDATE builds SET execution_result_json=?
+		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1
+		  AND execution_result_json=''`,
+		canonical, buildID, runID, string(types.BuildBuilding))
+	if err != nil {
+		return false, fmt.Errorf("store: accept build %s result: %w", buildID, err)
+	}
+	changed, err := updated.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: accept build %s result rows: %w", buildID, err)
+	}
+	if changed == 1 {
+		return true, nil
+	}
+
+	var stored string
+	err = s.db.QueryRowContext(ctx, `SELECT execution_result_json FROM builds
+		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1`,
+		buildID, runID, string(types.BuildBuilding)).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: build %s run %s", ErrBuildExecutionOwnership, buildID, runID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read accepted build %s result: %w", buildID, err)
+	}
+	if stored == canonical {
+		return false, nil
+	}
+	if stored != "" {
+		return false, fmt.Errorf("%w: build %s", ErrBuildResultConflict, buildID)
+	}
+	return false, fmt.Errorf("%w: build %s run %s", ErrBuildExecutionOwnership, buildID, runID)
+}
+
 // SetBuildRuntimeOwnership persists host resources acquired after execution
 // admission but before assignment. A restart can then recover a live unit's
 // result channel and reclaim the exact connector port without rerunning the
@@ -180,7 +238,7 @@ func (s *Store) SetBuildPhase(ctx context.Context, buildID, phase, sandboxID, st
 	case "finished":
 		query = `UPDATE builds SET phase='',phase_sandbox_id=''
 			WHERE build_id=? AND status=? AND execution_claimed=1
-			  AND phase=? AND phase_sandbox_id=?`
+			  AND ((phase=? AND phase_sandbox_id=?) OR (phase='' AND phase_sandbox_id=''))`
 		args = []any{buildID, string(types.BuildBuilding), phase, sandboxID}
 	case "failed":
 		// Keep the failed phase/SID visible until the Build terminal row is
