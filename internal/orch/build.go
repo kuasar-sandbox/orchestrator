@@ -837,7 +837,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if !b.Profile.Valid() {
 		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
 	}
-	dir := filepath.Join(o.cfg.Paths.RunRoot, b.BuildID)
+	dir := buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -1100,7 +1100,7 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, ca
 		if cleanupErr == nil {
 			port := b.RuntimeVswitchPort
 			cleanupErr = o.cleanupBuildRuntime(b, port,
-				filepath.Join(o.cfg.Paths.RunRoot, b.BuildID), port != "")
+				buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID), port != "")
 		}
 		if cleanupErr == nil {
 			return cause, nil
@@ -1298,7 +1298,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			TotalSec: o.cfg.Builder.TotalTimeoutSec,
 		},
 	}
-	return spec, filepath.Join(pend.workdir, b.BuildID+".pid"), true, nil
+	return spec, filepath.Join(pend.workdir, "builder.pid"), true, nil
 }
 
 // resolveBuildNetworks derives two roles from the same merged logical network:

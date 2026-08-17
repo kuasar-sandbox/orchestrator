@@ -249,10 +249,13 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
   `FD_CLOEXEC`,向 argv 追加其实际编号 `--ready-fd=<fd>`并替换为
   `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile 锁 fd 和 readiness fd;
   任一 pre-exec 失败都会关闭 readiness 连接,serve 立即读到 EOF。
-- **run-builder**:取得 bid 后锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec →
+- **run-builder**:取得 bid 后锁
+  `<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 BuildSpec →
   **驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
   `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传。
+  完整 bid 始终是持久业务身份;固定长度摘要只用于可重建的 node-local runtime 目录,
+  使嵌套 phase UDS 在较长 `run_root` 下仍不超过 Linux `sun_path`。
 
 ```
 node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
@@ -922,7 +925,8 @@ Delegate=yes                  # phase ctl/vmm 子 cgroup 与可信 VMM cgroup FD
 两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
 业务 id。runner 取得 sid 后再锁 `<run_root>/<sid>/<sid>.pid`,取 LaunchSpec 并
 `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
-sd_notify);builder 取得 bid 后再锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec,
+sd_notify);builder 取得 bid 后再锁
+`<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 BuildSpec,
 **驻留**驱动三阶段流水线(§12),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
@@ -1044,8 +1048,9 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   网络槽(tapfd transport、mac、inner_ip、nexthop、hostname、dns),全构建复用。
   run-builder 据此自建阶段沙箱(§12);仅在该构建单元运行期间可取(serve 持挂
   pending 状态,单元退出即失效)。
-- **鉴权**:peer pid ⟷ `<rundir>/<id>/<id>.pid`(启动器拨号前已锁写本 PID),相等即
-  认证。
+- **鉴权**:peer pid ⟷ spec 返回的锁定 pidfile(sandbox 为
+  `<rundir>/<sid>/<sid>.pid`,builder 为上述固定长度 runtime 目录中的
+  `builder.pid`),相等即认证。
 - 设计意图:**非密配置走文件**(`<sid>.yaml`;构建的阶段 yaml 由 run-builder 写进
   workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
 

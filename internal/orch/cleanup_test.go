@@ -148,7 +148,7 @@ func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000209")
 	build.BuildID = "cleanup-retry-without-restart"
-	workdir := filepath.Join(o.cfg.Paths.RunRoot, build.BuildID)
+	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
 	if err := os.MkdirAll(workdir, 0o700); err != nil {
 		t.Fatal(err)
 	}

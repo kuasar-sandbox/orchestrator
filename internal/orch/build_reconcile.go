@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -121,7 +120,7 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		return o.failInterruptedBuild(ctx, build, "cannot reconstruct live build: "+err.Error())
 	}
 	pend := &pendingBuild{
-		build: build, workdir: filepath.Join(o.cfg.Paths.RunRoot, build.BuildID), spec: spec,
+		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), spec: spec,
 		network: network, templateNetwork: templateNetwork, resources: resources,
 		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
 		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
@@ -229,7 +228,7 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 }
 
 func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Build, reason string) error {
-	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, filepath.Join(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
+	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
 		return fmt.Errorf("reconcile build %s cleanup: %w", build.BuildID, err)
 	}
 	build.Status, build.Reason = types.BuildError, reason

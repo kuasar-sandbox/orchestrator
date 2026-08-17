@@ -285,7 +285,7 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	runID := "br-00000000-0000-7000-8000-000000000001"
 	unit := "sandbox-builder@" + runID + ".service"
 	build := buildReconcileRow(t, runID)
-	if err := os.MkdirAll(filepath.Join(runRoot, build.BuildID), 0o700); err != nil {
+	if err := os.MkdirAll(buildRuntimeDir(runRoot, build.BuildID), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.PutBuild(context.Background(), build); err != nil {
@@ -371,7 +371,7 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	if len(vs.detached) != 1 || vs.detached[0] != "17" {
 		t.Fatalf("detached ports = %v", vs.detached)
 	}
-	if _, err := os.Stat(filepath.Join(runRoot, build.BuildID)); !os.IsNotExist(err) {
+	if _, err := os.Stat(buildRuntimeDir(runRoot, build.BuildID)); !os.IsNotExist(err) {
 		t.Fatalf("recovered workdir remains: %v", err)
 	}
 }
