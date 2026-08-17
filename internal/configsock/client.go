@@ -23,6 +23,11 @@ func HTTPClientWithTimeout(socket string, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
+			// Callers intentionally create a short-lived client per config-socket
+			// operation. Do not retain an idle UDS connection in the otherwise
+			// unreachable transport, especially while run-builder retries 5xx
+			// responses from a restarting or temporarily unhealthy controller.
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", socket)

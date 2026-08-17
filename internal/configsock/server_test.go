@@ -232,6 +232,17 @@ func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T
 	}
 }
 
+func TestConfigSocketClientsDoNotRetainIdleConnections(t *testing.T) {
+	client := HTTPClient(filepath.Join(t.TempDir(), "ctl.sock"))
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("HTTPClient transport = %T, want *http.Transport", client.Transport)
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("HTTPClient retains idle UDS connections across short-lived retry clients")
+	}
+}
+
 func TestBuildRetryClassification(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "id.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
