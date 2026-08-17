@@ -868,7 +868,7 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	case routesync.CmdDelete:
 		return n.handleDelete(cmd)
 	case routesync.CmdBuildRegister:
-		return n.handleBuildRegister(cmd)
+		return n.handleBuildRegisterContext(ctx, cmd)
 	default:
 		return ack(cmd, routesync.AckRejected, "unknown command kind")
 	}
@@ -1103,6 +1103,10 @@ func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
+	return n.handleBuildRegisterContext(context.Background(), cmd)
+}
+
+func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return ackHTTP(cmd, routesync.AckRejected, "build_id and template_ref are required", http.StatusBadRequest)
 	}
@@ -1129,9 +1133,22 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
 		conflict := !sameStubBuildRegistration(existing, b)
+		terminal := existing.State == "ready" || existing.State == "error"
+		event := &routesync.BuildEvent{
+			BuildID: existing.BuildID, State: existing.State,
+			TemplateID: existing.TemplateID, Reason: existing.Reason,
+		}
 		n.mu.Unlock()
 		if conflict {
 			return ackHTTP(cmd, routesync.AckRejected, "build immutable definition conflicts with existing build", http.StatusConflict)
+		}
+		if terminal {
+			select {
+			case n.buildEvents <- event:
+				n.svc.logEvent(n.ID, "build_event", event)
+			case <-ctx.Done():
+				return nil
+			}
 		}
 		return ack(cmd, routesync.AckAccepted, "")
 	}

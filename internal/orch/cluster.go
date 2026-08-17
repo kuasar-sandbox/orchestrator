@@ -189,7 +189,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	}
 	meta, builderOpts, err := buildcfg.Extract(config)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: build_register builder config: %v", api.ErrBadRequest, err)
 	}
 	if builderOpts.Resources != nil {
 		return fmt.Errorf("%w: build_register %s.resources must be normalized into build_resources", api.ErrBadRequest, buildcfg.NsBuilder)
@@ -319,10 +319,19 @@ func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
 }
 
 // publishBuildState emits a build event for a cluster build (no-op for a non-
-// cluster, e.g. single-node, build). Ordinary lifecycle transitions remain
-// non-blocking: a full buffer drops the event and a later transition/status
-// replay reconverges the Registry.
+// cluster, e.g. single-node, build). Intermediate lifecycle transitions are a
+// lossy notification, while a durable terminal result waits for node-link or
+// controller cancellation. Startup reconciliation uses the explicitly
+// best-effort helper below and is followed by a complete SQLite-backed replay.
 func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
+	if state == string(types.BuildReady) || state == string(types.BuildError) {
+		_ = o.publishBuildStateRequired(o.launchContext(), buildID, state, templateID, reason)
+		return
+	}
+	o.publishBuildStateBestEffort(buildID, state, templateID, reason)
+}
+
+func (o *Orchestrator) publishBuildStateBestEffort(buildID, state, templateID, reason string) {
 	ev, ok := o.buildStateEvent(context.Background(), buildID, state, templateID, reason)
 	if !ok {
 		return
@@ -350,6 +359,34 @@ func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, s
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// ReplayClusterBuildTerminalStates republishes every durable cluster terminal
+// result after node-link startup. Startup reconciliation can terminally fail an
+// arbitrary number of interrupted builders before node-link begins draining its
+// bounded event channel; rebuilding this stream from SQLite prevents that
+// bounded optimization from becoming a correctness limit. Replays are
+// idempotent at the Registry and repeat after every controller restart.
+func (o *Orchestrator) ReplayClusterBuildTerminalStates(ctx context.Context) error {
+	for _, state := range []types.BuildState{types.BuildReady, types.BuildError} {
+		builds, err := o.st.BuildsByStatus(ctx, state)
+		if err != nil {
+			return fmt.Errorf("replay cluster builds in state %s: %w", state, err)
+		}
+		for _, build := range builds {
+			if build.ClusterGroup == "" {
+				continue
+			}
+			templateID := ""
+			if state == types.BuildReady {
+				templateID = build.PersistID
+			}
+			if err := o.publishBuildStateRequired(ctx, build.BuildID, string(state), templateID, build.Reason); err != nil {
+				return fmt.Errorf("replay cluster build %s: %w", build.BuildID, err)
+			}
+		}
+	}
+	return nil
 }
 
 // clusterBuildCreds returns a cluster build's image-pull credentials. The

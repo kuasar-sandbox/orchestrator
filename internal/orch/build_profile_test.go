@@ -271,6 +271,23 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 		!strings.Contains(err.Error(), "must be normalized into build_resources") {
 		t.Fatalf("duplicate Build resource authority error = %v", err)
 	}
+
+	malformedBuilder := *cmd
+	malformedBuilder.CmdID = "malformed-builder-config"
+	malformedBuilder.Kind = routesync.CmdBuildRegister
+	malformedBuilder.BuildID = "malformed-builder-config"
+	malformedBuilder.TemplateRef = "transient-malformed-builder"
+	malformedBuilder.Config = make(map[string]string, len(cmd.Config)+1)
+	for key, value := range cmd.Config {
+		malformedBuilder.Config[key] = value
+	}
+	malformedBuilder.Config[buildcfg.NsBuilder] = `{"resources":null}`
+	if ack := o.HandleCommand(ctx, &malformedBuilder); ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("malformed builder config ack = %+v, want definitive 400", ack)
+	}
+	if stored, err := o.st.GetBuild(ctx, malformedBuilder.BuildID); err != nil || stored != nil {
+		t.Fatalf("malformed builder config stored build = %+v, err=%v", stored, err)
+	}
 }
 
 func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {

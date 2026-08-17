@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -454,6 +455,66 @@ func TestReconcileTreatsAlreadyDetachedBuildPortAsCompletedCleanup(t *testing.T)
 	}
 	if stored.Status != types.BuildError || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
 		t.Fatalf("already-detached cleanup did not release durable ownership: %+v", stored)
+	}
+}
+
+func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	total := cap(o.buildEvents) + 5
+	for i := 0; i < total; i++ {
+		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", i)
+		build.ClusterGroup = "/recovery"
+		build.RuntimeVswitchPort = ""
+		build.RuntimeFloatingIP = ""
+		build.RuntimePortMAC = ""
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(o.buildEvents); got != cap(o.buildEvents) {
+		t.Fatalf("recovery did not exercise the bounded event channel: len=%d cap=%d", got, cap(o.buildEvents))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
+	seen := make(map[string]bool, total)
+	doneCh := (<-chan error)(done)
+	for len(seen) < total || doneCh != nil {
+		select {
+		case event := <-o.buildEvents:
+			if event.State != string(types.BuildError) || event.Reason != "build unit was not live after controller restart" {
+				t.Fatalf("replayed terminal event = %+v", event)
+			}
+			seen[event.BuildID] = true
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+			doneCh = nil
+		case <-ctx.Done():
+			t.Fatalf("terminal replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("terminal replay delivered %d/%d unique builds", len(seen), total)
 	}
 }
 

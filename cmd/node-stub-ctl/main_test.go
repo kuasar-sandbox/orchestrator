@@ -48,6 +48,14 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	if got := node.handleBuildRegister(&replay); got.Status != routesync.AckAccepted {
 		t.Fatalf("identical replay ack = %+v", got)
 	}
+	select {
+	case event := <-node.buildEvents:
+		if event.BuildID != cmd.BuildID || event.State != "ready" || event.TemplateID != cmd.TemplateRef {
+			t.Fatalf("terminal replay event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal replay acknowledged before republishing the persisted result")
+	}
 	for name, mutate := range map[string]func(*routesync.Command){
 		"profile":  func(c *routesync.Command) { c.Profile = "e2b" },
 		"template": func(c *routesync.Command) { c.TemplateRef = "transient-2" },
@@ -77,10 +85,18 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 		t.Fatalf("replay changed stored build: count=%d build=%+v", buildCount, stored)
 	}
 	svc.mu.Lock()
-	eventCount := len(svc.events)
+	var registerEvents, stateEvents int
+	for _, event := range svc.events {
+		switch event.Type {
+		case "build_register":
+			registerEvents++
+		case "build_event":
+			stateEvents++
+		}
+	}
 	svc.mu.Unlock()
-	if eventCount != 1 {
-		t.Fatalf("replay restarted build state machine: events=%d", eventCount)
+	if registerEvents != 1 || stateEvents != 1 {
+		t.Fatalf("terminal replay restarted build state machine: register=%d state=%d", registerEvents, stateEvents)
 	}
 }
 

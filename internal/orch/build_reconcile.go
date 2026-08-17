@@ -236,6 +236,8 @@ func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Bu
 	if !o.persistTerminalBuild(ctx, build) {
 		return fmt.Errorf("reconcile build %s: terminal persistence failed", build.BuildID)
 	}
-	o.publishBuildState(build.BuildID, "error", "", reason)
+	// node-link starts only after reconciliation. Do not let its bounded channel
+	// block startup; node-ctl immediately follows with a complete durable replay.
+	o.publishBuildStateBestEffort(build.BuildID, "error", "", reason)
 	return nil
 }
