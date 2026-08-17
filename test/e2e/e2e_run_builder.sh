@@ -535,7 +535,7 @@ assert row["floor"] == {"memory_bytes": 512 << 20, "cpu_milli": 1000}, row
 assert row.get("connected") is True, row
 assert row.get("provisional", False) is False, row
 assert row["cgroup_path"].endswith("/vmm"), row
-assert row["sandbox_ctl_pid"] > 0, row
+assert row["peer_pid"] > 0, row
 PY
         then
             reservation_json=$(cat "$WORK/phase-reservations.json")
@@ -577,7 +577,7 @@ PY
 import json, sys
 for row in json.load(open(sys.argv[1])):
     if row["sandbox_id"] == sys.argv[2]:
-        print(row["sandbox_ctl_pid"])
+        print(row["peer_pid"])
         break
 PY
 )
