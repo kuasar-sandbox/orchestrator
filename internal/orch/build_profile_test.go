@@ -411,6 +411,19 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 	}
 }
 
+func TestPublishBuildStateRequiredDoesNotTreatStoreFailureAsDirectBuild(t *testing.T) {
+	o := testOrch(t)
+	if err := o.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	err := o.publishBuildStateRequired(ctx, "cluster-build-after-restart", string(types.BuildReady), "template", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publish after durable ownership read failure err=%v, want context deadline", err)
+	}
+}
+
 func TestIMGCreateDoesNotInheritBuildPhaseResourcePatch(t *testing.T) {
 	policy := sandboxcfg.NodeResourcePolicy{}
 	policy.ApplyDefaults()

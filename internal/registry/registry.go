@@ -2070,6 +2070,12 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	for _, plan := range buildPlans {
 		if plan.markDead {
 			plan.record.State, plan.record.Reason = BuildError, "node disconnected"
+			// A BUILD_STARTING intent retains registry pull credentials only so an
+			// ambiguous delivery can be replayed to the same live node. Once the
+			// owner is reaped and the record becomes terminal, that replay is no
+			// longer possible or useful.
+			plan.record.RegistrationImageRepo = ""
+			plan.record.RegistrationRegistryAuth = ""
 			if _, ok, err := r.stores.casRouteBuildShard(ctx, plan.record, plan.revision); err != nil || !ok {
 				continue
 			}

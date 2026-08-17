@@ -290,7 +290,7 @@ func (o *Orchestrator) BuildEvents() <-chan *routesync.BuildEvent { return o.bui
 // buildStateEvent constructs an event only for a cluster-owned Build. The
 // process-local map is a fast path; durable ClusterGroup is authoritative after
 // restart and after terminal cleanup removed transient credentials.
-func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, templateID, reason string) (*routesync.BuildEvent, bool) {
+func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, templateID, reason string) (*routesync.BuildEvent, bool, error) {
 	o.clusterBuildMu.Lock()
 	cb := o.clusterBuilds[buildID]
 	o.clusterBuildMu.Unlock()
@@ -299,14 +299,17 @@ func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, temp
 		// dedicated durable Build field, so controller restart cannot suppress
 		// building/terminal events or lose registration accounting convergence.
 		build, err := o.st.GetBuild(ctx, buildID)
-		if err != nil || build == nil {
-			return nil, false
+		if err != nil {
+			return nil, false, fmt.Errorf("resolve durable cluster build ownership: %w", err)
+		}
+		if build == nil {
+			return nil, false, nil
 		}
 		if build.ClusterGroup == "" {
-			return nil, false // direct-node build
+			return nil, false, nil // direct-node build
 		}
 	}
-	return &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true
+	return &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true, nil
 }
 
 func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
@@ -325,14 +328,20 @@ func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
 // best-effort helper below and is followed by a complete SQLite-backed replay.
 func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
 	if state == string(types.BuildReady) || state == string(types.BuildError) {
-		_ = o.publishBuildStateRequired(o.launchContext(), buildID, state, templateID, reason)
+		if err := o.publishBuildStateRequired(o.launchContext(), buildID, state, templateID, reason); err != nil {
+			o.log.Warn("publish terminal cluster build state", "bid", buildID, "state", state, "err", err)
+		}
 		return
 	}
 	o.publishBuildStateBestEffort(buildID, state, templateID, reason)
 }
 
 func (o *Orchestrator) publishBuildStateBestEffort(buildID, state, templateID, reason string) {
-	ev, ok := o.buildStateEvent(context.Background(), buildID, state, templateID, reason)
+	ev, ok, err := o.buildStateEvent(context.Background(), buildID, state, templateID, reason)
+	if err != nil {
+		o.log.Warn("resolve cluster build state event", "bid", buildID, "state", state, "err", err)
+		return
+	}
 	if !ok {
 		return
 	}
@@ -348,16 +357,37 @@ func (o *Orchestrator) publishBuildStateBestEffort(buildID, state, templateID, r
 // returning without an ACK keeps the Registry pinned to this node; a later
 // identical retry can safely repeat the event.
 func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, state, templateID, reason string) error {
-	ev, ok := o.buildStateEvent(ctx, buildID, state, templateID, reason)
-	if !ok {
-		return nil
-	}
-	select {
-	case o.buildEvents <- ev:
-		o.forgetTerminalClusterBuild(buildID, state)
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	delay := 20 * time.Millisecond
+	for {
+		ev, ok, err := o.buildStateEvent(ctx, buildID, state, templateID, reason)
+		if err == nil {
+			if !ok {
+				return nil
+			}
+			select {
+			case o.buildEvents <- ev:
+				o.forgetTerminalClusterBuild(buildID, state)
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// A transient SQLite read failure after restart is not evidence that this
+		// is a direct-node Build. Retain the terminal result and retry ownership
+		// resolution until the lifecycle context is canceled.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
 	}
 }
 

@@ -100,6 +100,47 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	}
 }
 
+func TestBuildRegisterExactReplayPrecedesStrictCredentialLease(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{ID: "n1", StrictKeys: true}, svc)
+	fingerprint := strings.Repeat("a", 64)
+	node.mu.Lock()
+	node.keyPairs[fingerprint] = stubKeyPair{APISecretFingerprint: fingerprint, ExpiresUnix: time.Now().Add(time.Hour).Unix()}
+	node.mu.Unlock()
+	cmd := &routesync.Command{
+		CmdID: "register-first", Kind: routesync.CmdBuildRegister,
+		BuildID: "strict-replay", TemplateRef: "transient-strict-replay", Profile: "bare",
+		APISecretFingerprint: fingerprint,
+		BuildResources:       &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		Config:               map[string]string{"stub.build_result": "timeout"},
+	}
+	if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+		t.Fatalf("initial registration = %+v", got)
+	}
+	node.mu.Lock()
+	delete(node.keyPairs, fingerprint) // credential lease ended after an ACK loss
+	node.mu.Unlock()
+
+	replay := *cmd
+	replay.CmdID = "register-replay"
+	if got := node.handleBuildRegister(&replay); got.Status != routesync.AckAccepted {
+		t.Fatalf("exact replay after key withdrawal = %+v", got)
+	}
+	conflict := replay
+	conflict.CmdID = "register-conflict"
+	conflict.Profile = "e2b"
+	if got := node.handleBuildRegister(&conflict); got.Status != routesync.AckRejected || got.HTTPStatus != http.StatusConflict {
+		t.Fatalf("conflicting replay after key withdrawal = %+v, want 409", got)
+	}
+	node.mu.Lock()
+	buildCount := len(node.builds)
+	node.mu.Unlock()
+	if buildCount != 1 {
+		t.Fatalf("replay changed registration count to %d", buildCount)
+	}
+}
+
 func TestBuildRegisterEnforcesRegistrationAndExecutionAdmission(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := newService("", log)
@@ -131,6 +172,70 @@ func TestBuildRegisterEnforcesRegistrationAndExecutionAdmission(t *testing.T) {
 	}
 	if replay := node.handleBuildRegister(accepted); replay.Status != routesync.AckAccepted {
 		t.Fatalf("exact retry after capacity filled = %+v", replay)
+	}
+}
+
+func TestStubExecutionAdmissionQueuesFIFOByAggregateResources(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{
+		ID: "n1",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 3, Resources: &routesync.BuildResources{CPU: 2000, Memory: 3 << 30},
+		},
+		BuildExecutionCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 2, Resources: &routesync.BuildResources{CPU: 1000, Memory: 2 << 30},
+		},
+	}, svc)
+	register := func(id string, cpu int64) {
+		t.Helper()
+		cmd := &routesync.Command{
+			CmdID: "register-" + id, Kind: routesync.CmdBuildRegister,
+			BuildID: id, TemplateRef: "transient-" + id, Profile: "bare",
+			BuildResources: &routesync.BuildResources{CPU: cpu, Memory: 1 << 30},
+			Config:         map[string]string{"stub.build_result": "timeout"},
+		}
+		if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+			t.Fatalf("register %s = %+v", id, got)
+		}
+	}
+	register("first", 600)
+	register("second", 600)
+	register("third", 400)
+	for _, id := range []string{"first", "second", "third"} {
+		if err := node.requestBuildExecution(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	node.mu.Lock()
+	states := map[string]string{}
+	for id, build := range node.builds {
+		states[id] = build.State
+	}
+	node.mu.Unlock()
+	if states["first"] != "building" || states["second"] != "registered" || states["third"] != "registered" {
+		t.Fatalf("FIFO head was bypassed under aggregate pressure: states=%v", states)
+	}
+	hb := node.Heartbeat()
+	if hb.BuildExecutionUsage.Builds != 1 || hb.BuildExecutionUsage.Resources.CPU != 600 {
+		t.Fatalf("execution usage before release = %+v", hb.BuildExecutionUsage)
+	}
+
+	if err := node.setBuildState("first", "ready", "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	states["first"] = node.builds["first"].State
+	states["second"] = node.builds["second"].State
+	states["third"] = node.builds["third"].State
+	node.mu.Unlock()
+	if states["first"] != "ready" || states["second"] != "building" || states["third"] != "building" {
+		t.Fatalf("queued Builds did not advance in FIFO order after release: states=%v", states)
+	}
+	hb = node.Heartbeat()
+	if hb.BuildExecutionUsage.Builds != 2 || hb.BuildExecutionUsage.Resources.CPU != 1000 {
+		t.Fatalf("execution usage after release = %+v", hb.BuildExecutionUsage)
 	}
 }
 

@@ -4026,7 +4026,8 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, build := range []*BuildRecord{
-		{Group: "/g", BuildID: "active", NodeID: "dead", State: BuildBuilding},
+		{Group: "/g", BuildID: "active", NodeID: "dead", State: BuildStarting,
+			RegistrationImageRepo: "registry.test/private", RegistrationRegistryAuth: `{"auths":{"registry.test":{"auth":"opaque"}}}`},
 		{Group: "/g", BuildID: "terminal", NodeID: "dead", State: BuildReady},
 		{Group: "/g", BuildID: "moved", NodeID: "other", State: BuildBuilding},
 	} {
@@ -4040,6 +4041,9 @@ func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
 	active, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "active")
 	if err != nil || !found || active.State != BuildError || active.Reason != "node disconnected" {
 		t.Fatalf("active build=%+v found=%v err=%v", active, found, err)
+	}
+	if active.RegistrationImageRepo != "" || active.RegistrationRegistryAuth != "" {
+		t.Fatalf("reaped terminal build retained registration credentials: %+v", active)
 	}
 	terminal, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "terminal")
 	if err != nil || !found || terminal.State != BuildReady {

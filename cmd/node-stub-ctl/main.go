@@ -665,6 +665,7 @@ type stubNode struct {
 	redirectTo   routesync.NodeLinkTarget
 	sandboxes    map[string]*stubSandbox
 	builds       map[string]*stubBuild
+	buildSeq     int64
 	keyPairs     map[string]stubKeyPair
 	commands     []commandLog
 	cmdSeq       int64
@@ -1117,13 +1118,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 	if err := resources.ValidateRequired(); err != nil {
 		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
 	}
-	if n.StrictKeys && !n.hasKeyPair(cmd.APISecretFingerprint) {
-		return ackHTTP(cmd, routesync.AckRejected, "credential pair not installed", http.StatusBadRequest)
-	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
-	if beh.BuildResult == "reject" {
-		return ackHTTP(cmd, routesync.AckRejected, "stub build rejected", http.StatusTooManyRequests)
-	}
 	b := &stubBuild{
 		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
@@ -1152,6 +1147,20 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		}
 		return ack(cmd, routesync.AckAccepted, "")
 	}
+	// An exact replay after an ambiguous/lost ACK must be recognized before the
+	// mutable credential lease and current admission policy are consulted. The
+	// Registry may otherwise treat key withdrawal as proof that this node had no
+	// side effect and place the same BuildID elsewhere.
+	if n.StrictKeys {
+		if _, ok := n.keyPairLocked(cmd.APISecretFingerprint); !ok {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "credential pair not installed", http.StatusBadRequest)
+		}
+	}
+	if beh.BuildResult == "reject" {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "stub build rejected", http.StatusTooManyRequests)
+	}
 	if !stubAdmissionLimit(n.BuildExecutionCapacity).AllowsOne(resources) {
 		n.mu.Unlock()
 		return ackHTTP(cmd, routesync.AckRejected, "build resources cannot fit execution admission", http.StatusBadRequest)
@@ -1178,6 +1187,12 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		n.mu.Unlock()
 		return ackHTTP(cmd, routesync.AckRejected, "registration admission capacity exceeded", http.StatusTooManyRequests)
 	}
+	if n.buildSeq == math.MaxInt64 {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "build registration sequence overflow", http.StatusTooManyRequests)
+	}
+	n.buildSeq++
+	b.RegistrationSeq = n.buildSeq
 	n.builds[b.BuildID] = b
 	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "build_register", b.snapshot(n.ID))
@@ -1272,14 +1287,13 @@ func (n *stubNode) publish(ev routesync.Event) {
 	}
 }
 
-func (n *stubNode) hasKeyPair(apiSecretFingerprint string) bool {
-	_, ok := n.keyPair(apiSecretFingerprint)
-	return ok
-}
-
 func (n *stubNode) keyPair(apiSecretFingerprint string) (stubKeyPair, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.keyPairLocked(apiSecretFingerprint)
+}
+
+func (n *stubNode) keyPairLocked(apiSecretFingerprint string) (stubKeyPair, bool) {
 	pair, ok := n.keyPairs[apiSecretFingerprint]
 	if !ok {
 		return stubKeyPair{}, false
@@ -1345,13 +1359,18 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	if state == "" {
 		state = "building"
 	}
+	if state == "building" {
+		return n.requestBuildExecution(buildID)
+	}
 	n.mu.Lock()
 	b := n.builds[buildID]
 	if b == nil {
 		n.mu.Unlock()
 		return fmt.Errorf("build not found")
 	}
+	wasBuilding := b.State == "building"
 	b.State = state
+	b.ExecutionReady = false
 	if templateID != "" {
 		b.TemplateID = templateID
 	}
@@ -1361,13 +1380,93 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	ev := &routesync.BuildEvent{BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
 	n.mu.Unlock()
 	if publish {
-		select {
-		case n.buildEvents <- ev:
-		default:
-		}
-		n.svc.logEvent(n.ID, "build_event", ev)
+		n.publishBuildEvent(ev)
+	}
+	if wasBuilding {
+		n.scheduleBuildExecutions()
 	}
 	return nil
+}
+
+func (n *stubNode) requestBuildExecution(buildID string) error {
+	n.mu.Lock()
+	b := n.builds[buildID]
+	if b == nil {
+		n.mu.Unlock()
+		return fmt.Errorf("build not found")
+	}
+	if b.State != "registered" {
+		n.mu.Unlock()
+		return nil
+	}
+	b.ExecutionReady = true
+	n.mu.Unlock()
+	n.scheduleBuildExecutions()
+	return nil
+}
+
+// scheduleBuildExecutions models the real node's durable FIFO execution
+// admission closely enough for cluster and fault-injection tests: registered
+// work remains queued until the aggregate count/CPU/memory/storage vector fits.
+func (n *stubNode) scheduleBuildExecutions() {
+	n.mu.Lock()
+	limit := stubAdmissionLimit(n.BuildExecutionCapacity)
+	var usedBuilds int64
+	var used types.BuildResources
+	queued := make([]*stubBuild, 0)
+	for _, b := range n.builds {
+		switch {
+		case b.State == "building":
+			if usedBuilds == math.MaxInt64 {
+				n.mu.Unlock()
+				return
+			}
+			usedBuilds++
+			var err error
+			used, err = used.Add(b.Resources.Types())
+			if err != nil {
+				n.mu.Unlock()
+				return
+			}
+		case b.State == "registered" && b.ExecutionReady:
+			queued = append(queued, b)
+		}
+	}
+	sort.Slice(queued, func(i, j int) bool {
+		if queued[i].RegistrationSeq == queued[j].RegistrationSeq {
+			return queued[i].BuildID < queued[j].BuildID
+		}
+		return queued[i].RegistrationSeq < queued[j].RegistrationSeq
+	})
+	events := make([]*routesync.BuildEvent, 0, len(queued))
+	for _, b := range queued {
+		resources := b.Resources.Types()
+		if !limit.AllowsAdd(usedBuilds, used, resources) {
+			break // strict FIFO: do not bypass the oldest ready Build
+		}
+		next, err := used.Add(resources)
+		if err != nil || usedBuilds == math.MaxInt64 {
+			break
+		}
+		used, usedBuilds = next, usedBuilds+1
+		b.State = "building"
+		b.ExecutionReady = false
+		events = append(events, &routesync.BuildEvent{
+			BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+		})
+	}
+	n.mu.Unlock()
+	for _, event := range events {
+		n.publishBuildEvent(event)
+	}
+}
+
+func (n *stubNode) publishBuildEvent(event *routesync.BuildEvent) {
+	select {
+	case n.buildEvents <- event:
+	default:
+	}
+	n.svc.logEvent(n.ID, "build_event", event)
 }
 
 func (n *stubNode) getSandbox(sid string) *stubSandbox {
@@ -1677,6 +1776,8 @@ type stubBuild struct {
 	RegistrationRegistryAuth string                    `json:"-"`
 	Behavior                 stubBehavior              `json:"behavior,omitempty"`
 	CreatedAt                string                    `json:"created_at,omitempty"`
+	RegistrationSeq          int64                     `json:"-"`
+	ExecutionReady           bool                      `json:"-"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
