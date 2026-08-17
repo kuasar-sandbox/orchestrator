@@ -225,6 +225,26 @@ func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 	}
 }
 
+func TestTerminalBuildStoreRetryContinuesWhileLinkHealthy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	attempts := 0
+	wantAttempts := terminalBuildStoreAttempts + 1
+	err := retryTerminalBuildStore(ctx, func(context.Context) error {
+		attempts++
+		if attempts < wantAttempts {
+			return shardkv.ErrQuorum
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry terminal build store: %v", err)
+	}
+	if attempts != wantAttempts {
+		t.Fatalf("attempts=%d, want %d beyond the detached retry limit", attempts, wantAttempts)
+	}
+}
+
 func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

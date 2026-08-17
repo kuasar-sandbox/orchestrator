@@ -46,6 +46,7 @@ const buildRegisterAckTimeout = 5 * time.Second
 const (
 	terminalBuildStoreAttempts   = 5
 	terminalBuildStoreRetryDelay = 20 * time.Millisecond
+	terminalBuildStoreRetryMax   = time.Second
 )
 
 var errNodeBuildIDConflict = errors.New("registry: build id is already owned by another group on this node")
@@ -445,9 +446,26 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 }
 
 func retryTerminalBuildStore(ctx context.Context, operation func(context.Context) error) error {
+	// Terminal BuildEvents have no wire acknowledgement. Keep the stream's
+	// ordered reader on this event while its session is healthy so a store
+	// outage cannot turn a delivered terminal state into permanent Registry
+	// drift. Once the link is canceled, a bounded detached grace period retains
+	// the old close-race protection; the next session's durable node replay is
+	// the remaining recovery path.
+	backoff := terminalBuildStoreRetryDelay
+	var lastErr error
+	for ctx.Err() == nil {
+		if lastErr = operation(ctx); lastErr == nil {
+			return nil
+		}
+		if !waitTerminalBuildStoreRetry(ctx, backoff) {
+			break
+		}
+		backoff = min(backoff*2, terminalBuildStoreRetryMax)
+	}
+
 	retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleAckTimeout)
 	defer cancel()
-	var lastErr error
 	for attempt := 0; attempt < terminalBuildStoreAttempts; attempt++ {
 		if lastErr = operation(retryCtx); lastErr == nil {
 			return nil
@@ -464,6 +482,17 @@ func retryTerminalBuildStore(ctx context.Context, operation func(context.Context
 		}
 	}
 	return lastErr
+}
+
+func waitTerminalBuildStoreRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (r *Registry) lookupNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {

@@ -29,6 +29,7 @@ type reconcileLauncher struct {
 	stopped            []string
 	reset              []string
 	resources          launcher.ResourceProperties
+	resourcesErr       error
 	stopErr            error
 	inactiveAfterLists int
 	listCalls          int
@@ -78,7 +79,7 @@ func (l *reconcileLauncher) SetResources(_ context.Context, _ string, p launcher
 	return nil
 }
 func (l *reconcileLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
-	return l.resources, nil
+	return l.resources, l.resourcesErr
 }
 func (l *reconcileLauncher) Close() error { return nil }
 
@@ -827,7 +828,7 @@ func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stored.Status != types.BuildError || stored.ExecutionClaimed ||
-		!strings.Contains(stored.Reason, "resource enforcement cannot be verified") {
+		!strings.Contains(stored.Reason, "resource enforcement does not match") {
 		t.Fatalf("mismatched live build = %+v", stored)
 	}
 	if !containsString(lc.stopped, unit) {
@@ -835,6 +836,51 @@ func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
 	}
 	if _, _, ok, err := o.BuildSpecFor(context.Background(), "build:"+build.BuildID); err != nil || ok {
 		t.Fatalf("mismatched unit was adopted: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000019"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	readErr := errors.New("transient D-Bus read failure")
+	lc := &reconcileLauncher{
+		units:        []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resourcesErr: readErr,
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	err = o.Reconcile(context.Background())
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Reconcile error = %v, want transient read failure", err)
+	}
+	stored, getErr := st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed || stored.RunID != runID {
+		t.Fatalf("resource read failure changed durable live build: %+v", stored)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("resource read failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	if len(vs.detached) != 0 {
+		t.Fatalf("resource read failure detached live network ownership: %v", vs.detached)
 	}
 }
 

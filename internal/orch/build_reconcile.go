@@ -122,12 +122,18 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		return o.failInterruptedBuild(ctx, build, "live build has invalid resource properties: "+err.Error())
 	}
 	gotProperties, err := o.lc.Resources(ctx, unit, "Service")
-	if err != nil || gotProperties != wantProperties {
+	if err != nil {
+		// A live unit plus its durable execution claim is recoverable. Abort
+		// reconciliation without touching either owner so the controller can
+		// retry the transient D-Bus read instead of killing valid work.
+		return fmt.Errorf("read live build resource enforcement for %s: %w", unit, err)
+	}
+	if gotProperties != wantProperties {
 		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
 			return stopErr
 		}
 		return o.failInterruptedBuild(ctx, build,
-			fmt.Sprintf("live build resource enforcement cannot be verified: effective=%+v want=%+v err=%v", gotProperties, wantProperties, err))
+			fmt.Sprintf("live build resource enforcement does not match: effective=%+v want=%+v", gotProperties, wantProperties))
 	}
 	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, build)
 	if err != nil {
