@@ -747,6 +747,16 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 }
 
 func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *buildResult, err error) {
+	o.completeBuildWithPublisher(ctx, b, res, err, o.publishBuildState)
+}
+
+func (o *Orchestrator) completeBuildWithPublisher(
+	ctx context.Context,
+	b *types.Build,
+	res *buildResult,
+	err error,
+	publish func(buildID, state, templateID, reason string),
+) {
 	var cleanupPending *buildCleanupPendingError
 	if errors.As(err, &cleanupPending) {
 		var cleanupErr error
@@ -766,7 +776,7 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
 		return
@@ -776,7 +786,7 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
@@ -784,14 +794,14 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 	if res == nil {
 		b.Status, b.Reason = types.BuildError, "build produced no result"
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		return
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotRef != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		return
 	}
@@ -805,14 +815,14 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		return
 	}
 	if _, err := types.ParseTemplateID(b.PersistID); err != nil {
 		b.Status, b.Reason = types.BuildError, "build produced invalid portable ref: "+err.Error()
 		if o.persistTerminalBuild(ctx, b) {
-			o.publishBuildState(b.BuildID, "error", "", b.Reason)
+			publish(b.BuildID, "error", "", b.Reason)
 		}
 		return
 	}
@@ -823,7 +833,7 @@ func (o *Orchestrator) completeBuild(ctx context.Context, b *types.Build, res *b
 	if !o.persistTerminalBuild(ctx, b) {
 		return
 	}
-	o.publishBuildState(b.BuildID, "ready", b.PersistID, "")
+	publish(b.BuildID, "ready", b.PersistID, "")
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
 }
 

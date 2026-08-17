@@ -654,6 +654,81 @@ func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
 	}
 }
 
+func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	total := cap(o.buildEvents) + 5
+	result := configsock.BuildResult{ImageRef: "manifest://" + strings.Repeat("a", 64)}
+	wantTemplateID := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: result.ImageRef}.String()
+	for i := 0; i < total; i++ {
+		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", i)
+		build.ClusterGroup = "/accepted-recovery"
+		build.RuntimeVswitchPort = ""
+		build.RuntimeFloatingIP = ""
+		build.RuntimePortMAC = ""
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+		if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, build.RunID, result); err != nil || !accepted {
+			t.Fatalf("accept result %d = %t, %v", i, accepted, err)
+		}
+	}
+
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(o.buildEvents); got != cap(o.buildEvents) {
+		t.Fatalf("accepted-result recovery did not fill the bounded channel: len=%d cap=%d", got, cap(o.buildEvents))
+	}
+	ready, err := st.BuildsByStatus(context.Background(), types.BuildReady)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != total {
+		t.Fatalf("durable ready builds = %d, want %d", len(ready), total)
+	}
+	for _, build := range ready {
+		if build.PersistID != wantTemplateID || build.ExecutionClaimed || build.ExecutionResult != nil {
+			t.Fatalf("accepted result did not finalize exactly: %+v", build)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
+	seen := make(map[string]bool, total)
+	doneCh := (<-chan error)(done)
+	for len(seen) < total || doneCh != nil {
+		select {
+		case event := <-o.buildEvents:
+			if event.State != string(types.BuildReady) || event.TemplateID != wantTemplateID || event.Reason != "" {
+				t.Fatalf("replayed accepted-result event = %+v", event)
+			}
+			seen[event.BuildID] = true
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+			doneCh = nil
+		case <-ctx.Done():
+			t.Fatalf("accepted-result replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+		}
+	}
+}
+
 func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
 	if err != nil {

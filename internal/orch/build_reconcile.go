@@ -162,7 +162,11 @@ func (o *Orchestrator) finishRecoveredBuildResult(ctx context.Context, build *ty
 		return fmt.Errorf("reconcile build %s accepted-result cleanup: %w", build.BuildID, err)
 	}
 	result := *build.ExecutionResult
-	o.completeBuild(ctx, build, &result, nil)
+	// node-link starts only after reconciliation. Use the bounded notification
+	// here; ReplayClusterBuildTerminalStates republishes every durable terminal
+	// row once node-link is draining, so accepted results cannot fill this
+	// process-local channel and deadlock controller startup.
+	o.completeBuildWithPublisher(ctx, build, &result, nil, o.publishBuildStateBestEffort)
 	if build.ExecutionClaimed {
 		return fmt.Errorf("reconcile build %s: accepted result remained nonterminal", build.BuildID)
 	}
