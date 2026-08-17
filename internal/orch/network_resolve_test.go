@@ -249,6 +249,9 @@ func TestResolveBuildNetworksFromTemplatePrecedence(t *testing.T) {
 func TestSourceTemplateNetworkReadsSnapshotMetadata(t *testing.T) {
 	cfg := buildNetworkTestConfig()
 	o := testOrchCfg(t, cfg)
+	// This test exercises the real sandbox-ctl parser rather than the generic
+	// test fixture's synthetic capacity-only snapshot inspector.
+	o.snapshotInspector = nil
 	binDir := t.TempDir()
 	script := filepath.Join(binDir, "sandbox-ctl")
 	body := `#!/bin/sh
