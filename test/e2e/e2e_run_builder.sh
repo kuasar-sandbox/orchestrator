@@ -902,16 +902,15 @@ grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
-python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost phase resources or launch.cgroup_control=true"
+python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost fixed capacity, leaked node-local resource policy, or launch.cgroup_control=true"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     cfg = json.load(source)
 assert cfg["Launch"]["CgroupControl"] is True, cfg["Launch"]
 resources = cfg["Resources"]
-assert resources["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, resources
-assert resources["Allocatable"]["CPU"] == 1, resources
-assert resources["Allocatable"]["Memory"] == "512MiB", resources
-assert resources["Startup"]["Memory"] == "3GiB", resources
+# Snapshot portability fixes capacity only. The restore node re-resolves
+# allocatable, startup, overhead, and controller from its own resource policy.
+assert resources == {"Capacity": {"CPU": 2, "Memory": "3GiB"}}, resources
 PY
 B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
 [ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest:// (upload-snapshot did not rewrite?): $(cat "$WORK/b2.cfg.json")"
