@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,6 +34,7 @@ type phaseSandbox struct {
 	waitErr        error
 	readyR         *os.File
 	readyCloseOnce sync.Once
+	cpuMax         phaseCPUMaxState
 }
 
 // startSandbox writes the phase yaml and spawns `sandbox-ctl run` as a
@@ -253,18 +255,20 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 }
 
 // teardown stops the phase sandbox: SIGTERM, then SIGKILL after a grace
-// period.
-func (sb *phaseSandbox) teardown() {
+// period. Until sandboxer#112 fixes the native vCPU kick race, the VMM leaf's
+// CPU ceiling is relaxed only across this shutdown handshake and restored
+// after the CH process has left the cgroup.
+func (sb *phaseSandbox) teardown() error {
 	sb.closeReady()
 	select {
 	case <-sb.done:
-		sb.p.log.Info("phase sandbox down", "sid", sb.sid)
-		return
+		return sb.finishTeardown()
 	default:
 	}
 	if sb.cmd.Process == nil {
-		return
+		return sb.finishTeardown()
 	}
+	relaxErr := sb.relaxCPUMaxForVCPUKick()
 	_ = sb.cmd.Process.Signal(syscall.SIGTERM)
 	timer := time.NewTimer(20 * time.Second)
 	defer timer.Stop()
@@ -274,7 +278,30 @@ func (sb *phaseSandbox) teardown() {
 		_ = sb.cmd.Process.Kill()
 		<-sb.done
 	}
+	return errors.Join(relaxErr, sb.finishTeardown())
+}
+
+func (sb *phaseSandbox) finishTeardown() error {
+	// Process exit is necessary but not sufficient: prove the delegated leaf is
+	// empty before reinstating its numeric ceiling. On an unexpected orphan we
+	// still attempt the restore so no live process is left unbounded, and return
+	// both failures to keep the Build fail closed.
+	emptyErr := sb.p.requirePhaseVMMCgroupEmpty()
+	restoreErr := sb.restoreCPUMaxAfterVCPUKick()
 	sb.p.log.Info("phase sandbox down", "sid", sb.sid)
+	return errors.Join(emptyErr, restoreErr)
+}
+
+func (sb *phaseSandbox) joinTeardownError(retErr *error) {
+	cleanupErr := sb.teardown()
+	if cleanupErr == nil {
+		return
+	}
+	if *retErr == nil {
+		*retErr = cleanupErr
+		return
+	}
+	*retErr = errors.Join(*retErr, cleanupErr)
 }
 
 // requirePhaseVMMCgroupEmpty proves that the ordinary sandbox has fully left

@@ -588,7 +588,7 @@ PY
     grep -qw memory "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable memory controller"
     [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
     [ "$(cat "$vmm_path/memory.high")" != "max" ] || fail "phase VMM did not receive controller memory.high"
-    python3 - "$unit_path" "$slice_path" <<'PY' || fail "effective per-Build/aggregate cgroup limits"
+    python3 - "$unit_path" "$slice_path" "$vmm_path" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
 import pathlib, sys
 
 def assert_cpu(path, milli):
@@ -596,11 +596,12 @@ def assert_cpu(path, milli):
     assert quota != "max", (path, quota, period)
     assert int(quota) * 1000 == int(period) * milli, (path, quota, period, milli)
 
-unit, pool = map(pathlib.Path, sys.argv[1:])
+unit, pool, vmm = map(pathlib.Path, sys.argv[1:])
 assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
 assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
 assert_cpu(unit, 2000)
 assert_cpu(pool, 4000)
+assert_cpu(vmm, 2000)
 PY
     echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified"
 }
@@ -628,6 +629,20 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(
         sleep 2
     done
     diag "$bid"; fail "$label did not reach ready (last status=$status)"
+}
+wait_phase_cpu_lifecycle_logs() { # bid expected-phase-count
+    local bid="$1" expected="$2" out="$WORK/$bid.cpu-lifecycle.journal" relaxed restored
+    for _ in $(seq 1 80); do
+        journalctl KUASAR_BUILD_ID="$bid" --no-pager --output=cat >"$out" 2>/dev/null || true
+        relaxed=$(grep -Fc 'phase cpu.max temporarily relaxed for native vCPU kick' "$out" || true)
+        restored=$(grep -Fc 'phase cpu.max restored after native vCPU kick' "$out" || true)
+        if [ "$relaxed" -eq "$expected" ] && [ "$restored" -eq "$expected" ]; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    cat "$out" >&2
+    fail "Build $bid phase cpu.max lifecycle logs relaxed=$relaxed restored=$restored want=$expected"
 }
 wait_error() { # tid bid label
     local tid="$1" bid="$2" label="$3" status="" code
@@ -797,6 +812,7 @@ code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
 wait_ready "$B1_TID" "$B1_BID" B1
 B1_PERSIST="$PERSIST"
+wait_phase_cpu_lifecycle_logs "$B1_BID" 1
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
 B1_BEFORE_RETRY=$(build_trigger_signature "$B1_BID")
 code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" \
@@ -872,6 +888,7 @@ code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 assert_active_build_accounting "$B2_TID" "$B2_BID"
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
+wait_phase_cpu_lifecycle_logs "$B2_BID" 2
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 echo "==> PASS: B2 ready → $B2_PERSIST"
 
