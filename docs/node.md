@@ -1828,14 +1828,6 @@ admission-only。`node-ctl builder status` 和 metrics 暴露配置、持久用�
 Admit/heartbeat/Release,并在 teardown/Release 完成后才进入下一阶段。Build.Resources 不进入
 nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在双重记账。
 
-**临时 native vCPU-kick 规避**:在 sandboxer#112 完成前,phase 正常执行期仍按
-`capacity.cpu` 保持数值型 `vmm/cpu.max`;run-builder 只在 Cloud Hypervisor snapshot pause
-或 teardown shutdown 的临界区,通过已继承的可信 VMM cgroup FD 校验原值后写入
-`max <原 period>`,CH 退出且 `cgroup.events:populated 0` 后立即恢复并回读原值。任一步失败
-都会让 Build fail closed。临界区仍受 per-Build service 与 `sandbox-builder.slice` 的外层
-CPUQuota 约束,但它是已知的短时 leaf 上界例外,不能作为普通 Sandbox CPU 合同的最终实现;
-sandboxer#112 的完成条件包括删除此规避并在数值型 `cpu.max` 下通过真实 KVM 验证。
-
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 
 1. **任务级 pull token**:SDK `api_headers` 头 `X-Kuasar-Pull-Token`,值为

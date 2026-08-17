@@ -630,27 +630,6 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(
     done
     diag "$bid"; fail "$label did not reach ready (last status=$status)"
 }
-wait_phase_cpu_lifecycle_logs() { # bid expected-phase-count
-    local bid="$1" expected="$2"
-    local out="$WORK/$bid.cpu-lifecycle.journal" run_id unit relaxed restored
-    for _ in $(seq 1 80); do
-        run_id=$(build_run_id "$bid")
-        if [ -n "$run_id" ]; then
-            unit="sandbox-builder@$run_id.service"
-            journalctl -u "$unit" --no-pager --output=cat >"$out" 2>/dev/null || true
-        else
-            : >"$out"
-        fi
-        relaxed=$(grep -Fc 'phase cpu.max temporarily relaxed for native vCPU kick' "$out" || true)
-        restored=$(grep -Fc 'phase cpu.max restored after native vCPU kick' "$out" || true)
-        if [ "$relaxed" -eq "$expected" ] && [ "$restored" -eq "$expected" ]; then
-            return 0
-        fi
-        sleep 0.25
-    done
-    cat "$out" >&2
-    fail "Build $bid phase cpu.max lifecycle logs relaxed=$relaxed restored=$restored want=$expected"
-}
 wait_error() { # tid bid label
     local tid="$1" bid="$2" label="$3" status="" code
     for _ in $(seq 1 240); do
@@ -819,7 +798,6 @@ code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
 wait_ready "$B1_TID" "$B1_BID" B1
 B1_PERSIST="$PERSIST"
-wait_phase_cpu_lifecycle_logs "$B1_BID" 1
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
 B1_BEFORE_RETRY=$(build_trigger_signature "$B1_BID")
 code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" \
@@ -895,7 +873,6 @@ code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 assert_active_build_accounting "$B2_TID" "$B2_BID"
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
-wait_phase_cpu_lifecycle_logs "$B2_BID" 2
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 echo "==> PASS: B2 ready → $B2_PERSIST"
 

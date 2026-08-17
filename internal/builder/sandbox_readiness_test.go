@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestAttachReadinessPipeUsesNextExtraFilesFD(t *testing.T) {
@@ -147,8 +146,7 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 	p := &buildPipeline{
 		spec: &configsock.BuildSpec{
 			BuildID: "build-123456", RunID: "run-1", Workdir: dir,
-			Paths:     configsock.BuildPaths{SandboxCtl: script},
-			Resources: rtconfig.ResourcesConfig{Capacity: rtconfig.CapacityConfig{CPU: 2}},
+			Paths: configsock.BuildPaths{SandboxCtl: script},
 		},
 		log: testBuilderLogger(), vmmCgroup: testVMMCgroupFD(t),
 	}
@@ -217,9 +215,8 @@ func TestPhaseImportUsesRuntimeEventsWithoutExecProbe(t *testing.T) {
 	p := &buildPipeline{
 		spec: &configsock.BuildSpec{
 			BuildID: "build-123456", RunID: "run-1", Workdir: dir, FromImage: "example.invalid/image:latest",
-			Paths:     configsock.BuildPaths{SandboxCtl: script},
-			Timeouts:  configsock.BuildTimeouts{PullSec: 1},
-			Resources: rtconfig.ResourcesConfig{Capacity: rtconfig.CapacityConfig{CPU: 2}},
+			Paths:    configsock.BuildPaths{SandboxCtl: script},
+			Timeouts: configsock.BuildTimeouts{PullSec: 1},
 		},
 		ctx: ctx, log: testBuilderLogger(), vmmCgroup: testVMMCgroupFD(t),
 	}
@@ -243,9 +240,6 @@ func testVMMCgroupFD(t *testing.T) *os.File {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cpu.max"), []byte("200000 100000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fd, err := os.Open(dir)

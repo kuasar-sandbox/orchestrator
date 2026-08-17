@@ -34,7 +34,6 @@ type phaseSandbox struct {
 	waitErr        error
 	readyR         *os.File
 	readyCloseOnce sync.Once
-	cpuMax         phaseCPUMaxState
 }
 
 // startSandbox writes the phase yaml and spawns `sandbox-ctl run` as a
@@ -255,9 +254,8 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 }
 
 // teardown stops the phase sandbox: SIGTERM, then SIGKILL after a grace
-// period. Until sandboxer#112 fixes the native vCPU kick race, the VMM leaf's
-// CPU ceiling is relaxed only across this shutdown handshake and restored
-// after the CH process has left the cgroup.
+// period, and verifies that the delegated VMM cgroup is empty before the next
+// phase may start.
 func (sb *phaseSandbox) teardown() error {
 	sb.closeReady()
 	select {
@@ -268,7 +266,6 @@ func (sb *phaseSandbox) teardown() error {
 	if sb.cmd.Process == nil {
 		return sb.finishTeardown()
 	}
-	relaxErr := sb.relaxCPUMaxForVCPUKick()
 	_ = sb.cmd.Process.Signal(syscall.SIGTERM)
 	timer := time.NewTimer(20 * time.Second)
 	defer timer.Stop()
@@ -278,18 +275,15 @@ func (sb *phaseSandbox) teardown() error {
 		_ = sb.cmd.Process.Kill()
 		<-sb.done
 	}
-	return errors.Join(relaxErr, sb.finishTeardown())
+	return sb.finishTeardown()
 }
 
 func (sb *phaseSandbox) finishTeardown() error {
 	// Process exit is necessary but not sufficient: prove the delegated leaf is
-	// empty before reinstating its numeric ceiling. On an unexpected orphan we
-	// still attempt the restore so no live process is left unbounded, and return
-	// both failures to keep the Build fail closed.
+	// empty before publishing phase completion.
 	emptyErr := sb.p.requirePhaseVMMCgroupEmpty()
-	restoreErr := sb.restoreCPUMaxAfterVCPUKick()
 	sb.p.log.Info("phase sandbox down", "sid", sb.sid)
-	return errors.Join(emptyErr, restoreErr)
+	return emptyErr
 }
 
 func (sb *phaseSandbox) joinTeardownError(retErr *error) {

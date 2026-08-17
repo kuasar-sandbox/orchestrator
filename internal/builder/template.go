@@ -89,9 +89,6 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 		return "", err
 	}
 
-	if err := sb.relaxCPUMaxForVCPUKick(); err != nil {
-		return "", fmt.Errorf("prepare snapshot vCPU kick: %w", err)
-	}
 	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, templateSnapshotArgs(sb.sid, s.Workdir, sb.runRoot)...)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w (%s)", err, firstLine(out))

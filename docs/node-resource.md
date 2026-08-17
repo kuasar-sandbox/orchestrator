@@ -164,13 +164,6 @@ sandbox:
   时固定 true。request/template/group/header/migration 都不能配置这两项。
 - `watermark_high` 与 `control.sensor` 不渲染,继续使用 sandboxer 当前默认。
 
-Builder phase 有一个由 sandboxer#112 跟踪的临时 native vCPU-kick 规避:正常 workload
-期间 `vmm/cpu.max` 仍精确对应 `capacity.cpu`;仅在 snapshot pause / teardown shutdown
-握手期间,run-builder 通过可信 cgroup FD 暂时解除该 leaf ceiling,CH 退出且 cgroup 确认为空
-后恢复并回读。外层 per-Build/aggregate Builder CPUQuota 在该窗口仍有效。这不是新的资源
-配置语义,也不改变 nodectl reservation;在 native fix 可用后必须删除,并恢复全生命周期
-数值型 `cpu.max` 的普通 Sandbox 合同。
-
 request/template 的 `kuasar-sandbox.resource` 只允许 capacity/allocatable/startup 的
 五个 leaf,严格 JSON 解析并逐 leaf 合并。优先级是 node < template/group < create/reserve
 body < resource header < E2B capacity leaf < restore snapshot capacity。任何低层非法 JSON
