@@ -92,6 +92,16 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
+# Keep #205's finite CPUQuota assertions while avoiding an additional parent
+# throttle around each independently limited phase VM. A Build receives the
+# host's full CPU capacity; admission aggregate limits scale with max_builds.
+BUILDER_CPU="$(nproc)"
+BUILDER_CPU_MILLI=$((BUILDER_CPU * 1000))
+BUILDER_EXECUTION_CPU=$((BUILDER_CPU * 2))
+BUILDER_EXECUTION_CPU_MILLI=$((BUILDER_EXECUTION_CPU * 1000))
+BUILDER_REGISTRATION_CPU=$((BUILDER_CPU * 16))
+BUILDER_REGISTRATION_CPU_MILLI=$((BUILDER_REGISTRATION_CPU * 1000))
+
 WORK="$(mktemp -d /tmp/e2e-builder-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 # Units must live in a real systemd load path; we only remove what we created.
@@ -276,10 +286,10 @@ builder:
   admission:
     registration:
       max_builds: 16
-      resources: { cpu: 32, memory: 96GiB, storage: 128GiB }
+      resources: { cpu: $BUILDER_REGISTRATION_CPU, memory: 96GiB, storage: 128GiB }
     execution:
       max_builds: 2
-      resources: { cpu: 8, memory: 12GiB, storage: 16GiB }
+      resources: { cpu: $BUILDER_EXECUTION_CPU, memory: 12GiB, storage: 16GiB }
   registration_ttl: 1h
   queue_ttl: 30m
   insecure_registry: true
@@ -464,11 +474,11 @@ wait_phase_audit() { # $1=phase, $2=build id
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
-    # Keep a finite, asserted Builder quota while leaving parent headroom above
-    # the independently configured 2-vCPU phase Sandbox.
-    body="{\"name\":\"$1\",\"cpuCount\":4,\"memoryMB\":6144}"
-    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":4,\"memoryMB\":6144}"
-    REQ_BUILDER_HEADER='{"resources":{"cpu":4,"memory":"6GiB","storage":"4GiB"}}'
+    # The finite, asserted Builder quota equals host capacity; the phase
+    # Sandbox independently remains 2 vCPU.
+    body="{\"name\":\"$1\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
+    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
+    REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}}"
     REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
     code=$(req POST /v3/templates "$AK" "$body")
     unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
@@ -499,11 +509,11 @@ PY
     done
     [ -n "$phase" ] || fail "build $bid never exposed an active phase"
 
-    python3 - "$WORK/resp.body" <<'PY' || fail "active Build status resources/enforcement"
+    python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status resources/enforcement"
 import json, sys
 status = json.load(open(sys.argv[1]))
 assert status["resources"] == {
-    "cpuMilli": 2000,
+    "cpuMilli": int(sys.argv[2]),
     "memoryBytes": 6 << 30,
     "storageBytes": 4 << 30,
 }, status
@@ -537,26 +547,27 @@ PY
 
     "$BIN/node-ctl" builder status --socket "$WORK/node-ctl.socket" >"$WORK/builder-status.json" \
         || fail "node-ctl builder status"
-    python3 - "$WORK/builder-status.json" <<'PY' || fail "durable Builder admission status"
+    python3 - "$WORK/builder-status.json" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" "$BUILDER_REGISTRATION_CPU_MILLI" <<'PY' || fail "durable Builder admission status"
 import json, sys
 status = json.load(open(sys.argv[1]))
+build_cpu, execution_cpu, registration_cpu = map(int, sys.argv[2:])
 assert status["registration"]["configured"] == {
     "max_builds": 16,
-    "resources": {"cpu": 32000, "memory": 96 << 30, "storage": 128 << 30},
+    "resources": {"cpu": registration_cpu, "memory": 96 << 30, "storage": 128 << 30},
 }, status
 assert status["execution"]["configured"] == {
     "max_builds": 2,
-    "resources": {"cpu": 8000, "memory": 12 << 30, "storage": 16 << 30},
+    "resources": {"cpu": execution_cpu, "memory": 12 << 30, "storage": 16 << 30},
 }, status
 # The deliberately untriggered negative-test registration and this active
 # Build both consume registration admission. Only this Build consumes execution.
 assert status["registration"]["used_builds"] == 2, status
 assert status["registration"]["used_resources"] == {
-    "cpu": 8000, "memory": 12 << 30, "storage": 8 << 30,
+    "cpu": 2 * build_cpu, "memory": 12 << 30, "storage": 8 << 30,
 }, status
 assert status["execution"]["used_builds"] == 1, status
 assert status["execution"]["used_resources"] == {
-    "cpu": 4000, "memory": 6 << 30, "storage": 4 << 30,
+    "cpu": build_cpu, "memory": 6 << 30, "storage": 4 << 30,
 }, status
 PY
 
@@ -590,7 +601,7 @@ PY
     grep -qw memory "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable memory controller"
     [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
     [ "$(cat "$vmm_path/memory.high")" != "max" ] || fail "phase VMM did not receive controller memory.high"
-    python3 - "$unit_path" "$slice_path" "$vmm_path" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
+    python3 - "$unit_path" "$slice_path" "$vmm_path" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
 import pathlib, sys
 
 def assert_cpu(path, milli):
@@ -598,11 +609,12 @@ def assert_cpu(path, milli):
     assert quota != "max", (path, quota, period)
     assert int(quota) * 1000 == int(period) * milli, (path, quota, period, milli)
 
-unit, pool, vmm = map(pathlib.Path, sys.argv[1:])
+unit, pool, vmm = map(pathlib.Path, sys.argv[1:4])
+build_cpu, execution_cpu = map(int, sys.argv[4:])
 assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
 assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
-assert_cpu(unit, 4000)
-assert_cpu(pool, 8000)
+assert_cpu(unit, build_cpu)
+assert_cpu(pool, execution_cpu)
 assert_cpu(vmm, 2000)
 PY
     echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified"

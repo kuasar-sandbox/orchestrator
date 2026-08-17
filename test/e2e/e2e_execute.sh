@@ -87,6 +87,11 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
+# Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
+# keeps its independent 2-vCPU resource contract below, while the parent unit
+# no longer introduces a second CPU bottleneck around snapshot teardown.
+BUILDER_CPU="$(nproc)"
+
 WORK="$(mktemp -d /tmp/e2e-exec-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
@@ -981,12 +986,12 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
-# Registration cpuCount/memoryMB are Build resources only. Give the Builder
-# unit enough CPU to drive its 2-vCPU phase without an additional parent-level
-# throttle. The independent Resource header defines the A/B/C Sandbox capacity,
-# which the phase-C snapshot must preserve on restore below.
+# Registration cpuCount/memoryMB are Build resources only. The Builder gets the
+# host's full CPU capacity so its independent 2-vCPU phase is not constrained by
+# an additional parent-level throttle. The Resource header defines the A/B/C
+# Sandbox capacity, which the phase-C snapshot must preserve on restore below.
 REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":4,"memoryMB":8192}')
+code=$(req POST /v3/templates "$AK" "{\"name\":\"exec-tmpl\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":8192}")
 unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
