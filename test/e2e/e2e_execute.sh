@@ -981,11 +981,12 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
-# Registration cpuCount/memoryMB are Build resources only. The independent
-# Resource header gives phases A/B/C a 2 CPU / 8 GiB Sandbox capacity, which the
-# phase-C snapshot must preserve on restore below.
+# Registration cpuCount/memoryMB are Build resources only. Give the Builder
+# unit enough CPU to drive its 2-vCPU phase without an additional parent-level
+# throttle. The independent Resource header defines the A/B/C Sandbox capacity,
+# which the phase-C snapshot must preserve on restore below.
 REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":1,"memoryMB":8192}')
+code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":2,"memoryMB":8192}')
 unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
