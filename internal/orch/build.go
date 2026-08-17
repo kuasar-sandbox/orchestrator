@@ -683,6 +683,30 @@ func (e *buildCleanupPendingError) Unwrap() []error {
 	return errList
 }
 
+// retainBuildCleanup keeps a pipeline cause distinct from ownership-cleanup
+// failures. In particular, a durably accepted worker result has no pipeline
+// cause: a transient failure to fence its unit must not turn that result into a
+// failed Build once a retry establishes the fence.
+func retainBuildCleanup(err, cleanup error, port, dir string, persisted bool) *buildCleanupPendingError {
+	pending := &buildCleanupPendingError{
+		cause: err, cleanup: cleanup, port: port, dir: dir, persisted: persisted,
+	}
+	var existing *buildCleanupPendingError
+	if !errors.As(err, &existing) {
+		return pending
+	}
+	pending.cause = existing.cause
+	pending.cleanup = errors.Join(existing.cleanup, cleanup)
+	if pending.port == "" {
+		pending.port = existing.port
+	}
+	if pending.dir == "" {
+		pending.dir = existing.dir
+	}
+	pending.persisted = pending.persisted || existing.persisted
+	return pending
+}
+
 // pendingBuild is the per-execution state BuildSpecFor serves while the
 // build run-id unit executes: the pre-attached network slot, the resolved
 // temporary-VM and persistent-template network roles, minted envd token, and
@@ -853,17 +877,12 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			portID = port.Port
 		}
 		if !cleanupSafe {
-			retErr = &buildCleanupPendingError{
-				cause: retErr, port: portID, dir: dir, persisted: runtimePersisted,
-			}
+			retErr = retainBuildCleanup(retErr, nil, portID, dir, runtimePersisted)
 			return
 		}
 		cleanupErr := o.cleanupBuildRuntime(b, portID, dir, runtimePersisted)
 		if cleanupErr != nil {
-			retErr = &buildCleanupPendingError{
-				cause: retErr, cleanup: cleanupErr,
-				port: portID, dir: dir, persisted: runtimePersisted,
-			}
+			retErr = retainBuildCleanup(retErr, cleanupErr, portID, dir, runtimePersisted)
 		}
 	}()
 	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, b)
@@ -1187,9 +1206,13 @@ func (o *Orchestrator) waitBuilderUnitExit(ctx context.Context, unit string, tim
 // does not exit after the acknowledged report, a successful Stop is an
 // equivalent execution-release fence and the accepted result still wins.
 func (o *Orchestrator) fenceAcceptedBuildResult(unit string, result buildResult) (*buildResult, error) {
-	if err := o.waitBuilderUnitExit(context.Background(), unit, 20*time.Second); err != nil {
+	return o.fenceAcceptedBuildResultWithin(unit, result, 20*time.Second)
+}
+
+func (o *Orchestrator) fenceAcceptedBuildResultWithin(unit string, result buildResult, timeout time.Duration) (*buildResult, error) {
+	if err := o.waitBuilderUnitExit(context.Background(), unit, timeout); err != nil {
 		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-			return nil, &buildCleanupPendingError{cause: err, cleanup: stopErr}
+			return &result, retainBuildCleanup(nil, errors.Join(err, stopErr), "", "", false)
 		}
 	}
 	return &result, nil
