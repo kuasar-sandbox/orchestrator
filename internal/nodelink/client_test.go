@@ -358,7 +358,7 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 
 func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	endSession := make(chan struct{})
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
 		msg, err := routesync.ReadMsg(req.Body)
@@ -370,10 +370,19 @@ func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T)
 			return
 		}
 		w.(http.Flusher).Flush()
-		// Ending the response forces the client to establish another session.
+		select {
+		case <-endSession:
+			// Abort only after the test observes this session's replay. Doing so
+			// proves Hello was consumed before deterministically forcing reconnect.
+			panic(http.ErrAbortHandler)
+		case <-req.Context().Done():
+		}
 	})
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
-	defer srv.Close()
+	defer func() {
+		cancel()
+		srv.Close()
+	}()
 
 	node := &replayingFakeNode{fakeNode: newFakeNode(), replays: make(chan struct{}, 4)}
 	client := New(
@@ -384,12 +393,16 @@ func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T)
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	go client.Run(ctx)
-	for i := 0; i < 2; i++ {
-		select {
-		case <-node.replays:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("terminal replay calls=%d, want at least 2 established sessions", i)
-		}
+	select {
+	case <-node.replays:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal replay did not run on first established session")
+	}
+	endSession <- struct{}{}
+	select {
+	case <-node.replays:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal replay did not run after forced reconnect")
 	}
 }
 
