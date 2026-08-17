@@ -986,7 +986,7 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 # throttle. The independent Resource header defines the A/B/C Sandbox capacity,
 # which the phase-C snapshot must preserve on restore below.
 REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":2,"memoryMB":8192}')
+code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":4,"memoryMB":8192}')
 unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)

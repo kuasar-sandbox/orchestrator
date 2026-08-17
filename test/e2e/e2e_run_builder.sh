@@ -279,7 +279,7 @@ builder:
       resources: { cpu: 32, memory: 96GiB, storage: 128GiB }
     execution:
       max_builds: 2
-      resources: { cpu: 4, memory: 12GiB, storage: 16GiB }
+      resources: { cpu: 8, memory: 12GiB, storage: 16GiB }
   registration_ttl: 1h
   queue_ttl: 30m
   insecure_registry: true
@@ -464,9 +464,11 @@ wait_phase_audit() { # $1=phase, $2=build id
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
-    body="{\"name\":\"$1\",\"cpuCount\":2,\"memoryMB\":6144}"
-    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":2,\"memoryMB\":6144}"
-    REQ_BUILDER_HEADER='{"resources":{"cpu":2,"memory":"6GiB","storage":"4GiB"}}'
+    # Keep a finite, asserted Builder quota while leaving parent headroom above
+    # the independently configured 2-vCPU phase Sandbox.
+    body="{\"name\":\"$1\",\"cpuCount\":4,\"memoryMB\":6144}"
+    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":4,\"memoryMB\":6144}"
+    REQ_BUILDER_HEADER='{"resources":{"cpu":4,"memory":"6GiB","storage":"4GiB"}}'
     REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
     code=$(req POST /v3/templates "$AK" "$body")
     unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
@@ -544,17 +546,17 @@ assert status["registration"]["configured"] == {
 }, status
 assert status["execution"]["configured"] == {
     "max_builds": 2,
-    "resources": {"cpu": 4000, "memory": 12 << 30, "storage": 16 << 30},
+    "resources": {"cpu": 8000, "memory": 12 << 30, "storage": 16 << 30},
 }, status
 # The deliberately untriggered negative-test registration and this active
 # Build both consume registration admission. Only this Build consumes execution.
 assert status["registration"]["used_builds"] == 2, status
 assert status["registration"]["used_resources"] == {
-    "cpu": 4000, "memory": 12 << 30, "storage": 8 << 30,
+    "cpu": 8000, "memory": 12 << 30, "storage": 8 << 30,
 }, status
 assert status["execution"]["used_builds"] == 1, status
 assert status["execution"]["used_resources"] == {
-    "cpu": 2000, "memory": 6 << 30, "storage": 4 << 30,
+    "cpu": 4000, "memory": 6 << 30, "storage": 4 << 30,
 }, status
 PY
 
@@ -599,8 +601,8 @@ def assert_cpu(path, milli):
 unit, pool, vmm = map(pathlib.Path, sys.argv[1:])
 assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
 assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
-assert_cpu(unit, 2000)
-assert_cpu(pool, 4000)
+assert_cpu(unit, 4000)
+assert_cpu(pool, 8000)
 assert_cpu(vmm, 2000)
 PY
     echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified"
