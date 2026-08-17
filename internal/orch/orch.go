@@ -115,6 +115,7 @@ type Orchestrator struct {
 	resourceControllerSocketIdentity string
 	snapshotInspector                func(context.Context, string, string) (snapshotDescription, error)
 	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
+	removeBuildRuntimeDir            func(string) error
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -162,6 +163,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		mmdsBuildOwners:           map[string]string{},
 		mmdsServices:              mmdsServices,
 		commitBuildTrigger:        st.CommitBuildTrigger,
+		removeBuildRuntimeDir:     os.RemoveAll,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))

@@ -894,9 +894,9 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			retErr = retainBuildCleanup(retErr, nil, portID, dir, runtimePersisted)
 			return
 		}
-		cleanupErr := o.cleanupBuildRuntime(b, portID, dir, runtimePersisted)
+		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, dir, runtimePersisted)
 		if cleanupErr != nil {
-			retErr = retainBuildCleanup(retErr, cleanupErr, portID, dir, runtimePersisted)
+			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.dir, progress.persisted)
 		}
 	}()
 	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, b)
@@ -1099,6 +1099,18 @@ func (o *Orchestrator) resolveBuildPhaseInputs(ctx context.Context, b *types.Bui
 }
 
 func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, persisted bool) error {
+	_, err := o.cleanupBuildRuntimeProgress(b, port, dir, persisted)
+	return err
+}
+
+type buildRuntimeCleanupProgress struct {
+	port      string
+	dir       string
+	persisted bool
+}
+
+func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir string, persisted bool) (buildRuntimeCleanupProgress, error) {
+	progress := buildRuntimeCleanupProgress{port: port, dir: dir, persisted: persisted}
 	var cleanupErr error
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1113,6 +1125,8 @@ func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, per
 					o.detachedBuildPortsPending = make(map[string]struct{})
 				}
 				o.detachedBuildPortsPending[port] = struct{}{}
+			} else {
+				progress.port = ""
 			}
 		}
 		if cleanupErr == nil && persisted {
@@ -1124,13 +1138,20 @@ func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, per
 			} else {
 				delete(o.detachedBuildPortsPending, port)
 				b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimeEnvdAccessToken = "", "", "", ""
+				progress.port, progress.persisted = "", false
 			}
 		}
 	}()
-	if err := os.RemoveAll(dir); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove build workdir: %w", err))
+	removeAll := o.removeBuildRuntimeDir
+	if removeAll == nil {
+		removeAll = os.RemoveAll
 	}
-	return cleanupErr
+	if err := removeAll(dir); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove build workdir: %w", err))
+	} else {
+		progress.dir = ""
+	}
+	return progress, cleanupErr
 }
 
 // retryBuildCleanup keeps a live controller making progress after a transient
@@ -1156,7 +1177,9 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pe
 			cleanupErr = o.stopBuilderUnit(o.builderUnit(b.RunID))
 		}
 		if cleanupErr == nil {
-			cleanupErr = o.cleanupBuildRuntime(b, port, dir, persisted)
+			var progress buildRuntimeCleanupProgress
+			progress, cleanupErr = o.cleanupBuildRuntimeProgress(b, port, dir, persisted)
+			port, dir, persisted = progress.port, progress.dir, progress.persisted
 		}
 		if cleanupErr == nil {
 			return cause, nil

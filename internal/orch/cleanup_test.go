@@ -178,6 +178,54 @@ func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 	}
 }
 
+func TestBuildCleanupWorkdirRetryDoesNotRedetachReleasedPort(t *testing.T) {
+	o := testOrch(t)
+	vs := &orderedCleanupVS{}
+	o.vs = vs
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000218")
+	build.RunID = ""
+	port := build.RuntimeVswitchPort
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	workdir := t.TempDir()
+	removeErr := errors.New("injected workdir removal failure")
+	var removeCalls atomic.Int32
+	o.removeBuildRuntimeDir = func(path string) error {
+		if removeCalls.Add(1) == 1 {
+			return removeErr
+		}
+		return os.RemoveAll(path)
+	}
+
+	progress, err := o.cleanupBuildRuntimeProgress(build, build.RuntimeVswitchPort, workdir, true)
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("first cleanup error=%v, want workdir failure", err)
+	}
+	if progress.port != "" || progress.persisted || progress.dir != workdir {
+		t.Fatalf("first cleanup progress=%+v, want only workdir pending", progress)
+	}
+	if got := vs.detachCalls.Load(); got != 1 {
+		t.Fatalf("first cleanup detach calls=%d, want 1", got)
+	}
+	if _, fenced := o.detachedBuildPortsPending[port]; fenced {
+		t.Fatal("durably cleared port remained fenced")
+	}
+
+	_, retryErr := o.retryBuildCleanup(context.Background(), build, &buildCleanupPendingError{
+		cleanup: err, port: progress.port, dir: progress.dir, persisted: progress.persisted,
+	})
+	if retryErr != nil {
+		t.Fatalf("retry cleanup: %v", retryErr)
+	}
+	if got := vs.detachCalls.Load(); got != 1 {
+		t.Fatalf("workdir-only retry detached released port: calls=%d", got)
+	}
+	if got := removeCalls.Load(); got != 2 {
+		t.Fatalf("workdir removal calls=%d, want failure plus retry", got)
+	}
+}
+
 func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
