@@ -227,14 +227,13 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 	for {
 		select {
 		case result := <-pend.result:
-			if err := o.waitBuilderUnitExit(ctx, unit, 20*time.Second); err != nil {
-				if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-					return nil, &buildCleanupPendingError{cause: err, cleanup: stopErr}
-				}
-				return nil, err
-			}
-			return &result, nil
+			return o.fenceAcceptedBuildResult(unit, result)
 		case <-ctx.Done():
+			select {
+			case result := <-pend.result:
+				return o.fenceAcceptedBuildResult(unit, result)
+			default:
+			}
 			if err := o.stopBuilderUnit(unit); err != nil {
 				return nil, &buildCleanupPendingError{cause: ctx.Err(), cleanup: err}
 			}

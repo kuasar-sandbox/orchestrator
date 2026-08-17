@@ -24,12 +24,14 @@ import (
 )
 
 type reconcileLauncher struct {
-	mu        sync.Mutex
-	units     []launcher.Unit
-	stopped   []string
-	reset     []string
-	resources launcher.ResourceProperties
-	stopErr   error
+	mu                 sync.Mutex
+	units              []launcher.Unit
+	stopped            []string
+	reset              []string
+	resources          launcher.ResourceProperties
+	stopErr            error
+	inactiveAfterLists int
+	listCalls          int
 }
 
 func (l *reconcileLauncher) Start(context.Context, string) error { return nil }
@@ -56,6 +58,12 @@ func (l *reconcileLauncher) ResetFailed(_ context.Context, unit string) error {
 func (l *reconcileLauncher) List(_ context.Context, pattern string) ([]launcher.Unit, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.listCalls++
+	if l.inactiveAfterLists > 0 && l.listCalls >= l.inactiveAfterLists {
+		for i := range l.units {
+			l.units[i].ActiveState = "inactive"
+		}
+	}
 	var matched []launcher.Unit
 	for _, unit := range l.units {
 		if ok, _ := filepath.Match(pattern, unit.Name); ok {
@@ -463,6 +471,44 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	case duplicate := <-pend.result:
 		t.Fatalf("idempotent replay queued a duplicate notification: %+v", duplicate)
 	default:
+	}
+}
+
+func TestWaitAssignmentReplaysDurableBuildRunBinding(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000213"
+	build := buildReconcileRow(t, runID)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	buildID, ok, err := o.WaitAssignment(context.Background(), runKindBuild, runID)
+	if err != nil || !ok || buildID != build.BuildID {
+		t.Fatalf("durable assignment replay = %q, %t, %v", buildID, ok, err)
+	}
+}
+
+func TestRecoveredAcceptedResultWinsCanceledMonitor(t *testing.T) {
+	runID := "br-00000000-0000-7000-8000-000000000214"
+	unit := "sandbox-builder@" + runID + ".service"
+	lc := &reconcileLauncher{
+		units:              []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		inactiveAfterLists: 2,
+	}
+	o := &Orchestrator{
+		cfg: buildReconcileConfig(t.TempDir()), lc: lc,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	build := buildReconcileRow(t, runID)
+	accepted := configsock.BuildResult{ImageRef: "manifest://accepted-before-shutdown"}
+	pend := &pendingBuild{result: make(chan configsock.BuildResult, 1)}
+	pend.result <- accepted
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := o.waitRecoveredBuild(ctx, build, pend, unit)
+	if err != nil || result == nil || *result != accepted {
+		t.Fatalf("accepted result after canceled monitor = %+v, %v", result, err)
 	}
 }
 

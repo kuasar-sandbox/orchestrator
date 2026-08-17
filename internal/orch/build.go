@@ -949,15 +949,24 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	for {
 		select {
 		case res := <-pend.result:
-			if err := o.waitBuilderUnitExit(ctx, unit, 20*time.Second); err != nil {
-				if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-					cleanupSafe = false
-					return nil, errors.Join(err, stopErr)
-				}
-				return nil, err
+			accepted, err := o.fenceAcceptedBuildResult(unit, res)
+			if err != nil {
+				cleanupSafe = false
 			}
-			return &res, nil
+			return accepted, err
 		case <-ctx.Done():
+			// A result may have committed and notified at the same instant shutdown
+			// canceled the monitor. Once accepted, it remains authoritative; fence
+			// the worker independently of the shutdown context before finalization.
+			select {
+			case res := <-pend.result:
+				accepted, err := o.fenceAcceptedBuildResult(unit, res)
+				if err != nil {
+					cleanupSafe = false
+				}
+				return accepted, err
+			default:
+			}
 			if err := o.stopBuilderUnit(unit); err != nil {
 				cleanupSafe = false
 				return nil, errors.Join(ctx.Err(), err)
@@ -972,14 +981,11 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		case <-tick.C:
 			select {
 			case res := <-pend.result:
-				if err := o.waitBuilderUnitExit(ctx, unit, 20*time.Second); err != nil {
-					if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-						cleanupSafe = false
-						return nil, errors.Join(err, stopErr)
-					}
-					return nil, err
+				accepted, err := o.fenceAcceptedBuildResult(unit, res)
+				if err != nil {
+					cleanupSafe = false
 				}
-				return &res, nil
+				return accepted, err
 			default:
 			}
 			if !o.unitActive(ctx, unit) {
@@ -1174,6 +1180,19 @@ func (o *Orchestrator) waitBuilderUnitExit(ctx context.Context, unit string, tim
 		case <-ticker.C:
 		}
 	}
+}
+
+// fenceAcceptedBuildResult preserves the durable worker result across
+// controller shutdown. Waiting uses its own bounded lifetime; if the worker
+// does not exit after the acknowledged report, a successful Stop is an
+// equivalent execution-release fence and the accepted result still wins.
+func (o *Orchestrator) fenceAcceptedBuildResult(unit string, result buildResult) (*buildResult, error) {
+	if err := o.waitBuilderUnitExit(context.Background(), unit, 20*time.Second); err != nil {
+		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
+			return nil, &buildCleanupPendingError{cause: err, cleanup: stopErr}
+		}
+	}
+	return &result, nil
 }
 
 // stopBuilderUnit is the execution-release fence. A successful systemd stop job

@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +89,39 @@ func cloneMMDSRouteSecretValues(values MMDSRouteSecretValues) MMDSRouteSecretVal
 	return out
 }
 
+func registrationMMDSValuesDigest(manifestKey, buildID, routesDigest string, values MMDSRouteSecretValues) (string, error) {
+	key, err := hex.DecodeString(manifestKey)
+	if err != nil || len(key) != sha256.Size {
+		return "", fmt.Errorf("registration MMDS value identity requires a 64-character hex manifest key")
+	}
+	canonical, err := encodeMMDSRouteSecretValues(values)
+	if err != nil {
+		return "", fmt.Errorf("encode registration MMDS value identity: %w", err)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("kuasar-build-registration-mmds-values-v1\x00"))
+	_, _ = mac.Write(mmdsRouteSecretAAD(MMDSRouteSecretOwnerBuild, buildID, routesDigest, 1))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(canonical)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+func prepareBuildRegistrationMMDSIdentity(build *types.Build, routesDigest string, values MMDSRouteSecretValues) error {
+	if build == nil {
+		return errors.New("build is required")
+	}
+	if build.RegistrationMMDSRoutesDigest != "" && build.RegistrationMMDSRoutesDigest != routesDigest {
+		return fmt.Errorf("store: register build %s: MMDS route identity does not match initial values", build.BuildID)
+	}
+	digest, err := registrationMMDSValuesDigest(build.ManifestKey, build.BuildID, routesDigest, values)
+	if err != nil {
+		return fmt.Errorf("store: register build %s: %w", build.BuildID, err)
+	}
+	build.RegistrationMMDSRoutesDigest = routesDigest
+	build.RegistrationMMDSValuesDigest = digest
+	return nil
+}
+
 func (s *Store) encryptMMDSRouteSecretValues(kind MMDSRouteSecretOwnerKind, ownerID, routesDigest string, revision int64, values MMDSRouteSecretValues) (string, error) {
 	plaintext, err := encodeMMDSRouteSecretValues(values)
 	if err != nil {
@@ -167,6 +202,9 @@ func (s *Store) InsertSandboxWithMMDSRouteSecretValues(ctx context.Context, sb *
 // InsertBuildWithMMDSRouteSecretValues is the Build Register equivalent of the
 // sandbox transaction primitive.
 func (s *Store) InsertBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, routesDigest string, values MMDSRouteSecretValues) error {
+	if err := prepareBuildRegistrationMMDSIdentity(build, routesDigest, values); err != nil {
+		return err
+	}
 	args, err := s.prepareBuildWrite(build)
 	if err != nil {
 		return err
@@ -203,6 +241,9 @@ var (
 // optional confidential MMDS values. An exact BuildID replay returns the
 // original row without consuming capacity again.
 func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, build *types.Build, limit types.BuildAdmissionLimit, routesDigest string, values MMDSRouteSecretValues) (*types.Build, bool, error) {
+	if err := prepareBuildRegistrationMMDSIdentity(build, routesDigest, values); err != nil {
+		return nil, false, err
+	}
 	args, err := s.prepareBuildWrite(build)
 	if err != nil {
 		return nil, false, err
@@ -220,9 +261,13 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 		return nil, false, fmt.Errorf("store: register build %s lookup: %w", build.BuildID, err)
 	}
 	if err == nil {
-		sameMMDS, compareErr := s.sameInitialBuildMMDSRouteSecretValuesTx(ctx, tx, build.BuildID, routesDigest, values)
-		if compareErr != nil {
-			return nil, false, compareErr
+		sameMMDS := true
+		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
+			var compareErr error
+			sameMMDS, compareErr = s.sameInitialBuildMMDSRouteSecretValuesTx(ctx, tx, build.BuildID, routesDigest, values)
+			if compareErr != nil {
+				return nil, false, compareErr
+			}
 		}
 		if !sameImmutableBuild(existing, build) || !sameMMDS {
 			return nil, false, fmt.Errorf("%w: %s", ErrBuildRegistrationConflict, build.BuildID)
@@ -315,6 +360,7 @@ func sameImmutableBuild(a, b *types.Build) bool {
 		a.RegistrationImageRepo == b.RegistrationImageRepo &&
 		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
 		a.RegistrationMMDSRoutesDigest == b.RegistrationMMDSRoutesDigest &&
+		hmac.Equal([]byte(a.RegistrationMMDSValuesDigest), []byte(b.RegistrationMMDSValuesDigest)) &&
 		a.PhaseResourcePatch == b.PhaseResourcePatch && equalRegistrationMetadata(a, b) &&
 		reflect.DeepEqual(a.Builder, b.Builder) &&
 		hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))

@@ -29,6 +29,16 @@ func (o *Orchestrator) WaitAssignment(ctx context.Context, kind, runID string) (
 	case runKindSandbox:
 		return o.runnerPool.WaitAssignment(ctx, runID)
 	case runKindBuild:
+		// BindBuildRun commits before runPool publishes its response. A retry after
+		// response loss (including across a controller restart) therefore resolves
+		// the same immutable assignment without consulting process-local pool state.
+		buildID, found, err := o.st.GetClaimedBuildIDByRunID(ctx, runID)
+		if err != nil {
+			return "", false, err
+		}
+		if found {
+			return buildID, true, nil
+		}
 		return o.builderRunPool.WaitAssignment(ctx, runID)
 	default:
 		return "", false, nil

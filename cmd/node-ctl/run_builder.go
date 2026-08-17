@@ -72,16 +72,26 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("prepare builder cgroup: %w", err)
 	}
 	defer vmmCgroup.Close()
-	bid, err := configsock.WaitAssignment(context.Background(), *socket, "build", *runID)
+	var bid string
+	err = retryBuildConfigSocket(context.Background(), log, "assignment", func(ctx context.Context) error {
+		var callErr error
+		bid, callErr = configsock.WaitAssignment(ctx, *socket, "build", *runID)
+		return callErr
+	})
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
 	if err := lockPidfile(builderAssignmentPidfile(*pidfile, bid)); err != nil {
 		return err
 	}
-	spec, err := configsock.FetchBuildSpec(*socket, "build:"+bid)
+	var spec *configsock.BuildSpec
+	err = retryBuildConfigSocket(context.Background(), log, "build spec", func(ctx context.Context) error {
+		var callErr error
+		spec, callErr = configsock.FetchBuildSpecContext(ctx, *socket, "build:"+bid)
+		return callErr
+	})
 	if err != nil {
-		postErr := retryBuildReport(context.Background(), log, "result", func(ctx context.Context) error {
+		postErr := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
 			return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
 		})
 		if postErr != nil {
@@ -96,7 +106,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 
 	reportPhase := func(phase, sandboxID, state string) error {
-		return retryBuildReport(context.Background(), log, "phase", func(ctx context.Context) error {
+		return retryBuildConfigSocket(context.Background(), log, "phase", func(ctx context.Context) error {
 			return configsock.PostBuildPhaseContext(ctx, *socket, *runID, bid, phase, sandboxID, state)
 		})
 	}
@@ -105,7 +115,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
-	if err := retryBuildReport(context.Background(), log, "result", func(ctx context.Context) error {
+	if err := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
 		return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, post)
 	}); err != nil {
 		return fmt.Errorf("post build result: %w", err)
@@ -116,18 +126,18 @@ func runBuilder(args []string, log *slog.Logger) error {
 	return nil
 }
 
-func retryBuildReport(ctx context.Context, log *slog.Logger, kind string, post func(context.Context) error) error {
+func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation string, call func(context.Context) error) error {
 	delay := 20 * time.Millisecond
 	for attempt := 1; ; attempt++ {
-		err := post(ctx)
+		err := call(ctx)
 		if err == nil {
 			return nil
 		}
-		if !configsock.IsReportTransportError(err) {
+		if !configsock.IsTransportError(err) {
 			return err
 		}
 		if attempt == 1 {
-			log.Warn("builder report interrupted; retrying", "kind", kind, "err", err)
+			log.Warn("builder config-socket operation interrupted; retrying", "operation", operation, "err", err)
 		}
 		timer := time.NewTimer(delay)
 		select {

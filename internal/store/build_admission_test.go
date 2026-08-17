@@ -197,6 +197,47 @@ func TestExecutionAdmissionVectorClaimAndFIFO(t *testing.T) {
 	}
 }
 
+func TestGetClaimedBuildIDByRunIDReturnsOnlyLiveDurableAssignment(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	runID := "br-durable-assignment"
+	claimed := admissionBuild("durable-assignment", types.BuildResources{CPU: 1000, Memory: 1 << 30})
+	claimed.Status = types.BuildBuilding
+	claimed.ExecutionClaimed = true
+	claimed.RunID = runID
+	if err := st.PutBuild(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := st.GetClaimedBuildIDByRunID(ctx, runID)
+	if err != nil || !found || got != claimed.BuildID {
+		t.Fatalf("claimed assignment = %q, %t, %v", got, found, err)
+	}
+	if got, found, err := st.GetClaimedBuildIDByRunID(ctx, "br-unknown"); err != nil || found || got != "" {
+		t.Fatalf("unknown assignment = %q, %t, %v", got, found, err)
+	}
+	duplicate := admissionBuild("duplicate-run-owner", claimed.Resources)
+	duplicate.Status, duplicate.ExecutionClaimed, duplicate.RunID = types.BuildBuilding, true, runID
+	if err := st.PutBuild(ctx, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := st.GetClaimedBuildIDByRunID(ctx, runID); err == nil || found || got != "" {
+		t.Fatalf("ambiguous assignment = %q, %t, %v", got, found, err)
+	}
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM builds WHERE build_id=?`, duplicate.BuildID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed.ExecutionClaimed = false
+	claimed.Status = types.BuildError
+	if err := st.PutBuild(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := st.GetClaimedBuildIDByRunID(ctx, runID); err != nil || found || got != "" {
+		t.Fatalf("terminal assignment replay = %q, %t, %v", got, found, err)
+	}
+}
+
 func TestExecutionAdmissionConcurrentClaimsDoNotOversubscribe(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -262,7 +303,8 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 	mmdsRoutes := `{"routes":[{"path":"/identity","data":"registered"}]}`
 	definition.Metadata = map[string]string{sandboxcfg.NsMMDS: mmdsRoutes, "ordinary": "preserved"}
 	definition.RegistrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(mmdsRoutes)
-	registered, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, limit, definition.RegistrationMMDSRoutesDigest, nil)
+	initialValues := MMDSRouteSecretValues{"identity": []byte("terminal-secret")}
+	registered, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, limit, definition.RegistrationMMDSRoutesDigest, initialValues)
 	if err != nil || !inserted {
 		t.Fatalf("register: inserted=%v err=%v", inserted, err)
 	}
@@ -282,8 +324,18 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 		t.Fatalf("terminal GetBuild = %+v, %v", terminalStored, err)
 	}
 	if _, present := terminalStored.Metadata[sandboxcfg.NsMMDS]; present ||
-		terminalStored.RegistrationMMDSRoutesDigest != definition.RegistrationMMDSRoutesDigest {
-		t.Fatalf("terminal registration identity = metadata %+v digest %q", terminalStored.Metadata, terminalStored.RegistrationMMDSRoutesDigest)
+		terminalStored.RegistrationMMDSRoutesDigest != definition.RegistrationMMDSRoutesDigest ||
+		terminalStored.RegistrationMMDSValuesDigest == "" ||
+		terminalStored.RegistrationMMDSValuesDigest != definition.RegistrationMMDSValuesDigest {
+		t.Fatalf("terminal registration identity = metadata %+v route digest %q value digest %q",
+			terminalStored.Metadata, terminalStored.RegistrationMMDSRoutesDigest, terminalStored.RegistrationMMDSValuesDigest)
+	}
+	if terminalStored.RegistrationMMDSValuesDigest == "terminal-secret" || len(terminalStored.RegistrationMMDSValuesDigest) != 64 {
+		t.Fatalf("terminal MMDS value identity is not an irreversible digest: %q", terminalStored.RegistrationMMDSValuesDigest)
+	}
+	var secretRows int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM build_mmds_route_secret_values WHERE build_id=?`, definition.BuildID).Scan(&secretRows); err != nil || secretRows != 0 {
+		t.Fatalf("terminal MMDS value rows = %d, err=%v", secretRows, err)
 	}
 
 	// Tightening both count and resource limits after acceptance must not turn a
@@ -292,7 +344,7 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 		MaxBuilds: 1,
 		Resources: types.BuildResources{CPU: 1, Memory: 1, Storage: 1},
 	}
-	replayed, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, tightened, definition.RegistrationMMDSRoutesDigest, nil)
+	replayed, inserted, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, tightened, definition.RegistrationMMDSRoutesDigest, initialValues)
 	if err != nil || inserted {
 		t.Fatalf("terminal replay: inserted=%v err=%v", inserted, err)
 	}
@@ -304,6 +356,10 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 	changed.RegistrationMMDSRoutesDigest = sandboxcfg.MMDSRoutesDigest(changed.Metadata[sandboxcfg.NsMMDS])
 	if _, _, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, &changed, tightened, changed.RegistrationMMDSRoutesDigest, nil); !errors.Is(err, ErrBuildRegistrationConflict) {
 		t.Fatalf("terminal MMDS identity conflict = %v", err)
+	}
+	changedValues := MMDSRouteSecretValues{"identity": []byte("different-terminal-secret")}
+	if _, _, err := st.RegisterBuildWithMMDSRouteSecretValues(ctx, definition, tightened, definition.RegistrationMMDSRoutesDigest, changedValues); !errors.Is(err, ErrBuildRegistrationConflict) {
+		t.Fatalf("terminal MMDS value identity conflict = %v", err)
 	}
 	usage, err := st.BuildUsage(ctx)
 	if err != nil {

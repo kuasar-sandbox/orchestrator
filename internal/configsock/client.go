@@ -40,12 +40,12 @@ func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, er
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
 	if err != nil {
-		return "", err
+		return "", &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out AssignmentResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("configsock: decode assignment: %w", err)
+		return "", &transportError{err: fmt.Errorf("configsock: decode assignment: %w", err)}
 	}
 	if out.Error != "" {
 		return "", errors.New(out.Error)
@@ -56,16 +56,16 @@ func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, er
 	return out.TaskID, nil
 }
 
-type reportTransportError struct{ err error }
+type transportError struct{ err error }
 
-func (e *reportTransportError) Error() string { return e.err.Error() }
-func (e *reportTransportError) Unwrap() error { return e.err }
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
 
-// IsReportTransportError identifies a report whose request or response was
-// interrupted by config-socket replacement. run-builder may safely retry these
-// because phase and result reports are idempotent at the durable provider.
-func IsReportTransportError(err error) bool {
-	var transport *reportTransportError
+// IsTransportError identifies a request whose config-socket connection or
+// response was interrupted. Idempotent run-builder operations may retry these;
+// provider rejections remain ordinary errors and must not be retried.
+func IsTransportError(err error) bool {
+	var transport *transportError
 	return errors.As(err, &transport)
 }
 
@@ -82,12 +82,12 @@ func PostBuildResultContext(ctx context.Context, socket, runID, buildID string, 
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClient(socket).Do(req)
 	if err != nil {
-		return &reportTransportError{err: err}
+		return &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out BuildResultResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return &reportTransportError{err: fmt.Errorf("configsock: decode build result: %w", err)}
+		return &transportError{err: fmt.Errorf("configsock: decode build result: %w", err)}
 	}
 	if out.Error != "" {
 		return errors.New(out.Error)
@@ -110,12 +110,12 @@ func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, s
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClient(socket).Do(req)
 	if err != nil {
-		return &reportTransportError{err: err}
+		return &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out BuildPhaseResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return &reportTransportError{err: fmt.Errorf("configsock: decode build phase: %w", err)}
+		return &transportError{err: fmt.Errorf("configsock: decode build phase: %w", err)}
 	}
 	if out.Error != "" {
 		return errors.New(out.Error)
@@ -151,20 +151,24 @@ func FetchLaunchSpec(socket, configID string) (*LaunchSpec, error) {
 // FetchBuildSpec dials the config-socket and pulls the BuildSpec for
 // configID ("build:<bid>"). Same auth contract as FetchLaunchSpec.
 func FetchBuildSpec(socket, configID string) (*BuildSpec, error) {
+	return FetchBuildSpecContext(context.Background(), socket, configID)
+}
+
+func FetchBuildSpecContext(ctx context.Context, socket, configID string) (*BuildSpec, error) {
 	body, _ := json.Marshal(Request{ConfigID: configID})
-	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathTaskBuildSpec, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildSpec, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClient(socket).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	var spec BuildSpec
 	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
-		return nil, fmt.Errorf("configsock: decode buildspec: %w", err)
+		return nil, &transportError{err: fmt.Errorf("configsock: decode buildspec: %w", err)}
 	}
 	if spec.Error != "" {
 		return nil, errors.New(spec.Error)

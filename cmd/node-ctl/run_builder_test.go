@@ -28,11 +28,11 @@ func TestBuilderAssignmentPidfileMatchesBuildSpecRuntimeIdentity(t *testing.T) {
 	}
 }
 
-func TestRetryBuildReportRetriesConfigSocketTransportFailure(t *testing.T) {
+func TestRetryBuildConfigSocketRetriesReportTransportFailure(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	missingSocket := filepath.Join(t.TempDir(), "restarting.sock")
 	var attempts atomic.Int32
-	err := retryBuildReport(context.Background(), log, "phase", func(ctx context.Context) error {
+	err := retryBuildConfigSocket(context.Background(), log, "phase", func(ctx context.Context) error {
 		if attempts.Add(1) < 3 {
 			return configsock.PostBuildPhaseContext(ctx, missingSocket,
 				"br-retry", "build-retry", "a", "bp-a-retry", "starting")
@@ -40,18 +40,46 @@ func TestRetryBuildReportRetriesConfigSocketTransportFailure(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("retryBuildReport: %v", err)
+		t.Fatalf("retryBuildConfigSocket: %v", err)
 	}
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("report attempts = %d, want 3", got)
 	}
 }
 
-func TestRetryBuildReportDoesNotRetryProviderRejection(t *testing.T) {
+func TestRetryBuildConfigSocketRetriesAssignmentAndSpecTransportFailures(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	missingSocket := filepath.Join(t.TempDir(), "restarting.sock")
+	for name, interrupted := range map[string]func(context.Context) error{
+		"assignment": func(ctx context.Context) error {
+			_, err := configsock.WaitAssignment(ctx, missingSocket, "build", "br-retry")
+			return err
+		},
+		"build spec": func(ctx context.Context) error {
+			_, err := configsock.FetchBuildSpecContext(ctx, missingSocket, "build:retry")
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var attempts atomic.Int32
+			err := retryBuildConfigSocket(context.Background(), log, name, func(ctx context.Context) error {
+				if attempts.Add(1) < 3 {
+					return interrupted(ctx)
+				}
+				return nil
+			})
+			if err != nil || attempts.Load() != 3 {
+				t.Fatalf("%s retry = %v after %d attempts", name, err, attempts.Load())
+			}
+		})
+	}
+}
+
+func TestRetryBuildConfigSocketDoesNotRetryProviderRejection(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	want := errors.New("execution ownership lost")
 	var attempts atomic.Int32
-	err := retryBuildReport(context.Background(), log, "result", func(context.Context) error {
+	err := retryBuildConfigSocket(context.Background(), log, "result", func(context.Context) error {
 		attempts.Add(1)
 		return want
 	})

@@ -196,6 +196,23 @@ func TestTaskPlane(t *testing.T) {
 	}
 }
 
+func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.sock")
+	if _, err := WaitAssignment(context.Background(), missing, "build", "br-test"); !IsTransportError(err) {
+		t.Fatalf("assignment transport error = %v, retryable=%t", err, IsTransportError(err))
+	}
+	if _, err := FetchBuildSpecContext(context.Background(), missing, "build:test"); !IsTransportError(err) {
+		t.Fatalf("build-spec transport error = %v, retryable=%t", err, IsTransportError(err))
+	}
+
+	pf := filepath.Join(t.TempDir(), "id.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
+	if _, err := FetchBuildSpecContext(context.Background(), sock, "unknown"); err == nil || IsTransportError(err) {
+		t.Fatalf("provider rejection = %v, retryable=%t", err, IsTransportError(err))
+	}
+}
+
 func TestRunPlane(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "run.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))

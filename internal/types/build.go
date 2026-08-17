@@ -119,6 +119,10 @@ type Build struct {
 	// of builder-only MMDS routes after terminal cleanup removes those routes and
 	// their confidential values from the portable template record.
 	RegistrationMMDSRoutesDigest string
+	// RegistrationMMDSValuesDigest is a keyed, irreversible identity for the
+	// initial confidential MMDS values. It lets an exact registration replay be
+	// verified after terminal cleanup has deliberately removed the ciphertext.
+	RegistrationMMDSValuesDigest string
 	StartCmd                     string // e2b only; non-empty => snapshot build (kind=snp)
 	ReadyCmd                     string // e2b only; readiness probe run after StartCmd (poll until exit 0)
 	Steps                        []TemplateStep
