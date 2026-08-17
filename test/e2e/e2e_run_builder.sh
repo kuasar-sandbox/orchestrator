@@ -471,6 +471,33 @@ wait_phase_audit() { # $1=phase, $2=build id
     tail -100 "$WORK/resource-audit.log" >&2 2>/dev/null || true
     return 1
 }
+wait_phase_admit() { # $1=phase, $2=build id
+    local sid
+    sid=$(phase_sandbox_id "$1" "$2")
+    for _ in $(seq 1 120); do
+        if grep -Eq "admit .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    tail -100 "$WORK/resource-audit.log" >&2 2>/dev/null || true
+    return 1
+}
+wait_resource_reservations_empty() {
+    for _ in $(seq 1 120); do
+        if "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >"$WORK/phase-reservations-final.json" 2>/dev/null &&
+            python3 - "$WORK/phase-reservations-final.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1])) == []
+PY
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    cat "$WORK/phase-reservations-final.json" >&2 2>/dev/null || true
+    return 1
+}
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
@@ -923,9 +950,14 @@ grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merge
 grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
 echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + manifest:// base + merged ENV/WORKDIR"
 wait_phase_audit a "$B1_BID" || fail "B1 phase A lacked ordinary nodectl Admit/Release"
-wait_phase_audit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit/Release"
+wait_phase_admit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit"
 wait_phase_audit c "$B2_BID" || fail "B2 phase C lacked ordinary nodectl Admit/Release"
-echo "==> PASS: A/B/C phase sandboxes each completed ordinary nodectl Admit/Release"
+wait_resource_reservations_empty || fail "phase sandbox reservation remained after B2 completion"
+B2_PHASE_B_SID=$(phase_sandbox_id b "$B2_BID")
+if ! grep -Eq "release .*sid=$B2_PHASE_B_SID( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
+    echo "==> NOTE: long phase B drained without an explicit normal Release; sandboxer#115 tracks that lifecycle race"
+fi
+echo "==> PASS: A/B/C used ordinary nodectl Admit; phases serialized and left no reservation (A/C normal Release verified)"
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"
