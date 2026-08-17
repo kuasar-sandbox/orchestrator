@@ -203,22 +203,37 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		return fmt.Errorf("%w: build_register cluster ownership: %v", api.ErrBadRequest, err)
 	}
 	meta = cloneStringMapWithout(meta, clusterstate.ObjectMetadataKey)
-	mmdsDoc, meta, err := sandboxcfg.ExtractMMDS(meta, nil, o.mmdsPolicy())
+	var mmdsDoc sandboxcfg.MMDSDocument
+	if existing != nil {
+		// A same-BuildID retry after an ambiguous/lost ACK is compared with
+		// durable immutable identity below. Do not let mutable MMDS enablement,
+		// route limits, reserved prefixes, or service configuration turn that
+		// already accepted ownership into a definitive no-side-effect rejection.
+		mmdsDoc, meta, err = sandboxcfg.ExtractMMDSReplay(meta, nil)
+	} else {
+		mmdsDoc, meta, err = sandboxcfg.ExtractMMDS(meta, nil, o.mmdsPolicy())
+	}
 	if err != nil {
 		return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
 	}
 	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
-	if err := o.validateBuildOptions(builderOpts, false); err != nil {
-		return err
-	}
 	phaseResourcePatch := meta[sandboxcfg.NsResource]
 	if phaseResourcePatch != "" {
 		meta = cloneStringMapWithout(meta, sandboxcfg.NsResource)
 	}
-	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
-		return err
+	if existing == nil {
+		// Mutable node policy admits new ownership only. Exact replay is still
+		// strictly decoded above and the store compares every immutable field;
+		// reapplying changed Referer or Sandbox policy here could incorrectly
+		// turn an ACK-lost acceptance into permission to place on another node.
+		if err := o.validateBuildOptions(builderOpts, false); err != nil {
+			return err
+		}
+		if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
+			return err
+		}
 	}
 	b := &types.Build{
 		BuildID:                  cmd.BuildID,

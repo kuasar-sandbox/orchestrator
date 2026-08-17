@@ -434,6 +434,70 @@ func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
 	}
 }
 
+func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runRoot := filepath.Join(t.TempDir(), "run")
+	runID := "br-00000000-0000-7000-8000-000000000215"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	// This deliberately cannot be parsed if recovery tries to reconstruct a
+	// completed pipeline. The already-acknowledged result must win first.
+	build.PhaseResourcePatch = `{"capacity":`
+	workdir := buildRuntimeDir(runRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	imageRef := "manifest://" + strings.Repeat("e", 64)
+	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
+		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		t.Fatalf("persist accepted result = %v, %v", accepted, err)
+	}
+
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(runRoot), st, lc, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("terminal build = %+v, %v", stored, err)
+	}
+	wantPersistID := types.TemplateID{Profile: build.Profile, Kind: types.KindImg, Ref: imageRef}.String()
+	if stored.Status != types.BuildReady || stored.PersistID != wantPersistID ||
+		stored.ExecutionClaimed || stored.ExecutionResult != nil {
+		t.Fatalf("accepted result was overwritten during live recovery: %+v", stored)
+	}
+	if len(lc.stopped) != 1 || lc.stopped[0] != unit {
+		t.Fatalf("accepted-result unit fence = %v, want %s", lc.stopped, unit)
+	}
+	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
+		t.Fatalf("accepted-result runtime detach = %v", vs.detached)
+	}
+	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted-result workdir remains: %v", err)
+	}
+}
+
 func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	o := testOrch(t)
 	runID := "br-00000000-0000-7000-8000-000000000212"

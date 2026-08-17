@@ -329,10 +329,14 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 }
 
 func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
-	o := testOrch(t)
+	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{
+		Referer: config.BuilderRefererConfig{Enabled: true},
+	}})
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterBuildRegisterCommand("durable-credential-replay", fingerprint)
+	cmd.Config[buildcfg.NsBuilder] = `{"referer":{"enabled":true}}`
+	cmd.Config[sandboxcfg.NsResource] = `{"allocatable":{"memory":"1GiB"}}`
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("initial BuildRegister ack = %+v", ack)
 	}
@@ -347,9 +351,15 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 	if err := o.dropClusterKey(ctx, fingerprint); err != nil {
 		t.Fatal(err)
 	}
+	o.cfg.Builder.Referer.Enabled = false
+	o.cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.NodeResourcePolicy{
+		Capacity:    sandboxcfg.NodeCapacityPolicy{CPU: 1, Memory: "512MiB"},
+		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "256MiB"},
+		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "32MiB"},
+	})
 
 	// A lost ACK replay remains accepted from the durable Build identity even
-	// after the mutable node allowlist no longer contains the key.
+	// after credential, Builder, and phase-Sandbox policies have changed.
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("exact replay after key withdrawal ack = %+v", ack)
 	}

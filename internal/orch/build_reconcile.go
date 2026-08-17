@@ -97,6 +97,17 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 			finish()
 		}
 	}()
+	if build.ExecutionResult != nil {
+		// PostBuildResult acknowledged only after persisting the complete result.
+		// Fence the still-live worker and finalize that authoritative result
+		// directly: rebuilding already-completed phase inputs would let transient
+		// snapshot reads or node-policy drift overwrite an accepted success.
+		if err := o.stopBuilderUnit(unit); err != nil {
+			return err
+		}
+		_ = o.lc.ResetFailed(ctx, unit)
+		return o.finishRecoveredBuildResult(ctx, build)
+	}
 	if build.RunID == "" || build.RuntimeVswitchPort == "" {
 		if err := o.stopBuilderUnit(unit); err != nil {
 			return err

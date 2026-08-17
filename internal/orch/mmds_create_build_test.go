@@ -131,6 +131,45 @@ func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) 
 	}
 }
 
+func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *testing.T) {
+	o := testOrchCfg(t, mmdsFeatureConfig())
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("cluster-mmds-policy-replay", fingerprint)
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}],"secrets":{"key":"initial"}}`
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("initial BuildRegister ack = %+v", ack)
+	}
+	select {
+	case <-o.buildEvents:
+	case <-time.After(time.Second):
+		t.Fatal("initial registration event was not published")
+	}
+
+	// Mutable operator policy governs only new ownership. An ACK-lost replay
+	// must still reach the store's immutable row/value comparison.
+	o.cfg.MMDS.Routes.Enabled = false
+	o.cfg.MMDS.Routes.MaxRoutesPerSandbox = 1
+	o.cfg.MMDS.Routes.MaxNamespaceBytes = 1
+	o.cfg.MMDS.Routes.MaxSecretValueBytes = 1
+	o.cfg.MMDS.Routes.ReservedPathPrefixes = []string{"/identity"}
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("exact replay after MMDS policy drift ack = %+v", ack)
+	}
+	usage, err := o.st.BuildUsage(ctx)
+	if err != nil || usage.RegistrationBuilds != 1 {
+		t.Fatalf("replay registration usage = %+v, err=%v", usage, err)
+	}
+
+	changed := *cmd
+	changed.CmdID = "changed-mmds-policy-replay"
+	changed.Config = cloneStringMapWithout(cmd.Config, "")
+	changed.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}],"secrets":{"key":"changed"}}`
+	if ack := o.HandleCommand(ctx, &changed); ack.Status != routesync.AckRejected || ack.HTTPStatus != 409 {
+		t.Fatalf("changed replay ack = %+v, want immutable conflict", ack)
+	}
+}
+
 func TestBuildMMDSRouteIsIncludedInFullSync(t *testing.T) {
 	o := testOrchCfg(t, mmdsFeatureConfig())
 	ctx := context.Background()
