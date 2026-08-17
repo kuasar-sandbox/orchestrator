@@ -1064,7 +1064,8 @@ func validateStubExecSessionEnvelope(cmd *routesync.Command) error {
 	if cmd.TTLSeconds < 0 || cmd.TimeoutSeconds != 0 || cmd.TemplateRef != "" || len(cmd.Config) != 0 ||
 		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
 		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
-		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" ||
+		len(cmd.BuildMMDSSecrets) != 0 {
 		return errors.New("exec session command contains fields for another operation")
 	}
 	return nil
@@ -1125,6 +1126,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 		RegistrationImageRepo: cmd.ImageRepo, RegistrationRegistryAuth: cmd.RegistryAuth,
+		RegistrationMMDSSecrets: cloneStringMap(cmd.BuildMMDSSecrets),
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
@@ -1218,7 +1220,8 @@ func sameStubBuildRegistration(a, b *stubBuild) bool {
 	return a.Profile == b.Profile && a.TemplateID == b.TemplateID &&
 		a.APISecretFingerprint == b.APISecretFingerprint && *a.Resources == *b.Resources &&
 		maps.Equal(a.Metadata, b.Metadata) && a.RegistrationImageRepo == b.RegistrationImageRepo &&
-		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth))
+		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
+		maps.Equal(a.RegistrationMMDSSecrets, b.RegistrationMMDSSecrets)
 }
 
 func stubAdmissionLimit(limit *routesync.BuildAdmissionLimit) types.BuildAdmissionLimit {
@@ -1783,6 +1786,7 @@ type stubBuild struct {
 	Resources                *routesync.BuildResources `json:"resources,omitempty"`
 	RegistrationImageRepo    string                    `json:"-"`
 	RegistrationRegistryAuth string                    `json:"-"`
+	RegistrationMMDSSecrets  map[string]string         `json:"-"`
 	Behavior                 stubBehavior              `json:"behavior,omitempty"`
 	CreatedAt                string                    `json:"created_at,omitempty"`
 	RegistrationSeq          int64                     `json:"-"`

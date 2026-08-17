@@ -107,7 +107,8 @@ func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) 
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterBuildRegisterCommand("cluster-mmds-secret", fingerprint)
-	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"cluster-initial"}}`
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`
+	cmd.BuildMMDSSecrets = map[string]string{"key": "cluster-initial"}
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("cluster BuildRegister ack = %+v", ack)
 	}
@@ -136,7 +137,8 @@ func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *te
 	ctx := context.Background()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterBuildRegisterCommand("cluster-mmds-policy-replay", fingerprint)
-	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}],"secrets":{"key":"initial"}}`
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}]}`
+	cmd.BuildMMDSSecrets = map[string]string{"key": "initial"}
 	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("initial BuildRegister ack = %+v", ack)
 	}
@@ -163,8 +165,7 @@ func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *te
 
 	changed := *cmd
 	changed.CmdID = "changed-mmds-policy-replay"
-	changed.Config = cloneStringMapWithout(cmd.Config, "")
-	changed.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}],"secrets":{"key":"changed"}}`
+	changed.BuildMMDSSecrets = map[string]string{"key": "changed"}
 	if ack := o.HandleCommand(ctx, &changed); ack.Status != routesync.AckRejected || ack.HTTPStatus != 409 {
 		t.Fatalf("changed replay ack = %+v, want immutable conflict", ack)
 	}

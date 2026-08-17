@@ -45,6 +45,7 @@ const (
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderResource    = "X-Kuasar-Sandbox-Resource"
 	HeaderBuilder     = "X-Kuasar-Sandbox-Builder"
+	HeaderMMDS        = "X-Kuasar-Sandbox-MMDS"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
 	HeaderCredentials = "X-Kuasar-Sandbox-Credentials"
 	HeaderCheckpoint  = "X-Kuasar-Sandbox-Checkpoint"
@@ -567,6 +568,20 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	var mmdsHeader *string
+	if values, present := r.Header[http.CanonicalHeaderKey(HeaderMMDS)]; present {
+		if len(values) != 1 {
+			http.Error(w, HeaderMMDS+" must appear exactly once", http.StatusBadRequest)
+			return
+		}
+		value := values[0]
+		mmdsHeader = &value
+	}
+	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDSReplay(metadata, mmdsHeader)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if values, present := r.Header[http.CanonicalHeaderKey(HeaderBuilder)]; present {
 		if len(values) != 1 {
 			http.Error(w, HeaderBuilder+" must appear exactly once", http.StatusBadRequest)
@@ -620,7 +635,11 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		metadata[buildcfg.NsBuilder] = builderJSON
 	}
 	resources := &buildResources{CPU: canonicalResources.CPU, Memory: canonicalResources.Memory, Storage: canonicalResources.Storage}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, metadata)
+	mmdsSecrets := make(map[string]string, len(mmdsDoc.SecretValues))
+	for name, value := range mmdsDoc.SecretValues {
+		mmdsSecrets[name] = string(value)
+	}
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, metadata, mmdsSecrets)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -1655,9 +1674,10 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata map[string]string) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, mmdsSecrets map[string]string) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{
 		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources, "metadata": metadata,
+		"mmds_secrets": mmdsSecrets,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

@@ -354,11 +354,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	go core.BuildPool(ctx, 2*time.Second)
 	if startNodeLink != nil {
 		startNodeLink()
-		go func() {
-			if err := core.ReplayClusterBuildTerminalStates(ctx); err != nil && ctx.Err() == nil {
-				log.Error("replay terminal cluster build states", "err", err)
-			}
-		}()
 	}
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),

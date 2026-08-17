@@ -502,7 +502,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,6 +889,8 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
 	var reserveProfiles []string
 	var reserveResource string
+	var reserveMMDS string
+	var reserveMMDSSecrets map[string]string
 	var reserveBuildResources routesync.BuildResources
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -922,6 +924,13 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 			reserveProfiles = append(reserveProfiles, profile)
 			if metadata, ok := body["metadata"].(map[string]any); ok {
 				reserveResource, _ = metadata[sandboxcfg.NsResource].(string)
+				reserveMMDS, _ = metadata[sandboxcfg.NsMMDS].(string)
+			}
+			if secrets, ok := body["mmds_secrets"].(map[string]any); ok {
+				reserveMMDSSecrets = make(map[string]string, len(secrets))
+				for name, value := range secrets {
+					reserveMMDSSecrets[name], _ = value.(string)
+				}
 			}
 			if resources, ok := body["resources"].(map[string]any); ok {
 				reserveBuildResources.CPU = int64(resources["cpu"].(float64))
@@ -981,15 +990,30 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	if hiddenInvalidResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
 		t.Fatalf("hidden invalid Builder status=%d reserveProfiles=%v", hiddenInvalidResp.StatusCode, reserveProfiles)
 	}
+	duplicateMMDSReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"cpuCount":4,"memoryMB":8192}`))
+	duplicateMMDSReq.Host = "api.test.local"
+	duplicateMMDSReq.Header.Set(HeaderGroup, "/g")
+	duplicateMMDSReq.Header.Set(HeaderAPIKey, "e2b_test")
+	duplicateMMDSReq.Header.Add(HeaderMMDS, `{}`)
+	duplicateMMDSReq.Header.Add(HeaderMMDS, `{}`)
+	duplicateMMDSResp, err := http.DefaultClient.Do(duplicateMMDSReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateMMDSResp.Body.Close()
+	if duplicateMMDSResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+		t.Fatalf("duplicate MMDS Header status=%d reserveProfiles=%v", duplicateMMDSResp.StatusCode, reserveProfiles)
+	}
 
 	// register a build via the router (control plane: Host api.<domain> + group).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
-		`{"cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}"}}`,
+		`{"cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}","kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/token\",\"type\":\"secret\",\"secret\":\"token\"}],\"secrets\":{\"token\":\"body-value\"}}"}}`,
 	))
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderAPIKey, "e2b_test")
 	req.Header.Set(HeaderResource, `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`)
+	req.Header.Set(HeaderMMDS, `{"secrets":{"token":"header-value"}}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1008,6 +1032,10 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}
 	if reserveBuildResources.CPU != 4000 || reserveBuildResources.Memory != 8192<<20 {
 		t.Fatalf("cluster build resources = %+v", reserveBuildResources)
+	}
+	if reserveMMDS != `{"routes":[{"path":"/token","type":"secret","secret":"token"}]}` ||
+		reserveMMDSSecrets["token"] != "header-value" || strings.Contains(reserveMMDS, "body-value") {
+		t.Fatalf("cluster build MMDS routes=%q secrets=%v", reserveMMDS, reserveMMDSSecrets)
 	}
 
 	// a trigger for b1 (no group header) must route to the recorded node.

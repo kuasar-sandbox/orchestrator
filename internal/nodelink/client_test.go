@@ -61,6 +61,16 @@ type fakeNode struct {
 	events               chan routesync.Event
 }
 
+type replayingFakeNode struct {
+	*fakeNode
+	replays chan struct{}
+}
+
+func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(context.Context) error {
+	n.replays <- struct{}{}
+	return nil
+}
+
 func newFakeNode() *fakeNode {
 	return &fakeNode{
 		routes:   map[string]routesync.RouteEntry{},
@@ -331,6 +341,43 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 			t.Fatal("node never registered after redirect")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		msg, err := routesync.ReadMsg(req.Body)
+		if err != nil || msg.Type != routesync.TypeNodeRegister {
+			http.Error(w, "bad node register", http.StatusBadRequest)
+			return
+		}
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		// Ending the response forces the client to establish another session.
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+
+	node := &replayingFakeNode{fakeNode: newFakeNode(), replays: make(chan struct{}, 4)}
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	go client.Run(ctx)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-node.replays:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("terminal replay calls=%d, want at least 2 established sessions", i)
+		}
 	}
 }
 

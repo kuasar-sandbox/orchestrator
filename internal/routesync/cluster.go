@@ -230,6 +230,10 @@ type Command struct {
 	BuildResources *BuildResources `json:"build_resources,omitempty"`
 	ImageRepo      string          `json:"image_repo,omitempty"`
 	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	// BuildMMDSSecrets carries request-scoped initial MMDS secret values to the
+	// selected node. The Registry deliberately excludes this field from its
+	// replicated BuildRecord; only the node persists the values, encrypted.
+	BuildMMDSSecrets map[string]string `json:"build_mmds_secrets,omitempty"`
 }
 
 // ConnectResult is the synchronous result of an accepted CmdConnect. It projects

@@ -25,19 +25,25 @@ const (
 
 // BuildRecord is the registry's view of a build (the node runs it + reports state).
 type BuildRecord struct {
-	Group                    string                    `json:"group"`
-	BuildID                  string                    `json:"build_id"`
-	NodeID                   string                    `json:"node_id"`
-	Profile                  types.Profile             `json:"profile"`
-	APISecretFingerprint     string                    `json:"api_secret_fingerprint"`
-	Resources                *routesync.BuildResources `json:"resources,omitempty"`
-	RegistrationConfig       map[string]string         `json:"registration_config,omitempty"`
-	RegistrationImageRepo    string                    `json:"registration_image_repo,omitempty"`
-	RegistrationRegistryAuth string                    `json:"registration_registry_auth,omitempty"`
-	State                    BuildState                `json:"state"`
-	TemplateID               string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
-	Reason                   string                    `json:"reason,omitempty"`
-	CreatedU                 int64                     `json:"created_unix,omitempty"`
+	Group                        string                    `json:"group"`
+	BuildID                      string                    `json:"build_id"`
+	NodeID                       string                    `json:"node_id"`
+	Profile                      types.Profile             `json:"profile"`
+	APISecretFingerprint         string                    `json:"api_secret_fingerprint"`
+	Resources                    *routesync.BuildResources `json:"resources,omitempty"`
+	RegistrationConfig           map[string]string         `json:"registration_config,omitempty"`
+	RegistrationMMDSValuesDigest string                    `json:"registration_mmds_values_digest,omitempty"`
+	RegistrationImageRepo        string                    `json:"registration_image_repo,omitempty"`
+	RegistrationRegistryAuth     string                    `json:"registration_registry_auth,omitempty"`
+	State                        BuildState                `json:"state"`
+	TemplateID                   string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	Reason                       string                    `json:"reason,omitempty"`
+	CreatedU                     int64                     `json:"created_unix,omitempty"`
+
+	// registrationMMDSSecrets exists only on the current ReserveBuild call. It
+	// is intentionally unexported so shard serialization can never persist
+	// tenant MMDS values in the replicated Registry record.
+	registrationMMDSSecrets map[string]string
 }
 
 // occupies reports whether the registry still considers the build live for node

@@ -49,6 +49,10 @@ type nodeLinkObserver interface {
 	NodeLinkRedirect(target routesync.NodeLinkTarget)
 }
 
+type buildTerminalReplayer interface {
+	ReplayClusterBuildTerminalStates(context.Context) error
+}
+
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
@@ -255,6 +259,16 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 			}
 		}
 	}()
+	// Build events have no wire acknowledgement. Rebuild terminal events from
+	// the node's durable store after every established session so a reset after
+	// the connection-local outbox consumed an event cannot lose it forever.
+	if replayer, ok := c.node.(buildTerminalReplayer); ok {
+		go func() {
+			if err := replayer.ReplayClusterBuildTerminalStates(sctx); err != nil && sctx.Err() == nil {
+				c.log.Error("node-link: replay terminal build states", "err", err)
+			}
+		}()
+	}
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
 }

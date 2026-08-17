@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -203,15 +204,26 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		return fmt.Errorf("%w: build_register cluster ownership: %v", api.ErrBadRequest, err)
 	}
 	meta = cloneStringMapWithout(meta, clusterstate.ObjectMetadataKey)
+	var mmdsHeader *string
+	if cmd.BuildMMDSSecrets != nil {
+		raw, marshalErr := json.Marshal(struct {
+			Secrets map[string]string `json:"secrets"`
+		}{Secrets: cmd.BuildMMDSSecrets})
+		if marshalErr != nil {
+			return fmt.Errorf("%w: build_register MMDS initial values: %v", api.ErrBadRequest, marshalErr)
+		}
+		value := string(raw)
+		mmdsHeader = &value
+	}
 	var mmdsDoc sandboxcfg.MMDSDocument
 	if existing != nil {
 		// A same-BuildID retry after an ambiguous/lost ACK is compared with
 		// durable immutable identity below. Do not let mutable MMDS enablement,
 		// route limits, reserved prefixes, or service configuration turn that
 		// already accepted ownership into a definitive no-side-effect rejection.
-		mmdsDoc, meta, err = sandboxcfg.ExtractMMDSReplay(meta, nil)
+		mmdsDoc, meta, err = sandboxcfg.ExtractMMDSReplay(meta, mmdsHeader)
 	} else {
-		mmdsDoc, meta, err = sandboxcfg.ExtractMMDS(meta, nil, o.mmdsPolicy())
+		mmdsDoc, meta, err = sandboxcfg.ExtractMMDS(meta, mmdsHeader, o.mmdsPolicy())
 	}
 	if err != nil {
 		return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
@@ -427,11 +439,12 @@ func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, s
 }
 
 // ReplayClusterBuildTerminalStates republishes every durable cluster terminal
-// result after node-link startup. Startup reconciliation can terminally fail an
-// arbitrary number of interrupted builders before node-link begins draining its
-// bounded event channel; rebuilding this stream from SQLite prevents that
-// bounded optimization from becoming a correctness limit. Replays are
-// idempotent at the Registry and repeat after every controller restart.
+// result after each node-link session is established. Startup reconciliation
+// can terminally fail an arbitrary number of interrupted builders before
+// node-link begins draining its bounded event channel, and a connection reset
+// can lose a session-local outbox item. Rebuilding this stream from SQLite
+// prevents either bounded optimization from becoming a correctness limit.
+// Replays are idempotent at the Registry.
 func (o *Orchestrator) ReplayClusterBuildTerminalStates(ctx context.Context) error {
 	for _, state := range []types.BuildState{types.BuildReady, types.BuildError} {
 		builds, err := o.st.BuildsByStatus(ctx, state)
@@ -931,7 +944,8 @@ func validateClusterExecSessionEnvelope(cmd *routesync.Command) error {
 	if cmd.TTLSeconds < 0 || cmd.TimeoutSeconds != 0 || cmd.TemplateRef != "" || len(cmd.Config) != 0 ||
 		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
 		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
-		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" ||
+		len(cmd.BuildMMDSSecrets) != 0 {
 		return fmt.Errorf("cluster exec session: command contains fields for another operation")
 	}
 	return nil

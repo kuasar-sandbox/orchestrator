@@ -2,6 +2,9 @@ package registry
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -33,6 +36,9 @@ type BuildReserveReq struct {
 	Profile    types.Profile             `json:"profile"`
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	Metadata   map[string]string         `json:"metadata,omitempty"`
+	// MMDSSecrets is a request-scoped transport envelope. ReserveBuild strips
+	// all secret values from Metadata before persisting its registration intent.
+	MMDSSecrets map[string]string `json:"mmds_secrets,omitempty"`
 }
 
 const buildRegisterAckTimeout = 5 * time.Second
@@ -57,7 +63,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if !req.Profile.Valid() {
 		return nil, fmt.Errorf("registry: unknown build profile %q", req.Profile)
 	}
-	metadata, err := sandboxcfg.NormalizeResourceMetadata(req.Metadata)
+	metadata, mmdsSecrets, mmdsDigest, err := normalizeBuildRegistrationMMDS(req.Metadata, req.MMDSSecrets)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+	}
+	metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 	}
@@ -91,12 +101,13 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if rec, found, err := r.stores.GetBuildInGroup(ctx, req.Group, req.BuildID); err != nil {
 			return nil, err
 		} else if found {
-			if !sameBuildRegistrationDefinition(rec, req.Profile, resources, req.Metadata, req.TemplateID) {
+			if !sameBuildRegistrationDefinition(rec, req.Profile, resources, req.Metadata, mmdsDigest, req.TemplateID) {
 				return nil, fmt.Errorf("registry: build %s immutable definition conflicts with existing registration", req.BuildID)
 			}
 			if rec.State != BuildStarting {
 				return r.buildReserveResult(ctx, rec), nil
 			}
+			rec.registrationMMDSSecrets = cloneStringMap(mmdsSecrets)
 			// A prior dispatch had an ambiguous result. Re-establish the node
 			// ownership index and replay the exact stored intent to the same node;
 			// neither current placement nor Provider output may change it.
@@ -180,12 +191,14 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		// only authoritative admission decision.
 		rec := &BuildRecord{
 			Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile,
-			APISecretFingerprint:     placement.APISecretFingerprint,
-			Resources:                cloneBuildResources(resources),
-			RegistrationConfig:       cloneStringMap(req.Metadata),
-			RegistrationImageRepo:    placement.ImageRepo,
-			RegistrationRegistryAuth: placement.RegistryAuth,
-			State:                    BuildStarting, TemplateID: templateID,
+			APISecretFingerprint:         placement.APISecretFingerprint,
+			Resources:                    cloneBuildResources(resources),
+			RegistrationConfig:           cloneStringMap(req.Metadata),
+			RegistrationMMDSValuesDigest: mmdsDigest,
+			RegistrationImageRepo:        placement.ImageRepo,
+			RegistrationRegistryAuth:     placement.RegistryAuth,
+			State:                        BuildStarting, TemplateID: templateID,
+			registrationMMDSSecrets: cloneStringMap(mmdsSecrets),
 		}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			return nil, err
@@ -244,9 +257,9 @@ func hasRegistrationHeadroom(node *NodeRecord, requested *routesync.BuildResourc
 	return capacity.AllowsAdd(usedBuilds, used, requested.Types())
 }
 
-func sameBuildRegistrationDefinition(rec *BuildRecord, profile types.Profile, resources *routesync.BuildResources, config map[string]string, requestedTemplateID string) bool {
+func sameBuildRegistrationDefinition(rec *BuildRecord, profile types.Profile, resources *routesync.BuildResources, config map[string]string, mmdsDigest, requestedTemplateID string) bool {
 	return rec != nil && rec.Profile == profile && rec.Resources != nil && resources != nil &&
-		*rec.Resources == *resources && maps.Equal(rec.RegistrationConfig, config) &&
+		*rec.Resources == *resources && maps.Equal(rec.RegistrationConfig, config) && rec.RegistrationMMDSValuesDigest == mmdsDigest &&
 		(requestedTemplateID == "" || rec.TemplateID == requestedTemplateID)
 }
 
@@ -254,14 +267,73 @@ func (r *Registry) dispatchBuildRegistration(ctx context.Context, rec *BuildReco
 	if r.nodeOwner == nil {
 		return nil, ErrNodeGone
 	}
+	digest, err := buildRegistrationMMDSDigest(rec.registrationMMDSSecrets)
+	if err != nil {
+		return nil, err
+	}
+	if digest != rec.RegistrationMMDSValuesDigest {
+		return nil, fmt.Errorf("registry: build %s MMDS replay values are unavailable or changed", rec.BuildID)
+	}
 	cmd := &routesync.Command{
 		CmdID: newID(), Kind: routesync.CmdBuildRegister,
 		BuildID: rec.BuildID, TemplateRef: rec.TemplateID, Profile: string(rec.Profile),
 		BuildResources: cloneBuildResources(rec.Resources), Config: cloneStringMap(rec.RegistrationConfig),
 		APISecretFingerprint: rec.APISecretFingerprint, ImageRepo: rec.RegistrationImageRepo,
-		RegistryAuth: rec.RegistrationRegistryAuth,
+		RegistryAuth: rec.RegistrationRegistryAuth, BuildMMDSSecrets: cloneStringMap(rec.registrationMMDSSecrets),
 	}
 	return r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, cmd, buildRegisterAckTimeout)
+}
+
+func normalizeBuildRegistrationMMDS(metadata map[string]string, separate map[string]string) (map[string]string, map[string]string, string, error) {
+	bodyDoc, _, err := sandboxcfg.ExtractMMDSReplay(metadata, nil)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("build MMDS config: %w", err)
+	}
+	if separate != nil && bodyDoc.SecretsPresent {
+		bodySecrets := make(map[string]string, len(bodyDoc.SecretValues))
+		for name, value := range bodyDoc.SecretValues {
+			bodySecrets[name] = string(value)
+		}
+		if !maps.Equal(bodySecrets, separate) {
+			return nil, nil, "", errors.New("build MMDS initial values conflict between metadata and request envelope")
+		}
+	}
+	var header *string
+	if separate != nil {
+		raw, err := json.Marshal(struct {
+			Secrets map[string]string `json:"secrets"`
+		}{Secrets: separate})
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("encode build MMDS initial values: %w", err)
+		}
+		value := string(raw)
+		header = &value
+	}
+	doc, cleaned, err := sandboxcfg.ExtractMMDSReplay(metadata, header)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("build MMDS config: %w", err)
+	}
+	values := make(map[string]string, len(doc.SecretValues))
+	for name, value := range doc.SecretValues {
+		values[name] = string(value)
+	}
+	digest, err := buildRegistrationMMDSDigest(values)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return cleaned, values, digest, nil
+}
+
+func buildRegistrationMMDSDigest(values map[string]string) (string, error) {
+	if len(values) == 0 {
+		values = map[string]string{}
+	}
+	canonical, err := json.Marshal(values)
+	if err != nil {
+		return "", fmt.Errorf("encode build MMDS identity: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func definitiveBuildRegistrationRejection(ack *routesync.CmdAck) bool {

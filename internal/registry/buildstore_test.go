@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -267,6 +268,54 @@ func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	if err != nil || !found || accepted.State != BuildRegistered ||
 		accepted.RegistrationImageRepo != "" || accepted.RegistrationRegistryAuth != "" {
 		t.Fatalf("accepted registration retained transient credentials: build=%+v found=%v err=%v", accepted, found, err)
+	}
+}
+
+func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
+	reg.SetNodeOwner(owner)
+	const secret = "cluster-initial-plaintext"
+	req := BuildReserveReq{
+		Group: "/g", BuildID: "mmds-build", TemplateID: "transient-mmds", Profile: types.ProfileE2B,
+		Resources: testWireBuildResources(),
+		Metadata:  map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"` + secret + `"}}`},
+	}
+	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
+		t.Fatalf("ambiguous reserve result=%+v err=%v", res, err)
+	}
+	rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", req.BuildID)
+	if err != nil || !found {
+		t.Fatalf("stored registration found=%v err=%v", found, err)
+	}
+	if got := rec.RegistrationConfig[sandboxcfg.NsMMDS]; got != `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}` {
+		t.Fatalf("persisted MMDS config=%q", got)
+	}
+	wire, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), secret) || strings.Contains(string(wire), `"secrets"`) || rec.RegistrationMMDSValuesDigest == "" {
+		t.Fatalf("replicated replay record retained MMDS values or lost digest: %s", wire)
+	}
+	if len(owner.commands) != 1 || owner.commands[0].BuildMMDSSecrets["key"] != secret {
+		t.Fatalf("node command did not receive request-scoped MMDS values: %+v", owner.commands)
+	}
+
+	changed := req
+	changed.Metadata = map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"changed"}}`}
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed MMDS replay err=%v", err)
+	}
+	owner.ackErr = nil
+	res, err := reg.ReserveBuild(ctx, req)
+	if err != nil || res == nil {
+		t.Fatalf("exact MMDS replay result=%+v err=%v", res, err)
+	}
+	if len(owner.commands) != 2 || owner.commands[1].BuildMMDSSecrets["key"] != secret {
+		t.Fatalf("exact MMDS replay command=%+v", owner.commands)
 	}
 }
 
