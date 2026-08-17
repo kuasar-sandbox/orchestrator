@@ -183,6 +183,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err := resources.ValidateRequired(); err != nil {
 		return fmt.Errorf("%w: build_register resources: %v", api.ErrBadRequest, err)
 	}
+	if _, err := builderResourceProperties(resources); err != nil {
+		o.recordRegistrationRejection("systemd_encoding")
+		return fmt.Errorf("%w: build_register resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
+	}
 	config, err := sandboxcfg.NormalizeResourceMetadata(cmd.Config)
 	if err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)

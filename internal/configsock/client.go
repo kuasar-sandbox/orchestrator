@@ -47,8 +47,8 @@ func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, er
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", &transportError{err: fmt.Errorf("configsock: decode assignment: %w", err)}
 	}
-	if out.Error != "" {
-		return "", errors.New(out.Error)
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return "", buildResponseError(resp.StatusCode, out.Error)
 	}
 	if out.TaskID == "" {
 		return "", errors.New("empty assignment")
@@ -67,6 +67,36 @@ func (e *transportError) Unwrap() error { return e.err }
 func IsTransportError(err error) bool {
 	var transport *transportError
 	return errors.As(err, &transport)
+}
+
+type retryableResponseError struct {
+	status int
+	err    error
+}
+
+func (e *retryableResponseError) Error() string { return e.err.Error() }
+func (e *retryableResponseError) Unwrap() error { return e.err }
+
+// IsRetryableError identifies an idempotent config-socket operation that can be
+// retried: either the connection/response was interrupted, or the server
+// returned a 5xx response. A structured 4xx provider rejection is definitive.
+func IsRetryableError(err error) bool {
+	if IsTransportError(err) {
+		return true
+	}
+	var response *retryableResponseError
+	return errors.As(err, &response)
+}
+
+func buildResponseError(status int, message string) error {
+	if message == "" {
+		message = fmt.Sprintf("configsock: server returned HTTP %d", status)
+	}
+	err := errors.New(message)
+	if status >= http.StatusInternalServerError {
+		return &retryableResponseError{status: status, err: err}
+	}
+	return err
 }
 
 func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
@@ -89,8 +119,8 @@ func PostBuildResultContext(ctx context.Context, socket, runID, buildID string, 
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return &transportError{err: fmt.Errorf("configsock: decode build result: %w", err)}
 	}
-	if out.Error != "" {
-		return errors.New(out.Error)
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return buildResponseError(resp.StatusCode, out.Error)
 	}
 	return nil
 }
@@ -117,8 +147,8 @@ func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, s
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return &transportError{err: fmt.Errorf("configsock: decode build phase: %w", err)}
 	}
-	if out.Error != "" {
-		return errors.New(out.Error)
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return buildResponseError(resp.StatusCode, out.Error)
 	}
 	return nil
 }
@@ -170,8 +200,8 @@ func FetchBuildSpecContext(ctx context.Context, socket, configID string) (*Build
 	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
 		return nil, &transportError{err: fmt.Errorf("configsock: decode buildspec: %w", err)}
 	}
-	if spec.Error != "" {
-		return nil, errors.New(spec.Error)
+	if spec.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return nil, buildResponseError(resp.StatusCode, spec.Error)
 	}
 	return &spec, nil
 }

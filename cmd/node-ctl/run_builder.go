@@ -133,11 +133,11 @@ func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation str
 		if err == nil {
 			return nil
 		}
-		if !configsock.IsTransportError(err) {
+		if !configsock.IsRetryableError(err) {
 			return err
 		}
 		if attempt == 1 {
-			log.Warn("builder config-socket operation interrupted; retrying", "operation", operation, "err", err)
+			log.Warn("builder config-socket operation temporarily unavailable; retrying", "operation", operation, "err", err)
 		}
 		timer := time.NewTimer(delay)
 		select {

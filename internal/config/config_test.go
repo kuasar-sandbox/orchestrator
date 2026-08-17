@@ -166,6 +166,36 @@ builder:
 	}
 }
 
+func TestBuilderIdlePoolCannotConsumeCappedExecutionSlice(t *testing.T) {
+	base := `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+units:
+  builder_pool_size: 1
+builder:
+  admission:
+    execution:
+      resources:
+`
+	for name, resource := range map[string]string{
+		"cpu":    "        cpu: 2\n",
+		"memory": "        memory: 2GiB\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, base+resource))
+			if err == nil || !strings.Contains(err.Error(), "units.builder_pool_size must be 0") {
+				t.Fatalf("Load error = %v, want capped-slice idle-pool rejection", err)
+			}
+		})
+	}
+
+	if _, err := Load(writeConfig(t, base+"        storage: 10GiB\n")); err != nil {
+		t.Fatalf("storage-only admission unexpectedly rejected idle pool: %v", err)
+	}
+}
+
 func TestBuilderAdmissionCPUPreservesDecimalForConservativeRounding(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `
 api: { domain: example.test }

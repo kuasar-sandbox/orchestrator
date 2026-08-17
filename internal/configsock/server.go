@@ -130,6 +130,27 @@ type BuildPhaseResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+// BuildReportRejection marks a worker report that the provider definitively
+// rejected (unknown/stale ownership or a conflicting replay). The server maps
+// it to 409 so run-builder does not retry it; unmarked provider failures remain
+// 5xx and are retryable because result/phase writes are idempotent.
+type BuildReportRejection struct{ Err error }
+
+func (e *BuildReportRejection) Error() string { return e.Err.Error() }
+func (e *BuildReportRejection) Unwrap() error { return e.Err }
+
+func RejectBuildReport(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &BuildReportRejection{Err: err}
+}
+
+func IsBuildReportRejection(err error) bool {
+	var rejection *BuildReportRejection
+	return errors.As(err, &rejection)
+}
+
 // LaunchSpec is the generic launch config the launcher applies and then exec-replaces
 // into: the absolute target binary, its args (after argv0), the working dir, and
 // env added to the inherited environment (secrets — e.g. MANIFEST_KEY — ride here,
@@ -553,7 +574,11 @@ func (s *Server) handleBuildResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.deps.Provider.PostBuildResult(r.Context(), req.RunID, req.BuildID, req.Result); err != nil {
 		s.log.Warn("configsock build result", "run_id", req.RunID, "build_id", req.BuildID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, &BuildResultResponse{Error: err.Error()})
+		status := http.StatusInternalServerError
+		if IsBuildReportRejection(err) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, &BuildResultResponse{Error: err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, &BuildResultResponse{})
@@ -585,7 +610,11 @@ func (s *Server) handleBuildPhase(w http.ResponseWriter, r *http.Request) {
 	if err := s.deps.Provider.PostBuildPhase(r.Context(), req.RunID, req.BuildID, req.Phase, req.SandboxID, req.State); err != nil {
 		s.log.Warn("configsock build phase", "run_id", req.RunID, "build_id", req.BuildID,
 			"phase", req.Phase, "state", req.State, "err", err)
-		writeJSON(w, http.StatusInternalServerError, &BuildPhaseResponse{Error: err.Error()})
+		status := http.StatusInternalServerError
+		if IsBuildReportRejection(err) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, &BuildPhaseResponse{Error: err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, &BuildPhaseResponse{})

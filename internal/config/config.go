@@ -941,6 +941,10 @@ func (c *Config) validate() error {
 	if c.Units.BuilderPoolSize < 0 {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
 	}
+	if c.Units.BuilderPoolSize > 0 &&
+		(execution.Resources.CPU > 0 || execution.Resources.Memory > 0) {
+		return fmt.Errorf("config: units.builder_pool_size must be 0 when builder.admission.execution configures CPU or memory; idle builders are not execution-admitted")
+	}
 	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)
 	if err != nil {
 		return fmt.Errorf("config: units.pool_wait_timeout %q: %w", c.Units.PoolWaitTimeout, err)

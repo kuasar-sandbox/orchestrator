@@ -46,6 +46,10 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err := spec.Resources.ValidateRequired(); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if _, err := builderResourceProperties(spec.Resources); err != nil {
+		o.recordRegistrationRejection("systemd_encoding")
+		return nil, fmt.Errorf("%w: build resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
+	}
 	executionLimit, err := o.cfg.Builder.ExecutionLimit()
 	if err != nil {
 		return nil, err

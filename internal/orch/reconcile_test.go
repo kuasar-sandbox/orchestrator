@@ -456,7 +456,7 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	}
 	conflict := result
 	conflict.ImageRef = "manifest://conflict"
-	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, conflict); !errors.Is(err, store.ErrBuildResultConflict) {
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, conflict); !errors.Is(err, store.ErrBuildResultConflict) || !configsock.IsBuildReportRejection(err) {
 		t.Fatalf("conflicting result replay = %v", err)
 	}
 	select {

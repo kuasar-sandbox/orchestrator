@@ -68,7 +68,7 @@ paths:
 #   runner: sandbox-runner@.service
 #   builder: sandbox-builder@.service
 #   runner_pool_size: 0
-#   builder_pool_size: 0
+#   builder_pool_size: 0 # required when execution CPU or memory is capped
 #   pool_wait_timeout: 5s
 #   install: true                                 # false = manage out of band
 

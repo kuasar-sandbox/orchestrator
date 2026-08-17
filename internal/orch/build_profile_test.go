@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -64,6 +65,43 @@ func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 	if _, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{}); !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("missing profile error = %v, want ErrBadRequest", err)
 	}
+}
+
+func TestRegisterBuildRejectsCPUThatSystemdCannotEncode(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("direct", func(t *testing.T) {
+		o := testOrch(t)
+		apiKey, _, _ := allowlistedBuildIdentity(t, o)
+		_, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
+			Profile: types.ProfileE2B,
+			Resources: types.BuildResources{
+				CPU: math.MaxInt64, Memory: 1 << 30,
+			},
+		})
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "cannot be enforced by systemd") {
+			t.Fatalf("RegisterBuild error = %v, want systemd encoding rejection", err)
+		}
+		usage, usageErr := o.st.BuildUsage(ctx)
+		if usageErr != nil || usage.RegistrationBuilds != 0 {
+			t.Fatalf("invalid CPU consumed registration admission: %+v, %v", usage, usageErr)
+		}
+	})
+
+	t.Run("cluster", func(t *testing.T) {
+		o := testOrch(t)
+		_, _, fingerprint := allowlistedBuildIdentity(t, o)
+		cmd := clusterBuildRegisterCommand("build-systemd-overflow", fingerprint)
+		cmd.BuildResources.CPU = math.MaxInt64
+		err := o.registerClusterBuild(ctx, cmd)
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "cannot be enforced by systemd") {
+			t.Fatalf("registerClusterBuild error = %v, want systemd encoding rejection", err)
+		}
+		stored, getErr := o.st.GetBuild(ctx, cmd.BuildID)
+		if getErr != nil || stored != nil {
+			t.Fatalf("invalid cluster Build persisted = %+v, %v", stored, getErr)
+		}
+	})
 }
 
 func TestRegisterBuildValidatesPhaseResourcesAgainstNodePolicy(t *testing.T) {

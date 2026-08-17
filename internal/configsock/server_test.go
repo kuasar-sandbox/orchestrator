@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,7 +19,13 @@ import (
 
 // --- plane stubs ---
 
-type stubProvider struct{ pidFile string }
+type stubProvider struct {
+	pidFile       string
+	assignmentErr error
+	buildSpecErr  error
+	resultErr     error
+	phaseErr      error
+}
 
 func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, string, bool, error) {
 	if id != "sandbox:x" {
@@ -28,6 +35,9 @@ func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, 
 }
 
 func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, string, bool, error) {
+	if s.buildSpecErr != nil {
+		return nil, s.pidFile, false, s.buildSpecErr
+	}
 	if id != "build:x" {
 		return nil, "", false, nil
 	}
@@ -45,6 +55,9 @@ func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
 }
 
 func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (string, bool, error) {
+	if s.assignmentErr != nil {
+		return "", false, s.assignmentErr
+	}
 	if kind == "sandbox" && runID == "sr-test" {
 		return "x", true, nil
 	}
@@ -55,6 +68,9 @@ func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (str
 }
 
 func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, _ BuildResult) error {
+	if s.resultErr != nil {
+		return s.resultErr
+	}
 	if runID == "br-test" && buildID == "x" {
 		return nil
 	}
@@ -62,6 +78,9 @@ func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, 
 }
 
 func (s stubProvider) PostBuildPhase(_ context.Context, runID, buildID, phase, sandboxID, state string) error {
+	if s.phaseErr != nil {
+		return s.phaseErr
+	}
 	if runID == "br-test" && buildID == "x" && phase == "a" && sandboxID == "bp-a-x" && state == "starting" {
 		return nil
 	}
@@ -210,6 +229,70 @@ func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T
 	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
 	if _, err := FetchBuildSpecContext(context.Background(), sock, "unknown"); err == nil || IsTransportError(err) {
 		t.Fatalf("provider rejection = %v, retryable=%t", err, IsTransportError(err))
+	}
+}
+
+func TestBuildRetryClassification(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "id.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	transient := errors.New("temporary sqlite write failure")
+
+	for name, call := range map[string]func(string) error{
+		"assignment": func(sock string) error {
+			_, err := WaitAssignment(context.Background(), sock, "build", "br-test")
+			return err
+		},
+		"build spec": func(sock string) error {
+			_, err := FetchBuildSpecContext(context.Background(), sock, "build:x")
+			return err
+		},
+		"result": func(sock string) error {
+			return PostBuildResultContext(context.Background(), sock, "br-test", "x", BuildResult{ImageRef: "image"})
+		},
+		"phase": func(sock string) error {
+			return PostBuildPhaseContext(context.Background(), sock, "br-test", "x", "a", "bp-a-x", "starting")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider := stubProvider{pidFile: pf}
+			switch name {
+			case "assignment":
+				provider.assignmentErr = transient
+			case "build spec":
+				provider.buildSpecErr = transient
+			case "result":
+				provider.resultErr = transient
+			case "phase":
+				provider.phaseErr = transient
+			}
+			sock, _ := startTestServer(t, Deps{Provider: provider})
+			err := call(sock)
+			if err == nil || !IsRetryableError(err) {
+				t.Fatalf("5xx error = %v, retryable=%t", err, IsRetryableError(err))
+			}
+			var response *retryableResponseError
+			if !errors.As(err, &response) || response.status != http.StatusInternalServerError {
+				t.Fatalf("retryable response = %#v, want preserved status 500", err)
+			}
+		})
+	}
+
+	for name, provider := range map[string]stubProvider{
+		"result": {pidFile: pf, resultErr: RejectBuildReport(errors.New("result ownership lost"))},
+		"phase":  {pidFile: pf, phaseErr: RejectBuildReport(errors.New("phase ownership lost"))},
+	} {
+		t.Run("reject "+name, func(t *testing.T) {
+			sock, _ := startTestServer(t, Deps{Provider: provider})
+			var err error
+			if name == "result" {
+				err = PostBuildResultContext(context.Background(), sock, "br-test", "x", BuildResult{})
+			} else {
+				err = PostBuildPhaseContext(context.Background(), sock, "br-test", "x", "a", "bp-a-x", "starting")
+			}
+			if err == nil || IsRetryableError(err) {
+				t.Fatalf("definitive error = %v, retryable=%t", err, IsRetryableError(err))
+			}
+		})
 	}
 }
 

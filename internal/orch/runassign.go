@@ -2,9 +2,11 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
 func (o *Orchestrator) RunPidFile(kind, runID string) (string, bool) {
@@ -53,12 +55,15 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 	pend := o.pend[buildID]
 	o.pendMu.Unlock()
 	if pend == nil {
-		return fmt.Errorf("unknown build %s", buildID)
+		return configsock.RejectBuildReport(fmt.Errorf("unknown build %s", buildID))
 	}
 	if pend.build.RunID != runID {
-		return fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID)
+		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
 	}
 	if _, err := o.st.AcceptBuildResult(ctx, buildID, runID, result); err != nil {
+		if errors.Is(err, store.ErrBuildExecutionOwnership) || errors.Is(err, store.ErrBuildResultConflict) {
+			return configsock.RejectBuildReport(err)
+		}
 		return err
 	}
 	select {
@@ -80,12 +85,15 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	pend := o.pend[buildID]
 	o.pendMu.Unlock()
 	if pend == nil {
-		return fmt.Errorf("unknown build %s", buildID)
+		return configsock.RejectBuildReport(fmt.Errorf("unknown build %s", buildID))
 	}
 	if pend.build.RunID != runID {
-		return fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID)
+		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
 	}
 	if err := o.st.SetBuildPhase(ctx, buildID, phase, sandboxID, state); err != nil {
+		if errors.Is(err, store.ErrBuildExecutionOwnership) {
+			return configsock.RejectBuildReport(err)
+		}
 		return err
 	}
 	o.log.Info("build phase", "bid", buildID, "run_id", runID, "phase", phase,

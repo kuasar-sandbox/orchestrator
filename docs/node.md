@@ -378,7 +378,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
-| `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动 |
+| `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动。execution 配置 CPU 或 memory 聚合上限时 `builder_pool_size` 必须为 0，避免未获 execution claim 的 idle 进程占用受限 Builder slice。 |
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
@@ -942,6 +942,12 @@ WaitAssignment;匹配 idle runner 后,pool 先调用 commit callback 绑定 run-
 才把 task ID 发给 runner 并向 Assign 调用方返回成功。commit 是 assignment 线性化点:
 其后发生的 caller cancel 不得把成功翻转为 canceled;pending cancel 与 pool shutdown 由
 pool loop 唯一回复,每个请求恰有一次结果。
+
+Builder execution 配置 CPU 或 memory 聚合上限时不允许保留长期 idle builder
+(`units.builder_pool_size` 必须为 0)。按需单元仍先启动并进入 WaitAssignment，但它已有
+对应 Build 的 durable execution claim；orchestrator 在发布 assignment 前设置并回读单元
+属性。这样未 claim 的 idle RSS/CPU 不会侵占 `sandbox-builder.slice` 为 active Build 保留的
+完整 aggregate ceiling，也不需要引入隐藏的 idle 资源预算。
 
 - **kill**:在 SID lifecycle fence 内取消 active launch→删除 durable row→
   `StopUnit`(连 CH 一并 SIGKILL)→`ResetFailedUnit`→tapfd `RELEASE` 或

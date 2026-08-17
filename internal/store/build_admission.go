@@ -256,7 +256,7 @@ func (s *Store) SetBuildPhase(ctx context.Context, buildID, phase, sandboxID, st
 	}
 	changed, _ := res.RowsAffected()
 	if changed != 1 {
-		return fmt.Errorf("store: set build %s phase: execution ownership lost", buildID)
+		return fmt.Errorf("store: set build %s phase: %w", buildID, ErrBuildExecutionOwnership)
 	}
 	return nil
 }
