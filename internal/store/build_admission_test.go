@@ -317,14 +317,17 @@ func TestTerminalRegistrationReplayReturnsOriginalWithoutReacquiringCapacity(t *
 func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
+	mmdsRoutes := `{"routes":[{"path":"/identity","data":"expires"}]}`
+	mmdsDigest := sandboxcfg.MMDSRoutesDigest(mmdsRoutes)
 	registered := admissionBuild("expires-registered", types.BuildResources{CPU: 1000, Memory: 1 << 30})
 	waiting := admissionBuild("expires-waiting", types.BuildResources{CPU: 1000, Memory: 1 << 30})
 	waiting.Status, waiting.WaitingUnix = types.BuildWaiting, 2
-	if err := st.PutBuild(ctx, registered); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutBuild(ctx, waiting); err != nil {
-		t.Fatal(err)
+	for _, build := range []*types.Build{registered, waiting} {
+		build.Metadata = map[string]string{sandboxcfg.NsMMDS: mmdsRoutes, "ordinary": "preserved"}
+		build.RegistrationMMDSRoutesDigest = mmdsDigest
+		if err := st.InsertBuildWithMMDSRouteSecretValues(ctx, build, mmdsDigest, MMDSRouteSecretValues{"identity": []byte("secret")}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if expired, err := st.ExpireBuild(ctx, registered.BuildID, types.BuildRegistered, "registration TTL"); err != nil || !expired {
 		t.Fatalf("expire registered: %v %v", expired, err)
@@ -335,6 +338,22 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 	usage, err := st.BuildUsage(ctx)
 	if err != nil || usage.RegistrationBuilds != 0 || usage.WaitingBuilds != 0 {
 		t.Fatalf("usage after expiry = %+v, %v", usage, err)
+	}
+	for _, buildID := range []string{registered.BuildID, waiting.BuildID} {
+		expired, err := st.GetBuild(ctx, buildID)
+		if err != nil || expired == nil {
+			t.Fatalf("expired build %s = %+v, %v", buildID, expired, err)
+		}
+		if expired.Metadata["ordinary"] != "preserved" {
+			t.Fatalf("expired build %s lost ordinary metadata: %+v", buildID, expired.Metadata)
+		}
+		if _, present := expired.Metadata[sandboxcfg.NsMMDS]; present || expired.RegistrationMMDSRoutesDigest != mmdsDigest {
+			t.Fatalf("expired build %s retained MMDS routes or lost identity: metadata=%+v digest=%q", buildID, expired.Metadata, expired.RegistrationMMDSRoutesDigest)
+		}
+		var secretRows int
+		if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM build_mmds_route_secret_values WHERE build_id=?`, buildID).Scan(&secretRows); err != nil || secretRows != 0 {
+			t.Fatalf("expired build %s secret rows = %d, err=%v", buildID, secretRows, err)
+		}
 	}
 
 	runtime := admissionBuild("runtime-owner", types.BuildResources{CPU: 1000, Memory: 1 << 30})

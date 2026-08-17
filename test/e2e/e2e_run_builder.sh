@@ -631,9 +631,16 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(
     diag "$bid"; fail "$label did not reach ready (last status=$status)"
 }
 wait_phase_cpu_lifecycle_logs() { # bid expected-phase-count
-    local bid="$1" expected="$2" out="$WORK/$bid.cpu-lifecycle.journal" relaxed restored
+    local bid="$1" expected="$2"
+    local out="$WORK/$bid.cpu-lifecycle.journal" run_id unit relaxed restored
     for _ in $(seq 1 80); do
-        journalctl KUASAR_BUILD_ID="$bid" --no-pager --output=cat >"$out" 2>/dev/null || true
+        run_id=$(build_run_id "$bid")
+        if [ -n "$run_id" ]; then
+            unit="sandbox-builder@$run_id.service"
+            journalctl -u "$unit" --no-pager --output=cat >"$out" 2>/dev/null || true
+        else
+            : >"$out"
+        fi
         relaxed=$(grep -Fc 'phase cpu.max temporarily relaxed for native vCPU kick' "$out" || true)
         restored=$(grep -Fc 'phase cpu.max restored after native vCPU kick' "$out" || true)
         if [ "$relaxed" -eq "$expected" ] && [ "$restored" -eq "$expected" ]; then

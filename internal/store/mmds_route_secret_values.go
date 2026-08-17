@@ -343,6 +343,27 @@ func equalRegistrationMetadata(a, b *types.Build) bool {
 	return equalEmptyCollections(withoutMMDS(a.Metadata), withoutMMDS(b.Metadata))
 }
 
+func terminalBuildMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+	terminal := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if key != sandboxcfg.NsMMDS {
+			terminal[key] = value
+		}
+	}
+	return terminal
+}
+
+func terminalBuildMetadataJSON(raw string) (string, error) {
+	var metadata map[string]string
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return "", fmt.Errorf("decode build metadata: %w", err)
+	}
+	return mj(terminalBuildMetadata(metadata)), nil
+}
+
 func equalEmptyCollections(a, b any) bool {
 	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
 	if av.IsValid() && bv.IsValid() && (av.Kind() == reflect.Map || av.Kind() == reflect.Slice) &&
@@ -483,14 +504,7 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 		return errors.New("build is required")
 	}
 	terminal := *build
-	if build.Metadata != nil {
-		terminal.Metadata = make(map[string]string, len(build.Metadata))
-		for key, value := range build.Metadata {
-			if key != sandboxcfg.NsMMDS {
-				terminal.Metadata[key] = value
-			}
-		}
-	}
+	terminal.Metadata = terminalBuildMetadata(build.Metadata)
 	if terminal.Status != types.BuildReady && terminal.Status != types.BuildError {
 		return fmt.Errorf("store: finish build %s: status %s is not terminal", build.BuildID, terminal.Status)
 	}
