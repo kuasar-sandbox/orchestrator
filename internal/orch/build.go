@@ -1437,7 +1437,11 @@ func (o *Orchestrator) sourceTemplateNetwork(ctx context.Context, b *types.Build
 	if tmpl.Kind != types.KindSnp {
 		return sandboxcfg.NetworkSpec{}, nil
 	}
-	cfg, err := o.inspectSnapshotConfig(ctx, b.ManifestKey, tmpl.Ref)
+	inspect := o.snapshotInspector
+	if inspect == nil {
+		inspect = o.inspectSnapshotConfig
+	}
+	cfg, err := inspect(ctx, b.ManifestKey, tmpl.Ref)
 	if err != nil {
 		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
 	}
@@ -1450,6 +1454,11 @@ func (o *Orchestrator) sourceTemplateNetwork(ctx context.Context, b *types.Build
 		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
 	}
 	return spec.Network, nil
+}
+
+func retryableBuildPhaseInputError(err error) bool {
+	var probeErr *snapshotConfigProbeError
+	return errors.As(err, &probeErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // shortID returns the first 8 chars (hostname-friendly handle).

@@ -1595,6 +1595,20 @@ type snapshotDescription struct {
 	Metadata map[string]string `json:"Metadata"`
 }
 
+// snapshotConfigProbeError distinguishes external snapshot/object reads, which
+// may recover without changing a live Build, from deterministic parsing or
+// local policy errors that reconciliation must fail closed.
+type snapshotConfigProbeError struct {
+	ref string
+	err error
+}
+
+func (e *snapshotConfigProbeError) Error() string {
+	return fmt.Sprintf("snapshot config probe %q: %v", e.ref, e.err)
+}
+
+func (e *snapshotConfigProbeError) Unwrap() error { return e.err }
+
 func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, ref string) (snapshotDescription, error) {
 	var cfg snapshotDescription
 	locations := map[string]string{}
@@ -1610,7 +1624,7 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+manifestKey)
 	out, err := cmd.Output()
 	if err != nil {
-		return cfg, fmt.Errorf("snapshot config probe %q: %w", ref, err)
+		return cfg, &snapshotConfigProbeError{ref: ref, err: err}
 	}
 	if err := json.Unmarshal(out, &cfg); err != nil {
 		return cfg, fmt.Errorf("snapshot config parse %q: %w", ref, err)

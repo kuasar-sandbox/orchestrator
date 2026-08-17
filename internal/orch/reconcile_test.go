@@ -30,6 +30,7 @@ type reconcileLauncher struct {
 	reset              []string
 	resources          launcher.ResourceProperties
 	resourcesErr       error
+	resourcesErrByUnit map[string]error
 	stopErr            error
 	inactiveAfterLists int
 	listCalls          int
@@ -78,7 +79,10 @@ func (l *reconcileLauncher) SetResources(_ context.Context, _ string, p launcher
 	l.resources = p
 	return nil
 }
-func (l *reconcileLauncher) Resources(context.Context, string, string) (launcher.ResourceProperties, error) {
+func (l *reconcileLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
+	if err := l.resourcesErrByUnit[unit]; err != nil {
+		return launcher.ResourceProperties{}, err
+	}
 	return l.resources, l.resourcesErr
 }
 func (l *reconcileLauncher) Close() error { return nil }
@@ -881,6 +885,122 @@ func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
 	}
 	if len(vs.detached) != 0 {
 		t.Fatalf("resource read failure detached live network ownership: %v", vs.detached)
+	}
+}
+
+func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runIDs := []string{
+		"br-00000000-0000-7000-8000-000000000020",
+		"br-00000000-0000-7000-8000-000000000021",
+	}
+	units := make([]launcher.Unit, 0, len(runIDs))
+	builds := make([]*types.Build, 0, len(runIDs))
+	for i, runID := range runIDs {
+		build := buildReconcileRow(t, runID)
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", 20+i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", 20+i)
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+		builds = append(builds, build)
+		units = append(units, launcher.Unit{Name: "sandbox-builder@" + runID + ".service", ActiveState: "active"})
+	}
+	readErr := errors.New("second unit D-Bus read failure")
+	lc := &reconcileLauncher{
+		units: units,
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+		resourcesErrByUnit: map[string]error{units[1].Name: readErr},
+	}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := o.Reconcile(context.Background()); !errors.Is(err, readErr) {
+		t.Fatalf("Reconcile error = %v, want later preflight failure", err)
+	}
+	o.pendMu.Lock()
+	owners := len(o.pend)
+	o.pendMu.Unlock()
+	if owners != 0 {
+		t.Fatalf("preflight failure started %d live monitors", owners)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("preflight failure touched units: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	for _, build := range builds {
+		stored, err := st.GetBuild(context.Background(), build.BuildID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+			t.Fatalf("preflight failure changed build %s: %+v", build.BuildID, stored)
+		}
+	}
+}
+
+func TestReconcilePreservesLiveBuildOnSnapshotProbeFailure(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000022"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	build.FromTemplate = types.TemplateID{
+		Profile: types.ProfileE2B,
+		Kind:    types.KindSnp,
+		Ref:     "manifest://" + strings.Repeat("a", 64),
+	}.String()
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	probeErr := errors.New("object store temporarily unavailable")
+	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
+		return snapshotDescription{}, &snapshotConfigProbeError{ref: "manifest://snapshot", err: probeErr}
+	}
+
+	if err := o.Reconcile(context.Background()); !errors.Is(err, probeErr) {
+		t.Fatalf("Reconcile error = %v, want snapshot probe failure", err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+		t.Fatalf("snapshot probe failure changed durable live build: %+v", stored)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("snapshot probe failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	if retryableBuildPhaseInputError(errors.New("malformed persisted resource patch")) {
+		t.Fatal("deterministic local parse error classified as retryable")
 	}
 }
 

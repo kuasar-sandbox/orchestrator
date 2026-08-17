@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"time"
 
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -37,6 +40,10 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 		return err
 	}
 	knownRuns := make(map[string]bool, len(building))
+	prepared := make(map[string]*liveBuildPreparation, len(building))
+	// Validate every live worker before adopting any of them. If one external
+	// read is transiently unavailable, startup can retry without canceling
+	// monitors that this same reconciliation pass already started.
 	for _, build := range building {
 		if !build.ExecutionClaimed {
 			return fmt.Errorf("reconcile build %s: building row has no execution claim", build.BuildID)
@@ -45,8 +52,20 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 			knownRuns[build.RunID] = true
 		}
 		unit, isLive := live[build.RunID]
+		if !isLive || build.ExecutionResult != nil {
+			continue
+		}
+		prep, err := o.prepareLiveBuild(ctx, build, unit)
+		if err != nil {
+			return err
+		}
+		prepared[build.BuildID] = prep
+	}
+
+	for _, build := range building {
+		unit, isLive := live[build.RunID]
 		if isLive {
-			if err := o.adoptLiveBuild(ctx, build, unit); err != nil {
+			if err := o.adoptLiveBuild(ctx, build, unit, prepared[build.BuildID]); err != nil {
 				return err
 			}
 			continue
@@ -86,7 +105,44 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 	return nil
 }
 
-func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, unit string) error {
+type liveBuildPreparation struct {
+	spec            sandboxcfg.SandboxSpec
+	network         sandboxcfg.NetworkSpec
+	templateNetwork sandboxcfg.NetworkSpec
+	resources       rtconfig.ResourcesConfig
+	failureReason   string
+}
+
+func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build, unit string) (*liveBuildPreparation, error) {
+	prep := &liveBuildPreparation{}
+	if build.RunID == "" || build.RuntimeVswitchPort == "" {
+		prep.failureReason = "live build has incomplete durable runtime ownership"
+		return prep, nil
+	}
+	wantProperties, err := builderResourceProperties(build.Resources)
+	if err != nil {
+		prep.failureReason = "live build has invalid resource properties: " + err.Error()
+		return prep, nil
+	}
+	gotProperties, err := o.lc.Resources(ctx, unit, "Service")
+	if err != nil {
+		return nil, fmt.Errorf("read live build resource enforcement for %s: %w", unit, err)
+	}
+	if gotProperties != wantProperties {
+		prep.failureReason = fmt.Sprintf("live build resource enforcement does not match: effective=%+v want=%+v", gotProperties, wantProperties)
+		return prep, nil
+	}
+	prep.spec, prep.network, prep.templateNetwork, prep.resources, err = o.resolveBuildPhaseInputs(ctx, build)
+	if err != nil {
+		if retryableBuildPhaseInputError(err) {
+			return nil, fmt.Errorf("read live build phase inputs for %s: %w", build.BuildID, err)
+		}
+		prep.failureReason = "cannot reconstruct live build: " + err.Error()
+	}
+	return prep, nil
+}
+
+func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, unit string, prep *liveBuildPreparation) error {
 	finish, err := o.buildOps.Begin(ctx)
 	if err != nil {
 		return err
@@ -108,43 +164,18 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		_ = o.lc.ResetFailed(ctx, unit)
 		return o.finishRecoveredBuildResult(ctx, build)
 	}
-	if build.RunID == "" || build.RuntimeVswitchPort == "" {
-		if err := o.stopBuilderUnit(unit); err != nil {
-			return err
-		}
-		return o.failInterruptedBuild(ctx, build, "live build has incomplete durable runtime ownership")
+	if prep == nil {
+		return fmt.Errorf("reconcile build %s: missing live-build preparation", build.BuildID)
 	}
-	wantProperties, err := builderResourceProperties(build.Resources)
-	if err != nil {
+	if prep.failureReason != "" {
 		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
 			return stopErr
 		}
-		return o.failInterruptedBuild(ctx, build, "live build has invalid resource properties: "+err.Error())
-	}
-	gotProperties, err := o.lc.Resources(ctx, unit, "Service")
-	if err != nil {
-		// A live unit plus its durable execution claim is recoverable. Abort
-		// reconciliation without touching either owner so the controller can
-		// retry the transient D-Bus read instead of killing valid work.
-		return fmt.Errorf("read live build resource enforcement for %s: %w", unit, err)
-	}
-	if gotProperties != wantProperties {
-		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-			return stopErr
-		}
-		return o.failInterruptedBuild(ctx, build,
-			fmt.Sprintf("live build resource enforcement does not match: effective=%+v want=%+v", gotProperties, wantProperties))
-	}
-	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, build)
-	if err != nil {
-		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-			return stopErr
-		}
-		return o.failInterruptedBuild(ctx, build, "cannot reconstruct live build: "+err.Error())
+		return o.failInterruptedBuild(ctx, build, prep.failureReason)
 	}
 	pend := &pendingBuild{
-		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), spec: spec,
-		network: network, templateNetwork: templateNetwork, resources: resources,
+		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), spec: prep.spec,
+		network: prep.network, templateNetwork: prep.templateNetwork, resources: prep.resources,
 		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
 		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
 		result: make(chan configsock.BuildResult, 1),

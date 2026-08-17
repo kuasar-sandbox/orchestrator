@@ -135,7 +135,9 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if first.NodeID != "n1" {
 		t.Fatalf("first placement=%+v", first)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)})
+	if err := reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()}); !errors.Is(err, errNodeBuildIDConflict) {
 		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
 	}
@@ -167,7 +169,9 @@ func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		}
 	}
 
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)})
+	if err := reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)}); err != nil {
+		t.Fatal(err)
+	}
 	g1, found, err := reg.stores.GetBuildInGroup(ctx, "/g1", "same-build")
 	if err != nil || !found || g1.State != BuildBuilding {
 		t.Fatalf("g1 build=%+v found=%v err=%v", g1, found, err)
@@ -225,23 +229,17 @@ func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 	}
 }
 
-func TestTerminalBuildStoreRetryContinuesWhileLinkHealthy(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+func TestTerminalBuildStoreFailureReturnsForSessionReplay(t *testing.T) {
 	attempts := 0
-	wantAttempts := terminalBuildStoreAttempts + 1
-	err := retryTerminalBuildStore(ctx, func(context.Context) error {
+	err := retryTerminalBuildStore(context.Background(), func(context.Context) error {
 		attempts++
-		if attempts < wantAttempts {
-			return shardkv.ErrQuorum
-		}
-		return nil
+		return shardkv.ErrQuorum
 	})
-	if err != nil {
-		t.Fatalf("retry terminal build store: %v", err)
+	if !errors.Is(err, shardkv.ErrQuorum) {
+		t.Fatalf("retry terminal build store error = %v, want quorum failure", err)
 	}
-	if attempts != wantAttempts {
-		t.Fatalf("attempts=%d, want %d beyond the detached retry limit", attempts, wantAttempts)
+	if attempts != terminalBuildStoreAttempts {
+		t.Fatalf("attempts=%d, want %d before forcing session replay", attempts, terminalBuildStoreAttempts)
 	}
 }
 
