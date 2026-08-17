@@ -486,9 +486,9 @@ wait_phase_admit() { # $1=phase, $2=build id
 wait_resource_reservations_empty() {
     for _ in $(seq 1 120); do
         if "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >"$WORK/phase-reservations-final.json" 2>/dev/null &&
-            python3 - "$WORK/phase-reservations-final.json" <<'PY'
+            python3 - "$WORK/phase-reservations-final.json" 2>/dev/null <<'PY'
 import json, sys
-assert json.load(open(sys.argv[1])) == []
+assert not json.load(open(sys.argv[1]))
 PY
         then
             return 0
@@ -551,7 +551,7 @@ PY
 
     for _ in $(seq 1 120); do
         if "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >"$WORK/phase-reservations.json" 2>/dev/null &&
-            SID="$sid" python3 - "$WORK/phase-reservations.json" <<'PY'
+            SID="$sid" python3 - "$WORK/phase-reservations.json" 2>/dev/null <<'PY'
 import json, os, sys
 rows = json.load(open(sys.argv[1]))
 assert len(rows) == 1, rows
