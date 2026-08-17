@@ -534,6 +534,8 @@ assert row["capacity"] == {"memory_bytes": 3 << 30, "cpu_milli": 2000}, row
 assert row["floor"] == {"memory_bytes": 512 << 20, "cpu_milli": 1000}, row
 assert row.get("connected") is True, row
 assert row.get("provisional", False) is False, row
+assert row["stage"] == "settled", row
+assert row["allocatable_memory"] == 512 << 20, row
 assert row["cgroup_path"].endswith("/vmm"), row
 assert row["peer_pid"] > 0, row
 PY
