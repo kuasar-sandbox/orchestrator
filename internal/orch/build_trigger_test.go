@@ -18,9 +18,10 @@ import (
 func registerTriggerTestBuild(t *testing.T, o *Orchestrator, apiKey string) *types.Build {
 	t.Helper()
 	b, err := o.RegisterBuild(context.Background(), apiKey, api.RegisterSpec{
-		Name:    "trigger-test",
-		Tags:    []string{"trigger-test-alias"},
-		Profile: types.ProfileE2B,
+		Name:      "trigger-test",
+		Tags:      []string{"trigger-test-alias"},
+		Profile:   types.ProfileE2B,
+		Resources: types.BuildResources{CPU: 2000, Memory: 2 << 30},
 	})
 	if err != nil {
 		t.Fatalf("RegisterBuild: %v", err)
@@ -142,6 +143,63 @@ func TestTriggerBuildChecksOwnershipBeforeState(t *testing.T) {
 	}
 }
 
+func TestTriggerBuildResourceAssertionPrecedesSideEffects(t *testing.T) {
+	value := func(v int64) *int64 { return &v }
+	for _, test := range []struct {
+		name      string
+		assertion buildcfg.ResourcePatch
+	}{
+		{name: "cpu increase", assertion: buildcfg.ResourcePatch{CPU: value(2001)}},
+		{name: "cpu decrease", assertion: buildcfg.ResourcePatch{CPU: value(1999)}},
+		{name: "memory increase", assertion: buildcfg.ResourcePatch{Memory: value((2 << 30) + 1)}},
+		{name: "memory decrease", assertion: buildcfg.ResourcePatch{Memory: value((2 << 30) - 1)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testOrch(t)
+			ctx := context.Background()
+			apiKey, _, _ := allowlistedBuildIdentity(t, o)
+			b := registerTriggerTestBuild(t, o, apiKey)
+			before, err := o.st.GetBuild(ctx, b.BuildID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The deliberately invalid pull token proves the immutable resource
+			// assertion is checked before credential resolution.
+			err = o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
+				FromImage:         "registry.test/assertion:latest",
+				ResourceAssertion: test.assertion,
+			}, api.BuildAuth{PullToken: "not-a-sealed-token"})
+			if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "does not match registered value") {
+				t.Fatalf("TriggerBuild error = %v, want resource assertion ErrBadRequest", err)
+			}
+			after, err := o.st.GetBuild(ctx, b.BuildID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected assertion changed durable build:\n before: %#v\n after: %#v", before, after)
+			}
+		})
+	}
+
+	o := testOrch(t)
+	ctx := context.Background()
+	apiKey, _, _ := allowlistedBuildIdentity(t, o)
+	b := registerTriggerTestBuild(t, o, apiKey)
+	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
+		FromImage: "registry.test/assertion-equal:latest",
+		ResourceAssertion: buildcfg.ResourcePatch{
+			CPU: value(2000), Memory: value(2 << 30),
+		},
+	}, api.BuildAuth{}); err != nil {
+		t.Fatalf("equal assertion: %v", err)
+	}
+	stored, err := o.st.GetBuild(ctx, b.BuildID)
+	if err != nil || stored.Status != types.BuildWaiting || stored.Resources != b.Resources {
+		t.Fatalf("equal assertion result = %+v, %v", stored, err)
+	}
+}
+
 func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
@@ -161,10 +219,6 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 				Steps:     []types.TemplateStep{{Type: "RUN", Args: []string{"steps-a"}}},
 				StartCmd:  "start-a",
 				ReadyCmd:  "ready-a",
-				Metadata: map[string]string{
-					"candidate":        "a",
-					buildcfg.NsBuilder: `{"referer":{"enabled":false}}`,
-				},
 			},
 			auth: api.BuildAuth{RegistryUsername: "user-a", RegistryPassword: "password-a"},
 		},
@@ -175,10 +229,6 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 				Steps:     []types.TemplateStep{{Type: "RUN", Args: []string{"steps-b"}}},
 				StartCmd:  "start-b",
 				ReadyCmd:  "ready-b",
-				Metadata: map[string]string{
-					"candidate":        "b",
-					buildcfg.NsBuilder: `{"referer":{"enabled":false,"writeback":false}}`,
-				},
 			},
 			auth: api.BuildAuth{RegistryUsername: "user-b", RegistryPassword: "password-b"},
 		},
@@ -244,7 +294,7 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 	if got.Status != types.BuildWaiting || got.Kind != types.KindSnp ||
 		got.FromImage != want.spec.FromImage || got.FromTemplate != "" ||
 		got.StartCmd != want.spec.StartCmd || got.ReadyCmd != want.spec.ReadyCmd ||
-		!reflect.DeepEqual(got.Steps, want.spec.Steps) || got.Metadata["candidate"] != want.label {
+		!reflect.DeepEqual(got.Steps, want.spec.Steps) {
 		t.Fatalf("stored concurrent work order is mixed or incomplete: %#v", got)
 	}
 	var creds regcreds.Creds
@@ -254,10 +304,8 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 	if creds.Username != want.auth.RegistryUsername || creds.Password != want.auth.RegistryPassword {
 		t.Fatalf("stored registry credentials = %#v, want candidate %s", creds, want.label)
 	}
-	if got.Builder.Referer == nil || got.Builder.Referer.Enabled == nil || *got.Builder.Referer.Enabled ||
-		(want.label == "a" && got.Builder.Referer.Writeback != nil) ||
-		(want.label == "b" && (got.Builder.Referer.Writeback == nil || *got.Builder.Referer.Writeback)) {
-		t.Fatalf("stored builder options do not match candidate %s: %#v", want.label, got.Builder)
+	if got.Builder.Referer != nil || len(got.Metadata) != 0 {
+		t.Fatalf("trigger modified sealed build definition: metadata=%#v builder=%#v", got.Metadata, got.Builder)
 	}
 }
 
@@ -281,13 +329,17 @@ func TestTriggerBuildCannotOverwritePoolClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if won, err := o.claimWaitingBuild(ctx, execution); err != nil || !won {
-		t.Fatalf("claimWaitingBuild: won=%t err=%v", won, err)
+	limit, _ := o.cfg.Builder.ExecutionLimit()
+	if won, err := o.st.ClaimBuildExecution(ctx, execution.BuildID, limit, time.Now()); err != nil || !won {
+		t.Fatalf("ClaimBuildExecution: won=%t err=%v", won, err)
 	}
 	if err := o.st.SetBuildRunID(ctx, b.BuildID, "run-active"); err != nil {
 		t.Fatal(err)
 	}
-	execution.RunID = "run-active"
+	execution, err = o.st.GetBuild(ctx, b.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	claimed, err := o.st.GetBuild(ctx, b.BuildID)
 	if err != nil {
 		t.Fatal(err)

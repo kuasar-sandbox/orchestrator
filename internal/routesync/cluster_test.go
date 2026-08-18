@@ -25,10 +25,13 @@ func roundTrip(t *testing.T, m *Msg) *Msg {
 func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	nr := roundTrip(t, &Msg{Type: TypeNodeRegister, NodeReg: &NodeRegister{
 		NodeID: "n1", Labels: map[string]string{"zone": "z1", "slot": "c01-s03"},
-		BuildCapacity: &BuildResources{CPU: 4000, Mem: 8 << 30, Storage: 64 << 30},
-		DataEndpoint:  "10.0.0.1:8443", AcceptRedirect: true,
+		BuildRegistrationCapacity: &BuildAdmissionLimit{MaxBuilds: 16, Resources: &BuildResources{CPU: 64000, Memory: 256 << 30, Storage: 1 << 40}},
+		BuildExecutionCapacity:    &BuildAdmissionLimit{MaxBuilds: 4, Resources: &BuildResources{CPU: 16000, Memory: 64 << 30, Storage: 256 << 30}},
+		DataEndpoint:              "10.0.0.1:8443", AcceptRedirect: true,
 	}})
-	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" || nr.NodeReg.BuildCapacity.Mem != 8<<30 || !nr.NodeReg.AcceptRedirect {
+	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" ||
+		nr.NodeReg.BuildRegistrationCapacity.Resources.Memory != 256<<30 ||
+		nr.NodeReg.BuildExecutionCapacity.MaxBuilds != 4 || !nr.NodeReg.AcceptRedirect {
 		t.Fatalf("node_register round-trip: %+v", nr.NodeReg)
 	}
 
@@ -67,8 +70,9 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 	b := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
 		CmdID: "b1", Kind: CmdBuildRegister, BuildID: "build-1", TemplateRef: "transient-1", Profile: "bare",
+		BuildMMDSSecrets: map[string]string{"token": "initial"},
 	}})
-	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" {
+	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" || b.Cmd.BuildMMDSSecrets["token"] != "initial" {
 		t.Fatalf("build_register round-trip: %+v", b.Cmd)
 	}
 

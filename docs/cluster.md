@@ -584,7 +584,7 @@ membership 重新解析 owner。
 
 node_link 维护以下 recordSet:
 
-- `profile`:node_id、labels、runtime_digest、data_endpoint、build_capacity、draining、liveness、link_owner。
+- `profile`:node_id、labels、runtime_digest、data_endpoint、Build registration/execution capacity 与 durable usage、draining、liveness、link_owner；其中低频 `node_list` 投影仅包含 capacity，usage 保留在 node owner 的实时 profile 中。
 - `sandbox`:该 node 上 sandbox 的
   `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
   完整归属表。
@@ -595,7 +595,7 @@ node_link 维护以下 recordSet:
 recordSet。sandbox/build 表由 cluster 在任务下发前写入。build 终态只释放容量,归属记录保留到对应
 build record 删除;key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
-build 的 cluster group 仍保存在其内部 metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
+build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
 
 同一 node 内 `node_sandbox_id` 归属以 CAS 写入:相同完整归属重放为幂等刷新,不同归属返回
 冲突且不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED

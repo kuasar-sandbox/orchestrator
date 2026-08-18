@@ -17,7 +17,7 @@ import (
 
 // --- phase C: template snapshot ---------------------------------------------
 
-func (p *buildPipeline) phaseTemplate() (string, error) {
+func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	s := p.spec
 	envdUDS := filepath.Join(s.Workdir, "envd.sock")
 	doc, err := p.templateYAML()
@@ -29,7 +29,7 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer sb.teardown()
+	defer sb.joinTeardownError(&retErr)
 
 	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
 	defer cancelBoot()

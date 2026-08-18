@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -60,6 +61,7 @@ type Orchestrator struct {
 
 	launches    launchGroup            // sole process-local owner of create and resume attempts
 	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
 	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
 	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
 
@@ -83,6 +85,17 @@ type Orchestrator struct {
 
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
+	// buildRecoveryReady closes only after every live builder has an adopted
+	// pendingBuild owner. The config socket may bind first, but build-spec,
+	// phase, and result requests wait here instead of failing in the
+	// bind-to-adoption window.
+	buildRecoveryReady     chan struct{}
+	buildRecoveryReadyOnce sync.Once
+	// networkAllocationMu serializes connector allocation with the Build-only
+	// detach -> durable ownership clear sequence. A detached-but-not-cleared
+	// port blocks new allocations so a crash/retry cannot detach a reused slot.
+	networkAllocationMu       sync.Mutex
+	detachedBuildPortsPending map[string]struct{}
 
 	runnerPool     *runPool
 	builderRunPool *runPool
@@ -102,6 +115,7 @@ type Orchestrator struct {
 	resourceControllerSocketIdentity string
 	snapshotInspector                func(context.Context, string, string) (snapshotDescription, error)
 	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
+	removeBuildRuntimeDir            func(string) error
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -112,7 +126,16 @@ type Orchestrator struct {
 	mmdsBuildOwners map[string]string
 	// Parsed once from conductor-owned mmds.services. Values are absolute Unix
 	// socket paths and never come from proxy.yaml or a tenant document.
-	mmdsServices mmdssvc.Registry
+	mmdsServices   mmdssvc.Registry
+	buildAdmission buildAdmissionObservability
+	mx             *metrics.M
+}
+
+// DrainBuilds prevents new execution work and waits for every claimed or
+// recovered Build goroutine to finish cleanup/persistence while dependencies
+// remain open.
+func (o *Orchestrator) DrainBuilds(ctx context.Context) error {
+	return o.buildOps.Drain(ctx)
 }
 
 // clusterBuild is a registry-driven build's transient image-pull context. Cluster
@@ -126,18 +149,21 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 	mmdsServices, _ := mmdssvc.BuildRegistry(cfg.MMDS.ServiceEndpoints())
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		sandboxReadyTimeout: 60 * time.Second,
-		reg:                 map[string]*types.Sandbox{},
-		lifecycleCtx:        context.Background(),
-		deadlineIntents:     map[string]struct{}{},
-		subs:                map[int]chan routesync.Event{},
-		routeFP:             uuid.NewString(),
-		pend:                map[string]*pendingBuild{},
-		clusterBuilds:       map[string]*clusterBuild{},
-		buildEvents:         make(chan *routesync.BuildEvent, 64),
-		mmdsBuildOwners:     map[string]string{},
-		mmdsServices:        mmdsServices,
-		commitBuildTrigger:  st.CommitBuildTrigger,
+		sandboxReadyTimeout:       60 * time.Second,
+		reg:                       map[string]*types.Sandbox{},
+		lifecycleCtx:              context.Background(),
+		deadlineIntents:           map[string]struct{}{},
+		subs:                      map[int]chan routesync.Event{},
+		routeFP:                   uuid.NewString(),
+		pend:                      map[string]*pendingBuild{},
+		buildRecoveryReady:        make(chan struct{}),
+		detachedBuildPortsPending: map[string]struct{}{},
+		clusterBuilds:             map[string]*clusterBuild{},
+		buildEvents:               make(chan *routesync.BuildEvent, 64),
+		mmdsBuildOwners:           map[string]string{},
+		mmdsServices:              mmdsServices,
+		commitBuildTrigger:        st.CommitBuildTrigger,
+		removeBuildRuntimeDir:     os.RemoveAll,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -1569,6 +1595,20 @@ type snapshotDescription struct {
 	Metadata map[string]string `json:"Metadata"`
 }
 
+// snapshotConfigProbeError distinguishes external snapshot/object reads, which
+// may recover without changing a live Build, from deterministic parsing or
+// local policy errors that reconciliation must fail closed.
+type snapshotConfigProbeError struct {
+	ref string
+	err error
+}
+
+func (e *snapshotConfigProbeError) Error() string {
+	return fmt.Sprintf("snapshot config probe %q: %v", e.ref, e.err)
+}
+
+func (e *snapshotConfigProbeError) Unwrap() error { return e.err }
+
 func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, ref string) (snapshotDescription, error) {
 	var cfg snapshotDescription
 	locations := map[string]string{}
@@ -1584,7 +1624,7 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+manifestKey)
 	out, err := cmd.Output()
 	if err != nil {
-		return cfg, fmt.Errorf("snapshot config probe %q: %w", ref, err)
+		return cfg, &snapshotConfigProbeError{ref: ref, err: err}
 	}
 	if err := json.Unmarshal(out, &cfg); err != nil {
 		return cfg, fmt.Errorf("snapshot config parse %q: %w", ref, err)
@@ -1676,6 +1716,11 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	ip, _, err := net.ParseCIDR(network.InnerIP)
 	if err != nil {
 		return nil, fmt.Errorf("orch: inner_ip %q: %w", network.InnerIP, err)
+	}
+	o.networkAllocationMu.Lock()
+	defer o.networkAllocationMu.Unlock()
+	if len(o.detachedBuildPortsPending) != 0 {
+		return nil, fmt.Errorf("orch: network allocation blocked while detached build ownership awaits durable cleanup")
 	}
 	return o.vs.Attach(ctx, vswitch.AttachReq{
 		InnerIP:          ip.String(),
@@ -1797,11 +1842,23 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Reconcile adopts/cleans sandboxes after an orchestrator restart, using the
-// systemd unit set as the liveness authority. A starting row is never adopted:
-// launch completion was not committed, so an interrupted resume returns to its
-// durable paused snapshot and an interrupted fresh create becomes dead.
+// Reconcile is the complete restart path used by tests and embedded callers.
+// The conductor starts its config socket between ReconcileSandboxes and
+// ReconcileBuilds so an already-running builder can never finish into an absent
+// result endpoint during adoption.
 func (o *Orchestrator) Reconcile(ctx context.Context) error {
+	if err := o.ReconcileSandboxes(ctx); err != nil {
+		return err
+	}
+	return o.ReconcileBuilds(ctx)
+}
+
+// ReconcileSandboxes adopts/cleans sandboxes after an orchestrator restart,
+// using the systemd unit set as the liveness authority. A starting row is never
+// adopted: launch completion was not committed, so an interrupted resume
+// returns to its durable paused snapshot and an interrupted fresh create
+// becomes dead.
+func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	units, err := o.lc.List(ctx, o.runnerPattern())
 	if err != nil {
 		return err
@@ -1894,6 +1951,21 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// ReconcileBuilds adopts live builder units only after the local config socket
+// is accepting phase/result reports. It must run before new Build work is
+// admitted to the run pool.
+func (o *Orchestrator) ReconcileBuilds(ctx context.Context) error {
+	if err := o.reconcileBuilds(ctx); err != nil {
+		return err
+	}
+	o.buildRecoveryReadyOnce.Do(func() {
+		if o.buildRecoveryReady != nil {
+			close(o.buildRecoveryReady)
+		}
+	})
+	return nil
+}
+
 func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
 	if unit == "" {
 		return false
@@ -1904,11 +1976,20 @@ func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
 		return true
 	}
 	for _, u := range units {
-		if u.Name == unit && (u.ActiveState == "active" || u.ActiveState == "activating") {
+		if u.Name == unit && builderUnitMayHaveProcesses(u.ActiveState) {
 			return true
 		}
 	}
 	return false
+}
+
+func builderUnitMayHaveProcesses(state string) bool {
+	switch state {
+	case "active", "activating", "reloading", "deactivating":
+		return true
+	default:
+		return false
+	}
 }
 
 // --- helpers ---

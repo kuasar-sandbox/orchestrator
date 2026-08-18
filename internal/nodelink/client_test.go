@@ -61,6 +61,28 @@ type fakeNode struct {
 	events               chan routesync.Event
 }
 
+type replayingFakeNode struct {
+	*fakeNode
+	replays        chan struct{}
+	replayMu       sync.Mutex
+	replayFailures int
+}
+
+func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(ctx context.Context) error {
+	select {
+	case n.replays <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	n.replayMu.Lock()
+	defer n.replayMu.Unlock()
+	if n.replayFailures > 0 {
+		n.replayFailures--
+		return errors.New("transient durable scan failure")
+	}
+	return nil
+}
+
 func newFakeNode() *fakeNode {
 	return &fakeNode{
 		routes:   map[string]routesync.RouteEntry{},
@@ -331,6 +353,111 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 			t.Fatal("node never registered after redirect")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	endSession := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		msg, err := routesync.ReadMsg(req.Body)
+		if err != nil || msg.Type != routesync.TypeNodeRegister {
+			http.Error(w, "bad node register", http.StatusBadRequest)
+			return
+		}
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-endSession:
+			// Abort only after the test observes this session's replay. Doing so
+			// proves Hello was consumed before deterministically forcing reconnect.
+			panic(http.ErrAbortHandler)
+		case <-req.Context().Done():
+		}
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer func() {
+		cancel()
+		srv.Close()
+	}()
+
+	node := &replayingFakeNode{fakeNode: newFakeNode(), replays: make(chan struct{}, 4)}
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	go client.Run(ctx)
+	select {
+	case <-node.replays:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal replay did not run on first established session")
+	}
+	endSession <- struct{}{}
+	select {
+	case <-node.replays:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal replay did not run after forced reconnect")
+	}
+}
+
+func TestNodeLinkRetriesTerminalBuildReplayWithinEstablishedSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sessions int
+	var sessionsMu sync.Mutex
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		sessionsMu.Lock()
+		sessions++
+		sessionsMu.Unlock()
+		msg, err := routesync.ReadMsg(req.Body)
+		if err != nil || msg.Type != routesync.TypeNodeRegister {
+			http.Error(w, "bad node register", http.StatusBadRequest)
+			return
+		}
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-req.Context().Done()
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer func() {
+		cancel()
+		srv.Close()
+	}()
+
+	node := &replayingFakeNode{
+		fakeNode:       newFakeNode(),
+		replays:        make(chan struct{}, 4),
+		replayFailures: 1,
+	}
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "n1"}, node, time.Hour, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	go client.Run(ctx)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-node.replays:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("terminal replay calls=%d, want retry after transient scan failure", i)
+		}
+	}
+	sessionsMu.Lock()
+	gotSessions := sessions
+	sessionsMu.Unlock()
+	if gotSessions != 1 {
+		t.Fatalf("node-link sessions=%d, want replay retry within one established session", gotSessions)
 	}
 }
 

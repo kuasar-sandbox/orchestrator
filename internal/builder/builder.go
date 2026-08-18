@@ -42,17 +42,24 @@ package builder
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
+// PhaseReporter records the currently active ordinary sandbox. A starting
+// report is made before spawning the phase, so losing the controller-side
+// execution claim fails closed before any phase resource side effect.
+type PhaseReporter func(phase, sandboxID, state string) error
+
 // Run drives the build pipeline for spec and returns its Result.
-func Run(spec *configsock.BuildSpec, log *slog.Logger) Result {
-	p := &buildPipeline{spec: spec, log: log}
+func Run(spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
+	p := &buildPipeline{spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
 	return p.run()
 }
 
@@ -66,10 +73,12 @@ type Result struct {
 }
 
 type buildPipeline struct {
-	spec    *configsock.BuildSpec
-	log     *slog.Logger
-	out     *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
-	profile types.Profile
+	spec      *configsock.BuildSpec
+	vmmCgroup *os.File
+	report    PhaseReporter
+	log       *slog.Logger
+	out       *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	profile   types.Profile
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -128,18 +137,23 @@ func (p *buildPipeline) run() (res Result) {
 	}
 
 	if s.FromImage != "" {
-		if err := p.phaseImport(); err != nil {
+		if err := p.runPhase("a", p.phaseImport); err != nil {
 			return fail(fmt.Errorf("import: %w", err))
 		}
 	}
 	if len(s.Steps) > 0 {
-		if err := p.phaseSteps(); err != nil {
+		if err := p.runPhase("b", p.phaseSteps); err != nil {
 			return fail(fmt.Errorf("steps: %w", err))
 		}
 	}
 	var bundle string
 	if p.profile == types.ProfileE2B && p.startCmd != "" {
-		b, err := p.phaseTemplate()
+		var b string
+		err := p.runPhase("c", func() error {
+			var phaseErr error
+			b, phaseErr = p.phaseTemplate()
+			return phaseErr
+		})
 		if err != nil {
 			return fail(fmt.Errorf("template: %w", err))
 		}
@@ -165,6 +179,33 @@ func (p *buildPipeline) run() (res Result) {
 	}
 	res.StartCmd, res.ReadyCmd = p.startCmd, p.readyCmd
 	return res
+}
+
+func (p *buildPipeline) runPhase(phase string, run func() error) error {
+	sid := phaseSandboxID(phase, p.spec.BuildID)
+	if p.report != nil {
+		if err := p.report(phase, sid, "starting"); err != nil {
+			return fmt.Errorf("report phase %s starting: %w", phase, err)
+		}
+	}
+	err := run()
+	if cleanupErr := p.requirePhaseVMMCgroupEmpty(); cleanupErr != nil {
+		err = errors.Join(err, cleanupErr)
+	}
+	if err != nil {
+		if p.report != nil {
+			if reportErr := p.report(phase, sid, "failed"); reportErr != nil {
+				p.log.Error("report failed phase", "phase", phase, "sid", sid, "err", reportErr)
+			}
+		}
+		return err
+	}
+	if p.report != nil {
+		if err := p.report(phase, sid, "finished"); err != nil {
+			return fmt.Errorf("report phase %s finished: %w", phase, err)
+		}
+	}
+	return nil
 }
 
 func validateBuildProfile(s *configsock.BuildSpec) (types.Profile, error) {

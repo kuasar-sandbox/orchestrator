@@ -170,6 +170,19 @@ func TestRunnerUnitCgroupRequiresExactRunAndSlice(t *testing.T) {
 	}
 }
 
+func TestTaskUnitCgroupAcceptsBuilderOnlyInBuilderSlice(t *testing.T) {
+	runID := "br-00000000-0000-7000-8000-000000000001"
+	validRoot := "/sandbox.slice/sandbox-builder.slice/sandbox-builder@" + runID + ".service"
+	for _, path := range []string{validRoot, validRoot + "/ctl"} {
+		if _, _, err := taskUnitCgroup(path, runID, "/sandbox.slice/sandbox-builder.slice"); err != nil {
+			t.Fatalf("valid builder cgroup %q rejected: %v", path, err)
+		}
+	}
+	if _, _, err := taskUnitCgroup(validRoot, runID, "/sandbox.slice/sandbox-runner.slice"); err == nil {
+		t.Fatalf("builder cgroup %q accepted as a runner", validRoot)
+	}
+}
+
 func TestUnifiedCgroupPath(t *testing.T) {
 	if got, err := unifiedCgroupPath([]byte("1:name=x:/legacy\n0::/slice/unit/ctl\n")); err != nil || got != "/slice/unit/ctl" {
 		t.Fatalf("path = %q, err = %v", got, err)

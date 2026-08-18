@@ -428,7 +428,7 @@ func (h *harness) waitForNodeKeyCache(t *testing.T, nodeID string) {
 func TestClusterStubBuildRegister(t *testing.T) {
 	h := newHarness(t)
 
-	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/v3/templates", strings.NewReader(`{"name":"tmpl","profile":"bare"}`))
+	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/v3/templates", strings.NewReader(`{"name":"tmpl","profile":"bare","cpuCount":2,"memoryMB":2048}`))
 	req.Host = "api." + testDomain
 	req.Header.Set(router.HeaderGroup, testGroup)
 	req.Header.Set(router.HeaderAPIKey, h.apiKey)
@@ -456,6 +456,9 @@ func TestClusterStubBuildRegister(t *testing.T) {
 	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" ||
 		cmd.APISecretFingerprint != fullFingerprint(t, testAPISecret) || cmd.Profile != "bare" {
 		t.Fatalf("build_register command = %+v", cmd)
+	}
+	if cmd.BuildResources == nil || cmd.BuildResources.CPU != 2000 || cmd.BuildResources.Memory != 2<<30 {
+		t.Fatalf("build_register resources = %+v, want cpu=2000m memory=2GiB", cmd.BuildResources)
 	}
 }
 
@@ -520,9 +523,10 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, dataEndpoint s
 	stub := &nodeStub{t: t, ctx: nctx, cancel: cancel, pw: pw, cmdCh: make(chan *routesync.Command, 64)}
 	stub.write(t, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
 		NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
-		BuildCapacity: &routesync.BuildResources{CPU: 4000, Mem: 4 << 30},
-		DataEndpoint:  dataEndpoint,
-		RuntimeDigest: "runtime-stub",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
+		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
+		DataEndpoint:              dataEndpoint,
+		RuntimeDigest:             "runtime-stub",
 	}})
 	var resp *http.Response
 	select {

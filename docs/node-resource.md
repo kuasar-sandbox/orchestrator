@@ -139,8 +139,8 @@ node-ctl resource reclaim <sid> --memory <target> [--socket /run/sandbox-resourc
 
 ### 3.1 managed sandbox resource policy
 
-Conductor 对普通 managed sandbox 使用以下 node-owned policy(builder sandbox 有独立模型,
-不在本节):
+Conductor 对所有 managed sandbox 使用以下 node-owned policy。Builder 的 A/B/C phase 也逐个
+走同一 resolver/controller 路径;Build resources 是外层工作流准入与 systemd 限制,不在本池记账:
 
 ```yaml
 sandbox:
@@ -153,7 +153,8 @@ sandbox:
     overhead: { memory: 32MiB }
 ```
 
-- `capacity` 是 guest VM 上限/SKU;E2B `cpuCount`/`memoryMB` 仍表示它。
+- `capacity` 是 guest VM 上限/SKU;Sandbox Create 的 E2B `cpuCount`/`memoryMB` 表示它。
+  Template Register 上的同名字段只表示 Build resources,二者不关联。
 - `allocatable` 是 steady floor。默认场景因此是 `memoryMB=2048`,floor=256MiB;
   dynamic 当前 grant 可在 `256MiB..2GiB` 变化。
 - `startup` 是 admission/pre-settled 启动预算。dynamic 中 request/node 都未显式设置
@@ -202,7 +203,8 @@ restore 必须先读出 snapshot capacity;request 同值可作 assertion,不同�
 
 旧 `sandbox.resources.vcpu/memory/control_socket` schema 不再接受,没有兼容别名或第二
 controller 优先级。trigger-time 通用 metadata/config header 同样已废弃并返回 400;
-暂保留的 trigger `cpuCount/memoryMB` 只覆盖 capacity leaf。
+模板 Build trigger 暂保留的 `cpuCount/memoryMB` 只可断言等于注册时 Build resources,
+不得覆盖本节 capacity 或 phase patch。
 
 ### 3.2 resource_listen 配置块
 
@@ -217,6 +219,7 @@ state_path: /run/node-ctl/state.json   # deprecated/ignored;仅兼容旧 YAML �
 audit_path: /run/node-ctl/audit.log    # tmpfs;异步 best-effort 审计,不阻塞 RPC
 cgroup_scan_paths:                     # 重启时扫描 populated sandbox cgroup
   - /sys/fs/cgroup/sandbox.slice/sandbox-runner.slice
+  - /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice
 
 resources:
   physical_memory: auto                # auto = 读 /proc/meminfo MemTotal
@@ -255,7 +258,7 @@ dampening:                              # 振荡阻尼,不进 sandbox.yaml
 | `socket` | `pkg/resource` 默认 | 文件系统 UDS 的 bind/dial 路径;`""` = 协议默认。保留配置中的绝对路径作为 endpoint,另把父目录 symlink 解析成 owner/lease canonical identity,因此短 alias 仍可规避 AF_UNIX 路径长度限制 |
 | `state_path` | 无 | **deprecated/ignored**;仅保留旧 YAML 可解析,不会打开、读取或写入 |
 | `audit_path` | `/run/node-ctl/audit.log` | tmpfs;后台 goroutine 异步 best-effort 写,资源 RPC 不等待文件 I/O |
-| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice]` | lease/cgroup 身份边界和重启对账扫描根；默认覆盖 orchestrator-managed runner 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
+| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]` | lease/cgroup 身份边界和重启对账扫描根；默认覆盖普通 sandbox runner 和 Builder A/B/C phase 的 `vmm` cgroup。直接运行 `sandbox-ctl run` 时需显式加入其 cgroup 根。 |
 | `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
 | `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
 | `resources.host_reserved.memory` | `16GiB` | host 自身预留(kernel + cache-ctl + store-ctl + monitoring),按节点实测覆盖(§10.2) |

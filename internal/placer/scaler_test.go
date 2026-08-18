@@ -1,6 +1,7 @@
 package placer
 
 import (
+	"math"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
@@ -165,16 +166,39 @@ func TestSelectorPatchTargets(t *testing.T) {
 }
 
 func TestPlaceBuildHeadroom(t *testing.T) {
-	// A node with no build headroom (alloc==capacity CPU) is excluded.
+	// Placer receives low-frequency capacity only. It rejects a node on which
+	// this Build can never fit; current usage is checked at the Holder boundary.
 	ns := nodes(
-		&registry.NodeRecord{NodeID: "full", BuildCapacity: &routesync.BuildResources{CPU: 2000}, BuildAlloc: &routesync.BuildResources{CPU: 2000}},
-		&registry.NodeRecord{NodeID: "free", BuildCapacity: &routesync.BuildResources{CPU: 2000}, BuildAlloc: &routesync.BuildResources{CPU: 0}},
+		&registry.NodeRecord{NodeID: "too-small", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 1000}}},
+		&registry.NodeRecord{NodeID: "fits", BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 2000}}},
 	)
 	for i := 0; i < 30; i++ {
-		node, err := placeBuild(placeParams{group: "/g", nodes: ns, candidates: 2})
-		if err != nil || node != "free" {
-			t.Fatalf("placeBuild = %q err=%v (want free: full node has no build headroom)", node, err)
+		node, err := placeBuild(placeParams{group: "/g", nodes: ns, candidates: 2, buildResources: &routesync.BuildResources{CPU: 1500}})
+		if err != nil || node != "fits" {
+			t.Fatalf("placeBuild = %q err=%v (want fits: request exceeds too-small capacity)", node, err)
 		}
+	}
+}
+
+func TestBuildDimensionFitsFailsClosedWithoutOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		used, requested, limit int64
+		want                   bool
+	}{
+		{name: "unlimited", requested: math.MaxInt64, want: true},
+		{name: "exact", used: 7, requested: 3, limit: 10, want: true},
+		{name: "over limit", used: 8, requested: 3, limit: 10},
+		{name: "request exceeds limit", requested: math.MaxInt64, limit: 1},
+		{name: "negative used", used: -1},
+		{name: "negative request", requested: -1},
+		{name: "negative limit", limit: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dimensionFits(tc.used, tc.requested, tc.limit); got != tc.want {
+				t.Fatalf("dimensionFits(%d, %d, %d) = %v, want %v", tc.used, tc.requested, tc.limit, got, tc.want)
+			}
+		})
 	}
 }
 

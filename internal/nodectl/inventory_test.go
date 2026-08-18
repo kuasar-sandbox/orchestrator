@@ -395,6 +395,52 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	corrupt.send("stop")
 }
 
+func TestInventoryDoesNotChargeTrustedControlSubgroup(t *testing.T) {
+	root := t.TempDir()
+	writeFakeCgroupRoot(t, root)
+	service := filepath.Join(root, "sandbox-builder@run.service")
+	writeFakeCgroupRoot(t, service)
+	writeFakeCgroup(t, filepath.Join(service, "ctl"), "max", 111)
+	writeFakeCgroup(t, filepath.Join(service, "vmm"), strconv.FormatUint(testLeaseCapacity, 10), 222)
+
+	state := makeState(4<<30, 0)
+	inventory := &Inventory{CgroupScanPaths: []string{root}, Pool: state.AllocatablePool, Logf: t.Logf}
+	if err := inventory.scanCgroups(state, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != testLeaseCapacity {
+		t.Fatalf("control subgroup entered sandbox accounting: %+v", snapshot)
+	}
+	for _, reservation := range state.ReservationViews() {
+		if filepath.Base(reservation.CgroupPath) != "vmm" {
+			t.Fatalf("charged cgroup = %q, want only vmm", reservation.CgroupPath)
+		}
+	}
+}
+
+func TestTrustedTaskControlCgroupIsNarrow(t *testing.T) {
+	root := filepath.Join("/sys/fs/cgroup", "sandbox-builder.slice")
+	for _, test := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"service child", filepath.Join(root, "sandbox-builder@run.service", "ctl"), true},
+		{"service root", filepath.Join(root, "ctl"), false},
+		{"arbitrary child", filepath.Join(root, "tenant", "ctl"), false},
+		{"nested service", filepath.Join(root, "nested.slice", "sandbox-builder@run.service", "ctl"), false},
+		{"different leaf", filepath.Join(root, "sandbox-builder@run.service", "vmm"), false},
+		{"outside root", filepath.Join(filepath.Dir(root), "other.service", "ctl"), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := trustedTaskControlCgroup(root, test.path); got != test.want {
+				t.Fatalf("trustedTaskControlCgroup(%q, %q) = %t, want %t", root, test.path, got, test.want)
+			}
+		})
+	}
+}
+
 func TestInventoryChargesEveryInvalidLiveLeaseWithDistinctIdentity(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "controller.sock")

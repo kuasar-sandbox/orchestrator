@@ -9,6 +9,7 @@
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
+//	node-ctl builder status                                    # durable Builder admission status (admin socket)
 //	node-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
@@ -75,6 +76,8 @@ func main() {
 		err = importSandboxCmd(os.Args[2:], log)
 	case "resource":
 		os.Exit(resourceCmd(os.Args[2:]))
+	case "builder":
+		os.Exit(builderCmd(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Println("node-ctl", version)
 	default:
@@ -87,7 +90,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|builder|version} [args]")
 	os.Exit(2)
 }
 
@@ -149,11 +152,13 @@ func runConductor(args []string, log *slog.Logger) error {
 	defer lc.Close()
 
 	plugins := configsock.NewRegistry()
+	mx := metrics.New()
 	core := orch.New(cfg, st, lc, vswitch.New(
 		cfg.ConnectorCtl(),
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
+	core.SetMetrics(mx)
 	core.SetLifecycleContext(ctx)
 	core.SetProxyRouteBarrierCoordinator(plugins)
 	if resolvedResources != nil {
@@ -167,6 +172,9 @@ func runConductor(args []string, log *slog.Logger) error {
 	// unavailable dependency.
 	defer func() {
 		stop()
+		if err := core.DrainBuilds(context.Background()); err != nil {
+			log.Error("drain builder executions", "err", err)
+		}
 		if err := core.DrainLaunches(context.Background()); err != nil {
 			log.Error("drain sandbox launches", "err", err)
 		}
@@ -177,10 +185,9 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
-	if err := core.Reconcile(ctx); err != nil {
-		return fmt.Errorf("reconcile: %w", err)
+	if err := core.ReconcileSandboxes(ctx); err != nil {
+		return fmt.Errorf("reconcile sandboxes: %w", err)
 	}
-	go core.Reaper(ctx, 5*time.Second)
 
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
@@ -197,6 +204,7 @@ func runConductor(args []string, log *slog.Logger) error {
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
 	// the node streams its sandbox routes up + executes the registry's commands.
+	var startNodeLink func()
 	if cfg.Cluster.NodeLink.Endpoint != "" {
 		nodeID := cfg.Cluster.NodeID
 		if nodeID == "" {
@@ -221,7 +229,7 @@ func runConductor(args []string, log *slog.Logger) error {
 			}
 			clientTLS = ct
 		}
-		capacity, buildCap, runtimeDigest := core.ClusterNodeInfo()
+		capacity, registrationCap, executionCap, runtimeDigest := core.ClusterNodeInfo()
 		nl := nodelink.NewWithEndpoint(
 			regAddr,
 			func(dctx context.Context, endpoint string) (net.Conn, error) {
@@ -237,18 +245,20 @@ func runConductor(args []string, log *slog.Logger) error {
 			},
 			routesync.NodeRegister{
 				NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint,
-				Capacity: capacity, BuildCapacity: buildCap, RuntimeDigest: runtimeDigest,
+				Capacity: capacity, BuildRegistrationCapacity: registrationCap,
+				BuildExecutionCapacity: executionCap, RuntimeDigest: runtimeDigest,
 			},
 			core, hbInterval, clientTLS, log, true,
 		)
-		go nl.Run(ctx)
-		log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		startNodeLink = func() {
+			go nl.Run(ctx)
+			log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		}
 	}
 
 	// Traffic stats providers are wired before either API listener can accept a
 	// request. Internal mode uses the same WorkerStats→MasterStats absolute update
 	// path in-process; external mode queries the registered proxy master's cache.
-	mx := metrics.New()
 	var internalWorkerStats *proxystats.WorkerStats
 	switch cfg.Proxy.Mode {
 	case config.ProxyInternal:
@@ -303,6 +313,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		Provider:                     core,
 		Admin:                        core,
 		MMDSRouteSecretAdmin:         core,
+		BuilderAdmissionAdmin:        core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
 		API:                          apiH,
 		AdminPidfile:                 cfg.Paths.AdminPidfile,
@@ -329,10 +340,21 @@ func runConductor(args []string, log *slog.Logger) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// A live builder can finish immediately after it is adopted. Bring the
+	// authenticated phase/result endpoint up first, then attach recovery
+	// monitors, and only then expose this node to cluster dispatch or admit new
+	// run-pool work.
+	if err := core.ReconcileBuilds(ctx); err != nil {
+		return fmt.Errorf("reconcile builds: %w", err)
+	}
+	go core.Reaper(ctx, 5*time.Second)
 	if err := core.StartRunPools(ctx); err != nil {
 		return err
 	}
 	go core.BuildPool(ctx, 2*time.Second)
+	if startNodeLink != nil {
+		startNodeLink()
+	}
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
 	// proxyForwarder to worker (external), or reject (off). External mode also

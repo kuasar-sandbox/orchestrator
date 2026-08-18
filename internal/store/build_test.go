@@ -62,9 +62,7 @@ func buildTriggerCandidate(base *types.Build, label string) *types.Build {
 	candidate.ReadyCmd = "ready-" + label
 	candidate.Steps = []types.TemplateStep{{Type: "RUN", Args: []string{"steps-" + label}, Force: true}}
 	candidate.Metadata = map[string]string{"metadata": label}
-	candidate.Builder = types.BuildOptions{Referer: &types.BuildRefererOptions{
-		Enabled: &disabled,
-	}}
+	candidate.Builder = types.BuildOptions{Referer: &types.BuildRefererOptions{Enabled: &disabled}}
 	candidate.Status = types.BuildWaiting
 	return &candidate
 }
@@ -77,8 +75,6 @@ func applyTriggerWorkOrder(dst, src *types.Build) {
 	dst.StartCmd = src.StartCmd
 	dst.ReadyCmd = src.ReadyCmd
 	dst.Steps = src.Steps
-	dst.Metadata = src.Metadata
-	dst.Builder = src.Builder
 	dst.Status = types.BuildWaiting
 }
 
@@ -120,8 +116,12 @@ func TestCommitBuildTriggerStateMatrix(t *testing.T) {
 			}
 			want := before
 			if state == types.BuildRegistered {
+				if after.WaitingSequence <= 0 {
+					t.Fatalf("committed trigger has invalid FIFO sequence %d", after.WaitingSequence)
+				}
 				wantCopy := *before
 				applyTriggerWorkOrder(&wantCopy, candidate)
+				wantCopy.WaitingSequence = after.WaitingSequence
 				want = &wantCopy
 			}
 			if !reflect.DeepEqual(after, want) {
@@ -196,8 +196,42 @@ func TestCommitBuildTriggerConcurrentHasCompleteSingleWinner(t *testing.T) {
 	}
 	want := *before
 	applyTriggerWorkOrder(&want, candidates[winner])
+	if got.WaitingSequence <= 0 {
+		t.Fatalf("winning trigger has invalid FIFO sequence %d", got.WaitingSequence)
+	}
+	want.WaitingSequence = got.WaitingSequence
 	if !reflect.DeepEqual(got, &want) {
 		t.Fatalf("stored trigger is mixed or incomplete:\n got: %#v\nwant: %#v", got, &want)
+	}
+}
+
+func TestCommitBuildTriggerAssignsDurableFIFOSequence(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	var candidates []*types.Build
+	for _, id := range []string{"z-triggered-first", "a-triggered-second"} {
+		registered := buildTriggerFixture(id, types.BuildRegistered)
+		if err := st.PutBuild(ctx, registered); err != nil {
+			t.Fatal(err)
+		}
+		candidate := buildTriggerCandidate(registered, id)
+		candidate.WaitingUnix = 100 // deliberately identical second-resolution time
+		candidates = append(candidates, candidate)
+	}
+	for _, candidate := range candidates {
+		if committed, err := st.CommitBuildTrigger(ctx, candidate); err != nil || !committed {
+			t.Fatalf("CommitBuildTrigger(%s): committed=%t err=%v", candidate.BuildID, committed, err)
+		}
+	}
+	waiting, err := st.BuildsByStatus(ctx, types.BuildWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(waiting) != 2 || waiting[0].BuildID != candidates[0].BuildID || waiting[1].BuildID != candidates[1].BuildID {
+		t.Fatalf("durable FIFO order = %+v", waiting)
+	}
+	if waiting[0].WaitingSequence <= 0 || waiting[1].WaitingSequence != waiting[0].WaitingSequence+1 {
+		t.Fatalf("FIFO sequences = %d, %d", waiting[0].WaitingSequence, waiting[1].WaitingSequence)
 	}
 }
 

@@ -89,8 +89,29 @@ CREATE TABLE IF NOT EXISTS builds (
   aliases_json      TEXT NOT NULL DEFAULT '[]',
   created_unix      INTEGER NOT NULL,
   registry_auth_enc TEXT NOT NULL DEFAULT '',
+  registration_image_repo TEXT NOT NULL DEFAULT '',
+  registration_registry_auth_enc TEXT NOT NULL DEFAULT '',
+  registration_mmds_routes_digest TEXT NOT NULL DEFAULT '',
+  registration_mmds_values_digest TEXT NOT NULL DEFAULT '',
+  cluster_group       TEXT NOT NULL DEFAULT '',
+  resources_cpu      INTEGER NOT NULL,
+  resources_memory   INTEGER NOT NULL,
+  resources_storage  INTEGER NOT NULL DEFAULT 0,
+  phase_resource_json TEXT NOT NULL DEFAULT '',
   metadata_json     TEXT NOT NULL DEFAULT '{}',
-  builder_json      TEXT NOT NULL DEFAULT '{}'
+  builder_json      TEXT NOT NULL DEFAULT '{}',
+  waiting_unix      INTEGER NOT NULL DEFAULT 0,
+  waiting_sequence  INTEGER NOT NULL DEFAULT 0,
+  execution_claimed INTEGER NOT NULL DEFAULT 0,
+  execution_claimed_unix INTEGER NOT NULL DEFAULT 0,
+  enforcement_status TEXT NOT NULL DEFAULT '',
+  phase              TEXT NOT NULL DEFAULT '',
+  phase_sandbox_id   TEXT NOT NULL DEFAULT '',
+  runtime_vswitch_port TEXT NOT NULL DEFAULT '',
+  runtime_floating_ip TEXT NOT NULL DEFAULT '',
+  runtime_port_mac TEXT NOT NULL DEFAULT '',
+  runtime_envd_access_token_enc TEXT NOT NULL DEFAULT '',
+  execution_result_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_ashash ON builds(api_secret_hash);
@@ -132,7 +153,7 @@ CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_ke
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
@@ -754,15 +775,26 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // --- builds (also the template registry) ---
 
 var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json`
+  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
+  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
+  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
+  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
-	var profile, kind, status, names, aliases, apiHash, apiEnc, manifestHash, manifestEnc, raEnc, steps, meta, builder string
+	var profile, kind, status, names, aliases, apiHash, apiEnc, manifestHash, manifestEnc, raEnc, registrationRAEnc, steps, meta, builder string
+	var runtimeEnvdAccessTokenEnc, executionResultJSON string
+	var executionClaimed int
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &apiHash, &apiEnc, &manifestHash, &manifestEnc, &profile, &kind,
-		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder); err != nil {
+		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
+		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.ClusterGroup,
+		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
+		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
+		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &executionResultJSON); err != nil {
 		return nil, err
 	}
+	b.ExecutionClaimed = executionClaimed != 0
 	b.Metadata = uj(meta)
 	b.Builder = ub(builder)
 	if steps != "" && steps != "[]" {
@@ -781,6 +813,23 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 			return nil, fmt.Errorf("store: decrypt registry auth for build %s: %w", b.BuildID, err)
 		}
 	}
+	if registrationRAEnc != "" {
+		if b.RegistrationRegistryAuth, err = s.box.DecryptString(registrationRAEnc); err != nil {
+			return nil, fmt.Errorf("store: decrypt registration registry auth for build %s: %w", b.BuildID, err)
+		}
+	}
+	if runtimeEnvdAccessTokenEnc != "" {
+		if b.RuntimeEnvdAccessToken, err = s.box.DecryptString(runtimeEnvdAccessTokenEnc); err != nil {
+			return nil, fmt.Errorf("store: decrypt runtime envd access token for build %s: %w", b.BuildID, err)
+		}
+	}
+	if executionResultJSON != "" {
+		var result types.BuildResult
+		if err := json.Unmarshal([]byte(executionResultJSON), &result); err != nil {
+			return nil, fmt.Errorf("store: decode execution result for build %s: %w", b.BuildID, err)
+		}
+		b.ExecutionResult = &result
+	}
 	b.Profile, b.Kind, b.Status = types.Profile(profile), types.Kind(kind), types.BuildState(status)
 	b.Names, b.Aliases = ujs(names), ujs(aliases)
 	return &b, nil
@@ -788,8 +837,12 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 
 const buildInsertSQL = `
 	INSERT INTO builds (build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
-	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
+	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
+	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
+	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
+	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -799,8 +852,20 @@ const buildUpsertSQL = buildInsertSQL + `
 	  ready_cmd=excluded.ready_cmd, steps_json=excluded.steps_json,
 	  status=excluded.status, reason=excluded.reason, run_id=excluded.run_id,
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
-	  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
-	  builder_json=excluded.builder_json`
+	  registry_auth_enc=excluded.registry_auth_enc, cluster_group=excluded.cluster_group,
+	  resources_cpu=excluded.resources_cpu, resources_memory=excluded.resources_memory,
+	  resources_storage=excluded.resources_storage, phase_resource_json=excluded.phase_resource_json,
+	  metadata_json=excluded.metadata_json, builder_json=excluded.builder_json,
+	  waiting_unix=excluded.waiting_unix, waiting_sequence=excluded.waiting_sequence,
+	  execution_claimed=excluded.execution_claimed,
+	  execution_claimed_unix=excluded.execution_claimed_unix,
+	  enforcement_status=excluded.enforcement_status, phase=excluded.phase,
+	  phase_sandbox_id=excluded.phase_sandbox_id,
+	  runtime_vswitch_port=excluded.runtime_vswitch_port,
+	  runtime_floating_ip=excluded.runtime_floating_ip,
+	  runtime_port_mac=excluded.runtime_port_mac,
+	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc,
+	  execution_result_json=excluded.execution_result_json`
 
 const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
 
@@ -822,6 +887,26 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 			return nil, fmt.Errorf("store: put build %s: encrypt registry auth: %w", b.BuildID, err)
 		}
 	}
+	var registrationRAEnc string
+	if b.RegistrationRegistryAuth != "" {
+		if registrationRAEnc, err = s.box.EncryptString(b.RegistrationRegistryAuth); err != nil {
+			return nil, fmt.Errorf("store: put build %s: encrypt registration registry auth: %w", b.BuildID, err)
+		}
+	}
+	var runtimeEnvdAccessTokenEnc string
+	if b.RuntimeEnvdAccessToken != "" {
+		if runtimeEnvdAccessTokenEnc, err = s.box.EncryptString(b.RuntimeEnvdAccessToken); err != nil {
+			return nil, fmt.Errorf("store: put build %s: encrypt runtime envd access token: %w", b.BuildID, err)
+		}
+	}
+	executionResultJSON := ""
+	if b.ExecutionResult != nil {
+		encoded, err := json.Marshal(b.ExecutionResult)
+		if err != nil {
+			return nil, fmt.Errorf("store: put build %s: execution result: %w", b.BuildID, err)
+		}
+		executionResultJSON = string(encoded)
+	}
 	stepsJSON := "[]"
 	if len(b.Steps) > 0 {
 		sj, jerr := json.Marshal(b.Steps)
@@ -833,8 +918,21 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 	return []any{
 		b.BuildID, b.TemplateID, b.PersistID, apiHash, apiEnc, manifestHash, manifestEnc, string(b.Profile), string(b.Kind),
 		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID,
-		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder),
+		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc,
+		b.RegistrationImageRepo, registrationRAEnc, b.RegistrationMMDSRoutesDigest, b.RegistrationMMDSValuesDigest, b.ClusterGroup,
+		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage, b.PhaseResourcePatch,
+		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
+		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
+		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
+		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, executionResultJSON,
 	}, nil
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // PutBuild upserts a build record. The credential pair is written only by the
@@ -879,10 +977,13 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, e
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET
 		kind=?, from_image=?, from_template=?, start_cmd=?, ready_cmd=?, steps_json=?,
-		registry_auth_enc=?, metadata_json=?, builder_json=?, status=?
+		registry_auth_enc=?, status=?, waiting_unix=?,
+		waiting_sequence=(SELECT CASE
+			WHEN COALESCE(MAX(waiting_sequence),0) >= 9223372036854775807 THEN NULL
+			ELSE COALESCE(MAX(waiting_sequence),0)+1 END FROM builds)
 		WHERE build_id=? AND status=?`,
 		string(b.Kind), b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
-		registryAuthEnc, mj(b.Metadata), mb(b.Builder), string(types.BuildWaiting),
+		registryAuthEnc, string(types.BuildWaiting), b.WaitingUnix,
 		b.BuildID, string(types.BuildRegistered))
 	if err != nil {
 		return false, fmt.Errorf("store: commit build trigger %s: %w", b.BuildID, err)
@@ -907,6 +1008,35 @@ func (s *Store) GetBuild(ctx context.Context, buildID string) (*types.Build, err
 	return b, nil
 }
 
+// GetClaimedBuildIDByRunID resolves an already-published builder assignment from
+// durable execution ownership. It is the idempotent replay path when the
+// config-socket response was interrupted after BindBuildRun committed.
+func (s *Store) GetClaimedBuildIDByRunID(ctx context.Context, runID string) (string, bool, error) {
+	if runID == "" {
+		return "", false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT build_id FROM builds
+		WHERE run_id=? AND status=? AND execution_claimed=1 ORDER BY build_id LIMIT 2`, runID, string(types.BuildBuilding))
+	if err != nil {
+		return "", false, fmt.Errorf("store: get claimed build by run %s: %w", runID, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", false, fmt.Errorf("store: get claimed build by run %s: %w", runID, err)
+		}
+		return "", false, nil
+	}
+	var buildID string
+	if err := rows.Scan(&buildID); err != nil {
+		return "", false, fmt.Errorf("store: get claimed build by run %s: %w", runID, err)
+	}
+	if rows.Next() {
+		return "", false, fmt.Errorf("store: run %s has multiple claimed builds", runID)
+	}
+	return buildID, true, nil
+}
+
 // GetBuildByTemplateID looks a build up by its (transient) template id — the
 // handle the files endpoint receives (GET /templates/{tid}/files/{hash}), which
 // carries no build id. The transient template id is a per-build uuidv7, so this
@@ -925,7 +1055,11 @@ func (s *Store) GetBuildByTemplateID(ctx context.Context, templateID string) (*t
 
 // BuildsByStatus returns builds in a given state (used by the builder pool + ListTemplates).
 func (s *Store) BuildsByStatus(ctx context.Context, status types.BuildState) ([]*types.Build, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds WHERE status=? ORDER BY created_unix ASC`, string(status))
+	order := "created_unix ASC, build_id ASC"
+	if status == types.BuildWaiting {
+		order = "waiting_sequence ASC"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds WHERE status=? ORDER BY `+order, string(status))
 	if err != nil {
 		return nil, fmt.Errorf("store: builds by status: %w", err)
 	}

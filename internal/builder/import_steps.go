@@ -26,7 +26,7 @@ import (
 
 // --- phase A: import -------------------------------------------------------
 
-func (p *buildPipeline) phaseImport() error {
+func (p *buildPipeline) phaseImport() (retErr error) {
 	s := p.spec
 	importYAML, err := p.importYAML()
 	if err != nil {
@@ -36,7 +36,7 @@ func (p *buildPipeline) phaseImport() error {
 	if err != nil {
 		return err
 	}
-	defer sb.teardown()
+	defer sb.joinTeardownError(&retErr)
 	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 60*time.Second)
 	defer cancelBoot()
 	if err := sb.waitRuntimeReady(bootCtx); err != nil {
@@ -315,7 +315,7 @@ func stepCtxFrom(base map[string]any) *stepCtx {
 	return c
 }
 
-func (p *buildPipeline) phaseSteps() error {
+func (p *buildPipeline) phaseSteps() (retErr error) {
 	s := p.spec
 	baseCfg, err := p.readBaseRuntimeConfig()
 	if err != nil {
@@ -329,7 +329,7 @@ func (p *buildPipeline) phaseSteps() error {
 	if err != nil {
 		return err
 	}
-	defer sb.teardown()
+	defer sb.joinTeardownError(&retErr)
 	bootCtx, cancelBoot := context.WithTimeout(p.ctx, 90*time.Second)
 	defer cancelBoot()
 	if err := sb.waitRuntimeReady(bootCtx); err != nil {

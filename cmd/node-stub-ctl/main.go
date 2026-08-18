@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -107,9 +109,12 @@ func runServe(args []string, log *slog.Logger) error {
 	adminListen := fs.String("admin-listen", "127.0.0.1:0", "admin API listen address")
 	dataListen := fs.String("data-listen", "127.0.0.1:0", "data-plane stub listen address")
 	capacity := fs.Int("capacity", 100, "sandbox capacity per node")
-	buildCPU := fs.Int("build-cpu", 4000, "build CPU capacity in milli-cores")
-	buildMem := fs.Int64("build-mem-bytes", 4<<30, "build memory capacity in bytes")
-	buildStorage := fs.Int64("build-storage-bytes", 0, "build storage capacity in bytes")
+	registrationBuildCPU := fs.Int("registration-build-cpu", 4000, "registration Build CPU capacity in milli-cores")
+	registrationBuildMem := fs.Int64("registration-build-mem-bytes", 4<<30, "registration Build memory capacity in bytes")
+	registrationBuildStorage := fs.Int64("registration-build-storage-bytes", 0, "registration Build storage capacity in bytes")
+	executionBuildCPU := fs.Int("execution-build-cpu", 4000, "execution Build CPU capacity in milli-cores")
+	executionBuildMem := fs.Int64("execution-build-mem-bytes", 4<<30, "execution Build memory capacity in bytes")
+	executionBuildStorage := fs.Int64("execution-build-storage-bytes", 0, "execution Build storage capacity in bytes")
 	heartbeat := fs.Duration("heartbeat", time.Second, "node heartbeat interval")
 	runtimeDigest := fs.String("runtime-digest", "runtime-stub", "runtime digest reported by each node")
 	strictKeys := fs.Bool("strict-keys", true, "reject builds when the referenced key is not installed; creates always require inline API secret material")
@@ -168,12 +173,17 @@ func runServe(args []string, log *slog.Logger) error {
 			labels["slot"] = strconv.Itoa(i)
 		}
 		node := newStubNode(stubNodeOptions{
-			ID:                fmt.Sprintf("%s-%d", *prefix, i),
-			NodeLink:          *nodeLink,
-			DataEndpoint:      svc.dataEndpoint,
-			Labels:            labels,
-			Capacity:          *capacity,
-			BuildCapacity:     &routesync.BuildResources{CPU: *buildCPU, Mem: *buildMem, Storage: *buildStorage},
+			ID:           fmt.Sprintf("%s-%d", *prefix, i),
+			NodeLink:     *nodeLink,
+			DataEndpoint: svc.dataEndpoint,
+			Labels:       labels,
+			Capacity:     *capacity,
+			BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{
+				CPU: int64(*registrationBuildCPU), Memory: *registrationBuildMem, Storage: *registrationBuildStorage,
+			}},
+			BuildExecutionCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{
+				CPU: int64(*executionBuildCPU), Memory: *executionBuildMem, Storage: *executionBuildStorage,
+			}},
 			RuntimeDigest:     *runtimeDigest,
 			StrictKeys:        *strictKeys,
 			HeartbeatInterval: *heartbeat,
@@ -627,17 +637,18 @@ func (s *service) findSandbox(sid string) (*stubNode, *stubSandbox) {
 }
 
 type stubNodeOptions struct {
-	ID                string
-	NodeLink          string
-	DataEndpoint      string
-	Labels            map[string]string
-	Capacity          int
-	BuildCapacity     *routesync.BuildResources
-	RuntimeDigest     string
-	StrictKeys        bool
-	HeartbeatInterval time.Duration
-	CreateDelay       time.Duration
-	BuildDelay        time.Duration
+	ID                        string
+	NodeLink                  string
+	DataEndpoint              string
+	Labels                    map[string]string
+	Capacity                  int
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit
+	RuntimeDigest             string
+	StrictKeys                bool
+	HeartbeatInterval         time.Duration
+	CreateDelay               time.Duration
+	BuildDelay                time.Duration
 }
 
 type stubNode struct {
@@ -654,6 +665,8 @@ type stubNode struct {
 	redirectTo   routesync.NodeLinkTarget
 	sandboxes    map[string]*stubSandbox
 	builds       map[string]*stubBuild
+	buildSeq     int64
+	executionSeq int64
 	keyPairs     map[string]stubKeyPair
 	commands     []commandLog
 	cmdSeq       int64
@@ -696,7 +709,9 @@ func (n *stubNode) start(parent context.Context) {
 	n.session++
 	identity := routesync.NodeRegister{
 		NodeID: n.ID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
-		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		DataEndpoint:              n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
 	}
 	n.mu.Unlock()
 
@@ -855,7 +870,7 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	case routesync.CmdDelete:
 		return n.handleDelete(cmd)
 	case routesync.CmdBuildRegister:
-		return n.handleBuildRegister(cmd)
+		return n.handleBuildRegisterContext(ctx, cmd)
 	default:
 		return ack(cmd, routesync.AckRejected, "unknown command kind")
 	}
@@ -1049,7 +1064,8 @@ func validateStubExecSessionEnvelope(cmd *routesync.Command) error {
 	if cmd.TTLSeconds < 0 || cmd.TimeoutSeconds != 0 || cmd.TemplateRef != "" || len(cmd.Config) != 0 ||
 		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
 		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
-		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" {
+		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" ||
+		len(cmd.BuildMMDSSecrets) != 0 {
 		return errors.New("exec session command contains fields for another operation")
 	}
 	return nil
@@ -1090,33 +1106,96 @@ func (n *stubNode) handleDelete(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
+	return n.handleBuildRegisterContext(context.Background(), cmd)
+}
+
+func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
-		return ack(cmd, routesync.AckRejected, "build_id and template_ref are required")
+		return ackHTTP(cmd, routesync.AckRejected, "build_id and template_ref are required", http.StatusBadRequest)
 	}
 	if !types.Profile(cmd.Profile).Valid() {
-		return ack(cmd, routesync.AckRejected, "valid profile is required")
+		return ackHTTP(cmd, routesync.AckRejected, "valid profile is required", http.StatusBadRequest)
 	}
-	if n.StrictKeys && !n.hasKeyPair(cmd.APISecretFingerprint) {
-		return ack(cmd, routesync.AckRejected, "credential pair not installed")
+	resources := cmd.BuildResources.Types()
+	if err := resources.ValidateRequired(); err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
 	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
-	if beh.BuildResult == "reject" {
-		return ack(cmd, routesync.AckRejected, "stub build rejected")
-	}
 	b := &stubBuild{
 		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
+		RegistrationImageRepo: cmd.ImageRepo, RegistrationRegistryAuth: cmd.RegistryAuth,
+		RegistrationMMDSSecrets: cloneStringMap(cmd.BuildMMDSSecrets),
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
-		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.APISecretFingerprint != b.APISecretFingerprint
+		conflict := !sameStubBuildRegistration(existing, b)
+		terminal := existing.State == "ready" || existing.State == "error"
+		event := &routesync.BuildEvent{
+			BuildID: existing.BuildID, State: existing.State,
+			TemplateID: existing.TemplateID, Reason: existing.Reason,
+		}
 		n.mu.Unlock()
 		if conflict {
-			return ack(cmd, routesync.AckRejected, "build identity conflicts with existing build")
+			return ackHTTP(cmd, routesync.AckRejected, "build immutable definition conflicts with existing build", http.StatusConflict)
+		}
+		if terminal {
+			select {
+			case n.buildEvents <- event:
+				n.svc.logEvent(n.ID, "build_event", event)
+			case <-ctx.Done():
+				return nil
+			}
 		}
 		return ack(cmd, routesync.AckAccepted, "")
 	}
+	// An exact replay after an ambiguous/lost ACK must be recognized before the
+	// mutable credential lease and current admission policy are consulted. The
+	// Registry may otherwise treat key withdrawal as proof that this node had no
+	// side effect and place the same BuildID elsewhere.
+	if n.StrictKeys {
+		if _, ok := n.keyPairLocked(cmd.APISecretFingerprint); !ok {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "credential pair not installed", http.StatusBadRequest)
+		}
+	}
+	if beh.BuildResult == "reject" {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "stub build rejected", http.StatusTooManyRequests)
+	}
+	if !stubAdmissionLimit(n.BuildExecutionCapacity).AllowsOne(resources) {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "build resources cannot fit execution admission", http.StatusBadRequest)
+	}
+	var usedBuilds int64
+	var used types.BuildResources
+	for _, existing := range n.builds {
+		if existing.State != "registered" && existing.State != "building" {
+			continue
+		}
+		if usedBuilds == math.MaxInt64 {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "registration admission usage overflow", http.StatusTooManyRequests)
+		}
+		usedBuilds++
+		var err error
+		used, err = used.Add(existing.Resources.Types())
+		if err != nil {
+			n.mu.Unlock()
+			return ackHTTP(cmd, routesync.AckRejected, "registration admission usage overflow", http.StatusTooManyRequests)
+		}
+	}
+	if !stubAdmissionLimit(n.BuildRegistrationCapacity).AllowsAdd(usedBuilds, used, resources) {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "registration admission capacity exceeded", http.StatusTooManyRequests)
+	}
+	if n.buildSeq == math.MaxInt64 {
+		n.mu.Unlock()
+		return ackHTTP(cmd, routesync.AckRejected, "build registration sequence overflow", http.StatusTooManyRequests)
+	}
+	n.buildSeq++
+	b.RegistrationSeq = n.buildSeq
 	n.builds[b.BuildID] = b
 	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "build_register", b.snapshot(n.ID))
@@ -1134,11 +1213,35 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 	return ack(cmd, routesync.AckAccepted, "")
 }
 
+func sameStubBuildRegistration(a, b *stubBuild) bool {
+	if a == nil || b == nil || a.Resources == nil || b.Resources == nil {
+		return false
+	}
+	return a.Profile == b.Profile && a.TemplateID == b.TemplateID &&
+		a.APISecretFingerprint == b.APISecretFingerprint && *a.Resources == *b.Resources &&
+		maps.Equal(a.Metadata, b.Metadata) && a.RegistrationImageRepo == b.RegistrationImageRepo &&
+		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
+		maps.Equal(a.RegistrationMMDSSecrets, b.RegistrationMMDSSecrets)
+}
+
+func stubAdmissionLimit(limit *routesync.BuildAdmissionLimit) types.BuildAdmissionLimit {
+	if limit == nil {
+		return types.BuildAdmissionLimit{}
+	}
+	out := types.BuildAdmissionLimit{MaxBuilds: limit.MaxBuilds}
+	if limit.Resources != nil {
+		out.Resources = limit.Resources.Types()
+	}
+	return out
+}
+
 func (n *stubNode) Heartbeat() *routesync.Heartbeat {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	var counts int
-	var alloc routesync.BuildResources
+	var registration, execution routesync.BuildAdmissionUsage
+	registration.Resources = &routesync.BuildResources{}
+	execution.Resources = &routesync.BuildResources{}
 	for _, sb := range n.sandboxes {
 		if sb.State == routesync.StateRunning || sb.State == routesync.StatePaused || sb.State == "creating" {
 			counts++
@@ -1146,11 +1249,17 @@ func (n *stubNode) Heartbeat() *routesync.Heartbeat {
 	}
 	for _, b := range n.builds {
 		if b.State == "registered" || b.State == "building" {
-			addBuildResources(&alloc, b.Resources)
+			registration.Builds++
+			addBuildResourcesFailClosed(registration.Resources, b.Resources)
+		}
+		if b.State == "building" {
+			execution.Builds++
+			addBuildResourcesFailClosed(execution.Resources, b.Resources)
 		}
 	}
 	zone := n.Labels["zone"]
-	return &routesync.Heartbeat{Zone: zone, Counts: counts, Draining: n.draining, BuildAlloc: &alloc}
+	return &routesync.Heartbeat{Zone: zone, Counts: counts, Draining: n.draining,
+		BuildRegistrationUsage: &registration, BuildExecutionUsage: &execution}
 }
 
 func (n *stubNode) BuildEvents() <-chan *routesync.BuildEvent { return n.buildEvents }
@@ -1182,14 +1291,13 @@ func (n *stubNode) publish(ev routesync.Event) {
 	}
 }
 
-func (n *stubNode) hasKeyPair(apiSecretFingerprint string) bool {
-	_, ok := n.keyPair(apiSecretFingerprint)
-	return ok
-}
-
 func (n *stubNode) keyPair(apiSecretFingerprint string) (stubKeyPair, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.keyPairLocked(apiSecretFingerprint)
+}
+
+func (n *stubNode) keyPairLocked(apiSecretFingerprint string) (stubKeyPair, bool) {
 	pair, ok := n.keyPairs[apiSecretFingerprint]
 	if !ok {
 		return stubKeyPair{}, false
@@ -1255,13 +1363,18 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	if state == "" {
 		state = "building"
 	}
+	if state == "building" {
+		return n.requestBuildExecution(buildID)
+	}
 	n.mu.Lock()
 	b := n.builds[buildID]
 	if b == nil {
 		n.mu.Unlock()
 		return fmt.Errorf("build not found")
 	}
+	wasBuilding := b.State == "building"
 	b.State = state
+	b.ExecutionReady = false
 	if templateID != "" {
 		b.TemplateID = templateID
 	}
@@ -1271,13 +1384,101 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	ev := &routesync.BuildEvent{BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
 	n.mu.Unlock()
 	if publish {
-		select {
-		case n.buildEvents <- ev:
-		default:
-		}
-		n.svc.logEvent(n.ID, "build_event", ev)
+		n.publishBuildEvent(ev)
+	}
+	if wasBuilding {
+		n.scheduleBuildExecutions()
 	}
 	return nil
+}
+
+func (n *stubNode) requestBuildExecution(buildID string) error {
+	n.mu.Lock()
+	b := n.builds[buildID]
+	if b == nil {
+		n.mu.Unlock()
+		return fmt.Errorf("build not found")
+	}
+	if b.State != "registered" {
+		n.mu.Unlock()
+		return nil
+	}
+	if !b.ExecutionReady {
+		if n.executionSeq == math.MaxInt64 {
+			n.mu.Unlock()
+			return fmt.Errorf("build execution sequence overflow")
+		}
+		n.executionSeq++
+		b.ExecutionReady = true
+		b.ExecutionSeq = n.executionSeq
+	}
+	n.mu.Unlock()
+	n.scheduleBuildExecutions()
+	return nil
+}
+
+// scheduleBuildExecutions models the real node's durable FIFO execution
+// admission closely enough for cluster and fault-injection tests: registered
+// work remains queued until the aggregate count/CPU/memory/storage vector fits.
+func (n *stubNode) scheduleBuildExecutions() {
+	n.mu.Lock()
+	limit := stubAdmissionLimit(n.BuildExecutionCapacity)
+	var usedBuilds int64
+	var used types.BuildResources
+	queued := make([]*stubBuild, 0)
+	for _, b := range n.builds {
+		switch {
+		case b.State == "building":
+			if usedBuilds == math.MaxInt64 {
+				n.mu.Unlock()
+				return
+			}
+			usedBuilds++
+			var err error
+			used, err = used.Add(b.Resources.Types())
+			if err != nil {
+				n.mu.Unlock()
+				return
+			}
+		case b.State == "registered" && b.ExecutionReady:
+			queued = append(queued, b)
+		}
+	}
+	sort.Slice(queued, func(i, j int) bool {
+		if queued[i].ExecutionSeq == queued[j].ExecutionSeq {
+			return queued[i].BuildID < queued[j].BuildID
+		}
+		return queued[i].ExecutionSeq < queued[j].ExecutionSeq
+	})
+	events := make([]*routesync.BuildEvent, 0, len(queued))
+	for _, b := range queued {
+		resources := b.Resources.Types()
+		if !limit.AllowsAdd(usedBuilds, used, resources) {
+			break // strict FIFO: do not bypass the oldest ready Build
+		}
+		next, err := used.Add(resources)
+		if err != nil || usedBuilds == math.MaxInt64 {
+			break
+		}
+		used, usedBuilds = next, usedBuilds+1
+		b.State = "building"
+		b.ExecutionReady = false
+		events = append(events, &routesync.BuildEvent{
+			BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+		})
+	}
+	n.mu.Unlock()
+	for _, event := range events {
+		n.publishBuildEvent(event)
+	}
+}
+
+func (n *stubNode) publishBuildEvent(event *routesync.BuildEvent) {
+	select {
+	case n.buildEvents <- event:
+	default:
+	}
+	n.svc.logEvent(n.ID, "build_event", event)
 }
 
 func (n *stubNode) getSandbox(sid string) *stubSandbox {
@@ -1575,16 +1776,22 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
-	BuildID              string                    `json:"build_id"`
-	Profile              string                    `json:"profile"`
-	APISecretFingerprint string                    `json:"-"`
-	Metadata             map[string]string         `json:"metadata,omitempty"`
-	State                string                    `json:"state"`
-	TemplateID           string                    `json:"template_id,omitempty"`
-	Reason               string                    `json:"reason,omitempty"`
-	Resources            *routesync.BuildResources `json:"resources,omitempty"`
-	Behavior             stubBehavior              `json:"behavior,omitempty"`
-	CreatedAt            string                    `json:"created_at,omitempty"`
+	BuildID                  string                    `json:"build_id"`
+	Profile                  string                    `json:"profile"`
+	APISecretFingerprint     string                    `json:"-"`
+	Metadata                 map[string]string         `json:"metadata,omitempty"`
+	State                    string                    `json:"state"`
+	TemplateID               string                    `json:"template_id,omitempty"`
+	Reason                   string                    `json:"reason,omitempty"`
+	Resources                *routesync.BuildResources `json:"resources,omitempty"`
+	RegistrationImageRepo    string                    `json:"-"`
+	RegistrationRegistryAuth string                    `json:"-"`
+	RegistrationMMDSSecrets  map[string]string         `json:"-"`
+	Behavior                 stubBehavior              `json:"behavior,omitempty"`
+	CreatedAt                string                    `json:"created_at,omitempty"`
+	RegistrationSeq          int64                     `json:"-"`
+	ExecutionReady           bool                      `json:"-"`
+	ExecutionSeq             int64                     `json:"-"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
@@ -1841,6 +2048,10 @@ func ack(cmd *routesync.Command, status, reason string) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason}
 }
 
+func ackHTTP(cmd *routesync.Command, status, reason string, httpStatus int) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus}
+}
+
 func sidFromHost(host string) string {
 	left := host
 	if i := strings.IndexByte(left, '.'); i >= 0 {
@@ -1904,13 +2115,29 @@ func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources
 	return &cp
 }
 
-func addBuildResources(dst *routesync.BuildResources, src *routesync.BuildResources) {
+func cloneBuildAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
+}
+
+func addBuildResourcesFailClosed(dst *routesync.BuildResources, src *routesync.BuildResources) {
 	if src == nil {
 		return
 	}
-	dst.CPU += src.CPU
-	dst.Mem += src.Mem
-	dst.Storage += src.Storage
+	next, err := dst.Types().Add(src.Types())
+	if err != nil {
+		// The stub feeds the same placement path as a real node. Never let a
+		// malformed test fixture or arithmetic wrap advertise false headroom.
+		dst.CPU = math.MaxInt64
+		dst.Memory = math.MaxInt64
+		dst.Storage = math.MaxInt64
+		return
+	}
+	*dst = *routesync.BuildResourcesFromTypes(next)
 }
 
 func randHex(n int) string {

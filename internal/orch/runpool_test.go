@@ -15,18 +15,20 @@ import (
 )
 
 type runPoolTestLauncher struct {
-	started chan string
-	stopped chan string
-	reset   chan string
-	startFn func(context.Context, string) error
-	stopFn  func(context.Context, string) error
+	started   chan string
+	stopped   chan string
+	reset     chan string
+	startFn   func(context.Context, string) error
+	stopFn    func(context.Context, string) error
+	resources map[string]launcher.ResourceProperties
 }
 
 func newRunPoolTestLauncher() *runPoolTestLauncher {
 	l := &runPoolTestLauncher{
-		started: make(chan string, 512),
-		stopped: make(chan string, 512),
-		reset:   make(chan string, 512),
+		started:   make(chan string, 512),
+		stopped:   make(chan string, 512),
+		reset:     make(chan string, 512),
+		resources: make(map[string]launcher.ResourceProperties),
 	}
 	l.startFn = func(ctx context.Context, unit string) error {
 		select {
@@ -63,7 +65,14 @@ func (l *runPoolTestLauncher) List(context.Context, string) ([]launcher.Unit, er
 	return nil, nil
 }
 func (l *runPoolTestLauncher) Reload(context.Context) error { return nil }
-func (l *runPoolTestLauncher) Close() error                 { return nil }
+func (l *runPoolTestLauncher) SetResources(_ context.Context, unit string, p launcher.ResourceProperties) error {
+	l.resources[unit] = p
+	return nil
+}
+func (l *runPoolTestLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
+	return l.resources[unit], nil
+}
+func (l *runPoolTestLauncher) Close() error { return nil }
 
 func testRunUnit(runID string) string { return "sandbox-runner@" + runID + ".service" }
 
@@ -454,6 +463,181 @@ func TestRunPoolStartFailureIsCleanedAndRefilled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("failed pool slot was not replenished")
+	}
+}
+
+func TestRunPoolDemandStartFailureReleasesAssignment(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	startErr := errors.New("injected demand start failure")
+	lc.startFn = func(context.Context, string) error { return startErr }
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 0, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(ctx, "build-with-failed-unit", func(string) error {
+			t.Error("commit ran for a unit that failed to start")
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, startErr) {
+			t.Fatalf("Assign error = %v, want start failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed demand-created unit left assignment pending")
+	}
+}
+
+func TestRunPoolDoesNotBindUnrelatedStartFailureToPendingTask(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	firstGate := make(chan struct{})
+	startErr := errors.New("injected baseline start failure")
+	starts := 0
+	lc.startFn = func(ctx context.Context, unit string) error {
+		select {
+		case lc.started <- unit:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		starts++
+		if starts == 1 {
+			select {
+			case <-firstGate:
+				return startErr
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 1, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	firstUnit := <-lc.started
+	req := &runConsumeReq{
+		taskID: "build-survives-baseline-failure", ctx: ctx,
+		commit: func(string) error { return nil }, resp: make(chan runConsumeResp, 1),
+	}
+	enqueued := make(chan struct{})
+	go func() {
+		p.consumeCh <- req
+		close(enqueued)
+	}()
+	<-enqueued
+	// A second loop request is a barrier: it cannot be answered until the
+	// pending task has caused ensure() to register another in-flight start.
+	if _, _, err := p.WaitAssignment(ctx, "not-a-real-run"); err == nil {
+		t.Fatal("barrier WaitAssignment unexpectedly succeeded")
+	}
+	close(firstGate)
+
+	var secondUnit string
+	select {
+	case secondUnit = <-lc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement/demand unit was not started")
+	}
+	select {
+	case stopped := <-lc.stopped:
+		if stopped != firstUnit {
+			t.Fatalf("stopped unit = %q, want failed baseline %q", stopped, firstUnit)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed baseline unit was not cleaned")
+	}
+	select {
+	case result := <-req.resp:
+		t.Fatalf("unrelated baseline failure completed pending task: %+v", result)
+	default:
+	}
+
+	secondRunID := strings.TrimSuffix(strings.TrimPrefix(secondUnit, "sandbox-builder@"), ".service")
+	taskID, ok, err := p.WaitAssignment(ctx, secondRunID)
+	if err != nil || !ok || taskID != req.taskID {
+		t.Fatalf("replacement assignment = task %q ok %t err %v", taskID, ok, err)
+	}
+	select {
+	case result := <-req.resp:
+		if result.err != nil || result.runID != secondRunID {
+			t.Fatalf("pending task result = %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending task did not use surviving capacity")
+	}
+}
+
+func TestRunPoolBoundsAllFailedPrestartsForPendingTask(t *testing.T) {
+	lc := newRunPoolTestLauncher()
+	firstGate := make(chan struct{})
+	startErr := errors.New("injected persistent start failure")
+	starts := 0
+	lc.startFn = func(ctx context.Context, unit string) error {
+		select {
+		case lc.started <- unit:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		starts++
+		if starts == 1 {
+			select {
+			case <-firstGate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return startErr
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p := newRunPool(runKindBuild, 1, time.Second, t.TempDir(), lc,
+		func(runID string) string { return "sandbox-builder@" + runID + ".service" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-lc.started: // baseline prestart is now blocked inside launcher.Start
+	case <-time.After(time.Second):
+		t.Fatal("baseline prestart did not begin")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Assign(ctx, "build-with-no-startable-unit", func(string) error {
+			t.Error("commit ran although every finite start attempt failed")
+			return nil
+		})
+		done <- err
+	}()
+	// This loop request is a barrier proving the pending assignment was recorded
+	// and its demand-created start attempt was added before the first failure.
+	if _, _, err := p.WaitAssignment(ctx, "not-a-real-run"); err == nil {
+		t.Fatal("barrier WaitAssignment unexpectedly succeeded")
+	}
+	close(firstGate)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, startErr) {
+			t.Fatalf("Assign error = %v, want persistent start failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement failures extended the pending assignment forever")
 	}
 }
 

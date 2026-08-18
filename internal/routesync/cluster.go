@@ -1,5 +1,7 @@
 package routesync
 
+import "github.com/kuasar-sandbox/orchestrator/internal/types"
+
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the execution-state authority (its sandbox routes flow as ID-only
@@ -29,6 +31,7 @@ type PlaceReq struct {
 	SandboxID           string            `json:"sandbox_id,omitempty"`
 	Config              map[string]string `json:"config,omitempty"`
 	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
+	BuildResources      *BuildResources   `json:"build_resources,omitempty"`
 	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
 	ExcludeNodeIDs      []string          `json:"exclude_node_ids,omitempty"`
 }
@@ -86,9 +89,9 @@ const (
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )
 
-// TypeBuildEvent: node -> registry, a build's state transition (cluster.md);
-// the registry converges the BuildStore (§6.1) + releases the build's reserved
-// resources on a terminal state.
+// TypeBuildEvent: node -> registry, a build's state transition (cluster.md).
+// The registry converges routing state; durable admission usage is node-owned
+// and follows the node's persisted Build lifecycle rather than this event.
 const TypeBuildEvent = "build_event"
 
 // BuildEvent reports a build's state up the node-link (§5.1). The node-link
@@ -124,13 +127,14 @@ const (
 // so the registry can place sandboxes (and later builds) on it and forward the
 // data plane to it (cluster.md / §6.1).
 type NodeRegister struct {
-	NodeID         string            `json:"node_id"`
-	Labels         map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
-	Capacity       int               `json:"capacity,omitempty"`        // max sandboxes (headroom signal)
-	BuildCapacity  *BuildResources   `json:"build_capacity,omitempty"`  // CPU/mem/storage build pool (§7.5)
-	DataEndpoint   string            `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
-	RuntimeDigest  string            `json:"runtime_digest,omitempty"`  // guest runtime identity
-	AcceptRedirect bool              `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
+	NodeID                    string               `json:"node_id"`
+	Labels                    map[string]string    `json:"labels,omitempty"`   // zone / pool / slot / node (nodeSelectors)
+	Capacity                  int                  `json:"capacity,omitempty"` // max sandboxes (headroom signal)
+	BuildRegistrationCapacity *BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
+	BuildExecutionCapacity    *BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	DataEndpoint              string               `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
+	RuntimeDigest             string               `json:"runtime_digest,omitempty"`  // guest runtime identity
+	AcceptRedirect            bool                 `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
 }
 
 type NodeLinkRedirect struct {
@@ -142,23 +146,52 @@ type NodeLinkTarget struct {
 	Endpoint string `json:"endpoint"`
 }
 
-// BuildResources is a node's build resource pool (or a build's request), kept
-// independent of sandbox memory because builds run in their own slice (§7.5).
+// BuildResources is a normalized build resource vector. Admission limits and
+// individual build requests use the same wire shape; neither is a sandbox
+// resource reservation.
 type BuildResources struct {
-	CPU     int   `json:"cpu,omitempty"`     // milli-cores
-	Mem     int64 `json:"mem,omitempty"`     // bytes
+	CPU     int64 `json:"cpu,omitempty"`     // milli-cores
+	Memory  int64 `json:"memory,omitempty"`  // bytes
 	Storage int64 `json:"storage,omitempty"` // bytes
+}
+
+type BuildAdmissionLimit struct {
+	MaxBuilds int64           `json:"max_builds,omitempty"`
+	Resources *BuildResources `json:"resources,omitempty"`
+}
+
+type BuildAdmissionUsage struct {
+	Builds            int64           `json:"builds,omitempty"`
+	Resources         *BuildResources `json:"resources,omitempty"`
+	Waiting           int64           `json:"waiting,omitempty"`
+	OldestWaitingUnix int64           `json:"oldest_waiting_unix,omitempty"`
+}
+
+func BuildResourcesFromTypes(in types.BuildResources) *BuildResources {
+	return &BuildResources{CPU: in.CPU, Memory: in.Memory, Storage: in.Storage}
+}
+
+func (r *BuildResources) Types() types.BuildResources {
+	if r == nil {
+		return types.BuildResources{}
+	}
+	return types.BuildResources{CPU: r.CPU, Memory: r.Memory, Storage: r.Storage}
+}
+
+func BuildAdmissionLimitFromTypes(in types.BuildAdmissionLimit) *BuildAdmissionLimit {
+	return &BuildAdmissionLimit{MaxBuilds: in.MaxBuilds, Resources: BuildResourcesFromTypes(in.Resources)}
 }
 
 // Heartbeat is the node's periodic water-level report (cluster.md). Draining
 // is set by node-side drain (node-resource.md §2.5) so placement excludes the node.
 type Heartbeat struct {
-	Zone       string          `json:"zone,omitempty"`
-	Allocated  int64           `json:"allocated,omitempty"`   // memory allocated (bytes)
-	Pool       int64           `json:"pool,omitempty"`        // allocatable pool (bytes)
-	BuildAlloc *BuildResources `json:"build_alloc,omitempty"` // in-flight + reserved build usage
-	Counts     int             `json:"counts,omitempty"`      // live sandbox count (headroom signal)
-	Draining   bool            `json:"draining,omitempty"`
+	Zone                   string               `json:"zone,omitempty"`
+	Allocated              int64                `json:"allocated,omitempty"` // memory allocated (bytes)
+	Pool                   int64                `json:"pool,omitempty"`      // allocatable pool (bytes)
+	BuildRegistrationUsage *BuildAdmissionUsage `json:"build_registration_usage,omitempty"`
+	BuildExecutionUsage    *BuildAdmissionUsage `json:"build_execution_usage,omitempty"`
+	Counts                 int                  `json:"counts,omitempty"` // live sandbox count (headroom signal)
+	Draining               bool                 `json:"draining,omitempty"`
 }
 
 // Command is a lifecycle / key primitive the registry sends the node (cluster.md
@@ -189,12 +222,18 @@ type Command struct {
 	ManifestKeyRef         string `json:"manifest_key_ref,omitempty"`         // provider ref
 	ExpiresUnix            int64  `json:"expires_unix,omitempty"`             // lease expiry (key_put)
 	// build_register (§7.5): pre-provision a build with registry-assigned ids +
-	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
-	// delivered WITH the build task and used transiently (never persisted on the node).
+	// its immutable resource demand. ImageRepo/RegistryAuth are the group's image-pull creds,
+	// delivered WITH the immutable registration command. The node retains them in
+	// protected registration state for exact replay and restart recovery; neither
+	// field becomes portable template metadata.
 	BuildID        string          `json:"build_id,omitempty"`
 	BuildResources *BuildResources `json:"build_resources,omitempty"`
 	ImageRepo      string          `json:"image_repo,omitempty"`
-	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient
+	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	// BuildMMDSSecrets carries request-scoped initial MMDS secret values to the
+	// selected node. The Registry deliberately excludes this field from its
+	// replicated BuildRecord; only the node persists the values, encrypted.
+	BuildMMDSSecrets map[string]string `json:"build_mmds_secrets,omitempty"`
 }
 
 // ConnectResult is the synchronous result of an accepted CmdConnect. It projects

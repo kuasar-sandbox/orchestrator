@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // --- yaml renderers -----------------------------------------------------------
@@ -52,12 +53,7 @@ func tapFDDoc(t configsock.TapFDConfig) map[string]any {
 	return doc
 }
 
-func (p *buildPipeline) resourcesDoc() map[string]any {
-	return map[string]any{
-		"capacity":    map[string]any{"cpu": p.spec.VCPU, "memory": p.spec.Memory},
-		"allocatable": map[string]any{"cpu": float64(p.spec.VCPU), "memory": p.spec.Memory},
-	}
-}
+func (p *buildPipeline) resourcesDoc() rtconfig.ResourcesConfig { return p.spec.Resources }
 
 func (p *buildPipeline) dnsFiles() []map[string]any {
 	if len(p.spec.Net.DNS) == 0 {
@@ -268,13 +264,6 @@ func firstLine(b []byte) string {
 	}
 	if len(s) > 200 {
 		s = s[:200]
-	}
-	return s
-}
-
-func shortBID(s string) string {
-	if len(s) > 8 {
-		return s[:8]
 	}
 	return s
 }

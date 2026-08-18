@@ -645,9 +645,9 @@ func shardDeleteIfFound(ctx context.Context, sh *shardkv.RecordSet, key shardkv.
 func nodeProfileFromRegistry(n *NodeRecord) clusterstate.NodeProfileRecord {
 	return clusterstate.NodeProfileRecord{
 		NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
-		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity), BuildExecutionCapacity: cloneBuildAdmissionLimit(n.BuildExecutionCapacity), DataEndpoint: n.DataEndpoint,
 		RuntimeDigest: n.RuntimeDigest, Zone: n.Zone, Allocated: n.Allocated, Pool: n.Pool,
-		BuildAlloc: cloneBuildResources(n.BuildAlloc), Counts: n.Counts, Draining: n.Draining,
+		BuildRegistrationUsage: cloneBuildAdmissionUsage(n.BuildRegistrationUsage), BuildExecutionUsage: cloneBuildAdmissionUsage(n.BuildExecutionUsage), Counts: n.Counts, Draining: n.Draining,
 		LastHeartbeatUnix: n.LastHeartbeatUnix, ResumeToken: n.ResumeToken, LinkOwner: n.LinkOwner,
 	}
 }
@@ -656,9 +656,9 @@ func nodeRecordFromProfile(p clusterstate.NodeProfileRecord, meta shardkv.Record
 	return &NodeRecord{
 		Meta:   clusterRecordMeta(meta),
 		NodeID: p.NodeID, Labels: cloneStringMap(p.Labels), Capacity: p.Capacity,
-		BuildCapacity: cloneBuildResources(p.BuildCapacity), DataEndpoint: p.DataEndpoint,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(p.BuildRegistrationCapacity), BuildExecutionCapacity: cloneBuildAdmissionLimit(p.BuildExecutionCapacity), DataEndpoint: p.DataEndpoint,
 		RuntimeDigest: p.RuntimeDigest, Zone: p.Zone, Allocated: p.Allocated, Pool: p.Pool,
-		BuildAlloc: cloneBuildResources(p.BuildAlloc), Counts: p.Counts, Draining: p.Draining,
+		BuildRegistrationUsage: cloneBuildAdmissionUsage(p.BuildRegistrationUsage), BuildExecutionUsage: cloneBuildAdmissionUsage(p.BuildExecutionUsage), Counts: p.Counts, Draining: p.Draining,
 		LastHeartbeatUnix: p.LastHeartbeatUnix, ResumeToken: p.ResumeToken, LinkOwner: p.LinkOwner,
 	}
 }

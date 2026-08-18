@@ -3,6 +3,7 @@ package vswitch
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"strings"
@@ -47,6 +48,49 @@ func TestDetachUsesTapFDSocketRelease(t *testing.T) {
 	}
 	if got, want := <-reqCh, "TAPFD/1 RELEASE VSWITCH=sw0 PORT=12\n"; got != want {
 		t.Fatalf("request = %q, want %q", got, want)
+	}
+}
+
+func TestDetachRecognizesExactAlreadyReleasedResponse(t *testing.T) {
+	sock, _, closeFn := serveTapFDOnce(t, "TAPFD/1 ERR code=PORT_UNAVAILABLE message=port_12:_port_not_attached\n")
+	defer closeFn()
+	c := New("connector-ctl", "sw0", WithTapFDSocket(sock))
+
+	err := c.Detach(context.Background(), "12")
+	if !errors.Is(err, ErrPortNotAttached) {
+		t.Fatalf("Detach error = %v, want ErrPortNotAttached", err)
+	}
+}
+
+func TestDetachDoesNotBroadenPortUnavailable(t *testing.T) {
+	sock, _, closeFn := serveTapFDOnce(t, "TAPFD/1 ERR code=PORT_UNAVAILABLE message=port_12:_port_not_provisioned\n")
+	defer closeFn()
+	c := New("connector-ctl", "sw0", WithTapFDSocket(sock))
+
+	err := c.Detach(context.Background(), "12")
+	if err == nil || errors.Is(err, ErrPortNotAttached) {
+		t.Fatalf("Detach error = %v, want ordinary provider failure", err)
+	}
+}
+
+func TestCLIPortNotAttachedRequiresExactPortError(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		stderr string
+		port   string
+		want   bool
+	}{
+		{name: "cobra", stderr: "Error: port 12: port not attached\n", port: "12", want: true},
+		{name: "main echo", stderr: "port 12: port not attached\n", port: "012", want: true},
+		{name: "other port", stderr: "Error: port 13: port not attached\n", port: "12"},
+		{name: "other unavailable", stderr: "Error: port 12: port not provisioned\n", port: "12"},
+		{name: "embedded", stderr: "failure: port 12: port not attached\n", port: "12"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cliPortNotAttached(tt.stderr, tt.port); got != tt.want {
+				t.Fatalf("cliPortNotAttached(%q, %q) = %t, want %t", tt.stderr, tt.port, got, tt.want)
+			}
+		})
 	}
 }
 

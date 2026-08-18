@@ -7,16 +7,16 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// BuildStore is the registry-facing view of build execution state. Builds are
-// stored as route_link build records and tracked through registered → building
-// → ready/error. A registered/building build's resources occupy its node's
-// build pool (§7.5 "RESERVED 即占用"); a terminal (ready/error) build no longer
-// occupies.
+// BuildStore is the registry-facing routing view of build execution state. Builds
+// are stored as route_link build records and tracked through registered →
+// building → ready/error. The node's SQLite state and heartbeat are the
+// authoritative source for admission usage.
 
 // BuildState mirrors the node's build lifecycle for placement accounting.
 type BuildState string
 
 const (
+	BuildStarting   BuildState = "starting"
 	BuildRegistered BuildState = "registered"
 	BuildBuilding   BuildState = "building"
 	BuildReady      BuildState = "ready"
@@ -25,21 +25,32 @@ const (
 
 // BuildRecord is the registry's view of a build (the node runs it + reports state).
 type BuildRecord struct {
-	Group                string                    `json:"group"`
-	BuildID              string                    `json:"build_id"`
-	NodeID               string                    `json:"node_id"`
-	Profile              types.Profile             `json:"profile"`
-	APISecretFingerprint string                    `json:"api_secret_fingerprint"`
-	Resources            *routesync.BuildResources `json:"resources,omitempty"`
-	State                BuildState                `json:"state"`
-	TemplateID           string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
-	Reason               string                    `json:"reason,omitempty"`
-	CreatedU             int64                     `json:"created_unix,omitempty"`
+	Group                        string                    `json:"group"`
+	BuildID                      string                    `json:"build_id"`
+	NodeID                       string                    `json:"node_id"`
+	Profile                      types.Profile             `json:"profile"`
+	APISecretFingerprint         string                    `json:"api_secret_fingerprint"`
+	Resources                    *routesync.BuildResources `json:"resources,omitempty"`
+	RegistrationConfig           map[string]string         `json:"registration_config,omitempty"`
+	RegistrationMMDSValuesDigest string                    `json:"registration_mmds_values_digest,omitempty"`
+	RegistrationImageRepo        string                    `json:"registration_image_repo,omitempty"`
+	RegistrationRegistryAuth     string                    `json:"registration_registry_auth,omitempty"`
+	State                        BuildState                `json:"state"`
+	TemplateID                   string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	Reason                       string                    `json:"reason,omitempty"`
+	CreatedU                     int64                     `json:"created_unix,omitempty"`
+
+	// registrationMMDSSecrets exists only on the current ReserveBuild call. It
+	// is intentionally unexported so shard serialization can never persist
+	// tenant MMDS values in the replicated Registry record.
+	registrationMMDSSecrets map[string]string
 }
 
-// occupies reports whether the build still holds its reserved build resources
-// (registered/building do; ready/error released).
-func (b *BuildRecord) occupies() bool { return b.State == BuildRegistered || b.State == BuildBuilding }
+// occupies reports whether the registry still considers the build live for node
+// ownership and disconnect reconciliation. It does not calculate admission usage.
+func (b *BuildRecord) occupies() bool {
+	return b.State == BuildStarting || b.State == BuildRegistered || b.State == BuildBuilding
+}
 
 func (s *Stores) PutBuild(ctx context.Context, b *BuildRecord) error {
 	_, err := s.putRouteBuildShard(ctx, b)

@@ -148,7 +148,7 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 			BuildID: "build-123456", RunID: "run-1", Workdir: dir,
 			Paths: configsock.BuildPaths{SandboxCtl: script},
 		},
-		log: testBuilderLogger(),
+		log: testBuilderLogger(), vmmCgroup: testVMMCgroupFD(t),
 	}
 	sb, err := p.startSandbox("a", map[string]any{"launch": map[string]any{"placeholder": true}}, nil)
 	if err != nil {
@@ -162,13 +162,13 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 			readyArg = arg
 		}
 	}
-	if readyArg != "--ready-fd=3" {
-		t.Fatalf("ready arg = %q, want --ready-fd=3", readyArg)
+	if readyArg != "--ready-fd=4" {
+		t.Fatalf("ready arg = %q, want --ready-fd=4", readyArg)
 	}
-	if len(sb.cmd.ExtraFiles) != 1 {
+	if len(sb.cmd.ExtraFiles) != 2 {
 		t.Fatalf("ExtraFiles count = %d", len(sb.cmd.ExtraFiles))
 	}
-	if _, err := sb.cmd.ExtraFiles[0].Write([]byte("x")); err == nil {
+	if _, err := sb.cmd.ExtraFiles[1].Write([]byte("x")); err == nil {
 		t.Fatal("parent readiness writer remained open after Start")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -179,6 +179,7 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 }
 
 func TestStartSandboxFailureClosesReadinessPipe(t *testing.T) {
+	vmmCgroup := testVMMCgroupFD(t)
 	before, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Skipf("count open descriptors: %v", err)
@@ -188,7 +189,7 @@ func TestStartSandboxFailureClosesReadinessPipe(t *testing.T) {
 			BuildID: "build-failure", Workdir: t.TempDir(),
 			Paths: configsock.BuildPaths{SandboxCtl: "/definitely/missing/sandbox-ctl"},
 		},
-		log: testBuilderLogger(),
+		log: testBuilderLogger(), vmmCgroup: vmmCgroup,
 	}
 	for range 10 {
 		if _, err := p.startSandbox("a", map[string]any{}, nil); err == nil {
@@ -217,7 +218,7 @@ func TestPhaseImportUsesRuntimeEventsWithoutExecProbe(t *testing.T) {
 			Paths:    configsock.BuildPaths{SandboxCtl: script},
 			Timeouts: configsock.BuildTimeouts{PullSec: 1},
 		},
-		ctx: ctx, log: testBuilderLogger(),
+		ctx: ctx, log: testBuilderLogger(), vmmCgroup: testVMMCgroupFD(t),
 	}
 	if err := p.phaseImport(); err == nil {
 		t.Fatal("phaseImport unexpectedly succeeded with failing fake exec")
@@ -233,6 +234,20 @@ func TestPhaseImportUsesRuntimeEventsWithoutExecProbe(t *testing.T) {
 	if !strings.Contains(got, guestFlatten) || !strings.Contains(got, " export ") {
 		t.Fatalf("first phase A exec was not the import operation: %s", got)
 	}
+}
+
+func testVMMCgroupFD(t *testing.T) *os.File {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	return fd
 }
 
 func pipePhaseSandbox(t *testing.T) (*phaseSandbox, *os.File) {
