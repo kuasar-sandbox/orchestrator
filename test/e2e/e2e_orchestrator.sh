@@ -160,12 +160,12 @@ echo "==> PASS: control plane up; auth rejects missing/malformed keys (401)"
 
 # A valid api key whose APISecret+ManifestKey pair is NOT allowlisted: passes the format check
 # (not 401) but create/register is refused with 403.
-code=$(req POST /v3/templates "$AK_OTHER" '{"name":"denied"}')
+code=$(req POST /v3/templates "$AK_OTHER" '{"name":"denied","cpuCount":1,"memoryMB":1024}')
 [ "$code" = "403" ] || fail "register with non-allowlisted key = $code (want 403)"
 echo "==> PASS: non-allowlisted credential pair refused (403)"
 
 # ---- 3. build API (e2b v3) + ownership ------------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"]}')
+code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"],"cpuCount":1,"memoryMB":1024}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register = $code (want 202)"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)

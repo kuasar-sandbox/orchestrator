@@ -85,6 +85,26 @@ type partialMMDS struct {
 // header is nil when X-Kuasar-Sandbox-MMDS was absent; a non-nil empty string is
 // an explicitly supplied malformed document and is rejected.
 func ExtractMMDS(meta map[string]string, header *string, policy MMDSPolicy) (MMDSDocument, map[string]string, error) {
+	return extractMMDS(meta, header, policy, true)
+}
+
+// ExtractMMDSReplay strictly normalizes a previously accepted registration
+// without reapplying mutable node admission policy. The durable registration
+// row and its confidential value digest remain authoritative for the final
+// identity comparison. This path is only for same-owner replay after an
+// ambiguous/lost acknowledgement; new registrations must use ExtractMMDS.
+func ExtractMMDSReplay(meta map[string]string, header *string) (MMDSDocument, map[string]string, error) {
+	maxInt := int(^uint(0) >> 1)
+	return extractMMDS(meta, header, MMDSPolicy{
+		Enabled:             true,
+		MaxRoutesPerSandbox: maxInt,
+		MaxNamespaceBytes:   maxInt,
+		MaxStaticBodyBytes:  maxInt,
+		MaxSecretValueBytes: maxInt,
+	}, false)
+}
+
+func extractMMDS(meta map[string]string, header *string, policy MMDSPolicy, requireServices bool) (MMDSDocument, map[string]string, error) {
 	var metadataRaw *string
 	if raw, ok := meta[NsMMDS]; ok {
 		copy := raw
@@ -119,7 +139,7 @@ func ExtractMMDS(meta map[string]string, header *string, policy MMDSPolicy) (MMD
 	if headerPart.routesPresent {
 		effective.routes, effective.routesPresent = headerPart.routes, true
 	}
-	doc, err := validateMMDSEffective(effective, policy, true)
+	doc, err := validateMMDSEffective(effective, policy, requireServices)
 	if err != nil {
 		return MMDSDocument{}, nil, err
 	}

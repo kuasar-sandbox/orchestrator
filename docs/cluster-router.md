@@ -114,7 +114,7 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面;stats body 无 SID,无需响应身份适配 |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + stable sandbox_id + target | 已知 NodeSandboxID/DataEndpoint 即直接建立一次性 node CONNECT,包括 paused/starting;target 缺失或 typed stale 才 fallback `operation=data`;miss 先 Resolve |
-| build register | group + build_id | 生成稳定 id,将 register resource body/Header 与 `cpuCount/memoryMB` 逐 leaf 合并后调用 `ReserveBuild` |
+| build register | group + build_id | 规范化 body/Builder header 为 Build.Resources,独立解析 phase ResourcePatch,再调用 `ReserveBuild`;选中节点执行最终 registration admission |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
 `route_key` 是 group 内 route 定位键,`sandbox_id` 是稳定公开身份。Registry 在首次 create 时生成

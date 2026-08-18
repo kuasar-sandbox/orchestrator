@@ -54,8 +54,12 @@ type TemplateStep struct {
 // BuildOptions are build-only controls. They are intentionally separate from
 // Build.Metadata, which becomes the template's default sandbox config.
 type BuildOptions struct {
-	Referer  *BuildRefererOptions  `json:"referer,omitempty" yaml:"referer,omitempty"`
-	Registry *BuildRegistryOptions `json:"registry,omitempty" yaml:"registry,omitempty"`
+	// Resources is accepted only in the registration-time builder namespace.
+	// Core normalizes it into Build.Resources and clears this definition copy
+	// before persistence so there is one durable resource authority.
+	Resources *BuildResources       `json:"resources,omitempty" yaml:"resources,omitempty"`
+	Referer   *BuildRefererOptions  `json:"referer,omitempty" yaml:"referer,omitempty"`
+	Registry  *BuildRegistryOptions `json:"registry,omitempty" yaml:"registry,omitempty"`
 }
 
 type BuildRefererOptions struct {
@@ -81,6 +85,18 @@ type BuildRegistryTLSOptions struct {
 	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 }
 
+// BuildResult is the immutable pipeline result accepted from run-builder. It
+// is persisted while the execution claim is still held so a controller restart
+// can finish unit/runtime cleanup without losing a successful result. None of
+// these fields contains tenant credentials.
+type BuildResult struct {
+	ImageRef    string `json:"image_ref,omitempty"`
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
+	StartCmd    string `json:"start_cmd,omitempty"`
+	ReadyCmd    string `json:"ready_cmd,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
 // Build is one template build, doubling as the template record.
 type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
@@ -93,21 +109,65 @@ type Build struct {
 	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
 	FromTemplate string  // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
 	RegistryAuth string  // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
-	StartCmd     string  // e2b only; non-empty => snapshot build (kind=snp)
-	ReadyCmd     string  // e2b only; readiness probe run after StartCmd (poll until exit 0)
-	Steps        []TemplateStep
-	Status       BuildState
-	Reason       string   // error detail
-	RunID        string   // current systemd builder runner instance id
-	Names        []string // user-supplied name(s) + persist id (when ready)
-	Aliases      []string // user-supplied alias(es) + persist id (when ready)
-	// Metadata is the template's default sandbox config — the same kuasar-sandbox.<ns>
-	// namespaced keys a create carries (register cpu/memory + X-Kuasar-Sandbox-*
-	// headers land here; trigger overrides). It drives the build's phase-C capacity
-	// and is layered under a create's own config (create wins) when launching from
-	// this template.
+	// RegistrationImageRepo and RegistrationRegistryAuth retain the exact
+	// registry-owned cluster Register input for durable BuildID replay checks.
+	// They are node-internal, never become template metadata, and the credential
+	// is encrypted at rest independently from the trigger work order above.
+	RegistrationImageRepo    string
+	RegistrationRegistryAuth string
+	// RegistrationMMDSRoutesDigest retains the immutable registration identity
+	// of builder-only MMDS routes after terminal cleanup removes those routes and
+	// their confidential values from the portable template record.
+	RegistrationMMDSRoutesDigest string
+	// RegistrationMMDSValuesDigest is a keyed, irreversible identity for the
+	// initial confidential MMDS values. It lets an exact registration replay be
+	// verified after terminal cleanup has deliberately removed the ciphertext.
+	RegistrationMMDSValuesDigest string
+	StartCmd                     string // e2b only; non-empty => snapshot build (kind=snp)
+	ReadyCmd                     string // e2b only; readiness probe run after StartCmd (poll until exit 0)
+	Steps                        []TemplateStep
+	Status                       BuildState
+	Reason                       string   // error detail
+	RunID                        string   // current systemd builder runner instance id
+	Names                        []string // user-supplied name(s) + persist id (when ready)
+	Aliases                      []string // user-supplied alias(es) + persist id (when ready)
+	// Resources is the immutable outer Build demand used by registration and
+	// execution admission plus systemd enforcement. It never becomes sandbox
+	// capacity/allocatable/startup and never enters a snapshot.
+	Resources BuildResources
+	// PhaseResourcePatch is canonical kuasar-sandbox.resource JSON used only to
+	// resolve the A/B/C phase sandboxes on this node. It is not portable template
+	// metadata and therefore cannot affect a later IMG Create.
+	PhaseResourcePatch string
+	// Metadata is portable template metadata. Build-only options and the phase
+	// resource patch are removed before it is stored here.
 	Metadata map[string]string
 	Builder  BuildOptions
+	// ClusterGroup is node-internal durable ownership for registry-driven
+	// Builds. It is deliberately separate from portable template Metadata.
+	ClusterGroup string
+
+	// Durable execution ownership and timestamps make both admission ledgers
+	// reconstructable from SQLite after a controller restart.
+	WaitingUnix          int64
+	WaitingSequence      int64
+	ExecutionClaimed     bool
+	ExecutionClaimedUnix int64
+	EnforcementStatus    string
+	Phase                string
+	PhaseSandboxID       string
+	// Runtime network ownership is persisted only while execution is claimed so
+	// a controller restart can reattach to a live builder unit or safely reclaim
+	// its host resources. The token is encrypted by Store and never enters
+	// portable metadata or a template artifact.
+	RuntimeVswitchPort     string
+	RuntimeFloatingIP      string
+	RuntimePortMAC         string
+	RuntimeEnvdAccessToken string
+	// ExecutionResult is set atomically before the config-socket acknowledges
+	// run-builder's report. Terminal persistence clears it together with the
+	// execution claim after the unit and host runtime have been reclaimed.
+	ExecutionResult *BuildResult
 
 	CreatedUnix int64
 }

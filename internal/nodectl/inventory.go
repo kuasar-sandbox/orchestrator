@@ -308,6 +308,16 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 			if !entry.IsDir() {
 				return nil
 			}
+			// ctl is the node-owned control subgroup created by the trusted
+			// runner helper. sandbox-ctl and, for Builder phases, run-builder
+			// live there while only the sibling vmm subgroup contains the
+			// sandbox consumer. Charging ctl would account BuildResources as a
+			// second nodectl reservation and, on restart, conservatively consume
+			// the whole pool for the run-builder process. No sandbox process is
+			// permitted to be born in this subgroup.
+			if trustedTaskControlCgroup(root, path) {
+				return filepath.SkipDir
+			}
 			populated, err := readCgroupPopulated(path)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -356,6 +366,25 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 		}
 	}
 	return nil
+}
+
+// trustedTaskControlCgroup recognizes only the node-owned ctl sibling created
+// directly beneath a systemd service instance inside the configured scan root.
+// A broader basename-based exemption could hide an unrelated populated cgroup
+// named ctl, violating recovery's conservative upper-bound contract.
+func trustedTaskControlCgroup(root, candidate string) bool {
+	if filepath.Base(candidate) != "ctl" {
+		return false
+	}
+	service := filepath.Dir(candidate)
+	if !strings.HasSuffix(filepath.Base(service), ".service") {
+		return false
+	}
+	rel, err := filepath.Rel(root, service)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return rel == "." || !strings.Contains(rel, string(filepath.Separator))
 }
 
 func (i *Inventory) LookupLiveLease(sid string) (LiveLease, error) {

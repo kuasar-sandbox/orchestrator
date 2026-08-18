@@ -21,6 +21,10 @@ import (
 
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }
 
+func testBuildResources() types.BuildResources {
+	return types.BuildResources{CPU: 2000, Memory: 2 << 30}
+}
+
 func deriveTestAPISecret(t *testing.T, manifestKey string) string {
 	t.Helper()
 	raw, err := hex.DecodeString(manifestKey)
@@ -55,6 +59,20 @@ func testOrchCfg(t *testing.T, cfg *config.Config) *Orchestrator {
 
 func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrator {
 	t.Helper()
+	if cfg.Builder.Admission.Execution == nil {
+		maxBuilds := int64(2)
+		cfg.Builder.Admission.Execution = &config.BuildAdmissionLimitConfig{MaxBuilds: &maxBuilds}
+	}
+	if cfg.Builder.Admission.Registration == nil {
+		maxBuilds := int64(2)
+		cfg.Builder.Admission.Registration = &config.BuildAdmissionLimitConfig{MaxBuilds: &maxBuilds}
+	}
+	if cfg.Builder.RegistrationTTL == "" {
+		cfg.Builder.RegistrationTTL = "1h"
+	}
+	if cfg.Builder.QueueTTL == "" {
+		cfg.Builder.QueueTTL = "30m"
+	}
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +83,10 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	}
 	t.Cleanup(func() { st.Close() })
 	o := New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// General unit fixtures model a controller after startup reconciliation.
+	// Recovery-boundary tests construct Orchestrator directly and control this
+	// gate explicitly.
+	o.buildRecoveryReadyOnce.Do(func() { close(o.buildRecoveryReady) })
 	installDefaultSnapshotInspector(o)
 	return o
 }

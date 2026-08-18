@@ -37,19 +37,21 @@ const (
 
 // NodeRecord is the registry-facing node_link view.
 type NodeRecord struct {
-	Meta          clusterstate.RecordMeta   `json:"meta,omitempty"`
-	NodeID        string                    `json:"node_id"`
-	Labels        map[string]string         `json:"labels,omitempty"`
-	Capacity      int                       `json:"capacity,omitempty"`
-	BuildCapacity *routesync.BuildResources `json:"build_capacity,omitempty"`
-	DataEndpoint  string                    `json:"data_endpoint,omitempty"`
-	RuntimeDigest string                    `json:"runtime_digest,omitempty"`
-	Zone          string                    `json:"zone,omitempty"`
-	Allocated     int64                     `json:"allocated,omitempty"`
-	Pool          int64                     `json:"pool,omitempty"`
-	BuildAlloc    *routesync.BuildResources `json:"build_alloc,omitempty"`
-	Counts        int                       `json:"counts,omitempty"`
-	Draining      bool                      `json:"draining,omitempty"`
+	Meta                      clusterstate.RecordMeta        `json:"meta,omitempty"`
+	NodeID                    string                         `json:"node_id"`
+	Labels                    map[string]string              `json:"labels,omitempty"`
+	Capacity                  int                            `json:"capacity,omitempty"`
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
+	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
+	Zone                      string                         `json:"zone,omitempty"`
+	Allocated                 int64                          `json:"allocated,omitempty"`
+	Pool                      int64                          `json:"pool,omitempty"`
+	BuildRegistrationUsage    *routesync.BuildAdmissionUsage `json:"build_registration_usage,omitempty"`
+	BuildExecutionUsage       *routesync.BuildAdmissionUsage `json:"build_execution_usage,omitempty"`
+	Counts                    int                            `json:"counts,omitempty"`
+	Draining                  bool                           `json:"draining,omitempty"`
 	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
 	// dead-node sweep resets a disconnected node whose last beat predates
 	// node_dead_after.
@@ -1022,26 +1024,28 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		st = clusterstate.NodeDrained
 	}
 	return clusterstate.NodeRecord{
-		Meta:              n.Meta,
-		NodeID:            n.NodeID,
-		State:             st,
-		Labels:            cloneStringMap(n.Labels),
-		Capacity:          n.Capacity,
-		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
-		DataEndpoint:      n.DataEndpoint,
-		RuntimeDigest:     n.RuntimeDigest,
-		Zone:              n.Zone,
-		Allocated:         n.Allocated,
-		Pool:              n.Pool,
-		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
-		Counts:            n.Counts,
-		Draining:          n.Draining,
-		LastHeartbeatUnix: n.LastHeartbeatUnix,
-		ResumeToken:       n.ResumeToken,
-		LinkOwner:         n.LinkOwner,
-		KeyPairs:          cloneNodeKeyPairs(n.KeyPairs),
-		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
-		Builds:            cloneNodeBuildRefs(n.Builds),
+		Meta:                      n.Meta,
+		NodeID:                    n.NodeID,
+		State:                     st,
+		Labels:                    cloneStringMap(n.Labels),
+		Capacity:                  n.Capacity,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		DataEndpoint:              n.DataEndpoint,
+		RuntimeDigest:             n.RuntimeDigest,
+		Zone:                      n.Zone,
+		Allocated:                 n.Allocated,
+		Pool:                      n.Pool,
+		BuildRegistrationUsage:    cloneBuildAdmissionUsage(n.BuildRegistrationUsage),
+		BuildExecutionUsage:       cloneBuildAdmissionUsage(n.BuildExecutionUsage),
+		Counts:                    n.Counts,
+		Draining:                  n.Draining,
+		LastHeartbeatUnix:         n.LastHeartbeatUnix,
+		ResumeToken:               n.ResumeToken,
+		LinkOwner:                 n.LinkOwner,
+		KeyPairs:                  cloneNodeKeyPairs(n.KeyPairs),
+		Sandboxes:                 cloneNodeSandboxRefs(n.Sandboxes),
+		Builds:                    cloneNodeBuildRefs(n.Builds),
 	}
 }
 
@@ -1050,25 +1054,27 @@ func cloneNodeRecord(n *NodeRecord) *NodeRecord {
 		return nil
 	}
 	return &NodeRecord{
-		Meta:              n.Meta,
-		NodeID:            n.NodeID,
-		Labels:            cloneStringMap(n.Labels),
-		Capacity:          n.Capacity,
-		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
-		DataEndpoint:      n.DataEndpoint,
-		RuntimeDigest:     n.RuntimeDigest,
-		Zone:              n.Zone,
-		Allocated:         n.Allocated,
-		Pool:              n.Pool,
-		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
-		Counts:            n.Counts,
-		Draining:          n.Draining,
-		LastHeartbeatUnix: n.LastHeartbeatUnix,
-		ResumeToken:       n.ResumeToken,
-		LinkOwner:         n.LinkOwner,
-		KeyPairs:          cloneNodeKeyPairs(n.KeyPairs),
-		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
-		Builds:            cloneNodeBuildRefs(n.Builds),
+		Meta:                      n.Meta,
+		NodeID:                    n.NodeID,
+		Labels:                    cloneStringMap(n.Labels),
+		Capacity:                  n.Capacity,
+		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		DataEndpoint:              n.DataEndpoint,
+		RuntimeDigest:             n.RuntimeDigest,
+		Zone:                      n.Zone,
+		Allocated:                 n.Allocated,
+		Pool:                      n.Pool,
+		BuildRegistrationUsage:    cloneBuildAdmissionUsage(n.BuildRegistrationUsage),
+		BuildExecutionUsage:       cloneBuildAdmissionUsage(n.BuildExecutionUsage),
+		Counts:                    n.Counts,
+		Draining:                  n.Draining,
+		LastHeartbeatUnix:         n.LastHeartbeatUnix,
+		ResumeToken:               n.ResumeToken,
+		LinkOwner:                 n.LinkOwner,
+		KeyPairs:                  cloneNodeKeyPairs(n.KeyPairs),
+		Sandboxes:                 cloneNodeSandboxRefs(n.Sandboxes),
+		Builds:                    cloneNodeBuildRefs(n.Builds),
 	}
 }
 

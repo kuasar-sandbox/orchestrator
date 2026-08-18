@@ -46,6 +46,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -66,17 +67,33 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if err := lockPidfile(*pidfile); err != nil {
 		return err
 	}
-	bid, err := configsock.WaitAssignment(context.Background(), *socket, "build", *runID)
+	vmmCgroup, err := prepareBuilderCgroup(*runID)
+	if err != nil {
+		return fmt.Errorf("prepare builder cgroup: %w", err)
+	}
+	defer vmmCgroup.Close()
+	var bid string
+	err = retryBuildConfigSocket(context.Background(), log, "assignment", func(ctx context.Context) error {
+		var callErr error
+		bid, callErr = configsock.WaitAssignment(ctx, *socket, "build", *runID)
+		return callErr
+	})
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
-	runRoot := filepath.Dir(filepath.Dir(*pidfile))
-	if err := lockPidfile(filepath.Join(runRoot, bid, bid+".pid")); err != nil {
+	if err := lockPidfile(builderAssignmentPidfile(*pidfile, bid)); err != nil {
 		return err
 	}
-	spec, err := configsock.FetchBuildSpec(*socket, "build:"+bid)
+	var spec *configsock.BuildSpec
+	err = retryBuildConfigSocket(context.Background(), log, "build spec", func(ctx context.Context) error {
+		var callErr error
+		spec, callErr = configsock.FetchBuildSpecContext(ctx, *socket, "build:"+bid)
+		return callErr
+	})
 	if err != nil {
-		postErr := configsock.PostBuildResult(*socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		postErr := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
+			return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		})
 		if postErr != nil {
 			return fmt.Errorf("fetch build spec: %w (post result: %v)", err, postErr)
 		}
@@ -88,16 +105,57 @@ func runBuilder(args []string, log *slog.Logger) error {
 		}
 	}
 
-	res := builder.Run(spec, log)
+	reportPhase := func(phase, sandboxID, state string) error {
+		return retryBuildConfigSocket(context.Background(), log, "phase", func(ctx context.Context) error {
+			return configsock.PostBuildPhaseContext(ctx, *socket, *runID, bid, phase, sandboxID, state)
+		})
+	}
+	res := builder.Run(spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
-	if err := configsock.PostBuildResult(*socket, *runID, bid, post); err != nil {
+	if err := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
+		return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, post)
+	}); err != nil {
 		return fmt.Errorf("post build result: %w", err)
 	}
 	if res.Error != "" {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation string, call func(context.Context) error) error {
+	delay := 20 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		err := call(ctx)
+		if err == nil {
+			return nil
+		}
+		if !configsock.IsRetryableError(err) {
+			return err
+		}
+		if attempt == 1 {
+			log.Warn("builder config-socket operation temporarily unavailable; retrying", "operation", operation, "err", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+}
+
+func builderAssignmentPidfile(runPidfile, buildID string) string {
+	runRoot := filepath.Dir(filepath.Dir(runPidfile))
+	return configsock.BuildPidfile(runRoot, buildID)
 }

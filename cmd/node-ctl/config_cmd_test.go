@@ -8,6 +8,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"gopkg.in/yaml.v3"
 )
 
 func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
@@ -31,6 +32,69 @@ func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
 	for _, forbidden := range []string{"vcpu:", "control_socket:"} {
 		if strings.Contains(sandboxBlock, forbidden) {
 			t.Errorf("sandbox template still contains %q:\n%s", forbidden, sandboxBlock)
+		}
+	}
+}
+
+func TestConductorConfigTemplateUsesBuilderTwoStageAdmission(t *testing.T) {
+	start := strings.Index(conductorConfigSkeleton, "builder:")
+	end := strings.Index(conductorConfigSkeleton[start:], "\n# resource_listen:")
+	if start < 0 || end < 0 {
+		t.Fatal("conductor template has no builder admission block")
+	}
+	block := conductorConfigSkeleton[start : start+end]
+	for _, want := range []string{
+		"admission:", "registration:", "execution:", "max_builds: 16",
+		"resources: { cpu: 64, memory: 256GiB, storage: 1TiB }",
+		"registration_ttl: 1h", "queue_ttl: 30m", "storage is admission-only",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("builder template does not contain %q:\n%s", want, block)
+		}
+	}
+	for _, forbidden := range []string{"max_concurrent:", "cpu_quota:", "memory_max:", "vcpu:"} {
+		if strings.Contains(block, forbidden) {
+			t.Errorf("builder template still contains %q:\n%s", forbidden, block)
+		}
+	}
+}
+
+func TestRenderConductorConfigResolvesBuilderAdmissionDefaults(t *testing.T) {
+	path := writeConductorConfig(t, `
+api: { domain: config.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+builder:
+  admission:
+    execution:
+      max_builds: 4
+      resources: { cpu: 2.0001, memory: 8GiB }
+`)
+	out, err := renderConductorConfig(false, true, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered config.Config
+	if err := yaml.Unmarshal(out, &rendered); err != nil {
+		t.Fatal(err)
+	}
+	registration, err := rendered.Builder.RegistrationLimit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := rendered.Builder.ExecutionLimit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registration != execution || execution.MaxBuilds != 4 ||
+		execution.Resources.CPU != 2001 || execution.Resources.Memory != 8<<30 {
+		t.Fatalf("resolved admission: registration=%+v execution=%+v\n%s", registration, execution, out)
+	}
+	text := string(out)
+	for _, forbidden := range []string{"max_concurrent:", "cpu_quota:", "memory_max:", "vcpu:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("resolved config contains %q:\n%s", forbidden, text)
 		}
 	}
 }

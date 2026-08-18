@@ -9,8 +9,9 @@ import (
 )
 
 // InstallUnits generates and installs the systemd template units (+ slices)
-// node-ctl drives, then daemon-reloads if anything changed. It is a
-// no-op when install_units=false (operator manages units out of band).
+// node-ctl drives, then daemon-reloads if anything changed. When
+// install_units=false, the operator manages unit files out of band and this
+// method only verifies explicitly configured aggregate builder limits.
 //
 //   - <runner>  (sandbox-runner@.service): one run-id unit that waits for a sandbox
 //     assignment, then exec-replaces into sandbox-ctl run with config pulled over
@@ -24,7 +25,7 @@ import (
 // reaper and the builder resource pool can account and reclaim them.
 func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 	if o.cfg.Units.Install != nil && !*o.cfg.Units.Install {
-		return nil
+		return o.verifyBuilderSlice(ctx)
 	}
 	files := map[string]string{
 		o.cfg.Units.Runner:      o.runnerUnitFile(),
@@ -45,9 +46,11 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 		o.log.Info("installed unit", "path", path)
 	}
 	if changed {
-		return o.lc.Reload(ctx)
+		if err := o.lc.Reload(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return o.verifyBuilderSlice(ctx)
 }
 
 func (o *Orchestrator) runnerUnitFile() string {
@@ -101,6 +104,9 @@ ExecStart=%s run-builder --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%
 ExecStopPost=/bin/rm -f %s/runs/%%i.pid
 KillMode=control-group
 Slice=sandbox-builder.slice
+# run-builder moves itself to ctl/ and hands the sibling vmm/ cgroup to each
+# strictly serial phase sandbox by inherited descriptor.
+Delegate=yes
 `, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 
@@ -111,13 +117,50 @@ func sliceFile(desc, caps string) string {
 // builderSliceCaps renders the cgroup ceiling for the builder pool from config.
 func (o *Orchestrator) builderSliceCaps() string {
 	var b strings.Builder
-	if o.cfg.Builder.CPUQuota != "" {
-		fmt.Fprintf(&b, "CPUQuota=%s\n", o.cfg.Builder.CPUQuota)
+	limit, err := o.cfg.Builder.ExecutionLimit()
+	if err != nil {
+		return ""
 	}
-	if o.cfg.Builder.MemoryMax != "" {
-		fmt.Fprintf(&b, "MemoryMax=%s\n", o.cfg.Builder.MemoryMax)
+	if limit.Resources.CPU > 0 {
+		fmt.Fprintf(&b, "CPUQuota=%s%%\n", formatMilliPercent(limit.Resources.CPU))
+	}
+	if limit.Resources.Memory > 0 {
+		fmt.Fprintf(&b, "MemoryMax=%d\n", limit.Resources.Memory)
 	}
 	return b.String()
+}
+
+func formatMilliPercent(cpuMilli int64) string {
+	whole, fraction := cpuMilli/10, cpuMilli%10
+	if fraction == 0 {
+		return fmt.Sprintf("%d", whole)
+	}
+	return fmt.Sprintf("%d.%d", whole, fraction)
+}
+
+func (o *Orchestrator) verifyBuilderSlice(ctx context.Context) error {
+	limit, err := o.cfg.Builder.ExecutionLimit()
+	if err != nil {
+		return err
+	}
+	want, err := builderResourceProperties(limit.Resources)
+	if err != nil {
+		return err
+	}
+	if want.CPUQuotaPerSecUSec == 0 && want.MemoryMax == 0 {
+		return nil
+	}
+	got, err := o.lc.Resources(ctx, "sandbox-builder.slice", "Slice")
+	if err != nil {
+		return fmt.Errorf("orch: verify sandbox-builder.slice resource limits: %w", err)
+	}
+	if want.CPUQuotaPerSecUSec != 0 && got.CPUQuotaPerSecUSec != want.CPUQuotaPerSecUSec {
+		return fmt.Errorf("orch: sandbox-builder.slice CPUQuota effective=%d want=%d", got.CPUQuotaPerSecUSec, want.CPUQuotaPerSecUSec)
+	}
+	if want.MemoryMax != 0 && got.MemoryMax != want.MemoryMax {
+		return fmt.Errorf("orch: sandbox-builder.slice MemoryMax effective=%d want=%d", got.MemoryMax, want.MemoryMax)
+	}
+	return nil
 }
 
 // --- unit-name helpers (honor the configurable template names) ---
@@ -140,8 +183,23 @@ func (o *Orchestrator) runnerPattern() string {
 	return strings.TrimSuffix(o.cfg.Units.Runner, ".service") + "*.service"
 }
 
+func (o *Orchestrator) builderPattern() string {
+	return strings.TrimSuffix(o.cfg.Units.Builder, ".service") + "*.service"
+}
+
 // unitToRunID extracts the run-id from a template instance unit name.
 func (o *Orchestrator) unitToRunID(name string) string {
-	name = strings.TrimPrefix(name, strings.TrimSuffix(o.cfg.Units.Runner, ".service"))
-	return strings.TrimSuffix(name, ".service")
+	return unitToRunIDFromTemplate(o.cfg.Units.Runner, name)
+}
+
+func (o *Orchestrator) builderUnitToRunID(name string) string {
+	return unitToRunIDFromTemplate(o.cfg.Units.Builder, name)
+}
+
+func unitToRunIDFromTemplate(template, name string) string {
+	prefix := strings.TrimSuffix(template, ".service")
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".service") {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".service")
 }

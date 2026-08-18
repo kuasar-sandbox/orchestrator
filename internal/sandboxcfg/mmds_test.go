@@ -76,6 +76,25 @@ func TestExtractMMDSHeaderAndMetadataTopLevelMerge(t *testing.T) {
 	}
 }
 
+func TestExtractMMDSReplayBypassesMutableAdmissionPolicyOnly(t *testing.T) {
+	raw := `{"secrets":{"key":"value-that-now-exceeds-the-limit"},"routes":[{"path":"/internal/accepted","type":"secret","secret":"key"},{"path":"/service","type":"service","service":"removed-service"}]}`
+	policy := testMMDSPolicy()
+	policy.MaxSecretValueBytes = 1
+	if _, _, err := ExtractMMDS(map[string]string{NsMMDS: raw}, nil, policy); err == nil {
+		t.Fatal("live admission policy accepted the now-disallowed document")
+	}
+	doc, metadata, err := ExtractMMDSReplay(map[string]string{NsMMDS: raw}, nil)
+	if err != nil {
+		t.Fatalf("ExtractMMDSReplay: %v", err)
+	}
+	if len(doc.Routes) != 2 || string(doc.SecretValues["key"]) != "value-that-now-exceeds-the-limit" || metadata[NsMMDS] == "" {
+		t.Fatalf("replay normalization = doc %+v metadata %+v", doc, metadata)
+	}
+	if _, _, err := ExtractMMDSReplay(map[string]string{NsMMDS: `{"routes":[],"routes":[]}`}, nil); err == nil {
+		t.Fatal("replay bypassed strict JSON validation")
+	}
+}
+
 func TestExtractMMDSExplicitEmptyTopLevelOverride(t *testing.T) {
 	meta := map[string]string{NsMMDS: `{
 		"secrets":{"key":"metadata-value"},

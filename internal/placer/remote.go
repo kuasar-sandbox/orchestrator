@@ -445,6 +445,7 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
 		zoneAdmitMax: s.cfg.ZoneAdmitMax, excludedNodeIDs: nodeIDSet(req.ExcludeNodeIDs),
 		targetRuntimeDigest: req.TargetRuntimeDigest,
+		buildResources:      req.BuildResources,
 	}
 	var node string
 	var placeErr error
@@ -1154,7 +1155,8 @@ func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
 	}
 	return &registry.NodeRecord{
 		Meta:   n.SourceMeta,
-		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity, BuildCapacity: n.BuildCapacity,
+		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity,
+		BuildRegistrationCapacity: n.BuildRegistrationCapacity, BuildExecutionCapacity: n.BuildExecutionCapacity,
 		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}, true
 }
@@ -1397,13 +1399,35 @@ func cloneNodeRecord(in *registry.NodeRecord) *registry.NodeRecord {
 	}
 	out := *in
 	out.Labels = cloneStringMap(in.Labels)
-	if in.BuildCapacity != nil {
-		bc := *in.BuildCapacity
-		out.BuildCapacity = &bc
+	out.BuildRegistrationCapacity = cloneAdmissionLimit(in.BuildRegistrationCapacity)
+	out.BuildExecutionCapacity = cloneAdmissionLimit(in.BuildExecutionCapacity)
+	out.BuildRegistrationUsage = cloneAdmissionUsage(in.BuildRegistrationUsage)
+	out.BuildExecutionUsage = cloneAdmissionUsage(in.BuildExecutionUsage)
+	return &out
+}
+
+func cloneAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
+	if in == nil {
+		return nil
 	}
-	if in.BuildAlloc != nil {
-		ba := *in.BuildAlloc
-		out.BuildAlloc = &ba
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
+}
+
+func cloneAdmissionUsage(in *routesync.BuildAdmissionUsage) *routesync.BuildAdmissionUsage {
+	if in == nil {
+		return nil
 	}
+	out := *in
+	out.Resources = cloneBuildResources(in.Resources)
+	return &out
+}
+
+func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources {
+	if in == nil {
+		return nil
+	}
+	out := *in
 	return &out
 }

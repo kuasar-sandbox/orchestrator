@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,11 +13,19 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // --- plane stubs ---
 
-type stubProvider struct{ pidFile string }
+type stubProvider struct {
+	pidFile       string
+	assignmentErr error
+	buildSpecErr  error
+	resultErr     error
+	phaseErr      error
+}
 
 func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, string, bool, error) {
 	if id != "sandbox:x" {
@@ -26,6 +35,9 @@ func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, 
 }
 
 func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, string, bool, error) {
+	if s.buildSpecErr != nil {
+		return nil, s.pidFile, false, s.buildSpecErr
+	}
 	if id != "build:x" {
 		return nil, "", false, nil
 	}
@@ -43,6 +55,9 @@ func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
 }
 
 func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (string, bool, error) {
+	if s.assignmentErr != nil {
+		return "", false, s.assignmentErr
+	}
 	if kind == "sandbox" && runID == "sr-test" {
 		return "x", true, nil
 	}
@@ -53,13 +68,40 @@ func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (str
 }
 
 func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, _ BuildResult) error {
+	if s.resultErr != nil {
+		return s.resultErr
+	}
 	if runID == "br-test" && buildID == "x" {
 		return nil
 	}
 	return os.ErrNotExist
 }
 
+func (s stubProvider) PostBuildPhase(_ context.Context, runID, buildID, phase, sandboxID, state string) error {
+	if s.phaseErr != nil {
+		return s.phaseErr
+	}
+	if runID == "br-test" && buildID == "x" && phase == "a" && sandboxID == "bp-a-x" && state == "starting" {
+		return nil
+	}
+	return os.ErrNotExist
+}
+
 type stubAdmin struct{ pairs map[string]AdminKeyInfo }
+
+type stubBuilderAdmissionAdmin struct{}
+
+func (stubBuilderAdmissionAdmin) BuilderAdmissionStatus(context.Context) (BuilderAdmissionStatus, error) {
+	available := int64(3)
+	return BuilderAdmissionStatus{
+		Registration: BuildAdmissionLevelStatus{
+			Configured: types.BuildAdmissionLimit{MaxBuilds: 4}, UsedBuilds: 1,
+			Used:      types.BuildResources{CPU: 1500, Memory: 2 << 30},
+			Available: BuildAdmissionHeadroom{MaxBuilds: &available},
+		},
+		WaitingBuilds: 1,
+	}, nil
+}
 
 func stubKeyPair(manifestKey, apiSecret string) (string, string, string) {
 	if apiSecret == "" {
@@ -173,6 +215,98 @@ func TestTaskPlane(t *testing.T) {
 	}
 }
 
+func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.sock")
+	if _, err := WaitAssignment(context.Background(), missing, "build", "br-test"); !IsTransportError(err) {
+		t.Fatalf("assignment transport error = %v, retryable=%t", err, IsTransportError(err))
+	}
+	if _, err := FetchBuildSpecContext(context.Background(), missing, "build:test"); !IsTransportError(err) {
+		t.Fatalf("build-spec transport error = %v, retryable=%t", err, IsTransportError(err))
+	}
+
+	pf := filepath.Join(t.TempDir(), "id.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
+	if _, err := FetchBuildSpecContext(context.Background(), sock, "unknown"); err == nil || IsTransportError(err) {
+		t.Fatalf("provider rejection = %v, retryable=%t", err, IsTransportError(err))
+	}
+}
+
+func TestConfigSocketClientsDoNotRetainIdleConnections(t *testing.T) {
+	client := HTTPClient(filepath.Join(t.TempDir(), "ctl.sock"))
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("HTTPClient transport = %T, want *http.Transport", client.Transport)
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("HTTPClient retains idle UDS connections across short-lived retry clients")
+	}
+}
+
+func TestBuildRetryClassification(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "id.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	transient := errors.New("temporary sqlite write failure")
+
+	for name, call := range map[string]func(string) error{
+		"assignment": func(sock string) error {
+			_, err := WaitAssignment(context.Background(), sock, "build", "br-test")
+			return err
+		},
+		"build spec": func(sock string) error {
+			_, err := FetchBuildSpecContext(context.Background(), sock, "build:x")
+			return err
+		},
+		"result": func(sock string) error {
+			return PostBuildResultContext(context.Background(), sock, "br-test", "x", BuildResult{ImageRef: "image"})
+		},
+		"phase": func(sock string) error {
+			return PostBuildPhaseContext(context.Background(), sock, "br-test", "x", "a", "bp-a-x", "starting")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider := stubProvider{pidFile: pf}
+			switch name {
+			case "assignment":
+				provider.assignmentErr = transient
+			case "build spec":
+				provider.buildSpecErr = transient
+			case "result":
+				provider.resultErr = transient
+			case "phase":
+				provider.phaseErr = transient
+			}
+			sock, _ := startTestServer(t, Deps{Provider: provider})
+			err := call(sock)
+			if err == nil || !IsRetryableError(err) {
+				t.Fatalf("5xx error = %v, retryable=%t", err, IsRetryableError(err))
+			}
+			var response *retryableResponseError
+			if !errors.As(err, &response) || response.status != http.StatusInternalServerError {
+				t.Fatalf("retryable response = %#v, want preserved status 500", err)
+			}
+		})
+	}
+
+	for name, provider := range map[string]stubProvider{
+		"result": {pidFile: pf, resultErr: RejectBuildReport(errors.New("result ownership lost"))},
+		"phase":  {pidFile: pf, phaseErr: RejectBuildReport(errors.New("phase ownership lost"))},
+	} {
+		t.Run("reject "+name, func(t *testing.T) {
+			sock, _ := startTestServer(t, Deps{Provider: provider})
+			var err error
+			if name == "result" {
+				err = PostBuildResultContext(context.Background(), sock, "br-test", "x", BuildResult{})
+			} else {
+				err = PostBuildPhaseContext(context.Background(), sock, "br-test", "x", "a", "bp-a-x", "starting")
+			}
+			if err == nil || IsRetryableError(err) {
+				t.Fatalf("definitive error = %v, retryable=%t", err, IsRetryableError(err))
+			}
+		})
+	}
+}
+
 func TestRunPlane(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "run.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
@@ -185,6 +319,9 @@ func TestRunPlane(t *testing.T) {
 	if err := PostBuildResult(sock, "br-test", "x", BuildResult{ImageRef: "image"}); err != nil {
 		t.Fatalf("PostBuildResult: %v", err)
 	}
+	if err := PostBuildPhase(sock, "br-test", "x", "a", "bp-a-x", "starting"); err != nil {
+		t.Fatalf("PostBuildPhase: %v", err)
+	}
 	if _, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-missing"); err == nil {
 		t.Fatal("unknown run should fail assignment")
 	}
@@ -195,6 +332,9 @@ func TestRunPlane(t *testing.T) {
 	}
 	if err := PostBuildResult(sock, "br-test", "x", BuildResult{}); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("wrong pid build-result error = %v, want not authorized", err)
+	}
+	if err := PostBuildPhase(sock, "br-test", "x", "a", "bp-a-x", "starting"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("wrong pid build-phase error = %v, want not authorized", err)
 	}
 }
 
@@ -221,6 +361,23 @@ func TestAdminPlane(t *testing.T) {
 	}
 	if r := adminPost(t, client, AdminKeyRequest{Op: "remove", ManifestKey: req.ManifestKey, APISecret: req.APISecret}); r.Status != "removed" {
 		t.Fatalf("remove: %+v", r)
+	}
+}
+
+func TestBuilderAdmissionAdminStatus(t *testing.T) {
+	_, client := startTestServer(t, Deps{BuilderAdmissionAdmin: stubBuilderAdmissionAdmin{}})
+	code, body := rawGet(t, client, PathAdminBuilderAdmission)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", code, body)
+	}
+	var status BuilderAdmissionStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Registration.Configured.MaxBuilds != 4 || status.Registration.UsedBuilds != 1 ||
+		status.Registration.Used.CPU != 1500 || status.Registration.Available.MaxBuilds == nil ||
+		*status.Registration.Available.MaxBuilds != 3 || status.WaitingBuilds != 1 {
+		t.Fatalf("builder admission status = %+v", status)
 	}
 }
 

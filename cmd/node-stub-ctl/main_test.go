@@ -32,7 +32,9 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	cmd := &routesync.Command{
 		CmdID: "c1", Kind: routesync.CmdBuildRegister,
 		BuildID: "b1", TemplateRef: "transient-1", Profile: "bare", APISecretFingerprint: apiSecretFingerprint,
-		Config: map[string]string{"stub.build_result": "timeout"},
+		BuildResources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		Config:         map[string]string{"stub.build_result": "timeout"},
+		ImageRepo:      "registry.test/repo", RegistryAuth: `{"auths":{"registry.test":{"auth":"opaque"}}}`,
 	}
 	if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
 		t.Fatalf("first build_register ack = %+v", got)
@@ -46,10 +48,25 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	if got := node.handleBuildRegister(&replay); got.Status != routesync.AckAccepted {
 		t.Fatalf("identical replay ack = %+v", got)
 	}
+	select {
+	case event := <-node.buildEvents:
+		if event.BuildID != cmd.BuildID || event.State != "ready" || event.TemplateID != cmd.TemplateRef {
+			t.Fatalf("terminal replay event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal replay acknowledged before republishing the persisted result")
+	}
 	for name, mutate := range map[string]func(*routesync.Command){
 		"profile":  func(c *routesync.Command) { c.Profile = "e2b" },
 		"template": func(c *routesync.Command) { c.TemplateRef = "transient-2" },
 		"tenant":   func(c *routesync.Command) { c.APISecretFingerprint = strings.Repeat("b", 64) },
+		"resources": func(c *routesync.Command) {
+			c.BuildResources = &routesync.BuildResources{CPU: 2000, Memory: 1 << 30}
+		},
+		"config": func(c *routesync.Command) {
+			c.Config = map[string]string{"stub.build_result": "timeout", "other": "value"}
+		},
+		"registry auth": func(c *routesync.Command) { c.RegistryAuth = `{"auths":{}}` },
 	} {
 		t.Run(name, func(t *testing.T) {
 			conflict := replay
@@ -68,10 +85,206 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 		t.Fatalf("replay changed stored build: count=%d build=%+v", buildCount, stored)
 	}
 	svc.mu.Lock()
-	eventCount := len(svc.events)
+	var registerEvents, stateEvents int
+	for _, event := range svc.events {
+		switch event.Type {
+		case "build_register":
+			registerEvents++
+		case "build_event":
+			stateEvents++
+		}
+	}
 	svc.mu.Unlock()
-	if eventCount != 1 {
-		t.Fatalf("replay restarted build state machine: events=%d", eventCount)
+	if registerEvents != 1 || stateEvents != 1 {
+		t.Fatalf("terminal replay restarted build state machine: register=%d state=%d", registerEvents, stateEvents)
+	}
+}
+
+func TestBuildRegisterExactReplayPrecedesStrictCredentialLease(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{ID: "n1", StrictKeys: true}, svc)
+	fingerprint := strings.Repeat("a", 64)
+	node.mu.Lock()
+	node.keyPairs[fingerprint] = stubKeyPair{APISecretFingerprint: fingerprint, ExpiresUnix: time.Now().Add(time.Hour).Unix()}
+	node.mu.Unlock()
+	cmd := &routesync.Command{
+		CmdID: "register-first", Kind: routesync.CmdBuildRegister,
+		BuildID: "strict-replay", TemplateRef: "transient-strict-replay", Profile: "bare",
+		APISecretFingerprint: fingerprint,
+		BuildResources:       &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		Config:               map[string]string{"stub.build_result": "timeout"},
+	}
+	if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+		t.Fatalf("initial registration = %+v", got)
+	}
+	node.mu.Lock()
+	delete(node.keyPairs, fingerprint) // credential lease ended after an ACK loss
+	node.mu.Unlock()
+
+	replay := *cmd
+	replay.CmdID = "register-replay"
+	if got := node.handleBuildRegister(&replay); got.Status != routesync.AckAccepted {
+		t.Fatalf("exact replay after key withdrawal = %+v", got)
+	}
+	conflict := replay
+	conflict.CmdID = "register-conflict"
+	conflict.Profile = "e2b"
+	if got := node.handleBuildRegister(&conflict); got.Status != routesync.AckRejected || got.HTTPStatus != http.StatusConflict {
+		t.Fatalf("conflicting replay after key withdrawal = %+v, want 409", got)
+	}
+	node.mu.Lock()
+	buildCount := len(node.builds)
+	node.mu.Unlock()
+	if buildCount != 1 {
+		t.Fatalf("replay changed registration count to %d", buildCount)
+	}
+}
+
+func TestBuildRegisterEnforcesRegistrationAndExecutionAdmission(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{
+		ID: "n1",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 2000, Memory: 2 << 30},
+		},
+		BuildExecutionCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		},
+	}, svc)
+	command := func(id string, resources *routesync.BuildResources) *routesync.Command {
+		return &routesync.Command{CmdID: id, Kind: routesync.CmdBuildRegister, BuildID: id,
+			TemplateRef: "transient-" + id, Profile: "bare", BuildResources: resources,
+			Config: map[string]string{"stub.build_result": "timeout"}}
+	}
+	tooLarge := node.handleBuildRegister(command("too-large", &routesync.BuildResources{CPU: 1001, Memory: 1 << 30}))
+	if tooLarge.Status != routesync.AckRejected || tooLarge.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("single-build execution rejection = %+v", tooLarge)
+	}
+	accepted := command("accepted", &routesync.BuildResources{CPU: 1000, Memory: 1 << 30})
+	if got := node.handleBuildRegister(accepted); got.Status != routesync.AckAccepted {
+		t.Fatalf("accepted registration = %+v", got)
+	}
+	full := node.handleBuildRegister(command("full", &routesync.BuildResources{CPU: 1000, Memory: 1 << 30}))
+	if full.Status != routesync.AckRejected || full.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("registration capacity rejection = %+v", full)
+	}
+	if replay := node.handleBuildRegister(accepted); replay.Status != routesync.AckAccepted {
+		t.Fatalf("exact retry after capacity filled = %+v", replay)
+	}
+}
+
+func TestStubExecutionAdmissionQueuesFIFOByAggregateResources(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := newService("", log)
+	node := newStubNode(stubNodeOptions{
+		ID: "n1",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 3, Resources: &routesync.BuildResources{CPU: 2000, Memory: 3 << 30},
+		},
+		BuildExecutionCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 2, Resources: &routesync.BuildResources{CPU: 1000, Memory: 2 << 30},
+		},
+	}, svc)
+	register := func(id string, cpu int64) {
+		t.Helper()
+		cmd := &routesync.Command{
+			CmdID: "register-" + id, Kind: routesync.CmdBuildRegister,
+			BuildID: id, TemplateRef: "transient-" + id, Profile: "bare",
+			BuildResources: &routesync.BuildResources{CPU: cpu, Memory: 1 << 30},
+			Config:         map[string]string{"stub.build_result": "timeout"},
+		}
+		if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+			t.Fatalf("register %s = %+v", id, got)
+		}
+	}
+	register("first", 600)
+	register("second", 600)
+	register("third", 400)
+	for _, id := range []string{"first", "second", "third"} {
+		if err := node.requestBuildExecution(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	node.mu.Lock()
+	states := map[string]string{}
+	for id, build := range node.builds {
+		states[id] = build.State
+	}
+	node.mu.Unlock()
+	if states["first"] != "building" || states["second"] != "registered" || states["third"] != "registered" {
+		t.Fatalf("FIFO head was bypassed under aggregate pressure: states=%v", states)
+	}
+	hb := node.Heartbeat()
+	if hb.BuildExecutionUsage.Builds != 1 || hb.BuildExecutionUsage.Resources.CPU != 600 {
+		t.Fatalf("execution usage before release = %+v", hb.BuildExecutionUsage)
+	}
+
+	if err := node.setBuildState("first", "ready", "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	states["first"] = node.builds["first"].State
+	states["second"] = node.builds["second"].State
+	states["third"] = node.builds["third"].State
+	node.mu.Unlock()
+	if states["first"] != "ready" || states["second"] != "building" || states["third"] != "building" {
+		t.Fatalf("queued Builds did not advance in FIFO order after release: states=%v", states)
+	}
+	hb = node.Heartbeat()
+	if hb.BuildExecutionUsage.Builds != 2 || hb.BuildExecutionUsage.Resources.CPU != 1000 {
+		t.Fatalf("execution usage after release = %+v", hb.BuildExecutionUsage)
+	}
+}
+
+func TestStubExecutionAdmissionFIFOUsesTriggerOrder(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := newService("", log)
+	node := newStubNode(stubNodeOptions{
+		ID: "n1",
+		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 3, Resources: &routesync.BuildResources{CPU: 3000, Memory: 3 << 30},
+		},
+		BuildExecutionCapacity: &routesync.BuildAdmissionLimit{
+			MaxBuilds: 1, Resources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		},
+	}, service)
+	for _, id := range []string{"blocker", "registered-first", "triggered-first"} {
+		cmd := &routesync.Command{
+			CmdID: "register-" + id, Kind: routesync.CmdBuildRegister,
+			BuildID: id, TemplateRef: "transient-" + id, Profile: "bare",
+			BuildResources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+			Config:         map[string]string{"stub.build_result": "timeout"},
+		}
+		if got := node.handleBuildRegister(cmd); got.Status != routesync.AckAccepted {
+			t.Fatalf("register %s = %+v", id, got)
+		}
+	}
+	for _, id := range []string{"blocker", "triggered-first", "registered-first"} {
+		if err := node.requestBuildExecution(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := node.setBuildState("blocker", "ready", "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	node.mu.Lock()
+	triggeredState := node.builds["triggered-first"].State
+	registeredState := node.builds["registered-first"].State
+	node.mu.Unlock()
+	if triggeredState != "building" || registeredState != "registered" {
+		t.Fatalf("execution FIFO followed registration rather than trigger order: triggered-first=%s registered-first=%s",
+			triggeredState, registeredState)
+	}
+}
+
+func TestAddBuildResourcesFailClosedOnOverflow(t *testing.T) {
+	dst := &routesync.BuildResources{CPU: math.MaxInt64 - 1, Memory: 1, Storage: 1}
+	addBuildResourcesFailClosed(dst, &routesync.BuildResources{CPU: 2, Memory: 1, Storage: 1})
+	if dst.CPU != math.MaxInt64 || dst.Memory != math.MaxInt64 || dst.Storage != math.MaxInt64 {
+		t.Fatalf("overflow usage = %+v, want fully occupied", dst)
 	}
 }
 
@@ -387,7 +600,8 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	build := &routesync.Command{
 		CmdID: "build-1", Kind: routesync.CmdBuildRegister, BuildID: "b1",
 		TemplateRef: "template-1", Profile: "bare", APISecretFingerprint: apiSecretFingerprint,
-		Config: map[string]string{"stub.build_result": "timeout"},
+		BuildResources: &routesync.BuildResources{CPU: 1000, Memory: 1 << 30},
+		Config:         map[string]string{"stub.build_result": "timeout"},
 	}
 	if got := node.HandleCommand(context.Background(), build); got.Status != routesync.AckAccepted {
 		t.Fatalf("build_register ack = %+v", got)

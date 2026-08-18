@@ -89,22 +89,24 @@ func ParsePlacerImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok b
 // NodeProfileRecord is the node_link profile record. Per-node sandboxes, builds,
 // and credential pairs are stored as separate node_link records in the same shard.
 type NodeProfileRecord struct {
-	NodeID            string                    `json:"node_id"`
-	State             NodeState                 `json:"state"`
-	Labels            map[string]string         `json:"labels,omitempty"`
-	Capacity          int                       `json:"capacity,omitempty"`
-	BuildCapacity     *routesync.BuildResources `json:"build_capacity,omitempty"`
-	DataEndpoint      string                    `json:"data_endpoint,omitempty"`
-	RuntimeDigest     string                    `json:"runtime_digest,omitempty"`
-	Zone              string                    `json:"zone,omitempty"`
-	Allocated         int64                     `json:"allocated,omitempty"`
-	Pool              int64                     `json:"pool,omitempty"`
-	BuildAlloc        *routesync.BuildResources `json:"build_alloc,omitempty"`
-	Counts            int                       `json:"counts,omitempty"`
-	Draining          bool                      `json:"draining,omitempty"`
-	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
-	ResumeToken       string                    `json:"resume_token,omitempty"`
-	LinkOwner         string                    `json:"link_owner,omitempty"`
+	NodeID                    string                         `json:"node_id"`
+	State                     NodeState                      `json:"state"`
+	Labels                    map[string]string              `json:"labels,omitempty"`
+	Capacity                  int                            `json:"capacity,omitempty"`
+	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
+	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
+	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
+	Zone                      string                         `json:"zone,omitempty"`
+	Allocated                 int64                          `json:"allocated,omitempty"`
+	Pool                      int64                          `json:"pool,omitempty"`
+	BuildRegistrationUsage    *routesync.BuildAdmissionUsage `json:"build_registration_usage,omitempty"`
+	BuildExecutionUsage       *routesync.BuildAdmissionUsage `json:"build_execution_usage,omitempty"`
+	Counts                    int                            `json:"counts,omitempty"`
+	Draining                  bool                           `json:"draining,omitempty"`
+	LastHeartbeatUnix         int64                          `json:"last_heartbeat_unix,omitempty"`
+	ResumeToken               string                         `json:"resume_token,omitempty"`
+	LinkOwner                 string                         `json:"link_owner,omitempty"`
 }
 
 type PlacerImportSourceState struct {

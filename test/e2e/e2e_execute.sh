@@ -87,6 +87,11 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
+# Give the outer Builder unit the host's full CPU capacity. The phase Sandbox
+# keeps its independent 2-vCPU resource contract below, while the parent unit
+# no longer introduces a second CPU bottleneck around snapshot teardown.
+BUILDER_CPU="$(nproc)"
+
 WORK="$(mktemp -d /tmp/e2e-exec-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
@@ -262,6 +267,7 @@ req() {
     # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
+    [ -n "${REQ_RESOURCE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Resource: ${REQ_RESOURCE_HEADER}")
     [ -n "${REQ_CHECKPOINT_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Checkpoint: ${REQ_CHECKPOINT_HEADER}")
     if [ "${REQ_ATTACH_MMDS:-0}" = 1 ] && [ -n "${REQ_MMDS_HEADER:-}" ]; then
         args+=(-H "X-Kuasar-Sandbox-MMDS: ${REQ_MMDS_HEADER}")
@@ -925,8 +931,6 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-  vcpu: 1
-  memory: 1GiB
 $resource_controller_config
 checkpoint:
   mode: local
@@ -982,7 +986,13 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl","cpuCount":2,"memoryMB":8192}')
+# Registration cpuCount/memoryMB are Build resources only. The Builder gets the
+# host's full CPU capacity so its independent 2-vCPU phase is not constrained by
+# an additional parent-level throttle. The Resource header defines the A/B/C
+# Sandbox capacity, which the phase-C snapshot must preserve on restore below.
+REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
+code=$(req POST /v3/templates "$AK" "{\"name\":\"exec-tmpl\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":8192}")
+unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)
@@ -1012,8 +1022,9 @@ echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to build
 # A snapshot restore preserves max(requested, snapshot-time allocatable), so the
 # snapshot template above cannot reproduce a 256 MiB startup floor. Build the
 # same OCI input as an image template (no startCmd), then cold boot it with the
-# complete 8 GiB / 256 MiB resource declaration from issue #152.
-code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup"}')
+# complete 8 GiB / 256 MiB resource declaration from issue #152. These are
+# independent Build resources sized for the node-default phase VM and toolchain.
+code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":6144}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
 LOW_TID=$(json_field "$WORK/resp.body" templateID)
 LOW_BID=$(json_field "$WORK/resp.body" buildID)
@@ -1036,7 +1047,7 @@ case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_
 # A bare image lets the capacity<256MiB case validate a real KVM launch without
 # paying envd's steady workload. It carries no resource patch, so the create
 # request below proves inherited 256MiB floor normalization.
-code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare"}')
+code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare","cpuCount":2,"memoryMB":6144}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "small-capacity register=$code"; }
 SMALL_TID=$(json_field "$WORK/resp.body" templateID)
 SMALL_BID=$(json_field "$WORK/resp.body" buildID)

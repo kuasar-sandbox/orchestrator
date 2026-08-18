@@ -168,7 +168,7 @@ node_list 由 registry 的 node owner 投影低频节点字段:
 - labels
 - runtime_digest
 - data_endpoint
-- build_capacity / capacity class
+- registration/execution Build configured capacity(usage/headroom 不进入低频视图)
 - draining
 - liveness timestamp
 
@@ -342,13 +342,15 @@ node-link 连接；断线、admission 拒绝或命令拒绝的候选加入 `excl
 group, build_id, template_id, resources
 ```
 
-Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算权威在 node owner:
+Build placement 与 sandbox 类似,但 Placer 的低频视图只按 configured registration capacity
+排除永远装不下单个 Build 的节点,不接收 heartbeat usage。当前 headroom 只在 Holder/节点边界读取:
 
-1. placer 返回建议 node。
-2. route owner 先通过 node owner 确认 node-link 仍在线。
-3. route owner 调 node owner `AdmitBuild(node_id, build_id, resources)`。
-4. node owner 若余量不足直接拒绝。
-5. route owner 排除该候选并重调度。
+1. placer 返回静态 capacity 可容纳的建议 node。
+2. Registry 通过当前 Holder 确认 node-link 在线并读取最新 durable registration usage。
+3. headroom 已不足时 Registry 排除该候选并重调度,尚不创建注册 intent。
+4. Registry 持久化选中 node/build 的 STARTING intent,再发送 `build_register`。
+5. node 在 SQLite 事务中作最终 registration admission；明确无副作用拒绝才允许排除候选,
+   timeout/断连/ACK 丢失则固定该 node/BuildID 查询或重试。
 
 ## 9. Key Distribution
 

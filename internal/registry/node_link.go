@@ -329,9 +329,13 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 			r.ackCommand(m.Ack)
 		case routesync.TypeBuildEvent:
 			// Build state transition: converge the BuildStore (§7.5); a terminal
-			// state releases the build's reserved node resources.
+			// state releases the build's reserved node resources. Persistence
+			// failure ends this unacknowledged stream so the node reconnects and
+			// replays its durable terminal rows without blocking unrelated frames.
 			if m.Build != nil {
-				r.applyBuildEvent(ctx, nr.NodeID, m.Build)
+				if err := r.applyBuildEvent(ctx, nr.NodeID, m.Build); err != nil {
+					return fmt.Errorf("node-link: apply build event: %w", err)
+				}
 			}
 		case routesync.TypeBookmark:
 			if collectingFull && m.FullSync {

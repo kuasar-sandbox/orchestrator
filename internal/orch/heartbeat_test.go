@@ -1,9 +1,11 @@
 package orch
 
 import (
+	"math"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type stubProbe struct {
@@ -34,14 +36,35 @@ func TestHeartbeatTelemetry(t *testing.T) {
 }
 
 func TestClusterNodeInfo(t *testing.T) {
-	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{VCPU: 2, Memory: "4GiB", MaxConcurrent: 3}})
+	registrationMax, executionMax := int64(16), int64(3)
+	registrationCPU, executionCPU := config.CPUCores("64"), config.CPUCores("6")
+	registrationMemory, executionMemory := "256GiB", "12GiB"
+	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{Admission: config.BuilderAdmissionConfig{
+		Registration: &config.BuildAdmissionLimitConfig{MaxBuilds: &registrationMax, Resources: config.BuildAdmissionResourcesConfig{CPU: &registrationCPU, Memory: &registrationMemory}},
+		Execution:    &config.BuildAdmissionLimitConfig{MaxBuilds: &executionMax, Resources: config.BuildAdmissionResourcesConfig{CPU: &executionCPU, Memory: &executionMemory}},
+	}}})
 	o.cfg.Sandbox.Capacity = 100
-	capacity, buildCap, _ := o.ClusterNodeInfo()
+	capacity, registration, execution, _ := o.ClusterNodeInfo()
 	if capacity != 100 {
 		t.Fatalf("capacity = %d, want 100", capacity)
 	}
-	// build pool = MaxConcurrent × per-build (2 cores=2000 milli, 4GiB).
-	if buildCap == nil || buildCap.CPU != 6000 || buildCap.Mem != 3*(4<<30) {
-		t.Fatalf("build capacity: %+v", buildCap)
+	if registration == nil || registration.MaxBuilds != 16 || registration.Resources.CPU != 64000 || registration.Resources.Memory != 256<<30 {
+		t.Fatalf("registration capacity: %+v", registration)
+	}
+	if execution == nil || execution.MaxBuilds != 3 || execution.Resources.CPU != 6000 || execution.Resources.Memory != 12<<30 {
+		t.Fatalf("execution capacity: %+v", execution)
+	}
+}
+
+func TestSaturatedBuildUsageFailsClosedForUnlimitedDimensions(t *testing.T) {
+	usage := saturatedBuildUsage()
+	if usage.Builds != math.MaxInt64 || usage.Resources == nil ||
+		usage.Resources.CPU != math.MaxInt64 || usage.Resources.Memory != math.MaxInt64 ||
+		usage.Resources.Storage != math.MaxInt64 {
+		t.Fatalf("saturated usage = %+v", usage)
+	}
+	if (types.BuildAdmissionLimit{}).AllowsAdd(usage.Builds, usage.Resources.Types(),
+		types.BuildResources{CPU: 1, Memory: 1}) {
+		t.Fatal("unlimited admission accepted a request after durable usage failure")
 	}
 }

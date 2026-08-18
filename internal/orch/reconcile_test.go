@@ -3,15 +3,20 @@ package orch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -19,25 +24,78 @@ import (
 )
 
 type reconcileLauncher struct {
-	units   []launcher.Unit
-	stopped []string
-	reset   []string
+	mu                 sync.Mutex
+	units              []launcher.Unit
+	stopped            []string
+	reset              []string
+	resources          launcher.ResourceProperties
+	resourcesErr       error
+	resourcesErrByUnit map[string]error
+	stopErr            error
+	inactiveAfterLists int
+	listCalls          int
 }
 
 func (l *reconcileLauncher) Start(context.Context, string) error { return nil }
 func (l *reconcileLauncher) Stop(_ context.Context, unit string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.stopped = append(l.stopped, unit)
+	if l.stopErr != nil {
+		return l.stopErr
+	}
+	for i := range l.units {
+		if l.units[i].Name == unit {
+			l.units[i].ActiveState = "inactive"
+		}
+	}
 	return nil
 }
 func (l *reconcileLauncher) ResetFailed(_ context.Context, unit string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.reset = append(l.reset, unit)
 	return nil
 }
-func (l *reconcileLauncher) List(context.Context, string) ([]launcher.Unit, error) {
-	return append([]launcher.Unit(nil), l.units...), nil
+func (l *reconcileLauncher) List(_ context.Context, pattern string) ([]launcher.Unit, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.listCalls++
+	if l.inactiveAfterLists > 0 && l.listCalls >= l.inactiveAfterLists {
+		for i := range l.units {
+			l.units[i].ActiveState = "inactive"
+		}
+	}
+	var matched []launcher.Unit
+	for _, unit := range l.units {
+		if ok, _ := filepath.Match(pattern, unit.Name); ok {
+			matched = append(matched, unit)
+		}
+	}
+	return matched, nil
 }
 func (l *reconcileLauncher) Reload(context.Context) error { return nil }
-func (l *reconcileLauncher) Close() error                 { return nil }
+func (l *reconcileLauncher) SetResources(_ context.Context, _ string, p launcher.ResourceProperties) error {
+	l.resources = p
+	return nil
+}
+func (l *reconcileLauncher) Resources(_ context.Context, unit, _ string) (launcher.ResourceProperties, error) {
+	if err := l.resourcesErrByUnit[unit]; err != nil {
+		return launcher.ResourceProperties{}, err
+	}
+	return l.resources, l.resourcesErr
+}
+func (l *reconcileLauncher) Close() error { return nil }
+
+func (l *reconcileLauncher) setUnitState(name, state string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := range l.units {
+		if l.units[i].Name == name {
+			l.units[i].ActiveState = state
+		}
+	}
+}
 
 type reconcileVS struct {
 	detached []string
@@ -221,6 +279,834 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		if _, err := os.Stat(resume.BaseDir); err != nil {
 			t.Fatalf("resume base directory %s was removed: %v", resume.BaseDir, err)
 		}
+	}
+}
+
+func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runRoot := filepath.Join(t.TempDir(), "run")
+	cfg := buildReconcileConfig(runRoot)
+	runID := "br-00000000-0000-7000-8000-000000000001"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := os.MkdirAll(buildRuntimeDir(runRoot, build.BuildID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := o.ReconcileSandboxes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	type buildSpecResult struct {
+		ok  bool
+		err error
+	}
+	specStarted := make(chan struct{})
+	specDone := make(chan buildSpecResult, 1)
+	go func() {
+		close(specStarted)
+		_, _, ok, err := o.BuildSpecFor(ctx, "build:"+build.BuildID)
+		specDone <- buildSpecResult{ok: ok, err: err}
+	}()
+	<-specStarted
+	imageRef := "manifest://" + strings.Repeat("b", 64)
+	postStarted := make(chan struct{})
+	postDone := make(chan error, 1)
+	go func() {
+		close(postStarted)
+		postDone <- o.PostBuildResult(ctx, runID, build.BuildID, configsock.BuildResult{ImageRef: imageRef})
+	}()
+	<-postStarted
+	select {
+	case result := <-specDone:
+		t.Fatalf("build spec crossed startup gate before adoption: %+v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case err := <-postDone:
+		t.Fatalf("build report crossed startup gate before adoption: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := o.ReconcileBuilds(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if result := <-specDone; result.err != nil || !result.ok {
+		t.Fatalf("recovered BuildSpec = ok %v err %v", result.ok, result.err)
+	}
+
+	// The recovered process has already run the pipeline. Posting its result must
+	// finalize that same claim; no scheduler/assignment path is involved.
+	lc.setUnitState(unit, "inactive")
+	if err := <-postDone; err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		stored, err := st.GetBuild(ctx, build.BuildID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status == types.BuildReady {
+			if stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
+				t.Fatalf("terminal build retained ownership: %+v", stored)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recovered build did not finish: %+v", stored)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := o.DrainBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(vs.detached) != 1 || vs.detached[0] != "17" {
+		t.Fatalf("detached ports = %v", vs.detached)
+	}
+	if _, err := os.Stat(buildRuntimeDir(runRoot, build.BuildID)); !os.IsNotExist(err) {
+		t.Fatalf("recovered workdir remains: %v", err)
+	}
+}
+
+func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("9", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runRoot := filepath.Join(t.TempDir(), "run")
+	runID := "br-00000000-0000-7000-8000-000000000211"
+	build := buildReconcileRow(t, runID)
+	workdir := buildRuntimeDir(runRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	imageRef := "manifest://" + strings.Repeat("f", 64)
+	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
+		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		t.Fatalf("persist accepted result = %v, %v", accepted, err)
+	}
+
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(runRoot), st, &reconcileLauncher{}, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("terminal build = %+v, %v", stored, err)
+	}
+	wantPersistID := types.TemplateID{Profile: build.Profile, Kind: types.KindImg, Ref: imageRef}.String()
+	if stored.Status != types.BuildReady || stored.PersistID != wantPersistID ||
+		stored.ExecutionClaimed || stored.ExecutionResult != nil || stored.RuntimeVswitchPort != "" {
+		t.Fatalf("accepted result was not recovered exactly: %+v", stored)
+	}
+	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
+		t.Fatalf("recovered accepted-result ports = %v", vs.detached)
+	}
+	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted-result workdir remains: %v", err)
+	}
+}
+
+func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runRoot := filepath.Join(t.TempDir(), "run")
+	runID := "br-00000000-0000-7000-8000-000000000215"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	// This deliberately cannot be parsed if recovery tries to reconstruct a
+	// completed pipeline. The already-acknowledged result must win first.
+	build.PhaseResourcePatch = `{"capacity":`
+	workdir := buildRuntimeDir(runRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	imageRef := "manifest://" + strings.Repeat("e", 64)
+	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
+		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		t.Fatalf("persist accepted result = %v, %v", accepted, err)
+	}
+
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(runRoot), st, lc, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("terminal build = %+v, %v", stored, err)
+	}
+	wantPersistID := types.TemplateID{Profile: build.Profile, Kind: types.KindImg, Ref: imageRef}.String()
+	if stored.Status != types.BuildReady || stored.PersistID != wantPersistID ||
+		stored.ExecutionClaimed || stored.ExecutionResult != nil {
+		t.Fatalf("accepted result was overwritten during live recovery: %+v", stored)
+	}
+	if len(lc.stopped) != 1 || lc.stopped[0] != unit {
+		t.Fatalf("accepted-result unit fence = %v, want %s", lc.stopped, unit)
+	}
+	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
+		t.Fatalf("accepted-result runtime detach = %v", vs.detached)
+	}
+	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted-result workdir remains: %v", err)
+	}
+}
+
+func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000212"
+	build := buildReconcileRow(t, runID)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	pend := &pendingBuild{build: build, result: make(chan configsock.BuildResult, 1)}
+	o.pend[build.BuildID] = pend
+	result := configsock.BuildResult{ImageRef: "manifest://accepted"}
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, result); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.ExecutionResult == nil || *stored.ExecutionResult != result {
+		t.Fatalf("acknowledged result was not durable: %+v, err=%v", stored, err)
+	}
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, result); err != nil {
+		t.Fatalf("identical result replay: %v", err)
+	}
+	conflict := result
+	conflict.ImageRef = "manifest://conflict"
+	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, conflict); !errors.Is(err, store.ErrBuildResultConflict) || !configsock.IsBuildReportRejection(err) {
+		t.Fatalf("conflicting result replay = %v", err)
+	}
+	select {
+	case got := <-pend.result:
+		if got != result {
+			t.Fatalf("result notification = %+v, want %+v", got, result)
+		}
+	default:
+		t.Fatal("durable result did not notify the live monitor")
+	}
+	select {
+	case duplicate := <-pend.result:
+		t.Fatalf("idempotent replay queued a duplicate notification: %+v", duplicate)
+	default:
+	}
+}
+
+func TestWaitAssignmentReplaysDurableBuildRunBinding(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000213"
+	build := buildReconcileRow(t, runID)
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	buildID, ok, err := o.WaitAssignment(context.Background(), runKindBuild, runID)
+	if err != nil || !ok || buildID != build.BuildID {
+		t.Fatalf("durable assignment replay = %q, %t, %v", buildID, ok, err)
+	}
+}
+
+func TestRecoveredAcceptedResultWinsCanceledMonitor(t *testing.T) {
+	runID := "br-00000000-0000-7000-8000-000000000214"
+	unit := "sandbox-builder@" + runID + ".service"
+	lc := &reconcileLauncher{
+		units:              []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		inactiveAfterLists: 2,
+	}
+	o := &Orchestrator{
+		cfg: buildReconcileConfig(t.TempDir()), lc: lc,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	build := buildReconcileRow(t, runID)
+	accepted := configsock.BuildResult{ImageRef: "manifest://accepted-before-shutdown"}
+	pend := &pendingBuild{result: make(chan configsock.BuildResult, 1)}
+	pend.result <- accepted
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := o.waitRecoveredBuild(ctx, build, pend, unit)
+	if err != nil || result == nil || *result != accepted {
+		t.Fatalf("accepted result after canceled monitor = %+v, %v", result, err)
+	}
+}
+
+func TestReconcileRetainsExecutionClaimUntilInterruptedCleanupSucceeds(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("2", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	runID := "br-00000000-0000-7000-8000-000000000002"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{units: []launcher.Unit{{Name: unit, ActiveState: "failed"}}}
+	vs := &reconcileVS{err: errors.New("connector unavailable")}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.Reconcile(context.Background()); err == nil {
+		t.Fatal("cleanup failure did not fail closed")
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed || stored.RuntimeVswitchPort == "" {
+		t.Fatalf("cleanup failure released durable usage: %+v", stored)
+	}
+
+	vs.err = nil
+	if err := o.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildError || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
+		t.Fatalf("successful retry did not terminally release: %+v", stored)
+	}
+}
+
+func TestReconcileTreatsAlreadyDetachedBuildPortAsCompletedCleanup(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("7", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000207"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	o := New(
+		buildReconcileConfig(filepath.Join(t.TempDir(), "run")),
+		st,
+		&reconcileLauncher{units: []launcher.Unit{{Name: unit, ActiveState: "failed"}}},
+		&reconcileVS{err: vswitch.ErrPortNotAttached},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	if err := o.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile replay of completed detach: %v", err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildError || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
+		t.Fatalf("already-detached cleanup did not release durable ownership: %+v", stored)
+	}
+}
+
+func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	total := cap(o.buildEvents) + 5
+	for i := 0; i < total; i++ {
+		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", i)
+		build.ClusterGroup = "/recovery"
+		build.RuntimeVswitchPort = ""
+		build.RuntimeFloatingIP = ""
+		build.RuntimePortMAC = ""
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(o.buildEvents); got != cap(o.buildEvents) {
+		t.Fatalf("recovery did not exercise the bounded event channel: len=%d cap=%d", got, cap(o.buildEvents))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
+	seen := make(map[string]bool, total)
+	doneCh := (<-chan error)(done)
+	for len(seen) < total || doneCh != nil {
+		select {
+		case event := <-o.buildEvents:
+			if event.State != string(types.BuildError) || event.Reason != "build unit was not live after controller restart" {
+				t.Fatalf("replayed terminal event = %+v", event)
+			}
+			seen[event.BuildID] = true
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+			doneCh = nil
+		case <-ctx.Done():
+			t.Fatalf("terminal replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("terminal replay delivered %d/%d unique builds", len(seen), total)
+	}
+}
+
+func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	total := cap(o.buildEvents) + 5
+	result := configsock.BuildResult{ImageRef: "manifest://" + strings.Repeat("a", 64)}
+	wantTemplateID := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: result.ImageRef}.String()
+	for i := 0; i < total; i++ {
+		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", i)
+		build.ClusterGroup = "/accepted-recovery"
+		build.RuntimeVswitchPort = ""
+		build.RuntimeFloatingIP = ""
+		build.RuntimePortMAC = ""
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+		if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, build.RunID, result); err != nil || !accepted {
+			t.Fatalf("accept result %d = %t, %v", i, accepted, err)
+		}
+	}
+
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(o.buildEvents); got != cap(o.buildEvents) {
+		t.Fatalf("accepted-result recovery did not fill the bounded channel: len=%d cap=%d", got, cap(o.buildEvents))
+	}
+	ready, err := st.BuildsByStatus(context.Background(), types.BuildReady)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready) != total {
+		t.Fatalf("durable ready builds = %d, want %d", len(ready), total)
+	}
+	for _, build := range ready {
+		if build.PersistID != wantTemplateID || build.ExecutionClaimed || build.ExecutionResult != nil {
+			t.Fatalf("accepted result did not finalize exactly: %+v", build)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
+	seen := make(map[string]bool, total)
+	doneCh := (<-chan error)(done)
+	for len(seen) < total || doneCh != nil {
+		select {
+		case event := <-o.buildEvents:
+			if event.State != string(types.BuildReady) || event.TemplateID != wantTemplateID || event.Reason != "" {
+				t.Fatalf("replayed accepted-result event = %+v", event)
+			}
+			seen[event.BuildID] = true
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+			doneCh = nil
+		case <-ctx.Done():
+			t.Fatalf("accepted-result replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+		}
+	}
+}
+
+func TestReconcileFailsClosedWhenLiveBuildResourcesDoNotMatch(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000004"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 999_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildError || stored.ExecutionClaimed ||
+		!strings.Contains(stored.Reason, "resource enforcement does not match") {
+		t.Fatalf("mismatched live build = %+v", stored)
+	}
+	if !containsString(lc.stopped, unit) {
+		t.Fatalf("mismatched unit was not stopped: %v", lc.stopped)
+	}
+	if _, _, ok, err := o.BuildSpecFor(context.Background(), "build:"+build.BuildID); err != nil || ok {
+		t.Fatalf("mismatched unit was adopted: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000019"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	readErr := errors.New("transient D-Bus read failure")
+	lc := &reconcileLauncher{
+		units:        []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resourcesErr: readErr,
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	err = o.Reconcile(context.Background())
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Reconcile error = %v, want transient read failure", err)
+	}
+	stored, getErr := st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed || stored.RunID != runID {
+		t.Fatalf("resource read failure changed durable live build: %+v", stored)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("resource read failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	if len(vs.detached) != 0 {
+		t.Fatalf("resource read failure detached live network ownership: %v", vs.detached)
+	}
+}
+
+func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runIDs := []string{
+		"br-00000000-0000-7000-8000-000000000020",
+		"br-00000000-0000-7000-8000-000000000021",
+	}
+	units := make([]launcher.Unit, 0, len(runIDs))
+	builds := make([]*types.Build, 0, len(runIDs))
+	for i, runID := range runIDs {
+		build := buildReconcileRow(t, runID)
+		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", 20+i)
+		build.TemplateID = fmt.Sprintf("transient-00000000-0000-7000-8000-%012d", 20+i)
+		if err := st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+		builds = append(builds, build)
+		units = append(units, launcher.Unit{Name: "sandbox-builder@" + runID + ".service", ActiveState: "active"})
+	}
+	readErr := errors.New("second unit D-Bus read failure")
+	lc := &reconcileLauncher{
+		units: units,
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+		resourcesErrByUnit: map[string]error{units[1].Name: readErr},
+	}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := o.Reconcile(context.Background()); !errors.Is(err, readErr) {
+		t.Fatalf("Reconcile error = %v, want later preflight failure", err)
+	}
+	o.pendMu.Lock()
+	owners := len(o.pend)
+	o.pendMu.Unlock()
+	if owners != 0 {
+		t.Fatalf("preflight failure started %d live monitors", owners)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("preflight failure touched units: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	for _, build := range builds {
+		stored, err := st.GetBuild(context.Background(), build.BuildID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+			t.Fatalf("preflight failure changed build %s: %+v", build.BuildID, stored)
+		}
+	}
+}
+
+func TestReconcilePreservesLiveBuildOnSnapshotProbeFailure(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000022"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	build.FromTemplate = types.TemplateID{
+		Profile: types.ProfileE2B,
+		Kind:    types.KindSnp,
+		Ref:     "manifest://" + strings.Repeat("a", 64),
+	}.String()
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	probeErr := errors.New("object store temporarily unavailable")
+	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
+		return snapshotDescription{}, &snapshotConfigProbeError{ref: "manifest://snapshot", err: probeErr}
+	}
+
+	if err := o.Reconcile(context.Background()); !errors.Is(err, probeErr) {
+		t.Fatalf("Reconcile error = %v, want snapshot probe failure", err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+		t.Fatalf("snapshot probe failure changed durable live build: %+v", stored)
+	}
+	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
+		t.Fatalf("snapshot probe failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	if retryableBuildPhaseInputError(errors.New("malformed persisted resource patch")) {
+		t.Fatal("deterministic local parse error classified as retryable")
+	}
+}
+
+func TestReconcileRetainsClaimWhenLiveBuilderCannotBeStopped(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("4", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runID := "br-00000000-0000-7000-8000-000000000005"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	stopErr := errors.New("systemd stop unavailable")
+	lc := &reconcileLauncher{
+		units:   []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		stopErr: stopErr,
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 999_000,
+			MemoryMax:          1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, vs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.Reconcile(context.Background()); !errors.Is(err, stopErr) {
+		t.Fatalf("Reconcile error = %v, want stop failure", err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed || stored.RuntimeVswitchPort != "17" {
+		t.Fatalf("failed stop released durable execution ownership: %+v", stored)
+	}
+	if len(vs.detached) != 0 {
+		t.Fatalf("failed stop advanced to connector cleanup: %v", vs.detached)
+	}
+}
+
+func TestRecoveredBuildPastDeadlineFailsClosedWhenUnitCannotStop(t *testing.T) {
+	runID := "br-00000000-0000-7000-8000-000000000006"
+	unit := "sandbox-builder@" + runID + ".service"
+	stopErr := errors.New("systemd stop unavailable")
+	lc := &reconcileLauncher{
+		units:   []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		stopErr: stopErr,
+	}
+	o := &Orchestrator{
+		cfg: buildReconcileConfig(t.TempDir()), lc: lc,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	build := buildReconcileRow(t, runID)
+	build.ExecutionClaimedUnix = time.Now().Add(-2 * time.Hour).Unix()
+
+	_, err := o.waitRecoveredBuild(context.Background(), build,
+		&pendingBuild{result: make(chan configsock.BuildResult, 1)}, unit)
+	if !errors.Is(err, errBuildCleanupPending) || !errors.Is(err, stopErr) {
+		t.Fatalf("waitRecoveredBuild error = %v, want cleanup-pending stop failure", err)
+	}
+}
+
+func buildReconcileConfig(runRoot string) *config.Config {
+	policy := sandboxcfg.NodeResourcePolicy{}
+	policy.ApplyDefaults()
+	maxBuilds := int64(2)
+	return &config.Config{
+		Paths: config.PathsConfig{RunRoot: runRoot},
+		Units: config.UnitsConfig{
+			Runner: "sandbox-runner@.service", Builder: "sandbox-builder@.service", PoolWaitTimeout: "5s",
+		},
+		Sandbox: config.SandboxConfig{
+			Resources: config.ResourcesConfig(policy),
+			Network: config.NetworkConfig{
+				Hostname: "sandbox", DNS: []string{"169.254.169.253"},
+				Bare: config.ProfileNet{InnerIP: "169.254.1.1/31", Nexthop: "169.254.1.0"},
+			},
+		},
+		Builder: config.BuilderConfig{
+			Admission: config.BuilderAdmissionConfig{
+				Registration: &config.BuildAdmissionLimitConfig{MaxBuilds: &maxBuilds},
+				Execution:    &config.BuildAdmissionLimitConfig{MaxBuilds: &maxBuilds},
+			},
+			TotalTimeoutSec: 60,
+		},
+	}
+}
+
+func buildReconcileRow(t *testing.T, runID string) *types.Build {
+	t.Helper()
+	manifestKey := strings.Repeat("a", 64)
+	return &types.Build{
+		BuildID: "00000000-0000-7000-8000-000000000003", TemplateID: "transient-00000000-0000-7000-8000-000000000004",
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildBuilding,
+		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
+		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), RunID: runID,
+		EnforcementStatus: "cpu,memory", RuntimeVswitchPort: "17", RuntimeFloatingIP: "192.0.2.17",
+		RuntimePortMAC: "02:00:00:00:00:17", CreatedUnix: time.Now().Unix(),
 	}
 }
 

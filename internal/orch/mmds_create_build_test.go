@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +71,7 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 	header := `{"secrets":{"key":"build-initial"}}`
 	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Profile:    types.ProfileE2B,
+		Resources:  testBuildResources(),
 		Metadata:   map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`},
 		MMDSHeader: &header,
 	})
@@ -93,19 +93,81 @@ func TestBuildRegisterOwnsMMDSAndTriggerCannotOverride(t *testing.T) {
 
 	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
 		FromImage: "registry.example/base:latest",
-		Metadata:  map[string]string{sandboxcfg.NsMMDS: `{"routes":[]}`},
-	}, api.BuildAuth{}); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("MMDS override error = %v", err)
-	}
-	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
-		FromImage: "registry.example/base:latest",
-		Metadata:  map[string]string{"ordinary": "trigger"},
 	}, api.BuildAuth{}); err != nil {
 		t.Fatal(err)
 	}
 	triggered, err := o.st.GetBuild(ctx, b.BuildID)
 	if err != nil || triggered.Metadata[sandboxcfg.NsMMDS] != raw {
 		t.Fatalf("trigger changed registered MMDS routes: err=%v", err)
+	}
+}
+
+func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) {
+	o := testOrchCfg(t, mmdsFeatureConfig())
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("cluster-mmds-secret", fingerprint)
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`
+	cmd.BuildMMDSSecrets = map[string]string{"key": "cluster-initial"}
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("cluster BuildRegister ack = %+v", ack)
+	}
+	stored, err := o.st.GetBuild(ctx, cmd.BuildID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored cluster build = %+v, err=%v", stored, err)
+	}
+	raw := stored.Metadata[sandboxcfg.NsMMDS]
+	if raw != `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}` ||
+		strings.Contains(raw, "cluster-initial") || strings.Contains(raw, `"secrets"`) {
+		t.Fatalf("cluster build persisted noncanonical or plaintext MMDS metadata: %s", raw)
+	}
+	digest := sandboxcfg.MMDSRoutesDigest(raw)
+	if stored.RegistrationMMDSRoutesDigest != digest {
+		t.Fatalf("cluster registration MMDS digest = %q, want %q", stored.RegistrationMMDSRoutesDigest, digest)
+	}
+	values, _, found, err := o.st.GetMMDSRouteSecretValues(
+		ctx, store.MMDSRouteSecretOwnerBuild, cmd.BuildID, digest)
+	if err != nil || !found || string(values["key"]) != "cluster-initial" {
+		t.Fatalf("cluster build MMDS values = %+v, found=%v err=%v", values, found, err)
+	}
+}
+
+func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *testing.T) {
+	o := testOrchCfg(t, mmdsFeatureConfig())
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("cluster-mmds-policy-replay", fingerprint)
+	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}]}`
+	cmd.BuildMMDSSecrets = map[string]string{"key": "initial"}
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("initial BuildRegister ack = %+v", ack)
+	}
+	select {
+	case <-o.buildEvents:
+	case <-time.After(time.Second):
+		t.Fatal("initial registration event was not published")
+	}
+
+	// Mutable operator policy governs only new ownership. An ACK-lost replay
+	// must still reach the store's immutable row/value comparison.
+	o.cfg.MMDS.Routes.Enabled = false
+	o.cfg.MMDS.Routes.MaxRoutesPerSandbox = 1
+	o.cfg.MMDS.Routes.MaxNamespaceBytes = 1
+	o.cfg.MMDS.Routes.MaxSecretValueBytes = 1
+	o.cfg.MMDS.Routes.ReservedPathPrefixes = []string{"/identity"}
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("exact replay after MMDS policy drift ack = %+v", ack)
+	}
+	usage, err := o.st.BuildUsage(ctx)
+	if err != nil || usage.RegistrationBuilds != 1 {
+		t.Fatalf("replay registration usage = %+v, err=%v", usage, err)
+	}
+
+	changed := *cmd
+	changed.CmdID = "changed-mmds-policy-replay"
+	changed.BuildMMDSSecrets = map[string]string{"key": "changed"}
+	if ack := o.HandleCommand(ctx, &changed); ack.Status != routesync.AckRejected || ack.HTTPStatus != 409 {
+		t.Fatalf("changed replay ack = %+v, want immutable conflict", ack)
 	}
 }
 
@@ -116,6 +178,7 @@ func TestBuildMMDSRouteIsIncludedInFullSync(t *testing.T) {
 	header := `{"secrets":{"key":"build-full-sync"}}`
 	build, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Profile:    types.ProfileE2B,
+		Resources:  testBuildResources(),
 		Metadata:   map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`},
 		MMDSHeader: &header,
 	})

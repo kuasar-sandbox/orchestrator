@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,24 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrPortNotAttached reports that a RELEASE target was already free. Callers
+// that durably remember connector ownership can treat this exact condition as
+// successful replay after a controller restart; all other provider failures
+// remain fatal.
+var ErrPortNotAttached = errors.New("connector vswitch port not attached")
+
+type tapFDProviderError struct {
+	code    string
+	message string
+}
+
+func (e *tapFDProviderError) Error() string {
+	if e.message != "" {
+		return fmt.Sprintf("provider error %s: %s", e.code, e.message)
+	}
+	return fmt.Sprintf("provider error %s", e.code)
+}
 
 const (
 	tapfdRequestVersion = "TAPFD/1"
@@ -149,6 +168,9 @@ func (c *CLI) Detach(ctx context.Context, port string) error {
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
+		if cliPortNotAttached(errb.String(), port) {
+			return fmt.Errorf("connector vswitch detach %s port %s: %w", c.sw, port, ErrPortNotAttached)
+		}
 		return fmt.Errorf("connector vswitch detach %s port %s: %w: %s", c.sw, port, err, errb.String())
 	}
 	return nil
@@ -203,7 +225,33 @@ func (c *CLI) release(ctx context.Context, port string) error {
 		return fmt.Errorf("connector tapfd release %s: invalid port %q", c.sw, port)
 	}
 	_, err = c.tapfdCall(ctx, "RELEASE", "VSWITCH="+c.sw, "PORT="+port)
+	if tapFDPortNotAttached(err, strconv.FormatUint(portNum, 10)) {
+		return fmt.Errorf("connector tapfd release %s port %s: %w", c.sw, port, ErrPortNotAttached)
+	}
 	return err
+}
+
+func tapFDPortNotAttached(err error, port string) bool {
+	var providerErr *tapFDProviderError
+	return errors.As(err, &providerErr) &&
+		providerErr.code == "PORT_UNAVAILABLE" &&
+		providerErr.message == "port_"+port+":_port_not_attached"
+}
+
+func cliPortNotAttached(stderr, port string) bool {
+	portNum, err := strconv.ParseUint(port, 10, 32)
+	if err != nil || portNum == 0 {
+		return false
+	}
+	want := "port " + strconv.FormatUint(portNum, 10) + ": port not attached"
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "Error: ")
+		if line == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *CLI) tapfdCall(ctx context.Context, op string, fields ...string) (map[string]string, error) {
@@ -291,11 +339,7 @@ func parseTapFDResponse(line string) (map[string]string, error) {
 		if code == "" {
 			code = "PROVIDER_INTERNAL"
 		}
-		msg := fields["message"]
-		if msg != "" {
-			return nil, fmt.Errorf("provider error %s: %s", code, msg)
-		}
-		return nil, fmt.Errorf("provider error %s", code)
+		return nil, &tapFDProviderError{code: code, message: fields["message"]}
 	default:
 		return nil, fmt.Errorf("unsupported response status %q", toks[1])
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // placeParams is one placement evaluation over the placer's local view.
@@ -22,6 +23,7 @@ type placeParams struct {
 	zoneAdmitMax        string // exclude nodes hotter than this (green<yellow<red<critical); "" = no zone filter
 	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
 	excludedNodeIDs     map[string]struct{}
+	buildResources      *routesync.BuildResources
 }
 
 // placeSandbox runs the sandbox placement algorithm (cluster-placer.md):
@@ -46,16 +48,16 @@ func placeSandbox(p placeParams) (string, error) {
 	return p2c(eligible, p.candidates, sandboxLoad).NodeID, nil
 }
 
-// placeBuild runs resource-aware build placement (cluster-placer.md): among
-// matching/non-draining nodes with build headroom (build_alloc <
-// build_capacity), P2C by build utilization. The per-build requested-resources
-// check + RESERVED occupancy live in the registry's BuildStore commit (P4); here
-// the placer suggests over its view.
+// placeBuild runs resource-aware build placement (cluster-placer.md). The
+// low-frequency node_list deliberately carries configured capacity but not
+// heartbeat usage, so this layer only rejects a request that can never fit a
+// node. Registry rechecks current registration headroom at the Holder boundary,
+// and the selected node remains the final transactional admission authority.
 func placeBuild(p placeParams) (string, error) {
 	maxZone := zoneRank(p.zoneAdmitMax)
 	var eligible []*registry.NodeRecord
 	for _, n := range p.nodes {
-		if !eligibleNode(n, p, maxZone) || !hasBuildHeadroom(n) {
+		if !eligibleNode(n, p, maxZone) || !canRegisterBuild(n, p.buildResources) {
 			continue
 		}
 		eligible = append(eligible, n)
@@ -63,33 +65,57 @@ func placeBuild(p placeParams) (string, error) {
 	if len(eligible) == 0 {
 		return "", registry.ErrNoNode
 	}
-	return p2c(eligible, p.candidates, buildLoad).NodeID, nil
+	return p2c(eligible, p.candidates, sandboxLoad).NodeID, nil
 }
 
-// hasBuildHeadroom is true when the node has spare build pool (CPU dimension);
-// a node with no declared build_capacity is treated as unconstrained.
-func hasBuildHeadroom(n *registry.NodeRecord) bool {
-	if n.BuildCapacity == nil || n.BuildCapacity.CPU == 0 {
+// canRegisterBuild is true when the request fits every configured registration
+// dimension in isolation. Current usage is intentionally unavailable in the
+// Placer view and is checked by Registry immediately before dispatch.
+func canRegisterBuild(n *registry.NodeRecord, want *routesync.BuildResources) bool {
+	limit := n.BuildRegistrationCapacity
+	if limit == nil {
 		return true
 	}
-	used := 0
-	if n.BuildAlloc != nil {
-		used = n.BuildAlloc.CPU
+	requested := routesync.BuildResources{}
+	if want != nil {
+		requested = *want
 	}
-	return used < n.BuildCapacity.CPU
+	return dimensionFits(0, 1, limit.MaxBuilds) &&
+		dimensionFits(0, requested.CPU, resourceCPU(limit.Resources)) &&
+		dimensionFits(0, requested.Memory, resourceMemory(limit.Resources)) &&
+		dimensionFits(0, requested.Storage, resourceStorage(limit.Resources))
 }
 
-// buildLoad ranks nodes by build-pool utilization (build_alloc/build_capacity),
-// falling back to sandbox load when no build pool is declared.
-func buildLoad(n *registry.NodeRecord) float64 {
-	if n.BuildCapacity == nil || n.BuildCapacity.CPU == 0 {
-		return sandboxLoad(n)
+func dimensionFits(used, requested, limit int64) bool {
+	if used < 0 || requested < 0 || limit < 0 {
+		return false
 	}
-	used := 0
-	if n.BuildAlloc != nil {
-		used = n.BuildAlloc.CPU
+	if limit == 0 {
+		return true
 	}
-	return float64(used) / float64(n.BuildCapacity.CPU)
+	if requested > limit {
+		return false
+	}
+	return used <= limit-requested
+}
+
+func resourceCPU(resources *routesync.BuildResources) int64 {
+	if resources == nil {
+		return 0
+	}
+	return resources.CPU
+}
+func resourceMemory(resources *routesync.BuildResources) int64 {
+	if resources == nil {
+		return 0
+	}
+	return resources.Memory
+}
+func resourceStorage(resources *routesync.BuildResources) int64 {
+	if resources == nil {
+		return 0
+	}
+	return resources.Storage
 }
 
 // eligibleNode is the shared eligibility predicate (sans shuffle slot): not
