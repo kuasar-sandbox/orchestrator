@@ -11,6 +11,16 @@ fail() {
   exit 1
 }
 
+WORKFLOW="$ROOT/.github/workflows/component-release.yml"
+for input in accelerator_version connector_version sandboxer_version; do
+  grep -Fq "      $input:" "$WORKFLOW" \
+    || fail "release workflow is missing required $input input"
+  [ "$(grep -Fc "ref: \${{ needs.preflight.outputs.$input }}" "$WORKFLOW")" -eq 2 ] \
+    || fail "release workflow does not pin both $input checkouts"
+done
+grep -Fq "repos/kuasar-sandbox/\$repository/releases/tags/\$version" "$WORKFLOW" \
+  || fail "release workflow does not verify dependency releases"
+
 for entrypoint in test/e2e/e2e_cluster_real.sh test/e2e/e2e_cluster_stub.sh \
   test/e2e/e2e_density.sh test/e2e/e2e_execute.sh \
   test/e2e/e2e_orchestrator.sh test/e2e/e2e_orchestrator_proxy.sh \

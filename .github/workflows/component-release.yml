@@ -8,6 +8,18 @@ on:
         description: Orchestrator version in vX.Y.Z or vX.Y.Z-preview.YYYYMMDD form
         required: true
         type: string
+      accelerator_version:
+        description: Published accelerator version used to build this release
+        required: true
+        type: string
+      connector_version:
+        description: Published connector version used to build this release
+        required: true
+        type: string
+      sandboxer_version:
+        description: Published sandboxer version used to build this release
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,6 +35,9 @@ jobs:
       actions: read
       contents: read
     outputs:
+      accelerator_version: ${{ steps.request.outputs.accelerator_version }}
+      connector_version: ${{ steps.request.outputs.connector_version }}
+      sandboxer_version: ${{ steps.request.outputs.sandboxer_version }}
       version: ${{ steps.request.outputs.version }}
     steps:
       - name: Check out trusted release tooling
@@ -34,14 +49,28 @@ jobs:
         id: request
         env:
           GH_TOKEN: ${{ github.token }}
+          ACCELERATOR_VERSION: ${{ inputs.accelerator_version }}
+          CONNECTOR_VERSION: ${{ inputs.connector_version }}
+          SANDBOXER_VERSION: ${{ inputs.sandboxer_version }}
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: x86_64
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] \
             || { echo "Component Release must run from main" >&2; exit 1; }
+          [[ "$ACCELERATOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+            || { echo "accelerator_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
+          [[ "$CONNECTOR_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+            || { echo "connector_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
+          [[ "$SANDBOXER_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
+            || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
           bash scripts/publish-release.sh check "$VERSION" "$TARGET_ARCH"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "accelerator_version=$ACCELERATOR_VERSION"
+            echo "connector_version=$CONNECTOR_VERSION"
+            echo "sandboxer_version=$SANDBOXER_VERSION"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: preflight
@@ -58,6 +87,9 @@ jobs:
       GOPROXY: https://goproxy.cn,direct
       GOSUMDB: sum.golang.google.cn
       GOTOOLCHAIN: local
+      ACCELERATOR_VERSION: ${{ needs.preflight.outputs.accelerator_version }}
+      CONNECTOR_VERSION: ${{ needs.preflight.outputs.connector_version }}
+      SANDBOXER_VERSION: ${{ needs.preflight.outputs.sandboxer_version }}
     steps:
       - name: Create read-only source token
         id: source-token
@@ -69,6 +101,31 @@ jobs:
           repositories: accelerator,connector,orchestrator,sandboxer
           permission-contents: read
           skip-token-revoke: true
+
+      - name: Verify dependency releases
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          for dependency in \
+            "accelerator $ACCELERATOR_VERSION" \
+            "connector $CONNECTOR_VERSION" \
+            "sandboxer $SANDBOXER_VERSION"
+          do
+            read -r repository version <<< "$dependency"
+            prerelease=false
+            [[ "$version" != *-preview.* ]] || prerelease=true
+            curl --fail --show-error --silent \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/kuasar-sandbox/$repository/releases/tags/$version" \
+              > "$repository-release.json"
+            jq -e --arg version "$version" --argjson prerelease "$prerelease" \
+              '.tag_name == $version and .draft == false and .prerelease == $prerelease' \
+              "$repository-release.json" >/dev/null
+          done
 
       - name: Check out exact orchestrator source
         id: checkout-orchestrator
@@ -97,7 +154,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/accelerator
-          ref: main
+          ref: ${{ needs.preflight.outputs.accelerator_version }}
           path: src/accelerator
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -107,7 +164,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/accelerator
-          ref: main
+          ref: ${{ needs.preflight.outputs.accelerator_version }}
           path: src/accelerator
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -118,7 +175,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/connector
-          ref: main
+          ref: ${{ needs.preflight.outputs.connector_version }}
           path: src/connector
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -128,7 +185,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/connector
-          ref: main
+          ref: ${{ needs.preflight.outputs.connector_version }}
           path: src/connector
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -139,7 +196,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/sandboxer
-          ref: main
+          ref: ${{ needs.preflight.outputs.sandboxer_version }}
           path: src/sandboxer
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -149,7 +206,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/sandboxer
-          ref: main
+          ref: ${{ needs.preflight.outputs.sandboxer_version }}
           path: src/sandboxer
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
