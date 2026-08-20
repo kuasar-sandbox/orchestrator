@@ -110,6 +110,8 @@ api:
   domain: sandboxes.example.com
   listen: ":443"                                 # dev: ":3000" (plain http/h2c)
   tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
+# tracing:                                         # optional OTLP/HTTP spans for public api.<domain> requests
+#   otlp_endpoint: http://otel-collector:4318/v1/traces
 proxy:                                           # data-plane policy (<port>-<sid>.<domain>)
   mode: internal                                 # internal | external | off
   auth: enforce                                  # off | log | enforce: validate X-Access-Token

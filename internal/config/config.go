@@ -58,6 +58,7 @@ const (
 // Config is the grouped node-local configuration.
 type Config struct {
 	API     APIConfig     `yaml:"api"`     // north control plane + TLS
+	Tracing TracingConfig `yaml:"tracing"` // optional north control-plane OpenTelemetry traces
 	Proxy   ProxyConfig   `yaml:"proxy"`   // data-plane proxy
 	Paths   PathsConfig   `yaml:"paths"`   // node-local dirs / sockets
 	Units   UnitsConfig   `yaml:"units"`   // systemd unit management
@@ -80,6 +81,12 @@ type Config struct {
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
 
 	execDir string // auto: dir of os.Executable(); used by Bin (not a YAML field)
+}
+
+// TracingConfig configures optional OpenTelemetry tracing. An empty endpoint
+// disables tracing; when set it is the complete OTLP/HTTP traces URL.
+type TracingConfig struct {
+	OTLPEndpoint string `yaml:"otlp_endpoint"`
 }
 
 // ResourceListenConfig hosts the in-process node resource controller inside serve

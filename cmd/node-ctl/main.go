@@ -128,6 +128,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	warnDeprecatedCheckpointMode(cfg, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	shutdownTracing := setupTracing(ctx, cfg.Tracing.OTLPEndpoint, log)
+	defer shutdownTracing()
 
 	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
 	if err != nil {
@@ -291,6 +293,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 	res := api.Resources{VCPU: cfg.Sandbox.Resources.Policy().Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
 	apiH := api.New(core, cfg.API.Domain, res, log).Handler()
+	publicAPIH := traceHTTPHandler(apiH)
 
 	// Local control socket: one UDS multiplexes run assignment/result, task specs,
 	// manifest-key management (admin plane, pid ∈ admin_pidfile or, when unset,
@@ -355,7 +358,7 @@ func runConductor(args []string, log *slog.Logger) error {
 			host = host[:i]
 		}
 		if host == "api."+cfg.API.Domain || strings.HasPrefix(host, "api.") {
-			apiH.ServeHTTP(w, r)
+			publicAPIH.ServeHTTP(w, r)
 			return
 		}
 		dataH.ServeHTTP(w, r)

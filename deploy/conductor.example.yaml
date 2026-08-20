@@ -17,6 +17,11 @@ api:
     cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
     key: /etc/node-ctl/tls/privkey.pem
 
+# Optional OpenTelemetry tracing for public api.<domain> requests only. The endpoint
+# is the complete OTLP/HTTP traces URL; omit this block (or leave it empty) to disable.
+# tracing:
+#   otlp_endpoint: http://otel-collector:4318/v1/traces
+
 # Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
 #   external           — offload to node-ctl proxy master (deploy/proxy.example.yaml

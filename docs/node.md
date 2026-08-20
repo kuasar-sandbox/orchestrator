@@ -349,6 +349,7 @@ serve daemon 的配置文件是 `conductor.yaml`。完整带注释样例见 `dep
 (`node-ctl config conductor --template` 输出同形骨架),权威结构是 `internal/config/config.go`。
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
+`tracing`、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
 `encryption_key`、`manifest_config`。**必填仅 `api.domain` 与 `encryption_key`**(后者可用
 `NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。外部二进制(sandbox-ctl/connector-ctl vswitch/flatten-ctl)**不配置**:按"与
@@ -359,6 +360,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
+| `tracing.otlp_endpoint` | 空(关) | 完整的 OTLP/HTTP 追踪上报地址(例如 `http://otel-collector:4318/v1/traces`)。启用后,仅导出并上报 `api.<domain>` 公共控制面 API 的请求。任何导出或上报失败仅记录日志,不影响服务可用性;数据面流量和 UDS 内部通信不追踪。 |
 | `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §3) |
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
 | `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段,external native exec 另要求 `proxy.yaml` 必填 `paths.run_root` |
