@@ -25,12 +25,16 @@ type stubProvider struct {
 	pidFile       string
 	assignmentErr error
 	buildSpecErr  error
+	buildPrepErr  error
 	resultErr     error
 	phaseErr      error
 	sandboxAuth   SandboxTaskAuth
 	bootstrapHits *atomic.Int32
 	prepareHits   *atomic.Int32
 	prepareErr    error
+	buildAuthHits *atomic.Int32
+	buildSpecHits *atomic.Int32
+	buildPrepHits *atomic.Int32
 }
 
 func (s stubProvider) SandboxTaskAuth(_ context.Context, sandboxID, runID string) (SandboxTaskAuth, bool, error) {
@@ -70,14 +74,43 @@ func (s stubProvider) CompleteSandboxPrepare(_ context.Context, sandboxID, runID
 	return &LaunchSpec{Exec: "/bin/true", Args: []string{"run"}}, nil
 }
 
-func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, string, bool, error) {
+func (s stubProvider) BuildTaskAuth(_ context.Context, buildID, runID string) (BuildTaskAuth, bool, error) {
+	if s.buildAuthHits != nil {
+		s.buildAuthHits.Add(1)
+	}
+	if buildID != "x" || runID != "br-test" {
+		return BuildTaskAuth{}, false, nil
+	}
+	return BuildTaskAuth{PidFile: s.pidFile}, true, nil
+}
+
+func (s stubProvider) BuildTaskSpecFor(_ context.Context, buildID, runID string) (*BuildTaskSpec, bool, error) {
+	if s.buildSpecHits != nil {
+		s.buildSpecHits.Add(1)
+	}
 	if s.buildSpecErr != nil {
-		return nil, s.pidFile, false, s.buildSpecErr
+		return nil, false, s.buildSpecErr
 	}
-	if id != "build:x" {
-		return nil, "", false, nil
+	if buildID != "x" || runID != "br-test" {
+		return nil, false, nil
 	}
-	return &BuildSpec{BuildID: "x", Workdir: "/tmp"}, s.pidFile, true, nil
+	return &BuildTaskSpec{
+		BuildID: buildID, RunID: runID,
+		Final: &BuildSpec{BuildID: buildID, RunID: runID, Workdir: "/tmp"},
+	}, true, nil
+}
+
+func (s stubProvider) CompleteBuildPrepare(_ context.Context, buildID, runID string, _ SnapshotPrepareSummary) (*BuildSpec, error) {
+	if s.buildPrepHits != nil {
+		s.buildPrepHits.Add(1)
+	}
+	if s.buildPrepErr != nil {
+		return nil, s.buildPrepErr
+	}
+	if buildID != "x" || runID != "br-test" {
+		return nil, RejectBuildPrepare(os.ErrNotExist)
+	}
+	return &BuildSpec{BuildID: buildID, RunID: runID, Workdir: "/tmp"}, nil
 }
 
 func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
@@ -299,19 +332,89 @@ func TestSandboxPrepareConflictIsDefinitive(t *testing.T) {
 	}
 }
 
+func TestBuildBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "builder.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	var secretCalls atomic.Int32
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, buildSpecHits: &secretCalls}})
+	if _, err := FetchBuildTaskSpec(context.Background(), sock, "x", "br-test"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized build bootstrap error = %v", err)
+	}
+	if got := secretCalls.Load(); got != 0 {
+		t.Fatalf("secret-bearing build provider calls = %d, want 0", got)
+	}
+}
+
+func TestBuildBootstrapRejectsUnsupportedSchemaBeforeProviders(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "builder.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	var authCalls, secretCalls atomic.Int32
+	_, client := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, buildAuthHits: &authCalls, buildSpecHits: &secretCalls,
+	}})
+	status, _ := rawPost(t, client, PathTaskBuildBootstrap, BuildTaskRequest{
+		BuildID: "x", RunID: "br-test", Version: SnapshotPrepareSchemaVersion + 1,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("unsupported build bootstrap status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if authCalls.Load() != 0 || secretCalls.Load() != 0 {
+		t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+	}
+}
+
+func TestBuildPrepareAuthenticatesBeforeCompletionProvider(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "builder.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	var completionCalls atomic.Int32
+	provider := stubProvider{pidFile: pf, buildPrepHits: &completionCalls}
+	sock, _ := startTestServer(t, Deps{Provider: provider})
+	summary := SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
+	if _, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", summary); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized build completion error = %v", err)
+	}
+	if got := completionCalls.Load(); got != 0 {
+		t.Fatalf("build completion provider calls = %d, want 0", got)
+	}
+
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	final, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", summary)
+	if err != nil || final == nil || final.BuildID != "x" {
+		t.Fatalf("authorized build completion = %+v, %v", final, err)
+	}
+	if got := completionCalls.Load(); got != 1 {
+		t.Fatalf("build completion provider calls = %d, want 1", got)
+	}
+}
+
+func TestBuildSnapshotPreparationDoesNotCrossTaskWire(t *testing.T) {
+	body, err := json.Marshal(BuildSpec{
+		BuildID: "build", SnapshotPreparation: &BuildSnapshotPreparation{
+			BaseRef: "manifest://task-local-only", StartCmd: "secret-local-metadata",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "task-local-only") || strings.Contains(string(body), "secret-local-metadata") ||
+		strings.Contains(string(body), "SnapshotPreparation") {
+		t.Fatalf("task-local snapshot preparation crossed wire: %s", body)
+	}
+}
+
 func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.sock")
 	if _, err := WaitAssignment(context.Background(), missing, "build", "br-test"); !IsTransportError(err) {
 		t.Fatalf("assignment transport error = %v, retryable=%t", err, IsTransportError(err))
 	}
-	if _, err := FetchBuildSpecContext(context.Background(), missing, "build:test"); !IsTransportError(err) {
+	if _, err := FetchBuildTaskSpec(context.Background(), missing, "test", "br-test"); !IsTransportError(err) {
 		t.Fatalf("build-spec transport error = %v, retryable=%t", err, IsTransportError(err))
 	}
 
 	pf := filepath.Join(t.TempDir(), "id.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
 	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
-	if _, err := FetchBuildSpecContext(context.Background(), sock, "unknown"); err == nil || IsTransportError(err) {
+	if _, err := FetchBuildTaskSpec(context.Background(), sock, "unknown", "br-test"); err == nil || IsTransportError(err) {
 		t.Fatalf("provider rejection = %v, retryable=%t", err, IsTransportError(err))
 	}
 }
@@ -337,8 +440,12 @@ func TestBuildRetryClassification(t *testing.T) {
 			_, err := WaitAssignment(context.Background(), sock, "build", "br-test")
 			return err
 		},
-		"build spec": func(sock string) error {
-			_, err := FetchBuildSpecContext(context.Background(), sock, "build:x")
+		"build bootstrap": func(sock string) error {
+			_, err := FetchBuildTaskSpec(context.Background(), sock, "x", "br-test")
+			return err
+		},
+		"build prepare": func(sock string) error {
+			_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", SnapshotPrepareSummary{})
 			return err
 		},
 		"result": func(sock string) error {
@@ -353,8 +460,10 @@ func TestBuildRetryClassification(t *testing.T) {
 			switch name {
 			case "assignment":
 				provider.assignmentErr = transient
-			case "build spec":
+			case "build bootstrap":
 				provider.buildSpecErr = transient
+			case "build prepare":
+				provider.buildPrepErr = transient
 			case "result":
 				provider.resultErr = transient
 			case "phase":
@@ -371,6 +480,15 @@ func TestBuildRetryClassification(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("reject build prepare", func(t *testing.T) {
+		provider := stubProvider{pidFile: pf, buildPrepErr: RejectBuildPrepare(errors.New("prepare digest conflict"))}
+		sock, _ := startTestServer(t, Deps{Provider: provider})
+		_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", SnapshotPrepareSummary{})
+		if err == nil || IsRetryableError(err) || err.Error() != "prepare digest conflict" {
+			t.Fatalf("prepare rejection = %v, retryable=%t", err, IsRetryableError(err))
+		}
+	})
 
 	for name, provider := range map[string]stubProvider{
 		"result": {pidFile: pf, resultErr: RejectBuildReport(errors.New("result ownership lost"))},

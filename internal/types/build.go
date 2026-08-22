@@ -90,11 +90,12 @@ type BuildRegistryTLSOptions struct {
 // can finish unit/runtime cleanup without losing a successful result. None of
 // these fields contains tenant credentials.
 type BuildResult struct {
-	ImageRef    string `json:"image_ref,omitempty"`
-	SnapshotRef string `json:"snapshot_ref,omitempty"`
-	StartCmd    string `json:"start_cmd,omitempty"`
-	ReadyCmd    string `json:"ready_cmd,omitempty"`
-	Error       string `json:"error,omitempty"`
+	ImageRef     string `json:"image_ref,omitempty"`
+	SnapshotRef  string `json:"snapshot_ref,omitempty"`
+	StartCmd     string `json:"start_cmd,omitempty"`
+	ReadyCmd     string `json:"ready_cmd,omitempty"`
+	Error        string `json:"error,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 // Build is one template build, doubling as the template record.
@@ -164,6 +165,11 @@ type Build struct {
 	RuntimeFloatingIP      string
 	RuntimePortMAC         string
 	RuntimeEnvdAccessToken string
+	// RuntimePrepareJSON is the non-secret canonical final host preparation
+	// committed atomically with the runtime port. It lets a new conductor return
+	// an equivalent BuildSpec without rereading the source snapshot or applying
+	// potentially changed node defaults.
+	RuntimePrepareJSON string
 	// ExecutionResult is set atomically before the config-socket acknowledges
 	// run-builder's report. Terminal persistence clears it together with the
 	// execution claim after the unit and host runtime have been reclaimed.

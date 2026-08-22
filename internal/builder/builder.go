@@ -41,7 +41,6 @@ package builder
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -57,9 +56,10 @@ import (
 // execution claim fails closed before any phase resource side effect.
 type PhaseReporter func(phase, sandboxID, state string) error
 
-// Run drives the build pipeline for spec and returns its Result.
-func Run(spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
-	p := &buildPipeline{spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
+// Run drives the build pipeline for spec and returns its Result. parent carries
+// task cancellation (including SIGTERM) into every phase subprocess.
+func Run(parent context.Context, spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
+	p := &buildPipeline{parent: parent, spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
 	return p.run()
 }
 
@@ -73,6 +73,7 @@ type Result struct {
 }
 
 type buildPipeline struct {
+	parent    context.Context
 	spec      *configsock.BuildSpec
 	vmmCgroup *os.File
 	report    PhaseReporter
@@ -93,6 +94,11 @@ type buildPipeline struct {
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
+
+// The conductor's absolute execution deadline includes durable reporting (and
+// excludes its separately bounded cleanup). Reserve a tail inside that same
+// deadline so run-builder can report a work timeout before the RPC is canceled.
+const buildResultReportGrace = 5 * time.Second
 
 // Guest-side paths for the flatten-ctl TLS config (projected via sandbox YAML
 // files into the Phase A import sandbox when a per-build registry TLS policy is
@@ -115,8 +121,7 @@ const (
 
 func (p *buildPipeline) run() (res Result) {
 	s := p.spec
-	p.ctx, p.cancel = context.WithTimeout(context.Background(),
-		time.Duration(s.Timeouts.TotalSec)*time.Second)
+	p.ctx, p.cancel = buildPipelineContext(p.parent, s.Timeouts)
 	defer p.cancel()
 	p.out = newBuildJournal(s.RunID, s.BuildID)
 	defer p.out.Close()
@@ -181,6 +186,35 @@ func (p *buildPipeline) run() (res Result) {
 	return res
 }
 
+func buildPipelineContext(parent context.Context, timeouts configsock.BuildTimeouts) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeouts.AbsoluteDeadlineUnixNano > 0 {
+		deadline := PreResultDeadline(
+			time.Unix(0, timeouts.AbsoluteDeadlineUnixNano), time.Now(),
+		)
+		return context.WithDeadline(parent, deadline)
+	}
+	return context.WithTimeout(parent, time.Duration(timeouts.TotalSec)*time.Second)
+}
+
+// PreResultDeadline reserves a bounded tail inside absolute for the task's
+// durable result report. Callers use the returned deadline for snapshot/host
+// preparation, phase reporting, and pipeline execution; only the final result
+// POST may consume the remaining tail.
+func PreResultDeadline(absolute, now time.Time) time.Time {
+	remaining := absolute.Sub(now)
+	if remaining <= 0 {
+		return absolute
+	}
+	grace := buildResultReportGrace
+	if half := remaining / 2; grace > half {
+		grace = half
+	}
+	return absolute.Add(-grace)
+}
+
 func (p *buildPipeline) runPhase(phase string, run func() error) error {
 	sid := phaseSandboxID(phase, p.spec.BuildID)
 	if p.report != nil {
@@ -229,62 +263,20 @@ func (p *buildPipeline) resolveBase() error {
 	case s.FromTemplateKind == "img":
 		p.baseRef = s.FromTemplateRef
 		return nil
-	default: // snp: the snapshot.cfg names the base image + overlay diff + start/ready
-		args := []string{"info", "--json", "--manifest-config", s.Paths.ManifestConfig}
-		args = appendRefLocationArgs(args, s.RefLocations)
-		args = append(args, s.FromTemplateRef)
-		out, err := p.hostCmdEnv(s.Env, p.spec.Paths.SandboxCtl, args...)
-		if err != nil {
-			return fmt.Errorf("read base template cfg: %w", err)
+	default: // snp: run-builder retained the only parsed root SnapshotCfg
+		prepared := s.SnapshotPreparation
+		if prepared == nil || prepared.BaseRef == "" {
+			return fmt.Errorf("base template %s: task-local snapshot preparation is missing", s.FromTemplateRef)
 		}
-		baseRef, overlayBase, overlayBaseFromRefs, meta, err := parseTemplateDisk(out)
-		if err != nil {
-			return fmt.Errorf("base template %s: %w", s.FromTemplateRef, err)
-		}
-		p.baseRef = baseRef
-		p.overlayBase = overlayBase
-		p.overlayBaseFromRefs = overlayBaseFromRefs
+		p.baseRef = prepared.BaseRef
+		p.overlayBase = prepared.OverlayBase
+		p.overlayBaseFromRefs = append([]string(nil), prepared.OverlayBaseFromRefs...)
 		if p.profile == types.ProfileE2B && p.startCmd == "" {
-			p.startCmd = meta["e2b.start_cmd"]
+			p.startCmd = prepared.StartCmd
 		}
 		if p.profile == types.ProfileE2B && p.readyCmd == "" {
-			p.readyCmd = meta["e2b.ready_cmd"]
+			p.readyCmd = prepared.ReadyCmd
 		}
 		return nil
 	}
-}
-
-// parseTemplateDisk extracts a base template's disk layout from its
-// `sandbox-ctl info --json` (the snapshot.cfg, §3.4): the erofs base image
-// (boot.root.base_ref) AND the accumulated overlay (boot.root.overlay) — the
-// read-only lower a fromTemplate cold-start MUST stack under its fresh writable
-// overlay, or the template's filesystem is lost. The overlay's captured top
-// (overlay.base) and its lower chain (overlay.base_from_refs) remain an explicit
-// top ref plus top-to-bottom array. info --json
-// re-emits restore.SnapshotCfg by Go field name, hence the BaseRef / Overlay /
-// Base / BaseFromRefs JSON keys.
-func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, overlayBaseFromRefs []string, meta map[string]string, err error) {
-	var cfg struct {
-		Metadata map[string]string `json:"Metadata"`
-		Boot     struct {
-			Root struct {
-				BaseRef string `json:"BaseRef"`
-				Overlay *struct {
-					Base         string   `json:"Base"`
-					BaseFromRefs []string `json:"BaseFromRefs"`
-				} `json:"Overlay"`
-			} `json:"Root"`
-		} `json:"Boot"`
-	}
-	if err := json.Unmarshal(infoJSON, &cfg); err != nil {
-		return "", "", nil, nil, fmt.Errorf("parse template cfg: %w", err)
-	}
-	if cfg.Boot.Root.BaseRef == "" {
-		return "", "", nil, nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
-	}
-	if ov := cfg.Boot.Root.Overlay; ov != nil {
-		overlayBase = ov.Base
-		overlayBaseFromRefs = append([]string(nil), ov.BaseFromRefs...)
-	}
-	return cfg.Boot.Root.BaseRef, overlayBase, overlayBaseFromRefs, cfg.Metadata, nil
 }

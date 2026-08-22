@@ -61,6 +61,11 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 	if pend.build.RunID != runID {
 		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
 	}
+	pend.resultMu.Lock()
+	defer pend.resultMu.Unlock()
+	if pend.resultClosed {
+		return configsock.RejectBuildReport(fmt.Errorf("build %s no longer accepts results for run %s", buildID, runID))
+	}
 	if _, err := o.st.AcceptBuildResult(ctx, buildID, runID, result); err != nil {
 		if errors.Is(err, store.ErrBuildExecutionOwnership) || errors.Is(err, store.ErrBuildResultConflict) {
 			return configsock.RejectBuildReport(err)
@@ -148,5 +153,17 @@ func (o *Orchestrator) waitBuildRecoveryReady(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (o *Orchestrator) buildRecoveryReadyNow() bool {
+	if o.buildRecoveryReady == nil {
+		return true
+	}
+	select {
+	case <-o.buildRecoveryReady:
+		return true
+	default:
+		return false
 	}
 }
