@@ -809,8 +809,10 @@ func (o *Orchestrator) completeBuildWithPublisher(
 			if o.persistTerminalBuild(ctx, b) {
 				publish(b.BuildID, "error", "", b.Reason)
 			}
-			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", res.FailureStage,
-				"task_snapshot_prepare_error_total", 1, "err", res.Error)
+			// run-builder emitted the task_snapshot_prepare_error_total event at
+			// the reader failure. Record the terminal stage here without counting
+			// the same task-local failure a second time.
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", res.FailureStage, "err", res.Error)
 			return
 		}
 		// The pipeline ran and reported its own failure. run-builder's fail()
