@@ -90,11 +90,12 @@ type BuildRegistryTLSOptions struct {
 // can finish unit/runtime cleanup without losing a successful result. None of
 // these fields contains tenant credentials.
 type BuildResult struct {
-	ImageRef    string `json:"image_ref,omitempty"`
-	SnapshotRef string `json:"snapshot_ref,omitempty"`
-	StartCmd    string `json:"start_cmd,omitempty"`
-	ReadyCmd    string `json:"ready_cmd,omitempty"`
-	Error       string `json:"error,omitempty"`
+	ImageRef     string `json:"image_ref,omitempty"`
+	SnapshotRef  string `json:"snapshot_ref,omitempty"`
+	StartCmd     string `json:"start_cmd,omitempty"`
+	ReadyCmd     string `json:"ready_cmd,omitempty"`
+	Error        string `json:"error,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 // Build is one template build, doubling as the template record.

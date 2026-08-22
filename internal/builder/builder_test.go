@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -262,6 +263,27 @@ func TestAuthoritativeProcessEnvReplacesManifestKeyOnce(t *testing.T) {
 	}
 	if manifestEntries != 1 {
 		t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
+	}
+}
+
+func TestBuildPipelineContextPropagatesTaskCancelAndReservesReportGrace(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	canceled, cancel := buildPipelineContext(parent, configsock.BuildTimeouts{TotalSec: 60})
+	defer cancel()
+	if !errors.Is(canceled.Err(), context.Canceled) {
+		t.Fatalf("pipeline context ignored task cancellation: %v", canceled.Err())
+	}
+
+	absolute := time.Now().Add(time.Minute).Round(0)
+	withDeadline, cancelDeadline := buildPipelineContext(context.Background(), configsock.BuildTimeouts{
+		AbsoluteDeadlineUnixNano: absolute.UnixNano(),
+	})
+	defer cancelDeadline()
+	got, ok := withDeadline.Deadline()
+	want := absolute.Add(-buildResultReportGrace)
+	if !ok || !got.Equal(want) {
+		t.Fatalf("pipeline deadline = %v, %t; want %v", got, ok, want)
 	}
 }
 

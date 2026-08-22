@@ -804,6 +804,15 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	}
 	switch {
 	case err == nil && res != nil && res.Error != "":
+		if res.FailureStage == "snapshot_prepare" {
+			b.Status, b.Reason = types.BuildError, res.Error
+			if o.persistTerminalBuild(ctx, b) {
+				publish(b.BuildID, "error", "", b.Reason)
+			}
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", res.FailureStage,
+				"task_snapshot_prepare_error_total", 1, "err", res.Error)
+			return
+		}
 		// The pipeline ran and reported its own failure. run-builder's fail()
 		// already wrote "build failed: <detail>" to the build log stream (tag
 		// build), which the SDK is streaming — so reason.message stays generic
@@ -822,8 +831,13 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		if o.persistTerminalBuild(ctx, b) {
 			publish(b.BuildID, "error", "", b.Reason)
 		}
-		o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", buildFailureStage(err),
-			"task_snapshot_prepare_error_total", 1, "err", err)
+		stage := buildFailureStage(err)
+		if stage == "snapshot_prepare" {
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage,
+				"task_snapshot_prepare_error_total", 1, "err", err)
+		} else {
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage, "err", err)
+		}
 		return
 	}
 	if res == nil {
@@ -917,6 +931,23 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, buildFailed("snapshot_prepare", err)
 	}
+	var port *vswitch.Port
+	runtimePersisted := false
+	cleanupSafe := true
+	defer func() {
+		portID := ""
+		if port != nil {
+			portID = port.Port
+		}
+		if !cleanupSafe {
+			retErr = retainBuildCleanup(retErr, nil, portID, dir, runtimePersisted)
+			return
+		}
+		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, dir, runtimePersisted)
+		if cleanupErr != nil {
+			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.dir, progress.persisted)
+		}
+	}()
 	spec, resources, err := o.resolveBuildRequestInputs(b)
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
@@ -942,24 +973,6 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	deadline := o.buildExecutionDeadline(b)
 	buildCtx, cancelBuild := context.WithDeadline(ctx, deadline)
 	defer cancelBuild()
-
-	var port *vswitch.Port
-	runtimePersisted := false
-	cleanupSafe := true
-	defer func() {
-		portID := ""
-		if port != nil {
-			portID = port.Port
-		}
-		if !cleanupSafe {
-			retErr = retainBuildCleanup(retErr, nil, portID, dir, runtimePersisted)
-			return
-		}
-		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, dir, runtimePersisted)
-		if cleanupErr != nil {
-			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.dir, progress.persisted)
-		}
-	}()
 
 	var unit string
 	var mmdsRow *types.Sandbox
@@ -1041,11 +1054,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("config_write", err)
 	}
-	pend.handoff.PublishFinal(final, nil)
-	finalPublished = true
-	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
-		mmdsRow = o.publishRecoveredBuildMMDS(b)
-	}
+	mmdsRow = o.publishBuildFinal(pend, final)
 	if mmdsRow != nil {
 		defer func() {
 			o.uncache(mmdsRow.ID)
@@ -1053,6 +1062,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			o.setMMDSBuildOwner(mmdsRow.ID, "")
 		}()
 	}
+	finalPublished = true
 	result, err = o.waitBuildResult(buildCtx, pend, unit)
 	if errors.Is(err, errBuildCleanupPending) {
 		cleanupSafe = false
@@ -1597,6 +1607,18 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		},
 	}
 	return spec, nil
+}
+
+// publishBuildFinal installs the optional MMDS route before making the final
+// spec observable. A task may start phase C as soon as WaitFinal returns, so
+// reversing these operations creates a real initialization race.
+func (o *Orchestrator) publishBuildFinal(pend *pendingBuild, spec *configsock.BuildSpec) *types.Sandbox {
+	var mmdsRow *types.Sandbox
+	if pend.build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
+		mmdsRow = o.publishRecoveredBuildMMDS(pend.build)
+	}
+	pend.handoff.PublishFinal(spec, nil)
+	return mmdsRow
 }
 
 // resolveBuildNetworks derives two roles from the same merged logical network:

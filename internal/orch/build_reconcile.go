@@ -228,13 +228,10 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	}
 	o.pend[build.BuildID] = pend
 	o.pendMu.Unlock()
-	if prep.durable != nil {
-		pend.handoff.PublishFinal(prep.final, nil)
-	}
 
 	var mmdsRow *types.Sandbox
 	if prep.durable != nil {
-		mmdsRow = o.publishRecoveredBuildMMDS(build)
+		mmdsRow = o.publishBuildFinal(pend, prep.final)
 	}
 	stage := "preparing"
 	if prep.durable != nil {
@@ -392,11 +389,8 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	if err != nil {
 		return nil, portID, true, nil, buildFailed("config_write", err)
 	}
-	pend.handoff.PublishFinal(final, nil)
+	mmdsRow = o.publishBuildFinal(pend, final)
 	finalPublished = true
-	if build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
-		mmdsRow = o.publishRecoveredBuildMMDS(build)
-	}
 	result, err = o.waitRecoveredBuild(buildCtx, build, pend, unit)
 	return result, portID, true, mmdsRow, buildFailed("runtime", err)
 }

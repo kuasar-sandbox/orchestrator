@@ -56,9 +56,10 @@ import (
 // execution claim fails closed before any phase resource side effect.
 type PhaseReporter func(phase, sandboxID, state string) error
 
-// Run drives the build pipeline for spec and returns its Result.
-func Run(spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
-	p := &buildPipeline{spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
+// Run drives the build pipeline for spec and returns its Result. parent carries
+// task cancellation (including SIGTERM) into every phase subprocess.
+func Run(parent context.Context, spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
+	p := &buildPipeline{parent: parent, spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
 	return p.run()
 }
 
@@ -72,6 +73,7 @@ type Result struct {
 }
 
 type buildPipeline struct {
+	parent    context.Context
 	spec      *configsock.BuildSpec
 	vmmCgroup *os.File
 	report    PhaseReporter
@@ -92,6 +94,11 @@ type buildPipeline struct {
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
+
+// The conductor's absolute deadline includes cleanup headroom. Reserve a
+// bounded tail inside that same deadline so run-builder can durably report a
+// pipeline timeout instead of losing the result to an already-canceled RPC.
+const buildResultReportGrace = 5 * time.Second
 
 // Guest-side paths for the flatten-ctl TLS config (projected via sandbox YAML
 // files into the Phase A import sandbox when a per-build registry TLS policy is
@@ -114,11 +121,7 @@ const (
 
 func (p *buildPipeline) run() (res Result) {
 	s := p.spec
-	if s.Timeouts.AbsoluteDeadlineUnixNano > 0 {
-		p.ctx, p.cancel = context.WithDeadline(context.Background(), time.Unix(0, s.Timeouts.AbsoluteDeadlineUnixNano))
-	} else {
-		p.ctx, p.cancel = context.WithTimeout(context.Background(), time.Duration(s.Timeouts.TotalSec)*time.Second)
-	}
+	p.ctx, p.cancel = buildPipelineContext(p.parent, s.Timeouts)
 	defer p.cancel()
 	p.out = newBuildJournal(s.RunID, s.BuildID)
 	defer p.out.Close()
@@ -181,6 +184,17 @@ func (p *buildPipeline) run() (res Result) {
 	}
 	res.StartCmd, res.ReadyCmd = p.startCmd, p.readyCmd
 	return res
+}
+
+func buildPipelineContext(parent context.Context, timeouts configsock.BuildTimeouts) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeouts.AbsoluteDeadlineUnixNano > 0 {
+		deadline := time.Unix(0, timeouts.AbsoluteDeadlineUnixNano).Add(-buildResultReportGrace)
+		return context.WithDeadline(parent, deadline)
+	}
+	return context.WithTimeout(parent, time.Duration(timeouts.TotalSec)*time.Second)
 }
 
 func (p *buildPipeline) runPhase(phase string, run func() error) error {

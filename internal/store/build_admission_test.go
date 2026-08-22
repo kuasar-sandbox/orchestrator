@@ -476,7 +476,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := types.BuildResult{
-		ImageRef: "manifest://result", StartCmd: "start", ReadyCmd: "ready",
+		Error: "snapshot.cfg is malformed", FailureStage: "snapshot_prepare",
 	}
 	if inserted, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, result); err != nil || !inserted {
 		t.Fatalf("first result acceptance = inserted %v err %v", inserted, err)
@@ -485,7 +485,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatalf("idempotent result replay = inserted %v err %v", inserted, err)
 	}
 	changed := result
-	changed.ImageRef = "manifest://different"
+	changed.Error = "snapshot.cfg is missing"
 	if _, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, changed); !errors.Is(err, ErrBuildResultConflict) {
 		t.Fatalf("conflicting result replay error = %v", err)
 	}
@@ -496,7 +496,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 	if err != nil || loaded.ExecutionResult == nil || *loaded.ExecutionResult != result {
 		t.Fatalf("durable result = %+v, err=%v", loaded, err)
 	}
-	loaded.Status = types.BuildReady
+	loaded.Status = types.BuildError
 	loaded.RuntimeVswitchPort = "7"
 	loaded.RuntimeFloatingIP = "192.0.2.7"
 	loaded.RuntimePortMAC = "02:00:00:00:00:07"

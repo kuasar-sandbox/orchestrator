@@ -177,6 +177,22 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	}
 }
 
+func TestRunBuildUnitCleansWorkdirWhenRequestResolutionFails(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	b := &types.Build{
+		BuildID: "build-invalid-request-input", Profile: types.ProfileBare,
+		Status: types.BuildBuilding, PhaseResourcePatch: `{"capacity":`,
+	}
+
+	if _, err := o.runBuildUnit(context.Background(), b); err == nil {
+		t.Fatal("malformed phase resource patch was accepted")
+	}
+	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("request-resolution failure retained build workdir: %v", err)
+	}
+}
+
 func TestBuildPoolTerminallyRejectsPermanentlyUnfitFIFOHead(t *testing.T) {
 	maxBuilds := int64(1)
 	executionCPU := config.CPUCores("1")

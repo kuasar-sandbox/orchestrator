@@ -262,7 +262,8 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
   在提交前已显式关闭，conductor 不读取任何 snapshot 工件。run-builder 将本地保留结果合入
   final spec 后**驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
-  `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传。
+  `{image_ref|snapshot_ref, start_cmd, ready_cmd, error, failure_stage}` 经 config-socket 回传。pipeline
+  在同一个 absolute deadline 内预留最后 5 秒用于持久回传结果；这不会重置或延长总预算。
   完整 bid 始终是持久业务身份;固定长度摘要只用于可重建的 node-local runtime 目录,
   使嵌套 phase UDS 在较长 `run_root` 下仍不超过 Linux `sun_path`。
 
@@ -1719,8 +1720,9 @@ image fast path无需第二次 RPC → strict解析继承network并与本次请�
 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 分配一个网络槽
 (整个构建复用,各阶段顺序交接 tapfd)→ 铸 envd token → 在一个 exact-run SQLite CAS 中原子写入
 port/token 与非秘密 `runtime_prepare_json`(prepare digest、resolved build/template network、
-resolved phase resources)→ 返回最终 BuildSpec →
-(`mmds.enabled` 时)挂一行 synthetic sandbox route,让模板阶段 FC 模式的 envd 能按
+resolved phase resources)→ (`mmds.enabled` 时)先挂一行 synthetic sandbox route → 返回最终
+BuildSpec。route 必须先于 final handoff 可见，避免 task 取得 spec 后立即启动 phase C 时尚无法
+解析自身；该 route 让模板阶段 FC 模式的 envd 能按
 floatingip 自解析,并把 Register 时声明的 MMDS routes 及 build-owner initial values
 投影给本次 builder guest → run-builder执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒

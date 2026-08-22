@@ -155,7 +155,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 			log.Error("build task snapshot prepare failed", "bid", bid, "run_id", *runID,
 				"task_snapshot_prepare_error_total", 1, "stage", "snapshot_prepare", "err", err)
 			postErr := retryBuildConfigSocket(taskCtx, log, "result", func(callCtx context.Context) error {
-				return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+				return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, configsock.BuildResult{
+					Error: err.Error(), FailureStage: "snapshot_prepare",
+				})
 			})
 			if postErr != nil {
 				return fmt.Errorf("prepare build snapshot: %w (post result: %v)", err, postErr)
@@ -185,7 +187,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 			return configsock.PostBuildPhaseContext(callCtx, *socket, *runID, bid, phase, sandboxID, state)
 		})
 	}
-	res := builder.Run(spec, vmmCgroup, reportPhase, log)
+	res := builder.Run(taskCtx, spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
