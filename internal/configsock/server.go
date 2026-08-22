@@ -274,7 +274,9 @@ type TapFDConfig struct {
 	Timeout string   `json:"timeout,omitempty"`
 }
 
-// BuildTimeouts are per-phase budgets in seconds.
+// BuildTimeouts are per-phase budgets in seconds. The absolute deadline covers
+// task/host preparation, pipeline execution, and result reporting; it excludes
+// the conductor's separately bounded fencing and cleanup allowance.
 type BuildTimeouts struct {
 	PullSec                  int   `json:"pull_sec"`
 	StepSec                  int   `json:"step_sec"`

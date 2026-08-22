@@ -177,6 +177,17 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	}
 }
 
+func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Builder.TotalTimeoutSec = 75
+	claimed := time.Unix(1_800_000_000, 0)
+	b := &types.Build{ExecutionClaimedUnix: claimed.Unix()}
+
+	if got, want := o.buildExecutionDeadline(b), claimed.Add(75*time.Second); !got.Equal(want) {
+		t.Fatalf("build execution deadline = %v, want %v", got, want)
+	}
+}
+
 func TestRunBuildUnitCleansWorkdirWhenRequestResolutionFails(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()

@@ -126,3 +126,45 @@ func TestBuildTaskAbsoluteDeadlineCoversFastAndSnapshotPaths(t *testing.T) {
 		t.Fatalf("snapshot path deadline = %d, want 22", got)
 	}
 }
+
+func TestInstallBuildTaskEnvironmentKeepsRegistryCredentialsNonAmbient(t *testing.T) {
+	processEnv := map[string]string{
+		"MANIFEST_KEY":              "inherited-manifest-key",
+		"FLATTEN_REGISTRY_TOKEN":    "inherited-token",
+		"FLATTEN_REGISTRY_USERNAME": "inherited-user",
+		"FLATTEN_REGISTRY_PASSWORD": "inherited-password",
+	}
+	bootstrapEnv := map[string]string{
+		"MANIFEST_KEY":              "authoritative-manifest-key",
+		"FLATTEN_REGISTRY_TOKEN":    "task-token",
+		"FLATTEN_REGISTRY_USERNAME": "task-user",
+		"FLATTEN_REGISTRY_PASSWORD": "task-password",
+		"BUILD_NON_SECRET":          "retained-only-in-spec",
+	}
+	setenv := func(key, value string) error {
+		processEnv[key] = value
+		return nil
+	}
+	unsetenv := func(key string) error {
+		delete(processEnv, key)
+		return nil
+	}
+
+	if err := installBuildTaskEnvironment(bootstrapEnv, setenv, unsetenv); err != nil {
+		t.Fatal(err)
+	}
+	if got := processEnv["MANIFEST_KEY"]; got != "authoritative-manifest-key" {
+		t.Fatalf("process MANIFEST_KEY = %q", got)
+	}
+	for _, key := range []string{"FLATTEN_REGISTRY_TOKEN", "FLATTEN_REGISTRY_USERNAME", "FLATTEN_REGISTRY_PASSWORD"} {
+		if value, ok := processEnv[key]; ok {
+			t.Fatalf("registry credential %s remained ambient as %q", key, value)
+		}
+	}
+	if _, ok := processEnv["BUILD_NON_SECRET"]; ok {
+		t.Fatal("non-reader bootstrap environment was installed process-wide")
+	}
+	if got := mergeAuthoritativeEnv(nil, bootstrapEnv)["FLATTEN_REGISTRY_TOKEN"]; got != "task-token" {
+		t.Fatalf("registry credential was not retained for explicit spec use: %q", got)
+	}
+}

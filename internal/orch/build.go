@@ -1088,7 +1088,11 @@ func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
 	if b.ExecutionClaimedUnix <= 0 {
 		start = time.Now()
 	}
-	return start.Add(time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second)
+	// Snapshot preparation, host preparation, pipeline execution, and result
+	// reporting all consume the configured build budget. Unit fencing and host
+	// cleanup use their existing separately bounded contexts; exposing that
+	// cleanup headroom here would silently extend tenant execution.
+	return start.Add(time.Duration(o.cfg.Builder.TotalTimeoutSec) * time.Second)
 }
 
 func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild, unit string) (configsock.SnapshotPrepareSummary, *configsock.BuildResult, error) {

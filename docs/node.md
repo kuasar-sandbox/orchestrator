@@ -1183,8 +1183,10 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
   且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值,但不调用
   sandbox/build host preparation中不调用CustomerKey、不建立key-bound reader、不打开/解密/解析snapshot。
   `<sid>.yaml`非密不含根凭据。
-  builder task同样只在认证后取得 authoritative env；run-builder及其子命令构造环境时先过滤
-  被 task spec 覆盖的 key，最终只有一个 `MANIFEST_KEY` 条目。
+  builder task同样只在认证后取得 authoritative env；run-builder仅把`MANIFEST_KEY`安装为
+  process-wide reader authority，并先清除继承的registry credential keys。registry凭据只保留在
+  本地BuildSpec中，定向传给需要它的host flatten调用或guest import命令，不被phase
+  `sandbox-ctl`及其后代环境继承；最终仍只有一个`MANIFEST_KEY`条目。
   APISecret 由 serve 用于 API 认证和 ServiceSecret 派生,并可投影给可信 router/proxy;
   不下发给 guest 或业务进程。auto-resume从资源行解密ManifestKey仅用于认证后投递给runner。
   集群下
@@ -2019,8 +2021,9 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 - port存在而preparation缺失、损坏或schema未知时先fence exact unit，再detach并终态失败，不能
   猜测一份可能与现有port不一致的配置；
 - 已持久接受的`execution_result_json`优先于preparing/prepared重建，先fence worker后按该结果
-  收尾，不再读取snapshot；deadline始终按原`execution_claimed_unix + total_timeout + 60s`
-  cleanup headroom计算，重启不续期。
+  收尾，不再读取snapshot；task/host prepare、pipeline与结果上报共用原
+  `execution_claimed_unix + total_timeout`截止时间，随后60s只保留给unit fencing和host cleanup，
+  重启不重置或延长任一预算。
 
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。

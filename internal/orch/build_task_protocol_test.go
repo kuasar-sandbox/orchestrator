@@ -16,6 +16,7 @@ import (
 func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 	cfg := &config.Config{ManifestConfig: filepath.Join(t.TempDir(), "manifest.yaml")}
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Builder.TotalTimeoutSec = 90
 	o := testOrchCfg(t, cfg)
 	manifestKey := strings.Repeat("a", 64)
 	build := &types.Build{
@@ -51,8 +52,9 @@ func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 	if err != nil || !found || task.Prepare == nil || task.Final != nil {
 		t.Fatalf("snapshot build bootstrap = %+v, %t, %v", task, found, err)
 	}
+	wantDeadline := time.Unix(build.ExecutionClaimedUnix, 0).Add(90 * time.Second).UnixNano()
 	if task.Env["MANIFEST_KEY"] != manifestKey || task.Prepare.RootRef == "" ||
-		task.Prepare.AbsoluteDeadlineUnixNano != o.buildExecutionDeadline(build).UnixNano() {
+		task.Prepare.AbsoluteDeadlineUnixNano != wantDeadline {
 		t.Fatalf("snapshot build bootstrap content = %+v", task)
 	}
 }

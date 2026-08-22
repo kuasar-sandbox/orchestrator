@@ -52,6 +52,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
@@ -111,10 +112,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
 		return fmt.Errorf("build task bootstrap must contain exactly one of final or prepare")
 	}
-	if _, ok := bootstrap.Env["MANIFEST_KEY"]; !ok {
-		return fmt.Errorf("build task bootstrap has no authoritative manifest key")
-	}
-	if err := installTaskEnvironment(bootstrap.Env, os.Setenv); err != nil {
+	if err := installBuildTaskEnvironment(bootstrap.Env, os.Setenv, os.Unsetenv); err != nil {
 		return err
 	}
 
@@ -201,6 +199,37 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+// installBuildTaskEnvironment gives the task-local snapshot reader only the
+// process-wide authority it needs. Registry credentials remain in the
+// authenticated bootstrap map and are merged into BuildSpec.Env for explicit
+// host/guest calls; they must never become ambient phase-process environment.
+func installBuildTaskEnvironment(
+	env map[string]string,
+	setenv func(string, string) error,
+	unsetenv func(string) error,
+) error {
+	if _, ok := env["MANIFEST_KEY"]; !ok {
+		return fmt.Errorf("build task bootstrap has no authoritative manifest key")
+	}
+	if setenv == nil {
+		return fmt.Errorf("build task environment installer is not configured")
+	}
+	if unsetenv == nil {
+		return fmt.Errorf("build task environment cleaner is not configured")
+	}
+	for _, key := range []string{regcreds.EnvToken, regcreds.EnvUsername, regcreds.EnvPassword} {
+		if err := unsetenv(key); err != nil {
+			return fmt.Errorf("clear inherited build credential %s: %w", key, err)
+		}
+	}
+	return installTaskEnvironment(env, func(key, value string) error {
+		if key != "MANIFEST_KEY" {
+			return nil
+		}
+		return setenv(key, value)
+	})
 }
 
 func buildTaskAbsoluteDeadline(task *configsock.BuildTaskSpec) int64 {
