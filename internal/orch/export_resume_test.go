@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -64,6 +65,7 @@ type asyncExportResult struct {
 
 type exportResumeFixture struct {
 	o        *Orchestrator
+	launcher *countingLauncher
 	ctx      context.Context
 	sb       *types.Sandbox
 	apiKey   string
@@ -106,7 +108,7 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	return exportResumeFixture{o: o, ctx: ctx, sb: sb, apiKey: apiKey, localRef: localRef}
+	return exportResumeFixture{o: o, launcher: lc, ctx: ctx, sb: sb, apiKey: apiKey, localRef: localRef}
 }
 
 func startExport(o *Orchestrator, ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) <-chan asyncExportResult {
@@ -225,39 +227,45 @@ func TestExportExternalWakePreemptsKMTPublish(t *testing.T) {
 	assertLocalResumeWon(t, fixture)
 }
 
-func TestFailedResumePreparationDoesNotPreemptExport(t *testing.T) {
+func TestAcceptedResumePreemptsExportBeforeAsyncSnapshotFailure(t *testing.T) {
 	fixture := newExportResumeFixture(t)
 	portableRef := "manifest://" + strings.Repeat("d", 64)
 	publisher := newBlockingExportPublisher(portableRef)
 	t.Cleanup(publisher.Release)
 	fixture.o.snapshotPublisher = publisher.Publish
-	fixture.o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		return snapshotDescription{}, errors.New("forced resume preparation failure")
+	fixture.launcher.snapshotSummary = &configsock.SnapshotPrepareSummary{
+		SchemaVersion:    configsock.SnapshotPrepareSchemaVersion,
+		Capacity:         configsock.SnapshotCapacity{}, // invalid, rejected asynchronously
+		ResolutionDigest: strings.Repeat("0", 64),
+		RequiredRefCount: 1,
 	}
 	done := startExport(fixture.o, fixture.ctx, fixture.apiKey, fixture.sb.ID, false, true)
 	waitPublisherStarted(t, publisher)
 
-	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0); err == nil ||
-		!strings.Contains(err.Error(), "forced resume preparation failure") {
-		t.Fatalf("Connect preparation error = %v", err)
+	accepted, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0)
+	if err != nil || accepted == nil || accepted.State != types.StateStarting {
+		t.Fatalf("Connect async acceptance = %+v, %v", accepted, err)
 	}
 	select {
 	case cause := <-publisher.canceled:
-		t.Fatalf("failed Resume canceled export: %v", cause)
-	default:
+		if !errors.Is(cause, api.ErrExportPreempted) {
+			t.Fatalf("resume cancellation cause = %v", cause)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted resume did not preempt export")
 	}
-
-	publisher.Release()
 	result := waitExportResult(t, done)
-	if result.err != nil || !strings.HasPrefix(result.result, "kmt1.") {
-		t.Fatalf("export after failed Resume = %q, %v", result.result, result.err)
+	if !errors.Is(result.err, api.ErrExportPreempted) || result.result != "" {
+		t.Fatalf("preempted export = %q, %v", result.result, result.err)
 	}
-	stored, err := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused || stored.SnapshotRef != portableRef {
-		t.Fatalf("source after failed Resume = %+v, %v", stored, err)
+	stored := waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StatePaused
+	}, "paused after async snapshot preparation failure")
+	if stored.SnapshotRef != fixture.localRef {
+		t.Fatalf("source after failed Resume = %+v", stored)
 	}
-	if _, err := os.Stat(fixture.localRef); !os.IsNotExist(err) {
-		t.Fatalf("successful finalizer retained local snapshot: %v", err)
+	if _, err := os.Stat(fixture.localRef); err != nil {
+		t.Fatalf("preempted export removed local snapshot: %v", err)
 	}
 }
 
@@ -414,13 +422,7 @@ func TestExportFinalizerWinsThenResumeUsesPortableRef(t *testing.T) {
 	}
 
 	restored := make(chan string, 1)
-	fixture.o.snapshotInspector = func(_ context.Context, _ string, ref string) (snapshotDescription, error) {
-		var description snapshotDescription
-		description.Resources.Capacity.CPU = 2
-		description.Resources.Capacity.Memory = "2GiB"
-		restored <- ref
-		return description, nil
-	}
+	fixture.launcher.snapshotRoots = restored
 	connected, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0)
 	if err != nil || connected == nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect after finalized export = %+v, %v", connected, err)
@@ -431,7 +433,7 @@ func TestExportFinalizerWinsThenResumeUsesPortableRef(t *testing.T) {
 			t.Fatalf("Resume restore ref = %q, want %q", ref, portableRef)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Resume did not inspect the portable snapshot")
+		t.Fatal("runner task did not receive the portable root snapshot")
 	}
 	waitForSandbox(t, fixture.o, fixture.ctx, fixture.sb.ID, func(current *types.Sandbox) bool {
 		return current.State == types.StateRunning

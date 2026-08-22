@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testing.T) {
@@ -143,12 +144,6 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	o.cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
 	o.cfg.Sandbox.Network.E2B.Nexthop = "169.254.0.22"
 	o.SetResourceControllerSocketIdentity("/target/resource.sock")
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		var description snapshotDescription
-		description.Resources.Capacity.CPU = 2
-		description.Resources.Capacity.Memory = "8GiB"
-		return description, nil
-	}
 
 	manifestKey := strings.Repeat("7", 64)
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
@@ -181,7 +176,10 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resources := preparation.Resources
+	resources, err := o.resolveRestoredResources(preparation.Spec, rtconfig.CapacityConfig{CPU: 2, Memory: "8GiB"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resources.Capacity.CPU != 2 || resources.Capacity.Memory != "8GiB" ||
 		resources.Allocatable.CPU != 2 || resources.Allocatable.Memory != "512MiB" ||
 		resources.Startup == nil || resources.Startup.Memory != "1GiB" ||

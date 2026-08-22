@@ -5,45 +5,106 @@ package main
 // into the target so it inherits this PID (the unit's main pid + cgroup).
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
 )
 
-// launchTask locks+writes the pidfile, fetches the LaunchSpec for
-// "sandbox:<sid>" over the config-socket, applies its workdir/env, and
-// exec-replaces into the target, passing the node-owned VMM cgroup capability.
-func launchTask(socket, configID, pidfile string, ready, vmmCgroup *os.File) error {
-	return launchTaskWith(socket, configID, pidfile, ready, vmmCgroup, taskLaunchOps{
-		lockPidfile: lockPidfile,
-		fetchSpec:   configsock.FetchLaunchSpec,
-		chdir:       os.Chdir,
-		exec:        syscall.Exec,
+// launchTask fetches the already-authenticated exact-run bootstrap, performs
+// optional task-local snapshot preparation, and exec-replaces into the target.
+// runAssignedSandbox has locked the task pidfile before this function is called.
+func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+	return launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
+		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
+		prepareSnapshot: tasksnapshot.Prepare,
+		completePrepare: configsock.CompleteSandboxPrepare,
+		setenv:          os.Setenv,
+		chdir:           os.Chdir,
+		exec:            syscall.Exec,
+		log:             log,
 	})
 }
 
 type taskLaunchOps struct {
-	lockPidfile func(string) error
-	fetchSpec   func(string, string) (*configsock.LaunchSpec, error)
-	chdir       func(string) error
-	exec        func(string, []string, []string) error
+	fetchBootstrap  func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
+	prepareSnapshot func(context.Context, configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error)
+	completePrepare func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error)
+	setenv          func(string, string) error
+	chdir           func(string) error
+	exec            func(string, []string, []string) error
+	log             *slog.Logger
 }
 
-func launchTaskWith(socket, configID, pidfile string, ready, vmmCgroup *os.File, ops taskLaunchOps) error {
-	if pidfile != "" {
-		if err := ops.lockPidfile(pidfile); err != nil {
+func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, ops taskLaunchOps) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if stopContext == nil {
+		stopContext = func() {}
+	}
+	if ops.log == nil {
+		ops.log = slog.Default()
+	}
+	bootstrap, err := ops.fetchBootstrap(ctx, socket, sandboxID, runID)
+	if err != nil {
+		return fmt.Errorf("fetch sandbox task bootstrap: %w", err)
+	}
+	if bootstrap.SandboxID != sandboxID || bootstrap.RunID != runID {
+		return fmt.Errorf("sandbox task bootstrap identity mismatch")
+	}
+	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
+		return fmt.Errorf("sandbox task bootstrap must contain exactly one of final or prepare")
+	}
+	if _, ok := bootstrap.Env["MANIFEST_KEY"]; !ok {
+		return fmt.Errorf("sandbox task bootstrap has no authoritative manifest key")
+	}
+	if err := installTaskEnvironment(bootstrap.Env, ops.setenv); err != nil {
+		return err
+	}
+
+	taskCtx := ctx
+	cancelDeadline := func() {}
+	if bootstrap.Prepare != nil {
+		deadline := time.Unix(0, bootstrap.Prepare.AbsoluteDeadlineUnixNano)
+		if bootstrap.Prepare.AbsoluteDeadlineUnixNano <= 0 || !deadline.After(time.Now()) {
+			return fmt.Errorf("sandbox task bootstrap launch deadline has expired")
+		}
+		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+	}
+	defer cancelDeadline()
+
+	spec := bootstrap.Final
+	locations := map[string]string{}
+	if bootstrap.Prepare != nil {
+		result, err := ops.prepareSnapshot(taskCtx, *bootstrap.Prepare)
+		if err != nil {
+			ops.log.Error("sandbox task snapshot prepare failed", "sid", sandboxID, "run_id", runID,
+				"task_snapshot_prepare_error_total", 1, "stage", "snapshot_prepare", "err", err)
 			return err
 		}
+		locations = result.RefLocationURIs
+		ops.log.Info("sandbox task snapshot prepared", "sid", sandboxID, "run_id", runID,
+			"task_snapshot_prepare_duration", result.PrepareDuration,
+			"task_snapshot_cfg_read_duration", result.ConfigReadDuration,
+			"task_snapshot_ref_count", result.Summary.RequiredRefCount)
+		spec, err = completeSandboxPrepareWithRetry(taskCtx, socket, sandboxID, runID, result.Summary, ops.completePrepare)
+		if err != nil {
+			return fmt.Errorf("complete sandbox snapshot preparation: %w", err)
+		}
 	}
-	spec, err := ops.fetchSpec(socket, configID)
-	if err != nil {
-		return fmt.Errorf("fetch launch spec: %w", err)
+	if spec == nil {
+		return fmt.Errorf("sandbox task has no final launch spec")
 	}
 	if spec.Exec == "" {
 		return fmt.Errorf("launch spec has no exec")
@@ -57,9 +118,13 @@ func launchTaskWith(socket, configID, pidfile string, ready, vmmCgroup *os.File,
 	if len(spec.Args) == 0 || spec.Args[0] != "run" {
 		return fmt.Errorf("launch spec must invoke sandbox-ctl run")
 	}
-	if spec.Workdir != "" {
-		if err := ops.chdir(spec.Workdir); err != nil {
-			return fmt.Errorf("chdir %s: %w", spec.Workdir, err)
+	workdir := spec.Workdir
+	if workdir == "" {
+		workdir = bootstrap.Workdir
+	}
+	if workdir != "" {
+		if err := ops.chdir(workdir); err != nil {
+			return fmt.Errorf("chdir %s: %w", workdir, err)
 		}
 	}
 	argv := []string{spec.Exec, "run", fmt.Sprintf("--cgroup-path=fd=%d", vmmCgroup.Fd())}
@@ -71,9 +136,13 @@ func launchTaskWith(socket, configID, pidfile string, ready, vmmCgroup *os.File,
 		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
 	}
 	argv = append(argv, spec.Args[1:]...)
-	env := taskEnv(spec.Env)
+	argv = appendRefLocationArgs(argv, locations)
+	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
+	env := taskEnv(authoritativeEnv)
 	// These are the last fallible operations before exec. If exec itself fails,
 	// runAssignedSandbox's defers close the now-inheritable descriptors.
+	cancelDeadline()
+	stopContext()
 	if err := clearCloseOnExec(vmmCgroup); err != nil {
 		return fmt.Errorf("make vmm cgroup descriptor inheritable: %w", err)
 	}
@@ -83,6 +152,82 @@ func launchTaskWith(socket, configID, pidfile string, ready, vmmCgroup *os.File,
 		}
 	}
 	return ops.exec(spec.Exec, argv, env)
+}
+
+func completeSandboxPrepareWithRetry(
+	ctx context.Context,
+	socket, sandboxID, runID string,
+	summary configsock.SnapshotPrepareSummary,
+	complete func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error),
+) (*configsock.LaunchSpec, error) {
+	delay := 50 * time.Millisecond
+	for {
+		spec, err := complete(ctx, socket, sandboxID, runID, summary)
+		if err == nil || !configsock.IsRetryableError(err) {
+			return spec, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if delay < time.Second {
+			delay *= 2
+			if delay > time.Second {
+				delay = time.Second
+			}
+		}
+	}
+}
+
+func appendRefLocationArgs(args []string, locations map[string]string) []string {
+	names := make([]string, 0, len(locations))
+	for name := range locations {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		args = append(args, "--ref-location", name+"="+locations[name])
+	}
+	return args
+}
+
+func installTaskEnvironment(env map[string]string, setenv func(string, string) error) error {
+	if setenv == nil {
+		return fmt.Errorf("task environment installer is not configured")
+	}
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if key == "" || strings.ContainsRune(key, '=') || strings.IndexByte(key, 0) >= 0 || strings.IndexByte(env[key], 0) >= 0 {
+			return fmt.Errorf("invalid task environment key %q", key)
+		}
+		if err := setenv(key, env[key]); err != nil {
+			return fmt.Errorf("set task environment %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func mergeAuthoritativeEnv(base, authoritative map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(authoritative))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range authoritative {
+		out[key] = value
+	}
+	return out
 }
 
 func launchSpecCgroupArg(args []string) (string, bool) {
@@ -128,9 +273,11 @@ func lockPidfile(path string) error {
 		return fmt.Errorf("pidfile %s locked (task already running?): %w", path, err)
 	}
 	if err := unix.Ftruncate(fd, 0); err != nil {
+		unix.Close(fd)
 		return fmt.Errorf("truncate pidfile: %w", err)
 	}
 	if _, err := unix.Pwrite(fd, []byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
+		unix.Close(fd)
 		return fmt.Errorf("write pidfile: %w", err)
 	}
 	if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
@@ -148,12 +295,24 @@ func taskEnv(add map[string]string) []string {
 	}
 	out := make([]string, 0, len(os.Environ())+len(add))
 	for _, kv := range os.Environ() {
-		if i := strings.IndexByte(kv, '='); i >= 0 && skip[kv[:i]] {
-			continue
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key := kv[:i]
+			if skip[key] {
+				continue
+			}
+			if _, overridden := add[key]; overridden {
+				continue
+			}
 		}
 		out = append(out, kv)
 	}
-	for k, v := range add {
+	keys := make([]string, 0, len(add))
+	for key := range add {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := add[k]
 		out = append(out, k+"="+v)
 	}
 	return out

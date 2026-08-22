@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -36,6 +37,76 @@ func TestLaunchGroupClaimCancelAndCleanupFence(t *testing.T) {
 	} else {
 		g.Finish(next, nil)
 	}
+}
+
+func TestLaunchAttemptSnapshotPrepareReplayAndFinalResult(t *testing.T) {
+	var g launchGroup
+	attempt, err := g.Claim(context.Background(), "sid", launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.SetRunID("run-1")
+	summary := configsock.SnapshotPrepareSummary{
+		SchemaVersion:    configsock.SnapshotPrepareSchemaVersion,
+		Capacity:         configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
+		ResolutionDigest: "digest", RequiredRefCount: 3,
+	}
+	if replay, err := attempt.SubmitPrepare("run-1", summary); err != nil || replay {
+		t.Fatalf("first SubmitPrepare = replay %t, err %v", replay, err)
+	}
+	if got, err := attempt.WaitPrepare(context.Background()); err != nil || got != summary {
+		t.Fatalf("WaitPrepare = %+v, %v", got, err)
+	}
+	if replay, err := attempt.SubmitPrepare("run-1", summary); err != nil || !replay {
+		t.Fatalf("identical SubmitPrepare = replay %t, err %v", replay, err)
+	}
+
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	if _, err := attempt.WaitFinalSpec(waitCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled final waiter = %v", err)
+	}
+	// Canceling one HTTP waiter does not revoke the accepted summary.
+	final := &configsock.LaunchSpec{Exec: "/sandbox-ctl", Args: []string{"run"}}
+	attempt.PublishFinalSpec(final)
+	for i := 0; i < 2; i++ {
+		if replay, err := attempt.SubmitPrepare("run-1", summary); err != nil || !replay {
+			t.Fatalf("post-final replay %d = %t, %v", i, replay, err)
+		}
+		got, err := attempt.WaitFinalSpec(context.Background())
+		if err != nil || got.Exec != final.Exec || len(got.Args) != 1 {
+			t.Fatalf("final replay %d = %+v, %v", i, got, err)
+		}
+		got.Args[0] = "mutated"
+	}
+	g.Finish(attempt, nil)
+}
+
+func TestLaunchAttemptSnapshotPrepareConflictCancelsExactRun(t *testing.T) {
+	var g launchGroup
+	attempt, err := g.Claim(context.Background(), "sid", launchCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.SetRunID("run-1")
+	first := configsock.SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: "first"}
+	if _, err := attempt.SubmitPrepare("run-1", first); err != nil {
+		t.Fatal(err)
+	}
+	conflict := first
+	conflict.ResolutionDigest = "different"
+	if _, err := attempt.SubmitPrepare("run-1", conflict); !errors.Is(err, errSnapshotPrepareConflict) {
+		t.Fatalf("conflicting replay error = %v", err)
+	}
+	select {
+	case <-attempt.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("conflicting replay did not cancel launch")
+	}
+	if _, err := attempt.SubmitPrepare("stale-run", first); !errors.Is(err, errLaunchOwnershipLost) {
+		t.Fatalf("stale exact run error = %v", err)
+	}
+	g.Finish(attempt, context.Canceled)
 }
 
 func TestLaunchGroupWaitHonorsCallerContext(t *testing.T) {

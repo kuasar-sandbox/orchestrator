@@ -191,15 +191,22 @@ func blockClusterExecLaunch(t *testing.T, fixture *clusterConnectFixture) {
 	fixture.o.SetLifecycleContext(launchCtx)
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-blocker.returned:
-		case <-time.After(2 * time.Second):
-			t.Error("blocked cluster exec launch did not stop")
-		}
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer drainCancel()
 		if err := fixture.o.DrainLaunches(drainCtx); err != nil {
 			t.Errorf("drain blocked cluster exec launch: %v", err)
+		}
+		// The accepted call is asynchronous and may be canceled before the new
+		// assignment-first restore flow reaches Attach. If Attach did start, it
+		// must have observed cancellation before DrainLaunches returns.
+		select {
+		case <-blocker.started:
+			select {
+			case <-blocker.returned:
+			default:
+				t.Error("blocked cluster exec launch did not stop")
+			}
+		default:
 		}
 	})
 }
