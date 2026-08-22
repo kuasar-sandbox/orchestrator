@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 type reconcileLauncher struct {
@@ -100,10 +102,13 @@ func (l *reconcileLauncher) setUnitState(name, state string) {
 type reconcileVS struct {
 	detached []string
 	err      error
+	attach   *vswitch.Port
+	attaches int
 }
 
-func (*reconcileVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
-	return nil, nil
+func (v *reconcileVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	v.attaches++
+	return v.attach, nil
 }
 func (v *reconcileVS) Detach(_ context.Context, port string) error {
 	v.detached = append(v.detached, port)
@@ -543,6 +548,31 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	}
 }
 
+func TestClosedBuildResultGateRejectsLateReportBeforePersistence(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000214"
+	build := buildReconcileRow(t, runID)
+	build.BuildID = "closed-result-gate"
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	pend := &pendingBuild{build: build, result: make(chan configsock.BuildResult, 1)}
+	o.pend[build.BuildID] = pend
+	if result, found := closePendingBuildResultsAndTake(pend); found || result != nil {
+		t.Fatalf("empty result gate returned %+v, found=%t", result, found)
+	}
+
+	err := o.PostBuildResult(context.Background(), runID, build.BuildID,
+		configsock.BuildResult{ImageRef: "manifest://too-late"})
+	if err == nil || !configsock.IsBuildReportRejection(err) {
+		t.Fatalf("late result was not definitively rejected: %v", err)
+	}
+	stored, getErr := o.st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil || stored.ExecutionResult != nil {
+		t.Fatalf("late result crossed closed gate: %+v, %v", stored, getErr)
+	}
+}
+
 func TestWaitAssignmentReplaysDurableBuildRunBinding(t *testing.T) {
 	o := testOrch(t)
 	runID := "br-00000000-0000-7000-8000-000000000213"
@@ -570,7 +600,10 @@ func TestRecoveredAcceptedResultWinsCanceledMonitor(t *testing.T) {
 	}
 	build := buildReconcileRow(t, runID)
 	accepted := configsock.BuildResult{ImageRef: "manifest://accepted-before-shutdown"}
-	pend := &pendingBuild{result: make(chan configsock.BuildResult, 1)}
+	pend := &pendingBuild{
+		handoff: newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID)),
+		result:  make(chan configsock.BuildResult, 1),
+	}
 	pend.result <- accepted
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -685,6 +718,7 @@ func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
 		build.RuntimeVswitchPort = ""
 		build.RuntimeFloatingIP = ""
 		build.RuntimePortMAC = ""
+		build.RuntimePrepareJSON = ""
 		if err := st.PutBuild(context.Background(), build); err != nil {
 			t.Fatal(err)
 		}
@@ -747,6 +781,7 @@ func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
 		build.RuntimeVswitchPort = ""
 		build.RuntimeFloatingIP = ""
 		build.RuntimePortMAC = ""
+		build.RuntimePrepareJSON = ""
 		if err := st.PutBuild(context.Background(), build); err != nil {
 			t.Fatal(err)
 		}
@@ -888,6 +923,173 @@ func TestReconcilePreservesLiveBuildWhenResourceReadFails(t *testing.T) {
 	}
 }
 
+func TestReconcileAdoptsSnapshotBuildStillPreparing(t *testing.T) {
+	st := testOrch(t).st
+	runRoot := filepath.Join(t.TempDir(), "run")
+	runID := "br-00000000-0000-7000-8000-000000000221"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	build.Profile = types.ProfileE2B
+	build.FromTemplate = types.TemplateID{
+		Profile: types.ProfileE2B, Kind: types.KindSnp,
+		Ref: "manifest://" + strings.Repeat("e", 64),
+	}.String()
+	build.RuntimeVswitchPort, build.RuntimeFloatingIP, build.RuntimePortMAC = "", "", ""
+	build.RuntimeEnvdAccessToken, build.RuntimePrepareJSON = "", ""
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
+		},
+	}
+	vs := &reconcileVS{attach: &vswitch.Port{
+		Port: "27", FloatingIP: "192.0.2.27", MAC: "02:00:00:00:00:27", InnerIP: "10.0.0.5",
+	}}
+	o := New(buildReconcileConfig(runRoot), st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := o.ReconcileBuilds(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	task, found, err := o.BuildTaskSpecFor(context.Background(), build.BuildID, runID)
+	if err != nil || !found || task.Prepare == nil || task.Final != nil {
+		cancel()
+		t.Fatalf("recovered preparing bootstrap = %+v, %t, %v", task, found, err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.RuntimeVswitchPort != "" || stored.RuntimePrepareJSON != "" {
+		cancel()
+		t.Fatalf("preparing build was prematurely committed: %+v, %v", stored, err)
+	}
+	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, validBuildPrepareSummary())
+	if err != nil || final == nil || final.BuildID != build.BuildID {
+		cancel()
+		t.Fatalf("recovered preparing completion = %+v, %v", final, err)
+	}
+	stored, err = st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.RuntimeVswitchPort != "27" || stored.RuntimePrepareJSON == "" || vs.attaches != 1 {
+		cancel()
+		t.Fatalf("recovered preparing durable final = %+v, attaches=%d, err=%v", stored, vs.attaches, err)
+	}
+	cancel()
+	if err := o.DrainBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileFailsClosedForPortWithoutDurablePreparation(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	runID := "br-00000000-0000-7000-8000-000000000222"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	build.RuntimePrepareJSON = ""
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(buildReconcileConfig(t.TempDir()), st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.Status != types.BuildError || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" ||
+		!strings.Contains(stored.Reason, "durable runtime preparation is missing") {
+		t.Fatalf("missing-preparation recovery = %+v, %v", stored, err)
+	}
+	if !containsString(lc.stopped, unit) || !containsString(vs.detached, "17") {
+		t.Fatalf("missing-preparation cleanup: stopped=%v detached=%v", lc.stopped, vs.detached)
+	}
+}
+
+func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	runID := "br-00000000-0000-7000-8000-000000000223"
+	unit := "sandbox-builder@" + runID + ".service"
+	build := buildReconcileRow(t, runID)
+	build.Profile = types.ProfileE2B
+	build.FromTemplate = types.TemplateID{
+		Profile: types.ProfileE2B, Kind: types.KindSnp,
+		Ref: "manifest://" + strings.Repeat("f", 64),
+	}.String()
+	digest := strings.Repeat("9", 64)
+	durableResources := rtconfig.ResourcesConfig{
+		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
+	}
+	durableNetwork := sandboxcfg.NetworkSpec{Hostname: "frozen-build", InnerIP: "10.44.0.5/24", Nexthop: "10.44.0.1"}
+	durableTemplateNetwork := durableNetwork
+	durableTemplateNetwork.Hostname = "frozen-template"
+	build.RuntimePrepareJSON, err = encodeBuildRuntimePreparation(buildRuntimePreparation{
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest,
+		Network: durableNetwork, TemplateNetwork: durableTemplateNetwork, Resources: durableResources,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	cfg := buildReconcileConfig(t.TempDir())
+	// These current defaults deliberately disagree with the values atomically
+	// committed alongside port 17 before the restart.
+	cfg.Sandbox.Network.E2B.InnerIP = "192.0.2.5/24"
+	cfg.Sandbox.Network.E2B.Nexthop = "192.0.2.1"
+	cfg.Sandbox.Resources.Capacity.Memory = "invalid-current-policy"
+	lc := &reconcileLauncher{
+		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
+		resources: launcher.ResourceProperties{
+			CPUQuotaPerSecUSec: 1_000_000, MemoryMax: 1 << 30,
+		},
+	}
+	vs := &reconcileVS{}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := o.ReconcileBuilds(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	summary := validBuildPrepareSummary()
+	summary.ResolutionDigest = digest
+	final, err := o.CompleteBuildPrepare(context.Background(), build.BuildID, runID, summary)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if final.Net.InnerIP != durableNetwork.InnerIP || final.Net.Hostname != durableNetwork.Hostname ||
+		!reflect.DeepEqual(final.TemplateNetwork, durableTemplateNetwork) || final.Resources.Capacity != durableResources.Capacity {
+		cancel()
+		t.Fatalf("recovered final spec drifted: net=%+v template=%+v resources=%+v", final.Net, final.TemplateNetwork, final.Resources)
+	}
+	cancel()
+	if err := o.DrainBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
 	if err != nil {
@@ -947,60 +1149,6 @@ func TestReconcilePreflightsAllLiveBuildsBeforeAdoption(t *testing.T) {
 		if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
 			t.Fatalf("preflight failure changed build %s: %+v", build.BuildID, stored)
 		}
-	}
-}
-
-func TestReconcilePreservesLiveBuildOnSnapshotProbeFailure(t *testing.T) {
-	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	runID := "br-00000000-0000-7000-8000-000000000022"
-	unit := "sandbox-builder@" + runID + ".service"
-	build := buildReconcileRow(t, runID)
-	build.FromTemplate = types.TemplateID{
-		Profile: types.ProfileE2B,
-		Kind:    types.KindSnp,
-		Ref:     "manifest://" + strings.Repeat("a", 64),
-	}.String()
-	if err := st.PutBuild(context.Background(), build); err != nil {
-		t.Fatal(err)
-	}
-	lc := &reconcileLauncher{
-		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
-		resources: launcher.ResourceProperties{
-			CPUQuotaPerSecUSec: 1_000_000,
-			MemoryMax:          1 << 30,
-		},
-	}
-	o := New(buildReconcileConfig(filepath.Join(t.TempDir(), "run")), st, lc, &reconcileVS{},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	probeErr := errors.New("object store temporarily unavailable")
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		return snapshotDescription{}, &snapshotConfigProbeError{ref: "manifest://snapshot", err: probeErr}
-	}
-
-	if err := o.Reconcile(context.Background()); !errors.Is(err, probeErr) {
-		t.Fatalf("Reconcile error = %v, want snapshot probe failure", err)
-	}
-	stored, err := st.GetBuild(context.Background(), build.BuildID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
-		t.Fatalf("snapshot probe failure changed durable live build: %+v", stored)
-	}
-	if len(lc.stopped) != 0 || len(lc.reset) != 0 {
-		t.Fatalf("snapshot probe failure touched live unit: stopped=%v reset=%v", lc.stopped, lc.reset)
-	}
-	if retryableBuildPhaseInputError(errors.New("malformed persisted resource patch")) {
-		t.Fatal("deterministic local parse error classified as retryable")
 	}
 }
 
@@ -1099,6 +1247,23 @@ func buildReconcileConfig(runRoot string) *config.Config {
 func buildReconcileRow(t *testing.T, runID string) *types.Build {
 	t.Helper()
 	manifestKey := strings.Repeat("a", 64)
+	runtimePrepare, err := encodeBuildRuntimePreparation(buildRuntimePreparation{
+		SchemaVersion: buildRuntimePrepareSchemaVersion,
+		PrepareDigest: strings.Repeat("b", 64),
+		Network: sandboxcfg.NetworkSpec{
+			Hostname: "build", InnerIP: "169.254.1.1/31", Nexthop: "169.254.1.0",
+		},
+		TemplateNetwork: sandboxcfg.NetworkSpec{
+			Hostname: "sandbox", InnerIP: "169.254.1.1/31", Nexthop: "169.254.1.0",
+		},
+		Resources: rtconfig.ResourcesConfig{
+			Capacity:    rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
+			Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &types.Build{
 		BuildID: "00000000-0000-7000-8000-000000000003", TemplateID: "transient-00000000-0000-7000-8000-000000000004",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
@@ -1106,7 +1271,7 @@ func buildReconcileRow(t *testing.T, runID string) *types.Build {
 		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), RunID: runID,
 		EnforcementStatus: "cpu,memory", RuntimeVswitchPort: "17", RuntimeFloatingIP: "192.0.2.17",
-		RuntimePortMAC: "02:00:00:00:00:17", CreatedUnix: time.Now().Unix(),
+		RuntimePortMAC: "02:00:00:00:00:17", RuntimePrepareJSON: runtimePrepare, CreatedUnix: time.Now().Unix(),
 	}
 }
 

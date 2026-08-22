@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -663,6 +665,34 @@ func (o *Orchestrator) expireBuildQueues(ctx context.Context, now time.Time) {
 type buildResult = configsock.BuildResult
 
 var errBuildCleanupPending = errors.New("build runtime cleanup remains pending")
+var errBuildRecoveryInProgress = errors.New("build: conductor recovery is still in progress")
+
+type buildStageError struct {
+	stage string
+	err   error
+}
+
+func (e *buildStageError) Error() string { return e.err.Error() }
+func (e *buildStageError) Unwrap() error { return e.err }
+
+func buildFailed(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *buildStageError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &buildStageError{stage: stage, err: err}
+}
+
+func buildFailureStage(err error) string {
+	var staged *buildStageError
+	if errors.As(err, &staged) {
+		return staged.stage
+	}
+	return "runtime"
+}
 
 type buildCleanupPendingError struct {
 	cause     error
@@ -711,22 +741,25 @@ func retainBuildCleanup(err, cleanup error, port, dir string, persisted bool) *b
 	return pending
 }
 
-// pendingBuild is the per-execution state BuildSpecFor serves while the
-// build run-id unit executes: the pre-attached network slot, the resolved
-// temporary-VM and persistent-template network roles, minted envd token, and
-// result channel.
+// pendingBuild is the exact-run process-local owner. It starts in preparing
+// form before network attachment, then carries the atomically persisted
+// network/resources, final handoff, and result channel for the pipeline.
 type pendingBuild struct {
-	build           *types.Build
-	workdir         string
-	spec            sandboxcfg.SandboxSpec
-	network         sandboxcfg.NetworkSpec
-	templateNetwork sandboxcfg.NetworkSpec
-	resources       rtconfig.ResourcesConfig
-	tapFD           vswitch.TapFD
-	mac             string
-	floating        string
-	envdToken       string
-	result          chan configsock.BuildResult
+	build            *types.Build
+	workdir          string
+	snapshotTemplate bool
+	handoff          *buildTaskHandoff
+	spec             sandboxcfg.SandboxSpec
+	network          sandboxcfg.NetworkSpec
+	templateNetwork  sandboxcfg.NetworkSpec
+	resources        rtconfig.ResourcesConfig
+	tapFD            vswitch.TapFD
+	mac              string
+	floating         string
+	envdToken        string
+	resultMu         sync.Mutex
+	resultClosed     bool
+	result           chan configsock.BuildResult
 }
 
 func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
@@ -774,6 +807,17 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	}
 	switch {
 	case err == nil && res != nil && res.Error != "":
+		if res.FailureStage == "snapshot_prepare" {
+			b.Status, b.Reason = types.BuildError, res.Error
+			if o.persistTerminalBuild(ctx, b) {
+				publish(b.BuildID, "error", "", b.Reason)
+			}
+			// run-builder emitted the task_snapshot_prepare_error_total event at
+			// the reader failure. Record the terminal stage here without counting
+			// the same task-local failure a second time.
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", res.FailureStage, "err", res.Error)
+			return
+		}
 		// The pipeline ran and reported its own failure. run-builder's fail()
 		// already wrote "build failed: <detail>" to the build log stream (tag
 		// build), which the SDK is streaming — so reason.message stays generic
@@ -782,7 +826,7 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		if o.persistTerminalBuild(ctx, b) {
 			publish(b.BuildID, "error", "", b.Reason)
 		}
-		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
+		o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", "runtime", "err", res.Error)
 		return
 	case err != nil:
 		// Infrastructure failure: the pipeline never ran (or produced no
@@ -792,7 +836,13 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		if o.persistTerminalBuild(ctx, b) {
 			publish(b.BuildID, "error", "", b.Reason)
 		}
-		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
+		stage := buildFailureStage(err)
+		if stage == "snapshot_prepare" {
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage,
+				"task_snapshot_prepare_error_total", 1, "err", err)
+		} else {
+			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage, "err", err)
+		}
 		return
 	}
 	if res == nil {
@@ -876,11 +926,15 @@ func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Bu
 
 func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result *buildResult, retErr error) {
 	if !b.Profile.Valid() {
-		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
+		return nil, buildFailed("resource_resolve", fmt.Errorf("build: unknown profile %q", b.Profile))
+	}
+	snapshotTemplate, err := buildUsesSnapshotTemplate(b)
+	if err != nil {
+		return nil, buildFailed("resource_resolve", err)
 	}
 	dir := buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+		return nil, buildFailed("snapshot_prepare", err)
 	}
 	var port *vswitch.Port
 	runtimePersisted := false
@@ -899,40 +953,21 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.dir, progress.persisted)
 		}
 	}()
-	spec, network, templateNetwork, resources, err := o.resolveBuildPhaseInputs(ctx, b)
+	spec, resources, err := o.resolveBuildRequestInputs(b)
 	if err != nil {
-		return nil, err
+		return nil, buildFailed("resource_resolve", err)
 	}
-	port, err = o.attachNetwork(ctx, network)
-	if err != nil {
-		return nil, err
-	}
-
-	envdTok := ""
-	if b.Profile == types.ProfileE2B {
-		envdTok, err = keys.MintToken()
-		if err != nil {
-			return nil, fmt.Errorf("build: mint phase envd token: %w", err)
-		}
-	}
-	owned, err := o.st.SetBuildRuntimeOwnership(ctx, b.BuildID, port.Port, port.FloatingIP, port.MAC, envdTok)
-	if err != nil {
-		return nil, err
-	}
-	if !owned {
-		return nil, fmt.Errorf("build: execution ownership lost before runtime allocation")
-	}
-	runtimePersisted = true
-	b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimeEnvdAccessToken = port.Port, port.FloatingIP, port.MAC, envdTok
 	pend := &pendingBuild{
-		build: b, workdir: dir, spec: spec,
-		network: network, templateNetwork: templateNetwork,
-		resources: resources,
-		tapFD:     o.vs.TapFD(port.Port), mac: port.MAC,
-		floating: port.FloatingIP, envdToken: envdTok,
+		build: b, workdir: dir, snapshotTemplate: snapshotTemplate,
+		handoff: newBuildTaskHandoff(snapshotTemplate, ""),
+		spec:    spec, resources: resources,
 		result: make(chan configsock.BuildResult, 1),
 	}
 	o.pendMu.Lock()
+	if o.pend[b.BuildID] != nil {
+		o.pendMu.Unlock()
+		return nil, fmt.Errorf("build: duplicate process-local execution owner")
+	}
 	o.pend[b.BuildID] = pend
 	o.pendMu.Unlock()
 	defer func() {
@@ -940,33 +975,91 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		delete(o.pend, b.BuildID)
 		o.pendMu.Unlock()
 	}()
+	deadline := o.buildExecutionDeadline(b)
+	buildCtx, cancelBuild := context.WithDeadline(ctx, deadline)
+	defer cancelBuild()
 
 	var unit string
 	var mmdsRow *types.Sandbox
-	if _, err := o.builderRunPool.Assign(ctx, b.BuildID, func(runID string) error {
+	if _, err := o.builderRunPool.Assign(buildCtx, b.BuildID, func(runID string) error {
 		var err error
-		unit, err = o.prepareBuilderUnit(ctx, b, runID)
-		if err != nil {
-			return err
-		}
-		// Publish only after the real run id is durably assigned. The worker
-		// cannot mint an unbound MMDSv2 token, and the builder's registered
-		// routes/values are now projected under the synthetic sandbox id.
-		if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
-			mmdsRow = &types.Sandbox{
-				ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
-				State: types.StateRunning, RunID: runID, FloatingIP: port.FloatingIP,
-				EnvdAccessToken: envdTok, APISecret: b.APISecret, ManifestKey: b.ManifestKey,
-				Metadata: b.Metadata, CreatedUnix: time.Now().Unix(),
-			}
-			o.setMMDSBuildOwner(mmdsRow.ID, b.BuildID)
-			o.cache(mmdsRow)
-			o.publishUpsert(mmdsRow)
-		}
-		return nil
+		unit, err = o.prepareBuilderUnit(buildCtx, b, runID)
+		return err
 	}); err != nil {
-		return nil, err
+		return nil, buildFailed("runtime", err)
 	}
+	finalPublished := false
+	defer func() {
+		if retErr != nil && !finalPublished {
+			pend.handoff.PublishFinal(nil, retErr)
+		}
+	}()
+
+	prepareDigest := fastBuildPrepareDigest(b.BuildID)
+	var inherited sandboxcfg.NetworkSpec
+	if snapshotTemplate {
+		summary, early, waitErr := o.waitBuildPrepare(buildCtx, pend, unit)
+		if early != nil || waitErr != nil {
+			if early != nil {
+				accepted, fenceErr := o.fenceAcceptedBuildResult(unit, *early)
+				if fenceErr != nil {
+					cleanupSafe = false
+				}
+				return accepted, buildFailed("runtime", fenceErr)
+			}
+			return nil, buildFailed("snapshot_prepare", waitErr)
+		}
+		inherited, err = validateBuildPrepareSummary(summary)
+		if err != nil {
+			return nil, buildFailed("snapshot_prepare", err)
+		}
+		prepareDigest = summary.ResolutionDigest
+		o.log.Info("build task snapshot prepared", "bid", b.BuildID, "run_id", b.RunID,
+			"task_snapshot_ref_count", summary.RequiredRefCount)
+	}
+	pend.network, pend.templateNetwork, err = o.resolveBuildNetworks(
+		b.Profile, inherited, pend.spec.Network, "build-"+shortID(b.BuildID),
+	)
+	if err != nil {
+		return nil, buildFailed("resource_resolve", err)
+	}
+	port, err = o.attachNetwork(buildCtx, pend.network)
+	if err != nil {
+		return nil, buildFailed("network_attach", err)
+	}
+	envdTok := ""
+	if b.Profile == types.ProfileE2B {
+		envdTok, err = keys.MintToken()
+		if err != nil {
+			return nil, buildFailed("network_commit", fmt.Errorf("build: mint phase envd token: %w", err))
+		}
+	}
+	durable := buildRuntimePreparation{
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
+		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
+	}
+	prepareJSON, err := encodeBuildRuntimePreparation(durable)
+	if err != nil {
+		return nil, buildFailed("network_commit", err)
+	}
+	owned, err := o.st.SetBuildRuntimePreparation(buildCtx, b.BuildID, b.RunID,
+		port.Port, port.FloatingIP, port.MAC, envdTok, prepareJSON)
+	if err != nil {
+		return nil, buildFailed("network_commit", err)
+	}
+	if !owned {
+		return nil, buildFailed("network_commit", fmt.Errorf("build: exact-run ownership lost before runtime preparation"))
+	}
+	runtimePersisted = true
+	b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC = port.Port, port.FloatingIP, port.MAC
+	b.RuntimeEnvdAccessToken, b.RuntimePrepareJSON = envdTok, prepareJSON
+	pend.tapFD, pend.mac, pend.floating, pend.envdToken = o.vs.TapFD(port.Port), port.MAC, port.FloatingIP, envdTok
+
+	final, err := o.buildSpecForPending(buildCtx, pend)
+	if err != nil {
+		return nil, buildFailed("config_write", err)
+	}
+	mmdsRow = o.publishBuildFinal(pend, final)
 	if mmdsRow != nil {
 		defer func() {
 			o.uncache(mmdsRow.ID)
@@ -974,58 +1067,157 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			o.setMMDSBuildOwner(mmdsRow.ID, "")
 		}()
 	}
-	timeout := time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	finalPublished = true
+	result, err = o.waitBuildResult(buildCtx, pend, unit)
+	if errors.Is(err, errBuildCleanupPending) {
+		cleanupSafe = false
+	}
+	return result, buildFailed("runtime", err)
+}
+
+func buildUsesSnapshotTemplate(b *types.Build) (bool, error) {
+	if b.FromTemplate == "" {
+		return false, nil
+	}
+	tmpl, err := types.ParseTemplateID(b.FromTemplate)
+	if err != nil {
+		return false, fmt.Errorf("build: fromTemplate %q: %w", b.FromTemplate, err)
+	}
+	return tmpl.Kind == types.KindSnp, nil
+}
+
+func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
+	start := time.Unix(b.ExecutionClaimedUnix, 0)
+	if b.ExecutionClaimedUnix <= 0 {
+		start = time.Now()
+	}
+	// Snapshot preparation, host preparation, pipeline execution, and result
+	// reporting all consume the configured build budget. Unit fencing and host
+	// cleanup use their existing separately bounded contexts; exposing that
+	// cleanup headroom here would silently extend tenant execution.
+	return start.Add(time.Duration(o.cfg.Builder.TotalTimeoutSec) * time.Second)
+}
+
+func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild, unit string) (configsock.SnapshotPrepareSummary, *configsock.BuildResult, error) {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	prepare := make(chan struct {
+		summary configsock.SnapshotPrepareSummary
+		err     error
+	}, 1)
+	go func() {
+		summary, err := pend.handoff.WaitPrepare(ctx)
+		prepare <- struct {
+			summary configsock.SnapshotPrepareSummary
+			err     error
+		}{summary: summary, err: err}
+	}()
+	for {
+		select {
+		case got := <-prepare:
+			return got.summary, nil, got.err
+		case result := <-pend.result:
+			return configsock.SnapshotPrepareSummary{}, &result, nil
+		case <-ctx.Done():
+			if result, ok := takePendingBuildResult(pend); ok {
+				return configsock.SnapshotPrepareSummary{}, result, nil
+			}
+			stopErr := o.stopBuilderUnit(unit)
+			result, ok := closePendingBuildResultsAndTake(pend)
+			if ok {
+				return configsock.SnapshotPrepareSummary{}, result, nil
+			}
+			if stopErr != nil {
+				return configsock.SnapshotPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
+			}
+			return configsock.SnapshotPrepareSummary{}, nil, ctx.Err()
+		case <-tick.C:
+			if !o.unitActive(ctx, unit) {
+				if result, ok := closePendingBuildResultsAndTake(pend); ok {
+					return configsock.SnapshotPrepareSummary{}, result, nil
+				}
+				return configsock.SnapshotPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during snapshot preparation", unit)
+			}
+		}
+	}
+}
+
+func (o *Orchestrator) waitBuildResult(ctx context.Context, pend *pendingBuild, unit string) (*buildResult, error) {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		select {
-		case res := <-pend.result:
-			accepted, err := o.fenceAcceptedBuildResult(unit, res)
-			if err != nil {
-				cleanupSafe = false
-			}
-			return accepted, err
-		case <-ctx.Done():
-			// A result may have committed and notified at the same instant shutdown
-			// canceled the monitor. Once accepted, it remains authoritative; fence
-			// the worker independently of the shutdown context before finalization.
-			select {
-			case res := <-pend.result:
-				accepted, err := o.fenceAcceptedBuildResult(unit, res)
-				if err != nil {
-					cleanupSafe = false
-				}
-				return accepted, err
-			default:
-			}
+		case result := <-pend.result:
+			return o.fenceAcceptedBuildResult(unit, result)
+		case <-pend.handoff.Conflict():
+			conflict := pend.handoff.ConflictErr()
 			if err := o.stopBuilderUnit(unit); err != nil {
-				cleanupSafe = false
-				return nil, errors.Join(ctx.Err(), err)
+				return nil, retainBuildCleanup(conflict, err, "", "", false)
+			}
+			return nil, conflict
+		case <-ctx.Done():
+			if result, found, err := o.fencePendingBuildResult(pend, unit, false); found {
+				return result, err
+			}
+			stopErr := o.stopBuilderUnit(unit)
+			result, found, resultErr := o.fencePendingBuildResult(pend, unit, true)
+			if found {
+				return result, resultErr
+			}
+			if stopErr != nil {
+				return nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
 			}
 			return nil, ctx.Err()
-		case <-timer.C:
-			if err := o.stopBuilderUnit(unit); err != nil {
-				cleanupSafe = false
-				return nil, errors.Join(fmt.Errorf("build: result timeout after %s", timeout), err)
-			}
-			return nil, fmt.Errorf("build: result timeout after %s", timeout)
 		case <-tick.C:
-			select {
-			case res := <-pend.result:
-				accepted, err := o.fenceAcceptedBuildResult(unit, res)
-				if err != nil {
-					cleanupSafe = false
-				}
-				return accepted, err
-			default:
-			}
 			if !o.unitActive(ctx, unit) {
+				if result, found, err := o.fencePendingBuildResult(pend, unit, true); found {
+					return result, err
+				}
 				return nil, fmt.Errorf("build: unit %s exited without result", unit)
 			}
 		}
 	}
+}
+
+func takePendingBuildResult(pend *pendingBuild) (*buildResult, bool) {
+	if pend == nil || pend.result == nil {
+		return nil, false
+	}
+	select {
+	case result := <-pend.result:
+		return &result, true
+	default:
+		return nil, false
+	}
+}
+
+func closePendingBuildResultsAndTake(pend *pendingBuild) (*buildResult, bool) {
+	if pend == nil {
+		return nil, false
+	}
+	pend.resultMu.Lock()
+	defer pend.resultMu.Unlock()
+	pend.resultClosed = true
+	return takePendingBuildResult(pend)
+}
+
+func (o *Orchestrator) fencePendingBuildResult(
+	pend *pendingBuild,
+	unit string,
+	closeResults bool,
+) (*buildResult, bool, error) {
+	var result *buildResult
+	var ok bool
+	if closeResults {
+		result, ok = closePendingBuildResultsAndTake(pend)
+	} else {
+		result, ok = takePendingBuildResult(pend)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	accepted, err := o.fenceAcceptedBuildResult(unit, *result)
+	return accepted, true, err
 }
 
 // prepareBuilderUnit is the assignment publication barrier: runtime limits are
@@ -1059,10 +1251,9 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 	return unit, nil
 }
 
-// resolveBuildPhaseInputs is the sole node-policy + persisted ResourcePatch
-// resolver for both fresh execution and restart adoption. It performs no host
-// resource side effects.
-func (o *Orchestrator) resolveBuildPhaseInputs(ctx context.Context, b *types.Build) (sandboxcfg.SandboxSpec, sandboxcfg.NetworkSpec, sandboxcfg.NetworkSpec, rtconfig.ResourcesConfig, error) {
+// resolveBuildRequestInputs performs only request/policy parsing. Snapshot
+// metadata is supplied later by the tenant-bound task and never opened here.
+func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build) (sandboxcfg.SandboxSpec, rtconfig.ResourcesConfig, error) {
 	phaseMetadata := cloneStringMapWithout(b.Metadata, "")
 	if phaseMetadata == nil {
 		phaseMetadata = map[string]string{}
@@ -1072,7 +1263,7 @@ func (o *Orchestrator) resolveBuildPhaseInputs(ctx context.Context, b *types.Bui
 	}
 	spec, err := sandboxcfg.ParseSpec(phaseMetadata)
 	if err != nil {
-		return sandboxcfg.SandboxSpec{}, sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{}, err
+		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, err
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
@@ -1083,19 +1274,11 @@ func (o *Orchestrator) resolveBuildPhaseInputs(ctx context.Context, b *types.Bui
 	})
 	if err != nil {
 		if errors.Is(err, sandboxcfg.ErrInvalidResourceRequest) {
-			return sandboxcfg.SandboxSpec{}, sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("%w: phase sandbox resources: %v", api.ErrBadRequest, err)
+			return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("%w: phase sandbox resources: %v", api.ErrBadRequest, err)
 		}
-		return sandboxcfg.SandboxSpec{}, sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("build: resolve phase sandbox resources: %w", err)
+		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("build: resolve phase sandbox resources: %w", err)
 	}
-	inherited, err := o.sourceTemplateNetwork(ctx, b)
-	if err != nil {
-		return sandboxcfg.SandboxSpec{}, sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{}, err
-	}
-	network, templateNetwork, err := o.resolveBuildNetworks(b.Profile, inherited, spec.Network, "build-"+shortID(b.BuildID))
-	if err != nil {
-		return sandboxcfg.SandboxSpec{}, sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{}, err
-	}
-	return spec, network, templateNetwork, resources, nil
+	return spec, resources, nil
 }
 
 func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, persisted bool) error {
@@ -1138,6 +1321,7 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir str
 			} else {
 				delete(o.detachedBuildPortsPending, port)
 				b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimeEnvdAccessToken = "", "", "", ""
+				b.RuntimePrepareJSON = ""
 				progress.port, progress.persisted = "", false
 			}
 		}
@@ -1277,8 +1461,99 @@ func (o *Orchestrator) stopBuilderUnit(unit string) error {
 
 // --- configsock.Provider (build) ---
 
-// BuildSpecFor resolves "build:<bid>" to the pipeline work order. Only
-// valid while executeBuild has the build pending (the unit is running).
+// BuildTaskAuth is deliberately non-secret. The exact durable run check is
+// performed before configsock reads the task pidfile and before BuildTaskSpecFor
+// can expose MANIFEST_KEY or registry credentials.
+func (o *Orchestrator) BuildTaskAuth(ctx context.Context, buildID, runID string) (configsock.BuildTaskAuth, bool, error) {
+	found, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
+	if err != nil || !found {
+		return configsock.BuildTaskAuth{}, found, err
+	}
+	return configsock.BuildTaskAuth{PidFile: configsock.BuildPidfile(o.cfg.Paths.RunRoot, buildID)}, true, nil
+}
+
+func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID string) (*configsock.BuildTaskSpec, bool, error) {
+	if !o.buildRecoveryReadyNow() {
+		return nil, false, errBuildRecoveryInProgress
+	}
+	o.pendMu.Lock()
+	pend := o.pend[buildID]
+	o.pendMu.Unlock()
+	if pend == nil || pend.build.RunID != runID || pend.handoff == nil {
+		return nil, false, nil
+	}
+	b := pend.build
+	response := &configsock.BuildTaskSpec{
+		BuildID: buildID, RunID: runID, Workdir: pend.workdir, Env: buildTaskEnv(b),
+	}
+	if !pend.snapshotTemplate {
+		final, err := pend.handoff.WaitFinal(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		response.Final = final
+		return response, true, nil
+	}
+	tmpl, err := types.ParseTemplateID(b.FromTemplate)
+	if err != nil || tmpl.Kind != types.KindSnp {
+		return nil, false, fmt.Errorf("build: invalid snapshot template %q", b.FromTemplate)
+	}
+	manifestConfig := o.cfg.ManifestConfig
+	if manifestConfig != "" && !filepath.IsAbs(manifestConfig) {
+		manifestConfig, err = filepath.Abs(manifestConfig)
+		if err != nil {
+			return nil, false, fmt.Errorf("build: absolute manifest config path: %w", err)
+		}
+	}
+	rootRef, err := normalizeSandboxTaskRootRef(tmpl.Ref, pend.workdir)
+	if err != nil {
+		return nil, false, err
+	}
+	response.Prepare = &configsock.SnapshotPrepareSpec{
+		RootRef: rootRef, ManifestConfig: manifestConfig,
+		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
+		RelativeDir:       pend.workdir, MaxRefs: maxRequiredSnapshotRefs,
+		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
+	}
+	return response, true, nil
+}
+
+func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.BuildSpec, error) {
+	if !o.buildRecoveryReadyNow() {
+		return nil, errBuildRecoveryInProgress
+	}
+	o.pendMu.Lock()
+	pend := o.pend[buildID]
+	o.pendMu.Unlock()
+	if pend == nil || pend.build.RunID != runID || pend.handoff == nil {
+		return nil, configsock.RejectBuildPrepare(fmt.Errorf("build: exact-run preparation owner not found"))
+	}
+	replay, err := pend.handoff.Submit(summary)
+	if err != nil {
+		return nil, configsock.RejectBuildPrepare(err)
+	}
+	if replay {
+		o.log.Info("build task snapshot prepare replay", "bid", buildID, "run_id", runID,
+			"task_snapshot_prepare_replay_total", 1)
+	}
+	return pend.handoff.WaitFinal(ctx)
+}
+
+func buildTaskEnv(b *types.Build) map[string]string {
+	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
+	if b.RegistryAuth != "" {
+		var creds regcreds.Creds
+		if json.Unmarshal([]byte(b.RegistryAuth), &creds) == nil {
+			for key, value := range creds.FlattenEnv() {
+				env[key] = value
+			}
+		}
+	}
+	return env
+}
+
+// BuildSpecFor constructs a final work order exclusively from request data and
+// already-resolved pending host preparation. It never opens an artifact.
 func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*configsock.BuildSpec, string, bool, error) {
 	kind, bid, found := strings.Cut(configID, ":")
 	if !found || kind != "build" {
@@ -1293,19 +1568,17 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	if pend == nil {
 		return nil, "", false, nil
 	}
+	spec, err := o.buildSpecForPending(ctx, pend)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return spec, configsock.BuildPidfile(o.cfg.Paths.RunRoot, pend.build.BuildID), true, nil
+}
+
+func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBuild) (*configsock.BuildSpec, error) {
 	b := pend.build
 	if !b.Profile.Valid() {
-		return nil, "", false, fmt.Errorf("build: unknown profile %q", b.Profile)
-	}
-
-	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
-	if b.RegistryAuth != "" {
-		var c regcreds.Creds
-		if json.Unmarshal([]byte(b.RegistryAuth), &c) == nil {
-			for k, v := range c.FlattenEnv() {
-				env[k] = v
-			}
-		}
+		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
 	}
 
 	// Presign each COPY context for the build's whole lifetime (it is signed
@@ -1317,7 +1590,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		if s.FilesHash != "" && o.files != nil {
 			url, err := o.files.PresignGet(ctx, b.TemplateID, s.FilesHash, getTTL)
 			if err != nil {
-				return nil, "", false, fmt.Errorf("presign COPY context %s: %w", s.FilesHash, err)
+				return nil, fmt.Errorf("presign COPY context %s: %w", s.FilesHash, err)
 			}
 			bs.FilesURL = url
 		}
@@ -1328,26 +1601,28 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	if b.FromTemplate != "" {
 		t, err := types.ParseTemplateID(b.FromTemplate)
 		if err != nil {
-			return nil, "", false, err
+			return nil, err
 		}
 		fromTemplateRef, fromTemplateKind = t.Ref, string(t.Kind)
-		refLocations, err = o.templateRefLocations(ctx, b.ManifestKey, t)
-		if err != nil {
-			return nil, "", false, err
+		if t.Kind == types.KindImg {
+			refLocations, err = o.singleRefLocations(t.Ref)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	toRefLocation := ""
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		uri, err := o.cfg.Checkpoint.RefLocationURI(b.BuildID)
 		if err != nil {
-			return nil, "", false, err
+			return nil, err
 		}
 		toRefLocation = b.BuildID + "=" + uri
 	}
 
 	importReferer, err := o.effectiveImportReferer(b)
 	if err != nil {
-		return nil, "", false, err
+		return nil, err
 	}
 
 	spec := &configsock.BuildSpec{
@@ -1363,7 +1638,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		Steps:            steps,
 		StartCmd:         b.StartCmd,
 		ReadyCmd:         b.ReadyCmd,
-		Env:              env,
+		Env:              nil,
 		Paths: configsock.BuildPaths{
 			Kernel:         o.cfg.Sandbox.Boot.Kernel,
 			Runtime:        o.cfg.Sandbox.Boot.Runtime,
@@ -1391,13 +1666,26 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		ImportReferer:   importReferer,
 		RegistryTLS:     o.effectiveRegistryTLS(b),
 		Timeouts: configsock.BuildTimeouts{
-			PullSec:  o.cfg.Builder.PullTimeoutSec,
-			StepSec:  o.cfg.Builder.StepTimeoutSec,
-			ReadySec: o.cfg.Builder.ReadyTimeoutSec,
-			TotalSec: o.cfg.Builder.TotalTimeoutSec,
+			PullSec:                  o.cfg.Builder.PullTimeoutSec,
+			StepSec:                  o.cfg.Builder.StepTimeoutSec,
+			ReadySec:                 o.cfg.Builder.ReadyTimeoutSec,
+			TotalSec:                 o.cfg.Builder.TotalTimeoutSec,
+			AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
 		},
 	}
-	return spec, configsock.BuildPidfile(o.cfg.Paths.RunRoot, b.BuildID), true, nil
+	return spec, nil
+}
+
+// publishBuildFinal installs the optional MMDS route before making the final
+// spec observable. A task may start phase C as soon as WaitFinal returns, so
+// reversing these operations creates a real initialization race.
+func (o *Orchestrator) publishBuildFinal(pend *pendingBuild, spec *configsock.BuildSpec) *types.Sandbox {
+	var mmdsRow *types.Sandbox
+	if pend.build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
+		mmdsRow = o.publishRecoveredBuildMMDS(pend.build)
+	}
+	pend.handoff.PublishFinal(spec, nil)
+	return mmdsRow
 }
 
 // resolveBuildNetworks derives two roles from the same merged logical network:
@@ -1420,45 +1708,6 @@ func (o *Orchestrator) resolveBuildNetworks(
 		return sandboxcfg.NetworkSpec{}, sandboxcfg.NetworkSpec{}, err
 	}
 	return buildNetwork, templateNetwork, nil
-}
-
-// sourceTemplateNetwork returns the self-described network from a snapshot
-// source. Image templates have no snapshot metadata channel, so they intentionally
-// contribute no inherited network. A malformed or unreadable snapshot fails the
-// build before host attachment instead of silently changing network semantics.
-func (o *Orchestrator) sourceTemplateNetwork(ctx context.Context, b *types.Build) (sandboxcfg.NetworkSpec, error) {
-	if b.FromTemplate == "" {
-		return sandboxcfg.NetworkSpec{}, nil
-	}
-	tmpl, err := types.ParseTemplateID(b.FromTemplate)
-	if err != nil {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate %q: %w", b.FromTemplate, err)
-	}
-	if tmpl.Kind != types.KindSnp {
-		return sandboxcfg.NetworkSpec{}, nil
-	}
-	inspect := o.snapshotInspector
-	if inspect == nil {
-		inspect = o.inspectSnapshotConfig
-	}
-	cfg, err := inspect(ctx, b.ManifestKey, tmpl.Ref)
-	if err != nil {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
-	}
-	raw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork])
-	if raw == "" {
-		return sandboxcfg.NetworkSpec{}, nil
-	}
-	spec, err := sandboxcfg.ParseSpec(map[string]string{sandboxcfg.NsNetwork: raw})
-	if err != nil {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: fromTemplate network: %w", err)
-	}
-	return spec.Network, nil
-}
-
-func retryableBuildPhaseInputError(err error) bool {
-	var probeErr *snapshotConfigProbeError
-	return errors.As(err, &probeErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // shortID returns the first 8 chars (hostname-friendly handle).

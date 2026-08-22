@@ -563,7 +563,7 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id=?,
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
 		execution_claimed_unix=0,phase='',phase_sandbox_id='',
-		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',
+		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
 		execution_result_json=''
 		WHERE build_id=? AND status=? AND execution_claimed=1`,
 		terminal.PersistID, string(terminal.Kind), terminal.StartCmd, terminal.ReadyCmd,

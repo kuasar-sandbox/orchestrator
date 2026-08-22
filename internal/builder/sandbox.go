@@ -78,11 +78,11 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	if err != nil {
 		return nil, fmt.Errorf("create readiness pipe: %w", err)
 	}
-	cmd.Env = append(os.Environ(),
-		"MANIFEST_KEY="+s.Env["MANIFEST_KEY"],
-		"KUASAR_RUN_ID="+s.RunID,
-		"KUASAR_BUILD_ID="+s.BuildID,
-	)
+	cmd.Env = authoritativeProcessEnv(map[string]string{
+		"MANIFEST_KEY":    s.Env["MANIFEST_KEY"],
+		"KUASAR_RUN_ID":   s.RunID,
+		"KUASAR_BUILD_ID": s.BuildID,
+	})
 	// sandbox-ctl's own process stdio (the app/kernel are off on journald) inherit
 	// run-builder's stderr → builder unit journal for host diagnostics.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr

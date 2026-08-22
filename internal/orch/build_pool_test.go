@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -19,12 +21,16 @@ type assignmentOrderLauncher struct {
 	value  launcher.ResourceProperties
 	setErr error
 	onRead func()
+	onList func()
 }
 
 func (l *assignmentOrderLauncher) Start(context.Context, string) error       { return nil }
 func (l *assignmentOrderLauncher) Stop(context.Context, string) error        { return nil }
 func (l *assignmentOrderLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *assignmentOrderLauncher) List(context.Context, string) ([]launcher.Unit, error) {
+	if l.onList != nil {
+		l.onList()
+	}
 	return nil, nil
 }
 func (l *assignmentOrderLauncher) Reload(context.Context) error { return nil }
@@ -153,6 +159,76 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
 	if err != nil || stored.RunID != "" || stored.EnforcementStatus != "" {
 		t.Fatalf("failed property application bound run = %+v, %v", stored, err)
+	}
+}
+
+func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Builder.TotalTimeoutSec = 1
+	b := &types.Build{
+		BuildID: "build-expired-before-assignment", Profile: types.ProfileBare,
+		FromImage: "example.invalid/base:latest", Status: types.BuildBuilding,
+		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Add(-2 * time.Minute).Unix(),
+	}
+	if _, err := o.runBuildUnit(context.Background(), b); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired assignment = %v, want deadline exceeded", err)
+	}
+	if b.RunID != "" || b.RuntimeVswitchPort != "" {
+		t.Fatalf("expired build acquired runtime ownership: %+v", b)
+	}
+	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired build workdir remained: %v", err)
+	}
+}
+
+func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Builder.TotalTimeoutSec = 75
+	claimed := time.Unix(1_800_000_000, 0)
+	b := &types.Build{ExecutionClaimedUnix: claimed.Unix()}
+
+	if got, want := o.buildExecutionDeadline(b), claimed.Add(75*time.Second); !got.Equal(want) {
+		t.Fatalf("build execution deadline = %v, want %v", got, want)
+	}
+}
+
+func TestWaitBuildResultRechecksAcceptedResultAfterInactiveReadback(t *testing.T) {
+	o := testOrch(t)
+	want := configsock.BuildResult{ImageRef: "manifest://accepted-after-exit"}
+	pend := &pendingBuild{
+		handoff: newBuildTaskHandoff(false, ""),
+		result:  make(chan configsock.BuildResult, 1),
+	}
+	published := false
+	o.lc = &assignmentOrderLauncher{onList: func() {
+		if !published {
+			published = true
+			pend.result <- want
+		}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := o.waitBuildResult(ctx, pend, "sandbox-builder@test.service")
+	if err != nil || got == nil || *got != want {
+		t.Fatalf("accepted result after inactive readback = %+v, %v", got, err)
+	}
+}
+
+func TestRunBuildUnitCleansWorkdirWhenRequestResolutionFails(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	b := &types.Build{
+		BuildID: "build-invalid-request-input", Profile: types.ProfileBare,
+		Status: types.BuildBuilding, PhaseResourcePatch: `{"capacity":`,
+	}
+
+	if _, err := o.runBuildUnit(context.Background(), b); err == nil {
+		t.Fatal("malformed phase resource patch was accepted")
+	}
+	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("request-resolution failure retained build workdir: %v", err)
 	}
 }
 

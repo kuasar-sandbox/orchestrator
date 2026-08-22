@@ -17,9 +17,9 @@ import (
 //     assignment, then exec-replaces into sandbox-ctl run with config pulled over
 //     the config-socket.
 //   - <builder> (sandbox-builder@.service): one run-id unit that waits for a build
-//     assignment, pulls the BuildSpec (MANIFEST_KEY + tenant registry creds in env)
-//     over the config-socket, drives the three-phase pipeline itself, and posts the
-//     result back to the socket.
+//     assignment, authenticates an exact-run bootstrap, prepares a snapshot root
+//     task-locally when required, then drives the three-phase pipeline and posts
+//     the result back to the socket.
 //
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
 // reaper and the builder resource pool can account and reclaim them.

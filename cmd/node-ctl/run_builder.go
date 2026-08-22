@@ -45,11 +45,16 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 func runBuilder(args []string, log *slog.Logger) error {
@@ -67,15 +72,17 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if err := lockPidfile(*pidfile); err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 	vmmCgroup, err := prepareBuilderCgroup(*runID)
 	if err != nil {
 		return fmt.Errorf("prepare builder cgroup: %w", err)
 	}
 	defer vmmCgroup.Close()
 	var bid string
-	err = retryBuildConfigSocket(context.Background(), log, "assignment", func(ctx context.Context) error {
+	err = retryBuildConfigSocket(ctx, log, "assignment", func(callCtx context.Context) error {
 		var callErr error
-		bid, callErr = configsock.WaitAssignment(ctx, *socket, "build", *runID)
+		bid, callErr = configsock.WaitAssignment(callCtx, *socket, "build", *runID)
 		return callErr
 	})
 	if err != nil {
@@ -84,20 +91,94 @@ func runBuilder(args []string, log *slog.Logger) error {
 	if err := lockPidfile(builderAssignmentPidfile(*pidfile, bid)); err != nil {
 		return err
 	}
-	var spec *configsock.BuildSpec
-	err = retryBuildConfigSocket(context.Background(), log, "build spec", func(ctx context.Context) error {
+	var bootstrap *configsock.BuildTaskSpec
+	err = retryBuildConfigSocket(ctx, log, "build bootstrap", func(callCtx context.Context) error {
 		var callErr error
-		spec, callErr = configsock.FetchBuildSpecContext(ctx, *socket, "build:"+bid)
+		bootstrap, callErr = configsock.FetchBuildTaskSpec(callCtx, *socket, bid, *runID)
 		return callErr
 	})
 	if err != nil {
-		postErr := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
-			return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		postErr := retryBuildConfigSocket(ctx, log, "result", func(callCtx context.Context) error {
+			return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
 		})
 		if postErr != nil {
 			return fmt.Errorf("fetch build spec: %w (post result: %v)", err, postErr)
 		}
 		return fmt.Errorf("fetch build spec: %w", err)
+	}
+	if bootstrap.BuildID != bid || bootstrap.RunID != *runID {
+		return fmt.Errorf("build task bootstrap identity mismatch")
+	}
+	if (bootstrap.Final == nil) == (bootstrap.Prepare == nil) {
+		return fmt.Errorf("build task bootstrap must contain exactly one of final or prepare")
+	}
+	if err := installBuildTaskEnvironment(bootstrap.Env, os.Setenv, os.Unsetenv); err != nil {
+		return err
+	}
+
+	taskCtx := ctx
+	cancelDeadline := func() {}
+	// workCtx stops before taskCtx so every preparation/phase failure still has
+	// a bounded tail in which the exact-run result can be durably reported.
+	workCtx := ctx
+	cancelWork := func() {}
+	deadlineUnixNano := buildTaskAbsoluteDeadline(bootstrap)
+	if deadlineUnixNano > 0 {
+		deadline := time.Unix(0, deadlineUnixNano)
+		if !deadline.After(time.Now()) {
+			return fmt.Errorf("build task bootstrap deadline has expired")
+		}
+		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+		workCtx, cancelWork = context.WithDeadline(taskCtx, builder.PreResultDeadline(deadline, time.Now()))
+	} else if bootstrap.Prepare != nil {
+		return fmt.Errorf("build task snapshot bootstrap has no absolute deadline")
+	}
+	defer cancelDeadline()
+	defer cancelWork()
+
+	spec := bootstrap.Final
+	var prepared *tasksnapshot.Result
+	var localPreparation *configsock.BuildSnapshotPreparation
+	if bootstrap.Prepare != nil {
+		prepared, err = tasksnapshot.Prepare(workCtx, *bootstrap.Prepare)
+		if err == nil {
+			localPreparation, err = buildSnapshotPreparation(prepared.RootCfg)
+		}
+		if err == nil {
+			log.Info("build task snapshot prepared", "bid", bid, "run_id", *runID,
+				"task_snapshot_prepare_duration", prepared.PrepareDuration,
+				"task_snapshot_cfg_read_duration", prepared.ConfigReadDuration,
+				"task_snapshot_ref_count", prepared.Summary.RequiredRefCount)
+			err = retryBuildConfigSocket(workCtx, log, "build prepare", func(callCtx context.Context) error {
+				var callErr error
+				spec, callErr = configsock.CompleteBuildPrepare(callCtx, *socket, bid, *runID, prepared.Summary)
+				return callErr
+			})
+		}
+		if err != nil {
+			log.Error("build task snapshot prepare failed", "bid", bid, "run_id", *runID,
+				"task_snapshot_prepare_error_total", 1, "stage", "snapshot_prepare", "err", err)
+			postErr := retryBuildConfigSocket(taskCtx, log, "result", func(callCtx context.Context) error {
+				return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, configsock.BuildResult{
+					Error: err.Error(), FailureStage: "snapshot_prepare",
+				})
+			})
+			if postErr != nil {
+				return fmt.Errorf("prepare build snapshot: %w (post result: %v)", err, postErr)
+			}
+			return fmt.Errorf("prepare build snapshot: %w", err)
+		}
+	}
+	if spec == nil {
+		return fmt.Errorf("build task has no final build spec")
+	}
+	if spec.BuildID != bid || spec.RunID != *runID {
+		return fmt.Errorf("final build spec identity mismatch")
+	}
+	spec.Env = mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
+	if prepared != nil {
+		spec.SnapshotPreparation = localPreparation
+		spec.RefLocations = prepared.RefLocationURIs
 	}
 	if spec.Workdir != "" {
 		if err := os.Chdir(spec.Workdir); err != nil {
@@ -106,17 +187,17 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 
 	reportPhase := func(phase, sandboxID, state string) error {
-		return retryBuildConfigSocket(context.Background(), log, "phase", func(ctx context.Context) error {
-			return configsock.PostBuildPhaseContext(ctx, *socket, *runID, bid, phase, sandboxID, state)
+		return retryBuildConfigSocket(workCtx, log, "phase", func(callCtx context.Context) error {
+			return configsock.PostBuildPhaseContext(callCtx, *socket, *runID, bid, phase, sandboxID, state)
 		})
 	}
-	res := builder.Run(spec, vmmCgroup, reportPhase, log)
+	res := builder.Run(workCtx, spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
-	if err := retryBuildConfigSocket(context.Background(), log, "result", func(ctx context.Context) error {
-		return configsock.PostBuildResultContext(ctx, *socket, *runID, bid, post)
+	if err := retryBuildConfigSocket(taskCtx, log, "result", func(callCtx context.Context) error {
+		return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, post)
 	}); err != nil {
 		return fmt.Errorf("post build result: %w", err)
 	}
@@ -124,6 +205,69 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+// installBuildTaskEnvironment gives the task-local snapshot reader only the
+// process-wide authority it needs. Registry credentials remain in the
+// authenticated bootstrap map and are merged into BuildSpec.Env for explicit
+// host/guest calls; they must never become ambient phase-process environment.
+func installBuildTaskEnvironment(
+	env map[string]string,
+	setenv func(string, string) error,
+	unsetenv func(string) error,
+) error {
+	if _, ok := env["MANIFEST_KEY"]; !ok {
+		return fmt.Errorf("build task bootstrap has no authoritative manifest key")
+	}
+	if setenv == nil {
+		return fmt.Errorf("build task environment installer is not configured")
+	}
+	if unsetenv == nil {
+		return fmt.Errorf("build task environment cleaner is not configured")
+	}
+	for _, key := range []string{regcreds.EnvToken, regcreds.EnvUsername, regcreds.EnvPassword} {
+		if err := unsetenv(key); err != nil {
+			return fmt.Errorf("clear inherited build credential %s: %w", key, err)
+		}
+	}
+	return installTaskEnvironment(env, func(key, value string) error {
+		if key != "MANIFEST_KEY" {
+			return nil
+		}
+		return setenv(key, value)
+	})
+}
+
+func buildTaskAbsoluteDeadline(task *configsock.BuildTaskSpec) int64 {
+	if task == nil {
+		return 0
+	}
+	if task.Prepare != nil {
+		return task.Prepare.AbsoluteDeadlineUnixNano
+	}
+	if task.Final != nil {
+		return task.Final.Timeouts.AbsoluteDeadlineUnixNano
+	}
+	return 0
+}
+
+func buildSnapshotPreparation(cfg *restore.SnapshotCfg) (*configsock.BuildSnapshotPreparation, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("build snapshot root config is nil")
+	}
+	if cfg.Boot.Root.BaseRef == "" {
+		return nil, fmt.Errorf("build snapshot has no base image ref (boot.root.base_ref)")
+	}
+	prepared := &configsock.BuildSnapshotPreparation{
+		BaseRef:  cfg.Boot.Root.BaseRef,
+		StartCmd: cfg.Metadata["e2b.start_cmd"],
+		ReadyCmd: cfg.Metadata["e2b.ready_cmd"],
+	}
+	if cfg.Boot.Root.Overlay != nil {
+		prepared.OverlayBase = cfg.Boot.Root.Overlay.Base
+		prepared.OverlayBaseFromRefs = append([]string(nil), cfg.Boot.Root.Overlay.BaseFromRefs...)
+	}
+	return prepared, nil
 }
 
 func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation string, call func(context.Context) error) error {

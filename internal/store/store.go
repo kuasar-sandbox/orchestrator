@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS builds (
   runtime_floating_ip TEXT NOT NULL DEFAULT '',
   runtime_port_mac TEXT NOT NULL DEFAULT '',
   runtime_envd_access_token_enc TEXT NOT NULL DEFAULT '',
+  runtime_prepare_json TEXT NOT NULL DEFAULT '',
   execution_result_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
@@ -162,7 +163,49 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
+	if err := ensureColumn(ctx, db, "builds", "runtime_prepare_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db, box: box}, nil
+}
+
+// ensureColumn performs the repository's additive SQLite compatibility
+// upgrade. CREATE TABLE IF NOT EXISTS cannot add fields to an existing node DB.
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("store: inspect %s schema: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: inspect %s columns: %w", table, err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: inspect %s columns: %w", table, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: close %s schema rows: %w", table, err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+		return fmt.Errorf("store: add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -818,7 +861,7 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json`
+  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
@@ -830,7 +873,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
-		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &executionResultJSON); err != nil {
+		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON); err != nil {
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
@@ -880,8 +923,8 @@ const buildInsertSQL = `
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,execution_result_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -904,6 +947,7 @@ const buildUpsertSQL = buildInsertSQL + `
 	  runtime_floating_ip=excluded.runtime_floating_ip,
 	  runtime_port_mac=excluded.runtime_port_mac,
 	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc,
+	  runtime_prepare_json=excluded.runtime_prepare_json,
 	  execution_result_json=excluded.execution_result_json`
 
 const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
@@ -963,7 +1007,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
-		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, executionResultJSON,
+		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON,
 	}, nil
 }
 
@@ -1074,6 +1118,26 @@ func (s *Store) GetClaimedBuildIDByRunID(ctx context.Context, runID string) (str
 		return "", false, fmt.Errorf("store: run %s has multiple claimed builds", runID)
 	}
 	return buildID, true, nil
+}
+
+// BuildingTaskIdentity verifies only non-secret exact-run ownership for the
+// config-socket authentication phase. It deliberately does not scan/decrypt the
+// Build row before SO_PEERCRED and pidfile authentication succeeds.
+func (s *Store) BuildingTaskIdentity(ctx context.Context, buildID, runID string) (bool, error) {
+	if buildID == "" || runID == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM builds
+		WHERE build_id=? AND run_id=? AND status=? AND execution_claimed=1`,
+		buildID, runID, string(types.BuildBuilding)).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: verify build %s run %s task identity: %w", buildID, runID, err)
+	}
+	return one == 1, nil
 }
 
 // GetBuildByTemplateID looks a build up by its (transient) template id — the

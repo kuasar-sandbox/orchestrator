@@ -184,29 +184,29 @@ func (s *Store) AcceptBuildResult(ctx context.Context, buildID, runID string, re
 	return false, fmt.Errorf("%w: build %s run %s", ErrBuildExecutionOwnership, buildID, runID)
 }
 
-// SetBuildRuntimeOwnership persists host resources acquired after execution
-// admission but before assignment. A restart can then recover a live unit's
-// result channel and reclaim the exact connector port without rerunning the
-// Build. The access token is encrypted with the store key.
-func (s *Store) SetBuildRuntimeOwnership(ctx context.Context, buildID, vswitchPort, floatingIP, portMAC, envdAccessToken string) (bool, error) {
-	if vswitchPort == "" {
-		return false, fmt.Errorf("store: set build %s runtime ownership: empty vswitch port", buildID)
+// SetBuildRuntimePreparation atomically commits exact-run host ownership and
+// the non-secret canonical final preparation. A restart must never see the port
+// without the network/resources values needed to reconstruct its BuildSpec.
+func (s *Store) SetBuildRuntimePreparation(ctx context.Context, buildID, runID, vswitchPort, floatingIP, portMAC, envdAccessToken, runtimePrepareJSON string) (bool, error) {
+	if runID == "" || vswitchPort == "" || runtimePrepareJSON == "" {
+		return false, fmt.Errorf("store: set build %s runtime preparation: run id, vswitch port, and preparation are required", buildID)
 	}
 	tokenEnc := ""
 	var err error
 	if envdAccessToken != "" {
 		tokenEnc, err = s.box.EncryptString(envdAccessToken)
 		if err != nil {
-			return false, fmt.Errorf("store: set build %s runtime ownership: encrypt envd token: %w", buildID, err)
+			return false, fmt.Errorf("store: set build %s runtime preparation: encrypt envd token: %w", buildID, err)
 		}
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
-		SET runtime_vswitch_port=?,runtime_floating_ip=?,runtime_port_mac=?,runtime_envd_access_token_enc=?
-		WHERE build_id=? AND status=? AND execution_claimed=1
-		  AND runtime_vswitch_port='' AND run_id=''`,
-		vswitchPort, floatingIP, portMAC, tokenEnc, buildID, string(types.BuildBuilding))
+		SET runtime_vswitch_port=?,runtime_floating_ip=?,runtime_port_mac=?,runtime_envd_access_token_enc=?,runtime_prepare_json=?
+		WHERE build_id=? AND status=? AND execution_claimed=1 AND run_id=?
+		  AND runtime_vswitch_port='' AND runtime_prepare_json=''`,
+		vswitchPort, floatingIP, portMAC, tokenEnc, runtimePrepareJSON,
+		buildID, string(types.BuildBuilding), runID)
 	if err != nil {
-		return false, fmt.Errorf("store: set build %s runtime ownership: %w", buildID, err)
+		return false, fmt.Errorf("store: set build %s runtime preparation: %w", buildID, err)
 	}
 	changed, err := res.RowsAffected()
 	return changed == 1, err
@@ -216,7 +216,7 @@ func (s *Store) SetBuildRuntimeOwnership(ctx context.Context, buildID, vswitchPo
 // while retaining the execution claim until the terminal Build row commits.
 func (s *Store) ClearBuildRuntimeOwnership(ctx context.Context, buildID string) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE builds
-		SET runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc=''
+		SET runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json=''
 		WHERE build_id=? AND status=? AND execution_claimed=1`,
 		buildID, string(types.BuildBuilding))
 	if err != nil {

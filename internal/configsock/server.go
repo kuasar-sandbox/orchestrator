@@ -6,7 +6,7 @@
 //     prestarted run-id units wait for their sandbox/build assignment; run-builder
 //     posts its result back here. Authed by SO_PEERCRED peer pid == the run-id
 //     pidfile (/run/sandbox/runs/<run-id>.pid).
-//   - task   (POST /internal/task/launchspec, /internal/task/buildspec):
+//   - task   (POST /internal/task/{sandbox,build}/{bootstrap,prepare}):
 //     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
 //     SO_PEERCRED peer pid == the task pidfile (/run/sandbox/<id>/<id>.pid).
 //   - admin  (/internal/admin/manifest-keys and sandbox MMDS route-value paths):
@@ -58,7 +58,8 @@ import (
 const (
 	PathTaskSandboxBootstrap       = "/internal/task/sandbox/bootstrap"
 	PathTaskSandboxPrepare         = "/internal/task/sandbox/prepare"
-	PathTaskBuildSpec              = "/internal/task/buildspec"
+	PathTaskBuildBootstrap         = "/internal/task/build/bootstrap"
+	PathTaskBuildPrepare           = "/internal/task/build/prepare"
 	PathRunAssignment              = "/internal/run/assignment"
 	PathRunBuildResult             = "/internal/run/build-result"
 	PathRunBuildPhase              = "/internal/run/build-phase"
@@ -85,12 +86,6 @@ const (
 	RunnerLogTag = "sandbox"
 	ConsoleTag   = "console"
 )
-
-// Request is what a task client (node-ctl run-sandbox / run-builder) sends.
-type Request struct {
-	ConfigID string `json:"config_id"`
-	Version  int    `json:"version"`
-}
 
 type AssignmentRequest struct {
 	Kind  string `json:"kind"`
@@ -173,43 +168,44 @@ type Provider interface {
 	SandboxTaskAuth(ctx context.Context, sandboxID, runID string) (auth SandboxTaskAuth, ok bool, err error)
 	SandboxTaskSpecFor(ctx context.Context, sandboxID, runID string) (resp *SandboxTaskSpec, ok bool, err error)
 	CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary SnapshotPrepareSummary) (*LaunchSpec, error)
-	// BuildSpecFor resolves "build:<bid>" to the build pipeline spec the
-	// run-builder orchestrates (it does NOT exec-replace — the spec is a
-	// work order, not a launch).
-	BuildSpecFor(ctx context.Context, configID string) (resp *BuildSpec, pidFile string, ok bool, err error)
+	BuildTaskAuth(ctx context.Context, buildID, runID string) (auth BuildTaskAuth, ok bool, err error)
+	BuildTaskSpecFor(ctx context.Context, buildID, runID string) (resp *BuildTaskSpec, ok bool, err error)
+	CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary SnapshotPrepareSummary) (*BuildSpec, error)
 	RunPidFile(kind, runID string) (pidFile string, ok bool)
 	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
 	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
 	PostBuildPhase(ctx context.Context, runID, buildID, phase, sandboxID, state string) error
 }
 
-// BuildSpec is the work order node-ctl run-builder fetches for
-// "build:<bid>": everything the three-phase pipeline (import → steps →
-// template snapshot) needs. Secrets (manifest key, tenant registry
-// creds) ride here over the socket, never on disk.
+// BuildSpec is the final work order an authenticated run-builder receives:
+// everything the three-phase pipeline (import → steps → template snapshot)
+// needs. Secrets ride in BuildTaskSpec.Env, never on disk.
 type BuildSpec struct {
-	BuildID          string                   `json:"build_id"`
-	Profile          string                   `json:"profile"`
-	RunID            string                   `json:"run_id,omitempty"`
-	Workdir          string                   `json:"workdir"` // build scratch dir (artifacts, run roots)
-	FromImage        string                   `json:"from_image,omitempty"`
-	FromTemplateRef  string                   `json:"from_template_ref,omitempty"`
-	FromTemplateKind string                   `json:"from_template_kind,omitempty"`
-	RefLocations     map[string]string        `json:"ref_locations,omitempty"`
-	ToRefLocation    string                   `json:"to_ref_location,omitempty"`
-	Steps            []BuildStep              `json:"steps,omitempty"`
-	StartCmd         string                   `json:"start_cmd,omitempty"`
-	ReadyCmd         string                   `json:"ready_cmd,omitempty"`
-	Env              map[string]string        `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
-	Paths            BuildPaths               `json:"paths"`
-	Net              BuildNet                 `json:"net"`
-	TemplateNetwork  sandboxcfg.NetworkSpec   `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
-	Resources        rtconfig.ResourcesConfig `json:"resources"`
-	MMDSEnabled      bool                     `json:"mmds_enabled"`
-	EnvdToken        string                   `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure         bool                     `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform         string                   `json:"platform,omitempty"`
-	ImportReferer    BuildImportReferer       `json:"import_referer,omitempty"`
+	BuildID          string            `json:"build_id"`
+	Profile          string            `json:"profile"`
+	RunID            string            `json:"run_id,omitempty"`
+	Workdir          string            `json:"workdir"` // build scratch dir (artifacts, run roots)
+	FromImage        string            `json:"from_image,omitempty"`
+	FromTemplateRef  string            `json:"from_template_ref,omitempty"`
+	FromTemplateKind string            `json:"from_template_kind,omitempty"`
+	RefLocations     map[string]string `json:"ref_locations,omitempty"`
+	// SnapshotPreparation is populated only inside run-builder from its retained
+	// root SnapshotCfg. It is intentionally absent from the conductor wire.
+	SnapshotPreparation *BuildSnapshotPreparation `json:"-"`
+	ToRefLocation       string                    `json:"to_ref_location,omitempty"`
+	Steps               []BuildStep               `json:"steps,omitempty"`
+	StartCmd            string                    `json:"start_cmd,omitempty"`
+	ReadyCmd            string                    `json:"ready_cmd,omitempty"`
+	Env                 map[string]string         `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
+	Paths               BuildPaths                `json:"paths"`
+	Net                 BuildNet                  `json:"net"`
+	TemplateNetwork     sandboxcfg.NetworkSpec    `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
+	Resources           rtconfig.ResourcesConfig  `json:"resources"`
+	MMDSEnabled         bool                      `json:"mmds_enabled"`
+	EnvdToken           string                    `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure            bool                      `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform            string                    `json:"platform,omitempty"`
+	ImportReferer       BuildImportReferer        `json:"import_referer,omitempty"`
 	// RegistryTLS carries the per-build registry TLS trust (inline CA bundle
 	// PEM and/or skip-verify) projected into the Phase A import sandbox as a
 	// flatten-ctl config YAML. Nil = use system root CAs. Register-time only;
@@ -278,12 +274,15 @@ type TapFDConfig struct {
 	Timeout string   `json:"timeout,omitempty"`
 }
 
-// BuildTimeouts are per-phase budgets in seconds.
+// BuildTimeouts are per-phase budgets in seconds. The absolute deadline covers
+// task/host preparation, pipeline execution, and result reporting; it excludes
+// the conductor's separately bounded fencing and cleanup allowance.
 type BuildTimeouts struct {
-	PullSec  int `json:"pull_sec"`
-	StepSec  int `json:"step_sec"`
-	ReadySec int `json:"ready_sec"`
-	TotalSec int `json:"total_sec"`
+	PullSec                  int   `json:"pull_sec"`
+	StepSec                  int   `json:"step_sec"`
+	ReadySec                 int   `json:"ready_sec"`
+	TotalSec                 int   `json:"total_sec"`
+	AbsoluteDeadlineUnixNano int64 `json:"absolute_deadline_unix_nano,omitempty"`
 }
 
 // AdminKeyInfo is one tenant key-pair allowlist entry. Only complete
@@ -364,7 +363,7 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
-	Provider                     Provider // task plane (LaunchSpec by config-id)
+	Provider                     Provider // exact-run task bootstrap/prepare and reports
 	Admin                        Admin    // admin plane (manifest-key allowlist)
 	MMDSRouteSecretAdmin         MMDSRouteSecretAdmin
 	BuilderAdmissionAdmin        BuilderAdmissionAdmin
@@ -442,7 +441,8 @@ func (s *Server) router() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathTaskSandboxBootstrap, s.handleSandboxBootstrap)
 	mux.HandleFunc("POST "+PathTaskSandboxPrepare, s.handleSandboxPrepare)
-	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
+	mux.HandleFunc("POST "+PathTaskBuildBootstrap, s.handleBuildBootstrap)
+	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)
@@ -545,34 +545,83 @@ func (s *Server) handleSandboxPrepare(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &SnapshotPrepareResponse{Final: final})
 }
 
-// handleBuildTask serves the legacy build-spec plane
-// (SO_PEERCRED pid == the build's pidfile), different payload.
-func (s *Server) handleBuildTask(w http.ResponseWriter, r *http.Request) {
+// handleBuildBootstrap authenticates the exact assigned task before invoking
+// the secret-bearing provider. In particular, MANIFEST_KEY cannot be loaded on
+// an unauthorized request.
+func (s *Server) handleBuildBootstrap(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerFrom(r.Context())
 	if !ok {
-		writeJSON(w, http.StatusForbidden, &BuildSpec{Error: "no peer credentials"})
+		writeJSON(w, http.StatusForbidden, &BuildTaskSpec{Error: "no peer credentials"})
 		return
 	}
-	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ConfigID == "" {
-		writeJSON(w, http.StatusBadRequest, &BuildSpec{Error: "bad request"})
+	var req BuildTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != SnapshotPrepareSchemaVersion {
+		writeJSON(w, http.StatusBadRequest, &BuildTaskSpec{Error: "bad request"})
 		return
 	}
-	spec, pidFile, found, err := s.deps.Provider.BuildSpecFor(r.Context(), req.ConfigID)
+	auth, found, err := s.deps.Provider.BuildTaskAuth(r.Context(), req.BuildID, req.RunID)
 	if err != nil {
-		s.log.Warn("configsock build provider", "id", req.ConfigID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, &BuildSpec{Error: "internal error"})
+		s.log.Warn("configsock build auth provider", "build_id", req.BuildID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildTaskSpec{Error: "internal error"})
 		return
 	}
 	if !found {
-		writeJSON(w, http.StatusNotFound, &BuildSpec{Error: "unknown build"})
+		writeJSON(w, http.StatusNotFound, &BuildTaskSpec{Error: "unknown build run"})
 		return
 	}
-	if !s.taskAuthed(req.ConfigID, pidFile, peer) {
-		writeJSON(w, http.StatusForbidden, &BuildSpec{Error: "not authorized"})
+	if !s.taskAuthed("build:"+req.BuildID+":"+req.RunID, auth.PidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &BuildTaskSpec{Error: "not authorized"})
+		return
+	}
+	spec, found, err := s.deps.Provider.BuildTaskSpecFor(r.Context(), req.BuildID, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock build bootstrap provider", "build_id", req.BuildID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildTaskSpec{Error: "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &BuildTaskSpec{Error: "unknown build run"})
 		return
 	}
 	writeJSON(w, http.StatusOK, spec)
+}
+
+func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &BuildPrepareResponse{Error: "no peer credentials"})
+		return
+	}
+	var req BuildPrepareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" {
+		writeJSON(w, http.StatusBadRequest, &BuildPrepareResponse{Error: "bad request"})
+		return
+	}
+	auth, found, err := s.deps.Provider.BuildTaskAuth(r.Context(), req.BuildID, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock build prepare auth provider", "build_id", req.BuildID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildPrepareResponse{Error: "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &BuildPrepareResponse{Error: "unknown build run"})
+		return
+	}
+	if !s.taskAuthed("build-prepare:"+req.BuildID+":"+req.RunID, auth.PidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &BuildPrepareResponse{Error: "not authorized"})
+		return
+	}
+	final, err := s.deps.Provider.CompleteBuildPrepare(r.Context(), req.BuildID, req.RunID, req.Summary)
+	if err != nil {
+		s.log.Warn("configsock build prepare provider", "build_id", req.BuildID, "run_id", req.RunID, "err", err)
+		status := http.StatusInternalServerError
+		if IsBuildPrepareRejection(err) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, &BuildPrepareResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &BuildPrepareResponse{Final: final})
 }
 
 func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {

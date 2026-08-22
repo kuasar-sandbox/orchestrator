@@ -87,17 +87,7 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	// Recovery-boundary tests construct Orchestrator directly and control this
 	// gate explicitly.
 	o.buildRecoveryReadyOnce.Do(func() { close(o.buildRecoveryReady) })
-	installDefaultSnapshotInspector(o)
 	return o
-}
-
-func installDefaultSnapshotInspector(o *Orchestrator) {
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		var description snapshotDescription
-		description.Resources.Capacity.CPU = 2
-		description.Resources.Capacity.Memory = "2GiB"
-		return description, nil
-	}
 }
 
 // TestResolveBuildCreds verifies the precedence: pull token > fromImageRegistry
