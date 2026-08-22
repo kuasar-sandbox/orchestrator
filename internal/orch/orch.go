@@ -1615,10 +1615,9 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
 	if err := o.addRefLocation(locations, ref); err != nil {
 		return cfg, err
 	}
-	args := []string{"info", "--json"}
-	if strings.HasPrefix(ref, "manifest://") {
-		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
-	}
+	// file:// refs with HMAC digests need the manifest config's crypto policy
+	// (crypto.local=auto) or sandbox-ctl rejects the ref before opening it.
+	args := []string{"info", "--json", "--manifest-config", o.cfg.ManifestConfig}
 	args = appendRefLocationArgs(args, locations)
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), append(args, ref)...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+manifestKey)
