@@ -335,6 +335,41 @@ func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	}
 }
 
+func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	vs := &orderedCleanupVS{detachErr: errors.New("injected first recovered detach failure")}
+	o.vs = vs
+	o.lc = &orderedCleanupLauncher{}
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000211")
+	build.BuildID = "recovered-cleanup-retry-unpersisted-port"
+	build.RuntimeVswitchPort = ""
+	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := o.cleanupRecoveredBuildRuntime(
+		build, errors.New("runtime preparation was not committed"), "recovered-local-port-22", workdir, false,
+	)
+	var pending *buildCleanupPendingError
+	if !errors.As(runErr, &pending) || pending.port != "recovered-local-port-22" || pending.persisted {
+		t.Fatalf("recovered cleanup progress = %#v, %v", pending, runErr)
+	}
+	o.completeBuild(context.Background(), build, nil, runErr)
+
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored.Status != types.BuildError || stored.ExecutionClaimed {
+		t.Fatalf("recovered cleanup retry terminal build = %+v, %v", stored, err)
+	}
+	if got := vs.detachedPorts(); len(got) != 2 || got[0] != "recovered-local-port-22" || got[1] != "recovered-local-port-22" {
+		t.Fatalf("recovered cleanup retries lost local port ownership: %v", got)
+	}
+}
+
 func TestLaunchCleanupRetriesInOwnershipOrder(t *testing.T) {
 	stopErr := errors.New("injected stop failure")
 	resetErr := errors.New("injected reset failure")

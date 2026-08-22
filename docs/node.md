@@ -263,7 +263,8 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
   final spec 后**驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
   `{image_ref|snapshot_ref, start_cmd, ready_cmd, error, failure_stage}` 经 config-socket 回传。pipeline
-  在同一个 absolute deadline 内预留最后 5 秒用于持久回传结果；这不会重置或延长总预算。
+  在同一个 absolute deadline 内预留最多最后5秒用于持久回传结果；剩余预算不足10秒时预留其
+  一半，避免短timeout在pipeline开始前即过期，同时不会重置或延长总预算。
   完整 bid 始终是持久业务身份;固定长度摘要只用于可重建的 node-local runtime 目录,
   使嵌套 phase UDS 在较长 `run_root` 下仍不超过 Linux `sun_path`。
 

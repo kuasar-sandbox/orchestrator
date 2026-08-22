@@ -304,12 +304,22 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 		result, port, runtimePersisted, mmdsRow, runErr = o.continueRecoveredBuildPreparation(ctx, build, pend, unit)
 	}
 	if !errors.Is(runErr, errBuildCleanupPending) {
-		cleanupErr := o.cleanupBuildRuntime(build, port, pend.workdir, runtimePersisted)
-		if cleanupErr != nil {
-			runErr = &buildCleanupPendingError{cause: runErr, cleanup: cleanupErr}
-		}
+		runErr = o.cleanupRecoveredBuildRuntime(build, runErr, port, pend.workdir, runtimePersisted)
 	}
 	o.completeBuild(ctx, build, result, runErr)
+}
+
+func (o *Orchestrator) cleanupRecoveredBuildRuntime(
+	build *types.Build,
+	cause error,
+	port, dir string,
+	persisted bool,
+) error {
+	progress, cleanupErr := o.cleanupBuildRuntimeProgress(build, port, dir, persisted)
+	if cleanupErr == nil {
+		return cause
+	}
+	return retainBuildCleanup(cause, cleanupErr, progress.port, progress.dir, progress.persisted)
 }
 
 func (o *Orchestrator) continueRecoveredBuildPreparation(

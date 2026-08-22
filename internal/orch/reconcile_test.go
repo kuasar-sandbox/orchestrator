@@ -548,6 +548,31 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	}
 }
 
+func TestClosedBuildResultGateRejectsLateReportBeforePersistence(t *testing.T) {
+	o := testOrch(t)
+	runID := "br-00000000-0000-7000-8000-000000000214"
+	build := buildReconcileRow(t, runID)
+	build.BuildID = "closed-result-gate"
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	pend := &pendingBuild{build: build, result: make(chan configsock.BuildResult, 1)}
+	o.pend[build.BuildID] = pend
+	if result, found := closePendingBuildResultsAndTake(pend); found || result != nil {
+		t.Fatalf("empty result gate returned %+v, found=%t", result, found)
+	}
+
+	err := o.PostBuildResult(context.Background(), runID, build.BuildID,
+		configsock.BuildResult{ImageRef: "manifest://too-late"})
+	if err == nil || !configsock.IsBuildReportRejection(err) {
+		t.Fatalf("late result was not definitively rejected: %v", err)
+	}
+	stored, getErr := o.st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil || stored.ExecutionResult != nil {
+		t.Fatalf("late result crossed closed gate: %+v, %v", stored, getErr)
+	}
+}
+
 func TestWaitAssignmentReplaysDurableBuildRunBinding(t *testing.T) {
 	o := testOrch(t)
 	runID := "br-00000000-0000-7000-8000-000000000213"

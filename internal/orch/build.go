@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -756,6 +757,8 @@ type pendingBuild struct {
 	mac              string
 	floating         string
 	envdToken        string
+	resultMu         sync.Mutex
+	resultClosed     bool
 	result           chan configsock.BuildResult
 }
 
@@ -1116,12 +1119,23 @@ func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild,
 		case result := <-pend.result:
 			return configsock.SnapshotPrepareSummary{}, &result, nil
 		case <-ctx.Done():
-			if err := o.stopBuilderUnit(unit); err != nil {
-				return configsock.SnapshotPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), err, "", "", false)
+			if result, ok := takePendingBuildResult(pend); ok {
+				return configsock.SnapshotPrepareSummary{}, result, nil
+			}
+			stopErr := o.stopBuilderUnit(unit)
+			result, ok := closePendingBuildResultsAndTake(pend)
+			if ok {
+				return configsock.SnapshotPrepareSummary{}, result, nil
+			}
+			if stopErr != nil {
+				return configsock.SnapshotPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
 			}
 			return configsock.SnapshotPrepareSummary{}, nil, ctx.Err()
 		case <-tick.C:
 			if !o.unitActive(ctx, unit) {
+				if result, ok := closePendingBuildResultsAndTake(pend); ok {
+					return configsock.SnapshotPrepareSummary{}, result, nil
+				}
 				return configsock.SnapshotPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during snapshot preparation", unit)
 			}
 		}
@@ -1142,21 +1156,68 @@ func (o *Orchestrator) waitBuildResult(ctx context.Context, pend *pendingBuild, 
 			}
 			return nil, conflict
 		case <-ctx.Done():
-			select {
-			case result := <-pend.result:
-				return o.fenceAcceptedBuildResult(unit, result)
-			default:
+			if result, found, err := o.fencePendingBuildResult(pend, unit, false); found {
+				return result, err
 			}
-			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, retainBuildCleanup(ctx.Err(), err, "", "", false)
+			stopErr := o.stopBuilderUnit(unit)
+			result, found, resultErr := o.fencePendingBuildResult(pend, unit, true)
+			if found {
+				return result, resultErr
+			}
+			if stopErr != nil {
+				return nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
 			}
 			return nil, ctx.Err()
 		case <-tick.C:
 			if !o.unitActive(ctx, unit) {
+				if result, found, err := o.fencePendingBuildResult(pend, unit, true); found {
+					return result, err
+				}
 				return nil, fmt.Errorf("build: unit %s exited without result", unit)
 			}
 		}
 	}
+}
+
+func takePendingBuildResult(pend *pendingBuild) (*buildResult, bool) {
+	if pend == nil || pend.result == nil {
+		return nil, false
+	}
+	select {
+	case result := <-pend.result:
+		return &result, true
+	default:
+		return nil, false
+	}
+}
+
+func closePendingBuildResultsAndTake(pend *pendingBuild) (*buildResult, bool) {
+	if pend == nil {
+		return nil, false
+	}
+	pend.resultMu.Lock()
+	defer pend.resultMu.Unlock()
+	pend.resultClosed = true
+	return takePendingBuildResult(pend)
+}
+
+func (o *Orchestrator) fencePendingBuildResult(
+	pend *pendingBuild,
+	unit string,
+	closeResults bool,
+) (*buildResult, bool, error) {
+	var result *buildResult
+	var ok bool
+	if closeResults {
+		result, ok = closePendingBuildResultsAndTake(pend)
+	} else {
+		result, ok = takePendingBuildResult(pend)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	accepted, err := o.fenceAcceptedBuildResult(unit, *result)
+	return accepted, true, err
 }
 
 // prepareBuilderUnit is the assignment publication barrier: runtime limits are

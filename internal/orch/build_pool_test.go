@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -20,12 +21,16 @@ type assignmentOrderLauncher struct {
 	value  launcher.ResourceProperties
 	setErr error
 	onRead func()
+	onList func()
 }
 
 func (l *assignmentOrderLauncher) Start(context.Context, string) error       { return nil }
 func (l *assignmentOrderLauncher) Stop(context.Context, string) error        { return nil }
 func (l *assignmentOrderLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *assignmentOrderLauncher) List(context.Context, string) ([]launcher.Unit, error) {
+	if l.onList != nil {
+		l.onList()
+	}
 	return nil, nil
 }
 func (l *assignmentOrderLauncher) Reload(context.Context) error { return nil }
@@ -185,6 +190,29 @@ func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
 
 	if got, want := o.buildExecutionDeadline(b), claimed.Add(75*time.Second); !got.Equal(want) {
 		t.Fatalf("build execution deadline = %v, want %v", got, want)
+	}
+}
+
+func TestWaitBuildResultRechecksAcceptedResultAfterInactiveReadback(t *testing.T) {
+	o := testOrch(t)
+	want := configsock.BuildResult{ImageRef: "manifest://accepted-after-exit"}
+	pend := &pendingBuild{
+		handoff: newBuildTaskHandoff(false, ""),
+		result:  make(chan configsock.BuildResult, 1),
+	}
+	published := false
+	o.lc = &assignmentOrderLauncher{onList: func() {
+		if !published {
+			published = true
+			pend.result <- want
+		}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := o.waitBuildResult(ctx, pend, "sandbox-builder@test.service")
+	if err != nil || got == nil || *got != want {
+		t.Fatalf("accepted result after inactive readback = %+v, %v", got, err)
 	}
 }
 

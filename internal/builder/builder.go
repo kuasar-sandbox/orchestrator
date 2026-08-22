@@ -191,10 +191,24 @@ func buildPipelineContext(parent context.Context, timeouts configsock.BuildTimeo
 		parent = context.Background()
 	}
 	if timeouts.AbsoluteDeadlineUnixNano > 0 {
-		deadline := time.Unix(0, timeouts.AbsoluteDeadlineUnixNano).Add(-buildResultReportGrace)
+		deadline := buildPipelineDeadline(
+			time.Unix(0, timeouts.AbsoluteDeadlineUnixNano), time.Now(),
+		)
 		return context.WithDeadline(parent, deadline)
 	}
 	return context.WithTimeout(parent, time.Duration(timeouts.TotalSec)*time.Second)
+}
+
+func buildPipelineDeadline(absolute, now time.Time) time.Time {
+	remaining := absolute.Sub(now)
+	if remaining <= 0 {
+		return absolute
+	}
+	grace := buildResultReportGrace
+	if half := remaining / 2; grace > half {
+		grace = half
+	}
+	return absolute.Add(-grace)
 }
 
 func (p *buildPipeline) runPhase(phase string, run func() error) error {

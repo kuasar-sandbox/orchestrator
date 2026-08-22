@@ -555,7 +555,7 @@ func (s *Server) handleBuildBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req BuildTaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != SnapshotPrepareSchemaVersion {
 		writeJSON(w, http.StatusBadRequest, &BuildTaskSpec{Error: "bad request"})
 		return
 	}

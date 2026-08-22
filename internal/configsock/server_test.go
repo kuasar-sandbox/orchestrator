@@ -345,6 +345,24 @@ func TestBuildBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
+func TestBuildBootstrapRejectsUnsupportedSchemaBeforeProviders(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "builder.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	var authCalls, secretCalls atomic.Int32
+	_, client := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, buildAuthHits: &authCalls, buildSpecHits: &secretCalls,
+	}})
+	status, _ := rawPost(t, client, PathTaskBuildBootstrap, BuildTaskRequest{
+		BuildID: "x", RunID: "br-test", Version: SnapshotPrepareSchemaVersion + 1,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("unsupported build bootstrap status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if authCalls.Load() != 0 || secretCalls.Load() != 0 {
+		t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+	}
+}
+
 func TestBuildPrepareAuthenticatesBeforeCompletionProvider(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))

@@ -285,6 +285,12 @@ func TestBuildPipelineContextPropagatesTaskCancelAndReservesReportGrace(t *testi
 	if !ok || !got.Equal(want) {
 		t.Fatalf("pipeline deadline = %v, %t; want %v", got, ok, want)
 	}
+
+	now := time.Unix(1_800_000_000, 0)
+	shortAbsolute := now.Add(4 * time.Second)
+	if got, want := buildPipelineDeadline(shortAbsolute, now), now.Add(2*time.Second); !got.Equal(want) {
+		t.Fatalf("short pipeline deadline = %v, want %v", got, want)
+	}
 }
 
 func TestUploadImageReusesBaseImageRef(t *testing.T) {
