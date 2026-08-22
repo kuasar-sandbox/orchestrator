@@ -197,9 +197,11 @@ dangling/ambiguous alias fail closed。`control.cgroup_path/CgroupFD` 不进 YAM
 run-sandbox 通过继承 FD 注入。
 
 img cold boot capacity 可由 portable patch 覆盖。snp create、paused resume、migration
-restore 必须先读出 snapshot capacity;request 同值可作 assertion,不同即拒绝。probe
-失败绝不回退 node defaults,且发生在 network Attach、runner Assign、resource Admit/cgroup/VM
-之前。snapshot balloon 的 `allocatable_at_snapshot` 仍按既有 wire protocol参与 initial grant。
+restore 的同步 admission 不读 snapshot;runner 绑定 exact run-id 后,task 在进程内读取根
+`snapshot.cfg`,再把 capacity 作为非秘密 summary 交给唯一 launch worker。request 同值可作
+assertion,不同则成为异步 `resource_resolve` failure。snapshot 读取或 capacity 校验失败绝不
+回退 node defaults,也不会 Attach network、写 YAML、启动 VM。snapshot balloon 的
+`allocatable_at_snapshot` 仍按既有 wire protocol参与 initial grant。
 
 旧 `sandbox.resources.vcpu/memory/control_socket` schema 不再接受,没有兼容别名或第二
 controller 优先级。trigger-time 通用 metadata/config header 同样已废弃并返回 400;

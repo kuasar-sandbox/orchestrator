@@ -158,33 +158,60 @@ func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, s
 	return nil
 }
 
-// FetchLaunchSpec dials the config-socket and pulls the LaunchSpec for configID.
-// The caller (node-ctl run-sandbox / run-builder) must have written its pidfile first so the
-// server's SO_PEERCRED check matches the connecting pid.
-func FetchLaunchSpec(socket, configID string) (*LaunchSpec, error) {
-	body, _ := json.Marshal(Request{ConfigID: configID})
-	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathTaskLaunchSpec, bytes.NewReader(body))
+// FetchSandboxTaskSpec fetches one exact-run bootstrap after the caller has
+// locked and written the assigned sandbox task pidfile.
+func FetchSandboxTaskSpec(ctx context.Context, socket, sandboxID, runID string) (*SandboxTaskSpec, error) {
+	body, _ := json.Marshal(SandboxTaskRequest{SandboxID: sandboxID, RunID: runID, Version: SnapshotPrepareSchemaVersion})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskSandboxBootstrap, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := HTTPClient(socket).Do(req)
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &transportError{err: err}
 	}
 	defer resp.Body.Close()
-	var spec LaunchSpec
+	var spec SandboxTaskSpec
 	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
-		return nil, fmt.Errorf("configsock: decode launchspec: %w", err)
+		return nil, &transportError{err: fmt.Errorf("configsock: decode sandbox bootstrap: %w", err)}
 	}
-	if spec.Error != "" {
-		return nil, errors.New(spec.Error)
+	if spec.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return nil, buildResponseError(resp.StatusCode, spec.Error)
 	}
 	return &spec, nil
 }
 
+// CompleteSandboxPrepare submits an idempotent non-secret summary and waits for
+// the final LaunchSpec. A transport interruption or 5xx is retryable with the
+// same summary; a 409 is definitive.
+func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string, summary SnapshotPrepareSummary) (*LaunchSpec, error) {
+	body, _ := json.Marshal(SnapshotPrepareRequest{SandboxID: sandboxID, RunID: runID, Summary: summary})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskSandboxPrepare, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
+	if err != nil {
+		return nil, &transportError{err: err}
+	}
+	defer resp.Body.Close()
+	var out SnapshotPrepareResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, &transportError{err: fmt.Errorf("configsock: decode sandbox prepare response: %w", err)}
+	}
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return nil, buildResponseError(resp.StatusCode, out.Error)
+	}
+	if out.Final == nil {
+		return nil, errors.New("configsock: sandbox prepare response has no final launch spec")
+	}
+	return out.Final, nil
+}
+
 // FetchBuildSpec dials the config-socket and pulls the BuildSpec for
-// configID ("build:<bid>"). Same auth contract as FetchLaunchSpec.
+// configID ("build:<bid>"). It retains the existing build pidfile auth contract.
 func FetchBuildSpec(socket, configID string) (*BuildSpec, error) {
 	return FetchBuildSpecContext(context.Background(), socket, configID)
 }

@@ -9,7 +9,6 @@ package config
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"gopkg.in/yaml.v3"
@@ -643,20 +643,11 @@ type CheckpointRemoteConfig struct {
 // RefLocationURI derives the node-local path for a logical location name. The
 // parent never enters a portable ref, TemplateID, or migration token.
 func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
-	if name == "" || path.Base(name) != name || strings.ContainsAny(name, `/\\`) || name == "." || name == ".." {
-		return "", fmt.Errorf("invalid ref location name %q", name)
-	}
-	if c.Remote.RefLocationParent == "" {
-		return "", fmt.Errorf("checkpoint.remote.ref_location_parent is not configured")
-	}
-	u, err := parseAbsoluteFileURI(c.Remote.RefLocationParent)
+	location, err := reflocation.Resolve(c.Remote.RefLocationParent, name)
 	if err != nil {
 		return "", err
 	}
-	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
-	u.Path = path.Join(u.Path, digest[:2], digest[2:4], name)
-	u.RawPath = ""
-	return u.String(), nil
+	return location.URI, nil
 }
 
 // Load reads the config file and applies defaults.

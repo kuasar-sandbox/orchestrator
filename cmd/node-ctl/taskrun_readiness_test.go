@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
 	"golang.org/x/sys/unix"
 )
 
@@ -67,6 +69,14 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 			}
 			return nil
 		},
+		lockTaskPidfile: func(path string) error {
+			order = append(order, "sandbox pidfile")
+			if path != filepath.Join(runRoot, "sid-1", "sid-1.pid") {
+				t.Fatalf("sandbox pidfile = %q", path)
+			}
+			assertCloseOnExec("sandbox pidfile", true)
+			return nil
+		},
 		prepareCgroup: func() (*os.File, error) {
 			order = append(order, "prepare cgroup")
 			assertCgroupCloseOnExec("prepare cgroup", true)
@@ -87,26 +97,26 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 			assertCloseOnExec("connect", true)
 			return readyW, nil
 		},
-		launchTask: func(socket, configID, pidfile string, ready, cgroup *os.File) error {
+		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
 			order = append(order, "launch task")
-			if socket != "/config.sock" || configID != "sandbox:sid-1" ||
-				pidfile != filepath.Join(runRoot, "sid-1", "sid-1.pid") || ready != readyW || cgroup != vmmCgroup {
-				t.Fatalf("launchTask(%q, %q, %q, %v, %v)", socket, configID, pidfile, ready, cgroup)
+			if socket != "/config.sock" || sid != "sid-1" || runID != "run-1" || ready != readyW || cgroup != vmmCgroup {
+				t.Fatalf("launchTask(%q, %q, %q, %v, %v)", socket, sid, runID, ready, cgroup)
 			}
-			return launchTaskWith(socket, configID, pidfile, ready, cgroup, taskLaunchOps{
-				lockPidfile: func(string) error {
-					order = append(order, "sandbox pidfile")
-					assertCloseOnExec("sandbox pidfile", true)
-					return nil
-				},
-				fetchSpec: func(string, string) (*configsock.LaunchSpec, error) {
+			return launchTaskWith(context.Background(), func() { order = append(order, "stop context") }, socket, sid, runID, ready, cgroup, taskLaunchOps{
+				fetchBootstrap: func(_ context.Context, socket, gotSID, gotRunID string) (*configsock.SandboxTaskSpec, error) {
 					order = append(order, "fetch spec")
 					assertCloseOnExec("fetch spec", true)
 					assertCgroupCloseOnExec("fetch spec", true)
-					return &configsock.LaunchSpec{
-						Exec: "/bin/sandbox-ctl", Args: []string{"run"}, Workdir: "/work",
+					if socket != "/config.sock" || gotSID != "sid-1" || gotRunID != "run-1" {
+						t.Fatalf("bootstrap identity = %q/%q/%q", socket, gotSID, gotRunID)
+					}
+					return &configsock.SandboxTaskSpec{
+						SandboxID: gotSID, RunID: gotRunID,
+						Env:   map[string]string{"MANIFEST_KEY": "task-key"},
+						Final: &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run"}, Workdir: "/work"},
 					}, nil
 				},
+				setenv: func(string, string) error { return nil },
 				chdir: func(path string) error {
 					order = append(order, "chdir")
 					assertCloseOnExec("chdir", true)
@@ -134,14 +144,134 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 		t.Fatalf("runAssignedSandbox error = %v", err)
 	}
 	wantOrder := []string{
-		"run pidfile", "prepare cgroup", "assignment", "connect ready", "launch task",
-		"sandbox pidfile", "fetch spec", "chdir", "exec",
+		"run pidfile", "prepare cgroup", "assignment", "connect ready", "sandbox pidfile",
+		"launch task", "fetch spec", "chdir", "stop context", "exec",
 	}
 	if !reflect.DeepEqual(order, wantOrder) {
 		t.Fatalf("order = %q, want %q", order, wantOrder)
 	}
 	if _, err := readyW.Write([]byte("x")); err == nil {
 		t.Fatal("ready fd remained open after exec failure")
+	}
+}
+
+func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
+	t.Setenv("MANIFEST_KEY", "inherited-wrong-key")
+	t.Setenv("KUASAR_RUN_ID", "inherited-run")
+	t.Setenv("TASK_SANDBOX_ID", "bootstrap-only")
+	vmm, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmm.Close()
+	execErr := errors.New("exec intercepted")
+	var fetches, reads, completions int
+	stopped := false
+	err = launchTaskWith(context.Background(), func() { stopped = true }, "/config.sock", "sid", "run-1", nil, vmm, taskLaunchOps{
+		fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
+			fetches++
+			return &configsock.SandboxTaskSpec{
+				SandboxID: "sid", RunID: "run-1", Workdir: "/task-work",
+				Env: map[string]string{"MANIFEST_KEY": "authoritative-key", "KUASAR_RUN_ID": "run-1"},
+				Prepare: &configsock.SnapshotPrepareSpec{
+					RootRef: "manifest://root", AbsoluteDeadlineUnixNano: time.Now().Add(time.Minute).UnixNano(),
+				},
+			}, nil
+		},
+		setenv: os.Setenv,
+		prepareSnapshot: func(_ context.Context, spec configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error) {
+			reads++
+			if os.Getenv("MANIFEST_KEY") != "authoritative-key" || spec.RootRef != "manifest://root" {
+				t.Fatalf("prepare environment/root = %q/%q", os.Getenv("MANIFEST_KEY"), spec.RootRef)
+			}
+			return &tasksnapshot.Result{
+				Summary:         configsock.SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("1", 64), RequiredRefCount: 2},
+				RefLocationURIs: map[string]string{"z-location": "file:///z", "a-location": "file:///a"},
+			}, nil
+		},
+		completePrepare: func(_ context.Context, socket, sid, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+			completions++
+			if socket != "/config.sock" || sid != "sid" || runID != "run-1" || summary.RequiredRefCount != 2 {
+				t.Fatalf("completion = %q/%q/%q %+v", socket, sid, runID, summary)
+			}
+			return &configsock.LaunchSpec{
+				Exec: "/bin/sandbox-ctl", Args: []string{"run", "--restore", "manifest://root"},
+				Env: map[string]string{"MANIFEST_KEY": "must-not-win", "FINAL_ONLY": "yes"},
+			}, nil
+		},
+		chdir: func(path string) error {
+			if path != "/task-work" {
+				t.Fatalf("workdir = %q", path)
+			}
+			return nil
+		},
+		exec: func(path string, argv, env []string) error {
+			if !stopped {
+				t.Fatal("task cancellation resources were not stopped before exec")
+			}
+			wantSuffix := []string{
+				"--restore", "manifest://root",
+				"--ref-location", "a-location=file:///a",
+				"--ref-location", "z-location=file:///z",
+			}
+			if path != "/bin/sandbox-ctl" || len(argv) < len(wantSuffix) || !reflect.DeepEqual(argv[len(argv)-len(wantSuffix):], wantSuffix) {
+				t.Fatalf("exec path/argv = %q, %q", path, argv)
+			}
+			manifestEntries := 0
+			for _, entry := range env {
+				switch {
+				case entry == "MANIFEST_KEY=authoritative-key":
+					manifestEntries++
+				case strings.HasPrefix(entry, "MANIFEST_KEY="):
+					t.Fatalf("non-authoritative manifest key in exec env: %q", entry)
+				case strings.HasPrefix(entry, "TASK_"):
+					t.Fatalf("bootstrap variable leaked into exec env: %q", entry)
+				}
+			}
+			if manifestEntries != 1 {
+				t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
+			}
+			return execErr
+		},
+	})
+	if !errors.Is(err, execErr) {
+		t.Fatalf("launchTaskWith error = %v", err)
+	}
+	if fetches != 1 || reads != 1 || completions != 1 {
+		t.Fatalf("calls fetch/read/complete = %d/%d/%d, want 1/1/1", fetches, reads, completions)
+	}
+}
+
+func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
+	vmm, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vmm.Close()
+	execErr := errors.New("exec intercepted")
+	var fetches int
+	err = launchTaskWith(context.Background(), func() {}, "/config.sock", "sid", "run", nil, vmm, taskLaunchOps{
+		fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
+			fetches++
+			return &configsock.SandboxTaskSpec{
+				SandboxID: "sid", RunID: "run", Env: map[string]string{"MANIFEST_KEY": "key"},
+				Final: &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run"}},
+			}, nil
+		},
+		prepareSnapshot: func(context.Context, configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error) {
+			t.Fatal("cold path prepared a snapshot")
+			return nil, nil
+		},
+		completePrepare: func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+			t.Fatal("cold path used a second RPC")
+			return nil, nil
+		},
+		setenv: func(string, string) error { return nil },
+		chdir:  func(string) error { return nil },
+		exec:   func(string, []string, []string) error { return execErr },
+	})
+	if !errors.Is(err, execErr) || fetches != 1 {
+		t.Fatalf("cold launch = %v, fetches=%d", err, fetches)
 	}
 }
 
@@ -157,18 +287,21 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 	}
 	wantErr := errors.New("fetch failed")
 	err = runAssignedSandbox("/run/sandbox/runs/run.pid", "/config.sock", "run", runSandboxOps{
-		lockPidfile:   func(string) error { return nil },
-		prepareCgroup: func() (*os.File, error) { return vmmCgroup, nil },
+		lockPidfile:     func(string) error { return nil },
+		lockTaskPidfile: func(string) error { return nil },
+		prepareCgroup:   func() (*os.File, error) { return vmmCgroup, nil },
 		waitAssignment: func(context.Context, string, string, string) (string, error) {
 			return "sid", nil
 		},
 		connectReady: func(string) (*os.File, error) { return readyW, nil },
-		launchTask: func(socket, configID, pidfile string, ready, cgroup *os.File) error {
-			return launchTaskWith(socket, configID, pidfile, ready, cgroup, taskLaunchOps{
-				lockPidfile: func(string) error { return nil },
-				fetchSpec:   func(string, string) (*configsock.LaunchSpec, error) { return nil, wantErr },
-				chdir:       func(string) error { return nil },
-				exec:        func(string, []string, []string) error { t.Fatal("exec called"); return nil },
+		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
+			return launchTaskWith(context.Background(), func() {}, socket, sid, runID, ready, cgroup, taskLaunchOps{
+				fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
+					return nil, wantErr
+				},
+				setenv: func(string, string) error { return nil },
+				chdir:  func(string) error { return nil },
+				exec:   func(string, []string, []string) error { t.Fatal("exec called"); return nil },
 			})
 		},
 	})
@@ -218,11 +351,16 @@ func TestLaunchTaskRejectsLaunchSpecCgroupOverride(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer vmm.Close()
-			err = launchTaskWith("/config.sock", "sandbox:sid", "", nil, vmm, taskLaunchOps{
-				fetchSpec: func(string, string) (*configsock.LaunchSpec, error) {
-					return &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run", arg}}, nil
+			err = launchTaskWith(context.Background(), func() {}, "/config.sock", "sid", "run", nil, vmm, taskLaunchOps{
+				fetchBootstrap: func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error) {
+					return &configsock.SandboxTaskSpec{
+						SandboxID: "sid", RunID: "run",
+						Env:   map[string]string{"MANIFEST_KEY": "task-key"},
+						Final: &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run", arg}},
+					}, nil
 				},
-				chdir: func(string) error { return nil },
+				setenv: func(string, string) error { return nil },
+				chdir:  func(string) error { return nil },
 				exec: func(string, []string, []string) error {
 					t.Fatal("exec called")
 					return nil

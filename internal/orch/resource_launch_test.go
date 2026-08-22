@@ -34,15 +34,13 @@ func (v *resourcePreflightVS) Attach(context.Context, vswitch.AttachReq) (*vswit
 func (*resourcePreflightVS) Detach(context.Context, string) error { return nil }
 func (*resourcePreflightVS) TapFD(string) vswitch.TapFD           { return vswitch.TapFD{} }
 
-func TestFreshRestoreSnapshotCapacityProbeFailureHasNoLaunchSideEffects(t *testing.T) {
+func TestFreshRestoreSnapshotReadFailureIsAsynchronousAndRollsBackDead(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	vs := &resourcePreflightVS{}
 	o.vs = vs
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		return snapshotDescription{}, errors.New("capacity probe failed")
-	}
+	lc.snapshotPrepareErr = errors.New("capacity probe failed")
 	req := createRequestFixture(t, o, "8")
 	req.TemplateID = types.TemplateID{
 		Profile: types.ProfileBare,
@@ -50,13 +48,14 @@ func TestFreshRestoreSnapshotCapacityProbeFailureHasNoLaunchSideEffects(t *testi
 		Ref:     "manifest://" + strings.Repeat("b", 64),
 	}.String()
 
-	if _, err := o.Create(ctx, req); err == nil || !strings.Contains(err.Error(), "capacity probe failed") {
-		t.Fatalf("Create error = %v", err)
+	created, err := o.Create(ctx, req)
+	if err != nil || created == nil || created.State != types.StateStarting {
+		t.Fatalf("Create acceptance = %+v, %v", created, err)
 	}
-	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
+	assertAsyncFreshRestoreFailure(t, o, ctx, created, vs, lc)
 }
 
-func TestFreshRestoreCapacityMismatchHasNoLaunchSideEffects(t *testing.T) {
+func TestFreshRestoreCapacityMismatchIsAsynchronousResourceFailure(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
@@ -70,10 +69,11 @@ func TestFreshRestoreCapacityMismatchHasNoLaunchSideEffects(t *testing.T) {
 	}.String()
 	req.Metadata[sandboxcfg.NsResource] = `{"capacity":{"memory":"4GiB"}}`
 
-	if _, err := o.Create(ctx, req); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("Create error = %v, want ErrBadRequest", err)
+	created, err := o.Create(ctx, req)
+	if err != nil || created == nil || created.State != types.StateStarting {
+		t.Fatalf("Create acceptance = %+v, %v", created, err)
 	}
-	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
+	assertAsyncFreshRestoreFailure(t, o, ctx, created, vs, lc)
 }
 
 func TestStaticStartupRequestHasNoLaunchSideEffects(t *testing.T) {
@@ -91,15 +91,33 @@ func TestStaticStartupRequestHasNoLaunchSideEffects(t *testing.T) {
 	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
 }
 
-func TestPausedResumeCapacityProbeFailureKeepsPausedWithoutSideEffects(t *testing.T) {
+func TestStaticStartupRestoreRequestIsRejectedSynchronously(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	vs := &resourcePreflightVS{}
 	o.vs = vs
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		return snapshotDescription{}, errors.New("resume capacity probe failed")
+	req := createRequestFixture(t, o, "7")
+	req.TemplateID = types.TemplateID{
+		Profile: types.ProfileBare,
+		Kind:    types.KindSnp,
+		Ref:     "manifest://" + strings.Repeat("7", 64),
+	}.String()
+	req.Metadata[sandboxcfg.NsResource] = `{"startup":{"memory":"1GiB"}}`
+
+	if _, err := o.Create(ctx, req); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("Create error = %v, want ErrBadRequest", err)
 	}
+	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
+}
+
+func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	vs := &resourcePreflightVS{}
+	o.vs = vs
+	lc.snapshotPrepareErr = errors.New("resume capacity probe failed")
 	sb := &types.Sandbox{
 		ID: "resource-resume-probe", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{
@@ -118,14 +136,15 @@ func TestPausedResumeCapacityProbeFailureKeepsPausedWithoutSideEffects(t *testin
 		t.Fatal(err)
 	}
 
-	if _, _, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil); err == nil || !strings.Contains(err.Error(), "resume capacity probe failed") {
-		t.Fatalf("ensureResumeAccepted error = %v", err)
+	accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	if err != nil || accepted == nil || accepted.State != types.StateStarting || attempt == nil {
+		t.Fatalf("ensureResumeAccepted = %+v, %+v, %v", accepted, attempt, err)
 	}
-	stored, err := o.st.Get(ctx, sb.ID)
-	if err != nil || stored == nil || stored.State != types.StatePaused {
-		t.Fatalf("stored sandbox = %+v, err=%v", stored, err)
+	stored := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool { return current.State == types.StatePaused }, "paused after task snapshot failure")
+	if stored.RunID != "" || stored.VswitchPort != "" {
+		t.Fatalf("stored sandbox retained ownership = %+v", stored)
 	}
-	if vs.attaches.Load() != 0 || lc.starts.Load() != 0 {
+	if vs.attaches.Load() != 0 || lc.starts.Load() != 1 || lc.stops.Load() != 1 {
 		t.Fatalf("resume side effects: attaches=%d starts=%d", vs.attaches.Load(), lc.starts.Load())
 	}
 }
@@ -210,5 +229,21 @@ func assertNoFreshLaunchSideEffects(t *testing.T, o *Orchestrator, ctx context.C
 	}
 	if len(rows) != 0 {
 		t.Fatalf("preflight failure persisted sandbox rows: %+v", rows)
+	}
+}
+
+func assertAsyncFreshRestoreFailure(t *testing.T, o *Orchestrator, ctx context.Context, created *types.Sandbox, vs *resourcePreflightVS, lc *countingLauncher) {
+	t.Helper()
+	dead := waitForSandbox(t, o, ctx, created.ID, func(current *types.Sandbox) bool { return current.State == types.StateDead }, "dead after async restore preparation failure")
+	if dead.RunID != "" || dead.VswitchPort != "" || dead.FloatingIP != "" {
+		t.Fatalf("dead sandbox retained ownership = %+v", dead)
+	}
+	if vs.attaches.Load() != 0 || lc.starts.Load() != 1 || lc.stops.Load() != 1 {
+		t.Fatalf("async restore cleanup: attaches=%d starts=%d stops=%d", vs.attaches.Load(), lc.starts.Load(), lc.stops.Load())
+	}
+	for _, dir := range []string{created.RunDir, created.BaseDir} {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("async restore cleanup retained %s: %v", dir, err)
+		}
 	}
 }

@@ -316,7 +316,7 @@ func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *test
 		t.Fatalf("initial connect ack = %+v", ack)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
-	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StatePaused)
+	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused)
 	if stored, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || stored == nil || stored.State != types.StatePaused {
 		t.Fatalf("failed resume row = %+v err=%v, want paused", stored, err)
 	}
@@ -327,7 +327,7 @@ func TestClusterConnectResumeFailureRepublishesPausedRouteAndAllowsRetry(t *test
 		t.Fatalf("retry connect ack = %+v", ack)
 	}
 	waitClusterConnectAttempt(t, failingVS.attempted)
-	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StatePaused)
+	waitClusterRouteStates(t, events, cmd.SID, routesync.StateStarting, routesync.StateStarting, routesync.StatePaused)
 }
 
 func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *testing.T) {
@@ -491,7 +491,13 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 		// Reaching the blocked attach proves resume was scheduled after the
 		// synchronous import instead of being included in the Ack path.
 	case <-time.After(2 * time.Second):
-		t.Fatal("accepted cluster connect did not schedule asynchronous resume")
+		current, getErr := fixture.o.st.Get(context.Background(), cmd.SID)
+		attempt, active := fixture.o.launches.Lookup(cmd.SID)
+		var launchErr error
+		if active {
+			launchErr = attempt.result()
+		}
+		t.Fatalf("accepted cluster connect did not schedule asynchronous resume: current=%+v get=%v active=%t launch=%v task=%v starts=%d stops=%d", current, getErr, active, launchErr, fixture.launcher.taskError(), fixture.launcher.starts.Load(), fixture.launcher.stops.Load())
 	}
 	cancel()
 	select {
@@ -669,17 +675,30 @@ type clusterConnectFixture struct {
 	fingerprint string
 	source      *types.Sandbox
 	token       string
+	launcher    *countingLauncher
 }
 
 func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortOrchestratorTestDir(t)
 	dbPath := filepath.Join(dir, "node.db")
 	o := migrationOrchestrator(t, dir, []byte("cluster-runtime"))
 	// migrationOrchestrator intentionally builds a minimal Config without loading
 	// defaults; provide the one network value needed for the async-resume probe to
 	// reach the blocking vswitch instead of failing CIDR validation first.
 	o.cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
+	// Restore launch now assigns the exact runner before task-local snapshot
+	// preparation and host network attach. Model that runner handshake instead
+	// of relying on the removed conductor-side pre-assignment snapshot probe.
+	o.cfg.Units.Runner = "sandbox-runner@.service"
+	lc := &countingLauncher{orch: o}
+	o.lc = lc
+	o.runnerPool = newRunPool(runKindSandbox, 0, o.cfg.Units.PoolWaitDuration(), o.cfg.Paths.RunRoot, lc, o.runnerUnit, o.log)
+	poolCtx, stopPool := context.WithCancel(context.Background())
+	t.Cleanup(stopPool)
+	if err := o.runnerPool.Start(poolCtx); err != nil {
+		t.Fatal(err)
+	}
 	pair := store.KeyPair{
 		ManifestKey: strings.Repeat("6", 64),
 	}
@@ -707,7 +726,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token}
+	return &clusterConnectFixture{o: o, dbPath: dbPath, pair: pair, fingerprint: fingerprint, source: source, token: token, launcher: lc}
 }
 
 func (f *clusterConnectFixture) command(targetID, token string) *routesync.Command {

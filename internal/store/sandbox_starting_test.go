@@ -84,6 +84,37 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 	}
 }
 
+func TestExactRunStartingResourcesAndNonSecretTaskIdentity(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("restore-exact-run", 0)
+	sb.State = types.StateStarting
+	sb.RunID = ""
+	sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", ""
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.BindStartingRunner(ctx, sb.ID, "run-current"); err != nil || !changed {
+		t.Fatalf("BindStartingRunner = %t, %v", changed, err)
+	}
+	if runDir, found, err := st.StartingTaskIdentity(ctx, sb.ID, "run-stale"); err != nil || found || runDir != "" {
+		t.Fatalf("stale StartingTaskIdentity = %q, %t, %v", runDir, found, err)
+	}
+	if runDir, found, err := st.StartingTaskIdentity(ctx, sb.ID, "run-current"); err != nil || !found || runDir != sb.RunDir {
+		t.Fatalf("exact StartingTaskIdentity = %q, %t, %v", runDir, found, err)
+	}
+	resources := StartingResources{FloatingIP: "192.0.2.3", VswitchPort: "port-1", InnerIP: "198.51.100.2/31", PortMAC: "02:00:00:00:00:03"}
+	if changed, err := st.SetStartingResourcesForRun(ctx, sb.ID, "run-stale", resources); err != nil || changed {
+		t.Fatalf("stale SetStartingResourcesForRun = %t, %v", changed, err)
+	}
+	if changed, err := st.SetStartingResourcesForRun(ctx, sb.ID, "run-current", resources); err != nil || !changed {
+		t.Fatalf("exact SetStartingResourcesForRun = %t, %v", changed, err)
+	}
+	if changed, err := st.SetStartingResourcesForRun(ctx, sb.ID, "run-current", StartingResources{VswitchPort: "port-2"}); err != nil || changed {
+		t.Fatalf("duplicate SetStartingResourcesForRun = %t, %v", changed, err)
+	}
+}
+
 func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

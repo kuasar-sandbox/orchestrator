@@ -39,10 +39,14 @@ type countingLauncher struct {
 	readinessNoSend    bool
 	readinessNoConnect bool
 	readinessErrors    chan<- error
+	snapshotSummary    *configsock.SnapshotPrepareSummary
+	snapshotRoots      chan<- string
+	snapshotPrepareErr error
 	stopEntered        chan<- struct{}
 	stopGate           <-chan struct{}
 	resourceMu         sync.Mutex
 	resources          map[string]launcher.ResourceProperties
+	lastTaskError      error
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -110,6 +114,36 @@ func (l *countingLauncher) runSandbox(runID string) {
 		default:
 		}
 	}
+	taskSpec, found, err := l.orch.SandboxTaskSpecFor(ctx, sid, runID)
+	if err != nil || !found {
+		l.reportReadinessError(err)
+		return
+	}
+	if taskSpec.Prepare != nil {
+		if l.snapshotRoots != nil {
+			select {
+			case l.snapshotRoots <- taskSpec.Prepare.RootRef:
+			default:
+			}
+		}
+		if l.snapshotPrepareErr != nil {
+			l.reportReadinessError(l.snapshotPrepareErr)
+			return
+		}
+		summary := configsock.SnapshotPrepareSummary{
+			SchemaVersion:    configsock.SnapshotPrepareSchemaVersion,
+			Capacity:         configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
+			ResolutionDigest: strings.Repeat("0", 64),
+			RequiredRefCount: 1,
+		}
+		if l.snapshotSummary != nil {
+			summary = *l.snapshotSummary
+		}
+		if _, err := l.orch.CompleteSandboxPrepare(ctx, sid, runID, summary); err != nil {
+			l.reportReadinessError(err)
+			return
+		}
+	}
 	if l.readinessDelay > 0 {
 		timer := time.NewTimer(l.readinessDelay)
 		defer timer.Stop()
@@ -135,13 +169,25 @@ func (l *countingLauncher) runSandbox(runID string) {
 }
 
 func (l *countingLauncher) reportReadinessError(err error) {
-	if err == nil || l.readinessErrors == nil {
+	if err == nil {
+		return
+	}
+	l.resourceMu.Lock()
+	l.lastTaskError = err
+	l.resourceMu.Unlock()
+	if l.readinessErrors == nil {
 		return
 	}
 	select {
 	case l.readinessErrors <- err:
 	default:
 	}
+}
+
+func (l *countingLauncher) taskError() error {
+	l.resourceMu.Lock()
+	defer l.resourceMu.Unlock()
+	return l.lastTaskError
 }
 
 func (l *countingLauncher) Stop(ctx context.Context, _ string) error {

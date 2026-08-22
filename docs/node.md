@@ -51,8 +51,9 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
    config-socket 下发 assignment;runner 单元下以 `ctl/vmm` 隔离监督进程与沙箱资源,
    builder 仍按完整单元核算;`StopUnit` 即完整回收,serve 不自己当进程监督者。
 4. **密钥不落明文盘**:租户 APISecret+ManifestKey 凭据对在库内 AES-256-GCM 加密;
-   运行期根凭据只存在于必要的内存、受保护路由投影和启动器 LaunchSpec 的 env 帧,
-   ManifestKey 不进入 guest(§6、§7)。集群下经 node-link 下行的凭据对同样仅加密落盘(§10)。
+   ManifestKey 只经认证后的 task bootstrap 注入单租户 runner/builder 进程的 authoritative
+   env,sandbox launch的conductor路径不用它打开或解析snapshot,也不进入guest(§6、§7)。集群下经node-link
+   下行的凭据对同样仅加密落盘(§10)。
 5. **本节点路由权威,数据面可外置,集群可接入**:serve 是**本节点**路由与生命周期的
    权威;数据面 proxy 可内置(单二进制)或外置为独立 worker(§9)。接入集群时,机群级
    路由权威是 registry——serve 经 node-link 上报沙箱事件、受理集群命令(§10),不与
@@ -125,14 +126,15 @@ master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才�
 201。201 表示资源已被持久接受,且 external proxy 已具备用该 starting identity 鉴权并
 parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
 已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
-`starting,run_id=""` 行并发布 Delete。后台流程再建 `<run_root>/<sid>/`(tmpfs)+
-`<base_root>/<sid>/`(disk)→检查 snapshot→配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、
-否则经 `connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` 并先以 CAS 持久化网络
-ownership→写非密配置 `<sid>.yaml`、绑定 `ready.sock`、发布 enriched starting→从 runner
-pool 分配 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)。pool commit callback
-先以 `starting AND run_id=''` CAS 绑定 run-id,成功后才把 sid 交给 runner。单元内
-`run-sandbox` 经 config-socket 的 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后
-`execve` 成 `sandbox-ctl run`→起 microVM→严格完成 runtime readiness wire→(e2b)直接
+`starting,run_id=""` 行并发布 Delete。cold image 后台路径保持原有单阶段 fast path:先完成
+resource/network/YAML,再从 runner pool 分配 run-id。restore 路径先建目录和绑定
+`ready.sock`,再由 pool commit callback 以 `starting AND run_id=''` CAS 绑定 exact run-id;
+task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootstrap。认证通过后
+ManifestKey 覆盖进程环境,task 在本进程读取一次根 `snapshot.cfg`,提交 capacity/network/ref
+closure 的非秘密 summary。唯一 launch worker随后 resolve resource/network→attach→以
+`starting AND run_id=<exact>` CAS 持久化 ownership→写非密 YAML→返回最终 LaunchSpec。
+runner追加本地保留的 ref-location并以同一 PID `execve sandbox-ctl run`→起 microVM→
+严格完成 runtime readiness wire→(e2b)直接
 `POST /init` 置 env/默认用户→以 exact run-id CAS 为 `running`并开放数据面。集群下,该
 create 由 node-link 的
 `create` 命令触发;profile、group、route-key
@@ -244,11 +246,14 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
 
 - **run-sandbox**:取得 sid 后立即连接固定的
   `<run_root>/<sid>/ready.sock`(此时 readiness fd 保持 `FD_CLOEXEC`)→ 锁
-  `<run_root>/<sid>/<sid>.pid`→ 取 LaunchSpec → `chdir(workdir)`、剥除 `TASK_*`
-  引导变量、合入 `spec.env`(密钥)→ 仅在最后一次 `execve` 前清 readiness fd 的
-  `FD_CLOEXEC`,向 argv 追加其实际编号 `--ready-fd=<fd>`并替换为
-  `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile 锁 fd 和 readiness fd;
-  任一 pre-exec 失败都会关闭 readiness 连接,serve 立即读到 EOF。
+  `<run_root>/<sid>/<sid>.pid`→以 sid + exact run-id 取 bootstrap。cold image bootstrap
+  直接带最终 LaunchSpec,只需一次 RPC。restore bootstrap 带 task-local prepare spec与
+  authoritative `MANIFEST_KEY`;runner 覆盖继承环境,在本进程读取一次根 `snapshot.cfg`,
+  提交同一 completion并等待最终 LaunchSpec。它保留根 cfg导出的 sorted ref-location,
+  显式关闭 reader/fetcher后才 `chdir(workdir)`、剥除 `TASK_*`、合入 task/spec env。
+  仅在最后一次 `execve` 前清 readiness fd 的 `FD_CLOEXEC`,向 argv 追加其实际编号
+  `--ready-fd=<fd>`并替换为 `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile
+  锁 fd 和 readiness fd;任一 pre-exec/prepare 失败都会关闭 readiness连接,serve立即读到 EOF。
 - **run-builder**:取得 bid 后锁
   `<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 BuildSpec →
   **驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
@@ -838,8 +843,10 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 其中 `resources` 只定义 Build resources,referer/registry 只控制本次模板构建。解析后均从模板 metadata 中剥离,
 持久化到 `builds.builder_json`;不会随模板 create/resume 进入运行时配置。
 
-- **渲染**:serve 在任何 network Attach/runner Assign 前用一个纯 resolver 生成完整
-  `ResourcesConfig`,renderer 直接安装该对象,不再逐字段重解释。YAML 不含
+- **渲染**:cold image 仍在 network Attach/runner Assign 前用纯 resolver 生成完整
+  `ResourcesConfig`。restore 在 runner task summary 到达后由唯一 launch worker解析
+  snapshot capacity并生成同一 canonical `ResourcesConfig`;conductor 不打开 snapshot。
+  renderer 直接安装该对象,不再逐字段重解释。YAML 不含
   `control.cgroup_path`;run-sandbox 最后以继承 cgroup FD 注入该 capability。
   dynamic `control.controller` 只取启动时解析的 `resource_listen.SocketIdentity`;
   `watermark_high`/sensor 保持 omitted。其它 boot/tapfd/已解析 network 与租户子集再经
@@ -857,13 +864,15 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   来自 `builds.metadata_json`。Build resources 与该 patch 完全独立,不互相默认、比较或推导;
   trigger 的 `cpuCount`/`memoryMB` 只可断言不可变 Build resources。
 - **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
-  快照**。request 显式相同 capacity 可作为 assertion,任一 leaf 不同则 400。无法可靠
-  probe snapshot capacity 时直接失败,且此时尚未 Attach network、Assign runner、创建
-  controller reservation/cgroup/VM;绝不回退 node defaults。snapshot 中已有
+  快照**。restore 的同步请求只校验 patch 结构;runner task读根 cfg后,request 显式相同
+  capacity 可作为 assertion,任一 leaf不同则异步 `resource_resolve` failure。无法可靠读取
+  snapshot capacity 时任务异步失败;runner已经 Assign,但尚未 Attach network、写 YAML或
+  启动 VM,且绝不回退 node defaults。snapshot 中已有
   `allocatable_at_snapshot` 仍由既有 resource protocol 提高 initial grant。
 - **network 随快照**:普通 sandbox 渲染时把已解析逻辑网络注入
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore
-  继承;restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。
+  继承;restore 时 runner task返回 raw metadata,serve按 sandbox 的 best-effort兼容语义解析,
+  填 create 未指定的网络字段(**显式 create 胜**,§8)。
   Build 的临时 VM 与最终模板分别从同一个 `NetworkSpec` 解析:未声明 hostname 时前者使用
   `build-<short-build-id>`,后者使用 `sandbox.network.hostname`;故临时 hostname 不进入模板。
   C 阶段把模板的完整有效 `NetworkSpec` 写入同一 snapshot metadata,使仅持有 snapshot
@@ -923,8 +932,9 @@ Delegate=yes                  # phase ctl/vmm 子 cgroup 与可信 VMM cgroup FD
 ```
 
 两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
-业务 id。runner 取得 sid 后再锁 `<run_root>/<sid>/<sid>.pid`,取 LaunchSpec 并
-`execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
+业务 id。runner 取得 sid 后立即连接 readiness,再锁 `<run_root>/<sid>/<sid>.pid`,以
+exact run-id取 bootstrap;restore task在进程内准备根 cfg并完成第二阶段后才取最终 LaunchSpec,
+随后 `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
 sd_notify);builder 取得 bid 后再锁
 `<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 BuildSpec,
 **驻留**驱动三阶段流水线(§12),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
@@ -955,11 +965,14 @@ Builder execution 配置 CPU 或 memory 聚合上限时不允许保留长期 idl
   attempt 完成其局部资源清理,因此迟到 CAS 不能复活该行,同 SID 也不能提前启动后继 attempt。
   `kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:serve 在分配 runner 前先绑定 `<run_root>/<sid>/ready.sock`(目录 0700、
-  socket 0600),分配后从 node-ctl 的 one-shot 连接严格读取
+  socket 0600),分配后 runner立即连接;serve同时等待 snapshot completion、readiness EOF、
+  attempt cancel与绝对 deadline,因此task在根读取期间退出会立即失败。随后从node-ctl的
+  one-shot连接严格读取
   `control_ready\nready\nEOF`;bare 到此启动成功。e2b 随后把 `POST /init` 作为首个 envd
-  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。runtime
-  launch budget 从 Assign 成功/runner handoff 后才开始,与前述 runner assignment budget
-  独立;它覆盖 wire 与 mandatory `/init` 的 60s 启动预算.首个 `/init` 立即发出;仅连接/传输
+  请求,不以 `/health` 作为启动门槛;health 仅在初始化完成后用于外部存活检查。restore
+  launch的单一绝对 budget从 Assign成功时开始,覆盖 task根读取、completion RPC、host
+  resource/network准备、final wait、exec/startup、runtime wire与mandatory `/init`,最终 spec
+  生成后不重置。cold path仍在runner handoff后使用现有runtime budget。首个 `/init`立即发出;仅连接/传输
   错误按 1ms,2ms,4ms,5ms 上限退避重试,每次请求最多 50ms.只有 204 表示成功;
   非 204 只返回状态码,不记录可能回显 access token/用户 env 的响应体;协议错误、提前
   EOF、取消或总预算超时都返回
@@ -1034,13 +1047,19 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
 各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
 
-**① task 平面** — 启动器取工作规约,两条路径、同一鉴权:
+**① task 平面** — 启动器取工作规约。sandbox 使用 exact-run 两阶段端点;builder 在
+§12 改造前暂用既有 BuildSpec端点:
 
-- `POST /internal/task/launchspec`(run-sandbox;req `{config_id: "sandbox:<sid>"}`)
-  → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
-  `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
-  <shared> --run-root <run_root> (--restore <ref>)
-  (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
+- `POST /internal/task/sandbox/bootstrap`(run-sandbox;req `{sandbox_id,run_id,version}`)
+  先取得不含秘密的 exact-run pidfile identity,完成 `SO_PEERCRED` + pidfile认证后才调用
+  secret-bearing provider。cold image返回 `Final LaunchSpec`;restore返回
+  `SnapshotPrepareSpec` + env。task读根 cfg后向
+  `POST /internal/task/sandbox/prepare` 提交 `{sandbox_id,run_id,summary}`并等待最终
+  **LaunchSpec** `{exec,args,workdir}`。相同 digest replay等待/返回同一final result且不重复
+  host side effect;冲突 replay返回409并fail closed;单次HTTP断开只取消该wait。
+  `exec=sandbox-ctl`,`args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml
+  --manifest-config <shared> --run-root <run_root> (--restore <ref>)
+  (--connect <uds:ip:port>)…]`。`--run-root` 把 sandbox-ctl
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
   pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。node-ctl 在最终 exec
   时另行强制追加本机 `--cgroup-path=fd=N`,不允许 LaunchSpec 覆盖。
@@ -1054,9 +1073,9 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   网络槽(tapfd transport、mac、inner_ip、nexthop、hostname、dns),全构建复用。
   run-builder 据此自建阶段沙箱(§12);仅在该构建单元运行期间可取(serve 持挂
   pending 状态,单元退出即失效)。
-- **鉴权**:peer pid ⟷ spec 返回的锁定 pidfile(sandbox 为
-  `<rundir>/<sid>/<sid>.pid`,builder 为上述固定长度 runtime 目录中的
-  `builder.pid`),相等即认证。
+- **鉴权**:sandbox端点以 sid + exact run-id查不含秘密的 task identity,再校验peer pid ⟷
+  已锁定 `<rundir>/<sid>/<sid>.pid`;认证失败时secret provider不会被调用。builder暂以
+  spec返回的固定长度runtime目录 `builder.pid`认证,由§12后续两阶段改造收敛。
 - 设计意图:**非密配置走文件**(`<sid>.yaml`;构建的阶段 yaml 由 run-builder 写进
   workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
 
@@ -1149,9 +1168,14 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
   `SHA256(salt‖明文)`、与租户 key 无关 ⇒ chunk 去重仍跨租户;租户之间不共享 key 与
   模板。
 - **根凭据不落明文**:sqlite 内加密;运行期只在必要的进程内存、受保护路由投影和进程 env 中。
-  ManifestKey 经 LaunchSpec/BuildSpec 注入需要内容访问的宿主进程;`<sid>.yaml` 非密不含根凭据。
+  sandbox ManifestKey只在exact-run bootstrap认证后投递,runner以它覆盖继承环境中的同名项,
+  且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值,但不调用
+  sandbox launch中不调用CustomerKey、不建立key-bound reader、不打开/解密/解析snapshot。
+  `<sid>.yaml`非密不含根凭据。
+  builder在§12两阶段改造前仍由BuildSpec注入需要内容访问的宿主进程。
   APISecret 由 serve 用于 API 认证和 ServiceSecret 派生,并可投影给可信 router/proxy;
-  不下发给 guest 或业务进程。auto-resume 从资源行解密 ManifestKey 访问快照。集群下
+  不下发给 guest 或业务进程。auto-resume从资源行解密ManifestKey仅用于认证后投递给runner。
+  集群下
   node-link 原子下发完整凭据对,
   两者同样仅入加密存储 + 运行期内存(§10)。
 - 每个 Sandbox 持久化独立 ServiceSecret。未 override 时按
@@ -1225,8 +1249,10 @@ starting ──success──► running ──pause / TTL──► paused
   attempt,节点记录 invariant violation 并 fail closed,不得再分配第二个 runner;重启 Reconcile
   或终态操作负责收敛。Stop/Reset/detach/local cleanup 任一步失败时按有界退避重试,在全部
   成功前不清空 durable runner/network ownership、不提交 dead/paused、也不释放 claim。
-- network attach 后先以 `starting AND run_id=''` CAS 持久化 ownership,再发布 enriched
-  starting;CAS 丢失时立即 detach 本地 port,不再写 cache/route 或启动 runner。初始 starting
+- cold image仍在runner分配前以 `starting AND run_id=''` CAS持久化network ownership。
+  restore先绑定runner,task summary到达后才attach,并以
+  `starting AND run_id=<exact run>` CAS持久化ownership;CAS丢失时立即detach本地port。
+  两条路径都只在durable commit后发布enriched starting;CAS丢失者不写cache/route或启动VM。初始 starting
   route 没有 FloatingIP,预先确定的 UDS 路径也尚未绑定,因而没有可用 backend endpoint;
   普通数据面只能 park。enriched starting 才可供 guest MMDS `/init` 查到完整身份。后台只使用
   窄 CAS,不得用 admission 时的旧 Sandbox 整行覆盖
@@ -1270,7 +1296,11 @@ starting ──success──► running ──pause / TTL──► paused
     后续数据面的无效 KAT 也不能触发本地恢复.
 - **phase timing**:launch 以低基数 `kind=create|resume`、`profile=e2b|bare`、
   `result=success|failure` 和 bounded `failure_stage` 记录 admission/prepare/runner_wait/
-  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration;external Create
+  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration;task另以结构化字段
+  记录 `task_snapshot_prepare_duration`、`task_snapshot_cfg_read_duration`、
+  `task_snapshot_ref_count`、prepare replay和分阶段error。failure stage包含
+  `snapshot_prepare/resource_resolve/network_attach/network_commit/config_write/runtime/init`。
+  external Create
   另记录 `proxy_route_ack_duration` 与 bounded result。sandbox ID 和
   run ID 只进入结构化日志字段,不作为 metric label。`runner_wait` 从调用 Assign 到 commit
   callback 首次拿到 run-id,`runner_commit` 只计窄 Bind/cache,`runtime_ready` 从 handoff 完成
@@ -1282,7 +1312,8 @@ starting ──success──► running ──pause / TTL──► paused
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
   门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
-  restore 时 serve 读回快照内的逻辑网络,填 create 未指定的字段(显式 create 胜)。
+  restore时runner task读回快照内的raw逻辑网络metadata,serve按best-effort语义解析后填
+  create未指定的字段(显式create胜)。
 
 ### 8.1 暂停态分层、转模板与跨机迁移
 
@@ -1375,8 +1406,11 @@ legacy remote 的 `snapshot --upload` 只作兼容回归。
   DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
   已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
   目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
-  `ref_location_parent` 部署映射。启动前 conductor 递归读取 snapshot `from_refs`,收集
-  graph 中实际出现的全部 location name,逐个派生 URI 并展开为 `--ref-location`。
+  `ref_location_parent` 部署映射。restore runner先为located根建立reader path mapping,
+  只读取根 `snapshot.cfg`一次,再从 `root + FromRefs + ArtifactRefs()` 收集flattened closure;
+  `FromRefs`是已展平memory chain、disk `BaseFromRefs`同理,不递归读取parent cfg。
+  location name去重排序并受1024上限约束,路径与CLI URI均按
+  `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
   decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
@@ -1987,7 +2021,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 | 脚本 | 覆盖 |
 |---|---|
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
-| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 |
+| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、exact-run bootstrap、cold单阶段/restore两阶段、execve、`TASK_*`和重复MANIFEST_KEY剥除;`config` CLI 往返 |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;Build Register MMDS、终态 cleanup、日志/DB/image 隔离 |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume 与恢复策略 |
 | `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑覆盖 internal static、secret 生命周期与 local UDS service |
