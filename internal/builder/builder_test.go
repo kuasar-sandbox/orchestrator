@@ -217,67 +217,51 @@ func TestUseLocalImageRejectsMalformedArtifactWithoutChangingState(t *testing.T)
 	}
 }
 
-// TestParseTemplateDisk covers the fromTemplate disk extraction: a base
-// template's `sandbox-ctl info --json` must yield both the erofs base image
-// AND its accumulated overlay diff (the read-only lower a cold-start stacks
-// under a fresh overlay), or the template's filesystem is lost.
-func TestParseTemplateDisk(t *testing.T) {
-	// overlay-mode template: base image + accumulated overlay diff, no chain.
-	overlayJSON := `{
-		"Metadata": {"e2b.start_cmd": "node server.js", "e2b.ready_cmd": "curl -sf localhost:3000"},
-		"Boot": {"Root": {
-			"BaseRef": "manifest://aaaabbbb",
-			"Overlay": {"Base": "manifest://ccccdddd", "BaseFromRefs": null}
-		}}
-	}`
-	baseRef, overlayBase, overlayChain, meta, err := parseTemplateDisk([]byte(overlayJSON))
-	if err != nil {
-		t.Fatalf("overlay-mode: unexpected err: %v", err)
+func TestResolveBaseConsumesTaskLocalSnapshotPreparation(t *testing.T) {
+	p := &buildPipeline{
+		profile: types.ProfileE2B,
+		spec: &configsock.BuildSpec{
+			FromTemplateRef: "manifest://root", FromTemplateKind: "snp",
+			SnapshotPreparation: &configsock.BuildSnapshotPreparation{
+				BaseRef: "manifest://base", OverlayBase: "manifest://top",
+				OverlayBaseFromRefs: []string{"manifest://lower-1", "manifest://lower-2"},
+				StartCmd:            "node server.js", ReadyCmd: "curl -sf localhost:3000",
+			},
+		},
 	}
-	if baseRef != "manifest://aaaabbbb" {
-		t.Errorf("baseRef = %q, want manifest://aaaabbbb", baseRef)
+	if err := p.resolveBase(); err != nil {
+		t.Fatal(err)
 	}
-	if overlayBase != "manifest://ccccdddd" {
-		t.Errorf("overlayBase = %q, want manifest://ccccdddd", overlayBase)
+	if p.baseRef != "manifest://base" || p.overlayBase != "manifest://top" ||
+		strings.Join(p.overlayBaseFromRefs, ",") != "manifest://lower-1,manifest://lower-2" {
+		t.Fatalf("resolved disk = base %q overlay %q chain %v", p.baseRef, p.overlayBase, p.overlayBaseFromRefs)
 	}
-	if len(overlayChain) != 0 {
-		t.Errorf("overlayChain = %v, want empty", overlayChain)
+	if p.startCmd != "node server.js" || p.readyCmd != "curl -sf localhost:3000" {
+		t.Fatalf("inherited commands = %q / %q", p.startCmd, p.readyCmd)
 	}
-	if meta["e2b.start_cmd"] != "node server.js" || meta["e2b.ready_cmd"] != "curl -sf localhost:3000" {
-		t.Errorf("meta = %v, want start/ready cmds", meta)
+	p.spec.SnapshotPreparation = nil
+	if err := p.resolveBase(); err == nil {
+		t.Fatal("missing task-local snapshot preparation was accepted")
 	}
+}
 
-	// overlay omitted (single-disk capture): base only, no overlay lower.
-	noOverlay := `{"Boot": {"Root": {"BaseRef": "manifest://eeee"}}}`
-	baseRef, overlayBase, overlayChain, _, err = parseTemplateDisk([]byte(noOverlay))
-	if err != nil {
-		t.Fatalf("no-overlay: unexpected err: %v", err)
+func TestAuthoritativeProcessEnvReplacesManifestKeyOnce(t *testing.T) {
+	t.Setenv("MANIFEST_KEY", "inherited-wrong-key")
+	env := authoritativeProcessEnv(map[string]string{
+		"MANIFEST_KEY": "task-key",
+		"BUILD_ONLY":   "yes",
+	})
+	manifestEntries := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "MANIFEST_KEY=") {
+			manifestEntries++
+			if entry != "MANIFEST_KEY=task-key" {
+				t.Fatalf("manifest entry = %q", entry)
+			}
+		}
 	}
-	if baseRef != "manifest://eeee" || overlayBase != "" {
-		t.Errorf("no-overlay: base=%q overlay=%q, want manifest://eeee + empty", baseRef, overlayBase)
-	}
-
-	// A chained overlay remains an explicit top ref plus base_from_refs.
-	chained := `{"Boot": {"Root": {
-		"BaseRef": "manifest://eeee",
-		"Overlay": {"Base": "manifest://ffff", "BaseFromRefs": ["manifest://gggg", "manifest://hhhh"]}
-	}}}`
-	_, overlayBase, overlayChain, _, err = parseTemplateDisk([]byte(chained))
-	if err != nil {
-		t.Fatalf("chained overlay: unexpected err: %v", err)
-	}
-	if overlayBase != "manifest://ffff" || strings.Join(overlayChain, ",") != "manifest://gggg,manifest://hhhh" {
-		t.Errorf("chained overlay = %q + %v", overlayBase, overlayChain)
-	}
-
-	// missing base image ref is an error.
-	if _, _, _, _, err = parseTemplateDisk([]byte(`{"Boot": {"Root": {}}}`)); err == nil {
-		t.Error("missing base ref: expected error, got nil")
-	}
-
-	// malformed JSON is an error.
-	if _, _, _, _, err = parseTemplateDisk([]byte(`not json`)); err == nil {
-		t.Error("malformed json: expected error, got nil")
+	if manifestEntries != 1 {
+		t.Fatalf("authoritative MANIFEST_KEY entries = %d", manifestEntries)
 	}
 }
 

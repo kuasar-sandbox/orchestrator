@@ -9,6 +9,7 @@ import (
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -106,17 +107,18 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 }
 
 type liveBuildPreparation struct {
-	spec            sandboxcfg.SandboxSpec
-	network         sandboxcfg.NetworkSpec
-	templateNetwork sandboxcfg.NetworkSpec
-	resources       rtconfig.ResourcesConfig
-	failureReason   string
+	spec             sandboxcfg.SandboxSpec
+	resources        rtconfig.ResourcesConfig
+	snapshotTemplate bool
+	durable          *buildRuntimePreparation
+	final            *configsock.BuildSpec
+	failureReason    string
 }
 
 func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build, unit string) (*liveBuildPreparation, error) {
 	prep := &liveBuildPreparation{}
-	if build.RunID == "" || build.RuntimeVswitchPort == "" {
-		prep.failureReason = "live build has incomplete durable runtime ownership"
+	if build.RunID == "" {
+		prep.failureReason = "live build has no durable run ownership"
 		return prep, nil
 	}
 	wantProperties, err := builderResourceProperties(build.Resources)
@@ -132,12 +134,39 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build,
 		prep.failureReason = fmt.Sprintf("live build resource enforcement does not match: effective=%+v want=%+v", gotProperties, wantProperties)
 		return prep, nil
 	}
-	prep.spec, prep.network, prep.templateNetwork, prep.resources, err = o.resolveBuildPhaseInputs(ctx, build)
+	prep.snapshotTemplate, err = buildUsesSnapshotTemplate(build)
 	if err != nil {
-		if retryableBuildPhaseInputError(err) {
-			return nil, fmt.Errorf("read live build phase inputs for %s: %w", build.BuildID, err)
+		prep.failureReason = "cannot classify live build: " + err.Error()
+		return prep, nil
+	}
+	if build.RuntimeVswitchPort == "" {
+		if build.RuntimePrepareJSON != "" {
+			prep.failureReason = "live preparing build has preparation without a runtime port"
+			return prep, nil
 		}
-		prep.failureReason = "cannot reconstruct live build: " + err.Error()
+		prep.spec, prep.resources, err = o.resolveBuildRequestInputs(build)
+		if err != nil {
+			prep.failureReason = "cannot reconstruct live build request: " + err.Error()
+		}
+		return prep, nil
+	}
+	durable, err := decodeBuildRuntimePreparation(build.RuntimePrepareJSON)
+	if err != nil {
+		prep.failureReason = err.Error()
+		return prep, nil
+	}
+	prep.durable = &durable
+	preflightPending := &pendingBuild{
+		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID),
+		snapshotTemplate: prep.snapshotTemplate,
+		spec:             prep.spec, resources: durable.Resources,
+		network: durable.Network, templateNetwork: durable.TemplateNetwork,
+		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
+		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
+	}
+	prep.final, err = o.buildSpecForPending(ctx, preflightPending)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild live build final spec for %s: %w", build.BuildID, err)
 	}
 	return prep, nil
 }
@@ -173,12 +202,21 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		}
 		return o.failInterruptedBuild(ctx, build, prep.failureReason)
 	}
+	expectedDigest := ""
+	if prep.durable != nil {
+		expectedDigest = prep.durable.PrepareDigest
+	}
 	pend := &pendingBuild{
-		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), spec: prep.spec,
-		network: prep.network, templateNetwork: prep.templateNetwork, resources: prep.resources,
-		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
-		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
+		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID),
+		snapshotTemplate: prep.snapshotTemplate,
+		handoff:          newBuildTaskHandoff(prep.snapshotTemplate, expectedDigest),
+		spec:             prep.spec, resources: prep.resources,
 		result: make(chan configsock.BuildResult, 1),
+	}
+	if prep.durable != nil {
+		pend.network, pend.templateNetwork, pend.resources = prep.durable.Network, prep.durable.TemplateNetwork, prep.durable.Resources
+		pend.tapFD, pend.mac = o.vs.TapFD(build.RuntimeVswitchPort), build.RuntimePortMAC
+		pend.floating, pend.envdToken = build.RuntimeFloatingIP, build.RuntimeEnvdAccessToken
 	}
 	if build.ExecutionResult != nil {
 		pend.result <- *build.ExecutionResult
@@ -190,13 +228,23 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	}
 	o.pend[build.BuildID] = pend
 	o.pendMu.Unlock()
+	if prep.durable != nil {
+		pend.handoff.PublishFinal(prep.final, nil)
+	}
 
-	mmdsRow := o.publishRecoveredBuildMMDS(build)
-	o.log.Info("reconcile: adopted live build", "bid", build.BuildID, "run_id", build.RunID)
+	var mmdsRow *types.Sandbox
+	if prep.durable != nil {
+		mmdsRow = o.publishRecoveredBuildMMDS(build)
+	}
+	stage := "preparing"
+	if prep.durable != nil {
+		stage = "prepared"
+	}
+	o.log.Info("reconcile: adopted live build", "bid", build.BuildID, "run_id", build.RunID, "stage", stage)
 	started = true
 	go func() {
 		defer finish()
-		o.monitorRecoveredBuild(ctx, build, pend, unit, mmdsRow)
+		o.monitorRecoveredBuild(ctx, build, pend, unit, mmdsRow, prep.durable != nil)
 	}()
 	return nil
 }
@@ -237,7 +285,7 @@ func (o *Orchestrator) publishRecoveredBuildMMDS(build *types.Build) *types.Sand
 	return row
 }
 
-func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.Build, pend *pendingBuild, unit string, mmdsRow *types.Sandbox) {
+func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.Build, pend *pendingBuild, unit string, mmdsRow *types.Sandbox, prepared bool) {
 	defer func() {
 		o.pendMu.Lock()
 		delete(o.pend, build.BuildID)
@@ -249,9 +297,17 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 		}
 	}()
 
-	result, runErr := o.waitRecoveredBuild(ctx, build, pend, unit)
+	port := build.RuntimeVswitchPort
+	runtimePersisted := prepared
+	var result *buildResult
+	var runErr error
+	if prepared {
+		result, runErr = o.waitRecoveredBuild(ctx, build, pend, unit)
+	} else {
+		result, port, runtimePersisted, mmdsRow, runErr = o.continueRecoveredBuildPreparation(ctx, build, pend, unit)
+	}
 	if !errors.Is(runErr, errBuildCleanupPending) {
-		cleanupErr := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, pend.workdir, true)
+		cleanupErr := o.cleanupBuildRuntime(build, port, pend.workdir, runtimePersisted)
 		if cleanupErr != nil {
 			runErr = &buildCleanupPendingError{cause: runErr, cleanup: cleanupErr}
 		}
@@ -259,11 +315,94 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 	o.completeBuild(ctx, build, result, runErr)
 }
 
-func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Build, pend *pendingBuild, unit string) (*buildResult, error) {
-	deadline := time.Now().Add(time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second)
-	if build.ExecutionClaimedUnix > 0 {
-		deadline = time.Unix(build.ExecutionClaimedUnix, 0).Add(time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second)
+func (o *Orchestrator) continueRecoveredBuildPreparation(
+	ctx context.Context,
+	build *types.Build,
+	pend *pendingBuild,
+	unit string,
+) (result *buildResult, portID string, persisted bool, mmdsRow *types.Sandbox, retErr error) {
+	deadline := o.buildExecutionDeadline(build)
+	buildCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	finalPublished := false
+	defer func() {
+		if retErr != nil && !finalPublished {
+			pend.handoff.PublishFinal(nil, retErr)
+		}
+	}()
+
+	prepareDigest := fastBuildPrepareDigest(build.BuildID)
+	var inherited sandboxcfg.NetworkSpec
+	if pend.snapshotTemplate {
+		summary, early, err := o.waitBuildPrepare(buildCtx, pend, unit)
+		if err != nil {
+			return nil, "", false, nil, buildFailed("snapshot_prepare", err)
+		}
+		if early != nil {
+			accepted, err := o.fenceAcceptedBuildResult(unit, *early)
+			return accepted, "", false, nil, buildFailed("runtime", err)
+		}
+		inherited, err = validateBuildPrepareSummary(summary)
+		if err != nil {
+			return nil, "", false, nil, buildFailed("snapshot_prepare", err)
+		}
+		prepareDigest = summary.ResolutionDigest
 	}
+	var err error
+	pend.network, pend.templateNetwork, err = o.resolveBuildNetworks(
+		build.Profile, inherited, pend.spec.Network, "build-"+shortID(build.BuildID),
+	)
+	if err != nil {
+		return nil, "", false, nil, buildFailed("resource_resolve", err)
+	}
+	port, err := o.attachNetwork(buildCtx, pend.network)
+	if err != nil {
+		return nil, "", false, nil, buildFailed("network_attach", err)
+	}
+	portID = port.Port
+	envdToken := ""
+	if build.Profile == types.ProfileE2B {
+		envdToken, err = keys.MintToken()
+		if err != nil {
+			return nil, portID, false, nil, buildFailed("network_commit", fmt.Errorf("build: mint phase envd token: %w", err))
+		}
+	}
+	durable := buildRuntimePreparation{
+		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
+		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
+	}
+	prepareJSON, err := encodeBuildRuntimePreparation(durable)
+	if err != nil {
+		return nil, portID, false, nil, buildFailed("network_commit", err)
+	}
+	owned, err := o.st.SetBuildRuntimePreparation(buildCtx, build.BuildID, build.RunID,
+		port.Port, port.FloatingIP, port.MAC, envdToken, prepareJSON)
+	if err != nil || !owned {
+		if err == nil {
+			err = fmt.Errorf("build: exact-run ownership lost during recovered runtime preparation")
+		}
+		return nil, portID, false, nil, buildFailed("network_commit", err)
+	}
+	persisted = true
+	build.RuntimeVswitchPort, build.RuntimeFloatingIP, build.RuntimePortMAC = port.Port, port.FloatingIP, port.MAC
+	build.RuntimeEnvdAccessToken, build.RuntimePrepareJSON = envdToken, prepareJSON
+	pend.tapFD, pend.mac, pend.floating = o.vs.TapFD(port.Port), port.MAC, port.FloatingIP
+	pend.envdToken = envdToken
+	final, err := o.buildSpecForPending(buildCtx, pend)
+	if err != nil {
+		return nil, portID, true, nil, buildFailed("config_write", err)
+	}
+	pend.handoff.PublishFinal(final, nil)
+	finalPublished = true
+	if build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
+		mmdsRow = o.publishRecoveredBuildMMDS(build)
+	}
+	result, err = o.waitRecoveredBuild(buildCtx, build, pend, unit)
+	return result, portID, true, mmdsRow, buildFailed("runtime", err)
+}
+
+func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Build, pend *pendingBuild, unit string) (*buildResult, error) {
+	deadline := o.buildExecutionDeadline(build)
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		timeoutErr := fmt.Errorf("build: recovered execution exceeded total timeout")
@@ -272,35 +411,9 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 		}
 		return nil, timeoutErr
 	}
-	timer := time.NewTimer(remaining)
-	defer timer.Stop()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case result := <-pend.result:
-			return o.fenceAcceptedBuildResult(unit, result)
-		case <-ctx.Done():
-			select {
-			case result := <-pend.result:
-				return o.fenceAcceptedBuildResult(unit, result)
-			default:
-			}
-			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, &buildCleanupPendingError{cause: ctx.Err(), cleanup: err}
-			}
-			return nil, ctx.Err()
-		case <-timer.C:
-			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, &buildCleanupPendingError{cause: fmt.Errorf("build: recovered execution timed out"), cleanup: err}
-			}
-			return nil, fmt.Errorf("build: recovered execution timed out")
-		case <-ticker.C:
-			if !o.unitActive(ctx, unit) {
-				return nil, fmt.Errorf("build: recovered unit %s exited without result", unit)
-			}
-		}
-	}
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	return o.waitBuildResult(waitCtx, pend, unit)
 }
 
 func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Build, reason string) error {

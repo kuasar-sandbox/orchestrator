@@ -210,30 +210,54 @@ func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string
 	return out.Final, nil
 }
 
-// FetchBuildSpec dials the config-socket and pulls the BuildSpec for
-// configID ("build:<bid>"). It retains the existing build pidfile auth contract.
-func FetchBuildSpec(socket, configID string) (*BuildSpec, error) {
-	return FetchBuildSpecContext(context.Background(), socket, configID)
-}
-
-func FetchBuildSpecContext(ctx context.Context, socket, configID string) (*BuildSpec, error) {
-	body, _ := json.Marshal(Request{ConfigID: configID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildSpec, bytes.NewReader(body))
+// FetchBuildTaskSpec fetches the auth-first exact-run bootstrap after the
+// caller has locked the assigned build task pidfile.
+func FetchBuildTaskSpec(ctx context.Context, socket, buildID, runID string) (*BuildTaskSpec, error) {
+	body, _ := json.Marshal(BuildTaskRequest{BuildID: buildID, RunID: runID, Version: SnapshotPrepareSchemaVersion})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildBootstrap, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := HTTPClient(socket).Do(req)
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
 	if err != nil {
 		return nil, &transportError{err: err}
 	}
 	defer resp.Body.Close()
-	var spec BuildSpec
+	var spec BuildTaskSpec
 	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
-		return nil, &transportError{err: fmt.Errorf("configsock: decode buildspec: %w", err)}
+		return nil, &transportError{err: fmt.Errorf("configsock: decode build bootstrap: %w", err)}
 	}
 	if spec.Error != "" || resp.StatusCode >= http.StatusBadRequest {
 		return nil, buildResponseError(resp.StatusCode, spec.Error)
 	}
 	return &spec, nil
+}
+
+// CompleteBuildPrepare submits the immutable task-local root summary and waits
+// for the final BuildSpec. Identical retries are safe after response loss or a
+// conductor restart; conflicts return a non-retryable 409.
+func CompleteBuildPrepare(ctx context.Context, socket, buildID, runID string, summary SnapshotPrepareSummary) (*BuildSpec, error) {
+	body, _ := json.Marshal(BuildPrepareRequest{BuildID: buildID, RunID: runID, Summary: summary})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildPrepare, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
+	if err != nil {
+		return nil, &transportError{err: err}
+	}
+	defer resp.Body.Close()
+	var out BuildPrepareResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, &transportError{err: fmt.Errorf("configsock: decode build prepare response: %w", err)}
+	}
+	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
+		return nil, buildResponseError(resp.StatusCode, out.Error)
+	}
+	if out.Final == nil {
+		return nil, errors.New("configsock: build prepare response has no final build spec")
+	}
+	return out.Final, nil
 }

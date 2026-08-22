@@ -164,6 +164,11 @@ type Build struct {
 	RuntimeFloatingIP      string
 	RuntimePortMAC         string
 	RuntimeEnvdAccessToken string
+	// RuntimePrepareJSON is the non-secret canonical final host preparation
+	// committed atomically with the runtime port. It lets a new conductor return
+	// an equivalent BuildSpec without rereading the source snapshot or applying
+	// potentially changed node defaults.
+	RuntimePrepareJSON string
 	// ExecutionResult is set atomically before the config-socket acknowledges
 	// run-builder's report. Terminal persistence clears it together with the
 	// execution claim after the unit and host runtime have been reclaimed.

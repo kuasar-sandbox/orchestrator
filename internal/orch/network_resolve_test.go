@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -246,25 +245,13 @@ func TestResolveBuildNetworksFromTemplatePrecedence(t *testing.T) {
 	}
 }
 
-func TestSourceTemplateNetworkReadsSnapshotMetadata(t *testing.T) {
-	cfg := buildNetworkTestConfig()
-	o := testOrchCfg(t, cfg)
-	// This test exercises the real sandbox-ctl parser rather than the generic
-	// test fixture's synthetic capacity-only snapshot inspector.
-	o.snapshotInspector = nil
-	binDir := t.TempDir()
-	script := filepath.Join(binDir, "sandbox-ctl")
-	body := `#!/bin/sh
-printf '%s' '{"Metadata":{"kuasar-sandbox.network":"{\"hostname\":\"source\",\"inner_ip\":\"10.0.0.5/24\",\"nexthop\":\"10.0.0.1\",\"transit_geneve_vni\":23}"}}'
-`
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-	key := strings.Repeat("a", 64)
-	got, err := o.sourceTemplateNetwork(context.Background(), &types.Build{
-		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + key}.String(),
-		ManifestKey:  strings.Repeat("b", 64),
+func TestBuildPrepareSummaryStrictlyParsesSnapshotMetadata(t *testing.T) {
+	got, err := validateBuildPrepareSummary(configsock.SnapshotPrepareSummary{
+		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
+		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
+		RawNetworkMetadata: `{"hostname":"source","inner_ip":"10.0.0.5/24","nexthop":"10.0.0.1","transit_geneve_vni":23}`,
+		ResolutionDigest:   strings.Repeat("a", 64),
+		RequiredRefCount:   1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -274,11 +261,15 @@ printf '%s' '{"Metadata":{"kuasar-sandbox.network":"{\"hostname\":\"source\",\"i
 		t.Fatalf("source network = %+v", got)
 	}
 
-	imageNetwork, err := o.sourceTemplateNetwork(context.Background(), &types.Build{
-		FromTemplate: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + key}.String(),
+	_, err = validateBuildPrepareSummary(configsock.SnapshotPrepareSummary{
+		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
+		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
+		RawNetworkMetadata: `{malformed`,
+		ResolutionDigest:   strings.Repeat("a", 64),
+		RequiredRefCount:   1,
 	})
-	if err != nil || !imageNetwork.IsZero() {
-		t.Fatalf("image source network = %+v, err=%v", imageNetwork, err)
+	if err == nil || !strings.Contains(err.Error(), "source-template network metadata") {
+		t.Fatalf("malformed inherited network = %v", err)
 	}
 }
 

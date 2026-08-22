@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -153,6 +154,26 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
 	if err != nil || stored.RunID != "" || stored.EnforcementStatus != "" {
 		t.Fatalf("failed property application bound run = %+v, %v", stored, err)
+	}
+}
+
+func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Builder.TotalTimeoutSec = 1
+	b := &types.Build{
+		BuildID: "build-expired-before-assignment", Profile: types.ProfileBare,
+		FromImage: "example.invalid/base:latest", Status: types.BuildBuilding,
+		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Add(-2 * time.Minute).Unix(),
+	}
+	if _, err := o.runBuildUnit(context.Background(), b); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired assignment = %v, want deadline exceeded", err)
+	}
+	if b.RunID != "" || b.RuntimeVswitchPort != "" {
+		t.Fatalf("expired build acquired runtime ownership: %+v", b)
+	}
+	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired build workdir remained: %v", err)
 	}
 }
 

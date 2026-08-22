@@ -16,9 +16,6 @@ func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
 
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		panic("LaunchSpecFor performed snapshot artifact I/O")
-	}
 
 	sid := "sbx-trust"
 	key := strings.Repeat("b", 64)

@@ -113,7 +113,6 @@ type Orchestrator struct {
 	// listener starts. The raw resource_listen socket is never a sandbox policy
 	// source.
 	resourceControllerSocketIdentity string
-	snapshotInspector                func(context.Context, string, string) (snapshotDescription, error)
 	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
 	removeBuildRuntimeDir            func(string) error
 
@@ -1578,55 +1577,6 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 	return &launchPreparation{Spec: spec, Network: network, Resources: resources}, nil
 }
 
-// snapshotDescription is the subset of `sandbox-ctl info --json` consumed by
-// the orchestrator. info marshals restore.SnapshotCfg by Go field name.
-type snapshotDescription struct {
-	Resources struct {
-		Capacity struct {
-			CPU    int    `json:"CPU"`
-			Memory string `json:"Memory"`
-		} `json:"Capacity"`
-	} `json:"Resources"`
-	Metadata map[string]string `json:"Metadata"`
-}
-
-// snapshotConfigProbeError distinguishes external snapshot/object reads, which
-// may recover without changing a live Build, from deterministic parsing or
-// local policy errors that reconciliation must fail closed.
-type snapshotConfigProbeError struct {
-	ref string
-	err error
-}
-
-func (e *snapshotConfigProbeError) Error() string {
-	return fmt.Sprintf("snapshot config probe %q: %v", e.ref, e.err)
-}
-
-func (e *snapshotConfigProbeError) Unwrap() error { return e.err }
-
-func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, ref string) (snapshotDescription, error) {
-	var cfg snapshotDescription
-	locations := map[string]string{}
-	if err := o.addRefLocation(locations, ref); err != nil {
-		return cfg, err
-	}
-	args := []string{"info", "--json"}
-	if strings.HasPrefix(ref, "manifest://") {
-		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
-	}
-	args = appendRefLocationArgs(args, locations)
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), append(args, ref)...)
-	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+manifestKey)
-	out, err := cmd.Output()
-	if err != nil {
-		return cfg, &snapshotConfigProbeError{ref: ref, err: err}
-	}
-	if err := json.Unmarshal(out, &cfg); err != nil {
-		return cfg, fmt.Errorf("snapshot config parse %q: %w", ref, err)
-	}
-	return cfg, nil
-}
-
 // --- configsock.Provider ---
 
 // sandboxConfigPath is where the per-sandbox SANDBOX_CONFIG yaml is written.
@@ -1700,9 +1650,10 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	})
 }
 
-// LaunchSpecFor is retained as a pure compatibility helper while the builder
-// still uses the older task plane. Managed sandbox runners use the exact-run
-// bootstrap methods below. This method never opens snapshot artifacts.
+// LaunchSpecFor is retained as a pure compatibility/test helper for sandbox
+// launch-spec construction. Managed runners use the exact-run task plane, and
+// builders use their own exact-run bootstrap. This method never opens an
+// artifact.
 func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*configsock.LaunchSpec, string, bool, error) {
 	kind, id, found := strings.Cut(configID, ":")
 	if !found {
@@ -1711,7 +1662,7 @@ func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*con
 	switch kind {
 	case "sandbox":
 		return o.sandboxLaunchSpec(ctx, id)
-	default: // builds use the buildspec plane (BuildSpecFor), not exec-replace
+	default:
 		return nil, "", false, nil
 	}
 }

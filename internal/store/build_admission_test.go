@@ -413,11 +413,13 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 	}
 
 	runtime := admissionBuild("runtime-owner", types.BuildResources{CPU: 1000, Memory: 1 << 30})
-	runtime.Status, runtime.ExecutionClaimed = types.BuildBuilding, true
+	runtime.Status, runtime.ExecutionClaimed, runtime.RunID = types.BuildBuilding, true, "br-runtime-owner"
 	if err := st.PutBuild(ctx, runtime); err != nil {
 		t.Fatal(err)
 	}
-	owned, err := st.SetBuildRuntimeOwnership(ctx, runtime.BuildID, "7", "192.0.2.7", "02:00:00:00:00:07", "secret-token")
+	prepareJSON := `{"schema_version":1}`
+	owned, err := st.SetBuildRuntimePreparation(ctx, runtime.BuildID, runtime.RunID,
+		"7", "192.0.2.7", "02:00:00:00:00:07", "secret-token", prepareJSON)
 	if err != nil || !owned {
 		t.Fatalf("set runtime ownership: %v %v", owned, err)
 	}
@@ -429,8 +431,25 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 		t.Fatalf("runtime token stored without encryption: %q", ciphertext)
 	}
 	loaded, err := st.GetBuild(ctx, runtime.BuildID)
-	if err != nil || loaded.RuntimeEnvdAccessToken != "secret-token" {
+	if err != nil || loaded.RuntimeEnvdAccessToken != "secret-token" || loaded.RuntimePrepareJSON != prepareJSON {
 		t.Fatalf("runtime ownership round trip = %+v, %v", loaded, err)
+	}
+	if found, err := st.BuildingTaskIdentity(ctx, runtime.BuildID, "br-stale"); err != nil || found {
+		t.Fatalf("stale task identity = %t, %v", found, err)
+	}
+	if found, err := st.BuildingTaskIdentity(ctx, runtime.BuildID, runtime.RunID); err != nil || !found {
+		t.Fatalf("exact task identity = %t, %v", found, err)
+	}
+	if owned, err := st.SetBuildRuntimePreparation(ctx, runtime.BuildID, runtime.RunID,
+		"8", "192.0.2.8", "02:00:00:00:00:08", "other-token", prepareJSON); err != nil || owned {
+		t.Fatalf("second runtime preparation = %t, %v", owned, err)
+	}
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID); err != nil || !cleared {
+		t.Fatalf("clear runtime preparation = %t, %v", cleared, err)
+	}
+	loaded, err = st.GetBuild(ctx, runtime.BuildID)
+	if err != nil || loaded.RuntimeVswitchPort != "" || loaded.RuntimeEnvdAccessToken != "" || loaded.RuntimePrepareJSON != "" {
+		t.Fatalf("cleared runtime preparation = %+v, %v", loaded, err)
 	}
 }
 
@@ -478,11 +497,17 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatalf("durable result = %+v, err=%v", loaded, err)
 	}
 	loaded.Status = types.BuildReady
+	loaded.RuntimeVswitchPort = "7"
+	loaded.RuntimeFloatingIP = "192.0.2.7"
+	loaded.RuntimePortMAC = "02:00:00:00:00:07"
+	loaded.RuntimeEnvdAccessToken = "runtime-token"
+	loaded.RuntimePrepareJSON = `{"schema_version":1}`
 	if err := st.PutBuildTerminal(ctx, loaded); err != nil {
 		t.Fatal(err)
 	}
 	terminal, err := st.GetBuild(ctx, b.BuildID)
-	if err != nil || terminal.ExecutionResult != nil || terminal.ExecutionClaimed {
+	if err != nil || terminal.ExecutionResult != nil || terminal.ExecutionClaimed ||
+		terminal.RuntimeVswitchPort != "" || terminal.RuntimeEnvdAccessToken != "" || terminal.RuntimePrepareJSON != "" {
 		t.Fatalf("terminal result cleanup = %+v, err=%v", terminal, err)
 	}
 }

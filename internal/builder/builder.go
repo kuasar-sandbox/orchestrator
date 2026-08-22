@@ -41,7 +41,6 @@ package builder
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -115,8 +114,11 @@ const (
 
 func (p *buildPipeline) run() (res Result) {
 	s := p.spec
-	p.ctx, p.cancel = context.WithTimeout(context.Background(),
-		time.Duration(s.Timeouts.TotalSec)*time.Second)
+	if s.Timeouts.AbsoluteDeadlineUnixNano > 0 {
+		p.ctx, p.cancel = context.WithDeadline(context.Background(), time.Unix(0, s.Timeouts.AbsoluteDeadlineUnixNano))
+	} else {
+		p.ctx, p.cancel = context.WithTimeout(context.Background(), time.Duration(s.Timeouts.TotalSec)*time.Second)
+	}
 	defer p.cancel()
 	p.out = newBuildJournal(s.RunID, s.BuildID)
 	defer p.out.Close()
@@ -229,62 +231,20 @@ func (p *buildPipeline) resolveBase() error {
 	case s.FromTemplateKind == "img":
 		p.baseRef = s.FromTemplateRef
 		return nil
-	default: // snp: the snapshot.cfg names the base image + overlay diff + start/ready
-		args := []string{"info", "--json", "--manifest-config", s.Paths.ManifestConfig}
-		args = appendRefLocationArgs(args, s.RefLocations)
-		args = append(args, s.FromTemplateRef)
-		out, err := p.hostCmdEnv(s.Env, p.spec.Paths.SandboxCtl, args...)
-		if err != nil {
-			return fmt.Errorf("read base template cfg: %w", err)
+	default: // snp: run-builder retained the only parsed root SnapshotCfg
+		prepared := s.SnapshotPreparation
+		if prepared == nil || prepared.BaseRef == "" {
+			return fmt.Errorf("base template %s: task-local snapshot preparation is missing", s.FromTemplateRef)
 		}
-		baseRef, overlayBase, overlayBaseFromRefs, meta, err := parseTemplateDisk(out)
-		if err != nil {
-			return fmt.Errorf("base template %s: %w", s.FromTemplateRef, err)
-		}
-		p.baseRef = baseRef
-		p.overlayBase = overlayBase
-		p.overlayBaseFromRefs = overlayBaseFromRefs
+		p.baseRef = prepared.BaseRef
+		p.overlayBase = prepared.OverlayBase
+		p.overlayBaseFromRefs = append([]string(nil), prepared.OverlayBaseFromRefs...)
 		if p.profile == types.ProfileE2B && p.startCmd == "" {
-			p.startCmd = meta["e2b.start_cmd"]
+			p.startCmd = prepared.StartCmd
 		}
 		if p.profile == types.ProfileE2B && p.readyCmd == "" {
-			p.readyCmd = meta["e2b.ready_cmd"]
+			p.readyCmd = prepared.ReadyCmd
 		}
 		return nil
 	}
-}
-
-// parseTemplateDisk extracts a base template's disk layout from its
-// `sandbox-ctl info --json` (the snapshot.cfg, §3.4): the erofs base image
-// (boot.root.base_ref) AND the accumulated overlay (boot.root.overlay) — the
-// read-only lower a fromTemplate cold-start MUST stack under its fresh writable
-// overlay, or the template's filesystem is lost. The overlay's captured top
-// (overlay.base) and its lower chain (overlay.base_from_refs) remain an explicit
-// top ref plus top-to-bottom array. info --json
-// re-emits restore.SnapshotCfg by Go field name, hence the BaseRef / Overlay /
-// Base / BaseFromRefs JSON keys.
-func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, overlayBaseFromRefs []string, meta map[string]string, err error) {
-	var cfg struct {
-		Metadata map[string]string `json:"Metadata"`
-		Boot     struct {
-			Root struct {
-				BaseRef string `json:"BaseRef"`
-				Overlay *struct {
-					Base         string   `json:"Base"`
-					BaseFromRefs []string `json:"BaseFromRefs"`
-				} `json:"Overlay"`
-			} `json:"Root"`
-		} `json:"Boot"`
-	}
-	if err := json.Unmarshal(infoJSON, &cfg); err != nil {
-		return "", "", nil, nil, fmt.Errorf("parse template cfg: %w", err)
-	}
-	if cfg.Boot.Root.BaseRef == "" {
-		return "", "", nil, nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
-	}
-	if ov := cfg.Boot.Root.Overlay; ov != nil {
-		overlayBase = ov.Base
-		overlayBaseFromRefs = append([]string(nil), ov.BaseFromRefs...)
-	}
-	return cfg.Boot.Root.BaseRef, overlayBase, overlayBaseFromRefs, cfg.Metadata, nil
 }

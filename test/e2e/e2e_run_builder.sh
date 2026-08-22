@@ -969,9 +969,17 @@ code=$(req POST "/v2/templates/$B3_TID/builds/$B3_BID" "$AK" \
 wait_ready "$B3_TID" "$B3_BID" B3
 B3_PERSIST="$PERSIST"
 case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-snp-…)";; esac
+B3_RUN_ID=$(build_run_id "$B3_BID")
+[ -n "$B3_RUN_ID" ] || fail "B3 ready record lost its run id"
+journalctl --no-pager -o cat -u "sandbox-builder@$B3_RUN_ID.service" >"$WORK/b3-builder.journal" 2>&1 || true
+B3_ROOT_READS=$(grep -F -c 'build task snapshot prepared' "$WORK/b3-builder.journal" || true)
+[ "$B3_ROOT_READS" = "1" ] \
+    || { cat "$WORK/b3-builder.journal"; fail "B3 task root snapshot.cfg read count=$B3_ROOT_READS (want 1)"; }
+grep -F -q 'task_snapshot_ref_count' "$WORK/b3-builder.journal" \
+    || { cat "$WORK/b3-builder.journal"; fail "B3 task snapshot ref-count instrumentation missing"; }
 # ready is only reachable if: the RUN saw B2's marker (base extraction worked)
 # AND the inherited startCmd/readyCmd ran on the new template VM.
-echo "==> PASS: B3 ready → $B3_PERSIST (base-image extraction + start/ready inheritance)"
+echo "==> PASS: B3 ready → $B3_PERSIST (one task-local root cfg read; base-image extraction + start/ready inheritance)"
 
 # ---- B4: COPY build context via files endpoint + presigned direct upload ----
 # Acts as the e2b client: GET the files endpoint (present=false) → PUT the

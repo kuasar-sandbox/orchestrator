@@ -389,9 +389,6 @@ func TestValidateSandboxPrepareSummaryDiscardsPartiallyParsedNetwork(t *testing.
 func TestSandboxTaskBootstrapUsesExactRunAndDoesNoArtifactIO(t *testing.T) {
 	cfg := &config.Config{ManifestConfig: "manifest.yaml"}
 	o := testOrchCfg(t, cfg)
-	o.snapshotInspector = func(context.Context, string, string) (snapshotDescription, error) {
-		panic("sandbox task bootstrap performed conductor snapshot I/O")
-	}
 	manifestKey := strings.Repeat("7", 64)
 	rootRef := "manifest://" + strings.Repeat("8", 64)
 	sb := &types.Sandbox{

@@ -150,3 +150,15 @@ func (o *Orchestrator) waitBuildRecoveryReady(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+func (o *Orchestrator) buildRecoveryReadyNow() bool {
+	if o.buildRecoveryReady == nil {
+		return true
+	}
+	select {
+	case <-o.buildRecoveryReady:
+		return true
+	default:
+		return false
+	}
+}
