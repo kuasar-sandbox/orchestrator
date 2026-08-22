@@ -118,6 +118,10 @@ func runBuilder(args []string, log *slog.Logger) error {
 
 	taskCtx := ctx
 	cancelDeadline := func() {}
+	// workCtx stops before taskCtx so every preparation/phase failure still has
+	// a bounded tail in which the exact-run result can be durably reported.
+	workCtx := ctx
+	cancelWork := func() {}
 	deadlineUnixNano := buildTaskAbsoluteDeadline(bootstrap)
 	if deadlineUnixNano > 0 {
 		deadline := time.Unix(0, deadlineUnixNano)
@@ -125,16 +129,18 @@ func runBuilder(args []string, log *slog.Logger) error {
 			return fmt.Errorf("build task bootstrap deadline has expired")
 		}
 		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+		workCtx, cancelWork = context.WithDeadline(taskCtx, builder.PreResultDeadline(deadline, time.Now()))
 	} else if bootstrap.Prepare != nil {
 		return fmt.Errorf("build task snapshot bootstrap has no absolute deadline")
 	}
 	defer cancelDeadline()
+	defer cancelWork()
 
 	spec := bootstrap.Final
 	var prepared *tasksnapshot.Result
 	var localPreparation *configsock.BuildSnapshotPreparation
 	if bootstrap.Prepare != nil {
-		prepared, err = tasksnapshot.Prepare(taskCtx, *bootstrap.Prepare)
+		prepared, err = tasksnapshot.Prepare(workCtx, *bootstrap.Prepare)
 		if err == nil {
 			localPreparation, err = buildSnapshotPreparation(prepared.RootCfg)
 		}
@@ -143,7 +149,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 				"task_snapshot_prepare_duration", prepared.PrepareDuration,
 				"task_snapshot_cfg_read_duration", prepared.ConfigReadDuration,
 				"task_snapshot_ref_count", prepared.Summary.RequiredRefCount)
-			err = retryBuildConfigSocket(taskCtx, log, "build prepare", func(callCtx context.Context) error {
+			err = retryBuildConfigSocket(workCtx, log, "build prepare", func(callCtx context.Context) error {
 				var callErr error
 				spec, callErr = configsock.CompleteBuildPrepare(callCtx, *socket, bid, *runID, prepared.Summary)
 				return callErr
@@ -181,11 +187,11 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 
 	reportPhase := func(phase, sandboxID, state string) error {
-		return retryBuildConfigSocket(taskCtx, log, "phase", func(callCtx context.Context) error {
+		return retryBuildConfigSocket(workCtx, log, "phase", func(callCtx context.Context) error {
 			return configsock.PostBuildPhaseContext(callCtx, *socket, *runID, bid, phase, sandboxID, state)
 		})
 	}
-	res := builder.Run(taskCtx, spec, vmmCgroup, reportPhase, log)
+	res := builder.Run(workCtx, spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
 		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,

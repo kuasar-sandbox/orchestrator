@@ -9,7 +9,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
@@ -124,6 +126,18 @@ func TestBuildTaskAbsoluteDeadlineCoversFastAndSnapshotPaths(t *testing.T) {
 		Final:   &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{AbsoluteDeadlineUnixNano: 33}},
 	}); got != 22 {
 		t.Fatalf("snapshot path deadline = %d, want 22", got)
+	}
+}
+
+func TestBuildTaskWorkDeadlineReservesFinalResultTail(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	absolute := now.Add(time.Minute)
+	if got, want := builder.PreResultDeadline(absolute, now), absolute.Add(-5*time.Second); !got.Equal(want) {
+		t.Fatalf("work deadline = %v, want %v", got, want)
+	}
+	shortAbsolute := now.Add(4 * time.Second)
+	if got, want := builder.PreResultDeadline(shortAbsolute, now), now.Add(2*time.Second); !got.Equal(want) {
+		t.Fatalf("short work deadline = %v, want %v", got, want)
 	}
 }
 

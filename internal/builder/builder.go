@@ -95,9 +95,9 @@ type buildPipeline struct {
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
 
-// The conductor's absolute deadline includes cleanup headroom. Reserve a
-// bounded tail inside that same deadline so run-builder can durably report a
-// pipeline timeout instead of losing the result to an already-canceled RPC.
+// The conductor's absolute execution deadline includes durable reporting (and
+// excludes its separately bounded cleanup). Reserve a tail inside that same
+// deadline so run-builder can report a work timeout before the RPC is canceled.
 const buildResultReportGrace = 5 * time.Second
 
 // Guest-side paths for the flatten-ctl TLS config (projected via sandbox YAML
@@ -191,7 +191,7 @@ func buildPipelineContext(parent context.Context, timeouts configsock.BuildTimeo
 		parent = context.Background()
 	}
 	if timeouts.AbsoluteDeadlineUnixNano > 0 {
-		deadline := buildPipelineDeadline(
+		deadline := PreResultDeadline(
 			time.Unix(0, timeouts.AbsoluteDeadlineUnixNano), time.Now(),
 		)
 		return context.WithDeadline(parent, deadline)
@@ -199,7 +199,11 @@ func buildPipelineContext(parent context.Context, timeouts configsock.BuildTimeo
 	return context.WithTimeout(parent, time.Duration(timeouts.TotalSec)*time.Second)
 }
 
-func buildPipelineDeadline(absolute, now time.Time) time.Time {
+// PreResultDeadline reserves a bounded tail inside absolute for the task's
+// durable result report. Callers use the returned deadline for snapshot/host
+// preparation, phase reporting, and pipeline execution; only the final result
+// POST may consume the remaining tail.
+func PreResultDeadline(absolute, now time.Time) time.Time {
 	remaining := absolute.Sub(now)
 	if remaining <= 0 {
 		return absolute
