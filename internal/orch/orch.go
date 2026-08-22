@@ -532,6 +532,9 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if preparation == nil {
 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
+	if preparation.RestoreRef != "" {
+		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation)
+	}
 	prepareStarted := time.Now()
 	prepareLogged := false
 	defer func() {
@@ -1521,52 +1524,44 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 	return cloneSandbox(current), nil
 }
 
-// snapInfo is the config the orchestrator inherits from a restore snapshot: the
-// frozen capacity (the runtime pins it) and the logical network (the
-// kuasar-sandbox.network key the orchestrator injected into the snapshot's metadata),
-// used to fill create-config network fields left unset (point 7).
-type snapInfo struct {
-	Network  sandboxcfg.NetworkSpec
-	Capacity rtconfig.CapacityConfig
-}
-
 // launchPreparation contains every pure, fallible input needed after launch
 // acceptance. It is built before route publication, network attach, resource
 // controller admission, cgroup creation, or runner assignment.
 type launchPreparation struct {
-	Spec      sandboxcfg.SandboxSpec
-	Network   sandboxcfg.NetworkSpec
-	Resources rtconfig.ResourcesConfig
+	Spec       sandboxcfg.SandboxSpec
+	RestoreRef string
+	Network    sandboxcfg.NetworkSpec
+	Resources  rtconfig.ResourcesConfig
 }
 
 func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*launchPreparation, error) {
 	if sb == nil {
 		return nil, errors.New("orch: sandbox launch preflight requires a sandbox")
 	}
-	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
-	var snapshotCapacity *rtconfig.CapacityConfig
-	var snapshotNetwork sandboxcfg.NetworkSpec
-	if restoreRef != "" {
-		snapshot, err := o.snapshotConfig(ctx, sb, restoreRef)
-		if err != nil {
-			return nil, err
-		}
-		snapshotCapacity = &snapshot.Capacity
-		snapshotNetwork = snapshot.Network
-	}
 	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
 	if err != nil {
 		return nil, err
 	}
+	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
 	if restoreRef != "" {
-		spec.Network = sandboxcfg.MergeNetwork(snapshotNetwork, spec.Network)
+		// Snapshot content is intentionally unavailable during synchronous
+		// admission. Request-owned fields and immutable node defaults are still
+		// checked here; inherited fields and capacity arrive asynchronously from
+		// the exact runner's task-local root reader.
+		dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
+		if spec.Resource.Startup != nil && !dynamic {
+			return nil, fmt.Errorf("%w: %s.startup requires dynamic resource control", api.ErrBadRequest, sandboxcfg.NsResource)
+		}
+		if _, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname); err != nil {
+			return nil, err
+		}
+		return &launchPreparation{Spec: spec, RestoreRef: restoreRef}, nil
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
 		Node:                     o.cfg.Sandbox.Resources.Policy(),
 		Patch:                    spec.Resource,
-		Restore:                  restoreRef != "",
-		SnapshotCapacity:         snapshotCapacity,
+		Restore:                  false,
 		Dynamic:                  dynamic,
 		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
 	})
@@ -1630,31 +1625,6 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
 		return cfg, fmt.Errorf("snapshot config parse %q: %w", ref, err)
 	}
 	return cfg, nil
-}
-
-// snapshotConfig reads resources.capacity + logical network from snapshot.cfg.
-// Capacity is mandatory for every managed restore; network metadata retains its
-// historical best-effort behavior and is independently overlaid by request data.
-func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) (snapInfo, error) {
-	var info snapInfo
-	inspect := o.inspectSnapshotConfig
-	if o.snapshotInspector != nil {
-		inspect = o.snapshotInspector
-	}
-	cfg, err := inspect(ctx, sb.ManifestKey, ref)
-	if err != nil {
-		return info, err
-	}
-	info.Capacity = rtconfig.CapacityConfig{
-		CPU: cfg.Resources.Capacity.CPU, Memory: cfg.Resources.Capacity.Memory,
-	}
-	if info.Capacity.CPU <= 0 || info.Capacity.Memory == "" {
-		return snapInfo{}, fmt.Errorf("snapshot config %q has no usable resources.capacity", ref)
-	}
-	if nraw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork]); nraw != "" {
-		_ = json.Unmarshal([]byte(nraw), &info.Network) // best-effort; malformed -> zero network
-	}
-	return info, nil
 }
 
 // --- configsock.Provider ---
@@ -1730,9 +1700,9 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	})
 }
 
-// LaunchSpecFor resolves "sandbox:<sid>" to the LaunchSpec the launcher
-// exec-replaces into. The secret manifest key rides in LaunchSpec.Env; the bulky
-// non-secret config is the file referenced by the args.
+// LaunchSpecFor is retained as a pure compatibility helper while the builder
+// still uses the older task plane. Managed sandbox runners use the exact-run
+// bootstrap methods below. This method never opens snapshot artifacts.
 func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*configsock.LaunchSpec, string, bool, error) {
 	kind, id, found := strings.Cut(configID, ":")
 	if !found {
@@ -1763,8 +1733,145 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	// The fully resolved network was already rendered by launch before the unit
-	// requests this spec. LaunchSpec only needs Params for restore/connect args.
+	locations, err := o.singleRefLocations(sandboxcfg.RestoreRefFor(sb, tmpl))
+	if err != nil {
+		return nil, "", false, err
+	}
+	spec := o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
+	spec.Env = sandboxTaskEnv(sb)
+	return spec, sb.PidFile(), true, nil
+}
+
+// SandboxTaskAuth implements the non-secret half of task bootstrap. The store
+// query selects only run_dir and exact ownership columns; no tenant credential
+// is decrypted before SO_PEERCRED and pidfile authentication succeeds.
+func (o *Orchestrator) SandboxTaskAuth(ctx context.Context, sandboxID, runID string) (configsock.SandboxTaskAuth, bool, error) {
+	attempt, ok := o.launches.Lookup(sandboxID)
+	if !ok || attempt.RunID() != runID {
+		return configsock.SandboxTaskAuth{}, false, nil
+	}
+	runDir, found, err := o.st.StartingTaskIdentity(ctx, sandboxID, runID)
+	if err != nil || !found {
+		return configsock.SandboxTaskAuth{}, found, err
+	}
+	return configsock.SandboxTaskAuth{PidFile: filepath.Join(runDir, sandboxID+".pid")}, true, nil
+}
+
+// SandboxTaskSpecFor is called by configsock only after exact-run peer
+// authentication. Reading the durable row here may decrypt MANIFEST_KEY solely
+// for delivery into this one tenant-bound task process.
+func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID string) (*configsock.SandboxTaskSpec, bool, error) {
+	attempt, ok := o.launches.Lookup(sandboxID)
+	if !ok || attempt.RunID() != runID {
+		return nil, false, nil
+	}
+	sb, err := o.st.Get(ctx, sandboxID)
+	if err != nil || sb == nil {
+		return nil, false, err
+	}
+	if sb.State != types.StateStarting || sb.RunID != runID {
+		return nil, false, nil
+	}
+	tmpl, err := types.ParseTemplateID(sb.TemplateID)
+	if err != nil {
+		return nil, false, err
+	}
+	cfgSpec, err := sandboxcfg.ParseSpec(sb.Metadata)
+	if err != nil {
+		return nil, false, err
+	}
+	response := &configsock.SandboxTaskSpec{
+		SandboxID: sandboxID,
+		RunID:     runID,
+		Workdir:   sb.RunDir,
+		Env:       sandboxTaskEnv(sb),
+	}
+	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
+	if restoreRef == "" {
+		locations, err := o.singleRefLocations(tmpl.Ref)
+		if err != nil {
+			return nil, false, err
+		}
+		response.Final = o.sandboxFinalLaunchSpec(sb, tmpl, cfgSpec, locations)
+		return response, true, nil
+	}
+	deadline := attempt.Deadline()
+	if deadline.IsZero() {
+		return nil, false, errors.New("orch: sandbox task launch deadline is not initialized")
+	}
+	manifestConfig := o.cfg.ManifestConfig
+	if manifestConfig != "" && !filepath.IsAbs(manifestConfig) {
+		manifestConfig, err = filepath.Abs(manifestConfig)
+		if err != nil {
+			return nil, false, fmt.Errorf("orch: absolute manifest config path: %w", err)
+		}
+	}
+	taskRootRef, err := normalizeSandboxTaskRootRef(restoreRef, sb.RunDir)
+	if err != nil {
+		return nil, false, err
+	}
+	response.Prepare = &configsock.SnapshotPrepareSpec{
+		RootRef:                  taskRootRef,
+		ManifestConfig:           manifestConfig,
+		RefLocationParent:        o.cfg.Checkpoint.Remote.RefLocationParent,
+		RelativeDir:              sb.RunDir,
+		MaxRefs:                  maxRequiredSnapshotRefs,
+		AbsoluteDeadlineUnixNano: deadline.UnixNano(),
+	}
+	return response, true, nil
+}
+
+func normalizeSandboxTaskRootRef(raw, relativeDir string) (string, error) {
+	if strings.HasPrefix(raw, "manifest://") || strings.HasPrefix(raw, "file://") {
+		return raw, nil
+	}
+	if filepath.IsAbs(raw) {
+		return filepath.Clean(raw), nil
+	}
+	if !filepath.IsAbs(relativeDir) {
+		return "", fmt.Errorf("orch: relative local snapshot root requires an absolute sandbox run directory")
+	}
+	return filepath.Clean(filepath.Join(relativeDir, raw)), nil
+}
+
+func sandboxTaskEnv(sb *types.Sandbox) map[string]string {
+	return map[string]string{
+		"MANIFEST_KEY":      sb.ManifestKey,
+		"KUASAR_RUN_ID":     sb.RunID,
+		"KUASAR_SANDBOX_ID": sb.ID,
+	}
+}
+
+func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+	attempt, ok := o.launches.Lookup(sandboxID)
+	if !ok || attempt.RunID() != runID {
+		return nil, configsock.RejectSnapshotPrepare(errLaunchOwnershipLost)
+	}
+	replay, err := attempt.SubmitPrepare(runID, summary)
+	if err != nil {
+		return nil, configsock.RejectSnapshotPrepare(err)
+	}
+	if replay {
+		o.log.Info("sandbox task snapshot prepare replay", "sid", sandboxID, "run_id", runID,
+			"task_snapshot_prepare_replay_total", 1)
+	}
+	return attempt.WaitFinalSpec(ctx)
+}
+
+func (o *Orchestrator) singleRefLocations(raw string) (map[string]string, error) {
+	locations := map[string]string{}
+	if raw == "" {
+		return locations, nil
+	}
+	if err := o.addRefLocation(locations, raw); err != nil {
+		return nil, err
+	}
+	return locations, nil
+}
+
+func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.TemplateID, cfgSpec sandboxcfg.SandboxSpec, locations map[string]string) *configsock.LaunchSpec {
+	// The fully resolved network was already rendered by the unique launch
+	// worker. This pure builder only supplies restore/connect CLI arguments.
 	p := o.sandboxParams(sb, tmpl, cfgSpec, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{})
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
@@ -1782,10 +1889,6 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		"--stderr-to", "journald=" + configsock.RunnerLogTag,
 		"--console", "journald=" + configsock.ConsoleTag,
 	}
-	locations, err := o.sandboxRefLocations(ctx, sb, tmpl)
-	if err != nil {
-		return nil, "", false, fmt.Errorf("sandbox %s ref locations: %w", sid, err)
-	}
 	args = appendRefLocationArgs(args, locations)
 	if r := p.RestoreRef(); r != "" {
 		args = append(args, "--restore", r)
@@ -1793,17 +1896,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)
 	}
-	spec := &configsock.LaunchSpec{
+	return &configsock.LaunchSpec{
 		Exec:    o.cfg.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
-		Env: map[string]string{
-			"MANIFEST_KEY":      sb.ManifestKey,
-			"KUASAR_RUN_ID":     sb.RunID,
-			"KUASAR_SANDBOX_ID": sb.ID,
-		},
 	}
-	return spec, sb.PidFile(), true, nil
 }
 
 // --- reaper / reconcile ---

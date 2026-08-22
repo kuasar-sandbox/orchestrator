@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,13 +27,47 @@ type stubProvider struct {
 	buildSpecErr  error
 	resultErr     error
 	phaseErr      error
+	sandboxAuth   SandboxTaskAuth
+	bootstrapHits *atomic.Int32
+	prepareHits   *atomic.Int32
+	prepareErr    error
 }
 
-func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, string, bool, error) {
-	if id != "sandbox:x" {
-		return nil, "", false, nil
+func (s stubProvider) SandboxTaskAuth(_ context.Context, sandboxID, runID string) (SandboxTaskAuth, bool, error) {
+	if sandboxID != "x" || runID != "sr-test" {
+		return SandboxTaskAuth{}, false, nil
 	}
-	return &LaunchSpec{Exec: "/bin/true", Args: []string{"a"}}, s.pidFile, true, nil
+	auth := s.sandboxAuth
+	if auth.PidFile == "" {
+		auth.PidFile = s.pidFile
+	}
+	return auth, true, nil
+}
+
+func (s stubProvider) SandboxTaskSpecFor(_ context.Context, sandboxID, runID string) (*SandboxTaskSpec, bool, error) {
+	if s.bootstrapHits != nil {
+		s.bootstrapHits.Add(1)
+	}
+	if sandboxID != "x" || runID != "sr-test" {
+		return nil, false, nil
+	}
+	return &SandboxTaskSpec{
+		SandboxID: sandboxID, RunID: runID,
+		Final: &LaunchSpec{Exec: "/bin/true", Args: []string{"run"}},
+	}, true, nil
+}
+
+func (s stubProvider) CompleteSandboxPrepare(_ context.Context, sandboxID, runID string, _ SnapshotPrepareSummary) (*LaunchSpec, error) {
+	if s.prepareHits != nil {
+		s.prepareHits.Add(1)
+	}
+	if s.prepareErr != nil {
+		return nil, s.prepareErr
+	}
+	if sandboxID != "x" || runID != "sr-test" {
+		return nil, RejectSnapshotPrepare(os.ErrNotExist)
+	}
+	return &LaunchSpec{Exec: "/bin/true", Args: []string{"run"}}, nil
 }
 
 func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, string, bool, error) {
@@ -202,16 +238,64 @@ func TestTaskPlane(t *testing.T) {
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
 	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
 
-	spec, err := FetchLaunchSpec(sock, "sandbox:x")
-	if err != nil || spec.Exec != "/bin/true" {
+	spec, err := FetchSandboxTaskSpec(context.Background(), sock, "x", "sr-test")
+	if err != nil || spec.Final == nil || spec.Final.Exec != "/bin/true" {
 		t.Fatalf("happy path: spec=%+v err=%v", spec, err)
 	}
-	if _, err := FetchLaunchSpec(sock, "nope"); err == nil {
+	if _, err := FetchSandboxTaskSpec(context.Background(), sock, "nope", "sr-test"); err == nil {
 		t.Fatal("unknown id should error")
 	}
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1)) // pidfile no longer matches peer
-	if _, err := FetchLaunchSpec(sock, "sandbox:x"); err == nil || err.Error() != "not authorized" {
+	if _, err := FetchSandboxTaskSpec(context.Background(), sock, "x", "sr-test"); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("wrong pid should be not authorized, got %v", err)
+	}
+}
+
+func TestSandboxBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "task.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	var secretCalls atomic.Int32
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, bootstrapHits: &secretCalls}})
+	if _, err := FetchSandboxTaskSpec(context.Background(), sock, "x", "sr-test"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized bootstrap error = %v", err)
+	}
+	if got := secretCalls.Load(); got != 0 {
+		t.Fatalf("secret-bearing provider calls = %d, want 0", got)
+	}
+}
+
+func TestSandboxPrepareAuthenticatesBeforeCompletionProvider(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "task.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	var completionCalls atomic.Int32
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, prepareHits: &completionCalls}})
+	summary := SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
+	if _, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", summary); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("unauthorized completion error = %v", err)
+	}
+	if got := completionCalls.Load(); got != 0 {
+		t.Fatalf("completion provider calls = %d, want 0", got)
+	}
+
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	final, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", summary)
+	if err != nil || final == nil || final.Exec != "/bin/true" {
+		t.Fatalf("authorized completion = %+v, %v", final, err)
+	}
+	if got := completionCalls.Load(); got != 1 {
+		t.Fatalf("completion provider calls = %d, want 1", got)
+	}
+}
+
+func TestSandboxPrepareConflictIsDefinitive(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "task.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, prepareErr: RejectSnapshotPrepare(errors.New("conflicting replay")),
+	}})
+	_, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", SnapshotPrepareSummary{})
+	if err == nil || IsRetryableError(err) || err.Error() != "conflicting replay" {
+		t.Fatalf("conflict error = %v, retryable=%t", err, IsRetryableError(err))
 	}
 }
 

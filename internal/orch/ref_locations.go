@@ -10,7 +10,6 @@ import (
 	"sort"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -28,13 +27,6 @@ func (o *Orchestrator) templateRefLocations(ctx context.Context, manifestKey str
 		return nil, err
 	}
 	return locations, nil
-}
-
-func (o *Orchestrator) sandboxRefLocations(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (map[string]string, error) {
-	if restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl); restoreRef != "" {
-		return o.snapshotRefLocations(ctx, sb.ManifestKey, restoreRef)
-	}
-	return o.templateRefLocations(ctx, sb.ManifestKey, tmpl)
 }
 
 // snapshotRefLocations walks only snapshot parent refs. Disk refs are scanned

@@ -56,7 +56,8 @@ import (
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
 // never uses); every other path falls through to the api handler.
 const (
-	PathTaskLaunchSpec             = "/internal/task/launchspec"
+	PathTaskSandboxBootstrap       = "/internal/task/sandbox/bootstrap"
+	PathTaskSandboxPrepare         = "/internal/task/sandbox/prepare"
 	PathTaskBuildSpec              = "/internal/task/buildspec"
 	PathRunAssignment              = "/internal/run/assignment"
 	PathRunBuildResult             = "/internal/run/build-result"
@@ -166,7 +167,12 @@ type LaunchSpec struct {
 // Provider resolves a config-id to its LaunchSpec + the pidfile used to
 // authenticate the caller (SO_PEERCRED). ok=false means the id is unknown.
 type Provider interface {
-	LaunchSpecFor(ctx context.Context, configID string) (resp *LaunchSpec, pidFile string, ok bool, err error)
+	// SandboxTaskAuth returns only the non-secret pidfile identity for one exact
+	// active assignment. The server calls it before SandboxTaskSpecFor or
+	// CompleteSandboxPrepare so an unauthorized peer cannot trigger secret reads.
+	SandboxTaskAuth(ctx context.Context, sandboxID, runID string) (auth SandboxTaskAuth, ok bool, err error)
+	SandboxTaskSpecFor(ctx context.Context, sandboxID, runID string) (resp *SandboxTaskSpec, ok bool, err error)
+	CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary SnapshotPrepareSummary) (*LaunchSpec, error)
 	// BuildSpecFor resolves "build:<bid>" to the build pipeline spec the
 	// run-builder orchestrates (it does NOT exec-replace — the spec is a
 	// work order, not a launch).
@@ -434,7 +440,8 @@ func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 
 func (s *Server) router() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+PathTaskLaunchSpec, s.handleTask)
+	mux.HandleFunc("POST "+PathTaskSandboxBootstrap, s.handleSandboxBootstrap)
+	mux.HandleFunc("POST "+PathTaskSandboxPrepare, s.handleSandboxPrepare)
 	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
@@ -461,35 +468,84 @@ func (s *Server) router() http.Handler {
 
 // --- task plane ---
 
-func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSandboxBootstrap(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerFrom(r.Context())
 	if !ok {
-		writeJSON(w, http.StatusForbidden, &LaunchSpec{Error: "no peer credentials"})
+		writeJSON(w, http.StatusForbidden, &SandboxTaskSpec{Error: "no peer credentials"})
 		return
 	}
-	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ConfigID == "" {
-		writeJSON(w, http.StatusBadRequest, &LaunchSpec{Error: "bad request"})
+	var req SandboxTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SandboxID == "" || req.RunID == "" || req.Version != SnapshotPrepareSchemaVersion {
+		writeJSON(w, http.StatusBadRequest, &SandboxTaskSpec{Error: "bad request"})
 		return
 	}
-	spec, pidFile, found, err := s.deps.Provider.LaunchSpecFor(r.Context(), req.ConfigID)
+	auth, found, err := s.deps.Provider.SandboxTaskAuth(r.Context(), req.SandboxID, req.RunID)
 	if err != nil {
-		s.log.Warn("configsock provider", "id", req.ConfigID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, &LaunchSpec{Error: "internal error"})
+		s.log.Warn("configsock sandbox auth provider", "sid", req.SandboxID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &SandboxTaskSpec{Error: "internal error"})
 		return
 	}
 	if !found {
-		writeJSON(w, http.StatusNotFound, &LaunchSpec{Error: "unknown task"})
+		writeJSON(w, http.StatusNotFound, &SandboxTaskSpec{Error: "unknown task"})
 		return
 	}
-	if !s.taskAuthed(req.ConfigID, pidFile, peer) {
-		writeJSON(w, http.StatusForbidden, &LaunchSpec{Error: "not authorized"})
+	if !s.taskAuthed("sandbox:"+req.SandboxID+":"+req.RunID, auth.PidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &SandboxTaskSpec{Error: "not authorized"})
+		return
+	}
+	// This provider may decrypt MANIFEST_KEY. It is deliberately unreachable
+	// until the exact-run peer identity above has succeeded.
+	spec, found, err := s.deps.Provider.SandboxTaskSpecFor(r.Context(), req.SandboxID, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock sandbox bootstrap provider", "sid", req.SandboxID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &SandboxTaskSpec{Error: "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &SandboxTaskSpec{Error: "unknown task"})
 		return
 	}
 	writeJSON(w, http.StatusOK, spec)
 }
 
-// handleBuildTask serves the build-spec plane: same auth as handleTask
+func (s *Server) handleSandboxPrepare(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &SnapshotPrepareResponse{Error: "no peer credentials"})
+		return
+	}
+	var req SnapshotPrepareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SandboxID == "" || req.RunID == "" {
+		writeJSON(w, http.StatusBadRequest, &SnapshotPrepareResponse{Error: "bad request"})
+		return
+	}
+	auth, found, err := s.deps.Provider.SandboxTaskAuth(r.Context(), req.SandboxID, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock sandbox prepare auth provider", "sid", req.SandboxID, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &SnapshotPrepareResponse{Error: "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &SnapshotPrepareResponse{Error: "unknown task"})
+		return
+	}
+	if !s.taskAuthed("sandbox-prepare:"+req.SandboxID+":"+req.RunID, auth.PidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &SnapshotPrepareResponse{Error: "not authorized"})
+		return
+	}
+	final, err := s.deps.Provider.CompleteSandboxPrepare(r.Context(), req.SandboxID, req.RunID, req.Summary)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if IsSnapshotPrepareRejection(err) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, &SnapshotPrepareResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &SnapshotPrepareResponse{Final: final})
+}
+
+// handleBuildTask serves the legacy build-spec plane
 // (SO_PEERCRED pid == the build's pidfile), different payload.
 func (s *Server) handleBuildTask(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerFrom(r.Context())

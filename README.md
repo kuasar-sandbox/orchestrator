@@ -37,7 +37,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `internal/{registry,router,placer}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权,export/import 扩展,ExecAccessToken 签发) |
 | `internal/proxy` `internal/proxyshm` `internal/routesync` | 数据面 L7 反代(service-addressed CONNECT,native exec gate),proxy master/worker 共享固定路由视图 + MMDS confidential heap(park/wake,世代清扫/fail closed),路由/node-link 同步协议(注册 + bookmark + typed command result) |
-| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key + Sandbox MMDS value + Builder admission status)/ plugin(proxy 注册 + 受控路由流)/ api,SO_PEERCRED 鉴权 |
+| `internal/configsock` | 本机控制 socket:task(exact-run sandbox bootstrap/prepare + BuildSpec)/ admin(manifest-key + Sandbox MMDS value + Builder admission status)/ plugin(proxy 注册 + 受控路由流)/ api,SO_PEERCRED + pidfile 鉴权 |
 | `internal/{apikey,secretbox,keys,regcreds}` | APISecret 派生与 api_key MAC,根凭据落盘 AES-GCM,Forward/Exec `kat1` 与数据面 token,ManifestKey 封装的镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys 凭据对) |
 | `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2 + exact route handler、external worker/master 本机查询、HTTP-over-UDS service relay、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |

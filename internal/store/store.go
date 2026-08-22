@@ -450,6 +450,45 @@ func (s *Store) SetStartingResources(ctx context.Context, id string, resources S
 	return sandboxUpdateChanged("set starting resources", id, result)
 }
 
+// SetStartingResourcesForRun transfers attached network ownership only to the
+// exact assigned starting runner. Restore launches bind a runner before task-
+// local snapshot preparation, so the older unassigned CAS is intentionally too
+// weak for their final host preparation.
+func (s *Store) SetStartingResourcesForRun(ctx context.Context, id, runID string, resources StartingResources) (bool, error) {
+	if runID == "" {
+		return false, fmt.Errorf("store: set starting resources sandbox %s: empty run id", id)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET floatingip=?, vswitch_port=?, inner_ip=?, port_mac=?
+		 WHERE id=? AND state=? AND run_id=? AND vswitch_port=''`,
+		resources.FloatingIP, resources.VswitchPort, resources.InnerIP, resources.PortMAC,
+		id, string(types.StateStarting), runID)
+	if err != nil {
+		return false, fmt.Errorf("store: set exact-run starting resources sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("set exact-run starting resources", id, result)
+}
+
+// StartingTaskIdentity reads only the non-secret identity used to authenticate
+// a sandbox task bootstrap. It deliberately does not select or decrypt tenant
+// credentials.
+func (s *Store) StartingTaskIdentity(ctx context.Context, id, runID string) (runDir string, found bool, err error) {
+	if id == "" || runID == "" {
+		return "", false, nil
+	}
+	err = s.db.QueryRowContext(ctx, `
+		SELECT run_dir FROM sandboxes
+		 WHERE id=? AND state=? AND run_id=?`, id, string(types.StateStarting), runID).Scan(&runDir)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: read starting task identity for sandbox %s: %w", id, err)
+	}
+	return runDir, true, nil
+}
+
 // BindStartingRunner is the runner-pool commit fence. It succeeds exactly once
 // while the accepted launch still owns an unassigned starting row.
 func (s *Store) BindStartingRunner(ctx context.Context, id, runID string) (bool, error) {

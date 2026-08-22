@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # e2e_runtask.sh — verify config/info CLI surfaces, then exercise the
-# run-sandbox handoff in a real delegated transient systemd unit without KVM.
+# exact-run run-sandbox bootstrap handoff in a delegated transient systemd unit
+# without KVM.
 #
 # The launcher case uses production cgroup preparation. It does not add an
 # environment variable or command-line bypass for the required ctl/vmm topology.
@@ -100,6 +101,7 @@ eval "exec \${READY_FD}>&-"
   echo "args=[\$*]"
   echo "cwd=\$PWD"
   echo "secret=[\${SECRET:-}]"
+  echo "manifest_key=[\${MANIFEST_KEY:-}]"
   echo "task_pidfile=[\${TASK_PIDFILE:-}]"
   echo "task_run_id=[\${TASK_RUN_ID:-}]"
   echo "task_sandbox_id=[\${TASK_SANDBOX_ID:-}]"
@@ -114,6 +116,8 @@ import json, os, socket, socketserver, sys, threading
 from http.server import BaseHTTPRequestHandler
 spec = {"exec": "$WORK/marker.sh", "args": ["run", "A", "B"],
         "workdir": "$WORK/wd", "env": {"SECRET": "s3cr3t"}}
+bootstrap = {"sandbox_id": "probe", "run_id": "$RUN_ID", "workdir": "$WORK/wd",
+             "env": {"MANIFEST_KEY": "task-authoritative-key"}, "final": spec}
 assignment = {"kind": "sandbox", "run_id": "$RUN_ID", "task_id": "probe"}
 try: os.unlink("$READY_SOCK")
 except FileNotFoundError: pass
@@ -140,12 +144,12 @@ class H(BaseHTTPRequestHandler):
         if n: self.rfile.read(n)
         if self.path == "/internal/run/assignment":
             body = json.dumps(assignment).encode()
-        elif self.path == "/internal/task/launchspec":
+        elif self.path == "/internal/task/sandbox/bootstrap":
             if not ready_connected.wait(2):
-                body = json.dumps({"error": "ready.sock was not connected before FetchLaunchSpec"}).encode()
+                body = json.dumps({"error": "ready.sock was not connected before bootstrap"}).encode()
             else:
                 with open("$ORDER_FILE", "a") as f: f.write("fetch\\n")
-                body = json.dumps(spec).encode()
+                body = json.dumps(bootstrap).encode()
         else:
             body = json.dumps(spec).encode()
         self.send_response(200)
@@ -174,6 +178,7 @@ systemd-run --quiet --unit="$UNIT" --service-type=exec \
     --property=Delegate=yes --property=KillMode=control-group \
     --setenv="TASK_PIDFILE=$PIDFILE" --setenv="TASK_CONFIG_SOCKET=$SOCK" \
     --setenv="TASK_RUN_ID=$RUN_ID" --setenv=TASK_SANDBOX_ID=legacy \
+    --setenv=MANIFEST_KEY=inherited-wrong-key \
     "$ORCH" run-sandbox
 for _ in $(seq 1 100); do [ -s "$OUTFILE" ] && break; sleep 0.1; done
 [ -s "$OUTFILE" ] || {
@@ -186,6 +191,8 @@ grep -Eq 'args=\[run --cgroup-path=fd=[0-9]+ --ready-fd=[0-9]+ A B\]' "$OUTFILE"
     || fail "injected cgroup/readiness descriptors or spec args not delivered"
 grep -q "cwd=$WORK/wd" "$OUTFILE" || fail "workdir not applied"
 grep -q 'secret=\[s3cr3t\]' "$OUTFILE" || fail "spec env not injected"
+grep -q 'manifest_key=\[task-authoritative-key\]' "$OUTFILE" \
+    || fail "task bootstrap MANIFEST_KEY did not override inherited value"
 grep -q 'task_pidfile=\[\]' "$OUTFILE" || fail "TASK_PIDFILE not stripped"
 grep -q 'task_run_id=\[\]' "$OUTFILE" || fail "TASK_RUN_ID not stripped"
 grep -q 'task_sandbox_id=\[\]' "$OUTFILE" || fail "TASK_SANDBOX_ID not stripped"
@@ -195,7 +202,7 @@ for _ in $(seq 1 50); do [ -f "$READY_WIRE" ] && break; sleep 0.1; done
 [ -f "$READY_WIRE" ] || fail "readiness connection did not reach EOF"
 printf 'control_ready\nready\n' > "$WORK/ready.expected"
 cmp -s "$WORK/ready.expected" "$READY_WIRE" || fail "readiness wire was not exact"
-[ "$(cat "$ORDER_FILE")" = $'connect\nfetch' ] || fail "LaunchSpec fetched before ready socket connect"
+[ "$(cat "$ORDER_FILE")" = $'connect\nfetch' ] || fail "bootstrap fetched before ready socket connect"
 
 RT_PID="$(tr -d '[:space:]' < "$PIDFILE")"
 TASK_PIDF="$(tr -d '[:space:]' < "$TASK_PIDFILE")"

@@ -276,8 +276,8 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 
 	waitForLauncherStart(t, started)
 	blocked, err := o.st.Get(ctx, targetID)
-	if err != nil || blocked == nil || blocked.State != types.StateStarting || blocked.RunID != "" || blocked.VswitchPort == "" {
-		t.Fatalf("imported row before launcher release = %+v, %v; want enriched pre-assignment starting", blocked, err)
+	if err != nil || blocked == nil || blocked.State != types.StateStarting || blocked.RunID != "" || blocked.VswitchPort != "" {
+		t.Fatalf("imported row before launcher release = %+v, %v; want unassigned starting without network ownership", blocked, err)
 	}
 	close(startGate)
 	waitForSandbox(t, o, ctx, targetID, func(sb *types.Sandbox) bool {
