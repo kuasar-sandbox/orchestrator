@@ -112,3 +112,17 @@ func TestBuildSnapshotPreparationRetainsRootDiskAndCommands(t *testing.T) {
 		t.Fatalf("snapshot preparation retained mutable cfg storage: %+v", got)
 	}
 }
+
+func TestBuildTaskAbsoluteDeadlineCoversFastAndSnapshotPaths(t *testing.T) {
+	if got := buildTaskAbsoluteDeadline(&configsock.BuildTaskSpec{
+		Final: &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{AbsoluteDeadlineUnixNano: 11}},
+	}); got != 11 {
+		t.Fatalf("fast path deadline = %d, want 11", got)
+	}
+	if got := buildTaskAbsoluteDeadline(&configsock.BuildTaskSpec{
+		Prepare: &configsock.SnapshotPrepareSpec{AbsoluteDeadlineUnixNano: 22},
+		Final:   &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{AbsoluteDeadlineUnixNano: 33}},
+	}); got != 22 {
+		t.Fatalf("snapshot path deadline = %d, want 22", got)
+	}
+}

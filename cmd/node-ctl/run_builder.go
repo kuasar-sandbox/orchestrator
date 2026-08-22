@@ -120,12 +120,15 @@ func runBuilder(args []string, log *slog.Logger) error {
 
 	taskCtx := ctx
 	cancelDeadline := func() {}
-	if bootstrap.Prepare != nil {
-		deadline := time.Unix(0, bootstrap.Prepare.AbsoluteDeadlineUnixNano)
-		if bootstrap.Prepare.AbsoluteDeadlineUnixNano <= 0 || !deadline.After(time.Now()) {
+	deadlineUnixNano := buildTaskAbsoluteDeadline(bootstrap)
+	if deadlineUnixNano > 0 {
+		deadline := time.Unix(0, deadlineUnixNano)
+		if !deadline.After(time.Now()) {
 			return fmt.Errorf("build task bootstrap deadline has expired")
 		}
 		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
+	} else if bootstrap.Prepare != nil {
+		return fmt.Errorf("build task snapshot bootstrap has no absolute deadline")
 	}
 	defer cancelDeadline()
 
@@ -196,6 +199,19 @@ func runBuilder(args []string, log *slog.Logger) error {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}
 	return nil
+}
+
+func buildTaskAbsoluteDeadline(task *configsock.BuildTaskSpec) int64 {
+	if task == nil {
+		return 0
+	}
+	if task.Prepare != nil {
+		return task.Prepare.AbsoluteDeadlineUnixNano
+	}
+	if task.Final != nil {
+		return task.Final.Timeouts.AbsoluteDeadlineUnixNano
+	}
+	return 0
 }
 
 func buildSnapshotPreparation(cfg *restore.SnapshotCfg) (*configsock.BuildSnapshotPreparation, error) {
