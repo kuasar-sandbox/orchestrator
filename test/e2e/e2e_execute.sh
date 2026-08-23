@@ -349,14 +349,14 @@ wait_resource_status() { # $1=sid, $2=expected status
     return 1
 }
 
-assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup|-, $4=controller|-, $5=floor(default 256MiB), $6=deflate(default true)|-
-    local floor_memory="${5:-256MiB}"
+assert_resolved_resource_yaml() { # $1=config, $2=capacity, $3=startup, $4=controller|-, $5=headroom(default 256MiB), $6=deflate(default true)|-
+    local headroom_memory="${5:-256MiB}"
     local deflate="${6:-true}"
-    python3 - "$1" "$2" "$3" "$4" "$floor_memory" "$deflate" <<'PY'
+    python3 - "$1" "$2" "$3" "$4" "$headroom_memory" "$deflate" <<'PY'
 import re
 import sys
 
-path, capacity_memory, startup_memory, controller, floor_memory, deflate = sys.argv[1:]
+path, capacity_memory, startup_memory, controller, headroom_memory, deflate = sys.argv[1:]
 values = {}
 stack = []
 for raw in open(path, encoding="utf-8"):
@@ -397,7 +397,7 @@ def size_bytes(field, value):
 
 memory_expected = {
     "resources.capacity.memory": capacity_memory,
-    "resources.allocatable.memory": floor_memory,
+    "resources.allocatable.memory": headroom_memory,
     "resources.overhead.memory": "32MiB",
 }
 for key, want in memory_expected.items():
@@ -409,13 +409,11 @@ if deflate == "-":
         raise SystemExit(f"{path}: no-balloon config rendered deflate_on_oom: {values}")
 elif values.get("resources.allocatable.deflate_on_oom") != deflate:
     raise SystemExit(f"{path}: deflate_on_oom={values.get('resources.allocatable.deflate_on_oom')!r}, want {deflate!r}")
-if startup_memory == "-":
-    if any(key.startswith("resources.startup") for key in values):
-        raise SystemExit(f"{path}: static config rendered startup: {values}")
-else:
-    got = values.get("resources.startup.memory")
-    if size_bytes("resources.startup.memory", got) != size_bytes("resources.startup.memory", startup_memory):
-        raise SystemExit(f"{path}: startup={got!r}, want {startup_memory!r}")
+got = values.get("resources.startup.memory")
+if size_bytes("resources.startup.memory", got) != size_bytes("resources.startup.memory", startup_memory):
+    raise SystemExit(f"{path}: startup={got!r}, want {startup_memory!r}")
+if values.get("resources.watermark_high.ratio") != "0.875":
+    raise SystemExit(f"{path}: watermark_high.ratio={values.get('resources.watermark_high.ratio')!r}, want '0.875'")
 if controller == "-":
     if "resources.control.controller" in values:
         raise SystemExit(f"{path}: static config rendered controller: {values}")
@@ -428,11 +426,11 @@ for forbidden in ("resources.control.cgroup_path", "resources.watermark_high.mem
 PY
 }
 
-assert_resource_lease() { # $1=sid, $2=capacity bytes, $3=floor bytes, $4=startup bytes
+assert_resource_lease() { # $1=sid, $2=capacity bytes, $3=headroom bytes, $4=startup headroom
     python3 - "$WORK/sandbox-resource.sock" "$1" "$2" "$3" "$4" <<'PY'
 import hashlib, json, pathlib, sys
 
-socket, sid, capacity, floor, startup = sys.argv[1:]
+socket, sid, capacity, headroom, startup = sys.argv[1:]
 lease = pathlib.Path(socket + ".leases") / (hashlib.sha256(sid.encode()).hexdigest() + ".json")
 row = json.loads(lease.read_text())
 expected = {
@@ -440,7 +438,7 @@ expected = {
     "controller_socket": socket,
     "capacity_memory": int(capacity),
     "capacity_cpu_milli": 2000,
-    "floor_memory": int(floor),
+    "floor_memory": int(headroom),
     "floor_cpu_milli": 2000,
     "startup_memory": int(startup),
 }
@@ -1019,11 +1017,11 @@ done
 echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
 
 # ---- low-allocatable runner cgroup isolation regression --------------------
-# A snapshot restore preserves max(requested, snapshot-time allocatable), so the
-# snapshot template above cannot reproduce a 256 MiB startup floor. Build the
-# same OCI input as an image template (no startCmd), then cold boot it with the
-# complete 8 GiB / 256 MiB resource declaration from issue #152. These are
-# independent Build resources sized for the node-default phase VM and toolchain.
+# Restore admission uses BudgetAtSnapshot and intentionally ignores startup
+# headroom, so the snapshot template above cannot validate cold-start policy.
+# Build the same OCI input as an image template (no startCmd), then cold boot it
+# with the complete 8 GiB / 256 MiB resource declaration from issue #152. These
+# are independent Build resources sized for the node-default phase VM and toolchain.
 code=$(req POST /v3/templates "$AK" '{"name":"exec-low-cgroup","cpuCount":2,"memoryMB":6144}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "low-cgroup register=$code"; }
 LOW_TID=$(json_field "$WORK/resp.body" templateID)
@@ -1046,7 +1044,7 @@ case "$LOW_TEMPLATE" in e2b-img-*) : ;; *) fail "low-cgroup build produced $LOW_
 
 # A bare image lets the capacity<256MiB case validate a real KVM launch without
 # paying envd's steady workload. It carries no resource patch, so the create
-# request below proves inherited 256MiB floor normalization.
+# request below proves inherited 256MiB settled-headroom normalization.
 code=$(req POST /v3/templates "$AK" '{"name":"small-capacity","profile":"bare","cpuCount":2,"memoryMB":6144}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "small-capacity register=$code"; }
 SMALL_TID=$(json_field "$WORK/resp.body" templateID)
@@ -1104,7 +1102,7 @@ run_low_allocatable_case() { # $1=iteration
     LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
     [ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable[$iteration] startup took ${LOW_ELAPSED_MS}ms"
     wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable[$iteration] sandbox not running"
-    assert_resolved_resource_yaml "$WORK/run/$LOW_SID/$LOW_SID.yaml" 8GiB - - \
+    assert_resolved_resource_yaml "$WORK/run/$LOW_SID/$LOW_SID.yaml" 8GiB 8GiB - \
         || fail "low-allocatable[$iteration] static resolved resource YAML"
     LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
     [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
@@ -1119,8 +1117,6 @@ run_low_allocatable_case() { # $1=iteration
     if ! VMM_MEMBERS_ERROR=$(e2e_assert_vmm_cgroup_members /proc "$LOW_VMM_PROCS" 2>&1); then
         fail "low-allocatable[$iteration] $VMM_MEMBERS_ERROR"
     fi
-    [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")" = "234881024" ] \
-        || fail "vmm memory.high is not 224MiB"
     [ "$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.max")" = "8623489024" ] \
         || fail "vmm memory.max does not reflect 8GiB capacity + 32MiB overhead"
     [ "$(<"/sys/fs/cgroup$LOW_CG/ctl/memory.high")" = "max" ] \
@@ -1129,6 +1125,32 @@ run_low_allocatable_case() { # $1=iteration
     LOW_JOURNAL="$WORK/low-allocatable-$iteration.journal"
     wait_for_mem_report_progress "$LOW_UNIT" "$LOW_JOURNAL" \
         || fail "low-allocatable[$iteration] mem_report made no progress after a transient failure"
+
+    local LOW_VM_INFO="$WORK/low-allocatable-$iteration.vm-info.json"
+    curl --silent --show-error --fail --max-time 2 \
+        --unix-socket "$WORK/run/$LOW_SID/ch.sock" \
+        http://localhost/api/v1/vm.info >"$LOW_VM_INFO" \
+        || fail "low-allocatable[$iteration] vm.info"
+    python3 - "$LOW_VM_INFO" <<'PY' || fail "cold target=0 did not retain a CH balloon device"
+import json, sys
+info = json.load(open(sys.argv[1]))
+balloon = info.get("config", {}).get("balloon")
+if not isinstance(balloon, dict) or not isinstance(balloon.get("size"), int):
+    raise SystemExit(1)
+if not isinstance(info.get("memory_actual_size"), int):
+    raise SystemExit(1)
+PY
+
+    local LOW_HIGH="max"
+    for _ in $(seq 1 80); do
+        LOW_HIGH=$(<"/sys/fs/cgroup$LOW_CG/vmm/memory.high")
+        [ "$LOW_HIGH" != "max" ] && break
+        sleep 0.25
+    done
+    [[ "$LOW_HIGH" =~ ^[0-9]+$ ]] \
+        || fail "low-allocatable[$iteration] memory.high stayed deferred without a trusted report"
+    [ "$LOW_HIGH" -gt 0 ] && [ "$LOW_HIGH" -le 8623489024 ] \
+        || fail "low-allocatable[$iteration] memory.high=$LOW_HIGH outside (0,memory.max]"
 
     code=$(req DELETE "/sandboxes/$LOW_SID" "$AK"); [ "$code" = "204" ] || fail "delete low-allocatable[$iteration] sandbox=$code"
     for _ in $(seq 1 50); do
@@ -1155,11 +1177,10 @@ for LOW_ALLOC_ITERATION in $(seq 1 "$LOW_ALLOC_REPEATS"); do
 done
 echo "==> PASS: repeated 8GiB/256MiB startup $LOW_ALLOC_REPEATS times"
 
-# Keep the pre-existing low-allocatable cgroup check in static mode: its exact
-# 224 MiB memory.high assertion is the launch-time value. A live controller may
-# legitimately grant memory before envd reaches ready. With no sandbox left from
-# that check, restart against the same store and attach subsequent sandboxes to
-# the controller for the resource stats and restore coverage below.
+# Keep the low-headroom cgroup check in static mode so its high/balloon state is
+# driven only by the sandbox-local loop. With no sandbox left from that check,
+# restart against the same store and attach subsequent sandboxes to the
+# controller for reservation stats and restore coverage below.
 stop_orchestrator
 write_orchestrator_config unset controller
 start_orchestrator "$WORK/orch.log"
@@ -1212,7 +1233,7 @@ assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
 exec_through_connect "$DEFAULT_SID" "$DEFAULT_EXEC_TOKEN" "DEFAULT_RESUME_$RANDOM"
 code=$(req DELETE "/sandboxes/$DEFAULT_SID" "$AK")
 [ "$code" = "204" ] || fail "default-policy delete=$code"
-echo "==> PASS: default 2GiB capacity / 256MiB floor cold boot, envd, exec, pause/resume, YAML and lease inventory"
+echo "==> PASS: default 2GiB capacity / 256MiB headroom cold boot, envd, exec, pause/resume, YAML and lease inventory"
 
 SMALL_CREATE_BODY=$(python3 - "$SMALL_TEMPLATE" <<'PY'
 import json, sys
@@ -1234,14 +1255,14 @@ wait_sandbox_state "$SMALL_SID" running 600 || {
 }
 assert_resolved_resource_yaml "$WORK/run/$SMALL_SID/$SMALL_SID.yaml" \
     192MiB 192MiB "$WORK/sandbox-resource.sock" 192MiB - \
-    || fail "capacity<256MiB did not normalize inherited floor"
+    || fail "capacity<256MiB did not normalize inherited headroom"
 assert_resource_lease "$SMALL_SID" 201326592 201326592 201326592 \
     || fail "small-capacity lease did not match normalized YAML"
 SMALL_EXEC_TOKEN="$(issue_exec_session "$SMALL_SID" "$AK")" || fail "small-capacity exec session"
 exec_through_connect "$SMALL_SID" "$SMALL_EXEC_TOKEN" "SMALL_CAPACITY_$RANDOM"
 code=$(req DELETE "/sandboxes/$SMALL_SID" "$AK")
 [ "$code" = "204" ] || fail "small-capacity delete=$code"
-echo "==> PASS: real bare KVM launch normalized inherited 256MiB floor to 192MiB capacity"
+echo "==> PASS: real bare KVM launch normalized inherited 256MiB headroom to 192MiB capacity"
 
 # ---- async launch failure/kill gates --------------------------------------
 # These deterministic injections surround the release-candidate binaries; they

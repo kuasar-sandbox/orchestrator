@@ -99,7 +99,6 @@ type ResourceListenConfig struct {
 	Watermarks      ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
 	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
 	Admission       ResourceAdmissionConfig  `yaml:"admission"`         // admit token bucket + queue
-	Dampening       ResourceDampeningConfig  `yaml:"dampening"`         // oscillation damping
 	LogLevel        string                   `yaml:"log_level"`         // info (default)
 }
 
@@ -138,12 +137,6 @@ type ResourceAdmissionConfig struct {
 	StartupTTL    string `yaml:"startup_ttl"`     // admit→settled deadline; default 30s
 	QueueTTL      string `yaml:"queue_ttl"`       // max short-block wait; default 30s
 	QueueMaxDepth int    `yaml:"queue_max_depth"` // queue capacity; default 256
-}
-
-// ResourceDampeningConfig damps zone oscillation (does not enter sandbox.yaml).
-type ResourceDampeningConfig struct {
-	RecoverDuration string `yaml:"recover_duration"` // burst→settled observation; default 60s
-	CooldownPeriods int    `yaml:"cooldown_periods"` // × 100ms; default 10
 }
 
 // ApplyDefaults fills the controller tuning defaults (node-resource.md §3.2). The
@@ -204,12 +197,6 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 	}
 	if r.Admission.QueueMaxDepth == 0 {
 		r.Admission.QueueMaxDepth = 256
-	}
-	if r.Dampening.RecoverDuration == "" {
-		r.Dampening.RecoverDuration = "60s"
-	}
-	if r.Dampening.CooldownPeriods == 0 {
-		r.Dampening.CooldownPeriods = 10
 	}
 	if r.LogLevel == "" {
 		r.LogLevel = "info"
@@ -350,8 +337,9 @@ type SandboxConfig struct {
 }
 
 // ResourcesConfig is the conductor-owned sandbox resource policy. Its
-// underlying schema is shared with sandboxcfg's resolver but deliberately does
-// not expose sandboxer's runtime control, deflate, watermark, or sensor fields.
+// underlying schema is shared with sandboxcfg's resolver. It exposes the
+// node-owned watermark ratio but deliberately omits sandboxer's runtime
+// control, deflate, and sensor fields.
 type ResourcesConfig sandboxcfg.NodeResourcePolicy
 
 func (r *ResourcesConfig) applyDefaults() {

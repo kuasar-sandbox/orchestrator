@@ -7,18 +7,18 @@ func installReservationForTest(t *testing.T, state *State, r Reservation) {
 	if r.SandboxID == "" {
 		r.SandboxID = "sid-" + r.Token
 	}
-	minimumCapacity := r.AllocatableNowMem
-	if r.EffectiveStartupBudget > minimumCapacity {
-		minimumCapacity = r.EffectiveStartupBudget
+	minimumCapacity := r.ReservationMemory
+	if r.InitialBudget > minimumCapacity {
+		minimumCapacity = r.InitialBudget
 	}
-	if r.Floor.MemoryBytes > minimumCapacity {
-		minimumCapacity = r.Floor.MemoryBytes
+	if r.ConfiguredAllocatable.MemoryBytes > minimumCapacity {
+		minimumCapacity = r.ConfiguredAllocatable.MemoryBytes
 	}
 	if r.Capacity.MemoryBytes < minimumCapacity {
 		r.Capacity.MemoryBytes = minimumCapacity
 	}
-	if r.Capacity.CPUMilli < r.Floor.CPUMilli {
-		r.Capacity.CPUMilli = r.Floor.CPUMilli
+	if r.Capacity.CPUMilli < r.ConfiguredAllocatable.CPUMilli {
+		r.Capacity.CPUMilli = r.ConfiguredAllocatable.CPUMilli
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -58,7 +58,11 @@ func mutateReservationForTest(t *testing.T, state *State, sid string, fn func(*R
 	if r == nil {
 		t.Fatalf("reservation %q not found", sid)
 	}
-	state.removeAggregatesLocked(r)
+	if err := state.removeAggregatesLocked(r); err != nil {
+		t.Fatal(err)
+	}
 	fn(r)
-	state.addAggregatesLocked(r)
+	if err := state.addAggregatesLocked(r); err != nil {
+		t.Fatal(err)
+	}
 }

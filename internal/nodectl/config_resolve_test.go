@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,5 +101,56 @@ func TestResolveRetainsShortBindableSocketAlias(t *testing.T) {
 	}
 	if len(resolved.SocketIdentity) <= 107 {
 		t.Fatalf("test identity is not beyond AF_UNIX limit: %q", resolved.SocketIdentity)
+	}
+}
+
+func TestResolveRejectsUnsafeResourcePoolArithmetic(t *testing.T) {
+	base := func() *config.ResourceListenConfig {
+		cfg := &config.ResourceListenConfig{}
+		cfg.Resources.PhysicalMemory = "32GiB"
+		cfg.Resources.PhysicalCPU = "8"
+		cfg.Resources.HostReserved.Memory = "1GiB"
+		cfg.Resources.HostReserved.CPU = 1
+		return cfg
+	}
+	tests := map[string]struct {
+		mutate func(*config.ResourceListenConfig)
+		want   string
+	}{
+		"host memory equals physical": {
+			mutate: func(cfg *config.ResourceListenConfig) { cfg.Resources.HostReserved.Memory = "32GiB" },
+			want:   "must be < physical_memory",
+		},
+		"host memory exceeds physical": {
+			mutate: func(cfg *config.ResourceListenConfig) { cfg.Resources.HostReserved.Memory = "33GiB" },
+			want:   "must be < physical_memory",
+		},
+		"operational factor is NaN": {
+			mutate: func(cfg *config.ResourceListenConfig) { cfg.Watermarks.OperationalMarginFactor = math.NaN() },
+			want:   "operational_margin_factor",
+		},
+		"zone factors are reversed": {
+			mutate: func(cfg *config.ResourceListenConfig) {
+				cfg.Watermarks.LowFactor, cfg.Watermarks.HighFactor = .9, .8
+			},
+			want: "low_factor < high_factor",
+		},
+		"emergency factor exceeds unit interval": {
+			mutate: func(cfg *config.ResourceListenConfig) { cfg.Watermarks.EmergencyFactor = 1.1 },
+			want:   "emergency_factor",
+		},
+		"grant factor exceeds unit interval": {
+			mutate: func(cfg *config.ResourceListenConfig) { cfg.RateLimits.MemoryGrantPerSecFactor = 1.1 },
+			want:   "memory_grant_per_sec_factor",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := base()
+			test.mutate(cfg)
+			if _, err := Resolve(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Resolve error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }

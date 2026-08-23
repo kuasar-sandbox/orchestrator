@@ -76,7 +76,7 @@ func TestFreshRestoreCapacityMismatchIsAsynchronousResourceFailure(t *testing.T)
 	assertAsyncFreshRestoreFailure(t, o, ctx, created, vs, lc)
 }
 
-func TestStaticStartupRequestHasNoLaunchSideEffects(t *testing.T) {
+func TestStaticStartupRequestIsAccepted(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
@@ -85,10 +85,9 @@ func TestStaticStartupRequestHasNoLaunchSideEffects(t *testing.T) {
 	req := createRequestFixture(t, o, "a")
 	req.Metadata[sandboxcfg.NsResource] = `{"startup":{"memory":"1GiB"}}`
 
-	if _, err := o.Create(ctx, req); !errors.Is(err, api.ErrBadRequest) {
-		t.Fatalf("Create error = %v, want ErrBadRequest", err)
+	if _, err := o.Create(ctx, req); err != nil {
+		t.Fatalf("Create error = %v", err)
 	}
-	assertNoFreshLaunchSideEffects(t, o, ctx, vs, lc)
 }
 
 func TestStaticStartupRestoreRequestIsRejectedSynchronously(t *testing.T) {
@@ -210,7 +209,7 @@ func TestDynamicLaunchUsesCanonicalResourceControllerIdentity(t *testing.T) {
 	if resources.Startup == nil || resources.Startup.Memory != "2GiB" {
 		t.Fatalf("dynamic default startup = %+v", resources.Startup)
 	}
-	if resources.WatermarkHigh != nil || resources.Control.Sensor != nil {
+	if resources.WatermarkHigh == nil || resources.WatermarkHigh.Ratio != 0.875 || resources.Control.Sensor != nil {
 		t.Fatalf("renderer fixed sandboxer-owned defaults: %+v", resources)
 	}
 	if resources.Allocatable.DeflateOnOOM == nil || !*resources.Allocatable.DeflateOnOOM {

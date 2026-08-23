@@ -267,7 +267,7 @@ func TestControllerSIGKILLRecoveryAroundAdmitAndGrantResponses(t *testing.T) {
 			}
 			grantDone := make(chan error, 1)
 			go func() {
-				_, _, _, err := hooks.RequestBudget(64<<20, resource.UrgencyNormal, "fault-window")
+				_, _, _, err := hooks.RequestBudget(256<<20, 64<<20, resource.UrgencyNormal, "fault-window")
 				grantDone <- err
 			}()
 			if line := crashing.next(t); line != "phase:"+tc.phase {
@@ -284,14 +284,14 @@ func TestControllerSIGKILLRecoveryAroundAdmitAndGrantResponses(t *testing.T) {
 					t.Fatalf("pre-response grant error = %v", err)
 				}
 			} else {
-				if _, _, _, err := hooks.RequestBudget(1, resource.UrgencyNormal, "detect-drop"); err == nil || !resource.IsTransportError(err) {
+				if _, _, _, err := hooks.RequestBudget(hooks.ReservationMemory(), 1, resource.UrgencyNormal, "detect-drop"); err == nil || !resource.IsTransportError(err) {
 					t.Fatalf("drop detection error = %v", err)
 				}
 			}
 			replacement := startRecoveryController(t, socket, root, "")
 			waitRecoveryHooksConnected(t, hooks)
-			if hooks.AllocatableNowMem() != tc.want {
-				t.Fatalf("sandbox applied allocation = %d, want %d", hooks.AllocatableNowMem(), tc.want)
+			if hooks.ReservationMemory() != tc.want {
+				t.Fatalf("sandbox reservation = %d, want %d", hooks.ReservationMemory(), tc.want)
 			}
 			assertRecoveredAllocation(t, socket, sid, tc.want)
 			hooks.Release("test")

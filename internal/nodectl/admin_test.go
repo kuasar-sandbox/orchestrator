@@ -56,83 +56,6 @@ func TestAdmin_DrainBlocksAdmit(t *testing.T) {
 	}
 }
 
-func TestAdmin_GrantOverridesPool(t *testing.T) {
-	srv, c, cleanup := startTestServer(t, 8<<30)
-	defer cleanup()
-
-	// Use a second client to admit a sandbox; first client stays as
-	// admin-only (the API doesn't require an admit-token to call admin
-	// verbs).
-	c2 := &Client{SocketPath: srv.Path}
-	if err := c2.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	if _, err := c2.Admit(AdmitParams{
-		SandboxID:           "sb-grant",
-		CapacityMemoryBytes: 1 << 30,
-		FloorMemoryBytes:    64 << 20,
-		StartupBudgetMemory: 64 << 20,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	newAlloc, err := c.AdminGrant("sb-grant", 256<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newAlloc != 64<<20+256<<20 {
-		t.Errorf("alloc=%d, want %d", newAlloc, 64<<20+256<<20)
-	}
-
-	// Server-side reservation should reflect new allocation.
-	r := reservationForTest(t, srv.State, "sb-grant")
-	if r.AllocatableNowMem != newAlloc {
-		t.Errorf("reservation alloc=%v, want %d", r, newAlloc)
-	}
-}
-
-func TestAdmin_ReclaimShrinksReservation(t *testing.T) {
-	srv, c, cleanup := startTestServer(t, 8<<30)
-	defer cleanup()
-
-	c2 := &Client{SocketPath: srv.Path}
-	if err := c2.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	if _, err := c2.Admit(AdmitParams{
-		SandboxID:           "sb-rec",
-		CapacityMemoryBytes: 1 << 30,
-		FloorMemoryBytes:    64 << 20,
-		StartupBudgetMemory: 512 << 20,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	newAlloc, err := c.AdminReclaim("sb-rec", 128<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if newAlloc != 128<<20 {
-		t.Errorf("alloc after reclaim = %d, want 128 MiB", newAlloc)
-	}
-
-	// Reclaiming below floor should clamp at floor.
-	clamped, err := c.AdminReclaim("sb-rec", 1<<20) // 1 MiB < floor 64 MiB
-	if err != nil {
-		t.Fatal(err)
-	}
-	if clamped != 64<<20 {
-		t.Errorf("clamped alloc = %d, want floor 64 MiB", clamped)
-	}
-
-	// Reclaim asking to grow should error.
-	if _, err := c.AdminReclaim("sb-rec", 256<<20); err == nil {
-		t.Error("expected error on reclaim-grow attempt")
-	}
-}
-
 func TestAdmin_StatusReturnsZone(t *testing.T) {
 	_, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
@@ -159,10 +82,10 @@ func TestAdminListPaginatesThousandReservationsOverUDS(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		installReservationForTest(t, srv.State, Reservation{
 			SandboxID: fmt.Sprintf("sandbox-%04d", i), PeerPID: 10000 + i,
-			CgroupPath:        fmt.Sprintf("/sys/fs/cgroup/sandbox-%04d", i),
-			Capacity:          Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
-			Floor:             Resources{MemoryBytes: 64 << 20, CPUMilli: 100},
-			AllocatableNowMem: 128 << 20, Stage: StageSettled,
+			CgroupPath:            fmt.Sprintf("/sys/fs/cgroup/sandbox-%04d", i),
+			Capacity:              Resources{MemoryBytes: 2 << 30, CPUMilli: 1000},
+			ConfiguredAllocatable: Resources{MemoryBytes: 64 << 20, CPUMilli: 100},
+			ReservationMemory:     128 << 20, Stage: StageSettled,
 			RecoverySource: RecoverySynced,
 		})
 	}
@@ -226,8 +149,8 @@ func TestAdminListCursorIsExclusive(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		installReservationForTest(t, state, Reservation{
 			SandboxID: fmt.Sprintf("sandbox-%02d", i),
-			Capacity:  Resources{MemoryBytes: 1 << 30}, Floor: Resources{MemoryBytes: 64 << 20},
-			AllocatableNowMem: 64 << 20, Stage: StageSettled, RecoverySource: RecoveryAdmit,
+			Capacity:  Resources{MemoryBytes: 1 << 30}, ConfiguredAllocatable: Resources{MemoryBytes: 64 << 20},
+			ReservationMemory: 64 << 20, Stage: StageSettled, RecoverySource: RecoveryAdmit,
 		})
 	}
 	srv := &Server{State: state}
@@ -253,8 +176,8 @@ func TestAdminListRejectsSingleReservationLargerThanFrame(t *testing.T) {
 	state := makeState(8<<30, 0)
 	installReservationForTest(t, state, Reservation{
 		SandboxID: strings.Repeat("s", MaxMessageBytes),
-		Capacity:  Resources{MemoryBytes: 1 << 30}, Floor: Resources{MemoryBytes: 64 << 20},
-		AllocatableNowMem: 64 << 20, Stage: StageSettled, RecoverySource: RecoveryAdmit,
+		Capacity:  Resources{MemoryBytes: 1 << 30}, ConfiguredAllocatable: Resources{MemoryBytes: 64 << 20},
+		ReservationMemory: 64 << 20, Stage: StageSettled, RecoverySource: RecoveryAdmit,
 	})
 	resp := (&Server{State: state}).handleAdminList(&Message{Type: TypeAdminList, ListLimit: 1})
 	if resp.Type != TypeError || !strings.Contains(resp.Msg, "reservation exceeds protocol frame") {
@@ -284,17 +207,16 @@ func TestHeartbeat_ReturnsAllocatable(t *testing.T) {
 		t.Errorf("hb allocatable=%d, want 256 MiB", res.NewAllocatable)
 	}
 
-	// Server-side admin reclaim shrinks; next heartbeat surfaces the
-	// new value to the client.
-	if _, err := srv.State.AdminReclaim("sb-hb", 128<<20); err != nil {
-		t.Fatal(err)
-	}
-
+	// A changed host memory.current is diagnostic only. It cannot rewrite the
+	// reservation or become an implicit balloon/cgroup command.
 	res, err = c.Heartbeat(120<<20, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.NewAllocatable != 128<<20 {
-		t.Errorf("after shrink hb allocatable=%d, want 128 MiB", res.NewAllocatable)
+	if res.NewAllocatable != 256<<20 {
+		t.Errorf("heartbeat reservation=%d, want unchanged 256 MiB", res.NewAllocatable)
+	}
+	if got := reservationForTest(t, srv.State, "sb-hb").ReservationMemory; got != 256<<20 {
+		t.Fatalf("heartbeat rewrote reservation to %d", got)
 	}
 }

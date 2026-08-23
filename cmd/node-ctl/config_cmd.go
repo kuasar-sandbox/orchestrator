@@ -144,9 +144,10 @@ sandbox:                                          # sandbox-instance defaults
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
     allocatable:
       # cpu: 2                                    # omitted => follows final capacity.cpu
-      memory: 256MiB                              # steady-state floor
-    # startup: { memory: 512MiB }                 # dynamic only; omitted => final capacity.memory
-    overhead: { memory: 32MiB }                   # node-owned VMM/control-plane headroom
+      memory: 256MiB                              # settled guest headroom, not a total Budget
+    # startup: { memory: 512MiB }                 # cold headroom in static/dynamic mode; omitted => capacity.memory
+    overhead: { memory: 32MiB }                   # node-owned host VMM overhead
+    watermark_high: { ratio: 0.875 }              # node-owned memory.high pressure ratio
   network:
     switch: sw0
     # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # persistent TAPFD/1 PREPARE/OPEN/RELEASE; connector: vswitch serve --tapfd-listen <same path>
@@ -202,11 +203,11 @@ builder:                                           # Build resources are separat
 # density; socket is the sole endpoint and its canonical identity is injected into
 # sandbox YAML + lease/inventory). Absent/disabled = static cgroup. The tuning
 # is inlined here (no separate file). Inspect / operate with:
-# node-ctl resource {status|list|drain|grant|reclaim}.
+# node-ctl resource {status|list|drain}.
 # resource_listen:
 #   enabled: true
 #   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
-#   # Advanced tuning — all defaulted (node-resource.md §3.3); usually left untouched:
+#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
 #   # state_path: /run/node-ctl/state.json         # deprecated and ignored
 #   # audit_path: /run/node-ctl/audit.log
 #   # cgroup_scan_paths: [/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice, /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice]
@@ -214,7 +215,6 @@ builder:                                           # Build resources are separat
 #   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
-#   # dampening: { recover_duration: 60s, cooldown_periods: 10 }
 checkpoint:                                        # paused-state capture
   mode: local                                     # local; remote is deprecated compatibility-only
   local_dir: /var/lib/sandbox-saved

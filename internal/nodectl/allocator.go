@@ -102,21 +102,21 @@ func (a *Allocator) FairnessScore(token string) uint64 {
 // GrantDecision is the outcome of a Grant call.
 type GrantDecision struct {
 	GrantedDelta uint64
-	NewAlloc     uint64
 	CooldownMs   int64
 }
 
-// Grant computes the allowed delta for a RequestBudget. State.Grant calls it
-// while holding State's private mutex after computing headroom; external
-// callers never lock or mutate State directly. This function only enforces
-// the rate limiter.
+// Grant computes the newly chargeable delta for a RequestBudget.
+// State.ReconcileAndGrant calls it while holding State's private mutex after
+// reusing any reservation already charged to the sandbox and computing the
+// remaining node headroom. External callers never lock or mutate State
+// directly. This function only enforces the rate limiter.
 //
 // Returns a GrantDecision; GrantedDelta == 0 means "denied this round,
-// retry after CooldownMs". Reservation.AllocatableNowMem is updated
-// in-place by the caller after the grant.
+// retry after CooldownMs". ReservationMemory is updated by the caller only
+// after the complete reconcile + grant result has been validated.
 //
 // headroom: the maximum delta the state-zone permits (e.g. capacity -
-// current_alloc, capped by emergency_pool exclusion).
+// reservation baseline, capped by emergency_pool exclusion).
 func (a *Allocator) Grant(token string, requested, headroom uint64, urgency string) GrantDecision {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -135,11 +135,12 @@ func (a *Allocator) Grant(token string, requested, headroom uint64, urgency stri
 	if a.policy.MaxGrantStep > 0 && delta > a.policy.MaxGrantStep {
 		delta = a.policy.MaxGrantStep
 	}
-	if a.policy.MinGrantStep > 0 && delta < a.policy.MinGrantStep {
-		delta = a.policy.MinGrantStep
-		if delta > headroom {
-			delta = headroom
-		}
+	// Never round a grant above RequestedDelta. A request whose complete tail is
+	// smaller than MinGrantStep must still be grantable; otherwise an earlier
+	// partial grant can strand the sandbox permanently just below its requested
+	// reservation. Only a sub-minimum *partial* grant is deferred.
+	if a.policy.MinGrantStep > 0 && delta < a.policy.MinGrantStep && delta != requested {
+		return GrantDecision{CooldownMs: 200}
 	}
 
 	// Token bucket. urgency=high is unlimited (emergency path).

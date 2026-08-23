@@ -31,7 +31,7 @@ func statusCmd(args []string) int {
 	fmt.Printf("host_reserved:       %d MiB / %d cpu_milli\n", status.HostReserved.MemoryBytes>>20, status.HostReserved.CPUMilli)
 	fmt.Printf("operational_margin:  %d MiB / %d cpu_milli\n", status.OperationalMargin.MemoryBytes>>20, status.OperationalMargin.CPUMilli)
 	fmt.Printf("allocatable_pool:    %d MiB / %d cpu_milli\n", status.Pool.MemoryBytes>>20, status.Pool.CPUMilli)
-	fmt.Printf("node_allocated:      %d MiB / %d cpu_milli\n", status.Allocated.MemoryBytes>>20, status.Allocated.CPUMilli)
+	fmt.Printf("reserved_memory:     %d MiB / %d cpu_milli\n", status.Allocated.MemoryBytes>>20, status.Allocated.CPUMilli)
 	if status.Pool.MemoryBytes > 0 {
 		fmt.Printf("utilization:         %.1f%%\n", float64(status.Allocated.MemoryBytes)/float64(status.Pool.MemoryBytes)*100)
 	}

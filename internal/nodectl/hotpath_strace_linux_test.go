@@ -110,9 +110,6 @@ func traceHotPathRPCs(t *testing.T, socket string) {
 	if err != nil || granted == 0 {
 		t.Fatalf("RequestBudget = granted %d current %d, %v", granted, current, err)
 	}
-	if _, err := client.AdminReclaim("strace-hot-path", 64<<20); err != nil {
-		t.Fatal(err)
-	}
 	if err := client.OOMReport(1, 123, 64<<20); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +163,7 @@ func assertNoHotPathFileIO(t *testing.T, segment string) {
 		// would be rendered as a pathname by strace -yy and fails this gate.
 		if strings.Contains(line, "<UNIX") || strings.Contains(line, "<pipe:") ||
 			strings.Contains(line, "<socket:[") ||
+			strings.Contains(line, "<(null):[") ||
 			strings.Contains(line, "<anon_inode:[eventfd]>") {
 			continue
 		}

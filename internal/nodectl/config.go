@@ -2,6 +2,7 @@ package nodectl
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,9 +35,6 @@ type Resolved struct {
 	Admission AdmissionPolicy
 	Allocator AllocatorPolicy
 
-	RecoverDuration time.Duration
-	CooldownPeriods int
-
 	LogLevel  string
 	AuditPath string
 }
@@ -67,7 +65,6 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		CgroupScanPaths: c.CgroupScanPaths,
 		LogLevel:        c.LogLevel,
 		AuditPath:       c.AuditPath,
-		CooldownPeriods: c.Dampening.CooldownPeriods,
 	}
 
 	if c.Resources.PhysicalMemory == "auto" || c.Resources.PhysicalMemory == "" {
@@ -82,6 +79,9 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 			return nil, fmt.Errorf("physical_memory: %w", err)
 		}
 		out.PhysicalMemory = mem
+	}
+	if out.PhysicalMemory == 0 {
+		return nil, fmt.Errorf("physical_memory must be > 0")
 	}
 
 	if c.Resources.PhysicalCPU == "auto" || c.Resources.PhysicalCPU == "" {
@@ -98,6 +98,9 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host_reserved.memory: %w", err)
 	}
+	if hostMem >= out.PhysicalMemory {
+		return nil, fmt.Errorf("host_reserved.memory (%d) must be < physical_memory (%d)", hostMem, out.PhysicalMemory)
+	}
 	out.HostReserved = Resources{
 		MemoryBytes: hostMem,
 		CPUMilli:    uint64(c.Resources.HostReserved.CPU * 1000),
@@ -110,16 +113,34 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		EmergencyFactor:         c.Watermarks.EmergencyFactor,
 		StartupFactor:           c.Watermarks.StartupFactor,
 	}
+	if !finiteFactor(out.Watermarks.OperationalMarginFactor) || out.Watermarks.OperationalMarginFactor >= 1 {
+		return nil, fmt.Errorf("watermarks.operational_margin_factor must be >= 0 and < 1")
+	}
+	if !finiteFactor(out.Watermarks.LowFactor) || !finiteFactor(out.Watermarks.HighFactor) ||
+		out.Watermarks.LowFactor >= out.Watermarks.HighFactor || out.Watermarks.HighFactor >= 1 {
+		return nil, fmt.Errorf("watermarks must satisfy 0 <= low_factor < high_factor < 1")
+	}
+	if !finiteFactor(out.Watermarks.EmergencyFactor) || out.Watermarks.EmergencyFactor >= 1 {
+		return nil, fmt.Errorf("watermarks.emergency_factor must be >= 0 and < 1")
+	}
 	if out.Watermarks.StartupFactor <= out.Watermarks.EmergencyFactor ||
-		out.Watermarks.StartupFactor > 1.0 {
+		!finiteFactor(out.Watermarks.StartupFactor) || out.Watermarks.StartupFactor > 1.0 {
 		return nil, fmt.Errorf("watermarks.startup_factor (%g) must satisfy "+
 			"emergency_factor (%g) < startup_factor ≤ 1.0",
 			out.Watermarks.StartupFactor, out.Watermarks.EmergencyFactor)
 	}
 
-	pool := uint64(float64(out.PhysicalMemory-out.HostReserved.MemoryBytes) *
-		(1 - out.Watermarks.OperationalMarginFactor))
-	out.MemoryGrantPerSecBytes = uint64(float64(pool) * c.RateLimits.MemoryGrantPerSecFactor)
+	nodeBudget := out.PhysicalMemory - out.HostReserved.MemoryBytes
+	operationalMargin := scaleUint64Floor(nodeBudget, out.Watermarks.OperationalMarginFactor)
+	if operationalMargin > nodeBudget {
+		operationalMargin = nodeBudget
+	}
+	pool := nodeBudget - operationalMargin
+	if !finiteFactor(c.RateLimits.MemoryGrantPerSecFactor) || c.RateLimits.MemoryGrantPerSecFactor <= 0 ||
+		c.RateLimits.MemoryGrantPerSecFactor > 1 {
+		return nil, fmt.Errorf("rate_limits.memory_grant_per_sec_factor must be > 0 and <= 1")
+	}
+	out.MemoryGrantPerSecBytes = scaleUint64Floor(pool, c.RateLimits.MemoryGrantPerSecFactor)
 
 	startupTTL, err := time.ParseDuration(c.Admission.StartupTTL)
 	if err != nil {
@@ -147,15 +168,11 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		MaxGrantStep:           512 << 20, // 512 MiB
 	}
 
-	if c.Dampening.RecoverDuration != "" {
-		rd, err := time.ParseDuration(c.Dampening.RecoverDuration)
-		if err != nil {
-			return nil, fmt.Errorf("dampening.recover_duration: %w", err)
-		}
-		out.RecoverDuration = rd
-	}
-
 	return out, nil
+}
+
+func finiteFactor(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func canonicalControllerSocket(socket string) (string, error) {

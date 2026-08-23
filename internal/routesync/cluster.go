@@ -182,11 +182,13 @@ func BuildAdmissionLimitFromTypes(in types.BuildAdmissionLimit) *BuildAdmissionL
 	return &BuildAdmissionLimit{MaxBuilds: in.MaxBuilds, Resources: BuildResourcesFromTypes(in.Resources)}
 }
 
-// Heartbeat is the node's periodic water-level report (cluster.md). Draining
-// is set by node-side drain (node-resource.md §2.5) so placement excludes the node.
+// Heartbeat is the node's periodic water-level report (cluster.md). Allocated
+// is the sum of sandbox NodeReservations, not host
+// cgroup charge or guest demand. Draining is set by node-side drain
+// (node-resource.md §2) so placement excludes the node.
 type Heartbeat struct {
 	Zone                   string               `json:"zone,omitempty"`
-	Allocated              int64                `json:"allocated,omitempty"` // memory allocated (bytes)
+	Allocated              int64                `json:"allocated,omitempty"` // reserved memory Budget (bytes)
 	Pool                   int64                `json:"pool,omitempty"`      // allocatable pool (bytes)
 	BuildRegistrationUsage *BuildAdmissionUsage `json:"build_registration_usage,omitempty"`
 	BuildExecutionUsage    *BuildAdmissionUsage `json:"build_execution_usage,omitempty"`

@@ -160,7 +160,7 @@ func (s *Server) Stop() error {
 }
 
 // serveConn runs the per-connection message loop. The connection is
-// associated with at most one Reservation (after Admit / Reattach
+// associated with at most one Reservation (after Admit / StateSync
 // succeeds), discovered by the Token field on incoming messages.
 func (s *Server) serveConn(ctx context.Context, conn net.Conn, peerPID int) {
 	defer conn.Close()
@@ -228,8 +228,6 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 	switch req.Type {
 	case TypeAdmit:
 		return s.handleAdmit(conn, peerPID, req, token)
-	case TypeReattach:
-		return s.handleReattach(conn, req, token)
 	case TypeStateSync:
 		return s.handleStateSync(conn, peerPID, req, token)
 	case TypeSettled:
@@ -241,16 +239,15 @@ func (s *Server) dispatch(conn net.Conn, peerPID int, req *Message, token *strin
 	case TypeHeartbeat:
 		return s.handleHeartbeat(req, *token)
 	case TypeRelease:
-		s.handleRelease(req, *token)
-		// Signal the connection loop to drop association.
-		*token = ""
-		return &Message{Type: TypeAck}
+		resp := s.handleRelease(req, *token)
+		if resp.Type == TypeAck {
+			// Signal the connection loop to drop association only after the
+			// checked aggregate removal committed.
+			*token = ""
+		}
+		return resp
 	case TypeAdminDrain:
 		return s.handleAdminDrain(req)
-	case TypeAdminGrant:
-		return s.handleAdminGrant(req)
-	case TypeAdminReclaim:
-		return s.handleAdminReclaim(req)
 	case TypeAdminStatus:
 		return s.handleAdminStatus()
 	case TypeAdminList:
@@ -279,6 +276,14 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 		return resp
 	}
+
+	// Serialize the resource check through reservation insertion with queued
+	// admissions. AnalyzeRequest is intentionally read-only; without this
+	// existing queue/state lock order, two connections could both observe the
+	// same headroom and then over-subscribe it in separate State.Admit calls.
+	// Replays above are excluded because they replace an already charged upper
+	// bound rather than introduce a new consumer.
+	s.Admission.queueMu.Lock()
 	oc := s.Admission.AnalyzeRequest(req)
 	switch oc.Status {
 	case OutcomeAdmitted:
@@ -288,11 +293,12 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 			oc = s.Admission.AnalyzeRequest(req)
 		}
 	}
-
-	switch oc.Status {
-	case OutcomeAdmitted:
-		// Token already consumed above (or admit didn't need a token recheck).
+	if oc.Status == OutcomeAdmitted {
+		if s.phaseHook != nil {
+			s.phaseHook("admit_checked")
+		}
 		resp, err := s.buildAdmitOK(conn, peerPID, req, token)
+		s.Admission.queueMu.Unlock()
 		if err != nil {
 			return &Message{
 				Type:   TypeAdmitResponse,
@@ -301,7 +307,10 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 			}
 		}
 		return resp
+	}
+	s.Admission.queueMu.Unlock()
 
+	switch oc.Status {
 	case OutcomePreCheckReject, OutcomeLongTermReject:
 		return &Message{
 			Type:   TypeAdmitResponse,
@@ -376,6 +385,13 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 	if err != nil {
 		return nil, err
 	}
+	// A replay may replace a Capacity-provisional recovery charge with the
+	// exact initial reservation. Wake the existing FIFO after the atomic
+	// replacement so resource-blocked admissions re-evaluate released
+	// headroom. For a brand-new admission this is a harmless coalesced wake.
+	if s.Admission != nil {
+		s.Admission.PushWake()
+	}
 	if oldConn != nil && oldConn != conn {
 		_ = oldConn.Close()
 	}
@@ -383,45 +399,30 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 		*token = t
 	}
 
-	s.Logf("admit %s sid=%s initial_alloc=%d",
-		t[:8], req.SandboxID, spec.InitialAllocatable)
+	s.Logf("admit %s sid=%s initial_budget=%d",
+		t[:8], req.SandboxID, spec.InitialBudget)
 	if s.Auditor != nil {
-		s.Auditor.Logf("admit token=%s sid=%s initial_alloc=%d cap_mem=%d floor_mem=%d effective_startup=%d",
-			t[:8], req.SandboxID, spec.InitialAllocatable,
-			req.CapacityMemoryBytes, req.FloorMemoryBytes, spec.EffectiveStartupBudget)
+		s.Auditor.Logf("admit token=%s sid=%s initial_budget=%d capacity_memory=%d headroom_memory=%d",
+			t[:8], req.SandboxID, spec.InitialBudget,
+			req.CapacityMemoryBytes, req.FloorMemoryBytes)
 	}
 	return &Message{
 		Type:                TypeAdmitResponse,
 		Token:               t,
 		Status:              StatusAdmitted,
-		GrantedInitialAlloc: spec.InitialAllocatable,
+		GrantedInitialAlloc: spec.InitialBudget,
 	}, nil
 }
 
 func admitSpecFromRequest(conn net.Conn, peerPID int, req *Message) AdmitSpec {
-	ebudget := computeEffectiveStartupBudget(req)
+	initialBudget := initialReservationBudget(req)
 	return AdmitSpec{
 		SandboxID: req.SandboxID, PeerPID: peerPID, CgroupPath: req.CgroupPath,
-		Capacity:           Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: cpuMilliCeil(float64(req.CapacityCPU))},
-		Floor:              Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: cpuMilliCeil(req.FloorCPU)},
-		InitialAllocatable: ebudget, EffectiveStartupBudget: ebudget,
-		ClientFeatures: req.ClientFeatures, Conn: conn,
+		Capacity:              Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: cpuMilliCeil(float64(req.CapacityCPU))},
+		ConfiguredAllocatable: Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: cpuMilliCeil(req.FloorCPU)},
+		InitialBudget:         initialBudget,
+		ClientFeatures:        req.ClientFeatures, Conn: conn,
 	}
-}
-
-// handleReattach re-binds a connection to an existing reservation
-// (after sandbox-ctl reconnect or controller restart).
-func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Message {
-	res, oldConn, found := s.State.Reattach(req.Token, conn)
-	if !found {
-		return &Message{Type: TypeError, Msg: "unknown token"}
-	}
-	if oldConn != nil && oldConn != conn {
-		_ = oldConn.Close()
-	}
-	*token = req.Token
-	s.Logf("reattach %s sid=%s stage=%s", req.Token[:8], res.SandboxID, res.Stage)
-	return &Message{Type: TypeAck, Token: req.Token, NewAllocatable: res.AllocatableNowMem}
 }
 
 func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token *string) *Message {
@@ -439,17 +440,17 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 		return &Message{Type: TypeError, Msg: "state sync identity: " + err.Error()}
 	}
 	l := live.Lease
-	if req.AppliedAllocatableMemory < l.FloorMemory || req.AppliedAllocatableMemory > l.CapacityMemory {
-		return &Message{Type: TypeError, Msg: "state sync applied allocatable outside floor/capacity"}
+	if req.AppliedAllocatableMemory == 0 || req.AppliedAllocatableMemory > l.CapacityMemory {
+		return &Message{Type: TypeError, Msg: "state sync reservation outside (0, capacity]"}
 	}
 	newToken := NewToken()
 	res, oldConns, err := s.State.Sync(SyncSpec{
 		Token: newToken, SandboxID: l.SandboxID, PeerPID: live.OwnerPID,
-		CgroupPath:    l.CgroupPath,
-		Capacity:      Resources{MemoryBytes: l.CapacityMemory, CPUMilli: l.CapacityCPUMilli},
-		Floor:         Resources{MemoryBytes: l.FloorMemory, CPUMilli: l.FloorCPUMilli},
-		StartupMemory: l.StartupMemory, AppliedMemory: req.AppliedAllocatableMemory,
-		Settled: req.Settled, CurrentRSS: req.CurrentRSS,
+		CgroupPath:            l.CgroupPath,
+		Capacity:              Resources{MemoryBytes: l.CapacityMemory, CPUMilli: l.CapacityCPUMilli},
+		ConfiguredAllocatable: Resources{MemoryBytes: l.FloorMemory, CPUMilli: l.FloorCPUMilli},
+		ReservationMemory:     req.AppliedAllocatableMemory,
+		Settled:               req.Settled, HostMemoryCurrent: req.CurrentRSS,
 		LeasePath: live.Path, ClientFeatures: l.ClientFeatures, Conn: conn,
 	})
 	if err != nil {
@@ -458,20 +459,29 @@ func (s *Server) handleStateSync(conn net.Conn, peerPID int, req *Message, token
 	for _, old := range oldConns {
 		_ = old.Close()
 	}
+	// StateSync commonly replaces the restart-time Capacity provisional charge
+	// (or an ambiguous response baseline) with an equal or smaller exact
+	// reservation. Make that released pool capacity visible to the FIFO.
+	if s.Admission != nil {
+		s.Admission.PushWake()
+	}
 	*token = newToken
-	s.Logf("state sync sid=%s pid=%d settled=%v alloc=%d", res.SandboxID, res.PeerPID, req.Settled, res.AllocatableNowMem)
-	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.AllocatableNowMem}
+	s.Logf("state sync sid=%s pid=%d settled=%v reservation=%d", res.SandboxID, res.PeerPID, req.Settled, res.ReservationMemory)
+	return &Message{Type: TypeAck, Token: newToken, NewAllocatable: res.ReservationMemory}
 }
 
 func (s *Server) handleSettled(req *Message, token string) *Message {
-	res, found := s.State.SetSettled(token, req.CurrentRSS, time.Now())
+	res, found, err := s.State.SetSettled(token, req.CurrentRSS, time.Now())
 	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
+	}
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
 	}
 
 	s.Admission.PushWake()
 
-	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, res.AllocatableNowMem)
+	s.Logf("settled %s sid=%s host_memory_current=%d reservation=%d", token[:8], res.SandboxID, req.CurrentRSS, res.ReservationMemory)
 	return &Message{Type: TypeAck}
 }
 
@@ -480,20 +490,38 @@ func (s *Server) handleRequestBudget(req *Message, token string) *Message {
 	if urgency == "" {
 		urgency = UrgencyNormal
 	}
-	result, found := s.State.Grant(token, req.RequestedDelta, urgency, s.Allocator)
+	// Admit checks pool headroom before inserting its reservation. Serialize a
+	// runtime grow with that existing check/insert critical section so the two
+	// operations cannot consume the same headroom concurrently. This is purely
+	// node-local reservation accounting; it does not expose admission state or
+	// policy to the sandbox controller.
+	if s.Admission != nil {
+		s.Admission.queueMu.Lock()
+		defer s.Admission.queueMu.Unlock()
+	}
+	result, found, err := s.State.ReconcileAndGrant(token, req.CurrentAlloc, req.RequestedDelta, urgency, s.Allocator)
 	if !found {
 		return &Message{Type: TypeError, Msg: "no precise reservation"}
 	}
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
+	}
 	res, dec, zone := result.Reservation, result.Decision, result.Zone
+	// A zero-delta absolute-baseline request commits a completed local shrink;
+	// a grow request may also reconcile an older conservative baseline down.
+	// Wake is coalesced and lets the admission head re-check the updated pool.
+	if s.Admission != nil {
+		s.Admission.PushWake()
+	}
 	resp := &Message{
 		Type:           TypeBudgetResponse,
 		GrantedDelta:   dec.GrantedDelta,
-		NewAllocatable: res.AllocatableNowMem,
+		NewAllocatable: res.ReservationMemory,
 		CooldownMs:     dec.CooldownMs,
 	}
 	if dec.GrantedDelta > 0 {
 		s.Logf("grant %s sid=%s +%d → %d (zone=%s urgency=%s)",
-			token[:8], res.SandboxID, dec.GrantedDelta, res.AllocatableNowMem, zone, urgency)
+			token[:8], res.SandboxID, dec.GrantedDelta, res.ReservationMemory, zone, urgency)
 	}
 	return resp
 }
@@ -513,16 +541,19 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	if !found {
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
-	// Sync allocatable_now to the client. If the active reclaimer or an
-	// admin command shrank it, the client picks up the new value here
-	// and applies it (cgroup memory.high + balloon resize).
-	return &Message{Type: TypeAck, NewAllocatable: res.AllocatableNowMem}
+	// Heartbeat is a consistency echo. Only sandbox-originated RequestBudget
+	// and StateSync may change this reservation; the response is never a
+	// balloon/cgroup command.
+	return &Message{Type: TypeAck, NewAllocatable: res.ReservationMemory}
 }
 
-func (s *Server) handleRelease(req *Message, token string) {
-	res, found := s.State.Release(token)
+func (s *Server) handleRelease(req *Message, token string) *Message {
+	res, found, err := s.State.Release(token)
 	if !found {
-		return
+		return &Message{Type: TypeAck}
+	}
+	if err != nil {
+		return &Message{Type: TypeError, Msg: err.Error()}
 	}
 	// Both main-pool and startup-pool accounting are derived from
 	// reservations + their Stage; removing the reservation here implicitly
@@ -536,9 +567,10 @@ func (s *Server) handleRelease(req *Message, token string) {
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
 		token[:8], res.SandboxID, req.Reason, wasPreSettled)
 	if s.Auditor != nil {
-		s.Auditor.Logf("release token=%s sid=%s reason=%s alloc_at_release=%d pre_settled=%v",
-			token[:8], res.SandboxID, req.Reason, res.AllocatableNowMem, wasPreSettled)
+		s.Auditor.Logf("release token=%s sid=%s reason=%s reservation_at_release=%d pre_settled=%v",
+			token[:8], res.SandboxID, req.Reason, res.ReservationMemory, wasPreSettled)
 	}
+	return &Message{Type: TypeAck}
 }
 
 // handleAdminDrain toggles drain mode based on req.Drain. While drained,
@@ -550,45 +582,20 @@ func (s *Server) handleAdminDrain(req *Message) *Message {
 	return &Message{Type: TypeAck, Drained: req.Drain}
 }
 
-// handleAdminGrant force-grants memory to a sandbox identified by
-// SandboxID. Bypasses water-mark + rate-limit (admin override). The
-// sandbox-ctl picks up the new allocatable on its next Heartbeat.
-func (s *Server) handleAdminGrant(req *Message) *Message {
-	res, delta, found := s.State.AdminGrant(req.SandboxID, req.RequestedDelta)
-	if !found {
-		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
-	}
-	s.Logf("admin grant sid=%s +%d → %d", req.SandboxID, delta, res.AllocatableNowMem)
-	return &Message{Type: TypeAck, GrantedDelta: delta, NewAllocatable: res.AllocatableNowMem}
-}
-
-// handleAdminReclaim sets allocatable_now down to req.TargetAllocatable
-// (clamped at floor) for a sandbox identified by SandboxID. The
-// sandbox-ctl picks up the new value on its next Heartbeat and shrinks
-// cgroup + balloon accordingly.
-func (s *Server) handleAdminReclaim(req *Message) *Message {
-	res, err := s.State.AdminReclaim(req.SandboxID, req.TargetAllocatable)
-	if err != nil {
-		return &Message{Type: TypeError, Msg: err.Error()}
-	}
-	s.Logf("admin reclaim sid=%s → %d", req.SandboxID, res.AllocatableNowMem)
-	return &Message{Type: TypeAck, NewAllocatable: res.AllocatableNowMem}
-}
-
 // handleAdminStatus returns one consistent snapshot of the live in-memory
 // node state over the controller UDS.
 func (s *Server) handleAdminStatus() *Message {
 	snapshot := s.State.ResourceSnapshot()
 	return &Message{
 		Type: TypeAck, Zone: string(snapshot.Zone),
-		NodeAllocated:    snapshot.Allocated.MemoryBytes,
+		NodeAllocated:    snapshot.Reserved.MemoryBytes,
 		AllocatablePool:  snapshot.AllocatablePool.MemoryBytes,
 		ReservationCount: snapshot.ReservationCount,
 		ProvisionalCount: snapshot.ProvisionalCount, UnknownCount: snapshot.UnknownCount,
 		Drained:    s.Admission.IsDrained(),
 		NodeBudget: resourceView(snapshot.NodeBudget), HostReserved: resourceView(snapshot.HostReserved),
 		OperationalMargin: resourceView(snapshot.OperationalMargin),
-		Allocated:         resourceView(snapshot.Allocated), Pool: resourceView(snapshot.AllocatablePool),
+		Allocated:         resourceView(snapshot.Reserved), Pool: resourceView(snapshot.AllocatablePool),
 		StartupInFlight: snapshot.StartupInFlight,
 	}
 }
@@ -609,10 +616,10 @@ func (s *Server) handleAdminList(req *Message) *Message {
 		}
 		views = append(views, ReservationView{
 			SandboxID: r.SandboxID, PeerPID: r.PeerPID, CgroupPath: r.CgroupPath,
-			Capacity: resourceView(r.Capacity), Floor: resourceView(r.Floor),
-			AllocatableMemory:     r.AllocatableNowMem,
-			EffectiveStartupBytes: r.EffectiveStartupBudget, Stage: r.Stage,
-			CurrentRSS: r.LastReportedRSS, LastReportUnix: lastReport,
+			Capacity: resourceView(r.Capacity), Floor: resourceView(r.ConfiguredAllocatable),
+			AllocatableMemory:     r.ReservationMemory,
+			EffectiveStartupBytes: r.InitialBudget, Stage: r.Stage,
+			CurrentRSS: r.LastHostMemoryCurrent, LastReportUnix: lastReport,
 			Connected: r.Conn != nil, Provisional: r.Provisional,
 			RecoverySource: r.RecoverySource, StartupExpired: r.StartupExpired,
 		})
@@ -668,14 +675,14 @@ func (s *Server) handleAdminList(req *Message) *Message {
 }
 
 // handleConnDrop is invoked by the connection goroutine after EOF /
-// network error. Reservation is NOT immediately released — sandbox-ctl
-// may reconnect within the reattach window.
+// network error. Reservation is NOT immediately released — sandbox-ctl may
+// reconnect and recover the same safe baseline through StateSync.
 func (s *Server) handleConnDrop(token string, conn net.Conn) {
 	res, changed := s.State.DropConnection(token, conn)
 	if !changed {
 		return
 	}
-	s.Logf("conn dropped for %s sid=%s (reservation pending reattach)",
+	s.Logf("conn dropped for %s sid=%s (reservation pending StateSync)",
 		token[:8], res.SandboxID)
 }
 
@@ -684,7 +691,7 @@ func (s *Server) handleQueuedConnDrop(sid string, conn net.Conn) {
 	if !changed {
 		return
 	}
-	s.Logf("conn dropped for queued sid=%s (reservation pending reattach)", res.SandboxID)
+	s.Logf("conn dropped for queued sid=%s (reservation retained until checked cleanup)", res.SandboxID)
 }
 
 // filepathDir replicates filepath.Dir without importing path/filepath
@@ -748,7 +755,10 @@ func (i *IdleSweeper) sweep() {
 				continue
 			}
 			i.Logf("sweep: sid=%s exceeded startup TTL and consumer is gone, releasing", res.SandboxID)
-			if removed, ok := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); ok {
+			if removed, ok, err := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); err != nil {
+				i.Logf("sweep: sid=%s checked release failed: %v", res.SandboxID, err)
+				continue
+			} else if ok {
 				i.Allocator.CleanupHistory(removed.Token)
 			}
 			swept = true
@@ -763,7 +773,10 @@ func (i *IdleSweeper) sweep() {
 				continue
 			}
 			i.Logf("sweep: sid=%s heartbeat stale and consumer is gone, releasing", res.SandboxID)
-			if removed, ok := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); ok {
+			if removed, ok, err := i.State.RemoveIfIdentity(res.SandboxID, res.identity()); err != nil {
+				i.Logf("sweep: sid=%s checked release failed: %v", res.SandboxID, err)
+				continue
+			} else if ok {
 				i.Allocator.CleanupHistory(removed.Token)
 			}
 			swept = true
