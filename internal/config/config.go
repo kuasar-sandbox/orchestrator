@@ -627,8 +627,11 @@ type CheckpointRemoteConfig struct {
 	RefLocationParent string `yaml:"ref_location_parent"`
 }
 
-// RefLocationURI derives the node-local path for a logical location name. The
-// parent never enters a portable ref, TemplateID, or migration token.
+// RefLocationURI derives the node-local path for a publication location id
+// (reflocation.NewID — minted at publication time, persisted before the
+// first upload side effect, and reused across retries). The parent never
+// enters a portable ref, TemplateID, or migration token. Bucketing rules and
+// GC-safety rationale live in the reflocation package.
 func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
 	location, err := reflocation.Resolve(c.Remote.RefLocationParent, name)
 	if err != nil {

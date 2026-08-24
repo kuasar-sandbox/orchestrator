@@ -1372,16 +1372,24 @@ working-set warm-up。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Ma
 Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback。
 
 portable publish 与 Pause mode 独立。若配置
-`checkpoint.remote.ref_location_parent`,`export-sandbox` 根据 source sandbox ID 计算:
+`checkpoint.remote.ref_location_parent`,`export-sandbox` 在发布时构造 publication
+name(实体 ID + 等宽发布日期后缀 `<sb.ID>-<YYYYMMDD>`,`reflocation.PublicationName`;
+UTC,同日重试同名收敛,跨日重试各随各的日期桶老化):
 
 ```text
-hash = SHA256(location-name)
-location URI = <parent>/<hash[0:2]>/<hash[2:4]>/<location-name>
+location name = <entity-id>-<YYYYMMDD>   (发布日期 = publication 日期,非实体创建日期)
+location URI  = <parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>
 ```
 
+首层日期目录即 GC 桶:字典序=日期序,GC 按"整日桶内所有发布时刻都早于 retention"
+删除日期目录;hash 两级扇出原样保留(限制单目录条目)。发布日期取自 name 后缀而非
+实体 ID 内嵌时间——晚导出的实体(创建久远但刚发布)落在当前日期桶,不会被 GC 误删。
+conductor 与 task reader 共用 `internal/reflocation` 一条规则,name 自足(ref 携带即可
+恢复,无需任何额外状态)。
+
 随后用 `upload-snapshot --to-ref-location` 发布,tarstream 得到
-`file://<digest>.snapshot@location:<source-sid>`,Bundle 得到
-`file://<root-key>.bundle@location:<source-sid>`。没有 parent 时发布到 Manifest Store。
+`file://<digest>.snapshot@location:<publication-name>`,Bundle 得到
+`file://<root-key>.bundle@location:<publication-name>`。没有 parent 时发布到 Manifest Store。
 两者都是 canonical portable ref.第一阶段只读 local checkpoint 并产生 portable ref,
 不改变 source row/cache/route 或本机文件;第二阶段取得 lifecycle finalizer 后才提交
 source retention 并删除明确的本机 checkpoint。located 目录绝不进入本机 cleanup。

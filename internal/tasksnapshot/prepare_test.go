@@ -24,24 +24,24 @@ func TestPrepareReadsOnlyRootAndCollectsFlattenedClosure(t *testing.T) {
 metadata:
   kuasar-sandbox.network: '{"hostname":"inherited"}'
 from_refs:
-  - file://parent.snapshot@location:memory-parent
-  - file://parent.snapshot@location:memory-parent
+  - file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824
+  - file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824
 boot:
-  runtime_ref: file://runtime.bundle@location:platform-runtime
+  runtime_ref: file://runtime.bundle@location:0198f7a11106-7234-9abc-012345670006-20260824
   root:
-    base_ref: file://root.image@location:root-image
+    base_ref: file://root.image@location:0198f7a11102-7234-9abc-012345670002-20260824
     base: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     base_from_refs:
-      - file://root-old.overlay@location:root-layer
+      - file://root-old.overlay@location:0198f7a11103-7234-9abc-012345670003-20260824
     overlay:
-      base: file://root-new.overlay@location:root-layer
+      base: file://root-new.overlay@location:0198f7a11103-7234-9abc-012345670003-20260824
       base_from_refs:
         - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   disks:
-    - base_ref: file://data.image@location:data-image
-      base: file://data.overlay@location:data-layer
+    - base_ref: file://data.image@location:0198f7a11104-7234-9abc-012345670004-20260824
+      base: file://data.overlay@location:0198f7a11105-7234-9abc-012345670005-20260824
       base_from_refs:
-        - file://data-old.overlay@location:data-layer
+        - file://data-old.overlay@location:0198f7a11105-7234-9abc-012345670005-20260824
 `
 	_, rootPath := writeTaskSnapshot(t, rootCfg)
 	result, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{
@@ -64,7 +64,7 @@ boot:
 	if result.Summary.RequiredRefCount != 10 {
 		t.Fatalf("required ref count = %d, want 10", result.Summary.RequiredRefCount)
 	}
-	for _, name := range []string{"memory-parent", "root-image", "root-layer", "data-image", "data-layer"} {
+	for _, name := range []string{"0198f7a11101-7234-9abc-012345670001-20260824", "0198f7a11102-7234-9abc-012345670002-20260824", "0198f7a11103-7234-9abc-012345670003-20260824", "0198f7a11104-7234-9abc-012345670004-20260824", "0198f7a11105-7234-9abc-012345670005-20260824"} {
 		location, err := reflocation.Resolve("file:///mnt/task-locations", name)
 		if err != nil {
 			t.Fatal(err)
@@ -73,12 +73,12 @@ boot:
 			t.Fatalf("location %q = %q, want %q", name, result.RefLocationURIs[name], location.URI)
 		}
 	}
-	if _, exists := result.RefLocationURIs["platform-runtime"]; exists {
+	if _, exists := result.RefLocationURIs["0198f7a11106-7234-9abc-012345670006-20260824"]; exists {
 		t.Fatal("Boot.RuntimeRef entered tenant ref locations")
 	}
 	// The parent path intentionally does not exist. Success proves the task did
 	// not reinterpret flattened FromRefs as snapshot.cfg graph edges.
-	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@location:memory-parent" {
+	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824" {
 		t.Fatalf("root config changed: %+v", result.RootCfg.FromRefs)
 	}
 	if result.ConfigReadDuration <= 0 || result.PrepareDuration < result.ConfigReadDuration {
@@ -91,7 +91,7 @@ func TestPrepareLocatedRootBuildsPathMappingBeforeRead(t *testing.T) {
 	base := filepath.Base(rootPath)
 	digest := strings.TrimSuffix(base, filepath.Ext(base))
 	ref := manifest.Ref{
-		Scheme: manifest.RefSchemeFile, Path: base, Location: "root-source",
+		Scheme: manifest.RefSchemeFile, Path: base, Location: "0198f7a11107-7234-9abc-012345670007-20260824",
 		DigestScheme: "sha256", Digest: digest,
 	}
 	location, err := reflocation.Resolve("file:///tmp/task-snapshot-locations", ref.Location)

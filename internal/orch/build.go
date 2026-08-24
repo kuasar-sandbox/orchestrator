@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -1613,11 +1614,16 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	}
 	toRefLocation := ""
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		uri, err := o.cfg.Checkpoint.RefLocationURI(b.BuildID)
+		// Publication location name: the build id plus the publication date.
+		// The date suffix is what the time-ordered layout buckets by; a
+		// same-day retry reuses the same name (and directory), while a
+		// cross-midnight retry simply ages out with its own bucket.
+		locName := reflocation.PublicationName(b.BuildID, time.Now())
+		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
 			return nil, err
 		}
-		toRefLocation = b.BuildID + "=" + uri
+		toRefLocation = locName + "=" + uri
 	}
 
 	importReferer, err := o.effectiveImportReferer(b)
