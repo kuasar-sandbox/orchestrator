@@ -605,7 +605,7 @@ assert status["execution"]["used_resources"] == {
 }, status
 PY
 
-    local build_pid sandbox_ctl_pid vmm_path ctl_path unit_path slice_path
+    local build_pid sandbox_ctl_pid vmm_path ctl_path unit_path slice_path memory_high=""
     build_pid=$(cat "$WORK/run/runs/$run_id.pid")
     sandbox_ctl_pid=$(python3 - "$WORK/phase-reservations.json" "$sid" <<'PY'
 import json, sys
@@ -634,7 +634,19 @@ PY
     grep -qw cpu "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable cpu controller"
     grep -qw memory "$unit_path/cgroup.subtree_control" || fail "builder unit did not enable memory controller"
     [ "$(cat "$ctl_path/memory.high")" = "max" ] || fail "builder ctl subgroup inherited a low memory.high"
-    [ "$(cat "$vmm_path/memory.high")" != "max" ] || fail "phase VMM did not receive controller memory.high"
+    # Cold start deliberately leaves VMM memory.high=max through launch ACK and
+    # settled.  The first trusted guest report starts the initial shrink, and
+    # high becomes finite only after balloon current converges.  The B2 phase
+    # stays alive for 20 seconds specifically so active enforcement can be
+    # inspected; wait inside that window instead of racing the report barrier.
+    for _ in $(seq 1 60); do
+        memory_high=$(cat "$vmm_path/memory.high" 2>/dev/null || true)
+        [ "$memory_high" != "max" ] && [ -n "$memory_high" ] && break
+        sleep 0.25
+    done
+    if [ "$memory_high" = "max" ] || [ -z "$memory_high" ]; then
+        fail "phase VMM did not leave deferred memory.high after a trusted report (last=${memory_high:-missing})"
+    fi
     python3 - "$unit_path" "$slice_path" "$vmm_path" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" <<'PY' || fail "effective per-Build/aggregate/phase cgroup limits"
 import pathlib, sys
 
@@ -651,7 +663,7 @@ assert_cpu(unit, build_cpu)
 assert_cpu(pool, execution_cpu)
 assert_cpu(vmm, 2000)
 PY
-    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified"
+    echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified (memory.high=$memory_high)"
 }
 diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
