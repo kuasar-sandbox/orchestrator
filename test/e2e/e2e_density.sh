@@ -850,23 +850,37 @@ phase_b2_dynamic_control() {
     b2_timeline_event "$sid" "sandbox_started pid=$pid"
 
     # Synchronize past launch and the first fresh report-driven steady action.
-    # The first workload allocation then acts as a deterministic pressure probe
-    # and remains held until node reservation is reflected by CH's accepted
-    # target. Grow deliberately does not wait memory_actual_size convergence.
+    # Boot-time PSI may already reserve and deliver a grow before the workload
+    # gate. Otherwise the first workload allocation is the pressure probe. In
+    # both cases the allocation remains held until the reservation is reflected
+    # by CH's accepted target. Grow deliberately does not wait for
+    # memory_actual_size convergence.
     wait_for_b2_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
     b2_timeline_event "$sid" "control_ready admission=1 settled=1 sensor=1 fresh_report=1"
     local target_baseline=-1 current_baseline=-1 grow_baseline=0
+    local initial_target=$(((B_CAP_MIB - B2_STARTUP_MIB) * 1024 * 1024))
+    local grow_phase=pressure target_reference=-1
     read -r target_baseline current_baseline <<<"$(read_ch_balloon_state "$sid")"
     [[ "$target_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid pre-pressure CH target"
     [[ "$current_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid pre-pressure CH current Budget"
     grow_baseline=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_baseline=0
+    target_reference=$target_baseline
+    if [ "$grow_baseline" -gt 0 ] && [ "$target_baseline" -lt "$initial_target" ] \
+        && grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null; then
+        # The retained pre-pressure Budget is already a complete dynamic grow:
+        # node reserved it before sandbox-ctl lowered the CH balloon target.
+        grow_phase=prepressure
+        target_reference=$initial_target
+    fi
     open_workload_gate "$sid" "$start_gate" start
     b2_timeline_event "$sid" "start_gate_open"
 
     wait_for_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
     b2_timeline_event "$sid" "pressure_probe_ready"
     wait_for_controller_grant "$sid" "$pid" "$B2_GRANT_TIMEOUT"
-    wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
+    if [ "$grow_phase" = pressure ]; then
+        wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
+    fi
 
     local node_reservation grant_line grow_line
     node_reservation=$(latest_controller_grant_alloc "$sid")
@@ -878,7 +892,7 @@ phase_b2_dynamic_control() {
     b2_timeline_event "$sid" "grant_applied log=$grow_line"
 
     wait_for_b2_guest_delivery \
-        "$sid" "$pid" "$node_reservation" "$B2_DELIVERY_TIMEOUT" "$target_baseline"
+        "$sid" "$pid" "$node_reservation" "$B2_DELIVERY_TIMEOUT" "$target_reference"
     open_workload_gate "$sid" "$delivery_gate" delivery
     b2_timeline_event "$sid" "delivery_gate_open"
     wait_for_b2_workload "$sid" "$pid" 45
@@ -901,7 +915,7 @@ phase_b2_dynamic_control() {
         fail "B2: guest self-cap fired before proactive control could absorb pressure"
     fi
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
-    echo "  Phase B2: grants=$grants oom_count=0 workload_done=1 delivery_verified=1"
+    echo "  Phase B2: grants=$grants grow_phase=$grow_phase oom_count=0 workload_done=1 delivery_verified=1"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
