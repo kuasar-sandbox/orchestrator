@@ -5,15 +5,13 @@
 #
 #   Phase A   sandbox-local Budget control with node reservation
 #             1 sandbox in dynamic mode runs an intermittent Python
-#             workload (active phases linearly grow RSS to R_max,
-#             Pareto-distributed durations, exponential idle gaps).
+#             workload with deterministic grow/rest cycles.
 #             Verifies sandbox-originated grow grants and report-driven,
 #             one-step local shrink during idle.
 #
-#   Phase B   emergency convergence vs proactive control (A/B comparison)
-#             B1: static mode, no node controller. The production guest
-#                 self-cap detects an infeasible balloon target, returns
-#                 memory, and the workload eventually completes.
+#   Phase B   static local control vs dynamic reservation (A/B comparison)
+#             B1: static mode, no node controller. Sandbox-local control
+#                 accepts a CH grow target and the workload completes.
 #             B2: dynamic mode, same headroom/workload. Node admission
 #                 and grants complete the workload without guest self-cap/OOM.
 #
@@ -147,9 +145,9 @@ echo "+memory +cpu" > /sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/nul
 # for reproducibility; perf harnesses can override.
 WORKLOAD_PY="$(cat "$SCRIPT_DIR/lib/workload.py")"
 
-# Phase B uses one workload definition for both sides of the comparison. The
-# dynamic side additionally reserves the InitialBudget derived from startup
-# headroom through the existing node boundary.
+# Phase B uses one workload definition for both sides of the comparison. Both
+# sides run the same sandbox-local balloon/cgroup control loop; the dynamic side
+# additionally obtains Budget through the existing node reservation boundary.
 B_HEADROOM_MIB=320
 B_CAP_MIB=1024
 B_WORKLOAD_DURATION=15
@@ -525,7 +523,7 @@ b2_timeline_event() {
     printf '%s %s\n' "$monotonic_ns" "$*" >>"$WORK/$sid-timeline.log"
 }
 
-wait_for_b2_pressure_probe() {
+wait_for_pressure_probe() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -538,7 +536,7 @@ wait_for_b2_pressure_probe() {
     fail "$sid: pressure probe was not ready within ${timeout}s"
 }
 
-wait_for_b2_local_grow() {
+wait_for_local_grow() {
     local sid="$1" pid="$2" timeout="$3" baseline="$4" count=0
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -546,10 +544,25 @@ wait_for_b2_local_grow() {
         if [ "$count" -gt "$baseline" ]; then
             return 0
         fi
-        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before applying a sensor grant"
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before applying a local grow target"
         sleep 0.1
     done
-    fail "$sid: sandbox-ctl did not apply the reserved grow target within ${timeout}s"
+    fail "$sid: sandbox-ctl did not apply a grow target within ${timeout}s"
+}
+
+wait_for_static_control_ready() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null \
+            && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before static control readiness barrier"
+        sleep 0.1
+    done
+    fail "$sid: static control readiness barrier not reached within ${timeout}s"
 }
 
 latest_controller_grant_alloc() {
@@ -588,6 +601,8 @@ wait_for_b2_guest_delivery() {
         if read -r target actual <<<"$state" \
             && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
             && [ "$target" -lt "$target_baseline" ]; then
+            [ "$target" -le "$capacity" ] && [ "$actual" -le "$capacity" ] \
+                || fail "$sid: CH balloon state exceeds Capacity (target=$target actual=$actual capacity=$capacity)"
             applied_budget=$((capacity - target))
             if [ "$applied_budget" -le "$node_reservation" ]; then
                 b2_timeline_event "$sid" \
@@ -605,6 +620,26 @@ wait_for_b2_guest_delivery() {
     b2_timeline_event "$sid" \
         "grow_target_timeout target=$target current_budget=$actual applied_budget=$applied_budget node_reservation=$node_reservation"
     fail "$sid: reserved grow target was not CH-accepted within ${timeout}s (target=$target actual=$actual reservation=$node_reservation)"
+}
+
+wait_for_static_grow_delivery() {
+    local sid="$1" pid="$2" timeout="$3" target_baseline="$4"
+    local capacity=$((B_CAP_MIB * 1024 * 1024))
+    local deadline=$((SECONDS + timeout)) state="" target=-1 actual=-1 applied_budget=0
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        state=$(read_ch_balloon_state "$sid" 2>/dev/null) || state=""
+        if read -r target actual <<<"$state" \
+            && [[ "$target" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] \
+            && [ "$target" -lt "$target_baseline" ]; then
+            [ "$target" -le "$capacity" ] && [ "$actual" -le "$capacity" ] \
+                || fail "$sid: CH balloon state exceeds Capacity (target=$target actual=$actual capacity=$capacity)"
+            applied_budget=$((capacity - target))
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before static grow delivery"
+        sleep 0.25
+    done
+    fail "$sid: static grow target was not CH-accepted within ${timeout}s (target=$target actual=$actual baseline=$target_baseline)"
 }
 
 memory_event_count() {
@@ -638,20 +673,6 @@ wait_for_b2_workload() {
         sleep 0.25
     done
     fail "$sid: workload did not complete within ${timeout}s"
-}
-
-wait_for_guest_self_cap() {
-    local sid="$1" pid="$2" timeout="$3"
-    local deadline=$((SECONDS + timeout))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        guest_self_cap_observed "$sid" && return 0
-        if ! kill -0 "$pid" 2>/dev/null; then
-            guest_self_cap_observed "$sid" && return 0
-            fail "$sid: sandbox exited without guest self-cap evidence"
-        fi
-        sleep 0.25
-    done
-    fail "$sid: no guest self-cap evidence within ${timeout}s"
 }
 
 reservation_count() {
@@ -725,21 +746,24 @@ phase_a() {
     echo "Phase A: PASS"
 }
 
-# ---------- Phase B1: static guest emergency convergence ----------
+# ---------- Phase B1: static sandbox-local control ----------
 
-phase_b1_static_self_cap() {
+phase_b1_static_control() {
     echo
-    echo "==> Phase B1: static mode → guest self-cap convergence and liveness"
+    echo "==> Phase B1: static mode → sandbox-local grow and liveness"
     # No daemon. Static mode has no controller.
 
     local sid=sb-B1-1
+    local start_gate=/tmp/e2e-density-b1.start
+    local delivery_gate=/tmp/e2e-density-b1.delivery
     setup_sb "$sid"
-    # The infeasible static target must trigger the production guest's sticky
-    # balloon self-cap. deflate_on_oom remains at its production default; the
-    # direct self-cap log, not an OOM race or host pressure, is authoritative.
+    # deflate_on_oom remains enabled as the guest emergency fallback, but the
+    # normal static path is the same sandbox-local Budget loop used by dynamic
+    # mode. Gates make its accepted CH target directly observable.
     emit_yaml "$sid" static "$B_HEADROOM_MIB" "$B_CAP_MIB" "$B2_STARTUP_MIB" \
         "$B_WORKLOAD_DURATION" "$B_WORKLOAD_CYCLES" \
-        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true
+        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true \
+        "$start_gate" "$delivery_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -750,13 +774,33 @@ phase_b1_static_self_cap() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # Observe the guest emergency mechanism before asserting terminal liveness.
-    wait_for_guest_self_cap "$sid" "$pid" 35
+    wait_for_static_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
+    local target_baseline=-1 current_baseline=-1 target_after=-1 current_after=-1
+    local grow_baseline=0 grows=0
+    read -r target_baseline current_baseline <<<"$(read_ch_balloon_state "$sid")"
+    [[ "$target_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid static pre-pressure CH target"
+    [[ "$current_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid static pre-pressure CH current Budget"
+    [ "$target_baseline" -le $((B_CAP_MIB * 1024 * 1024)) ] \
+        && [ "$current_baseline" -le $((B_CAP_MIB * 1024 * 1024)) ] \
+        || fail "$sid: static pre-pressure CH state exceeds Capacity"
+    grow_baseline=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_baseline=0
+
+    open_workload_gate "$sid" "$start_gate" start
+    wait_for_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+    wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
+    wait_for_static_grow_delivery "$sid" "$pid" "$B2_DELIVERY_TIMEOUT" "$target_baseline"
+    local state_after=""
+    state_after=$(read_ch_balloon_state "$sid") \
+        || fail "$sid: cannot read static post-grow CH state"
+    read -r target_after current_after <<<"$state_after"
+    [[ "$target_after" =~ ^[0-9]+$ ]] || fail "$sid: invalid static post-grow CH target"
+    [[ "$current_after" =~ ^[0-9]+$ ]] || fail "$sid: invalid static post-grow CH current Budget"
+    [ "$target_after" -lt "$target_baseline" ] \
+        || fail "B1: static grow did not reduce CH target ($target_baseline -> $target_after)"
+    open_workload_gate "$sid" "$delivery_gate" delivery
     wait_for_workload "$sid" "$pid" 45
 
-    # Host cgroup pressure remains diagnostics, not a substitute for the direct
-    # guest self-cap evidence above.
-    local oom=0 high=0
+    local oom=0 high=0 self_cap=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
         oom=$(awk '$1=="oom" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || oom=0
         high=$(awk '$1=="high" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || high=0
@@ -764,13 +808,15 @@ phase_b1_static_self_cap() {
         [ -z "$high" ] && high=0
     fi
 
-    guest_self_cap_observed "$sid" || fail "B1: guest self-cap evidence disappeared"
-    guest_oom_observed "$sid" && fail "B1: guest OOM/SIGKILL despite self-cap convergence"
-    [ "$oom" -eq 0 ] || fail "B1: cgroup oom_count=$oom despite self-cap convergence"
+    guest_self_cap_observed "$sid" && self_cap=1
+    guest_oom_observed "$sid" && fail "B1: guest OOM/SIGKILL despite static local control"
+    [ "$oom" -eq 0 ] || fail "B1: cgroup oom_count=$oom despite static local control"
+    grows=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grows=0
+    [ "$grows" -gt "$grow_baseline" ] || fail "B1: no static sandbox-local grow observed"
     if grep -q "sid=$sid" "$WORK/audit.log" "$WORK/daemon.log" 2>/dev/null; then
         fail "B1: node-controller activity observed for static sandbox"
     fi
-    echo "  Phase B1: self_cap=1 workload_done=1 cgroup_oom=0 cgroup_high=$high controller=none"
+    echo "  Phase B1: local_grows=$((grows - grow_baseline)) target=$target_baseline->$target_after workload_done=1 self_cap=$self_cap cgroup_oom=0 cgroup_high=$high controller=none"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -820,10 +866,10 @@ phase_b2_dynamic_control() {
     open_workload_gate "$sid" "$start_gate" start
     b2_timeline_event "$sid" "start_gate_open"
 
-    wait_for_b2_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+    wait_for_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
     b2_timeline_event "$sid" "pressure_probe_ready"
     wait_for_controller_grant "$sid" "$pid" "$B2_GRANT_TIMEOUT"
-    wait_for_b2_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
+    wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
 
     local node_reservation grant_line grow_line
     node_reservation=$(latest_controller_grant_alloc "$sid")
@@ -1036,7 +1082,7 @@ PY
 # ---------- run all phases ----------
 
 phase_a
-phase_b1_static_self_cap
+phase_b1_static_control
 phase_b2_dynamic_control
 phase_c
 phase_d_controller_restart
@@ -1044,7 +1090,7 @@ phase_d_controller_restart
 echo
 echo "==> e2e_density: PASS"
 echo "    Phase A: auto resource allocation (1 sandbox, controller-driven)"
-echo "    Phase B1: static → guest self-cap convergence + workload liveness"
+echo "    Phase B1: static → sandbox-local CH target grow + workload liveness"
 echo "    Phase B2: dynamic + same headroom/workload → proactive reservation, no self-cap/OOM"
 echo "    Phase C: 4 admits ok, 5th rejected by water mark"
 echo "    Phase D: controller SIGKILL → lease/provisional/StateSync, VM identity unchanged"
