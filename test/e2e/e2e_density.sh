@@ -6,8 +6,8 @@
 #   Phase A   sandbox-local Budget control with node reservation
 #             1 sandbox in dynamic mode runs an intermittent Python
 #             workload with deterministic grow/rest cycles.
-#             Verifies sandbox-originated grow grants and report-driven,
-#             one-step local shrink during idle.
+#             Verifies sandbox-originated grow grants and workload liveness;
+#             Phase B2 provides the gated dynamic shrink check.
 #
 #   Phase B   static local control vs dynamic reservation (A/B comparison)
 #             B1: static mode, no node controller. Sandbox-local control
@@ -465,19 +465,6 @@ wait_for_workload() {
     fail "$sid: workload did not complete within ${timeout}s"
 }
 
-wait_for_budget_activity() {
-    local sid="$1" timeout="$2"
-    local deadline=$((SECONDS + timeout))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        if grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null \
-            && grep -q 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.5
-    done
-    fail "$sid: missing node grant or sandbox-local shrink within ${timeout}s"
-}
-
 wait_for_controller_grant() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
@@ -720,7 +707,7 @@ phase_a() {
     # Bound cold-start and workload completion independently from controller
     # activity so a fast run does not pay the full worst-case allowance.
     wait_for_workload "$sid" "$pid" 40
-    wait_for_budget_activity "$sid" 20
+    wait_for_controller_grant "$sid" "$pid" 20
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "A: no admit in audit"
@@ -736,7 +723,6 @@ phase_a() {
 
     [ "$oom" -eq 0 ] || fail "A: cgroup oom_count=$oom (Budget grow failed)"
     [ "$grants" -gt 0 ] || fail "A: no sandbox-originated Budget grant observed"
-    [ "$shrinks" -gt 0 ] || fail "A: no fresh-report sandbox-local shrink observed"
 
     echo "  Phase A: grants=$grants local_shrinks=$shrinks oom_count=0"
 
@@ -776,7 +762,8 @@ phase_b1_static_control() {
 
     wait_for_static_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
     local target_baseline=-1 current_baseline=-1 target_after=-1 current_after=-1
-    local grow_baseline=0 grows=0
+    local initial_target=$(((B_CAP_MIB - B2_STARTUP_MIB) * 1024 * 1024))
+    local grow_baseline=0 grows=0 grow_phase=pressure target_reference=-1
     read -r target_baseline current_baseline <<<"$(read_ch_balloon_state "$sid")"
     [[ "$target_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid static pre-pressure CH target"
     [[ "$current_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid static pre-pressure CH current Budget"
@@ -784,19 +771,29 @@ phase_b1_static_control() {
         && [ "$current_baseline" -le $((B_CAP_MIB * 1024 * 1024)) ] \
         || fail "$sid: static pre-pressure CH state exceeds Capacity"
     grow_baseline=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_baseline=0
+    target_reference=$target_baseline
+    if [ "$grow_baseline" -gt 0 ] && [ "$target_baseline" -lt "$initial_target" ]; then
+        # Boot-time PSI may already have delivered a local grow before the
+        # workload gate. That retained Budget is the same valid static-control
+        # outcome; a second grow is neither necessary nor guaranteed.
+        grow_phase=prepressure
+        target_reference=$initial_target
+    fi
 
     open_workload_gate "$sid" "$start_gate" start
     wait_for_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
-    wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
-    wait_for_static_grow_delivery "$sid" "$pid" "$B2_DELIVERY_TIMEOUT" "$target_baseline"
+    if [ "$grow_phase" = pressure ]; then
+        wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
+    fi
+    wait_for_static_grow_delivery "$sid" "$pid" "$B2_DELIVERY_TIMEOUT" "$target_reference"
     local state_after=""
     state_after=$(read_ch_balloon_state "$sid") \
         || fail "$sid: cannot read static post-grow CH state"
     read -r target_after current_after <<<"$state_after"
     [[ "$target_after" =~ ^[0-9]+$ ]] || fail "$sid: invalid static post-grow CH target"
     [[ "$current_after" =~ ^[0-9]+$ ]] || fail "$sid: invalid static post-grow CH current Budget"
-    [ "$target_after" -lt "$target_baseline" ] \
-        || fail "B1: static grow did not reduce CH target ($target_baseline -> $target_after)"
+    [ "$target_after" -lt "$target_reference" ] \
+        || fail "B1: static grow did not reduce CH target below $target_reference (got $target_after)"
     open_workload_gate "$sid" "$delivery_gate" delivery
     wait_for_workload "$sid" "$pid" 45
 
@@ -812,11 +809,11 @@ phase_b1_static_control() {
     guest_oom_observed "$sid" && fail "B1: guest OOM/SIGKILL despite static local control"
     [ "$oom" -eq 0 ] || fail "B1: cgroup oom_count=$oom despite static local control"
     grows=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grows=0
-    [ "$grows" -gt "$grow_baseline" ] || fail "B1: no static sandbox-local grow observed"
+    [ "$grows" -gt 0 ] || fail "B1: no static sandbox-local grow observed"
     if grep -q "sid=$sid" "$WORK/audit.log" "$WORK/daemon.log" 2>/dev/null; then
         fail "B1: node-controller activity observed for static sandbox"
     fi
-    echo "  Phase B1: local_grows=$((grows - grow_baseline)) target=$target_baseline->$target_after workload_done=1 self_cap=$self_cap cgroup_oom=0 cgroup_high=$high controller=none"
+    echo "  Phase B1: local_grows=$grows grow_phase=$grow_phase target=$target_baseline->$target_after initial_target=$initial_target workload_done=1 self_cap=$self_cap cgroup_oom=0 cgroup_high=$high controller=none"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
