@@ -320,14 +320,50 @@ else
     echo "==> FAIL: CH --cpus did not reflect capacity=2"
     exit 1
 fi
+# Mirror util.ParseSize with exact integer arithmetic so fractional units do
+# not lose bytes before the CH command line and aligned target are checked.
 size_to_bytes() {
-    case "$1" in
-        *GiB) echo $(( ${1%GiB} * 1024 * 1024 * 1024 )) ;;
-        *MiB) echo $(( ${1%MiB} * 1024 * 1024 )) ;;
-        *KiB) echo $(( ${1%KiB} * 1024 )) ;;
-        *B)   echo "${1%B}" ;;
-        *)    echo "$1" ;;
-    esac
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+value = sys.argv[1].strip()
+match = re.fullmatch(
+    r"(?P<whole>[0-9]*)(?:\.(?P<fraction>[0-9]+))?\s*"
+    r"(?P<unit>b|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)?",
+    value,
+    flags=re.IGNORECASE,
+)
+if match is None or (not match["whole"] and match["fraction"] is None):
+    raise SystemExit(f"invalid size: {value!r}")
+
+whole = match["whole"] or "0"
+fraction = match["fraction"] or ""
+scale = {
+    None: 1,
+    "b": 1,
+    "k": 1 << 10,
+    "kb": 1 << 10,
+    "kib": 1 << 10,
+    "m": 1 << 20,
+    "mb": 1 << 20,
+    "mib": 1 << 20,
+    "g": 1 << 30,
+    "gb": 1 << 30,
+    "gib": 1 << 30,
+    "t": 1 << 40,
+    "tb": 1 << 40,
+    "tib": 1 << 40,
+}[match["unit"].lower() if match["unit"] else None]
+numerator = int(whole + fraction) * scale
+denominator = 10 ** len(fraction)
+byte_count, remainder = divmod(numerator, denominator)
+if remainder:
+    raise SystemExit(f"size is not an exact whole-byte value: {value!r}")
+if byte_count > (1 << 64) - 1:
+    raise SystemExit(f"size overflows uint64 bytes: {value!r}")
+print(byte_count)
+PY
 }
 cap_bytes=$(size_to_bytes "$CAP_MEM")
 # The memory-zone is the authoritative Capacity and must preserve the exact
