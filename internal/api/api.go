@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/prefetch"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -372,6 +373,16 @@ type ConnectMMDSCore interface {
 	ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int, metadata map[string]string, header *string) (*types.Sandbox, error)
 }
 
+// PrefetchCore is the optional ahead-of-time page-cache warming extension.
+// Implemented only where the hint is meaningful (the standalone orchestrator);
+// absent on cluster router implementations. It is deliberately not part of Core
+// so the e2b surface stays fixed. The reference is opaque — the implementation
+// owns interpreting it.
+type PrefetchCore interface {
+	Prefetch(ctx context.Context, reference string) (prefetch.Result, error)
+	PrefetchStatus(ctx context.Context, requestID string) (prefetch.Result, bool, error)
+}
+
 // Resources are the node-uniform VM resources surfaced in e2b list/get responses.
 // Every sandbox runs with the configured vcpu/memory (orch builds the launchspec
 // from the same config); DiskMB is the writable overlay seed. e2b's ListedSandbox
@@ -449,6 +460,11 @@ func (a *API) Handler() http.Handler {
 	// listener and the local control socket's api plane.
 	mux.HandleFunc("POST /sandboxes/{id}/export", a.auth(a.exportSandbox))
 	mux.HandleFunc("POST /sandboxes/import", a.auth(a.importSandbox))
+	// Ahead-of-time page-cache prefetch (orchestrator extension; api-key
+	// authed). Accepts an opaque reference the orchestrator decodes to warm
+	// before an expected activation. Standalone only (PrefetchCore).
+	mux.HandleFunc("POST /prefetch", a.auth(a.prefetch))
+	mux.HandleFunc("GET /prefetch/{requestID}", a.auth(a.prefetchStatus))
 	return mux
 }
 
@@ -1131,6 +1147,67 @@ func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"sandboxID": id})
+}
+
+// prefetch handles POST /prefetch and returns a request ID whose progress is
+// available from GET /prefetch/{requestID}.
+func (a *API) prefetch(w http.ResponseWriter, r *http.Request) {
+	pc, ok := a.core.(PrefetchCore)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "prefetch not supported")
+		return
+	}
+	var body struct {
+		Reference string `json:"reference"`
+	}
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	if body.Reference == "" {
+		writeErr(w, http.StatusBadRequest, "reference required")
+		return
+	}
+	res, err := pc.Prefetch(r.Context(), body.Reference)
+	if err != nil {
+		if errors.Is(err, prefetch.ErrUnsupportedReference) {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.log.Warn("prefetch error", "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "prefetch unavailable")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, res)
+}
+
+func (a *API) prefetchStatus(w http.ResponseWriter, r *http.Request) {
+	pc, ok := a.core.(PrefetchCore)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "prefetch not supported")
+		return
+	}
+	requestID := r.PathValue("requestID")
+	if requestID == "" {
+		writeErr(w, http.StatusNotFound, "prefetch request not found")
+		return
+	}
+	res, found, err := pc.PrefetchStatus(r.Context(), requestID)
+	if err != nil {
+		a.log.Warn("prefetch status error", "err", err)
+		writeErr(w, http.StatusServiceUnavailable, "prefetch unavailable")
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "prefetch request not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // failMigrate maps typed migration failures without returning storage paths,

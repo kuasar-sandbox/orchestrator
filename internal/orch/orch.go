@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/prefetch"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -55,6 +56,9 @@ type Orchestrator struct {
 	log *slog.Logger
 
 	sandboxReadyTimeout time.Duration
+
+	prefetchOnce sync.Once
+	prefetchW    prefetch.Warmer
 
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
@@ -199,6 +203,23 @@ func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierC
 // identity resolved by nodectl. It must be called before launch admission.
 func (o *Orchestrator) SetResourceControllerSocketIdentity(identity string) {
 	o.resourceControllerSocketIdentity = identity
+}
+
+// Prefetch implements api.PrefetchCore. It admits a tracked node-local warming
+// request; its worker lifetime is independent from the caller's HTTP context.
+func (o *Orchestrator) Prefetch(ctx context.Context, reference string) (prefetch.Result, error) {
+	o.prefetchOnce.Do(func() {
+		o.prefetchW = prefetch.New(o.cfg.Checkpoint, o.log)
+	})
+	return o.prefetchW.Warm(ctx, prefetch.PrefetchReq{Reference: reference})
+}
+
+func (o *Orchestrator) PrefetchStatus(_ context.Context, requestID string) (prefetch.Result, bool, error) {
+	o.prefetchOnce.Do(func() {
+		o.prefetchW = prefetch.New(o.cfg.Checkpoint, o.log)
+	})
+	result, found := o.prefetchW.Status(requestID)
+	return result, found, nil
 }
 
 // --- api.Core ---
