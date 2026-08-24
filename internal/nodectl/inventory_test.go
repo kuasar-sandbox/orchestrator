@@ -113,7 +113,7 @@ func TestNodeCtlProcessHelper(t *testing.T) {
 				}
 				applied := uint64(192 << 20)
 				if scanner.Text() == "syncbad" {
-					applied = 64 << 20
+					applied = testLeaseCapacity + 1
 				}
 				_, err := client.StateSync(resource.StateSyncParams{
 					SandboxID: sid, AppliedAllocatableMemory: applied,
@@ -305,7 +305,7 @@ func TestInventoryAcceptsLiveLeaseWithEquivalentLegacySocket(t *testing.T) {
 	}
 	snapshot := state.ResourceSnapshot()
 	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 1 || snapshot.UnknownCount != 0 ||
-		snapshot.Allocated.MemoryBytes != testLeaseCapacity {
+		snapshot.Reserved.MemoryBytes != testLeaseCapacity {
 		t.Fatalf("legacy alias recovery = %+v", snapshot)
 	}
 	live, err := inventory.LookupLiveLease(sid)
@@ -382,8 +382,8 @@ func TestInventoryLiveStaleCorruptAndLeaseCgroupDedup(t *testing.T) {
 	if snapshot.ReservationCount != 2 || snapshot.ProvisionalCount != 2 || snapshot.UnknownCount != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
-	if want := testLeaseCapacity + state.AllocatablePool.MemoryBytes; snapshot.Allocated.MemoryBytes != want {
-		t.Fatalf("allocated=%d want=%d", snapshot.Allocated.MemoryBytes, want)
+	if want := testLeaseCapacity + state.AllocatablePool.MemoryBytes; snapshot.Reserved.MemoryBytes != want {
+		t.Fatalf("reserved=%d want=%d", snapshot.Reserved.MemoryBytes, want)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale lease not removed: %v", err)
@@ -409,7 +409,7 @@ func TestInventoryDoesNotChargeTrustedControlSubgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := state.ResourceSnapshot()
-	if snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != testLeaseCapacity {
+	if snapshot.ReservationCount != 1 || snapshot.Reserved.MemoryBytes != testLeaseCapacity {
 		t.Fatalf("control subgroup entered sandbox accounting: %+v", snapshot)
 	}
 	for _, reservation := range state.ReservationViews() {
@@ -464,7 +464,7 @@ func TestInventoryChargesEveryInvalidLiveLeaseWithDistinctIdentity(t *testing.T)
 	if snapshot.ReservationCount != 2 || snapshot.ProvisionalCount != 2 || snapshot.UnknownCount != 2 {
 		t.Fatalf("invalid lease snapshot = %+v", snapshot)
 	}
-	if snapshot.Allocated.MemoryBytes != 2*state.AllocatablePool.MemoryBytes {
+	if snapshot.Reserved.MemoryBytes != 2*state.AllocatablePool.MemoryBytes {
 		t.Fatalf("invalid leases were not charged independently: %+v", snapshot)
 	}
 	first.send("stop")
@@ -483,7 +483,7 @@ func TestInventoryChargesSemanticallyInvalidLiveLease(t *testing.T) {
 	}
 	snapshot := state.ResourceSnapshot()
 	if snapshot.ReservationCount != 1 || snapshot.UnknownCount != 1 ||
-		snapshot.Allocated.MemoryBytes != state.AllocatablePool.MemoryBytes {
+		snapshot.Reserved.MemoryBytes != state.AllocatablePool.MemoryBytes {
 		t.Fatalf("invalid semantic lease was not charged full pool: %+v", snapshot)
 	}
 	invalid.send("stop")
@@ -500,7 +500,7 @@ func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := state.ResourceSnapshot()
-	if snapshot.ReservationCount != 2 || snapshot.Allocated.MemoryBytes != 300<<20+state.AllocatablePool.MemoryBytes {
+	if snapshot.ReservationCount != 2 || snapshot.Reserved.MemoryBytes != 300<<20+state.AllocatablePool.MemoryBytes {
 		t.Fatalf("orphan snapshot = %+v", snapshot)
 	}
 }
@@ -535,7 +535,7 @@ func TestInventoryOldManagedBeforeCgroupUsesFullPoolUpperBound(t *testing.T) {
 	}
 	res := reservationForTest(t, state, sid)
 	if !res.Provisional || res.RecoverySource != RecoveryUnknownManaged ||
-		res.AllocatableNowMem != state.AllocatablePool.MemoryBytes {
+		res.ReservationMemory != state.AllocatablePool.MemoryBytes {
 		t.Fatalf("legacy pre-cgroup reservation = %+v", res)
 	}
 	snapshot := state.ResourceSnapshot()
@@ -554,7 +554,7 @@ func TestSweeperRetainsLiveCgroupAcrossStartupAndHeartbeatTimeouts(t *testing.T)
 	installReservationForTest(t, state, Reservation{
 		Token: "startup-token", SandboxID: "startup-live", CgroupPath: cgroup,
 		Stage: StageStartup, StageEnteredAt: time.Now().Add(-time.Hour),
-		LastHeartbeatAt: time.Now().Add(-time.Hour), AllocatableNowMem: 512 << 20,
+		LastHeartbeatAt: time.Now().Add(-time.Hour), ReservationMemory: 512 << 20,
 		Capacity: Resources{MemoryBytes: 512 << 20}, RecoverySource: RecoveryCgroup,
 	})
 	inventory := &Inventory{ControllerSocket: filepath.Join(t.TempDir(), "controller.sock"), CgroupScanPaths: []string{root}, Pool: state.AllocatablePool}
@@ -614,7 +614,7 @@ func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := state.ResourceSnapshot()
-	if before.Allocated.MemoryBytes != testLeaseCapacity || before.ProvisionalCount != 1 {
+	if before.Reserved.MemoryBytes != testLeaseCapacity || before.ProvisionalCount != 1 {
 		t.Fatalf("before sync = %+v", before)
 	}
 	live, err := inventory.LookupLiveLease(sid)
@@ -646,7 +646,7 @@ func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
 		t.Fatalf("managed sync = %s", line)
 	}
 	after := state.ResourceSnapshot()
-	if after.Allocated.MemoryBytes != 192<<20 || after.StartupInFlight != 0 || after.ProvisionalCount != 0 || after.ReservationCount != 1 {
+	if after.Reserved.MemoryBytes != 192<<20 || after.StartupInFlight != 0 || after.ProvisionalCount != 0 || after.ReservationCount != 1 {
 		t.Fatalf("after sync = %+v", after)
 	}
 	res := reservationForTest(t, state, sid)
@@ -675,7 +675,7 @@ func TestStateSyncRejectsAllocationOutsideLease(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _ = srv.Serve(ctx); close(done) }()
 	client.send("syncbad")
-	if line := client.next(t); !strings.Contains(line, "outside floor/capacity") {
+	if line := client.next(t); !strings.Contains(line, "outside (0, capacity]") {
 		t.Fatalf("bad sync response = %q", line)
 	}
 	client.send("stop")
@@ -738,7 +738,7 @@ func TestInventoryCgroupInspectionFailureFailsClosed(t *testing.T) {
 
 	installReservationForTest(t, state, Reservation{
 		Token: "inspection-unknown", SandboxID: "inspection-unknown",
-		CgroupPath: root, Stage: StageSettled, AllocatableNowMem: 512 << 20,
+		CgroupPath: root, Stage: StageSettled, ReservationMemory: 512 << 20,
 	})
 	if !inventory.ConsumerLive(reservationForTest(t, state, "inspection-unknown")) {
 		t.Fatal("unknown cgroup liveness was treated as dead")

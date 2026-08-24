@@ -6,7 +6,7 @@ package util
 
 import (
 	"fmt"
-	"strconv"
+	"math/big"
 	"strings"
 )
 
@@ -31,18 +31,19 @@ func ParseSize(s string) (uint64, error) {
 	if s == "" {
 		return 0, fmt.Errorf("util: empty size")
 	}
-	// Split numeric prefix from unit suffix.
+	// Byte sizes must have one exact integer representation. Deliberately do
+	// not accept signs, exponents, NaN or Inf through a floating-point parser.
 	i := 0
-	for i < len(s) && (s[i] == '.' || s[i] == '-' || (s[i] >= '0' && s[i] <= '9')) {
+	dots := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		if s[i] == '.' {
+			dots++
+		}
 		i++
 	}
 	num, unit := s[:i], strings.TrimSpace(strings.ToLower(s[i:]))
-	if num == "" {
+	if num == "" || dots > 1 {
 		return 0, fmt.Errorf("util: size %q missing numeric part", s)
-	}
-	v, err := strconv.ParseFloat(num, 64)
-	if err != nil || v < 0 {
-		return 0, fmt.Errorf("util: bad size %q", s)
 	}
 	var mult uint64
 	switch unit {
@@ -59,5 +60,36 @@ func ParseSize(s string) (uint64, error) {
 	default:
 		return 0, fmt.Errorf("util: unknown size unit %q in %q", unit, s)
 	}
-	return uint64(v * float64(mult)), nil
+
+	parts := strings.Split(num, ".")
+	whole := parts[0]
+	fraction := ""
+	if len(parts) == 2 {
+		fraction = parts[1]
+	}
+	if whole == "" {
+		whole = "0"
+	}
+	if fraction == "" && strings.HasSuffix(num, ".") {
+		return 0, fmt.Errorf("util: bad size %q", s)
+	}
+	digits := whole + fraction
+	if digits == "" {
+		return 0, fmt.Errorf("util: bad size %q", s)
+	}
+	numerator, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		return 0, fmt.Errorf("util: bad size %q", s)
+	}
+	numerator.Mul(numerator, new(big.Int).SetUint64(mult))
+	denominator := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(len(fraction))), nil)
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(numerator, denominator, remainder)
+	if remainder.Sign() != 0 {
+		return 0, fmt.Errorf("util: size %q is not an exact whole-byte value", s)
+	}
+	if !quotient.IsUint64() {
+		return 0, fmt.Errorf("util: size %q overflows uint64 bytes", s)
+	}
+	return quotient.Uint64(), nil
 }

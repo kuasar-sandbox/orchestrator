@@ -47,7 +47,7 @@ func (i *Inventory) defaults() {
 	}
 }
 
-// Recover installs every live lease first, then managed legacy consumers, then
+// Recover installs every live lease first, then managed pidfile consumers, then
 // orphan cgroups. State's cgroup index deduplicates the same consumer across
 // sources.
 func (i *Inventory) Recover(state *State) error {
@@ -66,9 +66,9 @@ func (i *Inventory) Recover(state *State) error {
 		return err
 	}
 	snapshot := state.ResourceSnapshot()
-	i.Logf("inventory recovered reservations=%d provisional=%d unknown=%d allocated_memory=%d",
+	i.Logf("inventory recovered reservations=%d provisional=%d unknown=%d reserved_memory=%d",
 		snapshot.ReservationCount, snapshot.ProvisionalCount, snapshot.UnknownCount,
-		snapshot.Allocated.MemoryBytes)
+		snapshot.Reserved.MemoryBytes)
 	return nil
 }
 
@@ -136,9 +136,9 @@ func (i *Inventory) scanLeases(state *State, controlPIDs map[int]bool) error {
 			lease.ControllerSocket = controllerSocket
 			err = state.InstallProvisional(ProvisionalSpec{
 				SandboxID: lease.SandboxID, PeerPID: owner, CgroupPath: lease.CgroupPath,
-				Capacity:     Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
-				Floor:        Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
-				MemoryCharge: lease.CapacityMemory, StartupCharge: lease.CapacityMemory,
+				Capacity:              Resources{MemoryBytes: lease.CapacityMemory, CPUMilli: lease.CapacityCPUMilli},
+				ConfiguredAllocatable: Resources{MemoryBytes: lease.FloorMemory, CPUMilli: lease.FloorCPUMilli},
+				ReservationMemory:     lease.CapacityMemory, InitialBudget: lease.CapacityMemory,
 				RecoverySource: RecoveryLease, RecoveryKey: "lease:" + entry.Name(),
 				LeasePath: path, ClientFeatures: lease.ClientFeatures,
 			})
@@ -160,8 +160,8 @@ func (i *Inventory) installUnknownLease(state *State, path string, owner int, pa
 	i.Logf("live lease %s is invalid; charging full pool: %v", path, parseErr)
 	if err := state.InstallProvisional(ProvisionalSpec{
 		SandboxID: "unknown-lease-" + name, PeerPID: owner,
-		Capacity: i.Pool, Floor: Resources{CPUMilli: i.Pool.CPUMilli},
-		MemoryCharge: i.Pool.MemoryBytes, StartupCharge: i.Pool.MemoryBytes,
+		Capacity: i.Pool, ConfiguredAllocatable: Resources{CPUMilli: i.Pool.CPUMilli},
+		ReservationMemory: i.Pool.MemoryBytes, InitialBudget: i.Pool.MemoryBytes,
 		RecoverySource: RecoveryUnknownLease, RecoveryKey: "unknown:" + path,
 		LeasePath: path,
 	}); err != nil {
@@ -243,9 +243,9 @@ func (i *Inventory) scanManaged(state *State, controlPIDs map[int]bool) error {
 		}
 		if err := state.InstallProvisional(ProvisionalSpec{
 			SandboxID: sid, PeerPID: owner, CgroupPath: cgroupPath,
-			Capacity:     Resources{MemoryBytes: capMem, CPUMilli: cpuMilliCeil(float64(cfg.Resources.Capacity.CPU))},
-			Floor:        Resources{MemoryBytes: floorMem, CPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU)},
-			MemoryCharge: capMem, StartupCharge: capMem,
+			Capacity:              Resources{MemoryBytes: capMem, CPUMilli: cpuMilliCeil(float64(cfg.Resources.Capacity.CPU))},
+			ConfiguredAllocatable: Resources{MemoryBytes: floorMem, CPUMilli: cpuMilliCeil(cfg.Resources.Allocatable.CPU)},
+			ReservationMemory:     capMem, InitialBudget: capMem,
 			RecoverySource: RecoveryManagedPIDFile, RecoveryKey: "pidfile:" + pidPath,
 		}); err != nil {
 			return err
@@ -259,8 +259,8 @@ func (i *Inventory) installUnknownManaged(state *State, sid string, owner int, p
 	i.Logf("live managed sandbox %s has incomplete %s; charging full pool", sid, reason)
 	return state.InstallProvisional(ProvisionalSpec{
 		SandboxID: sid, PeerPID: owner,
-		Capacity: i.Pool, Floor: Resources{CPUMilli: i.Pool.CPUMilli},
-		MemoryCharge: i.Pool.MemoryBytes, StartupCharge: i.Pool.MemoryBytes,
+		Capacity: i.Pool, ConfiguredAllocatable: Resources{CPUMilli: i.Pool.CPUMilli},
+		ReservationMemory: i.Pool.MemoryBytes, InitialBudget: i.Pool.MemoryBytes,
 		RecoverySource: RecoveryUnknownManaged, RecoveryKey: "unknown-managed:" + pidPath,
 	})
 }
@@ -356,8 +356,8 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
 			sid := "orphan-cgroup-" + hex.EncodeToString(hash[:8])
 			return state.InstallProvisional(ProvisionalSpec{
 				SandboxID: sid, CgroupPath: path,
-				Capacity: Resources{MemoryBytes: charge}, MemoryCharge: charge,
-				StartupCharge: charge, RecoverySource: RecoveryCgroup,
+				Capacity: Resources{MemoryBytes: charge}, ReservationMemory: charge,
+				InitialBudget: charge, RecoverySource: RecoveryCgroup,
 				RecoveryKey: "cgroup:" + path,
 			})
 		})

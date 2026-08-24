@@ -43,13 +43,15 @@ type StartupPatch struct {
 }
 
 // NodeResourcePolicy is conductor-owned policy, deliberately narrower than
-// sandboxer's runtime ResourcesConfig. Tenant metadata never sees Overhead and
-// neither surface exposes control, watermark, sensor, or deflate policy.
+// sandboxer's runtime ResourcesConfig. Tenant metadata never sees Overhead or
+// WatermarkHigh, and neither request surface exposes control, sensor, or
+// deflate policy.
 type NodeResourcePolicy struct {
-	Capacity    NodeCapacityPolicy    `yaml:"capacity" json:"capacity"`
-	Allocatable NodeAllocatablePolicy `yaml:"allocatable" json:"allocatable"`
-	Startup     *NodeStartupPolicy    `yaml:"startup,omitempty" json:"startup,omitempty"`
-	Overhead    NodeOverheadPolicy    `yaml:"overhead" json:"overhead"`
+	Capacity      NodeCapacityPolicy       `yaml:"capacity" json:"capacity"`
+	Allocatable   NodeAllocatablePolicy    `yaml:"allocatable" json:"allocatable"`
+	Startup       *NodeStartupPolicy       `yaml:"startup,omitempty" json:"startup,omitempty"`
+	Overhead      NodeOverheadPolicy       `yaml:"overhead" json:"overhead"`
+	WatermarkHigh *NodeWatermarkHighPolicy `yaml:"watermark_high,omitempty" json:"watermark_high,omitempty"`
 }
 
 type NodeCapacityPolicy struct {
@@ -77,6 +79,12 @@ type NodeOverheadPolicy struct {
 	Memory string `yaml:"memory" json:"memory"`
 }
 
+type NodeWatermarkHighPolicy struct {
+	// Pointer preserves explicit ratio: 0 so validation rejects it instead of
+	// silently treating it as an omitted default.
+	Ratio *float64 `yaml:"ratio,omitempty" json:"ratio,omitempty"`
+}
+
 // ApplyDefaults fills conductor-owned resource defaults without manufacturing
 // an allocatable CPU presence bit: omitted CPU must continue to follow the
 // final capacity after request overlays.
@@ -93,6 +101,13 @@ func (p *NodeResourcePolicy) ApplyDefaults() {
 	}
 	if p.Overhead.Memory == "" {
 		p.Overhead.Memory = "32MiB"
+	}
+	if p.WatermarkHigh == nil {
+		p.WatermarkHigh = &NodeWatermarkHighPolicy{}
+	}
+	if p.WatermarkHigh.Ratio == nil {
+		ratio := 0.875
+		p.WatermarkHigh.Ratio = &ratio
 	}
 }
 
@@ -142,14 +157,20 @@ func ValidateNodeResourcePolicy(policy NodeResourcePolicy, dynamic bool) error {
 	if _, err := positiveSize("sandbox.resources.overhead.memory", policy.Overhead.Memory); err != nil {
 		return err
 	}
+	if policy.WatermarkHigh == nil || policy.WatermarkHigh.Ratio == nil ||
+		!positiveFinite(*policy.WatermarkHigh.Ratio) || *policy.WatermarkHigh.Ratio >= 1 {
+		return errors.New("sandbox.resources.watermark_high.ratio must be > 0 and < 1")
+	}
 	if policy.Startup != nil {
-		if !dynamic {
-			return errors.New("sandbox.resources.startup requires resource_listen.enabled=true")
-		}
-		if _, err := positiveSize("sandbox.resources.startup.memory", policy.Startup.Memory); err != nil {
+		startupMem, err := positiveSize("sandbox.resources.startup.memory", policy.Startup.Memory)
+		if err != nil {
 			return err
 		}
+		if startupMem > capMem {
+			return errors.New("sandbox.resources.startup.memory must be <= sandbox.resources.capacity.memory")
+		}
 	}
+	_ = dynamic // controller presence does not change startup/headroom semantics.
 	return nil
 }
 
@@ -398,9 +419,6 @@ func ValidateResourcePatch(patch ResourcePatch) error {
 	}
 	if hasCapacityMemory && hasAllocatableMemory && allocatableMemory > capacityMemory {
 		return fmt.Errorf("%s.allocatable.memory must be <= %s.capacity.memory", resourceFieldPath, resourceFieldPath)
-	}
-	if hasStartupMemory && hasAllocatableMemory && startupMemory < allocatableMemory {
-		return fmt.Errorf("%s.startup.memory must be >= %s.allocatable.memory", resourceFieldPath, resourceFieldPath)
 	}
 	if hasStartupMemory && hasCapacityMemory && startupMemory > capacityMemory {
 		return fmt.Errorf("%s.startup.memory must be <= %s.capacity.memory", resourceFieldPath, resourceFieldPath)
@@ -670,6 +688,9 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 			CPU: allocCPU, Memory: allocMemory,
 		},
 		Overhead: &rtconfig.OverheadConfig{Memory: policy.Overhead.Memory},
+		WatermarkHigh: &rtconfig.WatermarkHighConfig{
+			Ratio: *policy.WatermarkHigh.Ratio,
+		},
 	}
 	if allocMem < capMem {
 		resources.Allocatable.DeflateOnOOM = boolPtr(true)
@@ -680,31 +701,25 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 			return rtconfig.ResourcesConfig{}, errors.New("resource_listen canonical socket identity is required in dynamic mode")
 		}
 		resources.Control.Controller = input.ControllerSocketIdentity
-		switch {
-		case input.Patch.Startup != nil && input.Patch.Startup.Memory != nil:
-			startup := *input.Patch.Startup.Memory
-			startupMem, _ := positiveSize(resourceFieldPath+".startup.memory", startup)
-			if startupMem < allocMem || startupMem > capMem {
-				return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %s.startup.memory must be between allocatable.memory and capacity.memory",
-					ErrInvalidResourceRequest, resourceFieldPath)
-			}
-			resources.Startup = &rtconfig.StartupConfig{Memory: startup}
-		case policy.Startup != nil:
-			startup := policy.Startup.Memory
-			startupMem, _ := positiveSize("sandbox.resources.startup.memory", startup)
-			if startupMem < allocMem {
-				startup, startupMem = allocMemory, allocMem
-			}
-			if startupMem > capMem {
-				startup = capacity.Memory
-			}
-			resources.Startup = &rtconfig.StartupConfig{Memory: startup}
-		default:
-			resources.Startup = &rtconfig.StartupConfig{Memory: capacity.Memory}
+	}
+	switch {
+	case input.Patch.Startup != nil && input.Patch.Startup.Memory != nil:
+		startup := *input.Patch.Startup.Memory
+		startupMem, _ := positiveSize(resourceFieldPath+".startup.memory", startup)
+		if startupMem > capMem {
+			return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %s.startup.memory must be <= capacity.memory",
+				ErrInvalidResourceRequest, resourceFieldPath)
 		}
-	} else if input.Patch.Startup != nil {
-		return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %s.startup requires dynamic resource control",
-			ErrInvalidResourceRequest, resourceFieldPath)
+		resources.Startup = &rtconfig.StartupConfig{Memory: startup}
+	case policy.Startup != nil:
+		startup := policy.Startup.Memory
+		startupMem, _ := positiveSize("sandbox.resources.startup.memory", startup)
+		if startupMem > capMem {
+			startup = capacity.Memory
+		}
+		resources.Startup = &rtconfig.StartupConfig{Memory: startup}
+	default:
+		resources.Startup = &rtconfig.StartupConfig{Memory: capacity.Memory}
 	}
 
 	if err := ValidateResolvedResources(resources, input.Dynamic); err != nil {
@@ -742,8 +757,8 @@ func ValidateResolvedResources(resources rtconfig.ResourcesConfig, dynamic bool)
 	if _, err := positiveSize("resources.overhead.memory", resources.Overhead.Memory); err != nil {
 		return err
 	}
-	if resources.WatermarkHigh != nil {
-		return errors.New("resources.watermark_high must remain omitted")
+	if resources.WatermarkHigh == nil || !positiveFinite(resources.WatermarkHigh.Ratio) || resources.WatermarkHigh.Ratio >= 1 {
+		return errors.New("resources.watermark_high.ratio must be > 0 and < 1")
 	}
 	if resources.Control.Sensor != nil {
 		return errors.New("resources.control.sensor must remain omitted")
@@ -755,23 +770,20 @@ func ValidateResolvedResources(resources rtconfig.ResourcesConfig, dynamic bool)
 		if resources.Control.Controller == "" {
 			return errors.New("resources.control.controller is required in dynamic mode")
 		}
-		if resources.Startup == nil {
-			return errors.New("resources.startup is required in dynamic mode")
-		}
-		startupMem, err := positiveSize("resources.startup.memory", resources.Startup.Memory)
-		if err != nil {
-			return err
-		}
-		if startupMem < allocMem || startupMem > capMem {
-			return errors.New("resources.startup.memory must be between allocatable.memory and capacity.memory")
-		}
 	} else {
 		if resources.Control.Controller != "" {
 			return errors.New("resources.control.controller must be omitted in static mode")
 		}
-		if resources.Startup != nil {
-			return errors.New("resources.startup must be omitted in static mode")
-		}
+	}
+	if resources.Startup == nil {
+		return errors.New("resources.startup is required")
+	}
+	startupMem, err := positiveSize("resources.startup.memory", resources.Startup.Memory)
+	if err != nil {
+		return err
+	}
+	if startupMem > capMem {
+		return errors.New("resources.startup.memory must be <= resources.capacity.memory")
 	}
 	if allocMem < capMem && (resources.Allocatable.DeflateOnOOM == nil || !*resources.Allocatable.DeflateOnOOM) {
 		return errors.New("resources.allocatable.deflate_on_oom must be true when ballooning is enabled")

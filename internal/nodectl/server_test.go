@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,9 +109,9 @@ func TestRecoveredAdmitReplayBypassesNewConsumerGates(t *testing.T) {
 	features := []string{FeatureStateSyncV1}
 	if err := state.InstallProvisional(ProvisionalSpec{
 		SandboxID: "recovering", PeerPID: 4242, CgroupPath: cgroup,
-		Capacity:     Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
-		Floor:        Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
-		MemoryCharge: 512 << 20, StartupCharge: 512 << 20,
+		Capacity:              Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+		ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		ReservationMemory:     512 << 20, InitialBudget: 512 << 20,
 		RecoverySource: RecoveryLease, RecoveryKey: "lease:recovering", ClientFeatures: features,
 	}); err != nil {
 		t.Fatal(err)
@@ -136,8 +137,13 @@ func TestRecoveredAdmitReplayBypassesNewConsumerGates(t *testing.T) {
 		t.Fatalf("replayed Admit = %+v token=%q", resp, token)
 	}
 	snapshot := state.ResourceSnapshot()
-	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Allocated.MemoryBytes != 256<<20 {
+	if snapshot.ReservationCount != 1 || snapshot.ProvisionalCount != 0 || snapshot.Reserved.MemoryBytes != 256<<20 {
 		t.Fatalf("replayed Admit snapshot = %+v", snapshot)
+	}
+	select {
+	case <-admission.wakeCh:
+	default:
+		t.Fatal("provisional replacement did not wake resource-blocked admission")
 	}
 }
 
@@ -146,8 +152,143 @@ func TestAdmitSpecRoundsPositiveCPUFloorUp(t *testing.T) {
 		SandboxID: "sub-millicore", CapacityMemoryBytes: 512 << 20, CapacityCPU: 1,
 		FloorMemoryBytes: 128 << 20, FloorCPU: 0.0005, StartupBudgetMemory: 256 << 20,
 	})
-	if spec.Floor.CPUMilli != 1 {
-		t.Fatalf("Admit floor CPU = %d millicores, want 1", spec.Floor.CPUMilli)
+	if spec.ConfiguredAllocatable.CPUMilli != 1 {
+		t.Fatalf("Admit allocatable CPU = %d millicores, want 1", spec.ConfiguredAllocatable.CPUMilli)
+	}
+}
+
+func TestConcurrentAdmitCheckAndInsertCannotOversubscribePool(t *testing.T) {
+	state := NewState(1<<30, 8000, 0, 0, Watermarks{
+		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: 1,
+	})
+	admission := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
+	})
+	admission.SetWiring(state, nil, t.Logf, func(*PendingAdmit) (*Message, error) { return nil, nil })
+	srv := &Server{State: state, Admission: admission, Logf: t.Logf}
+
+	firstChecked := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var checked int32
+	srv.phaseHook = func(phase string) {
+		if phase != "admit_checked" {
+			return
+		}
+		if atomic.AddInt32(&checked, 1) == 1 {
+			close(firstChecked)
+			<-releaseFirst
+		}
+	}
+
+	type result struct{ response *Message }
+	request := func(sid string, conn net.Conn, done chan<- result) {
+		token := ""
+		done <- result{response: srv.handleAdmit(conn, 4242, &Message{
+			Type: TypeAdmit, SandboxID: sid,
+			CapacityMemoryBytes: 700 << 20, CapacityCPU: 1,
+			FloorMemoryBytes: 128 << 20, FloorCPU: .5,
+			StartupBudgetMemory: 600 << 20,
+		}, &token)}
+	}
+	firstClient, firstServer := net.Pipe()
+	secondClient, secondServer := net.Pipe()
+	defer firstClient.Close()
+	defer firstServer.Close()
+	defer secondClient.Close()
+	defer secondServer.Close()
+	firstDone, secondDone := make(chan result, 1), make(chan result, 1)
+	go request("first", firstServer, firstDone)
+	<-firstChecked
+	go request("second", secondServer, secondDone)
+
+	select {
+	case <-secondDone:
+		close(releaseFirst)
+		<-firstDone
+		t.Fatal("second Admit passed the check/insert serialization boundary")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	firstResult := <-firstDone
+	secondResult := <-secondDone
+	if firstResult.response == nil || firstResult.response.Status != StatusAdmitted {
+		t.Fatalf("first Admit = %+v", firstResult.response)
+	}
+	if secondResult.response != nil {
+		t.Fatalf("second Admit = %+v, want queued", secondResult.response)
+	}
+	snapshot := state.ResourceSnapshot()
+	if snapshot.ReservationCount != 1 || snapshot.Reserved.MemoryBytes != 600<<20 {
+		t.Fatalf("concurrent Admit oversubscribed state: %+v", snapshot)
+	}
+}
+
+func TestConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
+	state := NewState(1<<30, 8000, 0, 0, Watermarks{
+		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: 1,
+	})
+	installReservationForTest(t, state, Reservation{
+		Token: "existing-token", SandboxID: "existing",
+		Capacity: Resources{MemoryBytes: 800 << 20}, ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20},
+		ReservationMemory: 300 << 20, Stage: StageSettled,
+	})
+	admission := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
+	})
+	admission.SetWiring(state, nil, t.Logf, func(*PendingAdmit) (*Message, error) { return nil, nil })
+	srv := &Server{
+		State: state, Admission: admission,
+		Allocator: NewAllocator(AllocatorPolicy{
+			MemoryGrantPerSecBytes: 1 << 30, MinGrantStep: 1 << 20, MaxGrantStep: 1 << 30,
+		}),
+		Logf: t.Logf,
+	}
+
+	admitChecked := make(chan struct{})
+	releaseAdmit := make(chan struct{})
+	srv.phaseHook = func(phase string) {
+		if phase == "admit_checked" {
+			close(admitChecked)
+			<-releaseAdmit
+		}
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	token := ""
+	admitDone := make(chan *Message, 1)
+	go func() {
+		admitDone <- srv.handleAdmit(server, 4242, &Message{
+			Type: TypeAdmit, SandboxID: "new", CapacityMemoryBytes: 700 << 20, CapacityCPU: 1,
+			FloorMemoryBytes: 128 << 20, FloorCPU: .5, StartupBudgetMemory: 600 << 20,
+		}, &token)
+	}()
+	<-admitChecked
+
+	growDone := make(chan *Message, 1)
+	go func() {
+		growDone <- srv.handleRequestBudget(&Message{
+			CurrentAlloc: 300 << 20, RequestedDelta: 400 << 20, Urgency: UrgencyNormal,
+		}, "existing-token")
+	}()
+	select {
+	case response := <-growDone:
+		close(releaseAdmit)
+		<-admitDone
+		t.Fatalf("Budget grow crossed Admit check/insert boundary: %+v", response)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseAdmit)
+	if response := <-admitDone; response == nil || response.Status != StatusAdmitted {
+		t.Fatalf("Admit response = %+v", response)
+	}
+	response := <-growDone
+	if response.Type != TypeBudgetResponse || response.GrantedDelta != 0 || response.NewAllocatable != 300<<20 {
+		t.Fatalf("post-Admit grow response = %+v", response)
+	}
+	if snapshot := state.ResourceSnapshot(); snapshot.Reserved.MemoryBytes != 900<<20 ||
+		snapshot.Reserved.MemoryBytes > snapshot.AllocatablePool.MemoryBytes {
+		t.Fatalf("Admit/grow oversubscribed state: %+v", snapshot)
 	}
 }
 
@@ -158,9 +299,9 @@ func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing
 	})
 	installReservationForTest(t, state, Reservation{
 		Token: "filler-token", SandboxID: "filler",
-		Capacity:          Resources{MemoryBytes: 4 << 30, CPUMilli: 1000},
-		Floor:             Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
-		AllocatableNowMem: 128 << 20, EffectiveStartupBudget: 4 << 30,
+		Capacity:              Resources{MemoryBytes: 4 << 30, CPUMilli: 1000},
+		ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+		ReservationMemory:     128 << 20, InitialBudget: 4 << 30,
 		Stage: StageAdmitted, StageEnteredAt: time.Now(), LastHeartbeatAt: time.Now(),
 	})
 	admission := NewAdmissionController(AdmissionPolicy{
@@ -209,7 +350,7 @@ func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing
 	if admission.QueueDepth() != 1 {
 		t.Fatal("Admit did not enter queue")
 	}
-	if _, found := state.Release("filler-token"); !found {
+	if _, found, err := state.Release("filler-token"); err != nil || !found {
 		t.Fatal("failed to release startup-pool filler")
 	}
 	admission.PushWake()
@@ -261,8 +402,11 @@ func TestServer_AdmitSettledRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot, found := srv.State.SnapshotSandboxResource("sb-1"); !found ||
-		snapshot.LastReportedRSS != 120<<20 || snapshot.LastReportAt.IsZero() {
+		snapshot.HostMemoryCurrent != 120<<20 || snapshot.LastReportAt.IsZero() {
 		t.Fatalf("settled resource report = %+v found=%v", snapshot, found)
+	}
+	if got := reservationByTokenForTest(t, srv.State, c.Token()).ReservationMemory; got != 256<<20 {
+		t.Fatalf("Settled rewrote reservation to host memory.current=%d, want unchanged %d", got, uint64(256<<20))
 	}
 
 	if err := c.Release("normal"); err != nil {
@@ -274,7 +418,79 @@ func TestServer_AdmitSettledRelease(t *testing.T) {
 	}
 }
 
-func TestServer_BurstGrantAndRecover(t *testing.T) {
+func TestServer_ColdAndRestoreAdmissionUseExactSelectedBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		startup, headroom uint64
+		snapshot          uint64
+		want              uint64
+	}{
+		{name: "cold startup below headroom", startup: 128 << 20, headroom: 512 << 20, want: 128 << 20},
+		{name: "restore ignores startup and headroom", startup: 768 << 20, headroom: 512 << 20, snapshot: 192 << 20, want: 192 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c, cleanup := startTestServer(t, 8<<30)
+			defer cleanup()
+			result, err := c.Admit(AdmitParams{
+				SandboxID: tc.name, CapacityMemoryBytes: 1 << 30,
+				FloorMemoryBytes: tc.headroom, StartupBudgetMemory: tc.startup,
+				AllocatableAtSnapshot: tc.snapshot,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != StatusAdmitted || result.GrantedInitialAlloc != tc.want {
+				t.Fatalf("admission = %+v, want exact initial Budget %d", result, tc.want)
+			}
+		})
+	}
+}
+
+func TestServer_RequestBudgetReconcilesAbsoluteBaseline(t *testing.T) {
+	srv, c, cleanup := startTestServer(t, 8<<30)
+	defer cleanup()
+	result, err := c.Admit(AdmitParams{
+		SandboxID: "baseline", CapacityMemoryBytes: 1 << 30,
+		FloorMemoryBytes: 256 << 20, StartupBudgetMemory: 128 << 20,
+	})
+	if err != nil || result.Status != StatusAdmitted {
+		t.Fatalf("Admit = %+v, %v", result, err)
+	}
+	if err := c.Settled(900<<20, 0); err != nil {
+		t.Fatal(err)
+	}
+	granted, grown, _, err := c.RequestBudget(128<<20, 64<<20, UrgencyNormal, "grow")
+	if err != nil || granted != 64<<20 || grown != 192<<20 {
+		t.Fatalf("grow = granted %d reservation %d err %v", granted, grown, err)
+	}
+	// Discard the coalesced wake from Admit/Settled/grow so the shrink commit
+	// below must produce its own admission re-evaluation signal.
+	select {
+	case <-srv.Admission.wakeCh:
+	default:
+	}
+	granted, shrunk, _, err := c.RequestBudget(128<<20, 0, UrgencyLow, "shrink_commit")
+	if err != nil || granted != 0 || shrunk != 128<<20 {
+		t.Fatalf("shrink commit = granted %d reservation %d err %v", granted, shrunk, err)
+	}
+	reservation := reservationForTest(t, srv.State, "baseline")
+	if reservation.ReservationMemory != 128<<20 || reservation.Stage != StageSettled {
+		t.Fatalf("reconciled reservation = %+v", reservation)
+	}
+	if snapshot := srv.State.ResourceSnapshot(); snapshot.Reserved.MemoryBytes != 128<<20 {
+		t.Fatalf("node aggregate after shrink commit = %d, want %d", snapshot.Reserved.MemoryBytes, uint64(128<<20))
+	}
+	select {
+	case <-srv.Admission.wakeCh:
+	default:
+		t.Fatal("shrink commit did not wake resource-blocked admission")
+	}
+	if _, _, _, err := c.RequestBudget(192<<20, 0, UrgencyLow, "invalid_baseline"); err == nil {
+		t.Fatal("controller accepted sandbox baseline above its node reservation")
+	}
+}
+
+func TestServer_RequestBudgetGrowPreservesSettledLifecycle(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
@@ -304,11 +520,11 @@ func TestServer_BurstGrantAndRecover(t *testing.T) {
 
 	// Server-side reservation should reflect the new allocatable.
 	r := reservationByTokenForTest(t, srv.State, c.Token())
-	if r.AllocatableNowMem != newAlloc {
+	if r.ReservationMemory != newAlloc {
 		t.Errorf("reservation alloc=%v, want %d", r, newAlloc)
 	}
-	if r.Stage != StageBurst {
-		t.Errorf("stage=%s, want burst", r.Stage)
+	if r.Stage != StageSettled {
+		t.Errorf("stage=%s, want settled lifecycle unchanged", r.Stage)
 	}
 }
 
@@ -320,7 +536,7 @@ func TestServer_RejectInRedZone(t *testing.T) {
 	pool := srv.State.AllocatablePool.MemoryBytes
 	installReservationForTest(t, srv.State, Reservation{
 		Token: "dummy", SandboxID: "dummy",
-		AllocatableNowMem: uint64(float64(pool) * 0.90),
+		ReservationMemory: uint64(float64(pool) * 0.90),
 	})
 
 	res, err := c.Admit(AdmitParams{
@@ -362,7 +578,7 @@ func TestServer_OOMReportAndHeartbeat(t *testing.T) {
 		t.Errorf("oom_count = %d, want 2", r.OOMCount)
 	}
 	snapshot, found := srv.State.SnapshotSandboxResource("sb-h")
-	if !found || snapshot.LastReportedRSS != 50<<20 || snapshot.LastReportAt.IsZero() {
+	if !found || snapshot.HostMemoryCurrent != 50<<20 || snapshot.LastReportAt.IsZero() {
 		t.Fatalf("heartbeat resource report = %+v found=%v", snapshot, found)
 	}
 }
