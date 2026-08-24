@@ -988,7 +988,9 @@ echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 # host's full CPU capacity so its independent 2-vCPU phase is not constrained by
 # an additional parent-level throttle. The Resource header defines the A/B/C
 # Sandbox capacity, which the phase-C snapshot must preserve on restore below.
-REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"8GiB"}}'
+# Keep it distinct from the 2 GiB node default but below the default startup
+# pool so every restore can reserve BudgetAtSnapshot in full.
+REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"2560MiB"}}'
 code=$(req POST /v3/templates "$AK" "{\"name\":\"exec-tmpl\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":8192}")
 unset REQ_RESOURCE_HEADER
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
@@ -1399,9 +1401,9 @@ code=$(cat "$WORK/immediate-data.code")
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
 wait_internal_traffic_stats "$SID" idle || fail "internal traffic did not converge to idle"
 wait_resource_stats "$SID" || fail "controller resource stats were not reported"
-assert_resolved_resource_yaml "$WORK/run/$SID/$SID.yaml" 8GiB 8GiB "$WORK/sandbox-resource.sock" \
+assert_resolved_resource_yaml "$WORK/run/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
     || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
-assert_resource_lease "$SID" 8589934592 268435456 8589934592 \
+assert_resource_lease "$SID" 2684354560 268435456 2684354560 \
     || fail "snapshot restore lease did not match generated YAML"
 echo "==> PASS: post-Create data request was reported parking through readiness, then idle; resource stats are live (code=$code)"
 
