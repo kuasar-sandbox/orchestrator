@@ -14,7 +14,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/kuasar-sandbox/accelerator v0.0.0
 	github.com/kuasar-sandbox/connector v0.0.0
-	github.com/kuasar-sandbox/sandboxer v0.1.0-preview.20260823.0.20260824063508-2777d19fc05d
+	github.com/kuasar-sandbox/sandboxer v0.1.0-preview.20260823.0.20260824072230-ae8ab60a56ee
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
