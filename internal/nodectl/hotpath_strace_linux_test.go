@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -141,7 +142,62 @@ func hotPathTraceSegment(t *testing.T, trace string) string {
 	return trace[begin:endLineStart]
 }
 
-func assertNoHotPathFileIO(t *testing.T, segment string) {
+func isLegacyUnixSocketAnnotation(line, socket string) bool {
+	const prefix = "<(null):["
+	fdStart := -1
+	for _, syscall := range []string{"write(", "writev(", "pwrite64("} {
+		if start := strings.Index(line, syscall); start >= 0 {
+			fdStart = start + len(syscall)
+			break
+		}
+	}
+	if fdStart < 0 {
+		return false
+	}
+	start := strings.Index(line[fdStart:], prefix)
+	if start < 0 {
+		return false
+	}
+	start += fdStart
+	if _, err := strconv.ParseUint(strings.TrimSpace(line[fdStart:start]), 10, 64); err != nil {
+		return false
+	}
+	annotation := line[start+len(prefix):]
+	end := strings.Index(annotation, "]>")
+	if end < 0 {
+		return false
+	}
+	if remainder := annotation[end+2:]; !strings.HasPrefix(remainder, ",") {
+		return false
+	}
+	annotation = annotation[:end]
+	pathSuffix := `,"` + socket + `"`
+	if !strings.HasSuffix(annotation, pathSuffix) {
+		return false
+	}
+	inodes := strings.TrimSuffix(annotation, pathSuffix)
+	local, peer, ok := strings.Cut(inodes, "->")
+	if !ok || strings.Contains(peer, "->") {
+		return false
+	}
+	if _, err := strconv.ParseUint(local, 10, 64); err != nil {
+		return false
+	}
+	if _, err := strconv.ParseUint(peer, 10, 64); err != nil {
+		return false
+	}
+	return true
+}
+
+func isAllowedHotPathWrite(line, socket string) bool {
+	return strings.Contains(line, "<UNIX") ||
+		strings.Contains(line, "<pipe:") ||
+		strings.Contains(line, "<socket:[") ||
+		strings.Contains(line, "<anon_inode:[eventfd]>") ||
+		isLegacyUnixSocketAnnotation(line, socket)
+}
+
+func assertNoHotPathFileIO(t *testing.T, segment, socket string) {
 	t.Helper()
 	for _, syscall := range []string{
 		"open(", "openat(", "openat2(", "creat(",
@@ -161,10 +217,7 @@ func assertNoHotPathFileIO(t *testing.T, segment string) {
 		// RPC replies use Unix sockets. The only other writes in the marked
 		// interval are the helper's pipe markers. A regular-file descriptor
 		// would be rendered as a pathname by strace -yy and fails this gate.
-		if strings.Contains(line, "<UNIX") || strings.Contains(line, "<pipe:") ||
-			strings.Contains(line, "<socket:[") ||
-			strings.Contains(line, "<(null):[") ||
-			strings.Contains(line, "<anon_inode:[eventfd]>") {
+		if isAllowedHotPathWrite(line, socket) {
 			continue
 		}
 		t.Fatalf("resource RPC hot path wrote a non-socket file descriptor:\n%s", line)
@@ -229,5 +282,58 @@ func TestResourceRPCHotPathDoesNotPerformFileIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertNoHotPathFileIO(t, hotPathTraceSegment(t, string(data)))
+	assertNoHotPathFileIO(t, hotPathTraceSegment(t, string(data)), socket)
+}
+
+func TestLegacyUnixSocketAnnotation(t *testing.T) {
+	const socket = "/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"
+	for _, tt := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "legacy exact socket",
+			line: `123 write(7<(null):[12708690->12710563,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
+			want: true,
+		},
+		{
+			name: "different socket",
+			line: `123 write(7<(null):[12708690->12710563,"/tmp/other/controller.sock"]>, "ok", 2) = 2`,
+		},
+		{
+			name: "regular file pathname",
+			line: `123 write(7</tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock>, "ok", 2) = 2`,
+		},
+		{
+			name: "annotation only in regular file payload",
+			line: `123 write(7</tmp/output>, "<(null):[12708690->12710563,\"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock\"]>", 96) = 96`,
+		},
+		{
+			name: "nonnumeric file descriptor",
+			line: `123 write(fd<(null):[12708690->12710563,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
+		},
+		{
+			name: "missing descriptor boundary",
+			line: `123 write(7<(null):[12708690->12710563,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]> "ok", 2) = 2`,
+		},
+		{
+			name: "missing peer inode",
+			line: `123 write(7<(null):[12708690,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
+		},
+		{
+			name: "nonnumeric inode",
+			line: `123 write(7<(null):[socket->12710563,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
+		},
+		{
+			name: "extra inode arrow",
+			line: `123 write(7<(null):[1->2->3,"/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"]>, "ok", 2) = 2`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isLegacyUnixSocketAnnotation(tt.line, socket); got != tt.want {
+				t.Fatalf("isLegacyUnixSocketAnnotation() = %t, want %t", got, tt.want)
+			}
+		})
+	}
 }
