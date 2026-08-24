@@ -584,7 +584,7 @@ membership 重新解析 owner。
 
 node_link 维护以下 recordSet:
 
-- `profile`:node_id、labels、runtime_digest、data_endpoint、Build registration/execution capacity 与 durable usage、draining、liveness、link_owner；其中低频 `node_list` 投影仅包含 capacity，usage 保留在 node owner 的实时 profile 中。
+- `profile`:node_id、labels、runtime_digest、data_endpoint、Build registration/execution capacity 与 durable usage、draining、liveness、link_owner；heartbeat 的 `allocated` memory 是本节点全部 sandbox 的 NodeReservation 之和,`pool` 是 node allocatable pool,不是 host `memory.current`、VMM charge 或 guest demand；其中低频 `node_list` 投影仅包含 capacity，usage 保留在 node owner 的实时 profile 中。
 - `sandbox`:该 node 上 sandbox 的
   `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
   完整归属表。

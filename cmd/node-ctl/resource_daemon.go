@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -23,9 +24,19 @@ type resourceProbe struct {
 func (p resourceProbe) Snapshot() orch.ResourceProbeSnapshot {
 	snapshot := p.state.ResourceSnapshot()
 	return orch.ResourceProbeSnapshot{
-		Zone: string(snapshot.Zone), Allocated: int64(snapshot.Allocated.MemoryBytes),
-		Pool: int64(snapshot.AllocatablePool.MemoryBytes), Draining: p.admission.IsDrained(),
+		Zone: string(snapshot.Zone), Allocated: resourceProbeInt64(snapshot.Reserved.MemoryBytes),
+		Pool: resourceProbeInt64(snapshot.AllocatablePool.MemoryBytes), Draining: p.admission.IsDrained(),
 	}
+}
+
+// Cluster heartbeat fields predate the uint64 reservation model. Recovery may
+// conservatively charge more than one full-pool unknown consumer, so saturate
+// instead of wrapping a positive fail-closed charge into a negative int64.
+func resourceProbeInt64(value uint64) int64 {
+	if value > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(value)
 }
 
 func (p resourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats, bool) {
@@ -36,16 +47,18 @@ func (p resourceProbe) SandboxResourceStats(sandboxID string) (api.ResourceStats
 	cpuCount := float64(snapshot.Capacity.CPUMilli) / 1000
 	cpuAllocatable := float64(snapshot.CPUAllocatable) / 1000
 	memTotal := snapshot.Capacity.MemoryBytes
-	memAllocatable := snapshot.MemAllocatable
+	reservationMemory := snapshot.ReservationMemory
 	stats := api.ResourceStats{
 		CPUCount:       &cpuCount,
 		CPUAllocatable: &cpuAllocatable,
 		MemTotal:       &memTotal,
-		MemAllocatable: &memAllocatable,
+		// The E2B-compatible field name is retained at the HTTP boundary; its
+		// memory value is node reservation, not guest demand or host charge.
+		MemAllocatable: &reservationMemory,
 	}
 	if !snapshot.LastReportAt.IsZero() {
 		timestamp := snapshot.LastReportAt.Unix()
-		memUsed := snapshot.LastReportedRSS
+		memUsed := snapshot.HostMemoryCurrent
 		stats.TimestampUnix = &timestamp
 		stats.MemUsed = &memUsed
 	}
@@ -120,12 +133,6 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource sweep] "+f, a...) },
 	}
 	go sweeper.Run(ctx)
-
-	reclaimer := &nodectl.ActiveReclaimer{
-		State: state, Interval: 10 * time.Second, SafetyMargin: 1.25, Auditor: auditor,
-		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource reclaim] "+f, a...) },
-	}
-	go reclaimer.Run(ctx)
 
 	slogger.Info("resource controller listening (resource_listen)", "socket", resolved.Listen,
 		"pool_mib", state.AllocatablePool.MemoryBytes>>20, "host_reserved_mib", resolved.HostReserved.MemoryBytes>>20)

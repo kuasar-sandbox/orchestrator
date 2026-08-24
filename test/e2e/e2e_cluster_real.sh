@@ -394,13 +394,15 @@ expected = {
     "resources.allocatable.cpu": "2",
     "resources.allocatable.memory": "256MiB",
     "resources.allocatable.deflate_on_oom": "true",
+    "resources.startup.memory": "2GiB",
     "resources.overhead.memory": "32MiB",
+    "resources.watermark_high.ratio": "0.875",
 }
 for key, want in expected.items():
     if values.get(key) != want:
         raise SystemExit(f"{path}: {key}={values.get(key)!r}, want {want!r}; values={values}")
-for forbidden in ("resources.startup.memory", "resources.control.controller",
-                  "resources.control.cgroup_path", "resources.watermark_high.memory",
+for forbidden in ("resources.control.controller", "resources.control.cgroup_path",
+                  "resources.watermark_high.memory",
                   "resources.control.sensor.mode"):
     if forbidden in values:
         raise SystemExit(f"{path}: static cluster YAML contains {forbidden}: {values}")

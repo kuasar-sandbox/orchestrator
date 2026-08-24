@@ -16,6 +16,7 @@ func TestParseResourcePatchStrictSchema(t *testing.T) {
 		`{"capacity":{"memory":"2GiB"}}`,
 		`{"allocatable":{"cpu":0.5,"memory":"256MiB"}}`,
 		`{"startup":{"memory":"1GiB"}}`,
+		`{"allocatable":{"memory":"1GiB"},"startup":{"memory":"512MiB"}}`,
 		`{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":1.25,"memory":"512MiB"},"startup":{"memory":"2GiB"}}`,
 	}
 	for _, raw := range valid {
@@ -61,7 +62,6 @@ func TestParseResourcePatchStrictSchema(t *testing.T) {
 		"alloc mem above cap": {`{"capacity":{"memory":"128MiB"},"allocatable":{"memory":"256MiB"}}`, NsResource + ".allocatable.memory"},
 		"startup unknown":     {`{"startup":{"cpu":1}}`, NsResource + ".startup"},
 		"startup mem zero":    {`{"startup":{"memory":"0MiB"}}`, NsResource + ".startup.memory"},
-		"startup below alloc": {`{"allocatable":{"memory":"1GiB"},"startup":{"memory":"512MiB"}}`, NsResource + ".startup.memory"},
 		"startup above cap":   {`{"capacity":{"memory":"1GiB"},"startup":{"memory":"2GiB"}}`, NsResource + ".startup.memory"},
 	}
 	for name, test := range invalid {
@@ -158,8 +158,8 @@ func TestResolveResourcesDefaultsAndNormalization(t *testing.T) {
 	if resources.Allocatable.DeflateOnOOM == nil || !*resources.Allocatable.DeflateOnOOM {
 		t.Fatalf("deflate_on_oom = %v", resources.Allocatable.DeflateOnOOM)
 	}
-	if resources.Startup != nil || resources.Control.Controller != "" ||
-		resources.WatermarkHigh != nil || resources.Control.Sensor != nil {
+	if resources.Startup == nil || resources.Startup.Memory != "2GiB" || resources.Control.Controller != "" ||
+		resources.WatermarkHigh == nil || resources.WatermarkHigh.Ratio != 0.875 || resources.Control.Sensor != nil {
 		t.Fatalf("static/default runtime-only fields = %+v", resources)
 	}
 
@@ -212,7 +212,8 @@ func TestResolveResourcesDynamicStartupAndNodeOwnership(t *testing.T) {
 		resources.Control.Controller != identity {
 		t.Fatalf("dynamic defaults = %+v", resources)
 	}
-	if resources.Control.CgroupPath != "" || resources.Control.CgroupFD != 0 || resources.Control.Sensor != nil || resources.WatermarkHigh != nil {
+	if resources.Control.CgroupPath != "" || resources.Control.CgroupFD != 0 || resources.Control.Sensor != nil ||
+		resources.WatermarkHigh == nil || resources.WatermarkHigh.Ratio != 0.875 {
 		t.Fatalf("node runtime capability/defaults were rendered: %+v", resources)
 	}
 
@@ -223,8 +224,8 @@ func TestResolveResourcesDynamicStartupAndNodeOwnership(t *testing.T) {
 		Dynamic:                  true,
 		ControllerSocketIdentity: identity,
 	})
-	if err != nil || adjusted.Startup == nil || adjusted.Startup.Memory != "1GiB" {
-		t.Fatalf("node startup lower-bound adjustment = %+v, %v", adjusted, err)
+	if err != nil || adjusted.Startup == nil || adjusted.Startup.Memory != "512MiB" {
+		t.Fatalf("independent node startup headroom = %+v, %v", adjusted, err)
 	}
 	adjusted, err = ResolveResources(ResourceResolveInput{
 		Node:                     node,
@@ -236,15 +237,17 @@ func TestResolveResourcesDynamicStartupAndNodeOwnership(t *testing.T) {
 		t.Fatalf("node startup upper-bound adjustment = %+v, %v", adjusted, err)
 	}
 
+	static, err := ResolveResources(ResourceResolveInput{
+		Patch: mustResourcePatch(t, `{"allocatable":{"memory":"1GiB"},"startup":{"memory":"128MiB"}}`),
+	})
+	if err != nil || static.Startup == nil || static.Startup.Memory != "128MiB" {
+		t.Fatalf("static independent startup = %+v, %v", static, err)
+	}
+
 	for name, input := range map[string]ResourceResolveInput{
-		"below inherited allocatable": {
-			Patch: mustResourcePatch(t, `{"startup":{"memory":"128MiB"}}`), Dynamic: true, ControllerSocketIdentity: identity,
-		},
 		"above capacity": {
 			Patch: mustResourcePatch(t, `{"startup":{"memory":"4GiB"}}`), Dynamic: true, ControllerSocketIdentity: identity,
 		},
-		"static startup":       {Patch: mustResourcePatch(t, `{"startup":{"memory":"1GiB"}}`)},
-		"static empty startup": {Patch: mustResourcePatch(t, `{"startup":{}}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ResolveResources(input); !errors.Is(err, ErrInvalidResourceRequest) {
@@ -287,8 +290,8 @@ func TestValidateNodeResourcePolicy(t *testing.T) {
 	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{}, false); err != nil {
 		t.Fatalf("default static policy: %v", err)
 	}
-	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{Startup: &NodeStartupPolicy{Memory: "1GiB"}}, false); err == nil {
-		t.Fatal("static node policy accepted startup")
+	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{Startup: &NodeStartupPolicy{Memory: "1GiB"}}, false); err != nil {
+		t.Fatalf("static node policy rejected startup: %v", err)
 	}
 	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{Startup: &NodeStartupPolicy{Memory: "1GiB"}}, true); err != nil {
 		t.Fatalf("dynamic node policy rejected startup: %v", err)
@@ -296,6 +299,14 @@ func TestValidateNodeResourcePolicy(t *testing.T) {
 	badCPU := 3.0
 	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{Allocatable: NodeAllocatablePolicy{CPU: &badCPU}}, false); err == nil {
 		t.Fatal("node allocatable CPU above capacity accepted")
+	}
+	zero, one := 0.0, 1.0
+	for _, ratio := range []*float64{&zero, &one} {
+		if err := ValidateNodeResourcePolicy(NodeResourcePolicy{
+			WatermarkHigh: &NodeWatermarkHighPolicy{Ratio: ratio},
+		}, false); err == nil {
+			t.Fatalf("invalid watermark ratio %v accepted", *ratio)
+		}
 	}
 }
 

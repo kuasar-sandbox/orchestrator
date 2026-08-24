@@ -1,12 +1,12 @@
-// Package nodectl is the reference node-level resource controller — the
-// "sentinel" daemon's brains: admission, allocation, per-sandbox state,
-// budget reclaim, rebuildable recovery inventory and audit.
+// Package nodectl implements node-level reservation admission, allocation,
+// rebuildable recovery inventory and audit. Balloon, cgroup and guest-memory
+// policy remain sandbox-local.
 //
 // The wire protocol and the client it speaks are defined once in
 // sandboxer/pkg/resource (sandbox-ctl is the client). This file
 // re-exports those protocol symbols under their local names so the
 // controller and its CLI reference the protocol without churn; the
-// definitions live in sandbox-runtime.
+// definitions live in sandboxer/pkg/resource.
 package nodectl
 
 import "github.com/kuasar-sandbox/sandboxer/pkg/resource"
@@ -38,12 +38,9 @@ const (
 	TypeHeartbeat      = resource.TypeHeartbeat
 	TypeRelease        = resource.TypeRelease
 	TypeAck            = resource.TypeAck
-	TypeReattach       = resource.TypeReattach
 	TypeStateSync      = resource.TypeStateSync
 	TypeError          = resource.TypeError
 	TypeAdminDrain     = resource.TypeAdminDrain
-	TypeAdminGrant     = resource.TypeAdminGrant
-	TypeAdminReclaim   = resource.TypeAdminReclaim
 	TypeAdminStatus    = resource.TypeAdminStatus
 	TypeAdminList      = resource.TypeAdminList
 

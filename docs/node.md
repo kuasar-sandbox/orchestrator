@@ -168,7 +168,7 @@ TrafficAccessToken 仅供外部网关及 e2b
 | `serve` | 启动 daemon:控制面 + 数据面 + 本机控制 socket + reaper + 构建池;配 `cluster` 则起 node-link 客户端(§10),配 `resource_listen` 则内置资源控制器(node-resource.md) |
 | `proxy` | 外置数据面 worker(`proxy.mode=external`;见 §2.3 与 node-proxy.md) |
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
-| `resource` | `status`/`list`/`drain`/`grant`/`reclaim`:资源控制器只读巡检与运维(node-resource.md §2) |
+| `resource` | `status`/`list`/`drain`:reservation 控制器巡检与 admission 排空(node-resource.md §2) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build/import 凭据对白名单管理(§7;集群下另由 registry 租约写入,§10) |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移(§8.1) |
@@ -394,10 +394,11 @@ node-ctl 同目录 → PATH"自动发现。
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
-| `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 capacity,不是 steady floor。img 冷启可由 request/template 覆盖;restore 容量由 snapshot 固定 |
-| `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / `256MiB` | 稳态保证/floor;继承值超过最终 capacity 时收敛到 capacity,request 显式越界则拒绝 |
-| `sandbox.resources.startup.memory` | 未配置 | 仅 dynamic 模式可显式配置;未配置时每个沙箱取最终 capacity.memory,不会随 256MiB floor 一同降低 |
-| `sandbox.resources.overhead.memory` | `32MiB` | node-owned VMM/control-plane cgroup headroom;request/template 不可覆盖 |
+| `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 request/template 覆盖;restore Capacity 由 snapshot 固定 |
+| `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / `256MiB` | CPU 是调度权重/保证;memory 是 settled guest headroom,不是 total Budget。继承 memory 超过最终 Capacity 时收敛到 Capacity,request 显式越界则拒绝 |
+| `sandbox.resources.startup.memory` | 最终 `capacity.memory` | cold 首份可信 report 前的 headroom,static/dynamic 均有效,与 settled headroom 独立;restore 不使用 |
+| `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
+| `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
@@ -458,9 +459,9 @@ proxy 组件);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service e
 配置 `proxy_netns`。external 模式无须静态 worker 列表——proxy master 经 plugin 平面注册,
 proxyForwarder 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen.enabled=true` 时 node-ctl 在启动阶段解析一次 canonical controller
-identity并自动写入每个 sandbox YAML;没有第二个 `sandbox.resources.control_socket` 配置源。
-node policy 显式 `startup` 但 controller 未启用会在 daemon 产生 socket、网络或 runner
-副作用前失败。
+identity并自动写入每个 dynamic sandbox YAML;没有第二个
+`sandbox.resources.control_socket` 配置源。startup 对 static/dynamic 使用同一 headroom
+语义,不依赖 controller 是否启用。
 
 ## 4. e2b API 契约
 
@@ -480,7 +481,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
-| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,绝不改成 allocatable floor)与 ISO-8601 `startedAt`/`endAt` |
+| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
 | resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,可选 `ttlSeconds` 和 `X-Kuasar-Migration-Token`;不创建 guest process |
@@ -536,7 +537,7 @@ credential 读取/签发或异步 resume 任务接受失败统一对外返回脱
 不调用 Connect、Wake、Resume、Pause 或 envd,响应带 `Cache-Control: no-store`。
 
 `GET /sandboxes/{id}/stats/resource` 只消费 node-ctl 内置 resource controller 的当前
-reservation、预算和 sandbox-ctl 已上报样本。示例:
+reservation 和 sandbox-ctl 已上报的 host charge 样本。示例:
 
 ```json
 {
@@ -549,11 +550,12 @@ reservation、预算和 sandbox-ctl 已上报样本。示例:
 }
 ```
 
-每个字段都可省略:未采集就不序列化,不以零值伪造。`timestampUnix` 是最近一次携
-`CurrentRSS>0` 的 Settled/Heartbeat report 时间;`memUsed` 是 sandboxer 报告的 cgroup
-`memory.current`;capacity/allocatable 取 controller reservation。controller 未启用为 501;
+每个字段都可省略:未采集就不序列化,不以零值伪造。`timestampUnix` 是最近一次携带
+非零 host VMM charge 的 Settled/Heartbeat 时间;`memUsed` 是 sandboxer 报告的 VMM
+cgroup `memory.current`,不是 guest demand/working set。`memTotal` 是 Capacity;
+`memAllocatable` 是现有 API 名称,其值为 node reservation。controller 未启用为 501;
 starting 且 reservation 已存在可返回 sparse 200;paused 无 live reservation 为 409;running
-但 reservation 缺失为 503。reservation 存在而尚无 RSS report 时仍返回其它可得字段。
+但 reservation 缺失为 503。reservation 存在而尚无 host-charge report 时仍返回其它可得字段。
 它不是 guest `/metrics` 的兼容实现。
 
 `GET /sandboxes/{id}/stats/traffic` 返回最终 node proxy 已鉴权接纳的逻辑 ingress:
@@ -693,8 +695,8 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 零/负 CPU、空/非法/非正 memory 均返回 400,错误带完整
 `kuasar-sandbox.resource.<path>`。request/template/group/header/migration token 都不能
 携带 `allocatable.deflate_on_oom`、`overhead`、`watermark_high`、`control` 或
-`sensor`:overhead/deflate/controller/cgroup 属于 node/runtime,watermark/sensor 继续
-使用 sandboxer 默认。合法 patch 持久化为 compact canonical JSON。
+`sensor`:这些字段属于 node/runtime,其中 `watermark_high.ratio` 由 node policy 注入。
+合法 patch 持久化为 compact canonical JSON。
 
 固定的 leaf priority 是:
 
@@ -713,13 +715,13 @@ node resource policy
 registration 共用同一 helper。
 
 最终 resolver 先确定 capacity,再解析 allocatable/startup,最后添加 node-only
-overhead/deflate/controller。继承的 allocatable 超过最终 capacity 可安全收敛;
-request 显式越界拒绝。dynamic 下 request 显式 startup 必须位于
-`allocatable.memory..capacity.memory`;node 显式 startup 取
-`min(max(nodeStartup,effectiveAllocatable),finalCapacity)`,双方都未显式设置则取最终
-capacity。static 不渲染 startup/controller,任何 request startup 都在生命周期副作用前
-拒绝。有 balloon(`capacity.memory > allocatable.memory`)时最终 YAML 保证
-`deflate_on_oom: true`。
+overhead/watermark/deflate/controller。继承的 allocatable 超过最终 capacity 可安全收敛;
+request 显式越界拒绝。startup 与 allocatable 独立,request 显式值只需位于
+`(0,capacity.memory]`;node 显式 startup 超过最终 capacity 时收敛到 capacity,双方都未
+显式设置则取最终 capacity。static/dynamic 都渲染 startup,static 只省略 controller。
+settled policy 需要 balloon(`capacity.memory > allocatable.memory`)时最终 YAML 显式
+写入 `deflate_on_oom: true`;仅 cold startup target 非零时也会创建 balloon device,
+并使用 sandboxer 的同一 effective true 缺省。
 
 MMDS 在 Sandbox Create 与 Build Register 共用以下外部 schema。Header 直接携 JSON;
 metadata 的 value 仍是一个 JSON string:
@@ -856,7 +858,7 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   renderer 直接安装该对象,不再逐字段重解释。YAML 不含
   `control.cgroup_path`;run-sandbox 最后以继承 cgroup FD 注入该 capability。
   dynamic `control.controller` 只取启动时解析的 `resource_listen.SocketIdentity`;
-  `watermark_high`/sensor 保持 omitted。其它 boot/tapfd/已解析 network 与租户子集再经
+  `watermark_high.ratio` 由 node policy 注入,sensor 保持 omitted。其它 boot/tapfd/已解析 network 与租户子集再经
   config-socket 交 sandbox-ctl。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
   metadata,resource 按 leaf 取 header 优先、其它 namespace 整段取 header 优先)。create
@@ -871,11 +873,12 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   来自 `builds.metadata_json`。Build resources 与该 patch 完全独立,不互相默认、比较或推导;
   trigger 的 `cpuCount`/`memoryMB` 只可断言不可变 Build resources。
 - **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
-  快照**。restore 的同步请求只校验 patch 结构;runner task读根 cfg后,request 显式相同
-  capacity 可作为 assertion,任一 leaf不同则异步 `resource_resolve` failure。无法可靠读取
-  snapshot capacity 时任务异步失败;runner已经 Assign,但尚未 Attach network、写 YAML或
-  启动 VM,且绝不回退 node defaults。snapshot 中已有
-  `allocatable_at_snapshot` 仍由既有 resource protocol 提高 initial grant。
+  快照**。restore 的同步请求只校验 patch 结构;runner task 读取根 cfg 后,request 显式相同
+  Capacity 可作为 assertion,任一 leaf 不同则异步 `resource_resolve` failure。无法可靠读取
+  snapshot Capacity 时任务异步失败;runner 已经 Assign,但尚未 Attach network、写 YAML、
+  创建 controller reservation/cgroup 或启动 VM,且绝不回退 node defaults。restore initial
+  reservation 严格等于 sandboxer 从 CH snapshot target/current 推导的
+  `BudgetAtSnapshot`;startup headroom 不参与,也不接受 partial grant。
 - **network 随快照**:普通 sandbox 渲染时把已解析逻辑网络注入
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore
   继承;restore 时 runner task返回 raw metadata,serve按 sandbox 的 best-effort兼容语义解析,
@@ -1013,7 +1016,9 @@ unit 根或其 `ctl/`。前者创建 `ctl/` 并通过 `cgroup.procs` 将自身�
 
 sandbox-ctl 接收 FD 后立即恢复 CLOEXEC,写入资源上限,并以
 `clone3(CLONE_INTO_CGROUP)` 把 CH 原子创建到 `vmm/`。因此 `memory.high` 只限制
-VMM,sandbox-ctl 在 guest 压力下仍可处理 UFFD、vsock、信号和进程回收。
+VMM,sandbox-ctl 在 guest 压力下仍可处理 UFFD、vsock、信号和进程回收。具体 high
+值、balloon target/current 和 grow/shrink 顺序全部由 sandboxer 本地控制;node
+controller 只处理它发起的 reservation 请求。
 节点要求 Linux 5.7+ 且 seccomp 允许 `clone3`;不满足时 sandbox 启动 fail closed,
 不回退到启动后迁移或共享 cgroup。
 
@@ -1583,7 +1588,9 @@ heartbeat{zone, allocated, pool, build_registration_usage,
 ```
 
 两级 Build capacity 在首个 `register` frame 中发送；沙箱水位取自资源控制器
-(node-resource.md)。两级 Build usage 由节点 SQLite 中每条
+(node-resource.md)。`allocated` 的 memory 分量是本节点全部 sandbox 的
+NodeReservation 之和,`pool` 是 node allocatable pool；两者都不是 host
+`memory.current`、VMM charge 或 guest demand。两级 Build usage 由节点 SQLite 中每条
 非终态 Build.Resources / execution claim 精确求和,不是 active count × 默认向量。`draining` 由节点侧
 资源 drain 或维护策略置位。普通 heartbeat 只更新 node_link profile 中的 liveness 和本地水位，不更新
 node_list；首次注册和 draining 变化驱动低频目录投影。registry node owner 持有的当前连接是 placement
@@ -1640,7 +1647,7 @@ CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network own
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 节点以同一 canonical Build.Resources 做最终、事务化 registration admission;phase ResourcePatch、portable metadata 与 cluster group 分开持久化。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
 
-无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
+无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2 的 resource drain 或本机维护策略),
 集群侧只停止向其分配。
 
 CmdCreate 的任一 Ack 后 launch failure 将 fresh starting 回滚为 dead 并发 Delete;

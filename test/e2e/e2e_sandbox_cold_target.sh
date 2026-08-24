@@ -4,19 +4,19 @@
 # product's target spec:
 #
 #   capacity:    2 vCPU, 8 GiB     (what guest OS sees)
-#   allocatable: 0.1 vCPU, 128 MiB (steady-state floor)
-#   startup:     512 MiB           (controller-granted cold-start budget)
+#   allocatable: 0.1 vCPU, 128 MiB (settled guest headroom)
+#   startup:     512 MiB           (cold-start headroom before first report)
 #
 # Same workload as e2e_sandbox_cold.sh (python:3.12-slim → PYBOOT-OK)
 # but exercises the production-shaped resources block:
 #  - CH boots with --cpus boot=2 / --memory-zone size=8GiB (capacity)
-#  - node-ctl resource controller admits a startup budget above the 128MiB floor
-#  - CH initial balloon uses that startup budget; Heartbeat/reclaim can later
-#    converge the sandbox back to the floor
+#  - node-ctl admits the complete aligned InitialBudget derived from startup
+#  - CH initial balloon uses that Budget; after launch, fresh guest observations
+#    drive the sandbox-local steady Budget loop
 #
-# This is the "Agent app at idle in warm pool" footprint: very small
-# allocatable so a node can pack thousands; capacity is the burst ceiling
-# the app can reach (post-resize / via balloon deflate, future).
+# This is the "Agent app at idle in warm pool" shape: allocatable is the
+# configured steady guest headroom, while capacity is the immutable guest
+# memory domain and maximum Budget.
 #
 # Same skip semantics as cold.sh (KVM / TAP / docker missing → exit 0;
 # REQUIRE_KVM=1 fails hard).
@@ -41,6 +41,7 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH (host size parser)"
 
 for b in cloud-hypervisor sandbox-ctl node-ctl sandbox-init sandbox-runtime.bundle flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
@@ -128,9 +129,6 @@ resource_listen:
     startup_ttl: 120s
     queue_ttl: 30s
     queue_max_depth: 256
-  dampening:
-    recover_duration: 30s
-    cooldown_periods: 5
   log_level: info
 EOF
     "$BIN/node-ctl" conductor serve --config "$WORK/node-ctl.yaml" >"$WORK/node-ctl.log" 2>&1 &
@@ -169,15 +167,15 @@ mkfs.ext4 -q -F "$DIFF_FILE"
 
 # Spec semantics:
 #   capacity    = guest-visible vCPU + RAM (passed to CH --cpus / --memory-zone)
-#   allocatable = idle footprint target — drives the boot-time balloon size
-#                 (capacity - allocatable inflated, free_page_reporting on)
-#                 plus cgroup cpu.weight on the host CH process.
+#   allocatable = settled guest headroom used only after a fresh report;
+#                 it does not drive the cold command-line balloon target.
+#                 CPU allocatable continues to drive cgroup cpu.weight.
+#   startup     = cold-start headroom used to derive the aligned InitialBudget.
 #
 # Defaults track the product target: 2 vCPU / 8 GiB capacity, 0.1 vCPU /
-# 128 MiB allocatable. The uffd handler async EVENT_REMOVE flusher
-# (handler.go:runRemoveFlusher) coalesces guest free_page_reporting
-# events into batched fallocate(PUNCH_HOLE) calls, so the trickle storm
-# during boot no longer wedges the handler.
+# 128 MiB settled headroom and 512 MiB startup headroom. Balloon
+# free_page_reporting remains disabled; the sandbox-local controller combines
+# guest MemAvailable with CH target/current observations after launch.
 #
 # capacity.memory > 3 GiB triggers CH's PCI-hole split into two memory
 # regions (low [0,3GiB) at memfd offset 0 + high [4GiB,...) at memfd
@@ -281,7 +279,7 @@ echo "==> last 60 lines of log:"
 tail -60 "$LOG"
 
 echo
-echo "==> cold-start timing (wallclock, target spec 2c8G / 0.1c128M floor / startup $STARTUP_MEM):"
+echo "==> cold-start timing (wallclock, target spec 2c8G / 0.1c128M headroom / startup $STARTUP_MEM):"
 if [ -n "$T_APP_NS" ]; then
     APP_MS=$(ms_delta "$T0_NS" "$T_APP_NS")
     echo "    T0 → app first stdout (PYBOOT-OK):  ${APP_MS} ms"
@@ -323,39 +321,79 @@ else
     echo "==> FAIL: CH --cpus did not reflect capacity=2"
     exit 1
 fi
-cap_mb=$(awk -v c="$CAP_MEM" 'BEGIN{
-    sub(/GiB/,"",c); if(c+0>0) print c*1024; else { sub(/MiB/,"",c); print c+0 }
-}')
-# CH puts memory-zone size= on the same memory-zone token spelled
-# "--memory-zone id=ram0,size=2048M,...". A simple substring match
-# against the size= clause is enough to validate the wiring.
-if grep -q "memory-zone.*size=${cap_mb}M" "$LOG"; then
-    echo "==> PASS: CH given memory-zone size=${cap_mb}M (capacity=$CAP_MEM)"
+# Mirror util.ParseSize with exact integer arithmetic so fractional units do
+# not lose bytes before the CH command line and aligned target are checked.
+size_to_bytes() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+value = sys.argv[1].strip()
+match = re.fullmatch(
+    r"(?P<whole>[0-9]*)(?:\.(?P<fraction>[0-9]+))?\s*"
+    r"(?P<unit>b|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)?",
+    value,
+    flags=re.IGNORECASE,
+)
+if match is None or (not match["whole"] and match["fraction"] is None):
+    raise SystemExit(f"invalid size: {value!r}")
+
+whole = match["whole"] or "0"
+fraction = match["fraction"] or ""
+scale = {
+    None: 1,
+    "b": 1,
+    "k": 1 << 10,
+    "kb": 1 << 10,
+    "kib": 1 << 10,
+    "m": 1 << 20,
+    "mb": 1 << 20,
+    "mib": 1 << 20,
+    "g": 1 << 30,
+    "gb": 1 << 30,
+    "gib": 1 << 30,
+    "t": 1 << 40,
+    "tb": 1 << 40,
+    "tib": 1 << 40,
+}[match["unit"].lower() if match["unit"] else None]
+numerator = int(whole + fraction) * scale
+denominator = 10 ** len(fraction)
+byte_count, remainder = divmod(numerator, denominator)
+if remainder:
+    raise SystemExit(f"size is not an exact whole-byte value: {value!r}")
+if byte_count > (1 << 64) - 1:
+    raise SystemExit(f"size overflows uint64 bytes: {value!r}")
+print(byte_count)
+PY
+}
+cap_bytes=$(size_to_bytes "$CAP_MEM")
+# The memory-zone is the authoritative Capacity and must preserve the exact
+# configured byte count rather than truncating it to MiB.
+if grep -q "memory-zone.*size=${cap_bytes}" "$LOG"; then
+    echo "==> PASS: CH given exact memory-zone size=${cap_bytes} (capacity=$CAP_MEM)"
 else
     echo "==> FAIL: CH --memory-zone did not reflect capacity=$CAP_MEM"
     exit 1
 fi
 
-startup_bytes=$(awk -v s="$STARTUP_MEM" 'BEGIN{
-    if (s ~ /GiB$/) { sub(/GiB/,"",s); printf "%.0f", s*1024*1024*1024; exit }
-    if (s ~ /MiB$/) { sub(/MiB/,"",s); printf "%.0f", s*1024*1024; exit }
-    print s+0
-}')
-cap_bytes=$(awk -v c="$CAP_MEM" 'BEGIN{
-    if (c ~ /GiB$/) { sub(/GiB/,"",c); printf "%.0f", c*1024*1024*1024; exit }
-    if (c ~ /MiB$/) { sub(/MiB/,"",c); printf "%.0f", c*1024*1024; exit }
-    print c+0
-}')
-want_balloon=$((cap_bytes - startup_bytes))
+startup_bytes=$(size_to_bytes "$STARTUP_MEM")
+memory_step=$((64 * 1024 * 1024))
+raw_target=$((cap_bytes - startup_bytes))
+want_balloon=$((raw_target / memory_step * memory_step))
+want_initial_budget=$((cap_bytes - want_balloon))
 if grep -q -- "--balloon size=${want_balloon}" "$LOG"; then
-    echo "==> PASS: CH initial balloon reflects startup allocatable ($STARTUP_MEM)"
+    echo "==> PASS: CH initial balloon reflects aligned InitialBudget=${want_initial_budget}"
 else
-    echo "==> FAIL: CH initial balloon did not reflect startup allocatable ($STARTUP_MEM)"
+    echo "==> FAIL: CH initial balloon did not reflect startup headroom ($STARTUP_MEM)"
     exit 1
 fi
 
-grep -q "controller admit ok, initial allocatable=${startup_bytes}" "$LOG" || {
-    echo "==> FAIL: sandbox-ctl did not log controller startup admit for $STARTUP_MEM"
+grep -q "controller admit: .*initial_reservation=${want_initial_budget}" "$LOG" || {
+    echo "==> FAIL: sandbox-ctl did not log exact initial reservation ${want_initial_budget}"
+    exit 1
+}
+grep -q "initial cold Budget reserved=${want_initial_budget}" "$LOG" || {
+    echo "==> FAIL: sandbox-ctl did not retain InitialBudget ${want_initial_budget}"
     exit 1
 }
 grep -q "settled .* sid=" "$WORK/node-ctl.log" 2>/dev/null || {

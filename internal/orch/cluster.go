@@ -127,7 +127,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 // carry load signals.
 type ResourceProbeSnapshot struct {
 	Zone      string
-	Allocated int64
+	Allocated int64 // sum of node reservations
 	Pool      int64
 	Draining  bool
 }

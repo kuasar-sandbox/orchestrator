@@ -8,7 +8,7 @@
 //	node-ctl config <conductor|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
-//	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
+//	node-ctl resource <status|list|drain>                      # node reservation controller inspection (hosted in serve via resource_listen)
 //	node-ctl builder status                                    # durable Builder admission status (admin socket)
 //	node-ctl version
 //

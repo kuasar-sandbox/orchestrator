@@ -37,8 +37,8 @@ type BlockReason int
 
 const (
 	BlockNone              BlockReason = iota
-	BlockedByMainBudget                // effective_startup_budget > main_headroom (waits for Settled/Released)
-	BlockedByStartupBudget             // effective_startup_budget > startup_headroom (waits for Settled/Released-before-settled)
+	BlockedByMainBudget                // initial Budget > main headroom (waits for Settled/Released)
+	BlockedByStartupBudget             // initial Budget > pre-settled headroom (waits for Settled/Released-before-settled)
 	BlockedByTokenBucket               // token bucket empty (waits for refill — uses one-shot timer)
 )
 
@@ -411,14 +411,28 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 			RejectMsg:  "controller is draining",
 		}
 	}
-
-	// 2. compute effective_startup_budget
-	ebudget := computeEffectiveStartupBudget(req)
-	if ebudget == 0 {
+	if req == nil || req.CapacityMemoryBytes == 0 || req.FloorMemoryBytes == 0 ||
+		req.FloorMemoryBytes > req.CapacityMemoryBytes || req.StartupBudgetMemory == 0 ||
+		req.StartupBudgetMemory > req.CapacityMemoryBytes ||
+		req.AllocatableAtSnapshot > req.CapacityMemoryBytes {
 		return Outcome{
 			Status:     OutcomePreCheckReject,
-			RejectCode: "invalid_burst",
-			RejectMsg:  "all three of startup_budget_memory / floor_memory_bytes / allocatable_at_snapshot are zero",
+			RejectCode: "invalid_resource_contract",
+			RejectMsg:  "memory Capacity, settled headroom, cold InitialBudget, or BudgetAtSnapshot is outside its valid range",
+		}
+	}
+
+	// 2. Select the exact initial reservation. Cold start uses the already
+	// aligned StartupBudgetMemory. Restore uses AllocatableAtSnapshot, whose
+	// wire name is retained but whose value is BudgetAtSnapshot. Memory
+	// headroom is an independent steady-policy input and is never folded into
+	// this admission amount.
+	initialBudget := initialReservationBudget(req)
+	if initialBudget == 0 {
+		return Outcome{
+			Status:     OutcomePreCheckReject,
+			RejectCode: "invalid_initial_budget",
+			RejectMsg:  "selected initial reservation is zero",
 		}
 	}
 
@@ -426,23 +440,23 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 	pool := snapshot.Pool.MemoryBytes
 	startupPool := snapshot.StartupPool
 	emerg := snapshot.EmergencyMemory
-	mainAllocated := snapshot.Allocated.MemoryBytes
+	mainReserved := snapshot.Reserved.MemoryBytes
 	startupInFlight := snapshot.StartupInFlight
 	zone := snapshot.Zone
 
 	// 3. pre-check absolute capacity
-	if ebudget > pool {
+	if initialBudget > pool {
 		return Outcome{
 			Status:     OutcomePreCheckReject,
 			RejectCode: "exceeds_node_capacity",
-			RejectMsg:  fmt.Sprintf("effective_startup_budget %d > pool %d", ebudget, pool),
+			RejectMsg:  fmt.Sprintf("initial reservation %d > pool %d", initialBudget, pool),
 		}
 	}
-	if ebudget > startupPool {
+	if initialBudget > startupPool {
 		return Outcome{
 			Status:     OutcomePreCheckReject,
 			RejectCode: "exceeds_startup_pool",
-			RejectMsg:  fmt.Sprintf("effective_startup_budget %d > startup_pool %d", ebudget, startupPool),
+			RejectMsg:  fmt.Sprintf("initial reservation %d > startup_pool %d", initialBudget, startupPool),
 		}
 	}
 
@@ -457,10 +471,10 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 
 	// 5. budget headroom — both gates
 	mainHeadroom := uint64(0)
-	if pool > mainAllocated+emerg {
-		mainHeadroom = pool - mainAllocated - emerg
+	if mainReserved <= pool && emerg <= pool-mainReserved {
+		mainHeadroom = pool - mainReserved - emerg
 	}
-	if ebudget > mainHeadroom {
+	if initialBudget > mainHeadroom {
 		return Outcome{
 			Status: OutcomeShortTermBlock,
 			Block:  BlockedByMainBudget,
@@ -471,7 +485,7 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 	if startupPool > startupInFlight {
 		startupHeadroom = startupPool - startupInFlight
 	}
-	if ebudget > startupHeadroom {
+	if initialBudget > startupHeadroom {
 		return Outcome{
 			Status: OutcomeShortTermBlock,
 			Block:  BlockedByStartupBudget,
@@ -493,18 +507,16 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 	return Outcome{Status: OutcomeAdmitted}
 }
 
-// computeEffectiveStartupBudget returns max(startup_budget_memory,
-// floor_memory_bytes, allocatable_at_snapshot). Equivalent to user's
-// effective_burst = max(yaml.startup, yaml.allocatable, allocatable_at_snapshot).
-func computeEffectiveStartupBudget(req *Message) uint64 {
-	out := req.StartupBudgetMemory
-	if req.FloorMemoryBytes > out {
-		out = req.FloorMemoryBytes
+// initialReservationBudget is the reservation-side adapter for the unchanged
+// wire contract. A non-zero AllocatableAtSnapshot is BudgetAtSnapshot and
+// selects restore admission; otherwise StartupBudgetMemory is the exact cold
+// initial Budget. FloorMemoryBytes is settled guest headroom and does not
+// participate.
+func initialReservationBudget(req *Message) uint64 {
+	if req.AllocatableAtSnapshot != 0 {
+		return req.AllocatableAtSnapshot
 	}
-	if req.AllocatableAtSnapshot > out {
-		out = req.AllocatableAtSnapshot
-	}
-	return out
+	return req.StartupBudgetMemory
 }
 
 // ConsumeToken decrements the token bucket by one. Caller must have

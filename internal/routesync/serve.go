@@ -157,7 +157,7 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		for {
 			m, err := ReadMsg(body)
 			if err != nil {
-				if sctx.Err() == nil {
+				if sctx.Err() == nil && log != nil {
 					log.Debug("routesync: authority read end", "err", err)
 				}
 				return

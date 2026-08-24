@@ -41,7 +41,8 @@ sandbox:
 	policy := defaults.Sandbox.Resources.Policy()
 	if policy.Capacity.CPU != 2 || policy.Capacity.Memory != "2GiB" ||
 		policy.Allocatable.CPU != nil || policy.Allocatable.Memory != "256MiB" ||
-		policy.Startup != nil || policy.Overhead.Memory != "32MiB" {
+		policy.Startup != nil || policy.Overhead.Memory != "32MiB" || policy.WatermarkHigh == nil ||
+		policy.WatermarkHigh.Ratio == nil || *policy.WatermarkHigh.Ratio != 0.875 {
 		t.Fatalf("resource defaults = %+v", policy)
 	}
 
@@ -232,14 +233,14 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `
 	tests := map[string]string{
-		"vcpu":           "    vcpu: 2",
-		"memory":         "    memory: 2GiB",
-		"control_socket": "    control_socket: /run/controller.sock",
-		"control":        "    control: {}",
-		"watermark":      "    watermark_high: {}",
-		"sensor":         "    sensor: {}",
-		"deflate":        "    allocatable:\n      deflate_on_oom: false",
-		"unknown":        "    future: {}",
+		"vcpu":                 "    vcpu: 2",
+		"memory":               "    memory: 2GiB",
+		"control_socket":       "    control_socket: /run/controller.sock",
+		"control":              "    control: {}",
+		"old watermark memory": "    watermark_high:\n      memory: 1GiB",
+		"sensor":               "    sensor: {}",
+		"deflate":              "    allocatable:\n      deflate_on_oom: false",
+		"unknown":              "    future: {}",
 	}
 	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -269,7 +270,6 @@ sandbox:
 		resources      string
 		path           string
 	}{
-		"static startup":      {resources: "    startup:\n      memory: 1GiB", path: "startup"},
 		"bad capacity memory": {resources: "    capacity:\n      memory: nope", path: "capacity.memory"},
 		"zero alloc memory":   {resources: "    allocatable:\n      memory: 0", path: "allocatable.memory"},
 		"alloc memory above capacity": {
@@ -290,7 +290,7 @@ sandbox:
 }
 
 func TestLoadAllowsNodeStartupToBeNormalizedPerFinalSandbox(t *testing.T) {
-	for name, startup := range map[string]string{"below floor": "512MiB", "above capacity": "4GiB"} {
+	for name, startup := range map[string]string{"below headroom": "512MiB"} {
 		t.Run(name, func(t *testing.T) {
 			loaded, err := Load(writeConfig(t, `
 api: { domain: example.test }
@@ -312,10 +312,7 @@ sandbox:
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := "1GiB"
-			if name == "above capacity" {
-				want = "2GiB"
-			}
+			want := "512MiB"
 			if resources.Startup == nil || resources.Startup.Memory != want {
 				t.Fatalf("normalized startup = %+v, want %s", resources.Startup, want)
 			}
@@ -344,7 +341,7 @@ sandbox:
 		t.Fatal(err)
 	}
 	if resolved.Allocatable.Memory != "128MiB" {
-		t.Fatalf("inherited floor = %s, want capacity 128MiB", resolved.Allocatable.Memory)
+		t.Fatalf("inherited headroom = %s, want capacity 128MiB", resolved.Allocatable.Memory)
 	}
 	patch, err := sandboxcfg.ParseResourcePatch(`{"capacity":{"memory":"512MiB"}}`)
 	if err != nil {

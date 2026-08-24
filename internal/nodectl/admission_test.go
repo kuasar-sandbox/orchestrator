@@ -93,13 +93,13 @@ func TestAdmission_StartupPoolGate(t *testing.T) {
 	// Simulate the State accepting the reservation so startup_in_flight
 	// grows to reflect the just-admitted budget.
 	installReservationForTest(t, state, Reservation{
-		Token:                  "t1",
-		SandboxID:              "sb-1",
-		Capacity:               Resources{MemoryBytes: 4 << 30},
-		Floor:                  Resources{MemoryBytes: 1 << 30},
-		AllocatableNowMem:      3 << 30,
-		EffectiveStartupBudget: 3 << 30,
-		Stage:                  StageAdmitted,
+		Token:                 "t1",
+		SandboxID:             "sb-1",
+		Capacity:              Resources{MemoryBytes: 4 << 30},
+		ConfiguredAllocatable: Resources{MemoryBytes: 1 << 30},
+		ReservationMemory:     3 << 30,
+		InitialBudget:         3 << 30,
+		Stage:                 StageAdmitted,
 	})
 
 	// Second admit: startup_pool full (3GiB in flight, 5GiB cap, head=3GiB
@@ -185,26 +185,54 @@ func TestAdmission_PreCheckExceedsStartupPool(t *testing.T) {
 	}
 }
 
-func TestAdmission_EffectiveBudget_RespectsAllMaxes(t *testing.T) {
+func TestAdmission_SelectsColdOrRestoreInitialBudget(t *testing.T) {
 	cases := []struct {
 		name                 string
 		startup, floor, snap uint64
 		want                 uint64
 	}{
-		{"cold burst dominates", 4 << 30, 1 << 30, 0, 4 << 30},
-		{"cold floor dominates", 1 << 30, 4 << 30, 0, 4 << 30},
-		{"restore snap dominates", 1 << 30, 1 << 30, 4 << 30, 4 << 30},
-		{"restore burst over snap honored", 4 << 30, 1 << 30, 2 << 30, 4 << 30},
+		{"cold startup only", 4 << 30, 1 << 30, 0, 4 << 30},
+		{"cold startup may be below headroom", 1 << 30, 4 << 30, 0, 1 << 30},
+		{"restore snapshot only", 1 << 30, 4 << 30, 2 << 30, 2 << 30},
+		{"restore ignores larger startup", 4 << 30, 1 << 30, 2 << 30, 2 << 30},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := computeEffectiveStartupBudget(&Message{
+			got := initialReservationBudget(&Message{
 				StartupBudgetMemory:   c.startup,
 				FloorMemoryBytes:      c.floor,
 				AllocatableAtSnapshot: c.snap,
 			})
 			if got != c.want {
 				t.Errorf("got %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectsInvalidMemoryContract(t *testing.T) {
+	state := newTestState(t, 16<<30)
+	a := newTestAdmission(t, AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 16,
+	}, state)
+	valid := Message{
+		SandboxID: "valid", CapacityMemoryBytes: 1 << 30,
+		FloorMemoryBytes: 256 << 20, StartupBudgetMemory: 1 << 30,
+	}
+	for name, mutate := range map[string]func(*Message){
+		"zero capacity":           func(r *Message) { r.CapacityMemoryBytes = 0 },
+		"zero headroom":           func(r *Message) { r.FloorMemoryBytes = 0 },
+		"headroom above capacity": func(r *Message) { r.FloorMemoryBytes = 2 << 30 },
+		"zero startup":            func(r *Message) { r.StartupBudgetMemory = 0 },
+		"startup above capacity":  func(r *Message) { r.StartupBudgetMemory = 2 << 30 },
+		"snapshot above capacity": func(r *Message) { r.AllocatableAtSnapshot = 2 << 30 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := valid
+			mutate(&req)
+			outcome := a.AnalyzeRequest(&req)
+			if outcome.Status != OutcomePreCheckReject || outcome.RejectCode != "invalid_resource_contract" {
+				t.Fatalf("outcome = %+v", outcome)
 			}
 		})
 	}
@@ -221,11 +249,11 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 	// Force a short-term block by filling main pool with one big reservation.
 	installReservationForTest(t, state, Reservation{
 		Token: "filler", SandboxID: "filler",
-		Capacity:               Resources{MemoryBytes: 1 << 30},
-		Floor:                  Resources{MemoryBytes: 1 << 30},
-		AllocatableNowMem:      900 << 20,
-		EffectiveStartupBudget: 900 << 20,
-		Stage:                  StageAdmitted,
+		Capacity:              Resources{MemoryBytes: 1 << 30},
+		ConfiguredAllocatable: Resources{MemoryBytes: 1 << 30},
+		ReservationMemory:     900 << 20,
+		InitialBudget:         900 << 20,
+		Stage:                 StageAdmitted,
 	})
 
 	req := &Message{
@@ -295,10 +323,10 @@ func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
 		token := "queued-token"
 		_, _, err := state.Admit(AdmitSpec{
 			Token: token, SandboxID: p.req.SandboxID, PeerPID: p.peerPID,
-			Capacity:           Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
-			Floor:              Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
-			InitialAllocatable: 256 << 20, EffectiveStartupBudget: 256 << 20,
-			Conn: p.conn,
+			Capacity:              Resources{MemoryBytes: 512 << 20, CPUMilli: 1000},
+			ConfiguredAllocatable: Resources{MemoryBytes: 128 << 20, CPUMilli: 500},
+			InitialBudget:         256 << 20,
+			Conn:                  p.conn,
 		})
 		return &Message{Type: TypeAdmitResponse, Status: StatusAdmitted, Token: token}, err
 	}

@@ -34,6 +34,32 @@ func TestAllocator_CapByHeadroom(t *testing.T) {
 	}
 }
 
+func TestAllocator_GrantsExactSubMinimumTailWithoutOverGrant(t *testing.T) {
+	a := NewAllocator(AllocatorPolicy{
+		MemoryGrantPerSecBytes: 1 << 30,
+		MinGrantStep:           4 << 20,
+		MaxGrantStep:           1 << 30,
+	})
+	a.tokens = float64(1 << 30)
+	decision := a.Grant("small", 1<<20, 1<<30, UrgencyNormal)
+	if decision.GrantedDelta != 1<<20 {
+		t.Fatalf("sub-minimum tail was not granted exactly: %+v", decision)
+	}
+}
+
+func TestAllocator_DefersSubMinimumPartialGrant(t *testing.T) {
+	a := NewAllocator(AllocatorPolicy{
+		MemoryGrantPerSecBytes: 1 << 30,
+		MinGrantStep:           4 << 20,
+		MaxGrantStep:           1 << 30,
+	})
+	a.tokens = float64(1 << 30)
+	decision := a.Grant("fragment", 8<<20, 1<<20, UrgencyNormal)
+	if decision.GrantedDelta != 0 || decision.CooldownMs <= 0 {
+		t.Fatalf("sub-minimum partial grant was not deferred: %+v", decision)
+	}
+}
+
 func TestAllocator_RateLimited(t *testing.T) {
 	a := NewAllocator(AllocatorPolicy{
 		MemoryGrantPerSecBytes: 10 << 20, // 10 MiB/s
