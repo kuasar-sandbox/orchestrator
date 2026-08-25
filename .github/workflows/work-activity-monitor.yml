@@ -3,11 +3,11 @@ name: Work activity monitor
 on:
   workflow_dispatch:
   issues:
-    types: [opened, edited, closed, reopened, assigned, labeled, unlabeled, milestoned, demilestoned]
+    types: [opened, edited, closed, reopened, assigned, unassigned, labeled, unlabeled, milestoned, demilestoned]
   issue_comment:
     types: [created, edited]
   pull_request_target:
-    types: [opened, edited, closed, reopened, ready_for_review, converted_to_draft, review_requested, review_request_removed, assigned, labeled, unlabeled, milestoned, demilestoned]
+    types: [opened, edited, closed, reopened, ready_for_review, converted_to_draft, review_requested, review_request_removed, assigned, unassigned, labeled, unlabeled, milestoned, demilestoned]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
@@ -25,6 +25,10 @@ permissions:
   pull-requests: read
   discussions: read
 
+concurrency:
+  group: work-activity-monitor
+  cancel-in-progress: false
+
 jobs:
   monitor:
     if: github.actor != 'github-actions[bot]'
@@ -32,7 +36,7 @@ jobs:
     timeout-minutes: 3
     steps:
       - name: Detect actionable activity
-        uses: kuasar-sandbox/.github/.github/actions/work-activity-monitor@596aa5dee39646242ce661a350df9649c00bf576
+        uses: kuasar-sandbox/.github/.github/actions/work-activity-monitor@079e891bbaf8956318590526fbb41d9352537366
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           recipient: fullof-work
