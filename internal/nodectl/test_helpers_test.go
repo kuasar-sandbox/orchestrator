@@ -1,6 +1,25 @@
 package nodectl
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
+
+// shortTestDir avoids embedding long test and subtest names in Unix socket
+// paths, whose Linux sockaddr_un pathname limit is 107 bytes.
+func shortTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove short test directory: %v", err)
+		}
+	})
+	return dir
+}
 
 func installReservationForTest(t *testing.T, state *State, r Reservation) {
 	t.Helper()
