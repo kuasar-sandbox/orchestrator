@@ -577,7 +577,7 @@ func TestSweeperRetainsLiveCgroupAcrossStartupAndHeartbeatTimeouts(t *testing.T)
 }
 
 func TestStateSyncReplacesProvisionalAndValidatesManagedIdentity(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTestDir(t)
 	socket, root, runRoot := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), filepath.Join(dir, "run")
 	if err := os.MkdirAll(filepath.Join(dir, "intermediate"), 0o755); err != nil {
 		t.Fatal(err)
