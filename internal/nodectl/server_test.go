@@ -13,7 +13,7 @@ import (
 // startTestServer spins up a controller daemon backed by a tmpdir UDS.
 func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortTestDir(t)
 	sock := filepath.Join(dir, "ctl.sock")
 
 	state := NewState(physMem, 8000, 1<<30, 1500, Watermarks{
@@ -293,7 +293,7 @@ func TestConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
 }
 
 func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTestDir(t)
 	state := NewState(8<<30, 8000, 0, 0, Watermarks{
 		HighFactor: .85, LowFactor: .7, EmergencyFactor: .05, StartupFactor: .5,
 	})
