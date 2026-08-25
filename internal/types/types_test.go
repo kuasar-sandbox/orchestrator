@@ -36,6 +36,7 @@ func TestTemplateIDPortableRef(t *testing.T) {
 		{kind: KindSnp, ref: "manifest://" + key},
 		{kind: KindImg, ref: "file://" + key + ".image@location:0198-build"},
 		{kind: KindSnp, ref: "file://" + key + ".snapshot@location:0198-build"},
+		{kind: KindSnp, ref: "file://" + key + ".bundle@location:0198-build"},
 	} {
 		want := TemplateID{Profile: ProfileE2B, Kind: tt.kind, Ref: tt.ref}
 		got, err := ParseTemplateID(want.String())

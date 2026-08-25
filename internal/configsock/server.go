@@ -189,6 +189,7 @@ type BuildSpec struct {
 	FromTemplateRef  string            `json:"from_template_ref,omitempty"`
 	FromTemplateKind string            `json:"from_template_kind,omitempty"`
 	RefLocations     map[string]string `json:"ref_locations,omitempty"`
+	CheckpointMode   string            `json:"checkpoint_mode"`
 	// SnapshotPreparation is populated only inside run-builder from its retained
 	// root SnapshotCfg. It is intentionally absent from the conductor wire.
 	SnapshotPreparation *BuildSnapshotPreparation `json:"-"`
@@ -555,7 +556,7 @@ func (s *Server) handleBuildBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req BuildTaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != SnapshotPrepareSchemaVersion {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
 		writeJSON(w, http.StatusBadRequest, &BuildTaskSpec{Error: "bad request"})
 		return
 	}
@@ -593,7 +594,7 @@ func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req BuildPrepareRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
 		writeJSON(w, http.StatusBadRequest, &BuildPrepareResponse{Error: "bad request"})
 		return
 	}

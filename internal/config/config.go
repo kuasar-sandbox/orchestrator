@@ -45,8 +45,8 @@ const (
 
 // Checkpoint modes select where a paused sandbox's snapshot lands.
 const (
-	CheckpointLocal  = "local"  // sandbox-ctl snapshot --output → node-local files (default; node-bound)
-	CheckpointRemote = "remote" // deprecated compatibility mode; legacy routing remains unchanged
+	CheckpointLocal  = "local"  // sandbox-ctl snapshot --mode local → node-local tarstream (default; node-bound)
+	CheckpointBundle = "bundle" // sandbox-ctl snapshot --mode bundle → node-local Manifest Bundle (node-bound)
 )
 
 // Auto-discovered external binary names (resolved via Config.Bin against the
@@ -613,11 +613,10 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 	return time.Hour
 }
 
-// CheckpointConfig is the paused-state capture policy. Local capture may
-// explicitly override sandbox-ctl's merge-ref and drop-caches defaults. Remote
-// mode is retained only for compatibility and does not accept those overrides.
+// CheckpointConfig is the paused-state capture policy. Both capture modes may
+// explicitly override sandbox-ctl's merge-ref and drop-caches defaults.
 type CheckpointConfig struct {
-	Mode       string                 `yaml:"mode"`        // local (default) | remote (deprecated)
+	Mode       string                 `yaml:"mode"`        // local (default) | bundle
 	LocalDir   string                 `yaml:"local_dir"`   // local checkpoint files dir; default /var/lib/sandbox-saved
 	MergeRef   *bool                  `yaml:"merge_ref"`   // nil delegates to sandbox-ctl
 	DropCaches *bool                  `yaml:"drop_caches"` // nil delegates to sandbox-ctl
@@ -932,13 +931,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: units.pool_wait_timeout must be > 0")
 	}
 	switch c.Checkpoint.Mode {
-	case CheckpointLocal, CheckpointRemote:
+	case CheckpointLocal, CheckpointBundle:
 	default:
-		return fmt.Errorf("config: checkpoint.mode %q (want local|remote)", c.Checkpoint.Mode)
-	}
-	if c.Checkpoint.Mode == CheckpointRemote &&
-		(c.Checkpoint.MergeRef != nil || c.Checkpoint.DropCaches != nil) {
-		return fmt.Errorf("config: checkpoint merge_ref/drop_caches require checkpoint.mode=local")
+		return fmt.Errorf("config: checkpoint.mode %q (want local|bundle)", c.Checkpoint.Mode)
 	}
 	if parent := c.Checkpoint.Remote.RefLocationParent; parent != "" {
 		if _, err := parseAbsoluteFileURI(parent); err != nil {

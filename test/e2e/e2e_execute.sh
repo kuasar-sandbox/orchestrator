@@ -486,6 +486,21 @@ if bad:
     raise SystemExit(f"builder snapshot unexpectedly received checkpoint policy flags: {bad!r}")
 PY
 }
+
+assert_snapshot_mode() { # $1=index, $2=mode
+    python3 - "$SNAPSHOT_ARGV_LOG" "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    calls = [json.loads(line) for line in source if line.strip()]
+call = calls[int(sys.argv[2])]
+try:
+    mode = call[call.index("--mode") + 1]
+except (ValueError, IndexError):
+    raise SystemExit(f"snapshot call has no --mode value: {call!r}")
+if mode != sys.argv[3]:
+    raise SystemExit(f"snapshot mode={mode!r}, want {sys.argv[3]!r}: {call!r}")
+PY
+}
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
@@ -886,9 +901,10 @@ truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 CHECKPOINT_DIR="$WORK/checkpoints"
-write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller (default controller)
+write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=local|bundle
     local policy_mode="$1"
     local resource_mode="${2:-controller}"
+    local checkpoint_mode="${3:-local}"
     local resource_controller_config=""
     case "$resource_mode" in
         static) ;;
@@ -931,7 +947,7 @@ builder:
   diff_template: $BLD
 $resource_controller_config
 checkpoint:
-  mode: local
+  mode: $checkpoint_mode
   local_dir: $CHECKPOINT_DIR
 EOF
     if [ "$policy_mode" = "node-policy" ]; then
@@ -959,9 +975,6 @@ start_orchestrator() { # $1=log path
         sleep 0.5
     done
     [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
-    if grep -q 'checkpoint.mode=remote is deprecated' "$log_path"; then
-        fail "local checkpoint mode emitted the remote deprecation warning"
-    fi
     return 0
 }
 
@@ -1015,8 +1028,9 @@ BUILD_SNAPSHOT_COUNT=$(snapshot_argv_count)
 [ "$BUILD_SNAPSHOT_COUNT" -gt 0 ] || fail "builder did not invoke sandbox-ctl snapshot"
 for ((i=0; i<BUILD_SNAPSHOT_COUNT; i++)); do
     assert_snapshot_has_no_policy_flags "$i" || fail "builder snapshot received Pause-only policy flags"
+    assert_snapshot_mode "$i" local || fail "builder snapshot did not receive checkpoint.mode=local"
 done
-echo "==> PASS: local checkpoint mode did not add merge-ref/drop-caches to builder snapshots"
+echo "==> PASS: builder snapshots received checkpoint.mode=local without Pause-only policy flags"
 
 # ---- low-allocatable runner cgroup isolation regression --------------------
 # Restore admission uses BudgetAtSnapshot and intentionally ignores startup
@@ -1672,8 +1686,8 @@ wait_resource_status "$SID" 409 || fail "paused resource stats did not converge 
 # this host wall-clock interval.
 sleep 3
 assert_snapshot_argv "$UNSET_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
-    || fail "all-unset local Pause changed the legacy snapshot argv"
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    || fail "all-unset local Pause did not pass the configured mode"
 B_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
 [ -f "$B_LOCAL" ] || fail "local Pause did not create $B_LOCAL"
 B_ARTIFACT="$(readlink -f "$B_LOCAL")"
@@ -1736,7 +1750,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
     '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
 assert_snapshot_argv "$PORTABLE_W_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
     --merge-ref=false --drop-caches=false \
     || fail "portable W Pause policy did not reach sandbox-ctl exactly"
 W_PORTABLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
@@ -1985,7 +1999,7 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
 unset REQ_CHECKPOINT_HEADER
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "policy pause=$code (want 204)"; }
 assert_snapshot_argv "$POLICY_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
     --merge-ref=false --drop-caches=false \
     || fail "Pause body/header policy did not reach sandbox-ctl exactly"
 W_POLICY="$CHECKPOINT_DIR/$SID/$SID.snapshot"
@@ -2052,7 +2066,7 @@ PY
 done
 [ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
 assert_snapshot_argv "$AUTO_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --run-root "$WORK/run" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
     --merge-ref=false --drop-caches=false \
     || fail "auto-pause did not resolve metadata > node fieldwise"
 [ -f "$CHECKPOINT_DIR/$SID/$SID.snapshot" ] || fail "auto-pause did not create local W"
@@ -2061,5 +2075,78 @@ echo "==> PASS: reaper auto-pause used metadata merge_ref=false and node drop_ca
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill auto-paused sandbox=$code (want 204)"
 echo "==> PASS: all local checkpoint-policy sandboxes killed"
+
+# ---- bundle Pause -> local restore -> exact Store promotion ---------------
+stop_orchestrator
+write_orchestrator_config unset controller bundle
+start_orchestrator "$WORK/orch-bundle.log"
+wait_mmds_listener
+
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "bundle create=$code"; }
+SID=$(json_field "$WORK/resp.body" sandboxID)
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+ENVD_SOCK="$WORK/run/$SID/envd.sock"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue bundle sandbox exec capability"
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_START_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "bundle sandbox did not reach running"
+BUNDLE_PERSIST="BUNDLE_PERSIST_$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "echo $BUNDLE_PERSIST > /home/user/bundle-persist.txt" >"$WORK/bundle-write.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/bundle-write.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-write.out"; fail "write bundle marker"; }
+
+BUNDLE_CALL=$(snapshot_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle pause=$code"; }
+assert_snapshot_argv "$BUNDLE_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    || fail "bundle Pause did not pass --mode bundle exactly"
+BUNDLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+[ -L "$BUNDLE_LOCAL" ] || fail "bundle Pause did not retain $BUNDLE_LOCAL symlink"
+BUNDLE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
+case "$BUNDLE_TARGET" in *.bundle) ;; *) fail "bundle symlink target is not .bundle: $BUNDLE_TARGET" ;; esac
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BUNDLE_LOCAL" >"$WORK/bundle-local.json" \
+    || fail "local Manifest Bundle is unreadable"
+
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_RESTORE_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "local Manifest Bundle did not restore"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-read.out"; fail "local Manifest Bundle restore lost guest state"; }
+
+BUNDLE_PROMOTE_CALL=$(snapshot_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle promote pause=$code"; }
+assert_snapshot_argv "$BUNDLE_PROMOTE_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    || fail "second bundle Pause did not pass --mode bundle exactly"
+BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
+BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
+[[ "$BUNDLE_PROMOTE_TARGET" == *.bundle && "$BUNDLE_ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "second Bundle target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
+BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --socket "$WORK/node-ctl.socket") \
+    || fail "bundle export/promote failed"
+case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT result" ;; esac
+BUNDLE_REMOTE_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select snapshot_ref from sandboxes where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "")
+PY
+)
+[ "$BUNDLE_REMOTE_REF" = "manifest://$BUNDLE_ROOT_KEY" ] \
+    || fail "bundle promote changed the root ManifestKey: local=$BUNDLE_ROOT_KEY remote=$BUNDLE_REMOTE_REF"
+[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "bundle promote retained redundant local checkpoint directory"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
+    || fail "promoted Bundle root is unreadable from Store"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
+unset EXEC_TOKEN
+echo "==> PASS: checkpoint.mode=bundle drove Pause, local restore, exact promotion, and remote read"
+
 echo
-echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, auto $SID)"
+echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle $BUNDLE_REMOTE_REF)"

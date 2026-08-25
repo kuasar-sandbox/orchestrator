@@ -213,7 +213,7 @@ func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string
 // FetchBuildTaskSpec fetches the auth-first exact-run bootstrap after the
 // caller has locked the assigned build task pidfile.
 func FetchBuildTaskSpec(ctx context.Context, socket, buildID, runID string) (*BuildTaskSpec, error) {
-	body, _ := json.Marshal(BuildTaskRequest{BuildID: buildID, RunID: runID, Version: SnapshotPrepareSchemaVersion})
+	body, _ := json.Marshal(BuildTaskRequest{BuildID: buildID, RunID: runID, Version: BuildTaskSchemaVersion})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildBootstrap, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -238,7 +238,9 @@ func FetchBuildTaskSpec(ctx context.Context, socket, buildID, runID string) (*Bu
 // for the final BuildSpec. Identical retries are safe after response loss or a
 // conductor restart; conflicts return a non-retryable 409.
 func CompleteBuildPrepare(ctx context.Context, socket, buildID, runID string, summary SnapshotPrepareSummary) (*BuildSpec, error) {
-	body, _ := json.Marshal(BuildPrepareRequest{BuildID: buildID, RunID: runID, Summary: summary})
+	body, _ := json.Marshal(BuildPrepareRequest{
+		BuildID: buildID, RunID: runID, Version: BuildTaskSchemaVersion, Summary: summary,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskBuildPrepare, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

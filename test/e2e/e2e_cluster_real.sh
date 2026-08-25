@@ -548,7 +548,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: remote }
+checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
     step "starting temporary standalone node-ctl for template build (:${BUILD_PORT})"
     "$BIN/node-ctl" conductor serve --config "$WORK/build-node.yaml" > >(tee "$WORK/build-node.log" >&2) 2>&1 &
@@ -786,7 +786,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: remote }
+checkpoint: { mode: local, local_dir: $WORK/saved }
 cluster:
   node_link: { endpoint: "127.0.0.1:$CONTROL_PORT" }
   node_id: "$node_id"

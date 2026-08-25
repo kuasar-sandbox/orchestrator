@@ -473,7 +473,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "0198f7a1-1234"
 	localRef := makeLocalSnapshot(t, dir, sid)
-	portableRef := "file://" + strings.Repeat("c", 64) + ".snapshot@location:" + sid
+	portableRef := "file://" + strings.Repeat("c", 64) + ".bundle@location:" + sid
 	argsPath := filepath.Join(dir, "promote.args")
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\nprintf '%s\\n' '" + portableRef + "'\n"

@@ -172,6 +172,7 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	cfg.Sandbox.Network.E2B.Nexthop = "169.254.0.22"
 	cfg.Sandbox.Network.Bare.Nexthop = "169.254.1.0"
 	cfg.MMDS.Enabled = true
+	cfg.Checkpoint.Mode = config.CheckpointBundle
 	o := testOrchCfg(t, cfg)
 	b := &types.Build{BuildID: "build-bare", Profile: types.ProfileBare}
 	o.pend[b.BuildID] = &pendingBuild{
@@ -188,6 +189,9 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	}
 	if spec.Profile != string(types.ProfileBare) || spec.Net.InnerIP != "169.254.1.1/31" || spec.Net.Nexthop != "169.254.1.0" {
 		t.Fatalf("bare BuildSpec profile/network = %q %+v", spec.Profile, spec.Net)
+	}
+	if spec.CheckpointMode != config.CheckpointBundle {
+		t.Fatalf("BuildSpec checkpoint mode = %q, want bundle", spec.CheckpointMode)
 	}
 	if spec.MMDSEnabled || spec.EnvdToken != "" {
 		t.Fatalf("bare BuildSpec exposed e2b template controls: mmds=%t envd_token=%q", spec.MMDSEnabled, spec.EnvdToken)

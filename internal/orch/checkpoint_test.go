@@ -80,35 +80,36 @@ func TestResolveCheckpointPolicyPrecedence(t *testing.T) {
 	}
 }
 
-func TestPauseLocalCheckpointPolicyArgv(t *testing.T) {
+func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 	tests := []struct {
 		name     string
+		mode     string
 		node     sandboxcfg.CheckpointPolicy
 		metadata string
 		action   sandboxcfg.CheckpointPolicy
 		wantTail []string
 	}{
-		{name: "all unset"},
-		{name: "node values",
+		{name: "local all unset", mode: config.CheckpointLocal},
+		{name: "bundle node values", mode: config.CheckpointBundle,
 			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true)},
 			wantTail: []string{"--merge-ref=false", "--drop-caches=true"}},
-		{name: "metadata and action layered",
+		{name: "local metadata and action layered", mode: config.CheckpointLocal,
 			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
 			metadata: `{"merge_ref":false}`, action: sandboxcfg.CheckpointPolicy{DropCaches: orchCheckpointBool(false)},
 			wantTail: []string{"--merge-ref=false", "--drop-caches=false"}},
-		{name: "one explicit field", action: sandboxcfg.CheckpointPolicy{DropCaches: orchCheckpointBool(false)},
+		{name: "bundle one explicit field", mode: config.CheckpointBundle, action: sandboxcfg.CheckpointPolicy{DropCaches: orchCheckpointBool(false)},
 			wantTail: []string{"--drop-caches=false"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+			cfg := checkpointOrchestratorConfig(t, tc.mode)
 			cfg.Checkpoint.MergeRef = tc.node.MergeRef
 			cfg.Checkpoint.DropCaches = tc.node.DropCaches
 			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, tc.metadata)
 			if err := o.Pause(context.Background(), sb.ID, apiKey, tc.action); err != nil {
 				t.Fatal(err)
 			}
-			want := []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--run-root", cfg.Paths.RunRoot}
+			want := []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", tc.mode, "--run-root", cfg.Paths.RunRoot}
 			want = append(want, tc.wantTail...)
 			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
 				t.Fatalf("snapshot argv = %#v, want %#v", got, want)
@@ -142,66 +143,15 @@ func TestAutoPauseUsesMetadataOverNodePolicy(t *testing.T) {
 	}
 }
 
-func TestRemoteCheckpointRoutesRemainUnchanged(t *testing.T) {
-	tests := []struct {
-		name   string
-		parent string
-		want   func(*config.Config, *types.Sandbox) []string
-		ref    func(*config.Config, *types.Sandbox) string
-	}{
-		{
-			name: "direct upload",
-			want: func(cfg *config.Config, sb *types.Sandbox) []string {
-				return []string{"snapshot", "--sandbox-id", sb.ID, "--upload", "--run-root", cfg.Paths.RunRoot}
-			},
-			ref: func(_ *config.Config, _ *types.Sandbox) string {
-				return "manifest://" + strings.Repeat("a", 64)
-			},
-		},
-		{
-			name: "ref location parent still captures locally", parent: "file:///mnt/checkpoints",
-			want: func(cfg *config.Config, sb *types.Sandbox) []string {
-				return []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--run-root", cfg.Paths.RunRoot}
-			},
-			ref: func(cfg *config.Config, sb *types.Sandbox) string {
-				return filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot")
-			},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := checkpointOrchestratorConfig(t, config.CheckpointRemote)
-			cfg.Checkpoint.Remote.RefLocationParent = tc.parent
-			o, sb, apiKey, _, _, argsPath := newCheckpointPauseFixture(t, cfg, "")
-			if err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CheckpointPolicy{}); err != nil {
-				t.Fatal(err)
-			}
-			if got, want := readCheckpointArgs(t, argsPath), tc.want(cfg, sb); !reflect.DeepEqual(got, want) {
-				t.Fatalf("remote compatibility argv = %#v, want %#v", got, want)
-			}
-			stored, err := o.st.Get(context.Background(), sb.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if stored.SnapshotRef != tc.ref(cfg, sb) {
-				t.Fatalf("snapshot ref = %q, want %q", stored.SnapshotRef, tc.ref(cfg, sb))
-			}
-		})
-	}
-}
-
 func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 	tests := []struct {
 		name     string
 		mode     string
 		metadata string
-		action   sandboxcfg.CheckpointPolicy
 		auto     bool
 	}{
 		{name: "malformed historical metadata", mode: config.CheckpointLocal, metadata: `{"merge_ref":"false"}`},
-		{name: "remote explicit action", mode: config.CheckpointRemote, action: sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false)}},
-		{name: "remote metadata", mode: config.CheckpointRemote, metadata: `{"drop_caches":false}`},
-		{name: "remote auto-pause metadata", mode: config.CheckpointRemote, metadata: `{"merge_ref":true}`, auto: true},
+		{name: "bundle malformed auto-pause metadata", mode: config.CheckpointBundle, metadata: `{"drop_caches":"false"}`, auto: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,7 +161,7 @@ func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 			if tc.auto {
 				err = o.pauseSandbox(context.Background(), sb)
 			} else {
-				err = o.Pause(context.Background(), sb.ID, apiKey, tc.action)
+				err = o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
 			}
 			if !errors.Is(err, api.ErrBadRequest) {
 				t.Fatalf("Pause error = %v, want ErrBadRequest", err)
@@ -458,8 +408,8 @@ func TestCreateRejectsCheckpointPolicyBeforeLaunchSideEffects(t *testing.T) {
 		mode     string
 		metadata string
 	}{
-		{name: "malformed", mode: config.CheckpointLocal, metadata: `{"merge_ref":0}`},
-		{name: "remote conflict", mode: config.CheckpointRemote, metadata: `{"merge_ref":false}`},
+		{name: "local malformed", mode: config.CheckpointLocal, metadata: `{"merge_ref":0}`},
+		{name: "bundle malformed", mode: config.CheckpointBundle, metadata: `{"drop_caches":"false"}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

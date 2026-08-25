@@ -128,7 +128,6 @@ func runConductor(args []string, log *slog.Logger) error {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
 	}
-	warnDeprecatedCheckpointMode(cfg, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -429,19 +428,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 	log.Info("node-ctl serving", "listen", cfg.API.Listen, "domain", cfg.API.Domain, "proxy_mode", cfg.Proxy.Mode)
 	return serveListener(ctx, ln, mux, cfg.API.TLS.Cert, cfg.API.TLS.Key, log)
-}
-
-func warnDeprecatedCheckpointMode(cfg *config.Config, log *slog.Logger) {
-	if cfg.Checkpoint.Mode != config.CheckpointRemote {
-		return
-	}
-	message := "checkpoint.mode=remote is deprecated; use checkpoint.mode=local and publish separately"
-	if cfg.Checkpoint.Remote.RefLocationParent != "" {
-		log.Warn(message,
-			"compatibility_behavior", "ref_location_parent is set, so Pause currently uses local capture; migrate to checkpoint.mode=local")
-		return
-	}
-	log.Warn(message)
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.

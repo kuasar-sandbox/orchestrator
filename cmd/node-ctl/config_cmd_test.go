@@ -59,6 +59,48 @@ func TestConductorConfigTemplateUsesBuilderTwoStageAdmission(t *testing.T) {
 	}
 }
 
+func TestConductorConfigTemplateDocumentsBundleCheckpointAndRemotePublication(t *testing.T) {
+	start := strings.Index(conductorConfigSkeleton, "checkpoint:")
+	end := strings.Index(conductorConfigSkeleton[start:], "\n# mmds:")
+	if start < 0 || end < 0 {
+		t.Fatal("conductor template has no checkpoint block")
+	}
+	block := conductorConfigSkeleton[start : start+end]
+	for _, want := range []string{"mode: local", "local | bundle", "ref_location_parent:"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("checkpoint template does not contain %q:\n%s", want, block)
+		}
+	}
+	if strings.Contains(block, "mode=remote") || strings.Contains(block, "remote is deprecated") {
+		t.Fatalf("checkpoint template still advertises remote capture mode:\n%s", block)
+	}
+}
+
+func TestRenderConductorConfigPreservesBundleCheckpoint(t *testing.T) {
+	path := writeConductorConfig(t, `
+api: { domain: config.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+checkpoint:
+  mode: bundle
+  remote:
+    ref_location_parent: file:///mnt/shared/snapshots
+`)
+	out, err := renderConductorConfig(false, false, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered config.Config
+	if err := yaml.Unmarshal(out, &rendered); err != nil {
+		t.Fatal(err)
+	}
+	if rendered.Checkpoint.Mode != config.CheckpointBundle ||
+		rendered.Checkpoint.Remote.RefLocationParent != "file:///mnt/shared/snapshots" {
+		t.Fatalf("rendered checkpoint = %+v\n%s", rendered.Checkpoint, out)
+	}
+}
+
 func TestRenderConductorConfigResolvesBuilderAdmissionDefaults(t *testing.T) {
 	path := writeConductorConfig(t, `
 api: { domain: config.test }

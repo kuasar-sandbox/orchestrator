@@ -108,12 +108,12 @@ func ParseTemplateID(s string) (TemplateID, error) {
 		return TemplateID{}, fmt.Errorf("templateID %q: %w", s, err)
 	}
 	if ref.Scheme == manifest.RefSchemeFile {
-		ext := ".image"
-		if t.Kind == KindSnp {
-			ext = ".snapshot"
+		if t.Kind == KindImg && !strings.HasSuffix(ref.Path, ".image") {
+			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .image artifact", s, t.Kind)
 		}
-		if !strings.HasSuffix(ref.Path, ext) {
-			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a %s artifact", s, t.Kind, ext)
+		if t.Kind == KindSnp &&
+			!strings.HasSuffix(ref.Path, ".snapshot") && !strings.HasSuffix(ref.Path, ".bundle") {
+			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .snapshot or .bundle artifact", s, t.Kind)
 		}
 	}
 	return t, nil
