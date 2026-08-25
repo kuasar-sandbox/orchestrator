@@ -93,7 +93,10 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) (map[string]strin
 	return out, nil
 }
 
-func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
+// mergeCreateConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta and
+// applies the typed autoPauseMemory body field onto the checkpoint namespace.
+// Checkpoint precedence mirrors Pause: body metadata < typed field < header.
+func mergeCreateConfigHeaders(meta map[string]string, h http.Header, autoPauseMemory *bool) (map[string]string, error) {
 	var err error
 	meta, err = mergeConfigHeaders(meta, h)
 	if err != nil {
@@ -121,17 +124,20 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 		}
 	}
+	// The typed e2b field refines the raw metadata namespace; the dedicated
+	// header still wins over both.
+	policy := sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, sandboxcfg.CheckpointPolicy{Memory: autoPauseMemory})
+	bodyPresent = bodyPresent || autoPauseMemory != nil
 	_, headerPresent := h[http.CanonicalHeaderKey(checkpointHeader)]
 	if !bodyPresent && !headerPresent {
 		return meta, nil
 	}
-	policy := bodyPolicy
 	if headerPresent {
 		headerPolicy, err := sandboxcfg.ParseCheckpointPolicyJSON(h.Get(checkpointHeader))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", checkpointHeader, err)
 		}
-		policy = sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, headerPolicy)
+		policy = sandboxcfg.OverlayCheckpointPolicy(policy, headerPolicy)
 	}
 	if policy.Empty() {
 		delete(meta, sandboxcfg.NsCheckpoint)
@@ -200,6 +206,12 @@ var ErrAlreadyPaused = errors.New("already paused")
 // ErrSandboxStarting is returned when an operation such as Pause cannot run
 // until the accepted asynchronous launch reaches a terminal state.
 var ErrSandboxStarting = errors.New("sandbox starting")
+
+// ErrDiskOnlyUnsupported is returned by Core.Pause when the resolved checkpoint
+// policy requests a disk-only capture but the node runtime cannot honor it yet
+// (kuasar-sandbox/sandboxer#120). Explicit pauses fail fast with no side
+// effects; auto-pauses downgrade instead of surfacing this error (=> 501).
+var ErrDiskOnlyUnsupported = errors.New("disk-only pause unsupported by node runtime")
 
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
@@ -310,13 +322,18 @@ type CreateReq struct {
 	Metadata   map[string]string `json:"metadata"`
 	EnvVars    map[string]string `json:"envVars"`
 	Secure     bool              `json:"secure"`
-	APIKey     string            `json:"-"` // injected from X-API-KEY
-	MMDSHeader *string           `json:"-"` // nil = header absent; preserves top-level merge presence
+	// AutoPauseMemory selects whether automated timeout pauses preserve RAM
+	// (nil/default) or take disk-only snapshots (false). Folded into the
+	// sandbox checkpoint metadata namespace below header precedence.
+	AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
+	APIKey          string            `json:"-"` // injected from X-API-KEY
+	MMDSHeader      *string           `json:"-"` // nil = header absent; preserves top-level merge presence
 }
 
 // PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
-// lower-priority sandbox/node policy. memory=false is unsupported because Pause
-// always captures memory.
+// lower-priority sandbox/node policy. memory=false requests a disk-only capture;
+// until node runtime support lands it fails fast on explicit pauses while the
+// reaper downgrades auto-pauses to memory-bearing captures.
 type PauseRequest struct {
 	Memory               *bool `json:"memory,omitempty"`
 	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`
@@ -509,7 +526,7 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	}
 	// Headers are an alternate config-injection surface; fold them into the e2b
 	// metadata (header wins) so the orchestrator sees one uniform carrier.
-	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header)
+	req.Metadata, err = mergeCreateConfigHeaders(req.Metadata, r.Header, req.AutoPauseMemory)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -699,11 +716,8 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad body")
 		return
 	}
-	if req.Memory != nil && !*req.Memory {
-		writeErr(w, http.StatusBadRequest, "memory=false is not supported")
-		return
-	}
 	override := sandboxcfg.CheckpointPolicy{
+		Memory:     req.Memory,
 		MergeRef:   req.CheckpointMergeRef,
 		DropCaches: req.CheckpointDropCaches,
 	}
@@ -1249,6 +1263,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusTooManyRequests, ErrBuildAdmission.Error())
 	case errors.Is(err, ErrProxyUnavailable):
 		writeErr(w, http.StatusServiceUnavailable, ErrProxyUnavailable.Error())
+	case errors.Is(err, ErrDiskOnlyUnsupported):
+		writeErr(w, http.StatusNotImplemented, ErrDiskOnlyUnsupported.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

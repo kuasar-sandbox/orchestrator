@@ -13,11 +13,15 @@ import (
 type CheckpointPolicy struct {
 	MergeRef   *bool `json:"merge_ref,omitempty"`
 	DropCaches *bool `json:"drop_caches,omitempty"`
+	// Memory requests a disk-only capture when false (sandboxer#120). While
+	// node runtime support is absent, an explicit Pause fails fast and the
+	// reaper downgrades to a memory-bearing capture.
+	Memory *bool `json:"memory,omitempty"`
 }
 
 // Empty reports whether neither checkpoint field is specified.
 func (p CheckpointPolicy) Empty() bool {
-	return p.MergeRef == nil && p.DropCaches == nil
+	return p.MergeRef == nil && p.DropCaches == nil && p.Memory == nil
 }
 
 // CloneBool returns an independent copy of v.
@@ -34,6 +38,7 @@ func CloneCheckpointPolicy(p CheckpointPolicy) CheckpointPolicy {
 	return CheckpointPolicy{
 		MergeRef:   CloneBool(p.MergeRef),
 		DropCaches: CloneBool(p.DropCaches),
+		Memory:     CloneBool(p.Memory),
 	}
 }
 
@@ -47,12 +52,15 @@ func OverlayCheckpointPolicy(base, higher CheckpointPolicy) CheckpointPolicy {
 	if higher.DropCaches != nil {
 		out.DropCaches = CloneBool(higher.DropCaches)
 	}
+	if higher.Memory != nil {
+		out.Memory = CloneBool(higher.Memory)
+	}
 	return out
 }
 
 // ParseCheckpointPolicyJSON strictly parses the checkpoint metadata/header
 // representation. The top level must be exactly one object containing only
-// merge_ref and drop_caches, whose values may be true, false, or null.
+// merge_ref, drop_caches, and memory, whose values may be true, false, or null.
 func ParseCheckpointPolicyJSON(raw string) (CheckpointPolicy, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed[0] != '{' {
@@ -80,6 +88,8 @@ func ParseCheckpointPolicyJSON(raw string) (CheckpointPolicy, error) {
 			target = &policy.MergeRef
 		case "drop_caches":
 			target = &policy.DropCaches
+		case "memory":
+			target = &policy.Memory
 		default:
 			return CheckpointPolicy{}, fmt.Errorf("checkpoint policy contains unknown field %q", field)
 		}

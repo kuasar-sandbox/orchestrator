@@ -1031,6 +1031,12 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	return true, nil
 }
 
+// diskOnlyCaptureSupported reports whether the node runtime can capture
+// disk-only snapshots (kuasar-sandbox/sandboxer#120). Until that capability
+// ships, an explicit disk-only Pause fails fast before any side effect while
+// the reaper downgrades auto-pauses to memory-bearing captures.
+const diskOnlyCaptureSupported = false
+
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
@@ -1051,6 +1057,9 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 	policy, err := o.resolveCheckpointPolicy(sb.Metadata, actionOverride)
 	if err != nil {
 		return err
+	}
+	if !diskOnlyCaptureSupported && policy.Memory != nil && !*policy.Memory {
+		return fmt.Errorf("%w: sandbox %s", api.ErrDiskOnlyUnsupported, id)
 	}
 	return o.pauseSandboxLocked(ctx, sb, policy)
 }
@@ -1081,6 +1090,14 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if err != nil {
 		return err
 	}
+	if !diskOnlyCaptureSupported && policy.Memory != nil && !*policy.Memory {
+		// Background cleanup must keep working: capture memory-bearing and
+		// log instead of failing the reaper tick for this sandbox.
+		o.log.Warn("auto-pause downgraded to memory-bearing capture",
+			"sid", current.ID,
+			"reason", "node runtime cannot capture disk-only snapshots yet")
+		policy.Memory = nil
+	}
 	return o.pauseSandboxLocked(ctx, current, policy)
 }
 
@@ -1100,7 +1117,8 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"sid", sb.ID,
 		"mode", o.cfg.Checkpoint.Mode,
 		"merge_ref", checkpointPolicyValue(policy.MergeRef),
-		"drop_caches", checkpointPolicyValue(policy.DropCaches))
+		"drop_caches", checkpointPolicyValue(policy.DropCaches),
+		"memory", checkpointPolicyValue(policy.Memory))
 	ref, err := o.snapshot(opCtx, sb, policy)
 	if err != nil {
 		return err

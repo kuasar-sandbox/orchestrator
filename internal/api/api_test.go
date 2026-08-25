@@ -140,7 +140,7 @@ func mustMergeConfigHeaders(t *testing.T, meta map[string]string, headers http.H
 
 func mustMergeCreateConfigHeaders(t *testing.T, meta map[string]string, headers http.Header) map[string]string {
 	t.Helper()
-	got, err := mergeCreateConfigHeaders(meta, headers)
+	got, err := mergeCreateConfigHeaders(meta, headers, nil)
 	if err != nil {
 		t.Fatalf("mergeCreateConfigHeaders: %v", err)
 	}
@@ -550,6 +550,45 @@ func TestCreateCheckpointHeaderAbsentAndEmptyPolicy(t *testing.T) {
 	}
 }
 
+func TestCreateAutoPauseMemoryFoldsIntoCheckpointMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		headers    http.Header
+		wantPresent bool
+		wantRaw    string
+	}{
+		{name: "typed field alone", body: `{"autoPauseMemory":false}`,
+			wantPresent: true, wantRaw: `{"memory":false}`},
+		{name: "typed field true", body: `{"autoPauseMemory":true}`,
+			wantPresent: true, wantRaw: `{"memory":true}`},
+		{name: "typed field refines body metadata", body: `{"autoPauseMemory":false,"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":false}"}}`,
+			wantPresent: true, wantRaw: `{"merge_ref":false,"memory":false}`},
+		{name: "header wins over typed field", body: `{"autoPauseMemory":false}`,
+			headers: header(checkpointHeader, `{"memory":true}`),
+			wantPresent: true, wantRaw: `{"memory":true}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+				raw, present := req.Metadata[sandboxcfg.NsCheckpoint]
+				if present != tc.wantPresent {
+					t.Fatalf("checkpoint namespace present=%t, want %t: %+v", present, tc.wantPresent, req.Metadata)
+				}
+				if raw != tc.wantRaw {
+					t.Fatalf("checkpoint metadata = %q, want %q", raw, tc.wantRaw)
+				}
+				return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(tc.body), tc.headers)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestCreateCheckpointBodyValidationBeforeCore(t *testing.T) {
 	called := false
 	core := &checkpointCoreStub{create: func(context.Context, CreateReq) (*types.Sandbox, error) {
@@ -581,7 +620,12 @@ func TestPauseRequestPolicyAndStatus(t *testing.T) {
 		{name: "empty body", body: "", wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "empty object", body: `{}`, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "memory null", body: `{"memory":null}`, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "memory true", body: `{"memory":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory true passes through", body: `{"memory":true}`,
+			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory false passes through", body: `{"memory":false}`,
+			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(false)}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "disk-only unsupported maps to 501", body: `{"memory":false}`,
+			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(false)}, coreErr: ErrDiskOnlyUnsupported, wantStatus: http.StatusNotImplemented, wantCalls: 1},
 		{name: "body values", body: `{"checkpoint_merge_ref":false,"checkpoint_drop_caches":true}`,
 			want: sandboxcfg.CheckpointPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "body null inherits", body: `{"checkpoint_merge_ref":null,"checkpoint_drop_caches":false}`,
@@ -639,7 +683,6 @@ func TestPauseRejectsInvalidRequestsBeforeCore(t *testing.T) {
 		body   string
 		header *string
 	}{
-		{name: "memory false", body: `{"memory":false}`},
 		{name: "malformed body", body: `{`},
 		{name: "top-level null", body: `null`},
 		{name: "wrong memory type", body: `{"memory":"true"}`},

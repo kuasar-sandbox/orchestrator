@@ -21,6 +21,10 @@ func TestParseCheckpointPolicyJSON(t *testing.T) {
 			want: CheckpointPolicy{MergeRef: checkpointBool(false), DropCaches: checkpointBool(true)}},
 		{name: "null inherits", raw: `{"merge_ref":null,"drop_caches":false}`,
 			want: CheckpointPolicy{DropCaches: checkpointBool(false)}},
+		{name: "all fields", raw: `{"merge_ref":true,"drop_caches":false,"memory":false}`,
+			want: CheckpointPolicy{MergeRef: checkpointBool(true), DropCaches: checkpointBool(false), Memory: checkpointBool(false)}},
+		{name: "memory only", raw: `{"memory":null}`,
+			want: CheckpointPolicy{}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -49,6 +53,8 @@ func TestParseCheckpointPolicyJSONRejectsInvalidShape(t *testing.T) {
 		"merge array":        `{"merge_ref":[]}`,
 		"merge object":       `{"merge_ref":{}}`,
 		"drop string":        `{"drop_caches":"true"}`,
+		"memory string":      `{"memory":"false"}`,
+		"memory number":      `{"memory":0}`,
 		"second value":       `{} {}`,
 		"trailing non-space": `{} trailing`,
 	}
@@ -64,26 +70,35 @@ func TestParseCheckpointPolicyJSONRejectsInvalidShape(t *testing.T) {
 func TestCheckpointPolicyCloneAndOverlay(t *testing.T) {
 	baseMerge := true
 	baseDrop := false
-	base := CheckpointPolicy{MergeRef: &baseMerge, DropCaches: &baseDrop}
+	baseMemory := false
+	base := CheckpointPolicy{MergeRef: &baseMerge, DropCaches: &baseDrop, Memory: &baseMemory}
 	clone := CloneCheckpointPolicy(base)
-	if clone.MergeRef == base.MergeRef || clone.DropCaches == base.DropCaches {
+	if clone.MergeRef == base.MergeRef || clone.DropCaches == base.DropCaches || clone.Memory == base.Memory {
 		t.Fatal("clone shares bool pointers")
 	}
 	*base.MergeRef = false
+	*base.Memory = true
 	if !*clone.MergeRef {
 		t.Fatal("mutating source changed clone")
 	}
+	if *clone.Memory {
+		t.Fatal("mutating source memory changed clone")
+	}
 
 	overrideMerge := false
-	overlaid := OverlayCheckpointPolicy(clone, CheckpointPolicy{MergeRef: &overrideMerge})
-	if overlaid.MergeRef == &overrideMerge || overlaid.DropCaches == clone.DropCaches {
+	overrideMemory := true
+	overlaid := OverlayCheckpointPolicy(clone, CheckpointPolicy{MergeRef: &overrideMerge, Memory: &overrideMemory})
+	if overlaid.MergeRef == &overrideMerge || overlaid.DropCaches == clone.DropCaches || overlaid.Memory == &overrideMemory {
 		t.Fatal("overlay shares bool pointers")
 	}
-	if *overlaid.MergeRef || *overlaid.DropCaches {
-		t.Fatalf("overlay = %+v, want merge=false drop=false", overlaid)
+	if *overlaid.MergeRef || *overlaid.DropCaches || !*overlaid.Memory {
+		t.Fatalf("overlay = %+v, want merge=false drop=false memory=true", overlaid)
 	}
 	if (CheckpointPolicy{}).Empty() != true || overlaid.Empty() {
 		t.Fatal("Empty returned the wrong result")
+	}
+	if (CheckpointPolicy{Memory: checkpointBool(true)}).Empty() {
+		t.Fatal("memory-only policy reported Empty")
 	}
 }
 
@@ -98,16 +113,20 @@ func TestMarshalAndNormalizeCheckpointMetadata(t *testing.T) {
 	if err != nil || canonical != `{"drop_caches":false}` {
 		t.Fatalf("single-field canonical = %q, %v", canonical, err)
 	}
+	canonical, err = MarshalCheckpointPolicyJSON(CheckpointPolicy{Memory: checkpointBool(false)})
+	if err != nil || canonical != `{"memory":false}` {
+		t.Fatalf("memory canonical = %q, %v", canonical, err)
+	}
 
 	original := map[string]string{
-		NsCheckpoint: ` { "merge_ref" : false, "drop_caches" : null } `,
+		NsCheckpoint: ` { "merge_ref" : false, "drop_caches" : null, "memory" : false } `,
 		"keep":       "value",
 	}
 	got, err := NormalizeCheckpointMetadata(original)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[NsCheckpoint] != `{"merge_ref":false}` || got["keep"] != "value" {
+	if got[NsCheckpoint] != `{"merge_ref":false,"memory":false}` || got["keep"] != "value" {
 		t.Fatalf("normalized metadata = %+v", got)
 	}
 	got["keep"] = "changed"
@@ -115,7 +134,7 @@ func TestMarshalAndNormalizeCheckpointMetadata(t *testing.T) {
 		t.Fatal("normalization mutated its input map")
 	}
 
-	for _, raw := range []string{`{}`, `{"merge_ref":null}`, `{"drop_caches":null}`} {
+	for _, raw := range []string{`{}`, `{"merge_ref":null}`, `{"drop_caches":null}`, `{"memory":null}`} {
 		empty, err := NormalizeCheckpointMetadata(map[string]string{NsCheckpoint: raw, "keep": "value"})
 		if err != nil {
 			t.Fatalf("normalize %s: %v", raw, err)
@@ -157,7 +176,7 @@ func TestCheckpointMetadataIsCreateScopedAndHostOnly(t *testing.T) {
 		t.Fatalf("explicit Create policy was not retained: %+v", withRequest)
 	}
 
-	spec, err := ParseSpec(map[string]string{NsCheckpoint: `{"merge_ref":false,"drop_caches":false}`})
+	spec, err := ParseSpec(map[string]string{NsCheckpoint: `{"merge_ref":false,"drop_caches":false,"memory":false}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +186,7 @@ func TestCheckpointMetadataIsCreateScopedAndHostOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{NsCheckpoint, "merge_ref", "drop_caches"} {
+	for _, forbidden := range []string{NsCheckpoint, "merge_ref", "drop_caches", `"memory"`} {
 		if strings.Contains(string(body), forbidden) {
 			t.Fatalf("host-only checkpoint policy rendered into SANDBOX_CONFIG:\n%s", body)
 		}

@@ -148,6 +148,40 @@ func TestCreateCheckpointHeaderOverlaysBodyPerField(t *testing.T) {
 	}
 }
 
+func TestCreateCheckpointAutoPauseMemoryFoldsLikeStandalone(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		header  string
+		want    string
+		present bool
+	}{
+		{name: "typed field alone", body: `{"autoPauseMemory":false}`, want: `{"memory":false}`, present: true},
+		{name: "typed field refines body metadata",
+			body:    `{"autoPauseMemory":false,"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":false}"}}`,
+			want:    `{"merge_ref":false,"memory":false}`,
+			present: true},
+		{name: "header wins over typed field", body: `{"autoPauseMemory":false}`,
+			header: `{"memory":true}`, want: `{"memory":true}`, present: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(tc.body))
+			if tc.header != "" {
+				req.Header.Set(HeaderCheckpoint, tc.header)
+			}
+			got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, ok := got[sandboxcfg.NsCheckpoint]
+			if ok != tc.present || raw != tc.want {
+				t.Fatalf("checkpoint metadata present=%t raw=%q, want present=%t raw=%q", ok, raw, tc.present, tc.want)
+			}
+		})
+	}
+}
+
 func TestCreateCheckpointMetadataUsesStrictParser(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body   string

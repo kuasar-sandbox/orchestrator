@@ -395,7 +395,8 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 		}
 	}
 	var body struct {
-		Metadata map[string]string `json:"metadata"`
+		Metadata        map[string]string `json:"metadata"`
+		AutoPauseMemory *bool             `json:"autoPauseMemory"`
 	}
 	if r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
@@ -440,7 +441,9 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 	if credentialsHeader {
 		selected[sandboxcfg.NsCredentials] = credentialsRaw
 	}
-	if checkpointHeader {
+	// The typed autoPauseMemory body field refines the raw metadata namespace;
+	// the dedicated header still wins over both (mirrors the standalone API).
+	if checkpointHeader || body.AutoPauseMemory != nil {
 		bodyPolicy := sandboxcfg.CheckpointPolicy{}
 		if raw, ok := selected[sandboxcfg.NsCheckpoint]; ok {
 			var err error
@@ -449,7 +452,10 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 				return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 			}
 		}
-		policy := sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, checkpointHeaderPolicy)
+		policy := sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, sandboxcfg.CheckpointPolicy{Memory: body.AutoPauseMemory})
+		if checkpointHeader {
+			policy = sandboxcfg.OverlayCheckpointPolicy(policy, checkpointHeaderPolicy)
+		}
 		if policy.Empty() {
 			delete(selected, sandboxcfg.NsCheckpoint)
 		} else {

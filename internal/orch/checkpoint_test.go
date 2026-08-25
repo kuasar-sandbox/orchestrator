@@ -57,6 +57,14 @@ func TestResolveCheckpointPolicyPrecedence(t *testing.T) {
 			action:   sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false)},
 			want:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(false)},
 		},
+		{
+			name:     "memory layers like the other fields",
+			metadata: `{"memory":false,"drop_caches":true}`,
+			action:   sandboxcfg.CheckpointPolicy{Memory: orchCheckpointBool(true)},
+			want: sandboxcfg.CheckpointPolicy{
+				DropCaches: orchCheckpointBool(true), Memory: orchCheckpointBool(true),
+			},
+		},
 		{name: "all unset"},
 	}
 	for _, tc := range tests {
@@ -143,6 +151,70 @@ func TestAutoPauseUsesMetadataOverNodePolicy(t *testing.T) {
 	}
 }
 
+// Until the node runtime supports disk-only captures (sandboxer#120), an
+// explicit memory=false Pause must fail fast before any side effect.
+func TestExplicitDiskOnlyPauseFailsFastWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata string
+		action   sandboxcfg.CheckpointPolicy
+	}{
+		{name: "metadata preference"},
+		{name: "action override", action: sandboxcfg.CheckpointPolicy{Memory: orchCheckpointBool(false)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+			raw := tc.metadata
+			if raw == "" {
+				raw = `{"memory":false}`
+			}
+			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, raw)
+			err := o.Pause(context.Background(), sb.ID, apiKey, tc.action)
+			if !errors.Is(err, api.ErrDiskOnlyUnsupported) {
+				t.Fatalf("Pause error = %v, want ErrDiskOnlyUnsupported", err)
+			}
+			if _, statErr := os.Stat(argsPath); !os.IsNotExist(statErr) {
+				t.Fatalf("snapshot command ran for unsupported disk-only pause: stat error=%v", statErr)
+			}
+			stored, getErr := o.st.Get(context.Background(), sb.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if stored.State != types.StateRunning || stored.SnapshotRef != "" {
+				t.Fatalf("sandbox changed after rejected disk-only Pause: %+v", stored)
+			}
+			if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
+				t.Fatalf("rejected disk-only Pause stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
+			}
+		})
+	}
+}
+
+// The reaper downgrades a disk-only auto-pause to a memory-bearing capture so
+// background cleanup keeps working until sandboxer#120 lands.
+func TestAutoPauseDowngradesDiskOnlyMetadataToMemoryCapture(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sb, _, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, `{"memory":false}`)
+	if err := o.pauseSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", string(config.CheckpointLocal), "--run-root", cfg.Paths.RunRoot}
+	if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+		t.Fatalf("downgraded auto-pause argv = %#v, want %#v", got, want)
+	}
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != types.StatePaused || stored.SnapshotRef != filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot") {
+		t.Fatalf("downgraded auto-pause did not commit: %+v", stored)
+	}
+	if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
+		t.Fatalf("stop/detach = %d/%d, want 1/1", launcher.stops.Load(), vs.detaches.Load())
+	}
+}
+
 func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -152,6 +224,8 @@ func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 	}{
 		{name: "malformed historical metadata", mode: config.CheckpointLocal, metadata: `{"merge_ref":"false"}`},
 		{name: "bundle malformed auto-pause metadata", mode: config.CheckpointBundle, metadata: `{"drop_caches":"false"}`, auto: true},
+		{name: "malformed memory metadata", mode: config.CheckpointLocal, metadata: `{"memory":"false"}`},
+		{name: "bundle malformed memory metadata", mode: config.CheckpointBundle, metadata: `{"memory":0}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
