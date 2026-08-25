@@ -527,7 +527,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: remote }
+checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
 # ---- start serve (control plane), then the proxy master -------------------

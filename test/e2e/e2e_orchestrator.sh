@@ -113,7 +113,7 @@ units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }
   boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle }
-checkpoint: { mode: remote }
+checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 mkdir -p "$WORK/run" "$WORK/lib"
 # minimal shared manifest config (endpoints; key empty) so serve can read it

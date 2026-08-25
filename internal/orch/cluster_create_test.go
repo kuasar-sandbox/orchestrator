@@ -331,27 +331,23 @@ func TestPrecheckClusterCheckpointPolicy(t *testing.T) {
 		}
 	}
 
-	localCfg := &config.Config{}
-	localCfg.Checkpoint.Mode = config.CheckpointLocal
-	local := testOrchCfg(t, localCfg)
-	_, _, localFingerprint := allowlistedBuildIdentity(t, local)
-	cmd := newCommand(localFingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
-	if _, _, _, err := local.precheckCluster(context.Background(), cmd); err != nil {
-		t.Fatalf("local checkpoint policy rejected: %v", err)
-	}
-	if cmd.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
-		t.Fatalf("cluster checkpoint policy was not canonicalized: %+v", cmd.Config)
-	}
-	if _, _, _, err := local.precheckCluster(context.Background(), newCommand(localFingerprint, `{"merge_ref":0}`)); err == nil {
-		t.Fatal("malformed cluster checkpoint policy was accepted")
-	}
-
-	remoteCfg := &config.Config{}
-	remoteCfg.Checkpoint.Mode = config.CheckpointRemote
-	remote := testOrchCfg(t, remoteCfg)
-	_, _, remoteFingerprint := allowlistedBuildIdentity(t, remote)
-	if _, _, _, err := remote.precheckCluster(context.Background(), newCommand(remoteFingerprint, `{"drop_caches":false}`)); err == nil || !strings.Contains(err.Error(), "checkpoint.mode=local") {
-		t.Fatalf("remote cluster checkpoint policy error = %v", err)
+	for _, mode := range []string{config.CheckpointLocal, config.CheckpointBundle} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Checkpoint.Mode = mode
+			o := testOrchCfg(t, cfg)
+			_, _, fingerprint := allowlistedBuildIdentity(t, o)
+			cmd := newCommand(fingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
+			if _, _, _, err := o.precheckCluster(context.Background(), cmd); err != nil {
+				t.Fatalf("%s checkpoint policy rejected: %v", mode, err)
+			}
+			if cmd.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+				t.Fatalf("cluster checkpoint policy was not canonicalized: %+v", cmd.Config)
+			}
+			if _, _, _, err := o.precheckCluster(context.Background(), newCommand(fingerprint, `{"merge_ref":0}`)); err == nil {
+				t.Fatal("malformed cluster checkpoint policy was accepted")
+			}
+		})
 	}
 }
 

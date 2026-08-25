@@ -216,10 +216,13 @@ builder:                                           # Build resources are separat
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 checkpoint:                                        # paused-state capture
-  mode: local                                     # local; remote is deprecated compatibility-only
+  mode: local                                     # local | bundle
   local_dir: /var/lib/sandbox-saved
   # merge_ref: false                              # omit/null => sandbox-ctl default
   # drop_caches: false                            # omit/null => sandbox-ctl default
+  # remote:
+  #   # Used only by export-sandbox/promote publication; Pause always captures locally.
+  #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)
