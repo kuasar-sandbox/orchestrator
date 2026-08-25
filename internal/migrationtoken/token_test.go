@@ -237,19 +237,24 @@ func TestOptionalEnvAndMetadataMayBeOmitted(t *testing.T) {
 }
 
 func TestLocatedSnapshotRefRoundTrip(t *testing.T) {
+	for _, suffix := range []string{".snapshot", ".bundle"} {
+		t.Run(suffix, func(t *testing.T) {
+			payload := validPayload()
+			payload.SnapshotRef = "file://" + strings.Repeat("d", 64) + suffix + "@location:source-1"
+			token, err := Seal(testMaterial, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := Open(testMaterial, token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.SnapshotRef != payload.SnapshotRef {
+				t.Fatalf("SnapshotRef = %q, want %q", got.SnapshotRef, payload.SnapshotRef)
+			}
+		})
+	}
 	payload := validPayload()
-	payload.SnapshotRef = "file://" + strings.Repeat("d", 64) + ".snapshot@location:source-1"
-	token, err := Seal(testMaterial, payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := Open(testMaterial, token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.SnapshotRef != payload.SnapshotRef {
-		t.Fatalf("SnapshotRef = %q, want %q", got.SnapshotRef, payload.SnapshotRef)
-	}
 	payload.SnapshotRef = "file:///mnt/shared/root.snapshot"
 	if _, err := Seal(testMaterial, payload); err == nil {
 		t.Fatal("local file ref was accepted in migration token")

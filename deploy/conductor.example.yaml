@@ -153,16 +153,16 @@ builder:
 #   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 
-# Paused-state capture. Keep mode=local; mode=remote is deprecated compatibility
-# only. Optional bools are tri-state: omit/null delegates to sandbox-ctl, while
-# true/false is passed explicitly on local Pause. Publish separately via export.
+# Paused-state capture. mode=local writes the existing tarstream; mode=bundle writes
+# one multi-Manifest ZIP Bundle. Optional bools are tri-state: omit/null delegates
+# to sandbox-ctl, while true/false is passed explicitly. Publish separately via export.
 checkpoint:
   mode: local
   local_dir: /var/lib/sandbox-saved
   # merge_ref: false
   # drop_caches: false
   # remote:
-  #   # Used by export-sandbox publication; it does not make local Pause remote.
+  #   # Used by export-sandbox/promote publication; it does not change Pause mode.
   #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
 
 # mmds: optional envd metadata service for FC-mode token re-keying.

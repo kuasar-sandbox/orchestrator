@@ -1634,6 +1634,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		FromTemplateRef:  fromTemplateRef,
 		FromTemplateKind: fromTemplateKind,
 		RefLocations:     refLocations,
+		CheckpointMode:   o.cfg.Checkpoint.Mode,
 		ToRefLocation:    toRefLocation,
 		Steps:            steps,
 		StartCmd:         b.StartCmd,

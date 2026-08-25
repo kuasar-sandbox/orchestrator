@@ -308,7 +308,7 @@ resource_listen:
     physical_cpu: auto
     host_reserved: { memory: 1GiB, cpu: 0.5 }
   admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: bundle, local_dir: $WORK/saved }
 EOF
 
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
@@ -959,7 +959,7 @@ resources = cfg["Resources"]
 assert resources == {"Capacity": {"CPU": 2, "Memory": "3GiB"}}, resources
 PY
 B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
-[ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest:// (upload-snapshot did not rewrite?): $(cat "$WORK/b2.cfg.json")"
+[ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest://: $(cat "$WORK/b2.cfg.json")"
 MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "manifest://$B2_IMG_HEX" >"$WORK/b2.img.json" 2>"$WORK/b2.img.err" \
     || { cat "$WORK/b2.img.err"; fail "flatten-ctl info manifest://$B2_IMG_HEX"; }

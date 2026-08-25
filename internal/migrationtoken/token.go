@@ -334,7 +334,8 @@ func validStringMap(values map[string]string) bool {
 
 func validSnapshotRef(raw string) bool {
 	ref, err := types.ParsePortableRef(raw)
-	return err == nil && (ref.Scheme != "file" || strings.HasSuffix(ref.Path, ".snapshot"))
+	return err == nil && (ref.Scheme != "file" ||
+		strings.HasSuffix(ref.Path, ".snapshot") || strings.HasSuffix(ref.Path, ".bundle"))
 }
 
 func invalidPayload(field string) error {

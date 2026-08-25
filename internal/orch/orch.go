@@ -1073,12 +1073,11 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		return err
 	}
 	defer finish()
-	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
-		o.log.Info("checkpoint policy resolved",
-			"sid", sb.ID,
-			"merge_ref", checkpointPolicyValue(policy.MergeRef),
-			"drop_caches", checkpointPolicyValue(policy.DropCaches))
-	}
+	o.log.Info("checkpoint policy resolved",
+		"sid", sb.ID,
+		"mode", o.cfg.Checkpoint.Mode,
+		"merge_ref", checkpointPolicyValue(policy.MergeRef),
+		"drop_caches", checkpointPolicyValue(policy.DropCaches))
 	ref, err := o.snapshot(opCtx, sb, policy)
 	if err != nil {
 		return err
@@ -1159,37 +1158,24 @@ func checkpointMetadataPolicy(metadata map[string]string) (sandboxcfg.Checkpoint
 }
 
 func (o *Orchestrator) validateCreateCheckpointMode(metadata map[string]string) error {
-	policy, err := checkpointMetadataPolicy(metadata)
+	_, err := checkpointMetadataPolicy(metadata)
 	if err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if o.cfg.Checkpoint.Mode == config.CheckpointRemote && !policy.Empty() {
-		return fmt.Errorf("%w: checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
 	}
 	return nil
 }
 
 // resolveCheckpointPolicy validates historical metadata under the lifecycle
-// lock and resolves local policy field by field: node < metadata < action. In
-// deprecated remote mode every new-policy source is rejected and legacy capture
-// routing remains unchanged.
+// lock and resolves capture policy field by field: node < metadata < action.
 func (o *Orchestrator) resolveCheckpointPolicy(metadata map[string]string, actionOverride sandboxcfg.CheckpointPolicy) (sandboxcfg.CheckpointPolicy, error) {
 	metadataPolicy, err := checkpointMetadataPolicy(metadata)
 	if err != nil {
 		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	switch o.cfg.Checkpoint.Mode {
-	case config.CheckpointLocal:
+	case config.CheckpointLocal, config.CheckpointBundle:
 		policy := sandboxcfg.OverlayCheckpointPolicy(o.nodeCheckpointPolicy(), metadataPolicy)
 		return sandboxcfg.OverlayCheckpointPolicy(policy, actionOverride), nil
-	case config.CheckpointRemote:
-		if !metadataPolicy.Empty() {
-			return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: sandbox checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
-		}
-		if !actionOverride.Empty() {
-			return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: Pause checkpoint policy requires checkpoint.mode=local", api.ErrBadRequest)
-		}
-		return sandboxcfg.CheckpointPolicy{}, nil
 	default:
 		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: unsupported checkpoint.mode %q", api.ErrBadRequest, o.cfg.Checkpoint.Mode)
 	}
@@ -2193,57 +2179,27 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 }
 
 // snapshot pauses+captures the running sandbox via sandbox-ctl and returns its
-// restore ref. The client dials <run-root>/<sid>/ctl.sock; the running
-// snapshot captures sb per the configured checkpoint mode and returns the restore
-// ref to persist: a canonical portable ref or a local bundle path
-// (local — node-bound; the default). sandbox-ctl performs the work with its own
-// boot-time manifest config; we pass the resolved binary + the run root.
+// node-local restore ref. The client dials <run-root>/<sid>/ctl.sock and captures
+// either the legacy tarstream or the Manifest Bundle selected by checkpoint.mode.
 func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
 	// Named-location publishing is deliberately outside the VM pause/capture
-	// operation. Pause writes a local bundle; export or template finalization
+	// operation. Pause writes a local checkpoint; export or template finalization
 	// later upgrades it to the configured portable location.
-	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
-		return o.snapshotLocal(ctx, sb, policy)
-	}
-	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		return o.snapshotLocal(ctx, sb, sandboxcfg.CheckpointPolicy{})
-	}
-	key, err := o.snapshotRemote(ctx, sb)
-	if err != nil {
-		return "", err
-	}
-	return "manifest://" + key, nil
+	return o.snapshotLocal(ctx, sb, policy)
 }
 
-// snapshotRemote uploads the snapshot to the manifest store; stdout is the bare
-// 64-hex manifest key. Used for remote checkpoints without a named location.
-func (o *Orchestrator) snapshotRemote(ctx context.Context, sb *types.Sandbox) (string, error) {
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "snapshot",
-		"--sandbox-id", sb.ID, "--upload", "--run-root", o.cfg.Paths.RunRoot)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("orch: snapshot %s: %w: %s", sb.ID, err, errb.String())
-	}
-	key := strings.TrimSpace(out.String())
-	if _, err := types.ParsePortableRef("manifest://" + key); err != nil {
-		return "", fmt.Errorf("orch: snapshot %s: invalid manifest key %q", sb.ID, key)
-	}
-	return key, nil
-}
-
-// snapshotLocal writes the snapshot bundle to checkpoint.local_dir/<sid>/ and
-// returns the bundle path (node-bound; restorable only on this node). The lower
+// snapshotLocal writes the selected checkpoint format to checkpoint.local_dir/<sid>/
+// and returns its stable .snapshot symlink (node-bound; restorable only on this node). The lower
 // chain (the base template) stays remote, carried by reference.
 func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
 	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
-	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--run-root", o.cfg.Paths.RunRoot}
+	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
 	args = appendCheckpointPolicyArgs(args, policy)
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("orch: snapshot %s (local): %w: %s", sb.ID, err, errb.String())
+		return "", fmt.Errorf("orch: snapshot %s (mode %s): %w: %s", sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
 	}
 	return filepath.Join(dir, sb.ID+".snapshot"), nil
 }
@@ -2279,7 +2235,8 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 	}
 	ref := strings.TrimSpace(out.String())
 	parsed, err := types.ParsePortableRef(ref)
-	if err != nil || (parsed.Scheme == "file" && !strings.HasSuffix(parsed.Path, ".snapshot")) {
+	if err != nil || (parsed.Scheme == "file" &&
+		!strings.HasSuffix(parsed.Path, ".snapshot") && !strings.HasSuffix(parsed.Path, ".bundle")) {
 		return "", fmt.Errorf("orch: promote %s: invalid snapshot ref %q", sb.ID, ref)
 	}
 	return ref, nil

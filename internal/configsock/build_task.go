@@ -2,6 +2,11 @@ package configsock
 
 import "errors"
 
+// BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
+// SnapshotPrepareSchemaVersion. Version 2 adds BuildSpec.CheckpointMode; an old
+// run-builder must fail closed instead of silently defaulting that field.
+const BuildTaskSchemaVersion = 2
+
 // BuildTaskRequest identifies one exact assigned run-builder incarnation.
 type BuildTaskRequest struct {
 	BuildID string `json:"build_id"`
@@ -31,6 +36,7 @@ type BuildTaskAuth struct {
 type BuildPrepareRequest struct {
 	BuildID string                 `json:"build_id"`
 	RunID   string                 `json:"run_id"`
+	Version int                    `json:"version,omitempty"`
 	Summary SnapshotPrepareSummary `json:"summary"`
 }
 
