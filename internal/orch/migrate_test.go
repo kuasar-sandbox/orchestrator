@@ -470,6 +470,10 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
 	o := testOrchCfg(t, cfg)
+	// Pin the publication clock so the expected name is a constant even if
+	// the test straddles UTC midnight.
+	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
+	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
@@ -521,7 +525,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	if locName == "" {
 		t.Fatalf("promote args = %q, want a publication name=uri pair", args)
 	}
-	wantName := reflocation.PublicationName(sid, time.Now())
+	wantName := reflocation.PublicationName(sid, publishedAt)
 	if locName != wantName {
 		t.Fatalf("publication name = %q, want %q", locName, wantName)
 	}

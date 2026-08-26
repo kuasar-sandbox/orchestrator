@@ -16,12 +16,15 @@ import (
 // an entity created long before it exports must still land in a current
 // (publication-date) bucket: a GC deleting old date buckets can never remove a
 // just-published snapshot. The sandbox id below carries a 2025-era v7
-// timestamp; the publication name's date suffix is today's.
+// timestamp; the publication clock is pinned so the expected name (and bucket)
+// is a constant, not whatever today is.
 func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{}
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
 	o := testOrchCfg(t, cfg)
+	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
+	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
@@ -67,7 +70,7 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	for _, f := range strings.Fields(string(args)) {
 		if i := strings.Index(f, "="); i > 0 {
 			candidate := f[:i]
-			if strings.HasSuffix(candidate, "-"+time.Now().UTC().Format("20060102")) {
+			if strings.HasSuffix(candidate, "-20260824") {
 				if _, err := cfg.Checkpoint.RefLocationURI(candidate); err == nil {
 					locName = candidate
 				}
@@ -75,12 +78,12 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 		}
 	}
 	if locName == "" {
-		t.Fatalf("promote args = %q, want a publication name=uri pair with today's date", args)
+		t.Fatalf("promote args = %q, want a publication name=uri pair dated 20260824", args)
 	}
-	// The bucket must be today's date, not the entity's 2025 timestamp: the
-	// name was built at publication time.
-	if got := locName[len(locName)-8:]; got != time.Now().UTC().Format("20060102") {
-		t.Fatalf("publication date = %q, want today %q", got, time.Now().UTC().Format("20060102"))
+	// The bucket must be the pinned publication date, not the entity's 2025
+	// timestamp: the name was built at publication time.
+	if got := locName[len(locName)-8:]; got != "20260824" {
+		t.Fatalf("publication date = %q, want %q", got, "20260824")
 	}
 	if !strings.HasPrefix(locName, sid+"-") {
 		t.Fatalf("publication name %q does not start with the entity id %q", locName, sid)
@@ -92,7 +95,7 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	if !strings.Contains(string(args), "--to-ref-location "+locName+"="+locationURI) {
 		t.Fatalf("promote args = %q, want location %q resolved to %q", args, locName, locationURI)
 	}
-	if !strings.Contains(locationURI, "/"+time.Now().UTC().Format("20060102")+"/") {
+	if !strings.Contains(locationURI, "/20260824/") {
 		t.Fatalf("location URI %q is not bucketed by publication date", locationURI)
 	}
 	// And the returned template ref must carry that same publication name.
