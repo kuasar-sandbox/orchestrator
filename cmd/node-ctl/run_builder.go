@@ -33,11 +33,10 @@ package main
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// The finale uploads what was produced — platform credentials appear ONLY
-// here: an image-only build runs `manifest-ctl store image.img`; a snapshot build
-// runs ONE `sandbox-ctl upload-snapshot` (it publishes every local artifact the
-// snapshot.cfg references, the base image included, to the configured portable
-// backend). The result returns over the config-socket.
+// Publication normally happens at the finale. Bundle snapshot builds first
+// publish a newly built platform base before phase C so snapshot.cfg records
+// its existing manifest:// base_ref strategy; the finale exact-uploads the
+// byte-identical snapshot layers. The result returns over the config-socket.
 
 import (
 	"context"

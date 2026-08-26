@@ -31,12 +31,12 @@
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// The finale uploads what was produced — platform credentials appear ONLY
-// here: an image-only build runs `manifest-ctl store image.img`; a snapshot
-// build runs ONE `sandbox-ctl upload-snapshot` (it publishes every local
-// artifact the snapshot.cfg references, the base image included, to the
-// configured portable backend). The result returns to the orchestrator over the
-// config-socket.
+// Publication normally happens at the finale. A Bundle snapshot build is the
+// one deliberate exception: its newly built platform base image is published
+// before phase C so the byte-identical snapshot.cfg can retain the existing
+// manifest:// base_ref strategy; the finale then exact-uploads the snapshot
+// layers without rewriting that config. The result returns to the orchestrator
+// over the config-socket.
 package builder
 
 import (
@@ -154,6 +154,9 @@ func (p *buildPipeline) run() (res Result) {
 	}
 	var bundle string
 	if p.profile == types.ProfileE2B && p.startCmd != "" {
+		if err := p.prepareBundleTemplateBase(); err != nil {
+			return fail(fmt.Errorf("template base: %w", err))
+		}
 		var b string
 		err := p.runPhase("c", func() error {
 			var phaseErr error
@@ -166,7 +169,8 @@ func (p *buildPipeline) run() (res Result) {
 		bundle = b
 	}
 
-	// Finale: upload what was produced (the only place platform creds act).
+	// Finale: upload what was produced. Bundle template bases may already have
+	// been published immediately before phase C; uploadImage reuses that ref.
 	switch {
 	case bundle != "":
 		key, err := p.uploadSnapshot(bundle)

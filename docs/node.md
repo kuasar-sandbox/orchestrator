@@ -1368,7 +1368,9 @@ API 先把 body 与 Header 合为 action override;Core 在 lifecycle lock 内重
 决定。policy 校验完成前不会 cancel resume、snapshot、停 unit、detach 或改库。
 snapshot 成功后才写 ref/paused state;Pause 本身不执行 promote。Build/template 的 snapshot
 命令使用同一个 `checkpoint.mode`,但不接入这两个 flag,也不把 ready/start command 解释为
-working-set warm-up。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Manifest 使用完整本地
+working-set warm-up。Bundle 模式的 Builder 在 Phase C 前先把本次新导出的只读平台镜像发布为
+`manifest://`,使 byte-identical `snapshot.cfg` 自身选择既有的远端 `base_ref` 策略;后续 Bundle
+exact upload 仍只发布 snapshot layer,不改写 cfg。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Manifest 使用完整本地
 Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback。
 
 portable publish 与 Pause mode 独立。若配置
@@ -1436,10 +1438,14 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
   已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
   目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
-  `ref_location_parent` 部署映射。restore runner先为located根建立reader path mapping,
-  只读取根 `snapshot.cfg`一次,再从 `root + FromRefs + ArtifactRefs()` 收集flattened closure;
-  `FromRefs`是已展平memory chain、disk `BaseFromRefs`同理,不递归读取parent cfg。
-  location name去重排序并受1024上限约束,路径与CLI URI均按
+  `ref_location_parent` 部署映射。迁移token仍只携根ref。restore runner先为located根建立
+  reader path mapping;若根文件是Manifest Bundle,它只读取根文件从offset 0开始的metadata
+  prefix,从平面的 `bundle/refs` 收集全部 `@location` 名称并在打开根cfg前补全mapping。
+  无location的sibling ref相对根Bundle目录解析,无需独立mapping;runner不打开refs Bundle,
+  也不递归读取其 `bundle/refs`。随后只读取根 `snapshot.cfg`一次,再从
+  `root + FromRefs + ArtifactRefs()` 收集flattened逻辑closure;`FromRefs`是已展平memory
+  chain、disk `BaseFromRefs`同理,不递归读取parent cfg。逻辑ref上限和Bundle profile内
+  refs上限各为1024;所有location name去重排序,路径与CLI URI均按
   `<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生
   (日期段取自 name 自带的发布日期后缀,与 §8.1 的 dated 布局一致)。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
@@ -1813,7 +1819,10 @@ metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。f
 e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。overlay top 与
 `base_from_refs` 保持显式 top-to-bottom 数组,不编码复合 manifest ref。`FromRefs` 与
 `BaseFromRefs` 已是展平链，不读取 parent `snapshot.cfg`。root + FromRefs + ArtifactRefs
-只用于去重、排序、上限与 ref-location closure；`Boot.RuntimeRef` 不作为租户 located ref。
+只用于逻辑ref去重、排序和上限；`Boot.RuntimeRef` 不作为租户 located ref。snp源是
+Manifest Bundle时,同一task-local preflight还会只读根Bundle的metadata prefix,把平面
+`bundle/refs`里的located来源加入ref-location closure；同目录sibling无需mapping,也不会
+打开或递归扫描任何refs Bundle。完整mapping随BuildSpec交给所有Builder phase sandbox。
 snp 源模板的 `kuasar-sandbox.network` 由summary在 host Attach 前 strict解析并按字段继承,优先级为
 **当前 Build 显式 NetworkSpec > 源 snapshot NetworkSpec > 当前 profile/node 默认值**;
 img 源模板没有 snapshot metadata 通道,不从本地数据库增加入口相关的隐式回退。
@@ -1843,9 +1852,12 @@ COPY)。三段:
 唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`guest-runtime/native-deps make
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
-**收尾发布(平台凭据唯一出现点)**:img-only(包括所有 bare build) ⇒ `manifest-ctl store image.img`
-(stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用);
-产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <snapshot>`。Phase C 的 capture 使用
+**发布**:img-only(包括所有 bare build) ⇒ 收尾执行 `manifest-ctl store image.img`
+(stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用)。Bundle
+快照构建是唯一提前发布点:若 Phase B/Import 产生本地 `image.img`,在 Phase C 前先执行同一
+`manifest-ctl store`,并把所得 ref 作为平台 `base_ref`;这是 base_ref 的既有 manifest 策略,
+不是把 snapshot-layer Bundle 地址写进 cfg。随后快照收尾仍只执行**一条**
+`sandbox-ctl upload-snapshot <snapshot>`;exact upload不重写根。Phase C 的 capture 使用
 与 Pause 相同的 `checkpoint.mode`,但不继承 Pause-only merge/drop policy。配置
 `ref_location_parent` 时以 publication name(build ID + UTC 发布日期后缀,
 `reflocation.PublicationName`,builder 在 upload 开始前才铸造)发布到 named location,
