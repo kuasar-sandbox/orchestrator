@@ -50,6 +50,11 @@ func publicationDate(name string) (string, bool) {
 	if name[len(name)-len(dateLayout)-1] != '-' {
 		return "", false
 	}
+	// The suffix must be a real calendar date, not just 8 digits: Feb 30 or
+	// month 13 never resolve, so such names can never alias a bucket.
+	if _, err := time.Parse(dateLayout, suffix); err != nil {
+		return "", false
+	}
 	return suffix, true
 }
 

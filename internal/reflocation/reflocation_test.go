@@ -51,6 +51,29 @@ func TestResolveBucketLabelsSortChronologically(t *testing.T) {
 	}
 }
 
+func TestResolveAcceptsLeapDay(t *testing.T) {
+	// Feb 29 is a real calendar date on leap years — and only then.
+	for _, test := range []struct {
+		name string
+		loc  string
+		ok   bool
+	}{
+		{loc: "0198f7a1-1234-7234-9abc-0123456789ab-20240229", ok: true},
+		{loc: "0198f7a1-1234-7234-9abc-0123456789ab-20260228", ok: true},
+		{loc: "0198f7a1-1234-7234-9abc-0123456789ab-20250229", ok: false}, // 2025 is not a leap year
+	} {
+		t.Run(test.loc[len(test.loc)-8:], func(t *testing.T) {
+			_, err := Resolve("file:///mnt/shared/snapshots", test.loc)
+			if test.ok && err != nil {
+				t.Fatalf("Resolve() rejected valid date: %v", err)
+			}
+			if !test.ok && err == nil {
+				t.Fatal("Resolve() accepted a non-existent calendar date")
+			}
+		})
+	}
+}
+
 func TestResolveRejectsInvalidInputs(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -64,6 +87,8 @@ func TestResolveRejectsInvalidInputs(t *testing.T) {
 		{name: "wrong separator", parent: "file:///tmp", loc: "0198f7a1-1234-7234-9abc-0123456789ab_20260824"},
 		{name: "short date", parent: "file:///tmp", loc: "0198f7a1-1234-7234-9abc-0123456789ab-2026082"},
 		{name: "non-numeric date", parent: "file:///tmp", loc: "0198f7a1-1234-7234-9abc-0123456789ab-2026ab24"},
+		{name: "impossible day", parent: "file:///tmp", loc: "0198f7a1-1234-7234-9abc-0123456789ab-20260230"},
+		{name: "impossible month", parent: "file:///tmp", loc: "0198f7a1-1234-7234-9abc-0123456789ab-20261301"},
 		{name: "date only", parent: "file:///tmp", loc: "20260824"},
 		{name: "path separator", parent: "file:///tmp", loc: "a/b-20260824"},
 		{name: "dot", parent: "file:///tmp", loc: ".-20260824"},
