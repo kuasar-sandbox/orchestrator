@@ -23,7 +23,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
-	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -1612,19 +1611,12 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			}
 		}
 	}
-	toRefLocation := ""
-	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		// Publication location name: the build id plus the publication date.
-		// The date suffix is what the time-ordered layout buckets by; a
-		// same-day retry reuses the same name (and directory), while a
-		// cross-midnight retry simply ages out with its own bucket.
-		locName := reflocation.PublicationName(b.BuildID, time.Now())
-		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
-		if err != nil {
-			return nil, err
-		}
-		toRefLocation = locName + "=" + uri
-	}
+	// The publication name/URI is NOT derived here: the builder mints it
+	// right before the upload starts (see builder.uploadSnapshot), so the
+	// date bucket reflects the actual publication time, not spec-resolution
+	// time — a build that spans UTC midnight publishes into the day it
+	// actually uploads.
+	publishParent := o.cfg.Checkpoint.Remote.RefLocationParent
 
 	importReferer, err := o.effectiveImportReferer(b)
 	if err != nil {
@@ -1632,20 +1624,20 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	}
 
 	spec := &configsock.BuildSpec{
-		BuildID:          b.BuildID,
-		Profile:          string(b.Profile),
-		RunID:            b.RunID,
-		Workdir:          pend.workdir,
-		FromImage:        b.FromImage,
-		FromTemplateRef:  fromTemplateRef,
-		FromTemplateKind: fromTemplateKind,
-		RefLocations:     refLocations,
-		CheckpointMode:   o.cfg.Checkpoint.Mode,
-		ToRefLocation:    toRefLocation,
-		Steps:            steps,
-		StartCmd:         b.StartCmd,
-		ReadyCmd:         b.ReadyCmd,
-		Env:              nil,
+		BuildID:               b.BuildID,
+		Profile:               string(b.Profile),
+		RunID:                 b.RunID,
+		Workdir:               pend.workdir,
+		FromImage:             b.FromImage,
+		FromTemplateRef:       fromTemplateRef,
+		FromTemplateKind:      fromTemplateKind,
+		RefLocations:          refLocations,
+		CheckpointMode:        o.cfg.Checkpoint.Mode,
+		PublishLocationParent: publishParent,
+		Steps:                 steps,
+		StartCmd:              b.StartCmd,
+		ReadyCmd:              b.ReadyCmd,
+		Env:                   nil,
 		Paths: configsock.BuildPaths{
 			Kernel:         o.cfg.Sandbox.Boot.Kernel,
 			Runtime:        o.cfg.Sandbox.Boot.Runtime,

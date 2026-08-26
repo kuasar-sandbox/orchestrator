@@ -1440,7 +1440,8 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   只读取根 `snapshot.cfg`一次,再从 `root + FromRefs + ArtifactRefs()` 收集flattened closure;
   `FromRefs`是已展平memory chain、disk `BaseFromRefs`同理,不递归读取parent cfg。
   location name去重排序并受1024上限约束,路径与CLI URI均按
-  `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生。
+  `<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生
+  (日期段取自 name 自带的发布日期后缀,与 §8.1 的 dated 布局一致)。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
   decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
@@ -1846,7 +1847,8 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 (stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用);
 产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <snapshot>`。Phase C 的 capture 使用
 与 Pause 相同的 `checkpoint.mode`,但不继承 Pause-only merge/drop policy。配置
-`ref_location_parent` 时使用 build ID 作为 location name 发布到 named location,
+`ref_location_parent` 时以 publication name(build ID + UTC 发布日期后缀,
+`reflocation.PublicationName`,builder 在 upload 开始前才铸造)发布到 named location,
 否则发布到 manifest;Bundle 上传保持原始根 ManifestKey 与 byte-identical `snapshot.cfg`。结果
 `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传;
 快照模板的 start/ready 与模板有效 `NetworkSpec` 同时记进 snapshot.cfg metadata,
