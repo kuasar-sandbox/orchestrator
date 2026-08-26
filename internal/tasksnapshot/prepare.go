@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
@@ -51,9 +53,10 @@ type canonicalResolution struct {
 	Locations          []canonicalLocation         `json:"locations"`
 }
 
-// Prepare reads the root config exactly once, computes the flattened required
-// ref closure, and derives reader paths plus CLI URIs. It never opens a parent
-// snapshot.cfg.
+// Prepare reads the root config exactly once, computes the flattened logical
+// ref closure, and derives reader paths plus CLI URIs. A file-backed root is
+// content-detected first; Manifest Bundles contribute only their metadata
+// prefix refs. Prepare never opens a listed Bundle or a parent snapshot.cfg.
 func Prepare(ctx context.Context, spec configsock.SnapshotPrepareSpec) (*Result, error) {
 	started := time.Now()
 	if spec.RootRef == "" {
@@ -69,18 +72,45 @@ func Prepare(ctx context.Context, spec configsock.SnapshotPrepareSpec) (*Result,
 	if err := validateRootResolution(spec.RootRef, spec.RelativeDir); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	pathLocations := rtconfig.RefLocations{}
 	uriLocations := map[string]string{}
-	if name, err := refLocationName(spec.RootRef); err != nil {
-		return nil, fmt.Errorf("task snapshot prepare: root ref: %w", err)
-	} else if name != "" {
+	addLocation := func(source, name string) error {
+		if name == "" {
+			return nil
+		}
+		if _, exists := uriLocations[name]; exists {
+			return nil
+		}
 		location, err := reflocation.Resolve(spec.RefLocationParent, name)
 		if err != nil {
-			return nil, fmt.Errorf("task snapshot prepare: root location %q: %w", name, err)
+			return fmt.Errorf("task snapshot prepare: %s location %q: %w", source, name, err)
 		}
 		pathLocations[name] = location.Path
 		uriLocations[name] = location.URI
+		return nil
+	}
+	if name, err := refLocationName(spec.RootRef); err != nil {
+		return nil, fmt.Errorf("task snapshot prepare: root ref: %w", err)
+	} else if err := addLocation("root", name); err != nil {
+		return nil, err
+	}
+
+	bundleRefs, err := rootBundleRefs(spec.RootRef, spec.RelativeDir, pathLocations)
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range bundleRefs {
+		name, err := refLocationName(raw)
+		if err != nil {
+			return nil, fmt.Errorf("task snapshot prepare: Bundle ref %q: %w", raw, err)
+		}
+		if err := addLocation(fmt.Sprintf("Bundle ref %q", raw), name); err != nil {
+			return nil, err
+		}
 	}
 
 	manifestCfg, err := rtconfig.LoadManifestConfig(spec.ManifestConfig)
@@ -118,30 +148,27 @@ func Prepare(ctx context.Context, spec configsock.SnapshotPrepareSpec) (*Result,
 	if err != nil {
 		return nil, err
 	}
-	locationNames := make(map[string]struct{})
 	for _, raw := range requiredRefs {
 		name, err := refLocationName(raw)
 		if err != nil {
 			return nil, fmt.Errorf("task snapshot prepare: required ref %q: %w", raw, err)
 		}
-		if name != "" {
-			locationNames[name] = struct{}{}
+		if err := addLocation(fmt.Sprintf("required ref %q", raw), name); err != nil {
+			return nil, err
 		}
 	}
-	names := make([]string, 0, len(locationNames))
-	for name := range locationNames {
+	names := make([]string, 0, len(uriLocations))
+	for name := range uriLocations {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	canonicalLocations := make([]canonicalLocation, 0, len(names))
 	for _, name := range names {
-		location, err := reflocation.Resolve(spec.RefLocationParent, name)
-		if err != nil {
-			return nil, fmt.Errorf("task snapshot prepare: location %q: %w", name, err)
-		}
-		pathLocations[name] = location.Path
-		uriLocations[name] = location.URI
-		canonicalLocations = append(canonicalLocations, canonicalLocation{Name: name, Path: location.Path, URI: location.URI})
+		canonicalLocations = append(canonicalLocations, canonicalLocation{
+			Name: name,
+			Path: pathLocations[name],
+			URI:  uriLocations[name],
+		})
 	}
 
 	capacity := configsock.SnapshotCapacity{
@@ -234,4 +261,48 @@ func refLocationName(raw string) (string, error) {
 		return "", err
 	}
 	return ref.Location, nil
+}
+
+// rootBundleRefs discovers the root Bundle's flat physical search path from
+// its metadata prefix. It deliberately does not open any listed Bundle: those
+// sources remain lazy sandbox-runtime dependencies, and their own refs never
+// participate in this root's location discovery.
+func rootBundleRefs(root, relativeDir string, locations rtconfig.RefLocations) ([]string, error) {
+	path, isFile, err := rootFilePath(root, relativeDir, locations)
+	if err != nil {
+		return nil, err
+	}
+	if !isFile {
+		return nil, nil
+	}
+	format, err := artifact.DetectFileFormat(path)
+	if err != nil {
+		return nil, fmt.Errorf("task snapshot prepare: inspect root file format: %w", err)
+	}
+	if format != artifact.FileFormatManifestBundle {
+		return nil, nil
+	}
+	metadata, err := manifestbundle.OpenMetadata(path)
+	if err != nil {
+		return nil, fmt.Errorf("task snapshot prepare: read root Bundle metadata: %w", err)
+	}
+	return metadata.Refs(), nil
+}
+
+func rootFilePath(root, relativeDir string, locations rtconfig.RefLocations) (string, bool, error) {
+	if strings.HasPrefix(root, "manifest://") {
+		return "", false, nil
+	}
+	if strings.HasPrefix(root, "file://") {
+		ref, err := manifest.ParseRef(root)
+		if err != nil {
+			return "", false, fmt.Errorf("task snapshot prepare: parse root file ref: %w", err)
+		}
+		path, err := locations.ResolveFile(ref, relativeDir)
+		if err != nil {
+			return "", false, fmt.Errorf("task snapshot prepare: resolve root file ref: %w", err)
+		}
+		return path, true, nil
+	}
+	return root, true, nil
 }

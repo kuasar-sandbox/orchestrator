@@ -1428,10 +1428,14 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
   已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
   目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
-  `ref_location_parent` 部署映射。restore runner先为located根建立reader path mapping,
-  只读取根 `snapshot.cfg`一次,再从 `root + FromRefs + ArtifactRefs()` 收集flattened closure;
-  `FromRefs`是已展平memory chain、disk `BaseFromRefs`同理,不递归读取parent cfg。
-  location name去重排序并受1024上限约束,路径与CLI URI均按
+  `ref_location_parent` 部署映射。迁移token仍只携根ref。restore runner先为located根建立
+  reader path mapping;若根文件是Manifest Bundle,它只读取根文件从offset 0开始的metadata
+  prefix,从平面的 `bundle/refs` 收集全部 `@location` 名称并在打开根cfg前补全mapping。
+  无location的sibling ref相对根Bundle目录解析,无需独立mapping;runner不打开refs Bundle,
+  也不递归读取其 `bundle/refs`。随后只读取根 `snapshot.cfg`一次,再从
+  `root + FromRefs + ArtifactRefs()` 收集flattened逻辑closure;`FromRefs`是已展平memory
+  chain、disk `BaseFromRefs`同理,不递归读取parent cfg。逻辑ref上限和Bundle profile内
+  refs上限各为1024;所有location name去重排序,路径与CLI URI均按
   `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
@@ -1804,7 +1808,10 @@ metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。f
 e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。overlay top 与
 `base_from_refs` 保持显式 top-to-bottom 数组,不编码复合 manifest ref。`FromRefs` 与
 `BaseFromRefs` 已是展平链，不读取 parent `snapshot.cfg`。root + FromRefs + ArtifactRefs
-只用于去重、排序、上限与 ref-location closure；`Boot.RuntimeRef` 不作为租户 located ref。
+只用于逻辑ref去重、排序和上限；`Boot.RuntimeRef` 不作为租户 located ref。snp源是
+Manifest Bundle时,同一task-local preflight还会只读根Bundle的metadata prefix,把平面
+`bundle/refs`里的located来源加入ref-location closure；同目录sibling无需mapping,也不会
+打开或递归扫描任何refs Bundle。完整mapping随BuildSpec交给所有Builder phase sandbox。
 snp 源模板的 `kuasar-sandbox.network` 由summary在 host Attach 前 strict解析并按字段继承,优先级为
 **当前 Build 显式 NetworkSpec > 源 snapshot NetworkSpec > 当前 profile/node 默认值**;
 img 源模板没有 snapshot metadata 通道,不从本地数据库增加入口相关的隐式回退。
