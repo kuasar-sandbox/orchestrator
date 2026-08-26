@@ -2079,6 +2079,9 @@ echo "==> PASS: all local checkpoint-policy sandboxes killed"
 # ---- bundle Pause -> local restore -> exact Store promotion ---------------
 stop_orchestrator
 write_orchestrator_config unset controller bundle
+cat >> "$WORK/config.yaml" <<'EOF'
+  merge_ref: false
+EOF
 start_orchestrator "$WORK/orch-bundle.log"
 wait_mmds_listener
 
@@ -2101,11 +2104,13 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle pause=$code"; }
 assert_snapshot_argv "$BUNDLE_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    --merge-ref=false \
     || fail "bundle Pause did not pass --mode bundle exactly"
 BUNDLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
 [ -L "$BUNDLE_LOCAL" ] || fail "bundle Pause did not retain $BUNDLE_LOCAL symlink"
 BUNDLE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 case "$BUNDLE_TARGET" in *.bundle) ;; *) fail "bundle symlink target is not .bundle: $BUNDLE_TARGET" ;; esac
+BUNDLE_A_KEY=$(basename "$BUNDLE_TARGET" .bundle)
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_LOCAL" >"$WORK/bundle-local.json" \
     || fail "local Manifest Bundle is unreadable"
@@ -2117,16 +2122,101 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-read.out" \
     || { sed 's/^/  guest| /' "$WORK/bundle-read.out"; fail "local Manifest Bundle restore lost guest state"; }
 
+BUNDLE_B_CALL=$(snapshot_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle B pause=$code"; }
+assert_snapshot_argv "$BUNDLE_B_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    --merge-ref=false \
+    || fail "bundle B Pause did not pass --mode bundle exactly"
+BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
+BUNDLE_B_KEY=$(basename "$BUNDLE_B_TARGET" .bundle)
+[[ "$BUNDLE_B_TARGET" == *.bundle && "$BUNDLE_B_KEY" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "bundle B target does not encode its root ManifestKey: $BUNDLE_B_TARGET"
+python3 - "$BUNDLE_B_TARGET" "$(basename "$BUNDLE_TARGET")" <<'PY' \
+    || fail "bundle B refs are not the direct flat sibling dependency"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    got = archive.read("bundle/refs").decode("utf-8").splitlines()
+want = ["file://" + sys.argv[2]]
+if got != want:
+    raise SystemExit(f"bundle B refs={got!r}, want={want!r}")
+PY
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BUNDLE_B_TARGET" >"$WORK/bundle-b.json" || fail "bundle B snapshot.cfg is unreadable"
+python3 - "$WORK/bundle-b.json" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle B snapshot.cfg is not a manifest-only logical graph"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = json.load(stream)
+want = "manifest://" + sys.argv[2]
+if not (cfg.get("FromRefs") or []) or cfg["FromRefs"][0] != want:
+    raise SystemExit(f"bundle B FromRefs={cfg.get('FromRefs')!r}, want first {want!r}")
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from strings(nested)
+bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value]
+if bad:
+    raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
+PY
+
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_CHAIN_RESTORE_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "bundle B with sibling refs did not restore"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-chain-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-chain-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-chain-read.out"; fail "bundle B restore lost A state"; }
+
 BUNDLE_PROMOTE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
-[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle promote pause=$code"; }
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle C promote pause=$code"; }
 assert_snapshot_argv "$BUNDLE_PROMOTE_CALL" \
     snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
-    || fail "second bundle Pause did not pass --mode bundle exactly"
+    --merge-ref=false \
+    || fail "bundle C Pause did not pass --mode bundle exactly"
 BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
 [[ "$BUNDLE_PROMOTE_TARGET" == *.bundle && "$BUNDLE_ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "second Bundle target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
+    || fail "bundle C target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
+python3 - "$BUNDLE_PROMOTE_TARGET" "$(basename "$BUNDLE_B_TARGET")" "$(basename "$BUNDLE_TARGET")" <<'PY' \
+    || fail "bundle C refs are not the flattened B -> A sibling path"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    got = archive.read("bundle/refs").decode("utf-8").splitlines()
+want = ["file://" + sys.argv[2], "file://" + sys.argv[3]]
+if got != want:
+    raise SystemExit(f"bundle C refs={got!r}, want={want!r}")
+PY
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BUNDLE_PROMOTE_TARGET" >"$WORK/bundle-c.json" || fail "bundle C snapshot.cfg is unreadable"
+python3 - "$WORK/bundle-c.json" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle C snapshot.cfg is not the flattened manifest-only graph"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = json.load(stream)
+want = ["manifest://" + sys.argv[2], "manifest://" + sys.argv[3]]
+got = (cfg.get("FromRefs") or [])[:2]
+if got != want:
+    raise SystemExit(f"bundle C FromRefs prefix={got!r}, want={want!r}")
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from strings(nested)
+bad = [value for value in strings(cfg) if value.startswith("file://") and "@manifest:" in value]
+if bad:
+    raise SystemExit(f"physical Bundle selectors leaked into snapshot.cfg: {bad!r}")
+PY
 BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
     --keep-source --socket "$WORK/node-ctl.socket") \
     || fail "bundle export/promote failed"
@@ -2144,9 +2234,15 @@ PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
     || fail "promoted Bundle root is unreadable from Store"
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_STORE_RESTORE_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "exact-uploaded Bundle C did not restore from Store"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-store-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
 unset EXEC_TOKEN
-echo "==> PASS: checkpoint.mode=bundle drove Pause, local restore, exact promotion, and remote read"
+echo "==> PASS: checkpoint.mode=bundle drove A->B->C restore, flat sibling refs, exact promotion, and remote read"
 
 echo
 echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle $BUNDLE_REMOTE_REF)"
