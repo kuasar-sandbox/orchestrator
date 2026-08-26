@@ -14,10 +14,10 @@ import (
 
 // TestPromoteBucketsByPublicationTimeNotEntityCreation covers the case where
 // an entity created long before it exports must still land in a current
-// (publication-date) bucket: a GC deleting old date buckets can never remove a
-// just-published snapshot. The sandbox id below carries a 2025-era v7
-// timestamp; the publication clock is pinned so the expected name (and bucket)
-// is a constant, not whatever today is.
+// (publication-date) partition: partitioning follows publication time, not
+// entity creation time. The sandbox id below carries a 2025-era v7
+// timestamp; the publication clock is pinned so the expected name (and
+// partition) is a constant, not whatever today is.
 func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{}

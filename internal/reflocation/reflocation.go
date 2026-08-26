@@ -23,15 +23,16 @@ type Location struct {
 
 // dateLayout is the fixed-width publication-date suffix appended to entity ids
 // in location names. Its lexicographic order equals chronological order, so the
-// first path segment derived from it forms a time-ordered GC bucket.
+// first path segment derived from it forms an ordered publication-time
+// partition. (Whether and how anything is deleted is owned by the future
+// management-plane GC and is deliberately not this package's contract.)
 const dateLayout = "20060102"
 
 // PublicationName derives the location name for one publication of entityID
 // (sandbox ID or build ID): the entity id plus the publication date,
 // e.g. "019f...-20260824". The date suffix is what the time-ordered layout
-// below buckets by — publication time, not entity creation time, so an entity
-// created long before it exports still lands in a current bucket and a GC can
-// never delete a just-published snapshot.
+// below partitions by — publication time, not entity creation time, so an
+// entity created long before it exports still lands in a current partition.
 func PublicationName(entityID string, publishedAt time.Time) string {
 	return entityID + "-" + publishedAt.UTC().Format(dateLayout)
 }
@@ -64,8 +65,7 @@ func publicationDate(name string) (string, bool) {
 // same suffix travels inside the portable ref, so restore/import/inheritance
 // resolve the identical path on any node without extra state. The SHA256
 // fan-out below the date segment bounds directory size and is unchanged from
-// the pre-date layout. A bucket (one date) is removable once every publication
-// time it can represent is older than the retention cutoff.
+// the pre-date layout.
 // parentURI must be an absolute hostless file URI and name must be a valid
 // portable ref-location name carrying a publication-date suffix.
 func Resolve(parentURI, name string) (Location, error) {

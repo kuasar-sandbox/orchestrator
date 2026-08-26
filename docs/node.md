@@ -1376,18 +1376,19 @@ Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback�
 portable publish 与 Pause mode 独立。若配置
 `checkpoint.remote.ref_location_parent`,`export-sandbox` 在发布时构造 publication
 name(实体 ID + 等宽发布日期后缀 `<sb.ID>-<YYYYMMDD>`,`reflocation.PublicationName`;
-UTC,同日重试同名收敛,跨日重试各随各的日期桶老化):
+UTC,同日重试同名收敛,跨日重试使用新日期的 name/目录):
 
 ```text
 location name = <entity-id>-<YYYYMMDD>   (发布日期 = publication 日期,非实体创建日期)
 location URI  = <parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>
 ```
 
-首层日期目录即 GC 桶:字典序=日期序,GC 按"整日桶内所有发布时刻都早于 retention"
-删除日期目录;hash 两级扇出原样保留(限制单目录条目)。发布日期取自 name 后缀而非
-实体 ID 内嵌时间——晚导出的实体(创建久远但刚发布)落在当前日期桶,不会被 GC 误删。
-conductor 与 task reader 共用 `internal/reflocation` 一条规则,name 自足(ref 携带即可
-恢复,无需任何额外状态)。
+首层日期目录是按发布时间有序的分区(字典序=日期序),为未来的 GC 候选发现提供
+有序布局;hash 两级扇出原样保留(限制单目录条目)。发布日期取自 name 后缀而非
+实体 ID 内嵌时间——晚导出的实体(创建久远但刚发布)落在当前日期分区。GC 策略与
+删除流程(retention、可达性、在途发布处理、删除安全)不在本仓库范围,由未来的
+管理面 GC 组件负责。conductor 与 task reader 共用 `internal/reflocation` 一条规则,
+name 自足(ref 携带即可恢复,无需任何额外状态)。
 
 随后用 `upload-snapshot --to-ref-location` 发布,tarstream 得到
 `file://<digest>.snapshot@location:<publication-name>`,Bundle 得到

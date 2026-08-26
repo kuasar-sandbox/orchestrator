@@ -27,8 +27,9 @@ func TestPublicationNameAndResolve(t *testing.T) {
 }
 
 func TestResolveUsesPublicationDateNotEntityDate(t *testing.T) {
-	// An entity with a 2025-era v7 id exported today must land in today's
-	// bucket: a GC deleting old date buckets can never remove it.
+	// An entity with a 2025-era v7 id exported now must land in the current
+	// date partition: partitioning follows publication time, not entity
+	// creation time.
 	entity := "0194a1b2-c3d4-7234-9abc-0123456789ab" // 2025-era timestamp
 	name := PublicationName(entity, time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC))
 	got, err := Resolve("file:///mnt/shared/snapshots", name)
@@ -84,9 +85,9 @@ func TestSameDayRetryConvergesToSameLocation(t *testing.T) {
 
 // TestCrossMidnightRetryUsesNewBucket pins the cross-day retry contract: once
 // the retry lands on a later UTC date, a fresh publication name (and therefore
-// a fresh date bucket) is derived. The earlier attempt's directory is simply
-// an unreferenced orphan in its own date bucket and ages out with that
-// bucket's GC lifecycle — no durable identity ever points at it.
+// a fresh date partition) is derived. The earlier attempt's directory is simply
+// an unreferenced orphan in its own date partition; whether and when it is
+// deleted is owned by the future management-plane GC, not this package.
 func TestCrossMidnightRetryUsesNewBucket(t *testing.T) {
 	entity := "0198f7a1-1234-7234-9abc-0123456789ab"
 	parent := "file:///mnt/shared/snapshots"

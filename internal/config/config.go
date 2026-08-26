@@ -631,8 +631,8 @@ type CheckpointRemoteConfig struct {
 // (reflocation.PublicationName — the entity id plus its publication date).
 // The name is self-contained inside the portable ref, so any node resolves
 // the identical path; the parent never enters a portable ref, TemplateID, or
-// migration token. Bucketing rules and GC-safety rationale live in the
-// reflocation package.
+// migration token. Bucketing rules live in the reflocation package; GC policy
+// and deletion flow are out of scope for this repo.
 func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
 	location, err := reflocation.Resolve(c.Remote.RefLocationParent, name)
 	if err != nil {
