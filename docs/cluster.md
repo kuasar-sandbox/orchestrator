@@ -1057,6 +1057,12 @@ build execution、node ref、admission 或本机 checkpoint。节点虽持久化
 READY 上报才建立运行态 route。该 recovery-only workflow 由
 [issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪,不挂载在正常 route_link API。
 
+Manifest Bundle不改变migration token/KMT wire:token仍只携根Bundle ref。目标node的task-local
+preflight只读根Bundle的连续metadata prefix,从平面 `bundle/refs` 收集located来源并用
+`checkpoint.remote.ref_location_parent`确定性派生完整mapping;同目录sibling无需mapping,
+被引用Bundle不会在编排层打开或递归扫描。export/promote继续委托sandboxer原样发布根Bundle及
+其无location sibling,带location的外部依赖保持原地址。
+
 sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/provider 自己的持久化和灾备流程负责。
 在 #33/#34 完成前,完整 registry 执行态丢失没有 operator runtime import 兜底;系统必须明确报告不可恢复,
 而不是构造可能与节点冲突的 route/build ownership。

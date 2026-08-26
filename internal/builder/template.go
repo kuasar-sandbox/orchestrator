@@ -12,10 +12,29 @@ import (
 	"strings"
 	"time"
 
+	nodeconfig "github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // --- phase C: template snapshot ---------------------------------------------
+
+// prepareBundleTemplateBase preserves the existing platform base_ref policy
+// without relying on upload-snapshot to rewrite snapshot.cfg. Bundle exact
+// upload is intentionally byte-preserving, so a newly exported local image
+// must enter the Store before phase C and the snapshot must record that
+// manifest identity itself. Tarstream publication keeps its existing rewrite
+// path, and an already remote base needs no work.
+func (p *buildPipeline) prepareBundleTemplateBase() error {
+	if p.spec.CheckpointMode != nodeconfig.CheckpointBundle || p.imagePath == "" {
+		return nil
+	}
+	ref, err := p.uploadImage()
+	if err != nil {
+		return fmt.Errorf("publish platform image: %w", err)
+	}
+	p.baseRef = ref
+	return nil
+}
 
 func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	s := p.spec
@@ -192,9 +211,9 @@ func (p *buildPipeline) uploadImage() (string, error) {
 }
 
 func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
-	// upload-snapshot publishes every local artifact the snapshot.cfg
-	// references (the base image is a bundle-dir sibling) to the configured
-	// portable backend — one command finishes the build.
+	// Bundle mode exact-uploads snapshot layers without rewriting snapshot.cfg;
+	// prepareBundleTemplateBase has already published a newly built platform
+	// base. Tarstream mode retains upload-snapshot's existing graph rewrite.
 	p.progress("uploading template snapshot to the content store")
 	args := []string{"upload-snapshot", "--quiet"}
 	if p.spec.ToRefLocation != "" {

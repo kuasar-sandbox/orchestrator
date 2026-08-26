@@ -29,8 +29,9 @@
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
 # Deep asserts via the artifact chain: B2's snapshot.cfg carries
-# e2b.start_cmd metadata + a manifest:// base whose image config holds the
-# merged ENV/WORKDIR; B3's RUN step only succeeds if B2's RUN persisted.
+# e2b.start_cmd metadata and manifest identities for both the explicitly
+# published platform image and captured overlay; B3's RUN step proves B2's RUN
+# plus the merged ENV/WORKDIR persisted through the snapshot.
 #
 # Requires systemd as PID1 + root (units over D-Bus), /dev/kvm, docker (seeds
 # the base image), zot, mkfs.ext4, and bin/: node-ctl sandbox-ctl
@@ -936,9 +937,12 @@ B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 echo "==> PASS: B2 ready → $B2_PERSIST"
 
-# Deep asserts through the artifact chain: the uploaded snapshot.cfg names a
-# manifest:// base image and carries the e2b start/ready metadata; the base
-# image's runtime config holds the merged ENV/WORKDIR from the steps.
+# Deep asserts through the artifact chain: the uploaded snapshot.cfg names its
+# captured overlay as manifest:// and carries the e2b start/ready metadata.
+# base_ref remains outside issue #79's forced snapshot-layer conversion; this
+# Store-backed Builder explicitly publishes its new platform image before phase
+# C, selecting the existing manifest:// strategy. B3 below validates the merged
+# ENV/WORKDIR in the restored guest as well.
 B2_REF=$(persist_ref "$B2_PERSIST") \
     || fail "B2 persist id does not contain a valid portable ref: $B2_PERSIST"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
@@ -948,8 +952,8 @@ grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
-python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost fixed capacity, leaked node-local resource policy, or launch.cgroup_control=true"
-import json, sys
+B2_IMG_HEX=$(python3 - "$WORK/b2.cfg.json" <<'PY'
+import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     cfg = json.load(source)
 assert cfg["Launch"]["CgroupControl"] is True, cfg["Launch"]
@@ -957,15 +961,21 @@ resources = cfg["Resources"]
 # Snapshot portability fixes capacity only. The restore node re-resolves
 # allocatable, startup, overhead, and controller from its own resource policy.
 assert resources == {"Capacity": {"CPU": 2, "Memory": "3GiB"}}, resources
+root = cfg["Boot"]["Root"]
+# The Builder chooses the existing manifest strategy for its newly published
+# platform base. Issue #79 independently requires the captured overlay layer to
+# be manifest-only; neither field may contain a physical Bundle selector.
+assert re.fullmatch(r"manifest://[0-9a-f]{64}", root["BaseRef"]), root
+assert re.fullmatch(r"manifest://[0-9a-f]{64}", root["Overlay"]["Base"]), root
+print(root["BaseRef"].removeprefix("manifest://"))
 PY
-B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
-[ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest://: $(cat "$WORK/b2.cfg.json")"
+) || fail "B2 snapshot.cfg lost fixed capacity, published platform base, manifest overlay, or launch.cgroup_control=true"
 MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "manifest://$B2_IMG_HEX" >"$WORK/b2.img.json" 2>"$WORK/b2.img.err" \
     || { cat "$WORK/b2.img.err"; fail "flatten-ctl info manifest://$B2_IMG_HEX"; }
 grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
 grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
-echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + manifest:// base + merged ENV/WORKDIR"
+echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + published manifest base + manifest:// overlay + merged ENV/WORKDIR"
 wait_phase_audit a "$B1_BID" || fail "B1 phase A lacked ordinary nodectl Admit/Release"
 wait_phase_admit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit"
 wait_phase_audit c "$B2_BID" || fail "B2 phase C lacked ordinary nodectl Admit/Release"
@@ -981,7 +991,7 @@ echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"
 register e2e-child
 B3_TID="$TID"; B3_BID="$BID"
 code=$(req POST "/v2/templates/$B3_TID/builds/$B3_BID" "$AK" \
-    "{\"fromTemplate\":\"$B2_PERSIST\",\"steps\":[{\"type\":\"RUN\",\"args\":[\"test -f /etc/b2-marker\"]}]}")
+    "{\"fromTemplate\":\"$B2_PERSIST\",\"steps\":[{\"type\":\"RUN\",\"args\":[\"test -f /etc/b2-marker && test x\$BUILT = xyes && test x\$PWD = x/home/user\"]}]}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B3 trigger = $code (want 202)"; }
 wait_ready "$B3_TID" "$B3_BID" B3
 B3_PERSIST="$PERSIST"
@@ -994,9 +1004,9 @@ B3_ROOT_READS=$(grep -F -c 'build task snapshot prepared' "$WORK/b3-builder.jour
     || { cat "$WORK/b3-builder.journal"; fail "B3 task root snapshot.cfg read count=$B3_ROOT_READS (want 1)"; }
 grep -F -q 'task_snapshot_ref_count' "$WORK/b3-builder.journal" \
     || { cat "$WORK/b3-builder.journal"; fail "B3 task snapshot ref-count instrumentation missing"; }
-# ready is only reachable if: the RUN saw B2's marker (base extraction worked)
-# AND the inherited startCmd/readyCmd ran on the new template VM.
-echo "==> PASS: B3 ready → $B3_PERSIST (one task-local root cfg read; base-image extraction + start/ready inheritance)"
+# ready is only reachable if the RUN saw B2's marker and merged ENV/WORKDIR,
+# and the inherited startCmd/readyCmd ran on the new template VM.
+echo "==> PASS: B3 ready → $B3_PERSIST (one task-local root cfg read; restored RUN/ENV/WORKDIR + start/ready inheritance)"
 
 # ---- B4: COPY build context via files endpoint + presigned direct upload ----
 # Acts as the e2b client: GET the files endpoint (present=false) → PUT the
