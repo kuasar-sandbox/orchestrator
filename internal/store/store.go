@@ -849,7 +849,6 @@ func (s *Store) SetSnapshotRef(ctx context.Context, id, ref string) error {
 	return err
 }
 
-
 func (s *Store) Delete(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sandboxes WHERE id=?`, id)
 	return err
@@ -1178,7 +1177,6 @@ func (s *Store) BuildsByStatus(ctx context.Context, status types.BuildState) ([]
 	}
 	return out, rows.Err()
 }
-
 
 // SetBuildRunID records the systemd runner assigned to a build without
 // rewriting status or other fields that may have changed since admission.

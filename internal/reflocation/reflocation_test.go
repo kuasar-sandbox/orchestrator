@@ -3,6 +3,7 @@ package reflocation
 import (
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +49,71 @@ func TestResolveBucketLabelsSortChronologically(t *testing.T) {
 	newer := PublicationName(entity, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
 	if older[len(older)-8:] >= newer[len(newer)-8:] {
 		t.Fatalf("date suffixes must sort chronologically: %q vs %q", older, newer)
+	}
+}
+
+// TestSameDayRetryConvergesToSameLocation pins the same-day retry contract:
+// one entity retrying within the same UTC date — whether minutes or hours
+// apart, before or after any process restart — necessarily derives the
+// identical publication name and therefore the identical directory, because
+// the name is a pure function of (entity id, UTC date). No persisted state is
+// consulted or needed.
+func TestSameDayRetryConvergesToSameLocation(t *testing.T) {
+	entity := "0198f7a1-1234-7234-9abc-0123456789ab"
+	parent := "file:///mnt/shared/snapshots"
+	morning := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	lateEvening := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
+
+	name1 := PublicationName(entity, morning)
+	name2 := PublicationName(entity, lateEvening)
+	if name1 != name2 {
+		t.Fatalf("same-day retry changed the publication name: %q vs %q", name1, name2)
+	}
+	loc1, err := Resolve(parent, name1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc2, err := Resolve(parent, name2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc1 != loc2 {
+		t.Fatalf("same-day retry resolved different locations: %+v vs %+v", loc1, loc2)
+	}
+}
+
+// TestCrossMidnightRetryUsesNewBucket pins the cross-day retry contract: once
+// the retry lands on a later UTC date, a fresh publication name (and therefore
+// a fresh date bucket) is derived. The earlier attempt's directory is simply
+// an unreferenced orphan in its own date bucket and ages out with that
+// bucket's GC lifecycle — no durable identity ever points at it.
+func TestCrossMidnightRetryUsesNewBucket(t *testing.T) {
+	entity := "0198f7a1-1234-7234-9abc-0123456789ab"
+	parent := "file:///mnt/shared/snapshots"
+	beforeMidnight := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
+	afterMidnight := time.Date(2026, 8, 25, 0, 1, 0, 0, time.UTC)
+
+	name1 := PublicationName(entity, beforeMidnight)
+	name2 := PublicationName(entity, afterMidnight)
+	if name1 == name2 {
+		t.Fatalf("cross-midnight retry reused the publication name %q", name1)
+	}
+	loc1, err := Resolve(parent, name1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc2, err := Resolve(parent, name2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc1 == loc2 {
+		t.Fatalf("cross-midnight retry resolved the same location: %+v", loc1)
+	}
+	if !strings.Contains(loc1.Path, "/20260824/") {
+		t.Fatalf("first attempt path %q is not in the 20260824 bucket", loc1.Path)
+	}
+	if !strings.Contains(loc2.Path, "/20260825/") {
+		t.Fatalf("second attempt path %q is not in the 20260825 bucket", loc2.Path)
 	}
 }
 
