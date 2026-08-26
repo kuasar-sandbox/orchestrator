@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/prefetch"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -1563,4 +1564,65 @@ func header(k, v string) http.Header {
 	h := http.Header{}
 	h.Set(k, v)
 	return h
+}
+
+type prefetchCoreStub struct {
+	Core
+	prefetch func(context.Context, string) (prefetch.Result, error)
+	status   func(context.Context, string) (prefetch.Result, bool, error)
+}
+
+func (c *prefetchCoreStub) Prefetch(ctx context.Context, reference string) (prefetch.Result, error) {
+	return c.prefetch(ctx, reference)
+}
+
+func (c *prefetchCoreStub) PrefetchStatus(ctx context.Context, requestID string) (prefetch.Result, bool, error) {
+	return c.status(ctx, requestID)
+}
+
+func TestPrefetchRequestRoutes(t *testing.T) {
+	core := &prefetchCoreStub{
+		prefetch: func(context.Context, string) (prefetch.Result, error) {
+			return prefetch.Result{RequestID: "request-1", State: "queued"}, nil
+		},
+		status: func(_ context.Context, requestID string) (prefetch.Result, bool, error) {
+			if requestID != "request-1" {
+				return prefetch.Result{}, false, nil
+			}
+			return prefetch.Result{RequestID: requestID, State: "fetched"}, true, nil
+		},
+	}
+	handler, key := newMigrationTestHandler(t, core)
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/prefetch/request-1", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	if response := migrationRequest(t, handler, key, http.MethodPost, "/prefetch", strings.NewReader("{}"), nil); response.Code != http.StatusBadRequest {
+		t.Fatalf("missing reference status = %d", response.Code)
+	}
+	response := migrationRequest(t, handler, key, http.MethodPost, "/prefetch", strings.NewReader(`{"reference":"e2b-snp-x"}`), nil)
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"requestID":"request-1"`) {
+		t.Fatalf("submit status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = migrationRequest(t, handler, key, http.MethodGet, "/prefetch/request-1", nil, nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"state":"fetched"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = migrationRequest(t, handler, key, http.MethodGet, "/prefetch/missing", nil, nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPrefetchNodeFailureIsUnavailable(t *testing.T) {
+	core := &prefetchCoreStub{
+		prefetch: func(context.Context, string) (prefetch.Result, error) { return prefetch.Result{}, errors.New("mount unavailable") },
+		status:   func(context.Context, string) (prefetch.Result, bool, error) { return prefetch.Result{}, false, nil },
+	}
+	handler, key := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, key, http.MethodPost, "/prefetch", strings.NewReader(`{"reference":"e2b-snp-x"}`), nil)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
 }
