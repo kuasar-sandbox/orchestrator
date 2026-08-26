@@ -958,7 +958,8 @@ resources = cfg["Resources"]
 # allocatable, startup, overhead, and controller from its own resource policy.
 assert resources == {"Capacity": {"CPU": 2, "Memory": "3GiB"}}, resources
 PY
-B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
+B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" \
+    | grep -o '[0-9a-f]\{64\}' | head -1 || true)
 [ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest://: $(cat "$WORK/b2.cfg.json")"
 MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "manifest://$B2_IMG_HEX" >"$WORK/b2.img.json" 2>"$WORK/b2.img.err" \
