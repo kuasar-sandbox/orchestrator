@@ -29,9 +29,9 @@
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
 # Deep asserts via the artifact chain: B2's snapshot.cfg carries
-# e2b.start_cmd metadata, keeps the platform image BaseRef physical, and names
-# its captured overlay as manifest://; B3's RUN step proves B2's RUN plus the
-# merged ENV/WORKDIR persisted through the snapshot.
+# e2b.start_cmd metadata and manifest identities for both the explicitly
+# published platform image and captured overlay; B3's RUN step proves B2's RUN
+# plus the merged ENV/WORKDIR persisted through the snapshot.
 #
 # Requires systemd as PID1 + root (units over D-Bus), /dev/kvm, docker (seeds
 # the base image), zot, mkfs.ext4, and bin/: node-ctl sandbox-ctl
@@ -939,8 +939,10 @@ echo "==> PASS: B2 ready → $B2_PERSIST"
 
 # Deep asserts through the artifact chain: the uploaded snapshot.cfg names its
 # captured overlay as manifest:// and carries the e2b start/ready metadata.
-# The read-only base_ref remains a platform artifact by design; B3 below
-# validates the merged ENV/WORKDIR in the restored guest.
+# base_ref remains outside issue #79's forced snapshot-layer conversion; this
+# Store-backed Builder explicitly publishes its new platform image before phase
+# C, selecting the existing manifest:// strategy. B3 below validates the merged
+# ENV/WORKDIR in the restored guest as well.
 B2_REF=$(persist_ref "$B2_PERSIST") \
     || fail "B2 persist id does not contain a valid portable ref: $B2_PERSIST"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
@@ -950,7 +952,7 @@ grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
 grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
     || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
-python3 - "$WORK/b2.cfg.json" <<'PY' || fail "B2 snapshot.cfg lost fixed capacity, platform base identity, manifest overlay, or launch.cgroup_control=true"
+B2_IMG_HEX=$(python3 - "$WORK/b2.cfg.json" <<'PY'
 import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     cfg = json.load(source)
@@ -960,13 +962,20 @@ resources = cfg["Resources"]
 # allocatable, startup, overhead, and controller from its own resource policy.
 assert resources == {"Capacity": {"CPU": 2, "Memory": "3GiB"}}, resources
 root = cfg["Boot"]["Root"]
-# runtime_ref and the overlay-mode read-only base_ref are platform artifacts;
-# issue #79's manifest-only rule applies to snapshot layers, including
-# overlay.base, and must not rewrite this base_ref into a Bundle selector.
-assert re.fullmatch(r"file://[^/@]+@(sha256|hmac):[0-9a-f]{64}", root["BaseRef"]), root
+# The Builder chooses the existing manifest strategy for its newly published
+# platform base. Issue #79 independently requires the captured overlay layer to
+# be manifest-only; neither field may contain a physical Bundle selector.
+assert re.fullmatch(r"manifest://[0-9a-f]{64}", root["BaseRef"]), root
 assert re.fullmatch(r"manifest://[0-9a-f]{64}", root["Overlay"]["Base"]), root
+print(root["BaseRef"].removeprefix("manifest://"))
 PY
-echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + platform base_ref + manifest:// overlay"
+) || fail "B2 snapshot.cfg lost fixed capacity, published platform base, manifest overlay, or launch.cgroup_control=true"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "manifest://$B2_IMG_HEX" >"$WORK/b2.img.json" 2>"$WORK/b2.img.err" \
+    || { cat "$WORK/b2.img.err"; fail "flatten-ctl info manifest://$B2_IMG_HEX"; }
+grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
+grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
+echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + published manifest base + manifest:// overlay + merged ENV/WORKDIR"
 wait_phase_audit a "$B1_BID" || fail "B1 phase A lacked ordinary nodectl Admit/Release"
 wait_phase_admit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit"
 wait_phase_audit c "$B2_BID" || fail "B2 phase C lacked ordinary nodectl Admit/Release"

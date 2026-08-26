@@ -1368,7 +1368,9 @@ API 先把 body 与 Header 合为 action override;Core 在 lifecycle lock 内重
 决定。policy 校验完成前不会 cancel resume、snapshot、停 unit、detach 或改库。
 snapshot 成功后才写 ref/paused state;Pause 本身不执行 promote。Build/template 的 snapshot
 命令使用同一个 `checkpoint.mode`,但不接入这两个 flag,也不把 ready/start command 解释为
-working-set warm-up。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Manifest 使用完整本地
+working-set warm-up。Bundle 模式的 Builder 在 Phase C 前先把本次新导出的只读平台镜像发布为
+`manifest://`,使 byte-identical `snapshot.cfg` 自身选择既有的远端 `base_ref` 策略;后续 Bundle
+exact upload 仍只发布 snapshot layer,不改写 cfg。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Manifest 使用完整本地
 Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback。
 
 portable publish 与 Pause mode 独立。若配置
@@ -1841,9 +1843,12 @@ COPY)。三段:
 唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`guest-runtime/native-deps make
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
-**收尾发布(平台凭据唯一出现点)**:img-only(包括所有 bare build) ⇒ `manifest-ctl store image.img`
-(stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用);
-产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <snapshot>`。Phase C 的 capture 使用
+**发布**:img-only(包括所有 bare build) ⇒ 收尾执行 `manifest-ctl store image.img`
+(stdout 的 key 转为 canonical manifest ref;若 import referer 已命中则直接复用)。Bundle
+快照构建是唯一提前发布点:若 Phase B/Import 产生本地 `image.img`,在 Phase C 前先执行同一
+`manifest-ctl store`,并把所得 ref 作为平台 `base_ref`;这是 base_ref 的既有 manifest 策略,
+不是把 snapshot-layer Bundle 地址写进 cfg。随后快照收尾仍只执行**一条**
+`sandbox-ctl upload-snapshot <snapshot>`;exact upload不重写根。Phase C 的 capture 使用
 与 Pause 相同的 `checkpoint.mode`,但不继承 Pause-only merge/drop policy。配置
 `ref_location_parent` 时使用 build ID 作为 location name 发布到 named location,
 否则发布到 manifest;Bundle 上传保持原始根 ManifestKey 与 byte-identical `snapshot.cfg`。结果

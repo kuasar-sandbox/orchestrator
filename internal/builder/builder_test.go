@@ -305,6 +305,47 @@ func TestUploadImageReusesBaseImageRef(t *testing.T) {
 	}
 }
 
+func TestPrepareBundleTemplateBaseUsesPublishedManifest(t *testing.T) {
+	ref := "manifest://" + strings.Repeat("a", 64)
+	p := &buildPipeline{
+		spec:         &configsock.BuildSpec{CheckpointMode: "bundle"},
+		imagePath:    "/build/image.img",
+		baseImageRef: ref,
+		baseRef:      "file:///build/image.img@sha256:" + strings.Repeat("b", 64),
+	}
+	if err := p.prepareBundleTemplateBase(); err != nil {
+		t.Fatal(err)
+	}
+	if p.baseRef != ref {
+		t.Fatalf("Bundle template base = %q, want %q", p.baseRef, ref)
+	}
+}
+
+func TestPrepareBundleTemplateBaseLeavesOtherBaseStrategies(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mode      string
+		imagePath string
+	}{
+		{name: "tarstream", mode: "local", imagePath: "/build/image.img"},
+		{name: "already remote", mode: "bundle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const base = "manifest://existing-base"
+			p := &buildPipeline{
+				spec: &configsock.BuildSpec{CheckpointMode: test.mode}, imagePath: test.imagePath,
+				baseImageRef: "manifest://" + strings.Repeat("a", 64), baseRef: base,
+			}
+			if err := p.prepareBundleTemplateBase(); err != nil {
+				t.Fatal(err)
+			}
+			if p.baseRef != base {
+				t.Fatalf("base = %q, want unchanged %q", p.baseRef, base)
+			}
+		})
+	}
+}
+
 func TestRootDocKeepsExplicitOverlayChain(t *testing.T) {
 	p := &buildPipeline{
 		baseRef:             "manifest://base",
