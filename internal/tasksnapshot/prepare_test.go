@@ -211,6 +211,13 @@ func TestPrepareMalformedBundleMetadataFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRootBundleRefsManifestRootUsesStoreClosure(t *testing.T) {
+	refs, err := rootBundleRefs("manifest://"+strings.Repeat("a", 64), "", nil)
+	if err != nil || len(refs) != 0 {
+		t.Fatalf("manifest Store root Bundle refs = %#v, %v", refs, err)
+	}
+}
+
 func TestPrepareTruncatedBundleAfterValidMetadataFailsClosed(t *testing.T) {
 	rootPath, _, manifestConfig := writeTaskManifestBundle(t, t.TempDir(),
 		[]string{"file://" + strings.Repeat("1", 64) + ".bundle"}, "boot: {}\n")

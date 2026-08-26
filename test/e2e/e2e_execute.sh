@@ -2234,6 +2234,12 @@ PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
     || fail "promoted Bundle root is unreadable from Store"
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_STORE_RESTORE_$RANDOM"
+wait_sandbox_state "$SID" running 20 || fail "exact-uploaded Bundle C did not restore from Store"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-store-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
 unset EXEC_TOKEN
 echo "==> PASS: checkpoint.mode=bundle drove A->B->C restore, flat sibling refs, exact promotion, and remote read"

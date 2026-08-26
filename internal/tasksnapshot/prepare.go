@@ -291,6 +291,9 @@ func rootBundleRefs(root, relativeDir string, locations rtconfig.RefLocations) (
 
 func rootFilePath(root, relativeDir string, locations rtconfig.RefLocations) (string, bool, error) {
 	if strings.HasPrefix(root, "manifest://") {
+		// bundle/refs is deployment metadata, not a Store object. Exact Bundle
+		// upload publishes the complete logical Manifest closure, so a Store
+		// root is intentionally Store-only and has no Bundle locations to add.
 		return "", false, nil
 	}
 	if strings.HasPrefix(root, "file://") {
