@@ -219,6 +219,10 @@ func testBootstrap(t *testing.T) *componentexec.Bootstrap {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity, err := componentexec.CurrentExecutableIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Stat(executable)
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +242,8 @@ func testBootstrap(t *testing.T) *componentexec.Bootstrap {
 	return &componentexec.Bootstrap{
 		Component: componentexec.ComponentConductor, Role: componentexec.RoleConductor,
 		NodeCtlExecutable: "/bin/true", ComponentExecutable: executable,
-		Config: mustJSON(t, cfg),
+		ComponentIdentity: identity,
+		Config:            mustJSON(t, cfg),
 	}
 }
 

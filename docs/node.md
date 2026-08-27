@@ -453,8 +453,9 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 运维入口保持不变：`node-ctl conductor serve --config ...` 先严格解析并默认化 YAML。
 `paths.conductor_executable` 为空时进入内置 App；非空时 node-ctl 打开 protected absolute
 executable，依据该 FD 校验 owner/mode/file identity，并通过 `/proc/self/fd` 执行同一文件，
-不在校验后重新解析可替换的 pathname；随后以 sealed memfd 传递版本化 bootstrap，并用
-`exec` 原地替换为 xconductor。
+不在校验后重新解析可替换的 pathname；sealed bootstrap 同时记录该已打开文件的 device/inode，
+xconductor 只将它与 `/proc/self/exe` 比较，部署期间 pathname 被替换或删除不会改变已验证身份。
+随后 node-ctl 用 `exec` 原地替换为 xconductor。
 bootstrap 环境变量只含 FD 编号；配置正文/摘要在 memfd 中，FD 禁止 write/grow/shrink 并
 最终 seal。xconductor 直接运行、bootstrap 缺失/截断/超限/version/digest/component 不匹配
 均 fail closed。这个交接用于进程组织和防误用，不宣称抵抗同 UID 恶意进程。

@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	helperEnvironment          = "KUASAR_COMPONENTEXEC_TEST_HELPER"
-	helperComponentEnvironment = "KUASAR_COMPONENTEXEC_TEST_COMPONENT"
+	helperEnvironment            = "KUASAR_COMPONENTEXEC_TEST_HELPER"
+	helperComponentEnvironment   = "KUASAR_COMPONENTEXEC_TEST_COMPONENT"
+	helperReplacementEnvironment = "KUASAR_COMPONENTEXEC_TEST_REPLACE"
 )
 
 func TestMain(m *testing.M) {
@@ -44,6 +45,21 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(94)
 		}
+		if os.Getenv(helperReplacementEnvironment) == "1" {
+			component := os.Getenv(helperComponentEnvironment)
+			if err := os.Rename(component, component+".validated"); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(95)
+			}
+			if err := os.WriteFile(component, []byte("replacement"), 0o500); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(96)
+			}
+		}
+		if err := VerifyCurrentExecutable(bootstrap.ComponentIdentity); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(97)
+		}
 		argvOrEnvironmentContainsConfig := strings.Contains(
 			strings.Join(os.Environ(), "\x00")+"\x00"+strings.Join(os.Args, "\x00"),
 			"top-secret-bootstrap-value",
@@ -55,6 +71,15 @@ func TestMain(m *testing.M) {
 }
 
 func TestExecReplacesProcessAndKeepsConfigOutOfEnvironment(t *testing.T) {
+	testExecReplacesProcess(t, false)
+}
+
+func TestExecIdentitySurvivesComponentPathReplacement(t *testing.T) {
+	testExecReplacesProcess(t, true)
+}
+
+func testExecReplacesProcess(t *testing.T, replaceComponentPath bool) {
+	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +88,9 @@ func TestExecReplacesProcessAndKeepsConfigOutOfEnvironment(t *testing.T) {
 	copyComponentExecutable(t, executable, component)
 	command := exec.Command(executable, "-test.run=^$")
 	command.Env = append(os.Environ(), helperEnvironment+"=dispatch", helperComponentEnvironment+"="+component)
+	if replaceComponentPath {
+		command.Env = append(command.Env, helperReplacementEnvironment+"=1")
+	}
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -137,6 +165,11 @@ func TestReceiveRejectsMalformedBootstrap(t *testing.T) {
 		"bad schema":    func() []byte { value := base; value.ConfigSchemaVersion++; return marshalEnvelope(t, value) },
 		"bad component": func() []byte { value := base; value.Component = ComponentProxy; return marshalEnvelope(t, value) },
 		"bad role":      func() []byte { value := base; value.Role = RoleMaster; return marshalEnvelope(t, value) },
+		"bad identity": func() []byte {
+			value := base
+			value.ComponentIdentity = ExecutableIdentity{}
+			return marshalEnvelope(t, value)
+		},
 		"digest mismatch": func() []byte {
 			value := base
 			value.ConfigDigest = strings.Repeat("0", sha256.Size*2)
@@ -254,11 +287,15 @@ func TestExecRejectsInvalidEnvelopeInputsBeforeCreatingHandoff(t *testing.T) {
 }
 
 func TestVerifyCurrentExecutableRejectsDifferentFile(t *testing.T) {
-	different := filepath.Join(t.TempDir(), "different-component")
-	if err := os.WriteFile(different, []byte("different"), 0o500); err != nil {
+	identity, err := CurrentExecutableIdentity()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyCurrentExecutable(different); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err := VerifyCurrentExecutable(identity); err != nil {
+		t.Fatalf("VerifyCurrentExecutable current error=%v", err)
+	}
+	identity.Inode++
+	if err := VerifyCurrentExecutable(identity); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("VerifyCurrentExecutable error=%v", err)
 	}
 }
@@ -288,7 +325,8 @@ func envelopeForConfig(config json.RawMessage) envelope {
 		Component: ComponentConductor, Role: RoleConductor,
 		ConfigSchemaVersion: configSchemaVersion,
 		NodeCtlExecutable:   "/usr/bin/node-ctl", ComponentExecutable: "/opt/bin/xconductor",
-		Config: config, ConfigDigest: hex.EncodeToString(digest[:]),
+		ComponentIdentity: ExecutableIdentity{Device: 1, Inode: 1},
+		Config:            config, ConfigDigest: hex.EncodeToString(digest[:]),
 	}
 }
 

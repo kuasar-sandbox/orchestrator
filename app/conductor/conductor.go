@@ -21,7 +21,6 @@ import (
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
-	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -171,7 +170,7 @@ func (a *App) RunContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := componentexec.VerifyCurrentExecutable(bootstrap.ComponentExecutable); err != nil {
+	if err := componentexec.VerifyCurrentExecutable(bootstrap.ComponentIdentity); err != nil {
 		return err
 	}
 	var cfg publicconfig.Conductor
@@ -182,10 +181,6 @@ func (a *App) RunContext(ctx context.Context) error {
 	if immutableExecutable == "" || immutableExecutable != bootstrap.ComponentExecutable {
 		return fmt.Errorf("custom conductor bootstrap executable does not match config")
 	}
-	if err := configresolve.ValidateComponentExecutable(immutableExecutable, bootstrap.NodeCtlExecutable); err != nil {
-		return fmt.Errorf("paths.conductor_executable: %w", err)
-	}
-
 	runtimeBindings := &Runtime{}
 	if a.hooks.Configure != nil {
 		if err := a.hooks.Configure(ctx, &cfg, runtimeBindings); err != nil {

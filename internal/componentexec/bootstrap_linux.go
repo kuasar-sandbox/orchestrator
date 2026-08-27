@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -54,19 +55,29 @@ type Bootstrap struct {
 	Role                Role
 	NodeCtlExecutable   string
 	ComponentExecutable string
+	ComponentIdentity   ExecutableIdentity
 	Config              json.RawMessage
 }
 
+// ExecutableIdentity is the stable Linux file identity of the component that
+// node-ctl opened, validated, and executed. It lets the receiving App verify
+// /proc/self/exe without resolving the mutable configured pathname again.
+type ExecutableIdentity struct {
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
 type envelope struct {
-	Magic               string          `json:"magic"`
-	ProtocolVersion     int             `json:"protocolVersion"`
-	Component           Component       `json:"component"`
-	Role                Role            `json:"role"`
-	ConfigSchemaVersion int             `json:"configSchemaVersion"`
-	NodeCtlExecutable   string          `json:"nodeCtlExecutable"`
-	ComponentExecutable string          `json:"componentExecutable"`
-	Config              json.RawMessage `json:"config"`
-	ConfigDigest        string          `json:"configDigest"`
+	Magic               string             `json:"magic"`
+	ProtocolVersion     int                `json:"protocolVersion"`
+	Component           Component          `json:"component"`
+	Role                Role               `json:"role"`
+	ConfigSchemaVersion int                `json:"configSchemaVersion"`
+	NodeCtlExecutable   string             `json:"nodeCtlExecutable"`
+	ComponentExecutable string             `json:"componentExecutable"`
+	ComponentIdentity   ExecutableIdentity `json:"componentIdentity"`
+	Config              json.RawMessage    `json:"config"`
+	ConfigDigest        string             `json:"configDigest"`
 }
 
 // ErrNoBootstrap reports that a custom App was executed directly rather than
@@ -90,6 +101,10 @@ func Exec(component Component, role Role, nodeCtlExecutable, componentExecutable
 		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
 	}
 	defer componentFile.Close()
+	componentIdentity, err := executableIdentity(componentFile)
+	if err != nil {
+		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
+	}
 	if err := verifyNodeCtlExecutable(nodeCtlExecutable); err != nil {
 		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
 	}
@@ -112,6 +127,7 @@ func Exec(component Component, role Role, nodeCtlExecutable, componentExecutable
 		ConfigSchemaVersion: configSchemaVersion,
 		NodeCtlExecutable:   nodeCtlExecutable,
 		ComponentExecutable: componentExecutable,
+		ComponentIdentity:   componentIdentity,
 		Config:              rawConfig,
 		ConfigDigest:        hex.EncodeToString(digest[:]),
 	})
@@ -254,6 +270,9 @@ func Receive(wantComponent Component, wantRole Role) (*Bootstrap, error) {
 	if !filepath.IsAbs(encoded.NodeCtlExecutable) || !filepath.IsAbs(encoded.ComponentExecutable) {
 		return nil, fmt.Errorf("component bootstrap: executable paths must be absolute")
 	}
+	if !encoded.ComponentIdentity.valid() {
+		return nil, fmt.Errorf("component bootstrap: invalid component executable identity")
+	}
 	wantDigest, err := hex.DecodeString(encoded.ConfigDigest)
 	if err != nil || len(wantDigest) != sha256.Size {
 		return nil, fmt.Errorf("component bootstrap: invalid config digest")
@@ -271,6 +290,7 @@ func Receive(wantComponent Component, wantRole Role) (*Bootstrap, error) {
 		Role:                encoded.Role,
 		NodeCtlExecutable:   encoded.NodeCtlExecutable,
 		ComponentExecutable: encoded.ComponentExecutable,
+		ComponentIdentity:   encoded.ComponentIdentity,
 		Config:              configCopy,
 	}, nil
 }
@@ -279,23 +299,59 @@ func Receive(wantComponent Component, wantRole Role) (*Bootstrap, error) {
 // selected and validated by node-ctl. This is misuse protection and process
 // organization, not authentication against another process running as the same
 // operating-system user.
-func VerifyCurrentExecutable(expected string) error {
-	current, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("component bootstrap: resolve current executable: %w", err)
+func VerifyCurrentExecutable(expected ExecutableIdentity) error {
+	if !expected.valid() {
+		return fmt.Errorf("component bootstrap: invalid selected component identity")
 	}
-	currentInfo, err := os.Stat(current)
+	currentIdentity, err := currentExecutableIdentity()
 	if err != nil {
-		return fmt.Errorf("component bootstrap: stat current executable: %w", err)
+		return fmt.Errorf("component bootstrap: identify current executable: %w", err)
 	}
-	expectedInfo, err := os.Stat(expected)
-	if err != nil {
-		return fmt.Errorf("component bootstrap: stat selected executable: %w", err)
-	}
-	if !os.SameFile(currentInfo, expectedInfo) {
+	if currentIdentity != expected {
 		return fmt.Errorf("component bootstrap: current executable does not match selected component")
 	}
 	return nil
+}
+
+// CurrentExecutableIdentity returns the file identity used by
+// VerifyCurrentExecutable. It is primarily useful to construct in-process App
+// test bootstraps; production dispatch records identity from the validated FD.
+func CurrentExecutableIdentity() (ExecutableIdentity, error) {
+	return currentExecutableIdentity()
+}
+
+func currentExecutableIdentity() (ExecutableIdentity, error) {
+	fd, err := unix.Open("/proc/self/exe", unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return ExecutableIdentity{}, fmt.Errorf("component bootstrap: open current executable: %w", err)
+	}
+	current := os.NewFile(uintptr(fd), "/proc/self/exe")
+	if current == nil {
+		_ = unix.Close(fd)
+		return ExecutableIdentity{}, fmt.Errorf("component bootstrap: open current executable: invalid descriptor")
+	}
+	defer current.Close()
+	return executableIdentity(current)
+}
+
+func executableIdentity(file *os.File) (ExecutableIdentity, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return ExecutableIdentity{}, fmt.Errorf("identify executable: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ExecutableIdentity{}, fmt.Errorf("identify executable: Linux file identity is unavailable")
+	}
+	identity := ExecutableIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+	if !identity.valid() {
+		return ExecutableIdentity{}, fmt.Errorf("identify executable: invalid Linux file identity")
+	}
+	return identity, nil
+}
+
+func (i ExecutableIdentity) valid() bool {
+	return i.Inode != 0
 }
 
 // ClearEnvironment removes a stale top-level bootstrap descriptor from a
