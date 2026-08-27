@@ -59,14 +59,15 @@ external 模式由一个 proxy master 进程启动:
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模式不作为运维接口。
+`node-ctl` 运行内置 master，或按 `paths.proxy_executable` 原地 exec 静态定制 master；master
+始终 reexec 自己当前的 executable 启动 worker。内部 worker 模式不作为运维接口。
 
 `proxy.yaml` 字段:
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
-| `paths.proxy_executable` | 空 | 静态定制 external proxy master 的绝对 executable；空使用内置实现。node-ctl 拒绝非 regular/non-executable、与自身同一文件和 group/world-writable 文件；公共 App/worker 交接由 #244 的 proxy 阶段提供 |
+| `paths.proxy_executable` | 空 | 静态定制 external proxy master 的绝对 executable；空使用内置实现。node-ctl 拒绝非 regular/non-executable、与自身同一文件和 group/world-writable 文件；只用于 node-ctl → master，不用于选择 worker executable |
 | `paths.run_root` | (必填) | 本机 sandbox 运行目录根;external worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
@@ -83,6 +84,57 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 `proxy.yaml` 不含 `mmds_listen` 或 `services`:两者唯一来源是 conductor
 `mmds.listen` / `mmds.services`,经可信 plugin registration 的 `Hello{Policy}` 下发。
 
+### 2.1 静态定制 external proxy
+
+运维入口仍只有 `node-ctl proxy serve --config ...`。`paths.proxy_executable` 非空时，node-ctl
+先严格解析/default 配置并校验 protected absolute executable，再把公共 `config.Proxy` 的
+bootstrap snapshot 写入有大小上限且禁止 write/grow/shrink 的 sealed memfd；环境变量只传
+FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已验证的同一打开文件原地 exec
+xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
+不匹配均 fail closed；这是进程组织和防误用，不是抵抗同 UID 恶意进程的密码学认证。
+
+可编译示例见 `examples/custom-proxy`：
+
+```go
+app := proxy.New(proxy.Hooks{
+    Configure: func(ctx context.Context, cfg *proxy.Config) error {
+        // master-only declarative override
+        return nil
+    },
+    BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
+        // bind process-local logger / TLS provider
+        return nil
+    },
+})
+if err := app.Run(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`New` 无副作用；`Run` one-shot、处理 SIGINT/SIGTERM且不调用 `os.Exit`，上层托管可用
+`RunContext`。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
+`paths.proxy_executable` 未改变 → final validation → 再 deep-clone/canonical serialize/digest
+冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Hook、provider 或 final validation
+失败时尚未创建 SHM、listener、routesync session 或 worker。
+
+worker 固定由 master 的 `/proc/self/exe` reexec：内置 master 得到 node-ctl worker，custom master
+得到 xproxy worker，配置中的 executable 不参与选择。master 通过另一 sealed memfd 传递 frozen
+EffectiveConfig、digest、worker id/epoch、FD protocol/mapping 与当前 executable identity；listener、
+wake/notify、stats、MMDS RPC 等作为继承 FD 传入。worker 严格验证后调用
+`BindRuntime(worker)`，完成 stats hello/ready 与初始 route-table sync 后才 Serve。worker 从不读取
+`proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响 replacement worker。
+
+公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，V1 仅开放 logger
+和启动期 TLS material provider；provider 返回 certificate chain、`crypto.Signer` 与可选 client
+CA pool，不能替换任意 `*tls.Config`。provider 非 nil 即为权威来源，错误不回退 cert/key 文件；
+最低 TLS version、HTTP/2 ALPN 与 client-auth 策略仍由 core 固定。V1 不支持配置或材料热更新，
+custom component 与 node-ctl 必须来自兼容版本。
+
+该 API 只对应 external proxy，不为 `proxy.mode=internal` 增加 factory；也不开放 Router、SHM、
+listener、routesync、stats、dial target 或 credential records，不引入 Go plugin、运行时发现、
+middleware、生命周期 hook、通用 secret resolver 或 DI container。`node-ctl config proxy` 只做
+bootstrap 配置诊断，绝不执行 xproxy 或调用 Runtime provider。
+
 ## 3. 部署模式
 
 `proxy.mode` 选择 conductor 如何装配数据面:
@@ -95,7 +147,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 
 `app/conductor` 的静态定制不增加 internal proxy factory 或数据面 Hook：
 `proxy.mode=internal` 始终装配上游标准 proxy。只有 external proxy 才有独立 executable/App
-入口；其 master/worker 定制合同见本提案的 external-proxy 阶段。
+入口；其 master/worker 定制合同见 §2.1。
 
 external 拓扑:
 
@@ -297,9 +349,9 @@ TTY 模式中 stdin/stdout/stderr flags 沿用 ctl wire 的 ignored 语义,view 
 语义,不会因 flags 同时出现而拒绝合法请求.条件或结构 gate 失败不改变 parking/activity,
 不启动 guest child;因此也不会使 paused sandbox 恢复.
 
-internal 模式的 `run_root` 取自 conductor `paths.run_root`;external 模式的
-worker 直接读取自身 `proxy.yaml` 必填的 `paths.run_root`.该值应与同节点
-conductor 的 `paths.run_root` 一致.routesync `Policy` 和共享路由视图只提供
+internal 模式的 `run_root` 取自 conductor `paths.run_root`;external 模式的 worker 从
+master 冻结的 EffectiveConfig 取得 `proxy.yaml` 中必填的 `paths.run_root`，不重新读取文件。
+该值应与同节点 conductor 的 `paths.run_root` 一致.routesync `Policy` 和共享路由视图只提供
 路由,凭据及鉴权策略,不投影 `ctl.sock` 路径.
 
 共享的 sandboxer tunnel helper 不理解 KAT、CEL、route 或 lifecycle;它只冻结 callback 顺序、
@@ -313,8 +365,8 @@ KAT 在 CONNECT admission 时校验,并在首帧授权时重新检查 expiry;进
 可以建立多条独立 CONNECT.每条 tunnel 只承载一个 ctl exec session,不复用 backend 连接;
 新 CONNECT 在 route 切换后自动进入当前 NodeSandboxID,已建立 tunnel 不迁移.
 
-external worker 同样在本进程执行上述完整 token + request + backend gate,用
-`proxy.yaml` 的 `paths.run_root` 构造 `ctl.sock` 路径.路径和 CEL programs 不经 routesync
+external worker 同样在本进程执行上述完整 token + request + backend gate,用 frozen
+EffectiveConfig 的 `paths.run_root` 构造 `ctl.sock` 路径.路径和 CEL programs 不经 routesync
 `Policy`,SHM 记录或 conductor proxyForwarder 投影;proxyForwarder 仅透传同一 exec target、
 客户端 KAT 和字节流,不解析 KAT/CEL/ExecRequest.
 
@@ -364,7 +416,7 @@ access-token hash;`mmds.routes.enabled=true` 还开放显式声明的 static/sec
 exact route。internal 模式由 conductor 进程内 handler 直接读取 sqlite/service registry;
 external 模式由 worker 承载 HTTP,master 提供有界 route view。配置 `proxy_netns` 时,
 conductor 的 `mmds.listen` 在该 netns 绑定;external master 把同一个 listener fd 传给
-所有 worker,worker 不读取第二份 MMDS YAML。
+所有 worker；worker 不读取任何 proxy/MMDS YAML。
 
 ```text
 guest envd

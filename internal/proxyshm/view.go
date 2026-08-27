@@ -655,17 +655,55 @@ var _ proxy.ExecRouter = (*WorkerView)(nil)
 
 // Updates converts a notification pipe into local waitable revisions.
 type Updates struct {
-	mu  sync.Mutex
-	rev uint64
-	ch  chan struct{}
+	mu        sync.Mutex
+	rev       uint64
+	ch        chan struct{}
+	file      *os.File
+	stopRead  *os.File
+	stopWrite *os.File
+	done      chan struct{}
+	stopOnce  sync.Once
+	fileOnce  sync.Once
+	closeErr  error
 }
 
-func NewUpdatesFromFD(fd int) *Updates {
-	u := &Updates{ch: make(chan struct{})}
-	if fd >= 0 {
-		go u.readLoop(os.NewFile(uintptr(fd), "proxy-notify"))
+// NewUpdatesFromFD takes ownership of fd and starts one cancellable reader.
+func NewUpdatesFromFD(fd int) (*Updates, error) {
+	u := &Updates{ch: make(chan struct{}), done: make(chan struct{})}
+	if fd < 0 {
+		close(u.done)
+		return u, nil
 	}
-	return u
+	u.file = os.NewFile(uintptr(fd), "proxy-notify")
+	if u.file == nil {
+		return nil, errors.New("proxyshm: invalid notify descriptor")
+	}
+	stopRead, stopWrite, err := os.Pipe()
+	if err != nil {
+		_ = u.file.Close()
+		return nil, err
+	}
+	u.stopRead = stopRead
+	u.stopWrite = stopWrite
+	go u.readLoop()
+	return u, nil
+}
+
+// Close releases the notification descriptor and waits for the reader
+// goroutine. It is safe to call more than once.
+func (u *Updates) Close() error {
+	if u == nil {
+		return nil
+	}
+	u.stopOnce.Do(func() {
+		if u.stopWrite != nil {
+			_ = u.stopWrite.Close()
+			u.stopWrite = nil
+		}
+	})
+	<-u.done
+	u.closeFile()
+	return u.closeErr
 }
 
 func (u *Updates) Wait(ctx context.Context, deadline time.Time, changed func() bool) bool {
@@ -687,15 +725,48 @@ func (u *Updates) Wait(ctx context.Context, deadline time.Time, changed func() b
 	}
 }
 
-func (u *Updates) readLoop(f *os.File) {
-	defer f.Close()
+func (u *Updates) readLoop() {
+	defer close(u.done)
+	files := []unix.PollFd{
+		{Fd: int32(u.file.Fd()), Events: unix.POLLIN},
+		{Fd: int32(u.stopRead.Fd()), Events: unix.POLLIN},
+	}
 	buf := make([]byte, 256)
 	for {
-		if _, err := f.Read(buf); err != nil {
+		_, err := unix.Poll(files, -1)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil || files[1].Revents != 0 {
 			return
 		}
-		u.bump()
+		if files[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return
+		}
+		if files[0].Revents&unix.POLLIN == 0 {
+			continue
+		}
+		count, err := unix.Read(int(u.file.Fd()), buf)
+		if count > 0 {
+			u.bump()
+		}
+		if err != nil && !errors.Is(err, unix.EINTR) {
+			return
+		}
 	}
+}
+
+func (u *Updates) closeFile() {
+	u.fileOnce.Do(func() {
+		u.closeErr = errors.Join(closeOSFile(u.file), closeOSFile(u.stopRead), closeOSFile(u.stopWrite))
+	})
+}
+
+func closeOSFile(file *os.File) error {
+	if file == nil {
+		return nil
+	}
+	return file.Close()
 }
 
 func (u *Updates) bump() {
