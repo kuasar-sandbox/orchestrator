@@ -131,16 +131,16 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	process := worker.process
 	logger := runtime.Logger
 
-	notifyFD := int(worker.notifyFile.Fd())
-	worker.notifyFile = nil // Updates now owns this inherited descriptor.
-	updates, err := proxyshm.NewUpdatesFromFD(notifyFD)
+	notifyFile := worker.notifyFile
+	worker.notifyFile = nil // Updates now owns this inherited descriptor and wrapper.
+	updates, err := proxyshm.NewUpdatesFromFile(notifyFile)
 	if err != nil {
 		return fmt.Errorf("proxy worker: open notify descriptor: %w", err)
 	}
 	defer updates.Close()
-	wakeFD := int(worker.wakeFile.Fd())
-	worker.wakeFile = nil // WakeWriter now owns this inherited descriptor.
-	wakes := proxyshm.NewWakeWriterFromFD(wakeFD)
+	wakeFile := worker.wakeFile
+	worker.wakeFile = nil // WakeWriter now owns this inherited descriptor and wrapper.
+	wakes := proxyshm.NewWakeWriterFromFile(wakeFile)
 	if wakes == nil {
 		return fmt.Errorf("proxy worker: missing wake descriptor")
 	}

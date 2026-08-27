@@ -669,15 +669,26 @@ type Updates struct {
 
 // NewUpdatesFromFD takes ownership of fd and starts one cancellable reader.
 func NewUpdatesFromFD(fd int) (*Updates, error) {
-	u := &Updates{ch: make(chan struct{}), done: make(chan struct{})}
 	if fd < 0 {
+		return NewUpdatesFromFile(nil)
+	}
+	file := os.NewFile(uintptr(fd), "proxy-notify")
+	if file == nil {
+		return nil, errors.New("proxyshm: invalid notify descriptor")
+	}
+	return NewUpdatesFromFile(file)
+}
+
+// NewUpdatesFromFile takes ownership of file and starts one cancellable reader.
+// Accepting the existing *os.File preserves its finalizer ownership; callers
+// must not wrap the same descriptor in a second *os.File.
+func NewUpdatesFromFile(file *os.File) (*Updates, error) {
+	u := &Updates{ch: make(chan struct{}), done: make(chan struct{})}
+	if file == nil {
 		close(u.done)
 		return u, nil
 	}
-	u.file = os.NewFile(uintptr(fd), "proxy-notify")
-	if u.file == nil {
-		return nil, errors.New("proxyshm: invalid notify descriptor")
-	}
+	u.file = file
 	stopRead, stopWrite, err := os.Pipe()
 	if err != nil {
 		_ = u.file.Close()
@@ -787,7 +798,16 @@ func NewWakeWriterFromFD(fd int) *WakeWriter {
 	if fd < 0 {
 		return nil
 	}
-	return &WakeWriter{f: os.NewFile(uintptr(fd), "proxy-wake")}
+	return NewWakeWriterFromFile(os.NewFile(uintptr(fd), "proxy-wake"))
+}
+
+// NewWakeWriterFromFile takes ownership of file. Callers must not wrap its
+// descriptor in another *os.File.
+func NewWakeWriterFromFile(file *os.File) *WakeWriter {
+	if file == nil {
+		return nil
+	}
+	return &WakeWriter{f: file}
 }
 
 func (w *WakeWriter) Close() error {
