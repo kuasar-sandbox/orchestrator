@@ -110,7 +110,7 @@ type Runtime struct {
 
 // MarshalJSON rejects accidental process-runtime serialization. Runtime
 // providers and handles must never enter a component or worker snapshot.
-func (*Runtime) MarshalJSON() ([]byte, error) {
+func (Runtime) MarshalJSON() ([]byte, error) {
 	return nil, fmt.Errorf("conductor Runtime is process-local and cannot be serialized")
 }
 

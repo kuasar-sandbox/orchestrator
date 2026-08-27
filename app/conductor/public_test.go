@@ -21,8 +21,10 @@ func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
 	if app == nil {
 		t.Fatal("New returned nil")
 	}
-	if _, err := json.Marshal(&conductor.Runtime{}); err == nil {
-		t.Fatal("process-local Runtime was serializable")
+	for _, runtime := range []any{conductor.Runtime{}, &conductor.Runtime{}} {
+		if _, err := json.Marshal(runtime); err == nil {
+			t.Fatalf("process-local Runtime %T was serializable", runtime)
+		}
 	}
 
 	seen := map[reflect.Type]bool{}
