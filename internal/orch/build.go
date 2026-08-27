@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
@@ -52,7 +53,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		o.recordRegistrationRejection("systemd_encoding")
 		return nil, fmt.Errorf("%w: build resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
 	}
-	executionLimit, err := o.cfg.Builder.ExecutionLimit()
+	executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +138,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
 	}
 	b.RegistrationMMDSRoutesDigest = routesDigest
-	registrationLimit, err := o.cfg.Builder.RegistrationLimit()
+	registrationLimit, err := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +322,7 @@ func (o *Orchestrator) validateBuildPhaseResources(raw string) error {
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	_, err = sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node:                     o.cfg.Sandbox.Resources.Policy(),
+		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
 		Patch:                    patch,
 		Dynamic:                  dynamic,
 		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
@@ -553,7 +554,7 @@ func (o *Orchestrator) templateBuild(ctx context.Context, apiKey, ref string) *t
 // fit the current configuration is terminally rejected so it cannot block the
 // FIFO head forever after an operator tightens limits.
 func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
-	executionLimit, err := o.cfg.Builder.ExecutionLimit()
+	executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		o.log.Error("builder scheduler disabled", "err", err)
 		return
@@ -1267,7 +1268,7 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build) (sandboxcfg.San
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node:                     o.cfg.Sandbox.Resources.Policy(),
+		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
 		Patch:                    spec.Resource,
 		Dynamic:                  dynamic,
 		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
@@ -1643,9 +1644,9 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			Runtime:        o.cfg.Sandbox.Boot.Runtime,
 			OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 			BuilderDiffTpl: o.cfg.Builder.DiffTemplate,
-			SandboxCtl:     o.cfg.SandboxCtl(),
-			FlattenCtl:     o.cfg.FlattenCtl(),
-			ManifestCtl:    o.cfg.ManifestCtl(),
+			SandboxCtl:     o.executables.SandboxCtl(),
+			FlattenCtl:     o.executables.FlattenCtl(),
+			ManifestCtl:    o.executables.ManifestCtl(),
 			ManifestConfig: o.cfg.ManifestConfig,
 		},
 		Net: configsock.BuildNet{

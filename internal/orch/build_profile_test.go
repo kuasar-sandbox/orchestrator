@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -356,7 +357,7 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cfg.Builder.Referer.Enabled = false
-	o.cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.NodeResourcePolicy{
+	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
 		Capacity:    sandboxcfg.NodeCapacityPolicy{CPU: 1, Memory: "512MiB"},
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "256MiB"},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "32MiB"},
@@ -479,7 +480,7 @@ func TestPublishBuildStateRequiredDoesNotTreatStoreFailureAsDirectBuild(t *testi
 func TestIMGCreateDoesNotInheritBuildPhaseResourcePatch(t *testing.T) {
 	policy := sandboxcfg.NodeResourcePolicy{}
 	policy.ApplyDefaults()
-	cfg := &config.Config{Sandbox: config.SandboxConfig{Resources: config.ResourcesConfig(policy)}}
+	cfg := &config.Config{Sandbox: config.SandboxConfig{Resources: configresolve.PublicSandboxResources(policy)}}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
 	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
 	o.vs = blocked

@@ -12,6 +12,10 @@ config_socket: /run/sandbox/node-ctl.socket
 # Sandbox runtime root. Workers use <run_root>/<sid>/ctl.sock for native exec.
 # Configure this locally on the proxy; it is not projected over route sync.
 paths:
+  # Optional statically customized external-proxy App contract. The #244 proxy
+  # App stage uses it only for node-ctl -> master dispatch; workers reexec the
+  # master executable.
+  # proxy_executable: /opt/kuasar/bin/xproxy
   run_root: /run/sandbox
 
 # Data-plane ingress. The master binds once and passes the same listener fd to all

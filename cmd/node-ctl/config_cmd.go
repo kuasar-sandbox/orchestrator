@@ -1,15 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,6 +50,9 @@ func configCmd(args []string, _ *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if bytes.HasPrefix(output, []byte("# node-ctl bootstrap configuration is valid;")) {
+		_, _ = fmt.Fprintln(os.Stderr, "node-ctl config: bootstrap configuration is valid; final validation is performed by the custom component")
+	}
 	if *out != "" {
 		return os.WriteFile(*out, output, 0o644)
 	}
@@ -66,11 +70,18 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 	if path == "" {
 		return nil, fmt.Errorf("config conductor: --config <file> or --template required")
 	}
-	cfg, err := config.Load(path) // applies defaults + validates
+	cfg, err := config.LoadConductor(path) // applies defaults + bootstrap validation
 	if err != nil {
 		return nil, err
 	}
-	cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.MaterializedNodeResourcePolicy(cfg.Sandbox.Resources.Policy()))
+	executables, err := configresolve.CurrentExecutables()
+	if err != nil {
+		return nil, err
+	}
+	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ConductorExecutable, executables.OrchestratorCtl()); err != nil {
+		return nil, fmt.Errorf("paths.conductor_executable: %w", err)
+	}
+	cfg.Sandbox.Resources = configresolve.MaterializedSandboxResources(cfg.Sandbox.Resources)
 	if resolve && cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
 		r, rerr := nodectl.Resolve(cfg.ResourceListen)
 		if rerr != nil {
@@ -80,7 +91,14 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 		cfg.ResourceListen.Resources.PhysicalMemory = strconv.FormatUint(r.PhysicalMemory, 10)
 		cfg.ResourceListen.Resources.PhysicalCPU = strconv.Itoa(int(r.PhysicalCPU / 1000))
 	}
-	return yaml.Marshal(cfg)
+	output, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Paths.ConductorExecutable != "" {
+		output = append([]byte("# node-ctl bootstrap configuration is valid; the custom conductor App performs final validation.\n"), output...)
+	}
+	return output, nil
 }
 
 // renderProxyConfig handles `config proxy`. The worker config has no auto/derived
@@ -96,7 +114,21 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return yaml.Marshal(cfg)
+	executables, err := configresolve.CurrentExecutables()
+	if err != nil {
+		return nil, err
+	}
+	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ProxyExecutable, executables.OrchestratorCtl()); err != nil {
+		return nil, fmt.Errorf("paths.proxy_executable: %w", err)
+	}
+	output, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Paths.ProxyExecutable != "" {
+		output = append([]byte("# node-ctl bootstrap configuration is valid; the custom proxy App performs final validation.\n"), output...)
+	}
+	return output, nil
 }
 
 // conductorConfigSkeleton is the commented authoring template for conductor.yaml
@@ -124,6 +156,7 @@ encryption_key: "000000000000000000000000000000000000000000000000000000000000000
 # Shared remote manifest store (manifest.key empty; the tenant key arrives via env).
 manifest_config: /opt/sandbox/manifest.yaml
 paths:
+  # conductor_executable: /opt/kuasar/bin/xconductor # optional static custom App; absolute protected executable
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
   config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + manifest-key admin + plugin + api plane (h2c)
@@ -254,6 +287,7 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 # read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 paths:
+  # proxy_executable: /opt/kuasar/bin/xproxy         # optional static custom App; absolute protected executable
   run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + conductor MMDS listen; "" = current netns

@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -289,7 +290,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	// exact retry after an ambiguous/lost ACK must still reach the store's
 	// transactional immutable comparison and return the persisted result.
 	if existing == nil {
-		executionLimit, err := o.cfg.Builder.ExecutionLimit()
+		executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 		if err != nil {
 			return err
 		}
@@ -298,7 +299,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 			return fmt.Errorf("%w: build resources cannot fit builder.admission.execution", api.ErrBadRequest)
 		}
 	}
-	registrationLimit, err := o.cfg.Builder.RegistrationLimit()
+	registrationLimit, err := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
 	if err != nil {
 		return err
 	}
@@ -548,8 +549,8 @@ const nodectlZoneGreen = "green"
 // §5.1): sandbox capacity, both build admission limits, and the guest runtime
 // identity used by placement.
 func (o *Orchestrator) ClusterNodeInfo() (capacity int, registration, execution *routesync.BuildAdmissionLimit, runtimeDigest string) {
-	registrationLimit, _ := o.cfg.Builder.RegistrationLimit()
-	executionLimit, _ := o.cfg.Builder.ExecutionLimit()
+	registrationLimit, _ := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
+	executionLimit, _ := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	registration = routesync.BuildAdmissionLimitFromTypes(registrationLimit)
 	execution = routesync.BuildAdmissionLimitFromTypes(executionLimit)
 	if dig, err := sha256File(o.runtimeFileFor(types.ProfileE2B)); err == nil {

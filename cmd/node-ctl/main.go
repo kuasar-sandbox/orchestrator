@@ -33,6 +33,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
@@ -117,6 +118,16 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	executables, err := configresolve.CurrentExecutables()
+	if err != nil {
+		return err
+	}
+	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ConductorExecutable, executables.OrchestratorCtl()); err != nil {
+		return fmt.Errorf("paths.conductor_executable: %w", err)
+	}
+	if cfg.Paths.ConductorExecutable != "" {
+		return fmt.Errorf("custom conductor executable requires app bootstrap support")
+	}
 	// Resolve the dynamic controller endpoint and all resource policy before
 	// opening the durable store or touching systemd. The exact canonical socket
 	// identity is then shared by the controller's owner/inventory state and
@@ -131,7 +142,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
+	box, err := secretbox.NewFromColonHex(configresolve.EncryptionKeySpec(cfg))
 	if err != nil {
 		return err
 	}
@@ -153,10 +164,11 @@ func runConductor(args []string, log *slog.Logger) error {
 	plugins := configsock.NewRegistry()
 	mx := metrics.New()
 	core := orch.New(cfg, st, lc, vswitch.New(
-		cfg.ConnectorCtl(),
+		executables.ConnectorCtl(),
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log)
+	core.SetExecutables(executables)
 	core.SetMetrics(mx)
 	core.SetLifecycleContext(ctx)
 	core.SetProxyRouteBarrierCoordinator(plugins)
@@ -298,7 +310,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	if fi, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
 		diskMB = int(fi.Size() >> 20)
 	}
-	res := api.Resources{VCPU: cfg.Sandbox.Resources.Policy().Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
+	res := api.Resources{VCPU: configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
 	apiH := api.New(core, cfg.API.Domain, res, log).Handler()
 
 	// Local control socket: one UDS multiplexes run assignment/result, task specs,

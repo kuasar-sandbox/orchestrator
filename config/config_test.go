@@ -34,11 +34,11 @@ sandbox:
     kernel: /opt/sandbox/vmlinux
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `
-	defaults, err := Load(writeConfig(t, base))
+	defaults, err := LoadConductor(writeConfig(t, base))
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := defaults.Sandbox.Resources.Policy()
+	policy := defaults.Sandbox.Resources.nodeResourcePolicy()
 	if policy.Capacity.CPU != 2 || policy.Capacity.Memory != "2GiB" ||
 		policy.Allocatable.CPU != nil || policy.Allocatable.Memory != "256MiB" ||
 		policy.Startup != nil || policy.Overhead.Memory != "32MiB" || policy.WatermarkHigh == nil ||
@@ -46,7 +46,7 @@ sandbox:
 		t.Fatalf("resource defaults = %+v", policy)
 	}
 
-	configured, err := Load(writeConfig(t, `
+	configured, err := LoadConductor(writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
@@ -71,7 +71,7 @@ sandbox:
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy = configured.Sandbox.Resources.Policy()
+	policy = configured.Sandbox.Resources.nodeResourcePolicy()
 	if policy.Capacity.CPU != 4 || policy.Capacity.Memory != "8GiB" ||
 		policy.Allocatable.CPU == nil || *policy.Allocatable.CPU != 1.5 ||
 		policy.Allocatable.Memory != "512MiB" || policy.Startup == nil ||
@@ -87,15 +87,15 @@ encryption_key: test-key
 sandbox:
   boot: { kernel: /kernel, runtime: /runtime }
 `
-	defaults, err := Load(writeConfig(t, base))
+	defaults, err := LoadConductor(writeConfig(t, base))
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, err := defaults.Builder.ExecutionLimit()
+	execution, err := defaults.Builder.executionLimit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration, err := defaults.Builder.RegistrationLimit()
+	registration, err := defaults.Builder.registrationLimit()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ sandbox:
 		t.Fatalf("default limits: registration=%+v execution=%+v", registration, execution)
 	}
 
-	configured, err := Load(writeConfig(t, base+`
+	configured, err := LoadConductor(writeConfig(t, base+`
 builder:
   admission:
     execution:
@@ -115,8 +115,8 @@ builder:
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration, _ = configured.Builder.RegistrationLimit()
-	execution, _ = configured.Builder.ExecutionLimit()
+	registration, _ = configured.Builder.registrationLimit()
+	execution, _ = configured.Builder.executionLimit()
 	if registration.MaxBuilds != 0 || registration.Resources.CPU != 0 || registration.Resources.Storage != 0 || registration.Resources.Memory != 64<<30 {
 		t.Fatalf("explicit registration inherited hidden fields: %+v", registration)
 	}
@@ -159,7 +159,7 @@ builder:
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(writeConfig(t, fmt.Sprintf(base, test.body)))
+			_, err := LoadConductor(writeConfig(t, fmt.Sprintf(base, test.body)))
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want substring %q", err, test.want)
 			}
@@ -185,20 +185,20 @@ builder:
 		"memory": "        memory: 2GiB\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(writeConfig(t, base+resource))
+			_, err := LoadConductor(writeConfig(t, base+resource))
 			if err == nil || !strings.Contains(err.Error(), "units.builder_pool_size must be 0") {
 				t.Fatalf("Load error = %v, want capped-slice idle-pool rejection", err)
 			}
 		})
 	}
 
-	if _, err := Load(writeConfig(t, base+"        storage: 10GiB\n")); err != nil {
+	if _, err := LoadConductor(writeConfig(t, base+"        storage: 10GiB\n")); err != nil {
 		t.Fatalf("storage-only admission unexpectedly rejected idle pool: %v", err)
 	}
 }
 
 func TestBuilderAdmissionCPUPreservesDecimalForConservativeRounding(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
+	cfg, err := LoadConductor(writeConfig(t, `
 api: { domain: example.test }
 encryption_key: test-key
 sandbox:
@@ -211,7 +211,7 @@ builder:
 	if err != nil {
 		t.Fatal(err)
 	}
-	limit, err := cfg.Builder.ExecutionLimit()
+	limit, err := cfg.Builder.executionLimit()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ sandbox:
 	}
 	for name, fields := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(writeConfig(t, fmt.Sprintf(base, fields)))
+			_, err := LoadConductor(writeConfig(t, fmt.Sprintf(base, fields)))
 			if err == nil {
 				t.Fatalf("Load error = %v", err)
 			}
@@ -281,7 +281,7 @@ sandbox:
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := Load(writeConfig(t, fmt.Sprintf(base, test.resourceListen, test.resources)))
+			_, err := LoadConductor(writeConfig(t, fmt.Sprintf(base, test.resourceListen, test.resources)))
 			if err == nil || !strings.Contains(err.Error(), test.path) {
 				t.Fatalf("Load error = %v, want %q", err, test.path)
 			}
@@ -292,7 +292,7 @@ sandbox:
 func TestLoadAllowsNodeStartupToBeNormalizedPerFinalSandbox(t *testing.T) {
 	for name, startup := range map[string]string{"below headroom": "512MiB"} {
 		t.Run(name, func(t *testing.T) {
-			loaded, err := Load(writeConfig(t, `
+			loaded, err := LoadConductor(writeConfig(t, `
 api: { domain: example.test }
 encryption_key: test-key
 resource_listen: { enabled: true }
@@ -306,7 +306,7 @@ sandbox:
 				t.Fatal(err)
 			}
 			resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-				Node: loaded.Sandbox.Resources.Policy(), Dynamic: true,
+				Node: loaded.Sandbox.Resources.nodeResourcePolicy(), Dynamic: true,
 				ControllerSocketIdentity: "/run/resource.sock",
 			})
 			if err != nil {
@@ -330,12 +330,12 @@ sandbox:
 %s
   boot: { kernel: /kernel, runtime: /runtime }
 `
-	inherited, err := Load(writeConfig(t, fmt.Sprintf(base, "")))
+	inherited, err := LoadConductor(writeConfig(t, fmt.Sprintf(base, "")))
 	if err != nil {
 		t.Fatalf("omitted inherited floor: %v", err)
 	}
 	resolved, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node: inherited.Sandbox.Resources.Policy(),
+		Node: inherited.Sandbox.Resources.nodeResourcePolicy(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -348,7 +348,7 @@ sandbox:
 		t.Fatal(err)
 	}
 	raised, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node: inherited.Sandbox.Resources.Policy(), Patch: patch,
+		Node: inherited.Sandbox.Resources.nodeResourcePolicy(), Patch: patch,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -357,7 +357,7 @@ sandbox:
 		t.Fatalf("inherited default was permanently clamped: %s", raised.Allocatable.Memory)
 	}
 
-	_, err = Load(writeConfig(t, fmt.Sprintf(base, "    allocatable: { memory: 256MiB }")))
+	_, err = LoadConductor(writeConfig(t, fmt.Sprintf(base, "    allocatable: { memory: 256MiB }")))
 	if err == nil || !strings.Contains(err.Error(), "allocatable.memory") {
 		t.Fatalf("explicit floor above node capacity error = %v", err)
 	}
@@ -406,7 +406,7 @@ checkpoint:
   remote:
     ref_location_parent: https://example.test/snapshots
 `)
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "ref_location_parent") {
+	if _, err := LoadConductor(path); err == nil || !strings.Contains(err.Error(), "ref_location_parent") {
 		t.Fatalf("Load error = %v", err)
 	}
 }
@@ -422,7 +422,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `
 
-	omitted, err := Load(writeConfig(t, base))
+	omitted, err := LoadConductor(writeConfig(t, base))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ sandbox:
 		t.Fatalf("omitted checkpoint policy = %+v", omitted.Checkpoint)
 	}
 
-	nulls, err := Load(writeConfig(t, base+`
+	nulls, err := LoadConductor(writeConfig(t, base+`
 checkpoint:
   mode: bundle
   merge_ref: null
@@ -448,7 +448,7 @@ checkpoint:
 			for _, dropCaches := range []bool{false, true} {
 				name := fmt.Sprintf("%s_merge_%t_drop_%t", mode, mergeRef, dropCaches)
 				t.Run(name, func(t *testing.T) {
-					cfg, err := Load(writeConfig(t, base+fmt.Sprintf(`
+					cfg, err := LoadConductor(writeConfig(t, base+fmt.Sprintf(`
 checkpoint:
   mode: %s
   merge_ref: %t
@@ -484,7 +484,7 @@ checkpoint:
 `
 	for _, mode := range []string{"remote", "archive"} {
 		t.Run(mode, func(t *testing.T) {
-			_, err := Load(writeConfig(t, fmt.Sprintf(base, mode)))
+			_, err := LoadConductor(writeConfig(t, fmt.Sprintf(base, mode)))
 			if err == nil || !strings.Contains(err.Error(), "want local|bundle") {
 				t.Fatalf("Load error = %v", err)
 			}
@@ -504,7 +504,7 @@ sandbox:
     runtime_e2b: /opt/sandbox/runtime-e2b.erofs
 `)
 
-	_, err := Load(path)
+	_, err := LoadConductor(path)
 	if err == nil {
 		t.Fatal("Load succeeded with obsolete runtime_e2b field")
 	}
@@ -524,7 +524,7 @@ sandbox:
     kernel: /opt/sandbox/vmlinux
 `)
 
-	_, err := Load(path)
+	_, err := LoadConductor(path)
 	if err == nil {
 		t.Fatal("Load succeeded without sandbox.boot.runtime")
 	}
@@ -545,7 +545,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
 
-	cfg, err := Load(path)
+	cfg, err := LoadConductor(path)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -569,7 +569,7 @@ sandbox:
     kernel: /opt/sandbox/vmlinux
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
-			_, err := Load(path)
+			_, err := LoadConductor(path)
 			if err == nil || !strings.Contains(err.Error(), "units.pool_wait_timeout") {
 				t.Fatalf("Load error = %v, want units.pool_wait_timeout validation", err)
 			}
@@ -593,7 +593,7 @@ builder:
     desc: acme-prod
 `)
 
-	cfg, err := Load(path)
+	cfg, err := LoadConductor(path)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -620,7 +620,7 @@ builder:
     enabled: true
 `)
 
-	_, err := Load(path)
+	_, err := LoadConductor(path)
 	if err == nil {
 		t.Fatal("Load succeeded with referer enabled but no desc")
 	}
@@ -646,7 +646,7 @@ builder:
     validity: `+validity+`
 `)
 
-			_, err := Load(path)
+			_, err := LoadConductor(path)
 			if err == nil {
 				t.Fatal("Load succeeded with invalid referer validity")
 			}
@@ -671,7 +671,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
 
-	cfg, err := Load(path)
+	cfg, err := LoadConductor(path)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -694,7 +694,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
 
-	_, err := Load(path)
+	_, err := LoadConductor(path)
 	if err == nil {
 		t.Fatal("Load succeeded with relative tapfd_socket")
 	}
@@ -718,7 +718,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
 
-	cfg, err := Load(path)
+	cfg, err := LoadConductor(path)
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
@@ -742,7 +742,7 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.bundle
 `)
 
-	_, err := Load(path)
+	_, err := LoadConductor(path)
 	if err == nil {
 		t.Fatal("Load succeeded with proxy.proxy_netns in external mode")
 	}
@@ -851,7 +851,7 @@ func TestLoadProxyRejectsTopLevelRunRoot(t *testing.T) {
 }
 
 func TestLoadMMDSRoutesAndConductorServiceRegistry(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
+	cfg, err := LoadConductor(writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
@@ -885,7 +885,7 @@ mmds:
 }
 
 func TestLoadMMDSRouteDefaults(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
+	cfg, err := LoadConductor(writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
@@ -906,7 +906,7 @@ sandbox:
 }
 
 func TestLoadRejectsInvalidMMDSServiceEndpoint(t *testing.T) {
-	_, err := Load(writeConfig(t, `
+	_, err := LoadConductor(writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
@@ -942,7 +942,7 @@ func TestLoadProxyRejectsRemovedMMDSConfiguration(t *testing.T) {
 }
 
 func TestResourceStatePathRemainsParseOnlyCompatibility(t *testing.T) {
-	cfg, err := Load(writeConfig(t, `
+	cfg, err := LoadConductor(writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
