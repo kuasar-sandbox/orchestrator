@@ -513,7 +513,8 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 			"E2b-Sandbox-Service: exec\r\nX-Access-Token: %s\r\n\r\n",
 		sandbox.SID, token,
 	)
-	frame := stubExecFrame("/bin/true")
+	const secretArgv = "/bin/argv-must-not-be-observed"
+	frame := stubExecFrame(secretArgv)
 	if _, err := conn.Write(append([]byte(header), frame...)); err != nil {
 		t.Fatal(err)
 	}
@@ -547,14 +548,14 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 	service.mu.Lock()
 	hits := append([]dataHit(nil), service.dataHits...)
 	service.mu.Unlock()
-	if len(hits) != 1 || hits[0].SandboxID != sandbox.SID || hits[0].Path != "/bin/true" ||
+	if len(hits) != 1 || hits[0].SandboxID != sandbox.SID || hits[0].Path != "/exec-admitted" ||
 		hits[0].Method != "EXEC" || hits[0].Host != "exec" {
 		t.Fatalf("exec data hits = %+v", hits)
 	}
 	if encoded, err := json.Marshal(hits); err != nil {
 		t.Fatal(err)
-	} else if strings.Contains(string(encoded), token) {
-		t.Fatal("exec data observation exposed the access token")
+	} else if strings.Contains(string(encoded), token) || strings.Contains(string(encoded), secretArgv) {
+		t.Fatal("exec data observation exposed the access token or argv")
 	}
 }
 

@@ -610,7 +610,7 @@ func (s *service) serveExecDataConnect(
 				s.appendDataHit(dataHit{
 					NodeID: n.ID, SandboxID: sb.SID,
 					Cluster: cloneStubClusterContext(sb.Cluster), Metadata: observableSandboxMetadata(sb.Metadata),
-					Host: "exec", Path: frame.Request.Exec.Argv[0], Method: "EXEC",
+					Host: "exec", Path: "/exec-admitted", Method: "EXEC",
 				})
 				_, _ = io.WriteString(backend, "exec-admitted")
 			}()

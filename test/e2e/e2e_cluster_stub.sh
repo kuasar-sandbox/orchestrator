@@ -642,7 +642,7 @@ python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "exec tunnel did not 
 import json, sys, urllib.request
 admin, group, stable_sid = sys.argv[1:]
 hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2))
-exec_hits = [hit for hit in hits if hit.get("path") == "/bin/true"]
+exec_hits = [hit for hit in hits if hit.get("path") == "/exec-admitted"]
 assert len(exec_hits) == 1, exec_hits
 hit = exec_hits[0]
 assert hit.get("sid") == stable_sid + "-g0", hit
@@ -652,6 +652,7 @@ cluster = hit.get("cluster", {})
 assert cluster.get("group") == group, hit
 assert cluster.get("route_key") == "user1/session1", hit
 assert cluster.get("auth_sandbox_id") == stable_sid, hit
+assert "/bin/true" not in json.dumps(exec_hits, separators=(",", ":")), exec_hits
 PY
 
 code="$(retry_code 204 "$WORK/data1.body" \
