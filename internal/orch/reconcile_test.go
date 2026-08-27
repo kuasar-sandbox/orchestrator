@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -1228,7 +1229,7 @@ func buildReconcileConfig(runRoot string) *config.Config {
 			Runner: "sandbox-runner@.service", Builder: "sandbox-builder@.service", PoolWaitTimeout: "5s",
 		},
 		Sandbox: config.SandboxConfig{
-			Resources: config.ResourcesConfig(policy),
+			Resources: configresolve.PublicSandboxResources(policy),
 			Network: config.NetworkConfig{
 				Hostname: "sandbox", DNS: []string{"169.254.169.253"},
 				Bare: config.ProfileNet{InnerIP: "169.254.1.1/31", Nexthop: "169.254.1.0"},

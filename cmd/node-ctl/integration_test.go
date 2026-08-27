@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -49,7 +50,7 @@ func startCtlSocket(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
+	box, err := secretbox.NewFromColonHex(configresolve.EncryptionKeySpec(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func startCtlSocket(t *testing.T) string {
 	t.Cleanup(func() { st.Close() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	core := orch.New(cfg, st, nil, nil, log) // no launcher / vswitch — admin+export don't use them
-	apiH := api.New(core, cfg.API.Domain, api.Resources{VCPU: cfg.Sandbox.Resources.Policy().Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB()}, log).Handler()
+	apiH := api.New(core, cfg.API.Domain, api.Resources{VCPU: configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB()}, log).Handler()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {

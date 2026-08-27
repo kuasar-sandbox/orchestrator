@@ -71,6 +71,21 @@ type NodeAllocatablePolicy struct {
 	memoryInherited bool
 }
 
+// SetAllocatableMemoryInherited carries the conductor parser's distinction
+// between an omitted default and an explicitly configured value into the
+// internal resolver. It is intentionally an internal-package API; public
+// configuration callers never need to reference NodeResourcePolicy.
+func (p *NodeResourcePolicy) SetAllocatableMemoryInherited(inherited bool) {
+	p.Allocatable.memoryInherited = inherited
+}
+
+// AllocatableMemoryInherited reports the parser presence bit so normalized
+// public configuration can preserve the same semantics across a clone or
+// serialization boundary.
+func (p NodeResourcePolicy) AllocatableMemoryInherited() bool {
+	return p.Allocatable.memoryInherited
+}
+
 type NodeStartupPolicy struct {
 	Memory string `yaml:"memory" json:"memory"`
 }

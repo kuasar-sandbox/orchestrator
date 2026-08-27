@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -69,7 +70,7 @@ func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	limit, _ := o.cfg.Builder.ExecutionLimit()
+	limit, _ := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	won, err := o.st.ClaimBuildExecution(ctx, b.BuildID, limit, time.Now())
 	if err != nil || !won {
 		t.Fatalf("ClaimBuildExecution: won=%t err=%v", won, err)

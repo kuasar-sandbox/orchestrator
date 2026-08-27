@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
@@ -53,6 +54,16 @@ func runProxy(args []string, log *slog.Logger) error {
 	cfg, err := config.LoadProxy(*cfgPath)
 	if err != nil {
 		return err
+	}
+	executables, err := configresolve.CurrentExecutables()
+	if err != nil {
+		return err
+	}
+	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ProxyExecutable, executables.OrchestratorCtl()); err != nil {
+		return fmt.Errorf("paths.proxy_executable: %w", err)
+	}
+	if cfg.Paths.ProxyExecutable != "" {
+		return fmt.Errorf("custom proxy executable requires app bootstrap support")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -32,11 +33,11 @@ func (o *Orchestrator) SetMetrics(mx *metrics.M) {
 }
 
 func (o *Orchestrator) BuilderAdmissionStatus(ctx context.Context) (configsock.BuilderAdmissionStatus, error) {
-	registration, err := o.cfg.Builder.RegistrationLimit()
+	registration, err := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
 	if err != nil {
 		return configsock.BuilderAdmissionStatus{}, err
 	}
-	execution, err := o.cfg.Builder.ExecutionLimit()
+	execution, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		return configsock.BuilderAdmissionStatus{}, err
 	}
@@ -148,8 +149,8 @@ func (o *Orchestrator) refreshBuildAdmissionGauges(ctx context.Context) {
 }
 
 func (o *Orchestrator) setBuildAdmissionGauges(usage store.BuildAdmissionUsage) {
-	registration, registrationErr := o.cfg.Builder.RegistrationLimit()
-	execution, executionErr := o.cfg.Builder.ExecutionLimit()
+	registration, registrationErr := configresolve.BuilderRegistrationLimit(o.cfg.Builder)
+	execution, executionErr := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if registrationErr != nil || executionErr != nil {
 		return
 	}

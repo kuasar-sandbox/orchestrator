@@ -291,6 +291,9 @@ node-ctl config <conductor|proxy> --config <file> --resolve   # 再展开 auto/�
 角色作首参以消歧 schema:`conductor` 对应 `conductor.yaml`(§3),`proxy` 对应 `proxy.yaml`
 (node-proxy.md §2)。`--resolve` 对 `conductor` 额外展开 `resource_listen` 的 `auto` 内存/CPU
 (并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{conductor,proxy}.example.yaml` 对应。
+该命令只做严格 declarative decode、默认化与诊断，绝不执行 `conductor_executable` /
+`proxy_executable`，也不接触 custom App 的运行时材料。custom 路径非空时，输出首行明确
+标记这里只完成 bootstrap 校验；最终配置仍由对应 App 在启动副作用前校验。
 
 ### 2.6 `node-ctl manifest-key`
 
@@ -361,13 +364,19 @@ e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-p
 ## 3. 配置
 
 serve daemon 的配置文件是 `conductor.yaml`。完整带注释样例见 `deploy/conductor.example.yaml`
-(`node-ctl config conductor --template` 输出同形骨架),权威结构是 `internal/config/config.go`。
+(`node-ctl config conductor --template` 输出同形骨架),权威结构是公共包
+`github.com/kuasar-sandbox/orchestrator/config` 中的 `config.Conductor`；内部代码复用同一 schema，
+不维护第二份配置事实来源。该包提供严格的 `LoadConductor` / `DecodeConductor`、
+`LoadProxy` / `DecodeProxy`、hook 后不重套默认值的 `ValidateConductorFinal` /
+`ValidateProxyFinal`，以及真正深拷贝的 `Clone`。未知 YAML 字段和多文档输入会失败，
+Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、provider 或运行时句柄。
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
 `encryption_key`、`manifest_config`。**必填仅 `api.domain` 与 `encryption_key`**(后者可用
-`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。外部二进制(sandbox-ctl/connector-ctl vswitch/flatten-ctl)**不配置**:按"与
-node-ctl 同目录 → PATH"自动发现。
+`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。运行 helper(sandbox-ctl/connector-ctl vswitch/flatten-ctl)
+不进入公共 Config；它们先以最初的精确 node-ctl 相邻发行目录为解析基准，缺失时保留
+现有 PATH fallback。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -382,6 +391,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
 | `encryption_key` | (必填) | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
+| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受 executable regular file，拒绝与自身同一文件及 group/world-writable 文件。公共 App 交接由 #244 的 conductor 阶段提供 |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |

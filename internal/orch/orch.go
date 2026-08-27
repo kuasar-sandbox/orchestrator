@@ -23,6 +23,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -54,6 +55,9 @@ type Orchestrator struct {
 	lc  launcher.Launcher
 	vs  vsClient
 	log *slog.Logger
+	// executables is frozen process bootstrap state. It never enters the public
+	// declarative configuration or any serialized snapshot.
+	executables configresolve.Executables
 
 	sandboxReadyTimeout time.Duration
 	now                 func() time.Time // publication-date clock for promote; overridable in tests
@@ -179,6 +183,12 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		}
 	}
 	return o
+}
+
+// SetExecutables freezes the exact node-ctl path and adjacent helper lookup.
+// It must be called before unit installation or launch admission.
+func (o *Orchestrator) SetExecutables(executables configresolve.Executables) {
+	o.executables = executables
 }
 
 func (o *Orchestrator) StartRunPools(ctx context.Context) error {
@@ -1547,7 +1557,7 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node:                     o.cfg.Sandbox.Resources.Policy(),
+		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
 		Patch:                    spec.Resource,
 		Restore:                  false,
 		Dynamic:                  dynamic,
@@ -1837,7 +1847,7 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		args = append(args, "--connect", c)
 	}
 	return &configsock.LaunchSpec{
-		Exec:    o.cfg.SandboxCtl(),
+		Exec:    o.executables.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
 	}
@@ -2198,7 +2208,7 @@ func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, pol
 	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
 	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
 	args = appendCheckpointPolicyArgs(args, policy)
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
+	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
@@ -2234,7 +2244,7 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 		args = append(args, "--to-ref-location", locName+"="+uri)
 	}
 	args = append(args, localPath)
-	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)
+	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

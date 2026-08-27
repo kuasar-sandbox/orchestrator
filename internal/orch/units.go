@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 )
 
 // InstallUnits generates and installs the systemd template units (+ slices)
@@ -75,7 +77,7 @@ Slice=sandbox-runner.slice
 # after exec, sandbox-ctl stays there while node-ctl creates vmm/ for CH.
 Delegate=yes
 # KillMode=control-group recursively covers both delegated subgroups.
-`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
+`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 
 func (o *Orchestrator) builderUnitFile() string {
@@ -107,7 +109,7 @@ Slice=sandbox-builder.slice
 # run-builder moves itself to ctl/ and hands the sibling vmm/ cgroup to each
 # strictly serial phase sandbox by inherited descriptor.
 Delegate=yes
-`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
+`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 
 func sliceFile(desc, caps string) string {
@@ -117,7 +119,7 @@ func sliceFile(desc, caps string) string {
 // builderSliceCaps renders the cgroup ceiling for the builder pool from config.
 func (o *Orchestrator) builderSliceCaps() string {
 	var b strings.Builder
-	limit, err := o.cfg.Builder.ExecutionLimit()
+	limit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		return ""
 	}
@@ -139,7 +141,7 @@ func formatMilliPercent(cpuMilli int64) string {
 }
 
 func (o *Orchestrator) verifyBuilderSlice(ctx context.Context) error {
-	limit, err := o.cfg.Builder.ExecutionLimit()
+	limit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if err != nil {
 		return err
 	}

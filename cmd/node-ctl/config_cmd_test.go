@@ -1,17 +1,22 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
 )
 
 func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
+	if !strings.Contains(conductorConfigSkeleton, "conductor_executable: /opt/kuasar/bin/xconductor") {
+		t.Fatal("conductor template does not document paths.conductor_executable")
+	}
 	start := strings.Index(conductorConfigSkeleton, "sandbox:")
 	end := strings.Index(conductorConfigSkeleton[start:], "\nbuilder:")
 	if start < 0 || end < 0 {
@@ -33,6 +38,12 @@ func TestConductorConfigTemplateUsesNestedSandboxResourcePolicy(t *testing.T) {
 		if strings.Contains(sandboxBlock, forbidden) {
 			t.Errorf("sandbox template still contains %q:\n%s", forbidden, sandboxBlock)
 		}
+	}
+}
+
+func TestProxyConfigTemplateDocumentsCustomExecutable(t *testing.T) {
+	if !strings.Contains(proxyConfigSkeleton, "proxy_executable: /opt/kuasar/bin/xproxy") {
+		t.Fatal("proxy template does not document paths.proxy_executable")
 	}
 }
 
@@ -91,7 +102,7 @@ checkpoint:
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rendered config.Config
+	var rendered config.Conductor
 	if err := yaml.Unmarshal(out, &rendered); err != nil {
 		t.Fatal(err)
 	}
@@ -117,15 +128,15 @@ builder:
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rendered config.Config
+	var rendered config.Conductor
 	if err := yaml.Unmarshal(out, &rendered); err != nil {
 		t.Fatal(err)
 	}
-	registration, err := rendered.Builder.RegistrationLimit()
+	registration, err := configresolve.BuilderRegistrationLimit(rendered.Builder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution, err := rendered.Builder.ExecutionLimit()
+	execution, err := configresolve.BuilderExecutionLimit(rendered.Builder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +234,7 @@ sandbox:
 		t.Fatal(err)
 	}
 	normalized := writeConductorConfig(t, string(out))
-	reloaded, err := config.Load(normalized)
+	reloaded, err := config.LoadConductor(normalized)
 	if err != nil {
 		t.Fatalf("normalized config did not round-trip: %v\n%s", err, out)
 	}
@@ -231,7 +242,7 @@ sandbox:
 		t.Fatalf("normalized config made the inherited clamp explicit:\n%s", out)
 	}
 	resolved, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node: reloaded.Sandbox.Resources.Policy(),
+		Node: configresolve.SandboxResources(reloaded.Sandbox.Resources),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -244,13 +255,77 @@ sandbox:
 		t.Fatal(err)
 	}
 	raised, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node: reloaded.Sandbox.Resources.Policy(), Patch: patch,
+		Node: configresolve.SandboxResources(reloaded.Sandbox.Resources), Patch: patch,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if raised.Allocatable.Memory != "256MiB" {
 		t.Fatalf("reloaded inherited default did not follow raised capacity: %+v\n%s", raised, out)
+	}
+}
+
+func TestRenderCustomConfigIsBootstrapOnlyAndDoesNotExecute(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "custom-component")
+	// Deliberately not a valid executable image. Config diagnostics must only
+	// validate file metadata; trying to execute it would fail with ENOEXEC.
+	if err := os.WriteFile(custom, []byte("not an executable image\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	conductorPath := writeConductorConfig(t, "paths:\n  conductor_executable: "+custom+"\n")
+	conductor, err := renderConductorConfig(false, false, conductorPath)
+	if err != nil {
+		t.Fatalf("custom conductor bootstrap diagnostic: %v", err)
+	}
+	if !strings.HasPrefix(string(conductor), "# node-ctl bootstrap configuration is valid; the custom conductor App performs final validation.\n") {
+		t.Fatalf("custom conductor diagnostic did not distinguish bootstrap validation:\n%s", conductor)
+	}
+
+	proxyPath := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(proxyPath, []byte("paths:\n  proxy_executable: "+custom+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := renderProxyConfig(false, proxyPath)
+	if err != nil {
+		t.Fatalf("custom proxy bootstrap diagnostic: %v", err)
+	}
+	if !strings.HasPrefix(string(proxy), "# node-ctl bootstrap configuration is valid; the custom proxy App performs final validation.\n") {
+		t.Fatalf("custom proxy diagnostic did not distinguish bootstrap validation:\n%s", proxy)
+	}
+}
+
+func TestCustomConfigCommandReportsFinalValidationOnStderr(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "custom-component")
+	if err := os.WriteFile(custom, []byte("not an executable image\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeConductorConfig(t, "paths:\n  conductor_executable: "+custom+"\n")
+	outputPath := filepath.Join(t.TempDir(), "normalized.yaml")
+
+	oldStderr := os.Stderr
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writeEnd
+	t.Cleanup(func() { os.Stderr = oldStderr })
+	err = configCmd([]string{"conductor", "--config", configPath, "-o", outputPath}, nil)
+	_ = writeEnd.Close()
+	os.Stderr = oldStderr
+	if err != nil {
+		t.Fatal(err)
+	}
+	warning, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(warning), "final validation is performed by the custom component") {
+		t.Fatalf("stderr warning = %q", warning)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("normalized config was not written: %v", err)
 	}
 }
 
