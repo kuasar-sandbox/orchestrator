@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -35,6 +36,13 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	// command entry defensive for direct callers and tests that bypass framing.
 	if cmd != nil && len(cmd.MigrationToken) > migrationtoken.MaxWireSize {
 		return reject(cmd, migrationtoken.ErrTokenTooLarge)
+	}
+	if cmd != nil && cmd.Kind != routesync.CmdExecSession && cmd.ExecConditionsSpecified() {
+		return reject(cmd, fmt.Errorf("cluster command contains exec conditions: %w", api.ErrBadRequest))
+	}
+	if cmd != nil && cmd.Kind == routesync.CmdExecSession &&
+		cmd.ExecConditionsSpecified() && len(cmd.ExecConditions) == 0 {
+		return reject(cmd, fmt.Errorf("cluster command contains non-canonical exec conditions: %w", api.ErrBadRequest))
 	}
 	switch cmd.Kind {
 	case routesync.CmdCreate:
@@ -914,6 +922,13 @@ func (o *Orchestrator) prepareClusterExecSession(
 	if err := validateClusterExecSessionEnvelope(cmd); err != nil {
 		return nil, nil, err
 	}
+	compiler, err := execadmission.Default()
+	if err != nil {
+		return nil, nil, fmt.Errorf("cluster exec session: initialize admission: %w", err)
+	}
+	if _, err := compiler.Compile(cmd.ExecConditions); err != nil {
+		return nil, nil, fmt.Errorf("cluster exec session: invalid conditions: %w", api.ErrBadRequest)
+	}
 	if _, err := execSessionExpiry(now(), cmd.TTLSeconds); err != nil {
 		return nil, nil, err
 	}
@@ -928,7 +943,7 @@ func (o *Orchestrator) prepareClusterExecSession(
 		return validateClusterSandboxContext(current, cmd)
 	}, func(current *types.Sandbox) error {
 		var err error
-		token, err = mintExecSessionToken(current, cmd.TTLSeconds, now())
+		token, err = mintExecSessionToken(current, cmd.TTLSeconds, cmd.ExecConditions, now())
 		return err
 	})
 	if err != nil {

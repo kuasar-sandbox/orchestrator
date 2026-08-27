@@ -729,11 +729,13 @@ POST /route-link/reserve
   ?operation=create|connect|exec-session|data
   &group=<group>&route_key=<route-key>
   [&sid=<stable-sandbox-id>][&port=<effective-port>]
-  [&timeout=<seconds>][&ttl_seconds=<seconds>]
+  [&timeout=<seconds>]
 ```
 
-Reserve body 只属于 create;connect/exec-session/data body 为空.四种 operation 的凭据和
-完成条件不同:
+Reserve body 按 operation 使用独立 typed schema:create 携 create config,exec-session 携
+`{"ttl_seconds":N,"conditions":["..."]}`,connect/data body 为空.四种 operation 的凭据和
+完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
+`ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
 - `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 只允许 restore/credentials
   config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
@@ -748,13 +750,18 @@ Reserve body 只属于 create;connect/exec-session/data body 为空.四种 opera
   返回 typed `ConnectResult`;Registry 校验其
   NodeSandboxID/TemplateID/Profile/三项公开 token 与 route 一致后返回 `Route + Connect`。
   resume 异步进行,connect 不等待 READY,也不在 Router 合并不同请求。
-- `exec-session`:query 必须携期望的稳定 `sid`,可选非负 int64 `ttl_seconds`;
+- `exec-session`:query 必须携期望的稳定 `sid`;typed body 携非负 int64 `ttl_seconds` 和
+  已规范化的 CEL source string array;
   Header 携原始 `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`.Registry 以 route 业务
   记录已绑定的 APISecret 验证 API key,并校验 expected stable SID,之后原始 key 在
   Registry verifier 终止,不进入 command,Ack,route,日志或错误文本.Registry 向
   当前/新候选 NodeSandboxID 下发 `CmdExecSession{APISecretFingerprint,Profile,
-  TTLSeconds,MigrationToken?,Cluster?}`.Node 同步完成可选 import,对象/凭据/context
-  校验和 KAT 签名,Ack 仅携 `ExecSessionResult{ExecAccessToken}`,然后异步 resume.
+  TTLSeconds,ExecConditions,MigrationToken?,Cluster?}`.其它 command kind 携
+  `ExecConditions` 时必须拒绝.Node 同步完成可选 import,对象/凭据/context 校验,权威 CEL
+  编译和 KAT 签名,Ack 仅携 `ExecSessionResult{ExecAccessToken}`,然后按既有合同异步 resume.
+  编译/mint 失败发生在任何 resume mutation 之前.Conditions 只在本次 public request、
+  Reserve body、Command 和 token 中存在,不持久化到 Route、SandboxRecord、event 或 metadata,
+  日志也不输出 source.
   MigrationToken 只在本次 Reserve/command wire 内存活,不写 route/SandboxRecord,不进入日志或
   错误文本,Node 在同步 import 消费后丢弃.
   Registry 验证 typed result 后重读当前 route,返回 `Route + ExecSession`,不等待 READY;
@@ -899,18 +906,19 @@ Cluster native exec 的控制面不把 public node API reverse-proxy 到当前 n
 ```text
 POST /sandboxes/<stableSID>/exec-sessions
   X-Kuasar-Sandbox-Group + X-Kuasar-Route-Key + X-API-KEY
-  empty / {} / {"ttlSeconds":N} + optional MigrationToken
+  empty / {} / {"ttlSeconds":N,"conditions":[{"expr":"..."}]} + optional MigrationToken
     ↓ Router strict 64 KiB decode
-Reserve(operation=exec-session, expected stableSID)
+Reserve(operation=exec-session, expected stableSID, typed TTL + conditions body)
     ↓ Registry verifies API key and sends CmdExecSession
-Node validates/imports/signs, accepts async resume
+Node validates/imports, compiles conditions, signs, accepts async resume
     ↓ Route + ExecSessionResult
 201 Cache-Control:no-store {"execAccessToken":"kat1..."}
 ```
 
 Router 不签发 token,不向 node-link 传原始 API key,也不对外返回 NodeSandboxID.
-body 与 direct Node 共用同一严格解码合同:完整原始 body 上限 64 KiB,空 body 合法,
-unknown/duplicate 字段,`null`,负数,尾随第二个 JSON value 和越界 TTL 拒绝.
+body 与 direct Node 共用同一严格解码合同:完整原始 body 上限 64 KiB,空 body 合法;
+`conditions` 缺失和 `[]` 都规范化为 unrestricted nil,显式 `null`、unknown/duplicate 字段、
+空 expr、负数、尾随第二个 JSON value 和越界 TTL 拒绝.
 Registry/node 内部失败对外映射为固定,脱敏的 exec-session 错误,不包含 NodeSandboxID,
 socket path,fingerprint,ServiceSecret 或 token payload.
 
@@ -921,12 +929,12 @@ Node 负责以本地受信 profile 完成最终 backend 选择;特别地,bare �
 只对 `service=exec` 实现 service-aware 分支,不将其它三个显式 service 值描述为已支持;
 完整的 cluster 透传边界由 [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) 跟踪.
 
-`service=exec` 只接受 CONNECT 并始终 enforce KAT.Router 先做无副作用 Resolve/cache
-lookup,以 stable `AuthSandboxID + ServiceSecret` 验证原始 `X-Access-Token`.无效 token
-立即返回 401,不得进入 node CONNECT 或 Reserve。已有完整 node target 时,不论
-ready/paused/starting 都直接连接 node proxy;target 缺失或 node 返回 typed stale 时才调用
-`Reserve(operation=data)`,Registry 以同一 stable subject 和 ServiceSecret 复验后才能下发
-CmdConnect。Router 随后使用 fresh route 构造第二跳 CONNECT:
+`service=exec` 只接受 CONNECT 并始终 enforce KAT.Router 先做无副作用 Resolve/cache lookup,
+以 stable `AuthSandboxID + ServiceSecret` 验证原始 `X-Access-Token`,并在 HMAC 成功后编译
+conditions.返回 public CONNECT 200 后,Router 严格读取首个 ExecRequest、重查 expiry 并执行
+conditions;失败不调用 `Reserve(operation=data)`、不连接 node.只有 request admission 成功后,
+已有完整 node target 才直连 node proxy;target 缺失才调用 `Reserve(operation=data)`并在 fresh
+route 上重新核验 stable lineage/credential.随后构造第二跳 CONNECT:
 
 ```text
 E2b-Sandbox-Id:      <current NodeSandboxID>
@@ -936,10 +944,13 @@ X-Access-Token:      <same KAT>
 ```
 
 两跳之间只重写 stable SID 为 NodeSandboxID,service/port/token 值和 token Header 都不变;
-最终 node 以本地 route 再次验证同一 KAT,之后才能 resume 和连接 `ctl.sock`.
+Router 将首帧 Raw 原样发送一次.最终 node 不信任 Router,以本地 route 再次验证同一 KAT,
+重新读取并执行完整 ExecRequest gate,之后才能 parking、resume 和连接 `ctl.sock`.
 完整 target 的 cache hot path 不增加 Registry RPC,但 Router/node 两层验证仍保留.
 KAT 绑定 stable AuthSandboxID 而不绑定 NodeSandboxID/generation,因此同一逻辑沙箱的同节点
 resume,跨节点迁移或 re-place 不要求客户端重签;新 CONNECT 始终进入当前 NodeSandboxID.
+typed stale retry 只允许发生在 Raw 尚未写给任何 node 时;node CONNECT 200 且 Raw 已发送后
+禁止 retry/reroute/replay,node 返回的 ctl error 原样中继.
 
 ## 11. 密钥与鉴权
 

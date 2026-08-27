@@ -628,7 +628,8 @@ if "execAccessToken" in created:
 PY
 }
 issue_exec_session() {
-    local sid="$1" key="$2" code
+    local sid="$1" key="$2" body="${3:-}" code
+    [ -n "$body" ] || body='{}'
     code="$(curl -sS --noproxy '*' --max-time 30 \
         -D "$WORK/exec-session.headers" \
         -o "$WORK/exec-session.secret" \
@@ -637,7 +638,7 @@ issue_exec_session() {
         -H "Host: api.$DOMAIN" \
         -H "X-API-KEY: $key" \
         -H 'Content-Type: application/json' \
-        --data '{}' \
+        --data "$body" \
         "http://127.0.0.1:$PORT/sandboxes/$sid/exec-sessions")"
     [ "$code" = "201" ] || fail "exec-session=$code (want 201)"
     python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
@@ -653,6 +654,29 @@ if not isinstance(token, str) or not token.startswith("kat1.") or len(token.spli
     raise SystemExit("exec-session response contains an invalid KAT token")
 print(token)
 PY
+}
+exec_argv_allowed_through_connect() {
+    local sid="$1" token="$2" argv0="$3" diagnostics="$WORK/native-exec-condition-allowed.log"
+    timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        -- "$argv0" >"$diagnostics" 2>&1 \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "conditioned argv $argv0 was rejected"; }
+}
+exec_argv_denied_through_connect() {
+    local sid="$1" token="$2" diagnostics="$WORK/native-exec-condition-denied.log"
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        -- /bin/echo must-not-run >"$diagnostics" 2>&1; then
+        fail "denied argv unexpectedly executed"
+    fi
+    grep -Fq "exec: remote exec rejected" "$diagnostics" \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "denied argv did not return the redacted remote error"; }
 }
 exec_through_connect() {
     local sid="$1" token="$2" marker="$3"
@@ -727,7 +751,7 @@ exec_pty_resize_through_connect() {
         --proxy-header "E2b-Sandbox-Id: $sid" \
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
-        --tty -- /bin/sh -c \
+        --cwd /tmp --user 0:0 --tty -- /bin/sh -c \
         "stty size; trap 'stty size; echo $marker; exit 23' WINCH; echo PTY_READY; while :; do sleep 1; done" <<'PY' || status=$?
 import errno, fcntl, os, pty, select, signal, struct, subprocess, sys, termios, time
 
@@ -1440,13 +1464,22 @@ echo "==> PASS: sandbox detail/info returned RFC3339 timestamps and resource fie
 
 # ---- native exec capability -> CONNECT -> sandbox-ctl -> real guest -------
 echo "==> issue an explicit native exec capability (create has no default token)"
-EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue native exec capability"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" '{"conditions":[]}')" || fail "issue unrestricted [] native exec capability"
 rm -f "$WORK/exec-session.secret"
 NATIVE_MARK="NATIVE_EXEC_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
+EXACT_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" "{\"conditions\":[{\"expr\":\"request.argv == ['/bin/true']\"}]}")" \
+    || fail "issue exact-argv exec capability"
+exec_argv_allowed_through_connect "$SID" "$EXACT_EXEC_TOKEN" /bin/true
+exec_argv_denied_through_connect "$SID" "$EXACT_EXEC_TOKEN"
+OR_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" "{\"conditions\":[{\"expr\":\"request.argv == ['/bin/true'] || request.argv == ['/usr/bin/true']\"}]}")" \
+    || fail "issue OR exec capability"
+exec_argv_allowed_through_connect "$SID" "$OR_EXEC_TOKEN" /usr/bin/true
 PTY_MARK="NATIVE_EXEC_PTY_$RANDOM"
-exec_pty_resize_through_connect "$SID" "$EXEC_TOKEN" "$PTY_MARK"
-echo "==> PASS: real sandbox-ctl CONNECT reached the guest (stdio, duplicate headers, PTY resize, exit status)"
+PTY_EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" "{\"conditions\":[{\"expr\":\"request.cwd == '/tmp' && request.user == '0:0' && request.stdio.tty\"}]}")" \
+    || fail "issue cwd/user/tty exec capability"
+exec_pty_resize_through_connect "$SID" "$PTY_EXEC_TOKEN" "$PTY_MARK"
+echo "==> PASS: real sandbox-ctl CONNECT enforced omitted/[]/exact/OR/cwd/user/tty conditions and preserved stdio, PTY resize, exit status"
 
 # ---- execute a command in the guest via envd (Connect-RPC over envd.sock) --
 ENVD_SOCK="$WORK/run/$SID/envd.sock"
@@ -1844,6 +1877,11 @@ PY
 read -r PORTABLE_B_KEY PORTABLE_PARENT_LAYERS <<<"$PORTABLE_LAYER_SUMMARY"
 echo "==> PASS: independent promotion published distinct W self and opaque B memory layer"
 
+exec_argv_denied_through_connect "$SID" "$EXACT_EXEC_TOKEN"
+wait_sandbox_state "$SID" paused 20 \
+    || fail "condition-denied direct exec resumed the paused sandbox"
+wait_internal_traffic_stats "$SID" paused \
+    || fail "condition-denied direct exec changed paused traffic accounting"
 RESUME_MARK="PORTABLE_W_RESUME_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
 resumed=""

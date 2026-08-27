@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
@@ -40,102 +43,126 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	// ordinary off/log/enforce data-plane policy and accepts only the original
 	// X-Access-Token value.
 	token := r.Header.Get(HeaderAccessToken)
-	if err := keys.VerifyExecAccessToken(token, identity.ServiceSecret, identity.AuthSandboxID, time.Now()); err != nil {
+	claims, err := keys.ParseAndVerifyExecAccessToken(
+		token, identity.ServiceSecret, identity.AuthSandboxID, time.Now(),
+	)
+	if err != nil {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return
 	}
-	flow := p.traffic.BeginParking(identity.NodeSandboxID, ConnectServiceExec)
-	if flow == nil {
-		flow = noopTrafficFlow{}
-	}
-	defer flow.Close()
-
-	ready, found, err := execRouter.ActivateExec(r.Context(), sid, identity)
+	compiler, err := execadmission.Default()
 	if err != nil {
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusServiceUnavailable, "sandbox activation failed", ProxyErrorRouteError)
+		p.mx.Inc(`data_requests_total{result="denied"}`)
+		writeProxyError(w, http.StatusNotImplemented, "exec admission unavailable", ProxyErrorDenied)
 		return
 	}
-	if !found {
-		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		// The KAT was admitted and parking has started, so this is not a
-		// pre-admission stale response that a cluster router may safely retry.
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorRouteError)
-		return
-	}
-	// ActivateExec must preserve the exact node-local and credential identity
-	// authorized above; a changed lineage cannot inherit this request.
-	if ready != identity {
-		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorRouteError)
-		return
-	}
-
-	ctlRoute := Route{
-		Kind: KindUDS,
-		UDS:  filepath.Join(p.execRunRoot, ready.NodeSandboxID, "ctl.sock"),
-	}
-	ctlConn, err := p.dial(r.Context(), ctlRoute)
+	programs, err := compiler.Compile(claims.Conditions)
 	if err != nil {
-		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		writeProxyError(w, http.StatusBadRequest, "invalid exec conditions", ProxyErrorBadRequest)
 		return
 	}
-	ctlConn = flow.AttachBackend(ctlConn)
 
-	if r.ProtoMajor == 2 {
-		p.serveExecH2(w, r, ctlConn)
-		return
+	tunnelCtx := r.Context()
+	cancelTunnel := func() {}
+	if r.ProtoMajor != 2 {
+		// net/http cancels an HTTP/1 request context when it observes a TCP read
+		// EOF. After Hijack that EOF is a valid client write-side half-close, so
+		// preserve values and any explicit deadline while connection I/O carries
+		// disconnects.
+		tunnelCtx = context.WithoutCancel(r.Context())
+		if deadline, ok := r.Context().Deadline(); ok {
+			tunnelCtx, cancelTunnel = context.WithDeadline(tunnelCtx, deadline)
+		}
 	}
-	p.serveExecH1(w, r, ctlConn)
-}
+	defer cancelTunnel()
 
-func (p *Proxy) serveExecH1(w http.ResponseWriter, r *http.Request, ctlConn io.ReadWriteCloser) {
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		_ = ctlConn.Close()
-		writeProxyError(w, http.StatusInternalServerError, "connect unsupported", ProxyErrorUpstreamError)
-		return
-	}
-	client, rw, err := hijacker.Hijack()
+	var flow TrafficFlow
+	defer func() {
+		if flow != nil {
+			flow.Close()
+		}
+	}()
+	err = sandboxctl.ServeExecTunnel(tunnelCtx, sandboxctl.ExecTunnelOptions{
+		Authorize: func(context.Context) error { return nil },
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			if r.ProtoMajor == 2 {
+				return p.acceptExecH2(w, r)
+			}
+			return p.acceptExecH1(w)
+		},
+		AuthorizeRequest: func(ctx context.Context, frame *sandboxctl.ExecRequestFrame) error {
+			if claims.ExpiresUnix != nil && time.Now().Unix() >= *claims.ExpiresUnix {
+				return errors.New("exec capability expired")
+			}
+			return programs.Evaluate(ctx, frame.Request.Exec)
+		},
+		DialBackend: func(ctx context.Context, _ *sandboxctl.ExecRequestFrame) (io.ReadWriteCloser, error) {
+			flow = p.traffic.BeginParking(identity.NodeSandboxID, ConnectServiceExec)
+			if flow == nil {
+				flow = noopTrafficFlow{}
+			}
+			ready, found, err := execRouter.ActivateExec(ctx, sid, identity)
+			if err != nil {
+				p.mx.Inc(`data_requests_total{result="route_error"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
+			if !found {
+				p.mx.Inc(`data_requests_total{result="notfound"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
+			// Activation must preserve the exact identity authorized before 200.
+			if ready != identity {
+				p.mx.Inc(`data_requests_total{result="unauthorized"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
+			ctlRoute := Route{
+				Kind: KindUDS,
+				UDS:  filepath.Join(p.execRunRoot, ready.NodeSandboxID, "ctl.sock"),
+			}
+			ctlConn, err := p.dial(ctx, ctlRoute)
+			if err != nil {
+				p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
+			return flow.AttachBackend(ctlConn), nil
+		},
+		FirstRequestTimeout: limits.FirstRequestTimeout,
+	})
 	if err != nil {
-		_ = ctlConn.Close()
-		return
-	}
-	downstream := &h1ConnectStream{Conn: client, reader: rw.Reader}
-	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		_ = downstream.Close()
-		_ = ctlConn.Close()
-		return
-	}
-	if err := rw.Flush(); err != nil {
-		_ = downstream.Close()
-		_ = ctlConn.Close()
-		return
-	}
-	p.mx.Inc(`data_requests_total{result="ok"}`)
-	// net/http cancels an HTTP/1 request context when it observes a TCP read EOF,
-	// but after Hijack that EOF is a valid client write-side half-close. Preserve
-	// request values and any explicit deadline while letting connection I/O carry
-	// disconnects, so ctl output can still drain after stdin EOF.
-	tunnelCtx := context.WithoutCancel(r.Context())
-	cancel := func() {}
-	if deadline, ok := r.Context().Deadline(); ok {
-		tunnelCtx, cancel = context.WithDeadline(tunnelCtx, deadline)
-	}
-	defer cancel()
-	if err := sandboxctl.ProxyExec(tunnelCtx, downstream, ctlConn); err != nil {
 		p.logExecRelayError(tunnelCtx, err)
 	}
 }
 
-func (p *Proxy) serveExecH2(w http.ResponseWriter, r *http.Request, ctlConn io.ReadWriteCloser) {
+func (p *Proxy) acceptExecH1(w http.ResponseWriter) (io.ReadWriteCloser, error) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeProxyError(w, http.StatusInternalServerError, "connect unsupported", ProxyErrorUpstreamError)
+		return nil, errors.New("exec CONNECT hijack unsupported")
+	}
+	client, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, errors.New("exec CONNECT hijack failed")
+	}
+	downstream := &h1ConnectStream{Conn: client, reader: rw.Reader}
+	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = downstream.Close()
+		return nil, errors.New("exec CONNECT response failed")
+	}
+	if err := rw.Flush(); err != nil {
+		_ = downstream.Close()
+		return nil, errors.New("exec CONNECT response failed")
+	}
+	p.mx.Inc(`data_requests_total{result="ok"}`)
+	return downstream, nil
+}
+
+func (p *Proxy) acceptExecH2(w http.ResponseWriter, r *http.Request) (io.ReadWriteCloser, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		_ = ctlConn.Close()
 		writeProxyError(w, http.StatusInternalServerError, "connect unsupported", ProxyErrorUpstreamError)
-		return
+		return nil, errors.New("exec CONNECT flush unsupported")
 	}
 	body := r.Body
 	if body == nil {
@@ -145,9 +172,7 @@ func (p *Proxy) serveExecH2(w http.ResponseWriter, r *http.Request, ctlConn io.R
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	p.mx.Inc(`data_requests_total{result="ok"}`)
-	if err := sandboxctl.ProxyExec(r.Context(), downstream, ctlConn); err != nil {
-		p.logExecRelayError(r.Context(), err)
-	}
+	return downstream, nil
 }
 
 func (p *Proxy) logExecRelayError(ctx context.Context, err error) {

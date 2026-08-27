@@ -206,7 +206,8 @@ PY
 }
 
 issue_cluster_exec_session() {
-    local sid="$1" code
+    local sid="$1" body="${2:-}" code
+    [ -n "$body" ] || body='{}'
     code="$(curl -sS --noproxy '*' --max-time 30 \
         -D "$WORK/exec-session.headers" \
         -o "$WORK/exec-session.secret" \
@@ -217,7 +218,7 @@ issue_cluster_exec_session() {
         -H "X-Kuasar-Route-Key: $ROUTE_KEY" \
         -H "X-API-KEY: $CLUSTER_API_KEY" \
         -H 'Content-Type: application/json' \
-        --data '{}' \
+        --data "$body" \
         "http://127.0.0.1:$ROUTER_PORT/sandboxes/$sid/exec-sessions")"
     [ "$code" = "201" ] || fail "exec-session returned $code (want 201)"
     python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
@@ -233,6 +234,22 @@ if not isinstance(token, str) or not token.startswith("kat1.") or len(token.spli
     raise SystemExit("exec-session response contains an invalid KAT token")
 print(token)
 PY
+}
+
+exec_argv_denied_through_cluster() {
+    local sid="$1" token="$2" diagnostics="$WORK/native-exec-condition-denied.log"
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$ROUTER_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+        --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        -- /bin/true >"$diagnostics" 2>&1; then
+        fail "cluster executed a condition-denied argv"
+    fi
+    grep -Fq "exec: remote exec rejected" "$diagnostics" \
+        || { sed 's/^/  client| /' "$diagnostics" >&2; fail "cluster denial was not redacted"; }
 }
 
 exec_through_cluster_connect() {
@@ -284,7 +301,7 @@ router_req() {
     curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
 }
 
-wait_cluster_traffic_stats() { # $1=sid, $2=parking|idle
+wait_cluster_traffic_stats() { # $1=sid, $2=parking|idle|paused
     local sid="$1" mode="$2" code=""
     for _ in $(seq 1 240); do
         code="$(router_req GET "/sandboxes/$sid/stats/traffic" "$CLUSTER_API_KEY" "$ROUTE_KEY" || true)"
@@ -309,6 +326,8 @@ if mode == "parking":
     ok = inflight["parking"] >= 1 and "idleSince" not in stats
 elif mode == "idle":
     ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+elif mode == "paused":
+    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "egress": 0} and "idleSince" not in stats
 else:
     ok = False
 raise SystemExit(0 if ok else 1)
@@ -846,7 +865,8 @@ run_cluster_flow() {
 
     step "issuing explicit exec capability through router (stable SID + group + route-key)"
     local exec_token native_mark
-    exec_token="$(issue_cluster_exec_session "$sid")" || fail "issue cluster exec capability"
+    exec_token="$(issue_cluster_exec_session "$sid" "{\"conditions\":[{\"expr\":\"request.argv[0] == '/bin/sh'\"}]}")" \
+        || fail "issue conditioned cluster exec capability"
     rm -f "$WORK/exec-session.secret"
     native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
@@ -857,6 +877,9 @@ run_cluster_flow() {
     step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
     code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
+    exec_argv_denied_through_cluster "$sid" "$exec_token"
+    wait_cluster_traffic_stats "$sid" paused \
+        || fail "condition-denied cluster exec changed paused state or traffic"
     local resume_mark="CLUSTER_NATIVE_EXEC_RESUME_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$resume_mark" 40 &
     CLUSTER_EXEC_PID=$!

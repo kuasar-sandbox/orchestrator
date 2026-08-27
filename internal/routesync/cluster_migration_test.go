@@ -65,11 +65,14 @@ func TestNodeLinkExecSessionCommandAndAckRoundTrip(t *testing.T) {
 		},
 		MigrationToken: "kmt1.opaque-migration-token",
 		TTLSeconds:     37,
+		ExecConditions: []string{"request.cwd == '/'", "!request.stdio.tty"},
 	}
 	got := roundTrip(t, &Msg{Type: TypeCommand, Rev: 11, Cmd: command})
 	if got.Cmd == nil || got.Cmd.Kind != CmdExecSession || got.Cmd.SID != command.SID ||
 		got.Cmd.Profile != command.Profile || got.Cmd.APISecretFingerprint != command.APISecretFingerprint ||
 		got.Cmd.MigrationToken != command.MigrationToken || got.Cmd.TTLSeconds != command.TTLSeconds ||
+		len(got.Cmd.ExecConditions) != 2 || got.Cmd.ExecConditions[0] != command.ExecConditions[0] ||
+		got.Cmd.ExecConditions[1] != command.ExecConditions[1] ||
 		got.Cmd.Cluster == nil || *got.Cmd.Cluster != *command.Cluster || got.Rev != 11 {
 		t.Fatalf("exec-session command round-trip: %+v rev=%d", got.Cmd, got.Rev)
 	}
@@ -82,6 +85,36 @@ func TestNodeLinkExecSessionCommandAndAckRoundTrip(t *testing.T) {
 	if got.Ack == nil || got.Ack.ExecSession == nil || *got.Ack.ExecSession != *ack.ExecSession ||
 		got.Ack.CmdID != ack.CmdID || got.Ack.Status != ack.Status || got.Ack.Connect != nil {
 		t.Fatalf("exec-session ack round-trip: %+v", got.Ack)
+	}
+}
+
+func TestCommandTracksExecConditionsWirePresence(t *testing.T) {
+	for _, raw := range []string{
+		`{"cmd_id":"other-empty","kind":"connect","exec_conditions":[]}`,
+		`{"cmd_id":"exec-null","kind":"exec_session","exec_conditions":null}`,
+	} {
+		var command Command
+		if err := json.Unmarshal([]byte(raw), &command); err != nil {
+			t.Fatal(err)
+		}
+		if !command.ExecConditionsSpecified() {
+			t.Fatalf("wire presence lost for %s", raw)
+		}
+	}
+
+	var omitted Command
+	if err := json.Unmarshal([]byte(`{"cmd_id":"exec-omitted","kind":"exec_session"}`), &omitted); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.ExecConditionsSpecified() {
+		t.Fatal("omitted exec_conditions reported as specified")
+	}
+	payload, err := json.Marshal(&Command{CmdID: "exec-empty", Kind: CmdExecSession, ExecConditions: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte("exec_conditions")) {
+		t.Fatalf("empty exec conditions were not canonicalized to omission: %s", payload)
 	}
 }
 

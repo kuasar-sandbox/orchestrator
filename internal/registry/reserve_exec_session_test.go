@@ -46,9 +46,11 @@ func TestServeReserveExecSessionCarriesQueryAndReturnsTypedResult(t *testing.T) 
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	request := httptest.NewRequest(http.MethodPost,
-		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable&ttl_seconds=37", nil)
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable",
+		strings.NewReader(`{"ttl_seconds":37,"conditions":["request.cwd == '/workspace'"]}`))
 	request.Header.Set("X-API-KEY", testAPIKeyValue())
 	request.Header.Set("X-Kuasar-Migration-Token", "kmt1.opaque")
+	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -66,6 +68,7 @@ func TestServeReserveExecSessionCarriesQueryAndReturnsTypedResult(t *testing.T) 
 	if command == nil || command.Kind != routesync.CmdExecSession || command.SID != record.NodeSandboxID ||
 		command.Profile != record.Profile || command.APISecretFingerprint != record.APISecretFingerprint ||
 		command.TTLSeconds != 37 || command.MigrationToken != "kmt1.opaque" || command.TimeoutSeconds != 0 ||
+		len(command.ExecConditions) != 1 || command.ExecConditions[0] != "request.cwd == '/workspace'" ||
 		command.Cluster == nil || command.Cluster.Group != record.Group || command.Cluster.RouteKey != record.RouteKey ||
 		command.Cluster.AuthSandboxID != record.AuthSandboxID {
 		t.Fatalf("exec-session command = %+v", command)
@@ -608,13 +611,22 @@ func TestReserveExecSessionRejectsForeignFieldsAndRouteLinkBody(t *testing.T) {
 			t.Fatalf("query %q status = %d, body = %q", rawQuery, response.Code, response.Body.String())
 		}
 	}
-	request := httptest.NewRequest(http.MethodPost,
-		RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable", strings.NewReader(`{}`))
-	request.Header.Set("X-API-KEY", testAPIKeyValue())
-	response := httptest.NewRecorder()
-	mux.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest {
-		body, _ := io.ReadAll(response.Result().Body)
-		t.Fatalf("exec-session route-link body status = %d, body = %q", response.Code, body)
+	for _, body := range []string{
+		`null`,
+		`{"unknown":true}`,
+		`{"ttl_seconds":-1}`,
+		`{"ttl_seconds":0,"conditions":null}`,
+		`{"ttl_seconds":0,"conditions":[""]}`,
+		`{"ttl_seconds":0,"ttl_seconds":1}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost,
+			RouteLinkReservePath+"?group=/g&route_key=rk&operation=exec-session&sid=stable", strings.NewReader(body))
+		request.Header.Set("X-API-KEY", testAPIKeyValue())
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			responseBody, _ := io.ReadAll(response.Result().Body)
+			t.Fatalf("exec-session route-link body %q status = %d, body = %q", body, response.Code, responseBody)
+		}
 	}
 }

@@ -1,7 +1,9 @@
 package proxyshm
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -12,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 const workerExecServiceSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -526,6 +530,55 @@ func TestExternalExecInvalidKATDoesNotWakeOrDial(t *testing.T) {
 	}
 	if wakes.Load() != 0 || dials.Load() != 0 {
 		t.Fatalf("invalid KAT caused side effects: wakes=%d dials=%d", wakes.Load(), dials.Load())
+	}
+}
+
+func TestExternalExecConditionDenialDoesNotWakeOrDial(t *testing.T) {
+	tbl := newExecTable(t)
+	route := execWorkerRoute("external-condition", routesync.StatePaused)
+	if err := tbl.Upsert(route); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	var wakes atomic.Int32
+	var dials atomic.Int32
+	view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, time.Second)
+	px := proxy.NewWithDialer(view, func() string { return "off" }, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}, t.TempDir())
+	token, err := keys.MintExecAccessTokenWithConditions(
+		workerExecServiceSecret, route.AuthSandboxID, 0,
+		[]string{`request.argv == ['/bin/allowed']`},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"type":"exec_request","exec":{"argv":["/bin/denied"]}}`)
+	frame := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[4:], payload)
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(frame))
+	req.ProtoMajor, req.ProtoMinor, req.Proto = 2, 0, "HTTP/2.0"
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, route.SandboxID)
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	req.Header.Set(proxy.HeaderAccessToken, token)
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("condition denial CONNECT response = %d, want 200", resp.Code)
+	}
+	var rejection sandboxctl.Response
+	if err := sandboxctl.ReadMessage(bytes.NewReader(resp.Body.Bytes()), &rejection); err != nil {
+		t.Fatal(err)
+	}
+	if rejection.Type != sandboxctl.TypeError || rejection.Msg != "exec request rejected" {
+		t.Fatalf("condition denial = %+v", rejection)
+	}
+	if wakes.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("condition denial caused side effects: wakes=%d dials=%d", wakes.Load(), dials.Load())
 	}
 }
 

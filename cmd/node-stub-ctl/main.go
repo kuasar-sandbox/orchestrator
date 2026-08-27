@@ -30,12 +30,16 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 var version = "0.1.0-dev"
@@ -522,15 +526,33 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	var execClaims keys.ExecAccessClaims
+	var execPrograms *execadmission.ProgramSet
 	if execService {
-		if err := keys.VerifyExecAccessToken(
+		var err error
+		execClaims, err = keys.ParseAndVerifyExecAccessToken(
 			r.Header.Get("X-Access-Token"), sb.ServiceSecret, sb.AuthSandboxID, time.Now(),
-		); err != nil {
+		)
+		if err != nil {
 			http.Error(w, "invalid access token", http.StatusUnauthorized)
+			return
+		}
+		compiler, err := execadmission.Default()
+		if err != nil {
+			http.Error(w, "exec admission unavailable", http.StatusNotImplemented)
+			return
+		}
+		execPrograms, err = compiler.Compile(execClaims.Conditions)
+		if err != nil {
+			http.Error(w, "invalid exec conditions", http.StatusBadRequest)
 			return
 		}
 	}
 	if r.Method == http.MethodConnect {
+		if execService {
+			s.serveExecDataConnect(w, r, n, sb, execClaims, execPrograms)
+			return
+		}
 		s.serveDataConnect(w, r, n, sb)
 		return
 	}
@@ -546,6 +568,56 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	if body != "" {
 		_, _ = io.WriteString(w, body)
 	}
+}
+
+func (s *service) serveExecDataConnect(
+	w http.ResponseWriter,
+	r *http.Request,
+	n *stubNode,
+	sb *stubSandbox,
+	claims keys.ExecAccessClaims,
+	programs *execadmission.ProgramSet,
+) {
+	tunnelCtx := r.Context()
+	cancelTunnel := func() {}
+	if r.ProtoMajor != 2 {
+		tunnelCtx = context.WithoutCancel(tunnelCtx)
+		if deadline, ok := r.Context().Deadline(); ok {
+			tunnelCtx, cancelTunnel = context.WithDeadline(tunnelCtx, deadline)
+		}
+	}
+	defer cancelTunnel()
+	_ = sandboxctl.ServeExecTunnel(tunnelCtx, sandboxctl.ExecTunnelOptions{
+		Authorize: func(context.Context) error { return nil },
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			return proxypkg.AcceptConnectStream(w, r)
+		},
+		AuthorizeRequest: func(ctx context.Context, frame *sandboxctl.ExecRequestFrame) error {
+			if claims.ExpiresUnix != nil && time.Now().Unix() >= *claims.ExpiresUnix {
+				return errors.New("exec capability expired")
+			}
+			return programs.Evaluate(ctx, frame.Request.Exec)
+		},
+		DialBackend: func(_ context.Context, frame *sandboxctl.ExecRequestFrame) (io.ReadWriteCloser, error) {
+			client, backend := net.Pipe()
+			raw := append([]byte(nil), frame.Raw...)
+			go func() {
+				defer backend.Close()
+				got := make([]byte, len(raw))
+				if _, err := io.ReadFull(backend, got); err != nil || !bytes.Equal(got, raw) {
+					return
+				}
+				s.appendDataHit(dataHit{
+					NodeID: n.ID, SandboxID: sb.SID,
+					Cluster: cloneStubClusterContext(sb.Cluster), Metadata: observableSandboxMetadata(sb.Metadata),
+					Host: "exec", Path: "/exec-admitted", Method: "EXEC",
+				})
+				_, _ = io.WriteString(backend, "exec-admitted")
+			}()
+			return client, nil
+		},
+		FirstRequestTimeout: limits.FirstRequestTimeout,
+	})
 }
 
 func (s *service) serveDataConnect(w http.ResponseWriter, r *http.Request, n *stubNode, sb *stubSandbox) {
@@ -839,6 +911,12 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		return nil
 	}
 	n.recordCommand(cmd)
+	if cmd.Kind != routesync.CmdExecSession && cmd.ExecConditionsSpecified() {
+		return ack(cmd, routesync.AckRejected, "command contains exec conditions")
+	}
+	if cmd.Kind == routesync.CmdExecSession && cmd.ExecConditionsSpecified() && len(cmd.ExecConditions) == 0 {
+		return ack(cmd, routesync.AckRejected, "command contains non-canonical exec conditions")
+	}
 	switch cmd.Kind {
 	case routesync.CmdKeyPut:
 		pair, err := stubKeyPairFromCommand(cmd)
@@ -997,6 +1075,13 @@ func (n *stubNode) handleExecSession(cmd *routesync.Command) *routesync.CmdAck {
 	if err := validateStubExecSessionEnvelope(cmd); err != nil {
 		return ack(cmd, routesync.AckRejected, err.Error())
 	}
+	compiler, err := execadmission.Default()
+	if err != nil {
+		return ack(cmd, routesync.AckRejected, "exec admission is unavailable")
+	}
+	if _, err := compiler.Compile(cmd.ExecConditions); err != nil {
+		return ack(cmd, routesync.AckRejected, "invalid exec conditions")
+	}
 	if _, err := execsession.ExpiryUnix(time.Now().Unix(), cmd.TTLSeconds); err != nil {
 		return ack(cmd, routesync.AckRejected, "invalid exec session ttl")
 	}
@@ -1040,7 +1125,9 @@ func (n *stubNode) handleExecSession(cmd *routesync.Command) *routesync.CmdAck {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "invalid exec session ttl")
 	}
-	token, err := keys.MintExecAccessToken(sb.ServiceSecret, sb.AuthSandboxID, expiresUnix)
+	token, err := keys.MintExecAccessTokenWithConditions(
+		sb.ServiceSecret, sb.AuthSandboxID, expiresUnix, cmd.ExecConditions,
+	)
 	if err != nil {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "sandbox exec credentials are invalid")
