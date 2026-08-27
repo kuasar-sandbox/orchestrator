@@ -13,6 +13,8 @@ import (
 	"time"
 
 	nodeconfig "github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -215,13 +217,10 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	// prepareBundleTemplateBase has already published a newly built platform
 	// base. Tarstream mode retains upload-snapshot's existing graph rewrite.
 	p.progress("uploading template snapshot to the content store")
-	args := []string{"upload-snapshot", "--quiet"}
-	if p.spec.ToRefLocation != "" {
-		args = append(args, "--to-ref-location", p.spec.ToRefLocation)
-	} else {
-		args = append(args, "--manifest-config", p.spec.Paths.ManifestConfig)
+	args, err := uploadSnapshotArgs(p.spec, bundle, p.now())
+	if err != nil {
+		return "", err
 	}
-	args = append(args, bundle)
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
 	if err != nil {
 		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
@@ -232,4 +231,24 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	}
 	p.progress("uploaded template snapshot: %s", ref)
 	return ref, nil
+}
+
+// uploadSnapshotArgs builds the sandbox-ctl upload-snapshot argv. The
+// publication name is minted HERE, at upload time, not at spec-resolution
+// time: a build that spans UTC midnight publishes into the day it actually
+// uploads, not the day the orchestrator resolved the spec. now is a parameter
+// so tests can pin the clock across midnight.
+func uploadSnapshotArgs(spec *configsock.BuildSpec, bundle string, now time.Time) ([]string, error) {
+	args := []string{"upload-snapshot", "--quiet"}
+	if spec.PublishLocationParent != "" {
+		locName := reflocation.PublicationName(spec.BuildID, now)
+		location, err := reflocation.Resolve(spec.PublishLocationParent, locName)
+		if err != nil {
+			return nil, fmt.Errorf("publish location for %s: %w", locName, err)
+		}
+		args = append(args, "--to-ref-location", locName+"="+location.URI)
+	} else {
+		args = append(args, "--manifest-config", spec.Paths.ManifestConfig)
+	}
+	return append(args, bundle), nil
 }

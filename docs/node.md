@@ -1374,16 +1374,25 @@ exact upload 仍只发布 snapshot layer,不改写 cfg。Bundle restore 期间�
 Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback。
 
 portable publish 与 Pause mode 独立。若配置
-`checkpoint.remote.ref_location_parent`,`export-sandbox` 根据 source sandbox ID 计算:
+`checkpoint.remote.ref_location_parent`,`export-sandbox` 在发布时构造 publication
+name(实体 ID + 等宽发布日期后缀 `<sb.ID>-<YYYYMMDD>`,`reflocation.PublicationName`;
+UTC,同日重试同名收敛,跨日重试使用新日期的 name/目录):
 
 ```text
-hash = SHA256(location-name)
-location URI = <parent>/<hash[0:2]>/<hash[2:4]>/<location-name>
+location name = <entity-id>-<YYYYMMDD>   (发布日期 = publication 日期,非实体创建日期)
+location URI  = <parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>
 ```
 
+首层日期目录是按发布时间有序的分区(字典序=日期序),为未来的 GC 候选发现提供
+有序布局;hash 两级扇出原样保留(限制单目录条目)。发布日期取自 name 后缀而非
+实体 ID 内嵌时间——晚导出的实体(创建久远但刚发布)落在当前日期分区。GC 策略与
+删除流程(retention、可达性、在途发布处理、删除安全)不在本仓库范围,由未来的
+管理面 GC 组件负责。conductor 与 task reader 共用 `internal/reflocation` 一条规则,
+name 自足(ref 携带即可恢复,无需任何额外状态)。
+
 随后用 `upload-snapshot --to-ref-location` 发布,tarstream 得到
-`file://<digest>.snapshot@location:<source-sid>`,Bundle 得到
-`file://<root-key>.bundle@location:<source-sid>`。没有 parent 时发布到 Manifest Store。
+`file://<digest>.snapshot@location:<publication-name>`,Bundle 得到
+`file://<root-key>.bundle@location:<publication-name>`。没有 parent 时发布到 Manifest Store。
 两者都是 canonical portable ref.第一阶段只读 local checkpoint 并产生 portable ref,
 不改变 source row/cache/route 或本机文件;第二阶段取得 lifecycle finalizer 后才提交
 source retention 并删除明确的本机 checkpoint。located 目录绝不进入本机 cleanup。
@@ -1438,7 +1447,8 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   `root + FromRefs + ArtifactRefs()` 收集flattened逻辑closure;`FromRefs`是已展平memory
   chain、disk `BaseFromRefs`同理,不递归读取parent cfg。逻辑ref上限和Bundle profile内
   refs上限各为1024;所有location name去重排序,路径与CLI URI均按
-  `<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生。
+  `<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生
+  (日期段取自 name 自带的发布日期后缀,与 §8.1 的 dated 布局一致)。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
   decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
@@ -1850,7 +1860,8 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 不是把 snapshot-layer Bundle 地址写进 cfg。随后快照收尾仍只执行**一条**
 `sandbox-ctl upload-snapshot <snapshot>`;exact upload不重写根。Phase C 的 capture 使用
 与 Pause 相同的 `checkpoint.mode`,但不继承 Pause-only merge/drop policy。配置
-`ref_location_parent` 时使用 build ID 作为 location name 发布到 named location,
+`ref_location_parent` 时以 publication name(build ID + UTC 发布日期后缀,
+`reflocation.PublicationName`,builder 在 upload 开始前才铸造)发布到 named location,
 否则发布到 manifest;Bundle 上传保持原始根 ManifestKey 与 byte-identical `snapshot.cfg`。结果
 `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传;
 快照模板的 start/ready 与模板有效 `NetworkSpec` 同时记进 snapshot.cfg metadata,

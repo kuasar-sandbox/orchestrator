@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -55,6 +56,7 @@ type Orchestrator struct {
 	log *slog.Logger
 
 	sandboxReadyTimeout time.Duration
+	now                 func() time.Time // publication-date clock for promote; overridable in tests
 
 	mu  sync.Mutex
 	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
@@ -163,6 +165,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		mmdsServices:              mmdsServices,
 		commitBuildTrigger:        st.CommitBuildTrigger,
 		removeBuildRuntimeDir:     os.RemoveAll,
+		now:                       time.Now,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -2219,11 +2222,16 @@ func appendCheckpointPolicyArgs(args []string, policy sandboxcfg.CheckpointPolic
 func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
 	args := []string{"upload-snapshot", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		uri, err := o.cfg.Checkpoint.RefLocationURI(sb.ID)
+		// Publication location name: the sandbox id plus the publication
+		// date. The date suffix is what the time-ordered layout buckets by;
+		// a same-day retry reuses the same name (and directory), while a
+		// cross-midnight retry simply ages out with its own bucket.
+		locName := reflocation.PublicationName(sb.ID, o.now())
+		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
 			return "", fmt.Errorf("orch: promote %s: %w", sb.ID, err)
 		}
-		args = append(args, "--to-ref-location", sb.ID+"="+uri)
+		args = append(args, "--to-ref-location", locName+"="+uri)
 	}
 	args = append(args, localPath)
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), args...)

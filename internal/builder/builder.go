@@ -59,7 +59,7 @@ type PhaseReporter func(phase, sandboxID, state string) error
 // Run drives the build pipeline for spec and returns its Result. parent carries
 // task cancellation (including SIGTERM) into every phase subprocess.
 func Run(parent context.Context, spec *configsock.BuildSpec, vmmCgroup *os.File, report PhaseReporter, log *slog.Logger) Result {
-	p := &buildPipeline{parent: parent, spec: spec, vmmCgroup: vmmCgroup, report: report, log: log}
+	p := &buildPipeline{parent: parent, spec: spec, vmmCgroup: vmmCgroup, report: report, log: log, now: time.Now}
 	return p.run()
 }
 
@@ -78,7 +78,8 @@ type buildPipeline struct {
 	vmmCgroup *os.File
 	report    PhaseReporter
 	log       *slog.Logger
-	out       *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	now       func() time.Time // publication-date bucketing clock; overridable in tests
+	out       *buildJournal    // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
 	profile   types.Profile
 
 	ctx    context.Context

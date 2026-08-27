@@ -193,20 +193,24 @@ type BuildSpec struct {
 	// SnapshotPreparation is populated only inside run-builder from its retained
 	// root SnapshotCfg. It is intentionally absent from the conductor wire.
 	SnapshotPreparation *BuildSnapshotPreparation `json:"-"`
-	ToRefLocation       string                    `json:"to_ref_location,omitempty"`
-	Steps               []BuildStep               `json:"steps,omitempty"`
-	StartCmd            string                    `json:"start_cmd,omitempty"`
-	ReadyCmd            string                    `json:"ready_cmd,omitempty"`
-	Env                 map[string]string         `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
-	Paths               BuildPaths                `json:"paths"`
-	Net                 BuildNet                  `json:"net"`
-	TemplateNetwork     sandboxcfg.NetworkSpec    `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
-	Resources           rtconfig.ResourcesConfig  `json:"resources"`
-	MMDSEnabled         bool                      `json:"mmds_enabled"`
-	EnvdToken           string                    `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure            bool                      `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform            string                    `json:"platform,omitempty"`
-	ImportReferer       BuildImportReferer        `json:"import_referer,omitempty"`
+	// PublishLocationParent, when non-empty, publishes the final snapshot to
+	// a named ref location (upload-snapshot --to-ref-location). The builder
+	// derives the publication name and URI itself right before the upload
+	// starts, so the date bucket always reflects the actual publication time.
+	PublishLocationParent string                   `json:"publish_location_parent,omitempty"`
+	Steps                 []BuildStep              `json:"steps,omitempty"`
+	StartCmd              string                   `json:"start_cmd,omitempty"`
+	ReadyCmd              string                   `json:"ready_cmd,omitempty"`
+	Env                   map[string]string        `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
+	Paths                 BuildPaths               `json:"paths"`
+	Net                   BuildNet                 `json:"net"`
+	TemplateNetwork       sandboxcfg.NetworkSpec   `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
+	Resources             rtconfig.ResourcesConfig `json:"resources"`
+	MMDSEnabled           bool                     `json:"mmds_enabled"`
+	EnvdToken             string                   `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure              bool                     `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform              string                   `json:"platform,omitempty"`
+	ImportReferer         BuildImportReferer       `json:"import_referer,omitempty"`
 	// RegistryTLS carries the per-build registry TLS trust (inline CA bundle
 	// PEM and/or skip-verify) projected into the Phase A import sandbox as a
 	// flatten-ctl config YAML. Nil = use system root CAs. Register-time only;
