@@ -9,11 +9,13 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -468,15 +470,28 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
 	o := testOrchCfg(t, cfg)
+	// Pin the publication clock so the expected name is a constant even if
+	// the test straddles UTC midnight.
+	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
+	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
-	sid := "0198f7a1-1234"
+	sid := "0198f7a1-1234-7234-9abc-0123456789ab"
 	localRef := makeLocalSnapshot(t, dir, sid)
-	portableRef := "file://" + strings.Repeat("c", 64) + ".bundle@location:" + sid
+	// The publication name is the sandbox id plus the publication date; the
+	// fake sandbox-ctl echoes a ref carrying whatever name promote passed.
 	argsPath := filepath.Join(dir, "promote.args")
 	binDir := t.TempDir()
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\nprintf '%s\\n' '" + portableRef + "'\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\n" +
+		"for a in \"$@\"; do\n" +
+		"  case \"$a\" in\n" +
+		"    *-20*=*)\n" +
+		"      n=${a%%=*}\n" +
+		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".bundle@location:'\"$n\"\n" +
+		"      ;;\n" +
+		"  esac\n" +
+		"done\n"
 	if err := os.WriteFile(filepath.Join(binDir, "sandbox-ctl"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -491,18 +506,42 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpl, err := types.ParseTemplateID(templateID)
-	if err != nil || tmpl.Ref != portableRef || tmpl.Kind != types.KindSnp {
-		t.Fatalf("template = %#v, %v", tmpl, err)
-	}
 	args, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	locationURI, _ := cfg.Checkpoint.RefLocationURI(sid)
-	if !strings.Contains(string(args), "--to-ref-location "+sid+"="+locationURI) {
-		t.Fatalf("promote args = %q", args)
+	// Extract the publication name promote actually built from the recorded
+	// argv (the only <name>=<uri> pair).
+	var locName string
+	for _, f := range strings.Fields(string(args)) {
+		i := strings.Index(f, "=")
+		if i <= 0 {
+			continue
+		}
+		if f[i+1:] == mustRefLocationURI(t, cfg, f[:i]) {
+			locName = f[:i]
+		}
 	}
+	if locName == "" {
+		t.Fatalf("promote args = %q, want a publication name=uri pair", args)
+	}
+	wantName := reflocation.PublicationName(sid, publishedAt)
+	if locName != wantName {
+		t.Fatalf("publication name = %q, want %q", locName, wantName)
+	}
+	tmpl, err := types.ParseTemplateID(templateID)
+	if err != nil || !strings.Contains(tmpl.Ref, "@location:"+locName) {
+		t.Fatalf("template = %#v, %v; want ref carrying location %q", tmpl, err, locName)
+	}
+}
+
+func mustRefLocationURI(t *testing.T, cfg *config.Config, name string) string {
+	t.Helper()
+	uri, err := cfg.Checkpoint.RefLocationURI(name)
+	if err != nil {
+		t.Fatalf("RefLocationURI(%q): %v", name, err)
+	}
+	return uri
 }
 
 func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
