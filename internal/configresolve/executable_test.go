@@ -27,7 +27,7 @@ func TestValidateComponentExecutable(t *testing.T) {
 		want string
 	}{
 		{name: "relative", path: "xconductor", want: "absolute"},
-		{name: "missing", path: filepath.Join(dir, "missing"), want: "stat component"},
+		{name: "missing", path: filepath.Join(dir, "missing"), want: "open component"},
 		{name: "directory", path: dir, want: "regular file"},
 		{name: "not executable", prep: func() string {
 			path := filepath.Join(dir, "plain")
@@ -62,6 +62,48 @@ func TestValidateComponentExecutable(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestOpenComponentExecutableKeepsValidatedIdentityAcrossReplacement(t *testing.T) {
+	dir := t.TempDir()
+	nodeCtl := filepath.Join(dir, "node-ctl")
+	component := filepath.Join(dir, "xconductor")
+	replacement := filepath.Join(dir, "replacement")
+	for path, contents := range map[string]string{
+		nodeCtl: "node", component: "validated", replacement: "replacement",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o500); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opened, err := OpenComponentExecutable(component, nodeCtl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	openedInfo, err := opened.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, component); err != nil {
+		t.Fatal(err)
+	}
+	pathInfo, err := os.Stat(component)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(openedInfo, pathInfo) {
+		t.Fatal("opened component followed a pathname replacement")
+	}
+}
+
+func TestComponentOwnerMustMatchEffectiveUser(t *testing.T) {
+	if sameComponentOwner(uint32(os.Geteuid())) != true {
+		t.Fatal("effective user did not trust its own component")
+	}
+	if sameComponentOwner(uint32(os.Geteuid()+1)) != false {
+		t.Fatal("component owned by another user was trusted")
 	}
 }
 

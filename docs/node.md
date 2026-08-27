@@ -373,8 +373,9 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
-`encryption_key`、`manifest_config`。**必填仅 `api.domain` 与 `encryption_key`**(后者可用
-`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。运行 helper(sandbox-ctl/connector-ctl vswitch/flatten-ctl)
+`encryption_key`、`manifest_config`。内置模式必填 `api.domain` 与 `encryption_key`(后者可用
+`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)；custom conductor 可在 `Configure` 后由 Runtime provider
+满足 key/TLS/object-store 材料。运行 helper(sandbox-ctl/connector-ctl vswitch/flatten-ctl)
 不进入公共 Config；它们先以最初的精确 node-ctl 相邻发行目录为解析基准，缺失时保留
 现有 PATH fallback。
 
@@ -382,16 +383,16 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 |---|---|---|
 | `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
-| `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
+| `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文。custom Runtime TLS provider 非 nil 时为权威材料源，core 仍固定 TLS version/ALPN/client-auth 策略 |
 | `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §3) |
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
 | `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段,external native exec 另要求 `proxy.yaml` 必填 `paths.run_root` |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §4) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §6) |
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
-| `encryption_key` | (必填) | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
+| `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
-| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受 executable regular file，拒绝与自身同一文件及 group/world-writable 文件。公共 App 交接由 #244 的 conductor 阶段提供 |
+| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受由其 effective UID 持有的 executable regular file，拒绝与自身同一文件及 group/world-writable 文件；它执行已打开并校验的同一 FD，非空时原地 exec，失败绝不回退 |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
@@ -426,7 +427,7 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 | `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用(§4.6、§12) |
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
-| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
+| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录 |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
@@ -446,6 +447,53 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
+
+### 3.1 静态定制 conductor
+
+运维入口保持不变：`node-ctl conductor serve --config ...` 先严格解析并默认化 YAML。
+`paths.conductor_executable` 为空时进入内置 App；非空时 node-ctl 打开 protected absolute
+executable，依据该 FD 校验 owner/mode/file identity，并通过 `/proc/self/fd` 执行同一文件，
+不在校验后重新解析可替换的 pathname；sealed bootstrap 同时记录该已打开文件的 device/inode，
+xconductor 只将它与 `/proc/self/exe` 比较，部署期间 pathname 被替换或删除不会改变已验证身份。
+随后 node-ctl 用 `exec` 原地替换为 xconductor。
+bootstrap 环境变量只含 FD 编号；配置正文/摘要在 memfd 中，FD 禁止 write/grow/shrink 并
+最终 seal。xconductor 直接运行、bootstrap 缺失/截断/超限/version/digest/component 不匹配
+均 fail closed。这个交接用于进程组织和防误用，不宣称抵抗同 UID 恶意进程。
+
+custom main 只需要公共包；完整可编译版本见 `examples/custom-conductor`：
+
+```go
+app := conductor.New(conductor.Hooks{
+    Configure: func(ctx context.Context, cfg *conductor.Config, rt *conductor.Runtime) error {
+        // 替换/调整 declarative Config；绑定启动期 Runtime provider。
+        return nil
+    },
+})
+if err := app.Run(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`New` 无副作用，`Run` one-shot 并处理 SIGINT/SIGTERM；托管方可用 `RunContext`。App 不调用
+`os.Exit`。执行顺序固定为：decode bootstrap → clone Config → `Configure` exactly once →
+校验 `paths.conductor_executable` 未改变 → final declarative validation → 再 clone/freeze →
+解析 Runtime 材料 → 启动共享 conductor core。Hook/provider/final-validation 失败时尚未打开
+durable store、listener、systemd launcher/unit 或 node-link。Hook 可整体替换 Config，但必须
+恢复最初冻结的 executable；Hook 后不会重新应用默认值。
+
+`Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，V1 只开放 logger、
+TLS material、AES-256 ordered key set 与 builder files-storage neutral credentials provider。
+TLS provider 返回 DER certificate chain、`crypto.Signer` 与 root/client CA pool，不能返回任意
+`*tls.Config`；最低 TLS 版本、ALPN、mTLS/client verification 仍由 core 固定。所有 provider
+只在启动/SDK credential refresh 使用，不进入请求热路径；provider 非 nil 即为权威来源，
+任何错误都不回退文件、环境或静态 credential。V1 不支持热更新。
+
+xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runner/builder systemd unit
+仍执行该 node-ctl；`sandbox-ctl`、`connector-ctl`、`flatten-ctl`、`manifest-ctl` 的相邻目录
+解析也以 node-ctl 发行目录为准，不以 xconductor 目录为准。custom component 与 node-ctl
+必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/API handler/Router，不引入
+Go plugin、运行时发现、全局 registry、middleware、生命周期 hook 或 DI container；
+`proxy.mode=internal` 仍只使用 conductor 内置标准 proxy，没有独立定制入口。
 
 Builder 配置为未发布 schema 的直接切换,不保留 alias:
 
