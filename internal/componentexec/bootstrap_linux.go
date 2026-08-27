@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
@@ -84,6 +85,14 @@ func Exec(component Component, role Role, nodeCtlExecutable, componentExecutable
 	if !filepath.IsAbs(nodeCtlExecutable) || !filepath.IsAbs(componentExecutable) {
 		return fmt.Errorf("component bootstrap: executable paths must be absolute")
 	}
+	componentFile, err := configresolve.OpenComponentExecutable(componentExecutable, nodeCtlExecutable)
+	if err != nil {
+		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
+	}
+	defer componentFile.Close()
+	if err := verifyNodeCtlExecutable(nodeCtlExecutable); err != nil {
+		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
+	}
 	rawConfig, err := json.Marshal(config)
 	if err != nil {
 		return fmt.Errorf("component bootstrap: encode config: %w", err)
@@ -130,8 +139,24 @@ func Exec(component Component, role Role, nodeCtlExecutable, componentExecutable
 	env := withoutBootstrapEnvironment(os.Environ())
 	env = append(env, bootstrapEnvironment+"="+strconv.Itoa(fd))
 	argv := []string{componentExecutable}
-	if err := unix.Exec(componentExecutable, argv, env); err != nil {
+	execPath := "/proc/self/fd/" + strconv.Itoa(int(componentFile.Fd()))
+	if err := unix.Exec(execPath, argv, env); err != nil {
 		return fmt.Errorf("exec custom %s %s: %w", component, componentExecutable, err)
+	}
+	return nil
+}
+
+func verifyNodeCtlExecutable(expected string) error {
+	currentInfo, err := os.Stat("/proc/self/exe")
+	if err != nil {
+		return fmt.Errorf("component bootstrap: stat current node-ctl executable: %w", err)
+	}
+	expectedInfo, err := os.Stat(expected)
+	if err != nil {
+		return fmt.Errorf("component bootstrap: stat node-ctl executable: %w", err)
+	}
+	if !os.SameFile(currentInfo, expectedInfo) {
+		return fmt.Errorf("component bootstrap: node-ctl executable does not match current process")
 	}
 	return nil
 }

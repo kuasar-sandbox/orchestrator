@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const helperEnvironment = "KUASAR_COMPONENTEXEC_TEST_HELPER"
+const (
+	helperEnvironment          = "KUASAR_COMPONENTEXEC_TEST_HELPER"
+	helperComponentEnvironment = "KUASAR_COMPONENTEXEC_TEST_COMPONENT"
+)
 
 func TestMain(m *testing.M) {
 	switch os.Getenv(helperEnvironment) {
@@ -28,7 +32,8 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(91)
 		}
-		if err := Exec(ComponentConductor, RoleConductor, executable, executable, map[string]string{"value": "top-secret-bootstrap-value"}); err != nil {
+		component := os.Getenv(helperComponentEnvironment)
+		if err := Exec(ComponentConductor, RoleConductor, executable, component, map[string]string{"value": "top-secret-bootstrap-value"}); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(92)
 		}
@@ -54,8 +59,10 @@ func TestExecReplacesProcessAndKeepsConfigOutOfEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	component := filepath.Join(t.TempDir(), "xconductor")
+	copyComponentExecutable(t, executable, component)
 	command := exec.Command(executable, "-test.run=^$")
-	command.Env = append(os.Environ(), helperEnvironment+"=dispatch")
+	command.Env = append(os.Environ(), helperEnvironment+"=dispatch", helperComponentEnvironment+"="+component)
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -201,12 +208,36 @@ func TestReceiveRejectsMissingInvalidAndUnsealedDescriptors(t *testing.T) {
 
 func TestExecFailureDoesNotFallbackOrPersistEnvironment(t *testing.T) {
 	_ = os.Unsetenv(bootstrapEnvironment)
-	err := Exec(ComponentConductor, RoleConductor, "/usr/bin/node-ctl", "/does/not/exist/xconductor", struct{}{})
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		t.Fatal(executableErr)
+	}
+	err := Exec(ComponentConductor, RoleConductor, executable, "/does/not/exist/xconductor", struct{}{})
 	if err == nil || !strings.Contains(err.Error(), "exec custom conductor") {
 		t.Fatalf("Exec error=%v", err)
 	}
 	if _, ok := os.LookupEnv(bootstrapEnvironment); ok {
 		t.Fatal("failed exec mutated current process environment")
+	}
+}
+
+func copyComponentExecutable(t *testing.T, source, destination string) {
+	t.Helper()
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

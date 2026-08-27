@@ -392,7 +392,7 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
 | `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
-| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受 executable regular file，拒绝与自身同一文件及 group/world-writable 文件；非空时原地 exec，失败绝不回退 |
+| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受由其 effective UID 持有的 executable regular file，拒绝与自身同一文件及 group/world-writable 文件；它执行已打开并校验的同一 FD，非空时原地 exec，失败绝不回退 |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
@@ -451,8 +451,10 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 ### 3.1 静态定制 conductor
 
 运维入口保持不变：`node-ctl conductor serve --config ...` 先严格解析并默认化 YAML。
-`paths.conductor_executable` 为空时进入内置 App；非空时 node-ctl 校验 protected absolute
-executable 后，以 sealed memfd 传递版本化 bootstrap，并用 `exec` 原地替换为 xconductor。
+`paths.conductor_executable` 为空时进入内置 App；非空时 node-ctl 打开 protected absolute
+executable，依据该 FD 校验 owner/mode/file identity，并通过 `/proc/self/fd` 执行同一文件，
+不在校验后重新解析可替换的 pathname；随后以 sealed memfd 传递版本化 bootstrap，并用
+`exec` 原地替换为 xconductor。
 bootstrap 环境变量只含 FD 编号；配置正文/摘要在 memfd 中，FD 禁止 write/grow/shrink 并
 最终 seal。xconductor 直接运行、bootstrap 缺失/截断/超限/version/digest/component 不匹配
 均 fail closed。这个交接用于进程组织和防误用，不宣称抵抗同 UID 恶意进程。

@@ -6,7 +6,8 @@ Build the example with:
 go build -o /opt/kuasar/bin/xconductor ./examples/custom-conductor
 ```
 
-Protect the binary from group/world writes, set the absolute path in
+Own the binary with the node-ctl service UID, protect it from group/world
+writes, and set the absolute path in
 `paths.conductor_executable`, and keep starting the service through
 `node-ctl conductor serve --config ...`. The binary is not a standalone CLI.
 
