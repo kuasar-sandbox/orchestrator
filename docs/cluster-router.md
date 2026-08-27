@@ -3,8 +3,10 @@
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
 不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
 Reserve operation;数据面 cache miss 先 Resolve。只要 route 已有 `NodeSandboxID + DataEndpoint`,
-即使 paused/starting 也直接连接最终 node proxy,由 node 负责鉴权后的 parking、Wake 和 backend
-建连。`Reserve(operation=data)` 只保留为 target 缺失、typed stale 或兼容 fallback。
+普通数据面即使 paused/starting 也直接连接最终 node proxy,由 node 负责鉴权后的 parking、Wake
+和 backend 建连.Exec CONNECT 是例外:Router 在 public 200 后先读取并授权首个 ctl frame,
+通过后才连接最终 node.`Reserve(operation=data)` 只保留为 request admission 之后的 target
+缺失、Raw 发送前的 typed stale 或普通数据面的兼容 fallback。
 
 ## 1. 概述
 
@@ -15,9 +17,10 @@ client
   │ HTTPS e2b control/data
   ▼
 router
-  │ known NodeSandboxID + DataEndpoint (ready/paused/starting)
+  │ ordinary data: known NodeSandboxID + DataEndpoint (ready/paused/starting)
   ├────────────────────────────────────► node proxy
   │                                      auth → parking → Activate/Wake → backend
+  │ exec: token gate → public 200 → first-frame gate → node proxy
   │
   │ data cache miss / missing target / typed stale
   ▼
@@ -37,8 +40,8 @@ node owner / placer / node
    ready/paused/starting,新请求都不触发 Resolve/Reserve;
    在途请求不作为新请求的路由来源。
 4. **fail-fast 失效**:node 在接受内层请求前返回 typed not-found/unauthorized 时,router 淘汰
-   旧 target,经 ReserveData 重验同一 credential 并刷新 route 后只重试一次。连接失败仍淘汰,
-   后续请求重新 Resolve。
+   旧 target,经 ReserveData 重验同一 credential 并刷新 route 后只重试一次.Exec 仅在 Raw
+   尚未发给任何 node 时允许该 retry。连接失败仍淘汰,后续请求重新 Resolve。
 5. **数据面字节不进 registry**:registry 只参与显式 create/connect/exec-session、cache miss Resolve,
    以及 target 缺失或 typed stale 时的 data Reserve fallback。
 6. **根凭据用途分离**:create/connect/exec-session 由 Reserve 强制验证原始 API key;
@@ -135,8 +138,10 @@ Router 调用同一 `POST /route-link/reserve` 时按 operation 组装不同请�
 - `create`:query 为 `operation=create&group=&route_key=`,Header 携 `X-API-KEY`,body只携上述 portable/request-scoped create config。
 - `connect`:query 为 `operation=connect&group=&route_key=&sid=[&timeout=]`,Header 携 `X-API-KEY`
   和可选 `X-Kuasar-Migration-Token`,body 为空。
-- `exec-session`:query 为 `operation=exec-session&group=&route_key=&sid=[&ttl_seconds=]`,Header 携
-  `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`,body 为空.Router 已先严格解析 public body.
+- `exec-session`:query 为 `operation=exec-session&group=&route_key=&sid=`,Header 携
+  `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`,body 使用专用 typed
+  `{"ttl_seconds":N,"conditions":["..."]}`.Router 已先严格解析 public body;Registry
+  再做 schema/bounds 校验,不接受 ttl query、Header 或普通 metadata 传递 conditions.
 - `data`:query 为 `operation=data&group=&route_key=&sid=[&port=]`,Header 携 `X-Access-Token`;
   exec 目标同时携 `E2b-Sandbox-Service: exec`,body 为空.
 
@@ -259,14 +264,16 @@ profile 对应公开 token 的 e2b 响应。node 已同步完成校验、可选�
 凭据读取;resume 在 Ack 后异步进行。
 
 Exec session 的 public endpoint 是 `POST /sandboxes/{stableSandboxID}/exec-sessions`.请求必须携
-group,route-key 和原始 `X-API-KEY`,可选 `X-Kuasar-Migration-Token`.body 只允许空,
-`{}` 或 `{"ttlSeconds":<non-negative int64>}`;完整原始 body(含尾随空白)上限 64 KiB.
-已知 Content-Length 超限或实际读到 64 KiB + 1 返回 413;unknown/duplicate 字段,
-`null`,第二个 JSON value,负数或 TTL 加法/时间表示溢出返回 400.
+group,route-key 和原始 `X-API-KEY`,可选 `X-Kuasar-Migration-Token`.body 只允许空、
+`{}` 或严格的 `ttlSeconds` + `conditions:[{"expr":"..."}]`;完整原始 body(含尾随空白)
+上限 64 KiB.条件缺失与 `[]` 都是 unrestricted 并规范化为 nil;显式 `null`、unknown/duplicate
+字段、空 expr、第二个 JSON value、负数或 TTL/condition bounds 溢出返回 400.
 
-Router 将 API key 送到 Registry verifier,但不把它写入 command;CmdExecSession 只携
-APISecretFingerprint,expected Profile,TTLSeconds,可选 MigrationToken/cluster context.
-Node 同步 import/校验/签名,在 Ack 中返回 `ExecSessionResult`,然后异步 resume.
+Router 将 API key 送到 Registry verifier,但不把它写入 command;CmdExecSession 明确携
+APISecretFingerprint、expected Profile、TTLSeconds、ExecConditions 和可选
+MigrationToken/cluster context.Node 是唯一 signer,在任何 activation mutation 前权威编译
+conditions并签名,在 Ack 中只返回 `ExecSessionResult`,然后按既有 eager 合同异步 resume.
+Conditions 不进入 Route/record/event/metadata/log;#240 的 deferred activation 仍是独立工作.
 Registry 把该 result 与当前 stable lineage 的 Route 汇合;Router 验证两者一致后返回:
 
 ```http
@@ -337,19 +344,21 @@ fallback 返回不同 stable identity 或仍无完整 target 时 fail closed。`
 跳过 Router 对普通请求的本地 token 闸门;带显式错误 token 的 `/files` 在任何模式下都不回退
 signature。
 
-Exec CONNECT 使用单独的 KAT 合同:
+Exec CONNECT 使用单独的三阶段 KAT + request admission 合同:
 
 ```text
 client CONNECT
   stable SandboxID + service=exec + X-Access-Token=KAT
     ↓ side-effect-free cache/Resolve
-Router verifies stable AuthSandboxID + ServiceSecret
-    ↓ known node target: direct even paused/starting
+Router verifies stable AuthSandboxID + ServiceSecret, then compiles CEL
+    ↓ flush public 200; read strict first ctl frame; recheck expiry; evaluate
+    ↓ admission passed (no node/Reserve before this point)
 node CONNECT
   current NodeSandboxID + service=exec + optional original port + same KAT
-    ↓ node KAT verify → parking → ActivateExec/Wake → ctl.sock
+    ↓ node independently verifies KAT + CEL and reads/evaluates first frame
+    ↓ parking → ActivateExec/Wake → ctl.sock; Raw written exactly once
 
-missing/stale target only:
+missing/stale target, only after public request admission and before Raw send:
   Reserve(operation=data, same KAT + service=exec)
     ↓ Registry re-verifies and returns fresh current Route
   retry one node CONNECT
@@ -357,19 +366,22 @@ missing/stale target only:
 
 Exec 始终 enforce,不受 `auth.data_plane=off|log|enforce` 影响.EnvdAccessToken,
 ForwardAccessToken 或 TrafficAccessToken 不能代替 exec KAT.KAT 缺失,过期,签名错误,
-SID/audience 错误时返回 401,且不能触发 Router Reserve,Registry CmdConnect、Node parking 或
-resume.已有 node target 的 paused/starting 路径不增加 Registry 调用,Router 和 Node 都验证
-同一 KAT,Wake/等待发生在 Node.只有 missing/stale fallback 由 Registry 复验;Reserve 后 Router
-必须使用重读的 current NodeSandboxID,不能复用旧 node target.
+SID/audience 错误时在 public 200 前返回 401,且不能触发 Router Reserve、node CONNECT、
+Registry CmdConnect、Node parking 或 resume.ExecRequest/condition 在 200 后失败时返回统一
+`{"type":"error","msg":"exec request rejected"}`,同样无这些副作用.已有 node target 的
+paused/starting 路径不增加 Registry 调用.Router 和 Node 都执行完整 gate,纯 transport relay
+不解析 token/CEL/ExecRequest.只有 missing/stale fallback 由 Registry 复验;Reserve 后 Router
+必须重验 stable lineage/credential 并使用 current NodeSandboxID,不能复用旧 target.
 
-最终 Node 从本地 route 再次校验 `AuthSandboxID + ServiceSecret`,授权成功后才连接
-`<run_root>/<NodeSandboxID>/ctl.sock`,回复 CONNECT 200 并进入 `ctl.ProxyExec` gate.Router 只做
-前置 CONNECT 中继,不拨 `ctl.sock`,不执行首帧 gate.
+Router 在 public 200 后先执行首帧 gate,通过后才建立下一跳;最终 Node 从本地 route 再次校验
+`AuthSandboxID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
+activation 和连接 `<run_root>/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
 
 CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL
 或 fail-fast 失效.Router→Node CONNECT 的 response reader 已预读字节会随 tunnel 保留;
 中继在单向 EOF 时只传播 half-close,等待另一方向的 `exec_ack`,stdout/stderr 和 exit status
-完整结束,不在首个 `io.Copy` 返回时截断 tunnel.
+完整结束,不在首个 `io.Copy` 返回时截断 tunnel.Raw 尚未写给任何 node 前允许一次 typed stale
+retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明转发,不合成第二个 error.
 
 ## 9. 可靠性
 

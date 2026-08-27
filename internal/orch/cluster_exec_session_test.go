@@ -2,8 +2,10 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	cmd.CmdID = "exec-import"
 	cmd.Kind = routesync.CmdExecSession
 	cmd.TTLSeconds = 37
+	cmd.ExecConditions = []string{"request.cwd == '/workspace'"}
 	const preflight = int64(1_800_000_000)
 	const signing = int64(1_800_000_100)
 
@@ -37,6 +40,12 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	}
 	if result == nil || result.ExecAccessToken == "" {
 		t.Fatalf("exec-session result = %+v", result)
+	}
+	claims, err := keys.ParseAndVerifyExecAccessToken(
+		result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+36, 0),
+	)
+	if err != nil || len(claims.Conditions) != 1 || claims.Conditions[0] != cmd.ExecConditions[0] {
+		t.Fatalf("token conditions = %+v, %v", claims, err)
 	}
 	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+36, 0)); err != nil {
 		t.Fatalf("token before expiry: %v", err)
@@ -158,6 +167,48 @@ func TestClusterExecSessionRejectsTTLOverflowWithoutResume(t *testing.T) {
 	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
 	if err != nil || stored != nil {
 		t.Fatalf("overflow ttl inserted target = %+v, %v", stored, err)
+	}
+}
+
+func TestClusterExecSessionRejectsInvalidConditionsBeforeImportOrResume(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.CmdID = "exec-invalid-condition"
+	cmd.Kind = routesync.CmdExecSession
+	cmd.ExecConditions = []string{"request.unknown == true"}
+	ack := fixture.o.HandleCommand(context.Background(), cmd)
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != 400 || ack.ExecSession != nil {
+		t.Fatalf("invalid-condition ack = %+v", ack)
+	}
+	if sb, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || sb != nil {
+		t.Fatalf("invalid condition imported target: %+v, %v", sb, err)
+	}
+}
+
+func TestClusterNonExecCommandRejectsExecConditions(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	cmd := fixture.command("stable-g1", fixture.token)
+	cmd.CmdID = "connect-with-exec-condition"
+	cmd.Kind = routesync.CmdConnect
+	cmd.ExecConditions = []string{"true"}
+	ack := fixture.o.HandleCommand(context.Background(), cmd)
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != 400 {
+		t.Fatalf("foreign exec conditions ack = %+v", ack)
+	}
+	if sb, err := fixture.o.st.Get(context.Background(), cmd.SID); err != nil || sb != nil {
+		t.Fatalf("foreign exec conditions inserted target: %+v, %v", sb, err)
+	}
+}
+
+func TestClusterRejectsExplicitEmptyExecConditionsOnWrongCommand(t *testing.T) {
+	fixture := newClusterConnectFixture(t)
+	var cmd routesync.Command
+	if err := json.Unmarshal([]byte(`{"cmd_id":"foreign-empty","kind":"connect","exec_conditions":[]}`), &cmd); err != nil {
+		t.Fatal(err)
+	}
+	ack := fixture.o.HandleCommand(context.Background(), &cmd)
+	if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("explicit empty foreign exec conditions ack = %+v", ack)
 	}
 }
 

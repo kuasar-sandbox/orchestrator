@@ -12,6 +12,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 )
 
 const (
@@ -39,11 +41,20 @@ type forwardPayload struct {
 }
 
 type execPayload struct {
-	Version   int    `json:"v"`
-	SessionID string `json:"session_id"`
-	SID       string `json:"sid"`
-	Audience  string `json:"aud"`
-	Expires   *int64 `json:"exp,omitempty"`
+	Version    int      `json:"v"`
+	SessionID  string   `json:"session_id"`
+	SID        string   `json:"sid"`
+	Audience   string   `json:"aud"`
+	Expires    *int64   `json:"exp,omitempty"`
+	Conditions []string `json:"conditions,omitempty"`
+}
+
+// ExecAccessClaims are the verified request-authorization claims carried by an
+// exec KAT. All reference fields are defensive copies.
+type ExecAccessClaims struct {
+	SessionID   string
+	ExpiresUnix *int64
+	Conditions  []string
 }
 
 // DeriveServiceSecret derives the default sandbox-scoped ServiceSecret from a
@@ -122,61 +133,107 @@ func VerifyForwardAccessToken(token, serviceSecretHex, authSandboxID string) err
 // claim; a positive value is encoded verbatim. The UUIDv7 session id remains an
 // internal token claim and is intentionally not returned separately.
 func MintExecAccessToken(serviceSecretHex, authSandboxID string, expiresUnix int64) (string, error) {
+	return MintExecAccessTokenWithConditions(serviceSecretHex, authSandboxID, expiresUnix, nil)
+}
+
+// MintExecAccessTokenWithConditions returns a new exec capability carrying the
+// ordered condition sources. Empty input is normalized to an omitted claim.
+func MintExecAccessTokenWithConditions(
+	serviceSecretHex, authSandboxID string,
+	expiresUnix int64,
+	conditions []string,
+) (string, error) {
 	sessionID, err := uuid.NewV7()
 	if err != nil {
 		return "", errInvalidExecAccessToken
 	}
-	return mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID.String(), expiresUnix)
+	return mintExecAccessTokenWithConditions(
+		serviceSecretHex, authSandboxID, sessionID.String(), expiresUnix, conditions,
+	)
 }
 
 // VerifyExecAccessToken strictly validates token's kat1 wire encoding,
 // canonical exec claims, subject binding, expiry, and HMAC-SHA256 signature.
 func VerifyExecAccessToken(token, serviceSecretHex, authSandboxID string, now time.Time) error {
+	_, err := ParseAndVerifyExecAccessToken(token, serviceSecretHex, authSandboxID, now)
+	return err
+}
+
+// ParseAndVerifyExecAccessToken verifies HMAC and all canonical/binding claims
+// before returning claims to CEL admission. No condition is interpreted here.
+func ParseAndVerifyExecAccessToken(
+	token, serviceSecretHex, authSandboxID string,
+	now time.Time,
+) (ExecAccessClaims, error) {
 	serviceSecret, err := decodeCanonicalHex32(serviceSecretHex, errInvalidServiceSecret)
 	if err != nil {
-		return err
+		return ExecAccessClaims{}, err
 	}
 	if !validAuthSandboxID(authSandboxID) {
-		return errInvalidAuthSandboxID
+		return ExecAccessClaims{}, errInvalidAuthSandboxID
 	}
 
+	if len(token) > limits.MaxExecTokenBytes {
+		return ExecAccessClaims{}, errInvalidExecAccessToken
+	}
 	segments := bytes.Split([]byte(token), []byte{'.'})
 	if len(segments) != 3 || string(segments[0]) != kat1Prefix ||
 		len(segments[1]) == 0 || len(segments[2]) == 0 {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 	payload, ok := decodeCanonicalRawURL(segments[1])
 	if !ok {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 	signature, ok := decodeCanonicalRawURL(segments[2])
 	if !ok || len(signature) != sha256.Size {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 	signingInput := kat1Prefix + "." + string(segments[1])
 	if !hmac.Equal(signature, signKAT(serviceSecret, signingInput)) {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 
 	var claims execPayload
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 	canonical, err := json.Marshal(claims)
 	if err != nil || !bytes.Equal(payload, canonical) ||
 		claims.Version != 1 || claims.SID != authSandboxID || claims.Audience != execAudience ||
 		!validUUIDv7(claims.SessionID) {
-		return errInvalidExecAccessToken
+		return ExecAccessClaims{}, errInvalidExecAccessToken
+	}
+	if err := limits.ValidateExpressions(claims.Conditions); err != nil {
+		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
 	if claims.Expires != nil {
 		if *claims.Expires <= 0 || now.Unix() >= *claims.Expires {
-			return errInvalidExecAccessToken
+			return ExecAccessClaims{}, errInvalidExecAccessToken
 		}
 	}
-	return nil
+	result := ExecAccessClaims{
+		SessionID:  claims.SessionID,
+		Conditions: append([]string(nil), claims.Conditions...),
+	}
+	if claims.Expires != nil {
+		expires := *claims.Expires
+		result.ExpiresUnix = &expires
+	}
+	return result, nil
 }
 
 func mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID string, expiresUnix int64) (string, error) {
+	return mintExecAccessTokenWithConditions(
+		serviceSecretHex, authSandboxID, sessionID, expiresUnix, nil,
+	)
+}
+
+func mintExecAccessTokenWithConditions(
+	serviceSecretHex, authSandboxID, sessionID string,
+	expiresUnix int64,
+	conditions []string,
+) (string, error) {
 	serviceSecret, err := decodeCanonicalHex32(serviceSecretHex, errInvalidServiceSecret)
 	if err != nil {
 		return "", err
@@ -190,8 +247,13 @@ func mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID string, expi
 	if expiresUnix < 0 {
 		return "", errInvalidExecExpiry
 	}
+	normalizedConditions, err := limits.NormalizeExpressions(conditions)
+	if err != nil {
+		return "", errInvalidExecAccessToken
+	}
 	claims := execPayload{
 		Version: 1, SessionID: sessionID, SID: authSandboxID, Audience: execAudience,
+		Conditions: normalizedConditions,
 	}
 	if expiresUnix > 0 {
 		claims.Expires = &expiresUnix
@@ -203,7 +265,11 @@ func mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID string, expi
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
 	signingInput := kat1Prefix + "." + payloadB64
 	signature := signKAT(serviceSecret, signingInput)
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+	token := signingInput + "." + base64.RawURLEncoding.EncodeToString(signature)
+	if len(token) > limits.MaxExecTokenBytes {
+		return "", errInvalidExecAccessToken
+	}
+	return token, nil
 }
 
 func validUUIDv7(value string) bool {

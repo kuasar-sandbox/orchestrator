@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 )
 
 const (
@@ -241,6 +244,134 @@ func TestMintExecAccessTokenUsesUUIDv7AndOptionalExpiry(t *testing.T) {
 	}
 }
 
+func TestExecAccessTokenConditionsCanonicalClaims(t *testing.T) {
+	conditions := []string{
+		`request.argv == ['/bin/true']`,
+		`request.cwd == '/' || request.cwd == '/workspace'`,
+	}
+	token, err := mintExecAccessTokenWithConditions(
+		testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(token, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec","exp":1784835600,"conditions":["request.argv == ['/bin/true']","request.cwd == '/' || request.cwd == '/workspace'"]}`
+	if string(payload) != want {
+		t.Fatalf("conditions payload = %s\nwant = %s", payload, want)
+	}
+	claims, err := ParseAndVerifyExecAccessToken(
+		token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.SessionID != testExecSessionID || claims.ExpiresUnix == nil || *claims.ExpiresUnix != testExecExpiry ||
+		len(claims.Conditions) != 2 || claims.Conditions[0] != conditions[0] || claims.Conditions[1] != conditions[1] {
+		t.Fatalf("parsed claims = %+v", claims)
+	}
+	claims.Conditions[0] = "mutated"
+	again, err := ParseAndVerifyExecAccessToken(
+		token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0),
+	)
+	if err != nil || again.Conditions[0] != conditions[0] {
+		t.Fatalf("claims slice was not defensive: %+v, %v", again, err)
+	}
+}
+
+func TestExecAccessTokenEmptyConditionsMatchOmittedWire(t *testing.T) {
+	omitted, err := mintExecAccessTokenWithConditions(
+		testServiceSecret, testAuthSandboxID, testExecSessionID, 0, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := mintExecAccessTokenWithConditions(
+		testServiceSecret, testAuthSandboxID, testExecSessionID, 0, []string{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty != omitted {
+		t.Fatalf("empty conditions token differs from omitted:\nempty=%s\nomitted=%s", empty, omitted)
+	}
+	claims, err := ParseAndVerifyExecAccessToken(empty, testServiceSecret, testAuthSandboxID, time.Unix(1, 0))
+	if err != nil || claims.Conditions != nil {
+		t.Fatalf("unrestricted claims = %+v, %v", claims, err)
+	}
+}
+
+func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
+	token, err := mintExecAccessTokenWithConditions(
+		testServiceSecret, testAuthSandboxID, testExecSessionID, 0,
+		[]string{`request.cwd == '/'`},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(token, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedPayload := bytes.Replace(payload, []byte(`request.cwd == '/'`), []byte(`request.cwd == '/x'`), 1)
+	tampered := "kat1." + base64.RawURLEncoding.EncodeToString(tamperedPayload) + "." + parts[2]
+	if _, err := ParseAndVerifyExecAccessToken(tampered, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+		t.Fatalf("tampered conditions error = %v", err)
+	}
+
+	base := `{"v":1,"session_id":"01890f35-7b2c-7cc6-98c4-dc0c0c07398f","sid":"sandbox-01","aud":"exec"}`
+	payloads := map[string]string{
+		"explicit empty": strings.TrimSuffix(base, "}") + `,"conditions":[]}`,
+		"null":           strings.TrimSuffix(base, "}") + `,"conditions":null}`,
+		"duplicate":      strings.TrimSuffix(base, "}") + `,"conditions":["true"],"conditions":["true"]}`,
+		"unknown":        strings.TrimSuffix(base, "}") + `,"condition":"true"}`,
+		"too long": strings.TrimSuffix(base, "}") + `,"conditions":[` +
+			strconv.Quote(strings.Repeat("x", limits.MaxConditionExprBytes+1)) + `]}`,
+	}
+	tooMany := make([]string, limits.MaxConditions+1)
+	for index := range tooMany {
+		tooMany[index] = "true"
+	}
+	rawTooMany, err := json.Marshal(execPayload{
+		Version: 1, SessionID: testExecSessionID, SID: testAuthSandboxID,
+		Audience: execAudience, Conditions: tooMany,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads["too many"] = string(rawTooMany)
+	totalTooLarge := make([]string, 5)
+	for index := range totalTooLarge {
+		totalTooLarge[index] = strings.Repeat("x", limits.MaxConditionBytes/4)
+	}
+	rawTotalTooLarge, err := json.Marshal(execPayload{
+		Version: 1, SessionID: testExecSessionID, SID: testAuthSandboxID,
+		Audience: execAudience, Conditions: totalTooLarge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads["total condition bytes"] = string(rawTotalTooLarge)
+	for name, raw := range payloads {
+		t.Run(name, func(t *testing.T) {
+			candidate := signedRawPayload(t, []byte(raw), testServiceSecret)
+			if _, err := ParseAndVerifyExecAccessToken(candidate, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+				t.Fatalf("ParseAndVerifyExecAccessToken() = %v", err)
+			}
+		})
+	}
+	if _, err := ParseAndVerifyExecAccessToken(
+		strings.Repeat("x", limits.MaxExecTokenBytes+1), testServiceSecret, testAuthSandboxID, time.Unix(1, 0),
+	); !errors.Is(err, errInvalidExecAccessToken) {
+		t.Fatalf("oversized token error = %v", err)
+	}
+}
+
 func TestExecAccessTokenStrictWire(t *testing.T) {
 	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, 0)
 	if err != nil {
@@ -333,6 +464,29 @@ func TestKATErrorsDoNotEchoInputs(t *testing.T) {
 	_, err = DeriveServiceSecret(badSecret, testAuthSandboxID)
 	if err == nil || strings.Contains(err.Error(), badSecret) {
 		t.Fatalf("derivation error leaks secret: %v", err)
+	}
+}
+
+func BenchmarkMintMaximumExecConditionsToken(b *testing.B) {
+	conditions := make([]string, limits.MaxConditions)
+	for index := range conditions {
+		conditions[index] = strings.Repeat("x", limits.MaxConditionBytes/limits.MaxConditions-1) + strconv.Itoa(index%10)
+	}
+	token, err := mintExecAccessTokenWithConditions(
+		testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(token)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := mintExecAccessTokenWithConditions(
+			testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+		); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

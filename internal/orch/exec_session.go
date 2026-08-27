@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -22,24 +23,33 @@ func (o *Orchestrator) ExecSession(
 	ctx context.Context,
 	id, apiKey, migrationToken string,
 	ttlSeconds int64,
+	conditions []string,
 ) (string, error) {
-	return o.execSession(ctx, id, apiKey, migrationToken, ttlSeconds, wallUnix)
+	return o.execSession(ctx, id, apiKey, migrationToken, ttlSeconds, conditions, wallUnix)
 }
 
 func (o *Orchestrator) execSession(
 	ctx context.Context,
 	id, apiKey, migrationToken string,
 	ttlSeconds int64,
+	conditions []string,
 	now unixClock,
 ) (string, error) {
 	if _, err := execSessionExpiry(now(), ttlSeconds); err != nil {
 		return "", err
 	}
+	compiler, err := execadmission.Default()
+	if err != nil {
+		return "", fmt.Errorf("exec session: initialize admission: %w", err)
+	}
+	if _, err := compiler.Compile(conditions); err != nil {
+		return "", fmt.Errorf("exec session: invalid conditions: %w", api.ErrBadRequest)
+	}
 	if _, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken); err != nil {
 		return "", err
 	}
 	var token string
-	_, _, err := o.ensureResumeAcceptedPrepared(ctx, id, nil, func(current *types.Sandbox) error {
+	_, _, err = o.ensureResumeAcceptedPrepared(ctx, id, nil, func(current *types.Sandbox) error {
 		if !ownsSandbox(current, apiKey) {
 			return api.ErrNotFound
 		}
@@ -49,7 +59,7 @@ func (o *Orchestrator) execSession(
 		// Sample signing time only after synchronous import, lifecycle contention,
 		// and any previous launch cleanup have completed. The hook still runs
 		// before BeginResume, so token generation failure has no launch side effect.
-		token, err = mintExecSessionToken(current, ttlSeconds, now())
+		token, err = mintExecSessionToken(current, ttlSeconds, conditions, now())
 		return err
 	})
 	if err != nil {
@@ -58,7 +68,7 @@ func (o *Orchestrator) execSession(
 	return token, nil
 }
 
-func mintExecSessionToken(sb *types.Sandbox, ttlSeconds, nowUnix int64) (string, error) {
+func mintExecSessionToken(sb *types.Sandbox, ttlSeconds int64, conditions []string, nowUnix int64) (string, error) {
 	if err := validateExecSessionSandbox(sb); err != nil {
 		return "", err
 	}
@@ -66,7 +76,9 @@ func mintExecSessionToken(sb *types.Sandbox, ttlSeconds, nowUnix int64) (string,
 	if err != nil {
 		return "", err
 	}
-	token, err := keys.MintExecAccessToken(sb.ServiceSecret, sb.AuthSandboxID(), expiresUnix)
+	token, err := keys.MintExecAccessTokenWithConditions(
+		sb.ServiceSecret, sb.AuthSandboxID(), expiresUnix, conditions,
+	)
 	if err != nil {
 		return "", fmt.Errorf("exec session: mint access token: %w", err)
 	}

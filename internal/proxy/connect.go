@@ -339,6 +339,54 @@ var _ interface{ CloseWrite() error } = (*h1ConnectStream)(nil)
 var _ io.ReadWriteCloser = (*h2ConnectStream)(nil)
 var _ interface{ CloseWrite() error } = (*h2ConnectStream)(nil)
 
+// AcceptConnectStream flushes CONNECT 200 and returns the client-facing duplex
+// stream without dialing an upstream. HTTP/1 buffered bytes are preserved and
+// HTTP/2 writes are flushed. The caller owns the returned stream.
+func AcceptConnectStream(w http.ResponseWriter, r *http.Request) (io.ReadWriteCloser, error) {
+	if r.ProtoMajor == 2 {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return nil, fmt.Errorf("proxy: CONNECT response does not support flush")
+		}
+		body := r.Body
+		if body == nil {
+			body = http.NoBody
+		}
+		downstream := &h2ConnectStream{reader: body, writer: w, flusher: flusher}
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		return downstream, nil
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		return nil, fmt.Errorf("proxy: CONNECT response does not support hijack")
+	}
+	client, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, fmt.Errorf("proxy: hijack CONNECT: %w", err)
+	}
+	downstream := &h1ConnectStream{Conn: client, reader: rw.Reader}
+	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = downstream.Close()
+		return nil, fmt.Errorf("proxy: write CONNECT response: %w", err)
+	}
+	if err := rw.Flush(); err != nil {
+		_ = downstream.Close()
+		return nil, fmt.Errorf("proxy: flush CONNECT response: %w", err)
+	}
+	return downstream, nil
+}
+
+// BufferedConnectStream exposes bytes already buffered while reading an
+// upstream CONNECT response and preserves the connection's half-close support.
+func BufferedConnectStream(conn net.Conn, reader *bufio.Reader) net.Conn {
+	if reader == nil {
+		reader = bufio.NewReader(conn)
+	}
+	return &bufferedConn{Conn: conn, r: reader}
+}
+
 // Tunnel splices the client CONNECT stream to backend for HTTP/1.1 and HTTP/2.
 // A clean EOF half-closes the destination and both pumps are drained; an I/O
 // error closes both streams to unblock the peer pump. Tunnel owns and closes the

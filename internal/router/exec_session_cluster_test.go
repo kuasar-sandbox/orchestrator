@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,7 +26,7 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 		reserveHits.Add(1)
 		query := r.URL.Query()
 		if query.Get("operation") != "exec-session" || query.Get("group") != "/g" ||
-			query.Get("route_key") != "rk" || query.Get("sid") != "stable" || query.Get("ttl_seconds") != "37" ||
+			query.Get("route_key") != "rk" || query.Get("sid") != "stable" || query.Get("ttl_seconds") != "" ||
 			query.Get("port") != "" || query.Get("timeout") != "" {
 			t.Fatalf("exec-session reserve query = %q", r.URL.RawQuery)
 		}
@@ -35,12 +36,16 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 		if got := r.Header.Get(HeaderMigration); got != "kmt1.opaque" {
 			t.Fatalf("reserve migration token = %q", got)
 		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil || len(body) != 0 {
-			t.Fatalf("reserve body = %q, %v; want empty", body, err)
+		var body struct {
+			TTLSeconds int64    `json:"ttl_seconds"`
+			Conditions []string `json:"conditions"`
 		}
-		if got := r.Header.Get("Content-Type"); got != "" {
-			t.Fatalf("reserve Content-Type = %q, want empty", got)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TTLSeconds != 37 ||
+			len(body.Conditions) != 1 || body.Conditions[0] != "request.cwd == '/workspace'" {
+			t.Fatalf("reserve body = %+v, %v", body, err)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("reserve Content-Type = %q", got)
 		}
 		result := routerTestReserveResult(t, "stable", "/g", "rk", "node.invalid:9443", types.ProfileBare)
 		result.Route.State = "reserved"
@@ -54,7 +59,8 @@ func TestClusterExecSessionUsesReserveAndReturnsOnlyToken(t *testing.T) {
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes/stable/exec-sessions", strings.NewReader(`{"ttlSeconds":37}`))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes/stable/exec-sessions", strings.NewReader(
+		`{"ttlSeconds":37,"conditions":[{"expr":"request.cwd == '/workspace'"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +100,14 @@ func TestClusterExecSessionUsesSharedStrictBodyContract(t *testing.T) {
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reserveHits.Add(1)
-		if got := r.URL.Query().Get("ttl_seconds"); got != "" && got != "37" {
-			t.Fatalf("ttl_seconds = %q, want empty or 37", got)
+		if got := r.URL.Query().Get("ttl_seconds"); got != "" {
+			t.Fatalf("ttl_seconds query = %q", got)
+		}
+		var body struct {
+			TTLSeconds int64 `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
 		}
 		result := routerTestReserveResult(t, "stable", "/g", "rk", "node.invalid:9443", types.ProfileBare)
 		result.ExecSession = &execSessionResult{ExecAccessToken: "kat1.exec"}
@@ -165,8 +177,14 @@ func TestClusterExecSessionPropagatesReserveTTLOverflow(t *testing.T) {
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reserveHits.Add(1)
-		if got := r.URL.Query().Get("ttl_seconds"); got != "9223372036854775807" {
-			t.Fatalf("ttl_seconds = %q", got)
+		if got := r.URL.Query().Get("ttl_seconds"); got != "" {
+			t.Fatalf("ttl_seconds query = %q", got)
+		}
+		var body struct {
+			TTLSeconds int64 `json:"ttl_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TTLSeconds != math.MaxInt64 {
+			t.Fatalf("exec-session body = %+v, %v", body, err)
 		}
 		http.Error(w, "registry: bad reserve request: ttl_seconds overflows Unix time", http.StatusBadRequest)
 	}))

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -36,8 +37,9 @@ func (op ReserveOperation) Valid() bool {
 }
 
 // SandboxReserveRequest is the explicit trusted Router-to-Registry reserve
-// context. Config is consumed only by create; the other fields come from query
-// parameters and credential headers rather than a shared request body.
+// context. Config is consumed only by create; exec-session TTL/conditions come
+// from its dedicated typed body, while identities and credentials use query
+// parameters and headers.
 type SandboxReserveRequest struct {
 	Operation         ReserveOperation
 	Group             string
@@ -46,6 +48,7 @@ type SandboxReserveRequest struct {
 	Port              int
 	TimeoutSeconds    int
 	TTLSeconds        int64
+	ExecConditions    []string
 	APIKey            string
 	AccessToken       string
 	Service           string
@@ -61,13 +64,18 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 		int64(req.TimeoutSeconds) > routesync.MaxConnectTimeoutSeconds || req.TTLSeconds < 0 {
 		return nil, ErrReserveBadRequest
 	}
+	normalizedConditions, err := limits.NormalizeExpressions(req.ExecConditions)
+	if err != nil {
+		return nil, ErrReserveBadRequest
+	}
+	req.ExecConditions = normalizedConditions
 	if len(req.MigrationToken) > migrationtoken.MaxWireSize {
 		return nil, fmt.Errorf("%w: migration token is too large", ErrReserveBadRequest)
 	}
 	switch req.Operation {
 	case ReserveCreate:
 		if req.ExpectedSandboxID != "" || req.Port != 0 || req.TimeoutSeconds != 0 ||
-			req.TTLSeconds != 0 || req.AccessToken != "" || req.Service != "" || req.MigrationToken != "" {
+			req.TTLSeconds != 0 || len(req.ExecConditions) != 0 || req.AccessToken != "" || req.Service != "" || req.MigrationToken != "" {
 			return nil, fmt.Errorf("%w: create contains fields for another operation", ErrReserveBadRequest)
 		}
 		if err := r.authenticateCreate(ctx, req.Group, req.APIKey); err != nil {
@@ -76,7 +84,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 		return r.reserveCreate(ctx, req.Group, req.RouteKey, req.Config)
 	case ReserveConnect:
 		if req.ExpectedSandboxID == "" || req.Port != 0 || req.TTLSeconds != 0 ||
-			req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
+			len(req.ExecConditions) != 0 || req.AccessToken != "" || req.Service != "" || len(req.Config) != 0 {
 			return nil, fmt.Errorf("%w: connect contains fields for another operation", ErrReserveBadRequest)
 		}
 		return r.reserveConnect(ctx, req)
@@ -88,7 +96,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, req SandboxReserveRequest
 		return r.reserveExecSession(ctx, req)
 	case ReserveData:
 		if req.ExpectedSandboxID == "" || req.TimeoutSeconds != 0 || req.APIKey != "" ||
-			req.TTLSeconds != 0 || req.MigrationToken != "" || len(req.Config) != 0 ||
+			req.TTLSeconds != 0 || len(req.ExecConditions) != 0 || req.MigrationToken != "" || len(req.Config) != 0 ||
 			(req.Service != "" && req.Service != reserveDataServiceExec) {
 			return nil, fmt.Errorf("%w: data contains fields for another operation", ErrReserveBadRequest)
 		}
@@ -398,6 +406,7 @@ func execSessionCommand(req SandboxReserveRequest, rec *SandboxRecord) *routesyn
 		},
 		MigrationToken: req.MigrationToken,
 		TTLSeconds:     req.TTLSeconds,
+		ExecConditions: append([]string(nil), req.ExecConditions...),
 	}
 }
 

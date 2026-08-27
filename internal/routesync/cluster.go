@@ -1,6 +1,10 @@
 package routesync
 
-import "github.com/kuasar-sandbox/orchestrator/internal/types"
+import (
+	"encoding/json"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+)
 
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
@@ -214,6 +218,7 @@ type Command struct {
 	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
 	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time
+	ExecConditions       []string               `json:"exec_conditions,omitempty"`        // exec_session: ordered CEL sources; empty is unrestricted
 	// key_put / key_drop
 	APISecretType          string `json:"api_secret_type,omitempty"`          // inline | ref
 	APISecret              string `json:"api_secret,omitempty"`               // hex; only on inline key_put
@@ -236,6 +241,32 @@ type Command struct {
 	// selected node. The Registry deliberately excludes this field from its
 	// replicated BuildRecord; only the node persists the values, encrypted.
 	BuildMMDSSecrets map[string]string `json:"build_mmds_secrets,omitempty"`
+
+	execConditionsSpecified bool
+}
+
+// UnmarshalJSON remembers whether exec_conditions was explicitly carried on
+// the wire. Empty unrestricted conditions are canonicalized to omission, and
+// other command kinds must reject the field even when an attacker sends [].
+func (c *Command) UnmarshalJSON(raw []byte) error {
+	type commandWire Command
+	var decoded commandWire
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	*c = Command(decoded)
+	_, c.execConditionsSpecified = fields["exec_conditions"]
+	return nil
+}
+
+// ExecConditionsSpecified reports whether a command carries the typed field.
+// Programmatically constructed non-empty conditions count as specified too.
+func (c *Command) ExecConditionsSpecified() bool {
+	return c != nil && (c.execConditionsSpecified || len(c.ExecConditions) != 0)
 }
 
 // ConnectResult is the synchronous result of an accepted CmdConnect. It projects

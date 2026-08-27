@@ -1121,20 +1121,26 @@ func TestStandaloneConnectExistingTargetIgnoresOversizedMigrationHeader(t *testi
 
 func TestCreateExecSessionPassesStrictRequestAndReturnsOnlyToken(t *testing.T) {
 	tests := []struct {
-		name    string
-		body    string
-		wantTTL int64
+		name           string
+		body           string
+		wantTTL        int64
+		wantConditions []string
 	}{
 		{name: "empty"},
 		{name: "object", body: `{}`},
 		{name: "ttl", body: `{"ttlSeconds":37}`, wantTTL: 37},
+		{name: "conditions empty", body: `{"conditions":[]}`},
+		{name: "conditions", body: `{"conditions":[{"expr":"request.cwd == '/'"},{"expr":"!request.stdio.tty"}]}`,
+			wantConditions: []string{"request.cwd == '/'", "!request.stdio.tty"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var gotID, gotAPIKey, gotMigrationToken string
 			var gotTTL int64
-			core := &execSessionCoreStub{execSession: func(_ context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error) {
+			var gotConditions []string
+			core := &execSessionCoreStub{execSession: func(_ context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error) {
 				gotID, gotAPIKey, gotMigrationToken, gotTTL = id, apiKey, migrationToken, ttlSeconds
+				gotConditions = append([]string(nil), conditions...)
 				return "kat1.exec", nil
 			}}
 			handler, apiKey := newMigrationTestHandler(t, core)
@@ -1145,6 +1151,9 @@ func TestCreateExecSessionPassesStrictRequestAndReturnsOnlyToken(t *testing.T) {
 			}
 			if gotID != "stable" || gotAPIKey != apiKey || gotMigrationToken != "kmt1.opaque" || gotTTL != test.wantTTL {
 				t.Fatalf("ExecSession args = id=%q apiKey=%q migration=%q ttl=%d", gotID, gotAPIKey, gotMigrationToken, gotTTL)
+			}
+			if !reflect.DeepEqual(gotConditions, test.wantConditions) {
+				t.Fatalf("ExecSession conditions = %q, want %q", gotConditions, test.wantConditions)
 			}
 			if got := response.Header().Get("Cache-Control"); got != "no-store" {
 				t.Fatalf("Cache-Control = %q, want no-store", got)
@@ -1162,7 +1171,7 @@ func TestCreateExecSessionPassesStrictRequestAndReturnsOnlyToken(t *testing.T) {
 
 func TestCreateExecSessionRejectsBodyBeforeCore(t *testing.T) {
 	called := false
-	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64, []string) (string, error) {
 		called = true
 		return "", nil
 	}}
@@ -1175,6 +1184,9 @@ func TestCreateExecSessionRejectsBodyBeforeCore(t *testing.T) {
 		{name: "unknown", body: `{"unknown":true}`, wantStatus: http.StatusBadRequest},
 		{name: "negative ttl", body: `{"ttlSeconds":-1}`, wantStatus: http.StatusBadRequest},
 		{name: "second value", body: `{} {}`, wantStatus: http.StatusBadRequest},
+		{name: "conditions null", body: `{"conditions":null}`, wantStatus: http.StatusBadRequest},
+		{name: "condition unknown", body: `{"conditions":[{"expr":"true","other":1}]}`, wantStatus: http.StatusBadRequest},
+		{name: "condition empty", body: `{"conditions":[{"expr":""}]}`, wantStatus: http.StatusBadRequest},
 		{name: "oversized streamed", body: `{}` + strings.Repeat(" ", 64<<10-1), wantStatus: http.StatusRequestEntityTooLarge},
 	}
 	for _, test := range tests {
@@ -1196,7 +1208,7 @@ func TestCreateExecSessionRejectsBodyBeforeCore(t *testing.T) {
 
 func TestCreateExecSessionRejectsOversizedMigrationTokenBeforeCore(t *testing.T) {
 	called := false
-	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64, []string) (string, error) {
 		called = true
 		return "", nil
 	}}
@@ -1213,7 +1225,7 @@ func TestCreateExecSessionRejectsOversizedMigrationTokenBeforeCore(t *testing.T)
 
 func TestCreateExecSessionRequiresExplicitAPIKeyHeader(t *testing.T) {
 	called := false
-	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+	core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64, []string) (string, error) {
 		called = true
 		return "kat1.exec", nil
 	}}
@@ -1242,7 +1254,7 @@ func TestCreateExecSessionSanitizesOperationalFailuresAsUnavailable(t *testing.T
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, migrationToken := range []string{"", "kmt1.opaque"} {
-				core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64) (string, error) {
+				core := &execSessionCoreStub{execSession: func(context.Context, string, string, string, int64, []string) (string, error) {
 					return "", test.err
 				}}
 				handler, apiKey := newMigrationTestHandler(t, core)
@@ -1264,7 +1276,7 @@ func TestCreateExecSessionSanitizesOperationalFailuresAsUnavailable(t *testing.T
 
 type execSessionCoreStub struct {
 	Core
-	execSession func(context.Context, string, string, string, int64) (string, error)
+	execSession func(context.Context, string, string, string, int64, []string) (string, error)
 }
 
 type checkpointCoreStub struct {
@@ -1350,8 +1362,8 @@ func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, overr
 	return c.pause(ctx, id, apiKey, override)
 }
 
-func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error) {
-	return c.execSession(ctx, id, apiKey, migrationToken, ttlSeconds)
+func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error) {
+	return c.execSession(ctx, id, apiKey, migrationToken, ttlSeconds, conditions)
 }
 
 type migrationCoreStub struct {
