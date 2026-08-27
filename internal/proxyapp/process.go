@@ -108,7 +108,11 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
 	command := exec.CommandContext(workerCtx, "/proc/self/exe")
-	command.Args = []string{executable}
+	// Preserve the established worker process shape for operators and readiness
+	// probes. The sealed bootstrap, rather than these arguments, authorizes the
+	// private worker entry point; custom binaries also ignore the CLI arguments
+	// and enter through App's bootstrap detection.
+	command.Args = []string{executable, "proxy", "serve", "--worker"}
 	command.Env = append(
 		withoutWorkerEnvironment(os.Environ()),
 		workerBootstrapEnvironment+"="+strconv.Itoa(bootstrapDescriptor),

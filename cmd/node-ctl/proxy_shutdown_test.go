@@ -54,6 +54,10 @@ func runProxyMasterHelper() {
 }
 
 func runProxyWorkerHelper() {
+	if got, want := strings.Join(os.Args[1:], " "), "proxy serve --worker"; got != want {
+		fmt.Fprintf(os.Stderr, "proxy worker arguments = %q, want %q\n", got, want)
+		os.Exit(2)
+	}
 	file, err := os.OpenFile(os.Getenv(proxyPIDsHelperEnv), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
