@@ -25,15 +25,27 @@ import (
 	"os/signal"
 	"syscall"
 
+	publicproxy "github.com/kuasar-sandbox/orchestrator/app/proxy"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
 )
 
 var version = "0.2.0-dev"
 
 func main() {
+	if proxyapp.WorkerBootstrapPresent() {
+		componentexec.ClearEnvironment()
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		if err := publicproxy.New(publicproxy.Hooks{}).Run(); err != nil {
+			logger.Error("node-ctl", "cmd", "proxy-worker", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	proxyapp.ClearWorkerEnvironment()
 	// Top-level component bootstrap belongs only to a custom App. node-ctl never
 	// propagates stale bootstrap state into utility commands or helpers.
 	componentexec.ClearEnvironment()

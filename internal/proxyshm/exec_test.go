@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,7 +70,18 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 func TestWorkerLookupExecParksForInitialRouteWithoutWake(t *testing.T) {
 	tbl := newExecTable(t)
 	tbl.Bookmark()
-	updates := &Updates{ch: make(chan struct{})}
+	notifyRead, notifyWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer notifyWrite.Close()
+	updates, err := NewUpdatesFromFile(notifyRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updates.Close()
+	notifyRead = nil
+	runtime.GC()
 	var wakes atomic.Int32
 	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
 
@@ -93,7 +106,9 @@ func TestWorkerLookupExecParksForInitialRouteWithoutWake(t *testing.T) {
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
 	}
-	updates.bump()
+	if _, err := notifyWrite.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case got := <-done:
 		if got.err != nil || !got.found || got.identity != execWorkerIdentity(sid) {
@@ -232,7 +247,18 @@ func TestWorkerActivateExecWaitsForStartingWithoutWake(t *testing.T) {
 	}
 	tbl.Bookmark()
 
-	updates := &Updates{ch: make(chan struct{})}
+	notifyRead, notifyWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer notifyWrite.Close()
+	updates, err := NewUpdatesFromFile(notifyRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updates.Close()
+	notifyRead = nil
+	runtime.GC()
 	var wakes atomic.Int32
 	view := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
 	expected := execWorkerIdentity(route.SandboxID)
@@ -265,7 +291,9 @@ func TestWorkerActivateExecWaitsForStartingWithoutWake(t *testing.T) {
 	if err := tbl.Upsert(route); err != nil {
 		t.Fatal(err)
 	}
-	updates.bump()
+	if _, err := notifyWrite.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case got := <-done:
 		if got.err != nil || !got.found || got.identity != expected {
