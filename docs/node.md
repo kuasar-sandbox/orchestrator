@@ -527,6 +527,9 @@ Exec session 是显式授权动作,不是服务端 session 对象,也不启动 g
 副作用之前拒绝.64 KiB + 1 返回 413.`ttlSeconds` 缺省或为 0 时 token 长期有效;为正数时
 以实际签发时刻计算 `exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.
 
+standalone node 在编译 caller-controlled CEL 前先执行无副作用 credential preflight:既有目标验证
+resource-bound APISecret,缺失且准备 KMT import 的目标验证 allowlisted credential pair;编译后
+`prepareStandaloneTarget` 再次做权威校验以关闭并发变化,随后才可能 import/resume.
 CEL 使用固定强类型 `request` view:`argv list(string)`,`env map(string,string)`,`cwd string`,
 `user string` 和 `stdio.{tty,stdin,stdout,stderr} bool`;不暴露 route、claims、metadata、时间、
 文件系统、网络、secret 或可产生 I/O/副作用的函数.签发节点在 token mint 和任何

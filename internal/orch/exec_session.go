@@ -38,6 +38,9 @@ func (o *Orchestrator) execSession(
 	if _, err := execSessionExpiry(now(), ttlSeconds); err != nil {
 		return "", err
 	}
+	if err := o.preflightExecSessionCaller(ctx, id, apiKey, migrationToken); err != nil {
+		return "", err
+	}
 	compiler, err := execadmission.Default()
 	if err != nil {
 		return "", fmt.Errorf("exec session: initialize admission: %w", err)
@@ -66,6 +69,38 @@ func (o *Orchestrator) execSession(
 		return "", err
 	}
 	return token, nil
+}
+
+// preflightExecSessionCaller authenticates caller-controlled CEL input without
+// importing or resuming a sandbox. Existing targets use their resource-bound
+// APISecret; an absent migration target requires an allowlisted credential pair
+// before compilation. prepareStandaloneTarget repeats the authoritative checks
+// after compilation to close races before any import or lifecycle mutation.
+func (o *Orchestrator) preflightExecSessionCaller(
+	ctx context.Context,
+	id, apiKey, migrationToken string,
+) error {
+	existing, err := o.st.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if !ownsSandbox(existing, apiKey) {
+			return api.ErrNotFound
+		}
+		return nil
+	}
+	if migrationToken == "" {
+		return api.ErrNotFound
+	}
+	pair, err := o.resolveAllowed(ctx, apiKey)
+	if err != nil {
+		return err
+	}
+	if pair.APISecret == "" {
+		return fmt.Errorf("exec session: credential pair is not installed: %w", api.ErrNotAllowed)
+	}
+	return nil
 }
 
 func mintExecSessionToken(sb *types.Sandbox, ttlSeconds int64, conditions []string, nowUnix int64) (string, error) {

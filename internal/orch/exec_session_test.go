@@ -345,6 +345,42 @@ func TestExecSessionRejectsInvalidConditionsBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestExecSessionAuthenticatesBeforeCompilingAndCompilesBeforeImport(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("3", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	_, foreignKey := defaultTestCredentials(t, strings.Repeat("4", 64))
+	existing := &types.Sandbox{
+		ID: "exec-auth-order", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("5", 64)}.String(),
+		State:      types.StateRunning, APISecret: apiSecret, ManifestKey: manifestKey,
+		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+	}
+	materializeTestSandboxCredentials(t, existing)
+	if err := o.st.Put(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	invalidConditions := []string{"request.unknown == true"}
+	if _, err := o.ExecSession(ctx, existing.ID, foreignKey, "", 0, invalidConditions); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("foreign existing-target condition error = %v, want not found before compile", err)
+	}
+	if _, err := o.ExecSession(ctx, "missing-unallowed", foreignKey, "kmt1.not-opened", 0, invalidConditions); !errors.Is(err, api.ErrNotAllowed) {
+		t.Fatalf("unallowlisted import condition error = %v, want not allowed before compile", err)
+	}
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{
+		APISecret: apiSecret, ManifestKey: manifestKey,
+	}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ExecSession(ctx, "missing-invalid-condition", apiKey, "kmt1.not-opened", 0, invalidConditions); !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("authorized invalid-condition error = %v, want bad request before import", err)
+	}
+	if imported, err := o.st.Get(ctx, "missing-invalid-condition"); err != nil || imported != nil {
+		t.Fatalf("invalid condition reached import: sandbox=%+v err=%v", imported, err)
+	}
+}
+
 func TestExecSessionRejectsDeadAndInconsistentSandbox(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
