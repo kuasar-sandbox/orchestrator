@@ -100,3 +100,25 @@ func TestDedupSameKey(t *testing.T) {
 		t.Fatalf("duplicate key not deduped: %d keys", len(b.keys))
 	}
 }
+
+func TestNewAcceptsRawOrderedKeySetAndCopiesInput(t *testing.T) {
+	active, old := make([]byte, 32), make([]byte, 32)
+	active[0], old[0] = 1, 2
+	box, err := New([][]byte{active, old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := box.Encrypt([]byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active[0] = 9
+	old[0] = 9
+	plaintext, err := box.Decrypt(record)
+	if err != nil || string(plaintext) != "value" {
+		t.Fatalf("decrypt=%q err=%v", plaintext, err)
+	}
+	if _, err := New([][]byte{make([]byte, 31)}); err == nil {
+		t.Fatal("short raw key accepted")
+	}
+}

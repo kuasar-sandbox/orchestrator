@@ -31,6 +31,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(shardkv 执行态 + node_link / route_link / node_list / placer_link)/ `router`(e2b 入口)/ `placer`(provider/importer + WATCH_LIST + Place)/ `config` / `version` |
 | `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,提供 admin/data API 控制重启、清空、沙箱/build 状态和故障注入,不启动 microVM |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `derive-api-secret` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
+| `config`, `app/conductor` | 公共 declarative Config 与静态 custom conductor App；node-ctl 用 sealed memfd + 原地 exec 交接，Hook 只在启动期调整 Config/Runtime material |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | reservation 控制器:admission、pool/水位与 grant 仲裁、inventory/StateSync 恢复、审计;不介入 sandbox balloon/cgroup 闭环 |
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
@@ -42,6 +43,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys 凭据对) |
 | `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2 + exact route handler、external worker/master 本机查询、HTTP-over-UDS service relay、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
 | `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy.service`、`cluster-{registry,router,placer}.service`) |
+| `examples/custom-conductor` | 可编译的最小 xconductor；必须由 `node-ctl conductor serve` 进入 |
 
 ## 构建
 

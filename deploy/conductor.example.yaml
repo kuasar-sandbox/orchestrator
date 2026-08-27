@@ -51,8 +51,9 @@ manifest_config: /opt/sandbox/manifest.yaml
 # Node-local directories / sockets.
 paths:
   # Optional statically customized conductor App contract. node-ctl validates
-  # this as an absolute, protected executable; the #244 App/bootstrap stage
-  # supplies dispatch. Empty uses the built-in conductor.
+  # this as an absolute, protected executable and execs it with a sealed memfd
+  # bootstrap. It must use app/conductor and cannot run standalone. Empty uses
+  # the built-in conductor.
   # conductor_executable: /opt/kuasar/bin/xconductor
   run_root: /run/sandbox                          # tmpfs run state
   base_root: /var/lib/sandbox                     # persistent state

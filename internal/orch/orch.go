@@ -151,6 +151,23 @@ type clusterBuild struct {
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
+	var files *filestore.Store
+	if fc := cfg.Builder.FilesStorage; fc != nil {
+		fs, err := filestore.New(fc)
+		if err != nil {
+			log.Warn("builder.files_storage init failed; COPY steps will be rejected", "err", err)
+		} else {
+			files = fs
+		}
+	}
+	return NewResolved(cfg, st, lc, vs, files, log)
+}
+
+// NewResolved constructs the core with startup materials already resolved by
+// the conductor App. In particular, an authoritative object-store credential
+// provider is validated before this constructor and is never replaced by the
+// YAML or ambient AWS fallback inside the core.
+func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, files *filestore.Store, log *slog.Logger) *Orchestrator {
 	mmdsServices, _ := mmdssvc.BuildRegistry(cfg.MMDS.ServiceEndpoints())
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
@@ -170,18 +187,11 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		commitBuildTrigger:        st.CommitBuildTrigger,
 		removeBuildRuntimeDir:     os.RemoveAll,
 		now:                       time.Now,
+		files:                     files,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
 	o.builderRunPool = newRunPool(runKindBuild, cfg.Units.BuilderPoolSize, wait, cfg.Paths.RunRoot, lc, o.builderUnit, log.With("pool", "builder"))
-	if fc := cfg.Builder.FilesStorage; fc != nil {
-		fs, err := filestore.New(fc)
-		if err != nil {
-			log.Warn("builder.files_storage init failed; COPY steps will be rejected", "err", err)
-		} else {
-			o.files = fs
-		}
-	}
 	return o
 }
 
