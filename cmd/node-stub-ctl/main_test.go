@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
@@ -294,6 +296,7 @@ func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *tes
 	defer cancel()
 	command.TTLSeconds = 37
 	command.MigrationToken = "kmt1.ignored-for-existing-target"
+	command.ExecConditions = []string{"request.cwd == '/workspace'"}
 
 	issuedAt := time.Now()
 	got := node.HandleCommand(context.Background(), command)
@@ -305,6 +308,12 @@ func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *tes
 		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now(),
 	); err != nil {
 		t.Fatalf("exec access token = invalid: %v", err)
+	}
+	claims, err := keys.ParseAndVerifyExecAccessToken(
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now(),
+	)
+	if err != nil || len(claims.Conditions) != 1 || claims.Conditions[0] != command.ExecConditions[0] {
+		t.Fatalf("exec token conditions = %+v, %v", claims, err)
 	}
 	if err := keys.VerifyExecAccessToken(
 		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, issuedAt.Add(time.Minute),
@@ -346,8 +355,9 @@ func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *tes
 	if encoded, err := json.Marshal(service.events); err != nil {
 		t.Fatal(err)
 	} else if strings.Contains(string(encoded), got.ExecSession.ExecAccessToken) ||
-		strings.Contains(string(encoded), second.ExecSession.ExecAccessToken) {
-		t.Fatal("stub events exposed an exec access token")
+		strings.Contains(string(encoded), second.ExecSession.ExecAccessToken) ||
+		strings.Contains(string(encoded), command.ExecConditions[0]) {
+		t.Fatal("stub events exposed an exec token or condition source")
 	}
 }
 
@@ -359,6 +369,7 @@ func TestExecSessionRejectsInvalidEnvelopeAndBindingWithoutMutation(t *testing.T
 	}{
 		{name: "negative ttl", mutateCommand: func(c *routesync.Command) { c.TTLSeconds = -1 }},
 		{name: "unrepresentable ttl", mutateCommand: func(c *routesync.Command) { c.TTLSeconds = math.MaxInt64 }},
+		{name: "invalid condition", mutateCommand: func(c *routesync.Command) { c.ExecConditions = []string{"request.unknown == true"} }},
 		{name: "foreign operation field", mutateCommand: func(c *routesync.Command) { c.TimeoutSeconds = 1 }},
 		{name: "wrong credential", mutateCommand: func(c *routesync.Command) { c.APISecretFingerprint = strings.Repeat("f", 64) }},
 		{name: "wrong profile", mutateCommand: func(c *routesync.Command) { c.Profile = string(types.ProfileE2B) }},
@@ -395,6 +406,33 @@ func TestExecSessionRejectsInvalidEnvelopeAndBindingWithoutMutation(t *testing.T
 				t.Fatalf("rejected exec_session changed sandboxes: stored=%+v count=%d", stored, count)
 			}
 		})
+	}
+}
+
+func TestStubRejectsExecConditionsOnOtherCommandKinds(t *testing.T) {
+	_, node, sandbox, command := newExecStubFixture(t, routesync.StateRunning, time.Second)
+	command.Kind = routesync.CmdDelete
+	command.ExecConditions = []string{"true"}
+	ack := node.HandleCommand(context.Background(), command)
+	if ack.Status != routesync.AckRejected {
+		t.Fatalf("foreign exec conditions ack = %+v", ack)
+	}
+	node.mu.Lock()
+	stored := node.sandboxes[sandbox.SID]
+	node.mu.Unlock()
+	if stored != sandbox || stored.State != routesync.StateRunning {
+		t.Fatalf("foreign exec conditions mutated sandbox = %+v", stored)
+	}
+}
+
+func TestStubRejectsExplicitEmptyExecConditionsOnOtherCommandKinds(t *testing.T) {
+	_, node, _, _ := newExecStubFixture(t, routesync.StateRunning, time.Second)
+	var command routesync.Command
+	if err := json.Unmarshal([]byte(`{"cmd_id":"foreign-empty","kind":"delete","exec_conditions":[]}`), &command); err != nil {
+		t.Fatal(err)
+	}
+	if ack := node.HandleCommand(context.Background(), &command); ack.Status != routesync.AckRejected {
+		t.Fatalf("explicit empty foreign exec conditions ack = %+v", ack)
 	}
 }
 
@@ -470,13 +508,17 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	request := fmt.Sprintf(
+	header := fmt.Sprintf(
 		"CONNECT sandbox:443 HTTP/1.1\r\nHost: sandbox:443\r\nE2b-Sandbox-Id: %s\r\n"+
-			"E2b-Sandbox-Service: exec\r\nX-Access-Token: %s\r\n\r\n"+
-			"GET /exec-probe HTTP/1.1\r\nHost: guest\r\nConnection: close\r\n\r\n",
+			"E2b-Sandbox-Service: exec\r\nX-Access-Token: %s\r\n\r\n",
 		sandbox.SID, token,
 	)
-	if _, err := conn.Write([]byte(request)); err != nil {
+	const secretArgv = "/bin/argv-must-not-be-observed"
+	frame := stubExecFrame(secretArgv)
+	if _, err := conn.Write(append([]byte(header), frame...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(conn)
@@ -496,26 +538,88 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 			break
 		}
 	}
-	inner, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	tail, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inner.Body.Close()
-	if inner.StatusCode != http.StatusNoContent {
-		t.Fatalf("inner response status = %d", inner.StatusCode)
+	if string(tail) != "exec-admitted" {
+		t.Fatalf("exec response tail = %q", tail)
 	}
 	service.mu.Lock()
 	hits := append([]dataHit(nil), service.dataHits...)
 	service.mu.Unlock()
-	if len(hits) != 1 || hits[0].SandboxID != sandbox.SID || hits[0].Path != "/exec-probe" ||
-		hits[0].Method != http.MethodGet {
+	if len(hits) != 1 || hits[0].SandboxID != sandbox.SID || hits[0].Path != "/exec-admitted" ||
+		hits[0].Method != "EXEC" || hits[0].Host != "exec" {
 		t.Fatalf("exec data hits = %+v", hits)
 	}
 	if encoded, err := json.Marshal(hits); err != nil {
 		t.Fatal(err)
-	} else if strings.Contains(string(encoded), token) {
-		t.Fatal("exec data observation exposed the access token")
+	} else if strings.Contains(string(encoded), token) || strings.Contains(string(encoded), secretArgv) {
+		t.Fatal("exec data observation exposed the access token or argv")
 	}
+}
+
+func TestExecDataConditionFailureReturnsGenericCtlErrorWithoutHit(t *testing.T) {
+	service, _, sandbox, _ := newExecStubFixture(t, routesync.StateRunning, 0)
+	token, err := keys.MintExecAccessTokenWithConditions(
+		sandbox.ServiceSecret, sandbox.AuthSandboxID, 0,
+		[]string{`request.argv == ['/bin/allowed']`},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(service.serveData))
+	defer server.Close()
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConn := conn.(*net.TCPConn)
+	defer tcpConn.Close()
+	_ = tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
+	header := fmt.Sprintf(
+		"CONNECT sandbox:443 HTTP/1.1\r\nHost: sandbox:443\r\nE2b-Sandbox-Id: %s\r\n"+
+			"E2b-Sandbox-Service: exec\r\nX-Access-Token: %s\r\n\r\n",
+		sandbox.SID, token,
+	)
+	if _, err := tcpConn.Write(append([]byte(header), stubExecFrame("/bin/denied")...)); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(tcpConn)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d", response.StatusCode)
+	}
+	if err := tcpConn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	var rejected sandboxctl.Response
+	if err := sandboxctl.ReadMessage(reader, &rejected); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Type != sandboxctl.TypeError || rejected.Msg != "exec request rejected" {
+		t.Fatalf("rejection = %+v", rejected)
+	}
+	service.mu.Lock()
+	hits := len(service.dataHits)
+	service.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("denied exec produced %d data hits", hits)
+	}
+}
+
+func stubExecFrame(argv0 string) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"type": "exec_request",
+		"exec": map[string]any{"argv": []string{argv0}},
+	})
+	frame := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+	return frame
 }
 
 func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T) {

@@ -484,7 +484,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
 | resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
-| exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,可选 `ttlSeconds` 和 `X-Kuasar-Migration-Token`;不创建 guest process |
+| exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
 | pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停或正在 starting 回 **409**;starting 不调用 snapshot/ctl.sock |
 | timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL;starting 允许窄字段更新 |
 
@@ -507,13 +507,39 @@ conductor 进程内的恢复失败回 paused 后继续保留,只在某次 exact-
 sidecar 绕过。
 
 Exec session 是显式授权动作,不是服务端 session 对象,也不启动 guest process.请求 body
-只允许空,`{}` 或仅含一个 int64 `ttlSeconds` 字段的 JSON object.完整原始 body
-(含尾随空白)上限 64 KiB;unknown/duplicate 字段,`null`,负数,第二个 JSON value
-和越界 TTL 均在生命周期副作用之前拒绝.64 KiB + 1 返回 413;其它无效 body
-返回 400.`ttlSeconds` 缺省或为 0 时 token 长期有效;为正数时以实际签发时刻计算
-`exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.签发位于 SID lifecycle fence 内:
-先等前一 attempt 的 terminal cleanup 完成,再生成 token,随后才允许新的 paused→starting;
-因此 fence 等待不消耗 token TTL,签名失败也不会产生新的 launch side effect.
+是严格 JSON object,可含 int64 `ttlSeconds` 和 `conditions:[{"expr":"..."}]`.例如:
+
+```json
+{
+  "ttlSeconds": 3600,
+  "conditions": [
+    {"expr": "request.argv == ['/usr/bin/python3', '/workspace/task.py']"},
+    {"expr": "request.cwd == '/workspace'"},
+    {"expr": "request.user == '1000:1000' && !request.stdio.tty"}
+  ]
+}
+```
+
+`conditions` 缺失或 `[]` 都表示 unrestricted,规范化为 `nil` 并从 token payload 省略;
+显式 `null`、非数组、unknown/duplicate 字段、非 object 元素、元素中的 unknown/duplicate
+字段和空 `expr` 均返回 400.多个表达式按 AND 组合;需要 OR 时在单条 CEL 中使用 `||`.
+完整原始 body(含尾随空白)上限 64 KiB;第二个 JSON value、负数或越界 TTL 同样在生命周期
+副作用之前拒绝.64 KiB + 1 返回 413.`ttlSeconds` 缺省或为 0 时 token 长期有效;为正数时
+以实际签发时刻计算 `exp`,Unix 秒加法或 `time.Time` 表示溢出均返回 400.
+
+standalone node 在编译 caller-controlled CEL 前先执行无副作用 credential preflight:既有目标验证
+resource-bound APISecret,缺失且准备 KMT import 的目标验证 allowlisted credential pair;编译后
+`prepareStandaloneTarget` 再次做权威校验以关闭并发变化,随后才可能 import/resume.
+CEL 使用固定强类型 `request` view:`argv list(string)`,`env map(string,string)`,`cwd string`,
+`user string` 和 `stdio.{tty,stdin,stdout,stderr} bool`;不暴露 route、claims、metadata、时间、
+文件系统、网络、secret 或可产生 I/O/副作用的函数.签发节点在 token mint 和任何
+paused→starting 变化之前编译、bool type-check 并执行静态 bounds;unknown field、非 bool、
+超出 source/AST/cost bounds 均拒绝.这仍保留既有 eager exec-session activation 合同;
+deferred activation 属于独立的 #240,本合同不实现它.
+
+conditions 在目标准备和 lifecycle mutation 前完成编译.SID lifecycle fence 随后等待前一
+attempt 的 terminal cleanup,再按实际签发时间生成 token,最后才允许新的 paused→starting;
+因此 fence 等待不消耗 token TTL,编译或签名失败也不会产生新的 launch side effect.
 
 目标已存在时不解析 migration token;目标缺失且提供该 token 时可以先同步 import 并完成对象,
 credential binding 和 profile 校验.随后 node 以沙箱记录中的 ServiceSecret 签发 KAT;
@@ -628,8 +654,9 @@ X-Access-Token: kat1.<payload>.<signature>
 
 authority 的 443 只是 transport 占位,不是 guest port;即使请求同时携带
 `E2b-Sandbox-Port`,Node 也不用它选择 backend.`service=exec` 只接受 CONNECT,
-且始终强制验证 KAT,不受普通 proxy `off|log|enforce` 模式影响.验证成功后
-才可以恢复 paused sandbox,并由最终 node proxy 连接 `ctl.sock`;详见
+且始终强制验证 KAT,不受普通 proxy `off|log|enforce` 模式影响.最终 proxy 在回复
+CONNECT 200 后严格读取并授权完整 `exec_request` 首帧;条件通过后才可以恢复 paused
+sandbox、连接 `ctl.sock` 并原样转发首帧;详见
 [node-proxy.md](node-proxy.md) §5.
 
 ### 4.4 templateID 与模板形态(transient / persist,无 templates 表)
@@ -1214,9 +1241,11 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
   ExecAccessToken 不在 create/get/list 中缺省生成,也不写 Sandbox 业务行;它只由
   `POST /sandboxes/{id}/exec-sessions` 按次签发.每个 token 使用 UUIDv7 `session_id`,
   线格式为 `kat1.<base64url-no-padding(payload)>.<base64url-no-padding(signature)>`,
-  payload 的 canonical field 顺序为 `v,session_id,sid,aud[,exp]`,其中 `sid=AuthSandboxID()`,
+  payload 的 canonical field 顺序为 `v,session_id,sid,aud[,exp][,conditions]`,其中 `sid=AuthSandboxID()`,
   `aud=exec`,不包含 `iat`.signature 以解码后的 32-byte ServiceSecret 直接执行
-  HMAC-SHA256,不另派生 exec key.payload 也不含 constraints,generation,node ID 或
+  HMAC-SHA256,不另派生 exec key.`conditions` 是按 API 顺序保存的紧凑字符串数组,
+  unrestricted 时省略;它与其它 payload 字段一起受 HMAC 覆盖,不另加 digest.KAT holder
+  可以解码 payload,所以 condition 不具保密性,表达式不得含需要保密的字面量.payload 不含 generation,node ID 或
   route revision.Node 是唯一签发方;Router/proxy 只使用受保护 route 验证.验证严格检查
   3 段线格式,canonical no-padding base64url,32-byte signature,固定 JSON 字段/顺序,
   UUIDv7,SID,audience 和可选 expiry.session ID 只在 KAT 内部使用,不在 API 响应中外显.
@@ -1315,10 +1344,11 @@ starting ──success──► running ──pause / TTL──► paused
   - 数据面 auto-resume 等待恢复完成后再转发;`POST /sandboxes/{id}/connect` 则只同步
     完成鉴权、可选 KMT import 和凭据读取,接受/加入同一 launch attempt 后立即返回;
     带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
-  - exec-session 签发同步完成可选 import,对象/凭据校验和 KAT 签名,
+  - exec-session 签发同步完成可选 import、对象/凭据校验、CEL 编译和 KAT 签名,
     然后只接受异步 resume 并立即返回;目标已 starting 时可继续签发但不重复 resume。
-    KAT 签名失败时不启动 resume;
-    后续数据面的无效 KAT 也不能触发本地恢复.
+    CEL 编译或 KAT 签名失败时不启动 resume;
+    后续数据面的无效 KAT、非法首帧或 condition=false/error/unknown/cost/cancel 也不能
+    parking、刷新 activity 或触发本地恢复.
 - **phase timing**:launch 以低基数 `kind=create|resume`、`profile=e2b|bare`、
   `result=success|failure` 和 bounded `failure_stage` 记录 admission/prepare/runner_wait/
   runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration;task另以结构化字段
@@ -1492,7 +1522,7 @@ serve 启动末段按 `proxy.mode`(§3)装配数据面;控制面 `api.<domain>` 
 internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改为在 plugin 平面(§6)
 接受 proxy master 注册并向其广播路由(§9.2),数据面字节流不经 serve.#63 的
 legacy/explicit forward,envd 和 CI 转发判定由两模式共用.native exec 也在最终
-node proxy 执行 KAT 校验和 `ctl.ProxyExec` gate:internal 使用 conductor `paths.run_root`,
+node proxy 执行 KAT + ExecRequest gate 和 sandboxer ctl tunnel:internal 使用 conductor `paths.run_root`,
 external worker 使用自身 `proxy.yaml` 必填且与 conductor 一致的 `paths.run_root` 本地构造
 `<run_root>/<NodeSandboxID>/ctl.sock`.该路径不通过 routesync `Policy` 或共享路由视图传递.
 部署拓扑见 node-proxy.md §3,共享内存路由视图见 §4,转发判定与隧道详细见 §5.集群下,
@@ -1656,7 +1686,7 @@ CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network own
   |---|---|
   | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
   | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成 paused→starting、旧 network/run 清理与 deadline 持久化.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
-  | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.校验通过后生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后异步 resume,不等待 READY |
+  | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 节点以同一 canonical Build.Resources 做最终、事务化 registration admission;phase ResourcePatch、portable metadata 与 cluster group 分开持久化。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
@@ -2078,7 +2108,7 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
 external master/worker resync/rotation;handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
-proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession,H1/H2 `ctl.ProxyExec` gate 与
+proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
 

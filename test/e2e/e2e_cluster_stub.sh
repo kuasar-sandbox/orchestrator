@@ -496,7 +496,7 @@ code="$(http_code "$WORK/exec-session1.response" -D "$WORK/exec-session1.headers
     -H "X-Kuasar-Route-Key: user1/session1" \
     -H "X-API-KEY: $API_KEY" \
     -H "Content-Type: application/json" \
-    --data '{"ttlSeconds":60}' \
+    --data '{"ttlSeconds":60,"conditions":[{"expr":"request.argv == [\u0027/bin/true\u0027]"}]}' \
     "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID/exec-sessions" || true)"
 [ "$code" = "201" ] || fail "exec-session user1/session1 returned $code"
 
@@ -520,6 +520,7 @@ python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$WOR
 import json, pathlib, sys, urllib.request
 admin, group, stable_sid, response_path, work_dir = sys.argv[1:]
 token = json.load(open(response_path))["execAccessToken"]
+condition = "request.argv == ['/bin/true']"
 commands = json.load(urllib.request.urlopen(admin + "/v1/commands", timeout=2))
 events = json.load(urllib.request.urlopen(admin + "/v1/events", timeout=2))
 exec_commands = [
@@ -538,6 +539,7 @@ assert cluster.get("auth_sandbox_id") == stable_sid, command
 observed = json.dumps({"commands": commands, "events": events}, separators=(",", ":"))
 observed += "".join(path.read_text() for path in pathlib.Path(work_dir).glob("*.log"))
 assert token not in observed, "exec access token appeared in node-stub observations"
+assert condition not in observed, "exec condition appeared in node-stub observations"
 PY
 
 step "checking invalid exec KAT rejection at Router and node data endpoint"
@@ -580,11 +582,11 @@ after = observations()
 assert after == before, (before, after)
 PY
 
-step "checking service=exec CONNECT rewrite and buffered tunnel relay"
-python3 - "$ROUTER_PORT" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" <<'PY' || \
-    fail "cluster exec CONNECT did not preserve the tunnel"
-import json, socket, sys
-router_port, group, stable_sid, response_path = sys.argv[1:]
+step "checking conditioned service=exec ctl admission and denial"
+python3 - "$ROUTER_PORT" "$GROUP" "$SESSION1_SID" "$WORK/exec-session1.response" "$ADMIN" <<'PY' || \
+    fail "cluster exec CONNECT did not enforce the ctl request gate"
+import json, socket, struct, sys, urllib.request
+router_port, group, stable_sid, response_path, admin = sys.argv[1:]
 token = json.load(open(response_path))["execAccessToken"]
 headers = [
     "CONNECT sandbox:443 HTTP/1.1",
@@ -596,13 +598,6 @@ headers = [
     "X-Kuasar-Route-Key: user1/session1",
     "X-Access-Token: " + token,
 ]
-inner = [
-    "GET /exec-probe HTTP/1.1",
-    "Host: guest",
-    "Connection: close",
-]
-# One send covers both the outer CONNECT and the already-buffered inner bytes.
-request = ("\r\n".join(headers) + "\r\n\r\n" + "\r\n".join(inner) + "\r\n\r\n").encode()
 
 def read_head(stream):
     status = stream.readline().decode("ascii", "strict").rstrip("\r\n")
@@ -615,30 +610,49 @@ def read_head(stream):
         response_headers[name.strip().lower()] = value.strip()
     return status, response_headers
 
-with socket.create_connection(("127.0.0.1", int(router_port)), timeout=5) as conn:
-    conn.settimeout(5)
-    conn.sendall(request)
-    stream = conn.makefile("rb")
-    outer_status, _ = read_head(stream)
-    assert outer_status.startswith("HTTP/1.1 200 "), outer_status
-    inner_status, _ = read_head(stream)
-    assert inner_status.startswith("HTTP/1.1 204 "), inner_status
+def exec_frame(argv):
+    payload = json.dumps({"type": "exec_request", "exec": {"argv": argv}}, separators=(",", ":")).encode()
+    return struct.pack("<I", len(payload)) + payload
+
+def connect(argv):
+    # One send covers both the outer CONNECT and the already-buffered ctl frame.
+    request = ("\r\n".join(headers) + "\r\n\r\n").encode() + exec_frame(argv)
+    with socket.create_connection(("127.0.0.1", int(router_port)), timeout=5) as conn:
+        conn.settimeout(5)
+        conn.sendall(request)
+        conn.shutdown(socket.SHUT_WR)
+        stream = conn.makefile("rb")
+        outer_status, _ = read_head(stream)
+        assert outer_status.startswith("HTTP/1.1 200 "), outer_status
+        return stream.read()
+
+assert connect(["/bin/true"]) == b"exec-admitted"
+before = len(json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)))
+denied = connect(["/bin/false"])
+assert len(denied) >= 4, denied
+size = struct.unpack("<I", denied[:4])[0]
+error = json.loads(denied[4:4+size])
+assert error == {"type": "error", "msg": "exec request rejected"}, error
+assert len(denied) == 4 + size, denied
+after = len(json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2)))
+assert after == before, (before, after)
 PY
 
 python3 - "$ADMIN" "$GROUP" "$SESSION1_SID" <<'PY' || fail "exec tunnel did not reach the current NodeSandboxID"
 import json, sys, urllib.request
 admin, group, stable_sid = sys.argv[1:]
 hits = json.load(urllib.request.urlopen(admin + "/v1/data-hits", timeout=2))
-exec_hits = [hit for hit in hits if hit.get("path") == "/exec-probe"]
+exec_hits = [hit for hit in hits if hit.get("path") == "/exec-admitted"]
 assert len(exec_hits) == 1, exec_hits
 hit = exec_hits[0]
 assert hit.get("sid") == stable_sid + "-g0", hit
-assert hit.get("method") == "GET", hit
-assert hit.get("host") == "guest", hit
+assert hit.get("method") == "EXEC", hit
+assert hit.get("host") == "exec", hit
 cluster = hit.get("cluster", {})
 assert cluster.get("group") == group, hit
 assert cluster.get("route_key") == "user1/session1", hit
 assert cluster.get("auth_sandbox_id") == stable_sid, hit
+assert "/bin/true" not in json.dumps(exec_hits, separators=(",", ":")), exec_hits
 PY
 
 code="$(retry_code 204 "$WORK/data1.body" \

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
@@ -37,6 +40,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 // Headers the cluster ingress reads (cluster.md).
@@ -341,7 +345,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "create", group, routeKey, "", 0, 0, 0, createConfig,
+		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, nil,
 		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
 	)
 	if err != nil {
@@ -800,7 +804,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, 0, nil, headers,
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, nil, headers,
 	)
 	if err != nil {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -877,7 +881,11 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, request.TTLSeconds, nil, headers,
+		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, nil,
+		&registry.SandboxReserveExecSessionReq{
+			TTLSeconds: request.TTLSeconds,
+			Conditions: request.Expressions(),
+		}, headers,
 	)
 	if err != nil {
 		writeExecSessionRouteLinkError(w, err)
@@ -1104,8 +1112,8 @@ func rewriteSandboxIdentityResponse(resp *http.Response, sandboxID, nodeSandboxI
 
 // serveExecData handles the cluster-facing logical exec service. Route lookup is
 // read-only; a KAT must validate against the stable route identity before any
-// fallback Reserve(data). A known node-local target is contacted directly even
-// while paused/starting, so the final node proxy owns parking and Wake.
+// fallback Reserve(data). The first ExecRequest must pass admission before any
+// node is contacted; the final node proxy owns parking and Wake.
 func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 	sid, target, ok := proxypkg.ParseConnect(r)
 	if !ok || target.Service != proxypkg.ConnectServiceExec {
@@ -1142,61 +1150,61 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.Header.Get(HeaderAccessTok)
-	if err := keys.VerifyExecAccessToken(token, rr.ServiceSecret, rr.AuthSandboxID, time.Now()); err != nil {
+	claims, err := keys.ParseAndVerifyExecAccessToken(
+		token, rr.ServiceSecret, rr.AuthSandboxID, time.Now(),
+	)
+	if err != nil {
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
 	}
-
-	if !hasDirectNodeTarget(rr) {
-		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
-			map[string]string{
-				HeaderAccessTok:               token,
-				proxypkg.HeaderSandboxService: string(target.Service),
-			},
-		)
-		if err != nil {
-			writeExecDataReserveError(w, err)
-			return
-		}
-		current := &res.Route
-		if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) {
-			http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
-			return
-		}
-		rt.rememberRoute(current)
-		rr = current
-	}
-	if !hasDirectNodeTarget(rr) {
-		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
-		return
-	}
-	if !rt.forwardSandboxConnect(w, r, rr, sid, target, token) {
-		return
-	}
-	// A typed stale response means the node rejected the cached node-local
-	// identity before accepting the logical ingress. Refresh through the existing
-	// ReserveData fallback, which re-authenticates the KAT against the current
-	// lineage, then retry the final node exactly once.
-	res, err := rt.routeLinkReserve(
-		r.Context(), "data", rr.Group, rr.RouteKey, sid, target.Port, 0, 0, nil,
-		map[string]string{
-			HeaderAccessTok:               token,
-			proxypkg.HeaderSandboxService: string(target.Service),
-		},
-	)
+	compiler, err := execadmission.Default()
 	if err != nil {
-		writeExecDataReserveError(w, err)
+		http.Error(w, "exec admission unavailable", http.StatusNotImplemented)
 		return
 	}
-	current := &res.Route
-	if !routeMatchesIdentity(current, rr.Group, rr.RouteKey, sid) || !hasDirectNodeTarget(current) {
-		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+	programs, err := compiler.Compile(claims.Conditions)
+	if err != nil {
+		http.Error(w, "invalid exec conditions", http.StatusBadRequest)
 		return
 	}
-	rt.rememberRoute(current)
-	if rt.forwardSandboxConnect(w, r, current, sid, target, token) {
-		http.Error(w, "sandbox route is stale", http.StatusServiceUnavailable)
+	if r.ProtoMajor == 2 {
+		if _, ok := w.(http.Flusher); !ok {
+			http.Error(w, "connect unsupported", http.StatusInternalServerError)
+			return
+		}
+	} else if _, ok := w.(http.Hijacker); !ok {
+		http.Error(w, "connect unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	tunnelCtx := r.Context()
+	cancelTunnel := func() {}
+	if r.ProtoMajor != 2 {
+		tunnelCtx = context.WithoutCancel(r.Context())
+		if deadline, ok := r.Context().Deadline(); ok {
+			tunnelCtx, cancelTunnel = context.WithDeadline(tunnelCtx, deadline)
+		}
+	}
+	defer cancelTunnel()
+	stable := *rr
+	err = sandboxctl.ServeExecTunnel(tunnelCtx, sandboxctl.ExecTunnelOptions{
+		Authorize: func(context.Context) error { return nil },
+		AcceptDownstream: func(context.Context) (io.ReadWriteCloser, error) {
+			return proxypkg.AcceptConnectStream(w, r)
+		},
+		AuthorizeRequest: func(ctx context.Context, frame *sandboxctl.ExecRequestFrame) error {
+			if claims.ExpiresUnix != nil && time.Now().Unix() >= *claims.ExpiresUnix {
+				return errors.New("exec capability expired")
+			}
+			return programs.Evaluate(ctx, frame.Request.Exec)
+		},
+		DialBackend: func(ctx context.Context, _ *sandboxctl.ExecRequestFrame) (io.ReadWriteCloser, error) {
+			return rt.dialExecNode(ctx, &stable, sid, target, token, claims)
+		},
+		FirstRequestTimeout: limits.FirstRequestTimeout,
+	})
+	if err != nil && rt.log != nil {
+		rt.log.Debug("router: exec tunnel ended")
 	}
 }
 
@@ -1301,7 +1309,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// verified above, so its protected token is used only for the outer CONNECT.
 	if !hasDirectNodeTarget(rr) && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil,
 			map[string]string{HeaderAccessTok: connectToken},
 		)
 		if err != nil {
@@ -1325,7 +1333,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// request was sent. ReserveData is the stale-route fallback and validates the
 	// same admitted credential against the Registry's current lineage.
 	res, err := rt.routeLinkReserve(
-		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, 0, nil,
+		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil,
 		map[string]string{HeaderAccessTok: connectToken},
 	)
 	if err != nil {
@@ -1347,35 +1355,131 @@ func hasDirectNodeTarget(route *routeResolve) bool {
 	return route != nil && route.NodeSandboxID != "" && route.DataEndpoint != ""
 }
 
-// forwardSandboxConnect returns true only when the node rejected the CONNECT
-// with a typed stale-route error before accepting the ingress. In that case it
-// has not written a client response, so the caller may safely refresh and retry.
-func (rt *Router) forwardSandboxConnect(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxID string, target proxypkg.ConnectTarget, token string) bool {
-	doneActive := rt.beginActiveRoute(rr)
-	defer doneActive()
-	rt.mx.Inc(`router_requests_total{plane="data"}`)
-	backend, br, resp, err := proxypkg.DialSandboxConnect(
-		r.Context(), "tcp", rr.DataEndpoint, rr.NodeSandboxID, target, token,
+func (rt *Router) dialExecNode(
+	ctx context.Context,
+	stable *routeResolve,
+	sandboxID string,
+	target proxypkg.ConnectTarget,
+	token string,
+	claims keys.ExecAccessClaims,
+) (io.ReadWriteCloser, error) {
+	current := stable
+	for attempt := 0; attempt < 2; attempt++ {
+		if !hasDirectNodeTarget(current) {
+			resolved, err := rt.reserveExecDataRoute(ctx, stable, sandboxID, target, token, claims)
+			if err != nil {
+				return nil, errors.New("exec backend unavailable")
+			}
+			current = resolved
+		}
+		if !rt.execRouteStillAuthorized(current, stable, sandboxID, token, claims) {
+			return nil, errors.New("exec backend unavailable")
+		}
+
+		doneActive := rt.beginActiveRoute(current)
+		rt.mx.Inc(`router_requests_total{plane="data"}`)
+		backend, reader, response, err := proxypkg.DialSandboxConnect(
+			ctx, "tcp", current.DataEndpoint, current.NodeSandboxID, target, token,
+		)
+		if err != nil {
+			doneActive()
+			rt.evictRouteIfCurrent(current.Group, current.RouteKey, sandboxID, current.NodeSandboxID)
+			rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
+			if rt.log != nil {
+				rt.log.Warn("router: exec node connect failed", "sid", sandboxID, "node", current.NodeID)
+			}
+			return nil, errors.New("exec backend unavailable")
+		}
+		if response.StatusCode == http.StatusOK {
+			stream := proxypkg.BufferedConnectStream(backend, reader)
+			return &activeExecStream{ReadWriteCloser: stream, done: doneActive}, nil
+		}
+		_ = response.Body.Close()
+		_ = backend.Close()
+		doneActive()
+		if !staleProxyResponse(response.StatusCode, response.Header.Get(proxypkg.HeaderProxyError)) || attempt != 0 {
+			rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
+			return nil, errors.New("exec backend unavailable")
+		}
+		rt.evictRouteIfCurrent(current.Group, current.RouteKey, sandboxID, current.NodeSandboxID)
+		resolved, err := rt.reserveExecDataRoute(ctx, stable, sandboxID, target, token, claims)
+		if err != nil {
+			return nil, errors.New("exec backend unavailable")
+		}
+		current = resolved
+	}
+	return nil, errors.New("exec backend unavailable")
+}
+
+func (rt *Router) reserveExecDataRoute(
+	ctx context.Context,
+	stable *routeResolve,
+	sandboxID string,
+	target proxypkg.ConnectTarget,
+	token string,
+	claims keys.ExecAccessClaims,
+) (*routeResolve, error) {
+	result, err := rt.routeLinkReserve(
+		ctx, "data", stable.Group, stable.RouteKey, sandboxID, target.Port, 0, nil, nil,
+		map[string]string{
+			HeaderAccessTok:               token,
+			proxypkg.HeaderSandboxService: string(target.Service),
+		},
 	)
 	if err != nil {
-		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
-		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
-		rt.log.Warn("router: data connect", "sid", sandboxID, "node", rr.NodeID, "err", err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return nil, err
+	}
+	current := &result.Route
+	if !hasDirectNodeTarget(current) || !rt.execRouteStillAuthorized(current, stable, sandboxID, token, claims) {
+		return nil, errors.New("exec route authorization changed")
+	}
+	rt.rememberRoute(current)
+	return current, nil
+}
+
+func (rt *Router) execRouteStillAuthorized(
+	current, stable *routeResolve,
+	sandboxID, token string,
+	want keys.ExecAccessClaims,
+) bool {
+	if current == nil || stable == nil ||
+		!routeMatchesIdentity(current, stable.Group, stable.RouteKey, sandboxID) ||
+		current.AuthSandboxID != stable.AuthSandboxID {
 		return false
 	}
-	if resp.StatusCode != http.StatusOK {
-		backend.Close()
-		if staleProxyResponse(resp.StatusCode, resp.Header.Get(proxypkg.HeaderProxyError)) {
-			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
-			return true
-		}
-		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
-		http.Error(w, "connect refused by node", resp.StatusCode)
+	got, err := keys.ParseAndVerifyExecAccessToken(
+		token, current.ServiceSecret, current.AuthSandboxID, time.Now(),
+	)
+	return err == nil && sameExecAccessClaims(got, want)
+}
+
+func sameExecAccessClaims(left, right keys.ExecAccessClaims) bool {
+	if left.SessionID != right.SessionID || !slices.Equal(left.Conditions, right.Conditions) {
 		return false
 	}
-	proxypkg.TunnelBuffered(w, r, backend, br)
-	return false
+	if left.ExpiresUnix == nil || right.ExpiresUnix == nil {
+		return left.ExpiresUnix == nil && right.ExpiresUnix == nil
+	}
+	return *left.ExpiresUnix == *right.ExpiresUnix
+}
+
+type activeExecStream struct {
+	io.ReadWriteCloser
+	doneOnce sync.Once
+	done     func()
+}
+
+func (s *activeExecStream) Close() error {
+	err := s.ReadWriteCloser.Close()
+	s.doneOnce.Do(s.done)
+	return err
+}
+
+func (s *activeExecStream) CloseWrite() error {
+	if closer, ok := s.ReadWriteCloser.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
 }
 
 func expectedDataAccessToken(route *routeResolve, port int) string {
@@ -1640,7 +1744,14 @@ func randomHexID() string {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeKey, sandboxID string, port, timeout int, ttlSeconds int64, config map[string]string, headers map[string]string) (*reserveResult, error) {
+func (rt *Router) routeLinkReserve(
+	ctx context.Context,
+	operation, group, routeKey, sandboxID string,
+	port, timeout int,
+	config map[string]string,
+	execSession *registry.SandboxReserveExecSessionReq,
+	headers map[string]string,
+) (*reserveResult, error) {
 	query := url.Values{
 		"operation": []string{operation},
 		"group":     []string{group},
@@ -1655,13 +1766,16 @@ func (rt *Router) routeLinkReserve(ctx context.Context, operation, group, routeK
 	if timeout != 0 {
 		query.Set("timeout", strconv.Itoa(timeout))
 	}
-	if ttlSeconds > 0 {
-		query.Set("ttl_seconds", strconv.FormatInt(ttlSeconds, 10))
-	}
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
 	if operation == "create" {
 		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config})
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		headers["Content-Type"] = "application/json"
+	} else if operation == "exec-session" {
+		body, _ = json.Marshal(execSession)
 		if headers == nil {
 			headers = map[string]string{}
 		}

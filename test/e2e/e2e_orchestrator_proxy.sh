@@ -267,7 +267,7 @@ req() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
-wait_traffic_stats() { # $1=sid, $2=parking|idle
+wait_traffic_stats() { # $1=sid, $2=parking|idle|paused
     local sid="$1" mode="$2" code=""
     for _ in $(seq 1 240); do
         code="$(req GET "/sandboxes/$sid/stats/traffic" "$AK" || true)"
@@ -293,6 +293,8 @@ if mode == "parking":
     ok = inflight["parking"] >= 1 and inflight["egress"] >= 0 and "idleSince" not in stats
 elif mode == "idle":
     ok = stats.get("state") == "running" and inflight == {"parking": 0, "egress": 0} and "idleSince" in stats
+elif mode == "paused":
+    ok = stats.get("state") == "paused" and inflight == {"parking": 0, "egress": 0} and "idleSince" not in stats
 else:
     ok = False
 raise SystemExit(0 if ok else 1)
@@ -326,7 +328,8 @@ if "execAccessToken" in created:
 PY
 }
 issue_exec_session() {
-    local sid="$1" key="$2" code
+    local sid="$1" key="$2" body="${3:-}" code
+    [ -n "$body" ] || body='{}'
     code="$(curl -sS --noproxy '*' --max-time 30 \
         -D "$WORK/exec-session.headers" \
         -o "$WORK/exec-session.secret" \
@@ -335,7 +338,7 @@ issue_exec_session() {
         -H "Host: api.$DOMAIN" \
         -H "X-API-KEY: $key" \
         -H 'Content-Type: application/json' \
-        --data '{}' \
+        --data "$body" \
         "http://127.0.0.1:$PORT/sandboxes/$sid/exec-sessions")"
     [ "$code" = "201" ] || fail "exec-session=$code (want 201)"
     python3 - "$WORK/exec-session.headers" "$WORK/exec-session.secret" <<'PY'
@@ -351,6 +354,19 @@ if not isinstance(token, str) or not token.startswith("kat1.") or len(token.spli
     raise SystemExit("exec-session response contains an invalid KAT token")
 print(token)
 PY
+}
+exec_argv_denied_through_proxy() {
+    local sid="$1" token="$2" diagnostics="$WORK/native-exec-condition-denied.log"
+    if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header "E2b-Sandbox-Service: exec" \
+        --proxy-header "X-Access-Token: $token" \
+        -- /bin/true >"$diagnostics" 2>&1; then
+        fail "external proxy executed a condition-denied argv"
+    fi
+    grep -Fq "exec: remote exec rejected" "$diagnostics" \
+        || { sed 's/^/  client| /' "$diagnostics"; fail "external proxy denial was not redacted"; }
 }
 exec_through_proxy_connect() {
     local sid="$1" token="$2" marker="$3"
@@ -614,7 +630,8 @@ FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
 echo "==> PASS: sandbox $SID durably accepted after external route ACK (tokens captured; no default exec token)"
 echo "==> issue native exec capability immediately and park its external CONNECT from starting"
-EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue immediate native exec capability"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" "{\"conditions\":[{\"expr\":\"request.argv[0] == '/bin/sh'\"}]}")" \
+    || fail "issue conditioned immediate native exec capability"
 rm -f "$WORK/exec-session.secret"
 IMMEDIATE_NATIVE_MARK="EXTERNAL_PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
 (
@@ -863,6 +880,9 @@ echo "==> PASS: real sandbox-ctl CONNECT through the external proxy verified std
 echo "==> pause $SID, then reuse the same exec KAT through the external proxy"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
+    exec_argv_denied_through_proxy "$SID" "$EXEC_TOKEN"
+    wait_traffic_stats "$SID" paused \
+        || { dump_logs; fail "condition-denied external exec changed paused state or traffic"; }
     RESUME_MARK="EXTERNAL_PROXY_EXEC_RESUME_$RANDOM"
     exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK" 40
     ok=""

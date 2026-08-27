@@ -45,8 +45,9 @@ node proxy worker
 - **逻辑服务只影响 CONNECT**:普通 HTTP 不解析 `E2b-Sandbox-Service`,应用层
   Header 保持不变;CONNECT 中显式 service 是 backend 选择的权威输入.
 - **Exec 先鉴权后激活**:`service=exec` 始终验证绑定 `AuthSandboxID` 的 KAT;
-  失败请求不得触发 Wake/resume.最终 node proxy 只将已授权连接交给
-  `ctl.ProxyExec`,不向租户开放任意 UDS 或其它 ctl capability.
+  CONNECT 200 后还必须授权完整首个 ExecRequest.失败请求不得触发 parking、Wake/resume
+  或 backend dial.最终 node proxy 只将双重 gate 通过的请求交给 ctl tunnel helper,
+  不向租户开放任意 UDS 或其它 ctl capability.
 - **确定性 MMDS 密钥**:`MmdsSecret = MAC(manifest_key, sid)`,PUT 和 GET 即使落到
   不同 worker 也一致。
 
@@ -272,33 +273,45 @@ CONNECT:
 - 普通 forward/envd/CI 目标鉴权成功后,把客户端连接与后端连接双向 splice;
 - `service=exec` 只接受 CONNECT;普通 HTTP 携带该 service 返回 405,且不触发恢复.
 
-node proxy 的 exec 路径先做无副作用本地查找,以 route 中的
-`AuthSandboxID + ServiceSecret` 严格验证 `X-Access-Token` KAT.仅验证成功后才可以
-resume paused sandbox;若 cold Create 已返回但首个 starting route 尚未传播到 worker,
-lookup 在 `park_timeout` 内只等待该 identity 到达而不发送未鉴权 Wake;若 route 已是
-starting,则同样不再 Wake,只等当前 launch 完成。恢复后
-重读 NodeSandboxID 和 credential identity,二者必须与鉴权时
-一致.然后拨 `<run_root>/<NodeSandboxID>/ctl.sock`,发送并 flush CONNECT 200,将两个 stream
-的所有权交给 `sandboxer/pkg/ctl.ProxyExec`.
+node proxy 的 exec 路径分为三个有序阶段:
+
+1. CONNECT 200 前只做无副作用本地 `LookupExec`,以 route 中的
+   `AuthSandboxID + ServiceSecret` 严格验证 `X-Access-Token` KAT,并在 HMAC 验证成功后
+   编译/读取有界缓存中的 CEL programs.该阶段不 parking、不 activation、不拨
+   `ctl.sock`;token/identity/expiry/conditions 失败以 HTTP 400/401/404/501 结束.
+2. 返回并 flush CONNECT 200 后,在固定 10 秒 first-request timeout 内读取完整首个 ctl
+   frame.解析严格覆盖顶层 `exec_request`、`ExecSpec` 和 `StdioSpec`,保留客户端原始
+   4-byte little-endian length + JSON bytes,重新检查 expiry,构造规范化 request view 并
+   以 AND 执行全部 conditions.false、error、unknown、cost exceeded 或 cancel 都 fail closed.
+3. 只有 request admission 成功后才 `BeginParking → ActivateExec → exact identity recheck →
+   ctl.sock dial → AttachBackend`,然后把首帧 Raw 原样写入一次并进入双向 relay.首帧一旦
+   写入 backend 就不 retry、reroute 或 replay.
+
+CEL view 将 nil argv/env 规范化为 `[]`/`{}`,空 cwd 与 `/` 规范化为 `/`,user 保留请求原值.
+TTY 模式中 stdin/stdout/stderr flags 沿用 ctl wire 的 ignored 语义,view 暴露规范化后的有效
+语义,不会因 flags 同时出现而拒绝合法请求.条件或结构 gate 失败不改变 parking/activity,
+不启动 guest child;因此也不会使 paused sandbox 恢复.
 
 internal 模式的 `run_root` 取自 conductor `paths.run_root`;external 模式的
 worker 直接读取自身 `proxy.yaml` 必填的 `paths.run_root`.该值应与同节点
 conductor 的 `paths.run_root` 一致.routesync `Policy` 和共享路由视图只提供
 路由,凭据及鉴权策略,不投影 `ctl.sock` 路径.
 
-`ProxyExec` 只接受第一个 ctl frame 为 `exec_request`,复用 `ctl.MaxMessageBytes`,保留原始
-4-byte little-endian length + JSON bytes,然后透明中继 ctl/MUX 流.H1 从 Hijack 返回的 buffered reader 继续读,
+共享的 sandboxer tunnel helper 不理解 KAT、CEL、route 或 lifecycle;它只冻结 callback 顺序、
+严格首帧读取、Raw 单次转发和 half-close relay.H1 从 Hijack 返回的 buffered reader 继续读,
 H2 从 request body 读并及时 flush response;两者都保留 half-close,等待双向 relay 结束.
-CONNECT 200 后发现 malformed,oversized,truncated 或非 exec 首帧时只关闭 tunnel,
-不再合成 HTTP/ctl error.
+CONNECT 200 后,已完整识别的 request denial 或 backend failure 返回统一脱敏 ctl frame
+`{"type":"error","msg":"exec request rejected"}`;framing 无法恢复时直接关闭 tunnel.
 
-KAT 只在 CONNECT admission 时校验;过期不强制断开已建立 tunnel,有效期内同一 KAT
+KAT 在 CONNECT admission 时校验,并在首帧授权时重新检查 expiry;进入 backend relay 后
+过期不强制断开已建立 tunnel,有效期内同一 KAT
 可以建立多条独立 CONNECT.每条 tunnel 只承载一个 ctl exec session,不复用 backend 连接;
 新 CONNECT 在 route 切换后自动进入当前 NodeSandboxID,已建立 tunnel 不迁移.
 
-external worker 同样在本进程完成 KAT gate,用 `proxy.yaml` 的 `paths.run_root`
-构造 `ctl.sock` 路径并进入 `ProxyExec`.路径不经 routesync `Policy`,SHM 记录或
-conductor proxyForwarder 投影;proxyForwarder 仅透传同一 exec target 和客户端 KAT.
+external worker 同样在本进程执行上述完整 token + request + backend gate,用
+`proxy.yaml` 的 `paths.run_root` 构造 `ctl.sock` 路径.路径和 CEL programs 不经 routesync
+`Policy`,SHM 记录或 conductor proxyForwarder 投影;proxyForwarder 仅透传同一 exec target、
+客户端 KAT 和字节流,不解析 KAT/CEL/ExecRequest.
 
 proxyForwarder:
 
@@ -405,7 +418,7 @@ conductor 内存或受信 external master 的有界 heap。它们不写普通 me
 ```text
 ingress = parking + egress
 
-parking: #70 鉴权成功后,ActivateRoute/ActivateExec 与最终 backend dial 尚未完成
+parking: token 和 ExecRequest admission 成功后,ActivateRoute/ActivateExec 与最终 backend dial 尚未完成
 egress:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
 ```
 
@@ -413,7 +426,8 @@ service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b
 bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
 成功时在同一 worker-local entry lock 中原子执行 `parking--/egress++`;activation 或 dial
 失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 egress;只有 tracked backend
-的最终 `Close` 以 `sync.Once` 结束 egress。
+的最终 `Close` 以 `sync.Once` 结束 egress。token 或 ExecRequest admission 失败不进入
+parking/egress,也不刷新 sandbox activity/`idleSince`。
 
 空闲响应示例:
 

@@ -10,8 +10,11 @@ import (
 	"strconv"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
+	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
 // route_link paths. Routers dial this link for group-scoped route/build
@@ -56,6 +59,14 @@ type RouteResolve struct {
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
 	Config map[string]string `json:"config,omitempty"`
+}
+
+// SandboxReserveExecSessionReq is the dedicated Router-to-Registry
+// exec-session payload. It is request-scoped and is never persisted in a route
+// or sandbox record.
+type SandboxReserveExecSessionReq struct {
+	TTLSeconds int64    `json:"ttl_seconds"`
+	Conditions []string `json:"conditions,omitempty"`
 }
 
 // ServeRouteLink mounts the router/admin-facing route_link API.
@@ -167,6 +178,10 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "operation must be create, connect, exec-session, or data", http.StatusBadRequest)
 		return
 	}
+	if operation == ReserveExecSession && q.Has("ttl_seconds") {
+		http.Error(w, "exec-session ttl belongs in the typed body", http.StatusBadRequest)
+		return
+	}
 	port, err := reserveQueryInt(q.Get("port"), "port")
 	if err != nil || port > 65535 {
 		http.Error(w, "port must be an integer between 0 and 65535", http.StatusBadRequest)
@@ -177,18 +192,31 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("timeout must be an integer between 0 and %d", routesync.MaxConnectTimeoutSeconds), http.StatusBadRequest)
 		return
 	}
-	ttlSeconds, err := reserveQueryInt64(q.Get("ttl_seconds"), "ttl_seconds")
-	if err != nil {
-		http.Error(w, "ttl_seconds must be a non-negative integer", http.StatusBadRequest)
-		return
-	}
 	var body SandboxReserveReq
+	var execSessionBody SandboxReserveExecSessionReq
 	if operation == ReserveCreate && req.Body != nil {
 		err = json.NewDecoder(req.Body).Decode(&body)
 		if err != nil && !errors.Is(err, io.EOF) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+	} else if operation == ReserveExecSession {
+		if req.Body == nil {
+			http.Error(w, "invalid exec-session reserve body", http.StatusBadRequest)
+			return
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(req.Body, execsession.MaxRequestBodyBytes+1))
+		if readErr != nil || len(raw) == 0 || int64(len(raw)) > execsession.MaxRequestBodyBytes ||
+			strictjson.Decode(raw, &execSessionBody) != nil || execSessionBody.TTLSeconds < 0 {
+			http.Error(w, "invalid exec-session reserve body", http.StatusBadRequest)
+			return
+		}
+		normalized, validateErr := limits.NormalizeExpressions(execSessionBody.Conditions)
+		if validateErr != nil {
+			http.Error(w, "invalid exec-session reserve body", http.StatusBadRequest)
+			return
+		}
+		execSessionBody.Conditions = normalized
 	} else if req.Body != nil {
 		content, readErr := io.ReadAll(io.LimitReader(req.Body, 1))
 		if readErr != nil {
@@ -196,7 +224,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		if len(content) != 0 {
-			http.Error(w, "reserve body is only valid for create", http.StatusBadRequest)
+			http.Error(w, "reserve body is invalid for this operation", http.StatusBadRequest)
 			return
 		}
 	}
@@ -213,7 +241,8 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		ExpectedSandboxID: q.Get("sid"),
 		Port:              port,
 		TimeoutSeconds:    timeoutSeconds,
-		TTLSeconds:        ttlSeconds,
+		TTLSeconds:        execSessionBody.TTLSeconds,
+		ExecConditions:    execSessionBody.Conditions,
 		APIKey:            req.Header.Get("X-API-KEY"),
 		AccessToken:       req.Header.Get("X-Access-Token"),
 		Service:           req.Header.Get("E2b-Sandbox-Service"),
@@ -232,17 +261,6 @@ func reserveQueryInt(value, field string) (int, error) {
 		return 0, nil
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("registry: invalid %s", field)
-	}
-	return n, nil
-}
-
-func reserveQueryInt64(value, field string) (int64, error) {
-	if value == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("registry: invalid %s", field)
 	}

@@ -3,6 +3,7 @@ package router
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 type observedExecConnect struct {
@@ -134,14 +136,12 @@ func TestClusterExecSanitizesReserveFailure(t *testing.T) {
 	}
 	const internalDetail = "node stable-g7 rejected ctl path /private/run/ctl.sock"
 	for _, test := range []struct {
-		name       string
-		upstream   int
-		wantStatus int
-		wantBody   string
+		name     string
+		upstream int
 	}{
-		{name: "stale token", upstream: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized, wantBody: "invalid access token\n"},
-		{name: "route disappeared", upstream: http.StatusNotFound, wantStatus: http.StatusNotFound, wantBody: "sandbox not found\n"},
-		{name: "activation failed", upstream: http.StatusInternalServerError, wantStatus: http.StatusServiceUnavailable, wantBody: "sandbox activation failed\n"},
+		{name: "stale token", upstream: http.StatusUnauthorized},
+		{name: "route disappeared", upstream: http.StatusNotFound},
+		{name: "activation failed", upstream: http.StatusInternalServerError},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var reserveHits atomic.Int32
@@ -161,15 +161,168 @@ func TestClusterExecSanitizesReserveFailure(t *testing.T) {
 
 			resp := httptest.NewRecorder()
 			rt.Handler().ServeHTTP(resp, clusterExecRequest(token, 0))
-			if resp.Code != test.wantStatus || resp.Body.String() != test.wantBody || reserveHits.Load() == 0 {
-				t.Fatalf("status = %d, body = %q, reserve hits = %d; want %d, %q and at least one Reserve attempt",
-					resp.Code, resp.Body.String(), reserveHits.Load(), test.wantStatus, test.wantBody)
+			if resp.Code != http.StatusOK || reserveHits.Load() == 0 {
+				t.Fatalf("status = %d, body = %q, reserve hits = %d; want post-accept 200 and Reserve attempt",
+					resp.Code, resp.Body.String(), reserveHits.Load())
 			}
+			assertRouterExecRejected(t, resp.Body.Bytes())
 			if strings.Contains(resp.Body.String(), internalDetail) ||
 				strings.Contains(resp.Body.String(), "stable-g7") || strings.Contains(resp.Body.String(), "/private/") {
 				t.Fatalf("public reserve error leaked internal detail: %q", resp.Body.String())
 			}
 		})
+	}
+}
+
+func TestClusterExecConditionFailureDoesNotReserveOrDialNode(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint bool
+	}{
+		{name: "missing target"},
+		{name: "direct target", endpoint: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var nodeHits atomic.Int32
+			node := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				nodeHits.Add(1)
+			}))
+			defer node.Close()
+			endpoint := ""
+			if test.endpoint {
+				endpoint = strings.TrimPrefix(node.URL, "http://")
+			}
+			route := routerTestRouteResolve(t, "stable", "/g", "rk", endpoint, types.ProfileBare)
+			route.State = "paused"
+			var routeHits, reserveHits atomic.Int32
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/route-link/route":
+					routeHits.Add(1)
+					_ = json.NewEncoder(w).Encode(route)
+				case "/route-link/reserve":
+					reserveHits.Add(1)
+					w.WriteHeader(http.StatusInternalServerError)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer control.Close()
+			token, err := keys.MintExecAccessTokenWithConditions(
+				route.ServiceSecret, route.AuthSandboxID, 0,
+				[]string{`request.argv == ['/bin/allowed']`},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+			response := httptest.NewRecorder()
+			rt.Handler().ServeHTTP(response, clusterExecRequest(token, 0))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want post-accept 200", response.Code)
+			}
+			assertRouterExecRejected(t, response.Body.Bytes())
+			if routeHits.Load() != 1 || reserveHits.Load() != 0 || nodeHits.Load() != 0 {
+				t.Fatalf("condition failure route=%d reserve=%d node=%d", routeHits.Load(), reserveHits.Load(), nodeHits.Load())
+			}
+		})
+	}
+}
+
+func TestClusterExecReserveRevalidatesStableLineageBeforeNodeDial(t *testing.T) {
+	var nodeHits atomic.Int32
+	node := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		nodeHits.Add(1)
+	}))
+	defer node.Close()
+	initial := routerTestRouteResolve(t, "stable", "/g", "rk", "", types.ProfileBare)
+	initial.State = "paused"
+	changed := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
+	changed.AuthSandboxID = "different-lineage"
+	var reserveHits atomic.Int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(initial)
+		case "/route-link/reserve":
+			reserveHits.Add(1)
+			_ = json.NewEncoder(w).Encode(reserveResult{Route: changed})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	token, err := keys.MintExecAccessToken(initial.ServiceSecret, initial.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+	response := httptest.NewRecorder()
+	rt.Handler().ServeHTTP(response, clusterExecRequest(token, 0))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want post-accept 200", response.Code)
+	}
+	assertRouterExecRejected(t, response.Body.Bytes())
+	if reserveHits.Load() != 1 || nodeHits.Load() != 0 {
+		t.Fatalf("lineage change reserve=%d node=%d", reserveHits.Load(), nodeHits.Load())
+	}
+}
+
+func TestClusterExecRelaysNodeCtlErrorWithoutSynthesizingAnother(t *testing.T) {
+	frame := validRouterExecFrame()
+	var want bytes.Buffer
+	if err := sandboxctl.WriteMessage(&want, sandboxctl.Response{Type: sandboxctl.TypeError, Msg: "node rejected exec"}); err != nil {
+		t.Fatal(err)
+	}
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("node response writer cannot hijack")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := rw.Flush(); err != nil {
+			t.Error(err)
+			return
+		}
+		got := make([]byte, len(frame))
+		if _, err := io.ReadFull(rw.Reader, got); err != nil || !bytes.Equal(got, frame) {
+			t.Errorf("node first frame = %q, %v", got, err)
+			return
+		}
+		if _, err := conn.Write(want.Bytes()); err != nil {
+			t.Error(err)
+			return
+		}
+		if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		}
+	}))
+	defer node.Close()
+	route := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(route)
+	}))
+	defer control.Close()
+	token, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+	front := httptest.NewServer(rt.Handler())
+	defer front.Close()
+	status, output := rawClusterExecConnect(t, front.Listener.Addr().String(), token, 0, frame)
+	if status != http.StatusOK || !bytes.Equal(output, want.Bytes()) {
+		t.Fatalf("status=%d node ctl output=%q, want %q", status, output, want.Bytes())
 	}
 }
 
@@ -191,7 +344,7 @@ func TestClusterExecReadyCacheRewritesOnlySIDAndPreservesTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientInput := []byte("buffered-client-frame/mux-tail")
+	clientInput := append(validRouterExecFrame(), []byte("buffered-client-mux-tail")...)
 	status, output := rawClusterExecConnect(t, front.Listener.Addr().String(), token, 8123, clientInput)
 	if status != http.StatusOK || string(output) != "node-prefetched/node-tail" {
 		t.Fatalf("CONNECT status=%d output=%q", status, output)
@@ -253,8 +406,8 @@ func TestClusterExecKnownNonReadyTargetSkipsReserve(t *testing.T) {
 			if got.sid != route.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.token != token {
 				t.Fatalf("node CONNECT = %#v", got)
 			}
-			if gotInput := <-backendInput; len(gotInput) != 0 {
-				t.Fatalf("unexpected tunnel input %q", gotInput)
+			if gotInput := <-backendInput; !bytes.Equal(gotInput, validRouterExecFrame()) {
+				t.Fatalf("tunnel input = %q", gotInput)
 			}
 		})
 	}
@@ -308,8 +461,8 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	if got.sid != freshRoute.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.token != token {
 		t.Fatalf("fresh node CONNECT = %#v", got)
 	}
-	if gotInput := <-backendInput; len(gotInput) != 0 {
-		t.Fatalf("unexpected tunnel input %q", gotInput)
+	if gotInput := <-backendInput; !bytes.Equal(gotInput, validRouterExecFrame()) {
+		t.Fatalf("tunnel input = %q", gotInput)
 	}
 }
 
@@ -366,13 +519,14 @@ func TestClusterExecPausedReserveRechecksKATAndUsesCurrentNode(t *testing.T) {
 	if got.sid != current.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.port != "" || got.token != token {
 		t.Fatalf("current node CONNECT = %#v", got)
 	}
-	if gotInput := <-backendInput; len(gotInput) != 0 {
-		t.Fatalf("unexpected tunnel input %q", gotInput)
+	if gotInput := <-backendInput; !bytes.Equal(gotInput, validRouterExecFrame()) {
+		t.Fatalf("tunnel input = %q", gotInput)
 	}
 }
 
 func clusterExecRequest(token string, port int) *http.Request {
-	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(validRouterExecFrame()))
+	req.ProtoMajor = 2
 	req.Host = "sandbox:443"
 	req.Header.Set(proxypkg.HeaderSandboxID, "stable")
 	req.Header.Set(proxypkg.HeaderSandboxService, string(proxypkg.ConnectServiceExec))
@@ -403,6 +557,9 @@ func rawClusterExecConnect(t *testing.T, addr, token string, port int, input []b
 		fmt.Fprintf(&request, "%s: %d\r\n", proxypkg.HeaderSandboxPort, port)
 	}
 	request.WriteString("\r\n")
+	if input == nil {
+		input = validRouterExecFrame()
+	}
 	request.Write(input)
 	if _, err := tcpConn.Write(request.Bytes()); err != nil {
 		t.Fatal(err)
@@ -424,6 +581,25 @@ func rawClusterExecConnect(t *testing.T, addr, token string, port int, input []b
 		t.Fatal(err)
 	}
 	return resp.StatusCode, output
+}
+
+func validRouterExecFrame() []byte {
+	payload := []byte(`{"type":"exec_request","exec":{"argv":["/bin/true"]}}`)
+	frame := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+	return frame
+}
+
+func assertRouterExecRejected(t *testing.T, raw []byte) {
+	t.Helper()
+	var response sandboxctl.Response
+	if err := sandboxctl.ReadMessage(bytes.NewReader(raw), &response); err != nil {
+		t.Fatalf("read ctl rejection %q: %v", raw, err)
+	}
+	if response.Type != sandboxctl.TypeError || response.Msg != "exec request rejected" {
+		t.Fatalf("ctl rejection = %+v", response)
+	}
 }
 
 func newExecTunnelNode(t *testing.T, prefetched, tail string) (*httptest.Server, <-chan observedExecConnect, <-chan []byte) {

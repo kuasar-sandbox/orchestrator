@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 const execTestServiceSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -131,12 +133,13 @@ func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 		name           string
 		lookupFound    bool
 		activateFound  bool
+		wantStatus     int
 		wantProxyError string
 		wantParking    int32
 		wantActivate   int32
 	}{
-		{name: "lookup miss", wantProxyError: proxy.ProxyErrorNotFound},
-		{name: "activation miss", lookupFound: true, wantProxyError: proxy.ProxyErrorRouteError, wantParking: 1, wantActivate: 1},
+		{name: "lookup miss", wantStatus: http.StatusNotFound, wantProxyError: proxy.ProxyErrorNotFound},
+		{name: "activation miss", lookupFound: true, wantStatus: http.StatusOK, wantParking: 1, wantActivate: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			router := &execTestRouter{
@@ -149,15 +152,19 @@ func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 					t.Fatal("unexpected dial")
 					return nil, nil
 				}, t.TempDir()).WithTrafficTracker(traffic)
-			req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+			req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(validExecTestFrame()))
+			req.ProtoMajor = 2
 			req.Host = "sandbox:443"
 			req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
 			req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
 			req.Header.Set(proxy.HeaderAccessToken, token)
 			resp := httptest.NewRecorder()
 			px.ServeHTTP(resp, req)
-			if resp.Code != http.StatusNotFound || resp.Header().Get(proxy.HeaderProxyError) != test.wantProxyError {
-				t.Fatalf("response=%d proxy-error=%q, want 404/%q", resp.Code, resp.Header().Get(proxy.HeaderProxyError), test.wantProxyError)
+			if resp.Code != test.wantStatus || resp.Header().Get(proxy.HeaderProxyError) != test.wantProxyError {
+				t.Fatalf("response=%d proxy-error=%q, want %d/%q", resp.Code, resp.Header().Get(proxy.HeaderProxyError), test.wantStatus, test.wantProxyError)
+			}
+			if test.wantActivate != 0 {
+				assertExecRequestRejected(t, resp.Body.Bytes())
 			}
 			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != test.wantActivate ||
 				traffic.begins.Load() != test.wantParking || traffic.closes.Load() != test.wantParking {
@@ -166,6 +173,51 @@ func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 					test.wantActivate, test.wantParking, test.wantParking)
 			}
 		})
+	}
+}
+
+func TestExecConditionFailureHasNoParkingActivationOrDial(t *testing.T) {
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: "node-condition",
+		AuthSandboxID: "stable-condition",
+		ServiceSecret: execTestServiceSecret,
+	}
+	token, err := keys.MintExecAccessTokenWithConditions(
+		identity.ServiceSecret, identity.AuthSandboxID, 0,
+		[]string{`request.argv == ['/bin/allowed']`},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &execTestRouter{
+		identity: identity, found: true,
+		activateResult: identity, activateFound: true,
+	}
+	var dials atomic.Int32
+	traffic := &recordingTrafficTracker{}
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("unexpected dial")
+		}, t.TempDir()).WithTrafficTracker(traffic)
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(
+		execTestFrame(`{"type":"exec_request","exec":{"argv":["/bin/denied"]}}`)))
+	req.ProtoMajor = 2
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	req.Header.Set(proxy.HeaderAccessToken, token)
+	response := httptest.NewRecorder()
+	px.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want post-accept 200", response.Code)
+	}
+	assertExecRequestRejected(t, response.Body.Bytes())
+	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 ||
+		traffic.begins.Load() != 0 || traffic.attaches.Load() != 0 || traffic.closes.Load() != 0 {
+		t.Fatalf("denied request side effects lookup=%d activate=%d dial=%d parking=%d attach=%d close=%d",
+			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load(), traffic.begins.Load(),
+			traffic.attaches.Load(), traffic.closes.Load())
 	}
 }
 
@@ -189,12 +241,13 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 		token            string
 		activateIdentity proxy.ExecIdentity
 		wantActivations  int32
+		wantStatus       int
 		wantProxyError   string
 	}{
-		{name: "forward audience", token: forwardToken, activateIdentity: identity, wantActivations: 0, wantProxyError: proxy.ProxyErrorUnauthorized},
+		{name: "forward audience", token: forwardToken, activateIdentity: identity, wantStatus: http.StatusUnauthorized, wantActivations: 0, wantProxyError: proxy.ProxyErrorUnauthorized},
 		{name: "identity changed after activation", token: validToken, activateIdentity: proxy.ExecIdentity{
 			NodeSandboxID: "node-s1", AuthSandboxID: "other", ServiceSecret: execTestServiceSecret,
-		}, wantActivations: 1, wantProxyError: proxy.ProxyErrorRouteError},
+		}, wantStatus: http.StatusOK, wantActivations: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			router := &execTestRouter{
@@ -207,15 +260,16 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 					dials.Add(1)
 					return nil, fmt.Errorf("unexpected dial")
 				}, t.TempDir())
-			req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+			req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(validExecTestFrame()))
+			req.ProtoMajor = 2
 			req.Host = "sandbox:443"
 			req.Header.Set(proxy.HeaderSandboxID, "node-s1")
 			req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
 			req.Header.Set(proxy.HeaderAccessToken, test.token)
 			resp := httptest.NewRecorder()
 			px.ServeHTTP(resp, req)
-			if resp.Code != http.StatusUnauthorized {
-				t.Fatalf("response = %d, want 401", resp.Code)
+			if resp.Code != test.wantStatus {
+				t.Fatalf("response = %d, want %d", resp.Code, test.wantStatus)
 			}
 			if kind := resp.Header().Get(proxy.HeaderProxyError); kind != test.wantProxyError {
 				t.Fatalf("proxy error = %q, want %q", kind, test.wantProxyError)
@@ -224,11 +278,14 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 				t.Fatalf("calls lookup=%d activate=%d route=%d dial=%d",
 					router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load(), dials.Load())
 			}
+			if test.wantActivations != 0 {
+				assertExecRequestRejected(t, resp.Body.Bytes())
+			}
 		})
 	}
 }
 
-func TestExecActivationFailureReturnsServiceUnavailableBeforeDial(t *testing.T) {
+func TestExecActivationFailureReturnsGenericPostAcceptErrorBeforeDial(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
 		AuthSandboxID: "stable-s1",
@@ -249,16 +306,18 @@ func TestExecActivationFailureReturnsServiceUnavailableBeforeDial(t *testing.T) 
 			dials.Add(1)
 			return nil, fmt.Errorf("unexpected dial")
 		}, t.TempDir()).WithTrafficTracker(traffic)
-	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(validExecTestFrame()))
+	req.ProtoMajor = 2
 	req.Host = "sandbox:443"
 	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
 	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
 	req.Header.Set(proxy.HeaderAccessToken, token)
 	resp := httptest.NewRecorder()
 	px.ServeHTTP(resp, req)
-	if resp.Code != http.StatusServiceUnavailable {
-		t.Fatalf("activation failure response = %d, want 503", resp.Code)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("activation failure response = %d, want post-accept 200", resp.Code)
 	}
+	assertExecRequestRejected(t, resp.Body.Bytes())
 	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 1 || dials.Load() != 0 {
 		t.Fatalf("calls lookup=%d activate=%d dial=%d",
 			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
@@ -324,13 +383,13 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	if err := tcpConn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	// The server request context is canceled by this TCP read EOF even after
-	// Hijack. The exec relay must still drain the reverse direction.
+	// The tunnel context intentionally survives this valid HTTP/1 write-side EOF
+	// so the reverse direction can drain.
 	requestCtx := <-router.activateCtx
 	select {
 	case <-requestCtx.Done():
-	case <-time.After(3 * time.Second):
-		t.Fatal("net/http request context did not observe client write-side EOF")
+		t.Fatal("exec tunnel context was canceled by a valid HTTP/1 write-side EOF")
+	case <-time.After(100 * time.Millisecond):
 	}
 	defer resp.Body.Close()
 	gotResponse, err := io.ReadAll(resp.Body)
@@ -377,7 +436,7 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := execTestFrame(`{"type":"exec_request"}`)
+	frame := validExecTestFrame()
 	requestBytes := append(append([]byte(nil), frame...), []byte("h2-mux-tail")...)
 	bodyReader, bodyWriter := io.Pipe()
 	req, err := http.NewRequest(http.MethodConnect, ts.URL, bodyReader)
@@ -434,32 +493,17 @@ func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 		AuthSandboxID: "stable-gate",
 		ServiceSecret: execTestServiceSecret,
 	}
-	dir := filepath.Join(runRoot, identity.NodeSandboxID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("unix", filepath.Join(dir, "ctl.sock"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	backendBytes := make(chan []byte, 1)
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			backendBytes <- []byte("accept-error")
-			return
-		}
-		defer conn.Close()
-		got, _ := io.ReadAll(conn)
-		backendBytes <- got
-	}()
-
 	router := &execTestRouter{
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot)
+	var dials atomic.Int32
+	traffic := &recordingTrafficTracker{}
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("unexpected dial")
+		}, runRoot).WithTrafficTracker(traffic)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
@@ -494,8 +538,9 @@ func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 	}
 	_, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if got := <-backendBytes; len(got) != 0 {
-		t.Fatalf("gate forwarded non-exec first frame: %q", got)
+	if router.activateCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
+		t.Fatalf("invalid frame crossed gate: activate=%d dial=%d parking=%d",
+			router.activateCalls.Load(), dials.Load(), traffic.begins.Load())
 	}
 }
 
@@ -515,7 +560,7 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	frame := execTestFrame(`{"type":"exec_request"}`)
+	frame := validExecTestFrame()
 	frameSeen := make(chan struct{})
 	backendDone := make(chan error, 1)
 	go func() {
@@ -612,7 +657,7 @@ func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	frame := execTestFrame(`{"type":"exec_request"}`)
+	frame := validExecTestFrame()
 	frameSeen := make(chan struct{})
 	backendDone := make(chan error, 1)
 	go func() {
@@ -744,6 +789,21 @@ func execTestFrame(payload string) []byte {
 	binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))
 	copy(frame[4:], payload)
 	return frame
+}
+
+func validExecTestFrame() []byte {
+	return execTestFrame(`{"type":"exec_request","exec":{"argv":["/bin/true"]}}`)
+}
+
+func assertExecRequestRejected(t *testing.T, raw []byte) {
+	t.Helper()
+	var response sandboxctl.Response
+	if err := sandboxctl.ReadMessage(bytes.NewReader(raw), &response); err != nil {
+		t.Fatalf("read ctl rejection %q: %v", raw, err)
+	}
+	if response.Type != sandboxctl.TypeError || response.Msg != "exec request rejected" {
+		t.Fatalf("ctl rejection = %+v", response)
+	}
 }
 
 func discardExecLogger() *slog.Logger {

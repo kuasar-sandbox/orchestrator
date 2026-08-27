@@ -335,7 +335,7 @@ type Core interface {
 	List(ctx context.Context, apiKey, state string, limit int, cursor string) ([]*types.Sandbox, string, error)
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
 	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
-	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64) (string, error)
+	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error)
 	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
@@ -651,7 +651,8 @@ func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, err := a.core.ExecSession(
-		r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, request.TTLSeconds,
+		r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken,
+		request.TTLSeconds, request.Expressions(),
 	)
 	if err != nil {
 		a.failExecSession(w, err)
