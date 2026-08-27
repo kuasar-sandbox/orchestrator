@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -139,7 +140,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	o.cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
-	o.cfg.Sandbox.Resources = config.ResourcesConfig(sandboxcfg.NodeResourcePolicy{
+	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "128MiB"},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "64MiB"},
 	})

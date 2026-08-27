@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -266,7 +267,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 func (o *Orchestrator) resolveRestoredResources(spec sandboxcfg.SandboxSpec, snapshotCapacity rtconfig.CapacityConfig) (rtconfig.ResourcesConfig, error) {
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	return sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node:                     o.cfg.Sandbox.Resources.Policy(),
+		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
 		Patch:                    spec.Resource,
 		Restore:                  true,
 		SnapshotCapacity:         &snapshotCapacity,

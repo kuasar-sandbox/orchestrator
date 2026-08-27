@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -329,7 +330,7 @@ func TestTriggerBuildCannotOverwritePoolClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	limit, _ := o.cfg.Builder.ExecutionLimit()
+	limit, _ := configresolve.BuilderExecutionLimit(o.cfg.Builder)
 	if won, err := o.st.ClaimBuildExecution(ctx, execution.BuildID, limit, time.Now()); err != nil || !won {
 		t.Fatalf("ClaimBuildExecution: won=%t err=%v", won, err)
 	}

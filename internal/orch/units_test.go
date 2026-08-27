@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -76,6 +77,22 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 	}
 	if !strings.Contains(builder, "Slice=sandbox-builder.slice") || !strings.Contains(builder, "Delegate=yes") {
 		t.Fatalf("builder unit lost delegated aggregate-slice placement:\n%s", builder)
+	}
+}
+
+func TestGeneratedUnitsUseExactBootstrappingNodeCtl(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Paths: config.PathsConfig{
+		RunRoot:      "/run/kuasar-test",
+		ConfigSocket: "/run/kuasar-test/node-ctl.socket",
+	}}}
+	o.SetExecutables(configresolve.ExecutablesForNodeCtl("/opt/kuasar/node-ctl"))
+	for name, unit := range map[string]string{
+		"runner":  o.runnerUnitFile(),
+		"builder": o.builderUnitFile(),
+	} {
+		if !strings.Contains(unit, "ExecStart=/opt/kuasar/node-ctl run-") {
+			t.Fatalf("%s unit did not retain exact node-ctl path:\n%s", name, unit)
+		}
 	}
 }
 
