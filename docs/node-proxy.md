@@ -93,6 +93,10 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `external` | proxy master + worker | `node-ctl conductor serve` + `node-ctl proxy serve` |
 | `off` | 拒绝数据面请求 | conductor 返回 501 |
 
+`app/conductor` 的静态定制不增加 internal proxy factory 或数据面 Hook：
+`proxy.mode=internal` 始终装配上游标准 proxy。只有 external proxy 才有独立 executable/App
+入口；其 master/worker 定制合同见本提案的 external-proxy 阶段。
+
 external 拓扑:
 
 ```text

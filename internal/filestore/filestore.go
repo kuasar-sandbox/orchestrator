@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -33,9 +34,35 @@ type Store struct {
 	putTTL  time.Duration // upload URL lifetime (client uploads immediately)
 }
 
-// New builds a Store from the files_storage config. Static access_key/secret_key
-// take precedence; empty falls back to the AWS default chain (env / instance role).
+// Credentials is the provider-neutral credential value used at the public App
+// boundary. The AWS SDK adapter remains private to this package.
+type Credentials struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Expires         time.Time
+	CanExpire       bool
+}
+
+// CredentialsProvider supports process-local credential refresh without
+// exposing AWS SDK types through the public customization API.
+type CredentialsProvider interface {
+	Retrieve(context.Context) (Credentials, error)
+}
+
+// New builds a Store from the built-in files_storage config. Static
+// access_key/secret_key take precedence; empty falls back to the AWS default
+// chain (env / instance role). Custom Apps use NewWithCredentials instead.
 func New(c *config.FilesStorageConfig) (*Store, error) {
+	return NewWithCredentials(context.Background(), c, nil)
+}
+
+// NewWithCredentials builds a Store with an optional authoritative runtime
+// credentials provider. The provider is primed during startup so its initial
+// failure cannot be deferred until after conductor listeners or units start.
+// Subsequent SDK refreshes continue to call the provider and never fall back to
+// static YAML credentials or the ambient AWS chain.
+func NewWithCredentials(ctx context.Context, c *config.FilesStorageConfig, provider CredentialsProvider) (*Store, error) {
 	if c.Bucket == "" {
 		return nil, fmt.Errorf("filestore: bucket is required")
 	}
@@ -43,11 +70,21 @@ func New(c *config.FilesStorageConfig) (*Store, error) {
 	if c.Region != "" {
 		opts = append(opts, awsconfig.WithRegion(c.Region))
 	}
-	if c.AccessKey != "" {
+	if provider != nil {
+		first, err := provider.Retrieve(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("filestore: retrieve runtime credentials: %w", err)
+		}
+		if err := validateCredentials(first); err != nil {
+			return nil, err
+		}
+		adapter := &awsCredentialsProvider{provider: provider, first: &first}
+		opts = append(opts, awsconfig.WithCredentialsProvider(aws.NewCredentialsCache(adapter)))
+	} else if c.AccessKey != "" {
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, "")))
 	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), opts...)
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("filestore: load aws config: %w", err)
 	}
@@ -64,6 +101,51 @@ func New(c *config.FilesStorageConfig) (*Store, error) {
 		prefix:  strings.Trim(c.Prefix, "/"),
 		putTTL:  c.PresignExpiryDur(),
 	}, nil
+}
+
+type awsCredentialsProvider struct {
+	provider CredentialsProvider
+	mu       sync.Mutex
+	first    *Credentials
+}
+
+func (p *awsCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.Lock()
+	first := p.first
+	p.first = nil
+	p.mu.Unlock()
+	if first != nil {
+		return awsCredentials(*first), nil
+	}
+	value, err := p.provider.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("runtime credentials: %w", err)
+	}
+	if err := validateCredentials(value); err != nil {
+		return aws.Credentials{}, err
+	}
+	return awsCredentials(value), nil
+}
+
+func validateCredentials(value Credentials) error {
+	if value.AccessKeyID == "" || value.SecretAccessKey == "" {
+		return fmt.Errorf("filestore: runtime credentials require access key and secret key")
+	}
+	if value.CanExpire && value.Expires.IsZero() {
+		return fmt.Errorf("filestore: expiring runtime credentials require expiration")
+	}
+	if value.CanExpire && !value.Expires.After(time.Now()) {
+		return fmt.Errorf("filestore: runtime credentials are expired")
+	}
+	return nil
+}
+
+func awsCredentials(value Credentials) aws.Credentials {
+	return aws.Credentials{
+		AccessKeyID: value.AccessKeyID, SecretAccessKey: value.SecretAccessKey,
+		SessionToken: value.SessionToken, Expires: value.Expires,
+		CanExpire: value.CanExpire, Source: "kuasar runtime provider",
+	}
 }
 
 // key lays out the object: {prefix}/files/{aaaa}/{bb}/{uuid}/{hash}. The uuid

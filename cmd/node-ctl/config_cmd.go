@@ -156,7 +156,7 @@ encryption_key: "000000000000000000000000000000000000000000000000000000000000000
 # Shared remote manifest store (manifest.key empty; the tenant key arrives via env).
 manifest_config: /opt/sandbox/manifest.yaml
 paths:
-  # conductor_executable: /opt/kuasar/bin/xconductor # optional static custom App; absolute protected executable
+  # conductor_executable: /opt/kuasar/bin/xconductor # service-UID-owned app/conductor binary; validated-FD exec + sealed bootstrap
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
   config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + manifest-key admin + plugin + api plane (h2c)

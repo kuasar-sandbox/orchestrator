@@ -4,6 +4,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 )
 
@@ -23,10 +24,7 @@ func TestResourceProbeSaturatesConservativeRecoveryCharge(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	probe := resourceProbe{
-		state:     state,
-		admission: nodectl.NewAdmissionController(nodectl.AdmissionPolicy{}),
-	}
+	probe := conductorapp.NewResourceProbe(state, nodectl.NewAdmissionController(nodectl.AdmissionPolicy{}))
 	snapshot := probe.Snapshot()
 	if snapshot.Allocated != math.MaxInt64 || snapshot.Pool != math.MaxInt64 {
 		t.Fatalf("resource probe did not saturate safely: %+v", snapshot)

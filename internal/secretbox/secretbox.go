@@ -35,8 +35,12 @@ type Box struct{ keys []aeadKey }
 // (the first is active). Used for the orchestrator's encryption_key config / the
 // NODE_CONFIG_ENCRYPTION_KEY env. Empty/blank entries are ignored.
 func NewFromColonHex(spec string) (*Box, error) {
-	var b Box
-	seen := map[[tagLen]byte]bool{}
+	var keys [][]byte
+	defer func() {
+		for _, key := range keys {
+			clear(key)
+		}
+	}()
 	for _, p := range strings.Split(spec, ":") {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -46,16 +50,35 @@ func NewFromColonHex(spec string) (*Box, error) {
 		if err != nil || len(raw) != 32 {
 			return nil, errors.New("secretbox: each encryption key must be 64 hex chars (32 bytes)")
 		}
+		keys = append(keys, raw)
+	}
+	return New(keys)
+}
+
+// New builds a Box directly from raw AES-256 keys. The first key is active and
+// the remaining keys are decryption fallbacks. It is the runtime-provider entry
+// point, avoiding an intermediate textual encoding of secret key material.
+func New(keys [][]byte) (*Box, error) {
+	var b Box
+	seen := map[[tagLen]byte]bool{}
+	for _, supplied := range keys {
+		if len(supplied) != 32 {
+			return nil, errors.New("secretbox: each encryption key must be 32 bytes")
+		}
+		raw := append([]byte(nil), supplied...)
 		blk, err := aes.NewCipher(raw)
 		if err != nil {
+			clear(raw)
 			return nil, fmt.Errorf("secretbox: aes: %w", err)
 		}
 		aead, err := cipher.NewGCM(blk)
 		if err != nil {
+			clear(raw)
 			return nil, fmt.Errorf("secretbox: gcm: %w", err)
 		}
 		var tag [tagLen]byte
 		sum := sha256.Sum256(raw)
+		clear(raw)
 		copy(tag[:], sum[:tagLen])
 		if seen[tag] {
 			continue // same key listed twice
