@@ -172,12 +172,15 @@ sandbox:
 	sandboxBlock := text[start : start+end]
 	for _, want := range []string{
 		"capacity:\n            cpu: 2\n            memory: 2GiB",
-		"allocatable:\n            memory: 256MiB",
+		"allocatable: {}",
 		"overhead:\n            memory: 32MiB",
 	} {
 		if !strings.Contains(sandboxBlock, want) {
 			t.Errorf("normalized sandbox config does not contain %q:\n%s", want, sandboxBlock)
 		}
+	}
+	if strings.Contains(sandboxBlock, "allocatable:\n            memory:") {
+		t.Fatalf("normalized config made inherited allocatable.memory explicit:\n%s", sandboxBlock)
 	}
 	if strings.Contains(text, "control_socket:") {
 		t.Fatalf("normalized config exposes removed control_socket:\n%s", text)

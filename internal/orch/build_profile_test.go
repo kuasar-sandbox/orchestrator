@@ -357,9 +357,10 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cfg.Builder.Referer.Enabled = false
+	allocatableMemory := "256MiB"
 	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
 		Capacity:    sandboxcfg.NodeCapacityPolicy{CPU: 1, Memory: "512MiB"},
-		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "256MiB"},
+		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: &allocatableMemory},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "32MiB"},
 	})
 

@@ -140,8 +140,9 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	o.cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
+	allocatableMemory := "128MiB"
 	o.cfg.Sandbox.Resources = configresolve.PublicSandboxResources(sandboxcfg.NodeResourcePolicy{
-		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: "128MiB"},
+		Allocatable: sandboxcfg.NodeAllocatablePolicy{Memory: &allocatableMemory},
 		Overhead:    sandboxcfg.NodeOverheadPolicy{Memory: "64MiB"},
 	})
 	o.cfg.Sandbox.Network.E2B.InnerIP = "169.254.0.21/30"
