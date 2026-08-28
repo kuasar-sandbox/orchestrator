@@ -2177,14 +2177,16 @@ BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_B_KEY=$(basename "$BUNDLE_B_TARGET" .bundle)
 [[ "$BUNDLE_B_TARGET" == *.bundle && "$BUNDLE_B_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle B target does not encode its root ManifestKey: $BUNDLE_B_TARGET"
-python3 - "$BUNDLE_B_TARGET" "$(basename "$BUNDLE_TARGET")" <<'PY' \
-    || fail "bundle B refs are not the direct flat sibling dependency"
+python3 - "$BUNDLE_B_TARGET" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle B retained external refs or omitted its embedded A manifest"
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as archive:
-    got = archive.read("bundle/refs").decode("utf-8").splitlines()
-want = ["file://" + sys.argv[2]]
-if got != want:
-    raise SystemExit(f"bundle B refs={got!r}, want={want!r}")
+    names = set(archive.namelist())
+if "bundle/refs" in names:
+    raise SystemExit("bundle B unexpectedly retained external refs")
+want = "manifest/" + sys.argv[2]
+if want not in names:
+    raise SystemExit(f"bundle B entries omit embedded A manifest {want!r}")
 PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_B_TARGET" >"$WORK/bundle-b.json" || fail "bundle B snapshot.cfg is unreadable"
@@ -2228,14 +2230,17 @@ BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
 [[ "$BUNDLE_PROMOTE_TARGET" == *.bundle && "$BUNDLE_ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle C target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
-python3 - "$BUNDLE_PROMOTE_TARGET" "$(basename "$BUNDLE_B_TARGET")" "$(basename "$BUNDLE_TARGET")" <<'PY' \
-    || fail "bundle C refs are not the flattened B -> A sibling path"
+python3 - "$BUNDLE_PROMOTE_TARGET" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle C retained external refs or omitted embedded B/A manifests"
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as archive:
-    got = archive.read("bundle/refs").decode("utf-8").splitlines()
-want = ["file://" + sys.argv[2], "file://" + sys.argv[3]]
-if got != want:
-    raise SystemExit(f"bundle C refs={got!r}, want={want!r}")
+    names = set(archive.namelist())
+if "bundle/refs" in names:
+    raise SystemExit("bundle C unexpectedly retained external refs")
+want = {"manifest/" + key for key in sys.argv[2:]}
+missing = sorted(want - names)
+if missing:
+    raise SystemExit(f"bundle C entries omit embedded manifests {missing!r}")
 PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_PROMOTE_TARGET" >"$WORK/bundle-c.json" || fail "bundle C snapshot.cfg is unreadable"
