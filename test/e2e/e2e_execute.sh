@@ -1829,7 +1829,10 @@ if parent_top == top(working_root) or parent_top in chain(working_root):
 if not parent_top.startswith("file://"):
     raise SystemExit(f"B root disk top is not local: {parent_top!r}")
 relative = parent_top[len("file://"):].split("@", 1)[0]
-if relative != os.path.basename(relative) or not relative.endswith(".overlay"):
+if (
+    relative != os.path.basename(relative)
+    or not relative.endswith((".overlay", ".sandbox"))
+):
     raise SystemExit(f"refusing to remove unexpected B disk ref {parent_top!r}")
 print(relative)
 PY
