@@ -112,6 +112,11 @@ type RouteEntry struct {
 	// A subscriber (e.g. the platform agent) reads it to decide migration; the actual
 	// MIGRATION_TOKEN is minted on demand by export-sandbox, never broadcast here.
 	SnapshotLocation string `json:"snap_loc,omitempty"`
+	// ResumeKind mirrors types.Sandbox.ResumeKind for paused entries: "" /
+	// "snapshot" auto-wakes on traffic (memory restore); "sandbox" is a cold
+	// resume source (Sandbox artifact E) and must never auto-wake — proxies
+	// reject data-plane requests until an explicit Connect.
+	ResumeKind string `json:"resume_kind,omitempty"`
 	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.

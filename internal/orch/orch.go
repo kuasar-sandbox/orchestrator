@@ -554,7 +554,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if preparation == nil {
 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
-	if preparation.RestoreRef != "" {
+	if preparation.ResumeKind == types.ResumeSnapshot && preparation.ResumeRef != "" {
 		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation)
 	}
 	prepareStarted := time.Now()
@@ -1031,12 +1031,6 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	return true, nil
 }
 
-// diskOnlyCaptureSupported reports whether the node runtime can capture
-// disk-only snapshots (kuasar-sandbox/sandboxer#120). Until that capability
-// ships, an explicit disk-only Pause fails fast before any side effect while
-// the reaper downgrades auto-pauses to memory-bearing captures.
-const diskOnlyCaptureSupported = false
-
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
@@ -1057,9 +1051,6 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 	policy, err := o.resolveCheckpointPolicy(sb.Metadata, actionOverride)
 	if err != nil {
 		return err
-	}
-	if !diskOnlyCaptureSupported && policy.Memory != nil && !*policy.Memory {
-		return fmt.Errorf("%w: sandbox %s", api.ErrDiskOnlyUnsupported, id)
 	}
 	return o.pauseSandboxLocked(ctx, sb, policy)
 }
@@ -1090,17 +1081,13 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if err != nil {
 		return err
 	}
-	if !diskOnlyCaptureSupported && policy.Memory != nil && !*policy.Memory {
-		// Background cleanup must keep working: capture memory-bearing and
-		// log instead of failing the reaper tick for this sandbox.
-		o.log.Warn("auto-pause downgraded to memory-bearing capture",
-			"sid", current.ID,
-			"reason", "node runtime cannot capture disk-only snapshots yet")
-		policy.Memory = nil
-	}
 	return o.pauseSandboxLocked(ctx, current, policy)
 }
 
+// pauseSandboxLocked captures the sandbox per the resolved checkpoint policy:
+// memory-bearing → snapshot (run --restore resume source), disk-only → Sandbox
+// artifact E (run --from cold resume source), then commits the typed resume
+// source and stops the runner.
 func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
@@ -1119,11 +1106,19 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		"merge_ref", checkpointPolicyValue(policy.MergeRef),
 		"drop_caches", checkpointPolicyValue(policy.DropCaches),
 		"memory", checkpointPolicyValue(policy.Memory))
-	ref, err := o.snapshot(opCtx, sb, policy)
+	ref, resumeKind := types.ResumeSnapshot, ""
+	if policy.Memory != nil && !*policy.Memory {
+		// Disk-only pause: capture the disk state as a Sandbox artifact E and
+		// destroy the VM. The resume source is a cold `run --from`.
+		ref, err = o.exportArtifact(opCtx, sb)
+		resumeKind = types.ResumeSandbox
+	} else {
+		ref, err = o.snapshot(opCtx, sb, policy)
+	}
 	if err != nil {
 		return err
 	}
-	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, ref)
+	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, ref, resumeKind)
 	if err != nil {
 		return fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
@@ -1132,6 +1127,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	}
 	paused := cloneSandbox(sb)
 	paused.SnapshotRef = ref
+	paused.ResumeKind = resumeKind
 	paused.State = types.StatePaused
 	o.cache(paused)
 
@@ -1554,8 +1550,13 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 // acceptance. It is built before route publication, network attach, resource
 // controller admission, cgroup creation, or runner assignment.
 type launchPreparation struct {
-	Spec       sandboxcfg.SandboxSpec
-	RestoreRef string
+	Spec sandboxcfg.SandboxSpec
+	// ResumeKind/ResumeRef carry the typed resume source: ResumeSnapshot with a
+	// snapshot ref (memory restore via the two-stage prepare protocol) or
+	// ResumeSandbox with a Sandbox artifact E ref (cold `run --from`, ordinary
+	// cold admission). Both empty for a fresh cold create.
+	ResumeKind string
+	ResumeRef  string
 	Network    sandboxcfg.NetworkSpec
 	Resources  rtconfig.ResourcesConfig
 }
@@ -1568,8 +1569,8 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 	if err != nil {
 		return nil, err
 	}
-	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
-	if restoreRef != "" {
+	resumeKind, resumeRef := sandboxcfg.ResumeSourceFor(sb, tmpl)
+	if resumeKind == types.ResumeSnapshot && resumeRef != "" {
 		// Snapshot content is intentionally unavailable during synchronous
 		// admission. Request-owned fields and immutable node defaults are still
 		// checked here; inherited fields and capacity arrive asynchronously from
@@ -1581,8 +1582,11 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 		if _, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname); err != nil {
 			return nil, err
 		}
-		return &launchPreparation{Spec: spec, RestoreRef: restoreRef}, nil
+		return &launchPreparation{Spec: spec, ResumeKind: resumeKind, ResumeRef: resumeRef}, nil
 	}
+	// A fresh cold create and a Sandbox artifact (E) cold resume share the
+	// ordinary cold admission: fresh resource + network resolution. The E ref
+	// travels to the runner as `run --from` (Final spec, no snapshot prepare).
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
 		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
@@ -1601,7 +1605,7 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 	if err != nil {
 		return nil, err
 	}
-	return &launchPreparation{Spec: spec, Network: network, Resources: resources}, nil
+	return &launchPreparation{Spec: spec, ResumeKind: resumeKind, ResumeRef: resumeRef, Network: network, Resources: resources}, nil
 }
 
 // --- configsock.Provider ---
@@ -1868,8 +1872,15 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		"--console", "journald=" + configsock.ConsoleTag,
 	}
 	args = appendRefLocationArgs(args, locations)
-	if r := p.RestoreRef(); r != "" {
-		args = append(args, "--restore", r)
+	// Typed resume source: a Sandbox artifact E cold-boots via `run --from`
+	// (ordinary cold start over the E graph); a snapshot restores memory via
+	// `run --restore`.
+	if kind, ref := p.ResumeSource(); ref != "" {
+		if kind == types.ResumeSandbox {
+			args = append(args, "--from", ref)
+		} else {
+			args = append(args, "--restore", ref)
+		}
 	}
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)
@@ -2217,6 +2228,26 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 	}
 	o.uncache(sb.ID)
 	return nil
+}
+
+// exportArtifact captures the running sandbox's disk state as a Sandbox
+// artifact E via `sandbox-ctl export` and returns the local E path. E carries
+// the disk provenance and portable cold-start configuration but no memory: the
+// resume source is a cold `run --from` (kuasar-sandbox/sandboxer#143). Only
+// checkpoint.mode=local is supported — E artifacts are node-bound in v1.
+func (o *Orchestrator) exportArtifact(ctx context.Context, sb *types.Sandbox) (string, error) {
+	if o.cfg.Checkpoint.Mode != config.CheckpointLocal {
+		return "", fmt.Errorf("%w: disk-only pause requires checkpoint.mode=local", api.ErrBadRequest)
+	}
+	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
+	args := []string{"export", "--sandbox-id", sb.ID, "--output", dir, "--run-root", o.cfg.Paths.RunRoot}
+	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("orch: export %s: %w: %s", sb.ID, err, errb.String())
+	}
+	return filepath.Join(dir, sb.ID+".sandbox"), nil
 }
 
 // snapshot pauses+captures the running sandbox via sandbox-ctl and returns its

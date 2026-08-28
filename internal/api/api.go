@@ -207,12 +207,6 @@ var ErrAlreadyPaused = errors.New("already paused")
 // until the accepted asynchronous launch reaches a terminal state.
 var ErrSandboxStarting = errors.New("sandbox starting")
 
-// ErrDiskOnlyUnsupported is returned by Core.Pause when the resolved checkpoint
-// policy requests a disk-only capture but the node runtime cannot honor it yet
-// (kuasar-sandbox/sandboxer#120). Explicit pauses fail fast with no side
-// effects; auto-pauses downgrade instead of surfacing this error (=> 501).
-var ErrDiskOnlyUnsupported = errors.New("disk-only pause unsupported by node runtime")
-
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
@@ -325,9 +319,9 @@ type CreateReq struct {
 	// AutoPauseMemory selects whether automated timeout pauses preserve RAM
 	// (nil/default) or take disk-only snapshots (false). Folded into the
 	// sandbox checkpoint metadata namespace below header precedence.
-	AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
-	APIKey          string            `json:"-"` // injected from X-API-KEY
-	MMDSHeader      *string           `json:"-"` // nil = header absent; preserves top-level merge presence
+	AutoPauseMemory *bool   `json:"autoPauseMemory,omitempty"`
+	APIKey          string  `json:"-"` // injected from X-API-KEY
+	MMDSHeader      *string `json:"-"` // nil = header absent; preserves top-level merge presence
 }
 
 // PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
@@ -1263,8 +1257,6 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusTooManyRequests, ErrBuildAdmission.Error())
 	case errors.Is(err, ErrProxyUnavailable):
 		writeErr(w, http.StatusServiceUnavailable, ErrProxyUnavailable.Error())
-	case errors.Is(err, ErrDiskOnlyUnsupported):
-		writeErr(w, http.StatusNotImplemented, ErrDiskOnlyUnsupported.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

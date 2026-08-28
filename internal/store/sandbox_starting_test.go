@@ -124,7 +124,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.
 		t.Fatal(err)
 	}
 
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", "snapshot-stale"); err != nil || changed {
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", "snapshot-stale", types.ResumeSnapshot); err != nil || changed {
 		t.Fatalf("stale CommitRunningPaused = %v, %v; want CAS miss", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
@@ -139,7 +139,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.
 		BEGIN SELECT RAISE(ABORT, 'forced pause commit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-failed"); err == nil || changed {
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-failed", types.ResumeSnapshot); err == nil || changed {
 		t.Fatalf("failed CommitRunningPaused = %v, %v; want propagated error", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
@@ -153,7 +153,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.
 		t.Fatal(err)
 	}
 
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-current"); err != nil || !changed {
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-current", types.ResumeSnapshot); err != nil || !changed {
 		t.Fatalf("CommitRunningPaused = %v, %v", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
@@ -163,7 +163,7 @@ func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.
 	if got.State != types.StatePaused || got.SnapshotRef != "snapshot-current" || got.RunID != sb.RunID {
 		t.Fatalf("committed pause = %+v", got)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-late"); err != nil || changed {
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-late", types.ResumeSnapshot); err != nil || changed {
 		t.Fatalf("late CommitRunningPaused = %v, %v; want CAS miss", changed, err)
 	}
 }

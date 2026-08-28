@@ -13,6 +13,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -67,7 +68,15 @@ const (
 	ProxyErrorDenied        = "denied"
 	ProxyErrorUnauthorized  = "unauthorized"
 	ProxyErrorUpstreamError = "upstream_error"
+	ProxyErrorPausedCold    = "paused_cold"
 )
+
+// ErrColdSandbox is returned by router activation when a paused sandbox's
+// resume source is a Sandbox artifact (E): data-plane traffic must never
+// auto-boot it. Handlers map it to an explicit paused status so the client
+// knows to use Connect. Defined here because the router implementations import
+// this package.
+var ErrColdSandbox = errors.New("proxy: sandbox is paused with a cold resume source")
 
 // ConnectService is the canonical logical service selected by a CONNECT request.
 // The empty value is the legacy profile + raw-port mapping used when the service
@@ -349,6 +358,13 @@ func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, t
 	route, found, err := p.router.ActivateRoute(r.Context(), binding)
 	if err != nil {
 		flow.Close()
+		if errors.Is(err, ErrColdSandbox) {
+			// A Sandbox artifact (E) resume source never auto-boots on traffic;
+			// surface the cold state so the client uses Connect.
+			p.mx.Inc(`data_requests_total{result="paused_cold"}`)
+			writeProxyError(w, http.StatusServiceUnavailable, "sandbox is paused; connect to resume it", ProxyErrorPausedCold)
+			return Route{}, nil, false
+		}
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "sandbox activation failed", ProxyErrorRouteError)
 		return Route{}, nil, false

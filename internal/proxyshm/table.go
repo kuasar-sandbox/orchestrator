@@ -24,7 +24,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 6
+	schema uint32 = 7
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -44,6 +44,7 @@ const (
 	maxSnapLoc     = 32
 	maxMmdsSecret  = 128
 	maxRunID       = 128
+	maxResumeKind  = 16
 )
 
 var (
@@ -97,6 +98,7 @@ type mmapRecord struct {
 	SnapshotLocation       [maxSnapLoc]byte
 	MmdsSecret             [maxMmdsSecret]byte
 	RunID                  [maxRunID]byte
+	ResumeKind             [maxResumeKind]byte
 }
 
 // mmapTerminalRecord is a bounded, credential-free correlation cache for
@@ -568,6 +570,7 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
 				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
 				RunID:                  fixedString(rec.RunID[:]),
+				ResumeKind:             fixedString(rec.ResumeKind[:]),
 			},
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
@@ -613,6 +616,7 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	_ = putFixed(rec.SnapshotLocation[:], snapshot.entry.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], snapshot.entry.MmdsSecret)
 	_ = putFixed(rec.RunID[:], snapshot.entry.RunID)
+	_ = putFixed(rec.ResumeKind[:], snapshot.entry.ResumeKind)
 	finishWrite(rec)
 }
 
@@ -755,6 +759,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
 		{"run_id", r.RunID, maxRunID},
+		{"resume_kind", r.ResumeKind, maxResumeKind},
 	}
 	for _, c := range checks {
 		if len(c.val) > c.max {

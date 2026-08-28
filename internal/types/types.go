@@ -46,6 +46,14 @@ const (
 	StateDead     State = "dead"
 )
 
+// Resume source kinds for a paused sandbox. ResumeSnapshot restores captured
+// memory (`sandbox-ctl run --restore`); ResumeSandbox cold-boots a Sandbox
+// artifact E (`run --from`) and never auto-wakes on data-plane traffic.
+const (
+	ResumeSnapshot = "snapshot"
+	ResumeSandbox  = "sandbox"
+)
+
 // MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
 const MaxLocalSandboxIDBytes = 57
 
@@ -164,6 +172,10 @@ type Sandbox struct {
 	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
 	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
 	SnapshotRef        string // latest local path or canonical portable snapshot ref; empty if never paused
+	// ResumeKind selects how SnapshotRef resumes: "" / ResumeSnapshot restores
+	// captured memory (`run --restore`), ResumeSandbox cold-boots the Sandbox
+	// artifact E (`run --from`) and must never auto-wake on data-plane traffic.
+	ResumeKind         string
 	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
 	EnvdAccessToken    string
 	TrafficAccessToken string

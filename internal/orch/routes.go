@@ -66,6 +66,7 @@ func routeEntryBase(sb *types.Sandbox) routesync.RouteEntry {
 		TrafficAccessToken:     sb.TrafficAccessToken,
 		ForwardAccessToken:     sb.ForwardAccessToken,
 		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
+		ResumeKind:             sb.ResumeKind,
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		RunID:                  sb.RunID,
 	}
@@ -188,6 +189,14 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 	case types.StatePaused:
 		// ensureResumeAccepted performs its own authoritative re-read under this
 		// lifecycle lock, so release it before entering the common admission.
+		// A Sandbox artifact (E) resume source is a cold start owned by explicit
+		// Connect: data-plane Wake must never auto-boot it (sandboxer#143 §1.3).
+		if sb.ResumeKind == types.ResumeSandbox {
+			o.cache(sb)
+			o.publishUpsert(sb) // keep the route visible; proxies cold-reject traffic
+			unlock()
+			return
+		}
 		unlock()
 		if _, _, err := o.ensureResumeAccepted(ctx, sid, nil, nil); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)

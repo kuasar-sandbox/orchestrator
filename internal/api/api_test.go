@@ -552,11 +552,11 @@ func TestCreateCheckpointHeaderAbsentAndEmptyPolicy(t *testing.T) {
 
 func TestCreateAutoPauseMemoryFoldsIntoCheckpointMetadata(t *testing.T) {
 	tests := []struct {
-		name       string
-		body       string
-		headers    http.Header
+		name        string
+		body        string
+		headers     http.Header
 		wantPresent bool
-		wantRaw    string
+		wantRaw     string
 	}{
 		{name: "typed field alone", body: `{"autoPauseMemory":false}`,
 			wantPresent: true, wantRaw: `{"memory":false}`},
@@ -565,7 +565,7 @@ func TestCreateAutoPauseMemoryFoldsIntoCheckpointMetadata(t *testing.T) {
 		{name: "typed field refines body metadata", body: `{"autoPauseMemory":false,"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":false}"}}`,
 			wantPresent: true, wantRaw: `{"merge_ref":false,"memory":false}`},
 		{name: "header wins over typed field", body: `{"autoPauseMemory":false}`,
-			headers: header(checkpointHeader, `{"memory":true}`),
+			headers:     header(checkpointHeader, `{"memory":true}`),
 			wantPresent: true, wantRaw: `{"memory":true}`},
 	}
 	for _, tc := range tests {
@@ -624,8 +624,6 @@ func TestPauseRequestPolicyAndStatus(t *testing.T) {
 			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "memory false passes through", body: `{"memory":false}`,
 			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(false)}, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "disk-only unsupported maps to 501", body: `{"memory":false}`,
-			want: sandboxcfg.CheckpointPolicy{Memory: boolPtr(false)}, coreErr: ErrDiskOnlyUnsupported, wantStatus: http.StatusNotImplemented, wantCalls: 1},
 		{name: "body values", body: `{"checkpoint_merge_ref":false,"checkpoint_drop_caches":true}`,
 			want: sandboxcfg.CheckpointPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "body null inherits", body: `{"checkpoint_merge_ref":null,"checkpoint_drop_caches":false}`,

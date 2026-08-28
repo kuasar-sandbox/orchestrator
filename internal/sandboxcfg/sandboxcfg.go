@@ -352,15 +352,15 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	if p.Template.Kind == types.KindImg {
 		c.Boot.Root.Base = p.Template.Ref
 	}
-	// Restore policy is host-only and meaningful only when this invocation has a
-	// restore ref. Keep image cold boots free of restore configuration while
-	// retaining the policy in Sandbox.Metadata for a later pause/resume.
-	if p.RestoreRef() != "" {
+	// Restore prefetch is snapshot-specific and meaningful only when this
+	// invocation restores captured memory. A Sandbox artifact (E) cold resume
+	// owns its own disk graph, so the host diff template must not apply either;
+	// only a plain cold boot takes the host-provided fresh-upper template.
+	kind, resumeRef := p.ResumeSource()
+	if kind == types.ResumeSnapshot && resumeRef != "" {
 		c.Restore.Prefetch = p.Spec.Restore.Prefetch
 	}
-	// Cold boot needs a pre-formatted ext4 source for the writable upper; restore
-	// gets the overlay chain from the snapshot.
-	if p.RestoreRef() == "" && p.OverlayDiffTpl != "" {
+	if resumeRef == "" && p.OverlayDiffTpl != "" {
 		c.Boot.Root.Overlay.DiffTemplate = "file://" + p.OverlayDiffTpl
 	}
 
@@ -504,12 +504,38 @@ func guestFiles(hostname string, dns []string) []rtconfig.FileConfig {
 	return files
 }
 
+// ResumeSourceFor returns the typed resume source for this sandbox: kind
+// types.ResumeSandbox with the Sandbox artifact E ref (cold `run --from`,
+// never auto-waking), or kind types.ResumeSnapshot with the snapshot ref
+// (`run --restore`). ref is "" for a plain cold boot. A sandbox-kind source
+// always comes from its own persisted pause; template sources are always
+// snapshot-kind (a template build snapshot restores memory).
+func ResumeSourceFor(sb *types.Sandbox, tmpl types.TemplateID) (string, string) {
+	if sb.ResumeKind == types.ResumeSandbox {
+		if sb.SnapshotRef != "" {
+			return types.ResumeSandbox, sb.SnapshotRef
+		}
+		return "", ""
+	}
+	if ref := sb.SnapshotRef; ref != "" {
+		return types.ResumeSnapshot, ref
+	}
+	if tmpl.Kind == types.KindSnp {
+		return types.ResumeSnapshot, tmpl.Ref
+	}
+	return "", ""
+}
+
 // RestoreRefFor is the snapshot ref sandbox-ctl should restore from, or "" for a
 // cold boot. A resumed sandbox (img OR snp) restores from its latest pause snapshot;
 // otherwise a snp template cold-starts by restoring its build snapshot, and an img
 // template cold-boots. Exported so the orchestrator can resolve it before rendering
-// (to read the snapshot's inherited config).
+// (to read the snapshot's inherited config). Snapshot sources only: a
+// sandbox-kind (E) resume source must use ResumeSourceFor.
 func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
+	if sb.ResumeKind == types.ResumeSandbox {
+		return ""
+	}
 	if ref := sb.SnapshotRef; ref != "" {
 		return ref
 	}
@@ -521,6 +547,9 @@ func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
 
 // RestoreRef is RestoreRefFor for this Params.
 func (p Params) RestoreRef() string { return RestoreRefFor(p.Sandbox, p.Template) }
+
+// ResumeSource is ResumeSourceFor for this Params.
+func (p Params) ResumeSource() (string, string) { return ResumeSourceFor(p.Sandbox, p.Template) }
 
 // MergeNetwork overlays over (the explicit / create network) onto base (the
 // snapshot-inherited network) field by field: explicit wins, the snapshot fills what

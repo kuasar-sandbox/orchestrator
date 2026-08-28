@@ -359,6 +359,11 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 	if r.State == routesync.StateRunning {
 		return workerDialRoute(r, expected), true, nil
 	}
+	// A Sandbox artifact (E) resume source is a cold start owned by explicit
+	// Connect: reject instead of parking or waking (sandboxer#143 §1.3).
+	if r.State == routesync.StatePaused && r.ResumeKind == types.ResumeSandbox {
+		return proxy.Route{}, false, proxy.ErrColdSandbox
+	}
 	seenStarting := r.State == routesync.StateStarting
 	woke := false
 	if r.State == routesync.StatePaused && v.wake != nil {
@@ -476,6 +481,11 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	}
 	if r.State == routesync.StateRunning {
 		return identity, true, nil
+	}
+	// Cold resume sources (Sandbox artifact E) never auto-boot on exec traffic
+	// either; explicit Connect owns the cold start.
+	if r.State == routesync.StatePaused && r.ResumeKind == types.ResumeSandbox {
+		return proxy.ExecIdentity{}, false, proxy.ErrColdSandbox
 	}
 	seenStarting := r.State == routesync.StateStarting
 	woke := false

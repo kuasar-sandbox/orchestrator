@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   manifest_key_hash    TEXT NOT NULL,
   manifest_key_enc     TEXT NOT NULL,
   snapshot_ref         TEXT NOT NULL DEFAULT '',
+  resume_kind          TEXT NOT NULL DEFAULT '',
   service_secret_enc       TEXT NOT NULL,
   envd_access_token_enc    TEXT NOT NULL,
   traffic_access_token_enc TEXT NOT NULL,
@@ -164,6 +165,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
 	if err := ensureColumn(ctx, db, "builds", "runtime_prepare_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "resume_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -337,9 +342,9 @@ func ub(s string) types.BuildOptions {
 
 const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
-	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
+	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,resume_kind,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -347,7 +352,7 @@ ON CONFLICT(id) DO UPDATE SET
   run_dir=excluded.run_dir, base_dir=excluded.base_dir, run_id=excluded.run_id, envd_uds=excluded.envd_uds,
   ci_uds=excluded.ci_uds, floatingip=excluded.floatingip, vswitch_port=excluded.vswitch_port,
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
-  snapshot_ref=excluded.snapshot_ref,
+  snapshot_ref=excluded.snapshot_ref, resume_kind=excluded.resume_kind,
   metadata_json=excluded.metadata_json, env_json=excluded.env_json`
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
@@ -394,7 +399,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	return []any{
 		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.AuthSandboxIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
-		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef,
+		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef, sb.ResumeKind,
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
 		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix,
 	}, nil
@@ -564,14 +569,15 @@ func (s *Store) CommitStartingRunning(ctx context.Context, id, runID string) (bo
 	return sandboxUpdateChanged("commit starting running", id, result)
 }
 
-// CommitRunningPaused publishes a completed snapshot only while the exact
-// runner that produced it still owns a running row. State and snapshot ref are
-// one atomic update so readers can never observe a partially committed pause.
-func (s *Store) CommitRunningPaused(ctx context.Context, id, runID, snapshotRef string) (bool, error) {
+// CommitRunningPaused publishes a completed pause (memory snapshot or Sandbox
+// artifact E) only while the exact runner that produced it still owns a running
+// row. State, ref, and resume kind are one atomic update so readers can never
+// observe a partially committed pause.
+func (s *Store) CommitRunningPaused(ctx context.Context, id, runID, snapshotRef, resumeKind string) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes SET state=?, snapshot_ref=?
+		UPDATE sandboxes SET state=?, snapshot_ref=?, resume_kind=?
 		 WHERE id=? AND state=? AND run_id=?`,
-		string(types.StatePaused), snapshotRef, id, string(types.StateRunning), runID)
+		string(types.StatePaused), snapshotRef, resumeKind, id, string(types.StateRunning), runID)
 	if err != nil {
 		return false, fmt.Errorf("store: commit running paused sandbox %s: %w", id, err)
 	}
@@ -614,7 +620,7 @@ func (s *Store) DeletePreLaunchStarting(ctx context.Context, id string) (bool, e
 }
 
 var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
-  vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
+  vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,resume_kind,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
@@ -624,7 +630,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.AuthSandboxIDValue,
 		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
-		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef,
+		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef, &sb.ResumeKind,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
 		&meta, &env, &sb.CreatedUnix); err != nil {
 		return nil, err
