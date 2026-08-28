@@ -370,6 +370,10 @@ serve daemon 的配置文件是 `conductor.yaml`。完整带注释样例见 `dep
 `LoadProxy` / `DecodeProxy`、hook 后不重套默认值的 `ValidateConductorFinal` /
 `ValidateProxyFinal`，以及真正深拷贝的 `Clone`。未知 YAML 字段和多文档输入会失败，
 Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、provider 或运行时句柄。
+`ResourceAllocatable.Memory` 以 `*string` 公开 presence：`nil` 表示继承 internal resolver
+中的 `256MiB` 默认值，非 nil（包括显式 `256MiB`）表示 operator/custom `Configure`
+的明确策略，必须满足 capacity 上界。`SetMemory` / `InheritMemory` 只是便利方法；直接赋
+pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 presence。
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
@@ -406,7 +410,7 @@ Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
 | `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 request/template 覆盖;restore Capacity 由 snapshot 固定 |
-| `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / `256MiB` | CPU 是调度权重/保证;memory 是 settled guest headroom,不是 total Budget。继承 memory 超过最终 Capacity 时收敛到 Capacity,request 显式越界则拒绝 |
+| `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / 省略时继承 `256MiB` | CPU 是调度权重/保证;memory 是 settled guest headroom,不是 total Budget。conductor 配置省略 memory 时可随最终 Capacity 收敛；operator/custom 显式值（即使等于 `256MiB`）不得静默收敛，越界直接拒绝。request patch 的 pointer schema 与规则不变 |
 | `sandbox.resources.startup.memory` | 最终 `capacity.memory` | cold 首份可信 report 前的 headroom,static/dynamic 均有效,与 settled headroom 独立;restore 不使用 |
 | `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
 | `sandbox.resources.watermark_high.ratio` | `0.875` | node-owned sandbox `memory.high` pressure ratio,必须在 `(0,1)`;request/template 不可覆盖 |
@@ -820,8 +824,8 @@ node resource policy
 registration 共用同一 helper。
 
 最终 resolver 先确定 capacity,再解析 allocatable/startup,最后添加 node-only
-overhead/watermark/deflate/controller。继承的 allocatable 超过最终 capacity 可安全收敛;
-request 显式越界拒绝。startup 与 allocatable 独立,request 显式值只需位于
+overhead/watermark/deflate/controller。node policy 中省略的 allocatable.memory 超过最终
+capacity 可安全收敛；node policy 或 request 的显式值越界拒绝。startup 与 allocatable 独立,request 显式值只需位于
 `(0,capacity.memory]`;node 显式 startup 超过最终 capacity 时收敛到 capacity,双方都未
 显式设置则取最终 capacity。static/dynamic 都渲染 startup,static 只省略 controller。
 settled policy 需要 balloon(`capacity.memory > allocatable.memory`)时最终 YAML 显式

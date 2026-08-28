@@ -173,6 +173,17 @@ func TestResolveResourcesDefaultsAndNormalization(t *testing.T) {
 	if small.Allocatable.DeflateOnOOM != nil {
 		t.Fatalf("no-balloon config rendered deflate_on_oom: %+v", small.Allocatable)
 	}
+	explicitMemory := "512MiB"
+	_, err = ResolveResources(ResourceResolveInput{
+		Node: NodeResourcePolicy{
+			Capacity:    NodeCapacityPolicy{CPU: 2, Memory: "2GiB"},
+			Allocatable: NodeAllocatablePolicy{Memory: &explicitMemory},
+		},
+		Patch: mustResourcePatch(t, `{"capacity":{"memory":"128MiB"}}`),
+	})
+	if !errors.Is(err, ErrInvalidResourceRequest) {
+		t.Fatalf("explicit node allocatable above requested capacity error = %v", err)
+	}
 
 	configuredCPU := 2.0
 	inheritedCPU, err := ResolveResources(ResourceResolveInput{
@@ -284,6 +295,18 @@ func TestResolveResourcesRestoreCapacityConstraint(t *testing.T) {
 	if _, err := ResolveResources(ResourceResolveInput{Restore: true}); err == nil || errors.Is(err, ErrInvalidResourceRequest) {
 		t.Fatalf("missing snapshot capacity error = %v", err)
 	}
+	explicitMemory := "512MiB"
+	_, err = ResolveResources(ResourceResolveInput{
+		Node: NodeResourcePolicy{
+			Capacity:    NodeCapacityPolicy{CPU: 2, Memory: "2GiB"},
+			Allocatable: NodeAllocatablePolicy{Memory: &explicitMemory},
+		},
+		Restore:          true,
+		SnapshotCapacity: &rtconfig.CapacityConfig{CPU: 1, Memory: "128MiB"},
+	})
+	if !errors.Is(err, ErrInvalidResourceRequest) {
+		t.Fatalf("explicit node allocatable above restore capacity error = %v", err)
+	}
 }
 
 func TestValidateNodeResourcePolicy(t *testing.T) {
@@ -299,6 +322,32 @@ func TestValidateNodeResourcePolicy(t *testing.T) {
 	badCPU := 3.0
 	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{Allocatable: NodeAllocatablePolicy{CPU: &badCPU}}, false); err == nil {
 		t.Fatal("node allocatable CPU above capacity accepted")
+	}
+	capacity := NodeCapacityPolicy{CPU: 1, Memory: "128MiB"}
+	inherited := NodeResourcePolicy{Capacity: capacity}
+	inherited.ApplyDefaults()
+	if inherited.Allocatable.Memory != nil {
+		t.Fatalf("ApplyDefaults materialized inherited memory: %+v", inherited.Allocatable)
+	}
+	if err := ValidateNodeResourcePolicy(inherited, false); err != nil {
+		t.Fatalf("inherited default above small capacity was rejected: %v", err)
+	}
+	resolvedInherited, err := ResolveResources(ResourceResolveInput{Node: inherited})
+	if err != nil || resolvedInherited.Allocatable.Memory != "128MiB" {
+		t.Fatalf("defaulted inherited runtime value = %+v, %v", resolvedInherited.Allocatable, err)
+	}
+	explicitDefault := "256MiB"
+	if err := ValidateNodeResourcePolicy(NodeResourcePolicy{
+		Capacity: capacity, Allocatable: NodeAllocatablePolicy{Memory: &explicitDefault},
+	}, false); err == nil || !strings.Contains(err.Error(), "allocatable.memory") {
+		t.Fatalf("explicit default above small capacity error = %v", err)
+	}
+	explicit := "64MiB"
+	resolved, err := ResolveResources(ResourceResolveInput{Node: NodeResourcePolicy{
+		Capacity: capacity, Allocatable: NodeAllocatablePolicy{Memory: &explicit},
+	}})
+	if err != nil || resolved.Allocatable.Memory != explicit {
+		t.Fatalf("explicit runtime value = %+v, %v", resolved.Allocatable, err)
 	}
 	zero, one := 0.0, 1.0
 	for _, ratio := range []*float64{&zero, &one} {

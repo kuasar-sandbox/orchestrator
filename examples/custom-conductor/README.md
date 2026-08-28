@@ -14,3 +14,8 @@ writes, and set the absolute path in
 `Configure` runs once before any conductor listener, durable store, systemd
 unit, or worker starts. Declarative overrides belong in `Config`; logger and
 material providers belong in `Runtime` and are never serialized.
+
+`cfg.Sandbox.Resources.Allocatable.SetMemory("512MiB")` makes memory explicit;
+direct pointer assignment is equivalent. `InheritMemory()` restores the
+omitted `256MiB` default and its capacity-clamp behavior. Config snapshots and
+`Clone` preserve this distinction.
