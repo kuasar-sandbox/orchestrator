@@ -2213,7 +2213,7 @@ if bad:
 PY
 
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_CHAIN_RESTORE_$RANDOM"
-wait_sandbox_state "$SID" running 20 || fail "bundle B with sibling refs did not restore"
+wait_sandbox_state "$SID" running 20 || fail "bundle B with embedded A manifest did not restore"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-chain-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-chain-read.out" \
@@ -2291,7 +2291,7 @@ grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
     || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
 unset EXEC_TOKEN
-echo "==> PASS: checkpoint.mode=bundle drove A->B->C restore, flat sibling refs, exact promotion, and remote read"
+echo "==> PASS: checkpoint.mode=bundle drove self-contained A->B->C restore, exact promotion, and remote read"
 
 echo
 echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle $BUNDLE_REMOTE_REF)"
