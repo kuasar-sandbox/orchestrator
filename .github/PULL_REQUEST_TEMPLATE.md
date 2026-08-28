@@ -28,10 +28,13 @@ Commands and results:
 - [ ] The change has completed code review.
 - [ ] Review conversations are resolved.
 - [ ] The current base SHA and reviewed pull request head SHA have been recorded.
-- [ ] The tested integration commit has exactly those base/head SHAs as its two parents.
-- [ ] The workflow was dispatched with `--ref main`, whose SHA matched the recorded base.
-- [ ] `BMS E2E / e2e` succeeded for that integration SHA.
-- [ ] Neither the pull request base nor head has changed since the successful check.
+- [ ] The integration commit has exactly two parents: the recorded base, then the recorded head.
+- [ ] The current `kuasar-bms-companions` block (or its absence) matches the
+  admitted source set recorded below; any later body or companion change
+  received fresh exact-head evidence.
+- [ ] `kuasar/bms-exact-head` is `success` on that integration SHA.
+- [ ] The exact-head status points to a completed, successful `pull_request_target` BMS run.
+- [ ] A final query confirmed that the base, head, and integration SHA are unchanged and the exact-head status still succeeds for the recorded run.
 - [ ] The pull request will be squash merged manually; auto-merge is not used.
 
 Base SHA:
@@ -52,14 +55,18 @@ Integration SHA:
 
 ```
 
-Trusted workflow SHA:
+Companion source set (`none`, or each `repository#PR` with
+base/head/integration SHAs):
 
 ```text
 
 ```
 
-BMS E2E run URL:
+BMS exact-head status / run URL:
 
 ```text
 
 ```
+
+The central workflow revisions, when needed for audit, are available from the
+run metadata's `referenced_workflows`; they are not a separate merge-gate field.
