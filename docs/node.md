@@ -1308,8 +1308,10 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
 - **业务记录复制**:create/build/import 插入时把完整 pair 复制进 sandbox/build 行。
   后续 allowlist add/drop/TTL 或 provider 凭据更新只影响新插入记录,不重绑既有业务记录。
 - **与收敛加密的关系**:manifest_key 只封 manifest 的密钥表;chunk 加密密钥派生自
-  `SHA256(salt‖明文)`、与租户 key 无关 ⇒ chunk 去重仍跨租户;租户之间不共享 key 与
-  模板。
+  `SHA256(salt‖明文)`.共享同一 store salt 的 writer 属于同一内容共享安全域,域内相同
+  明文可以复用 physical object;需要隔离的租户或部署必须使用 `extra_salt` 或独立
+  store/salt domain.租户之间不共享 manifest key、APISecret 或模板,内容相同也不自动
+  扩大凭据和模板边界.
 - **根凭据不落明文**:sqlite 内加密;运行期只在必要的进程内存、受保护路由投影和进程 env 中。
   sandbox ManifestKey只在exact-run bootstrap认证后投递,runner以它覆盖继承环境中的同名项,
   且最终exec env只有一个authoritative `MANIFEST_KEY`。conductor可持久化/投递该值,但不调用
