@@ -6,7 +6,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
   (未改造的 e2b SDK/CLI 直接指向即可 create/exec/pause/resume/kill microVM 沙箱、构建
   自定义模板);同时提供显式 ExecAccessToken 签发和 `service=exec` native exec,
   不依赖 guest envd;内含数据面 proxy(反代 guest envd / floatingip / native exec),可选的**节点资源控制器**
-  (沙箱准入、内存预算分配、主动回收,把固定虚拟规格下的物理密度推到单节点 3,000+ 沙箱),
+  (沙箱准入、内存预算分配、主动回收,在声明资源和节点安全余量范围内提高有效利用率),
   以及 **node-link 客户端**(接入集群)。既可独立运行,也可经 node-link 交由 cluster-ctl 编排。
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
   逻辑沙箱池,**三角色均为独立进程**(无同进程内存模式):**registry**(shardkv 状态集群 +
