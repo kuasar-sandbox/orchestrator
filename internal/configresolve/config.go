@@ -78,14 +78,14 @@ func EncryptionKeySpec(cfg *publicconfig.Conductor) string {
 }
 
 // SandboxResources converts the public resource policy into the internal
-// resolver input while preserving the parser's omitted-default presence bit.
+// resolver input while preserving pointer presence.
 func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePolicy {
 	out := sandboxcfg.NodeResourcePolicy{
 		Capacity: sandboxcfg.NodeCapacityPolicy{
 			CPU: in.Capacity.CPU, Memory: in.Capacity.Memory,
 		},
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{
-			CPU: clonePtr(in.Allocatable.CPU), Memory: in.Allocatable.Memory,
+			CPU: clonePtr(in.Allocatable.CPU), Memory: clonePtr(in.Allocatable.Memory),
 		},
 		Overhead: sandboxcfg.NodeOverheadPolicy{Memory: in.Overhead.Memory},
 	}
@@ -95,7 +95,6 @@ func SandboxResources(in publicconfig.ResourcesConfig) sandboxcfg.NodeResourcePo
 	if in.WatermarkHigh != nil {
 		out.WatermarkHigh = &sandboxcfg.NodeWatermarkHighPolicy{Ratio: clonePtr(in.WatermarkHigh.Ratio)}
 	}
-	out.SetAllocatableMemoryInherited(in.AllocatableMemoryInherited())
 	return out
 }
 
@@ -108,7 +107,7 @@ func PublicSandboxResources(policy sandboxcfg.NodeResourcePolicy) publicconfig.R
 			CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory,
 		},
 		Allocatable: publicconfig.ResourceAllocatable{
-			CPU: clonePtr(policy.Allocatable.CPU), Memory: policy.Allocatable.Memory,
+			CPU: clonePtr(policy.Allocatable.CPU), Memory: clonePtr(policy.Allocatable.Memory),
 		},
 		Overhead: publicconfig.ResourceOverhead{Memory: policy.Overhead.Memory},
 	}

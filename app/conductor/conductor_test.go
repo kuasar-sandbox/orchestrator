@@ -184,6 +184,64 @@ func TestAppRejectsExecutableMutationAndIncompleteFinalConfig(t *testing.T) {
 	}
 }
 
+func TestAppRejectsExplicitAllocatableMemoryAboveCapacity(t *testing.T) {
+	app := New(Hooks{Configure: func(_ context.Context, cfg *Config, runtime *Runtime) error {
+		completeConfig(cfg)
+		cfg.Sandbox.Resources.Capacity.Memory = "2GiB"
+		cfg.Sandbox.Resources.Allocatable.SetMemory("3GiB")
+		runtime.EncryptionKeys = EncryptionKeyProviderFunc(func(context.Context) ([][]byte, error) {
+			return [][]byte{make([]byte, 32)}, nil
+		})
+		return nil
+	}})
+	app.receive = func() (*componentexec.Bootstrap, error) { return testBootstrap(t), nil }
+	app.run = func(context.Context, *publicconfig.Conductor, string, *conductorapp.Runtime) error {
+		t.Fatal("core started with an explicit allocatable memory above capacity")
+		return nil
+	}
+
+	err := app.RunContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "allocatable.memory") {
+		t.Fatalf("RunContext error = %v, want allocatable.memory rejection", err)
+	}
+}
+
+func TestAppBootstrapPreservesAllocatableMemoryPresence(t *testing.T) {
+	for name, explicit := range map[string]bool{"inherited": false, "explicit": true} {
+		t.Run(name, func(t *testing.T) {
+			bootstrap := testBootstrap(t)
+			if explicit {
+				var cfg publicconfig.Conductor
+				if err := json.Unmarshal(bootstrap.Config, &cfg); err != nil {
+					t.Fatal(err)
+				}
+				cfg.Sandbox.Resources.Allocatable.SetMemory("512MiB")
+				bootstrap.Config = mustJSON(t, &cfg)
+			}
+			app := New(Hooks{Configure: func(_ context.Context, cfg *Config, runtime *Runtime) error {
+				if got := cfg.Sandbox.Resources.Allocatable.Memory != nil; got != explicit {
+					t.Fatalf("bootstrap explicit presence = %t, want %t", got, explicit)
+				}
+				completeConfig(cfg)
+				runtime.EncryptionKeys = EncryptionKeyProviderFunc(func(context.Context) ([][]byte, error) {
+					return [][]byte{make([]byte, 32)}, nil
+				})
+				return nil
+			}})
+			app.receive = func() (*componentexec.Bootstrap, error) { return bootstrap, nil }
+			app.run = func(_ context.Context, cfg *publicconfig.Conductor, _ string, _ *conductorapp.Runtime) error {
+				if got := cfg.Sandbox.Resources.Allocatable.Memory != nil; got != explicit {
+					t.Fatalf("frozen explicit presence = %t, want %t", got, explicit)
+				}
+				return nil
+			}
+			if err := app.RunContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDirectCustomConductorIsRejected(t *testing.T) {
 	componentexec.ClearEnvironment()
 	app := New(Hooks{})

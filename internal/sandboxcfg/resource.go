@@ -63,27 +63,11 @@ type NodeAllocatablePolicy struct {
 	// A nil CPU follows the final per-request capacity CPU. A configured value
 	// is still inherited node policy and may be clamped if a request lowers
 	// capacity; an explicit request allocatable value is never clamped.
-	CPU    *float64 `yaml:"cpu,omitempty" json:"cpu,omitempty"`
-	Memory string   `yaml:"memory,omitempty" json:"memory,omitempty"`
-	// memoryInherited survives conductor defaulting so validation and the final
-	// resolver can distinguish an omitted 256MiB default (safe to clamp) from an
-	// operator's explicit value (which must satisfy the node policy as written).
-	memoryInherited bool
-}
-
-// SetAllocatableMemoryInherited carries the conductor parser's distinction
-// between an omitted default and an explicitly configured value into the
-// internal resolver. It is intentionally an internal-package API; public
-// configuration callers never need to reference NodeResourcePolicy.
-func (p *NodeResourcePolicy) SetAllocatableMemoryInherited(inherited bool) {
-	p.Allocatable.memoryInherited = inherited
-}
-
-// AllocatableMemoryInherited reports the parser presence bit so normalized
-// public configuration can preserve the same semantics across a clone or
-// serialization boundary.
-func (p NodeResourcePolicy) AllocatableMemoryInherited() bool {
-	return p.Allocatable.memoryInherited
+	CPU *float64 `yaml:"cpu,omitempty" json:"cpu,omitempty"`
+	// Memory is nil for the inherited 256MiB default and non-nil for an
+	// explicit conductor value. Request-level resource patches use their own
+	// unchanged pointer schema.
+	Memory *string `yaml:"memory,omitempty" json:"memory,omitempty"`
 }
 
 type NodeStartupPolicy struct {
@@ -101,18 +85,14 @@ type NodeWatermarkHighPolicy struct {
 }
 
 // ApplyDefaults fills conductor-owned resource defaults without manufacturing
-// an allocatable CPU presence bit: omitted CPU must continue to follow the
-// final capacity after request overlays.
+// allocatable presence. Omitted CPU follows final capacity; omitted Memory is
+// interpreted as 256MiB only while validating or resolving a runtime value.
 func (p *NodeResourcePolicy) ApplyDefaults() {
 	if p.Capacity.CPU == 0 {
 		p.Capacity.CPU = 2
 	}
 	if p.Capacity.Memory == "" {
 		p.Capacity.Memory = "2GiB"
-	}
-	if p.Allocatable.Memory == "" {
-		p.Allocatable.Memory = "256MiB"
-		p.Allocatable.memoryInherited = true
 	}
 	if p.Overhead.Memory == "" {
 		p.Overhead.Memory = "32MiB"
@@ -126,20 +106,11 @@ func (p *NodeResourcePolicy) ApplyDefaults() {
 	}
 }
 
-// MaterializedNodeResourcePolicy returns a self-contained policy suitable for
-// normalized config output. The ordinary 256MiB default is materialized. When
-// it currently exceeds node capacity, however, the leaf remains omitted so a
-// reload preserves its per-sandbox min(default, final capacity) semantics.
+// MaterializedNodeResourcePolicy returns a normalized policy suitable for
+// config output without turning inherited allocatable values into explicit
+// values.
 func MaterializedNodeResourcePolicy(policy NodeResourcePolicy) NodeResourcePolicy {
 	policy.ApplyDefaults()
-	if policy.Allocatable.memoryInherited {
-		capMem, capErr := positiveSize("sandbox.resources.capacity.memory", policy.Capacity.Memory)
-		allocMem, allocErr := positiveSize("sandbox.resources.allocatable.memory", policy.Allocatable.Memory)
-		if capErr == nil && allocErr == nil && allocMem > capMem {
-			policy.Allocatable.Memory = ""
-		}
-	}
-	policy.Allocatable.memoryInherited = false
 	return policy
 }
 
@@ -162,11 +133,11 @@ func ValidateNodeResourcePolicy(policy NodeResourcePolicy, dynamic bool) error {
 			return errors.New("sandbox.resources.allocatable.cpu must be <= sandbox.resources.capacity.cpu")
 		}
 	}
-	allocMem, err := positiveSize("sandbox.resources.allocatable.memory", policy.Allocatable.Memory)
+	allocMem, err := positiveSize("sandbox.resources.allocatable.memory", nodeAllocatableMemory(policy))
 	if err != nil {
 		return err
 	}
-	if allocMem > capMem && !policy.Allocatable.memoryInherited {
+	if allocMem > capMem && policy.Allocatable.Memory != nil {
 		return errors.New("sandbox.resources.allocatable.memory must be <= sandbox.resources.capacity.memory")
 	}
 	if _, err := positiveSize("sandbox.resources.overhead.memory", policy.Overhead.Memory); err != nil {
@@ -617,10 +588,10 @@ type ResourceResolveInput struct {
 // and node-only runtime policy in one place.
 func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, error) {
 	policy := input.Node
-	policy.ApplyDefaults()
 	if err := ValidateNodeResourcePolicy(policy, input.Dynamic); err != nil {
 		return rtconfig.ResourcesConfig{}, err
 	}
+	policy.ApplyDefaults()
 	if err := ValidateResourcePatch(input.Patch); err != nil {
 		return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: %v", ErrInvalidResourceRequest, err)
 	}
@@ -681,7 +652,7 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 		allocCPU = min(*policy.Allocatable.CPU, float64(capacity.CPU))
 	}
 
-	allocMemory := policy.Allocatable.Memory
+	allocMemory := nodeAllocatableMemory(policy)
 	allocMem, err := positiveSize("sandbox.resources.allocatable.memory", allocMemory)
 	if err != nil {
 		return rtconfig.ResourcesConfig{}, err
@@ -694,6 +665,10 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 				ErrInvalidResourceRequest, resourceFieldPath)
 		}
 	} else if allocMem > capMem {
+		if policy.Allocatable.Memory != nil {
+			return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: sandbox.resources.allocatable.memory must be <= final capacity.memory",
+				ErrInvalidResourceRequest)
+		}
 		allocMemory, allocMem = capacity.Memory, capMem
 	}
 
@@ -741,6 +716,13 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 		return rtconfig.ResourcesConfig{}, err
 	}
 	return resources, nil
+}
+
+func nodeAllocatableMemory(policy NodeResourcePolicy) string {
+	if policy.Allocatable.Memory == nil {
+		return "256MiB"
+	}
+	return *policy.Allocatable.Memory
 }
 
 // ValidateResolvedResources checks the pure resource relationships without

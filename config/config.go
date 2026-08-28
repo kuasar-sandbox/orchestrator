@@ -90,6 +90,7 @@ func (c *Conductor) Clone() *Conductor {
 	out.Cluster.Labels = cloneMap(c.Cluster.Labels)
 	out.Sandbox.Network.DNS = cloneSlice(c.Sandbox.Network.DNS)
 	out.Sandbox.Resources.Allocatable.CPU = clonePtr(c.Sandbox.Resources.Allocatable.CPU)
+	out.Sandbox.Resources.Allocatable.Memory = clonePtr(c.Sandbox.Resources.Allocatable.Memory)
 	if c.Sandbox.Resources.Startup != nil {
 		startup := *c.Sandbox.Resources.Startup
 		out.Sandbox.Resources.Startup = &startup
@@ -406,27 +407,11 @@ type ResourcesConfig struct {
 	Startup       *ResourceStartup       `yaml:"startup,omitempty" json:"startup,omitempty"`
 	Overhead      ResourceOverhead       `yaml:"overhead" json:"overhead"`
 	WatermarkHigh *ResourceWatermarkHigh `yaml:"watermark_high,omitempty" json:"watermark_high,omitempty"`
-
-	// allocatableMemoryInherited preserves the semantic difference between an
-	// omitted default and an explicitly configured 256MiB value. It is runtime
-	// parsing state, not part of YAML/JSON serialization.
-	allocatableMemoryInherited bool
 }
 
-// MarshalJSON preserves the semantic distinction between an inherited
-// allocatable.memory default and an explicit value by omitting the inherited
-// leaf. UnmarshalJSON restores the default and its presence bit. This keeps
-// node-ctl -> custom component snapshots equivalent even when Configure later
-// changes capacity.
-func (r ResourcesConfig) MarshalJSON() ([]byte, error) {
-	type wire ResourcesConfig
-	out := wire(r)
-	if r.allocatableMemoryInherited {
-		out.Allocatable.Memory = ""
-	}
-	return json.Marshal(out)
-}
-
+// UnmarshalJSON preserves the public schema's strict nested JSON decoding.
+// Pointer presence carries allocatable-memory semantics directly; no separate
+// parsing state is reconstructed here.
 func (r *ResourcesConfig) UnmarshalJSON(raw []byte) error {
 	type wire ResourcesConfig
 	var decoded wire
@@ -442,21 +427,7 @@ func (r *ResourcesConfig) UnmarshalJSON(raw []byte) error {
 		}
 		return err
 	}
-	var presence struct {
-		Allocatable *map[string]json.RawMessage `json:"allocatable"`
-	}
-	if err := json.Unmarshal(raw, &presence); err != nil {
-		return err
-	}
 	*r = ResourcesConfig(decoded)
-	explicit := false
-	if presence.Allocatable != nil {
-		_, explicit = (*presence.Allocatable)["memory"]
-	}
-	if !explicit {
-		r.Allocatable.Memory = "256MiB"
-		r.allocatableMemoryInherited = true
-	}
 	return nil
 }
 
@@ -466,9 +437,17 @@ type ResourceCapacity struct {
 }
 
 type ResourceAllocatable struct {
-	CPU    *float64 `yaml:"cpu,omitempty" json:"cpu,omitempty"`
-	Memory string   `yaml:"memory,omitempty" json:"memory,omitempty"`
+	CPU *float64 `yaml:"cpu,omitempty" json:"cpu,omitempty"`
+	// Memory is nil when the operator or Configure hook inherits the 256MiB
+	// default. A non-nil value is explicit, including an explicit "256MiB".
+	Memory *string `yaml:"memory,omitempty" json:"memory,omitempty"`
 }
+
+// SetMemory makes value an explicit allocatable-memory policy.
+func (a *ResourceAllocatable) SetMemory(value string) { a.Memory = &value }
+
+// InheritMemory restores the internal 256MiB default and clamp semantics.
+func (a *ResourceAllocatable) InheritMemory() { a.Memory = nil }
 
 type ResourceStartup struct {
 	Memory string `yaml:"memory" json:"memory"`
@@ -480,14 +459,6 @@ type ResourceOverhead struct {
 
 type ResourceWatermarkHigh struct {
 	Ratio *float64 `yaml:"ratio,omitempty" json:"ratio,omitempty"`
-}
-
-// AllocatableMemoryInherited reports whether allocatable.memory came from the
-// conductor default rather than an explicit operator value. Internal resource
-// resolution uses this presence bit when a small VM capacity temporarily
-// clamps the default headroom.
-func (r ResourcesConfig) AllocatableMemoryInherited() bool {
-	return r.allocatableMemoryInherited
 }
 
 func (r *ResourcesConfig) applyDefaults() {
@@ -502,7 +473,7 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 			CPU: r.Capacity.CPU, Memory: r.Capacity.Memory,
 		},
 		Allocatable: sandboxcfg.NodeAllocatablePolicy{
-			CPU: r.Allocatable.CPU, Memory: r.Allocatable.Memory,
+			CPU: clonePtr(r.Allocatable.CPU), Memory: clonePtr(r.Allocatable.Memory),
 		},
 		Startup: func() *sandboxcfg.NodeStartupPolicy {
 			if r.Startup == nil {
@@ -518,14 +489,14 @@ func (r ResourcesConfig) nodeResourcePolicy() sandboxcfg.NodeResourcePolicy {
 			return &sandboxcfg.NodeWatermarkHighPolicy{Ratio: r.WatermarkHigh.Ratio}
 		}(),
 	}
-	policy.SetAllocatableMemoryInherited(r.allocatableMemoryInherited)
 	return policy
 }
 
 func (r *ResourcesConfig) setNodeResourcePolicy(policy sandboxcfg.NodeResourcePolicy) {
 	r.Capacity = ResourceCapacity{CPU: policy.Capacity.CPU, Memory: policy.Capacity.Memory}
-	r.Allocatable = ResourceAllocatable{CPU: policy.Allocatable.CPU, Memory: policy.Allocatable.Memory}
-	r.allocatableMemoryInherited = policy.AllocatableMemoryInherited()
+	r.Allocatable = ResourceAllocatable{
+		CPU: clonePtr(policy.Allocatable.CPU), Memory: clonePtr(policy.Allocatable.Memory),
+	}
 	if policy.Startup == nil {
 		r.Startup = nil
 	} else {

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestDecodeConductorStrictAndCustomBootstrap(t *testing.T) {
@@ -121,13 +122,14 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	max := int64(3)
 	cpu := config.CPUCores("2")
 	memory := "4GiB"
+	allocatableMemory := "512MiB"
 	cfg := &config.Conductor{
 		Units:   config.UnitsConfig{Install: &install},
 		Cluster: config.ClusterConfig{Labels: map[string]string{"zone": "z1"}},
 		Sandbox: config.SandboxConfig{
 			Network: config.NetworkConfig{DNS: []string{"1.1.1.1"}},
 			Resources: config.ResourcesConfig{
-				Allocatable:   config.ResourceAllocatable{CPU: &one},
+				Allocatable:   config.ResourceAllocatable{CPU: &one, Memory: &allocatableMemory},
 				Startup:       &config.ResourceStartup{Memory: "1GiB"},
 				WatermarkHigh: &config.ResourceWatermarkHigh{Ratio: &ratio},
 			},
@@ -152,6 +154,7 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	clone.Cluster.Labels["zone"] = "z2"
 	clone.Sandbox.Network.DNS[0] = "8.8.8.8"
 	*clone.Sandbox.Resources.Allocatable.CPU = 2
+	*clone.Sandbox.Resources.Allocatable.Memory = "1GiB"
 	clone.Sandbox.Resources.Startup.Memory = "2GiB"
 	*clone.Sandbox.Resources.WatermarkHigh.Ratio = 0.9
 	*clone.Builder.Admission.Execution.MaxBuilds = 9
@@ -164,7 +167,8 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	clone.MMDS.Services["svc"] = config.MMDSServiceRegistryEntry{Endpoint: "unix:///run/other.sock"}
 
 	if !*cfg.Units.Install || cfg.Cluster.Labels["zone"] != "z1" || cfg.Sandbox.Network.DNS[0] != "1.1.1.1" ||
-		*cfg.Sandbox.Resources.Allocatable.CPU != 1 || cfg.Sandbox.Resources.Startup.Memory != "1GiB" ||
+		*cfg.Sandbox.Resources.Allocatable.CPU != 1 || *cfg.Sandbox.Resources.Allocatable.Memory != "512MiB" ||
+		cfg.Sandbox.Resources.Startup.Memory != "1GiB" ||
 		*cfg.Sandbox.Resources.WatermarkHigh.Ratio != 0.8 || *cfg.Builder.Admission.Execution.MaxBuilds != 3 ||
 		*cfg.Builder.Admission.Execution.Resources.CPU != "2" || *cfg.Builder.Admission.Execution.Resources.Memory != "4GiB" ||
 		cfg.Builder.FilesStorage.Bucket != "bucket" || cfg.ResourceListen.CgroupScanPaths[0] != "/a" ||
@@ -190,8 +194,7 @@ func TestConfigJSONRoundTripAndNoInternalTypes(t *testing.T) {
 	if round.Paths.ConductorExecutable != cfg.Paths.ConductorExecutable || round.Cluster.Labels["zone"] != "z1" {
 		t.Fatalf("JSON round trip = %+v", round)
 	}
-	if !cfg.Sandbox.Resources.AllocatableMemoryInherited() || !round.Sandbox.Resources.AllocatableMemoryInherited() ||
-		round.Sandbox.Resources.Allocatable.Memory != "256MiB" {
+	if cfg.Sandbox.Resources.Allocatable.Memory != nil || round.Sandbox.Resources.Allocatable.Memory != nil {
 		t.Fatalf("JSON round trip lost inherited resource presence: before=%+v after=%+v", cfg.Sandbox.Resources, round.Sandbox.Resources)
 	}
 
@@ -215,7 +218,7 @@ builder:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Sandbox.Resources.AllocatableMemoryInherited() {
+	if cfg.Sandbox.Resources.Allocatable.Memory == nil {
 		t.Fatal("explicit allocatable.memory was marked inherited")
 	}
 	b, err := json.Marshal(cfg)
@@ -229,11 +232,65 @@ builder:
 	if err := json.Unmarshal(b, &round); err != nil {
 		t.Fatal(err)
 	}
-	if round.Sandbox.Resources.AllocatableMemoryInherited() || round.Sandbox.Resources.Allocatable.Memory != "256MiB" {
+	if round.Sandbox.Resources.Allocatable.Memory == nil || *round.Sandbox.Resources.Allocatable.Memory != "256MiB" {
 		t.Fatalf("explicit resource presence changed: %+v", round.Sandbox.Resources)
 	}
 	if got := *round.Builder.Admission.Execution.Resources.CPU; got != config.CPUCores("2.0001") {
 		t.Fatalf("CPU = %q, want 2.0001", got)
+	}
+}
+
+func TestAllocatableMemoryPresenceSurvivesYAMLRoundTrip(t *testing.T) {
+	for name, input := range map[string]struct {
+		yaml     string
+		explicit bool
+	}{
+		"inherited": {
+			yaml: "paths:\n  conductor_executable: /opt/kuasar/xconductor\n",
+		},
+		"null inherits": {
+			yaml: "paths:\n  conductor_executable: /opt/kuasar/xconductor\nsandbox:\n  resources:\n    allocatable:\n      memory: null\n",
+		},
+		"explicit default": {
+			yaml:     "paths:\n  conductor_executable: /opt/kuasar/xconductor\nsandbox:\n  resources:\n    allocatable:\n      memory: 256MiB\n",
+			explicit: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := config.DecodeConductor(strings.NewReader(input.yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := yaml.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			round, err := config.DecodeConductor(strings.NewReader(string(raw)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if input.explicit {
+				if round.Sandbox.Resources.Allocatable.Memory == nil || *round.Sandbox.Resources.Allocatable.Memory != "256MiB" {
+					t.Fatalf("explicit memory lost across YAML round trip: %s", raw)
+				}
+				return
+			}
+			if round.Sandbox.Resources.Allocatable.Memory != nil || strings.Contains(string(raw), "memory: 256MiB") {
+				t.Fatalf("inherited memory became explicit across YAML round trip: %s", raw)
+			}
+		})
+	}
+}
+
+func TestResourceAllocatableMemoryConvenienceMethods(t *testing.T) {
+	var allocatable config.ResourceAllocatable
+	allocatable.SetMemory("512MiB")
+	if allocatable.Memory == nil || *allocatable.Memory != "512MiB" {
+		t.Fatalf("SetMemory result = %+v", allocatable)
+	}
+	allocatable.InheritMemory()
+	if allocatable.Memory != nil {
+		t.Fatalf("InheritMemory result = %+v", allocatable)
 	}
 }
 

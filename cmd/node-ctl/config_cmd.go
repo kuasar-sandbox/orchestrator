@@ -177,7 +177,7 @@ sandbox:                                          # sandbox-instance defaults
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
     allocatable:
       # cpu: 2                                    # omitted => follows final capacity.cpu
-      memory: 256MiB                              # settled guest headroom, not a total Budget
+      # memory: 256MiB                            # omitted => inherited 256MiB default; configured value is explicit
     # startup: { memory: 512MiB }                 # cold headroom in static/dynamic mode; omitted => capacity.memory
     overhead: { memory: 32MiB }                   # node-owned host VMM overhead
     watermark_high: { ratio: 0.875 }              # node-owned memory.high pressure ratio

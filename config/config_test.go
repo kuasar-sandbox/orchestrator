@@ -38,12 +38,20 @@ sandbox:
 	if err != nil {
 		t.Fatal(err)
 	}
+	if defaults.Sandbox.Resources.Allocatable.Memory != nil {
+		t.Fatalf("public inherited allocatable.memory = %v, want nil", *defaults.Sandbox.Resources.Allocatable.Memory)
+	}
 	policy := defaults.Sandbox.Resources.nodeResourcePolicy()
+	policy.ApplyDefaults()
 	if policy.Capacity.CPU != 2 || policy.Capacity.Memory != "2GiB" ||
-		policy.Allocatable.CPU != nil || policy.Allocatable.Memory != "256MiB" ||
+		policy.Allocatable.CPU != nil || policy.Allocatable.Memory != nil ||
 		policy.Startup != nil || policy.Overhead.Memory != "32MiB" || policy.WatermarkHigh == nil ||
 		policy.WatermarkHigh.Ratio == nil || *policy.WatermarkHigh.Ratio != 0.875 {
 		t.Fatalf("resource defaults = %+v", policy)
+	}
+	resolvedDefaults, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{Node: policy})
+	if err != nil || resolvedDefaults.Allocatable.Memory != "256MiB" {
+		t.Fatalf("runtime allocatable default = %+v, %v", resolvedDefaults.Allocatable, err)
 	}
 
 	configured, err := LoadConductor(writeConfig(t, `
@@ -74,7 +82,7 @@ sandbox:
 	policy = configured.Sandbox.Resources.nodeResourcePolicy()
 	if policy.Capacity.CPU != 4 || policy.Capacity.Memory != "8GiB" ||
 		policy.Allocatable.CPU == nil || *policy.Allocatable.CPU != 1.5 ||
-		policy.Allocatable.Memory != "512MiB" || policy.Startup == nil ||
+		policy.Allocatable.Memory == nil || *policy.Allocatable.Memory != "512MiB" || policy.Startup == nil ||
 		policy.Startup.Memory != "1GiB" || policy.Overhead.Memory != "64MiB" {
 		t.Fatalf("configured resource policy = %+v", policy)
 	}
@@ -271,6 +279,7 @@ sandbox:
 		path           string
 	}{
 		"bad capacity memory": {resources: "    capacity:\n      memory: nope", path: "capacity.memory"},
+		"empty alloc memory":  {resources: "    allocatable:\n      memory: \"\"", path: "allocatable.memory"},
 		"zero alloc memory":   {resources: "    allocatable:\n      memory: 0", path: "allocatable.memory"},
 		"alloc memory above capacity": {
 			resources: "    capacity:\n      memory: 128MiB\n    allocatable:\n      memory: 256MiB", path: "allocatable.memory",
@@ -360,6 +369,34 @@ sandbox:
 	_, err = LoadConductor(writeConfig(t, fmt.Sprintf(base, "    allocatable: { memory: 256MiB }")))
 	if err == nil || !strings.Contains(err.Error(), "allocatable.memory") {
 		t.Fatalf("explicit floor above node capacity error = %v", err)
+	}
+}
+
+func TestInheritAllocatableMemoryRestoresDefaultResolution(t *testing.T) {
+	cfg, err := LoadConductor(writeConfig(t, `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  resources:
+    capacity: { cpu: 1, memory: 128MiB }
+    allocatable: { memory: 64MiB }
+  boot: { kernel: /kernel, runtime: /runtime }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Sandbox.Resources.Allocatable.InheritMemory()
+	if err := ValidateConductorFinal(cfg); err != nil {
+		t.Fatalf("inherited default final validation: %v", err)
+	}
+	resolved, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
+		Node: cfg.Sandbox.Resources.nodeResourcePolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Allocatable.Memory != "128MiB" {
+		t.Fatalf("inherited runtime memory = %q, want capacity clamp", resolved.Allocatable.Memory)
 	}
 }
 
