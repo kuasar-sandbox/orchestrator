@@ -29,6 +29,9 @@ Commands and results:
 - [ ] Review conversations are resolved.
 - [ ] The current base SHA and reviewed pull request head SHA have been recorded.
 - [ ] The integration commit has exactly two parents: the recorded base, then the recorded head.
+- [ ] The current `kuasar-bms-companions` block (or its absence) matches the
+  admitted source set recorded below; any later body or companion change
+  received fresh exact-head evidence.
 - [ ] `kuasar/bms-exact-head` is `success` on that integration SHA.
 - [ ] The exact-head status points to a completed, successful `pull_request_target` BMS run.
 - [ ] A final query confirmed that the base, head, and integration SHA are unchanged and the exact-head status still succeeds for the recorded run.
@@ -47,6 +50,13 @@ Reviewed head SHA:
 ```
 
 Integration SHA:
+
+```text
+
+```
+
+Companion source set (`none`, or each `repository#PR` with
+base/head/integration SHAs):
 
 ```text
 
