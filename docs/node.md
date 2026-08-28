@@ -571,7 +571,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);`X-Kuasar-Sandbox-MMDS`/`metadata["kuasar-sandbox.mmds"]` 可声明 routes 与 initial secrets(§4.6);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?}` + 可选 `X-Kuasar-Sandbox-*` Header(`autoPauseMemory:false` 持久化为 checkpoint metadata `{"memory":false}`,超时 auto-suspend 走仅磁盘暂停;timeout 缺省取 `sandbox.timeout_sec`,默认 300s);`X-Kuasar-Sandbox-MMDS`/`metadata["kuasar-sandbox.mmds"]` 可声明 routes 与 initial secrets(§4.6);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
@@ -799,7 +799,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `restore` | 本次 host restore 的 `prefetch` 策略;可省略,显式值只允许 `off`/`memory` |
 | `credentials` | 创建期 ServiceSecret、Envd/Traffic token override;解析后从普通 metadata 剥离,不进入 guest |
-| `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
+| `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches`/`memory` 各自为 `true`/`false`/`null`;`memory:false` 等价于 create 体字段 `autoPauseMemory:false`,表示超时 auto-suspend 走仅磁盘暂停(Sandbox artifact E);只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
 | `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
 
 `resource` 是唯一按 leaf 合并而不是整段 namespace 覆盖的配置。公开 JSON 只允许:
@@ -1424,15 +1424,22 @@ starting ──success──► running ──pause / TTL──► paused
   {"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":null}
   ```
 
-  `memory` 缺失/`null`/`true` 均表示内存 checkpoint;`false` 在调用 Core 前返回 400。
-  两个 checkpoint 字段仅覆盖本次动作,不写回 metadata。可同时携
-  `X-Kuasar-Sandbox-Checkpoint`;Header 的具体 `true`/`false` 按字段覆盖 body,
-  Header `null`/缺失继续继承 body。body/header 解析失败均无 Pause 副作用。
-- **auto-suspend**:reaper(5s 周期)发现 `deadline` 已过 → 对运行中 sandbox-ctl 封
-  快照(按 `checkpoint.mode`,§8.1)→ 记 `snapshot_ref`、标 paused → `StopUnit` →
-  detach。路由表保留 paused 路由,后续数据面流量可唤醒。
-- **auto-resume**:数据面流量打到 paused 沙箱 → 读库 → 重走 launch(建目录 + attach
-  + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
+  `memory` 缺失/`null`/`true` 均表示内存 checkpoint;`false` 请求**仅磁盘暂停**:
+  调用 `sandbox-ctl export` 产出 Sandbox artifact E(不读内存、单冻结点),提交
+  冷启动 resume source(`resume_kind=sandbox`);仅磁盘暂停要求
+  `checkpoint.mode=local`。两个 checkpoint 字段仅覆盖本次动作,不写回 metadata。
+  可同时携 `X-Kuasar-Sandbox-Checkpoint`;Header 的具体 `true`/`false` 按字段覆盖
+  body,Header `null`/缺失继续继承 body。body/header 解析失败均无 Pause 副作用。
+- **auto-suspend**:reaper(5s 周期)发现 `deadline` 已过 → 按 checkpoint 策略:
+  `memory=false` 走 `sandbox-ctl export`(Sandbox artifact E,冷 resume source),
+  否则封内存快照(按 `checkpoint.mode`,§8.1)→ 记 `snapshot_ref` + `resume_kind`、
+  标 paused → `StopUnit` → detach。路由表保留 paused 路由;snapshot 源可被数据面
+  流量唤醒,sandbox(E)源仅显式 Connect 冷启动。
+- **auto-resume**:数据面流量打到 paused 沙箱 → 读库 → snapshot 源重走 launch
+  (建目录 + attach + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` →
+  sandbox-ctl 解封恢复。sandbox(E)源不被流量唤醒:proxy 对 paused+cold 路由直接
+  回 `503 paused_cold`;显式 Connect 重走 launch,LaunchSpec 带
+  `--from <sandbox_ref>` 冷启动(sandboxer#143 §1.3:数据面不得自动唤醒 E 源)。
   - **launch ownership**:同一 sid 的并发 Connect/Wake/exec activation 与 create/resume 均由
     上述 launch group 合并,杜绝重复 IP 分配、attach 或 StartUnit。internal 模式 proxy 在
     请求内接受/等待;external 模式经 routesync `Wake` 上行。集群数据面激活另由 registry
