@@ -1829,7 +1829,10 @@ if parent_top == top(working_root) or parent_top in chain(working_root):
 if not parent_top.startswith("file://"):
     raise SystemExit(f"B root disk top is not local: {parent_top!r}")
 relative = parent_top[len("file://"):].split("@", 1)[0]
-if relative != os.path.basename(relative) or not relative.endswith(".overlay"):
+if (
+    relative != os.path.basename(relative)
+    or not relative.endswith((".overlay", ".sandbox"))
+):
     raise SystemExit(f"refusing to remove unexpected B disk ref {parent_top!r}")
 print(relative)
 PY
@@ -1858,17 +1861,20 @@ MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manif
     "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
     || fail "promoted W is not readable from the manifest store"
 PORTABLE_LAYER_SUMMARY=$(python3 - "$WORK/w-portable-manifest.json" "$WORK/b-local.json" "$PORTABLE_W_REF" <<'PY'
-import json, sys
+import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     working = json.load(source)
 with open(sys.argv[2], encoding="utf-8") as source:
     parent = json.load(source)
 refs = working.get("FromRefs") or []
 parent_refs = parent.get("FromRefs") or []
-if len(refs) != len(parent_refs) + 1 or not refs[0].startswith("manifest://"):
-    raise SystemExit(f"portable W from_refs={refs!r}, want manifest B plus {parent_refs!r}")
-if refs[1:] != parent_refs:
-    raise SystemExit(f"portable W lower tail={refs[1:]!r}, want preserved {parent_refs!r}")
+if len(refs) != len(parent_refs) + 1:
+    raise SystemExit(
+        f"portable W from_refs={refs!r}, want {len(parent_refs) + 1} published memory layers"
+    )
+invalid_refs = [ref for ref in refs if re.fullmatch(r"manifest://[0-9a-f]{64}", ref) is None]
+if invalid_refs:
+    raise SystemExit(f"portable W has non-manifest memory refs: {invalid_refs!r}")
 if refs[0] == sys.argv[3]:
     raise SystemExit("portable W self and B memory lower collapsed to one ref")
 print(refs[0][len("manifest://"):], len(refs))
@@ -2171,14 +2177,16 @@ BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_B_KEY=$(basename "$BUNDLE_B_TARGET" .bundle)
 [[ "$BUNDLE_B_TARGET" == *.bundle && "$BUNDLE_B_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle B target does not encode its root ManifestKey: $BUNDLE_B_TARGET"
-python3 - "$BUNDLE_B_TARGET" "$(basename "$BUNDLE_TARGET")" <<'PY' \
-    || fail "bundle B refs are not the direct flat sibling dependency"
+python3 - "$BUNDLE_B_TARGET" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle B retained external refs or omitted its embedded A manifest"
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as archive:
-    got = archive.read("bundle/refs").decode("utf-8").splitlines()
-want = ["file://" + sys.argv[2]]
-if got != want:
-    raise SystemExit(f"bundle B refs={got!r}, want={want!r}")
+    names = set(archive.namelist())
+if "bundle/refs" in names:
+    raise SystemExit("bundle B unexpectedly retained external refs")
+want = "manifest/" + sys.argv[2]
+if want not in names:
+    raise SystemExit(f"bundle B entries omit embedded A manifest {want!r}")
 PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_B_TARGET" >"$WORK/bundle-b.json" || fail "bundle B snapshot.cfg is unreadable"
@@ -2205,7 +2213,7 @@ if bad:
 PY
 
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_CHAIN_RESTORE_$RANDOM"
-wait_sandbox_state "$SID" running 20 || fail "bundle B with sibling refs did not restore"
+wait_sandbox_state "$SID" running 20 || fail "bundle B with embedded A manifest did not restore"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-chain-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-chain-read.out" \
@@ -2222,14 +2230,17 @@ BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 BUNDLE_ROOT_KEY=$(basename "$BUNDLE_PROMOTE_TARGET" .bundle)
 [[ "$BUNDLE_PROMOTE_TARGET" == *.bundle && "$BUNDLE_ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "bundle C target does not encode its root ManifestKey: $BUNDLE_PROMOTE_TARGET"
-python3 - "$BUNDLE_PROMOTE_TARGET" "$(basename "$BUNDLE_B_TARGET")" "$(basename "$BUNDLE_TARGET")" <<'PY' \
-    || fail "bundle C refs are not the flattened B -> A sibling path"
+python3 - "$BUNDLE_PROMOTE_TARGET" "$BUNDLE_B_KEY" "$BUNDLE_A_KEY" <<'PY' \
+    || fail "bundle C retained external refs or omitted embedded B/A manifests"
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as archive:
-    got = archive.read("bundle/refs").decode("utf-8").splitlines()
-want = ["file://" + sys.argv[2], "file://" + sys.argv[3]]
-if got != want:
-    raise SystemExit(f"bundle C refs={got!r}, want={want!r}")
+    names = set(archive.namelist())
+if "bundle/refs" in names:
+    raise SystemExit("bundle C unexpectedly retained external refs")
+want = {"manifest/" + key for key in sys.argv[2:]}
+missing = sorted(want - names)
+if missing:
+    raise SystemExit(f"bundle C entries omit embedded manifests {missing!r}")
 PY
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_PROMOTE_TARGET" >"$WORK/bundle-c.json" || fail "bundle C snapshot.cfg is unreadable"
@@ -2280,7 +2291,7 @@ grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
     || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
 unset EXEC_TOKEN
-echo "==> PASS: checkpoint.mode=bundle drove A->B->C restore, flat sibling refs, exact promotion, and remote read"
+echo "==> PASS: checkpoint.mode=bundle drove self-contained A->B->C restore, exact promotion, and remote read"
 
 echo
 echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle $BUNDLE_REMOTE_REF)"
