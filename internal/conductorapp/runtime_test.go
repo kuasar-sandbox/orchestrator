@@ -46,6 +46,14 @@ func TestResolveRuntimeProviderPriorityAndFailure(t *testing.T) {
 	}
 }
 
+func TestResolveRuntimeRejectsMissingEncryptionMaterial(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	_, err := ResolveRuntime(context.Background(), &publicconfig.Conductor{}, Bindings{})
+	if err == nil || !strings.Contains(err.Error(), "encryption keys") {
+		t.Fatalf("missing encryption material error = %v", err)
+	}
+}
+
 func TestResolveRuntimeTLSProviderKeepsCorePolicy(t *testing.T) {
 	der, signer, certificate := testCertificate(t)
 	clientPool := x509.NewCertPool()

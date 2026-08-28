@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -58,6 +59,51 @@ func TestCustomProxyExecFailureDoesNotFallbackBuiltIn(t *testing.T) {
 	}
 	if _, err := os.Stat(sharedMemory); !os.IsNotExist(err) {
 		t.Fatalf("built-in fallback touched shared memory: %v", err)
+	}
+}
+
+func TestBuiltInConductorFinalAndRuntimeValidationPrecedeCoreSideEffects(t *testing.T) {
+	for name, body := range map[string]string{
+		"final":            "paths:\n  db_path: %s\n",
+		"runtime material": "api: { domain: built-in.test }\npaths:\n  db_path: %s\nsandbox:\n  boot: { kernel: /kernel, runtime: /runtime }\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+			database := filepath.Join(t.TempDir(), "must-not-exist.db")
+			configPath := filepath.Join(t.TempDir(), "conductor.yaml")
+			if err := os.WriteFile(configPath, []byte(fmt.Sprintf(body, database)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := runConductor([]string{"--config", configPath}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err == nil {
+				t.Fatal("runConductor succeeded")
+			}
+			if name == "final" && !strings.Contains(err.Error(), "api.domain") {
+				t.Fatalf("final validation error = %v", err)
+			}
+			if name == "runtime material" && !strings.Contains(err.Error(), "encryption keys") {
+				t.Fatalf("runtime material error = %v", err)
+			}
+			if _, statErr := os.Stat(database); !os.IsNotExist(statErr) {
+				t.Fatalf("validation failure touched database: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestBuiltInProxyFinalValidationPrecedesSharedMemoryCreation(t *testing.T) {
+	directory := t.TempDir()
+	sharedMemory := filepath.Join(directory, "must-not-exist.shm")
+	configPath := filepath.Join(directory, "proxy.yaml")
+	if err := os.WriteFile(configPath, []byte("shm_path: "+sharedMemory+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runProxy([]string{"--config", configPath}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "paths.run_root") {
+		t.Fatalf("runProxy final validation error = %v", err)
+	}
+	if _, statErr := os.Stat(sharedMemory); !os.IsNotExist(statErr) {
+		t.Fatalf("final validation touched shared memory: %v", statErr)
 	}
 }
 

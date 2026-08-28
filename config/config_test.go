@@ -550,7 +550,7 @@ sandbox:
 	}
 }
 
-func TestLoadRequiresRuntime(t *testing.T) {
+func TestLoadDefersRequiredRuntimeToFinalValidation(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
 api:
@@ -561,11 +561,12 @@ sandbox:
     kernel: /opt/sandbox/vmlinux
 `)
 
-	_, err := LoadConductor(path)
-	if err == nil {
-		t.Fatal("Load succeeded without sandbox.boot.runtime")
+	cfg, err := LoadConductor(path)
+	if err != nil {
+		t.Fatalf("declarative Load failed without final runtime: %v", err)
 	}
-	if !strings.Contains(err.Error(), "sandbox.boot.runtime") {
+	err = ValidateConductorFinal(cfg)
+	if err == nil || !strings.Contains(err.Error(), "sandbox.boot.runtime") {
 		t.Fatalf("error %q does not mention sandbox.boot.runtime", err)
 	}
 }
@@ -857,17 +858,18 @@ func TestLoadProxyStatsSocketValidation(t *testing.T) {
 	}
 }
 
-func TestLoadProxyRequiresRunRoot(t *testing.T) {
+func TestLoadProxyDefersRunRootToFinalValidation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxy.yaml")
 	if err := os.WriteFile(path, []byte("proxy_netns: sw0_mgmt\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := LoadProxy(path)
-	if err == nil {
-		t.Fatal("LoadProxy succeeded without run_root")
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("declarative LoadProxy failed without run_root: %v", err)
 	}
-	if !strings.Contains(err.Error(), "paths.run_root is required") {
+	err = ValidateProxyFinal(cfg)
+	if err == nil || !strings.Contains(err.Error(), "paths.run_root is required") {
 		t.Fatalf("error %q does not report required run_root", err)
 	}
 }

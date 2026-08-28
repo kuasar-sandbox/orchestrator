@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -114,10 +115,51 @@ func TestDirectCustomProxyIsRejected(t *testing.T) {
 	}
 }
 
-func TestNilContextAndAppAreRejected(t *testing.T) {
-	if err := (*App)(nil).RunContext(context.Background()); err == nil {
-		t.Fatal("nil App succeeded")
+func TestZeroAppFailsBeforeConsumingBootstrap(t *testing.T) {
+	componentRead, componentWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer componentRead.Close()
+	defer componentWrite.Close()
+	workerRead, workerWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workerRead.Close()
+	defer workerWrite.Close()
+	componentFD := strconv.Itoa(int(componentRead.Fd()))
+	workerFD := strconv.Itoa(int(workerRead.Fd()))
+	t.Setenv("KUASAR_INTERNAL_COMPONENT_BOOTSTRAP_FD", componentFD)
+	t.Setenv("KUASAR_INTERNAL_PROXY_WORKER_BOOTSTRAP_FD", workerFD)
+
+	var zero App
+	want := "proxy App must be constructed with proxy.New"
+	for name, run := range map[string]func() error{
+		"Run":         zero.Run,
+		"RunContext":  func() error { return zero.RunContext(context.Background()) },
+		"nil Run":     (*App)(nil).Run,
+		"nil context": func() error { return zero.RunContext(nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(); err == nil || err.Error() != want {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+		})
+	}
+	if got := os.Getenv("KUASAR_INTERNAL_COMPONENT_BOOTSTRAP_FD"); got != componentFD {
+		t.Fatalf("zero App consumed component bootstrap environment: got %q, want %q", got, componentFD)
+	}
+	if got := os.Getenv("KUASAR_INTERNAL_PROXY_WORKER_BOOTSTRAP_FD"); got != workerFD {
+		t.Fatalf("zero App consumed worker bootstrap environment: got %q, want %q", got, workerFD)
+	}
+	if _, err := componentRead.Stat(); err != nil {
+		t.Fatalf("zero App consumed component bootstrap descriptor: %v", err)
+	}
+	if _, err := workerRead.Stat(); err != nil {
+		t.Fatalf("zero App consumed worker bootstrap descriptor: %v", err)
+	}
+
 	if err := New(Hooks{}).RunContext(nil); err == nil {
 		t.Fatal("nil context succeeded")
 	}

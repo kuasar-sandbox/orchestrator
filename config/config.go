@@ -829,8 +829,9 @@ func (c CheckpointConfig) RefLocationURI(name string) (string, error) {
 	return location.URI, nil
 }
 
-// LoadConductor reads, strictly decodes, defaults, and bootstrap-validates a
-// conductor configuration file.
+// LoadConductor reads, strictly decodes, defaults, and declaratively validates
+// a conductor configuration file. Startup callers must separately invoke
+// ValidateConductorFinal after any custom Configure hook.
 func LoadConductor(path string) (*Conductor, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -845,9 +846,8 @@ func LoadConductor(path string) (*Conductor, error) {
 }
 
 // DecodeConductor strictly decodes one YAML document, applies declarative
-// defaults, and performs bootstrap validation. A custom executable may leave
-// final required fields for its Configure hook; the custom App performs final
-// validation before opening any dependency.
+// defaults, and validates provided values. It does not inspect ambient runtime
+// material, component files, or final startup requirements.
 func DecodeConductor(r io.Reader) (*Conductor, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxConfigBytes+1))
 	if err != nil {
@@ -864,7 +864,7 @@ func DecodeConductor(r io.Reader) (*Conductor, error) {
 		return nil, err
 	}
 	c.applyDefaults()
-	if err := c.validateBootstrap(); err != nil {
+	if err := c.validateDeclarative(); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -1035,22 +1035,6 @@ func (c *Conductor) ParkTimeoutDur() time.Duration {
 	return d
 }
 
-func (c *Conductor) validateBootstrap() error {
-	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
-		return fmt.Errorf("config: paths.conductor_executable must be absolute")
-	}
-	if c.Paths.ConductorExecutable == "" {
-		if err := ValidateConductorFinal(c); err != nil {
-			return err
-		}
-		if c.EncryptionKey == "" && os.Getenv("NODE_CONFIG_ENCRYPTION_KEY") == "" {
-			return fmt.Errorf("config: encryption_key (or NODE_CONFIG_ENCRYPTION_KEY env) is required")
-		}
-		return nil
-	}
-	return c.validateDeclarative()
-}
-
 // ValidateConductorFinal validates the fully configured declarative value
 // without applying defaults or resolving runtime material. Custom Apps call it
 // after Configure; a Runtime encryption-key provider may satisfy material
@@ -1075,6 +1059,9 @@ func ValidateConductorFinal(c *Conductor) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
+	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
+		return fmt.Errorf("config: paths.conductor_executable must be absolute")
+	}
 	dynamicResources := c.ResourceListen != nil && c.ResourceListen.Enabled
 	if err := sandboxcfg.ValidateNodeResourcePolicy(c.Sandbox.Resources.nodeResourcePolicy(), dynamicResources); err != nil {
 		return fmt.Errorf("config: %w", err)
@@ -1271,7 +1258,9 @@ type ProxyPathsConfig struct {
 	RunRoot         string `yaml:"run_root" json:"run_root"`                                     // sandbox runtime root containing <sid>/ctl.sock; required
 }
 
-// LoadProxy reads the proxy master config, applies defaults, and validates.
+// LoadProxy reads the proxy master config, applies defaults, and validates
+// provided declarative values. Startup callers separately validate final
+// requirements after any custom Configure hook.
 func LoadProxy(path string) (*Proxy, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1285,8 +1274,9 @@ func LoadProxy(path string) (*Proxy, error) {
 	return p, nil
 }
 
-// DecodeProxy strictly decodes one proxy YAML document and applies bootstrap
-// defaults and validation.
+// DecodeProxy strictly decodes one proxy YAML document, applies declarative
+// defaults, and validates provided values without selecting a startup mode or
+// inspecting a component executable.
 func DecodeProxy(r io.Reader) (*Proxy, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxConfigBytes+1))
 	if err != nil {
@@ -1300,7 +1290,7 @@ func DecodeProxy(r io.Reader) (*Proxy, error) {
 		return nil, err
 	}
 	p.applyDefaults()
-	if err := p.validateBootstrap(); err != nil {
+	if err := p.validateDeclarative(); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -1333,16 +1323,6 @@ func (p *Proxy) applyDefaults() {
 	}
 }
 
-func (p *Proxy) validateBootstrap() error {
-	if p.Paths.ProxyExecutable != "" && !filepath.IsAbs(p.Paths.ProxyExecutable) {
-		return fmt.Errorf("proxy config: paths.proxy_executable must be absolute")
-	}
-	if p.Paths.ProxyExecutable == "" {
-		return ValidateProxyFinal(p)
-	}
-	return p.validateDeclarative()
-}
-
 // ValidateProxyFinal validates a fully configured external proxy without
 // applying defaults. Custom proxy Apps call it after their master-only
 // Configure hook and before freezing the effective worker configuration.
@@ -1360,6 +1340,9 @@ func ValidateProxyFinal(p *Proxy) error {
 }
 
 func (p *Proxy) validateDeclarative() error {
+	if p.Paths.ProxyExecutable != "" && !filepath.IsAbs(p.Paths.ProxyExecutable) {
+		return fmt.Errorf("proxy config: paths.proxy_executable must be absolute")
+	}
 	switch p.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
 	default:
