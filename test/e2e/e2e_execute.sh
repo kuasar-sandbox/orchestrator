@@ -1861,17 +1861,20 @@ MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manif
     "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
     || fail "promoted W is not readable from the manifest store"
 PORTABLE_LAYER_SUMMARY=$(python3 - "$WORK/w-portable-manifest.json" "$WORK/b-local.json" "$PORTABLE_W_REF" <<'PY'
-import json, sys
+import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as source:
     working = json.load(source)
 with open(sys.argv[2], encoding="utf-8") as source:
     parent = json.load(source)
 refs = working.get("FromRefs") or []
 parent_refs = parent.get("FromRefs") or []
-if len(refs) != len(parent_refs) + 1 or not refs[0].startswith("manifest://"):
-    raise SystemExit(f"portable W from_refs={refs!r}, want manifest B plus {parent_refs!r}")
-if refs[1:] != parent_refs:
-    raise SystemExit(f"portable W lower tail={refs[1:]!r}, want preserved {parent_refs!r}")
+if len(refs) != len(parent_refs) + 1:
+    raise SystemExit(
+        f"portable W from_refs={refs!r}, want {len(parent_refs) + 1} published memory layers"
+    )
+invalid_refs = [ref for ref in refs if re.fullmatch(r"manifest://[0-9a-f]{64}", ref) is None]
+if invalid_refs:
+    raise SystemExit(f"portable W has non-manifest memory refs: {invalid_refs!r}")
 if refs[0] == sys.argv[3]:
     raise SystemExit("portable W self and B memory lower collapsed to one ref")
 print(refs[0][len("manifest://"):], len(refs))
