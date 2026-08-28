@@ -95,8 +95,9 @@ An optional `kuasar-bms-companions` block in the pull request body may select
 current integration commits from other component pull requests. Admission
 validates and records each companion's base, head, two-parent integration, and
 current `main`; finalization revalidates the same source set. Pull requests
-without this block use the other repositories' current `main` revisions during
-source assembly.
+without this block use the other component repositories' current `main`
+revisions resolved during source assembly. The platform source is pinned to the
+central workflow revision resolved for that run.
 
 After BMS finishes, the trusted finalizer re-queries the pull request. It writes
 `kuasar/bms-exact-head=success` only if BMS succeeded and the pull request is
