@@ -281,7 +281,7 @@ func TestRenderCustomConfigIsBootstrapOnlyAndDoesNotExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("custom conductor bootstrap diagnostic: %v", err)
 	}
-	if !strings.HasPrefix(string(conductor), "# node-ctl bootstrap configuration is valid; the custom conductor App performs final validation.\n") {
+	if !strings.HasPrefix(string(conductor), "# node-ctl declarative/bootstrap configuration is valid; runtime owner and final validation are deferred to custom conductor startup.\n") {
 		t.Fatalf("custom conductor diagnostic did not distinguish bootstrap validation:\n%s", conductor)
 	}
 
@@ -293,7 +293,7 @@ func TestRenderCustomConfigIsBootstrapOnlyAndDoesNotExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("custom proxy bootstrap diagnostic: %v", err)
 	}
-	if !strings.HasPrefix(string(proxy), "# node-ctl bootstrap configuration is valid; the custom proxy App performs final validation.\n") {
+	if !strings.HasPrefix(string(proxy), "# node-ctl declarative/bootstrap configuration is valid; runtime owner and final validation are deferred to custom proxy startup.\n") {
 		t.Fatalf("custom proxy diagnostic did not distinguish bootstrap validation:\n%s", proxy)
 	}
 }
@@ -324,11 +324,25 @@ func TestCustomConfigCommandReportsFinalValidationOnStderr(t *testing.T) {
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if !strings.Contains(string(warning), "final validation is performed by the custom component") {
+	if !strings.Contains(string(warning), "runtime owner and final validation are deferred to component startup") {
 		t.Fatalf("stderr warning = %q", warning)
 	}
 	if _, err := os.Stat(outputPath); err != nil {
 		t.Fatalf("normalized config was not written: %v", err)
+	}
+}
+
+func TestConfigCommandAppliesFinalValidationOnlyForBuiltInComponents(t *testing.T) {
+	conductorPath := writeConductorConfig(t, "{}")
+	if _, err := renderConductorConfig(false, false, conductorPath); err == nil || !strings.Contains(err.Error(), "api.domain") {
+		t.Fatalf("built-in conductor final validation error = %v", err)
+	}
+	proxyPath := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(proxyPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := renderProxyConfig(false, proxyPath); err == nil || !strings.Contains(err.Error(), "paths.run_root") {
+		t.Fatalf("built-in proxy final validation error = %v", err)
 	}
 }
 

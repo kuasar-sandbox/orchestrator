@@ -9,14 +9,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ValidateComponentExecutable validates the node-ctl dispatch target against
-// the exact node-ctl file identity. It follows symlinks into one stable opened
-// description and rejects targets writable by less-privileged users.
-func ValidateComponentExecutable(component, nodeCtl string) error {
+// ValidateComponentExecutableMetadata performs configuration-time static
+// diagnosis without applying the eventual service process's owner policy.
+// Runtime dispatch reopens and validates the selected file exactly once in
+// OpenComponentExecutable before executing that same file description.
+func ValidateComponentExecutableMetadata(component, nodeCtl string) error {
 	if component == "" {
 		return nil
 	}
-	file, err := OpenComponentExecutable(component, nodeCtl)
+	file, err := openComponentExecutable(component, nodeCtl, false)
 	if err != nil {
 		return err
 	}
@@ -27,6 +28,10 @@ func ValidateComponentExecutable(component, nodeCtl string) error {
 // stable file description. Callers that execute a component must execute this
 // opened description instead of resolving component again by pathname.
 func OpenComponentExecutable(component, nodeCtl string) (*os.File, error) {
+	return openComponentExecutable(component, nodeCtl, true)
+}
+
+func openComponentExecutable(component, nodeCtl string, validateOwner bool) (*os.File, error) {
 	if !filepath.IsAbs(component) {
 		return nil, fmt.Errorf("component executable must be absolute")
 	}
@@ -56,12 +61,14 @@ func OpenComponentExecutable(component, nodeCtl string) (*os.File, error) {
 	if componentInfo.Mode().Perm()&0o022 != 0 {
 		return fail(fmt.Errorf("component executable must not be group/world writable"))
 	}
-	stat, ok := componentInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fail(fmt.Errorf("component executable ownership is unavailable"))
-	}
-	if !sameComponentOwner(stat.Uid) {
-		return fail(fmt.Errorf("component executable must be owned by the node-ctl effective user"))
+	if validateOwner {
+		stat, ok := componentInfo.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fail(fmt.Errorf("component executable ownership is unavailable"))
+		}
+		if err := validateComponentOwner(stat.Uid, uint32(os.Geteuid())); err != nil {
+			return fail(err)
+		}
 	}
 	if nodeCtl == "" {
 		return fail(fmt.Errorf("node-ctl executable path is required"))
@@ -76,6 +83,15 @@ func OpenComponentExecutable(component, nodeCtl string) (*os.File, error) {
 	return file, nil
 }
 
-func sameComponentOwner(owner uint32) bool {
-	return owner == uint32(os.Geteuid())
+func validateComponentOwner(owner, euid uint32) error {
+	if euid == 0 {
+		if owner != 0 {
+			return fmt.Errorf("component executable must be root-owned when node-ctl runs as root")
+		}
+		return nil
+	}
+	if owner != 0 && owner != euid {
+		return fmt.Errorf("component executable must be owned by root or the node-ctl effective user")
+	}
+	return nil
 }

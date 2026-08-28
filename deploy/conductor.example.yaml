@@ -51,8 +51,9 @@ manifest_config: /opt/sandbox/manifest.yaml
 # Node-local directories / sockets.
 paths:
   # Optional statically customized conductor App contract. node-ctl validates
-  # this as an absolute executable owned by node-ctl's effective UID, rejects
-  # group/world writes, and executes the same validated FD with a sealed memfd
+  # this as an absolute protected executable, rejects group/world writes, and
+  # at runtime accepts root ownership or (for non-root node-ctl) its effective
+  # UID. It executes the same validated FD with a sealed memfd
   # bootstrap. It must use app/conductor and cannot run standalone. Empty uses
   # the built-in conductor.
   # conductor_executable: /opt/kuasar/bin/xconductor

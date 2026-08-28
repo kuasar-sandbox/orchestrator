@@ -25,8 +25,12 @@ func TestDecodeConductorStrictAndCustomBootstrap(t *testing.T) {
 	if cfg.API.Listen != ":443" || cfg.Paths.RunRoot != "/run/sandbox" {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
-	if _, err := config.DecodeConductor(strings.NewReader("{}\n")); err == nil || !strings.Contains(err.Error(), "api.domain") {
-		t.Fatalf("built-in bootstrap error = %v", err)
+	declarative, err := config.DecodeConductor(strings.NewReader("{}\n"))
+	if err != nil {
+		t.Fatalf("incomplete declarative config did not decode: %v", err)
+	}
+	if err := config.ValidateConductorFinal(declarative); err == nil || !strings.Contains(err.Error(), "api.domain") {
+		t.Fatalf("final conductor error = %v", err)
 	}
 	if _, err := config.DecodeConductor(strings.NewReader("paths:\n  conductor_executable: /opt/x\n---\n{}\n")); err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
 		t.Fatalf("multiple document error = %v", err)
@@ -59,8 +63,12 @@ func TestDecodeProxyStrictAndCustomBootstrap(t *testing.T) {
 	if cfg.Workers != 1 || cfg.ConfigSocket != "/run/sandbox/node-ctl.socket" {
 		t.Fatalf("proxy defaults not applied: %+v", cfg)
 	}
-	if _, err := config.DecodeProxy(strings.NewReader("{}\n")); err == nil || !strings.Contains(err.Error(), "paths.run_root") {
-		t.Fatalf("built-in proxy error = %v", err)
+	declarative, err := config.DecodeProxy(strings.NewReader("{}\n"))
+	if err != nil {
+		t.Fatalf("incomplete proxy declarative config did not decode: %v", err)
+	}
+	if err := config.ValidateProxyFinal(declarative); err == nil || !strings.Contains(err.Error(), "paths.run_root") {
+		t.Fatalf("final proxy error = %v", err)
 	}
 	for name, body := range map[string]string{
 		"enum":     "auth: future\n",
@@ -73,6 +81,23 @@ func TestDecodeProxyStrictAndCustomBootstrap(t *testing.T) {
 				t.Fatalf("explicitly invalid custom bootstrap was accepted:\n%s", body)
 			}
 		})
+	}
+}
+
+func TestDecodeConductorIsIndependentOfEncryptionEnvironment(t *testing.T) {
+	const input = "api:\n  domain: custom.test\nsandbox:\n  boot:\n    kernel: /kernel\n    runtime: /runtime\n"
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	withoutEnvironment, err := config.DecodeConductor(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", strings.Repeat("a", 64))
+	withEnvironment, err := config.DecodeConductor(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(withoutEnvironment, withEnvironment) {
+		t.Fatalf("DecodeConductor depended on ambient encryption key:\nwithout=%+v\nwith=%+v", withoutEnvironment, withEnvironment)
 	}
 }
 

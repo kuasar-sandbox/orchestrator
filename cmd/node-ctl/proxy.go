@@ -29,14 +29,11 @@ func runProxy(args []string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	executables, err := configresolve.CurrentExecutables()
-	if err != nil {
-		return err
-	}
-	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ProxyExecutable, executables.OrchestratorCtl()); err != nil {
-		return fmt.Errorf("paths.proxy_executable: %w", err)
-	}
 	if cfg.Paths.ProxyExecutable != "" {
+		executables, err := configresolve.CurrentExecutables()
+		if err != nil {
+			return err
+		}
 		return componentexec.Exec(
 			componentexec.ComponentProxy,
 			componentexec.RoleMaster,

@@ -6,8 +6,8 @@ Build the example with:
 go build -o /opt/kuasar/bin/xproxy ./examples/custom-proxy
 ```
 
-Own the binary with the node-ctl service UID, protect it from group/world
-writes, set its absolute path in `paths.proxy_executable`, and keep starting the
+Own the binary with root or the non-root node-ctl service UID, protect it from
+group/world writes, set its absolute path in `paths.proxy_executable`, and keep starting the
 service through `node-ctl proxy serve --config ...`. It is not a standalone CLI.
 
 `Configure` runs exactly once in the master. `BindRuntime` runs in the master

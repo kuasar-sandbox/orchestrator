@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -239,6 +240,68 @@ func TestAppBootstrapPreservesAllocatableMemoryPresence(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestConfigureCanUseThirdPartyDeclarativeConfigAndRuntimeKeyProvider(t *testing.T) {
+	app := New(Hooks{Configure: func(_ context.Context, cfg *Config, runtime *Runtime) error {
+		thirdParty, err := publicconfig.DecodeConductor(strings.NewReader(`
+api: { domain: third-party.test }
+sandbox:
+  boot: { kernel: /third-party/kernel, runtime: /third-party/runtime }
+`))
+		if err != nil {
+			return err
+		}
+		immutableExecutable := cfg.Paths.ConductorExecutable
+		*cfg = *thirdParty.Clone()
+		cfg.Paths.ConductorExecutable = immutableExecutable
+		runtime.EncryptionKeys = EncryptionKeyProviderFunc(func(context.Context) ([][]byte, error) {
+			return [][]byte{make([]byte, 32)}, nil
+		})
+		return nil
+	}})
+	app.receive = func() (*componentexec.Bootstrap, error) { return testBootstrap(t), nil }
+	app.run = func(_ context.Context, cfg *publicconfig.Conductor, _ string, runtime *conductorapp.Runtime) error {
+		if cfg.API.Domain != "third-party.test" || cfg.EncryptionKey != "" || runtime.SecretBox == nil {
+			t.Fatalf("third-party startup config=%+v runtime=%+v", cfg, runtime)
+		}
+		return nil
+	}
+	if err := app.RunContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestZeroAppFailsBeforeConsumingBootstrap(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readEnd.Close()
+	defer writeEnd.Close()
+	rawFD := strconv.Itoa(int(readEnd.Fd()))
+	t.Setenv("KUASAR_INTERNAL_COMPONENT_BOOTSTRAP_FD", rawFD)
+
+	var zero App
+	want := "conductor App must be constructed with conductor.New"
+	for name, run := range map[string]func() error{
+		"Run":         zero.Run,
+		"RunContext":  func() error { return zero.RunContext(context.Background()) },
+		"nil Run":     (*App)(nil).Run,
+		"nil context": func() error { return zero.RunContext(nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(); err == nil || err.Error() != want {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+		})
+	}
+	if got := os.Getenv("KUASAR_INTERNAL_COMPONENT_BOOTSTRAP_FD"); got != rawFD {
+		t.Fatalf("zero App consumed bootstrap environment: got %q, want %q", got, rawFD)
+	}
+	if _, err := readEnd.Stat(); err != nil {
+		t.Fatalf("zero App consumed bootstrap descriptor: %v", err)
 	}
 }
 

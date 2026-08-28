@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestValidateComponentExecutable(t *testing.T) {
+func TestValidateComponentExecutableMetadata(t *testing.T) {
 	dir := t.TempDir()
 	nodeCtl := filepath.Join(dir, "node-ctl")
 	custom := filepath.Join(dir, "xconductor")
@@ -16,7 +16,7 @@ func TestValidateComponentExecutable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := ValidateComponentExecutable(custom, nodeCtl); err != nil {
+	if err := ValidateComponentExecutableMetadata(custom, nodeCtl); err != nil {
 		t.Fatalf("valid executable: %v", err)
 	}
 
@@ -57,7 +57,7 @@ func TestValidateComponentExecutable(t *testing.T) {
 			if test.prep != nil {
 				path = test.prep()
 			}
-			err := ValidateComponentExecutable(path, nodeCtl)
+			err := ValidateComponentExecutableMetadata(path, nodeCtl)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
@@ -98,12 +98,53 @@ func TestOpenComponentExecutableKeepsValidatedIdentityAcrossReplacement(t *testi
 	}
 }
 
-func TestComponentOwnerMustMatchEffectiveUser(t *testing.T) {
-	if sameComponentOwner(uint32(os.Geteuid())) != true {
-		t.Fatal("effective user did not trust its own component")
+func TestValidateComponentOwnerPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		owner      uint32
+		euid       uint32
+		wantAccept bool
+	}{
+		{name: "root service root owned", owner: 0, euid: 0, wantAccept: true},
+		{name: "root service non-root owned", owner: 1000, euid: 0},
+		{name: "non-root service root owned", owner: 0, euid: 1000, wantAccept: true},
+		{name: "non-root service same uid owned", owner: 1000, euid: 1000, wantAccept: true},
+		{name: "non-root service other uid owned", owner: 1001, euid: 1000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateComponentOwner(test.owner, test.euid)
+			if got := err == nil; got != test.wantAccept {
+				t.Fatalf("validateComponentOwner(%d, %d) error = %v, accept=%t", test.owner, test.euid, err, got)
+			}
+		})
 	}
-	if sameComponentOwner(uint32(os.Geteuid()+1)) != false {
-		t.Fatal("component owned by another user was trusted")
+}
+
+func TestOpenComponentExecutableAppliesRuntimeModeAndIdentityChecks(t *testing.T) {
+	dir := t.TempDir()
+	nodeCtl := filepath.Join(dir, "node-ctl")
+	valid := filepath.Join(dir, "valid")
+	writable := filepath.Join(dir, "writable")
+	for path, mode := range map[string]os.FileMode{nodeCtl: 0o500, valid: 0o500, writable: 0o522} {
+		if err := os.WriteFile(path, []byte("binary"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opened, err := OpenComponentExecutable(valid, nodeCtl)
+	if err != nil {
+		t.Fatalf("current-user runtime executable: %v", err)
+	}
+	_ = opened.Close()
+	for name, path := range map[string]string{"writable": writable, "same file": nodeCtl} {
+		t.Run(name, func(t *testing.T) {
+			opened, err := OpenComponentExecutable(path, nodeCtl)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if err == nil {
+				t.Fatal("runtime executable validation succeeded")
+			}
+		})
 	}
 }
 

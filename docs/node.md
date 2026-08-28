@@ -368,8 +368,11 @@ serve daemon 的配置文件是 `conductor.yaml`。完整带注释样例见 `dep
 `github.com/kuasar-sandbox/orchestrator/config` 中的 `config.Conductor`；内部代码复用同一 schema，
 不维护第二份配置事实来源。该包提供严格的 `LoadConductor` / `DecodeConductor`、
 `LoadProxy` / `DecodeProxy`、hook 后不重套默认值的 `ValidateConductorFinal` /
-`ValidateProxyFinal`，以及真正深拷贝的 `Clone`。未知 YAML 字段和多文档输入会失败，
-Config 的 JSON/YAML 只包含可序列化 declarative 数据，不含 logger、provider 或运行时句柄。
+`ValidateProxyFinal`，以及真正深拷贝的 `Clone`。Decode/Load 只执行 bounded strict decode、
+declarative defaults 和已提供值的枚举/duration/range/格式校验；它们不读取环境、检查 component
+文件或根据 executable 决定启动必填项。同一输入的结果不随 `NODE_CONFIG_ENCRYPTION_KEY` 改变。
+未知 YAML 字段和多文档输入会失败，Config 的 JSON/YAML 只包含可序列化 declarative 数据，
+不含 logger、provider 或运行时句柄。
 `ResourceAllocatable.Memory` 以 `*string` 公开 presence：`nil` 表示继承 internal resolver
 中的 `256MiB` 默认值，非 nil（包括显式 `256MiB`）表示 operator/custom `Configure`
 的明确策略，必须满足 capacity 上界。`SetMemory` / `InheritMemory` 只是便利方法；直接赋
@@ -377,9 +380,10 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
-`encryption_key`、`manifest_config`。内置模式必填 `api.domain` 与 `encryption_key`(后者可用
-`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)；custom conductor 可在 `Configure` 后由 Runtime provider
-满足 key/TLS/object-store 材料。运行 helper(sandbox-ctl/connector-ctl vswitch/flatten-ctl)
+`encryption_key`、`manifest_config`。内置模式由 node-ctl 显式执行 final declarative validation，
+再在 runtime resolution 读取 `NODE_CONFIG_ENCRYPTION_KEY` / YAML key；custom conductor 则在
+`Configure` 后 final validate，并可由 Runtime provider 满足 key/TLS/object-store 材料。provider
+优先于 environment/YAML 且失败不回退。运行 helper(sandbox-ctl/connector-ctl vswitch/flatten-ctl)
 不进入公共 Config；它们先以最初的精确 node-ctl 相邻发行目录为解析基准，缺失时保留
 现有 PATH fallback。
 
@@ -396,7 +400,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
 | `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
-| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。node-ctl 只接受由其 effective UID 持有的 executable regular file，拒绝与自身同一文件及 group/world-writable 文件；它执行已打开并校验的同一 FD，非空时原地 exec，失败绝不回退 |
+| `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。`node-ctl config` 只诊断 regular/executable、非 group/world-writable、非 node-ctl same-file 元数据，不按诊断 EUID 判断 owner；实际 dispatch 中 root node-ctl 只接受 root-owned，非 root node-ctl 接受 root-owned 或本 EUID-owned。它执行已打开并校验的同一 FD，失败绝不回退 |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
@@ -454,9 +458,10 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 
 ### 3.1 静态定制 conductor
 
-运维入口保持不变：`node-ctl conductor serve --config ...` 先严格解析并默认化 YAML。
-`paths.conductor_executable` 为空时进入内置 App；非空时 node-ctl 打开 protected absolute
-executable，依据该 FD 校验 owner/mode/file identity，并通过 `/proc/self/fd` 执行同一文件，
+运维入口保持不变：`node-ctl conductor serve --config ...` 先做环境无关的严格解析、默认化和
+declarative validation。`paths.conductor_executable` 为空时 node-ctl 显式 final validate 并在
+runtime resolution 解析 key/TLS/credential 材料；非空时 node-ctl 打开 protected absolute
+executable，依据该 FD 校验 runtime owner/mode/file identity，并通过 `/proc/self/fd` 执行同一文件，
 不在校验后重新解析可替换的 pathname；sealed bootstrap 同时记录该已打开文件的 device/inode，
 xconductor 只将它与 `/proc/self/exe` 比较，部署期间 pathname 被替换或删除不会改变已验证身份。
 随后 node-ctl 用 `exec` 原地替换为 xconductor。
@@ -485,6 +490,12 @@ if err := app.Run(); err != nil {
 durable store、listener、systemd launcher/unit 或 node-link。Hook 可整体替换 Config，但必须
 恢复最初冻结的 executable；Hook 后不会重新应用默认值。
 
+`App` 必须由 `conductor.New` 构造；零值或 nil receiver 的 `Run` / `RunContext` 在安装 signal
+handler、读取 bootstrap FD 或启动 goroutine 之前返回明确错误。`node-ctl config conductor`
+只做 declarative/bootstrap 与 executable metadata 诊断，不执行 custom App/provider，也不以
+诊断进程 EUID 代替实际 service owner policy；custom 模式明确提示 runtime owner 与 final
+validation 均延后到 component startup。
+
 `Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，V1 只开放 logger、
 TLS material、AES-256 ordered key set 与 builder files-storage neutral credentials provider。
 TLS provider 返回 DER certificate chain、`crypto.Signer` 与 root/client CA pool，不能返回任意
@@ -501,8 +512,9 @@ Go plugin、运行时发现、全局 registry、middleware、生命周期 hook �
 
 ### 3.2 静态定制 external proxy
 
-`paths.proxy_executable` 为空时 `node-ctl proxy` 运行内置 App；非空时 node-ctl 严格解析
-bootstrap 配置、校验 protected absolute executable，并通过 sealed memfd + 原地 exec 交接
+`paths.proxy_executable` 为空时 `node-ctl proxy` 在 declarative decode 后显式 final validate并
+运行内置 App；非空时 node-ctl 校验 protected absolute executable 的 runtime owner/mode/identity，
+并通过 sealed memfd + 原地 exec 交接
 到 xproxy，失败不回退。xproxy 必须经 `node-ctl proxy serve` 启动，不能独立运行。公共
 `app/proxy` 只开放 `New(Hooks)`、one-shot `Run`/`RunContext`、master-only `Configure` 及
 master/every-worker `BindRuntime`；`Config` 是声明式值，`Runtime` 是不可序列化的 logger/TLS

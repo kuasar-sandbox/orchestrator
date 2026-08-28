@@ -67,7 +67,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
-| `paths.proxy_executable` | 空 | 静态定制 external proxy master 的绝对 executable；空使用内置实现。node-ctl 拒绝非 regular/non-executable、与自身同一文件和 group/world-writable 文件；只用于 node-ctl → master，不用于选择 worker executable |
+| `paths.proxy_executable` | 空 | 静态定制 external proxy master 的绝对 executable；空使用内置实现。静态 config 诊断检查 regular/executable、非 group/world-writable 和 same-file，不按诊断 EUID 判断 owner；实际 root dispatch 只接受 root-owned，非 root dispatch 接受 root-owned 或本 EUID-owned。只用于 node-ctl → master，不用于选择 worker executable |
 | `paths.run_root` | (必填) | 本机 sandbox 运行目录根;external worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
@@ -86,8 +86,10 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 ### 2.1 静态定制 external proxy
 
-运维入口仍只有 `node-ctl proxy serve --config ...`。`paths.proxy_executable` 非空时，node-ctl
-先严格解析/default 配置并校验 protected absolute executable，再把公共 `config.Proxy` 的
+运维入口仍只有 `node-ctl proxy serve --config ...`。公共 Load/Decode 只做环境无关的 strict
+decode、defaults 与 provided-value validation；内置路径由 node-ctl 显式 final validate，custom
+路径则延后到 master `Configure` 后。`paths.proxy_executable` 非空时，node-ctl 校验 protected
+absolute executable 的 runtime owner/mode/identity，再把公共 `config.Proxy` 的
 bootstrap snapshot 写入有大小上限且禁止 write/grow/shrink 的 sealed memfd；环境变量只传
 FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已验证的同一打开文件原地 exec
 xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
@@ -112,7 +114,8 @@ if err := app.Run(); err != nil {
 ```
 
 `New` 无副作用；`Run` one-shot、处理 SIGINT/SIGTERM且不调用 `os.Exit`，上层托管可用
-`RunContext`。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
+`RunContext`。零值/nil App 在 signal、component bootstrap 或 worker bootstrap 处理前返回
+必须由 `proxy.New` 构造的明确错误。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
 `paths.proxy_executable` 未改变 → final validation → 再 deep-clone/canonical serialize/digest
 冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Hook、provider 或 final validation
 失败时尚未创建 SHM、listener、routesync session 或 worker。
@@ -133,7 +136,8 @@ custom component 与 node-ctl 必须来自兼容版本。
 该 API 只对应 external proxy，不为 `proxy.mode=internal` 增加 factory；也不开放 Router、SHM、
 listener、routesync、stats、dial target 或 credential records，不引入 Go plugin、运行时发现、
 middleware、生命周期 hook、通用 secret resolver 或 DI container。`node-ctl config proxy` 只做
-bootstrap 配置诊断，绝不执行 xproxy 或调用 Runtime provider。
+declarative/bootstrap 与 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或
+用诊断命令 EUID 代替实际启动的 runtime owner 校验。
 
 ## 3. 部署模式
 
