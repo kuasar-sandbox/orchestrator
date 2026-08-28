@@ -76,6 +76,13 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			unlock()
 			return "", fmt.Errorf("export-sandbox: pause %s first (e2b sandbox pause %s): %w", sid, sid, api.ErrBadRequest)
 		}
+		if sb.ResumeKind == types.ResumeSandbox {
+			// A disk-only pause produced a node-bound Sandbox artifact E with no
+			// memory to publish; snapshot publication or template conversion
+			// would silently turn it into a memory restore source.
+			unlock()
+			return "", fmt.Errorf("export-sandbox: disk-only paused sandbox %s has a node-bound Sandbox artifact; export and template conversion are not supported: %w", sid, api.ErrBadRequest)
+		}
 		tmpl, err = types.ParseTemplateID(sb.TemplateID)
 		if err != nil {
 			unlock()

@@ -38,6 +38,11 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 
 	if sb.State == types.StatePaused {
 		_, _, err := o.ensureResumeAccepted(ctx, sandboxID, nil, func(current *types.Sandbox) error {
+			// Cold resume sources (Sandbox artifact E) never auto-boot on exec
+			// traffic either; explicit Connect owns the cold start.
+			if current.State == types.StatePaused && current.ResumeKind == types.ResumeSandbox {
+				return proxy.ErrColdSandbox
+			}
 			if !execRoutePresent(current) || execIdentity(current) != expected {
 				return errExecIdentityChanged
 			}

@@ -31,6 +31,12 @@ func (o *Orchestrator) ActivateRoute(ctx context.Context, expected proxy.RouteBi
 		return proxy.Route{}, false, nil
 	}
 	current, _, err := o.ensureResumeAccepted(ctx, expected.SandboxID, nil, func(sb *types.Sandbox) error {
+		// A Sandbox artifact (E) resume source is a cold start owned by explicit
+		// Connect: the in-process router must not auto-boot it on data-plane
+		// traffic (sandboxer#143 §1.3) — same contract as proxyshm.WorkerView.
+		if sb.State == types.StatePaused && sb.ResumeKind == types.ResumeSandbox {
+			return proxy.ErrColdSandbox
+		}
 		binding, present := routeBinding(sb, expected.Target)
 		if !present || binding != expected {
 			return errRouteBindingChanged

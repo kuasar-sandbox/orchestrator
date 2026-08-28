@@ -1195,9 +1195,16 @@ func checkpointMetadataPolicy(metadata map[string]string) (sandboxcfg.Checkpoint
 }
 
 func (o *Orchestrator) validateCreateCheckpointMode(metadata map[string]string) error {
-	_, err := checkpointMetadataPolicy(metadata)
+	policy, err := checkpointMetadataPolicy(metadata)
 	if err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	// A persisted disk-only preference must be executable by the node: the
+	// reaper honors it via Sandbox artifact E export, which v1 supports only
+	// in local checkpoint mode. Rejecting here avoids a paused-forever sandbox
+	// whose reaper ticks fail repeatedly.
+	if policy.Memory != nil && !*policy.Memory && o.cfg.Checkpoint.Mode != config.CheckpointLocal {
+		return fmt.Errorf("%w: checkpoint policy memory=false requires checkpoint.mode=local", api.ErrBadRequest)
 	}
 	return nil
 }
