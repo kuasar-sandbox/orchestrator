@@ -113,12 +113,14 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if cfg.Paths.ConductorExecutable == "" {
+		if err := publicconfig.ValidateConductorFinal(cfg); err != nil {
+			return err
+		}
+	}
 	executables, err := configresolve.CurrentExecutables()
 	if err != nil {
 		return err
-	}
-	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ConductorExecutable, executables.OrchestratorCtl()); err != nil {
-		return fmt.Errorf("paths.conductor_executable: %w", err)
 	}
 	if cfg.Paths.ConductorExecutable != "" {
 		return componentexec.Exec(
@@ -128,9 +130,6 @@ func runConductor(args []string, log *slog.Logger) error {
 			cfg.Paths.ConductorExecutable,
 			cfg,
 		)
-	}
-	if err := publicconfig.ValidateConductorFinal(cfg); err != nil {
-		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

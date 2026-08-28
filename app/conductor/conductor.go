@@ -126,8 +126,9 @@ type Hooks struct {
 
 // App is a one-shot custom conductor application. New has no side effects.
 type App struct {
-	hooks Hooks
-	ran   atomic.Bool
+	hooks       Hooks
+	initialized bool
+	ran         atomic.Bool
 
 	receive func() (*componentexec.Bootstrap, error)
 	run     func(context.Context, *publicconfig.Conductor, string, *conductorapp.Runtime) error
@@ -136,7 +137,8 @@ type App struct {
 // New constructs a one-shot App without performing I/O or invoking hooks.
 func New(hooks Hooks) *App {
 	return &App{
-		hooks: hooks,
+		hooks:       hooks,
+		initialized: true,
 		receive: func() (*componentexec.Bootstrap, error) {
 			return componentexec.Receive(componentexec.ComponentConductor, componentexec.RoleConductor)
 		},
@@ -146,6 +148,9 @@ func New(hooks Hooks) *App {
 
 // Run installs SIGINT/SIGTERM handling and runs the App once.
 func (a *App) Run() error {
+	if err := a.requireInitialized(); err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return a.RunContext(ctx)
@@ -154,8 +159,8 @@ func (a *App) Run() error {
 // RunContext consumes node-ctl bootstrap, invokes Configure exactly once,
 // freezes the effective configuration/runtime bindings, and starts the core.
 func (a *App) RunContext(ctx context.Context) error {
-	if a == nil {
-		return fmt.Errorf("conductor app is nil")
+	if err := a.requireInitialized(); err != nil {
+		return err
 	}
 	if ctx == nil {
 		return fmt.Errorf("conductor app context is nil")
@@ -200,6 +205,13 @@ func (a *App) RunContext(ctx context.Context) error {
 		return err
 	}
 	return a.run(ctx, frozenConfig, bootstrap.NodeCtlExecutable, resolved)
+}
+
+func (a *App) requireInitialized() error {
+	if a == nil || !a.initialized {
+		return fmt.Errorf("conductor App must be constructed with conductor.New")
+	}
+	return nil
 }
 
 func decodeConfig(raw []byte, out *publicconfig.Conductor) error {

@@ -15,6 +15,8 @@ paths:
   # Optional statically customized external-proxy App. Used only for node-ctl ->
   # master dispatch; every worker reexecs the master's current executable and
   # receives a frozen config snapshot, so workers never reread this YAML.
+  # Runtime owner policy accepts root ownership or, for non-root node-ctl, its
+  # effective UID; group/world-writable files are always rejected.
   # proxy_executable: /opt/kuasar/bin/xproxy
   run_root: /run/sandbox
 

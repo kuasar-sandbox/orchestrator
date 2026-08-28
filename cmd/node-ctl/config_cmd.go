@@ -50,8 +50,8 @@ func configCmd(args []string, _ *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if bytes.HasPrefix(output, []byte("# node-ctl bootstrap configuration is valid;")) {
-		_, _ = fmt.Fprintln(os.Stderr, "node-ctl config: bootstrap configuration is valid; final validation is performed by the custom component")
+	if bytes.HasPrefix(output, []byte("# node-ctl declarative/bootstrap configuration is valid;")) {
+		_, _ = fmt.Fprintln(os.Stderr, "node-ctl config: declarative/bootstrap configuration is valid; runtime owner and final validation are deferred to component startup")
 	}
 	if *out != "" {
 		return os.WriteFile(*out, output, 0o644)
@@ -70,16 +70,22 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 	if path == "" {
 		return nil, fmt.Errorf("config conductor: --config <file> or --template required")
 	}
-	cfg, err := config.LoadConductor(path) // applies defaults + bootstrap validation
+	cfg, err := config.LoadConductor(path)
 	if err != nil {
 		return nil, err
 	}
-	executables, err := configresolve.CurrentExecutables()
-	if err != nil {
-		return nil, err
-	}
-	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ConductorExecutable, executables.OrchestratorCtl()); err != nil {
-		return nil, fmt.Errorf("paths.conductor_executable: %w", err)
+	if cfg.Paths.ConductorExecutable == "" {
+		if err := config.ValidateConductorFinal(cfg); err != nil {
+			return nil, err
+		}
+	} else {
+		executables, err := configresolve.CurrentExecutables()
+		if err != nil {
+			return nil, err
+		}
+		if err := configresolve.ValidateComponentExecutableMetadata(cfg.Paths.ConductorExecutable, executables.OrchestratorCtl()); err != nil {
+			return nil, fmt.Errorf("paths.conductor_executable: %w", err)
+		}
 	}
 	cfg.Sandbox.Resources = configresolve.MaterializedSandboxResources(cfg.Sandbox.Resources)
 	if resolve && cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
@@ -96,7 +102,7 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 		return nil, err
 	}
 	if cfg.Paths.ConductorExecutable != "" {
-		output = append([]byte("# node-ctl bootstrap configuration is valid; the custom conductor App performs final validation.\n"), output...)
+		output = append([]byte("# node-ctl declarative/bootstrap configuration is valid; runtime owner and final validation are deferred to custom conductor startup.\n"), output...)
 	}
 	return output, nil
 }
@@ -114,19 +120,25 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	executables, err := configresolve.CurrentExecutables()
-	if err != nil {
-		return nil, err
-	}
-	if err := configresolve.ValidateComponentExecutable(cfg.Paths.ProxyExecutable, executables.OrchestratorCtl()); err != nil {
-		return nil, fmt.Errorf("paths.proxy_executable: %w", err)
+	if cfg.Paths.ProxyExecutable == "" {
+		if err := config.ValidateProxyFinal(cfg); err != nil {
+			return nil, err
+		}
+	} else {
+		executables, err := configresolve.CurrentExecutables()
+		if err != nil {
+			return nil, err
+		}
+		if err := configresolve.ValidateComponentExecutableMetadata(cfg.Paths.ProxyExecutable, executables.OrchestratorCtl()); err != nil {
+			return nil, fmt.Errorf("paths.proxy_executable: %w", err)
+		}
 	}
 	output, err := yaml.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Paths.ProxyExecutable != "" {
-		output = append([]byte("# node-ctl bootstrap configuration is valid; the custom proxy App performs final validation.\n"), output...)
+		output = append([]byte("# node-ctl declarative/bootstrap configuration is valid; runtime owner and final validation are deferred to custom proxy startup.\n"), output...)
 	}
 	return output, nil
 }
@@ -156,7 +168,7 @@ encryption_key: "000000000000000000000000000000000000000000000000000000000000000
 # Shared remote manifest store (manifest.key empty; the tenant key arrives via env).
 manifest_config: /opt/sandbox/manifest.yaml
 paths:
-  # conductor_executable: /opt/kuasar/bin/xconductor # service-UID-owned app/conductor binary; validated-FD exec + sealed bootstrap
+  # conductor_executable: /opt/kuasar/bin/xconductor # root- or non-root service-UID-owned App; validated-FD exec + sealed bootstrap
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
   config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + manifest-key admin + plugin + api plane (h2c)
@@ -287,7 +299,7 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 # read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 paths:
-  # proxy_executable: /opt/kuasar/bin/xproxy         # optional static custom App; only node-ctl -> master (workers reexec master)
+  # proxy_executable: /opt/kuasar/bin/xproxy         # root- or non-root service-UID-owned App; only node-ctl -> master
   run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + conductor MMDS listen; "" = current netns

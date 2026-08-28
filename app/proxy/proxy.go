@@ -89,8 +89,9 @@ type Hooks struct {
 
 // App is a one-shot external proxy application. New has no side effects.
 type App struct {
-	hooks Hooks
-	ran   atomic.Bool
+	hooks       Hooks
+	initialized bool
+	ran         atomic.Bool
 
 	workerPresent    func() bool
 	receiveWorker    func() (*proxyapp.WorkerBootstrap, error)
@@ -104,6 +105,7 @@ type App struct {
 func New(hooks Hooks) *App {
 	return &App{
 		hooks:         hooks,
+		initialized:   true,
 		workerPresent: proxyapp.WorkerBootstrapPresent,
 		receiveWorker: proxyapp.ReceiveWorkerBootstrap,
 		receiveComponent: func() (*componentexec.Bootstrap, error) {
@@ -119,6 +121,9 @@ func New(hooks Hooks) *App {
 
 // Run installs SIGINT/SIGTERM handling and runs the App once.
 func (a *App) Run() error {
+	if err := a.requireInitialized(); err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return a.RunContext(ctx)
@@ -127,8 +132,8 @@ func (a *App) Run() error {
 // RunContext enters either the custom master bootstrap or the private worker
 // bootstrap. Worker state is detected before any CLI/config-file handling.
 func (a *App) RunContext(ctx context.Context) error {
-	if a == nil {
-		return fmt.Errorf("proxy app is nil")
+	if err := a.requireInitialized(); err != nil {
+		return err
 	}
 	if ctx == nil {
 		return fmt.Errorf("proxy app context is nil")
@@ -142,6 +147,13 @@ func (a *App) RunContext(ctx context.Context) error {
 	}
 	proxyapp.ClearWorkerEnvironment()
 	return a.runMasterProcess(ctx)
+}
+
+func (a *App) requireInitialized() error {
+	if a == nil || !a.initialized {
+		return fmt.Errorf("proxy App must be constructed with proxy.New")
+	}
+	return nil
 }
 
 func (a *App) runMasterProcess(ctx context.Context) error {
