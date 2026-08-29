@@ -21,12 +21,14 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
 const execTestServiceSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 type execTestRouter struct {
+	resumeKind     string
 	identity       proxy.ExecIdentity
 	found          bool
 	lookupErr      error
@@ -52,6 +54,13 @@ func (r *execTestRouter) ActivateRoute(context.Context, proxy.RouteBinding) (pro
 func (r *execTestRouter) LookupExec(context.Context, string) (proxy.ExecIdentity, bool, error) {
 	r.lookupCalls.Add(1)
 	return r.identity, r.found, r.lookupErr
+}
+
+func (r *execTestRouter) LookupResumeKind(context.Context, string) (string, bool, error) {
+	if r.resumeKind == "" {
+		return "", false, nil
+	}
+	return r.resumeKind, true, nil
 }
 
 func (r *execTestRouter) ActivateExec(ctx context.Context, _ string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
@@ -822,5 +831,105 @@ func TestExecUnavailableWithoutTrustedRunRoot(t *testing.T) {
 	px.ServeHTTP(resp, req)
 	if resp.Code != http.StatusNotImplemented || router.lookupCalls.Load() != 0 || router.activateCalls.Load() != 0 {
 		t.Fatalf("response=%d lookup=%d activate=%d, want side-effect-free 501", resp.Code, router.lookupCalls.Load(), router.activateCalls.Load())
+	}
+}
+
+// A paused sandbox with a Sandbox artifact (E) resume source is rejected by
+// native exec admission BEFORE the CONNECT 200 (503 paused_cold, no Wake, no
+// parking) — activation itself stays lazy so admission-denied requests still
+// never wake the sandbox.
+func TestExecColdSourceRejectedBeforeTunnelWithNoSideEffects(t *testing.T) {
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: "node-cold",
+		AuthSandboxID: "stable-node-cold",
+		ServiceSecret: execTestServiceSecret,
+	}
+	router := &execTestRouter{
+		identity: identity, found: true,
+		activateResult: identity, activateFound: true,
+		resumeKind: types.ResumeSandbox,
+	}
+	traffic := &recordingTrafficTracker{}
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(router, func() string { return "off" }, discardExecLogger(), nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}, t.TempDir()).WithTrafficTracker(traffic)
+
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, "node-cold")
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(proxy.HeaderAccessToken, token)
+	resp := httptest.NewRecorder()
+	px.ServeHTTP(resp, req)
+	if resp.Code != http.StatusServiceUnavailable || resp.Header().Get(proxy.HeaderProxyError) != proxy.ProxyErrorPausedCold {
+		t.Fatalf("cold exec response = %d kind=%q, want 503 paused_cold", resp.Code, resp.Header().Get(proxy.HeaderProxyError))
+	}
+	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
+		t.Fatalf("cold exec side effects: lookup=%d activate=%d dial=%d parking=%d",
+			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load(), traffic.begins.Load())
+	}
+}
+
+// When a racing pause occurs after CONNECT admission, ActivateExec returns
+// ErrColdSandbox inside DialBackend: the tunnel closes with the sanitized
+// rejection and counts a paused_cold failure (no waking or retry).
+func TestExecInTunnelActivationColdSourceRejection(t *testing.T) {
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: "node-race-cold",
+		AuthSandboxID: "stable-race-cold",
+		ServiceSecret: execTestServiceSecret,
+	}
+	router := &execTestRouter{
+		identity: identity, found: true,
+		activateErr: proxy.ErrColdSandbox,
+		// Pre-admission lookup observes running; pause races after 200.
+		resumeKind: "",
+	}
+	traffic := &recordingTrafficTracker{}
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			return nil, errors.New("unexpected dial")
+		}, t.TempDir()).WithTrafficTracker(traffic)
+	ts := httptest.NewServer(px)
+	defer ts.Close()
+
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConn := conn.(*net.TCPConn)
+	defer tcpConn.Close()
+	_ = tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(tcpConn, "CONNECT sandbox:443 HTTP/1.1\r\nHost: sandbox:443\r\n%s: %s\r\n%s: exec\r\n%s: %s\r\n\r\n",
+		proxy.HeaderSandboxID, identity.NodeSandboxID,
+		proxy.HeaderSandboxService,
+		proxy.HeaderAccessToken, token)
+	reader := bufio.NewReader(tcpConn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
+	}
+	if _, err := tcpConn.Write(execTestFrame(`{"type":"exec_request","exec":{"cmd":["echo","hi"]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if router.activateCalls.Load() != 1 || traffic.begins.Load() != 1 || traffic.closes.Load() != 1 {
+		t.Fatalf("racing cold exec calls: activate=%d begins=%d closes=%d",
+			router.activateCalls.Load(), traffic.begins.Load(), traffic.closes.Load())
 	}
 }

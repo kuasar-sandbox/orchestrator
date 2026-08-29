@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
@@ -64,6 +65,27 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 		return
 	}
 
+	// Authenticated pre-admission cold check: a paused Sandbox artifact (E)
+	// resume source is a cold start owned by explicit Connect, so native exec
+	// gets the same explicit 503 paused_cold as ordinary traffic — while an
+	// HTTP status can still be written. The check is side-effect-free (no
+	// Wake); activation stays lazy on the first exec frame, so admission-
+	// denied requests still never wake the sandbox. A pause racing after this
+	// check surfaces as the in-tunnel activation rejection instead.
+	if cold, ok := execRouter.(ColdResumeLookup); ok {
+		kind, found, kindErr := cold.LookupResumeKind(r.Context(), sid)
+		if kindErr != nil {
+			p.mx.Inc(`data_requests_total{result="route_error"}`)
+			writeProxyError(w, http.StatusServiceUnavailable, "routing error", ProxyErrorRouteError)
+			return
+		}
+		if found && kind == types.ResumeSandbox {
+			p.mx.Inc(`data_requests_total{result="paused_cold"}`)
+			writeProxyError(w, http.StatusServiceUnavailable, "sandbox is paused; connect to resume it", ProxyErrorPausedCold)
+			return
+		}
+	}
+
 	tunnelCtx := r.Context()
 	cancelTunnel := func() {}
 	if r.ProtoMajor != 2 {
@@ -104,6 +126,10 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 				flow = noopTrafficFlow{}
 			}
 			ready, found, err := execRouter.ActivateExec(ctx, sid, identity)
+			if errors.Is(err, ErrColdSandbox) {
+				p.mx.Inc(`data_requests_total{result="paused_cold"}`)
+				return nil, errors.New("sandbox is paused; connect to resume it")
+			}
 			if err != nil {
 				p.mx.Inc(`data_requests_total{result="route_error"}`)
 				return nil, errors.New("exec backend unavailable")

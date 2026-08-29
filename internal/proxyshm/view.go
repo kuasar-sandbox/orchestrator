@@ -437,6 +437,24 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 // emitted until the caller has authenticated the capability. A missing first
 // sample is parked briefly because Create may return before its starting route
 // reaches this worker.
+// LookupResumeKind is the side-effect-free read behind proxy.ColdResumeLookup:
+// it reports the persisted resume kind of a known route without parking,
+// waking, or otherwise touching the lifecycle. Cold resume sources (Sandbox
+// artifact E) are rejected by exec admission before the CONNECT 200.
+func (v *WorkerView) LookupResumeKind(ctx context.Context, sid string) (string, bool, error) {
+	if !v.waitSynced(ctx) {
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	r, found, _ := v.table.LookupRevision(sid)
+	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
+		return "", false, nil
+	}
+	return r.ResumeKind, true, nil
+}
+
 func (v *WorkerView) LookupExec(ctx context.Context, sid string) (proxy.ExecIdentity, bool, error) {
 	if !v.waitSynced(ctx) {
 		if err := ctx.Err(); err != nil {

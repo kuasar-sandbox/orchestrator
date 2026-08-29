@@ -128,6 +128,15 @@ type ExecRouter interface {
 	ActivateExec(ctx context.Context, sandboxID string, expected ExecIdentity) (ExecIdentity, bool, error)
 }
 
+// ColdResumeLookup is an optional ExecRouter capability: a side-effect-free
+// read of a sandbox's persisted resume kind. Exec admission uses it to reject
+// paused cold resume sources (Sandbox artifact E) with an explicit paused
+// status BEFORE the CONNECT 200 — activation itself stays lazy on the first
+// exec frame so admission-denied requests never wake the sandbox.
+type ColdResumeLookup interface {
+	LookupResumeKind(ctx context.Context, sandboxID string) (resumeKind string, found bool, err error)
+}
+
 // Counter is the narrow metrics surface the proxy needs.
 type Counter interface {
 	Inc(name string)

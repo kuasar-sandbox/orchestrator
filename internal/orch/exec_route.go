@@ -93,4 +93,23 @@ func execIdentity(sb *types.Sandbox) proxy.ExecIdentity {
 	}
 }
 
+// LookupResumeKind is the side-effect-free read behind proxy.ColdResumeLookup:
+// exec admission rejects paused cold resume sources (Sandbox artifact E)
+// before the CONNECT 200, without waking or touching the lifecycle.
+func (o *Orchestrator) LookupResumeKind(ctx context.Context, sandboxID string) (string, bool, error) {
+	sb := o.lookup(sandboxID)
+	if sb == nil {
+		stored, err := o.st.Get(ctx, sandboxID)
+		if err != nil || stored == nil {
+			return "", false, err
+		}
+		sb = stored
+	}
+	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
+		return "", false, nil
+	}
+	return sb.ResumeKind, true, nil
+}
+
 var _ proxy.ExecRouter = (*Orchestrator)(nil)
+var _ proxy.ColdResumeLookup = (*Orchestrator)(nil)
