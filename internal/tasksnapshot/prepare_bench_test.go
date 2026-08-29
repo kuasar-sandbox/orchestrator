@@ -38,7 +38,7 @@ func BenchmarkPrepareConcurrency(b *testing.B) {
 							RootRef: root,
 							MaxRefs: 4,
 						})
-						if err != nil || result.Summary.RequiredRefCount != 3 {
+						if err != nil || result.Summary.RequiredRefCount != 4 {
 							b.Errorf("Prepare() = %+v, %v", result, err)
 							return
 						}
