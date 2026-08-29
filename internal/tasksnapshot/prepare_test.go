@@ -13,10 +13,14 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
+	sandboxconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,24 +32,17 @@ func TestPrepareReadsOnlyRootAndCollectsFlattenedClosure(t *testing.T) {
 metadata:
   kuasar-sandbox.network: '{"hostname":"inherited"}'
 from_refs:
-  - file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824
-  - file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824
+  - file://parent.snapshot@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824
 boot:
-  runtime_ref: file://runtime.bundle@location:0198f7a11106-7234-9abc-012345670006-20260824
+  runtime_ref: file://runtime.bundle@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   root:
-    base_ref: file://root.image@location:0198f7a11102-7234-9abc-012345670002-20260824
-    base: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    base: self
     base_from_refs:
-      - file://root-old.overlay@location:0198f7a11103-7234-9abc-012345670003-20260824
-    overlay:
-      base: file://root-new.overlay@location:0198f7a11103-7234-9abc-012345670003-20260824
-      base_from_refs:
-        - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  disks:
-    - base_ref: file://data.image@location:0198f7a11104-7234-9abc-012345670004-20260824
-      base: file://data.overlay@location:0198f7a11105-7234-9abc-012345670005-20260824
-      base_from_refs:
-        - file://data-old.overlay@location:0198f7a11105-7234-9abc-012345670005-20260824
+      - file://root.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002-20260824
+      - file://root-old.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003-20260824
+      - file://data.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
+      - file://data.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
+      - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 `
 	_, rootPath := writeTaskSnapshot(t, rootCfg)
 	result, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{
@@ -65,8 +62,8 @@ boot:
 	if result.Summary.SchemaVersion != configsock.SnapshotPrepareSchemaVersion || len(result.Summary.ResolutionDigest) != 64 {
 		t.Fatalf("summary = %+v", result.Summary)
 	}
-	if result.Summary.RequiredRefCount != 10 {
-		t.Fatalf("required ref count = %d, want 10", result.Summary.RequiredRefCount)
+	if result.Summary.RequiredRefCount != 8 {
+		t.Fatalf("required ref count = %d, want 8", result.Summary.RequiredRefCount)
 	}
 	for _, name := range []string{"0198f7a11101-7234-9abc-012345670001-20260824", "0198f7a11102-7234-9abc-012345670002-20260824", "0198f7a11103-7234-9abc-012345670003-20260824", "0198f7a11104-7234-9abc-012345670004-20260824", "0198f7a11105-7234-9abc-012345670005-20260824"} {
 		location, err := reflocation.Resolve("file:///mnt/task-locations", name)
@@ -77,12 +74,12 @@ boot:
 			t.Fatalf("location %q = %q, want %q", name, result.RefLocationURIs[name], location.URI)
 		}
 	}
-	if _, exists := result.RefLocationURIs["0198f7a11106-7234-9abc-012345670006-20260824"]; exists {
-		t.Fatal("Boot.RuntimeRef entered tenant ref locations")
+	if len(result.RefLocationURIs) != 5 {
+		t.Fatalf("location map = %#v, want five tenant artifact locations", result.RefLocationURIs)
 	}
 	// The parent path intentionally does not exist. Success proves the task did
 	// not reinterpret flattened FromRefs as snapshot.cfg graph edges.
-	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@location:0198f7a11101-7234-9abc-012345670001-20260824" {
+	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824" {
 		t.Fatalf("root config changed: %+v", result.RootCfg.FromRefs)
 	}
 	if result.ConfigReadDuration <= 0 || result.PrepareDuration < result.ConfigReadDuration {
@@ -111,10 +108,18 @@ func TestPrepareLocatedRootBuildsPathMappingBeforeRead(t *testing.T) {
 	if err := os.MkdirAll(location.Path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(rootPath, filepath.Join(location.Path, base)); err != nil {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_ = dir
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Rename(filepath.Join(dir, entry.Name()), filepath.Join(location.Path, entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
 	result, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{
 		RootRef:           ref.String(),
 		RefLocationParent: parent,
@@ -148,8 +153,9 @@ from_refs:
   - manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 boot:
   root:
+    base_ref: manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     overlay:
-      base: manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      base: self
 `
 	rootPath, rootKey, manifestConfig := writeTaskManifestBundle(t, rootLocation.Path, refs, snapshotCfg)
 	rootRef := manifest.Ref{
@@ -182,7 +188,8 @@ boot:
 		t.Fatalf("location map = %#v, want only root/A/B", result.RefLocationURIs)
 	}
 	if result.RootCfg.FromRefs[0] != "manifest://"+strings.Repeat("a", 64) ||
-		result.RootCfg.Boot.Root.Overlay.Base != "manifest://"+strings.Repeat("b", 64) {
+		result.RootCfg.Boot.Root.BaseRef != "manifest://"+strings.Repeat("b", 64) ||
+		result.RootCfg.Boot.Root.Overlay.Base != result.RootCfg.SandboxRef {
 		t.Fatalf("logical snapshot graph changed: %+v", result.RootCfg)
 	}
 	// None of the listed files or location directories exists. Success proves
@@ -281,20 +288,16 @@ func TestPrepareHonorsCanceledContext(t *testing.T) {
 	}
 }
 
-func writeTaskSnapshot(t *testing.T, cfg string) (string, string) {
+func writeTaskSnapshot(t testing.TB, cfg string) (string, string) {
 	t.Helper()
-	zipBody, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json":  {},
-		"snapshot.cfg": []byte(cfg),
-		"state.json":   {},
-	})
+	sandboxSource, fromRefs := taskSandboxSource(t, cfg)
+	dir := t.TempDir()
+	sink := snapshot.NewFileSink(dir, "task-root", nil, false, nil)
+	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
-	_, path, err := snapshot.NewFileSink(dir, "task-root", nil, false, nil).AbsorbBundle(
-		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)), nil, bytes.NewReader(zipBody),
-	)
+	_, path, err := sink.AbsorbSnapshot(context.Background(), taskMemorySource(t, sandboxRef, fromRefs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,17 +322,16 @@ func writeTaskManifestBundle(t testing.TB, directory string, refs []string, cfgB
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	inner, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json":  {},
-		"snapshot.cfg": []byte(cfgBody),
-		"state.json":   {},
-	})
+	sandboxSource, fromRefs := taskSandboxSource(t, cfgBody)
+	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootRef, path, err := sink.AbsorbBundle(context.Background(),
-		bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)), nil, bytes.NewReader(inner))
+	rootRef, _, err := sink.AbsorbSnapshot(context.Background(), taskMemorySource(t, sandboxRef, fromRefs))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSnapshot(context.Background(), rootRef, ""); err != nil {
 		t.Fatal(err)
 	}
 	rootKey, err := manifest.ParseKeyRef(rootRef)
@@ -344,5 +346,97 @@ func writeTaskManifestBundle(t testing.TB, directory string, refs []string, cfgB
 	if err := os.WriteFile(configPath, configBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path, manifest.HexKey(rootKey), configPath
+	return filepath.Join(directory, manifest.HexKey(rootKey)+".bundle"), manifest.HexKey(rootKey), configPath
+}
+
+// taskSandboxSource turns the compatibility projection used by these tests
+// into the current two-artifact model: portable disk/resource state in Sandbox
+// E, with only memory ancestry retained for the later Snapshot S fixture.
+func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
+	t.Helper()
+	var projected restore.SnapshotCfg
+	if err := yaml.Unmarshal([]byte(raw), &projected); err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Boot.Disks) != 0 {
+		t.Fatal("task snapshot fixture does not support data disks")
+	}
+	cpu := projected.Resources.Capacity.CPU
+	if cpu == 0 {
+		cpu = 1
+	}
+	memory := projected.Resources.Capacity.Memory
+	if memory == "" {
+		memory = "64MiB"
+	}
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	runtimeRef := projected.Boot.RuntimeRef
+	if runtimeRef == "" {
+		runtimeRef = "file://sandbox-runtime.bundle@sha256:" + digest
+	}
+	root := sandboxconfig.PortableRootConfig{
+		Base:         projected.Boot.Root.Base,
+		BaseFromRefs: append([]string(nil), projected.Boot.Root.BaseFromRefs...),
+	}
+	if projected.Boot.Root.Overlay != nil {
+		root.Base = projected.Boot.Root.BaseRef
+		if root.Base == "" {
+			root.Base = "self"
+		}
+		root.BaseFromRefs = nil
+		root.Overlay = &sandboxconfig.PortableOverlayConfig{
+			Base:         projected.Boot.Root.Overlay.Base,
+			BaseFromRefs: append([]string(nil), projected.Boot.Root.Overlay.BaseFromRefs...),
+		}
+	} else if root.Base == "" {
+		root.Base = projected.Boot.Root.BaseRef
+		if root.Base == "" {
+			root.Base = "self"
+		}
+	}
+	portable := &sandboxconfig.PortableSandboxConfig{
+		Version: sandboxconfig.PortableSandboxConfigVersion,
+		Resources: sandboxconfig.PortableResourcesConfig{
+			Capacity:    sandboxconfig.CapacityConfig{CPU: cpu, Memory: memory},
+			Allocatable: sandboxconfig.AllocatableConfig{CPU: float64(cpu), Memory: memory},
+		},
+		Boot: sandboxconfig.PortableBootConfig{
+			Kernel: "file://vmlinux@sha256:" + digest, Runtime: runtimeRef, Root: root,
+		},
+		Launch: sandboxconfig.PortableLaunchConfig{
+			Exec: "/bin/true", Workdir: "/", Restart: "never", CgroupControl: projected.Launch.CgroupControl,
+		},
+		Metadata: projected.Metadata,
+	}
+	portableRaw, err := sandboxconfig.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x41}, 4096)
+	logical, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), nil, portableRaw,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logical, append([]string(nil), projected.FromRefs...)
+}
+
+func taskMemorySource(t testing.TB, sandboxRef string, fromRefs []string) sparse.Source {
+	t.Helper()
+	cfg, err := snapshot.MarshalConfig(&snapshot.Config{
+		Version: snapshot.SnapshotConfigVersion, SandboxRef: sandboxRef, FromRefs: fromRefs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memory := bytes.Repeat([]byte{0x5a}, 4096)
+	logical, err := snapshotfile.BuildSource(
+		sparse.Dense(bytes.NewReader(memory), uint64(len(memory))),
+		[]byte("{}"), []byte("{}"), cfg,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logical
 }

@@ -1,7 +1,6 @@
 package tasksnapshot
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -14,7 +13,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
-	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )
 
 // BenchmarkPrepareConcurrency is a repeatable artifact-free proxy for the task
@@ -121,27 +119,15 @@ func percentile(sorted []time.Duration, percent int) time.Duration {
 
 func benchmarkSnapshot(b *testing.B) string {
 	b.Helper()
-	zipBody, err := snapshot.BuildZIP(map[string][]byte{
-		"config.json": {},
-		"snapshot.cfg": []byte(`resources:
+	_, path := writeTaskSnapshot(b, `resources:
   capacity: {cpu: 2, memory: 2GiB}
 from_refs:
   - manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 boot:
   root:
-    base_ref: manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-`),
-		"state.json": {},
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
-	dir := b.TempDir()
-	_, path, err := snapshot.NewFileSink(dir, "benchmark-root", nil, false, nil).AbsorbBundle(
-		context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)), nil, bytes.NewReader(zipBody),
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
+    base: self
+    base_from_refs:
+      - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+`)
 	return filepath.Clean(path)
 }
