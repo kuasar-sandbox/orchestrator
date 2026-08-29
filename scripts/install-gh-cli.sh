@@ -22,7 +22,8 @@ flock 9
 if ! printf '%s  %s\n' "$SHA256" "$cache_archive" | sha256sum --check --status; then
   download_path="$(mktemp "$cache_root/$ARCHIVE.XXXXXX")"
   trap 'rm -f "$download_path"' EXIT
-  curl --fail --location --retry 3 --connect-timeout 20 --max-time 300 \
+  curl --fail --location --retry 3 --retry-max-time 240 \
+    --connect-timeout 20 --max-time 300 \
     --silent --show-error --output "$download_path" \
     "https://github.com/cli/cli/releases/download/v${VERSION}/${ARCHIVE}"
   printf '%s  %s\n' "$SHA256" "$download_path" | sha256sum --check
