@@ -11,17 +11,19 @@ SHA256=b57848131bdf0c229cd35e1f2a51aa718199858b2e728410b37e89a428943ec4
 [ "$(uname -m)" = x86_64 ] || { echo "install-gh-cli: x86_64 is required" >&2; exit 1; }
 
 cache_root=${KUASAR_GH_CLI_CACHE:-/var/cache/kuasar/gh-cli}
-if ! install -d -m 0755 "$cache_root" 2>/dev/null; then
+if ! install -d -m 0755 "$cache_root" 2>/dev/null \
+  || ! { exec 9>"$cache_root/.download.lock"; } 2>/dev/null; then
   cache_root="$RUNNER_TEMP/gh-cli-cache"
   install -d -m 0755 "$cache_root"
+  exec 9>"$cache_root/.download.lock"
 fi
 cache_archive="$cache_root/$ARCHIVE"
-exec 9>"$cache_root/.download.lock"
 flock 9
 if ! printf '%s  %s\n' "$SHA256" "$cache_archive" | sha256sum --check --status; then
   download_path="$(mktemp "$cache_root/$ARCHIVE.XXXXXX")"
   trap 'rm -f "$download_path"' EXIT
-  curl --fail --location --retry 3 --silent --show-error --output "$download_path" \
+  curl --fail --location --retry 3 --connect-timeout 20 --max-time 300 \
+    --silent --show-error --output "$download_path" \
     "https://github.com/cli/cli/releases/download/v${VERSION}/${ARCHIVE}"
   printf '%s  %s\n' "$SHA256" "$download_path" | sha256sum --check
   mv "$download_path" "$cache_archive"
