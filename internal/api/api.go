@@ -325,9 +325,9 @@ type CreateReq struct {
 }
 
 // PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
-// lower-priority sandbox/node policy. memory=false requests a disk-only capture;
-// until node runtime support lands it fails fast on explicit pauses while the
-// reaper downgrades auto-pauses to memory-bearing captures.
+// lower-priority sandbox/node policy. memory=false requests a disk-only pause
+// (capturing a Sandbox artifact E and destroying the live VM; resumed via
+// explicit Connect with `run --from`).
 type PauseRequest struct {
 	Memory               *bool `json:"memory,omitempty"`
 	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`

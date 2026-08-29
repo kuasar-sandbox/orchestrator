@@ -13,9 +13,9 @@ import (
 type CheckpointPolicy struct {
 	MergeRef   *bool `json:"merge_ref,omitempty"`
 	DropCaches *bool `json:"drop_caches,omitempty"`
-	// Memory requests a disk-only capture when false (sandboxer#120). While
-	// node runtime support is absent, an explicit Pause fails fast and the
-	// reaper downgrades to a memory-bearing capture.
+	// Memory requests a disk-only pause when false (Sandbox artifact E,
+	// kuasar-sandbox/sandboxer#143) with a cold `run --from` resume source.
+	// Nil / true performs standard memory-bearing snapshot captures.
 	Memory *bool `json:"memory,omitempty"`
 }
 
