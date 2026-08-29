@@ -12,9 +12,7 @@ func TestValidateComponentExecutableMetadata(t *testing.T) {
 	nodeCtl := filepath.Join(dir, "node-ctl")
 	custom := filepath.Join(dir, "xconductor")
 	for _, path := range []string{nodeCtl, custom} {
-		if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		writeFileWithMode(t, path, []byte("binary"), 0o755)
 	}
 	if err := ValidateComponentExecutableMetadata(custom, nodeCtl); err != nil {
 		t.Fatalf("valid executable: %v", err)
@@ -31,16 +29,12 @@ func TestValidateComponentExecutableMetadata(t *testing.T) {
 		{name: "directory", path: dir, want: "regular file"},
 		{name: "not executable", prep: func() string {
 			path := filepath.Join(dir, "plain")
-			if err := os.WriteFile(path, nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
+			writeFileWithMode(t, path, nil, 0o644)
 			return path
 		}, want: "not executable"},
 		{name: "writable", prep: func() string {
 			path := filepath.Join(dir, "writable")
-			if err := os.WriteFile(path, nil, 0o775); err != nil {
-				t.Fatal(err)
-			}
+			writeFileWithMode(t, path, nil, 0o775)
 			return path
 		}, want: "group/world writable"},
 		{name: "same file", prep: func() string {
@@ -73,9 +67,7 @@ func TestOpenComponentExecutableKeepsValidatedIdentityAcrossReplacement(t *testi
 	for path, contents := range map[string]string{
 		nodeCtl: "node", component: "validated", replacement: "replacement",
 	} {
-		if err := os.WriteFile(path, []byte(contents), 0o500); err != nil {
-			t.Fatal(err)
-		}
+		writeFileWithMode(t, path, []byte(contents), 0o500)
 	}
 	opened, err := OpenComponentExecutable(component, nodeCtl)
 	if err != nil {
@@ -126,9 +118,7 @@ func TestOpenComponentExecutableAppliesRuntimeModeAndIdentityChecks(t *testing.T
 	valid := filepath.Join(dir, "valid")
 	writable := filepath.Join(dir, "writable")
 	for path, mode := range map[string]os.FileMode{nodeCtl: 0o500, valid: 0o500, writable: 0o522} {
-		if err := os.WriteFile(path, []byte("binary"), mode); err != nil {
-			t.Fatal(err)
-		}
+		writeFileWithMode(t, path, []byte("binary"), mode)
 	}
 	opened, err := OpenComponentExecutable(valid, nodeCtl)
 	if err != nil {
@@ -159,14 +149,22 @@ func TestExecutablesUseExactNodeCtlAndAdjacentHelperFallback(t *testing.T) {
 		t.Fatalf("missing adjacent helper = %q, want PATH fallback", got)
 	}
 	adjacent := filepath.Join(dir, "sandbox-ctl")
-	if err := os.WriteFile(adjacent, nil, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFileWithMode(t, adjacent, nil, 0o755)
 	if got := executables.SandboxCtl(); got != adjacent {
 		t.Fatalf("adjacent helper = %q, want %q", got, adjacent)
 	}
 	absolute := filepath.Join(t.TempDir(), "explicit-helper")
 	if got := executables.binary(absolute); got != absolute {
 		t.Fatalf("absolute helper = %q, want %q", got, absolute)
+	}
+}
+
+func writeFileWithMode(t *testing.T, path string, contents []byte, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
 }
