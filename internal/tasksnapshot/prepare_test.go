@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,9 +41,13 @@ boot:
     base_from_refs:
       - file://root.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002-20260824
       - file://root-old.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003-20260824
-      - file://data.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
-      - file://data.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
       - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  disks:
+    - base_ref: file://data.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
+      overlay:
+        base: file://data.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
+        base_from_refs:
+          - manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 `
 	_, rootPath := writeTaskSnapshot(t, rootCfg)
 	result, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{
@@ -62,8 +67,8 @@ boot:
 	if result.Summary.SchemaVersion != configsock.SnapshotPrepareSchemaVersion || len(result.Summary.ResolutionDigest) != 64 {
 		t.Fatalf("summary = %+v", result.Summary)
 	}
-	if result.Summary.RequiredRefCount != 8 {
-		t.Fatalf("required ref count = %d, want 8", result.Summary.RequiredRefCount)
+	if result.Summary.RequiredRefCount != 9 {
+		t.Fatalf("required ref count = %d, want 9", result.Summary.RequiredRefCount)
 	}
 	for _, name := range []string{"0198f7a11101-7234-9abc-012345670001-20260824", "0198f7a11102-7234-9abc-012345670002-20260824", "0198f7a11103-7234-9abc-012345670003-20260824", "0198f7a11104-7234-9abc-012345670004-20260824", "0198f7a11105-7234-9abc-012345670005-20260824"} {
 		location, err := reflocation.Resolve("file:///mnt/task-locations", name)
@@ -358,9 +363,6 @@ func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
 	if err := yaml.Unmarshal([]byte(raw), &projected); err != nil {
 		t.Fatal(err)
 	}
-	if len(projected.Boot.Disks) != 0 {
-		t.Fatal("task snapshot fixture does not support data disks")
-	}
 	cpu := projected.Resources.Capacity.CPU
 	if cpu == 0 {
 		cpu = 1
@@ -394,6 +396,28 @@ func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
 			root.Base = "self"
 		}
 	}
+	disks := make([]sandboxconfig.PortableDiskConfig, len(projected.Boot.Disks))
+	mounts := make([]sandboxconfig.MountConfig, len(projected.Boot.Disks))
+	for i := range projected.Boot.Disks {
+		projectedDisk := &projected.Boot.Disks[i]
+		diskRoot := sandboxconfig.PortableRootConfig{
+			Base:         projectedDisk.Base,
+			BaseFromRefs: append([]string(nil), projectedDisk.BaseFromRefs...),
+		}
+		if projectedDisk.Overlay != nil {
+			diskRoot.Base = projectedDisk.BaseRef
+			diskRoot.BaseFromRefs = nil
+			diskRoot.Overlay = &sandboxconfig.PortableOverlayConfig{
+				Base:         projectedDisk.Overlay.Base,
+				BaseFromRefs: append([]string(nil), projectedDisk.Overlay.BaseFromRefs...),
+			}
+		} else if diskRoot.Base == "" {
+			diskRoot.Base = projectedDisk.BaseRef
+		}
+		name := fmt.Sprintf("data-%d", i)
+		disks[i] = sandboxconfig.PortableDiskConfig{Name: name, PortableRootConfig: diskRoot}
+		mounts[i] = sandboxconfig.MountConfig{Target: "/mnt/" + name, Type: "disk", Source: name}
+	}
 	portable := &sandboxconfig.PortableSandboxConfig{
 		Version: sandboxconfig.PortableSandboxConfigVersion,
 		Resources: sandboxconfig.PortableResourcesConfig{
@@ -401,12 +425,13 @@ func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
 			Allocatable: sandboxconfig.AllocatableConfig{CPU: float64(cpu), Memory: memory},
 		},
 		Boot: sandboxconfig.PortableBootConfig{
-			Kernel: "file://vmlinux@sha256:" + digest, Runtime: runtimeRef, Root: root,
+			Kernel: "file://vmlinux@sha256:" + digest, Runtime: runtimeRef, Root: root, Disks: disks,
 		},
 		Launch: sandboxconfig.PortableLaunchConfig{
 			Exec: "/bin/true", Workdir: "/", Restart: "never", CgroupControl: projected.Launch.CgroupControl,
 		},
 		Metadata: projected.Metadata,
+		Mounts:   mounts,
 	}
 	portableRaw, err := sandboxconfig.MarshalPortableSandboxConfig(portable)
 	if err != nil {
