@@ -108,6 +108,9 @@ func (o *Orchestrator) LookupResumeKind(ctx context.Context, sandboxID string) (
 	if sb.State != types.StateStarting && sb.State != types.StateRunning && sb.State != types.StatePaused {
 		return "", false, nil
 	}
+	if sb.State != types.StatePaused {
+		return "", true, nil
+	}
 	return sb.ResumeKind, true, nil
 }
 

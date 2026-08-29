@@ -452,6 +452,9 @@ func (v *WorkerView) LookupResumeKind(ctx context.Context, sid string) (string, 
 	if !found || (r.State != routesync.StateStarting && r.State != routesync.StateRunning && r.State != routesync.StatePaused) {
 		return "", false, nil
 	}
+	if r.State != routesync.StatePaused {
+		return "", true, nil
+	}
 	return r.ResumeKind, true, nil
 }
 

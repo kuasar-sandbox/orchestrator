@@ -50,6 +50,11 @@ func TestInProcessRouterNeverWakesColdSandboxSource(t *testing.T) {
 	if _, _, err := o.ActivateExec(context.Background(), sb.ID, execIdentity(sb)); !errors.Is(err, proxy.ErrColdSandbox) {
 		t.Fatalf("ActivateExec err = %v, want ErrColdSandbox", err)
 	}
+	kind, found, err := o.LookupResumeKind(context.Background(), sb.ID)
+	if err != nil || !found || kind != types.ResumeSandbox {
+		t.Fatalf("LookupResumeKind(paused) = %q, %v, %v, want ResumeSandbox", kind, found, err)
+	}
+
 	// The cold rejection must not have started a resume: durable state stays
 	// paused with the E ref intact.
 	stored, err := o.st.Get(context.Background(), sb.ID)
@@ -58,6 +63,22 @@ func TestInProcessRouterNeverWakesColdSandboxSource(t *testing.T) {
 	}
 	if stored.State != types.StatePaused || stored.ResumeKind != types.ResumeSandbox || stored.RunID != "" {
 		t.Fatalf("cold rejection changed durable state: %+v", stored)
+	}
+
+	// Resuming to running preserves ResumeKind on the row, but LookupResumeKind
+	// and router activation must not treat the live sandbox as cold.
+	sb.State = types.StateRunning
+	sb.RunID = "run-live"
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	o.mutateCached(sb.ID, func(cached *types.Sandbox) {
+		cached.State = types.StateRunning
+		cached.RunID = sb.RunID
+	})
+	kind, found, err = o.LookupResumeKind(context.Background(), sb.ID)
+	if err != nil || !found || kind != "" {
+		t.Fatalf("LookupResumeKind(running) = %q, %v, %v, want empty kind", kind, found, err)
 	}
 
 	// Snapshot-kind paused sandboxes keep the historical auto-resume.

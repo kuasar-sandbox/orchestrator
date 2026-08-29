@@ -53,6 +53,27 @@ func TestWorkerActivationNeverWakesColdSandboxSource(t *testing.T) {
 		t.Fatalf("ActivateExec(cold) err = %v, want ErrColdSandbox", err)
 	}
 
+	kind, found, err := view.LookupResumeKind(context.Background(), "cold")
+	if err != nil || !found || kind != types.ResumeSandbox {
+		t.Fatalf("LookupResumeKind(paused cold) = %q, %v, %v, want ResumeSandbox", kind, found, err)
+	}
+
+	// When the route transitions to starting or running, LookupResumeKind must
+	// return empty kind so exec requests proceed to normal live handling.
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: "cold", AuthSandboxID: "stable-cold", Profile: "e2b", State: routesync.StateRunning,
+		EnvdUDS: "/run/cold/ctl.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
+		ServiceSecret: workerExecServiceSecret,
+		ResumeKind:    types.ResumeSandbox,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	kind, found, err = view.LookupResumeKind(context.Background(), "cold")
+	if err != nil || !found || kind != "" {
+		t.Fatalf("LookupResumeKind(running) = %q, %v, %v, want empty kind", kind, found, err)
+	}
+
 	// Snapshot-kind paused routes keep the historical auto-resume behavior:
 	// activation wakes and parks (no cold error).
 	snapshotBinding, found, err := view.LookupRoute(context.Background(), "snapshot-paused", proxy.LegacyTarget(49983))
