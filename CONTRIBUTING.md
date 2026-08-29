@@ -78,8 +78,9 @@ Admission re-queries the current pull request and compares its state, base ref,
 base/head repositories and SHAs, author, and draft state with the triggering
 event. A non-draft same-repository pull request is eligible automatically. A
 fork pull request is eligible only when its author is currently an active
-`kuasar-sandbox` organization member. Draft pull requests do not acquire the
-self-hosted BMS runner: their `kuasar/bms-exact-head` status remains `pending`.
+`kuasar-sandbox` organization member. Draft pull requests run only the BMS
+control jobs, not the full E2E job; their `kuasar/bms-exact-head` status remains
+`pending`.
 Marking a draft Ready emits `ready_for_review`, causing a fresh admission and
 BMS run.
 
