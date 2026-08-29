@@ -923,13 +923,14 @@ func TestExecInTunnelActivationColdSourceRejection(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
 	}
-	if _, err := tcpConn.Write(execTestFrame(`{"type":"exec_request","exec":{"cmd":["echo","hi"]}}`)); err != nil {
+	if _, err := tcpConn.Write(validExecTestFrame()); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	body, _ := io.ReadAll(reader)
+	_ = tcpConn.Close()
 	if router.activateCalls.Load() != 1 || traffic.begins.Load() != 1 || traffic.closes.Load() != 1 {
 		t.Fatalf("racing cold exec calls: activate=%d begins=%d closes=%d",
 			router.activateCalls.Load(), traffic.begins.Load(), traffic.closes.Load())
 	}
+	assertExecRequestRejected(t, body)
 }
