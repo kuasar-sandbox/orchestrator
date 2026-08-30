@@ -96,11 +96,15 @@ revalidate_preview_line() {
 
 release_notes_file() {
   local tag="$1" commit="$2" bundle="$3" source_ref="$4"
-  local notes="$TMP/release-notes.md"
+  local notes="$TMP/release-notes.md" unit source
   cp "$bundle/release-notes.md" "$notes"
+  unit="$(release_unit "$tag")"
+  source="$(jq -cn --arg source_ref "$source_ref" --arg source_sha "$commit" \
+    --arg unit "$unit" \
+    '{source_ref: $source_ref, source_sha: $source_sha, unit: $unit}')"
+  printf '\n<!-- kuasar-release-source %s -->\n' "$source" >> "$notes"
   if [[ "$tag" == *-preview.* ]]; then
-    local unit dependencies binding
-    unit="$(release_unit "$tag")"
+    local dependencies binding
     dependencies="${RELEASE_DEPENDENCIES:-}"
     if [ -n "$dependencies" ] \
       && ! [[ "$dependencies" =~ ^[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?(,[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?)*$ ]]; then
@@ -117,6 +121,82 @@ release_notes_file() {
     printf '\n<!-- kuasar-preview-binding %s -->\n' "$binding" >> "$notes"
   fi
   printf '%s\n' "$notes"
+}
+
+stable_tag_is_newer() {
+  local candidate="$1" current="$2" candidate_match current_match index
+  candidate_match='^(runtime-|vmlinux-)?v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+  current_match="$candidate_match"
+  [[ "$candidate" =~ $candidate_match ]] || return 1
+  local candidate_parts=("${BASH_REMATCH[@]:2}")
+  [[ "$current" =~ $current_match ]] || return 1
+  local current_parts=("${BASH_REMATCH[@]:2}")
+  for index in 0 1 2; do
+    if (( candidate_parts[index] > current_parts[index] )); then return 0; fi
+    if (( candidate_parts[index] < current_parts[index] )); then return 1; fi
+  done
+  [[ "$candidate" > "$current" ]]
+}
+
+reconcile_main_latest() {
+  local releases="$TMP/stable-releases" main_sha selected_id='' selected_tag='' selected_sha=''
+  main_sha="$(gh api "repos/$REPOSITORY/git/ref/heads/main" \
+    --jq 'select(.object.type == "commit") | .object.sha')"
+  [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]] || fail "main has an invalid commit target"
+  gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" \
+    | jq -c '[.[][] | select(.draft == false and .prerelease == false)]' > "$releases"
+
+  local encoded release binding source_ref source_sha unit id tag target status
+  while IFS= read -r encoded; do
+    release="$(printf '%s' "$encoded" | base64 -d)"
+    binding="$(jq -r '
+      try (.body // "" | capture("<!-- kuasar-release-source (?<value>\\{[^\\r\\n]*\\}) -->").value)
+      catch empty
+    ' <<< "$release")"
+    [ -n "$binding" ] || continue
+    jq -e '
+      type == "object" and keys == ["source_ref", "source_sha", "unit"]
+      and ([.[] | type == "string"] | all)
+    ' <<< "$binding" >/dev/null || continue
+    source_ref="$(jq -r .source_ref <<< "$binding")"
+    source_sha="$(jq -r .source_sha <<< "$binding")"
+    unit="$(jq -r .unit <<< "$binding")"
+    id="$(jq -r .id <<< "$release")"
+    tag="$(jq -r .tag_name <<< "$release")"
+    target="$(jq -r .target_commitish <<< "$release")"
+    [ "$source_ref" = main ] || continue
+    if [ "${REPOSITORY##*/}" = guest-runtime ]; then
+      [[ "$tag" =~ ^(runtime-|vmlinux-)v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    else
+      [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    fi
+    [ "$source_sha" = "$target" ] || continue
+    [ "$unit" = "$(release_unit "$tag")" ] || continue
+    [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$id" =~ ^[0-9]+$ ]] || continue
+
+    status="$(gh api "repos/$REPOSITORY/compare/$source_sha...$main_sha" --jq .status)"
+    [[ "$status" = ahead || "$status" = identical ]] || continue
+    if [ -z "$selected_id" ]; then
+      selected_id="$id"
+      selected_tag="$tag"
+      selected_sha="$source_sha"
+      continue
+    fi
+    status="$(gh api "repos/$REPOSITORY/compare/$selected_sha...$source_sha" --jq .status)"
+    if [ "$status" = ahead ] \
+      || { [ "$status" = identical ] && stable_tag_is_newer "$tag" "$selected_tag"; }; then
+      selected_id="$id"
+      selected_tag="$tag"
+      selected_sha="$source_sha"
+    elif [[ "$status" != behind && "$status" != identical ]]; then
+      echo "publish-release: ignore unrelated main release candidate $tag" >&2
+    fi
+  done < <(jq -r '.[] | @base64' "$releases")
+
+  [ -n "$selected_id" ] || fail "cannot select the latest main Stable release"
+  jq -n '{make_latest: "true"}' \
+    | gh api --method PATCH "repos/$REPOSITORY/releases/$selected_id" --input - >/dev/null
+  echo "==> reconciled $REPOSITORY Latest to $selected_tag from $selected_sha"
 }
 
 publish_bundle() {
@@ -163,6 +243,9 @@ publish_bundle() {
   jq -n --argjson prerelease "$prerelease" \
     '{draft: false, prerelease: $prerelease, make_latest: "false"}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$(jq -er '.id' "$TMP/release")" --input - >/dev/null
+  if [ "$prerelease" = false ] && [ "$source_ref" = main ]; then
+    reconcile_main_latest
+  fi
   gh api "repos/$REPOSITORY/releases/tags/$tag" > "$TMP/release"
   jq -e --arg tag "$tag" --arg commit "$commit" --argjson prerelease "$prerelease" '
       .tag_name == $tag and .target_commitish == $commit and .draft == false and .prerelease == $prerelease

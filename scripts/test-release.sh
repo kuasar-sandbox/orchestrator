@@ -37,12 +37,14 @@ grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelera
 grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
   || fail "Preview publisher does not record its build binding"
 for workflow in component-release.yml delete-preview.yml; do
-  grep -Fq 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
-    "$ROOT/.github/workflows/$workflow" \
-    || fail "$workflow does not use the shared exact-version mutation group"
+  [ "$(grep -Fc 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
+    "$ROOT/.github/workflows/$workflow")" -eq 1 ] \
+    || fail "$workflow does not hold exactly one full-workflow mutation lock"
 done
-grep -Fq 'make_latest: "false"' "$ROOT/scripts/publish-release.sh" \
-  || fail "component publisher attempts to own the project Latest marker"
+grep -Fq 'kuasar-release-source' "$ROOT/scripts/publish-release.sh" \
+  || fail "publisher does not record Stable source provenance"
+grep -Fq 'reconcile_main_latest' "$ROOT/scripts/publish-release.sh" \
+  || fail "publisher does not reconcile component main Latest by source commit"
 if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
   fail "workflows use the unsupported concurrency queue key"
 fi

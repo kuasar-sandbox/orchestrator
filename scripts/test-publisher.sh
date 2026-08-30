@@ -17,17 +17,19 @@ EXPECTED_LATEST=false
 if [[ "$TAG" = *-preview.* ]]; then
   EXPECTED_PRERELEASE=true
 fi
+if [ "$EXPECTED_PRERELEASE" = false ] && [ "$SOURCE_REF" = main ]; then
+  EXPECTED_LATEST=true
+fi
 AGGREGATE_VERSION=
 AGGREGATE_SHA=1111111111111111111111111111111111111111
 FAKE_PLATFORM_MANIFEST=
 UNIT="${REPOSITORY##*/}"
 RELEASE_DEPENDENCIES=
+if [ "$UNIT" = guest-runtime ]; then
+  case "$TAG" in runtime-*) UNIT=runtime ;; vmlinux-*) UNIT=vmlinux ;; esac
+fi
 if [ "$EXPECTED_PRERELEASE" = true ]; then
   preview_date="${TAG##*-preview.}"
-  if [ "$UNIT" = guest-runtime ]; then
-    case "$TAG" in runtime-*) unit=runtime ;; vmlinux-*) unit=vmlinux ;; esac
-    UNIT="$unit"
-  fi
   case "$UNIT" in
     sandboxer) RELEASE_DEPENDENCIES='accelerator=v1.0.0,connector=v1.0.0' ;;
     orchestrator|runtime)
@@ -111,6 +113,12 @@ if [ "${1:-}" = api ]; then
       [ -f "$state/tag" ] || not_found
       emit "$(jq -cn --arg sha "$(cat "$state/tag")" '{object: {sha: $sha}}')" "$filter"
       ;;
+    "GET repos/$repository/git/ref/heads/main")
+      emit "$(jq -cn --arg sha "$commit" '{object: {type: "commit", sha: $sha}}')" "$filter"
+      ;;
+    "GET repos/$repository/compare/$commit...$commit")
+      emit '{"status":"identical"}' "$filter"
+      ;;
     "POST repos/$repository/git/refs")
       [ "$(jq -er '.ref' "$request")" = "refs/tags/$tag" ] || exit 2
       jq -er '.sha' "$request" > "$state/tag"
@@ -122,11 +130,15 @@ if [ "${1:-}" = api ]; then
       emit "$(release_state)" "$filter"
       ;;
     "GET repos/$repository/releases?per_page=100")
-      if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
-        delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
-        if [ "$delay" -gt 0 ]; then
-          printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
-          json='[]'
+      if [ -f "$state/release-draft" ]; then
+        if [ "$(cat "$state/release-draft")" = true ]; then
+          delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
+          if [ "$delay" -gt 0 ]; then
+            printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
+            json='[]'
+          else
+            json="[$(release_state)]"
+          fi
         else
           json="[$(release_state)]"
         fi
@@ -143,10 +155,14 @@ if [ "${1:-}" = api ]; then
       printf '%s\n' "$((count + 1))" > "$state/delete-count"
       ;;
     "PATCH repos/$repository/releases/77")
-      [ "$(jq -er '.draft' "$request")" = false ] || exit 2
-      jq -r '.prerelease' "$request" > "$state/release-prerelease"
-      jq -er '.make_latest' "$request" > "$state/make-latest"
-      printf 'false\n' > "$state/release-draft"
+      if jq -e 'has("draft")' "$request" >/dev/null; then
+        [ "$(jq -er '.draft' "$request")" = false ] || exit 2
+        jq -r '.prerelease' "$request" > "$state/release-prerelease"
+        printf 'false\n' > "$state/release-draft"
+      fi
+      if jq -e 'has("make_latest")' "$request" >/dev/null; then
+        jq -er '.make_latest' "$request" > "$state/make-latest"
+      fi
       emit "$(release_state)" "$filter"
       ;;
     *)
@@ -242,6 +258,16 @@ env "${common_env[@]}" "$PUBLISHER" publish \
   || { echo "test-publisher: release has the wrong latest policy" >&2; exit 1; }
 binding_lines="$(grep -c '^<!-- kuasar-preview-binding .* -->$' \
   "$TMP/state/release-notes.md" || true)"
+source_lines="$(grep -c '^<!-- kuasar-release-source .* -->$' \
+  "$TMP/state/release-notes.md" || true)"
+[ "$source_lines" -eq 1 ] \
+  || { echo "test-publisher: release source binding is missing or duplicated" >&2; exit 1; }
+source_binding="$(sed -n 's/^<!-- kuasar-release-source \(.*\) -->$/\1/p' \
+  "$TMP/state/release-notes.md")"
+jq -e --arg source_ref "$SOURCE_REF" --arg source_sha "$COMMIT" --arg unit "$UNIT" '
+  .source_ref == $source_ref and .source_sha == $source_sha and .unit == $unit
+' <<< "$source_binding" >/dev/null \
+  || { echo "test-publisher: release source binding is incorrect" >&2; exit 1; }
 if [ "$EXPECTED_PRERELEASE" = true ]; then
   [ "$binding_lines" -eq 1 ] \
     || { echo "test-publisher: Preview binding is missing or duplicated" >&2; exit 1; }
