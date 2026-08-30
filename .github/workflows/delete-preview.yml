@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: component-publish-${{ github.repository }}
+  group: component-release-${{ github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:

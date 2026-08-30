@@ -38,12 +38,12 @@ trap 'rm -rf "$TMP"' EXIT
 gh api \
   "repos/kuasar-sandbox/kuasar-sandbox/contents/releases/daily-preview.yaml?ref=$AGGREGATE_SHA" \
   --jq .content | tr -d '\n' | base64 -d > "$TMP/daily-preview.yaml"
-MANIFEST_BASE="$(awk '$1 == "version:" {print $2}' "$TMP/daily-preview.yaml")"
-MANIFEST_PREVIEW="$(awk '$1 == "preview_version:" {print $2}' "$TMP/daily-preview.yaml")"
+MANIFEST_BASE="$(awk '/^version:[[:space:]]+/ {print $2}' "$TMP/daily-preview.yaml")"
+MANIFEST_PREVIEW="$(awk '/^preview_version:[[:space:]]+/ {print $2}' "$TMP/daily-preview.yaml")"
 MANIFEST_COMPONENT="$(awk -v key="$UNIT:" '$1 == key {print $2}' \
   "$TMP/daily-preview.yaml")"
-[ "$(awk '$1 == "version:" {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
-[ "$(awk '$1 == "preview_version:" {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
+[ "$(awk '/^version:[[:space:]]+/ {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
+[ "$(awk '/^preview_version:[[:space:]]+/ {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$(awk -v key="$UNIT:" '$1 == key {count++} END {print count + 0}' \
   "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$MANIFEST_BASE-$MANIFEST_PREVIEW" = "$AGGREGATE" ] || {

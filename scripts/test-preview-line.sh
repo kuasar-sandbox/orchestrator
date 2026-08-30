@@ -27,6 +27,7 @@ FAKE_MANIFEST="$(printf '%s\n' \
   'version: release-v9.8.7' \
   'preview_version: preview.20260831' \
   'components:' \
+  '    version: ignored-nested-value' \
   '  orchestrator: v1.2.3-preview.20260831' | base64 -w0)"
 
 PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$FAKE_MANIFEST" \
