@@ -79,5 +79,20 @@ if PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$BAD_COMPONENT_MANIFEST" \
   echo "test-preview-line: accepted an unselected component Preview" >&2
   exit 1
 fi
+OUTSIDE_COMPONENT_MANIFEST="$(printf '%s\n' \
+  'version: release-v9.8.7' \
+  'preview_version: preview.20260831' \
+  'metadata:' \
+  '  orchestrator: v1.2.3-preview.20260831' \
+  'components:' \
+  '  connector: v1.2.3-preview.20260831' | base64 -w0)"
+if PATH="$TMP/bin:$PATH" FAKE_MANIFEST="$OUTSIDE_COMPONENT_MANIFEST" \
+  bash "$SCRIPT_DIR/validate-preview-line.sh" \
+    orchestrator v1.2.3-preview.20260831 \
+    release-v9.8.7-preview.20260831 "$AGGREGATE_SHA" \
+    >/dev/null 2>&1; then
+  echo "test-preview-line: accepted a unit outside components" >&2
+  exit 1
+fi
 
 echo "test-preview-line: PASS"

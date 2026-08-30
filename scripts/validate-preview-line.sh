@@ -40,12 +40,23 @@ gh api \
   --jq .content | tr -d '\n' | base64 -d > "$TMP/daily-preview.yaml"
 MANIFEST_BASE="$(awk '/^version:[[:space:]]+/ {print $2}' "$TMP/daily-preview.yaml")"
 MANIFEST_PREVIEW="$(awk '/^preview_version:[[:space:]]+/ {print $2}' "$TMP/daily-preview.yaml")"
-MANIFEST_COMPONENT="$(awk -v key="$UNIT:" '$1 == key {print $2}' \
-  "$TMP/daily-preview.yaml")"
+MANIFEST_COMPONENT="$(awk -v key="$UNIT:" '
+  /^components:[[:space:]]*$/ {inside = 1; next}
+  /^[^[:space:]]/ {inside = 0}
+  inside && substr($0, 1, 2) == "  " &&
+    substr($0, 3, 1) !~ /[[:space:]]/ && $1 == key {print $2}
+' "$TMP/daily-preview.yaml")"
 [ "$(awk '/^version:[[:space:]]+/ {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$(awk '/^preview_version:[[:space:]]+/ {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
-[ "$(awk -v key="$UNIT:" '$1 == key {count++} END {print count + 0}' \
+[ "$(awk '/^components:[[:space:]]*$/ {count++} END {print count + 0}' \
   "$TMP/daily-preview.yaml")" -eq 1 ]
+[ "$(awk -v key="$UNIT:" '
+  /^components:[[:space:]]*$/ {inside = 1; next}
+  /^[^[:space:]]/ {inside = 0}
+  inside && substr($0, 1, 2) == "  " &&
+    substr($0, 3, 1) !~ /[[:space:]]/ && $1 == key {count++}
+  END {print count + 0}
+' "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$MANIFEST_BASE-$MANIFEST_PREVIEW" = "$AGGREGATE" ] || {
   echo "$AGGREGATE is not selected by platform commit $AGGREGATE_SHA" >&2
   exit 1
