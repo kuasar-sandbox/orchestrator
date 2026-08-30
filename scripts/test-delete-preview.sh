@@ -46,4 +46,3 @@ if grep -q 'git/refs/tags' "$DELETE_LOG"; then
 fi
 
 echo "test-delete-preview: PASS"
-
