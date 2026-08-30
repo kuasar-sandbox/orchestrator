@@ -246,6 +246,7 @@ if [ "$EXPECTED_PRERELEASE" = true ]; then
 fi
 env "${common_env[@]}" "$PUBLISHER" publish \
   "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF"
+env "${common_env[@]}" "$PUBLISHER" reconcile
 [ "$(cat "$TMP/state/delete-count")" = "$expected_delete_count" ] \
   || { echo "test-publisher: retry did not replace the stale draft" >&2; exit 1; }
 [ "$(cat "$TMP/state/tag")" = "$COMMIT" ] \

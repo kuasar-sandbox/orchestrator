@@ -193,7 +193,10 @@ reconcile_main_latest() {
     fi
   done < <(jq -r '.[] | @base64' "$releases")
 
-  [ -n "$selected_id" ] || fail "cannot select the latest main Stable release"
+  if [ -z "$selected_id" ]; then
+    echo "==> no source-bound main Stable release; keep $REPOSITORY Latest unchanged"
+    return 0
+  fi
   jq -n '{make_latest: "true"}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$selected_id" --input - >/dev/null
   echo "==> reconciled $REPOSITORY Latest to $selected_tag from $selected_sha"
@@ -243,9 +246,6 @@ publish_bundle() {
   jq -n --argjson prerelease "$prerelease" \
     '{draft: false, prerelease: $prerelease, make_latest: "false"}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$(jq -er '.id' "$TMP/release")" --input - >/dev/null
-  if [ "$prerelease" = false ] && [ "$source_ref" = main ]; then
-    reconcile_main_latest
-  fi
   gh api "repos/$REPOSITORY/releases/tags/$tag" > "$TMP/release"
   jq -e --arg tag "$tag" --arg commit "$commit" --argjson prerelease "$prerelease" '
       .tag_name == $tag and .target_commitish == $commit and .draft == false and .prerelease == $prerelease
@@ -260,5 +260,10 @@ command -v jq >/dev/null || fail "jq is required"
 case "${1:-}" in
   check) shift; check_release "$@" ;;
   publish) shift; publish_bundle "$@" ;;
-  *) fail "usage: publish-release.sh <check|publish> ..." ;;
+  reconcile)
+    shift
+    [ "$#" -eq 0 ] || fail "usage: publish-release.sh reconcile"
+    reconcile_main_latest
+    ;;
+  *) fail "usage: publish-release.sh <check|publish|reconcile> ..." ;;
 esac
