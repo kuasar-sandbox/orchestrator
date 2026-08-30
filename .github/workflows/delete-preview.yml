@@ -1,0 +1,56 @@
+name: Delete Preview
+run-name: Delete ${{ inputs.version }} (${{ inputs.mode }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Preview tag selected by the platform controller
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit the preview tag must reference
+        required: true
+        type: string
+      mode:
+        description: Incomplete-publication recovery or retention GC
+        required: true
+        type: choice
+        options:
+          - incomplete
+          - gc
+
+permissions:
+  contents: read
+
+concurrency:
+  group: component-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    permissions:
+      contents: write
+    steps:
+      - name: Require trusted cleanup controller
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "Preview cleanup must run from main" >&2; exit 1; }
+
+      - name: Check out trusted cleanup tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned GitHub CLI
+        run: bash scripts/install-gh-cli.sh
+
+      - name: Delete preview release, assets, and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MODE: ${{ inputs.mode }}
+        run: bash scripts/delete-preview.sh orchestrator "$VERSION" "$SOURCE_SHA" "$MODE"

@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-[ "$#" -eq 5 ] || {
-  echo "usage: test-publisher.sh <publisher> <bundle> <repository> <tag> <commit>" >&2
+[ "$#" -eq 6 ] || {
+  echo "usage: test-publisher.sh <publisher> <bundle> <repository> <tag> <commit> <source-ref>" >&2
   exit 2
 }
 PUBLISHER="$1"
@@ -11,11 +11,14 @@ BUNDLE="$2"
 REPOSITORY="$3"
 TAG="$4"
 COMMIT="$5"
+SOURCE_REF="$6"
 EXPECTED_PRERELEASE=false
-EXPECTED_LATEST=true
+EXPECTED_LATEST=false
 if [[ "$TAG" = *-preview.* ]]; then
   EXPECTED_PRERELEASE=true
-  EXPECTED_LATEST=false
+fi
+if [ "$EXPECTED_PRERELEASE" = false ] && [ "$SOURCE_REF" = main ]; then
+  EXPECTED_LATEST=true
 fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -172,13 +175,14 @@ common_env=(
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
 if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1 \
-  "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" >/dev/null 2>&1; then
+  "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF" >/dev/null 2>&1; then
   echo "test-publisher: interrupted draft creation unexpectedly succeeded" >&2
   exit 1
 fi
 [ "$(cat "$TMP/state/release-draft")" = true ] \
   || { echo "test-publisher: interrupted publish did not leave a draft" >&2; exit 1; }
-env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE"
+env "${common_env[@]}" "$PUBLISHER" publish \
+  "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF"
 [ "$(cat "$TMP/state/delete-count")" = 1 ] \
   || { echo "test-publisher: retry did not replace the stale draft" >&2; exit 1; }
 [ "$(cat "$TMP/state/tag")" = "$COMMIT" ] \

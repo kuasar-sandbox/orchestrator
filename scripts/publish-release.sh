@@ -74,9 +74,11 @@ verify_uploaded_assets() {
 }
 
 publish_bundle() {
-  [ "$#" -eq 4 ] || fail "usage: publish-release.sh publish <tag> <arch> <commit> <bundle-dir>"
-  local tag="$1" arch="$2" commit="$3" bundle="$4"
+  [ "$#" -eq 5 ] || fail "usage: publish-release.sh publish <tag> <arch> <commit> <bundle-dir> <source-ref>"
+  local tag="$1" arch="$2" commit="$3" bundle="$4" source_ref="$5"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase SHA"
+  [[ "$source_ref" = main || "$source_ref" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.x$ ]] \
+    || fail "source-ref must be main or release/vMAJOR.MINOR.x"
   release_cli validate "$tag" "$arch" "$bundle"
 
   local tag_state="$TMP/tag"
@@ -108,10 +110,11 @@ publish_bundle() {
   wait_for_draft_release "$tag" "$drafts"
   jq '.[0]' "$drafts" > "$TMP/release"
   verify_uploaded_assets "$TMP/release" "$bundle"
-  local prerelease=false
+  local prerelease=false make_latest=false
   [[ "$tag" != *-preview.* ]] || prerelease=true
-  jq -n --argjson prerelease "$prerelease" \
-    '{draft: false, prerelease: $prerelease, make_latest: (if $prerelease then "false" else "true" end)}' \
+  [ "$prerelease" = true ] || [ "$source_ref" != main ] || make_latest=true
+  jq -n --argjson prerelease "$prerelease" --argjson make_latest "$make_latest" \
+    '{draft: false, prerelease: $prerelease, make_latest: ($make_latest | tostring)}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$(jq -er '.id' "$TMP/release")" --input - >/dev/null
   gh api "repos/$REPOSITORY/releases/tags/$tag" > "$TMP/release"
   jq -e --arg tag "$tag" --arg commit "$commit" --argjson prerelease "$prerelease" '

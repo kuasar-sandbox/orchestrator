@@ -11,6 +11,20 @@ fail() {
   exit 1
 }
 
+mkdir -p "$TMP/source-bin"
+cat > "$TMP/source-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = api ] || exit 2
+printf '%s\n' "${FAKE_SOURCE_SHA:?}"
+EOF
+chmod +x "$TMP/source-bin/gh"
+env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.2.3 orchestrator >/dev/null
+if env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrator FAKE_SOURCE_SHA=1111111111111111111111111111111111111111 bash "$ROOT/scripts/validate-release-source.sh" release/v1.2.x 1111111111111111111111111111111111111111 v1.3.0 orchestrator >/dev/null 2>&1; then
+  fail "release source validator accepted a tag from another version line"
+fi
+bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
+
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
@@ -42,7 +56,10 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
-  1111111111111111111111111111111111111111
+  1111111111111111111111111111111111111111 main
+"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+  "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
+  1111111111111111111111111111111111111111 release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
