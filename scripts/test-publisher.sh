@@ -23,16 +23,24 @@ fi
 AGGREGATE_VERSION=
 AGGREGATE_SHA=1111111111111111111111111111111111111111
 FAKE_PLATFORM_MANIFEST=
+UNIT="${REPOSITORY##*/}"
+RELEASE_DEPENDENCIES=
 if [ "$EXPECTED_PRERELEASE" = true ]; then
   preview_date="${TAG##*-preview.}"
-  unit="${REPOSITORY##*/}"
-  if [ "$unit" = guest-runtime ]; then
+  if [ "$UNIT" = guest-runtime ]; then
     case "$TAG" in runtime-*) unit=runtime ;; vmlinux-*) unit=vmlinux ;; esac
+    UNIT="$unit"
   fi
+  case "$UNIT" in
+    sandboxer) RELEASE_DEPENDENCIES='accelerator=v1.0.0,connector=v1.0.0' ;;
+    orchestrator|runtime)
+      RELEASE_DEPENDENCIES='accelerator=v1.0.0,connector=v1.0.0,sandboxer=v1.0.0'
+      ;;
+  esac
   AGGREGATE_VERSION="release-v9.8.7-preview.$preview_date"
   FAKE_PLATFORM_MANIFEST="$(printf '%s\n' \
     'version: release-v9.8.7' "preview_version: preview.$preview_date" \
-    'components:' "  $unit: $TAG" | base64 -w0)"
+    'components:' "  $UNIT: $TAG" | base64 -w0)"
 fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,14 +63,15 @@ not_found() {
 }
 
 release_state() {
-  local assets='[]' draft prerelease
+  local assets='[]' body='' draft prerelease
   [ ! -s "$state/assets.ndjson" ] || assets="$(jq -s '.' "$state/assets.ndjson")"
   draft="$(cat "$state/release-draft")"
   prerelease="$(cat "$state/release-prerelease" 2>/dev/null || printf false)"
+  body="$(cat "$state/release-notes.md" 2>/dev/null || true)"
   jq -cn --arg tag "$tag" --arg commit "$commit" --argjson draft "$draft" \
-    --argjson prerelease "$prerelease" --argjson assets "$assets" \
+    --argjson prerelease "$prerelease" --argjson assets "$assets" --arg body "$body" \
     '{id: 77, tag_name: $tag, target_commitish: $commit, draft: $draft,
-      prerelease: $prerelease, assets: $assets}'
+      prerelease: $prerelease, assets: $assets, body: $body}'
 }
 
 emit() {
@@ -158,7 +167,8 @@ if [ "${1:-}" = release ] && [ "${2:-}" = create ]; then
   : > "$state/assets.ndjson"
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --repo|--target|--title|--notes-file) shift 2 ;;
+      --repo|--target|--title) shift 2 ;;
+      --notes-file) cp "$2" "$state/release-notes.md"; shift 2 ;;
       --draft|--verify-tag) shift ;;
       *)
         file="$1"
@@ -195,6 +205,7 @@ common_env=(
   FAKE_GH_COMMIT="$COMMIT"
   AGGREGATE_VERSION="$AGGREGATE_VERSION"
   AGGREGATE_SHA="$AGGREGATE_SHA"
+  RELEASE_DEPENDENCIES="$RELEASE_DEPENDENCIES"
   FAKE_AGGREGATE_VERSION="$AGGREGATE_VERSION"
   FAKE_AGGREGATE_SHA="$AGGREGATE_SHA"
   FAKE_PLATFORM_MANIFEST="$FAKE_PLATFORM_MANIFEST"
@@ -232,6 +243,25 @@ env "${common_env[@]}" "$PUBLISHER" publish \
   || { echo "test-publisher: release has the wrong prerelease state" >&2; exit 1; }
 [ "$(cat "$TMP/state/make-latest")" = "$EXPECTED_LATEST" ] \
   || { echo "test-publisher: release has the wrong latest policy" >&2; exit 1; }
+binding_lines="$(grep -c '^<!-- kuasar-preview-binding .* -->$' \
+  "$TMP/state/release-notes.md" || true)"
+if [ "$EXPECTED_PRERELEASE" = true ]; then
+  [ "$binding_lines" -eq 1 ] \
+    || { echo "test-publisher: Preview binding is missing or duplicated" >&2; exit 1; }
+  binding="$(sed -n 's/^<!-- kuasar-preview-binding \(.*\) -->$/\1/p' \
+    "$TMP/state/release-notes.md")"
+  jq -e --arg aggregate "$AGGREGATE_VERSION" --arg aggregate_sha "$AGGREGATE_SHA" \
+    --arg dependencies "$RELEASE_DEPENDENCIES" --arg source_ref "$SOURCE_REF" \
+    --arg source_sha "$COMMIT" --arg unit "$UNIT" '
+      .aggregate_version == $aggregate and .aggregate_sha == $aggregate_sha
+      and .dependencies == $dependencies and .source_ref == $source_ref
+      and .source_sha == $source_sha and .unit == $unit
+    ' <<< "$binding" >/dev/null \
+    || { echo "test-publisher: Preview binding is incorrect" >&2; exit 1; }
+else
+  [ "$binding_lines" -eq 0 ] \
+    || { echo "test-publisher: Stable release contains a Preview binding" >&2; exit 1; }
+fi
 if env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64 >/dev/null 2>&1; then
   echo "test-publisher: preflight accepted an already published release" >&2
   exit 1

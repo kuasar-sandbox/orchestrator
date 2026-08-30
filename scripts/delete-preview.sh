@@ -66,16 +66,17 @@ if [ "$(jq 'length' "$TMP/releases")" -eq 1 ]; then
   fi
 fi
 
+if [ "$(jq 'length' "$TMP/releases")" -eq 1 ]; then
+  jq -e --arg source_sha "$SOURCE_SHA" \
+    '.[0].target_commitish == $source_sha' "$TMP/releases" >/dev/null \
+    || fail "Release target_commitish does not match the Preview Tag"
+fi
+
 if gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > "$TMP/ref" 2> "$TMP/ref-error"; then
   [ "$(jq -er '.object.type' "$TMP/ref")" = commit ]     || fail "refusing to delete a non-lightweight tag"
   [ "$(jq -er '.object.sha' "$TMP/ref")" = "$SOURCE_SHA" ]     || fail "$TAG does not point to the expected source commit"
 elif grep -q '(HTTP 404)' "$TMP/ref-error"; then
   : > "$TMP/ref"
-  if [ "$(jq 'length' "$TMP/releases")" -eq 1 ]; then
-    jq -e --arg source_sha "$SOURCE_SHA" \
-      '.[0].target_commitish == $source_sha' "$TMP/releases" >/dev/null \
-      || fail "tag is absent and Release target_commitish does not prove source ownership"
-  fi
 else
   cat "$TMP/ref-error" >&2
   exit 1

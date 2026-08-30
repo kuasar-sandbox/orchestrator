@@ -73,9 +73,8 @@ verify_uploaded_assets() {
     || { diff -u "$expected" "$actual" >&2 || true; fail "uploaded asset set does not match the bundle"; }
 }
 
-revalidate_preview_line() {
+release_unit() {
   local tag="$1" unit="${REPOSITORY##*/}"
-  [[ "$tag" == *-preview.* ]] || return 0
   if [ "$unit" = guest-runtime ]; then
     case "$tag" in
       runtime-*) unit=runtime ;;
@@ -83,9 +82,41 @@ revalidate_preview_line() {
       *) fail "cannot derive guest-runtime release unit from $tag" ;;
     esac
   fi
+  printf '%s\n' "$unit"
+}
+
+revalidate_preview_line() {
+  local tag="$1" unit
+  [[ "$tag" == *-preview.* ]] || return 0
+  unit="$(release_unit "$tag")"
   "$SCRIPT_DIR/validate-preview-line.sh" "$unit" "$tag" \
     "${AGGREGATE_VERSION:?AGGREGATE_VERSION is required for a Preview}" \
     "${AGGREGATE_SHA:?AGGREGATE_SHA is required for a Preview}"
+}
+
+release_notes_file() {
+  local tag="$1" commit="$2" bundle="$3" source_ref="$4"
+  local notes="$TMP/release-notes.md"
+  cp "$bundle/release-notes.md" "$notes"
+  if [[ "$tag" == *-preview.* ]]; then
+    local unit dependencies binding
+    unit="$(release_unit "$tag")"
+    dependencies="${RELEASE_DEPENDENCIES:-}"
+    if [ -n "$dependencies" ] \
+      && ! [[ "$dependencies" =~ ^[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?(,[a-z][a-z0-9-]*=v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?)*$ ]]; then
+      fail "invalid RELEASE_DEPENDENCIES"
+    fi
+    binding="$(jq -cn \
+      --arg aggregate_sha "${AGGREGATE_SHA:?AGGREGATE_SHA is required for a Preview}" \
+      --arg aggregate_version "${AGGREGATE_VERSION:?AGGREGATE_VERSION is required for a Preview}" \
+      --arg dependencies "$dependencies" --arg source_ref "$source_ref" \
+      --arg source_sha "$commit" --arg unit "$unit" \
+      '{aggregate_sha: $aggregate_sha, aggregate_version: $aggregate_version,
+        dependencies: $dependencies, source_ref: $source_ref,
+        source_sha: $source_sha, unit: $unit}')"
+    printf '\n<!-- kuasar-preview-binding %s -->\n' "$binding" >> "$notes"
+  fi
+  printf '%s\n' "$notes"
 }
 
 publish_bundle() {
@@ -117,11 +148,12 @@ publish_bundle() {
   if [ "$(jq 'length' "$drafts")" -eq 1 ]; then
     gh api --method DELETE "repos/$REPOSITORY/releases/$(jq -er '.[0].id' "$drafts")" >/dev/null
   fi
-  local files=() file
+  local files=() file notes
   while IFS= read -r file; do files+=("$file"); done \
     < <(find "$bundle/assets" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
+  notes="$(release_notes_file "$tag" "$commit" "$bundle" "$source_ref")"
   gh release create "$tag" "${files[@]}" --repo "$REPOSITORY" --draft --verify-tag \
-    --target "$commit" --title "$tag" --notes-file "$bundle/release-notes.md" >/dev/null
+    --target "$commit" --title "$tag" --notes-file "$notes" >/dev/null
   wait_for_draft_release "$tag" "$drafts"
   jq '.[0]' "$drafts" > "$TMP/release"
   verify_uploaded_assets "$TMP/release" "$bundle"
