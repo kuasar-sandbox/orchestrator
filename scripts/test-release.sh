@@ -12,6 +12,7 @@ fail() {
 }
 
 bash "$ROOT/scripts/test-preview-line.sh"
+bash "$ROOT/scripts/test-delete-preview.sh"
 
 mkdir -p "$TMP/source-bin"
 cat > "$TMP/source-bin/gh" <<'EOF'

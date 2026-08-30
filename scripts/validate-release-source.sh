@@ -49,7 +49,8 @@ if [[ "$SOURCE_REF" =~ ^release/v([0-9]+)\.([0-9]+)\.x$ ]]; then
     || fail "$TAG does not belong to $SOURCE_REF"
 fi
 
-REF_SHA="$(gh api "repos/$REPOSITORY/commits/$SOURCE_REF" --jq .sha)"
+REF_SHA="$(gh api "repos/$REPOSITORY/git/ref/heads/$SOURCE_REF" \
+  --jq 'select(.object.type == "commit") | .object.sha')"
 [ "$REF_SHA" = "$SOURCE_SHA" ] \
   || fail "$SOURCE_REF moved: expected $SOURCE_SHA, found $REF_SHA"
 

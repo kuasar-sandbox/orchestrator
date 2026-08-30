@@ -32,6 +32,10 @@ on:
         description: Owning aggregate Preview; required when version is a Preview
         required: false
         type: string
+      aggregate_sha:
+        description: Platform commit selecting aggregate_version; required for a Preview
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -78,6 +82,7 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
+          AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: x86_64
         run: |
@@ -90,7 +95,8 @@ jobs:
             || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
           bash scripts/validate-release-source.sh \
             "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
-          bash scripts/validate-preview-line.sh "$VERSION" "$AGGREGATE_VERSION"
+          bash scripts/validate-preview-line.sh \
+            "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh check "$VERSION" "$TARGET_ARCH"
           {
             echo "accelerator_version=$ACCELERATOR_VERSION"
@@ -325,9 +331,13 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
+          AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           TARGET_ARCH: x86_64
         run: |
           set -euo pipefail
+          bash scripts/validate-preview-line.sh \
+            "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh publish \
             "$VERSION" "$TARGET_ARCH" "$SOURCE_SHA" release-bundle "$SOURCE_REF"
 
