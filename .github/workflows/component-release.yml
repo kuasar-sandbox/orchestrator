@@ -307,6 +307,7 @@ jobs:
     concurrency:
       group: component-publish-${{ github.repository }}
       cancel-in-progress: false
+      queue: max
     permissions:
       actions: read
       contents: write
