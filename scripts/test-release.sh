@@ -36,6 +36,14 @@ grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelera
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
   || fail "Preview publisher does not record its build binding"
+for workflow in component-release.yml delete-preview.yml; do
+  grep -Fq 'group: component-publish-${{ github.repository }}-${{ inputs.version }}' \
+    "$ROOT/.github/workflows/$workflow" \
+    || fail "$workflow does not serialize publication by exact version"
+done
+if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
+  fail "workflows use the unsupported concurrency queue key"
+fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
