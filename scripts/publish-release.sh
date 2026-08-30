@@ -157,12 +157,11 @@ publish_bundle() {
   wait_for_draft_release "$tag" "$drafts"
   jq '.[0]' "$drafts" > "$TMP/release"
   verify_uploaded_assets "$TMP/release" "$bundle"
-  local prerelease=false make_latest=false
+  local prerelease=false
   [[ "$tag" != *-preview.* ]] || prerelease=true
-  [ "$prerelease" = true ] || [ "$source_ref" != main ] || make_latest=true
   revalidate_preview_line "$tag"
-  jq -n --argjson prerelease "$prerelease" --argjson make_latest "$make_latest" \
-    '{draft: false, prerelease: $prerelease, make_latest: ($make_latest | tostring)}' \
+  jq -n --argjson prerelease "$prerelease" \
+    '{draft: false, prerelease: $prerelease, make_latest: "false"}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$(jq -er '.id' "$TMP/release")" --input - >/dev/null
   gh api "repos/$REPOSITORY/releases/tags/$tag" > "$TMP/release"
   jq -e --arg tag "$tag" --arg commit "$commit" --argjson prerelease "$prerelease" '

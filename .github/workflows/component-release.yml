@@ -305,7 +305,7 @@ jobs:
       - build
     runs-on: [self-hosted, Linux, X64, kuasar-control]
     concurrency:
-      group: component-publish-${{ github.repository }}-${{ (!contains(inputs.version, '-preview.') && inputs.source_ref == 'main') && 'stable-main' || inputs.version }}
+      group: component-mutation-${{ github.repository }}-${{ inputs.version }}
       cancel-in-progress: false
     permissions:
       actions: read
