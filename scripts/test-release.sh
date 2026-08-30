@@ -11,6 +11,8 @@ fail() {
   exit 1
 }
 
+bash "$ROOT/scripts/test-preview-line.sh"
+
 mkdir -p "$TMP/source-bin"
 cat > "$TMP/source-bin/gh" <<'EOF'
 #!/usr/bin/env bash

@@ -28,6 +28,10 @@ on:
         description: Exact source commit selected from source_ref
         required: true
         type: string
+      aggregate_version:
+        description: Owning aggregate Preview; required when version is a Preview
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -73,6 +77,7 @@ jobs:
           SANDBOXER_VERSION: ${{ inputs.sandboxer_version }}
           SOURCE_REF: ${{ inputs.source_ref }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: x86_64
         run: |
@@ -85,6 +90,7 @@ jobs:
             || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
           bash scripts/validate-release-source.sh \
             "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
+          bash scripts/validate-preview-line.sh "$VERSION" "$AGGREGATE_VERSION"
           bash scripts/publish-release.sh check "$VERSION" "$TARGET_ARCH"
           {
             echo "accelerator_version=$ACCELERATOR_VERSION"
