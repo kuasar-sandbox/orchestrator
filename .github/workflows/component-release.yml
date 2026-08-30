@@ -96,7 +96,7 @@ jobs:
           bash scripts/validate-release-source.sh \
             "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
           bash scripts/validate-preview-line.sh \
-            "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
+            orchestrator "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh check "$VERSION" "$TARGET_ARCH"
           {
             echo "accelerator_version=$ACCELERATOR_VERSION"
@@ -337,7 +337,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/validate-preview-line.sh \
-            "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
+            orchestrator "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh publish \
             "$VERSION" "$TARGET_ARCH" "$SOURCE_SHA" release-bundle "$SOURCE_REF"
 

@@ -2,14 +2,15 @@
 
 set -euo pipefail
 
-[ "$#" -eq 3 ] || {
-  echo "usage: validate-preview-line.sh <component-tag> <aggregate-version> <aggregate-sha>" >&2
+[ "$#" -eq 4 ] || {
+  echo "usage: validate-preview-line.sh <unit> <component-tag> <aggregate-version> <aggregate-sha>" >&2
   exit 2
 }
 
-TAG="$1"
-AGGREGATE="$2"
-AGGREGATE_SHA="$3"
+UNIT="$1"
+TAG="$2"
+AGGREGATE="$3"
+AGGREGATE_SHA="$4"
 if [[ "$TAG" != *-preview.* ]]; then
   exit 0
 fi
@@ -39,10 +40,18 @@ gh api \
   --jq .content | tr -d '\n' | base64 -d > "$TMP/daily-preview.yaml"
 MANIFEST_BASE="$(awk '$1 == "version:" {print $2}' "$TMP/daily-preview.yaml")"
 MANIFEST_PREVIEW="$(awk '$1 == "preview_version:" {print $2}' "$TMP/daily-preview.yaml")"
+MANIFEST_COMPONENT="$(awk -v key="$UNIT:" '$1 == key {print $2}' \
+  "$TMP/daily-preview.yaml")"
 [ "$(awk '$1 == "version:" {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$(awk '$1 == "preview_version:" {count++} END {print count + 0}' "$TMP/daily-preview.yaml")" -eq 1 ]
+[ "$(awk -v key="$UNIT:" '$1 == key {count++} END {print count + 0}' \
+  "$TMP/daily-preview.yaml")" -eq 1 ]
 [ "$MANIFEST_BASE-$MANIFEST_PREVIEW" = "$AGGREGATE" ] || {
   echo "$AGGREGATE is not selected by platform commit $AGGREGATE_SHA" >&2
+  exit 1
+}
+[ "$MANIFEST_COMPONENT" = "$TAG" ] || {
+  echo "$TAG is not selected as $UNIT by platform commit $AGGREGATE_SHA" >&2
   exit 1
 }
 
