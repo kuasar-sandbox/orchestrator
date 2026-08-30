@@ -73,6 +73,21 @@ verify_uploaded_assets() {
     || { diff -u "$expected" "$actual" >&2 || true; fail "uploaded asset set does not match the bundle"; }
 }
 
+revalidate_preview_line() {
+  local tag="$1" unit="${REPOSITORY##*/}"
+  [[ "$tag" == *-preview.* ]] || return 0
+  if [ "$unit" = guest-runtime ]; then
+    case "$tag" in
+      runtime-*) unit=runtime ;;
+      vmlinux-*) unit=vmlinux ;;
+      *) fail "cannot derive guest-runtime release unit from $tag" ;;
+    esac
+  fi
+  "$SCRIPT_DIR/validate-preview-line.sh" "$unit" "$tag" \
+    "${AGGREGATE_VERSION:?AGGREGATE_VERSION is required for a Preview}" \
+    "${AGGREGATE_SHA:?AGGREGATE_SHA is required for a Preview}"
+}
+
 publish_bundle() {
   [ "$#" -eq 5 ] || fail "usage: publish-release.sh publish <tag> <arch> <commit> <bundle-dir> <source-ref>"
   local tag="$1" arch="$2" commit="$3" bundle="$4" source_ref="$5"
@@ -113,6 +128,7 @@ publish_bundle() {
   local prerelease=false make_latest=false
   [[ "$tag" != *-preview.* ]] || prerelease=true
   [ "$prerelease" = true ] || [ "$source_ref" != main ] || make_latest=true
+  revalidate_preview_line "$tag"
   jq -n --argjson prerelease "$prerelease" --argjson make_latest "$make_latest" \
     '{draft: false, prerelease: $prerelease, make_latest: ($make_latest | tostring)}' \
     | gh api --method PATCH "repos/$REPOSITORY/releases/$(jq -er '.id' "$TMP/release")" --input - >/dev/null

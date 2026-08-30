@@ -20,6 +20,20 @@ fi
 if [ "$EXPECTED_PRERELEASE" = false ] && [ "$SOURCE_REF" = main ]; then
   EXPECTED_LATEST=true
 fi
+AGGREGATE_VERSION=
+AGGREGATE_SHA=1111111111111111111111111111111111111111
+FAKE_PLATFORM_MANIFEST=
+if [ "$EXPECTED_PRERELEASE" = true ]; then
+  preview_date="${TAG##*-preview.}"
+  unit="${REPOSITORY##*/}"
+  if [ "$unit" = guest-runtime ]; then
+    case "$TAG" in runtime-*) unit=runtime ;; vmlinux-*) unit=vmlinux ;; esac
+  fi
+  AGGREGATE_VERSION="release-v9.8.7-preview.$preview_date"
+  FAKE_PLATFORM_MANIFEST="$(printf '%s\n' \
+    'version: release-v9.8.7' "preview_version: preview.$preview_date" \
+    'components:' "  $unit: $TAG" | base64 -w0)"
+fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/state"
@@ -32,6 +46,8 @@ state="${FAKE_GH_STATE:?}"
 repository="${FAKE_GH_REPOSITORY:?}"
 tag="${FAKE_GH_TAG:?}"
 commit="${FAKE_GH_COMMIT:?}"
+aggregate_version="${FAKE_AGGREGATE_VERSION:-}"
+aggregate_sha="${FAKE_AGGREGATE_SHA:-}"
 
 not_found() {
   echo 'gh: Not Found (HTTP 404)' >&2
@@ -79,6 +95,12 @@ if [ "${1:-}" = api ]; then
     cp "$input" "$request"
   fi
   case "$method $endpoint" in
+    "GET repos/kuasar-sandbox/kuasar-sandbox/contents/releases/daily-preview.yaml?ref=$aggregate_sha")
+      emit "$(jq -cn --arg content "${FAKE_PLATFORM_MANIFEST:?}" '{content: $content}')" "$filter"
+      ;;
+    "GET repos/kuasar-sandbox/kuasar-sandbox/releases/tags/${aggregate_version%-preview.*}")
+      [ "${FAKE_STABLE_EXISTS:-0}" = 1 ] && emit '{}' "$filter" || not_found
+      ;;
     "GET repos/$repository/git/ref/tags/$tag")
       [ -f "$state/tag" ] || not_found
       emit "$(jq -cn --arg sha "$(cat "$state/tag")" '{object: {sha: $sha}}')" "$filter"
@@ -171,6 +193,11 @@ common_env=(
   FAKE_GH_REPOSITORY="$REPOSITORY"
   FAKE_GH_TAG="$TAG"
   FAKE_GH_COMMIT="$COMMIT"
+  AGGREGATE_VERSION="$AGGREGATE_VERSION"
+  AGGREGATE_SHA="$AGGREGATE_SHA"
+  FAKE_AGGREGATE_VERSION="$AGGREGATE_VERSION"
+  FAKE_AGGREGATE_SHA="$AGGREGATE_SHA"
+  FAKE_PLATFORM_MANIFEST="$FAKE_PLATFORM_MANIFEST"
 )
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
@@ -181,9 +208,21 @@ if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1 \
 fi
 [ "$(cat "$TMP/state/release-draft")" = true ] \
   || { echo "test-publisher: interrupted publish did not leave a draft" >&2; exit 1; }
+expected_delete_count=1
+if [ "$EXPECTED_PRERELEASE" = true ]; then
+  if env "${common_env[@]}" FAKE_STABLE_EXISTS=1 \
+    "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF" \
+    >/dev/null 2>&1; then
+    echo "test-publisher: published a Preview after its Stable line closed" >&2
+    exit 1
+  fi
+  [ "$(cat "$TMP/state/release-draft")" = true ] \
+    || { echo "test-publisher: closure check exposed a partial release" >&2; exit 1; }
+  expected_delete_count=2
+fi
 env "${common_env[@]}" "$PUBLISHER" publish \
   "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF"
-[ "$(cat "$TMP/state/delete-count")" = 1 ] \
+[ "$(cat "$TMP/state/delete-count")" = "$expected_delete_count" ] \
   || { echo "test-publisher: retry did not replace the stale draft" >&2; exit 1; }
 [ "$(cat "$TMP/state/tag")" = "$COMMIT" ] \
   || { echo "test-publisher: tag points to the wrong commit" >&2; exit 1; }
