@@ -23,6 +23,7 @@ func TestAppConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 	var configured atomic.Int32
 	var retainedConfig *Config
 	var retainedRuntime *Runtime
+	extension := &testExtension{}
 	app := New(Hooks{Configure: func(_ context.Context, cfg *Config, runtime *Runtime) error {
 		configured.Add(1)
 		retainedConfig = cfg
@@ -32,6 +33,7 @@ func TestAppConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 		cfg.Sandbox.Boot.Runtime = "/custom/runtime"
 		cfg.Cluster.Labels = map[string]string{"zone": "custom"}
 		runtime.Logger = wantLogger
+		runtime.Extension = extension
 		runtime.EncryptionKeys = EncryptionKeyProviderFunc(func(context.Context) ([][]byte, error) {
 			return [][]byte{make([]byte, 32)}, nil
 		})
@@ -41,13 +43,14 @@ func TestAppConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 	app.run = func(_ context.Context, cfg *publicconfig.Conductor, nodeCtl string, runtime *conductorapp.Runtime) error {
 		retainedConfig.Cluster.Labels["zone"] = "mutated-after-hook"
 		retainedRuntime.Logger = nil
+		retainedRuntime.Extension = nil
 		if cfg.API.Domain != "custom.test" || cfg.Cluster.Labels["zone"] != "custom" {
 			t.Fatalf("effective config was not frozen: %+v", cfg)
 		}
 		if nodeCtl != bootstrap.NodeCtlExecutable {
 			t.Fatalf("node-ctl path=%q", nodeCtl)
 		}
-		if runtime.Logger != wantLogger || runtime.SecretBox == nil {
+		if runtime.Logger != wantLogger || runtime.SecretBox == nil || runtime.Extension != extension {
 			t.Fatalf("runtime was not frozen/resolved: %+v", runtime)
 		}
 		return nil
@@ -62,6 +65,10 @@ func TestAppConfigureOnceFreezesConfigAndRuntime(t *testing.T) {
 		t.Fatalf("Configure calls=%d", configured.Load())
 	}
 }
+
+type testExtension struct{}
+
+func (*testExtension) Start(context.Context, Host) error { return nil }
 
 func TestAppWithNilHooksUsesBootstrappedConfiguration(t *testing.T) {
 	bootstrap := testBootstrap(t)

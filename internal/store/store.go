@@ -727,6 +727,33 @@ func (s *Store) Get(ctx context.Context, id string) (*types.Sandbox, error) {
 	return sb, nil
 }
 
+// RangeSandboxes streams every durable sandbox in a stable order from one
+// SQLite read snapshot. fn must be read-only with respect to Store while the
+// cursor is open. Returning an error stops iteration and returns that error.
+func (s *Store) RangeSandboxes(ctx context.Context, fn func(*types.Sandbox) error) error {
+	if fn == nil {
+		return errors.New("store: range sandboxes callback is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM sandboxes ORDER BY created_unix ASC, id ASC`)
+	if err != nil {
+		return fmt.Errorf("store: range sandboxes: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		sandbox, err := s.scan(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(sandbox); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: range sandboxes: %w", err)
+	}
+	return nil
+}
+
 // List returns sandboxes ordered by id (cursor pagination). ownerCandidateHash
 // is the 24-hex API-secret fingerprint prefix embedded in an API key. It is only
 // a pre-filter; the caller must verify the API-key MAC against every candidate.
@@ -1089,6 +1116,35 @@ func (s *Store) GetBuild(ctx context.Context, buildID string) (*types.Build, err
 		return nil, fmt.Errorf("store: get build %s: %w", buildID, err)
 	}
 	return b, nil
+}
+
+// RangeBuilds streams the durable current Build set in a stable order from one
+// SQLite read snapshot. Error rows are historical and deliberately excluded.
+// fn must be read-only with respect to Store while the cursor is open.
+func (s *Store) RangeBuilds(ctx context.Context, fn func(*types.Build) error) error {
+	if fn == nil {
+		return errors.New("store: range builds callback is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds
+		WHERE status IN (?,?,?,?) ORDER BY created_unix ASC, build_id ASC`,
+		string(types.BuildRegistered), string(types.BuildWaiting), string(types.BuildBuilding), string(types.BuildReady))
+	if err != nil {
+		return fmt.Errorf("store: range builds: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		build, err := s.scanBuild(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(build); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: range builds: %w", err)
+	}
+	return nil
 }
 
 // GetClaimedBuildIDByRunID resolves an already-published builder assignment from

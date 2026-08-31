@@ -78,6 +78,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 			o.cache(bound)
 		}
 		o.publishUpsert(bound)
+		o.observeSandboxUpsert(bound)
 		commitFinished = time.Now()
 		return nil
 	})
@@ -207,6 +208,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 		o.cache(updated)
 	}
 	o.publishUpsert(updated)
+	o.observeSandboxUpsert(updated)
 	unlock()
 
 	if err := launchCtx.Err(); err != nil {
@@ -261,6 +263,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 	sb.State = types.StateRunning
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
+	o.observeSandboxUpsert(running)
 	return nil
 }
 

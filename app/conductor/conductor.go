@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorapp"
@@ -105,6 +106,9 @@ type Runtime struct {
 	TLS                    TLSMaterialProvider
 	EncryptionKeys         EncryptionKeyProvider
 	ObjectStoreCredentials ObjectStoreCredentialsProvider
+	// Extension is the one trusted, statically linked runtime extension. Nil
+	// preserves the built-in conductor startup and runtime behavior.
+	Extension conductorextension.Extension
 }
 
 // MarshalJSON rejects accidental process-runtime serialization. Runtime
@@ -234,7 +238,7 @@ func decodeConfig(raw []byte, out *publicconfig.Conductor) error {
 }
 
 func freezeRuntime(runtime *Runtime) conductorapp.Bindings {
-	bindings := conductorapp.Bindings{Logger: runtime.Logger}
+	bindings := conductorapp.Bindings{Logger: runtime.Logger, Extension: runtime.Extension}
 	if runtime.TLS != nil {
 		provider := runtime.TLS
 		bindings.TLSMaterial = func(ctx context.Context, purpose conductorapp.TLSPurpose) (conductorapp.TLSMaterial, error) {
