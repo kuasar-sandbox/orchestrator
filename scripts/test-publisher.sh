@@ -25,12 +25,19 @@ AGGREGATE_SHA=1111111111111111111111111111111111111111
 FAKE_PLATFORM_MANIFEST=
 UNIT="${REPOSITORY##*/}"
 RELEASE_DEPENDENCIES=
+if [ "$UNIT" = guest-runtime ]; then
+  case "$TAG" in runtime-*) UNIT=runtime ;; vmlinux-*) UNIT=vmlinux ;; esac
+fi
+SECOND_TAG=
+if [ "$EXPECTED_LATEST" = true ]; then
+  case "$TAG" in
+    runtime-*) SECOND_TAG=runtime-v9223372036854775808.0.0 ;;
+    vmlinux-*) SECOND_TAG=vmlinux-v9223372036854775808.0.0 ;;
+    *) SECOND_TAG=v9223372036854775808.0.0 ;;
+  esac
+fi
 if [ "$EXPECTED_PRERELEASE" = true ]; then
   preview_date="${TAG##*-preview.}"
-  if [ "$UNIT" = guest-runtime ]; then
-    case "$TAG" in runtime-*) unit=runtime ;; vmlinux-*) unit=vmlinux ;; esac
-    UNIT="$unit"
-  fi
   case "$UNIT" in
     sandboxer) RELEASE_DEPENDENCIES='accelerator=v1.0.0,connector=v1.0.0' ;;
     orchestrator|runtime)
@@ -56,6 +63,8 @@ tag="${FAKE_GH_TAG:?}"
 commit="${FAKE_GH_COMMIT:?}"
 aggregate_version="${FAKE_AGGREGATE_VERSION:-}"
 aggregate_sha="${FAKE_AGGREGATE_SHA:-}"
+second_tag="${FAKE_SECOND_TAG:-}"
+unit="${FAKE_GH_UNIT:?}"
 
 not_found() {
   echo 'gh: Not Found (HTTP 404)' >&2
@@ -72,6 +81,17 @@ release_state() {
     --argjson prerelease "$prerelease" --argjson assets "$assets" --arg body "$body" \
     '{id: 77, tag_name: $tag, target_commitish: $commit, draft: $draft,
       prerelease: $prerelease, assets: $assets, body: $body}'
+}
+
+second_release_state() {
+  local source body
+  source="$(jq -cn --arg source_ref main --arg source_sha "$commit" \
+    --arg unit "$unit" \
+    '{source_ref: $source_ref, source_sha: $source_sha, unit: $unit}')"
+  body="<!-- kuasar-release-source $source -->"
+  jq -cn --arg tag "$second_tag" --arg commit "$commit" --arg body "$body" \
+    '{id: 88, tag_name: $tag, target_commitish: $commit, draft: false,
+      prerelease: false, assets: [], body: $body}'
 }
 
 emit() {
@@ -114,6 +134,12 @@ if [ "${1:-}" = api ]; then
       [ -f "$state/tag" ] || not_found
       emit "$(jq -cn --arg sha "$(cat "$state/tag")" '{object: {sha: $sha}}')" "$filter"
       ;;
+    "GET repos/$repository/git/ref/heads/main")
+      emit "$(jq -cn --arg sha "$commit" '{object: {type: "commit", sha: $sha}}')" "$filter"
+      ;;
+    "GET repos/$repository/compare/$commit...$commit")
+      emit '{"status":"identical"}' "$filter"
+      ;;
     "POST repos/$repository/git/refs")
       [ "$(jq -er '.ref' "$request")" = "refs/tags/$tag" ] || exit 2
       jq -er '.sha' "$request" > "$state/tag"
@@ -125,16 +151,24 @@ if [ "${1:-}" = api ]; then
       emit "$(release_state)" "$filter"
       ;;
     "GET repos/$repository/releases?per_page=100")
-      if [ -f "$state/release-draft" ] && [ "$(cat "$state/release-draft")" = true ]; then
-        delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
-        if [ "$delay" -gt 0 ]; then
-          printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
-          json='[]'
+      if [ -f "$state/release-draft" ]; then
+        if [ "$(cat "$state/release-draft")" = true ]; then
+          delay="$(cat "$state/visibility-delay" 2>/dev/null || printf 0)"
+          if [ "$delay" -gt 0 ]; then
+            printf '%s\n' "$((delay - 1))" > "$state/visibility-delay"
+            json='[]'
+          else
+            json="[$(release_state)]"
+          fi
         else
           json="[$(release_state)]"
         fi
       else
         json='[]'
+      fi
+      if [ -n "$second_tag" ]; then
+        json="$(jq -cn --argjson items "$json" \
+          --argjson second "$(second_release_state)" '$items + [$second]')"
       fi
       [ "$slurp" = false ] || json="[$json]"
       emit "$json" "$filter"
@@ -145,12 +179,28 @@ if [ "${1:-}" = api ]; then
       count="$(cat "$state/delete-count" 2>/dev/null || printf 0)"
       printf '%s\n' "$((count + 1))" > "$state/delete-count"
       ;;
-    "PATCH repos/$repository/releases/77")
-      [ "$(jq -er '.draft' "$request")" = false ] || exit 2
-      jq -r '.prerelease' "$request" > "$state/release-prerelease"
-      jq -er '.make_latest' "$request" > "$state/make-latest"
-      printf 'false\n' > "$state/release-draft"
-      emit "$(release_state)" "$filter"
+    "PATCH repos/$repository/releases/"*)
+      release_id="${endpoint##*/}"
+      if [ "$release_id" != 77 ] \
+        && { [ "$release_id" != 88 ] || [ -z "$second_tag" ]; }; then
+        exit 2
+      fi
+      if [ "$release_id" = 77 ] && jq -e 'has("draft")' "$request" >/dev/null; then
+        [ "$(jq -er '.draft' "$request")" = false ] || exit 2
+        jq -r '.prerelease' "$request" > "$state/release-prerelease"
+        printf 'false\n' > "$state/release-draft"
+      fi
+      if jq -e 'has("make_latest")' "$request" >/dev/null; then
+        jq -er '.make_latest' "$request" > "$state/make-latest"
+        if [ "$(jq -r '.make_latest' "$request")" = true ]; then
+          printf '%s\n' "$release_id" > "$state/latest-id"
+        fi
+      fi
+      if [ "$release_id" = 77 ]; then
+        emit "$(release_state)" "$filter"
+      else
+        emit "$(second_release_state)" "$filter"
+      fi
       ;;
     *)
       echo "fake gh: unsupported API call: $method $endpoint" >&2
@@ -203,6 +253,8 @@ common_env=(
   FAKE_GH_REPOSITORY="$REPOSITORY"
   FAKE_GH_TAG="$TAG"
   FAKE_GH_COMMIT="$COMMIT"
+  FAKE_GH_UNIT="$UNIT"
+  FAKE_SECOND_TAG="$SECOND_TAG"
   AGGREGATE_VERSION="$AGGREGATE_VERSION"
   AGGREGATE_SHA="$AGGREGATE_SHA"
   RELEASE_DEPENDENCIES="$RELEASE_DEPENDENCIES"
@@ -233,6 +285,7 @@ if [ "$EXPECTED_PRERELEASE" = true ]; then
 fi
 env "${common_env[@]}" "$PUBLISHER" publish \
   "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF"
+env "${common_env[@]}" "$PUBLISHER" reconcile
 [ "$(cat "$TMP/state/delete-count")" = "$expected_delete_count" ] \
   || { echo "test-publisher: retry did not replace the stale draft" >&2; exit 1; }
 [ "$(cat "$TMP/state/tag")" = "$COMMIT" ] \
@@ -243,8 +296,22 @@ env "${common_env[@]}" "$PUBLISHER" publish \
   || { echo "test-publisher: release has the wrong prerelease state" >&2; exit 1; }
 [ "$(cat "$TMP/state/make-latest")" = "$EXPECTED_LATEST" ] \
   || { echo "test-publisher: release has the wrong latest policy" >&2; exit 1; }
+if [ "$EXPECTED_LATEST" = true ]; then
+  [ "$(cat "$TMP/state/latest-id")" = 88 ] \
+    || { echo "test-publisher: unbounded same-commit SemVer did not win" >&2; exit 1; }
+fi
 binding_lines="$(grep -c '^<!-- kuasar-preview-binding .* -->$' \
   "$TMP/state/release-notes.md" || true)"
+source_lines="$(grep -c '^<!-- kuasar-release-source .* -->$' \
+  "$TMP/state/release-notes.md" || true)"
+[ "$source_lines" -eq 1 ] \
+  || { echo "test-publisher: release source binding is missing or duplicated" >&2; exit 1; }
+source_binding="$(sed -n 's/^<!-- kuasar-release-source \(.*\) -->$/\1/p' \
+  "$TMP/state/release-notes.md")"
+jq -e --arg source_ref "$SOURCE_REF" --arg source_sha "$COMMIT" --arg unit "$UNIT" '
+  .source_ref == $source_ref and .source_sha == $source_sha and .unit == $unit
+' <<< "$source_binding" >/dev/null \
+  || { echo "test-publisher: release source binding is incorrect" >&2; exit 1; }
 if [ "$EXPECTED_PRERELEASE" = true ]; then
   [ "$binding_lines" -eq 1 ] \
     || { echo "test-publisher: Preview binding is missing or duplicated" >&2; exit 1; }

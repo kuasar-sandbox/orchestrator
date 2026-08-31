@@ -36,6 +36,28 @@ grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelera
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
   || fail "Preview publisher does not record its build binding"
+for workflow in component-release.yml delete-preview.yml; do
+  [ "$(grep -Fc 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
+    "$ROOT/.github/workflows/$workflow")" -eq 1 ] \
+    || fail "$workflow does not hold exactly one full-workflow mutation lock"
+done
+grep -Fq 'kuasar-release-source' "$ROOT/scripts/publish-release.sh" \
+  || fail "publisher does not record Stable source provenance"
+grep -Fq 'reconcile_main_latest' "$ROOT/scripts/publish-release.sh" \
+  || fail "publisher does not reconcile component main Latest by source commit"
+RECONCILE_WORKFLOW="$ROOT/.github/workflows/reconcile-latest.yml"
+grep -Fq 'group: component-latest-reconciliation-${{ github.repository }}' \
+  "$RECONCILE_WORKFLOW" \
+  || fail "Latest reconciliation is not serialized across component versions"
+grep -Fq 'workflow_run:' "$RECONCILE_WORKFLOW" \
+  || fail "Latest reconciliation is not triggered after release completion"
+grep -Fq 'schedule:' "$RECONCILE_WORKFLOW" \
+  || fail "Latest reconciliation has no automatic recovery schedule"
+grep -Fq 'publish-release.sh reconcile' "$RECONCILE_WORKFLOW" \
+  || fail "Latest reconciliation does not use the idempotent entrypoint"
+if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
+  fail "workflows use the unsupported concurrency queue key"
+fi
 for input in accelerator_version connector_version sandboxer_version; do
   grep -Fq "      $input:" "$WORKFLOW" \
     || fail "release workflow is missing required $input input"
