@@ -7,6 +7,14 @@ import proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extensio
 type MasterExtension = proxyextension.MasterExtension
 type MasterHost = proxyextension.MasterHost
 type ManagementWrapper = proxyextension.ManagementWrapper
+type WorkerExtension = proxyextension.WorkerExtension
+type WorkerHost = proxyextension.WorkerHost
+type IngressWrapper = proxyextension.IngressWrapper
+type Role = proxyextension.Role
+type Process = proxyextension.Process
+type ConnectService = proxyextension.ConnectService
+type ConnectTarget = proxyextension.ConnectTarget
+type ForwardRequest = proxyextension.ForwardRequest
 type RouteSource = proxyextension.RouteSource
 type Profile = proxyextension.Profile
 type RouteState = proxyextension.RouteState
@@ -21,6 +29,15 @@ type TrafficInflight = proxyextension.TrafficInflight
 type ServiceTrafficView = proxyextension.ServiceTrafficView
 
 const (
+	RoleMaster = proxyextension.RoleMaster
+	RoleWorker = proxyextension.RoleWorker
+
+	ConnectServiceLegacy         = proxyextension.ConnectServiceLegacy
+	ConnectServiceForward        = proxyextension.ConnectServiceForward
+	ConnectServiceE2BEnvd        = proxyextension.ConnectServiceE2BEnvd
+	ConnectServiceE2BInterpreter = proxyextension.ConnectServiceE2BInterpreter
+	ConnectServiceExec           = proxyextension.ConnectServiceExec
+
 	ProfileE2B  = proxyextension.ProfileE2B
 	ProfileBare = proxyextension.ProfileBare
 

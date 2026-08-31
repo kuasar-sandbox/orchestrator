@@ -107,6 +107,9 @@ app := proxy.New(proxy.Hooks{
         // bind process-local logger / TLS provider
         if process.Role == proxy.RoleMaster {
             rt.MasterExtension = newMasterExtension()
+        } else if process.Role == proxy.RoleWorker {
+            // Construct a fresh instance for this worker epoch.
+            rt.WorkerExtension = newWorkerExtension()
         }
         return nil
     },
@@ -131,11 +134,16 @@ worker 固定由 master 的 `/proc/self/exe` reexec：内置 master 得到 node-
 得到 xproxy worker，配置中的 executable 不参与选择。master 通过另一 sealed memfd 传递 frozen
 EffectiveConfig、digest、worker id/epoch、FD protocol/mapping 与当前 executable identity；listener、
 wake/notify、stats、MMDS RPC 等作为继承 FD 传入。worker 严格验证后调用
-`BindRuntime(worker)`，完成 stats hello/ready 与初始 route-table sync 后才 Serve。worker 从不读取
-`proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响 replacement worker。
+`BindRuntime(worker)`。每个 worker epoch 都得到新的 `Runtime`，不得复用上一 epoch 的
+`WorkerExtension` 实例。worker 完成 stats hello/ready、构造 Host 并等待初始 route-table sync，
+随后调用 `WorkerExtension.Start` 恰好一次、冻结同一对象的可选 `IngressWrapper`，成功后才
+Serve。Start 错误或 nil wrapper 不开放 data/proxy listener，由既有 master supervisor 重启
+worker。worker 从不读取 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响
+replacement worker。
 
 公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
-启动期 TLS material provider 与一个可信、静态编译的 `MasterExtension`。provider 返回
+启动期 TLS material provider，以及按 process role 使用的可信、静态编译
+`MasterExtension`/`WorkerExtension`。provider 返回
 certificate chain、`crypto.Signer` 与可选 client CA pool，不能替换任意 `*tls.Config`。
 provider 非 nil 即为权威来源，错误不回退 cert/key 文件；最低 TLS version、HTTP/2 ALPN 与
 client-auth 策略仍由 core 固定。V1 不支持配置、材料或 Extension 热更新，custom component
@@ -155,10 +163,26 @@ Wake 或 worker notification。
 要求新鲜度的调用者同时检查 Route `SyncState`。Management wrapper 可添加、覆盖或透传任意本地
 route；框架不保留 namespace、不做 route conflict 检测，也不规定认证。
 
+`WorkerHost.Process()` 返回当前 worker id/epoch；`GetRoute(sid)` 只做当前 SHM 点查并返回
+独立的非秘密 `RouteView` 副本，不暴露 raw record/Router/可变指针，也不提供 worker Route
+Watch。`IngressWrapper` 在 canonical Host/Header 与 CONNECT parser 之前接收 raw request；同一
+wrapped handler 同时服务 `data_listen` 和 `proxy_socket`，MMDS listener 不使用它。Extension
+可自行定义 Header/path/auth、覆盖或本地响应；未匹配请求调用 `next` 即保留 core token 与
+native exec 语义。
+
+私有认证完成后，`WorkerHost.ForwardAuthorized` 可复用 core 的
+`LookupRoute → BeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate →
+dial → ordinary HTTP/CONNECT → traffic close`。该 helper 拥有 `ResponseWriter`，返回后调用方
+不得再写错误；它不校验 Kuasar `X-Access-Token`。`Revalidate` 在 activation 后、dial 前执行；
+普通 HTTP 的 `Rewrite` 只收到 guest-facing clone，失败时不写任何 guest request bytes；CONNECT
+不调用 Rewrite。generic helper 拒绝 native exec，后者继续经 `next` 走 KAT + per-command CEL。
+本接口不增加 WebSocket transport；WebSocket 仍由 #269 独立跟踪。
+
 该 API 只对应 external proxy，不为 `proxy.mode=internal` 增加 factory；也不开放原始 Router、
 SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
-可选 management wrapper 外，不引入 Go plugin、运行时发现、多 Extension registry、通用 lifecycle
-hook、secret resolver 或 DI container。`node-ctl config proxy` 只做 declarative/bootstrap 与
+可选 management wrapper 和同一 worker Extension 的可选 ingress wrapper 外，不引入 Go plugin、
+运行时发现、多 Extension registry、通用 lifecycle hook、secret resolver 或 DI container。
+`node-ctl config proxy` 只做 declarative/bootstrap 与
 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
 启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md](extensions.md)。
 
@@ -184,7 +208,7 @@ external 拓扑:
          Wake / BarrierAck(sid/id) ▲ │ Hello / Upsert / Delete / Bookmark / Barrier
                               │     ▼
 node-ctl conductor serve ─────┴── node-ctl proxy master
-        ▲ fallback CONNECT          ├─ fixed route writer ─► shared route mmap
+        ▲ fallback HTTP/CONNECT     ├─ fixed route writer ─► shared route mmap
         │ traffic GET ──────────────► cached aggregate
         │ via proxy_socket          ├─ MMDS routes/values ─► bounded heap
         │                           ├─ stats UDS (master only)
@@ -198,7 +222,7 @@ client ─┴────────► inherited data/MMDS listener ─► pro
 
 - conductor 只看到一个 proxy plugin id,当前实现固定为 `proxy`。
 - `proxy_socket` 是 conductor fallback 的唯一注册目标;data-plane 请求误打到
-  conductor 监听口时,proxyForwarder 通过这个 UDS 发 chained CONNECT。
+  conductor 监听口时,proxyForwarder 通过这个 UDS 透传原始 HTTP/CONNECT。
 - `stats_socket` 只由 master 监听;conductor 的公开 traffic GET 经该 UDS 读 master
   聚合缓存,不会查询时扇出 worker。
 - worker 不注册 plugin,不保存独立全量路由表;崩溃后由 master 重启,重启后直接读取
@@ -400,11 +424,15 @@ EffectiveConfig 的 `paths.run_root` 构造 `ctl.sock` 路径.路径和 CEL prog
 proxyForwarder:
 
 - conductor 收到数据面请求但处于 external 模式时,不会自己查路由;
-- 它向 `proxy_socket` 发 chained CONNECT,显式携带 sid,可选 service/port,并原样携带
-  客户端的 `X-Access-Token`;
-- 普通 HTTP 在该 CONNECT 隧道里发送一条请求;CONNECT 则继续隧道化到沙箱。
+- canonical parser 能无副作用解析 sid 时只把 sid 用作稳定 worker affinity；解析失败改用
+  `Host + method + URL path` 稳定 hash，不再成为 correctness gate;
+- 它向所选 `proxy_socket` 只写一次客户端原始 ordinary HTTP 或 CONNECT，worker raw wrapper/core
+  handler 才是最终 parser；不整包缓存 body，发送后不自动 replay;
+- ordinary HTTP 读取并流式转发一个 response；CONNECT 读取 response，200 后复用保留双方 buffered
+  bytes 与 half-close 的 tunnel，非 200 转发 worker 状态。无 WorkerExtension 时，最终 worker 仍
+  产生既有 canonical parser/token 错误。
 
-proxyForwarder 和 cluster-router 的 chained CONNECT 都只是中继,不重复计数;traffic
+proxyForwarder raw relay 和 cluster-router 的 canonical chained CONNECT 都只是中继,不重复计数;traffic
 统计只发生在建立最终 sandbox backend 的 node worker。
 
 ## 6. 数据面鉴权

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -12,10 +13,12 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
@@ -164,6 +167,14 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
 	workerStats := proxystats.NewWorkerStats()
+	var proxyHandler *proxy.Proxy
+	var extensionHost proxyextension.WorkerHost
+	if runtime.WorkerExtension != nil {
+		proxyHandler = proxy.NewWithDialer(
+			view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
+		).WithTrafficTracker(workerStats)
+		extensionHost = proxyext.NewWorkerHost(process, worker.table, proxyHandler)
+	}
 	senderDone, err := workerStats.StartSender(
 		workerCtx, process.WorkerID, process.WorkerEpoch, proxystats.StreamSender(worker.statsConn),
 	)
@@ -173,19 +184,29 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	if err := waitTableSync(workerCtx, worker.table); err != nil {
 		return err
 	}
+	if proxyHandler == nil {
+		proxyHandler = proxy.NewWithDialer(
+			view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
+		).WithTrafficTracker(workerStats)
+	}
+	var ingressHandler http.Handler = proxyHandler
+	if runtime.WorkerExtension != nil {
+		ingressHandler, err = startWorkerIngress(
+			workerCtx, runtime.WorkerExtension, extensionHost, proxyHandler,
+		)
+		if err != nil {
+			return err
+		}
+	}
 	go workerStats.RunGC(workerCtx, func(sandboxID string) bool {
 		_, found := worker.table.Lookup(sandboxID)
 		return found
 	}, 5*time.Minute)
-	proxyHandler := proxy.NewWithDialer(
-		view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
-	).WithTrafficTracker(workerStats)
-
 	errorChannel := make(chan error, 4)
 	go func() { errorChannel <- <-senderDone }()
-	go func() { errorChannel <- appnet.Serve(workerCtx, worker.forward, proxyHandler, nil) }()
+	go func() { errorChannel <- appnet.Serve(workerCtx, worker.forward, ingressHandler, nil) }()
 	if worker.data != nil {
-		go func() { errorChannel <- appnet.Serve(workerCtx, worker.data, proxyHandler, runtime.DataTLS) }()
+		go func() { errorChannel <- appnet.Serve(workerCtx, worker.data, ingressHandler, runtime.DataTLS) }()
 	}
 	if worker.mmds != nil {
 		go func() { errorChannel <- mmds.New(view, cfg.ParkTimeoutDur(), logger).Serve(workerCtx, worker.mmds) }()
@@ -201,6 +222,29 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 		}
 		return err
 	}
+}
+
+func startWorkerIngress(
+	ctx context.Context,
+	extension proxyextension.WorkerExtension,
+	host proxyextension.WorkerHost,
+	next http.Handler,
+) (http.Handler, error) {
+	if extension == nil {
+		return next, nil
+	}
+	if err := extension.Start(ctx, host); err != nil {
+		return nil, fmt.Errorf("proxy worker extension start: %w", err)
+	}
+	wrapper, ok := extension.(proxyextension.IngressWrapper)
+	if !ok {
+		return next, nil
+	}
+	handler := wrapper.WrapIngress(next)
+	if handler == nil {
+		return nil, fmt.Errorf("proxy worker extension returned a nil ingress handler")
+	}
+	return handler, nil
 }
 
 // Close releases prepared resources and is safe to call more than once.
