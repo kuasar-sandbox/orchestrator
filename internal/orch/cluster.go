@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -73,7 +74,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if requestedDeadline > 0 {
 			deadline = &requestedDeadline
 		}
-		sb, _, err = o.ensureResumeAccepted(ctx, cmd.SID, deadline, func(current *types.Sandbox) error {
+		sb, _, err = o.ensureResumeAcceptedFrom(ctx, cmd.SID, deadline, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
 			if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
 				return err
 			}
@@ -97,6 +98,14 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 		if err != nil {
 			return reject(cmd, err)
+		}
+		if o.extensionSandboxHook != nil {
+			deleteAccepted, err := o.prepareClusterDelete(ctx, cmd)
+			if err != nil {
+				return reject(cmd, err)
+			}
+			go deleteAccepted()
+			return accept(cmd)
 		}
 		go func() {
 			if err := o.deleteCluster(o.asyncCtx(), sb); err != nil {
@@ -189,6 +198,16 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 			return err
 		}
 	}
+	registrationRequestDigest, err := clusterBuildRegistrationRequestDigest(pair.ManifestKey, cmd)
+	if err != nil {
+		return err
+	}
+	if existing != nil && existing.RegistrationRequestDigest == "" {
+		// Rows accepted before the additive digest column keep the established
+		// field-by-field replay contract. Do not turn a compatible upgrade into a
+		// conflict merely because the old row could not record this identity.
+		registrationRequestDigest = ""
+	}
 	resources := cmd.BuildResources.Types()
 	if err := resources.ValidateRequired(); err != nil {
 		return fmt.Errorf("%w: build_register resources: %v", api.ErrBadRequest, err)
@@ -257,33 +276,65 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		}
 	}
 	b := &types.Build{
-		BuildID:                  cmd.BuildID,
-		TemplateID:               cmd.TemplateRef,
-		APISecret:                pair.APISecret,
-		ManifestKey:              pair.ManifestKey,
-		Profile:                  profile,
-		Kind:                     types.KindImg,
-		Status:                   types.BuildRegistered,
-		FromImage:                o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
-		Resources:                resources,
-		RegistrationImageRepo:    cmd.ImageRepo,
-		RegistrationRegistryAuth: cmd.RegistryAuth,
-		ClusterGroup:             location.Group,
-		PhaseResourcePatch:       phaseResourcePatch,
-		Metadata:                 meta,
-		Builder:                  builderOpts,
-		CreatedUnix:              time.Now().Unix(),
+		BuildID:                   cmd.BuildID,
+		TemplateID:                cmd.TemplateRef,
+		APISecret:                 pair.APISecret,
+		ManifestKey:               pair.ManifestKey,
+		Profile:                   profile,
+		Kind:                      types.KindImg,
+		Status:                    types.BuildRegistered,
+		FromImage:                 o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
+		Resources:                 resources,
+		RegistrationImageRepo:     cmd.ImageRepo,
+		RegistrationRegistryAuth:  cmd.RegistryAuth,
+		RegistrationRequestDigest: registrationRequestDigest,
+		ClusterGroup:              location.Group,
+		PhaseResourcePatch:        phaseResourcePatch,
+		Metadata:                  meta,
+		Builder:                   builderOpts,
+		CreatedUnix:               time.Now().Unix(),
 	}
-	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
+	if existing == nil && o.extensionBuildHook != nil {
+		operation := newBuildOperation(conductorextension.BuildOperationRegister, conductorextension.BuildOriginCluster, b.BuildID, nil)
+		operation.Register = buildRegisterRequestFromBuild(b)
+		operationID := operation.ID
+		if err := o.callBuildHook(ctx, operation); err != nil {
+			return err
+		}
+		if err := validateBuildOperationEnvelope(operation, operationID, conductorextension.BuildOperationRegister, conductorextension.BuildOriginCluster, b.BuildID); err != nil {
+			return err
+		}
+		request := cloneBuildRegisterRequest(operation.Register)
+		if request == nil {
+			return fmt.Errorf("%w: extension removed build registration candidate", api.ErrBadRequest)
+		}
+		if request.TemplateID != b.TemplateID {
+			return fmt.Errorf("%w: extension changed core-owned template identity", api.ErrBadRequest)
+		}
+		secretHeader, err := mmdsSecretHeader(mmdsDoc)
+		if err != nil {
+			return err
+		}
+		final, err := o.normalizeBuildRegistration(request, secretHeader)
+		if err != nil {
+			return err
+		}
+		modified := registeredBuildFromCandidate(b.BuildID, pair, final, o.imageURIFromMask(b.TemplateID, b.BuildID))
+		modified.TemplateID = b.TemplateID
+		modified.RegistrationImageRepo = b.RegistrationImageRepo
+		modified.RegistrationRegistryAuth = b.RegistrationRegistryAuth
+		modified.RegistrationRequestDigest = b.RegistrationRequestDigest
+		modified.ClusterGroup = b.ClusterGroup
+		modified.CreatedUnix = b.CreatedUnix
+		b = modified
+		resources = b.Resources
+		mmdsDoc = final.mmds
+	}
+	initialMMDS, err := o.validateInitialBuildMMDS(b, mmdsDoc)
+	if err != nil {
+		return fmt.Errorf("build_register MMDS config: %w", err)
+	}
 	if initialMMDS != nil {
-		transportRow := &types.Sandbox{
-			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
-			State: types.StateRunning, RunID: "build-registration-check",
-			APISecret: b.APISecret, ManifestKey: b.ManifestKey, Metadata: b.Metadata,
-		}
-		if err := validateInitialMMDSRouteEntry(transportRow, initialMMDS); err != nil {
-			return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
-		}
 		b.RegistrationMMDSRoutesDigest = initialMMDS.routesDigest
 	}
 	// A tightened execution policy rejects only new registration ownership. An
@@ -625,6 +676,12 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 
 func clusterCommandRejection(err error) (int, string) {
 	switch {
+	case errors.Is(err, conductorextension.ErrRejected):
+		return http.StatusForbidden, conductorextension.ErrRejected.Error()
+	case errors.Is(err, api.ErrExtensionUnavailable):
+		return http.StatusServiceUnavailable, api.ErrExtensionUnavailable.Error()
+	case errors.Is(err, api.ErrSandboxChanged):
+		return http.StatusConflict, api.ErrSandboxChanged.Error()
 	case errors.Is(err, api.ErrBadRequest):
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, api.ErrBuildAdmission):
@@ -735,7 +792,74 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 // Accepted ACK always names both a durable row and an active launch owner.
 func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, credentials sandboxcfg.Credentials) (*types.Sandbox, *launchAttempt, error) {
 	admissionStarted := time.Now()
-	meta := clusterSandboxMetadata(cmd.Config)
+	metadata := cloneStringMap(cmd.Config)
+	timeoutSeconds := o.cfg.Sandbox.TimeoutSec
+	var environment map[string]string
+	var err error
+	if o.extensionSandboxHook != nil {
+		// precheckCluster has already strictly parsed and removed credentials.
+		// Reconstruct their canonical request carrier so the Hook's final metadata
+		// is parsed again rather than applying a stale preliminary extraction.
+		if credentials.ServiceSecret != "" || credentials.EnvdAccessToken != "" || credentials.TrafficAccessToken != "" {
+			raw, err := json.Marshal(credentials)
+			if err != nil {
+				return nil, nil, fmt.Errorf("cluster create: marshal credential candidate: %w", err)
+			}
+			if metadata == nil {
+				metadata = make(map[string]string)
+			}
+			metadata[sandboxcfg.NsCredentials] = string(raw)
+		}
+		clusterMetadata, clusterMetadataPresent := metadata[clusterstate.ObjectMetadataKey]
+		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginCluster, cmd.SID, &conductorextension.SandboxCreateRequest{
+			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: timeoutSeconds,
+			Metadata: cloneStringMap(metadata),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if candidate.TemplateID != tmpl.String() {
+			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned sandbox template identity", api.ErrBadRequest)
+		}
+		if candidate.TimeoutSeconds <= 0 {
+			return nil, nil, fmt.Errorf("%w: cluster sandbox timeout must be positive", api.ErrBadRequest)
+		}
+		if candidate.MMDS != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create does not accept a top-level MMDS candidate", api.ErrBadRequest)
+		}
+		finalClusterMetadata, finalClusterMetadataPresent := candidate.Metadata[clusterstate.ObjectMetadataKey]
+		if clusterMetadataPresent != finalClusterMetadataPresent || clusterMetadata != finalClusterMetadata {
+			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned sandbox context", api.ErrBadRequest)
+		}
+		metadata, err = sandboxcfg.NormalizeRestoreMetadata(candidate.Metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		metadata, err = sandboxcfg.NormalizeCheckpointMetadata(metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		credentials, metadata, err = sandboxcfg.ExtractCredentials(metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		if err := o.validateCreateCheckpointMode(metadata); err != nil {
+			return nil, nil, fmt.Errorf("cluster create: %w", err)
+		}
+		if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		timeoutSeconds = candidate.TimeoutSeconds
+		environment = cloneStringMap(candidate.Env)
+	}
+	meta := clusterSandboxMetadata(metadata)
 
 	sb := &types.Sandbox{
 		ID:                 cmd.SID,
@@ -749,8 +873,9 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		APISecret:          pair.APISecret,
 		ManifestKey:        pair.ManifestKey,
 		Metadata:           meta,
+		Env:                environment,
 		CreatedUnix:        time.Now().Unix(),
-		DeadlineUnix:       time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix(),
+		DeadlineUnix:       time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
 	}
 	if err := materializeSandboxCredentials(sb, credentials); err != nil {
 		return nil, nil, fmt.Errorf("cluster create: %w", err)
@@ -940,7 +1065,7 @@ func (o *Orchestrator) prepareClusterExecSession(
 		return nil, nil, err
 	}
 	var token string
-	sb, _, err := o.ensureResumeAcceptedPrepared(ctx, cmd.SID, nil, func(current *types.Sandbox) error {
+	sb, _, err := o.ensureResumeAcceptedPreparedFrom(ctx, cmd.SID, nil, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
 		if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
 			return err
 		}
@@ -1027,7 +1152,71 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) err
 	if current == nil {
 		return nil
 	}
+	return o.deleteClusterLocked(ctx, current)
+}
+
+// prepareClusterDelete runs the policy Hook synchronously so a rejection can
+// become the command ACK, then hands an already fenced delete to the existing
+// asynchronous cleanup path. The lifecycle lock remains held until the worker
+// starts, so the checked incarnation cannot change between ACK admission and
+// its durable delete.
+func (o *Orchestrator) prepareClusterDelete(ctx context.Context, cmd *routesync.Command) (func(), error) {
+	unlock, err := o.lockLifecycleMutation(ctx, cmd.SID)
+	if err != nil {
+		return nil, err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
+	current, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	precondition := sandboxPrecondition(current)
+	operation := newSandboxOperation(conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginCluster, cmd.SID, current)
+	operation.Delete = &conductorextension.SandboxDeleteRequest{Reason: "cluster delete"}
+	operationID := operation.ID
+	unlock()
+	locked = false
+
+	if err := o.callSandboxHook(ctx, operation); err != nil {
+		return nil, err
+	}
+	if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginCluster, cmd.SID); err != nil {
+		return nil, err
+	}
+	if cloneSandboxDeleteRequest(operation.Delete) == nil {
+		return nil, fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
+	}
+
+	unlock, err = o.lockLifecycleMutation(ctx, cmd.SID)
+	if err != nil {
+		return nil, err
+	}
+	locked = true
+	current, err = o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if !sandboxPreconditionMatches(precondition, current) {
+		return nil, api.ErrSandboxChanged
+	}
+	locked = false
+	return func() {
+		defer unlock()
+		if err := o.deleteClusterLocked(o.asyncCtx(), current); err != nil {
+			o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
+		}
+	}, nil
+}
+
+func (o *Orchestrator) deleteClusterLocked(ctx context.Context, current *types.Sandbox) error {
 	attempt, launchActive := o.launches.Lookup(current.ID)
+	o.launches.Cancel(current.ID)
 	if err := o.st.Delete(ctx, current.ID); err != nil {
 		return err
 	}

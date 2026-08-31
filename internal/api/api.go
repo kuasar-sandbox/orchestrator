@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
@@ -207,6 +208,19 @@ var ErrNotFound = errors.New("sandbox not found")
 // ErrProxyUnavailable means external Create could not establish its route-applied
 // barrier. It is a temporary admission failure, not an accepted sandbox.
 var ErrProxyUnavailable = errors.New("external proxy temporarily unavailable")
+
+// ErrExtensionUnavailable is the fixed internal classification for a Hook
+// error other than extension.ErrRejected. The original error is logged by the
+// orchestrator and never returned over direct or cluster APIs.
+var ErrExtensionUnavailable = errors.New("extension temporarily unavailable")
+
+// ErrSandboxChanged reports that authoritative lifecycle state changed while
+// an Extension Hook was running outside the lifecycle lock.
+var ErrSandboxChanged = errors.New("sandbox changed during extension hook")
+
+// ErrBuildChanged reports that authoritative registration state changed while
+// an Extension Hook was running outside the store transaction.
+var ErrBuildChanged = errors.New("build changed during extension hook")
 
 // Stats errors have deliberately coarse public mappings. Providers may carry
 // richer internal causes, but the API must not expose node topology or worker
@@ -667,6 +681,12 @@ func (a *API) execSession(w http.ResponseWriter, r *http.Request) {
 // internal error details.
 func (a *API) failExecSession(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, conductorextension.ErrRejected):
+		writeErr(w, http.StatusForbidden, conductorextension.ErrRejected.Error())
+	case errors.Is(err, ErrExtensionUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrExtensionUnavailable.Error())
+	case errors.Is(err, ErrSandboxChanged):
+		writeErr(w, http.StatusConflict, ErrSandboxChanged.Error())
 	case errors.Is(err, migrationtoken.ErrAuthentication),
 		errors.Is(err, migrationtoken.ErrCredentialMismatch),
 		errors.Is(err, ErrNotAllowed):
@@ -1138,6 +1158,10 @@ func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
 // credential material, token fragments, or other internal diagnostics.
 func (a *API) failMigrate(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, conductorextension.ErrRejected):
+		writeErr(w, http.StatusForbidden, conductorextension.ErrRejected.Error())
+	case errors.Is(err, ErrExtensionUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrExtensionUnavailable.Error())
 	case errors.Is(err, ErrExportPreempted):
 		writeErr(w, http.StatusConflict, ErrExportPreempted.Error())
 	case errors.Is(err, ErrAlreadyExists):
@@ -1239,6 +1263,14 @@ func isoUnix(sec int64) string { return time.Unix(sec, 0).UTC().Format(time.RFC3
 
 func (a *API) fail(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, conductorextension.ErrRejected):
+		writeErr(w, http.StatusForbidden, conductorextension.ErrRejected.Error())
+	case errors.Is(err, ErrExtensionUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, ErrExtensionUnavailable.Error())
+	case errors.Is(err, ErrSandboxChanged):
+		writeErr(w, http.StatusConflict, ErrSandboxChanged.Error())
+	case errors.Is(err, ErrBuildChanged):
+		writeErr(w, http.StatusConflict, ErrBuildChanged.Error())
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):

@@ -27,6 +27,12 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 	return view
 }
 
+// ProjectSandbox returns the same deep-copied public projection used by Get and
+// Watch. Lifecycle Hook operations use it so Current never aliases core state.
+func ProjectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
+	return projectSandbox(sandbox)
+}
+
 func snapshotLocation(ref string) conductorextension.SnapshotLocation {
 	switch {
 	case ref == "":
@@ -60,6 +66,12 @@ func projectBuild(build *types.Build) conductorextension.BuildView {
 	view.APISecretFingerprint, _ = store.APISecretHash(build.APISecret)
 	view.ManifestKeyFingerprint, _ = store.ManifestKeyHash(build.ManifestKey)
 	return view
+}
+
+// ProjectBuild returns the same deep-copied public projection used by Get and
+// Watch. Lifecycle Hook operations use it so Current never aliases core state.
+func ProjectBuild(build *types.Build) conductorextension.BuildView {
+	return projectBuild(build)
 }
 
 func projectSteps(steps []types.TemplateStep) []conductorextension.BuildStep {

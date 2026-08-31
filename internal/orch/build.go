@@ -17,9 +17,9 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -43,49 +43,9 @@ const maxCABundlePEMSize = 16 * 1024
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
 func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, spec api.RegisterSpec) (*types.Build, error) {
-	if !spec.Profile.Valid() {
-		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, spec.Profile)
-	}
-	if err := spec.Resources.ValidateRequired(); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if _, err := builderResourceProperties(spec.Resources); err != nil {
-		o.recordRegistrationRejection("systemd_encoding")
-		return nil, fmt.Errorf("%w: build resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
-	}
-	executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
+	request := buildRegisterRequest(spec, "")
+	preliminary, err := o.normalizeBuildRegistration(request, spec.MMDSHeader)
 	if err != nil {
-		return nil, err
-	}
-	if !executionLimit.AllowsOne(spec.Resources) {
-		o.recordRegistrationRejection("execution_fit")
-		return nil, fmt.Errorf("%w: build resources cannot fit builder.admission.execution", api.ErrBadRequest)
-	}
-	metadata := spec.Metadata
-	if _, present := metadata[clusterstate.ObjectMetadataKey]; present {
-		return nil, fmt.Errorf("%w: %s is node-managed cluster context", api.ErrBadRequest, clusterstate.ObjectMetadataKey)
-	}
-	builderOpts := spec.Builder
-	builderOpts.Resources = nil
-	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDS(metadata, spec.MMDSHeader, o.mmdsPolicy())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	phaseResourcePatch := metadata[sandboxcfg.NsResource]
-	if phaseResourcePatch != "" {
-		metadata = cloneStringMapWithout(metadata, sandboxcfg.NsResource)
-	}
-	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
-		return nil, err
-	}
-	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
 	pair, err := o.resolveAllowed(ctx, apiKey)
@@ -104,33 +64,41 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		return nil, fmt.Errorf("orch: new template id: %w", err)
 	}
 	templateID := types.TransientPrefix + tid.String()
-	b := &types.Build{
-		BuildID:            bid.String(),
-		TemplateID:         templateID,
-		APISecret:          pair.APISecret,
-		ManifestKey:        pair.ManifestKey,
-		Profile:            spec.Profile,
-		Kind:               types.KindImg,
-		Status:             types.BuildRegistered,
-		FromImage:          o.imageURIFromMask(templateID, bid.String()),
-		Names:              nonEmpty(spec.Name),
-		Aliases:            append([]string{}, spec.Tags...),
-		Resources:          spec.Resources,
-		PhaseResourcePatch: phaseResourcePatch,
-		Metadata:           metadata,
-		Builder:            builderOpts,
-		CreatedUnix:        time.Now().Unix(),
+	preliminary.templateID = templateID
+	final := preliminary
+	if o.extensionBuildHook != nil {
+		request = buildRegisterRequestFromCandidate(preliminary)
+		operation := newBuildOperation(conductorextension.BuildOperationRegister, conductorextension.BuildOriginDirect, bid.String(), nil)
+		operation.Register = cloneBuildRegisterRequest(request)
+		operationID := operation.ID
+		if err := o.callBuildHook(ctx, operation); err != nil {
+			return nil, err
+		}
+		if err := validateBuildOperationEnvelope(operation, operationID, conductorextension.BuildOperationRegister, conductorextension.BuildOriginDirect, bid.String()); err != nil {
+			return nil, err
+		}
+		request = cloneBuildRegisterRequest(operation.Register)
+		if request == nil {
+			return nil, fmt.Errorf("%w: extension removed build registration candidate", api.ErrBadRequest)
+		}
+		if request.TemplateID != templateID {
+			return nil, fmt.Errorf("%w: extension changed core-owned template identity", api.ErrBadRequest)
+		}
+		secretHeader, err := mmdsSecretHeader(preliminary.mmds)
+		if err != nil {
+			return nil, err
+		}
+		final, err = o.normalizeBuildRegistration(request, secretHeader)
+		if err != nil {
+			return nil, err
+		}
 	}
-	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
-	if initialMMDS != nil {
-		transportRow := &types.Sandbox{
-			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
-			State: types.StateRunning, RunID: "build-registration-check",
-			APISecret: b.APISecret, ManifestKey: b.ManifestKey, Metadata: b.Metadata,
-		}
-		if err := validateInitialMMDSRouteEntry(transportRow, initialMMDS); err != nil {
-			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-		}
+	final.templateID = templateID
+	b := registeredBuildFromCandidate(bid.String(), pair, final, o.imageURIFromMask(templateID, bid.String()))
+	b.CreatedUnix = time.Now().Unix()
+	initialMMDS, err := o.validateInitialBuildMMDS(b, final.mmds)
+	if err != nil {
+		return nil, err
 	}
 	var routesDigest string
 	var secretValues store.MMDSRouteSecretValues
@@ -179,18 +147,47 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if b.Status != types.BuildRegistered {
 		return &api.BuildStateConflictError{State: b.Status}
 	}
-	if err := assertBuildResources(b.Resources, spec.ResourceAssertion); err != nil {
-		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	if err := validateBuildTriggerDefinition(b, spec); err != nil {
+		return err
 	}
-	if !b.Profile.Valid() {
-		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
+	if o.extensionBuildHook != nil {
+		precondition := buildPrecondition(b)
+		operation := newBuildOperation(conductorextension.BuildOperationTrigger, conductorextension.BuildOriginDirect, bid, b)
+		operation.Trigger = buildTriggerRequest(spec)
+		operationID := operation.ID
+		if err := o.callBuildHook(ctx, operation); err != nil {
+			return err
+		}
+		if err := validateBuildOperationEnvelope(operation, operationID, conductorextension.BuildOperationTrigger, conductorextension.BuildOriginDirect, bid); err != nil {
+			return err
+		}
+		request := cloneBuildTriggerRequest(operation.Trigger)
+		if request == nil {
+			return fmt.Errorf("%w: extension removed build trigger candidate", api.ErrBadRequest)
+		}
+		spec = internalBuildTriggerRequest(request)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current, err := o.st.GetBuild(ctx, bid)
+		if err != nil {
+			return err
+		}
+		if !ownsBuild(current, apiKey) || current.TemplateID != tid {
+			return api.ErrNotFound
+		}
+		if current.Status != types.BuildRegistered {
+			return &api.BuildStateConflictError{State: current.Status}
+		}
+		if !buildPreconditionMatches(precondition, current) {
+			return api.ErrBuildChanged
+		}
+		b = current
+		if err := validateBuildTriggerDefinition(b, spec); err != nil {
+			return err
+		}
 	}
-	if b.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
-		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
-	}
-	if spec.FromImage != "" && spec.FromTemplate != "" {
-		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
-	}
+	b = cloneBuildForObservation(b)
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
 	// front so the build fails fast instead of mid-pipeline.
@@ -240,7 +237,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		}
 		b.FromImage, b.FromTemplate = fromImage, ""
 	}
-	b.Steps = spec.Steps
+	b.Steps = internalBuildSteps(publicBuildSteps(spec.Steps))
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
 	// Node builder.insecure_registry (plain HTTP) and a per-build registry TLS
@@ -283,6 +280,22 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return api.ErrNotFound
 	}
 	return &api.BuildStateConflictError{State: current.Status}
+}
+
+func validateBuildTriggerDefinition(build *types.Build, spec api.TriggerSpec) error {
+	if err := assertBuildResources(build.Resources, spec.ResourceAssertion); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if !build.Profile.Valid() {
+		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, build.Profile)
+	}
+	if build.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
+		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
+	}
+	if spec.FromImage != "" && spec.FromTemplate != "" {
+		return fmt.Errorf("%w: fromImage and fromTemplate are mutually exclusive", api.ErrBadRequest)
+	}
+	return nil
 }
 
 func assertBuildResources(resources types.BuildResources, assertion buildcfg.ResourcePatch) error {

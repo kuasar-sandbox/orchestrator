@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS builds (
   registration_registry_auth_enc TEXT NOT NULL DEFAULT '',
   registration_mmds_routes_digest TEXT NOT NULL DEFAULT '',
   registration_mmds_values_digest TEXT NOT NULL DEFAULT '',
+  registration_request_digest TEXT NOT NULL DEFAULT '',
   cluster_group       TEXT NOT NULL DEFAULT '',
   resources_cpu      INTEGER NOT NULL,
   resources_memory   INTEGER NOT NULL,
@@ -164,6 +165,10 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
 	if err := ensureColumn(ctx, db, "builds", "runtime_prepare_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "builds", "registration_request_digest", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -885,7 +890,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 
 var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
   from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
-  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
+  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
   runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json`
@@ -897,7 +902,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	var executionClaimed int
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &apiHash, &apiEnc, &manifestHash, &manifestEnc, &profile, &kind,
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
-		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.ClusterGroup,
+		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.RegistrationRequestDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
 		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON); err != nil {
@@ -947,11 +952,11 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 const buildInsertSQL = `
 	INSERT INTO builds (build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
-	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,cluster_group,
+	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
 	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -1029,7 +1034,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		b.BuildID, b.TemplateID, b.PersistID, apiHash, apiEnc, manifestHash, manifestEnc, string(b.Profile), string(b.Kind),
 		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID,
 		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc,
-		b.RegistrationImageRepo, registrationRAEnc, b.RegistrationMMDSRoutesDigest, b.RegistrationMMDSValuesDigest, b.ClusterGroup,
+		b.RegistrationImageRepo, registrationRAEnc, b.RegistrationMMDSRoutesDigest, b.RegistrationMMDSValuesDigest, b.RegistrationRequestDigest, b.ClusterGroup,
 		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage, b.PhaseResourcePatch,
 		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,

@@ -79,9 +79,13 @@ func cloneBuildForObservation(build *types.Build) *types.Build {
 		return nil
 	}
 	clone := *build
-	clone.Names = append([]string(nil), build.Names...)
-	clone.Aliases = append([]string(nil), build.Aliases...)
-	clone.Metadata = cloneStringMapWithout(build.Metadata, "")
+	if build.Names != nil {
+		clone.Names = append([]string{}, build.Names...)
+	}
+	if build.Aliases != nil {
+		clone.Aliases = append([]string{}, build.Aliases...)
+	}
+	clone.Metadata = cloneStringMap(build.Metadata)
 	if build.Steps != nil {
 		clone.Steps = make([]types.TemplateStep, len(build.Steps))
 		for index, step := range build.Steps {

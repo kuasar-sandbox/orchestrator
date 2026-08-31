@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -1534,6 +1535,38 @@ func TestFailMapsProxyUnavailableToServiceUnavailable(t *testing.T) {
 	}
 	if got := response.Body.String(); got != "{\"message\":\"external proxy temporarily unavailable\"}\n" {
 		t.Fatalf("public response = %q", got)
+	}
+}
+
+func TestFailMapsExtensionErrorsWithoutLeakingDetails(t *testing.T) {
+	a := &API{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+		body   string
+	}{
+		{name: "rejected", err: errors.Join(conductorextension.ErrRejected, errors.New("private policy detail")), status: http.StatusForbidden, body: conductorextension.ErrRejected.Error()},
+		{name: "unavailable", err: errors.Join(ErrExtensionUnavailable, errors.New("private outage detail")), status: http.StatusServiceUnavailable, body: ErrExtensionUnavailable.Error()},
+		{name: "sandbox changed", err: ErrSandboxChanged, status: http.StatusConflict, body: ErrSandboxChanged.Error()},
+		{name: "build changed", err: ErrBuildChanged, status: http.StatusConflict, body: ErrBuildChanged.Error()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			a.fail(response, test.err)
+			if response.Code != test.status || response.Body.String() != "{\"message\":\""+test.body+"\"}\n" {
+				t.Fatalf("response = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestFailExecSessionMapsStaleExtensionResult(t *testing.T) {
+	a := &API{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	response := httptest.NewRecorder()
+	a.failExecSession(response, errors.Join(ErrSandboxChanged, errors.New("private incarnation detail")))
+	if response.Code != http.StatusConflict || response.Body.String() != "{\"message\":\""+ErrSandboxChanged.Error()+"\"}\n" {
+		t.Fatalf("response = %d %q", response.Code, response.Body.String())
 	}
 }
 

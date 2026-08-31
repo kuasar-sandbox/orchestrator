@@ -262,7 +262,9 @@ func (s *Store) RegisterBuildWithMMDSRouteSecretValues(ctx context.Context, buil
 	}
 	if err == nil {
 		sameMMDS := true
-		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
+		exactOriginalRequest := existing.RegistrationRequestDigest != "" &&
+			existing.RegistrationRequestDigest == build.RegistrationRequestDigest
+		if !exactOriginalRequest && existing.Status != types.BuildReady && existing.Status != types.BuildError {
 			var compareErr error
 			sameMMDS, compareErr = s.sameInitialBuildMMDSRouteSecretValuesTx(ctx, tx, build.BuildID, routesDigest, values)
 			if compareErr != nil {
@@ -350,6 +352,17 @@ func scanBuildTx(s *Store, row *sql.Row) (*types.Build, error) { return s.scanBu
 func sameImmutableBuild(a, b *types.Build) bool {
 	if a == nil || b == nil {
 		return false
+	}
+	// A cluster registration Extension may modify its credential-free mutable
+	// candidate. Replay cannot invoke that Hook again: policy may have changed
+	// after an ACK was lost. Its tenant-keyed original-request digest therefore
+	// becomes the immutable comparison authority while core IDs and credentials
+	// are still checked independently. Older rows and direct registrations keep
+	// the field-by-field comparison below.
+	if a.RegistrationRequestDigest != "" || b.RegistrationRequestDigest != "" {
+		return a.BuildID == b.BuildID && a.TemplateID == b.TemplateID &&
+			a.RegistrationRequestDigest != "" && a.RegistrationRequestDigest == b.RegistrationRequestDigest &&
+			hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
 	}
 	// Trigger and finalization intentionally mutate kind, work-order fields,
 	// names/aliases, and status. A delayed retry of the original registration
