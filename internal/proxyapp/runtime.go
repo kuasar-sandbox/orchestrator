@@ -27,6 +27,7 @@ type Bindings struct {
 	Logger          *slog.Logger
 	TLSMaterial     func(context.Context) (TLSMaterial, error)
 	MasterExtension proxyextension.MasterExtension
+	WorkerExtension proxyextension.WorkerExtension
 }
 
 // Runtime is fully resolved before a master creates shared state/listeners or
@@ -35,6 +36,7 @@ type Runtime struct {
 	Logger          *slog.Logger
 	DataTLS         *tls.Config
 	MasterExtension proxyextension.MasterExtension
+	WorkerExtension proxyextension.WorkerExtension
 }
 
 // ResolveRuntime applies authoritative provider precedence while keeping TLS
@@ -72,7 +74,10 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Proxy, bindings Bindi
 		}
 		dataTLS = serverTLSConfig(&certificate, nil)
 	}
-	return &Runtime{Logger: logger, DataTLS: dataTLS, MasterExtension: bindings.MasterExtension}, nil
+	return &Runtime{
+		Logger: logger, DataTLS: dataTLS,
+		MasterExtension: bindings.MasterExtension, WorkerExtension: bindings.WorkerExtension,
+	}, nil
 }
 
 func certificateFromMaterial(material TLSMaterial) (*tls.Certificate, error) {

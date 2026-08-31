@@ -19,6 +19,19 @@ type appTestMasterExtension struct{}
 
 func (*appTestMasterExtension) Start(context.Context, MasterHost) error { return nil }
 
+type appTestWorkerExtension struct{}
+
+func (*appTestWorkerExtension) Start(context.Context, WorkerHost) error { return nil }
+
+func TestFreezeRuntimeCarriesRoleExtensionsWithoutSerialization(t *testing.T) {
+	master := &appTestMasterExtension{}
+	worker := &appTestWorkerExtension{}
+	bindings := freezeRuntime(&Runtime{MasterExtension: master, WorkerExtension: worker})
+	if bindings.MasterExtension != master || bindings.WorkerExtension != worker {
+		t.Fatalf("bindings master=%T worker=%T", bindings.MasterExtension, bindings.WorkerExtension)
+	}
+}
+
 func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 	bootstrap := testComponentBootstrap(t)
 	var configureCalls atomic.Int32

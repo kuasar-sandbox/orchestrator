@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
@@ -31,16 +32,12 @@ const (
 )
 
 const (
-	RoleMaster = "master"
-	RoleWorker = "worker"
+	RoleMaster = proxyextension.RoleMaster
+	RoleWorker = proxyextension.RoleWorker
 )
 
-// Process identifies one proxy process-local runtime binding.
-type Process struct {
-	Role        string
-	WorkerID    string
-	WorkerEpoch uint64
-}
+// Process aliases the public leaf value used for process-local runtime binding.
+type Process = proxyextension.Process
 
 type workerFDMapping struct {
 	Data    int `json:"data"`
@@ -55,7 +52,7 @@ type workerFDMapping struct {
 type workerEnvelope struct {
 	Magic               string                           `json:"magic"`
 	ProtocolVersion     int                              `json:"protocolVersion"`
-	Role                string                           `json:"role"`
+	Role                proxyextension.Role              `json:"role"`
 	WorkerID            string                           `json:"workerID"`
 	WorkerEpoch         uint64                           `json:"workerEpoch"`
 	ConfigSchemaVersion int                              `json:"configSchemaVersion"`

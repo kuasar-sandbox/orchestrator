@@ -18,7 +18,7 @@ import (
 // may carry an optional meaningful port. The sandbox id comes from
 // E2b-Sandbox-Id or a legacy authority label. The final node resolves the canonical
 // target, checks its access token, and splices the client to the selected backend.
-// The same Tunnel primitive serves direct ingress and external chained CONNECT.
+// The same Tunnel primitive serves direct ingress and CONNECT relays.
 
 // directDialRoute opens a connection to a resolved route's backend in the
 // process's current network namespace.
@@ -246,17 +246,32 @@ func DialSandboxConnect(ctx context.Context, network, addr, sid string, target C
 // ForwardHTTPOnce sends r through one already-connected backend connection and
 // reads exactly one response. It does not retain or pool the connection.
 func ForwardHTTPOnce(r *http.Request, backend net.Conn, br *bufio.Reader, mutate func(*http.Request)) (*http.Response, error) {
-	if br == nil {
-		br = bufio.NewReader(backend)
+	out := cloneForwardHTTPRequest(r)
+	normalizeForwardHTTPRequest(out)
+	if mutate != nil {
+		mutate(out)
 	}
+	return writeForwardHTTPRequest(out, backend, br)
+}
+
+func cloneForwardHTTPRequest(r *http.Request) *http.Request {
 	out := r.Clone(r.Context())
-	out.RequestURI = ""
 	if out.URL == nil {
 		out.URL = &url.URL{}
 	} else {
 		u := *out.URL
 		out.URL = &u
 	}
+	return out
+}
+
+func forwardClonedHTTPOnce(out *http.Request, backend net.Conn, br *bufio.Reader) (*http.Response, error) {
+	normalizeForwardHTTPRequest(out)
+	return writeForwardHTTPRequest(out, backend, br)
+}
+
+func normalizeForwardHTTPRequest(out *http.Request) {
+	out.RequestURI = ""
 	out.URL.Scheme = "http"
 	if out.Host != "" {
 		out.URL.Host = out.Host
@@ -265,8 +280,11 @@ func ForwardHTTPOnce(r *http.Request, backend net.Conn, br *bufio.Reader, mutate
 	}
 	out.Close = true
 	removeHopHeaders(out.Header)
-	if mutate != nil {
-		mutate(out)
+}
+
+func writeForwardHTTPRequest(out *http.Request, backend net.Conn, br *bufio.Reader) (*http.Response, error) {
+	if br == nil {
+		br = bufio.NewReader(backend)
 	}
 	if err := out.Write(backend); err != nil {
 		return nil, err

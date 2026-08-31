@@ -7,11 +7,12 @@ a long-lived fork. An extension is trusted code compiled into `xconductor` or
 and network capabilities. The API organizes ownership and concurrency; it is
 not a security sandbox.
 
-There is one extension object per conductor or external proxy-master process.
-The framework does not discover or load plugins at runtime, maintain an
-extension registry, assign priorities, provide a dependency-injection
-container, or reserve URL namespaces. A private project can compose any modules
-it needs behind its one object.
+There is one extension object per conductor or external proxy-master process,
+and one fresh object per external proxy-worker epoch. The framework does not
+discover or load plugins at runtime, maintain an extension registry, assign
+priorities, provide a dependency-injection container, or reserve URL
+namespaces. A private project can compose any modules it needs behind the one
+object for that role and lifetime.
 
 ## Conductor object sources
 
@@ -255,13 +256,122 @@ maps and time pointers are independent copies. V1 intentionally has no traffic
 Watch. A route retained during reconnect remains queryable, so callers that
 require freshness also inspect `Routes().SyncState()`.
 
+## Proxy worker extension
+
+`BindRuntime` runs in every worker re-execution with a fresh `Runtime` value. A
+custom proxy may construct that epoch's one extension object there:
+
+```go
+type WorkerExtension interface {
+    Start(context.Context, WorkerHost) error
+}
+
+type WorkerHost interface {
+    Process() Process
+    GetRoute(string) (RouteView, bool)
+    ForwardAuthorized(http.ResponseWriter, *http.Request, ForwardRequest)
+}
+```
+
+The worker reconstructs its SHM table, listeners, update/wake channels, and
+process-local clients, constructs the Host, and waits for the required initial
+route sync before calling `Start` exactly once. A Start error prevents both
+ingress listeners from serving and lets the existing master supervisor restart
+that worker epoch. The supplied context is canceled when the epoch exits.
+
+After Start succeeds, the same object is checked once for the optional raw
+ingress capability:
+
+```go
+type IngressWrapper interface {
+    WrapIngress(http.Handler) http.Handler
+}
+```
+
+The resulting handler is frozen for the epoch and used unchanged by both the
+public data listener and conductor-facing `proxy_socket` listener. It receives
+requests before `ParseSandbox`, `ParseConnect`, or core token admission, so it
+may define a private Header/path/authentication contract, rewrite canonical
+`E2b-Sandbox-*` input and call `next`, answer locally, contact another upstream,
+or intentionally override a standard request. Unmatched requests should call
+`next` when built-in behavior is desired. MMDS does not use this wrapper.
+Returning nil aborts the worker epoch; panics are not recovered. A nil worker
+extension or one without `IngressWrapper` uses the original core handler object
+directly.
+
+### Worker route point lookup
+
+`GetRoute` returns an independent public `RouteView` copied from the worker's
+current SHM point lookup. It exposes the same existing non-secret route fields
+and revision used by the master projection, not the raw SHM record, router,
+tokens, or mutable pointers. Worker V1 deliberately has no route Watch; dynamic
+route observation remains master-only. This small surface is API discipline,
+not a security boundary for trusted same-process code.
+
+### Authorized core forwarding
+
+`ForwardAuthorized` is for a wrapper that has already completed its private
+authentication but wants to reuse the core route and transport pipeline:
+
+```go
+type ForwardRequest struct {
+    SandboxID string
+    Target    ConnectTarget
+    Revalidate func(context.Context) error
+    Rewrite    func(*http.Request) error
+}
+```
+
+It owns `http.ResponseWriter` and completes the response on every success or
+failure path; callers must return without writing another error after it does.
+It intentionally does not verify Kuasar's `X-Access-Token`. A wrapper that needs
+that token contract should canonicalize the request and call `next` instead.
+
+The fixed sequence is side-effect-free route lookup and target validation,
+traffic parking, `ActivateRoute`/Wake plus binding revalidation, optional
+`Revalidate`, backend dial, ordinary HTTP or CONNECT transport, and traffic
+close/idle accounting. `Revalidate` runs after activation but before dial, so a
+private registration, policy generation, or lease revision can fence a resumed
+route. Its private error detail is logged and the client receives only a fixed
+stale-policy response; no old backend is dialed.
+
+For ordinary HTTP, `Rewrite` receives an independent guest-facing request clone.
+The core performs final hop-header and transport normalization after the
+callback and writes no guest request bytes if it fails. CONNECT has no guest
+HTTP request and never invokes `Rewrite`. Native exec targets are rejected by
+this generic helper: standard exec continues through `next` and its KAT plus
+per-command CEL path. The helper uses the repository's current ordinary HTTP
+and CONNECT transport and does not implement WebSocket support.
+
+## Transparent external fallback
+
+In external mode the conductor no longer rejects a non-API request merely
+because its Header or path is not canonical. It first selects one registered
+`proxy_socket`: a side-effect-free canonical parse retains stable SandboxID
+affinity when possible; otherwise `Host`, method, and URL path form a stable
+fallback hash. Parse failure changes only this affinity hint.
+
+The conductor writes the original ordinary HTTP or CONNECT request once to that
+socket and reads one response, without buffering the complete body or retrying
+after body bytes have been sent. The worker raw wrapper and built-in handler are
+the final parser. A successful CONNECT reuses the existing buffer-preserving,
+half-close tunnel; a non-200 worker response is forwarded. Without a worker
+extension, the built-in worker still produces the existing canonical parser,
+token, and target errors.
+
+This transparency is node-local. Cluster router, registry, and placer do not
+gain extensions or private ingress: a private deployment must canonicalize a
+cluster request at its outer boundary before using the existing canonical
+cluster path.
+
 ## Boundaries
 
-A nil conductor or proxy-master extension preserves the built-in startup and
-request behavior: no event hub, watcher goroutine, lifecycle callback, or
-wrapper is created. Cluster router, registry, and placer do not have extension
-objects; node-local Hooks and observation do not change node-link ACK, exact
-replay, idempotency, or stable SandboxID to NodeSandboxID authority.
+A nil conductor, proxy-master, or proxy-worker extension preserves the built-in
+startup and request behavior: no event hub, watcher goroutine, lifecycle
+callback, or wrapper is created. Cluster router, registry, and placer do not
+have extension objects; node-local Hooks and observation do not change
+node-link ACK, exact replay, idempotency, or stable SandboxID to NodeSandboxID
+authority.
 
 This API has no namespace, fixed extension URI, dynamic loading, hot reload, or
 component compatibility version. WebSocket transport is outside Issue #256 and
