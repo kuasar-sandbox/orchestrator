@@ -121,6 +121,10 @@ type Orchestrator struct {
 	resourceControllerSocketIdentity string
 	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
 	removeBuildRuntimeDir            func(string) error
+	// extensionObserver is nil in the built-in path. The one nil branch at each
+	// committed transition avoids hubs, queues, and background work otherwise.
+	extensionObserver    ExtensionObserver
+	extensionBuildEvents keyedLockGroup
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -392,6 +396,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	initial := cloneSandbox(sb)
 	o.cache(initial)
 	o.publishUpsert(initial)
+	o.observeSandboxUpsert(initial)
 	if barrier != nil {
 		barrierStarted := time.Now()
 		o.publishRouteBarrier(barrier.ID())
@@ -444,8 +449,13 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 			if !changed {
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
 			}
+			deleted := o.lookup(sid)
 			o.uncache(sid)
 			o.publishDelete(sid)
+			if deleted == nil {
+				deleted = &types.Sandbox{ID: sid}
+			}
+			o.observeSandboxDelete(deleted)
 			return firstErr
 		}
 		if firstErr == nil {
@@ -607,7 +617,6 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		}
 		return launchFailed("resources", ownershipErr)
 	}
-
 	p := o.sandboxParams(sb, tmpl, spec, network, preparation.Resources)
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return launchFailed("config", err)
@@ -624,6 +633,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if getErr == nil && current != nil && current.State == types.StateStarting && current.RunID == "" && current.VswitchPort == sb.VswitchPort {
 		o.cache(current)
 		o.publishUpsert(current)
+		o.observeSandboxUpsert(current)
 	}
 	unlock()
 	if getErr != nil {
@@ -670,6 +680,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		// Publish the incarnation-bound starting route first so an external MMDS
 		// worker can mint tokens during mandatory envd initialization.
 		o.publishUpsert(bound)
+		o.observeSandboxUpsert(bound)
 		commitFinished = time.Now()
 		return nil
 	})
@@ -760,6 +771,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	sb.State = types.StateRunning
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
+	o.observeSandboxUpsert(running)
 	return nil
 }
 
@@ -923,8 +935,18 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			return errors.Join(firstCleanupErr, firstStoreErr)
 		}
 		if attempt.Kind() == launchCreate {
+			dead, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				o.log.Error("reload rolled-back sandbox failed", "sid", sb.ID, "err", getErr)
+			}
 			o.uncache(sb.ID)
 			o.publishDelete(sb.ID)
+			if dead == nil {
+				dead = cloneSandbox(sb)
+				dead.State = types.StateDead
+				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
+			}
+			o.observeSandboxUpsert(dead)
 			unlock()
 			cancel()
 			return errors.Join(firstCleanupErr, firstStoreErr)
@@ -944,6 +966,7 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 				}
 				o.cache(paused)
 				o.publishUpsert(paused)
+				o.observeSandboxUpsert(paused)
 				unlock()
 				cancel()
 				return errors.Join(firstCleanupErr, firstStoreErr)
@@ -1028,6 +1051,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	o.clearDeadlineIntent(id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
+	o.observeSandboxDelete(sb)
 	return true, nil
 }
 
@@ -1131,6 +1155,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		o.log.Warn("pause: detach vswitch port", "sid", paused.ID, "port", paused.VswitchPort, "err", err)
 	}
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
+	o.observeSandboxUpsert(paused)
 	return nil
 }
 
@@ -1368,7 +1393,11 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 				return nil, nil, err
 			}
 			sb.DeadlineUnix = *requestedDeadline
-			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			updated := o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			if updated == nil {
+				updated = sb
+			}
+			o.observeSandboxUpsert(updated)
 		}
 		return cloneSandbox(sb), nil, nil
 	case types.StateStarting:
@@ -1382,7 +1411,11 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 				return nil, nil, err
 			}
 			sb.DeadlineUnix = *requestedDeadline
-			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			updated := o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			if updated == nil {
+				updated = sb
+			}
+			o.observeSandboxUpsert(updated)
 		}
 		attempt, found := o.launches.Lookup(sid)
 		if !found {
@@ -1469,6 +1502,7 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 		starting.PortMAC = ""
 		o.cache(starting)
 		o.publishUpsert(starting)
+		o.observeSandboxUpsert(starting)
 		work := cloneSandbox(starting)
 		o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
 			return o.runLaunch(launchCtx, current, work, tmpl, launchPreparation)
@@ -1499,7 +1533,11 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		return false, err
 	}
 	sb.DeadlineUnix = deadline
-	o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
+	updated := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
+	if updated == nil {
+		updated = sb
+	}
+	o.observeSandboxUpsert(updated)
 	if sb.State == types.StatePaused {
 		o.markDeadlineIntent(id)
 	} else if sb.State == types.StateStarting {
@@ -1946,6 +1984,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		}
 		if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
+			o.observeSandboxUpsert(sb)
 		} else {
 			dead = append(dead, sb)
 		}
@@ -1985,13 +2024,26 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			// restart. The intent is consumed by the next exact-run success.
 			o.markDeadlineIntent(sb.ID)
 		}
+		if changed {
+			updated, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				return getErr
+			}
+			if updated != nil {
+				o.observeSandboxUpsert(updated)
+			}
+		}
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
 		}
-		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
+		if err := o.st.SetState(ctx, sb.ID, types.StateDead); err == nil {
+			updated := cloneSandbox(sb)
+			updated.State = types.StateDead
+			o.observeSandboxUpsert(updated)
+		}
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
 	// pool instance because their old WaitAssignment request belonged to the

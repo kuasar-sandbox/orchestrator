@@ -107,6 +107,8 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 			return fmt.Errorf("wait for build phase %s sandbox %s resource release: %w", phase, sandboxID, err)
 		}
 	}
+	unlockEvent := o.lockExtensionBuildEvent(buildID)
+	defer unlockExtensionEvent(unlockEvent)
 	if err := o.st.SetBuildPhase(ctx, buildID, phase, sandboxID, state); err != nil {
 		if errors.Is(err, store.ErrBuildExecutionOwnership) {
 			return configsock.RejectBuildReport(err)
@@ -115,6 +117,13 @@ func (o *Orchestrator) PostBuildPhase(ctx context.Context, runID, buildID, phase
 	}
 	o.log.Info("build phase", "bid", buildID, "run_id", runID, "phase", phase,
 		"sandbox_id", sandboxID, "state", state)
+	observed := cloneBuildForObservation(pend.build)
+	if state == "finished" {
+		observed.Phase, observed.PhaseSandboxID = "", ""
+	} else {
+		observed.Phase, observed.PhaseSandboxID = phase, sandboxID
+	}
+	o.observeBuildUpsert(observed)
 	return nil
 }
 
