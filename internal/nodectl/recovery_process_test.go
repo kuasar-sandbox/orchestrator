@@ -41,7 +41,7 @@ func runRecoveryControllerHelper(t *testing.T) {
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
 	}
-	admission.SetWiring(state, nil, func(string, ...any) {}, func(p *PendingAdmit) (*Message, error) {
+	admission.SetWiring(state, nil, func(p *PendingAdmit) (*Message, error) {
 		return srv.BuildAdmitOKFromQueue(p)
 	})
 	admission.Run()

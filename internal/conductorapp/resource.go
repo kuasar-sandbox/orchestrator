@@ -3,7 +3,6 @@ package conductorapp
 import (
 	"context"
 	"fmt"
-	"log"
 	"log/slog"
 	"math"
 	"time"
@@ -66,11 +65,12 @@ var _ orch.ResourceProbe = ResourceProbe{}
 var _ orch.SandboxResourceProvider = ResourceProbe{}
 
 func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceListenConfig, resolved *nodectl.Resolved, managedRunRoot string, logger *slog.Logger) (orch.ResourceProbe, error) {
-	if cfg.StatePath != "" {
-		logger.Warn("resource_listen.state_path is deprecated and ignored", "state_path", cfg.StatePath)
-	}
 	if resolved == nil {
 		return nil, fmt.Errorf("resolved resource_listen configuration is required")
+	}
+	resourceLogger := logger.With("component", "resource-controller")
+	if cfg.StatePath != "" {
+		resourceLogger.Warn("resource_listen.state_path is deprecated and ignored", "state_path", cfg.StatePath)
 	}
 	state := nodectl.NewState(
 		resolved.PhysicalMemory, resolved.PhysicalCPU,
@@ -79,46 +79,40 @@ func StartResourceController(ctx context.Context, cfg *publicconfig.ResourceList
 	)
 	admission := nodectl.NewAdmissionController(resolved.Admission)
 	allocator := nodectl.NewAllocator(resolved.Allocator)
-	auditor, auditErr := nodectl.NewAuditor(resolved.AuditPath)
-	if auditErr != nil {
-		log.Printf("[node-ctl resource] audit log disabled (%v)", auditErr)
-	}
+	inventoryLogger := resourceLogger.With("subsystem", "inventory")
 	server := &nodectl.Server{
 		Path: resolved.Listen, Identity: resolved.SocketIdentity,
 		State: state, Admission: admission, Allocator: allocator,
 		Inventory: &nodectl.Inventory{
 			ControllerSocket: resolved.SocketIdentity, CgroupScanPaths: resolved.CgroupScanPaths,
 			ManagedRunRoot: managedRunRoot, Pool: state.AllocatablePool,
-			Logf: func(format string, args ...any) { log.Printf("[node-ctl resource inventory] "+format, args...) },
+			Logf: func(format string, args ...any) { inventoryLogger.Info(fmt.Sprintf(format, args...)) },
 		},
-		Auditor: auditor,
-		Logf:    func(format string, args ...any) { log.Printf("[node-ctl resource] "+format, args...) },
+		Logf: func(format string, args ...any) { resourceLogger.Info(fmt.Sprintf(format, args...)) },
 	}
 	if err := server.Listen(); err != nil {
-		auditor.Close()
 		return nil, err
 	}
-	admission.SetWiring(state, auditor,
-		func(format string, args ...any) { log.Printf("[node-ctl resource admit] "+format, args...) },
+	admission.SetWiring(state, resourceLogger.With("subsystem", "admission"),
 		func(pending *nodectl.PendingAdmit) (*nodectl.Message, error) {
 			return server.BuildAdmitOKFromQueue(pending)
 		},
 	)
 	admission.Run()
+	sweeperLogger := resourceLogger.With("subsystem", "sweeper")
 	sweeper := &nodectl.IdleSweeper{
 		State: state, Admission: admission, Allocator: allocator, Inventory: server.Inventory,
 		StartupTTL: resolved.Admission.StartupTTL, Heartbeat: 30 * time.Second, Interval: 10 * time.Second,
-		Logf: func(format string, args ...any) { log.Printf("[node-ctl resource sweep] "+format, args...) },
+		Logf: func(format string, args ...any) { sweeperLogger.Info(fmt.Sprintf(format, args...)) },
 	}
 	go sweeper.Run(ctx)
-	logger.Info("resource controller listening (resource_listen)", "socket", resolved.Listen,
+	resourceLogger.Info("resource controller listening (resource_listen)", "socket", resolved.Listen,
 		"pool_mib", state.AllocatablePool.MemoryBytes>>20, "host_reserved_mib", resolved.HostReserved.MemoryBytes>>20)
 	go func() {
 		if err := server.Serve(ctx); err != nil {
-			logger.Error("resource controller", "err", err)
+			resourceLogger.Error("resource controller", "err", err)
 		}
 		admission.Stop()
-		auditor.Close()
 	}()
 	return ResourceProbe{state: state, admission: admission}, nil
 }

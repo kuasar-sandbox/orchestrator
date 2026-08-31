@@ -154,7 +154,6 @@ type ResourceListenConfig struct {
 	Enabled         bool                     `yaml:"enabled" json:"enabled"`
 	Socket          string                   `yaml:"socket" json:"socket"`                       // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
 	StatePath       string                   `yaml:"state_path" json:"state_path"`               // deprecated and ignored; retained only so older YAML still parses
-	AuditPath       string                   `yaml:"audit_path" json:"audit_path"`               // audit log (tmpfs); default /run/node-ctl/audit.log
 	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths" json:"cgroup_scan_paths"` // restart recovery roots for populated sandbox cgroups
 	Resources       ResourceHostConfig       `yaml:"resources" json:"resources"`                 // node physical capacity + host reservation
 	Watermarks      ResourceWatermarksConfig `yaml:"watermarks" json:"watermarks"`               // zone thresholds (fractions of allocatable pool)
@@ -205,9 +204,6 @@ type ResourceAdmissionConfig struct {
 // owns that protocol constant. Exported so nodectl.Resolve can default a config
 // block built outside config.Load (e.g. in tests).
 func (r *ResourceListenConfig) ApplyDefaults() {
-	if r.AuditPath == "" {
-		r.AuditPath = "/run/node-ctl/audit.log"
-	}
 	if len(r.CgroupScanPaths) == 0 {
 		r.CgroupScanPaths = []string{
 			"/sys/fs/cgroup/sandbox.slice/sandbox-runner.slice",

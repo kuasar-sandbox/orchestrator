@@ -25,7 +25,6 @@ type Server struct {
 	Allocator *Allocator
 	Inventory *Inventory
 	Owner     *OwnerLock
-	Auditor   *Auditor // optional
 	Logf      func(string, ...any)
 
 	listener net.Listener
@@ -320,7 +319,7 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 		}
 
 	case OutcomeShortTermBlock:
-		entry, ok := s.Admission.Enqueue(req, conn, peerPID)
+		_, ok := s.Admission.Enqueue(req, conn, peerPID)
 		if !ok {
 			return &Message{
 				Type:   TypeAdmitResponse,
@@ -328,10 +327,6 @@ func (s *Server) handleAdmit(conn net.Conn, peerPID int, req *Message, token *st
 				Reason: "queue_full",
 				Msg:    "admission queue at capacity",
 			}
-		}
-		if s.Auditor != nil {
-			s.Auditor.Logf("admit_queued sid=%s pos=%d block=%d",
-				req.SandboxID, entry.queuedPos, int(oc.Block))
 		}
 		// nil → serveConn loop skips this write; the admission worker
 		// will write Admitted/Rejected when the head is processed. The
@@ -401,11 +396,6 @@ func (s *Server) buildAdmitOK(conn net.Conn, peerPID int, req *Message, token *s
 
 	s.Logf("admit %s sid=%s initial_budget=%d",
 		t[:8], req.SandboxID, spec.InitialBudget)
-	if s.Auditor != nil {
-		s.Auditor.Logf("admit token=%s sid=%s initial_budget=%d capacity_memory=%d headroom_memory=%d",
-			t[:8], req.SandboxID, spec.InitialBudget,
-			req.CapacityMemoryBytes, req.FloorMemoryBytes)
-	}
 	return &Message{
 		Type:                TypeAdmitResponse,
 		Token:               t,
@@ -566,10 +556,6 @@ func (s *Server) handleRelease(req *Message, token string) *Message {
 
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
 		token[:8], res.SandboxID, req.Reason, wasPreSettled)
-	if s.Auditor != nil {
-		s.Auditor.Logf("release token=%s sid=%s reason=%s reservation_at_release=%d pre_settled=%v",
-			token[:8], res.SandboxID, req.Reason, res.ReservationMemory, wasPreSettled)
-	}
 	return &Message{Type: TypeAck}
 }
 
