@@ -105,6 +105,9 @@ app := proxy.New(proxy.Hooks{
     },
     BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
         // bind process-local logger / TLS provider
+        if process.Role == proxy.RoleMaster {
+            rt.MasterExtension = newMasterExtension()
+        }
         return nil
     },
 })
@@ -117,8 +120,12 @@ if err := app.Run(); err != nil {
 `RunContext`。零值/nil App 在 signal、component bootstrap 或 worker bootstrap 处理前返回
 必须由 `proxy.New` 构造的明确错误。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
 `paths.proxy_executable` 未改变 → final validation → 再 deep-clone/canonical serialize/digest
-冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Hook、provider 或 final validation
-失败时尚未创建 SHM、listener、routesync session 或 worker。
+冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Configure Hook、provider 或 final
+validation 失败时尚未创建 SHM、listener、routesync session 或 worker。若设置
+`MasterExtension`，core 创建共享路由表与进程内 traffic aggregate 后调用其
+`Start(ctx, MasterHost)` 恰好一次；Start 失败时尚未绑定 listener、启动 routesync 或 worker，
+已建 SHM 会清理。Start 成功后同一对象的可选 `ManagementWrapper` 能包装
+`stats_socket` handler；能力只检查一次并冻结，返回 nil handler 会中止启动。
 
 worker 固定由 master 的 `/proc/self/exe` reexec：内置 master 得到 node-ctl worker，custom master
 得到 xproxy worker，配置中的 executable 不参与选择。master 通过另一 sealed memfd 传递 frozen
@@ -127,17 +134,33 @@ wake/notify、stats、MMDS RPC 等作为继承 FD 传入。worker 严格验证�
 `BindRuntime(worker)`，完成 stats hello/ready 与初始 route-table sync 后才 Serve。worker 从不读取
 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响 replacement worker。
 
-公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，V1 仅开放 logger
-和启动期 TLS material provider；provider 返回 certificate chain、`crypto.Signer` 与可选 client
-CA pool，不能替换任意 `*tls.Config`。provider 非 nil 即为权威来源，错误不回退 cert/key 文件；
-最低 TLS version、HTTP/2 ALPN 与 client-auth 策略仍由 core 固定。V1 不支持配置或材料热更新，
-custom component 与 node-ctl 必须来自兼容版本。
+公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
+启动期 TLS material provider 与一个可信、静态编译的 `MasterExtension`。provider 返回
+certificate chain、`crypto.Signer` 与可选 client CA pool，不能替换任意 `*tls.Config`。
+provider 非 nil 即为权威来源，错误不回退 cert/key 文件；最低 TLS version、HTTP/2 ALPN 与
+client-auth 策略仍由 core 固定。V1 不支持配置、材料或 Extension 热更新，custom component
+与 node-ctl 必须来自兼容版本。
 
-该 API 只对应 external proxy，不为 `proxy.mode=internal` 增加 factory；也不开放 Router、SHM、
-listener、routesync、stats、dial target 或 credential records，不引入 Go plugin、运行时发现、
-middleware、生命周期 hook、通用 secret resolver 或 DI container。`node-ctl config proxy` 只做
-declarative/bootstrap 与 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或
-用诊断命令 EUID 代替实际启动的 runtime owner 校验。
+`MasterHost.Routes()` 提供 applied route 的 `Get`、generation-based `Watch` 与
+`SyncState(initializing|syncing|synced|stale)`。完整 generation 是
+`sync_begin → snapshot upsert* → sync_end`，之后按发布顺序发送 live upsert/delete；断线发送
+`sync_lost`。慢 watcher 只使自身 generation 失效并自动 full resync；允许重复、不保证观察到
+每个中间变化，也不是 durable audit。View 复制身份、profile/template/state/RunID、当前 endpoint、
+snapshot location、fingerprint 与 route revision，不复制原始 secret/token，也不增加 route metadata
+或 SHM schema。observer 只在 core SHM apply 成功后非阻塞发布，绝不影响 routesync、barrier ACK、
+Wake 或 worker notification。
+
+`MasterHost.Traffic().Get` 以当前 route identity 直接读取 master 的进程内 worker aggregate，
+不经 stats UDS 回环，返回 map/pointer 副本；V1 没有 Traffic Watch。断线期间保留 route 仍可查询，
+要求新鲜度的调用者同时检查 Route `SyncState`。Management wrapper 可添加、覆盖或透传任意本地
+route；框架不保留 namespace、不做 route conflict 检测，也不规定认证。
+
+该 API 只对应 external proxy，不为 `proxy.mode=internal` 增加 factory；也不开放原始 Router、
+SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
+可选 management wrapper 外，不引入 Go plugin、运行时发现、多 Extension registry、通用 lifecycle
+hook、secret resolver 或 DI container。`node-ctl config proxy` 只做 declarative/bootstrap 与
+executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
+启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md](extensions.md)。
 
 ## 3. 部署模式
 

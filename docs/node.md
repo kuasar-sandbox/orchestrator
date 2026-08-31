@@ -539,7 +539,17 @@ xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runne
 到 xproxy，失败不回退。xproxy 必须经 `node-ctl proxy serve` 启动，不能独立运行。公共
 `app/proxy` 只开放 `New(Hooks)`、one-shot `Run`/`RunContext`、master-only `Configure` 及
 master/every-worker `BindRuntime`；`Config` 是声明式值，`Runtime` 是不可序列化的 logger/TLS
-material provider。provider 非 nil 时权威，错误不回退文件，TLS policy 仍由 core 固定。
+material provider，并可在 master 绑定一个可信、静态编译的 `MasterExtension`。provider 非 nil
+时权威，错误不回退文件，TLS policy 仍由 core 固定。
+
+master 创建共享 route table 与 traffic aggregate 后、绑定任何 listener 或启动 routesync/worker
+前，恰好调用一次 `MasterExtension.Start(ctx, MasterHost)`；失败清理 SHM 并中止。Host 的
+RouteSource 提供 applied route `Get+Watch+SyncState`，generation/resync 允许重复且不是 durable
+audit；TrafficSource 直接读进程内聚合，不走 stats UDS。observer 只在 core apply 成功后有界、
+非阻塞发布，慢 callback 不影响 SHM、routesync、barrier ACK、Wake 或 worker。Start 后同一对象
+的可选 `ManagementWrapper` 可添加、覆盖或透传 `stats_socket` route；没有 namespace 或 conflict
+registry。公共 View 不复制原始 secret/token，也不新增 route metadata 或 SHM schema。详见
+[extensions.md](extensions.md)。
 
 master 在 Configure/final validation 后 deep-clone、canonical serialize 并 digest 冻结
 EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式是 node-ctl，custom 模式是
@@ -549,8 +559,10 @@ identity，调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync�
 不得改变它。V1 不支持热更新，custom component 与 node-ctl 必须来自兼容版本。完整 API、
 示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy.md) §2.1。
 
-该扩展仅覆盖 external proxy；internal proxy 不增加独立 factory，也不开放 listener、SHM、
-Router/routesync/stats 或请求热路径 Hook，不引入 plugin、middleware、生命周期 hook 或 DI。
+该扩展仅覆盖 external proxy；internal proxy 和 cluster-router/registry/placer 不增加 Extension。
+除上述 master management wrapper 外，不开放 listener、原始 SHM/Router/routesync/stats，也不
+引入 plugin registry、动态加载、通用生命周期 hook 或 DI。WebSocket 不属于 Issue #256，由
+Issue #269 独立跟踪。
 
 Builder 配置为未发布 schema 的直接切换,不保留 alias:
 

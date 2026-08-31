@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 )
 
@@ -23,15 +24,17 @@ type TLSMaterial struct {
 
 // Bindings are process-local adapters populated by the public proxy App.
 type Bindings struct {
-	Logger      *slog.Logger
-	TLSMaterial func(context.Context) (TLSMaterial, error)
+	Logger          *slog.Logger
+	TLSMaterial     func(context.Context) (TLSMaterial, error)
+	MasterExtension proxyextension.MasterExtension
 }
 
 // Runtime is fully resolved before a master creates shared state/listeners or
 // a worker advertises readiness.
 type Runtime struct {
-	Logger  *slog.Logger
-	DataTLS *tls.Config
+	Logger          *slog.Logger
+	DataTLS         *tls.Config
+	MasterExtension proxyextension.MasterExtension
 }
 
 // ResolveRuntime applies authoritative provider precedence while keeping TLS
@@ -69,7 +72,7 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Proxy, bindings Bindi
 		}
 		dataTLS = serverTLSConfig(&certificate, nil)
 	}
-	return &Runtime{Logger: logger, DataTLS: dataTLS}, nil
+	return &Runtime{Logger: logger, DataTLS: dataTLS, MasterExtension: bindings.MasterExtension}, nil
 }
 
 func certificateFromMaterial(material TLSMaterial) (*tls.Certificate, error) {
