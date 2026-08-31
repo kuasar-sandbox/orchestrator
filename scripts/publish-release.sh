@@ -123,17 +123,28 @@ release_notes_file() {
   printf '%s\n' "$notes"
 }
 
+numeric_string_is_greater() {
+  local candidate="$1" current="$2"
+  if [ "${#candidate}" -gt "${#current}" ]; then return 0; fi
+  if [ "${#candidate}" -lt "${#current}" ]; then return 1; fi
+  [[ "$candidate" > "$current" ]]
+}
+
 stable_tag_is_newer() {
   local candidate="$1" current="$2" candidate_match current_match index
-  candidate_match='^(runtime-|vmlinux-)?v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+  candidate_match='^(runtime-|vmlinux-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
   current_match="$candidate_match"
   [[ "$candidate" =~ $candidate_match ]] || return 1
   local candidate_parts=("${BASH_REMATCH[@]:2}")
   [[ "$current" =~ $current_match ]] || return 1
   local current_parts=("${BASH_REMATCH[@]:2}")
   for index in 0 1 2; do
-    if (( candidate_parts[index] > current_parts[index] )); then return 0; fi
-    if (( candidate_parts[index] < current_parts[index] )); then return 1; fi
+    if numeric_string_is_greater "${candidate_parts[index]}" "${current_parts[index]}"; then
+      return 0
+    fi
+    if numeric_string_is_greater "${current_parts[index]}" "${candidate_parts[index]}"; then
+      return 1
+    fi
   done
   [[ "$candidate" > "$current" ]]
 }

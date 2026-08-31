@@ -65,6 +65,8 @@ platform 包。平台聚合版本 `release-vX.Y.Z` 由项目主仓选择各组�
 Latest;独立的幂等 Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,
 同一提交才比较 SemVer。平台按精确 Tag 聚合组件,不依赖 Latest。当前 Release 只发布已完成全量构建与 BMS
 验证的 Linux x86_64 目标。
+同版本发布与删除共用完整 workflow mutation group;若 GitHub 合并 pending 请求,项目主仓
+协调器会把 cancelled 状态作为未完成操作自动重跑,不会把它当作发布或 GC 已完成。
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
 和 guest-runtime 构建出的 `sandbox-runtime.bundle`。
