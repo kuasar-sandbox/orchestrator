@@ -203,6 +203,19 @@ func TestResumeHookRejectsBeforeClaimAndIdempotentStatesSkipHook(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("Resume Hook calls = %d, want 1", calls.Load())
 	}
+
+	stored.State = types.StateStarting
+	stored.RunID = ""
+	if err := fixture.o.st.Put(fixture.ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.cache(stored)
+	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0); err != nil {
+		t.Fatalf("idempotent starting Connect = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("running/starting idempotent Resume Hook calls = %d, want 1", calls.Load())
+	}
 }
 
 func TestResumeHookResultIsRejectedAfterIncarnationChanges(t *testing.T) {
