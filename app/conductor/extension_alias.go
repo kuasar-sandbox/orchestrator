@@ -4,6 +4,9 @@ import conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/
 
 type Extension = conductorextension.Extension
 type Host = conductorextension.Host
+type APIWrapper = conductorextension.APIWrapper
+type SandboxHook = conductorextension.SandboxHook
+type BuildHook = conductorextension.BuildHook
 type Profile = conductorextension.Profile
 type SandboxSource = conductorextension.SandboxSource
 type SandboxView = conductorextension.SandboxView
@@ -24,6 +27,21 @@ type BuildRegistryOptions = conductorextension.BuildRegistryOptions
 type BuildRegistryTLSOptions = conductorextension.BuildRegistryTLSOptions
 type BuildEvent = conductorextension.BuildEvent
 type BuildEventKind = conductorextension.BuildEventKind
+type SandboxOperation = conductorextension.SandboxOperation
+type SandboxOperationKind = conductorextension.SandboxOperationKind
+type SandboxOperationOrigin = conductorextension.SandboxOperationOrigin
+type SandboxCreateRequest = conductorextension.SandboxCreateRequest
+type SandboxPauseRequest = conductorextension.SandboxPauseRequest
+type SandboxResumeRequest = conductorextension.SandboxResumeRequest
+type SandboxDeleteRequest = conductorextension.SandboxDeleteRequest
+type BuildOperation = conductorextension.BuildOperation
+type BuildOperationKind = conductorextension.BuildOperationKind
+type BuildOperationOrigin = conductorextension.BuildOperationOrigin
+type BuildRegisterRequest = conductorextension.BuildRegisterRequest
+type BuildTriggerRequest = conductorextension.BuildTriggerRequest
+type BuildResourcePatch = conductorextension.BuildResourcePatch
+
+var ErrRejected = conductorextension.ErrRejected
 
 const (
 	ProfileE2B  = conductorextension.ProfileE2B
@@ -56,4 +74,20 @@ const (
 	BuildUpsert    = conductorextension.BuildUpsert
 	BuildRemove    = conductorextension.BuildRemove
 	BuildSyncEnd   = conductorextension.BuildSyncEnd
+
+	SandboxOperationCreate = conductorextension.SandboxOperationCreate
+	SandboxOperationPause  = conductorextension.SandboxOperationPause
+	SandboxOperationResume = conductorextension.SandboxOperationResume
+	SandboxOperationDelete = conductorextension.SandboxOperationDelete
+
+	SandboxOriginDirect  = conductorextension.SandboxOriginDirect
+	SandboxOriginCluster = conductorextension.SandboxOriginCluster
+	SandboxOriginProxy   = conductorextension.SandboxOriginProxy
+	SandboxOriginExec    = conductorextension.SandboxOriginExec
+
+	BuildOperationRegister = conductorextension.BuildOperationRegister
+	BuildOperationTrigger  = conductorextension.BuildOperationTrigger
+
+	BuildOriginDirect  = conductorextension.BuildOriginDirect
+	BuildOriginCluster = conductorextension.BuildOriginCluster
 )

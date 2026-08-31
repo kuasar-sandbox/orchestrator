@@ -124,14 +124,19 @@ type Build struct {
 	// initial confidential MMDS values. It lets an exact registration replay be
 	// verified after terminal cleanup has deliberately removed the ciphertext.
 	RegistrationMMDSValuesDigest string
-	StartCmd                     string // e2b only; non-empty => snapshot build (kind=snp)
-	ReadyCmd                     string // e2b only; readiness probe run after StartCmd (poll until exit 0)
-	Steps                        []TemplateStep
-	Status                       BuildState
-	Reason                       string   // error detail
-	RunID                        string   // current systemd builder runner instance id
-	Names                        []string // user-supplied name(s) + persist id (when ready)
-	Aliases                      []string // user-supplied alias(es) + persist id (when ready)
+	// RegistrationRequestDigest is a tenant-keyed identity of the original
+	// canonical cluster BuildRegister command before an Extension may modify its
+	// mutable candidate. Exact ACK replay checks this digest without re-running
+	// the Hook or retaining its confidential input in plaintext.
+	RegistrationRequestDigest string
+	StartCmd                  string // e2b only; non-empty => snapshot build (kind=snp)
+	ReadyCmd                  string // e2b only; readiness probe run after StartCmd (poll until exit 0)
+	Steps                     []TemplateStep
+	Status                    BuildState
+	Reason                    string   // error detail
+	RunID                     string   // current systemd builder runner instance id
+	Names                     []string // user-supplied name(s) + persist id (when ready)
+	Aliases                   []string // user-supplied alias(es) + persist id (when ready)
 	// Resources is the immutable outer Build demand used by registration and
 	// execution admission plus systemd enforcement. It never becomes sandbox
 	// capacity/allocatable/startup and never enters a snapshot.

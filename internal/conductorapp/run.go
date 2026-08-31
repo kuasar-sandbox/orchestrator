@@ -3,12 +3,14 @@ package conductorapp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
@@ -92,8 +94,19 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 			logger.Error("drain accepted sandbox operations", "err", err)
 		}
 	}()
-	if err := startExtension(ctx, runtime, storage, core); err != nil {
+	startedExtension, err := startExtension(ctx, runtime, storage, core)
+	if err != nil {
 		return err
+	}
+	var apiHandler http.Handler
+	if startedExtension != nil {
+		apiHandler = newAPIHandler(cfg, core, logger)
+		if startedExtension.api != nil {
+			apiHandler, err = wrapExtensionAPI(startedExtension.api, apiHandler)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
@@ -187,15 +200,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		core.SetSandboxTrafficProvider(&ExternalTrafficProvider{Plugins: plugins})
 	}
 
-	diskMB := 0
-	if info, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
-		diskMB = int(info.Size() >> 20)
+	if apiHandler == nil {
+		apiHandler = newAPIHandler(cfg, core, logger)
 	}
-	resources := api.Resources{
-		VCPU:     configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU,
-		MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB,
-	}
-	apiHandler := api.New(core, cfg.API.Domain, resources, logger).Handler()
 	configServer := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
@@ -295,14 +302,44 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	return appnet.Serve(ctx, listener, mux, runtime.APITLS)
 }
 
-func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store, core *orch.Orchestrator) error {
+type startedExtension struct {
+	api conductorextension.APIWrapper
+}
+
+func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store, core *orch.Orchestrator) (*startedExtension, error) {
 	if runtime.Extension == nil {
-		return nil
+		return nil, nil
 	}
 	host, observer := conductorext.New(storage)
 	core.SetExtensionObserver(observer)
 	if err := runtime.Extension.Start(ctx, host); err != nil {
-		return fmt.Errorf("conductor extension start: %w", err)
+		return nil, fmt.Errorf("conductor extension start: %w", err)
 	}
-	return nil
+	// Optional capabilities are discovered only after Start succeeds and then
+	// frozen for the process lifetime. They are not dynamic registrations.
+	sandboxHook, _ := runtime.Extension.(conductorextension.SandboxHook)
+	buildHook, _ := runtime.Extension.(conductorextension.BuildHook)
+	apiWrapper, _ := runtime.Extension.(conductorextension.APIWrapper)
+	core.SetExtensionHooks(sandboxHook, buildHook)
+	return &startedExtension{api: apiWrapper}, nil
+}
+
+func wrapExtensionAPI(wrapper conductorextension.APIWrapper, next http.Handler) (http.Handler, error) {
+	wrapped := wrapper.WrapAPI(next)
+	if wrapped == nil {
+		return nil, fmt.Errorf("conductor extension API wrapper returned nil")
+	}
+	return wrapped, nil
+}
+
+func newAPIHandler(cfg *publicconfig.Conductor, core api.Core, logger *slog.Logger) http.Handler {
+	diskMB := 0
+	if info, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
+		diskMB = int(info.Size() >> 20)
+	}
+	resources := api.Resources{
+		VCPU:     configresolve.SandboxResources(cfg.Sandbox.Resources).Capacity.CPU,
+		MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB,
+	}
+	return api.New(core, cfg.API.Domain, resources, logger).Handler()
 }

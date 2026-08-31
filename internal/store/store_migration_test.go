@@ -10,7 +10,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 )
 
-func TestOpenAddsRuntimePrepareColumnToExistingDatabase(t *testing.T) {
+func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
@@ -31,6 +31,10 @@ func TestOpenAddsRuntimePrepareColumnToExistingDatabase(t *testing.T) {
 		_ = db.Close()
 		t.Fatal(err)
 	}
+	if _, err := db.ExecContext(context.Background(), `ALTER TABLE builds DROP COLUMN registration_request_digest`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -40,12 +44,14 @@ func TestOpenAddsRuntimePrepareColumnToExistingDatabase(t *testing.T) {
 		t.Fatalf("upgrade legacy database: %v", err)
 	}
 	defer upgraded.Close()
-	var count int
-	if err := upgraded.db.QueryRowContext(context.Background(), `
-		SELECT count(*) FROM pragma_table_info('builds') WHERE name='runtime_prepare_json'`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("runtime_prepare_json columns = %d, want 1", count)
+	for _, column := range []string{"runtime_prepare_json", "registration_request_digest"} {
+		var count int
+		if err := upgraded.db.QueryRowContext(context.Background(), `
+			SELECT count(*) FROM pragma_table_info('builds') WHERE name=?`, column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s columns = %d, want 1", column, count)
+		}
 	}
 }
