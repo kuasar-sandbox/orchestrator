@@ -106,7 +106,6 @@ resource_listen:
   enabled: true
   socket: $WORK/sandbox-resource.sock
   state_path: $WORK/state.json
-  audit_path: $WORK/audit.log
   cgroup_scan_paths:
     - $CGROUP_ROOT
   resources:
@@ -134,7 +133,11 @@ EOF
     "$BIN/node-ctl" conductor serve --config "$WORK/node-ctl.yaml" >"$WORK/node-ctl.log" 2>&1 &
     DAEMON_PID=$!
     for _ in $(seq 1 80); do
-        [ -S "$WORK/sandbox-resource.sock" ] && return 0
+        if [ -S "$WORK/sandbox-resource.sock" ] \
+            && "$BIN/node-ctl" resource status \
+                --socket "$WORK/sandbox-resource.sock" >/dev/null 2>&1; then
+            return 0
+        fi
         if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
             cat "$WORK/node-ctl.log" >&2
             return 1
@@ -143,6 +146,24 @@ EOF
     done
     cat "$WORK/node-ctl.log" >&2
     return 1
+}
+
+resource_controller_settled() {
+    local reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+assert len(rows) == 1, rows
+row = rows[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+assert row.get("stage") == "settled", row
+assert row.get("recovery_source") in {"admit", "synced"}, row
+PY
 }
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
@@ -256,13 +277,29 @@ timeout -k 10s "$TIMEOUT_S" "$BIN/sandbox-ctl" run \
 SBPID=$!
 
 T_APP_NS=""
+RESOURCE_SETTLED=0
+RESOURCE_POLL_TICK=0
 while kill -0 "$SBPID" 2>/dev/null; do
-    if grep -qE "^PYBOOT-OK [0-9]+$" "$LOG" 2>/dev/null; then
+    if [ -z "$T_APP_NS" ] && grep -qE "^PYBOOT-OK [0-9]+$" "$LOG" 2>/dev/null; then
         T_APP_NS=$(date +%s%N)
+    fi
+    # Before app output, sample at 250 ms to avoid perturbing the cold path.
+    # Once the short-lived workload has printed, poll continuously until the
+    # trusted settled reservation is observed or sandbox-ctl exits.
+    if [ "$RESOURCE_SETTLED" -eq 0 ] \
+        && { [ -n "$T_APP_NS" ] || [ $((RESOURCE_POLL_TICK % 50)) -eq 0 ]; } \
+        && resource_controller_settled; then
+        RESOURCE_SETTLED=1
+    fi
+    if [ -n "$T_APP_NS" ] && [ "$RESOURCE_SETTLED" -eq 1 ]; then
         break
     fi
+    RESOURCE_POLL_TICK=$((RESOURCE_POLL_TICK + 1))
     sleep 0.005
 done
+if [ "$RESOURCE_SETTLED" -eq 1 ] || resource_controller_settled; then
+    RESOURCE_SETTLED=1
+fi
 wait "$SBPID"
 EXIT=$?
 T_END_NS=$(date +%s%N)
@@ -396,8 +433,8 @@ grep -q "initial cold Budget reserved=${want_initial_budget}" "$LOG" || {
     echo "==> FAIL: sandbox-ctl did not retain InitialBudget ${want_initial_budget}"
     exit 1
 }
-grep -q "settled .* sid=" "$WORK/node-ctl.log" 2>/dev/null || {
-    echo "==> FAIL: resource controller did not record settled transition"
+[ "$RESOURCE_SETTLED" -eq 1 ] || {
+    echo "==> FAIL: resource list never exposed a connected settled reservation"
     exit 1
 }
 

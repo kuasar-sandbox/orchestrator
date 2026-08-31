@@ -208,6 +208,7 @@ func TestConfigJSONRoundTripAndNoInternalTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.ResourceListen = &config.ResourceListenConfig{Enabled: true}
 	b, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +222,9 @@ func TestConfigJSONRoundTripAndNoInternalTypes(t *testing.T) {
 	}
 	if cfg.Sandbox.Resources.Allocatable.Memory != nil || round.Sandbox.Resources.Allocatable.Memory != nil {
 		t.Fatalf("JSON round trip lost inherited resource presence: before=%+v after=%+v", cfg.Sandbox.Resources, round.Sandbox.Resources)
+	}
+	if strings.Contains(string(b), "audit_path") {
+		t.Fatalf("public config JSON contains removed resource_listen.audit_path: %s", b)
 	}
 
 	seen := map[reflect.Type]bool{}

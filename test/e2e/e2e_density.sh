@@ -77,7 +77,6 @@ declare -a SANDBOX_SIDS=()
 dump_logs_on_fail() {
     echo "==> failure: dumping last 80 lines of relevant logs"
     [ -f "$WORK/daemon.log" ] && { echo "--- daemon.log ---"; tail -80 "$WORK/daemon.log"; }
-    [ -f "$WORK/audit.log" ]  && { echo "--- audit.log ---";  cat "$WORK/audit.log"; }
     for f in "$WORK"/sb-*.log; do
         [ -f "$f" ] && { echo "--- ${f##*/} ---"; tail -80 "$f"; }
     done
@@ -336,7 +335,6 @@ resource_listen:
   enabled: true
   socket: $WORK/sandbox-resource.sock
   state_path: $WORK/state.json
-  audit_path: $WORK/audit.log
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandboxes
   resources:
@@ -382,7 +380,6 @@ resource_listen:
   enabled: true
   socket: $WORK/sandbox-resource.sock
   state_path: $WORK/state.json
-  audit_path: $WORK/audit.log
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandboxes
   # Sized for DETERMINISTIC creation-rate backpressure (Phase C), independent of
@@ -465,23 +462,26 @@ wait_for_workload() {
     fail "$sid: workload did not complete within ${timeout}s"
 }
 
-wait_for_controller_grant() {
-    local sid="$1" pid="$2" timeout="$3"
+wait_for_reservation_growth() {
+    local sid="$1" pid="$2" timeout="$3" baseline="$4" reservation=0
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null && return 0
-        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before a controller grant"
+        reservation=$(resource_reservation_memory "$sid") || reservation=0
+        if [[ "$reservation" =~ ^[0-9]+$ ]] && [ "$reservation" -gt "$baseline" ]; then
+            echo "$reservation"
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before reservation growth"
         sleep 0.25
     done
-    fail "$sid: controller did not grant memory within ${timeout}s"
+    fail "$sid: reservation did not grow above $baseline within ${timeout}s"
 }
 
-wait_for_b2_control_ready() {
+wait_for_dynamic_control_ready() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if grep -q "admit token=.* sid=$sid" "$WORK/audit.log" 2>/dev/null \
-            && grep -q "settled .* sid=$sid " "$WORK/daemon.log" 2>/dev/null \
+        if resource_reservation_matches "$sid" settled \
             && grep -qE 'sensor: (PSI|events_poll) mode active' "$WORK/$sid.log" 2>/dev/null \
             && grep -q 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null \
             && grep -q 'workload waiting for start gate' "$WORK/$sid.log" 2>/dev/null; then
@@ -550,20 +550,6 @@ wait_for_static_control_ready() {
         sleep 0.1
     done
     fail "$sid: static control readiness barrier not reached within ${timeout}s"
-}
-
-latest_controller_grant_alloc() {
-    local sid="$1"
-    awk -v needle="sid=$sid" '
-        index($0, " grant ") && index($0, needle) {
-            n = split($0, sides, "→ ")
-            if (n > 1) {
-                split(sides[2], fields, " ")
-                alloc = fields[1]
-            }
-        }
-        END { if (alloc != "") print alloc }
-    ' "$WORK/daemon.log"
 }
 
 read_ch_balloon_state() {
@@ -673,6 +659,64 @@ reservation_count() {
         <<<"$reservations" 2>/dev/null || echo 0
 }
 
+resource_reservation_matches() {
+    local sid="$1" mode="$2" reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    SID="$sid" MODE="$mode" RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+sid = os.environ["SID"]
+mode = os.environ["MODE"]
+matches = [row for row in rows if row.get("sandbox_id") == sid]
+assert len(matches) == 1, rows
+row = matches[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+if mode in {"settled", "synced"}:
+    assert row.get("stage") == "settled", row
+if mode == "settled":
+    assert row.get("recovery_source") in {"admit", "synced"}, row
+elif mode == "synced":
+    assert len(rows) == 1, rows
+    assert row.get("recovery_source") == "synced", row
+else:
+    raise AssertionError(f"unknown reservation mode: {mode}")
+PY
+}
+
+resource_reservation_memory() {
+    local sid="$1" reservations
+    reservations=$("$BIN/node-ctl" resource list \
+        --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || return 1
+    SID="$sid" RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+matches = [row for row in rows if row.get("sandbox_id") == os.environ["SID"]]
+assert len(matches) == 1, rows
+row = matches[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+print(row["allocatable_memory"])
+PY
+}
+
+wait_for_reservation_state() {
+    local sid="$1" pid="$2" timeout="$3" mode="$4"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        resource_reservation_matches "$sid" "$mode" && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before reservation reached $mode state"
+        sleep 0.25
+    done
+    "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >&2 2>/dev/null || true
+    fail "$sid: reservation did not reach $mode state within ${timeout}s"
+}
+
 wait_for_reservations() {
     local want="$1" timeout="$2" count=0
     local deadline=$((SECONDS + timeout))
@@ -690,10 +734,10 @@ phase_a() {
     write_default_config
     start_daemon "$WORK/node-ctl.yaml"
 
-    local sid=sb-A-1
+    local sid=sb-A-1 start_gate=/tmp/e2e-density-a.start
     setup_sb "$sid"
     # Workload: 20s, 3 grow/rest cycles, R 96-192 MiB above headroom=64 MiB.
-    emit_yaml "$sid" dynamic 64 1024 128   20 3 96 192   true
+    emit_yaml "$sid" dynamic 64 1024 128   20 3 96 192   true "$start_gate"
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -706,14 +750,16 @@ phase_a() {
 
     # Bound cold-start and workload completion independently from controller
     # activity so a fast run does not pay the full worst-case allowance.
+    wait_for_dynamic_control_ready "$sid" "$pid" 20
+    local node_reservation_baseline node_reservation
+    node_reservation_baseline=$(resource_reservation_memory "$sid") \
+        || fail "$sid: could not read precise node reservation before workload"
+    open_workload_gate "$sid" "$start_gate" start
+    node_reservation=$(wait_for_reservation_growth "$sid" "$pid" 20 "$node_reservation_baseline")
     wait_for_workload "$sid" "$pid" 40
-    wait_for_controller_grant "$sid" "$pid" 20
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
-    grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "A: no admit in audit"
-
-    local grants shrinks oom
-    grants=$(grep -c " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grants=0
+    local shrinks oom
     shrinks=$(grep -c 'memory: shrink committed Budget=' "$WORK/$sid.log" 2>/dev/null) || shrinks=0
     oom=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
@@ -722,9 +768,8 @@ phase_a() {
     fi
 
     [ "$oom" -eq 0 ] || fail "A: cgroup oom_count=$oom (Budget grow failed)"
-    [ "$grants" -gt 0 ] || fail "A: no sandbox-originated Budget grant observed"
 
-    echo "  Phase A: grants=$grants local_shrinks=$shrinks oom_count=0"
+    echo "  Phase A: granted_reservation=$node_reservation local_shrinks=$shrinks oom_count=0"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -810,9 +855,6 @@ phase_b1_static_control() {
     [ "$oom" -eq 0 ] || fail "B1: cgroup oom_count=$oom despite static local control"
     grows=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grows=0
     [ "$grows" -gt 0 ] || fail "B1: no static sandbox-local grow observed"
-    if grep -q "sid=$sid" "$WORK/audit.log" "$WORK/daemon.log" 2>/dev/null; then
-        fail "B1: node-controller activity observed for static sandbox"
-    fi
     echo "  Phase B1: local_grows=$grows grow_phase=$grow_phase target=$target_baseline->$target_after initial_target=$initial_target workload_done=1 self_cap=$self_cap cgroup_oom=0 cgroup_high=$high controller=none"
 
     shutdown_sandbox "$pid" "$sid"
@@ -855,18 +897,20 @@ phase_b2_dynamic_control() {
     # both cases the allocation remains held until the reservation is reflected
     # by CH's accepted target. Grow deliberately does not wait for
     # memory_actual_size convergence.
-    wait_for_b2_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
+    wait_for_dynamic_control_ready "$sid" "$pid" "$B2_READY_TIMEOUT"
     b2_timeline_event "$sid" "control_ready admission=1 settled=1 sensor=1 fresh_report=1"
-    local target_baseline=-1 current_baseline=-1 grow_baseline=0
+    local target_baseline=-1 current_baseline=-1 grow_baseline=0 node_reservation_baseline=0
     local initial_target=$(((B_CAP_MIB - B2_STARTUP_MIB) * 1024 * 1024))
     local grow_phase=pressure target_reference=-1
     read -r target_baseline current_baseline <<<"$(read_ch_balloon_state "$sid")"
     [[ "$target_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid pre-pressure CH target"
     [[ "$current_baseline" =~ ^[0-9]+$ ]] || fail "$sid: invalid pre-pressure CH current Budget"
     grow_baseline=$(grep -c 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_baseline=0
+    node_reservation_baseline=$(resource_reservation_memory "$sid") \
+        || fail "$sid: could not read precise node reservation before pressure"
     target_reference=$target_baseline
     if [ "$grow_baseline" -gt 0 ] && [ "$target_baseline" -lt "$initial_target" ] \
-        && grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null; then
+        && [ "$node_reservation_baseline" -gt $((B_HEADROOM_MIB * 1024 * 1024)) ]; then
         # The retained pre-pressure Budget is already a complete dynamic grow:
         # node reserved it before sandbox-ctl lowered the CH balloon target.
         grow_phase=prepressure
@@ -877,18 +921,22 @@ phase_b2_dynamic_control() {
 
     wait_for_pressure_probe "$sid" "$pid" "$B2_GRANT_TIMEOUT"
     b2_timeline_event "$sid" "pressure_probe_ready"
-    wait_for_controller_grant "$sid" "$pid" "$B2_GRANT_TIMEOUT"
+    local node_reservation
+    if [ "$grow_phase" = prepressure ]; then
+        node_reservation=$node_reservation_baseline
+    else
+        node_reservation=$(wait_for_reservation_growth \
+            "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$node_reservation_baseline")
+    fi
     if [ "$grow_phase" = pressure ]; then
         wait_for_local_grow "$sid" "$pid" "$B2_GRANT_TIMEOUT" "$grow_baseline"
     fi
 
-    local node_reservation grant_line grow_line
-    node_reservation=$(latest_controller_grant_alloc "$sid")
+    local grow_line
     [[ "$node_reservation" =~ ^[0-9]+$ ]] \
         || fail "$sid: could not parse node reservation after grant"
-    grant_line=$(grep -m1 " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grant_line="missing"
     grow_line=$(grep -m1 'memory: grow accepted Budget=' "$WORK/$sid.log" 2>/dev/null) || grow_line="missing"
-    b2_timeline_event "$sid" "grant_decision reservation=$node_reservation log=$grant_line"
+    b2_timeline_event "$sid" "grant_decision reservation=$node_reservation"
     b2_timeline_event "$sid" "grant_applied log=$grow_line"
 
     wait_for_b2_guest_delivery \
@@ -897,15 +945,12 @@ phase_b2_dynamic_control() {
     b2_timeline_event "$sid" "delivery_gate_open"
     wait_for_b2_workload "$sid" "$pid" 45
 
-    local oom=0 grants=0
+    local oom=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
         oom=$(awk '$1=="oom" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || oom=0
         [ -z "$oom" ] && oom=0
     fi
-    grants=$(grep -c " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grants=0
-
     [ "$oom" -eq 0 ]  || fail "B2: cgroup oom_count=$oom (controller couldn't prevent OOM)"
-    [ "$grants" -gt 0 ] || fail "B2: workload completed without a controller grant"
     grep -q "workload done" "$WORK/$sid.log" || fail "B2: workload did not complete"
     if guest_oom_observed "$sid"; then
         fail "B2: guest log contains OOM or SIGKILL despite controller"
@@ -914,8 +959,7 @@ phase_b2_dynamic_control() {
         b2_timeline_event "$sid" "self_cap_after_guest_delivery"
         fail "B2: guest self-cap fired before proactive control could absorb pressure"
     fi
-    grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
-    echo "  Phase B2: grants=$grants grow_phase=$grow_phase oom_count=0 workload_done=1 delivery_verified=1"
+    echo "  Phase B2: reservation=$node_reservation grow_phase=$grow_phase oom_count=0 workload_done=1 delivery_verified=1"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -1031,8 +1075,7 @@ phase_d_controller_restart() {
     local sandbox_pid=$!
     SANDBOX_PIDS+=("$sandbox_pid")
 
-    wait_for_log_pattern "$WORK/daemon.log" "settled .* sid=$sid " 20 "$sid initial Settled"
-    wait_for_reservations 1 10 >/dev/null
+    wait_for_reservation_state "$sid" "$sandbox_pid" 20 settled
     wait_for_log_pattern "$WORK/$sid.log" 'CH started pid=[0-9]+' 10 "$sid CH pid"
 
     local ch_pid sandbox_started ch_started
@@ -1050,7 +1093,7 @@ phase_d_controller_restart() {
     printf '{corrupt-state\n' >"$WORK/state.json"
     start_daemon "$WORK/node-ctl.yaml"
 
-    wait_for_log_pattern "$WORK/$sid.log" 'controller state sync restored token=' 20 "$sid StateSync"
+    wait_for_reservation_state "$sid" "$sandbox_pid" 20 synced
     kill -0 "$sandbox_pid" 2>/dev/null || fail "D: sandbox-ctl exited across controller restart"
     kill -0 "$ch_pid" 2>/dev/null || fail "D: CH exited across controller restart"
     [ "$(process_start_time "$sandbox_pid")" = "$sandbox_started" ] \
@@ -1058,30 +1101,13 @@ phase_d_controller_restart() {
     [ "$(process_start_time "$ch_pid")" = "$ch_started" ] \
         || fail "D: CH process identity changed"
 
-    local reservations
-    reservations=$("$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock") \
-        || fail "D: live reservation query failed after restart"
-    if ! SID="$sid" RESERVATIONS_JSON="$reservations" python3 - <<'PY'
-import json, os
-sid = os.environ["SID"]
-rows = json.loads(os.environ["RESERVATIONS_JSON"])
-assert len(rows) == 1, rows
-row = rows[0]
-assert row["sandbox_id"] == sid, row
-assert row["connected"] is True, row
-assert row["provisional"] is False, row
-assert row["recovery_source"] == "synced", row
-PY
-    then
-        fail "D: reservation did not converge to one connected precise StateSync view"
-    fi
-
     timeout -k 5s 20 "$BIN/sandbox-ctl" exec \
         --sandbox-id "$sid" --run-root "$WORK/run" -- /bin/true \
         >"$WORK/$sid-restart-exec.log" 2>&1 \
         || { sed 's/^/  exec| /' "$WORK/$sid-restart-exec.log"; fail "D: guest exec failed after controller restart"; }
     grep -qx '{corrupt-state' "$WORK/state.json" \
         || fail "D: deprecated state_path was read/replaced by controller"
+    [ ! -e "$WORK/audit.log" ] || fail "D: controller created removed audit.log"
 
     echo "  Phase D: sandbox_pid=$sandbox_pid ch_pid=$ch_pid reservations=1 state_sync=1"
     shutdown_sandbox "$sandbox_pid" "$sid"

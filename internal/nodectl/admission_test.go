@@ -1,7 +1,12 @@
 package nodectl
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -26,7 +31,6 @@ func newTestAdmission(t *testing.T, policy AdmissionPolicy, state *State) *Admis
 	t.Helper()
 	a := NewAdmissionController(policy)
 	a.SetWiring(state, nil,
-		func(string, ...any) {},
 		func(p *PendingAdmit) (*Message, error) { return nil, nil },
 	)
 	return a
@@ -313,11 +317,63 @@ func TestAdmission_QueueAtCap(t *testing.T) {
 	}
 }
 
+type queueLockCheckingWriter struct {
+	queueMu          *sync.Mutex
+	buf              bytes.Buffer
+	wroteWhileLocked bool
+}
+
+func (w *queueLockCheckingWriter) Write(p []byte) (int, error) {
+	if !w.queueMu.TryLock() {
+		w.wroteWhileLocked = true
+	} else {
+		w.queueMu.Unlock()
+	}
+	return w.buf.Write(p)
+}
+
+func TestAdmission_QueuedBuildFailureLogsDiagnostic(t *testing.T) {
+	state := newTestState(t, 8<<30)
+	a := NewAdmissionController(AdmissionPolicy{
+		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
+	})
+	logs := &queueLockCheckingWriter{queueMu: &a.queueMu}
+	a.SetWiring(state, slog.New(slog.NewJSONHandler(logs, nil)), func(*PendingAdmit) (*Message, error) {
+		return nil, errors.New("build failed")
+	})
+	client, server := net.Pipe()
+	defer server.Close()
+	req := &Message{
+		SandboxID: "queued-build-failure", CapacityMemoryBytes: 512 << 20,
+		FloorMemoryBytes: 128 << 20, StartupBudgetMemory: 256 << 20,
+	}
+	if _, ok := a.Enqueue(req, server, 4242); !ok {
+		t.Fatal("enqueue failed")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a.processQueue()
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["level"] != "WARN" || record["event"] != "admit_queue_build_failed" ||
+		record["sandbox_id"] != req.SandboxID || record["error"] != "build failed" {
+		t.Fatalf("queue diagnostic = %v", record)
+	}
+}
+
 func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
 	state := newTestState(t, 8<<30)
 	a := NewAdmissionController(AdmissionPolicy{
 		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
 	})
+	logs := &queueLockCheckingWriter{queueMu: &a.queueMu}
+	a.logger = slog.New(slog.NewJSONHandler(logs, nil))
 	a.state = state
 	a.processFn = func(p *PendingAdmit) (*Message, error) {
 		token := "queued-token"
@@ -346,6 +402,18 @@ func TestAdmission_QueuedWriteFailureClearsReservationConnection(t *testing.T) {
 	got := reservationForTest(t, state, req.SandboxID)
 	if got.Conn != nil {
 		t.Fatal("failed queued response retained a closed connection as liveness evidence")
+	}
+	var record map[string]any
+	if logs.wroteWhileLocked {
+		t.Fatal("queue diagnostic was written while queueMu was held")
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(logs.buf.Bytes()), &record); err != nil {
+		t.Fatalf("decode queue diagnostic: %v: %s", err, logs.buf.String())
+	}
+	if record["level"] != "WARN" || record["event"] != "admit_queue_write_failed" ||
+		record["sandbox_id"] != req.SandboxID || record["queue_position"] != float64(0) ||
+		record["error"] == "" {
+		t.Fatalf("queue diagnostic = %v", record)
 	}
 }
 

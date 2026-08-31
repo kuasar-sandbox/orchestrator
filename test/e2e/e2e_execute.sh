@@ -937,7 +937,6 @@ write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=l
   enabled: true
   socket: $WORK/sandbox-resource.sock
   state_path: $WORK/resource-state.json
-  audit_path: $WORK/resource-audit.log
   resources:
     physical_memory: auto
     physical_cpu: auto
