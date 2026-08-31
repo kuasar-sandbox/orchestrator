@@ -303,7 +303,6 @@ $FILES_STORAGE_YAML
 resource_listen:
   enabled: true
   socket: $WORK/sandbox-resource.sock
-  audit_path: $WORK/resource-audit.log
   resources:
     physical_memory: auto
     physical_cpu: auto
@@ -459,29 +458,31 @@ encoded = base64.b32hexencode(digest).decode().rstrip("=").lower()
 print(f"bp-{sys.argv[1]}-{encoded}")
 PY
 }
-wait_phase_audit() { # $1=phase, $2=build id
-    local sid
-    sid=$(phase_sandbox_id "$1" "$2")
-    for _ in $(seq 1 120); do
-        if grep -Eq "admit .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null &&
-            grep -Eq "release .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
+wait_phase_reservation() { # $1=phase, $2=build id
+    local phase="$1" bid="$2" sid reservations=""
+    sid=$(phase_sandbox_id "$phase" "$bid")
+    for _ in $(seq 1 240); do
+        reservations=$("$BIN/node-ctl" resource list \
+            --socket "$WORK/sandbox-resource.sock" 2>/dev/null) || reservations=""
+        if SID="$sid" RESERVATIONS_JSON="$reservations" python3 - 2>/dev/null <<'PY'
+import json
+import os
+
+rows = json.loads(os.environ["RESERVATIONS_JSON"])
+matches = [row for row in rows if row.get("sandbox_id") == os.environ["SID"]]
+assert len(matches) == 1, rows
+row = matches[0]
+assert row.get("connected") is True, row
+assert row.get("provisional", False) is False, row
+assert row.get("stage") == "settled", row
+assert row.get("recovery_source") in {"admit", "synced"}, row
+PY
+        then
             return 0
         fi
         sleep 0.25
     done
-    tail -100 "$WORK/resource-audit.log" >&2 2>/dev/null || true
-    return 1
-}
-wait_phase_admit() { # $1=phase, $2=build id
-    local sid
-    sid=$(phase_sandbox_id "$1" "$2")
-    for _ in $(seq 1 120); do
-        if grep -Eq "admit .*sid=$sid( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.25
-    done
-    tail -100 "$WORK/resource-audit.log" >&2 2>/dev/null || true
+    printf '%s\n' "$reservations" >&2
     return 1
 }
 wait_resource_reservations_empty() {
@@ -517,17 +518,17 @@ register() { # name [profile] → sets TID/BID
     [ "$got_profile" = "$expected_profile" ] \
         || fail "register $1 profile=$got_profile (want $expected_profile)"
 }
-assert_active_build_accounting() { # $1=tid, $2=bid
-    local tid="$1" bid="$2" code="" phase="" sid="" run_id="" reservation_json=""
+assert_active_build_accounting() { # $1=tid, $2=bid, $3=expected phase
+    local tid="$1" bid="$2" expected_phase="$3" code="" phase="" sid="" run_id="" reservation_json=""
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK" || true)
         if [ "$code" = "200" ]; then
             phase="" sid="" run_id=""
-            read -r phase sid run_id < <(python3 - "$WORK/resp.body" <<'PY'
-import json, sys
+            read -r phase sid run_id < <(EXPECTED_PHASE="$expected_phase" python3 - "$WORK/resp.body" <<'PY'
+import json, os, sys
 status = json.load(open(sys.argv[1]))
 phase = status.get("phase") or {}
-if phase.get("name") and phase.get("sandboxID") and status.get("runID"):
+if phase.get("name") == os.environ["EXPECTED_PHASE"] and phase.get("sandboxID") and status.get("runID"):
     print(phase["name"], phase["sandboxID"], status["runID"])
 PY
 ) || true
@@ -535,7 +536,7 @@ PY
         fi
         sleep 0.25
     done
-    [ -n "$phase" ] || fail "build $bid never exposed an active phase"
+    [ -n "$phase" ] || fail "build $bid never exposed active phase $expected_phase"
 
     python3 - "$WORK/resp.body" "$BUILDER_CPU_MILLI" <<'PY' || fail "active Build status resources/enforcement"
 import json, sys
@@ -857,6 +858,8 @@ register e2e-img
 B1_TID="$TID"; B1_BID="$BID"
 code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
+wait_phase_reservation a "$B1_BID" \
+    || fail "B1 phase A never exposed a connected settled nodectl reservation"
 wait_ready "$B1_TID" "$B1_BID" B1
 B1_PERSIST="$PERSIST"
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
@@ -931,7 +934,9 @@ EOF
 )
 code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
-assert_active_build_accounting "$B2_TID" "$B2_BID"
+assert_active_build_accounting "$B2_TID" "$B2_BID" b
+wait_phase_reservation c "$B2_BID" \
+    || fail "B2 phase C never exposed a connected settled nodectl reservation"
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
@@ -976,15 +981,8 @@ MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manif
 grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
 grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
 echo "==> PASS: B2 artifacts — cgroup_control + snapshot metadata + published manifest base + manifest:// overlay + merged ENV/WORKDIR"
-wait_phase_audit a "$B1_BID" || fail "B1 phase A lacked ordinary nodectl Admit/Release"
-wait_phase_admit b "$B2_BID" || fail "B2 phase B lacked ordinary nodectl Admit"
-wait_phase_audit c "$B2_BID" || fail "B2 phase C lacked ordinary nodectl Admit/Release"
 wait_resource_reservations_empty || fail "phase sandbox reservation remained after B2 completion"
-B2_PHASE_B_SID=$(phase_sandbox_id b "$B2_BID")
-if ! grep -Eq "release .*sid=$B2_PHASE_B_SID( |$)" "$WORK/resource-audit.log" 2>/dev/null; then
-    echo "==> NOTE: long phase B drained without an explicit normal Release; sandboxer#115 tracks that lifecycle race"
-fi
-echo "==> PASS: A/B/C used ordinary nodectl Admit; phases serialized and left no reservation (A/C normal Release verified)"
+echo "==> PASS: phases A/B/C used precise nodectl reservations and left no reservation"
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"

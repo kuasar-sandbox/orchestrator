@@ -2,9 +2,11 @@ package nodectl
 
 import (
 	"container/list"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -108,9 +110,8 @@ type AdmissionController struct {
 	tokenTimer *time.Timer // one-shot, set when head is BlockedByTokenBucket
 
 	// Worker fan-outs.
-	state     *State   // for budget checks
-	auditor   *Auditor // optional
-	logf      func(string, ...any)
+	state     *State // for budget checks
+	logger    *slog.Logger
 	processFn func(*PendingAdmit) (*Message, error) // builds the AdmitResponse (reservation insert etc.)
 	stopCh    chan struct{}
 	stoppedCh chan struct{}
@@ -130,7 +131,7 @@ func NewAdmissionController(policy AdmissionPolicy) *AdmissionController {
 	}
 }
 
-// SetWiring connects the controller to the State + audit + admit-builder
+// SetWiring connects the controller to the State, standard logger, and admit-builder
 // callback. Must be called before Run.
 //
 // admitBuilder is invoked under queueMu (not under state.Lock — it takes
@@ -138,13 +139,11 @@ func NewAdmissionController(policy AdmissionPolicy) *AdmissionController {
 // response message, then returns it for the worker to write to conn).
 func (a *AdmissionController) SetWiring(
 	state *State,
-	auditor *Auditor,
-	logf func(string, ...any),
+	logger *slog.Logger,
 	admitBuilder func(*PendingAdmit) (*Message, error),
 ) {
 	a.state = state
-	a.auditor = auditor
-	a.logf = logf
+	a.logger = logger
 	a.processFn = admitBuilder
 }
 
@@ -188,12 +187,31 @@ func (a *AdmissionController) pushWake() {
 // to ask the worker to re-evaluate the queue.
 func (a *AdmissionController) PushWake() { a.pushWake() }
 
+type admissionDiagnostic struct {
+	level slog.Level
+	msg   string
+	attrs []any
+}
+
 // processQueue is the worker's single pass: clean cancelled / TTL-expired
 // entries, then FIFO-try admit head until head is blocked or queue empty.
 // On token-bucket-only block, schedules a one-shot refill timer.
 func (a *AdmissionController) processQueue() {
+	diagnostics := a.processQueueLocked()
+	if a.logger == nil {
+		return
+	}
+	for _, diagnostic := range diagnostics {
+		a.logger.Log(context.Background(), diagnostic.level, diagnostic.msg, diagnostic.attrs...)
+	}
+}
+
+// processQueueLocked returns diagnostics to emit after queueMu is released, so
+// a synchronous logger cannot extend the admission queue critical section.
+func (a *AdmissionController) processQueueLocked() []admissionDiagnostic {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
+	var diagnostics []admissionDiagnostic
 
 	// 1. cancelled (conn EOF / TTL fired)
 	for e := a.queue.Front(); e != nil; {
@@ -211,10 +229,6 @@ func (a *AdmissionController) processQueue() {
 				Msg:    "queued admit canceled (TTL or client disconnect)",
 			})
 			_ = p.conn.Close()
-			elapsedMs := int64(time.Since(p.queuedAt) / time.Millisecond)
-			if a.auditor != nil {
-				a.auditor.Logf("admit_queue_canceled sid=%s waited_ms=%d", p.req.SandboxID, elapsedMs)
-			}
 		default:
 		}
 		e = next
@@ -231,7 +245,7 @@ func (a *AdmissionController) processQueue() {
 			// behavior (head stays in queue, token-refill timer set).
 			if !a.consumeToken() {
 				a.resetTokenTimer()
-				return
+				return diagnostics
 			}
 			a.queue.Remove(a.queue.Front())
 			head.ttlTimer.Stop()
@@ -241,9 +255,17 @@ func (a *AdmissionController) processQueue() {
 					Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error(),
 				})
 				_ = head.conn.Close()
-				if a.auditor != nil {
-					a.auditor.Logf("admit_queue_build_failed sid=%s err=%q", head.req.SandboxID, err.Error())
-				}
+				diagnostics = append(diagnostics, admissionDiagnostic{
+					level: slog.LevelWarn,
+					msg:   "admission queue response build failed",
+					attrs: []any{
+						"event", "admit_queue_build_failed",
+						"sandbox_id", head.req.SandboxID,
+						"error", err,
+						"queue_position", head.queuedPos,
+						"waited_ms", time.Since(head.queuedAt).Milliseconds(),
+					},
+				})
 				continue
 			}
 			resp.QueuedForMs = int64(time.Since(head.queuedAt) / time.Millisecond)
@@ -256,15 +278,21 @@ func (a *AdmissionController) processQueue() {
 					a.state.DropSandboxConnection(head.req.SandboxID, head.conn)
 				}
 				_ = head.conn.Close()
-				if a.auditor != nil {
-					a.auditor.Logf("admit_queue_write_failed sid=%s err=%q",
-						head.req.SandboxID, err.Error())
-				}
+				diagnostics = append(diagnostics, admissionDiagnostic{
+					level: slog.LevelWarn,
+					msg:   "admission queue response write failed",
+					attrs: []any{
+						"event", "admit_queue_write_failed",
+						"sandbox_id", head.req.SandboxID,
+						"error", err,
+						"queue_position", head.queuedPos,
+						"waited_ms", time.Since(head.queuedAt).Milliseconds(),
+					},
+				})
 			}
 			// Conn left open on success: caller will continue to use it
-			// for RPC. No separate audit event here — the canonical
-			// `admit token=...` line was already emitted by buildAdmitOK
-			// (via processFn). The fact that this admit came from the
+			// for RPC. buildAdmitOK already emits the standard successful
+			// Admit log. The fact that this admit came from the
 			// queue is reflected in the response's QueuedForMs metadata
 			// that the client logs.
 			continue
@@ -279,10 +307,17 @@ func (a *AdmissionController) processQueue() {
 				Msg:    oc.RejectMsg,
 			})
 			_ = head.conn.Close()
-			if a.auditor != nil {
-				a.auditor.Logf("admit_queue_dropped_long sid=%s reason=%s",
-					head.req.SandboxID, oc.RejectCode)
-			}
+			diagnostics = append(diagnostics, admissionDiagnostic{
+				level: slog.LevelInfo,
+				msg:   "admission queue request rejected",
+				attrs: []any{
+					"event", "admit_queue_dropped_long",
+					"sandbox_id", head.req.SandboxID,
+					"reason", oc.RejectCode,
+					"queue_position", head.queuedPos,
+					"waited_ms", time.Since(head.queuedAt).Milliseconds(),
+				},
+			})
 			continue
 
 		case OutcomeShortTermBlock:
@@ -290,7 +325,7 @@ func (a *AdmissionController) processQueue() {
 			if oc.Block == BlockedByTokenBucket {
 				a.resetTokenTimer()
 			}
-			return
+			return diagnostics
 
 		case OutcomePreCheckReject:
 			// Should never reach the queue (pre-check happens at admit
@@ -307,6 +342,7 @@ func (a *AdmissionController) processQueue() {
 			continue
 		}
 	}
+	return diagnostics
 }
 
 // resetTokenTimer arms a one-shot wake for when the next token would

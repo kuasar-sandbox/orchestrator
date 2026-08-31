@@ -1014,6 +1014,24 @@ resource_listen:
 	}
 }
 
+func TestLoadRejectsRemovedResourceAuditField(t *testing.T) {
+	_, err := LoadConductor(writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/runtime.erofs
+resource_listen:
+  enabled: true
+  audit_path: /run/node-ctl/audit.log
+`))
+	if err == nil || !strings.Contains(err.Error(), "field audit_path not found") {
+		t.Fatalf("removed resource_listen.audit_path error = %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "node.yaml")

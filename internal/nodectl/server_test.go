@@ -30,7 +30,7 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 		QueueTTL:      60 * time.Second,
 		QueueMaxDepth: 256,
 	})
-	admission.SetWiring(state, nil, t.Logf,
+	admission.SetWiring(state, nil,
 		func(p *PendingAdmit) (*Message, error) { return nil, nil })
 	allocator := NewAllocator(AllocatorPolicy{
 		MemoryGrantPerSecBytes: 1 << 30, // 1 GiB/s for tests
@@ -164,7 +164,7 @@ func TestConcurrentAdmitCheckAndInsertCannotOversubscribePool(t *testing.T) {
 	admission := NewAdmissionController(AdmissionPolicy{
 		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
 	})
-	admission.SetWiring(state, nil, t.Logf, func(*PendingAdmit) (*Message, error) { return nil, nil })
+	admission.SetWiring(state, nil, func(*PendingAdmit) (*Message, error) { return nil, nil })
 	srv := &Server{State: state, Admission: admission, Logf: t.Logf}
 
 	firstChecked := make(chan struct{})
@@ -235,7 +235,7 @@ func TestConcurrentAdmitAndBudgetGrowCannotOversubscribePool(t *testing.T) {
 	admission := NewAdmissionController(AdmissionPolicy{
 		Rate: 100, Burst: 100, QueueTTL: time.Second, QueueMaxDepth: 4,
 	})
-	admission.SetWiring(state, nil, t.Logf, func(*PendingAdmit) (*Message, error) { return nil, nil })
+	admission.SetWiring(state, nil, func(*PendingAdmit) (*Message, error) { return nil, nil })
 	srv := &Server{
 		State: state, Admission: admission,
 		Allocator: NewAllocator(AllocatorPolicy{
@@ -311,7 +311,7 @@ func TestQueuedAdmitDisconnectBeforeFirstTokenRequestClearsConnection(t *testing
 		Path: filepath.Join(dir, "controller.sock"), State: state, Admission: admission,
 		Allocator: NewAllocator(AllocatorPolicy{}), Logf: t.Logf,
 	}
-	admission.SetWiring(state, nil, t.Logf, srv.BuildAdmitOKFromQueue)
+	admission.SetWiring(state, nil, srv.BuildAdmitOKFromQueue)
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
 	}

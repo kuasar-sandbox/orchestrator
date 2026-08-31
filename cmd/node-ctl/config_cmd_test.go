@@ -47,6 +47,12 @@ func TestProxyConfigTemplateDocumentsCustomExecutable(t *testing.T) {
 	}
 }
 
+func TestConductorConfigTemplateOmitsRemovedResourceAuditField(t *testing.T) {
+	if strings.Contains(conductorConfigSkeleton, "audit_path") {
+		t.Fatal("conductor template still contains removed resource_listen.audit_path")
+	}
+}
+
 func TestConductorConfigTemplateUsesBuilderTwoStageAdmission(t *testing.T) {
 	start := strings.Index(conductorConfigSkeleton, "builder:")
 	end := strings.Index(conductorConfigSkeleton[start:], "\n# resource_listen:")

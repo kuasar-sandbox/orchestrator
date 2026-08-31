@@ -35,8 +35,7 @@ type Resolved struct {
 	Admission AdmissionPolicy
 	Allocator AllocatorPolicy
 
-	LogLevel  string
-	AuditPath string
+	LogLevel string
 }
 
 // Resolve expands a config.ResourceListenConfig into the controller's runtime
@@ -64,7 +63,6 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		SocketIdentity:  identity,
 		CgroupScanPaths: c.CgroupScanPaths,
 		LogLevel:        c.LogLevel,
-		AuditPath:       c.AuditPath,
 	}
 
 	if c.Resources.PhysicalMemory == "auto" || c.Resources.PhysicalMemory == "" {
