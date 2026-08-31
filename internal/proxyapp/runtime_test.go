@@ -20,6 +20,10 @@ type runtimeTestMasterExtension struct{}
 
 func (runtimeTestMasterExtension) Start(context.Context, proxyextension.MasterHost) error { return nil }
 
+type runtimeTestWorkerExtension struct{}
+
+func (runtimeTestWorkerExtension) Start(context.Context, proxyextension.WorkerHost) error { return nil }
+
 func TestResolveRuntimeTLSProviderKeepsCorePolicy(t *testing.T) {
 	der, signer, certificate := testProxyCertificate(t)
 	clientPool := x509.NewCertPool()
@@ -54,6 +58,17 @@ func TestResolveRuntimeCarriesProcessLocalMasterExtension(t *testing.T) {
 	}
 	if runtime.MasterExtension != extension {
 		t.Fatal("MasterExtension binding was not retained")
+	}
+}
+
+func TestResolveRuntimeCarriesProcessLocalWorkerExtension(t *testing.T) {
+	extension := runtimeTestWorkerExtension{}
+	runtime, err := ResolveRuntime(context.Background(), testProxyConfig(t), Bindings{WorkerExtension: extension})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.WorkerExtension != extension {
+		t.Fatal("WorkerExtension binding was not retained")
 	}
 }
 

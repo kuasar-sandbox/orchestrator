@@ -539,7 +539,8 @@ xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runne
 到 xproxy，失败不回退。xproxy 必须经 `node-ctl proxy serve` 启动，不能独立运行。公共
 `app/proxy` 只开放 `New(Hooks)`、one-shot `Run`/`RunContext`、master-only `Configure` 及
 master/every-worker `BindRuntime`；`Config` 是声明式值，`Runtime` 是不可序列化的 logger/TLS
-material provider，并可在 master 绑定一个可信、静态编译的 `MasterExtension`。provider 非 nil
+material provider，并可在 master/worker 分别绑定一个可信、静态编译的
+`MasterExtension`/`WorkerExtension`。provider 非 nil
 时权威，错误不回退文件，TLS policy 仍由 core 固定。
 
 master 创建共享 route table 与 traffic aggregate 后、绑定任何 listener 或启动 routesync/worker
@@ -555,14 +556,23 @@ master 在 Configure/final validation 后 deep-clone、canonical serialize 并 d
 EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式是 node-ctl，custom 模式是
 xproxy。worker 通过 sealed bootstrap 验证 config digest、role/id/epoch、FD mapping 和 executable
 identity，调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync；它不读取
-`proxy.yaml`，不调用 `Configure`。配置中的 executable 仅选择 node-ctl → master，用户 Hook
+`proxy.yaml`，不调用 `Configure`。每个 worker epoch 的 `BindRuntime` 必须创建新 Extension；
+初始 route sync 后 core 调用其 `Start` 一次，再冻结可选 `IngressWrapper`，成功后才开放 data 与
+`proxy_socket` listener。wrapper 在 canonical parser 前接收 raw request，两个 listener 共用同一
+handler，MMDS 不经过它。`GetRoute` 只提供当前 SHM 点查副本，不提供 worker Watch。
+
+已完成私有认证的 wrapper 可调用拥有 HTTP 响应的 `ForwardAuthorized`，复用 lookup、parking、
+activation/Wake、binding revalidation、dial 和 traffic 生命周期；它不验证 Kuasar token。
+`Revalidate` 在 activation 后、dial 前 fence 私有 revision，`Rewrite` 只修改 ordinary HTTP 的
+guest clone，CONNECT 不调用它；generic helper 拒绝 native exec，标准 `next` 仍走 KAT/CEL。
+配置中的 executable 仅选择 node-ctl → master，用户 Hook
 不得改变它。V1 不支持热更新，custom component 与 node-ctl 必须来自兼容版本。完整 API、
 示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy.md) §2.1。
 
 该扩展仅覆盖 external proxy；internal proxy 和 cluster-router/registry/placer 不增加 Extension。
-除上述 master management wrapper 外，不开放 listener、原始 SHM/Router/routesync/stats，也不
-引入 plugin registry、动态加载、通用生命周期 hook 或 DI。WebSocket 不属于 Issue #256，由
-Issue #269 独立跟踪。
+除上述 master management 与 worker ingress wrapper 外，不开放 listener、原始
+SHM/Router/routesync/stats，也不引入 namespace、plugin registry、动态加载、通用生命周期 hook
+或 DI。WebSocket 不属于 Issue #256，由 Issue #269 独立跟踪。
 
 Builder 配置为未发布 schema 的直接切换,不保留 alias:
 
@@ -1700,11 +1710,14 @@ external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 
 ### 9.3 proxyForwarder
 
 数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 经
-已注册的 `proxy_socket` UDS 建立一次性 chained CONNECT,由 proxy worker 照常处理(含鉴权)。
-链式请求显式复用 `E2b-Sandbox-Id`,可选 `E2b-Sandbox-Service`/
-`E2b-Sandbox-Port` 和原始 `X-Access-Token`,不创造内部 token Header.普通 HTTP 在该隧道内
-发送一条请求,CONNECT 则直接 splice 客户端与 worker;无 proxy 注册时回 502.
-链式隧道与转发细节见 node-proxy.md §5.
+已注册的 `proxy_socket` UDS 只写一次原始 ordinary HTTP/CONNECT，由 proxy worker raw wrapper
+与 core handler 作最终 parse/auth。能无副作用解析 canonical SID 时继续按 SID 选择 worker；不能
+解析时按 `Host + method + URL path` 稳定 hash，parse failure 只影响 affinity，不再拒绝私有
+Header/path。请求 body 不整包缓存，发送后不自动重放。CONNECT 200 后保留 client/UDS 双方
+buffered bytes 并沿用 half-close tunnel，非 200 转发 worker response；无 proxy 注册时回 502。
+没有 WorkerExtension 时，最终 worker 仍产生既有 canonical parser/token 错误。该透明行为只属
+node-local external fallback；cluster ingress 必须在外层 canonicalize，且不增加 cluster
+Extension。转发细节见 node-proxy.md §5。
 
 ## 10. 集群接入(node-link)
 
@@ -2239,7 +2252,7 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
 external master/worker resync/rotation;handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
-proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
+proxyForwarder raw HTTP/CONNECT relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
 

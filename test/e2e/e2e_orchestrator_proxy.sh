@@ -14,6 +14,8 @@
 #                       exec requests park across runner boot and init without retry
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
+#   GET <conductor>/private/... with a non-canonical private Header reaches the
+#                       worker raw ingress; built-in worker remains final parser
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
 #   GET <proxy> for an unknown sandbox -> passive propagation wait, no Wake
 #   POST /sandboxes/<sid>/exec-sessions -> KAT; service=exec CONNECT through the
@@ -589,6 +591,21 @@ proxy_timeline "master pid=$PROXY_MASTER_PID launched"
 wait_external_proxy_ready "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
 echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
+
+# A non-canonical private Header/path must cross the conductor external fallback
+# and be rejected by the built-in worker parser, not by the conductor affinity
+# hint. X-Kuasar-Proxy-Error is produced only by the worker core in this path.
+code=$(curl -sS --noproxy '*' \
+    -D "$WORK/raw-fallback.headers" \
+    -o "$WORK/raw-fallback.body" \
+    -w '%{http_code}' \
+    -H 'Host: private.invalid' \
+    -H 'X-Sandbox-Id: private-s1' \
+    "http://127.0.0.1:$PORT/private/sandboxes/private-s1")
+[ "$code" = "400" ] || { cat "$WORK/raw-fallback.body"; dump_logs; fail "raw external fallback=$code (want worker 400)"; }
+grep -Eiq '^X-Kuasar-Proxy-Error:[[:space:]]*bad_request' "$WORK/raw-fallback.headers" \
+    || { cat "$WORK/raw-fallback.headers"; fail "raw external fallback did not reach worker parser"; }
+echo "==> PASS: non-canonical private Header/path reached worker raw ingress through conductor fallback"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 # The 6GiB Build limit is independent of the phase Sandbox's node-default 2GiB
