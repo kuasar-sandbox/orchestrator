@@ -280,12 +280,18 @@ T_APP_NS=""
 RESOURCE_SETTLED=0
 RESOURCE_POLL_TICK=0
 while kill -0 "$SBPID" 2>/dev/null; do
-    if [ "$RESOURCE_SETTLED" -eq 0 ] && [ $((RESOURCE_POLL_TICK % 50)) -eq 0 ] \
+    if [ -z "$T_APP_NS" ] && grep -qE "^PYBOOT-OK [0-9]+$" "$LOG" 2>/dev/null; then
+        T_APP_NS=$(date +%s%N)
+    fi
+    # Before app output, sample at 250 ms to avoid perturbing the cold path.
+    # Once the short-lived workload has printed, poll continuously until the
+    # trusted settled reservation is observed or sandbox-ctl exits.
+    if [ "$RESOURCE_SETTLED" -eq 0 ] \
+        && { [ -n "$T_APP_NS" ] || [ $((RESOURCE_POLL_TICK % 50)) -eq 0 ]; } \
         && resource_controller_settled; then
         RESOURCE_SETTLED=1
     fi
-    if grep -qE "^PYBOOT-OK [0-9]+$" "$LOG" 2>/dev/null; then
-        T_APP_NS=$(date +%s%N)
+    if [ -n "$T_APP_NS" ] && [ "$RESOURCE_SETTLED" -eq 1 ]; then
         break
     fi
     RESOURCE_POLL_TICK=$((RESOURCE_POLL_TICK + 1))
