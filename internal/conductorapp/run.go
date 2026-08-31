@@ -12,6 +12,7 @@ import (
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
+	"github.com/kuasar-sandbox/orchestrator/internal/conductorext"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
@@ -91,6 +92,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 			logger.Error("drain accepted sandbox operations", "err", err)
 		}
 	}()
+	if err := startExtension(ctx, runtime, storage, core); err != nil {
+		return err
+	}
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
@@ -289,4 +293,16 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	}
 	logger.Info("node-ctl serving", "listen", cfg.API.Listen, "domain", cfg.API.Domain, "proxy_mode", cfg.Proxy.Mode)
 	return appnet.Serve(ctx, listener, mux, runtime.APITLS)
+}
+
+func startExtension(ctx context.Context, runtime *Runtime, storage *store.Store, core *orch.Orchestrator) error {
+	if runtime.Extension == nil {
+		return nil
+	}
+	host, observer := conductorext.New(storage)
+	core.SetExtensionObserver(observer)
+	if err := runtime.Extension.Start(ctx, host); err != nil {
+		return fmt.Errorf("conductor extension start: %w", err)
+	}
+	return nil
 }

@@ -308,6 +308,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if initialMMDS != nil {
 		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
 	}
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
 	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
@@ -335,6 +337,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	o.clusterBuildMu.Unlock()
 	if inserted {
 		o.publishBuildState(cmd.BuildID, "registered", "", "")
+		o.observeBuildUpsert(registered)
 	}
 	return nil
 }
@@ -1046,6 +1049,7 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) err
 	o.clearDeadlineIntent(current.ID)
 	o.uncache(current.ID)
 	o.publishDelete(current.ID)
+	o.observeSandboxDelete(current)
 	return nil
 }
 

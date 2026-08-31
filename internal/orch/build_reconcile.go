@@ -221,9 +221,11 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	if build.ExecutionResult != nil {
 		pend.result <- *build.ExecutionResult
 	}
+	unlockEvent := o.lockExtensionBuildEvent(build.BuildID)
 	o.pendMu.Lock()
 	if o.pend[build.BuildID] != nil {
 		o.pendMu.Unlock()
+		unlockExtensionEvent(unlockEvent)
 		return fmt.Errorf("reconcile build %s: duplicate process-local owner", build.BuildID)
 	}
 	o.pend[build.BuildID] = pend
@@ -238,6 +240,8 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		stage = "prepared"
 	}
 	o.log.Info("reconcile: adopted live build", "bid", build.BuildID, "run_id", build.RunID, "stage", stage)
+	o.observeBuildUpsert(build)
+	unlockExtensionEvent(unlockEvent)
 	started = true
 	go func() {
 		defer finish()
@@ -382,9 +386,11 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	if err != nil {
 		return nil, portID, false, nil, buildFailed("network_commit", err)
 	}
+	unlockEvent := o.lockExtensionBuildEvent(build.BuildID)
 	owned, err := o.st.SetBuildRuntimePreparation(buildCtx, build.BuildID, build.RunID,
 		port.Port, port.FloatingIP, port.MAC, envdToken, prepareJSON)
 	if err != nil || !owned {
+		unlockExtensionEvent(unlockEvent)
 		if err == nil {
 			err = fmt.Errorf("build: exact-run ownership lost during recovered runtime preparation")
 		}
@@ -397,9 +403,12 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	pend.envdToken = envdToken
 	final, err := o.buildSpecForPending(buildCtx, pend)
 	if err != nil {
+		unlockExtensionEvent(unlockEvent)
 		return nil, portID, true, nil, buildFailed("config_write", err)
 	}
 	mmdsRow = o.publishBuildFinal(pend, final)
+	o.observeBuildUpsert(build)
+	unlockExtensionEvent(unlockEvent)
 	finalPublished = true
 	result, err = o.waitRecoveredBuild(buildCtx, build, pend, unit)
 	return result, portID, true, mmdsRow, buildFailed("runtime", err)
@@ -424,6 +433,8 @@ func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Bu
 	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
 		return fmt.Errorf("reconcile build %s cleanup: %w", build.BuildID, err)
 	}
+	unlockEvent := o.lockExtensionBuildEvent(build.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
 	build.Status, build.Reason = types.BuildError, reason
 	if !o.persistTerminalBuild(ctx, build) {
 		return fmt.Errorf("reconcile build %s: terminal persistence failed", build.BuildID)
@@ -431,5 +442,6 @@ func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Bu
 	// node-link starts only after reconciliation. Do not let its bounded channel
 	// block startup; node-ctl immediately follows with a complete durable replay.
 	o.publishBuildStateBestEffort(build.BuildID, "error", "", reason)
+	o.observeBuildRemove(build)
 	return nil
 }

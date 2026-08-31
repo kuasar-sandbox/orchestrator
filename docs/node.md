@@ -475,6 +475,7 @@ custom main 只需要公共包；完整可编译版本见 `examples/custom-condu
 app := conductor.New(conductor.Hooks{
     Configure: func(ctx context.Context, cfg *conductor.Config, rt *conductor.Runtime) error {
         // 替换/调整 declarative Config；绑定启动期 Runtime provider。
+        rt.Extension = myExtension
         return nil
     },
 })
@@ -486,7 +487,7 @@ if err := app.Run(); err != nil {
 `New` 无副作用，`Run` one-shot 并处理 SIGINT/SIGTERM；托管方可用 `RunContext`。App 不调用
 `os.Exit`。执行顺序固定为：decode bootstrap → clone Config → `Configure` exactly once →
 校验 `paths.conductor_executable` 未改变 → final declarative validation → 再 clone/freeze →
-解析 Runtime 材料 → 启动共享 conductor core。Hook/provider/final-validation 失败时尚未打开
+解析 Runtime 材料 → 启动共享 conductor core。Configure/provider/final-validation 失败时尚未打开
 durable store、listener、systemd launcher/unit 或 node-link。Hook 可整体替换 Config，但必须
 恢复最初冻结的 executable；Hook 后不会重新应用默认值。
 
@@ -496,12 +497,20 @@ handler、读取 bootstrap FD 或启动 goroutine 之前返回明确错误。`no
 诊断进程 EUID 代替实际 service owner policy；custom 模式明确提示 runtime owner 与 final
 validation 均延后到 component startup。
 
-`Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，V1 只开放 logger、
-TLS material、AES-256 ordered key set 与 builder files-storage neutral credentials provider。
+`Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，开放 logger、
+TLS material、AES-256 ordered key set、builder files-storage neutral credentials provider，
+以及一个可信、静态编译的 `Extension`。
 TLS provider 返回 DER certificate chain、`crypto.Signer` 与 root/client CA pool，不能返回任意
 `*tls.Config`；最低 TLS 版本、ALPN、mTLS/client verification 仍由 core 固定。所有 provider
 只在启动/SDK credential refresh 使用，不进入请求热路径；provider 非 nil 即为权威来源，
 任何错误都不回退文件、环境或静态 credential。V1 不支持热更新。
+
+Extension 的 `Start(ctx, Host)` 在 store/launcher/core 构造后、InstallUnits/reconcile/pool/
+node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取消通知 Extension 自有 goroutine
+退出。`Host` 提供 Sandbox/Build `Get+Watch` 非秘密深拷贝视图。Watch 使用
+`sync_begin → snapshot → sync_end → live` generation；慢 watcher 只使自己的 generation
+失效并自动 full resync，不保证观察每个中间变化，也不是 durable audit。完整合同见
+[extensions.md](extensions.md)。
 
 xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runner/builder systemd unit
 仍执行该 node-ctl；`sandbox-ctl`、`connector-ctl`、`flatten-ctl`、`manifest-ctl` 的相邻目录

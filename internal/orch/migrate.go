@@ -205,6 +205,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			current.SnapshotRef = ref
 			o.cache(current)
 			o.publishUpsert(current)
+			o.observeSandboxUpsert(current)
 		}
 	} else {
 		cleanupCtx, cancelCleanup := cleanupContext()
@@ -220,6 +221,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		o.uncache(sid)
 		o.clearDeadlineIntent(sid)
 		o.publishDelete(sid)
+		o.observeSandboxDelete(current)
 	}
 	if localRef != "" {
 		localDir := filepath.Dir(localRef)
@@ -435,6 +437,8 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 			return nil, fmt.Errorf("import-sandbox: MMDS route projection: %w: %v", migrationtoken.ErrInvalidPayload, err)
 		}
 	}
+	unlockEvent := o.lockExtensionSandboxEvent(sb.ID)
+	defer unlockExtensionEvent(unlockEvent)
 	var insertErr error
 	if mmdsImport.routesPresent {
 		insertErr = o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, sb, mmdsImport.routesDigest, mmdsImport.secretValues)
@@ -447,6 +451,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		}
 		return nil, fmt.Errorf("import-sandbox: insert target %s: %w", targetID, insertErr)
 	}
+	o.observeSandboxUpsert(sb)
 	return sb, nil
 }
 

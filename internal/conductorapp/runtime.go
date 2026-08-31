@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
@@ -43,6 +44,7 @@ type Bindings struct {
 	TLSMaterial            func(context.Context, TLSPurpose) (TLSMaterial, error)
 	EncryptionKeys         func(context.Context) ([][]byte, error)
 	ObjectStoreCredentials filestore.CredentialsProvider
+	Extension              conductorextension.Extension
 }
 
 // Runtime is the immutable, resolved process material consumed by Run.
@@ -52,6 +54,7 @@ type Runtime struct {
 	Files       *filestore.Store
 	APITLS      *tls.Config
 	NodeLinkTLS *tls.Config
+	Extension   conductorextension.Extension
 }
 
 // ResolveRuntime resolves every provider before the durable store, listeners,
@@ -107,7 +110,7 @@ func ResolveRuntime(ctx context.Context, cfg *publicconfig.Conductor, bindings B
 		}
 	}
 
-	return &Runtime{Logger: logger, SecretBox: box, Files: files, APITLS: apiTLS, NodeLinkTLS: nodeLinkTLS}, nil
+	return &Runtime{Logger: logger, SecretBox: box, Files: files, APITLS: apiTLS, NodeLinkTLS: nodeLinkTLS, Extension: bindings.Extension}, nil
 }
 
 func resolveTLS(ctx context.Context, cfg *publicconfig.Conductor, provider func(context.Context, TLSPurpose) (TLSMaterial, error)) (*tls.Config, *tls.Config, error) {
