@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
@@ -52,7 +53,7 @@ func (o *Orchestrator) execSession(
 		return "", err
 	}
 	var token string
-	_, _, err = o.ensureResumeAcceptedPrepared(ctx, id, nil, func(current *types.Sandbox) error {
+	_, _, err = o.ensureResumeAcceptedPreparedFrom(ctx, id, nil, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
 		if !ownsSandbox(current, apiKey) {
 			return api.ErrNotFound
 		}

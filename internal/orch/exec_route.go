@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -37,7 +38,7 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 	}
 
 	if sb.State == types.StatePaused {
-		_, _, err := o.ensureResumeAccepted(ctx, sandboxID, nil, func(current *types.Sandbox) error {
+		_, _, err := o.ensureResumeAcceptedFrom(ctx, sandboxID, nil, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
 			if !execRoutePresent(current) || execIdentity(current) != expected {
 				return errExecIdentityChanged
 			}

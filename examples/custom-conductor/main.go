@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/app/conductor"
 )
@@ -53,5 +55,36 @@ func (e *objectExtension) Start(ctx context.Context, host conductor.Host) error 
 			e.logger.Error("sandbox watch stopped", "err", err)
 		}
 	}()
+	return nil
+}
+
+// WrapAPI adds one private route and otherwise preserves the canonical API.
+// An extension may intentionally override core routes too; this example does
+// not. Production private authentication must be designed for the deployment.
+func (e *objectExtension) WrapAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/private/extension/health" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// PrepareSandbox applies a small request policy to new sandboxes. The
+// operation is a deep copy; the core normalizes it again after this returns.
+func (e *objectExtension) PrepareSandbox(_ context.Context, operation *conductor.SandboxOperation) error {
+	if operation.Kind != conductor.SandboxOperationCreate || operation.Create == nil {
+		return nil
+	}
+	if operation.Create.Metadata == nil {
+		operation.Create.Metadata = make(map[string]string)
+	}
+	operation.Create.Metadata["example.extension"] = "custom-conductor"
+	if operation.Create.TimeoutSeconds < int((15 * time.Minute).Seconds()) {
+		operation.Create.TimeoutSeconds = int((15 * time.Minute).Seconds())
+	}
 	return nil
 }

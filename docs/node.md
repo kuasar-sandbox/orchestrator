@@ -512,11 +512,23 @@ node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取�
 失效并自动 full resync，不保证观察每个中间变化，也不是 durable audit。完整合同见
 [extensions.md](extensions.md)。
 
+同一 Extension 可选实现 `SandboxHook`、`BuildHook` 与 `APIWrapper`；这些能力只在 Start
+成功后检查一次并冻结。生命周期 Hook 都在认证后、durable/runner/network/snapshot 副作用前
+调用，并采用“锁内捕获 precondition → 锁外 Hook → 锁内权威重读/重验 → commit”。普通显式
+Delete 可拒绝，TTL/rollback/reconcile/shutdown 等 mandatory cleanup 永远绕过 Hook。
+Build Register Hook 位于 capacity transaction 前，Trigger Hook 位于最终 registry credential
+解析和 registered→waiting CAS 前；waiting→building claim 无 Hook。cluster BuildRegister 的
+exact replay 不重复执行可变 Hook。`APIWrapper` 可增加、改写或覆盖任意 core API route；同一
+wrapped handler 同时服务公网 API 与 config-socket API fallback，config-socket internal route
+不经过它。Hook 的 `ErrRejected` 映射固定 policy rejection，其他错误映射固定 503，不回显私有
+细节。
+
 xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runner/builder systemd unit
 仍执行该 node-ctl；`sandbox-ctl`、`connector-ctl`、`flatten-ctl`、`manifest-ctl` 的相邻目录
 解析也以 node-ctl 发行目录为准，不以 xconductor 目录为准。custom component 与 node-ctl
-必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/API handler/Router，不引入
-Go plugin、运行时发现、全局 registry、middleware、生命周期 hook 或 DI container；
+必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/Router；API 只以
+`http.Handler` next 形式交给可信 wrapper，不暴露 internal 类型。它不引入 Go plugin、运行时
+发现、全局 registry、动态 middleware 注册或 DI container；
 `proxy.mode=internal` 仍只使用 conductor 内置标准 proxy，没有独立定制入口。
 
 ### 3.2 静态定制 external proxy

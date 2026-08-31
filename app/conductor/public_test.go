@@ -35,9 +35,13 @@ func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
 		(*conductor.TLSMaterialProvider)(nil), (*conductor.EncryptionKeyProvider)(nil),
 		(*conductor.ObjectStoreCredentialsProvider)(nil),
 		(*conductorextension.Extension)(nil), (*conductorextension.Host)(nil),
+		(*conductorextension.APIWrapper)(nil), (*conductorextension.SandboxHook)(nil), (*conductorextension.BuildHook)(nil),
 		(*conductorextension.SandboxSource)(nil), (*conductorextension.BuildSource)(nil),
 		conductorextension.SandboxView{}, conductorextension.SandboxEvent{},
 		conductorextension.BuildView{}, conductorextension.BuildEvent{},
+		conductorextension.SandboxOperation{}, conductorextension.SandboxCreateRequest{},
+		conductorextension.SandboxPauseRequest{}, conductorextension.SandboxResumeRequest{}, conductorextension.SandboxDeleteRequest{},
+		conductorextension.BuildOperation{}, conductorextension.BuildRegisterRequest{}, conductorextension.BuildTriggerRequest{},
 	} {
 		assertNoInternalType(t, reflect.TypeOf(value), seen)
 	}
@@ -60,6 +64,18 @@ func TestObjectViewsDoNotCarryRawCredentialsOrEnvironment(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildHookRequestDoesNotCarryCredentialInputs(t *testing.T) {
+	typeOf := reflect.TypeOf(conductorextension.BuildRegisterRequest{})
+	for _, forbidden := range []string{
+		"MMDS", "MMDSHeader", "MMDSSecrets", "RegistryAuth", "PullToken",
+		"RegistryUsername", "RegistryPassword",
+	} {
+		if _, found := typeOf.FieldByName(forbidden); found {
+			t.Fatalf("BuildRegisterRequest exposes forbidden credential input %s", forbidden)
+		}
 	}
 }
 
