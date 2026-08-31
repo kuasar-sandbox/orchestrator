@@ -24,9 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: component-publish-${{ github.repository }}
+  group: component-mutation-${{ github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
-  queue: max
 
 jobs:
   delete:

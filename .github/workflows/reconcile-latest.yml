@@ -1,0 +1,54 @@
+name: Reconcile Latest
+run-name: Reconcile main Stable Latest
+
+on:
+  workflow_run:
+    workflows:
+      - "Component Release"
+    types: [completed]
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: component-latest-reconciliation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Require trusted default-branch execution
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+          TRIGGER_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          TRIGGER_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "Latest reconciliation must run from main" >&2; exit 1; }
+          if [ "$TRIGGER_EVENT" = workflow_run ]; then
+            [ "$TRIGGER_REPOSITORY" = "$GITHUB_REPOSITORY" ]
+            [ "$TRIGGER_BRANCH" = main ]
+          fi
+
+      - name: Check out trusted reconciliation tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install pinned GitHub CLI
+        run: bash scripts/install-gh-cli.sh
+
+      - name: Reconcile source-ordered main Stable Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/publish-release.sh reconcile
