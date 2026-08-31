@@ -3,16 +3,29 @@ package proxy_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/app/proxy"
 )
+
+type compileMasterExtension struct{}
+
+func (compileMasterExtension) Start(ctx context.Context, host proxy.MasterHost) error {
+	_, _, _ = host.Routes().Get(ctx, "sandbox")
+	_, _ = host.Traffic().Get(ctx, "sandbox")
+	_ = host.Routes().SyncState()
+	return nil
+}
+
+func (compileMasterExtension) WrapManagement(next http.Handler) http.Handler { return next }
 
 func TestPublicAPICompilesWithoutInternalTypes(t *testing.T) {
 	app := proxy.New(proxy.Hooks{
 		Configure: func(context.Context, *proxy.Config) error { return nil },
 		BindRuntime: func(_ context.Context, process proxy.Process, runtime *proxy.Runtime) error {
 			_ = process.Role
+			runtime.MasterExtension = compileMasterExtension{}
 			runtime.TLS = proxy.TLSMaterialProviderFunc(func(context.Context) (proxy.TLSMaterial, error) {
 				return proxy.TLSMaterial{}, nil
 			})
@@ -23,6 +36,13 @@ func TestPublicAPICompilesWithoutInternalTypes(t *testing.T) {
 		t.Fatal("New returned nil")
 	}
 	for _, value := range []any{proxy.RoleMaster, proxy.RoleWorker, proxy.Process{}, proxy.TLSMaterial{}, (*proxy.App)(nil)} {
+		_ = value
+	}
+	for _, value := range []any{
+		proxy.RouteView{}, proxy.RouteEvent{}, proxy.TrafficView{}, proxy.ProfileBare,
+		proxy.RouteStateRunning, proxy.RouteSyncSynced, proxy.RouteSyncLost,
+		proxy.ErrTrafficUnavailable, proxy.ErrTrafficConflict,
+	} {
 		_ = value
 	}
 }

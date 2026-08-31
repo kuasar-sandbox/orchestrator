@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
@@ -68,6 +69,9 @@ func (f TLSMaterialProviderFunc) TLSMaterial(ctx context.Context) (TLSMaterial, 
 type Runtime struct {
 	Logger *slog.Logger
 	TLS    TLSMaterialProvider
+	// MasterExtension is the one trusted, statically linked extension used by
+	// the master process. Worker processes ignore this field.
+	MasterExtension proxyextension.MasterExtension
 }
 
 // MarshalJSON rejects accidental process-runtime serialization.
@@ -256,7 +260,7 @@ func decodeConfig(raw []byte, out *publicconfig.Proxy) error {
 }
 
 func freezeRuntime(runtime *Runtime) proxyapp.Bindings {
-	bindings := proxyapp.Bindings{Logger: runtime.Logger}
+	bindings := proxyapp.Bindings{Logger: runtime.Logger, MasterExtension: runtime.MasterExtension}
 	if runtime.TLS != nil {
 		provider := runtime.TLS
 		bindings.TLSMaterial = func(ctx context.Context) (proxyapp.TLSMaterial, error) {

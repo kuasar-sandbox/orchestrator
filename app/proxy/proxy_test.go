@@ -15,11 +15,16 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
 )
 
+type appTestMasterExtension struct{}
+
+func (*appTestMasterExtension) Start(context.Context, MasterHost) error { return nil }
+
 func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 	bootstrap := testComponentBootstrap(t)
 	var configureCalls atomic.Int32
 	var bindCalls atomic.Int32
 	var retained *Config
+	extension := &appTestMasterExtension{}
 	app := New(Hooks{
 		Configure: func(_ context.Context, cfg *Config) error {
 			configureCalls.Add(1)
@@ -32,6 +37,7 @@ func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 			if process != (Process{Role: RoleMaster}) {
 				t.Fatalf("process=%+v", process)
 			}
+			runtime.MasterExtension = extension
 			return nil
 		},
 	})
@@ -42,7 +48,7 @@ func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 		if got := effective.Config().Paths.RunRoot; got != "/run/custom-proxy" {
 			t.Fatalf("frozen run_root=%q", got)
 		}
-		if runtime == nil || runtime.Logger == nil {
+		if runtime == nil || runtime.Logger == nil || runtime.MasterExtension != extension {
 			t.Fatal("runtime was not resolved")
 		}
 		return nil

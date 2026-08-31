@@ -1,16 +1,17 @@
 # Runtime extensions
 
-Kuasar's conductor supports statically linked runtime extensions for
-deployments that need process-local integration without carrying a long-lived
-fork. An extension is trusted code compiled into `xconductor`. It shares the
-core process address space, UID, lifetime, filesystem, and network capabilities.
-The API organizes ownership and concurrency; it is not a security sandbox.
+Kuasar's conductor and external proxy support statically linked runtime
+extensions for deployments that need process-local integration without carrying
+a long-lived fork. An extension is trusted code compiled into `xconductor` or
+`xproxy`. It shares the core process address space, UID, lifetime, filesystem,
+and network capabilities. The API organizes ownership and concurrency; it is
+not a security sandbox.
 
-There is one extension object per conductor process. The framework does not
-discover or load plugins at runtime, maintain an extension registry, assign
-priorities, provide a dependency-injection container, or reserve URL
-namespaces. A private project can compose any modules it needs behind its one
-object.
+There is one extension object per conductor or external proxy-master process.
+The framework does not discover or load plugins at runtime, maintain an
+extension registry, assign priorities, provide a dependency-injection
+container, or reserve URL namespaces. A private project can compose any modules
+it needs behind its one object.
 
 ## Conductor object sources
 
@@ -177,17 +178,94 @@ plugin, and secret-management routes remain outside the wrapper. The data-plane
 handler is also outside it. A nil extension or an extension without
 `APIWrapper` uses the existing core handler object directly.
 
+## Proxy master extension
+
+An external proxy may set `proxy.Runtime.MasterExtension` from the master
+invocation of `BindRuntime`. It uses a public leaf contract that does not depend
+on `internal/*`:
+
+```go
+type MasterExtension interface {
+    Start(context.Context, MasterHost) error
+}
+
+type MasterHost interface {
+    Routes() RouteSource
+    Traffic() TrafficSource
+}
+```
+
+There is one object for the master process. The master creates its shared route
+table and in-process traffic aggregate, calls `Start` exactly once, and only
+then binds listeners or starts route synchronization and workers. A Start error
+aborts startup and removes the shared-memory and socket artifacts already
+created. The supplied context is canceled at master shutdown. As with the
+conductor contract, `Start` should launch rather than wait for long-running
+extension goroutines.
+
+After a successful Start, the same object is checked once for the optional
+management capability:
+
+```go
+type ManagementWrapper interface {
+    WrapManagement(http.Handler) http.Handler
+}
+```
+
+`WrapManagement` wraps the existing handler on `stats_socket`. It may add or
+override any local path, proxy elsewhere, or call the built-in traffic handler.
+There is no reserved namespace or conflict registry. Returning nil aborts
+startup; panics are not recovered. A nil extension or one without this optional
+interface uses the original handler directly.
+
+### Master route source
+
+`RouteSource.Get` returns an independent, non-secret projection of the route
+that the master successfully applied to its core table. It includes sandbox and
+authorization identities, profile, template, state, RunID, current local
+endpoints, snapshot location, credential fingerprints, and the core route
+revision. It omits raw secrets, access tokens, MMDS values, and internal SHM
+records. This minimizes routine event data and accidental logging; it is not a
+permission boundary for trusted in-process code. No metadata field or new SHM
+schema is introduced for extensions.
+
+`SyncState` reports `initializing`, `syncing`, `synced`, or `stale`. A routesync
+disconnect moves the source to `stale` and produces `sync_lost`; the serving SHM
+retains its existing reconnect behavior. A subsequent sync replaces the
+projection at its bookmark and returns the source to `synced`.
+
+`RouteSource.Watch` follows the generation rules described above. A complete
+consumer generation is `sync_begin`, the sorted applied-route snapshot, then
+`sync_end`; ordered live `upsert` and `delete` events follow it. A source reset
+or lagging bounded queue abandons only that watcher's incomplete generation and
+starts a new full snapshot after the source is synced. Duplicates are allowed,
+intermediate states are not guaranteed, and this is not a durable audit stream.
+
+The observing sink updates the extension projection only after the core SHM
+operation succeeds. Publication is bounded and non-blocking, and callbacks run
+only in the goroutine calling Watch. Extension lag, callback errors, or resyncs
+cannot terminate routesync, block SHM changes or worker notification, delay a
+RouteBarrier ACK, or affect Wake/activation.
+
+### Master traffic source
+
+`TrafficSource.Get` combines the current applied route identity with
+`MasterStats` directly in process; it does not query the stats UDS. Returned
+maps and time pointers are independent copies. V1 intentionally has no traffic
+Watch. A route retained during reconnect remains queryable, so callers that
+require freshness also inspect `Routes().SyncState()`.
+
 ## Boundaries
 
-A nil extension preserves the built-in startup and request behavior: no event
-hub, watcher goroutine, lifecycle callback, or wrapper is created. Cluster
-router, registry, and placer do not have extension objects; node-local Hooks and
-observation do not change node-link ACK, exact replay, idempotency, or stable
-SandboxID to NodeSandboxID authority.
+A nil conductor or proxy-master extension preserves the built-in startup and
+request behavior: no event hub, watcher goroutine, lifecycle callback, or
+wrapper is created. Cluster router, registry, and placer do not have extension
+objects; node-local Hooks and observation do not change node-link ACK, exact
+replay, idempotency, or stable SandboxID to NodeSandboxID authority.
 
 This API has no namespace, fixed extension URI, dynamic loading, hot reload, or
 component compatibility version. WebSocket transport is outside Issue #256 and
 is tracked independently by Issue #269.
 
-See [`examples/custom-conductor`](../examples/custom-conductor) for a complete,
-buildable program.
+See [`examples/custom-conductor`](../examples/custom-conductor) and
+[`examples/custom-proxy`](../examples/custom-proxy) for buildable programs.
