@@ -287,8 +287,8 @@ func TestE2BInitMustCompleteWithinLaunchDeadline(t *testing.T) {
 	if elapsed < 140*time.Millisecond || elapsed > 500*time.Millisecond {
 		t.Fatalf("launch elapsed %s, want the 180ms launch budget", elapsed)
 	}
-	if got := attempts.Load(); got < 2 {
-		t.Fatalf("envd /init attempts = %d, want transport timeouts retried", got)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("envd /init attempts = %d, want one attempt before the shared launch deadline", got)
 	}
 }
 
@@ -378,6 +378,32 @@ func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
 				t.Fatalf("MMDS-disabled payload contains accessToken: %+v", got.payload)
 			}
 		})
+	}
+}
+
+func TestEnvdInitAllowsSlowRequestWithinSharedDeadline(t *testing.T) {
+	cfg := &config.Config{}
+	o := &Orchestrator{cfg: cfg}
+	sb := &types.Sandbox{ID: "slow-init", EnvdUDS: filepath.Join(shortOrchestratorTestDir(t), "envd.sock")}
+	var attempts atomic.Int64
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		timer := time.NewTimer(100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			w.WriteHeader(http.StatusNoContent)
+		case <-r.Context().Done():
+		}
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := o.envdInit(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("envd /init attempts = %d, want one request within the shared deadline", got)
 	}
 }
 
