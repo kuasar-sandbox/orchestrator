@@ -52,7 +52,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
-	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
+	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
@@ -136,18 +136,18 @@ func runBuilder(args []string, log *slog.Logger) error {
 	defer cancelWork()
 
 	spec := bootstrap.Final
-	var prepared *tasksnapshot.Result
+	var prepared *taskartifact.Result
 	var localPreparation *configsock.BuildSnapshotPreparation
 	if bootstrap.Prepare != nil {
-		prepared, err = tasksnapshot.Prepare(workCtx, *bootstrap.Prepare)
+		prepared, err = taskartifact.Prepare(workCtx, *bootstrap.Prepare)
 		if err == nil {
 			localPreparation, err = buildSnapshotPreparation(prepared.RootCfg)
 		}
 		if err == nil {
-			log.Info("build task snapshot prepared", "bid", bid, "run_id", *runID,
-				"task_snapshot_prepare_duration", prepared.PrepareDuration,
-				"task_snapshot_cfg_read_duration", prepared.ConfigReadDuration,
-				"task_snapshot_ref_count", prepared.Summary.RequiredRefCount)
+			log.Info("build task artifact prepared", "bid", bid, "run_id", *runID,
+				"task_artifact_prepare_duration", prepared.PrepareDuration,
+				"task_artifact_config_read_duration", prepared.ConfigReadDuration,
+				"task_artifact_ref_count", prepared.Summary.RequiredRefCount)
 			err = retryBuildConfigSocket(workCtx, log, "build prepare", func(callCtx context.Context) error {
 				var callErr error
 				spec, callErr = configsock.CompleteBuildPrepare(callCtx, *socket, bid, *runID, prepared.Summary)
@@ -155,11 +155,11 @@ func runBuilder(args []string, log *slog.Logger) error {
 			})
 		}
 		if err != nil {
-			log.Error("build task snapshot prepare failed", "bid", bid, "run_id", *runID,
-				"task_snapshot_prepare_error_total", 1, "stage", "snapshot_prepare", "err", err)
+			log.Error("build task artifact prepare failed", "bid", bid, "run_id", *runID,
+				"task_artifact_prepare_error_total", 1, "stage", "artifact_prepare", "err", err)
 			postErr := retryBuildConfigSocket(taskCtx, log, "result", func(callCtx context.Context) error {
 				return configsock.PostBuildResultContext(callCtx, *socket, *runID, bid, configsock.BuildResult{
-					Error: err.Error(), FailureStage: "snapshot_prepare",
+					Error: err.Error(), FailureStage: "artifact_prepare",
 				})
 			})
 			if postErr != nil {

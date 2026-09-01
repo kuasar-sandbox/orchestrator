@@ -18,16 +18,17 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
+	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
-// optional task-local snapshot preparation, and exec-replaces into the target.
+// optional task-local artifact preparation, and exec-replaces into the target.
 // runAssignedSandbox has locked the task pidfile before this function is called.
 func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
 	return launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
-		prepareSnapshot: tasksnapshot.Prepare,
+		prepareArtifact: taskartifact.Prepare,
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
@@ -38,8 +39,8 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 
 type taskLaunchOps struct {
 	fetchBootstrap  func(context.Context, string, string, string) (*configsock.SandboxTaskSpec, error)
-	prepareSnapshot func(context.Context, configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error)
-	completePrepare func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error)
+	prepareArtifact func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error)
+	completePrepare func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error)
 	setenv          func(string, string) error
 	chdir           func(string) error
 	exec            func(string, []string, []string) error
@@ -86,21 +87,23 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 
 	spec := bootstrap.Final
 	locations := map[string]string{}
+	var preparedSource types.ResumeSource
 	if bootstrap.Prepare != nil {
-		result, err := ops.prepareSnapshot(taskCtx, *bootstrap.Prepare)
+		result, err := ops.prepareArtifact(taskCtx, *bootstrap.Prepare)
 		if err != nil {
-			ops.log.Error("sandbox task snapshot prepare failed", "sid", sandboxID, "run_id", runID,
-				"task_snapshot_prepare_error_total", 1, "stage", "snapshot_prepare", "err", err)
+			ops.log.Error("sandbox task artifact prepare failed", "sid", sandboxID, "run_id", runID,
+				"task_artifact_prepare_error_total", 1, "stage", "artifact_prepare", "err", err)
 			return err
 		}
 		locations = result.RefLocationURIs
-		ops.log.Info("sandbox task snapshot prepared", "sid", sandboxID, "run_id", runID,
-			"task_snapshot_prepare_duration", result.PrepareDuration,
-			"task_snapshot_cfg_read_duration", result.ConfigReadDuration,
-			"task_snapshot_ref_count", result.Summary.RequiredRefCount)
+		preparedSource = result.PreparedSource
+		ops.log.Info("sandbox task artifact prepared", "sid", sandboxID, "run_id", runID,
+			"task_artifact_prepare_duration", result.PrepareDuration,
+			"task_artifact_config_read_duration", result.ConfigReadDuration,
+			"task_artifact_ref_count", result.Summary.RequiredRefCount)
 		spec, err = completeSandboxPrepareWithRetry(taskCtx, socket, sandboxID, runID, result.Summary, ops.completePrepare)
 		if err != nil {
-			return fmt.Errorf("complete sandbox snapshot preparation: %w", err)
+			return fmt.Errorf("complete sandbox artifact preparation: %w", err)
 		}
 	}
 	if spec == nil {
@@ -117,6 +120,9 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	}
 	if len(spec.Args) == 0 || spec.Args[0] != "run" {
 		return fmt.Errorf("launch spec must invoke sandbox-ctl run")
+	}
+	if arg, ok := launchSpecArtifactArg(spec.Args); ok {
+		return fmt.Errorf("launch spec must not set task-owned artifact argument %q", arg)
 	}
 	workdir := spec.Workdir
 	if workdir == "" {
@@ -136,6 +142,16 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 		argv = append(argv, fmt.Sprintf("--ready-fd=%d", fd))
 	}
 	argv = append(argv, spec.Args[1:]...)
+	if !preparedSource.Empty() {
+		switch preparedSource.Kind {
+		case types.ResumeSourceSandbox:
+			argv = append(argv, "--from", preparedSource.Ref)
+		case types.ResumeSourceSnapshot:
+			argv = append(argv, "--restore", preparedSource.Ref)
+		default:
+			return fmt.Errorf("task prepared unsupported source kind %q", preparedSource.Kind)
+		}
+	}
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	env := taskEnv(authoritativeEnv)
@@ -157,8 +173,8 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 func completeSandboxPrepareWithRetry(
 	ctx context.Context,
 	socket, sandboxID, runID string,
-	summary configsock.SnapshotPrepareSummary,
-	complete func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error),
+	summary configsock.ArtifactPrepareSummary,
+	complete func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error),
 ) (*configsock.LaunchSpec, error) {
 	delay := 50 * time.Millisecond
 	for {
@@ -234,6 +250,16 @@ func launchSpecCgroupArg(args []string) (string, bool) {
 	for _, arg := range args {
 		if arg == "--cgroup-path" || strings.HasPrefix(arg, "--cgroup-path=") ||
 			arg == "--cgroup-adopt" || strings.HasPrefix(arg, "--cgroup-adopt=") {
+			return arg, true
+		}
+	}
+	return "", false
+}
+
+func launchSpecArtifactArg(args []string) (string, bool) {
+	for _, arg := range args {
+		if arg == "--from" || strings.HasPrefix(arg, "--from=") ||
+			arg == "--restore" || strings.HasPrefix(arg, "--restore=") {
 			return arg, true
 		}
 	}

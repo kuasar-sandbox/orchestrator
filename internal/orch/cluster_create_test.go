@@ -50,6 +50,46 @@ func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
 	}
 }
 
+func TestClusterCreatePersistsAutoPauseMemoryDefaultAndValues(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		sid   string
+		value *bool
+		want  bool
+	}{
+		{name: "missing defaults true", sid: "cluster-auto-default", want: true},
+		{name: "explicit true", sid: "cluster-auto-true", value: orchCheckpointBool(true), want: true},
+		{name: "explicit false", sid: "cluster-auto-false", value: orchCheckpointBool(false)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			startGate := make(chan struct{})
+			lc := &countingLauncher{startGate: startGate}
+			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+			_, _, fingerprint := allowlistedBuildIdentity(t, o)
+			cmd := clusterCreateCommand(fingerprint, test.sid)
+			cmd.AutoPauseMemory = test.value
+
+			ack := o.HandleCommand(ctx, cmd)
+			if ack.Status != routesync.AckAccepted {
+				t.Fatalf("cluster Create ack = %+v", ack)
+			}
+			stored, err := o.st.Get(ctx, cmd.SID)
+			if err != nil || stored == nil || stored.State != types.StateStarting ||
+				stored.AutoPauseMemory != test.want || stored.LaunchMode != types.LaunchImage {
+				t.Fatalf("durable cluster Create = %+v, %v", stored, err)
+			}
+			close(startGate)
+			running := waitForSandbox(t, o, ctx, cmd.SID, func(current *types.Sandbox) bool {
+				return current.State == types.StateRunning
+			}, "running after cluster AutoPauseMemory create")
+			if running.AutoPauseMemory != test.want || running.LaunchMode != "" {
+				t.Fatalf("running cluster AutoPauseMemory/mode = %t/%q", running.AutoPauseMemory, running.LaunchMode)
+			}
+		})
+	}
+}
+
 func TestClusterCreateAckFollowsDurableStartingAcceptance(t *testing.T) {
 	cfg := &config.Config{}
 	started := make(chan struct{}, 1)
@@ -319,7 +359,7 @@ func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
 	}
 }
 
-func TestPrecheckClusterCheckpointPolicy(t *testing.T) {
+func TestPrecheckClusterSnapshotPolicy(t *testing.T) {
 	newCommand := func(fingerprint, raw string) *routesync.Command {
 		return &routesync.Command{
 			SID:                  "stable-g0",
@@ -491,6 +531,7 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 		Cluster:       &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
 		StableIDValue: "stable",
 		State:         types.StatePaused,
+		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:     deriveTestAPISecret(t, manifestKey),
 		ManifestKey:   manifestKey,
 	}

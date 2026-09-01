@@ -212,6 +212,7 @@ func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) 
 		ID: "retry-pre-launch-delete", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:      types.StateStarting,
+		LaunchMode: types.LaunchImage,
 		APISecret:  deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
 	}

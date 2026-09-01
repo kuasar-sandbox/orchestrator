@@ -120,6 +120,38 @@ func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestServeReserveConnectStrictlyBoundsTypedBody(t *testing.T) {
+	reg := New(NewStores(), nil, 0, nil)
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	for _, test := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "unknown field", body: `{"unknown":true}`, want: http.StatusBadRequest},
+		{name: "duplicate field", body: `{"memory":true,"memory":false}`, want: http.StatusBadRequest},
+		{name: "malformed memory", body: `{"memory":"false"}`, want: http.StatusBadRequest},
+		{name: "trailing value", body: `{ } { }`, want: http.StatusBadRequest},
+		{name: "array", body: `[]`, want: http.StatusBadRequest},
+		{name: "chunked over limit", body: strings.Repeat(" ", maxConnectReserveBody+1), want: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost,
+				RouteLinkReservePath+"?group=/g&route_key=rk&operation=connect&sid=sb-route",
+				strings.NewReader(test.body),
+			)
+			request.ContentLength = -1
+			request.Header.Set("X-API-KEY", testAPIKeyValue())
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%q, want %d", response.Code, response.Body.String(), test.want)
+			}
+		})
+	}
+}
+
 func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 	placements := 0
 	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
@@ -249,7 +281,7 @@ func TestServeReserveMapsOperationErrorsWithoutLifecycleSideEffects(t *testing.T
 		{name: "expected identity mismatch", path: "?group=/g&route_key=rk&operation=connect&sid=sb-other", apiKey: testAPIKeyValue(), wantStatus: http.StatusNotFound},
 		{name: "connected node unavailable", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), wantStatus: http.StatusServiceUnavailable},
 		{name: "wrong data credential", path: "?group=/g&route_key=rk&operation=data&sid=sb-route&port=8080", access: "wrong", wantStatus: http.StatusUnauthorized},
-		{name: "connect body", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
+		{name: "connect create fields", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", body: `{"config":{"kuasar-sandbox.restore":"{}"}}`, apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
 		{name: "overflowing connect timeout", path: fmt.Sprintf("?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=%d", routesync.MaxConnectTimeoutSeconds+1), apiKey: testAPIKeyValue(), wantStatus: http.StatusBadRequest},
 		{name: "oversized migration token", path: "?group=/g&route_key=rk&operation=connect&sid=sb-route", apiKey: testAPIKeyValue(), migration: strings.Repeat("x", migrationtoken.MaxWireSize+1), wantStatus: http.StatusBadRequest},
 	}
@@ -287,6 +319,9 @@ func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Memory == nil || *cmd.Memory {
+			t.Errorf("connect memory = %v, want explicit false", cmd.Memory)
+		}
 		go reg.ackCommand(&routesync.CmdAck{
 			CmdID: cmd.CmdID, Status: routesync.AckAccepted,
 			Connect: testConnectResult(record, cmd.SID),
@@ -295,8 +330,9 @@ func TestServeReserveConnectReturnsNestedRouteAndTypedResult(t *testing.T) {
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	req := httptest.NewRequest(http.MethodPost,
-		RouteLinkReservePath+"?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=37", nil)
+		RouteLinkReservePath+"?group=/g&route_key=rk&operation=connect&sid=sb-route&timeout=37", strings.NewReader(`{"memory":false}`))
 	req.Header.Set("X-API-KEY", testAPIKeyValue())
+	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	mux.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {

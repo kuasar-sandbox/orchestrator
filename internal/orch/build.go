@@ -850,12 +850,12 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	defer unlockExtensionEvent(unlockEvent)
 	switch {
 	case err == nil && res != nil && res.Error != "":
-		if res.FailureStage == "snapshot_prepare" {
+		if res.FailureStage == "artifact_prepare" {
 			b.Status, b.Reason = types.BuildError, res.Error
 			if o.persistTerminalBuild(ctx, b) {
 				o.publishTerminalBuild(publish, b, "")
 			}
-			// run-builder emitted the task_snapshot_prepare_error_total event at
+			// run-builder emitted the task_artifact_prepare_error_total event at
 			// the reader failure. Record the terminal stage here without counting
 			// the same task-local failure a second time.
 			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", res.FailureStage, "err", res.Error)
@@ -880,9 +880,9 @@ func (o *Orchestrator) completeBuildWithPublisher(
 			o.publishTerminalBuild(publish, b, "")
 		}
 		stage := buildFailureStage(err)
-		if stage == "snapshot_prepare" {
+		if stage == "artifact_prepare" {
 			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage,
-				"task_snapshot_prepare_error_total", 1, "err", err)
+				"task_artifact_prepare_error_total", 1, "err", err)
 		} else {
 			o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", stage, "err", err)
 		}
@@ -998,7 +998,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	}
 	dir := buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, buildFailed("snapshot_prepare", err)
+		return nil, buildFailed("artifact_prepare", err)
 	}
 	var port *vswitch.Port
 	runtimePersisted := false
@@ -1071,15 +1071,15 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 				}
 				return accepted, buildFailed("runtime", fenceErr)
 			}
-			return nil, buildFailed("snapshot_prepare", waitErr)
+			return nil, buildFailed("artifact_prepare", waitErr)
 		}
 		inherited, err = validateBuildPrepareSummary(summary)
 		if err != nil {
-			return nil, buildFailed("snapshot_prepare", err)
+			return nil, buildFailed("artifact_prepare", err)
 		}
 		prepareDigest = summary.ResolutionDigest
-		o.log.Info("build task snapshot prepared", "bid", b.BuildID, "run_id", b.RunID,
-			"task_snapshot_ref_count", summary.RequiredRefCount)
+		o.log.Info("build task artifact prepared", "bid", b.BuildID, "run_id", b.RunID,
+			"task_artifact_ref_count", summary.RequiredRefCount)
 	}
 	pend.network, pend.templateNetwork, err = o.resolveBuildNetworks(
 		b.Profile, inherited, pend.spec.Network, "build-"+shortID(b.BuildID),
@@ -1168,17 +1168,17 @@ func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
 	return start.Add(time.Duration(o.cfg.Builder.TotalTimeoutSec) * time.Second)
 }
 
-func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild, unit string) (configsock.SnapshotPrepareSummary, *configsock.BuildResult, error) {
+func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild, unit string) (configsock.ArtifactPrepareSummary, *configsock.BuildResult, error) {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	prepare := make(chan struct {
-		summary configsock.SnapshotPrepareSummary
+		summary configsock.ArtifactPrepareSummary
 		err     error
 	}, 1)
 	go func() {
 		summary, err := pend.handoff.WaitPrepare(ctx)
 		prepare <- struct {
-			summary configsock.SnapshotPrepareSummary
+			summary configsock.ArtifactPrepareSummary
 			err     error
 		}{summary: summary, err: err}
 	}()
@@ -1187,26 +1187,26 @@ func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild,
 		case got := <-prepare:
 			return got.summary, nil, got.err
 		case result := <-pend.result:
-			return configsock.SnapshotPrepareSummary{}, &result, nil
+			return configsock.ArtifactPrepareSummary{}, &result, nil
 		case <-ctx.Done():
 			if result, ok := takePendingBuildResult(pend); ok {
-				return configsock.SnapshotPrepareSummary{}, result, nil
+				return configsock.ArtifactPrepareSummary{}, result, nil
 			}
 			stopErr := o.stopBuilderUnit(unit)
 			result, ok := closePendingBuildResultsAndTake(pend)
 			if ok {
-				return configsock.SnapshotPrepareSummary{}, result, nil
+				return configsock.ArtifactPrepareSummary{}, result, nil
 			}
 			if stopErr != nil {
-				return configsock.SnapshotPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
+				return configsock.ArtifactPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
 			}
-			return configsock.SnapshotPrepareSummary{}, nil, ctx.Err()
+			return configsock.ArtifactPrepareSummary{}, nil, ctx.Err()
 		case <-tick.C:
 			if !o.unitActive(ctx, unit) {
 				if result, ok := closePendingBuildResultsAndTake(pend); ok {
-					return configsock.SnapshotPrepareSummary{}, result, nil
+					return configsock.ArtifactPrepareSummary{}, result, nil
 				}
-				return configsock.SnapshotPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during snapshot preparation", unit)
+				return configsock.ArtifactPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during snapshot preparation", unit)
 			}
 		}
 	}
@@ -1589,16 +1589,17 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 	if err != nil {
 		return nil, false, err
 	}
-	response.Prepare = &configsock.SnapshotPrepareSpec{
-		RootRef: rootRef, ManifestConfig: manifestConfig,
+	response.Prepare = &configsock.ArtifactPrepareSpec{
+		RootSourceKind: string(types.ResumeSourceSnapshot),
+		RootRef:        rootRef, LaunchMode: string(types.LaunchMemory), ManifestConfig: manifestConfig,
 		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
-		RelativeDir:       pend.workdir, MaxRefs: maxRequiredSnapshotRefs,
+		RelativeDir:       pend.workdir, MaxRefs: maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
 	}
 	return response, true, nil
 }
 
-func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.BuildSpec, error) {
+func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary configsock.ArtifactPrepareSummary) (*configsock.BuildSpec, error) {
 	if !o.buildRecoveryReadyNow() {
 		return nil, errBuildRecoveryInProgress
 	}
@@ -1613,8 +1614,8 @@ func (o *Orchestrator) CompleteBuildPrepare(ctx context.Context, buildID, runID 
 		return nil, configsock.RejectBuildPrepare(err)
 	}
 	if replay {
-		o.log.Info("build task snapshot prepare replay", "bid", buildID, "run_id", runID,
-			"task_snapshot_prepare_replay_total", 1)
+		o.log.Info("build task artifact prepare replay", "bid", buildID, "run_id", runID,
+			"task_artifact_prepare_replay_total", 1)
 	}
 	return pend.handoff.WaitFinal(ctx)
 }

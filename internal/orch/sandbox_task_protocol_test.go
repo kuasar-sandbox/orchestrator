@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -259,7 +257,7 @@ func waitForAcceptedPrepare(t *testing.T, o *Orchestrator, sid string) *launchAt
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("snapshot prepare summary was not accepted")
+	t.Fatal("artifact prepare summary was not accepted")
 	return nil
 }
 
@@ -344,12 +342,14 @@ func TestRestoreYAMLFailureAfterNetworkCommitRollsBackExactOwnership(t *testing.
 	}
 }
 
-func TestRestoreMalformedInheritedNetworkIsBestEffort(t *testing.T) {
+func TestRestoreInvalidInheritedNetworkFailsClosed(t *testing.T) {
 	cfg := &config.Config{}
-	lc := &countingLauncher{snapshotSummary: &configsock.SnapshotPrepareSummary{
-		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
-		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-		RawNetworkMetadata: "{malformed",
+	lc := &countingLauncher{artifactSummary: &configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: string(types.ResumeSourceSnapshot),
+		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		Network:            configsock.ArtifactNetwork{InnerIP: "not-a-cidr"},
+		DiskTopology:       validArtifactDiskTopology(),
 		ResolutionDigest:   strings.Repeat("a", 64),
 		RequiredRefCount:   1,
 	}}
@@ -363,26 +363,25 @@ func TestRestoreMalformedInheritedNetworkIsBestEffort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	running := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateRunning }, "running with malformed inherited network")
-	if running.VswitchPort == "" {
-		t.Fatalf("running sandbox has no network ownership: %+v", running)
+	dead := waitForSandbox(t, o, ctx, created.ID, func(sb *types.Sandbox) bool { return sb.State == types.StateDead }, "dead after invalid inherited network")
+	if dead.RunID != "" || dead.VswitchPort != "" || dead.LaunchMode != "" {
+		t.Fatalf("failed launch retained ownership: %+v", dead)
 	}
 }
 
-func TestValidateSandboxPrepareSummaryDiscardsPartiallyParsedNetwork(t *testing.T) {
-	summary := configsock.SnapshotPrepareSummary{
-		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
-		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-		RawNetworkMetadata: `{"hostname":"must-not-survive","dns":`,
+func TestValidateSandboxPrepareSummaryRejectsInvalidNetwork(t *testing.T) {
+	summary := configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: string(types.ResumeSourceSnapshot),
+		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		Network:            configsock.ArtifactNetwork{TransitMAC: "not-a-mac"},
+		DiskTopology:       validArtifactDiskTopology(),
 		ResolutionDigest:   strings.Repeat("a", 64),
 		RequiredRefCount:   1,
 	}
-	_, network, err := validateSandboxPrepareSummary(summary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(network, sandboxcfg.NetworkSpec{}) {
-		t.Fatalf("partially parsed malformed network survived: %+v", network)
+	_, _, err := validateArtifactPrepareSummary(summary, types.LaunchMemory)
+	if err == nil || !strings.Contains(err.Error(), "artifact network summary") {
+		t.Fatalf("invalid network error = %v", err)
 	}
 }
 
@@ -395,7 +394,8 @@ func TestSandboxTaskBootstrapUsesExactRunAndDoesNoArtifactIO(t *testing.T) {
 		ID: "task-bootstrap", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: rootRef}.String(),
 		State:      types.StateStarting, RunID: "run-current",
-		RunDir: filepath.Join(t.TempDir(), "run", "task-bootstrap"), BaseDir: filepath.Join(t.TempDir(), "base", "task-bootstrap"),
+		LaunchMode: types.LaunchMemory,
+		RunDir:     filepath.Join(t.TempDir(), "run", "task-bootstrap"), BaseDir: filepath.Join(t.TempDir(), "base", "task-bootstrap"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 	}
 	materializeTestSandboxCredentials(t, sb)

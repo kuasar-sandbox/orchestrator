@@ -248,6 +248,26 @@ func TestCreateRestoreMetadataAcceptsExact16MiBChunkedBody(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxMetadataRejectsAmbiguousBodyButAllowsUpstreamExtensions(t *testing.T) {
+	accepted := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"autoPause":true,"autoResume":{"enabled":false},"network":{},"iam":null}`,
+	))
+	if _, err := createSandboxMetadata(httptest.NewRecorder(), accepted); err != nil {
+		t.Fatalf("upstream extension fields rejected: %v", err)
+	}
+	for _, body := range []string{
+		`{"autoPauseMemory":true,"autoPauseMemory":false}`,
+		`{"autoPauseMemory":"false"}`,
+		`{} {}`,
+		`[]`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+		if _, err := createSandboxMetadata(httptest.NewRecorder(), request); err == nil {
+			t.Fatalf("ambiguous create body %q accepted", body)
+		}
+	}
+}
+
 func TestHandleCreateRejectsChunkedBodyPast16MiBWithoutHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
 	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes + 1))
@@ -363,11 +383,64 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	})}
 
 	config := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
-	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
+	if _, err := rt.routeLinkReserve(context.Background(), "create", "/g", "rk", "", 0, 0, config, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
 		t.Fatal(err)
 	}
 	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
 		t.Fatalf("route-link reserve config=%v", got.Config)
+	}
+}
+
+func TestRouteLinkReserveCarriesTypedLifecycleBooleans(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		operation string
+		field     string
+		value     bool
+	}{
+		{name: "create auto pause true", operation: "create", field: "auto_pause_memory", value: true},
+		{name: "create auto pause false", operation: "create", field: "auto_pause_memory"},
+		{name: "connect memory true", operation: "connect", field: "memory", value: true},
+		{name: "connect memory false", operation: "connect", field: "memory"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if len(body) != 1 {
+					t.Fatalf("reserve body fields = %v", body)
+				}
+				var got bool
+				if err := json.Unmarshal(body[test.field], &got); err != nil || got != test.value {
+					t.Fatalf("reserve %s = %t, %v; want %t", test.field, got, err, test.value)
+				}
+				result := routerTestReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				if test.operation == "connect" {
+					result = routerTestConnectReserveResult(t, "s1", "/g", "rk", "node:1", types.ProfileBare)
+				}
+				encoded, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return textResponse(http.StatusOK, string(encoded)), nil
+			})}
+			rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+				return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
+			})}
+			value := test.value
+			var autoPauseMemory, memory *bool
+			if test.operation == "create" {
+				autoPauseMemory = &value
+			} else {
+				memory = &value
+			}
+			if _, err := rt.routeLinkReserve(context.Background(), test.operation, "/g", "rk", "s1", 0, 0,
+				nil, autoPauseMemory, memory, nil, map[string]string{HeaderAPIKey: "api-key"}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -438,7 +511,7 @@ func TestRouteLinkReserveConnectAndDataUseQueryAndHeadersOnly(t *testing.T) {
 				return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
 			})}
 			if _, err := rt.routeLinkReserve(
-				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, nil, tc.headers,
+				context.Background(), tc.operation, "/g", "rk", "s1", tc.port, tc.timeout, nil, nil, nil, nil, tc.headers,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -467,7 +540,7 @@ func TestRouteLinkReserveConnectDoesNotRetryConflict(t *testing.T) {
 		}, nil
 	})}
 
-	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, nil, map[string]string{HeaderAPIKey: "api-key"})
+	_, err := rt.routeLinkReserve(context.Background(), "connect", "/g", "rk", "s1", 0, 0, nil, nil, nil, nil, map[string]string{HeaderAPIKey: "api-key"})
 	var routeErr *routeLinkCallError
 	if !errors.As(err, &routeErr) || routeErr.status != http.StatusConflict {
 		t.Fatalf("connect reserve error=%v, want route-link 409", err)

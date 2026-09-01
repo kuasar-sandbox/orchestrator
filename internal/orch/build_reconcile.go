@@ -347,7 +347,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	if pend.snapshotTemplate {
 		summary, early, err := o.waitBuildPrepare(buildCtx, pend, unit)
 		if err != nil {
-			return nil, "", false, nil, buildFailed("snapshot_prepare", err)
+			return nil, "", false, nil, buildFailed("artifact_prepare", err)
 		}
 		if early != nil {
 			accepted, err := o.fenceAcceptedBuildResult(unit, *early)
@@ -355,7 +355,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 		}
 		inherited, err = validateBuildPrepareSummary(summary)
 		if err != nil {
-			return nil, "", false, nil, buildFailed("snapshot_prepare", err)
+			return nil, "", false, nil, buildFailed("artifact_prepare", err)
 		}
 		prepareDigest = summary.ResolutionDigest
 	}

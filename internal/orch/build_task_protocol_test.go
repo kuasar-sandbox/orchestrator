@@ -95,7 +95,7 @@ func TestCompleteBuildPrepareExactRunReplayAndConflict(t *testing.T) {
 			err  error
 		}{spec: spec, err: err}
 	}()
-	if got, err := handoff.WaitPrepare(context.Background()); err != nil || got != summary {
+	if got, err := handoff.WaitPrepare(context.Background()); err != nil || !configsock.EqualArtifactPrepareSummary(got, summary) {
 		t.Fatalf("host prepare = %+v, %v", got, err)
 	}
 	handoff.PublishFinal(want, nil)

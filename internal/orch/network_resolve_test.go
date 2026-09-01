@@ -246,12 +246,16 @@ func TestResolveBuildNetworksFromTemplatePrecedence(t *testing.T) {
 }
 
 func TestBuildPrepareSummaryStrictlyParsesSnapshotMetadata(t *testing.T) {
-	got, err := validateBuildPrepareSummary(configsock.SnapshotPrepareSummary{
-		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
-		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-		RawNetworkMetadata: `{"hostname":"source","inner_ip":"10.0.0.5/24","nexthop":"10.0.0.1","transit_geneve_vni":23}`,
-		ResolutionDigest:   strings.Repeat("a", 64),
-		RequiredRefCount:   1,
+	got, err := validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: string(types.ResumeSourceSnapshot),
+		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		Network: configsock.ArtifactNetwork{
+			Hostname: "source", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1", TransitGeneveVNI: 23,
+		},
+		DiskTopology:     validArtifactDiskTopology(),
+		ResolutionDigest: strings.Repeat("a", 64),
+		RequiredRefCount: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -261,15 +265,17 @@ func TestBuildPrepareSummaryStrictlyParsesSnapshotMetadata(t *testing.T) {
 		t.Fatalf("source network = %+v", got)
 	}
 
-	_, err = validateBuildPrepareSummary(configsock.SnapshotPrepareSummary{
-		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
-		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-		RawNetworkMetadata: `{malformed`,
+	_, err = validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: string(types.ResumeSourceSnapshot),
+		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		Network:            configsock.ArtifactNetwork{Nexthop: "not-an-ip"},
+		DiskTopology:       validArtifactDiskTopology(),
 		ResolutionDigest:   strings.Repeat("a", 64),
 		RequiredRefCount:   1,
 	})
-	if err == nil || !strings.Contains(err.Error(), "source-template network metadata") {
-		t.Fatalf("malformed inherited network = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "source-template network summary") {
+		t.Fatalf("invalid inherited network = %v", err)
 	}
 }
 

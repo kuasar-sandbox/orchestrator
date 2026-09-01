@@ -159,6 +159,45 @@ func createRequestFixture(t *testing.T, o *Orchestrator, marker string) api.Crea
 	}
 }
 
+func TestStandaloneCreatePersistsAutoPauseMemoryDefaultAndValues(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		marker string
+		value  *bool
+		want   bool
+	}{
+		{name: "missing defaults true", marker: "1", want: true},
+		{name: "explicit true", marker: "2", value: orchCheckpointBool(true), want: true},
+		{name: "explicit false", marker: "3", value: orchCheckpointBool(false)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			startGate := make(chan struct{})
+			lc := &countingLauncher{startGate: startGate}
+			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+			req := createRequestFixture(t, o, test.marker)
+			req.AutoPauseMemory = test.value
+
+			accepted, err := o.Create(ctx, req)
+			if err != nil || accepted == nil || accepted.State != types.StateStarting ||
+				accepted.AutoPauseMemory != test.want || accepted.LaunchMode != types.LaunchImage {
+				t.Fatalf("Create = %+v, %v", accepted, err)
+			}
+			stored, err := o.st.Get(ctx, accepted.ID)
+			if err != nil || stored == nil || stored.AutoPauseMemory != test.want || stored.LaunchMode != types.LaunchImage {
+				t.Fatalf("durable Create = %+v, %v", stored, err)
+			}
+			close(startGate)
+			running := waitForSandbox(t, o, ctx, accepted.ID, func(current *types.Sandbox) bool {
+				return current.State == types.StateRunning
+			}, "running after AutoPauseMemory create")
+			if running.AutoPauseMemory != test.want || running.LaunchMode != "" {
+				t.Fatalf("running AutoPauseMemory/mode = %t/%q", running.AutoPauseMemory, running.LaunchMode)
+			}
+		})
+	}
+}
+
 func TestCreateReturnsBeforeResourcePreparationAndOutlivesRequestContext(t *testing.T) {
 	cfg := &config.Config{}
 	lc := &countingLauncher{}

@@ -1,8 +1,17 @@
 package configsock
 
-import "errors"
+import (
+	"errors"
+	"slices"
 
-const SnapshotPrepareSchemaVersion = 1
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+)
+
+// ArtifactPrepareSchemaVersion 2 replaces the v1 Snapshot-only prepare wire
+// with typed E/S sources, durable launch mode, a selected prepared source, and
+// bounded network/disk topology summaries. Old runners must fail closed before
+// the secret-bearing bootstrap provider is called.
+const ArtifactPrepareSchemaVersion = 2
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -11,11 +20,14 @@ type SandboxTaskRequest struct {
 	Version   int    `json:"version,omitempty"`
 }
 
-// SnapshotPrepareSpec is the non-policy input a tenant-bound runner needs to
-// read one root snapshot.cfg in-process. AbsoluteDeadlineUnixNano is one launch
-// budget shared by task preparation, host preparation, exec, and readiness.
-type SnapshotPrepareSpec struct {
+// ArtifactPrepareSpec is the complete non-secret resolution request for one
+// tenant-bound runner. RootSourceKind and LaunchMode are durable lifecycle
+// values. Artifact bytes, MANIFEST_KEY, and the selected prepared reference
+// never cross back into the conductor process.
+type ArtifactPrepareSpec struct {
+	RootSourceKind           string `json:"root_source_kind"`
 	RootRef                  string `json:"root_ref"`
+	LaunchMode               string `json:"launch_mode"`
 	ManifestConfig           string `json:"manifest_config,omitempty"`
 	RefLocationParent        string `json:"ref_location_parent,omitempty"`
 	RelativeDir              string `json:"relative_dir,omitempty"`
@@ -32,33 +44,74 @@ type SandboxTaskSpec struct {
 	Workdir   string               `json:"workdir"`
 	Env       map[string]string    `json:"env,omitempty"`
 	Final     *LaunchSpec          `json:"final,omitempty"`
-	Prepare   *SnapshotPrepareSpec `json:"prepare,omitempty"`
+	Prepare   *ArtifactPrepareSpec `json:"prepare,omitempty"`
 	Error     string               `json:"error,omitempty"`
 }
 
-type SnapshotCapacity struct {
+type ArtifactCapacity struct {
 	CPU    int    `json:"cpu"`
 	Memory string `json:"memory"`
 }
 
-// SnapshotPrepareSummary is the non-secret immutable handoff from a runner to
+// ArtifactNetwork is the bounded, non-secret network projection produced by
+// the tenant task after it has parsed and validated artifact metadata. The
+// conductor never receives or parses the original metadata document.
+type ArtifactNetwork struct {
+	Hostname         string   `json:"hostname,omitempty"`
+	DNS              []string `json:"dns,omitempty"`
+	InnerIP          string   `json:"inner_ip,omitempty"`
+	Nexthop          string   `json:"nexthop,omitempty"`
+	TransitGatewayIP string   `json:"transit_gateway_ip,omitempty"`
+	TransitGeneveVNI uint32   `json:"transit_geneve_vni,omitempty"`
+	TransitMAC       string   `json:"transit_mac,omitempty"`
+}
+
+// ArtifactPrepareSummary is the non-secret immutable handoff from a runner to
 // the one launch worker for its exact run. ResolutionDigest is an idempotency
 // fingerprint, not an authentication credential.
-type SnapshotPrepareSummary struct {
-	SchemaVersion      int              `json:"schema_version"`
-	Capacity           SnapshotCapacity `json:"capacity"`
-	RawNetworkMetadata string           `json:"raw_network_metadata,omitempty"`
-	ResolutionDigest   string           `json:"resolution_digest"`
-	RequiredRefCount   int              `json:"required_ref_count"`
+type ArtifactPrepareSummary struct {
+	SchemaVersion      int                        `json:"schema_version"`
+	PreparedSourceKind string                     `json:"prepared_source_kind"`
+	Capacity           ArtifactCapacity           `json:"capacity"`
+	Network            ArtifactNetwork            `json:"network,omitempty"`
+	DiskTopology       types.ArtifactDiskTopology `json:"disk_topology"`
+	ResolutionDigest   string                     `json:"resolution_digest"`
+	RequiredRefCount   int                        `json:"required_ref_count"`
 }
 
-type SnapshotPrepareRequest struct {
+// CloneArtifactPrepareSummary isolates every slice-bearing summary field so an
+// HTTP caller cannot mutate an accepted replay identity after admission.
+func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepareSummary {
+	summary.Network.DNS = append([]string(nil), summary.Network.DNS...)
+	summary.DiskTopology.Disks = append([]types.ArtifactDiskShape(nil), summary.DiskTopology.Disks...)
+	return summary
+}
+
+// EqualArtifactPrepareSummary compares the complete immutable task handoff.
+func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
+	return a.SchemaVersion == b.SchemaVersion &&
+		a.PreparedSourceKind == b.PreparedSourceKind &&
+		a.Capacity == b.Capacity &&
+		a.Network.Hostname == b.Network.Hostname &&
+		slices.Equal(a.Network.DNS, b.Network.DNS) &&
+		a.Network.InnerIP == b.Network.InnerIP &&
+		a.Network.Nexthop == b.Network.Nexthop &&
+		a.Network.TransitGatewayIP == b.Network.TransitGatewayIP &&
+		a.Network.TransitGeneveVNI == b.Network.TransitGeneveVNI &&
+		a.Network.TransitMAC == b.Network.TransitMAC &&
+		a.DiskTopology.Root == b.DiskTopology.Root &&
+		slices.Equal(a.DiskTopology.Disks, b.DiskTopology.Disks) &&
+		a.ResolutionDigest == b.ResolutionDigest &&
+		a.RequiredRefCount == b.RequiredRefCount
+}
+
+type ArtifactPrepareRequest struct {
 	SandboxID string                 `json:"sandbox_id"`
 	RunID     string                 `json:"run_id"`
-	Summary   SnapshotPrepareSummary `json:"summary"`
+	Summary   ArtifactPrepareSummary `json:"summary"`
 }
 
-type SnapshotPrepareResponse struct {
+type ArtifactPrepareResponse struct {
 	Final *LaunchSpec `json:"final,omitempty"`
 	Error string      `json:"error,omitempty"`
 }
@@ -69,21 +122,21 @@ type SandboxTaskAuth struct {
 	PidFile string
 }
 
-// SnapshotPrepareRejection marks a definitive stale/conflicting completion.
+// ArtifactPrepareRejection marks a definitive stale/conflicting completion.
 // The task must not retry it as a transient conductor failure.
-type SnapshotPrepareRejection struct{ Err error }
+type ArtifactPrepareRejection struct{ Err error }
 
-func (e *SnapshotPrepareRejection) Error() string { return e.Err.Error() }
-func (e *SnapshotPrepareRejection) Unwrap() error { return e.Err }
+func (e *ArtifactPrepareRejection) Error() string { return e.Err.Error() }
+func (e *ArtifactPrepareRejection) Unwrap() error { return e.Err }
 
-func RejectSnapshotPrepare(err error) error {
+func RejectArtifactPrepare(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &SnapshotPrepareRejection{Err: err}
+	return &ArtifactPrepareRejection{Err: err}
 }
 
-func IsSnapshotPrepareRejection(err error) bool {
-	var rejection *SnapshotPrepareRejection
+func IsArtifactPrepareRejection(err error) bool {
+	var rejection *ArtifactPrepareRejection
 	return errors.As(err, &rejection)
 }

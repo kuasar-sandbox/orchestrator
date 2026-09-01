@@ -21,8 +21,8 @@ import (
 // --- phase C: template snapshot ---------------------------------------------
 
 // prepareBundleTemplateBase preserves the existing platform base_ref policy
-// without relying on upload-snapshot to rewrite snapshot.cfg. Bundle exact
-// upload is intentionally byte-preserving, so a newly exported local image
+// without relying on publication to rewrite snapshot.cfg. Bundle exact
+// publication is intentionally byte-preserving, so a newly exported local image
 // must enter the Store before phase C and the snapshot must record that
 // manifest identity itself. Tarstream publication keeps its existing rewrite
 // path, and an already remote base needs no work.
@@ -212,12 +212,12 @@ func (p *buildPipeline) uploadImage() (string, error) {
 	return p.baseImageRef, nil
 }
 
-func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
+func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 	// Bundle mode exact-uploads snapshot layers without rewriting snapshot.cfg;
 	// prepareBundleTemplateBase has already published a newly built platform
-	// base. Tarstream mode retains upload-snapshot's existing graph rewrite.
+	// base. Tarstream publication rewrites the graph into portable refs.
 	p.progress("uploading template snapshot to the content store")
-	args, err := uploadSnapshotArgs(p.spec, bundle, p.now())
+	args, err := publishArtifactArgs(p.spec, bundle, p.now())
 	if err != nil {
 		return "", err
 	}
@@ -227,19 +227,22 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	}
 	ref := strings.TrimSpace(string(out))
 	if _, err := types.ParsePortableRef(ref); err != nil {
-		return "", fmt.Errorf("upload-snapshot output %q: %w", ref, err)
+		return "", fmt.Errorf("publish output %q: %w", ref, err)
 	}
 	p.progress("uploaded template snapshot: %s", ref)
 	return ref, nil
 }
 
-// uploadSnapshotArgs builds the sandbox-ctl upload-snapshot argv. The
-// publication name is minted HERE, at upload time, not at spec-resolution
+// publishArtifactArgs builds the sandbox-ctl publish argv. The publication
+// name is minted HERE, at publication time, not at spec-resolution
 // time: a build that spans UTC midnight publishes into the day it actually
 // uploads, not the day the orchestrator resolved the spec. now is a parameter
 // so tests can pin the clock across midnight.
-func uploadSnapshotArgs(spec *configsock.BuildSpec, bundle string, now time.Time) ([]string, error) {
-	args := []string{"upload-snapshot", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
+func publishArtifactArgs(spec *configsock.BuildSpec, artifact string, now time.Time) ([]string, error) {
+	// Bundle publication needs the Manifest store even when the root output is
+	// located, because its exact object graph is validated and published before
+	// the located carrier is committed.
+	args := []string{"publish", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
 	if spec.PublishLocationParent != "" {
 		locName := reflocation.PublicationName(spec.BuildID, now)
 		location, err := reflocation.Resolve(spec.PublishLocationParent, locName)
@@ -248,5 +251,5 @@ func uploadSnapshotArgs(spec *configsock.BuildSpec, bundle string, now time.Time
 		}
 		args = append(args, "--to-ref-location", locName+"="+location.URI)
 	}
-	return append(args, bundle), nil
+	return append(args, artifact), nil
 }

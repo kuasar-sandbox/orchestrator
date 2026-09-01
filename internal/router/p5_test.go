@@ -387,6 +387,37 @@ func TestConnectBoundsAndValidatesRequestBody(t *testing.T) {
 			contentLength: -1,
 			wantStatus:    http.StatusBadRequest,
 		},
+		{
+			name:          "unknown field",
+			body:          func() io.Reader { return strings.NewReader(`{"unknown":true}`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "duplicate memory",
+			body:          func() io.Reader { return strings.NewReader(`{"memory":true,"memory":false}`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "malformed memory",
+			body:          func() io.Reader { return strings.NewReader(`{"memory":"false"}`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "array",
+			body:          func() io.Reader { return strings.NewReader(`[]`) },
+			contentLength: -1,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:          "top-level null",
+			body:          func() io.Reader { return strings.NewReader(`null`) },
+			contentLength: -1,
+			wantStatus:    http.StatusOK,
+			wantReserve:   1,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var reserveHits int

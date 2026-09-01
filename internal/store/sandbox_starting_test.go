@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -13,6 +14,7 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 	ctx := context.Background()
 	sb := sandboxInsertFixture("starting-cas", 0)
 	sb.State = types.StatePaused
+	sb.LaunchMode = ""
 	sb.DeadlineUnix = 100
 	sb.RunID = "stale-run"
 	sb.FloatingIP = "192.0.2.10"
@@ -25,11 +27,11 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := st.BeginResume(ctx, sb.ID, 200)
+	changed, err := st.BeginResume(ctx, sb.ID, 200, types.LaunchCold)
 	if err != nil || !changed {
 		t.Fatalf("BeginResume = %v, %v", changed, err)
 	}
-	if changed, err := st.BeginResume(ctx, sb.ID, 201); err != nil || changed {
+	if changed, err := st.BeginResume(ctx, sb.ID, 201, types.LaunchCold); err != nil || changed {
 		t.Fatalf("second BeginResume = %v, %v; want CAS miss", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
@@ -40,7 +42,7 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 		got.FloatingIP != "" || got.VswitchPort != "" || got.InnerIP != "" || got.PortMAC != "" {
 		t.Fatalf("accepted resume retained stale ownership: %+v", got)
 	}
-	if got.SnapshotRef != sb.SnapshotRef || got.TemplateID != sb.TemplateID ||
+	if got.ResumeSource != sb.ResumeSource || got.LaunchMode != types.LaunchCold || got.TemplateID != sb.TemplateID ||
 		got.APISecret != sb.APISecret || got.ManifestKey != sb.ManifestKey ||
 		!reflect.DeepEqual(got.Metadata, wantMetadata) || !reflect.DeepEqual(got.Env, wantEnv) {
 		t.Fatalf("accepted resume changed immutable/portable fields: %+v", got)
@@ -89,6 +91,7 @@ func TestExactRunStartingResourcesAndNonSecretTaskIdentity(t *testing.T) {
 	ctx := context.Background()
 	sb := sandboxInsertFixture("restore-exact-run", 0)
 	sb.State = types.StateStarting
+	sb.LaunchMode = types.LaunchCold
 	sb.RunID = ""
 	sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", ""
 	if err := st.InsertSandbox(ctx, sb); err != nil {
@@ -115,56 +118,158 @@ func TestExactRunStartingResourcesAndNonSecretTaskIdentity(t *testing.T) {
 	}
 }
 
-func TestCommitRunningPausedFencesRunnerAndUpdatesSnapshotAtomically(t *testing.T) {
+func TestResetStartingOwnershipForRecoveryPreservesAcceptedModeAndSource(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("recover-cold-resume", 0)
+	sb.State = types.StateStarting
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+	sb.LaunchMode = types.LaunchCold
+	sb.RunID = "run-current"
+	sb.FloatingIP = "192.0.2.20"
+	sb.VswitchPort = "port-current"
+	sb.InnerIP = "198.51.100.20/31"
+	sb.PortMAC = "02:00:00:00:00:20"
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.ResetStartingOwnershipForRecovery(ctx, sb.ID, "run-stale"); err != nil || changed {
+		t.Fatalf("stale recovery reset = %t, %v; want CAS miss", changed, err)
+	}
+	if changed, err := st.ResetStartingOwnershipForRecovery(ctx, sb.ID, sb.RunID); err != nil || !changed {
+		t.Fatalf("exact recovery reset = %t, %v", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got == nil {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	if got.State != types.StateStarting || got.ResumeSource != sb.ResumeSource || got.LaunchMode != types.LaunchCold ||
+		got.RunID != "" || got.FloatingIP != "" || got.VswitchPort != "" || got.InnerIP != "" || got.PortMAC != "" {
+		t.Fatalf("recovery reset changed accepted resume intent: %+v", got)
+	}
+}
+
+func TestCommitRunningPausedFencesRunnerAndUpdatesResumeSourceAtomically(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	sb := sandboxInsertFixture("pause-cas", 0)
-	sb.SnapshotRef = "snapshot-old"
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-old"}
 	if err := st.InsertSandbox(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", "snapshot-stale"); err != nil || changed {
+	staleSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-stale"}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "run-stale", staleSource); err != nil || changed {
 		t.Fatalf("stale CommitRunningPaused = %v, %v; want CAS miss", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != types.StateRunning || got.SnapshotRef != "snapshot-old" {
+	if got.State != types.StateRunning || got.ResumeSource != sb.ResumeSource {
 		t.Fatalf("CAS miss partially changed pause: %+v", got)
 	}
 	if _, err := st.db.Exec(`
-		CREATE TRIGGER fail_pause_commit BEFORE UPDATE OF state, snapshot_ref ON sandboxes
+		CREATE TRIGGER fail_pause_commit BEFORE UPDATE OF state, resume_source_kind, resume_source_ref ON sandboxes
 		BEGIN SELECT RAISE(ABORT, 'forced pause commit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-failed"); err == nil || changed {
+	failedSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-failed"}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, failedSource); err == nil || changed {
 		t.Fatalf("failed CommitRunningPaused = %v, %v; want propagated error", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != types.StateRunning || got.SnapshotRef != "snapshot-old" {
+	if got.State != types.StateRunning || got.ResumeSource != sb.ResumeSource {
 		t.Fatalf("failed commit partially changed pause: %+v", got)
 	}
 	if _, err := st.db.Exec(`DROP TRIGGER fail_pause_commit`); err != nil {
 		t.Fatal(err)
 	}
 
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-current"); err != nil || !changed {
+	currentSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, currentSource); err != nil || !changed {
 		t.Fatalf("CommitRunningPaused = %v, %v", changed, err)
 	}
 	got, err = st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != types.StatePaused || got.SnapshotRef != "snapshot-current" || got.RunID != sb.RunID {
+	if got.State != types.StatePaused || got.ResumeSource != currentSource || got.RunID != sb.RunID || got.LaunchMode != "" {
 		t.Fatalf("committed pause = %+v", got)
 	}
-	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, "snapshot-late"); err != nil || changed {
+	lateSource := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-late"}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, lateSource); err != nil || changed {
 		t.Fatalf("late CommitRunningPaused = %v, %v; want CAS miss", changed, err)
+	}
+}
+
+func TestPausedOwnershipCleanupUsesIndependentExactCAS(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("paused-cleanup-cas", 0)
+	sb.State = types.StatePaused
+	sb.LaunchMode = ""
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := st.ClearPausedRunner(ctx, sb.ID, "run-stale"); err != nil || changed {
+		t.Fatalf("stale runner clear = %t, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedNetwork(ctx, sb.ID, "port-stale"); err != nil || changed {
+		t.Fatalf("stale network clear = %t, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedNetwork(ctx, sb.ID, sb.VswitchPort); err != nil || !changed {
+		t.Fatalf("exact network clear = %t, %v", changed, err)
+	}
+	intermediate, err := st.Get(ctx, sb.ID)
+	if err != nil || intermediate == nil {
+		t.Fatalf("Get intermediate = %+v, %v", intermediate, err)
+	}
+	if intermediate.RunID != sb.RunID || intermediate.VswitchPort != "" || intermediate.FloatingIP != "" ||
+		intermediate.InnerIP != "" || intermediate.PortMAC != "" || intermediate.ResumeSource != sb.ResumeSource {
+		t.Fatalf("network clear changed independent paused state: %+v", intermediate)
+	}
+	if changed, err := st.ClearPausedRunner(ctx, sb.ID, sb.RunID); err != nil || !changed {
+		t.Fatalf("exact runner clear = %t, %v", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got == nil || got.State != types.StatePaused || got.RunID != "" ||
+		got.ResumeSource != sb.ResumeSource || got.LaunchMode != "" {
+		t.Fatalf("cleaned paused row = %+v, %v", got, err)
+	}
+	if changed, err := st.ClearPausedRunner(ctx, sb.ID, sb.RunID); err != nil || changed {
+		t.Fatalf("duplicate runner clear = %t, %v", changed, err)
+	}
+}
+
+func TestReplacePausedResumeSourceFencesExactOriginal(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("promote-source-cas", 0)
+	sb.State = types.StatePaused
+	sb.LaunchMode = ""
+	sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", "", ""
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	replacement := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("a", 64)}
+	stale := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "stale.snapshot"}
+	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, stale, replacement); err != nil || changed {
+		t.Fatalf("stale source replacement = %t, %v; want CAS miss", changed, err)
+	}
+	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, sb.ResumeSource, replacement); err != nil || !changed {
+		t.Fatalf("exact source replacement = %t, %v", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got == nil || got.State != types.StatePaused || got.ResumeSource != replacement || got.LaunchMode != "" {
+		t.Fatalf("promoted paused source = %+v, %v", got, err)
+	}
+	if changed, err := st.ReplacePausedResumeSource(ctx, sb.ID, sb.ResumeSource, replacement); err != nil || changed {
+		t.Fatalf("duplicate stale replacement = %t, %v; want CAS miss", changed, err)
 	}
 }
 
@@ -174,6 +279,8 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 
 	pre := sandboxInsertFixture("rollback-pre", 1)
 	pre.State = types.StateStarting
+	pre.ResumeSource = types.ResumeSource{}
+	pre.LaunchMode = types.LaunchImage
 	pre.RunID = ""
 	if err := st.InsertSandbox(ctx, pre); err != nil {
 		t.Fatal(err)
@@ -188,6 +295,7 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 
 	post := sandboxInsertFixture("rollback-post", 2)
 	post.State = types.StateStarting
+	post.LaunchMode = types.LaunchCold
 	post.RunID = "run-current"
 	if err := st.InsertSandbox(ctx, post); err != nil {
 		t.Fatal(err)
@@ -205,6 +313,8 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 
 	deleted := sandboxInsertFixture("rollback-deleted", 3)
 	deleted.State = types.StateStarting
+	deleted.ResumeSource = types.ResumeSource{}
+	deleted.LaunchMode = types.LaunchImage
 	deleted.RunID = ""
 	if err := st.InsertSandbox(ctx, deleted); err != nil {
 		t.Fatal(err)
@@ -231,6 +341,41 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 	}
 }
 
+func TestStartingRollbackRejectsWrongLifecycleKind(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	fresh := sandboxInsertFixture("rollback-fresh-as-paused", 4)
+	fresh.State = types.StateStarting
+	fresh.ResumeSource = types.ResumeSource{}
+	fresh.LaunchMode = types.LaunchImage
+	fresh.RunID = "fresh-run"
+	if err := st.InsertSandbox(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.RollbackStartingPaused(ctx, fresh.ID, fresh.RunID); err != nil || changed {
+		t.Fatalf("fresh rollback to paused = %v, %v; want lifecycle-kind CAS miss", changed, err)
+	}
+
+	resume := sandboxInsertFixture("rollback-resume-as-dead", 5)
+	resume.State = types.StateStarting
+	resume.LaunchMode = types.LaunchMemory
+	resume.RunID = "resume-run"
+	if err := st.InsertSandbox(ctx, resume); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.RollbackStartingDead(ctx, resume.ID, resume.RunID); err != nil || changed {
+		t.Fatalf("resume rollback to dead = %v, %v; want lifecycle-kind CAS miss", changed, err)
+	}
+
+	for _, id := range []string{fresh.ID, resume.ID} {
+		got, err := st.Get(ctx, id)
+		if err != nil || got == nil || got.State != types.StateStarting || got.LaunchMode == "" {
+			t.Fatalf("rejected rollback changed %s: %+v, %v", id, got, err)
+		}
+	}
+}
+
 func TestDeletePreLaunchStartingRequiresEmptyOwnership(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -243,6 +388,8 @@ func TestDeletePreLaunchStartingRequiresEmptyOwnership(t *testing.T) {
 	}
 	pre := sandboxInsertFixture("delete-pre-launch", 1)
 	pre.State = types.StateStarting
+	pre.ResumeSource = types.ResumeSource{}
+	pre.LaunchMode = types.LaunchImage
 	clearOwnership(pre)
 	if err := st.InsertSandbox(ctx, pre); err != nil {
 		t.Fatal(err)
@@ -260,11 +407,17 @@ func TestDeletePreLaunchStartingRequiresEmptyOwnership(t *testing.T) {
 	}{
 		{name: "runner", mutate: func(sb *types.Sandbox) { sb.RunID = "run-1" }},
 		{name: "network", mutate: func(sb *types.Sandbox) { sb.VswitchPort = "port-1" }},
-		{name: "running", mutate: func(sb *types.Sandbox) { sb.State = types.StateRunning }},
+		{name: "resume", mutate: func(sb *types.Sandbox) {
+			sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "paused.sandbox"}
+			sb.LaunchMode = types.LaunchCold
+		}},
+		{name: "running", mutate: func(sb *types.Sandbox) { sb.State, sb.LaunchMode = types.StateRunning, "" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			sb := sandboxInsertFixture("delete-pre-launch-"+test.name, 2)
 			sb.State = types.StateStarting
+			sb.ResumeSource = types.ResumeSource{}
+			sb.LaunchMode = types.LaunchImage
 			clearOwnership(sb)
 			test.mutate(sb)
 			if err := st.InsertSandbox(ctx, sb); err != nil {
@@ -286,6 +439,9 @@ func TestListDefaultHidesStartingAndDeadButExplicitStateRemainsDiagnostic(t *tes
 	for i, state := range []types.State{types.StateRunning, types.StatePaused, types.StateStarting, types.StateDead} {
 		sb := sandboxInsertFixture("list-state-"+string(rune('a'+i)), i)
 		sb.State = state
+		if state == types.StateStarting {
+			sb.LaunchMode = types.LaunchCold
+		}
 		if err := st.InsertSandbox(ctx, sb); err != nil {
 			t.Fatal(err)
 		}

@@ -196,6 +196,7 @@ func cloneSandboxCreateRequest(request *conductorextension.SandboxCreateRequest)
 	out.Metadata = cloneStringMap(request.Metadata)
 	out.Env = cloneStringMap(request.Env)
 	out.MMDS = cloneString(request.MMDS)
+	out.AutoPauseMemory = cloneBool(request.AutoPauseMemory)
 	return &out
 }
 
@@ -204,6 +205,7 @@ func cloneSandboxPauseRequest(request *conductorextension.SandboxPauseRequest) *
 		return nil
 	}
 	return &conductorextension.SandboxPauseRequest{
+		CaptureKind:          request.CaptureKind,
 		CheckpointMergeRef:   cloneBool(request.CheckpointMergeRef),
 		CheckpointDropCaches: cloneBool(request.CheckpointDropCaches),
 	}
@@ -213,7 +215,10 @@ func cloneSandboxResumeRequest(request *conductorextension.SandboxResumeRequest)
 	if request == nil {
 		return nil
 	}
-	return &conductorextension.SandboxResumeRequest{RequestedDeadlineUnix: cloneInt64(request.RequestedDeadlineUnix)}
+	return &conductorextension.SandboxResumeRequest{
+		RequestedDeadlineUnix: cloneInt64(request.RequestedDeadlineUnix),
+		Mode:                  request.Mode, Trigger: request.Trigger,
+	}
 }
 
 func cloneSandboxDeleteRequest(request *conductorextension.SandboxDeleteRequest) *conductorextension.SandboxDeleteRequest {

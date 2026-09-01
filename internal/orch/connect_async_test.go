@@ -42,7 +42,7 @@ func TestConnectExistingTargetIgnoresMalformedMigrationToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := o.Connect(ctx, sb.ID, apiKey, "not-a-kmt1-token", 0)
+	got, err := o.Connect(ctx, sb.ID, apiKey, "not-a-kmt1-token", api.ConnectOptions{})
 	if err != nil {
 		t.Fatalf("Connect existing target: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestConnectExistingTargetIgnoresMalformedMigrationToken(t *testing.T) {
 
 func TestConnectMissingTargetWithoutMigrationTokenReturnsNotFound(t *testing.T) {
 	o := testOrch(t)
-	_, err := o.Connect(context.Background(), "missing-target", "any-api-key", "", 0)
+	_, err := o.Connect(context.Background(), "missing-target", "any-api-key", "", api.ConnectOptions{})
 	if !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("Connect missing target error = %v, want ErrNotFound", err)
 	}
@@ -71,7 +71,9 @@ func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
 			Kind:    types.KindImg,
 			Ref:     "manifest://" + strings.Repeat("b", 64),
 		}.String(),
-		State: types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("c", 64),
+		State: types.StatePaused, ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64),
+		},
 		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
 		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-finishing-owner"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-finishing-owner"),
 		CreatedUnix: 1, DeadlineUnix: 100,
@@ -96,7 +98,10 @@ func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
 	}
 	done := make(chan acceptanceResult, 1)
 	go func() {
-		accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, func(*types.Sandbox) error {
+		accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, types.ResumeRequest{
+			Trigger: types.ResumeTriggerConnect,
+			Mode:    types.ResumeAuto,
+		}, func(*types.Sandbox) error {
 			validatedOnce.Do(func() { close(validated) })
 			return nil
 		})
@@ -157,18 +162,20 @@ func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := &types.Sandbox{
-		ID:           "portable-source",
-		Profile:      types.ProfileBare,
-		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
-		State:        types.StatePaused,
-		SnapshotRef:  "manifest://" + strings.Repeat("e", 64),
+		ID:         "portable-source",
+		Profile:    types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
+		State:      types.StatePaused,
+		ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
+		},
 		APISecret:    apiSecret,
 		ManifestKey:  mk,
 		CreatedUnix:  1,
 		DeadlineUnix: 100,
 	}
 	materializeTestSandboxCredentials(t, source)
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +187,7 @@ func TestConnectImportsAndDurablyAcceptsResumeBeforeReturning(t *testing.T) {
 	}
 	done := make(chan connectResult, 1)
 	go func() {
-		sb, err := o.Connect(ctx, targetID, apiKey, token, 0)
+		sb, err := o.Connect(ctx, targetID, apiKey, token, api.ConnectOptions{})
 		done <- connectResult{sb: sb, err: err}
 	}()
 
@@ -239,7 +246,9 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 		sb := &types.Sandbox{
 			ID: id, Profile: types.ProfileBare,
 			TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("8", 64)}.String(),
-			State:      types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("9", 64),
+			State:      types.StatePaused, ResumeSource: types.ResumeSource{
+				Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("9", 64),
+			},
 			APISecret: apiSecret, ManifestKey: mk,
 			Metadata:    map[string]string{"winner": marker, "padding": strings.Repeat(marker, 128<<10)},
 			CreatedUnix: 1, DeadlineUnix: 100,
@@ -251,7 +260,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	tokens := make([]string, len(sources))
 	for i, source := range sources {
 		var err error
-		tokens[i], err = o.mintSandboxToken(source, source.SnapshotRef)
+		tokens[i], err = o.mintSandboxToken(source, source.ResumeSource)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +281,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 		go func() {
 			ready.Done()
 			<-release
-			sb, err := o.Connect(ctx, targetID, apiKey, token, 0)
+			sb, err := o.Connect(ctx, targetID, apiKey, token, api.ConnectOptions{})
 			results <- concurrentConnectResult{sb: sb, err: err}
 		}()
 	}
@@ -339,6 +348,7 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 		Profile:      types.ProfileBare,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
 		State:        types.StatePaused,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("2", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
 		RunDir:       filepath.Join(cfg.Paths.RunRoot, "timeout-target"),
@@ -352,7 +362,7 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 	}
 
 	before := time.Now().Unix()
-	connected, err := o.Connect(ctx, sb.ID, apiKey, "", 37)
+	connected, err := o.Connect(ctx, sb.ID, apiKey, "", api.ConnectOptions{TimeoutSec: 37})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +406,9 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "deadline-retry", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("4", 64)}.String(),
-		State:      types.StatePaused, APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
+		State:      types.StatePaused, ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("3", 64),
+		}, APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
 		RunDir: filepath.Join(cfg.Paths.RunRoot, "deadline-retry"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "deadline-retry"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -404,7 +416,7 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", 73)
+	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", api.ConnectOptions{TimeoutSec: 73})
 	if err != nil || accepted == nil || accepted.State != types.StateStarting {
 		t.Fatalf("first Connect = %+v, %v", accepted, err)
 	}
@@ -437,7 +449,7 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 	// the in-memory intent only after the exact runner commits running.
 	lc.connectGate = nil
 	lc.readinessWire = nil
-	retry, err := o.Connect(ctx, sb.ID, apiKey, "", 0)
+	retry, err := o.Connect(ctx, sb.ID, apiKey, "", api.ConnectOptions{})
 	if err != nil || retry == nil || retry.State != types.StateStarting || retry.DeadlineUnix != explicitDeadline {
 		t.Fatalf("retry Connect = %+v, %v; want preserved deadline %d", retry, err, explicitDeadline)
 	}
@@ -455,7 +467,7 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 func TestKillCancelsStartingResumeWithoutWaitingOrResurrection(t *testing.T) {
 	f := newBlockedResumeFixture(t)
 
-	connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 0)
+	connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{})
 	if err != nil || connected == nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v; want starting result", connected, err)
 	}
@@ -498,14 +510,16 @@ func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *tes
 	sb := &types.Sandbox{
 		ID: "kill-readiness", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		State:      types.StatePaused, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		State:      types.StatePaused, ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64),
+		}, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(cfg.Paths.RunRoot, "kill-readiness"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "kill-readiness"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", 0)
+	accepted, err := o.Connect(ctx, sb.ID, apiKey, "", api.ConnectOptions{})
 	if err != nil || accepted == nil || accepted.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v", accepted, err)
 	}
@@ -541,10 +555,10 @@ func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *tes
 
 func TestPauseStartingReturnsConflictWithoutSnapshotting(t *testing.T) {
 	f := newBlockedResumeFixture(t)
-	if connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 0); err != nil || connected.State != types.StateStarting {
+	if connected, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{}); err != nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v", connected, err)
 	}
-	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, sandboxcfg.CheckpointPolicy{}); !errors.Is(err, api.ErrSandboxStarting) {
+	if err := f.o.Pause(f.ctx, f.sb.ID, f.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrSandboxStarting) {
 		t.Fatalf("Pause starting sandbox = %v, want ErrSandboxStarting", err)
 	}
 	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
@@ -562,7 +576,7 @@ func TestPauseStartingReturnsConflictWithoutSnapshotting(t *testing.T) {
 
 func TestSetTimeoutAfterAsyncConnectWins(t *testing.T) {
 	f := newBlockedResumeFixture(t)
-	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 37); err != nil {
+	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{TimeoutSec: 37}); err != nil {
 		t.Fatal(err)
 	}
 	waitForLauncherStart(t, f.started)
@@ -601,7 +615,7 @@ func TestSetTimeoutAfterAsyncConnectWins(t *testing.T) {
 
 func TestLaterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 	f := newBlockedResumeFixture(t)
-	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 37); err != nil {
+	if _, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{TimeoutSec: 37}); err != nil {
 		t.Fatal(err)
 	}
 	waitForLauncherStart(t, f.started)
@@ -613,7 +627,7 @@ func TestLaterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 	done := make(chan connectResult, 1)
 	before := time.Now().Unix()
 	go func() {
-		sb, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", 91)
+		sb, err := f.o.Connect(f.ctx, f.sb.ID, f.apiKey, "", api.ConnectOptions{TimeoutSec: 91})
 		done <- connectResult{sb: sb, err: err}
 	}()
 	var result connectResult
@@ -662,6 +676,7 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 		Profile:      types.ProfileBare,
 		TemplateID:   types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:        types.StatePaused,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
 		RunDir:       filepath.Join(cfg.Paths.RunRoot, "blocked-resume-target"),

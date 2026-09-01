@@ -154,7 +154,7 @@ client-auth 策略仍由 core 固定。V1 不支持配置、材料或 Extension 
 `sync_begin → snapshot upsert* → sync_end`，之后按发布顺序发送 live upsert/delete；断线发送
 `sync_lost`。慢 watcher 只使自身 generation 失效并自动 full resync；允许重复、不保证观察到
 每个中间变化，也不是 durable audit。View 复制身份、profile/template/state/RunID、当前 endpoint、
-snapshot location、fingerprint 与 route revision，不复制原始 secret/token，也不增加 route metadata
+artifact location、fingerprint 与 route revision，不复制原始 secret/token，也不增加 route metadata
 或 SHM schema。observer 只在 core SHM apply 成功后非阻塞发布，绝不影响 routesync、barrier ACK、
 Wake 或 worker notification。
 
@@ -283,7 +283,8 @@ SHM route;paused/Delete 先撤销 heap 再更新 SHM,让已采样旧 active row 
 本文中 `RouteEntry.SandboxID`、`sid` 和共享表 key 均是 node-local SandboxID.集群路径下,它们是
 Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公开稳定 SandboxID 转换为该值.
 `RouteEntry.StableID` 是跨 NodeSandboxID 变化保持的 sandbox identity，用于 KAT/credential
-binding，不参与共享表 lookup。routesync V3 将该 JSON wire 一次性切换为 `stable_id`；subscriber
+binding，不参与共享表 lookup。routesync V3 将 identity 一次性切换为 `stable_id`；V4 将
+Snapshot-specific location 改为与 E/S kind 正交的 `artifact_location`；subscriber
 和 node-link client 在首个 Hello 校验版本，不匹配时在处理 route/command 前终止 session。
 
 共享表是固定容量开放寻址 hash 表。master 单写;每条记录带 seqlock,worker 读取时若遇到

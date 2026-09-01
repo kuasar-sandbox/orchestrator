@@ -54,7 +54,7 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
 		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
-		SnapshotLocation: "remote", MmdsSecret: hex.EncodeToString([]byte("mmds")),
+		ArtifactLocation: "remote", MmdsSecret: hex.EncodeToString([]byte("mmds")),
 	}
 	master.BeginSync()
 	if err := master.Upsert(entry); err != nil {

@@ -529,7 +529,8 @@ func testSandbox(id string, created int64) *types.Sandbox {
 		State:      types.StateRunning, DeadlineUnix: created + 100, RunDir: "/run/" + id, BaseDir: "/base/" + id,
 		RunID: "run-" + id, FloatingIP: "192.0.2.1", VswitchPort: "port-1", InnerIP: "10.0.0.1/24",
 		PortMAC: "02:00:00:00:00:01", APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64),
-		SnapshotRef: "/snapshots/" + id, ServiceSecret: serviceSecret, ForwardAccessToken: forward,
+		ResumeSource:    types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "/snapshots/" + id},
+		AutoPauseMemory: true, ServiceSecret: serviceSecret, ForwardAccessToken: forward,
 		Metadata: map[string]string{"key": "sandbox"}, Env: map[string]string{"SECRET_ENV": "not projected"}, CreatedUnix: created,
 	}
 }

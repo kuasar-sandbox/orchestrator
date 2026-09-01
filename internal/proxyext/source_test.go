@@ -60,7 +60,7 @@ func testRoute(sandboxID, runID string) routesync.RouteEntry {
 		SandboxID: sandboxID, StableID: "stable-" + sandboxID,
 		Profile: "bare", TemplateID: "tmpl-1",
 		State: routesync.StateRunning, RunID: runID,
-		FloatingIP: "10.0.0.2", SnapshotLocation: "remote",
+		FloatingIP: "10.0.0.2", ArtifactLocation: "remote",
 		APISecret: "raw-api-secret", APISecretFingerprint: "api-fingerprint",
 		ManifestKeyFingerprint: "manifest-fingerprint", ServiceSecret: "raw-service-secret",
 		EnvdAccessToken: "raw-envd-token", TrafficAccessToken: "raw-traffic-token",

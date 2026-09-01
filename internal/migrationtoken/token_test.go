@@ -24,7 +24,7 @@ const (
 	testMigrationKey        = "efc3f9ac75d63ece0a9065ab26bb24e6429bc78ef12ba07865bb99544c5e89b7"
 	testServiceSecret       = "0213051156fc06b40aebdeb333caeb9c95866d91f08298264901787551897989"
 	testForwardToken        = "kat1.eyJ2IjoxLCJzaWQiOiJzYW5kYm94LTAxIiwiYXVkIjoiZm9yd2FyZCJ9.uk154F30--e531Hogd4pgj0oGFsuIJJT0nWr17gkdSw"
-	testGoldenTokenSHA256   = "d0db333b19b381485a828a3feb947fef9e8545ceef77f69fbffbef3e8877c6bb"
+	testGoldenTokenSHA256   = "34f5f785e77d62997dcdb98519563e82a57c973176546f8074dad0cdc440add5"
 )
 
 var testMaterial = KeyMaterial{APISecret: testAPISecret, ManifestKey: testManifestKey}
@@ -39,11 +39,13 @@ func validPayload() MigrationTokenPayloadV1 {
 		TemplateID:             types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		Profile:                "e2b",
 		RuntimeDigest:          strings.Repeat("b", 64),
-		SnapshotRef:            "manifest://" + strings.Repeat("c", 64),
+		ResumeSourceKind:       types.ResumeSourceSnapshot,
+		ResumeSourceRef:        "manifest://" + strings.Repeat("c", 64),
 		Env:                    map[string]string{"LANG": "C.UTF-8"},
 		Metadata:               map[string]string{"purpose": "migration"},
 		CreatedUnix:            1_700_000_000,
 		DeadlineUnix:           0,
+		AutoPauseMemory:        true,
 		ServiceSecret:          testServiceSecret,
 		EnvdAccessToken:        "envd-token",
 		TrafficAccessToken:     "traffic-token",
@@ -244,11 +246,11 @@ func TestOptionalEnvAndMetadataMayBeOmitted(t *testing.T) {
 	}
 }
 
-func TestLocatedSnapshotRefRoundTrip(t *testing.T) {
+func TestLocatedResumeSourceRefRoundTrip(t *testing.T) {
 	for _, suffix := range []string{".snapshot", ".bundle"} {
 		t.Run(suffix, func(t *testing.T) {
 			payload := validPayload()
-			payload.SnapshotRef = "file://" + strings.Repeat("d", 64) + suffix + "@location:source-1"
+			payload.ResumeSourceRef = "file://" + strings.Repeat("d", 64) + suffix + "@location:source-1"
 			token, err := Seal(testMaterial, payload)
 			if err != nil {
 				t.Fatal(err)
@@ -257,13 +259,13 @@ func TestLocatedSnapshotRefRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.SnapshotRef != payload.SnapshotRef {
-				t.Fatalf("SnapshotRef = %q, want %q", got.SnapshotRef, payload.SnapshotRef)
+			if got.ResumeSourceRef != payload.ResumeSourceRef {
+				t.Fatalf("ResumeSourceRef = %q, want %q", got.ResumeSourceRef, payload.ResumeSourceRef)
 			}
 		})
 	}
 	payload := validPayload()
-	payload.SnapshotRef = "file:///mnt/shared/root.snapshot"
+	payload.ResumeSourceRef = "file:///mnt/shared/root.snapshot"
 	if _, err := Seal(testMaterial, payload); err == nil {
 		t.Fatal("local file ref was accepted in migration token")
 	}
@@ -282,7 +284,7 @@ func TestOpenValidatesPayloadSemantics(t *testing.T) {
 			p.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 		},
 		"runtime":           func(p *MigrationTokenPayloadV1) { p.RuntimeDigest = strings.Repeat("B", 64) },
-		"snapshot":          func(p *MigrationTokenPayloadV1) { p.SnapshotRef = "/local/snapshot" },
+		"snapshot":          func(p *MigrationTokenPayloadV1) { p.ResumeSourceRef = "/local/snapshot" },
 		"created":           func(p *MigrationTokenPayloadV1) { p.CreatedUnix = 0 },
 		"deadline":          func(p *MigrationTokenPayloadV1) { p.DeadlineUnix = -1 },
 		"service secret":    func(p *MigrationTokenPayloadV1) { p.ServiceSecret = strings.Repeat("S", 64) },
@@ -422,7 +424,9 @@ func TestValidateExpectations(t *testing.T) {
 		TemplateID:    payload.TemplateID,
 		Profile:       types.Profile(payload.Profile),
 		RuntimeDigest: payload.RuntimeDigest,
-		SnapshotRef:   payload.SnapshotRef,
+		ResumeSource: types.ResumeSource{
+			Kind: payload.ResumeSourceKind, Ref: payload.ResumeSourceRef,
+		},
 	}
 	if err := ValidateExpectations(payload, matching); err != nil {
 		t.Fatal(err)
@@ -436,7 +440,9 @@ func TestValidateExpectations(t *testing.T) {
 		"template":  {TemplateID: "other"},
 		"profile":   {Profile: types.ProfileBare},
 		"runtime":   {RuntimeDigest: strings.Repeat("d", 64)},
-		"snapshot":  {SnapshotRef: "manifest://" + strings.Repeat("e", 64)},
+		"resume source": {ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
+		}},
 	}
 	for name, expected := range tests {
 		t.Run(name, func(t *testing.T) {

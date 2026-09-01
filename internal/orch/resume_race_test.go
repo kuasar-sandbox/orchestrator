@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
@@ -29,24 +30,26 @@ type countingLauncher struct {
 	stops  atomic.Int64
 	orch   *Orchestrator
 
-	started            chan<- struct{}
-	startGate          <-chan struct{}
-	assigned           chan<- string
-	connectGate        <-chan struct{}
-	readyConnected     chan<- struct{}
-	readinessWire      []byte // nil means the exact successful wire; empty means immediate EOF.
-	readinessDelay     time.Duration
-	readinessNoSend    bool
-	readinessNoConnect bool
-	readinessErrors    chan<- error
-	snapshotSummary    *configsock.SnapshotPrepareSummary
-	snapshotRoots      chan<- string
-	snapshotPrepareErr error
-	stopEntered        chan<- struct{}
-	stopGate           <-chan struct{}
-	resourceMu         sync.Mutex
-	resources          map[string]launcher.ResourceProperties
-	lastTaskError      error
+	started             chan<- struct{}
+	startGate           <-chan struct{}
+	assigned            chan<- string
+	connectGate         <-chan struct{}
+	readyConnected      chan<- struct{}
+	readinessWire       []byte // nil means the exact successful wire; empty means immediate EOF.
+	readinessDelay      time.Duration
+	readinessNoSend     bool
+	readinessNoConnect  bool
+	readinessErrors     chan<- error
+	artifactSummary     *configsock.ArtifactPrepareSummary
+	artifactLaunchModes chan<- string
+	snapshotRoots       chan<- string
+	artifactPrepareErr  error
+	stopEntered         chan<- struct{}
+	stopGate            <-chan struct{}
+	listedUnits         []launcher.Unit
+	resourceMu          sync.Mutex
+	resources           map[string]launcher.ResourceProperties
+	lastTaskError       error
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -120,24 +123,36 @@ func (l *countingLauncher) runSandbox(runID string) {
 		return
 	}
 	if taskSpec.Prepare != nil {
+		if l.artifactLaunchModes != nil {
+			select {
+			case l.artifactLaunchModes <- taskSpec.Prepare.LaunchMode:
+			default:
+			}
+		}
 		if l.snapshotRoots != nil {
 			select {
 			case l.snapshotRoots <- taskSpec.Prepare.RootRef:
 			default:
 			}
 		}
-		if l.snapshotPrepareErr != nil {
-			l.reportReadinessError(l.snapshotPrepareErr)
+		if l.artifactPrepareErr != nil {
+			l.reportReadinessError(l.artifactPrepareErr)
 			return
 		}
-		summary := configsock.SnapshotPrepareSummary{
-			SchemaVersion:    configsock.SnapshotPrepareSchemaVersion,
-			Capacity:         configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-			ResolutionDigest: strings.Repeat("0", 64),
-			RequiredRefCount: 1,
+		preparedKind := types.ResumeSourceSandbox
+		if taskSpec.Prepare.LaunchMode == string(types.LaunchMemory) {
+			preparedKind = types.ResumeSourceSnapshot
 		}
-		if l.snapshotSummary != nil {
-			summary = *l.snapshotSummary
+		summary := configsock.ArtifactPrepareSummary{
+			SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+			PreparedSourceKind: string(preparedKind),
+			Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+			DiskTopology:       validArtifactDiskTopology(),
+			ResolutionDigest:   strings.Repeat("0", 64),
+			RequiredRefCount:   1,
+		}
+		if l.artifactSummary != nil {
+			summary = *l.artifactSummary
 		}
 		if _, err := l.orch.CompleteSandboxPrepare(ctx, sid, runID, summary); err != nil {
 			l.reportReadinessError(err)
@@ -209,7 +224,7 @@ func (l *countingLauncher) Stop(ctx context.Context, _ string) error {
 }
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
-	return nil, nil
+	return append([]launcher.Unit(nil), l.listedUnits...), nil
 }
 func (l *countingLauncher) Reload(context.Context) error { return nil }
 func (l *countingLauncher) SetResources(_ context.Context, unit string, p launcher.ResourceProperties) error {
@@ -276,11 +291,12 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), State: types.StatePaused,
-		APISecret:   apiSecret,
-		ManifestKey: mk,
-		RunDir:      cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:     cfg.Paths.BaseRoot + "/" + sid,
-		CreatedUnix: 1,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
+		APISecret:    apiSecret,
+		ManifestKey:  mk,
+		RunDir:       cfg.Paths.RunRoot + "/" + sid,
+		BaseDir:      cfg.Paths.BaseRoot + "/" + sid,
+		CreatedUnix:  1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := st.Put(ctx, sb); err != nil {
@@ -289,7 +305,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 
 	// Connect returns while its asynchronous resume is blocked in launcher.Start.
 	// That guarantees the Route calls below join the same active attempt.
-	connected, err := o.Connect(ctx, sid, apiKey, "", 60)
+	connected, err := o.Connect(ctx, sid, apiKey, "", api.ConnectOptions{TimeoutSec: 60})
 	if err != nil || connected == nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v; want durable starting result", connected, err)
 	}

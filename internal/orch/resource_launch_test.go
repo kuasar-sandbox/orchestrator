@@ -40,7 +40,7 @@ func TestFreshRestoreSnapshotReadFailureIsAsynchronousAndRollsBackDead(t *testin
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	vs := &resourcePreflightVS{}
 	o.vs = vs
-	lc.snapshotPrepareErr = errors.New("capacity probe failed")
+	lc.artifactPrepareErr = errors.New("capacity probe failed")
 	req := createRequestFixture(t, o, "8")
 	req.TemplateID = types.TemplateID{
 		Profile: types.ProfileBare,
@@ -116,15 +116,17 @@ func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	vs := &resourcePreflightVS{}
 	o.vs = vs
-	lc.snapshotPrepareErr = errors.New("resume capacity probe failed")
+	lc.artifactPrepareErr = errors.New("resume capacity probe failed")
 	sb := &types.Sandbox{
 		ID: "resource-resume-probe", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{
 			Profile: types.ProfileBare, Kind: types.KindImg,
 			Ref: "manifest://" + strings.Repeat("d", 64),
 		}.String(),
-		State:       types.StatePaused,
-		SnapshotRef: "manifest://" + strings.Repeat("e", 64),
+		State: types.StatePaused,
+		ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
+		},
 		APISecret:   deriveTestAPISecret(t, strings.Repeat("f", 64)),
 		ManifestKey: strings.Repeat("f", 64),
 		RunDir:      filepath.Join(cfg.Paths.RunRoot, "resource-resume-probe"),
@@ -135,7 +137,10 @@ func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing
 		t.Fatal(err)
 	}
 
-	accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	accepted, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, types.ResumeRequest{
+		Trigger: types.ResumeTriggerConnect,
+		Mode:    types.ResumeAuto,
+	}, nil)
 	if err != nil || accepted == nil || accepted.State != types.StateStarting || attempt == nil {
 		t.Fatalf("ensureResumeAccepted = %+v, %+v, %v", accepted, attempt, err)
 	}
@@ -186,7 +191,7 @@ func TestDynamicLaunchUsesCanonicalResourceControllerIdentity(t *testing.T) {
 		Profile: types.ProfileBare, Kind: types.KindImg,
 		Ref: "manifest://" + strings.Repeat("1", 64),
 	}
-	sb := &types.Sandbox{ID: "canonical-controller", Profile: types.ProfileBare}
+	sb := &types.Sandbox{ID: "canonical-controller", Profile: types.ProfileBare, LaunchMode: types.LaunchImage}
 	prep, err := o.prepareSandboxLaunch(context.Background(), sb, tmpl)
 	if err != nil {
 		t.Fatal(err)

@@ -109,6 +109,8 @@ func TestClusterCommandRejectMapsMigrationErrors(t *testing.T) {
 		{name: "authentication", err: migrationtoken.ErrAuthentication, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
 		{name: "fingerprint", err: migrationtoken.ErrCredentialMismatch, wantStatus: http.StatusForbidden, wantReason: "migration credential not allowed"},
 		{name: "incompatible", err: migrationtoken.ErrIncompatible, wantStatus: http.StatusConflict, wantReason: "target environment incompatible"},
+		{name: "memory unavailable", err: types.ErrMemoryUnavailable, wantStatus: http.StatusConflict, wantReason: types.ErrMemoryUnavailable.Error()},
+		{name: "launch mode conflict", err: types.ErrLaunchModeConflict, wantStatus: http.StatusConflict, wantReason: types.ErrLaunchModeConflict.Error()},
 		{name: "too large", err: migrationtoken.ErrTokenTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantReason: migrationtoken.ErrTokenTooLarge.Error()},
 		{name: "proxy unavailable", err: api.ErrProxyUnavailable, wantStatus: http.StatusServiceUnavailable, wantReason: api.ErrProxyUnavailable.Error()},
 		{name: "unclassified", err: errors.New("ordinary rejection"), wantReason: "private-detail: ordinary rejection"},
@@ -161,6 +163,90 @@ func TestClusterConnectDeadlineAcceptsMaximumDuration(t *testing.T) {
 	deadline := clusterConnectDeadline(int(routesync.MaxConnectTimeoutSeconds))
 	if deadline <= now {
 		t.Fatalf("maximum connect timeout deadline = %d, want later than %d", deadline, now)
+	}
+}
+
+func TestHandleClusterConnectResumeModeMatrix(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		sourceKind types.ResumeSourceKind
+		memory     *bool
+		wantMode   types.LaunchMode
+		wantErr    error
+	}{
+		{name: "snapshot auto", sourceKind: types.ResumeSourceSnapshot, wantMode: types.LaunchMemory},
+		{name: "snapshot memory", sourceKind: types.ResumeSourceSnapshot, memory: resumeMemoryOption(true), wantMode: types.LaunchMemory},
+		{name: "snapshot cold", sourceKind: types.ResumeSourceSnapshot, memory: resumeMemoryOption(false), wantMode: types.LaunchCold},
+		{name: "sandbox auto", sourceKind: types.ResumeSourceSandbox, wantMode: types.LaunchCold},
+		{name: "sandbox cold", sourceKind: types.ResumeSourceSandbox, memory: resumeMemoryOption(false), wantMode: types.LaunchCold},
+		{name: "sandbox memory unavailable", sourceKind: types.ResumeSourceSandbox, memory: resumeMemoryOption(true), wantErr: types.ErrMemoryUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			startGate := make(chan struct{})
+			launchModes := make(chan string, 1)
+			lc := &countingLauncher{startGate: startGate, artifactLaunchModes: launchModes}
+			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+			manifestKey := strings.Repeat("6", 64)
+			apiSecret := deriveTestAPISecret(t, manifestKey)
+			fingerprint, err := store.APISecretHash(apiSecret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			extension := ".snapshot"
+			if test.sourceKind == types.ResumeSourceSandbox {
+				extension = ".sandbox"
+			}
+			sb := &types.Sandbox{
+				ID: "cluster-resume-mode", Profile: types.ProfileBare,
+				Cluster: &types.ClusterSandboxContext{Group: "/g", RouteKey: "rk"}, StableIDValue: "stable",
+				TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
+				State:      types.StatePaused, ResumeSource: types.ResumeSource{
+					Kind: test.sourceKind, Ref: "file://" + strings.Repeat("8", 64) + extension + "@location:cluster-mode",
+				},
+				APISecret: apiSecret, ManifestKey: manifestKey,
+				RunDir: filepath.Join(cfg.Paths.RunRoot, "cluster-resume-mode"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "cluster-resume-mode"), CreatedUnix: 1,
+			}
+			materializeTestSandboxCredentials(t, sb)
+			if err := o.st.Put(ctx, sb); err != nil {
+				t.Fatal(err)
+			}
+			cmd := &routesync.Command{
+				CmdID: "connect-cluster-resume-mode", Kind: routesync.CmdConnect, SID: sb.ID,
+				Profile: string(sb.Profile), APISecretFingerprint: fingerprint, Memory: test.memory,
+				Cluster: &routesync.ClusterSandboxContext{Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey, StableID: sb.StableID()},
+			}
+			ack := o.HandleCommand(ctx, cmd)
+			if test.wantErr != nil {
+				if ack.Status != routesync.AckRejected || ack.HTTPStatus != http.StatusConflict || ack.Reason != test.wantErr.Error() {
+					t.Fatalf("cluster conflict ack = %+v", ack)
+				}
+				stored, err := o.st.Get(ctx, sb.ID)
+				if err != nil || stored == nil || stored.State != types.StatePaused || stored.LaunchMode != "" || stored.ResumeSource != sb.ResumeSource {
+					t.Fatalf("cluster conflict changed row = %+v, %v", stored, err)
+				}
+				return
+			}
+			if ack.Status != routesync.AckAccepted || ack.Connect == nil {
+				t.Fatalf("cluster Connect ack = %+v", ack)
+			}
+			stored, err := o.st.Get(ctx, sb.ID)
+			if err != nil || stored == nil || stored.State != types.StateStarting || stored.LaunchMode != test.wantMode {
+				t.Fatalf("durable cluster resume = %+v, %v", stored, err)
+			}
+			close(startGate)
+			select {
+			case got := <-launchModes:
+				if got != string(test.wantMode) {
+					t.Fatalf("cluster task launch mode = %q, want %q", got, test.wantMode)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("cluster task did not receive accepted launch mode")
+			}
+			waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+				return current.State == types.StateRunning
+			}, "running after cluster mode-selected resume")
+		})
 	}
 }
 
@@ -237,6 +323,7 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 		StableIDValue: "stable",
 		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
 		State:         types.StatePaused,
+		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
 		APISecret:     deriveTestAPISecret(t, manifestKey),
 		ManifestKey:   manifestKey,
 		RunDir:        filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
@@ -360,6 +447,7 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 		StableIDValue: "stable",
 		TemplateID:    types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		State:         types.StatePaused,
+		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
 		APISecret:     apiSecret,
 		ManifestKey:   manifestKey,
 		RunDir:        filepath.Join(cfg.Paths.RunRoot, sid),
@@ -605,7 +693,7 @@ func TestPrepareClusterConnectConcurrentTargetIsInsertOnly(t *testing.T) {
 	tokens := make([]string, len(sources))
 	for i, source := range sources {
 		var err error
-		tokens[i], err = fixture.o.mintSandboxToken(source, source.SnapshotRef)
+		tokens[i], err = fixture.o.mintSandboxToken(source, source.ResumeSource)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -722,7 +810,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}

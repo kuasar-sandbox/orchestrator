@@ -20,42 +20,46 @@ import (
 
 func orchCheckpointBool(value bool) *bool { return &value }
 
-func TestResolveCheckpointPolicyPrecedence(t *testing.T) {
+func orchSnapshotCapture(policy sandboxcfg.SnapshotPolicy) sandboxcfg.CaptureRequest {
+	return sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, SnapshotPolicy: policy}
+}
+
+func TestResolveSnapshotPolicyPrecedence(t *testing.T) {
 	tests := []struct {
 		name     string
-		node     sandboxcfg.CheckpointPolicy
+		node     sandboxcfg.SnapshotPolicy
 		metadata string
-		action   sandboxcfg.CheckpointPolicy
-		want     sandboxcfg.CheckpointPolicy
+		action   sandboxcfg.SnapshotPolicy
+		want     sandboxcfg.SnapshotPolicy
 	}{
 		{
 			name: "node only",
-			node: sandboxcfg.CheckpointPolicy{
+			node: sandboxcfg.SnapshotPolicy{
 				MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(false),
 			},
-			want: sandboxcfg.CheckpointPolicy{
+			want: sandboxcfg.SnapshotPolicy{
 				MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(false),
 			},
 		},
 		{
 			name:     "metadata overrides node",
-			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
+			node:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
 			metadata: `{"merge_ref":false,"drop_caches":false}`,
-			want:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(false)},
+			want:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(false)},
 		},
 		{
 			name:     "action overrides metadata",
-			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
+			node:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
 			metadata: `{"merge_ref":false,"drop_caches":false}`,
-			action:   sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
-			want:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
+			action:   sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
+			want:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
 		},
 		{
 			name:     "fields come from different layers",
-			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true)},
+			node:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true)},
 			metadata: `{"drop_caches":false}`,
-			action:   sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false)},
-			want:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(false)},
+			action:   sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(false)},
+			want:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(false)},
 		},
 		{name: "all unset"},
 	}
@@ -69,7 +73,7 @@ func TestResolveCheckpointPolicyPrecedence(t *testing.T) {
 			if tc.metadata != "" {
 				metadata[sandboxcfg.NsCheckpoint] = tc.metadata
 			}
-			got, err := o.resolveCheckpointPolicy(metadata, tc.action)
+			got, err := o.resolveSnapshotPolicy(metadata, tc.action)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -84,20 +88,20 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 	tests := []struct {
 		name     string
 		mode     string
-		node     sandboxcfg.CheckpointPolicy
+		node     sandboxcfg.SnapshotPolicy
 		metadata string
-		action   sandboxcfg.CheckpointPolicy
+		action   sandboxcfg.SnapshotPolicy
 		wantTail []string
 	}{
 		{name: "local all unset", mode: config.CheckpointLocal},
 		{name: "bundle node values", mode: config.CheckpointBundle,
-			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true)},
+			node:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true)},
 			wantTail: []string{"--merge-ref=false", "--drop-caches=true"}},
 		{name: "local metadata and action layered", mode: config.CheckpointLocal,
-			node:     sandboxcfg.CheckpointPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
-			metadata: `{"merge_ref":false}`, action: sandboxcfg.CheckpointPolicy{DropCaches: orchCheckpointBool(false)},
+			node:     sandboxcfg.SnapshotPolicy{MergeRef: orchCheckpointBool(true), DropCaches: orchCheckpointBool(true)},
+			metadata: `{"merge_ref":false}`, action: sandboxcfg.SnapshotPolicy{DropCaches: orchCheckpointBool(false)},
 			wantTail: []string{"--merge-ref=false", "--drop-caches=false"}},
-		{name: "bundle one explicit field", mode: config.CheckpointBundle, action: sandboxcfg.CheckpointPolicy{DropCaches: orchCheckpointBool(false)},
+		{name: "bundle one explicit field", mode: config.CheckpointBundle, action: sandboxcfg.SnapshotPolicy{DropCaches: orchCheckpointBool(false)},
 			wantTail: []string{"--drop-caches=false"}},
 	}
 	for _, tc := range tests {
@@ -106,7 +110,7 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			cfg.Checkpoint.MergeRef = tc.node.MergeRef
 			cfg.Checkpoint.DropCaches = tc.node.DropCaches
 			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, tc.metadata)
-			if err := o.Pause(context.Background(), sb.ID, apiKey, tc.action); err != nil {
+			if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(tc.action)); err != nil {
 				t.Fatal(err)
 			}
 			want := []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", tc.mode, "--run-root", cfg.Paths.RunRoot}
@@ -118,13 +122,88 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if stored.State != types.StatePaused || stored.SnapshotRef != filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot") {
+			if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
+				Kind: types.ResumeSourceSnapshot,
+				Ref:  filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot"),
+			}) {
 				t.Fatalf("paused sandbox = %+v", stored)
 			}
 			if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
 				t.Fatalf("stop/detach = %d/%d, want 1/1", launcher.stops.Load(), vs.detaches.Load())
 			}
 		})
+	}
+}
+
+func TestPauseSandboxCaptureAndTTLAutoPauseSelection(t *testing.T) {
+	for _, mode := range []string{config.CheckpointLocal, config.CheckpointBundle} {
+		t.Run(mode+" explicit sandbox", func(t *testing.T) {
+			cfg := checkpointOrchestratorConfig(t, mode)
+			o, sb, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, "")
+			if err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"export", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", mode, "--run-root", cfg.Paths.RunRoot}
+			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+				t.Fatalf("export argv = %#v, want %#v", got, want)
+			}
+			stored, err := o.st.Get(context.Background(), sb.ID)
+			if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
+				Kind: types.ResumeSourceSandbox, Ref: filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".sandbox"),
+			}) || stored.RunID != "" || stored.VswitchPort != "" {
+				t.Fatalf("paused Sandbox E = %+v, %v", stored, err)
+			}
+			if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
+				t.Fatalf("stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
+			}
+		})
+
+		t.Run(mode+" ttl sandbox", func(t *testing.T) {
+			cfg := checkpointOrchestratorConfig(t, mode)
+			o, sb, _, _, _, argsPath := newCheckpointPauseFixture(t, cfg, `{"merge_ref":true,"drop_caches":true}`)
+			if err := o.st.Delete(context.Background(), sb.ID); err != nil {
+				t.Fatal(err)
+			}
+			sb.AutoPauseMemory = false
+			if err := o.st.Put(context.Background(), sb); err != nil {
+				t.Fatal(err)
+			}
+			o.cache(sb)
+			if err := o.pauseSandbox(context.Background(), sb); err != nil {
+				t.Fatal(err)
+			}
+			args := readCheckpointArgs(t, argsPath)
+			if len(args) == 0 || args[0] != "export" || containsString(args, "--merge-ref=true") || containsString(args, "--drop-caches=true") {
+				t.Fatalf("TTL Sandbox E argv = %#v", args)
+			}
+			stored, err := o.st.Get(context.Background(), sb.ID)
+			if err != nil || stored == nil || stored.ResumeSource.Kind != types.ResumeSourceSandbox {
+				t.Fatalf("TTL Sandbox E row = %+v, %v", stored, err)
+			}
+		})
+	}
+}
+
+func TestExplicitPauseDefaultsToSnapshotIndependentlyOfAutoPauseMemory(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sb, apiKey, _, _, argsPath := newCheckpointPauseFixture(t, cfg, "")
+	if err := o.st.Delete(context.Background(), sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	sb.AutoPauseMemory = false
+	if err := o.st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+		t.Fatal(err)
+	}
+	if args := readCheckpointArgs(t, argsPath); len(args) == 0 || args[0] != "snapshot" {
+		t.Fatalf("explicit default Pause argv = %#v, want Snapshot S", args)
+	}
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil || stored == nil || stored.ResumeSource.Kind != types.ResumeSourceSnapshot {
+		t.Fatalf("explicit default Pause row = %+v, %v", stored, err)
 	}
 }
 
@@ -161,7 +240,7 @@ func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 			if tc.auto {
 				err = o.pauseSandbox(context.Background(), sb)
 			} else {
-				err = o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+				err = o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
 			}
 			if !errors.Is(err, api.ErrBadRequest) {
 				t.Fatalf("Pause error = %v, want ErrBadRequest", err)
@@ -173,7 +252,7 @@ func TestPausePolicyValidationHasNoSideEffects(t *testing.T) {
 			if getErr != nil {
 				t.Fatal(getErr)
 			}
-			if stored.State != types.StateRunning || stored.SnapshotRef != "" {
+			if stored.State != types.StateRunning || stored.ResumeSource != (types.ResumeSource{}) {
 				t.Fatalf("sandbox changed after rejected Pause: %+v", stored)
 			}
 			if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
@@ -187,18 +266,36 @@ func TestSnapshotFailureLeavesSandboxRunning(t *testing.T) {
 	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
 	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
 	t.Setenv("CHECKPOINT_FAIL", "1")
-	if err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CheckpointPolicy{}); err == nil {
+	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err == nil {
 		t.Fatal("Pause succeeded despite snapshot failure")
 	}
 	stored, err := o.st.Get(context.Background(), sb.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != types.StateRunning || stored.SnapshotRef != "" {
+	if stored.State != types.StateRunning || stored.ResumeSource != (types.ResumeSource{}) {
 		t.Fatalf("snapshot failure changed sandbox: %+v", stored)
 	}
 	if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
 		t.Fatalf("snapshot failure stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
+	}
+}
+
+func TestSandboxExportFailureLeavesRunningOwnershipUnchanged(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointBundle)
+	o, sb, apiKey, launcher, vs, _ := newCheckpointPauseFixture(t, cfg, "")
+	t.Setenv("CHECKPOINT_FAIL", "1")
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
+	if err := o.Pause(context.Background(), sb.ID, apiKey, request); err == nil {
+		t.Fatal("Pause succeeded despite Sandbox export failure")
+	}
+	stored, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning || stored.ResumeSource != (types.ResumeSource{}) ||
+		stored.RunID != sb.RunID || stored.VswitchPort != sb.VswitchPort {
+		t.Fatalf("export failure changed running ownership: %+v, %v", stored, err)
+	}
+	if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
+		t.Fatalf("export failure stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
 	}
 }
 
@@ -217,7 +314,7 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 
 	pauseDone := make(chan error, 1)
 	go func() {
-		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
 	}()
 	waitForCheckpointFile(t, started)
 
@@ -244,7 +341,10 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != types.StatePaused || stored.SnapshotRef != filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot") {
+	if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot,
+		Ref:  filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot"),
+	}) {
 		t.Fatalf("pause after cancellation was not committed: %+v", stored)
 	}
 	if launcher.stops.Load() != 1 || vs.detaches.Load() != 1 {
@@ -298,7 +398,7 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 
 	pauseDone := make(chan error, 1)
 	go func() {
-		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, sandboxcfg.CheckpointPolicy{})
+		pauseDone <- o.Pause(requestCtx, sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
 	}()
 	waitForCheckpointFile(t, started)
 	cancelRequest()
@@ -321,7 +421,7 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 	}
 	connectDone := make(chan connectResult, 1)
 	go func() {
-		connected, connectErr := o.Connect(lifecycleCtx, sb.ID, apiKey, "", 0)
+		connected, connectErr := o.Connect(lifecycleCtx, sb.ID, apiKey, "", api.ConnectOptions{})
 		connectDone <- connectResult{sb: connected, err: connectErr}
 	}()
 	select {
@@ -402,7 +502,7 @@ func waitCheckpointResult(t *testing.T, done <-chan error) error {
 	}
 }
 
-func TestCreateRejectsCheckpointPolicyBeforeLaunchSideEffects(t *testing.T) {
+func TestCreateRejectsSnapshotPolicyBeforeLaunchSideEffects(t *testing.T) {
 	tests := []struct {
 		name     string
 		mode     string
@@ -440,7 +540,7 @@ func TestCreateRejectsCheckpointPolicyBeforeLaunchSideEffects(t *testing.T) {
 	}
 }
 
-func TestCheckpointPolicyLogValues(t *testing.T) {
+func TestSnapshotPolicyLogValues(t *testing.T) {
 	if checkpointPolicyValue(nil) != "default" || checkpointPolicyValue(orchCheckpointBool(true)) != "true" || checkpointPolicyValue(orchCheckpointBool(false)) != "false" {
 		t.Fatal("checkpoint policy log values do not distinguish default/true/false")
 	}
@@ -469,7 +569,8 @@ func newCheckpointPauseFixture(t *testing.T, cfg *config.Config, metadataRaw str
 		ID: "checkpoint-sandbox", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("2", 64)}.String(),
 		State:      types.StateRunning, RunID: "checkpoint-run", VswitchPort: "checkpoint-port",
-		APISecret: apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
+		AutoPauseMemory: true,
+		APISecret:       apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
 	}
 	if metadataRaw != "" {
 		sb.Metadata = map[string]string{sandboxcfg.NsCheckpoint: metadataRaw}

@@ -38,7 +38,8 @@ func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expec
 	}
 
 	if sb.State == types.StatePaused {
-		_, _, err := o.ensureResumeAcceptedFrom(ctx, sandboxID, nil, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
+		request := types.ResumeRequest{Trigger: types.ResumeTriggerExec, Mode: types.ResumeAuto}
+		_, _, err := o.ensureResumeAcceptedFrom(ctx, sandboxID, nil, request, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
 			if !execRoutePresent(current) || execIdentity(current) != expected {
 				return errExecIdentityChanged
 			}

@@ -297,6 +297,7 @@ func TestBusinessCredentialsAreEncryptedImmutableAndIndependentOfAllowlist(t *te
 	}
 
 	sb.APISecret, sb.ManifestKey, sb.State = replacement.APISecret, replacement.ManifestKey, types.StatePaused
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "sandbox-current"}
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}

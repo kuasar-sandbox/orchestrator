@@ -38,8 +38,10 @@ import (
 )
 
 // Version is the protocol version announced by the authority in Hello.
-// Version 3 is the hard cut from the former route identity field to stable_id.
-const Version = 3
+// Version 3 was the hard cut to stable_id. Version 4 replaces the Snapshot-
+// specific route location field with kind-orthogonal artifact_location; mixed
+// peers must fail closed instead of silently losing migration placement state.
+const Version = 4
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -109,11 +111,12 @@ type RouteEntry struct {
 	EnvdAccessToken        string `json:"envd_access_token,omitempty"`
 	TrafficAccessToken     string `json:"traffic_access_token,omitempty"`
 	ForwardAccessToken     string `json:"forward_access_token,omitempty"`
-	// SnapshotLocation is "" for running/dead, else "local" (node-bound checkpoint
-	// bundle — blocks a node drain unless migrated) or "remote" (uploaded, portable).
+	// ArtifactLocation is "" when the row owns no ResumeSource, "local" for a
+	// node-bound E/S capture, or "remote" for a portable E/S reference. It is
+	// independent of lifecycle state because a running row may retain ownership.
 	// A subscriber (e.g. the platform agent) reads it to decide migration; the actual
 	// MIGRATION_TOKEN is minted on demand by export-sandbox, never broadcast here.
-	SnapshotLocation string `json:"snap_loc,omitempty"`
+	ArtifactLocation string `json:"artifact_location,omitempty"`
 	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.

@@ -1,15 +1,8 @@
-// Package sandboxcfg renders one sandbox's config: the SANDBOX_CONFIG YAML plus
-// the restore ref and connect forwards. Nothing is written to disk by the caller
-// path that matters — the orchestrator serves these to sandbox-ctl over the
-// config-socket at startup (see internal/configsock). The manifest key is delivered
-// there too, separately.
-//
-// The config IS sandbox-runtime's config.SandboxConfig (imported, single source of
-// truth — no hand-rolled schema to drift). The orchestrator builds the node-managed
-// base (boot / tapfd / control / capacity / resolved network) and overlays the
-// tenant-controllable SandboxSpec parsed from the kuasar-sandbox.<ns> metadata keys.
-// Deep validation stays in sandbox-ctl (which receives the node-owned VMM cgroup
-// FD plus the snapshot); here we only format-check tenant input.
+// Package sandboxcfg renders the three mode-specific sandbox-ctl configuration
+// contracts. Image launches receive a complete cold config, Sandbox E launches
+// receive only ApplyFromRules host/instance fields, and Snapshot S restores
+// receive only ApplyRestoreRules host fields. The orchestrator serves the YAML
+// through the config socket; MANIFEST_KEY remains a separate task-local secret.
 package sandboxcfg
 
 import (
@@ -295,6 +288,13 @@ func (n NetworkSpec) validate() error {
 	return nil
 }
 
+// ValidateNetworkSpec validates one already-decoded logical network. Artifact
+// preparation uses this after strict task-local decoding so no raw tenant
+// metadata needs to cross into the conductor.
+func ValidateNetworkSpec(n NetworkSpec) error {
+	return n.validate()
+}
+
 // IsZero reports whether the tenant supplied no network fields.
 func (n NetworkSpec) IsZero() bool {
 	return n.Hostname == "" && len(n.DNS) == 0 && n.InnerIP == "" && n.Nexthop == "" &&
@@ -306,13 +306,15 @@ func (n NetworkSpec) IsZero() bool {
 type Params struct {
 	Sandbox        *types.Sandbox
 	Template       types.TemplateID
-	Runtime        string // erofs path (file path, no scheme)
-	Kernel         string // vmlinux path
-	OverlayDiffTpl string // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
+	PreparedSource types.ResumeSource         // task-local selected E/S; empty for image launch
+	ArtifactDisks  types.ArtifactDiskTopology // task-projected shape for host-owned active bindings
+	Runtime        string                     // erofs path (file path, no scheme)
+	Kernel         string                     // vmlinux path
+	OverlayDiffTpl string                     // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
 	TapFD          TapFD
 	EnvVars        map[string]string        // create-time launch env
 	Resources      rtconfig.ResourcesConfig // fully resolved node + tenant + restore policy
-	Network        NetworkSpec              // RESOLVED logical network (create ?? snapshot ?? defaults)
+	Network        NetworkSpec              // resolved logical network (request over artifact over node defaults)
 	MMDSEnabled    bool
 	Spec           SandboxSpec // parsed tenant override except resources, resolved above
 }
@@ -326,16 +328,104 @@ func (p Params) WriteYAML(path string) error {
 	return os.WriteFile(path, b, 0o600)
 }
 
-// BuildYAML renders the SANDBOX_CONFIG document from a config.SandboxConfig.
+// ImageColdConfig is the complete config accepted by an image launch. Image
+// creation is the only path allowed to define an immutable disk graph.
+type ImageColdConfig rtconfig.SandboxConfig
+
+type hostActiveOverlayConfig struct {
+	Diff         string `yaml:"diff,omitempty"`
+	DiffTemplate string `yaml:"diff_template,omitempty"`
+	DiffSize     string `yaml:"diff_size,omitempty"`
+}
+
+type hostActiveRootConfig struct {
+	Diff         string                   `yaml:"diff,omitempty"`
+	DiffTemplate string                   `yaml:"diff_template,omitempty"`
+	DiffSize     string                   `yaml:"diff_size,omitempty"`
+	Overlay      *hostActiveOverlayConfig `yaml:"overlay,omitempty"`
+}
+
+type hostActiveDiskConfig struct {
+	Name         string                   `yaml:"name"`
+	Diff         string                   `yaml:"diff,omitempty"`
+	DiffTemplate string                   `yaml:"diff_template,omitempty"`
+	DiffSize     string                   `yaml:"diff_size,omitempty"`
+	Overlay      *hostActiveOverlayConfig `yaml:"overlay,omitempty"`
+}
+
+type hostBootConfig struct {
+	Kernel  string                 `yaml:"kernel"`
+	Runtime string                 `yaml:"runtime"`
+	Root    hostActiveRootConfig   `yaml:"root"`
+	Disks   []hostActiveDiskConfig `yaml:"disks,omitempty"`
+}
+
+// SandboxHostConfig is the presence-aware host/instance document for
+// sandbox-ctl run --from. Its root/disk DTOs can express only host-owned active
+// diff fields plus the artifact-projected name/order/topology; immutable graph
+// fields are unrepresentable.
+type SandboxHostConfig struct {
+	Resources      rtconfig.ResourcesConfig `yaml:"resources"`
+	Network        rtconfig.NetworkConfig   `yaml:"network"`
+	Boot           hostBootConfig           `yaml:"boot"`
+	Restore        rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
+	Timeouts       rtconfig.TimeoutsConfig  `yaml:"timeouts,omitempty"`
+	Launch         *rtconfig.LaunchConfig   `yaml:"launch,omitempty"`
+	Mounts         []rtconfig.MountConfig   `yaml:"mounts,omitempty"`
+	Files          []rtconfig.FileConfig    `yaml:"files,omitempty"`
+	EphemeralFiles []rtconfig.FileConfig    `yaml:"ephemeral_files,omitempty"`
+	Init           []rtconfig.InitConfig    `yaml:"init,omitempty"`
+	Metadata       map[string]string        `yaml:"metadata,omitempty"`
+}
+
+// SnapshotHostConfig is the host-only document for sandbox-ctl run --restore.
+// Its type has no launch, file, init, plugin, mount, metadata, cmdline, or disk
+// graph field, making those forbidden values unrepresentable here.
+type SnapshotHostConfig struct {
+	Resources rtconfig.ResourcesConfig `yaml:"resources"`
+	Network   rtconfig.NetworkConfig   `yaml:"network"`
+	Boot      hostBootConfig           `yaml:"boot"`
+	Restore   rtconfig.RestoreConfig   `yaml:"restore,omitempty"`
+	Timeouts  rtconfig.TimeoutsConfig  `yaml:"timeouts,omitempty"`
+}
+
+// BuildYAML dispatches to one of three mode-specific DTO renderers. LaunchMode
+// is already resolved and durable before this method is called.
 func (p Params) BuildYAML() ([]byte, error) {
-	c, err := p.build()
+	if p.Sandbox == nil {
+		return nil, fmt.Errorf("sandboxcfg: missing sandbox")
+	}
+	var (
+		config any
+		err    error
+	)
+	switch p.Sandbox.LaunchMode {
+	case types.LaunchImage:
+		config, err = p.BuildImageColdConfig()
+	case types.LaunchCold:
+		config, err = p.BuildSandboxHostConfig()
+	case types.LaunchMemory:
+		config, err = p.BuildSnapshotHostConfig()
+	default:
+		return nil, fmt.Errorf("sandboxcfg: unsupported launch mode %q", p.Sandbox.LaunchMode)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return yaml.Marshal(c)
+	return yaml.Marshal(config)
 }
 
-func (p Params) build() (*rtconfig.SandboxConfig, error) {
+// BuildImageColdConfig renders the full image-launch contract.
+func (p Params) BuildImageColdConfig() (*ImageColdConfig, error) {
+	c, err := p.buildImageColdConfig()
+	if err != nil {
+		return nil, err
+	}
+	result := ImageColdConfig(*c)
+	return &result, nil
+}
+
+func (p Params) buildImageColdConfig() (*rtconfig.SandboxConfig, error) {
 	c := &rtconfig.SandboxConfig{}
 
 	// Resources were resolved and cross-validated before any network attach or
@@ -365,22 +455,7 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	}
 
 	// --- network (guest side) ---
-	tapFD := p.TapFD.runtime()
-	c.Network.TapFD = &tapFD
-	if p.Sandbox.PortMAC != "" {
-		c.Network.MAC = p.Sandbox.PortMAC
-	}
-	if p.Sandbox.InnerIP != "" {
-		c.Network.IP = p.Sandbox.InnerIP // CIDR form
-		// Default route via the inner-CIDR gateway; the vswitch ARP-proxies it and
-		// extracts off-subnet traffic (proxy/mgmt floatingip + internet egress).
-		if p.Network.Nexthop != "" {
-			c.Network.Nexthop = p.Network.Nexthop
-		}
-	}
-	if p.Network.Hostname != "" {
-		c.Network.Hostname = p.Network.Hostname
-	}
+	c.Network = p.buildRuntimeNetwork()
 
 	// --- launch ---
 	if err := p.buildLaunch(c); err != nil {
@@ -391,14 +466,142 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	c.Init = p.Spec.Init
 	c.Mounts = p.Spec.Mounts
 
-	// --- files: orchestrator-derived (/etc/hosts, /etc/resolv.conf) + tenant files ---
-	// (tmpfs+bind, re-applied at launch AND restore; flattened images ship neither,
-	// so without /etc/hosts getfqdn(hostname) stalls ~20s on DNS.)
-	c.Files = append(guestFiles(p.Network.Hostname, p.Network.DNS), p.Spec.Files...)
+	// --- files ---
+	// Tenant files are persistent C0 input. Node-derived /etc/hosts and
+	// /etc/resolv.conf are invocation-local cold-start input and must never become
+	// part of the portable artifact graph.
+	c.Files = append([]rtconfig.FileConfig(nil), p.Spec.Files...)
+	c.EphemeralFiles = guestFiles(p.Network.Hostname, p.Network.DNS)
 
 	// --- metadata: tenant passthrough + the resolved logical network ---
 	c.Metadata = p.buildMetadata()
 	return c, nil
+}
+
+// BuildSandboxHostConfig renders only fields admitted by ApplyFromRules.
+func (p Params) BuildSandboxHostConfig() (*SandboxHostConfig, error) {
+	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchCold {
+		return nil, fmt.Errorf("sandboxcfg: Sandbox host config requires cold launch mode")
+	}
+	boot, err := p.buildArtifactHostBoot()
+	if err != nil {
+		return nil, err
+	}
+	c := &SandboxHostConfig{
+		Resources:      p.Resources,
+		Network:        p.buildRuntimeNetwork(),
+		Boot:           boot,
+		Restore:        rtconfig.RestoreConfig{Prefetch: p.Spec.Restore.Prefetch},
+		EphemeralFiles: guestFiles(p.Network.Hostname, p.Network.DNS),
+	}
+	// A new Sandbox-template Create may intentionally persist request launch,
+	// env, files, init, mounts, and metadata into the next C1. A resume from a
+	// durable paused source keeps E's C0 authoritative and emits none of them.
+	freshTemplateCreate := p.Sandbox.ResumeSource.Empty() && p.Template.Kind == types.KindSbx
+	if freshTemplateCreate {
+		launchContainer := &rtconfig.SandboxConfig{}
+		if err := p.buildLaunch(launchContainer); err != nil {
+			return nil, err
+		}
+		c.Launch = &launchContainer.Launch
+		c.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
+		c.Files = append([]rtconfig.FileConfig(nil), p.Spec.Files...)
+		c.Init = append([]rtconfig.InitConfig(nil), p.Spec.Init...)
+		c.Metadata = p.buildMetadata()
+	}
+	return c, nil
+}
+
+// BuildSnapshotHostConfig renders only fields admitted by ApplyRestoreRules.
+func (p Params) BuildSnapshotHostConfig() (*SnapshotHostConfig, error) {
+	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchMemory {
+		return nil, fmt.Errorf("sandboxcfg: Snapshot host config requires memory launch mode")
+	}
+	boot, err := p.buildArtifactHostBoot()
+	if err != nil {
+		return nil, err
+	}
+	return &SnapshotHostConfig{
+		Resources: p.Resources,
+		Network:   p.buildRuntimeNetwork(),
+		Boot:      boot,
+		Restore:   rtconfig.RestoreConfig{Prefetch: p.Spec.Restore.Prefetch},
+	}, nil
+}
+
+func (p Params) buildArtifactHostBoot() (hostBootConfig, error) {
+	boot := hostBootConfig{Kernel: "file://" + p.Kernel, Runtime: "file://" + p.Runtime}
+	topology := p.ArtifactDisks
+	if topology.Root.Name != "" || !topology.Root.Mode.Valid() {
+		return hostBootConfig{}, fmt.Errorf("sandboxcfg: invalid artifact root disk shape")
+	}
+	if len(topology.Disks) > rtconfig.MaxDataDisks {
+		return hostBootConfig{}, fmt.Errorf("sandboxcfg: artifact has %d data disks, max %d", len(topology.Disks), rtconfig.MaxDataDisks)
+	}
+	root, err := p.hostActiveRoot(topology.Root)
+	if err != nil {
+		return hostBootConfig{}, fmt.Errorf("sandboxcfg: artifact root: %w", err)
+	}
+	boot.Root = root
+	seen := make(map[string]struct{}, len(topology.Disks))
+	boot.Disks = make([]hostActiveDiskConfig, len(topology.Disks))
+	for i, shape := range topology.Disks {
+		if shape.Name == "" || !shape.Mode.Valid() {
+			return hostBootConfig{}, fmt.Errorf("sandboxcfg: invalid artifact data disk %d shape", i)
+		}
+		if _, duplicate := seen[shape.Name]; duplicate {
+			return hostBootConfig{}, fmt.Errorf("sandboxcfg: duplicate artifact data disk name %q", shape.Name)
+		}
+		seen[shape.Name] = struct{}{}
+		active, err := p.hostActiveRoot(shape)
+		if err != nil {
+			return hostBootConfig{}, fmt.Errorf("sandboxcfg: artifact data disk %q: %w", shape.Name, err)
+		}
+		boot.Disks[i] = hostActiveDiskConfig{
+			Name: shape.Name, Diff: active.Diff, DiffTemplate: active.DiffTemplate,
+			DiffSize: active.DiffSize, Overlay: active.Overlay,
+		}
+	}
+	return boot, nil
+}
+
+func (p Params) hostActiveRoot(shape types.ArtifactDiskShape) (hostActiveRootConfig, error) {
+	var template string
+	if !shape.HasActiveBase {
+		if p.OverlayDiffTpl == "" {
+			return hostActiveRootConfig{}, fmt.Errorf("formatted diff template is required without an active artifact base")
+		}
+		template = "file://" + p.OverlayDiffTpl
+	}
+	switch shape.Mode {
+	case types.ArtifactDiskSingle:
+		return hostActiveRootConfig{DiffTemplate: template}, nil
+	case types.ArtifactDiskOverlay:
+		return hostActiveRootConfig{Overlay: &hostActiveOverlayConfig{DiffTemplate: template}}, nil
+	default:
+		return hostActiveRootConfig{}, fmt.Errorf("unsupported disk mode %q", shape.Mode)
+	}
+}
+
+func (p Params) buildRuntimeNetwork() rtconfig.NetworkConfig {
+	tapFD := p.TapFD.runtime()
+	network := rtconfig.NetworkConfig{TapFD: &tapFD}
+	if p.Sandbox == nil {
+		return network
+	}
+	if p.Sandbox.PortMAC != "" {
+		network.MAC = p.Sandbox.PortMAC
+	}
+	if p.Sandbox.InnerIP != "" {
+		network.IP = p.Sandbox.InnerIP
+		if p.Network.Nexthop != "" {
+			network.Nexthop = p.Network.Nexthop
+		}
+	}
+	if p.Network.Hostname != "" {
+		network.Hostname = p.Network.Hostname
+	}
+	return network
 }
 
 // buildLaunch fills launch. e2b is envd-owned (a tenant launch override is rejected);
@@ -504,16 +707,13 @@ func guestFiles(hostname string, dns []string) []rtconfig.FileConfig {
 	return files
 }
 
-// RestoreRefFor is the snapshot ref sandbox-ctl should restore from, or "" for a
-// cold boot. A resumed sandbox (img OR snp) restores from its latest pause snapshot;
-// otherwise a snp template cold-starts by restoring its build snapshot, and an img
-// template cold-boots. Exported so the orchestrator can resolve it before rendering
-// (to read the snapshot's inherited config).
+// RestoreRefFor is the memory Snapshot ref sandbox-ctl should restore from.
+// Cold launches, including S+cold, never pass a Snapshot to run --restore.
 func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
-	if ref := sb.SnapshotRef; ref != "" {
-		return ref
+	if sb != nil && sb.LaunchMode == types.LaunchMemory && sb.ResumeSource.Kind == types.ResumeSourceSnapshot {
+		return sb.ResumeSource.Ref
 	}
-	if tmpl.Kind == types.KindSnp {
+	if sb != nil && sb.LaunchMode == types.LaunchMemory && sb.ResumeSource.Empty() && tmpl.Kind == types.KindSnp {
 		return tmpl.Ref
 	}
 	return ""
@@ -521,6 +721,42 @@ func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
 
 // RestoreRef is RestoreRefFor for this Params.
 func (p Params) RestoreRef() string { return RestoreRefFor(p.Sandbox, p.Template) }
+
+// FromRef is the prepared Sandbox artifact used by a cold --from launch.
+func (p Params) FromRef() string {
+	if p.Sandbox == nil || p.Sandbox.LaunchMode != types.LaunchCold {
+		return ""
+	}
+	if p.PreparedSource.Kind == types.ResumeSourceSandbox {
+		return p.PreparedSource.Ref
+	}
+	if p.Sandbox.ResumeSource.Kind == types.ResumeSourceSandbox {
+		return p.Sandbox.ResumeSource.Ref
+	}
+	if p.Sandbox.ResumeSource.Empty() && p.Template.Kind == types.KindSbx {
+		return p.Template.Ref
+	}
+	return ""
+}
+
+// SourceForLaunch returns the durable root artifact that the tenant task must
+// prepare. Fresh image launches have no Artifact source.
+func SourceForLaunch(sb *types.Sandbox, tmpl types.TemplateID) types.ResumeSource {
+	if sb == nil {
+		return types.ResumeSource{}
+	}
+	if sb.ResumeSource.Valid() {
+		return sb.ResumeSource
+	}
+	switch {
+	case sb.LaunchMode == types.LaunchCold && tmpl.Kind == types.KindSbx:
+		return types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: tmpl.Ref}
+	case sb.LaunchMode == types.LaunchMemory && tmpl.Kind == types.KindSnp:
+		return types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: tmpl.Ref}
+	default:
+		return types.ResumeSource{}
+	}
+}
 
 // MergeNetwork overlays over (the explicit / create network) onto base (the
 // snapshot-inherited network) field by field: explicit wins, the snapshot fills what

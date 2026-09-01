@@ -797,8 +797,9 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 	return time.Hour
 }
 
-// CheckpointConfig is the paused-state capture policy. Both capture modes may
-// explicitly override sandbox-ctl's merge-ref and drop-caches defaults.
+// CheckpointConfig is the paused-state capture policy. Mode and LocalDir apply
+// to both CaptureSnapshot and CaptureSandbox; MergeRef and DropCaches apply only
+// to CaptureSnapshot and override sandbox-ctl's snapshot defaults when set.
 type CheckpointConfig struct {
 	Mode       string                 `yaml:"mode" json:"mode"`               // local (default) | bundle
 	LocalDir   string                 `yaml:"local_dir" json:"local_dir"`     // local checkpoint files dir; default /var/lib/sandbox-saved
