@@ -66,17 +66,17 @@ func routeEntryBase(sb *types.Sandbox) routesync.RouteEntry {
 		EnvdAccessToken:        sb.EnvdAccessToken,
 		TrafficAccessToken:     sb.TrafficAccessToken,
 		ForwardAccessToken:     sb.ForwardAccessToken,
-		SnapshotLocation:       snapshotLocation(sb.SnapshotRef),
+		ArtifactLocation:       artifactLocation(sb.ResumeSource.Ref),
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		RunID:                  sb.RunID,
 	}
 	return e
 }
 
-// snapshotLocation classifies a sandbox's persisted state so a subscriber can
-// decide migration: "" when never paused (starting/running/dead), "remote" for an uploaded
-// portable canonical ref, else "local" (a node-bound checkpoint bundle).
-func snapshotLocation(ref string) string {
+// artifactLocation classifies a retained ResumeSource independently of state
+// and source kind: "" means no owned artifact, "remote" is a portable
+// canonical ref, and "local" is a node-bound capture artifact.
+func artifactLocation(ref string) string {
 	switch {
 	case ref == "":
 		return ""
@@ -190,7 +190,8 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		// ensureResumeAccepted performs its own authoritative re-read under this
 		// lifecycle lock, so release it before entering the common admission.
 		unlock()
-		if _, _, err := o.ensureResumeAcceptedFrom(ctx, sid, nil, conductorextension.SandboxOriginProxy, nil); err != nil {
+		request := types.ResumeRequest{Trigger: types.ResumeTriggerWake, Mode: types.ResumeAuto}
+		if _, _, err := o.ensureResumeAcceptedFrom(ctx, sid, nil, request, conductorextension.SandboxOriginProxy, nil); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 		}
 	case types.StateStarting:

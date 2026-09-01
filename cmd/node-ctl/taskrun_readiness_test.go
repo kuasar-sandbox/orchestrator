@@ -14,7 +14,8 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/tasksnapshot"
+	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"golang.org/x/sys/unix"
 )
 
@@ -173,29 +174,33 @@ func TestLaunchTaskTwoStageUsesAuthoritativeEnvAndLocalLocations(t *testing.T) {
 			return &configsock.SandboxTaskSpec{
 				SandboxID: "sid", RunID: "run-1", Workdir: "/task-work",
 				Env: map[string]string{"MANIFEST_KEY": "authoritative-key", "KUASAR_RUN_ID": "run-1"},
-				Prepare: &configsock.SnapshotPrepareSpec{
+				Prepare: &configsock.ArtifactPrepareSpec{
 					RootRef: "manifest://root", AbsoluteDeadlineUnixNano: time.Now().Add(time.Minute).UnixNano(),
 				},
 			}, nil
 		},
 		setenv: os.Setenv,
-		prepareSnapshot: func(_ context.Context, spec configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error) {
+		prepareArtifact: func(_ context.Context, spec configsock.ArtifactPrepareSpec) (*taskartifact.Result, error) {
 			reads++
 			if os.Getenv("MANIFEST_KEY") != "authoritative-key" || spec.RootRef != "manifest://root" {
 				t.Fatalf("prepare environment/root = %q/%q", os.Getenv("MANIFEST_KEY"), spec.RootRef)
 			}
-			return &tasksnapshot.Result{
-				Summary:         configsock.SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("1", 64), RequiredRefCount: 2},
+			return &taskartifact.Result{
+				PreparedSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://root"},
+				Summary: configsock.ArtifactPrepareSummary{
+					SchemaVersion: configsock.ArtifactPrepareSchemaVersion, PreparedSourceKind: string(types.ResumeSourceSnapshot),
+					ResolutionDigest: strings.Repeat("1", 64), RequiredRefCount: 2,
+				},
 				RefLocationURIs: map[string]string{"z-location": "file:///z", "a-location": "file:///a"},
 			}, nil
 		},
-		completePrepare: func(_ context.Context, socket, sid, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+		completePrepare: func(_ context.Context, socket, sid, runID string, summary configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error) {
 			completions++
 			if socket != "/config.sock" || sid != "sid" || runID != "run-1" || summary.RequiredRefCount != 2 {
 				t.Fatalf("completion = %q/%q/%q %+v", socket, sid, runID, summary)
 			}
 			return &configsock.LaunchSpec{
-				Exec: "/bin/sandbox-ctl", Args: []string{"run", "--restore", "manifest://root"},
+				Exec: "/bin/sandbox-ctl", Args: []string{"run"},
 				Env: map[string]string{"MANIFEST_KEY": "must-not-win", "FINAL_ONLY": "yes"},
 			}, nil
 		},
@@ -258,11 +263,11 @@ func TestLaunchTaskColdFastPathUsesOneBootstrapOnly(t *testing.T) {
 				Final: &configsock.LaunchSpec{Exec: "/bin/sandbox-ctl", Args: []string{"run"}},
 			}, nil
 		},
-		prepareSnapshot: func(context.Context, configsock.SnapshotPrepareSpec) (*tasksnapshot.Result, error) {
+		prepareArtifact: func(context.Context, configsock.ArtifactPrepareSpec) (*taskartifact.Result, error) {
 			t.Fatal("cold path prepared a snapshot")
 			return nil, nil
 		},
-		completePrepare: func(context.Context, string, string, string, configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+		completePrepare: func(context.Context, string, string, string, configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error) {
 			t.Fatal("cold path used a second RPC")
 			return nil, nil
 		},

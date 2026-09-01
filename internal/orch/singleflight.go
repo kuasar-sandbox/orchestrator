@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type launchKind string
@@ -20,7 +21,7 @@ const (
 var (
 	errLaunchClaimed           = errors.New("orchestrator: sandbox launch already claimed")
 	errLaunchOwnershipLost     = errors.New("orchestrator: sandbox launch ownership lost")
-	errSnapshotPrepareConflict = errors.New("orchestrator: conflicting sandbox snapshot preparation replay")
+	errArtifactPrepareConflict = errors.New("orchestrator: conflicting sandbox artifact preparation replay")
 )
 
 // launchAttempt is the process-local owner of one accepted create or resume.
@@ -40,9 +41,10 @@ type launchAttempt struct {
 	err        error
 	acceptedAt time.Time
 	deadline   time.Time
+	launchMode types.LaunchMode
 
 	prepareReady chan struct{}
-	prepare      *configsock.SnapshotPrepareSummary
+	prepare      *configsock.ArtifactPrepareSummary
 	prepareCount uint64
 	finalReady   chan struct{}
 	finalSpec    *configsock.LaunchSpec
@@ -97,6 +99,18 @@ func (a *launchAttempt) Deadline() time.Time {
 	return a.deadline
 }
 
+func (a *launchAttempt) SetLaunchMode(mode types.LaunchMode) {
+	a.mu.Lock()
+	a.launchMode = mode
+	a.mu.Unlock()
+}
+
+func (a *launchAttempt) LaunchMode() types.LaunchMode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.launchMode
+}
+
 func (a *launchAttempt) prepareChannelsLocked() {
 	if a.prepareReady == nil {
 		a.prepareReady = make(chan struct{})
@@ -109,7 +123,7 @@ func (a *launchAttempt) prepareChannelsLocked() {
 // SubmitPrepare accepts exactly one immutable canonical summary. Identical
 // retries share the existing final result; conflicting replays cancel the
 // attempt so any in-flight host side effect fails closed and rolls back.
-func (a *launchAttempt) SubmitPrepare(runID string, summary configsock.SnapshotPrepareSummary) (replay bool, err error) {
+func (a *launchAttempt) SubmitPrepare(runID string, summary configsock.ArtifactPrepareSummary) (replay bool, err error) {
 	a.mu.Lock()
 	a.prepareChannelsLocked()
 	if runID == "" || a.runID != runID {
@@ -117,24 +131,24 @@ func (a *launchAttempt) SubmitPrepare(runID string, summary configsock.SnapshotP
 		return false, errLaunchOwnershipLost
 	}
 	if a.prepare == nil {
-		copySummary := summary
+		copySummary := configsock.CloneArtifactPrepareSummary(summary)
 		a.prepare = &copySummary
 		a.prepareCount = 1
 		close(a.prepareReady)
 		a.mu.Unlock()
 		return false, nil
 	}
-	if *a.prepare == summary {
+	if configsock.EqualArtifactPrepareSummary(*a.prepare, summary) {
 		a.prepareCount++
 		a.mu.Unlock()
 		return true, nil
 	}
 	a.mu.Unlock()
 	a.cancel()
-	return false, errSnapshotPrepareConflict
+	return false, errArtifactPrepareConflict
 }
 
-func (a *launchAttempt) WaitPrepare(ctx context.Context) (configsock.SnapshotPrepareSummary, error) {
+func (a *launchAttempt) WaitPrepare(ctx context.Context) (configsock.ArtifactPrepareSummary, error) {
 	a.mu.Lock()
 	a.prepareChannelsLocked()
 	ready := a.prepareReady
@@ -144,11 +158,11 @@ func (a *launchAttempt) WaitPrepare(ctx context.Context) (configsock.SnapshotPre
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.prepare == nil {
-			return configsock.SnapshotPrepareSummary{}, fmt.Errorf("orchestrator: snapshot preparation signaled without summary")
+			return configsock.ArtifactPrepareSummary{}, fmt.Errorf("orchestrator: artifact preparation signaled without summary")
 		}
-		return *a.prepare, nil
+		return configsock.CloneArtifactPrepareSummary(*a.prepare), nil
 	case <-ctx.Done():
-		return configsock.SnapshotPrepareSummary{}, ctx.Err()
+		return configsock.ArtifactPrepareSummary{}, ctx.Err()
 	}
 }
 

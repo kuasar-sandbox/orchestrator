@@ -1044,6 +1044,9 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
+		if cmd.AutoPauseMemory == nil || !*cmd.AutoPauseMemory {
+			t.Errorf("default create AutoPauseMemory = %v, want true", cmd.AutoPauseMemory)
+		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go reg.applyRoute(context.Background(), "n1", &route)
@@ -1073,6 +1076,43 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 	rec, _, found, err := reg.stores.GetSandbox(ctx, "/c/p/a/g1", "u1:s1")
 	if err != nil || !found || rec.State != StateReady {
 		t.Fatalf("stored record: %+v found=%v err=%v", rec, found, err)
+	}
+	if !rec.AutoPauseMemory {
+		t.Fatal("default create record lost AutoPauseMemory=true")
+	}
+}
+
+func TestReserveSandboxCreatePropagatesAutoPauseMemoryFalse(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakeConn{nodeID: "n1"}
+	conn.onCmd = func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		if cmd.AutoPauseMemory == nil || *cmd.AutoPauseMemory {
+			t.Errorf("create AutoPauseMemory = %v, want explicit false", cmd.AutoPauseMemory)
+		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
+		go reg.applyRoute(context.Background(), "n1", &route)
+	}
+	reg.addNode(conn)
+
+	request := testCreateReserve("/g", "auto-pause-false", nil)
+	value := false
+	request.AutoPauseMemory = &value
+	if _, err := reg.ReserveSandbox(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	record, _, found, err := reg.stores.GetSandbox(ctx, "/g", "auto-pause-false")
+	if err != nil || !found || record.State != StateReady || record.AutoPauseMemory {
+		t.Fatalf("stored explicit false record = %+v, found=%t, err=%v", record, found, err)
 	}
 }
 
@@ -2282,7 +2322,7 @@ func TestReadyReplacementRejectsCredentialBindingChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig); err == nil ||
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true); err == nil ||
 		!strings.Contains(err.Error(), "credential binding mismatch") {
 		t.Fatalf("placeAndCreate error = %v; want binding mismatch", err)
 	}
@@ -2316,7 +2356,7 @@ func TestReadyReplacementRejectsProfileChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig); err == nil ||
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true); err == nil ||
 		!strings.Contains(err.Error(), "replacement profile mismatch") {
 		t.Fatalf("placeAndCreate error = %v; want profile mismatch", err)
 	}
@@ -2330,6 +2370,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "sb-old", "old", StateReady)
+	original.AutoPauseMemory = false
 	if _, err := reg.stores.PutSandbox(ctx, original); err != nil {
 		t.Fatal(err)
 	}
@@ -2372,6 +2413,9 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	if command == nil || command.Cluster == nil || command.Cluster.StableID != original.StableID {
 		t.Fatal("replacement create did not preserve StableID")
 	}
+	if command.AutoPauseMemory == nil || *command.AutoPauseMemory {
+		t.Fatalf("replacement create changed durable AutoPauseMemory: %v", command.AutoPauseMemory)
+	}
 	createCredentials, _, err := sandboxcfg.ExtractCredentials(command.Config)
 	if err != nil {
 		t.Fatal(err)
@@ -2381,9 +2425,9 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		createCredentials.TrafficAccessToken != original.TrafficAccessToken {
 		t.Fatal("replacement create did not preserve the original credential overrides")
 	}
-	if reserved == nil || reserved.SandboxID != original.SandboxID || reserved.NodeSandboxID != command.SID || reserved.SandboxGeneration != 1 || reserved.CreateCredentials == nil ||
+	if reserved == nil || reserved.SandboxID != original.SandboxID || reserved.NodeSandboxID != command.SID || reserved.SandboxGeneration != 1 || reserved.CreateCredentials == nil || reserved.AutoPauseMemory ||
 		!sameRouteCredentials(reserved, original) {
-		t.Fatal("replacement RESERVED row did not retain materialized credentials")
+		t.Fatal("replacement RESERVED row did not retain materialized credentials and TTL capture policy")
 	}
 	if result.Route.SandboxID != original.SandboxID || result.Route.NodeSandboxID == original.NodeSandboxID || result.Route.StableID != original.StableID ||
 		result.Route.ServiceSecret != original.ServiceSecret || result.Route.EnvdAccessToken != original.EnvdAccessToken ||
@@ -2392,8 +2436,8 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		t.Fatal("replacement READY result changed materialized credentials")
 	}
 	ready, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
-	if err != nil || !found || ready.CreateCredentials != nil || !sameRouteCredentials(ready, original) {
-		t.Fatal("replacement READY row changed credentials or retained create overrides")
+	if err != nil || !found || ready.CreateCredentials != nil || ready.AutoPauseMemory || !sameRouteCredentials(ready, original) {
+		t.Fatal("replacement READY row changed credentials or TTL capture policy, or retained create overrides")
 	}
 }
 
@@ -2401,6 +2445,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	original := testE2BSandboxRecord("/g", "rk", "stable-auth-sid", "old", StateReserved)
+	original.AutoPauseMemory = false
 	original.CreateCredentials = &sandboxcfg.Credentials{
 		ServiceSecret: original.ServiceSecret, EnvdAccessToken: original.EnvdAccessToken,
 		TrafficAccessToken: original.TrafficAccessToken,
@@ -2440,7 +2485,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	newOverride := &sandboxcfg.Credentials{
 		ServiceSecret: strings.Repeat("4", 64), EnvdAccessToken: "new-envd", TrafficAccessToken: "new-traffic",
 	}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, newOverride, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if placements != 2 || len(commands) != 2 {
@@ -2450,6 +2495,9 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		if cmd.Cluster == nil || cmd.Cluster.StableID != original.StableID ||
 			cmd.APISecretFingerprint != original.APISecretFingerprint {
 			t.Fatal("replacement retry changed the stable ID or credential binding")
+		}
+		if cmd.AutoPauseMemory == nil || *cmd.AutoPauseMemory {
+			t.Fatalf("replacement retry changed durable AutoPauseMemory: %v", cmd.AutoPauseMemory)
 		}
 		credentials, _, err := sandboxcfg.ExtractCredentials(cmd.Config)
 		if err != nil {
@@ -2463,7 +2511,7 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
 	if err != nil || !found || reserved.State != StateReserved || reserved.NodeID != "n2" ||
-		!sameRouteCredentials(reserved, original) {
+		reserved.AutoPauseMemory || !sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement retry did not persist the original credential binding")
 	}
 	route := testRouteFromRecord(original, reserved.NodeSandboxID, routesync.StateRunning)
@@ -2510,7 +2558,7 @@ func TestMaterializedReservedRetryRejectsBindingChange(t *testing.T) {
 	}})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) { commands++ }})
 
-	err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil)
+	err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, nil, true)
 	if err == nil || !strings.Contains(err.Error(), "credential binding mismatch") {
 		t.Fatalf("placeAndCreate error=%v, want credential binding mismatch", err)
 	}
@@ -2531,7 +2579,7 @@ func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T)
 			APISecretFingerprint: testAPIFingerprint,
 		}, nil
 	}))
-	err := reg.placeAndCreate(ctx, "/g", "rk", nil, &sandboxcfg.Credentials{EnvdAccessToken: "envd"}, nil)
+	err := reg.placeAndCreate(ctx, "/g", "rk", nil, &sandboxcfg.Credentials{EnvdAccessToken: "envd"}, nil, true)
 	if err == nil || !strings.Contains(err.Error(), "not valid for bare") {
 		t.Fatalf("placeAndCreate error = %v", err)
 	}
@@ -2611,7 +2659,7 @@ func TestPlaceAndCreateRejectsUnseparatedCredentials(t *testing.T) {
 	const privateValue = "must-not-appear"
 	err := reg.placeAndCreate(context.Background(), "/g", "rk", map[string]string{
 		sandboxcfg.NsCredentials: `{"envd_access_token":"` + privateValue + `"}`,
-	}, nil, nil)
+	}, nil, nil, true)
 	if err == nil || strings.Contains(err.Error(), privateValue) {
 		t.Fatalf("unseparated credentials error=%q", err)
 	}
@@ -2679,7 +2727,7 @@ func TestCreateCredentialsPersistWithReservedAndClearOnReady(t *testing.T) {
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{"ordinary": "value"}, credentials, nil); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{"ordinary": "value"}, credentials, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -2744,7 +2792,7 @@ func TestCreateCredentialsCASRetryUsesCommittedWinner(t *testing.T) {
 		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 	}})
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if placements != 2 {
@@ -2789,7 +2837,7 @@ func TestCreateCredentialsCASRetryDropsRolledBackWinner(t *testing.T) {
 	}})
 
 	requestCredentials := &sandboxcfg.Credentials{EnvdAccessToken: "request-winner"}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, requestCredentials, nil); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, requestCredentials, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if placements != 2 {
@@ -2821,7 +2869,7 @@ func TestReservedWithoutCreateCredentialsRejectsLaterFallback(t *testing.T) {
 	}})
 
 	later := &sandboxcfg.Credentials{EnvdAccessToken: "later-envd"}
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, later, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, found := commandConfig[sandboxcfg.NsCredentials]; found {
@@ -2893,7 +2941,7 @@ func TestReadyReplacementCASRetryPreservesConcurrentCredentialBinding(t *testing
 		return &Placement{NodeID: "candidate", APISecretFingerprint: testAPIFingerprint}, nil
 	}))
 
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true); err != nil {
 		t.Fatal(err)
 	}
 	if placements != 1 {
@@ -2928,7 +2976,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		}
 	}})
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, nil, orig, true); err != nil {
 		t.Fatalf("placeAndCreate: %v", err)
 	}
 	reserved, reservedRev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -3238,6 +3286,9 @@ func TestReservePausedResume(t *testing.T) {
 		}
 		if len(cmd.Config) != 0 {
 			t.Errorf("connect carried create-only config")
+		}
+		if cmd.Memory != nil {
+			t.Errorf("implicit connect memory presence = %v, want nil", cmd.Memory)
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := testRouteFromRecord(original, original.NodeSandboxID, routesync.StateRunning)

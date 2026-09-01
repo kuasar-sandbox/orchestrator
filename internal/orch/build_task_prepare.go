@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
@@ -87,12 +88,15 @@ func fastBuildPrepareDigest(buildID string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func validateBuildPrepareSummary(summary configsock.SnapshotPrepareSummary) (sandboxcfg.NetworkSpec, error) {
-	if summary.SchemaVersion != configsock.SnapshotPrepareSchemaVersion {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: unsupported snapshot prepare schema %d", summary.SchemaVersion)
+func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (sandboxcfg.NetworkSpec, error) {
+	if summary.SchemaVersion != configsock.ArtifactPrepareSchemaVersion {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: unsupported artifact prepare schema %d", summary.SchemaVersion)
 	}
-	if summary.RequiredRefCount < 1 || summary.RequiredRefCount > maxRequiredSnapshotRefs {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredSnapshotRefs)
+	if summary.RequiredRefCount < 1 || summary.RequiredRefCount > maxRequiredArtifactRefs {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredArtifactRefs)
+	}
+	if types.ResumeSourceKind(summary.PreparedSourceKind) != types.ResumeSourceSnapshot {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: prepared source kind %q is not Snapshot", summary.PreparedSourceKind)
 	}
 	digest, err := hex.DecodeString(summary.ResolutionDigest)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != summary.ResolutionDigest {
@@ -106,16 +110,12 @@ func validateBuildPrepareSummary(summary configsock.SnapshotPrepareSummary) (san
 	if err != nil || bytes == 0 {
 		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot config has invalid resources.capacity.memory %q", summary.Capacity.Memory)
 	}
-	if len(summary.RawNetworkMetadata) > maxSnapshotNetworkMetadataLen {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot network metadata exceeds %d bytes", maxSnapshotNetworkMetadataLen)
+	inherited := artifactNetworkSpec(summary.Network)
+	if err := sandboxcfg.ValidateNetworkSpec(inherited); err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template network summary: %w", err)
 	}
-	var inherited sandboxcfg.NetworkSpec
-	if raw := strings.TrimSpace(summary.RawNetworkMetadata); raw != "" {
-		parsed, err := sandboxcfg.ParseSpec(map[string]string{sandboxcfg.NsNetwork: raw})
-		if err != nil {
-			return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template network metadata: %w", err)
-		}
-		inherited = parsed.Network
+	if err := validateArtifactDiskTopology(summary.DiskTopology); err != nil {
+		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template disk summary: %w", err)
 	}
 	return inherited, nil
 }
@@ -128,7 +128,7 @@ type buildTaskHandoff struct {
 
 	snapshot       bool
 	expectedDigest string
-	summary        *configsock.SnapshotPrepareSummary
+	summary        *configsock.ArtifactPrepareSummary
 	prepareReady   chan struct{}
 
 	final      *configsock.BuildSpec
@@ -146,7 +146,7 @@ func newBuildTaskHandoff(snapshot bool, expectedDigest string) *buildTaskHandoff
 	}
 }
 
-func (h *buildTaskHandoff) Submit(summary configsock.SnapshotPrepareSummary) (bool, error) {
+func (h *buildTaskHandoff) Submit(summary configsock.ArtifactPrepareSummary) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.snapshot {
@@ -159,18 +159,18 @@ func (h *buildTaskHandoff) Submit(summary configsock.SnapshotPrepareSummary) (bo
 		if summary.ResolutionDigest == h.expectedDigest {
 			return true, nil
 		}
-		return false, h.setConflictLocked(errors.New("build: snapshot prepare conflicts with durable preparation"))
+		return false, h.setConflictLocked(errors.New("build: artifact prepare conflicts with durable preparation"))
 	}
 	if h.summary == nil {
-		copySummary := summary
+		copySummary := configsock.CloneArtifactPrepareSummary(summary)
 		h.summary = &copySummary
 		close(h.prepareReady)
 		return false, nil
 	}
-	if *h.summary == summary {
+	if configsock.EqualArtifactPrepareSummary(*h.summary, summary) {
 		return true, nil
 	}
-	return false, h.setConflictLocked(errors.New("build: conflicting snapshot prepare replay"))
+	return false, h.setConflictLocked(errors.New("build: conflicting artifact prepare replay"))
 }
 
 func (h *buildTaskHandoff) setConflictLocked(err error) error {
@@ -181,24 +181,24 @@ func (h *buildTaskHandoff) setConflictLocked(err error) error {
 	return h.conflict
 }
 
-func (h *buildTaskHandoff) WaitPrepare(ctx context.Context) (configsock.SnapshotPrepareSummary, error) {
+func (h *buildTaskHandoff) WaitPrepare(ctx context.Context) (configsock.ArtifactPrepareSummary, error) {
 	select {
 	case <-h.prepareReady:
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.conflict != nil {
-			return configsock.SnapshotPrepareSummary{}, h.conflict
+			return configsock.ArtifactPrepareSummary{}, h.conflict
 		}
 		if h.summary == nil {
-			return configsock.SnapshotPrepareSummary{}, errors.New("build: prepare completed without summary")
+			return configsock.ArtifactPrepareSummary{}, errors.New("build: prepare completed without summary")
 		}
-		return *h.summary, nil
+		return configsock.CloneArtifactPrepareSummary(*h.summary), nil
 	case <-h.conflictReady:
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		return configsock.SnapshotPrepareSummary{}, h.conflict
+		return configsock.ArtifactPrepareSummary{}, h.conflict
 	case <-ctx.Done():
-		return configsock.SnapshotPrepareSummary{}, ctx.Err()
+		return configsock.ArtifactPrepareSummary{}, ctx.Err()
 	}
 }
 

@@ -31,7 +31,8 @@ func (o *Orchestrator) ActivateRoute(ctx context.Context, expected proxy.RouteBi
 	if expected.SandboxID == "" {
 		return proxy.Route{}, false, nil
 	}
-	current, _, err := o.ensureResumeAcceptedFrom(ctx, expected.SandboxID, nil, conductorextension.SandboxOriginProxy, func(sb *types.Sandbox) error {
+	request := types.ResumeRequest{Trigger: types.ResumeTriggerRoute, Mode: types.ResumeAuto}
+	current, _, err := o.ensureResumeAcceptedFrom(ctx, expected.SandboxID, nil, request, conductorextension.SandboxOriginProxy, func(sb *types.Sandbox) error {
 		binding, present := routeBinding(sb, expected.Target)
 		if !present || binding != expected {
 			return errRouteBindingChanged

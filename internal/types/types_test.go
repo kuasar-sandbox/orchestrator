@@ -33,8 +33,11 @@ func TestTemplateIDPortableRef(t *testing.T) {
 		ref  string
 	}{
 		{kind: KindImg, ref: "manifest://" + key},
+		{kind: KindSbx, ref: "manifest://" + key},
 		{kind: KindSnp, ref: "manifest://" + key},
 		{kind: KindImg, ref: "file://" + key + ".image@location:0198-build"},
+		{kind: KindSbx, ref: "file://" + key + ".sandbox@location:0198-build"},
+		{kind: KindSbx, ref: "file://" + key + ".bundle@location:0198-build"},
 		{kind: KindSnp, ref: "file://" + key + ".snapshot@location:0198-build"},
 		{kind: KindSnp, ref: "file://" + key + ".bundle@location:0198-build"},
 	} {
@@ -50,14 +53,16 @@ func TestTemplateIDPortableRef(t *testing.T) {
 }
 
 func TestTemplateIDRejectsNonPortableOrWrongArtifact(t *testing.T) {
-	encode := func(ref string) string {
-		return "e2b-snp-" + base64.RawURLEncoding.EncodeToString([]byte(ref))
+	encode := func(kind Kind, ref string) string {
+		return "e2b-" + string(kind) + "-" + base64.RawURLEncoding.EncodeToString([]byte(ref))
 	}
 	for _, raw := range []string{
 		"e2b-snp-not-base64!",
-		encode("file:///tmp/root.snapshot"),
-		encode("file://root.image@location:build"),
-		encode("manifest://short"),
+		encode(KindSnp, "file:///tmp/root.snapshot"),
+		encode(KindSnp, "file://root.image@location:build"),
+		encode(KindSbx, "file://root.snapshot@location:build"),
+		encode(KindSbx, "file://root.image@location:build"),
+		encode(KindSnp, "manifest://short"),
 	} {
 		if _, err := ParseTemplateID(raw); err == nil {
 			t.Fatalf("ParseTemplateID(%q) succeeded", raw)

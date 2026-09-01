@@ -18,7 +18,7 @@ type ForwardRequest = proxyextension.ForwardRequest
 type RouteSource = proxyextension.RouteSource
 type Profile = proxyextension.Profile
 type RouteState = proxyextension.RouteState
-type SnapshotLocation = proxyextension.SnapshotLocation
+type ArtifactLocation = proxyextension.ArtifactLocation
 type RouteView = proxyextension.RouteView
 type RouteEvent = proxyextension.RouteEvent
 type RouteEventKind = proxyextension.RouteEventKind
@@ -46,9 +46,9 @@ const (
 	RouteStatePaused   = proxyextension.RouteStatePaused
 	RouteStateDead     = proxyextension.RouteStateDead
 
-	SnapshotLocationNone   = proxyextension.SnapshotLocationNone
-	SnapshotLocationLocal  = proxyextension.SnapshotLocationLocal
-	SnapshotLocationRemote = proxyextension.SnapshotLocationRemote
+	ArtifactLocationNone   = proxyextension.ArtifactLocationNone
+	ArtifactLocationLocal  = proxyextension.ArtifactLocationLocal
+	ArtifactLocationRemote = proxyextension.ArtifactLocationRemote
 
 	RouteSyncInitializing = proxyextension.RouteSyncInitializing
 	RouteSyncSyncing      = proxyextension.RouteSyncSyncing

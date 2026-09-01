@@ -21,6 +21,7 @@ import (
 func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{}
+	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
 	o := testOrchCfg(t, cfg)
 	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)

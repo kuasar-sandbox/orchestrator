@@ -573,13 +573,13 @@ func ApplyCapacity(meta map[string]string, cpu, memoryMiB int) (map[string]strin
 }
 
 // ResourceResolveInput supplies the complete pure inputs for one final runtime
-// resource document. Restore=true requires SnapshotCapacity and treats any
+// resource document. Restore=true requires ArtifactCapacity and treats any
 // explicit request capacity leaves as equality assertions.
 type ResourceResolveInput struct {
 	Node                     NodeResourcePolicy
 	Patch                    ResourcePatch
 	Restore                  bool
-	SnapshotCapacity         *rtconfig.CapacityConfig
+	ArtifactCapacity         *rtconfig.CapacityConfig
 	Dynamic                  bool
 	ControllerSocketIdentity string
 }
@@ -606,10 +606,10 @@ func ResolveResources(input ResourceResolveInput) (rtconfig.ResourcesConfig, err
 		}
 	}
 	if input.Restore {
-		if input.SnapshotCapacity == nil {
+		if input.ArtifactCapacity == nil {
 			return rtconfig.ResourcesConfig{}, errors.New("restore snapshot capacity is required")
 		}
-		snapshot := *input.SnapshotCapacity
+		snapshot := *input.ArtifactCapacity
 		if snapshot.CPU <= 0 {
 			return rtconfig.ResourcesConfig{}, errors.New("restore snapshot resources.capacity.cpu must be > 0")
 		}

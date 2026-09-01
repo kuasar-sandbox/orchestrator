@@ -476,7 +476,7 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := types.BuildResult{
-		Error: "snapshot.cfg is malformed", FailureStage: "snapshot_prepare",
+		Error: "snapshot.cfg is malformed", FailureStage: "artifact_prepare",
 	}
 	if inserted, err := st.AcceptBuildResult(ctx, b.BuildID, b.RunID, result); err != nil || !inserted {
 		t.Fatalf("first result acceptance = inserted %v err %v", inserted, err)

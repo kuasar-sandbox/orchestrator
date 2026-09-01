@@ -20,14 +20,14 @@ const (
 	RouteStateDead     RouteState = "dead"
 )
 
-// SnapshotLocation describes whether a paused snapshot is node-bound or
-// portable. The empty value means no snapshot location is currently routed.
-type SnapshotLocation string
+// ArtifactLocation describes whether a retained E/S artifact is node-bound or
+// portable. The empty value means the row owns no artifact.
+type ArtifactLocation string
 
 const (
-	SnapshotLocationNone   SnapshotLocation = ""
-	SnapshotLocationLocal  SnapshotLocation = "local"
-	SnapshotLocationRemote SnapshotLocation = "remote"
+	ArtifactLocationNone   ArtifactLocation = ""
+	ArtifactLocationLocal  ArtifactLocation = "local"
+	ArtifactLocationRemote ArtifactLocation = "remote"
 )
 
 // RouteSyncState reports the master route source's relationship to the
@@ -54,7 +54,7 @@ type RouteView struct {
 	EnvdUDS                string
 	CIUDS                  string
 	FloatingIP             string
-	SnapshotLocation       SnapshotLocation
+	ArtifactLocation       ArtifactLocation
 	APISecretFingerprint   string
 	ManifestKeyFingerprint string
 	Revision               uint64

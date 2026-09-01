@@ -35,7 +35,8 @@ func TestLookupRouteIsSideEffectFreeAndActivateRevalidatesBinding(t *testing.T) 
 	o := testOrch(t)
 	sb := &types.Sandbox{
 		ID: "paused", Profile: types.ProfileBare, State: types.StatePaused,
-		FloatingIP: "192.0.2.10", APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("3", 64),
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
+		FloatingIP:   "192.0.2.10", APISecret: strings.Repeat("1", 64), ManifestKey: strings.Repeat("3", 64),
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 	}
 	materializeTestSandboxCredentials(t, sb)

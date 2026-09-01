@@ -44,26 +44,57 @@ type SandboxOperation struct {
 // still resolve to that profile. MMDS preserves whether a top-level MMDS value
 // was supplied. All maps and pointers are independent copies.
 type SandboxCreateRequest struct {
-	TemplateID     string
-	Profile        Profile
-	TimeoutSeconds int
-	Metadata       map[string]string
-	Env            map[string]string
-	Secure         bool
-	MMDS           *string
+	TemplateID      string
+	Profile         Profile
+	TimeoutSeconds  int
+	Metadata        map[string]string
+	Env             map[string]string
+	Secure          bool
+	AutoPauseMemory *bool
+	MMDS            *string
 }
 
-// SandboxPauseRequest contains action-scoped checkpoint overrides. Nil fields
-// inherit sandbox and node policy.
+type CaptureKind string
+
+const (
+	CaptureKindSnapshot CaptureKind = "snapshot"
+	CaptureKindSandbox  CaptureKind = "sandbox"
+)
+
+// SandboxPauseRequest contains the core-owned capture selector plus
+// action-scoped checkpoint overrides. CaptureKind is observable but immutable;
+// nil policy fields inherit sandbox and node policy.
 type SandboxPauseRequest struct {
+	CaptureKind          CaptureKind
 	CheckpointMergeRef   *bool
 	CheckpointDropCaches *bool
 }
 
-// SandboxResumeRequest contains the normalized caller deadline intent. Nil
-// means the core's existing resume-deadline policy applies.
+type ResumeMode string
+
+const (
+	ResumeModeAuto   ResumeMode = "auto"
+	ResumeModeMemory ResumeMode = "memory"
+	ResumeModeCold   ResumeMode = "cold"
+)
+
+type ResumeTrigger string
+
+const (
+	ResumeTriggerConnect     ResumeTrigger = "connect"
+	ResumeTriggerWake        ResumeTrigger = "wake"
+	ResumeTriggerRoute       ResumeTrigger = "route"
+	ResumeTriggerExec        ResumeTrigger = "exec"
+	ResumeTriggerExecSession ResumeTrigger = "exec-session"
+)
+
+// SandboxResumeRequest contains the normalized caller deadline intent plus the
+// observable, core-owned Mode and Trigger. A nil deadline means the core's
+// existing resume-deadline policy applies.
 type SandboxResumeRequest struct {
 	RequestedDeadlineUnix *int64
+	Mode                  ResumeMode
+	Trigger               ResumeTrigger
 }
 
 // SandboxDeleteRequest describes an ordinary explicit delete. Mandatory

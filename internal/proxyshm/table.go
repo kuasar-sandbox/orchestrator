@@ -32,18 +32,18 @@ const (
 	defaultCapacity      = 65536
 	maxTerminalRevisions = 4096
 
-	maxSandboxID   = 128
-	maxProfile     = 16
-	maxTemplateID  = types.MaxTemplateIDBytes
-	maxState       = 16
-	maxUDS         = 256
-	maxFloatingIP  = 64
-	maxSecret      = 64
-	maxFingerprint = 64
-	maxAccessToken = 256
-	maxSnapLoc     = 32
-	maxMmdsSecret  = 128
-	maxRunID       = 128
+	maxSandboxID        = 128
+	maxProfile          = 16
+	maxTemplateID       = types.MaxTemplateIDBytes
+	maxState            = 16
+	maxUDS              = 256
+	maxFloatingIP       = 64
+	maxSecret           = 64
+	maxFingerprint      = 64
+	maxAccessToken      = 256
+	maxArtifactLocation = 32
+	maxMmdsSecret       = 128
+	maxRunID            = 128
 )
 
 var (
@@ -94,7 +94,7 @@ type mmapRecord struct {
 	EnvdAccessToken        [maxAccessToken]byte
 	TrafficAccessToken     [maxAccessToken]byte
 	ForwardAccessToken     [maxAccessToken]byte
-	SnapshotLocation       [maxSnapLoc]byte
+	ArtifactLocation       [maxArtifactLocation]byte
 	MmdsSecret             [maxMmdsSecret]byte
 	RunID                  [maxRunID]byte
 }
@@ -565,7 +565,7 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				EnvdAccessToken:        fixedString(rec.EnvdAccessToken[:]),
 				TrafficAccessToken:     fixedString(rec.TrafficAccessToken[:]),
 				ForwardAccessToken:     fixedString(rec.ForwardAccessToken[:]),
-				SnapshotLocation:       fixedString(rec.SnapshotLocation[:]),
+				ArtifactLocation:       fixedString(rec.ArtifactLocation[:]),
 				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
 				RunID:                  fixedString(rec.RunID[:]),
 			},
@@ -610,7 +610,7 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	_ = putFixed(rec.EnvdAccessToken[:], snapshot.entry.EnvdAccessToken)
 	_ = putFixed(rec.TrafficAccessToken[:], snapshot.entry.TrafficAccessToken)
 	_ = putFixed(rec.ForwardAccessToken[:], snapshot.entry.ForwardAccessToken)
-	_ = putFixed(rec.SnapshotLocation[:], snapshot.entry.SnapshotLocation)
+	_ = putFixed(rec.ArtifactLocation[:], snapshot.entry.ArtifactLocation)
 	_ = putFixed(rec.MmdsSecret[:], snapshot.entry.MmdsSecret)
 	_ = putFixed(rec.RunID[:], snapshot.entry.RunID)
 	finishWrite(rec)
@@ -752,7 +752,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"envd_access_token", r.EnvdAccessToken, maxAccessToken},
 		{"traffic_access_token", r.TrafficAccessToken, maxAccessToken},
 		{"forward_access_token", r.ForwardAccessToken, maxAccessToken},
-		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
+		{"artifact_location", r.ArtifactLocation, maxArtifactLocation},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
 		{"run_id", r.RunID, maxRunID},
 	}

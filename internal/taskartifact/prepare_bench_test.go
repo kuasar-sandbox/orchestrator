@@ -1,4 +1,4 @@
-package tasksnapshot
+package taskartifact
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // BenchmarkPrepareConcurrency is a repeatable artifact-free proxy for the task
@@ -34,7 +35,7 @@ func BenchmarkPrepareConcurrency(b *testing.B) {
 					go func() {
 						defer wg.Done()
 						at := time.Now()
-						result, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{
+						result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchMemory),
 							RootRef: root,
 							MaxRefs: 4,
 						})
@@ -91,7 +92,7 @@ func BenchmarkPrepareBundleRefLocations(b *testing.B) {
 				Scheme: manifest.RefSchemeFile, Path: filepath.Base(rootPath), DigestScheme: "manifest",
 				Digest: rootKey, Location: "root-20260824",
 			}.String()
-			spec := configsock.SnapshotPrepareSpec{
+			spec := configsock.ArtifactPrepareSpec{RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchMemory),
 				RootRef: rootRef, ManifestConfig: manifestConfig, RefLocationParent: parent, MaxRefs: 4,
 			}
 			b.ReportAllocs()

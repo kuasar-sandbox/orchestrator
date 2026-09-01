@@ -273,7 +273,7 @@ func TestResolveResourcesRestoreCapacityConstraint(t *testing.T) {
 	resources, err := ResolveResources(ResourceResolveInput{
 		Patch:            mustResourcePatch(t, `{"capacity":{"cpu":4,"memory":"4096MiB"},"allocatable":{"memory":"512MiB"}}`),
 		Restore:          true,
-		SnapshotCapacity: snapshot,
+		ArtifactCapacity: snapshot,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestResolveResourcesRestoreCapacityConstraint(t *testing.T) {
 		"memory mismatch": `{"capacity":{"memory":"2GiB"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := ResolveResources(ResourceResolveInput{Patch: mustResourcePatch(t, raw), Restore: true, SnapshotCapacity: snapshot})
+			_, err := ResolveResources(ResourceResolveInput{Patch: mustResourcePatch(t, raw), Restore: true, ArtifactCapacity: snapshot})
 			if !errors.Is(err, ErrInvalidResourceRequest) {
 				t.Fatalf("restore mismatch error = %v", err)
 			}
@@ -302,7 +302,7 @@ func TestResolveResourcesRestoreCapacityConstraint(t *testing.T) {
 			Allocatable: NodeAllocatablePolicy{Memory: &explicitMemory},
 		},
 		Restore:          true,
-		SnapshotCapacity: &rtconfig.CapacityConfig{CPU: 1, Memory: "128MiB"},
+		ArtifactCapacity: &rtconfig.CapacityConfig{CPU: 1, Memory: "128MiB"},
 	})
 	if !errors.Is(err, ErrInvalidResourceRequest) {
 		t.Fatalf("explicit node allocatable above restore capacity error = %v", err)

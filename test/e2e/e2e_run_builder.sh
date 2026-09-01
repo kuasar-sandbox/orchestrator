@@ -13,7 +13,7 @@
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
 #       boots the steps VM from manifest://, applies RUN/ENV/WORKDIR, exports
 #       (config merge), runs startCmd/readyCmd on the production runtime,
-#       snapshots, then ONE upload-snapshot uploads bundle + image + overlay
+#       snapshots, then ONE publish uploads bundle + image + overlay
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
 #       extracts the base image from B2's snapshot.cfg and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
@@ -997,11 +997,11 @@ case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-
 B3_RUN_ID=$(build_run_id "$B3_BID")
 [ -n "$B3_RUN_ID" ] || fail "B3 ready record lost its run id"
 journalctl --no-pager -o cat -u "sandbox-builder@$B3_RUN_ID.service" >"$WORK/b3-builder.journal" 2>&1 || true
-B3_ROOT_READS=$(grep -F -c 'build task snapshot prepared' "$WORK/b3-builder.journal" || true)
+B3_ROOT_READS=$(grep -F -c 'build task artifact prepared' "$WORK/b3-builder.journal" || true)
 [ "$B3_ROOT_READS" = "1" ] \
     || { cat "$WORK/b3-builder.journal"; fail "B3 task root snapshot.cfg read count=$B3_ROOT_READS (want 1)"; }
-grep -F -q 'task_snapshot_ref_count' "$WORK/b3-builder.journal" \
-    || { cat "$WORK/b3-builder.journal"; fail "B3 task snapshot ref-count instrumentation missing"; }
+grep -F -q 'task_artifact_ref_count' "$WORK/b3-builder.journal" \
+    || { cat "$WORK/b3-builder.journal"; fail "B3 task artifact ref-count instrumentation missing"; }
 # ready is only reachable if the RUN saw B2's marker and merged ENV/WORKDIR,
 # and the inherited startCmd/readyCmd ran on the new template VM.
 echo "==> PASS: B3 ready → $B3_PERSIST (one task-local root cfg read; restored RUN/ENV/WORKDIR + start/ready inheritance)"

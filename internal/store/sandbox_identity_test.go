@@ -38,6 +38,7 @@ func TestSandboxIdentityRoundTrip(t *testing.T) {
 		ID: "import-target", Profile: types.ProfileE2B, StableIDValue: "source-stable-id",
 		TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), State: types.StatePaused,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 2,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
 	}
 	setTestSandboxServiceCredentials(standalone)
 	if err := st.Put(ctx, standalone); err != nil {
@@ -73,12 +74,25 @@ func TestSandboxSchemaUsesStableIDHardCut(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if !columns["stable_id"] {
-		t.Fatal("sandboxes schema is missing stable_id")
+	for _, required := range []string{
+		"stable_id",
+		"resume_source_kind",
+		"resume_source_ref",
+		"auto_pause_memory",
+		"launch_mode",
+	} {
+		if !columns[required] {
+			t.Fatalf("sandboxes schema is missing %q", required)
+		}
 	}
-	legacyColumn := strings.Join([]string{"auth", "sandbox", "id"}, "_")
-	if columns[legacyColumn] {
-		t.Fatalf("sandboxes schema retained legacy column %q", legacyColumn)
+	for _, legacy := range []string{
+		strings.Join([]string{"auth", "sandbox", "id"}, "_"),
+		strings.Join([]string{"snapshot", "ref"}, "_"),
+		strings.Join([]string{"resume", "kind"}, "_"),
+	} {
+		if columns[legacy] {
+			t.Fatalf("sandboxes schema retained legacy column %q", legacy)
+		}
 	}
 }
 
@@ -101,6 +115,7 @@ func TestSandboxStableIDIsNotUnique(t *testing.T) {
 			APISecret:     pair.APISecret,
 			ManifestKey:   pair.ManifestKey,
 			CreatedUnix:   1,
+			ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("f", 64)},
 		}
 		setTestSandboxServiceCredentials(sb)
 		if err := st.InsertSandbox(ctx, sb); err != nil {
@@ -136,6 +151,7 @@ func TestSandboxSystemIdentityIsInsertBound(t *testing.T) {
 	sb.Cluster = &types.ClusterSandboxContext{Group: "/replacement", RouteKey: "other"}
 	sb.StableIDValue = "replacement"
 	sb.State = types.StatePaused
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)}
 	setTestSandboxServiceCredentials(sb)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
@@ -165,10 +181,11 @@ func TestCASRunStateFencesStaleRunner(t *testing.T) {
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.CASRunState(ctx, sb.ID, "sandbox-stale", types.StateRunning, types.StatePaused); err != nil || changed {
+	source := types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, "sandbox-stale", source); err != nil || changed {
 		t.Fatalf("stale runner state change = %v, %v", changed, err)
 	}
-	if changed, err := st.CASRunState(ctx, sb.ID, sb.RunID, types.StateRunning, types.StatePaused); err != nil || !changed {
+	if changed, err := st.CommitRunningPaused(ctx, sb.ID, sb.RunID, source); err != nil || !changed {
 		t.Fatalf("current runner state change = %v, %v", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
@@ -242,6 +259,12 @@ func TestSandboxListDefaultExcludesInternalLifecycleStates(t *testing.T) {
 			ID: row.id, Profile: types.ProfileBare,
 			TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("e", 64)}.String(),
 			State:      row.state, APISecret: pair.APISecret, ManifestKey: pair.ManifestKey, CreatedUnix: 1,
+		}
+		if row.state == types.StateStarting {
+			sb.LaunchMode = types.LaunchImage
+		}
+		if row.state == types.StatePaused {
+			sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "snapshot-current"}
 		}
 		setTestSandboxServiceCredentials(sb)
 		if err := st.Put(ctx, sb); err != nil {

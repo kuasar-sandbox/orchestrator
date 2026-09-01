@@ -448,7 +448,7 @@ checkpoint:
 	}
 }
 
-func TestLoadCheckpointPolicyTriState(t *testing.T) {
+func TestLoadSnapshotPolicyTriState(t *testing.T) {
 	base := `
 api:
   domain: example.test

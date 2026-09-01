@@ -3,6 +3,7 @@ package types
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -17,6 +18,16 @@ const (
 	ProfileE2B  Profile = "e2b"  // envd in guest; full e2b data plane
 	ProfileBare Profile = "bare" // no envd; only floatingip network
 )
+
+func (t ResumeTrigger) Valid() bool {
+	switch t {
+	case ResumeTriggerConnect, ResumeTriggerWake, ResumeTriggerRoute,
+		ResumeTriggerExec, ResumeTriggerExecSession:
+		return true
+	default:
+		return false
+	}
+}
 
 func (p Profile) Valid() bool { return p == ProfileE2B || p == ProfileBare }
 
@@ -33,8 +44,168 @@ type Kind string
 
 const (
 	KindImg Kind = "img" // cold boot from an image manifest
+	KindSbx Kind = "sbx" // cold boot from a portable sandbox
 	KindSnp Kind = "snp" // restore from a snapshot manifest
 )
+
+// CaptureKind selects the artifact produced by a pause operation. Capture and
+// resume are deliberately independent: the saved artifact constrains, but does
+// not by itself request, a later launch mode.
+type CaptureKind string
+
+const (
+	CaptureSnapshot CaptureKind = "snapshot"
+	CaptureSandbox  CaptureKind = "sandbox"
+)
+
+func (k CaptureKind) Valid() bool { return k == CaptureSnapshot || k == CaptureSandbox }
+
+// ResumeSourceKind identifies the durable artifact owned by a paused sandbox.
+type ResumeSourceKind string
+
+const (
+	ResumeSourceSnapshot ResumeSourceKind = "snapshot"
+	ResumeSourceSandbox  ResumeSourceKind = "sandbox"
+)
+
+func (k ResumeSourceKind) Valid() bool {
+	return k == ResumeSourceSnapshot || k == ResumeSourceSandbox
+}
+
+// ResumeSource is the durable artifact from which a paused sandbox may resume.
+type ResumeSource struct {
+	Kind ResumeSourceKind `json:"kind"`
+	Ref  string           `json:"ref"`
+}
+
+func (s ResumeSource) Empty() bool { return s.Kind == "" && s.Ref == "" }
+
+func (s ResumeSource) Valid() bool { return s.Kind.Valid() && s.Ref != "" }
+
+type ArtifactDiskMode string
+
+const (
+	ArtifactDiskSingle  ArtifactDiskMode = "single"
+	ArtifactDiskOverlay ArtifactDiskMode = "overlay"
+)
+
+func (m ArtifactDiskMode) Valid() bool {
+	return m == ArtifactDiskSingle || m == ArtifactDiskOverlay
+}
+
+// ArtifactDiskShape is the minimum non-secret disk projection needed to place
+// host-owned active diff fields without disclosing the artifact's immutable
+// refs. HasActiveBase means the portable graph supplies a captured ext4 base;
+// false requires the node's formatted diff template.
+type ArtifactDiskShape struct {
+	Name          string           `json:"name,omitempty"`
+	Mode          ArtifactDiskMode `json:"mode"`
+	HasActiveBase bool             `json:"has_active_base"`
+}
+
+// ArtifactDiskTopology preserves root plus data-disk order. sandboxer checks
+// the generated host document against the same PortableSandboxConfig before
+// applying any binding.
+type ArtifactDiskTopology struct {
+	Root  ArtifactDiskShape   `json:"root"`
+	Disks []ArtifactDiskShape `json:"disks,omitempty"`
+}
+
+// ResumeMode is an admission request. Auto resolves against the durable source.
+type ResumeMode string
+
+const (
+	ResumeAuto   ResumeMode = "auto"
+	ResumeMemory ResumeMode = "memory"
+	ResumeCold   ResumeMode = "cold"
+)
+
+func (m ResumeMode) Valid() bool {
+	return m == ResumeAuto || m == ResumeMemory || m == ResumeCold
+}
+
+// LaunchMode is the already-resolved launch path persisted while state is
+// starting. It is authoritative across conductor restarts.
+type LaunchMode string
+
+const (
+	LaunchImage  LaunchMode = "image"
+	LaunchCold   LaunchMode = "cold"
+	LaunchMemory LaunchMode = "memory"
+)
+
+func (m LaunchMode) Valid() bool {
+	return m == LaunchImage || m == LaunchCold || m == LaunchMemory
+}
+
+// ResumeTrigger records why resume admission was requested. It never selects a
+// launch mode and never controls whether a paused artifact may wake.
+type ResumeTrigger string
+
+const (
+	ResumeTriggerConnect     ResumeTrigger = "connect"
+	ResumeTriggerWake        ResumeTrigger = "wake"
+	ResumeTriggerRoute       ResumeTrigger = "route"
+	ResumeTriggerExec        ResumeTrigger = "exec"
+	ResumeTriggerExecSession ResumeTrigger = "exec-session"
+)
+
+type ResumeRequest struct {
+	Trigger ResumeTrigger
+	Mode    ResumeMode
+}
+
+var ErrMemoryUnavailable = errors.New("memory resume is unavailable for a sandbox artifact")
+var ErrLaunchModeConflict = errors.New("requested resume mode conflicts with the accepted launch mode")
+
+// ResumeModeForMemory preserves the tri-state Connect extension: absence means
+// automatic resolution, true requests memory, and false requests cold.
+func ResumeModeForMemory(memory *bool) ResumeMode {
+	if memory == nil {
+		return ResumeAuto
+	}
+	if *memory {
+		return ResumeMemory
+	}
+	return ResumeCold
+}
+
+// ResolveLaunchMode combines a durable paused source with one admission request.
+func ResolveLaunchMode(source ResumeSource, requested ResumeMode) (LaunchMode, error) {
+	if !source.Valid() {
+		return "", fmt.Errorf("invalid resume source kind=%q ref=%q", source.Kind, source.Ref)
+	}
+	if !requested.Valid() {
+		return "", fmt.Errorf("invalid resume mode %q", requested)
+	}
+	switch source.Kind {
+	case ResumeSourceSnapshot:
+		if requested == ResumeCold {
+			return LaunchCold, nil
+		}
+		return LaunchMemory, nil
+	case ResumeSourceSandbox:
+		if requested == ResumeMemory {
+			return "", ErrMemoryUnavailable
+		}
+		return LaunchCold, nil
+	default:
+		panic("unreachable resume source kind")
+	}
+}
+
+func LaunchModeForTemplate(kind Kind) (LaunchMode, error) {
+	switch kind {
+	case KindImg:
+		return LaunchImage, nil
+	case KindSbx:
+		return LaunchCold, nil
+	case KindSnp:
+		return LaunchMemory, nil
+	default:
+		return "", fmt.Errorf("unsupported template kind %q", kind)
+	}
+}
 
 // State is the lifecycle state persisted in the store.
 type State string
@@ -88,7 +259,7 @@ func ParseTemplateID(s string) (TemplateID, error) {
 	}
 	t.Profile, t.Kind = profile, Kind(parts[1])
 	switch t.Kind {
-	case KindImg, KindSnp:
+	case KindImg, KindSbx, KindSnp:
 	default:
 		return t, fmt.Errorf("templateID %q: unknown kind %q", s, t.Kind)
 	}
@@ -110,6 +281,10 @@ func ParseTemplateID(s string) (TemplateID, error) {
 	if ref.Scheme == manifest.RefSchemeFile {
 		if t.Kind == KindImg && !strings.HasSuffix(ref.Path, ".image") {
 			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .image artifact", s, t.Kind)
+		}
+		if t.Kind == KindSbx &&
+			!strings.HasSuffix(ref.Path, ".sandbox") && !strings.HasSuffix(ref.Path, ".bundle") {
+			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .sandbox or .bundle artifact", s, t.Kind)
 		}
 		if t.Kind == KindSnp &&
 			!strings.HasSuffix(ref.Path, ".snapshot") && !strings.HasSuffix(ref.Path, ".bundle") {
@@ -163,7 +338,9 @@ type Sandbox struct {
 	PortMAC            string // per-port MAC from attach -> Network.MAC
 	APISecret          string // per-tenant API authentication root (hex); never written to env/yaml
 	ManifestKey        string // per-tenant manifest encryption root (hex); never written to env/yaml
-	SnapshotRef        string // latest local path or canonical portable snapshot ref; empty if never paused
+	ResumeSource       ResumeSource
+	AutoPauseMemory    bool
+	LaunchMode         LaunchMode
 	ServiceSecret      string // per-sandbox service authentication root (hex); never exposed publicly
 	EnvdAccessToken    string
 	TrafficAccessToken string

@@ -77,7 +77,14 @@ func TestResourceStatsDisabledAndMissingReservationStates(t *testing.T) {
 			o := testOrch(t)
 			sb := &types.Sandbox{
 				ID: "resource-" + string(tc.state), Profile: types.ProfileBare, State: tc.state,
-				APISecret: strings.Repeat("4", 64), ManifestKey: strings.Repeat("5", 64),
+				TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+				APISecret:  strings.Repeat("4", 64), ManifestKey: strings.Repeat("5", 64),
+			}
+			if tc.state == types.StateStarting {
+				sb.LaunchMode = types.LaunchImage
+			}
+			if tc.state == types.StatePaused {
+				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
 			}
 			materializeTestSandboxCredentials(t, sb)
 			if err := o.st.Put(context.Background(), sb); err != nil {
@@ -99,7 +106,8 @@ func TestTrafficStatsAuthenticatesBeforeProviderAndPassesRunIdentity(t *testing.
 	o := testOrch(t)
 	sb := &types.Sandbox{
 		ID: "traffic", RunID: "run-7", Profile: types.ProfileE2B, State: types.StatePaused,
-		APISecret: strings.Repeat("6", 64), ManifestKey: strings.Repeat("7", 64),
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("c", 64)},
+		APISecret:    strings.Repeat("6", 64), ManifestKey: strings.Repeat("7", 64),
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {

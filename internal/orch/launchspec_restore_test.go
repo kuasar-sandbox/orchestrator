@@ -9,7 +9,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
+func TestSandboxLaunchSpecNeverCarriesTaskLocalArtifactRef(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ManifestConfig = "/tmp/manifest.yaml"
 	cfg.Paths.RunRoot = "/tmp/run"
@@ -39,8 +39,8 @@ func TestSandboxLaunchSpecCarriesRestoreRef(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("LaunchSpecFor: ok=%v err=%v", ok, err)
 	}
-	if !hasArgPair(spec.Args, "--restore", "manifest://"+key) {
-		t.Fatalf("restore arg missing from %v", spec.Args)
+	if hasArg(spec.Args, "--restore") || hasArg(spec.Args, "--from") {
+		t.Fatalf("conductor launch spec leaked task-local Artifact selection: %v", spec.Args)
 	}
 	assertNoCgroupArgs(t, spec.Args)
 }

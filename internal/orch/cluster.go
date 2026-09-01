@@ -42,6 +42,12 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	if cmd != nil && cmd.Kind != routesync.CmdExecSession && cmd.ExecConditionsSpecified() {
 		return reject(cmd, fmt.Errorf("cluster command contains exec conditions: %w", api.ErrBadRequest))
 	}
+	if cmd != nil && cmd.Kind != routesync.CmdCreate && cmd.AutoPauseMemory != nil {
+		return reject(cmd, fmt.Errorf("cluster command auto_pause_memory is create-only: %w", api.ErrBadRequest))
+	}
+	if cmd != nil && cmd.Kind != routesync.CmdConnect && cmd.Memory != nil {
+		return reject(cmd, fmt.Errorf("cluster command memory is connect-only: %w", api.ErrBadRequest))
+	}
 	if cmd != nil && cmd.Kind == routesync.CmdExecSession &&
 		cmd.ExecConditionsSpecified() && len(cmd.ExecConditions) == 0 {
 		return reject(cmd, fmt.Errorf("cluster command contains non-canonical exec conditions: %w", api.ErrBadRequest))
@@ -74,7 +80,8 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if requestedDeadline > 0 {
 			deadline = &requestedDeadline
 		}
-		sb, _, err = o.ensureResumeAcceptedFrom(ctx, cmd.SID, deadline, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
+		request := types.ResumeRequest{Trigger: types.ResumeTriggerConnect, Mode: types.ResumeModeForMemory(cmd.Memory)}
+		sb, _, err = o.ensureResumeAcceptedFrom(ctx, cmd.SID, deadline, request, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
 			if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
 				return err
 			}
@@ -682,6 +689,10 @@ func clusterCommandRejection(err error) (int, string) {
 		return http.StatusServiceUnavailable, api.ErrExtensionUnavailable.Error()
 	case errors.Is(err, api.ErrSandboxChanged):
 		return http.StatusConflict, api.ErrSandboxChanged.Error()
+	case errors.Is(err, types.ErrMemoryUnavailable):
+		return http.StatusConflict, types.ErrMemoryUnavailable.Error()
+	case errors.Is(err, types.ErrLaunchModeConflict):
+		return http.StatusConflict, types.ErrLaunchModeConflict.Error()
 	case errors.Is(err, api.ErrBadRequest):
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, api.ErrBuildAdmission):
@@ -795,6 +806,10 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 	metadata := cloneStringMap(cmd.Config)
 	timeoutSeconds := o.cfg.Sandbox.TimeoutSec
 	var environment map[string]string
+	autoPauseMemory := true
+	if cmd.AutoPauseMemory != nil {
+		autoPauseMemory = *cmd.AutoPauseMemory
+	}
 	var err error
 	if o.extensionSandboxHook != nil {
 		// precheckCluster has already strictly parsed and removed credentials.
@@ -813,7 +828,7 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		clusterMetadata, clusterMetadataPresent := metadata[clusterstate.ObjectMetadataKey]
 		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginCluster, cmd.SID, &conductorextension.SandboxCreateRequest{
 			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: timeoutSeconds,
-			Metadata: cloneStringMap(metadata),
+			Metadata: cloneStringMap(metadata), AutoPauseMemory: cloneBool(cmd.AutoPauseMemory),
 		})
 		if err != nil {
 			return nil, nil, err
@@ -858,24 +873,35 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		}
 		timeoutSeconds = candidate.TimeoutSeconds
 		environment = cloneStringMap(candidate.Env)
+		if candidate.AutoPauseMemory == nil {
+			autoPauseMemory = true
+		} else {
+			autoPauseMemory = *candidate.AutoPauseMemory
+		}
 	}
 	meta := clusterSandboxMetadata(metadata)
+	launchMode, err := types.LaunchModeForTemplate(tmpl.Kind)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	sb := &types.Sandbox{
-		ID:            cmd.SID,
-		Profile:       tmpl.Profile,
-		Cluster:       &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
-		StableIDValue: cmd.Cluster.StableID,
-		TemplateID:    tmpl.String(),
-		State:         types.StateStarting,
-		RunDir:        o.cfg.Paths.RunRoot + "/" + cmd.SID,
-		BaseDir:       o.cfg.Paths.BaseRoot + "/" + cmd.SID,
-		APISecret:     pair.APISecret,
-		ManifestKey:   pair.ManifestKey,
-		Metadata:      meta,
-		Env:           environment,
-		CreatedUnix:   time.Now().Unix(),
-		DeadlineUnix:  time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
+		ID:              cmd.SID,
+		Profile:         tmpl.Profile,
+		Cluster:         &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		StableIDValue:   cmd.Cluster.StableID,
+		TemplateID:      tmpl.String(),
+		State:           types.StateStarting,
+		LaunchMode:      launchMode,
+		AutoPauseMemory: autoPauseMemory,
+		RunDir:          o.cfg.Paths.RunRoot + "/" + cmd.SID,
+		BaseDir:         o.cfg.Paths.BaseRoot + "/" + cmd.SID,
+		APISecret:       pair.APISecret,
+		ManifestKey:     pair.ManifestKey,
+		Metadata:        meta,
+		Env:             environment,
+		CreatedUnix:     time.Now().Unix(),
+		DeadlineUnix:    time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
 	}
 	if err := materializeSandboxCredentials(sb, credentials); err != nil {
 		return nil, nil, fmt.Errorf("cluster create: %w", err)
@@ -1065,7 +1091,8 @@ func (o *Orchestrator) prepareClusterExecSession(
 		return nil, nil, err
 	}
 	var token string
-	sb, _, err := o.ensureResumeAcceptedPreparedFrom(ctx, cmd.SID, nil, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
+	request := types.ResumeRequest{Trigger: types.ResumeTriggerExecSession, Mode: types.ResumeAuto}
+	sb, _, err := o.ensureResumeAcceptedPreparedFrom(ctx, cmd.SID, nil, request, conductorextension.SandboxOriginCluster, func(current *types.Sandbox) error {
 		if err := validateClusterSandboxCredentialBinding(current, cmd.APISecretFingerprint); err != nil {
 			return err
 		}

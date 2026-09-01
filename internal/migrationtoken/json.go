@@ -17,9 +17,11 @@ var requiredPayloadFields = map[string]struct{}{
 	"templateID":             {},
 	"profile":                {},
 	"runtimeDigest":          {},
-	"snapshotRef":            {},
+	"resumeSourceKind":       {},
+	"resumeSourceRef":        {},
 	"createdUnix":            {},
 	"deadlineUnix":           {},
+	"autoPauseMemory":        {},
 	"serviceSecret":          {},
 	"envdAccessToken":        {},
 	"trafficAccessToken":     {},
@@ -99,8 +101,10 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.Profile)
 	case "runtimeDigest":
 		return decodeStrict(raw, &payload.RuntimeDigest)
-	case "snapshotRef":
-		return decodeStrict(raw, &payload.SnapshotRef)
+	case "resumeSourceKind":
+		return decodeStrict(raw, &payload.ResumeSourceKind)
+	case "resumeSourceRef":
+		return decodeStrict(raw, &payload.ResumeSourceRef)
 	case "env":
 		value, err := decodeStringMap(raw)
 		payload.Env = value
@@ -113,6 +117,8 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.CreatedUnix)
 	case "deadlineUnix":
 		return decodeStrict(raw, &payload.DeadlineUnix)
+	case "autoPauseMemory":
+		return decodeStrict(raw, &payload.AutoPauseMemory)
 	case "serviceSecret":
 		return decodeStrict(raw, &payload.ServiceSecret)
 	case "envdAccessToken":

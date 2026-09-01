@@ -74,7 +74,7 @@ type SandboxRecord struct {
 	NextSandboxGeneration  uint64                    `json:"next_sandbox_generation"`
 	State                  SandboxState              `json:"state"`
 	NodeID                 string                    `json:"node_id,omitempty"`
-	SnapLoc                string                    `json:"snap_loc,omitempty"`
+	ArtifactLocation       string                    `json:"artifact_location,omitempty"`
 	TemplateID             string                    `json:"template_id,omitempty"`
 	Profile                string                    `json:"profile,omitempty"`
 	APISecretFingerprint   string                    `json:"api_secret_fingerprint,omitempty"`
@@ -93,6 +93,7 @@ type SandboxRecord struct {
 	BuildResources         *routesync.BuildResources `json:"build_resources,omitempty"`
 	BuildReason            string                    `json:"build_reason,omitempty"`
 	CreatedU               int64                     `json:"created_unix,omitempty"`
+	AutoPauseMemory        bool                      `json:"auto_pause_memory"`
 }
 
 type WatchEventType int

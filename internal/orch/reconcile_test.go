@@ -158,7 +158,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	createStarting.ID = "create-starting"
 	createStarting.State = types.StateStarting
 	createStarting.RunID = createStartingRun
-	createStarting.SnapshotRef = ""
+	createStarting.ResumeSource = types.ResumeSource{}
+	createStarting.LaunchMode = types.LaunchImage
 	createStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, createStarting.ID)
 	createStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, createStarting.ID)
 	createStarting.VswitchPort = "create-assigned-port"
@@ -171,7 +172,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeStarting.ID = "resume-starting"
 	resumeStarting.State = types.StateStarting
 	resumeStarting.RunID = resumeStartingRun
-	resumeStarting.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
+	resumeStarting.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
+	resumeStarting.LaunchMode = types.LaunchMemory
 	resumeStarting.DeadlineUnix = 1_900_000_111
 	resumeStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeStarting.ID)
 	resumeStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeStarting.ID)
@@ -239,22 +241,24 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		t.Fatalf("known unit was cleaned: stopped=%v reset=%v", lc.stopped, lc.reset)
 	}
 	for _, tt := range []struct {
-		id   string
-		want types.State
+		id       string
+		want     types.State
+		wantMode types.LaunchMode
 	}{
 		{id: createStarting.ID, want: types.StateDead},
-		{id: resumeStarting.ID, want: types.StatePaused},
+		{id: resumeStarting.ID, want: types.StateStarting, wantMode: types.LaunchMemory},
 		{id: createEmpty.ID, want: types.StateDead},
-		{id: resumeEmpty.ID, want: types.StatePaused},
+		{id: resumeEmpty.ID, want: types.StateStarting, wantMode: types.LaunchMemory},
 	} {
 		got, err := st.Get(context.Background(), tt.id)
-		if err != nil || got == nil || got.State != tt.want || got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" {
+		if err != nil || got == nil || got.State != tt.want || got.LaunchMode != tt.wantMode ||
+			got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" {
 			t.Fatalf("reconciled %s = %+v, %v; want %s", tt.id, got, err, tt.want)
 		}
 		if o.lookup(tt.id) != nil {
 			t.Fatalf("interrupted starting sandbox %s was adopted into cache", tt.id)
 		}
-		if tt.want == types.StatePaused {
+		if tt.want == types.StateStarting {
 			if !o.hasDeadlineIntent(tt.id) {
 				t.Fatalf("interrupted resume %s lost durable deadline intent", tt.id)
 			}
@@ -285,6 +289,151 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		if _, err := os.Stat(resume.BaseDir); err != nil {
 			t.Fatalf("resume base directory %s was removed: %v", resume.BaseDir, err)
 		}
+	}
+}
+
+func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "base")
+	cfg.Units.Runner = "sandbox-runner@.service"
+	runID := "sr-00000000-0000-7000-8000-000000000066"
+	manifestKey := strings.Repeat("a", 64)
+	source := types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "manifest://" + strings.Repeat("b", 64)}
+	sb := &types.Sandbox{
+		ID: "paused-interrupted-cleanup", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("c", 64)}.String(),
+		State:      types.StatePaused, ResumeSource: source,
+		RunID: runID, VswitchPort: "paused-old-port", FloatingIP: "192.0.2.66",
+		InnerIP: "198.51.100.66/31", PortMAC: "02:00:00:00:00:66",
+		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-interrupted-cleanup"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-interrupted-cleanup"),
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1, AutoPauseMemory: true,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	unit := "sandbox-runner@" + runID + ".service"
+	lc := &reconcileLauncher{units: []launcher.Unit{{Name: unit, ActiveState: "active"}}}
+	vs := &reconcileVS{}
+	o := New(cfg, st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := o.ReconcileSandboxes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.Get(context.Background(), sb.ID)
+	if err != nil || got == nil || got.State != types.StatePaused || got.ResumeSource != source ||
+		got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" || got.InnerIP != "" || got.PortMAC != "" {
+		t.Fatalf("reconciled paused row = %+v, %v", got, err)
+	}
+	if !containsString(lc.stopped, unit) || !containsString(lc.reset, unit) {
+		t.Fatalf("paused runner cleanup stopped=%v reset=%v", lc.stopped, lc.reset)
+	}
+	if !containsString(vs.detached, "paused-old-port") {
+		t.Fatalf("paused network cleanup = %v", vs.detached)
+	}
+	if cached := o.lookup(sb.ID); cached == nil || cached.RunID != "" || cached.VswitchPort != "" || cached.ResumeSource != source {
+		t.Fatalf("reconciled paused cache = %+v", cached)
+	}
+}
+
+func TestReconcileRetriesSnapshotColdResumeWithDurableLaunchMode(t *testing.T) {
+	dir := shortOrchestratorTestDir(t)
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "base")
+	cfg.Units.Runner = "sandbox-runner@.service"
+	cfg.Units.Builder = "sandbox-builder@.service"
+	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
+	oldRunID := "sr-00000000-0000-7000-8000-000000000077"
+	manifestKey := strings.Repeat("a", 64)
+	source := types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot,
+		Ref:  "manifest://" + strings.Repeat("c", 64),
+	}
+	sb := &types.Sandbox{
+		ID: "recover-snapshot-cold", Profile: types.ProfileBare,
+		TemplateID: types.TemplateID{
+			Profile: types.ProfileBare, Kind: types.KindImg,
+			Ref: "manifest://" + strings.Repeat("b", 64),
+		}.String(),
+		State: types.StateStarting, ResumeSource: source, LaunchMode: types.LaunchCold,
+		RunID: oldRunID, VswitchPort: "old-port", FloatingIP: "192.0.2.77",
+		RunDir:    filepath.Join(cfg.Paths.RunRoot, "recover-snapshot-cold"),
+		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "recover-snapshot-cold"),
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		CreatedUnix: 1, DeadlineUnix: time.Now().Add(time.Hour).Unix(), AutoPauseMemory: true,
+	}
+	materializeTestSandboxCredentials(t, sb)
+	if err := st.Put(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	launchModes := make(chan string, 1)
+	launcher := &countingLauncher{
+		listedUnits: []launcher.Unit{{
+			Name: "sandbox-runner@" + oldRunID + ".service", ActiveState: "active",
+		}},
+		artifactLaunchModes: launchModes,
+	}
+	vs := &checkpointVS{}
+	o := New(cfg, st, launcher, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	launcher.orch = o
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	o.SetClusterContext(ctx)
+	if err := o.ReconcileSandboxes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := st.Get(ctx, sb.ID)
+	if err != nil || recovered == nil || recovered.State != types.StateStarting || recovered.RunID != "" ||
+		recovered.ResumeSource != source || recovered.LaunchMode != types.LaunchCold {
+		t.Fatalf("reconciled cold resume = %+v, %v", recovered, err)
+	}
+	if err := o.StartRunPools(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case mode := <-launchModes:
+		if mode != string(types.LaunchCold) {
+			t.Fatalf("recovered task launch mode = %q, want cold", mode)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovered resume did not reach task-local artifact preparation")
+	}
+	running := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after recovered cold resume")
+	if running.ResumeSource != source || running.LaunchMode != "" {
+		t.Fatalf("recovered running source/mode = %+v/%q", running.ResumeSource, running.LaunchMode)
+	}
+	if vs.detaches.Load() != 1 {
+		t.Fatalf("old network detaches = %d, want 1", vs.detaches.Load())
 	}
 }
 
@@ -1299,6 +1448,7 @@ func TestReconcileCleanupFailurePreservesStartingOwnership(t *testing.T) {
 			Ref: "manifest://" + strings.Repeat("b", 64),
 		}.String(),
 		State: types.StateStarting, RunID: runID,
+		LaunchMode:  types.LaunchImage,
 		RunDir:      filepath.Join(cfg.Paths.RunRoot, "cleanup-failure"),
 		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "cleanup-failure"),
 		VswitchPort: "still-owned-port", FloatingIP: "192.0.2.99",

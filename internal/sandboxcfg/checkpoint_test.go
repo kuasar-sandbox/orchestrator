@@ -10,21 +10,21 @@ import (
 
 func checkpointBool(value bool) *bool { return &value }
 
-func TestParseCheckpointPolicyJSON(t *testing.T) {
+func TestParseSnapshotPolicyJSON(t *testing.T) {
 	tests := []struct {
 		name string
 		raw  string
-		want CheckpointPolicy
+		want SnapshotPolicy
 	}{
-		{name: "empty object", raw: `{}`, want: CheckpointPolicy{}},
+		{name: "empty object", raw: `{}`, want: SnapshotPolicy{}},
 		{name: "both values", raw: ` { "merge_ref" : false, "drop_caches" : true } `,
-			want: CheckpointPolicy{MergeRef: checkpointBool(false), DropCaches: checkpointBool(true)}},
+			want: SnapshotPolicy{MergeRef: checkpointBool(false), DropCaches: checkpointBool(true)}},
 		{name: "null inherits", raw: `{"merge_ref":null,"drop_caches":false}`,
-			want: CheckpointPolicy{DropCaches: checkpointBool(false)}},
+			want: SnapshotPolicy{DropCaches: checkpointBool(false)}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseCheckpointPolicyJSON(tc.raw)
+			got, err := ParseSnapshotPolicyJSON(tc.raw)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -35,7 +35,7 @@ func TestParseCheckpointPolicyJSON(t *testing.T) {
 	}
 }
 
-func TestParseCheckpointPolicyJSONRejectsInvalidShape(t *testing.T) {
+func TestParseSnapshotPolicyJSONRejectsInvalidShape(t *testing.T) {
 	invalid := map[string]string{
 		"empty":              "",
 		"top null":           `null`,
@@ -49,23 +49,24 @@ func TestParseCheckpointPolicyJSONRejectsInvalidShape(t *testing.T) {
 		"merge array":        `{"merge_ref":[]}`,
 		"merge object":       `{"merge_ref":{}}`,
 		"drop string":        `{"drop_caches":"true"}`,
+		"duplicate field":    `{"merge_ref":true,"merge_ref":false}`,
 		"second value":       `{} {}`,
 		"trailing non-space": `{} trailing`,
 	}
 	for name, raw := range invalid {
 		t.Run(name, func(t *testing.T) {
-			if _, err := ParseCheckpointPolicyJSON(raw); err == nil {
-				t.Fatalf("ParseCheckpointPolicyJSON(%q) succeeded", raw)
+			if _, err := ParseSnapshotPolicyJSON(raw); err == nil {
+				t.Fatalf("ParseSnapshotPolicyJSON(%q) succeeded", raw)
 			}
 		})
 	}
 }
 
-func TestCheckpointPolicyCloneAndOverlay(t *testing.T) {
+func TestSnapshotPolicyCloneAndOverlay(t *testing.T) {
 	baseMerge := true
 	baseDrop := false
-	base := CheckpointPolicy{MergeRef: &baseMerge, DropCaches: &baseDrop}
-	clone := CloneCheckpointPolicy(base)
+	base := SnapshotPolicy{MergeRef: &baseMerge, DropCaches: &baseDrop}
+	clone := CloneSnapshotPolicy(base)
 	if clone.MergeRef == base.MergeRef || clone.DropCaches == base.DropCaches {
 		t.Fatal("clone shares bool pointers")
 	}
@@ -75,26 +76,26 @@ func TestCheckpointPolicyCloneAndOverlay(t *testing.T) {
 	}
 
 	overrideMerge := false
-	overlaid := OverlayCheckpointPolicy(clone, CheckpointPolicy{MergeRef: &overrideMerge})
+	overlaid := OverlaySnapshotPolicy(clone, SnapshotPolicy{MergeRef: &overrideMerge})
 	if overlaid.MergeRef == &overrideMerge || overlaid.DropCaches == clone.DropCaches {
 		t.Fatal("overlay shares bool pointers")
 	}
 	if *overlaid.MergeRef || *overlaid.DropCaches {
 		t.Fatalf("overlay = %+v, want merge=false drop=false", overlaid)
 	}
-	if (CheckpointPolicy{}).Empty() != true || overlaid.Empty() {
+	if (SnapshotPolicy{}).Empty() != true || overlaid.Empty() {
 		t.Fatal("Empty returned the wrong result")
 	}
 }
 
 func TestMarshalAndNormalizeCheckpointMetadata(t *testing.T) {
-	canonical, err := MarshalCheckpointPolicyJSON(CheckpointPolicy{
+	canonical, err := MarshalSnapshotPolicyJSON(SnapshotPolicy{
 		MergeRef: checkpointBool(false), DropCaches: checkpointBool(true),
 	})
 	if err != nil || canonical != `{"merge_ref":false,"drop_caches":true}` {
 		t.Fatalf("canonical = %q, %v", canonical, err)
 	}
-	canonical, err = MarshalCheckpointPolicyJSON(CheckpointPolicy{DropCaches: checkpointBool(false)})
+	canonical, err = MarshalSnapshotPolicyJSON(SnapshotPolicy{DropCaches: checkpointBool(false)})
 	if err != nil || canonical != `{"drop_caches":false}` {
 		t.Fatalf("single-field canonical = %q, %v", canonical, err)
 	}

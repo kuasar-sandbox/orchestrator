@@ -173,9 +173,9 @@ func (p *buildPipeline) run() (res Result) {
 	// been published immediately before phase C; uploadImage reuses that ref.
 	switch {
 	case bundle != "":
-		key, err := p.uploadSnapshot(bundle)
+		key, err := p.publishSnapshot(bundle)
 		if err != nil {
-			return fail(fmt.Errorf("upload snapshot: %w", err))
+			return fail(fmt.Errorf("publish snapshot: %w", err))
 		}
 		res.SnapshotRef = key
 	case p.imagePath != "" || p.baseImageRef != "":

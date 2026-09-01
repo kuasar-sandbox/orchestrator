@@ -14,13 +14,17 @@ import (
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
-func validBuildPrepareSummary() configsock.SnapshotPrepareSummary {
-	return configsock.SnapshotPrepareSummary{
-		SchemaVersion:      configsock.SnapshotPrepareSchemaVersion,
-		Capacity:           configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
-		RawNetworkMetadata: `{"hostname":"source","inner_ip":"10.0.0.5/24","nexthop":"10.0.0.1"}`,
-		ResolutionDigest:   strings.Repeat("a", 64),
-		RequiredRefCount:   3,
+func validBuildPrepareSummary() configsock.ArtifactPrepareSummary {
+	return configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: string(types.ResumeSourceSnapshot),
+		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		Network: configsock.ArtifactNetwork{
+			Hostname: "source", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1",
+		},
+		DiskTopology:     validArtifactDiskTopology(),
+		ResolutionDigest: strings.Repeat("a", 64),
+		RequiredRefCount: 3,
 	}
 }
 
@@ -30,7 +34,7 @@ func TestBuildTaskHandoffIdenticalReplayReturnsOneFinalResult(t *testing.T) {
 	if replay, err := h.Submit(summary); err != nil || replay {
 		t.Fatalf("first submit = replay %t, err %v", replay, err)
 	}
-	if got, err := h.WaitPrepare(context.Background()); err != nil || got != summary {
+	if got, err := h.WaitPrepare(context.Background()); err != nil || !configsock.EqualArtifactPrepareSummary(got, summary) {
 		t.Fatalf("prepare = %+v, %v", got, err)
 	}
 
@@ -92,7 +96,7 @@ func TestValidateBuildPrepareSummaryIsStrict(t *testing.T) {
 	}
 
 	badNetwork := summary
-	badNetwork.RawNetworkMetadata = `{malformed`
+	badNetwork.Network.InnerIP = "not-a-cidr"
 	if _, err := validateBuildPrepareSummary(badNetwork); err == nil {
 		t.Fatal("malformed source-template network was accepted")
 	}
@@ -179,7 +183,7 @@ func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
 	o.setMMDSBuildOwner(mmdsRow.ID, "")
 }
 
-func TestSnapshotPrepareFailureResultIsVisibleWithoutBuildJournal(t *testing.T) {
+func TestArtifactPrepareFailureResultIsVisibleWithoutBuildJournal(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	manifestKey := strings.Repeat("f", 64)
@@ -195,7 +199,7 @@ func TestSnapshotPrepareFailureResultIsVisibleWithoutBuildJournal(t *testing.T) 
 	want := "prepare build snapshot: snapshot.cfg is malformed"
 	var publishedState, publishedReason string
 	o.completeBuildWithPublisher(ctx, b, &buildResult{
-		Error: want, FailureStage: "snapshot_prepare",
+		Error: want, FailureStage: "artifact_prepare",
 	}, nil, func(_ string, state string, _ string, reason string) {
 		publishedState, publishedReason = state, reason
 	})

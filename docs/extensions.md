@@ -50,6 +50,13 @@ build cleanup/runtime-preparation internals. This minimizes routine event data
 and accidental logging; it does not restrict what trusted in-process code could
 otherwise access.
 
+`SandboxView` exposes the typed lifecycle projection directly:
+`ResumeSourceKind`, `ResumeSourceRef`, `ArtifactLocation`,
+`AutoPauseMemory`, and `LaunchMode`. `ArtifactLocation` is orthogonal to E/S
+kind, and a running row may retain a source for node-local artifact ownership.
+`LaunchMode` is non-empty only while `starting`; it is the durable, already
+resolved launch decision rather than the trigger that requested it.
+
 `SandboxSource.Watch` covers all durable sandbox rows. `BuildSource.Watch`
 covers the current `registered`, `waiting`, `building`, and `ready` set. A live
 transition to build `error` produces `BuildRemove` with the final view and
@@ -112,13 +119,16 @@ Sandbox operations are admitted as follows:
   durable `starting`, directories, network attachment, route publication, or
   runner assignment. A Hook may change the template reference, timeout,
   metadata, environment, secure flag, and supported request MMDS input. The
-  final template is resolved again and must retain the core-owned profile.
+  Hook may also change `AutoPauseMemory`; the final template is resolved again
+  and must retain the core-owned profile.
 - `pause`: after ownership, running incarnation, and checkpoint preconditions
   are captured; before snapshot or durable state changes. The Hook may change
-  action-scoped merge-ref and drop-cache policy.
+  action-scoped merge-ref and drop-cache policy. `CaptureKind` is observable
+  but core-owned and cannot be changed.
 - `resume`: only for a real `paused → starting` admission shared by API Connect,
   proxy Wake, native exec, and canonical cluster commands. Running/starting
-  idempotent joins do not invoke it. The Hook may change the requested deadline.
+  idempotent joins do not invoke it. The Hook may change the requested deadline;
+  `Mode` and `Trigger` are observable but core-owned.
 - `delete`: only ordinary explicit API or canonical cluster Delete. It can reject
   that request. Failed-create/failed-resume rollback, reconciliation, shutdown,
   recovery, and other mandatory cleanup never call the Hook and cannot be
@@ -224,11 +234,13 @@ interface uses the original handler directly.
 `RouteSource.Get` returns an independent, non-secret projection of the route
 that the master successfully applied to its core table. It includes sandbox and
 authorization identities, profile, template, state, RunID, current local
-endpoints, snapshot location, credential fingerprints, and the core route
+endpoints, E/S artifact location, credential fingerprints, and the core route
 revision. It omits raw secrets, access tokens, MMDS values, and internal SHM
 records. This minimizes routine event data and accidental logging; it is not a
 permission boundary for trusted in-process code. No metadata field or new SHM
-schema is introduced for extensions.
+schema is introduced for extensions. The proxy projection deliberately exposes
+only `ArtifactLocation`; it has no ResumeSource kind or launch-mode gate and
+cannot decide whether a paused route may Wake.
 
 `SyncState` reports `initializing`, `syncing`, `synced`, or `stale`. A routesync
 disconnect moves the source to `stale` and produces `sync_lost`; the serving SHM

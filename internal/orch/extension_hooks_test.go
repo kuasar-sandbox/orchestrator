@@ -53,7 +53,9 @@ func TestPauseHookRunsOutsideLifecycleLockCanReadHostAndRejectsBeforeSnapshot(t 
 	}), nil)
 
 	done := make(chan error, 1)
-	go func() { done <- o.Pause(context.Background(), sandbox.ID, apiKey, sandboxcfg.CheckpointPolicy{}) }()
+	go func() {
+		done <- o.Pause(context.Background(), sandbox.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{}))
+	}()
 	select {
 	case err := <-done:
 		if !errors.Is(err, conductorextension.ErrRejected) {
@@ -67,6 +69,29 @@ func TestPauseHookRunsOutsideLifecycleLockCanReadHostAndRejectsBeforeSnapshot(t 
 	}
 	if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
 		t.Fatalf("rejected Pause stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
+	}
+}
+
+func TestPauseHookCannotChangeCaptureKindBeforeSideEffects(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sandbox, apiKey, launcher, vs, argsPath := newCheckpointPauseFixture(t, cfg, "")
+	o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
+		operation.Pause.CaptureKind = conductorextension.CaptureKindSnapshot
+		return nil
+	}), nil)
+	err := o.Pause(context.Background(), sandbox.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox})
+	if !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("Pause error = %v, want bad request", err)
+	}
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatalf("capture-kind mutation invoked sandbox-ctl: %v", err)
+	}
+	if launcher.stops.Load() != 0 || vs.detaches.Load() != 0 {
+		t.Fatalf("capture-kind mutation stop/detach = %d/%d", launcher.stops.Load(), vs.detaches.Load())
+	}
+	stored, getErr := o.st.Get(context.Background(), sandbox.ID)
+	if getErr != nil || stored.State != types.StateRunning {
+		t.Fatalf("capture-kind mutation state = %+v, %v", stored, getErr)
 	}
 }
 
@@ -180,7 +205,7 @@ func TestResumeHookRejectsBeforeClaimAndIdempotentStatesSkipHook(t *testing.T) {
 		}
 		return fmtRejected("private resume policy")
 	}), nil)
-	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0); !errors.Is(err, conductorextension.ErrRejected) {
+	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{}); !errors.Is(err, conductorextension.ErrRejected) {
 		t.Fatalf("Connect error = %v", err)
 	}
 	if _, found := fixture.o.launches.Lookup(fixture.sb.ID); found {
@@ -197,7 +222,7 @@ func TestResumeHookRejectsBeforeClaimAndIdempotentStatesSkipHook(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.o.cache(stored)
-	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0); err != nil {
+	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{}); err != nil {
 		t.Fatalf("idempotent running Connect = %v", err)
 	}
 	if calls.Load() != 1 {
@@ -206,15 +231,36 @@ func TestResumeHookRejectsBeforeClaimAndIdempotentStatesSkipHook(t *testing.T) {
 
 	stored.State = types.StateStarting
 	stored.RunID = ""
+	stored.LaunchMode = types.LaunchMemory
 	if err := fixture.o.st.Put(fixture.ctx, stored); err != nil {
 		t.Fatal(err)
 	}
 	fixture.o.cache(stored)
-	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", 0); err != nil {
+	if _, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{}); err != nil {
 		t.Fatalf("idempotent starting Connect = %v", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("running/starting idempotent Resume Hook calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestResumeHookCannotChangeModeBeforeClaim(t *testing.T) {
+	fixture := newBlockedResumeFixture(t)
+	fixture.o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
+		operation.Resume.Mode = conductorextension.ResumeModeCold
+		return nil
+	}), nil)
+	memory := true
+	_, err := fixture.o.Connect(fixture.ctx, fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{Memory: &memory})
+	if !errors.Is(err, api.ErrBadRequest) {
+		t.Fatalf("Connect error = %v, want bad request", err)
+	}
+	if _, found := fixture.o.launches.Lookup(fixture.sb.ID); found {
+		t.Fatal("resume-mode mutation claimed a launch")
+	}
+	stored, getErr := fixture.o.st.Get(fixture.ctx, fixture.sb.ID)
+	if getErr != nil || stored.State != types.StatePaused || stored.LaunchMode != "" {
+		t.Fatalf("resume-mode mutation state = %+v, %v", stored, getErr)
 	}
 }
 
@@ -229,7 +275,10 @@ func TestResumeHookResultIsRejectedAfterIncarnationChanges(t *testing.T) {
 	}), nil)
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := fixture.o.ensureResumeAccepted(fixture.ctx, fixture.sb.ID, nil, nil)
+		_, _, err := fixture.o.ensureResumeAccepted(fixture.ctx, fixture.sb.ID, nil, types.ResumeRequest{
+			Trigger: types.ResumeTriggerConnect,
+			Mode:    types.ResumeAuto,
+		}, nil)
 		done <- err
 	}()
 	select {

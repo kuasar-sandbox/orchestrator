@@ -53,7 +53,8 @@ func (o *Orchestrator) execSession(
 		return "", err
 	}
 	var token string
-	_, _, err = o.ensureResumeAcceptedPreparedFrom(ctx, id, nil, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
+	request := types.ResumeRequest{Trigger: types.ResumeTriggerExecSession, Mode: types.ResumeAuto}
+	_, _, err = o.ensureResumeAcceptedPreparedFrom(ctx, id, nil, request, conductorextension.SandboxOriginExec, func(current *types.Sandbox) error {
 		if !ownsSandbox(current, apiKey) {
 			return api.ErrNotFound
 		}

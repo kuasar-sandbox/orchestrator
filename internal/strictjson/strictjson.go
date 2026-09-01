@@ -20,6 +20,13 @@ func Decode(raw []byte, out any) error {
 	return decode(raw, out, true, true)
 }
 
+// DecodeAllowNull is the strict owned-schema decoder for APIs where null has a
+// specified presence meaning. Duplicate keys, unknown fields, and trailing data
+// remain errors.
+func DecodeAllowNull(raw []byte, out any) error {
+	return decode(raw, out, true, false)
+}
+
 // DecodeAllowUnknown provides duplicate/trailing protections for an established
 // envelope whose unrelated extension fields are intentionally ignored. Null is
 // rejected by each owned presence-aware leaf instead of globally: an unrelated

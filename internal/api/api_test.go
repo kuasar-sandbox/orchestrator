@@ -568,33 +568,112 @@ func TestCreateCheckpointBodyValidationBeforeCore(t *testing.T) {
 	}
 }
 
+func TestCreatePreservesAutoPauseMemoryPresence(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		body        string
+		wantPresent bool
+		wantValue   bool
+	}{
+		{name: "missing", body: `{}`},
+		{name: "null", body: `{"autoPauseMemory":null}`},
+		{name: "true", body: `{"autoPauseMemory":true}`, wantPresent: true, wantValue: true},
+		{name: "false", body: `{"autoPauseMemory":false}`, wantPresent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+				if (req.AutoPauseMemory != nil) != test.wantPresent {
+					t.Fatalf("AutoPauseMemory presence = %t, want %t", req.AutoPauseMemory != nil, test.wantPresent)
+				}
+				if req.AutoPauseMemory != nil && *req.AutoPauseMemory != test.wantValue {
+					t.Fatalf("AutoPauseMemory = %t, want %t", *req.AutoPauseMemory, test.wantValue)
+				}
+				return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+			}}
+			handler, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(test.body), nil)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateStrictlyBoundsOwnedFieldsAndAllowsUpstreamExtensions(t *testing.T) {
+	calls := 0
+	core := &checkpointCoreStub{create: func(_ context.Context, req CreateReq) (*types.Sandbox, error) {
+		calls++
+		return &types.Sandbox{ID: "created", Profile: types.ProfileBare}, nil
+	}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+
+	accepted := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"templateID":"template","autoPause":true,"autoResume":{"enabled":false},"network":{},"iam":null}`,
+	), nil)
+	if accepted.Code != http.StatusCreated || calls != 1 {
+		t.Fatalf("upstream extension body = %d %q calls=%d", accepted.Code, accepted.Body.String(), calls)
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "duplicate autoPauseMemory", body: `{"autoPauseMemory":true,"autoPauseMemory":false}`},
+		{name: "malformed autoPauseMemory", body: `{"autoPauseMemory":"false"}`},
+		{name: "trailing value", body: `{ } { }`},
+		{name: "array", body: `[]`},
+		{name: "top-level null", body: `null`},
+		{name: "empty", body: ``},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := calls
+			response := migrationRequest(t, handler, apiKey, http.MethodPost, "/sandboxes", strings.NewReader(test.body), nil)
+			if response.Code != http.StatusBadRequest || calls != before {
+				t.Fatalf("response=%d %q calls=%d, want 400/no Core call", response.Code, response.Body.String(), calls)
+			}
+		})
+	}
+
+	oversized := strings.Repeat(" ", maxCreateRequestBytes+1)
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	request.Body = io.NopCloser(strings.NewReader(oversized))
+	request.ContentLength = -1
+	request.Header.Set("X-API-KEY", apiKey)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge || calls != 1 {
+		t.Fatalf("chunked oversized response=%d %q calls=%d", response.Code, response.Body.String(), calls)
+	}
+}
+
 func TestPauseRequestPolicyAndStatus(t *testing.T) {
 	boolPtr := func(value bool) *bool { return &value }
 	tests := []struct {
 		name       string
 		body       string
 		header     *string
-		want       sandboxcfg.CheckpointPolicy
+		want       sandboxcfg.CaptureRequest
 		coreErr    error
 		wantStatus int
 		wantCalls  int
 	}{
-		{name: "empty body", body: "", wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "empty object", body: `{}`, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "memory null", body: `{"memory":null}`, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "memory true", body: `{"memory":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "empty body", body: "", want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "top-level null", body: `null`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "empty object", body: `{}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory null", body: `{"memory":null}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory true", body: `{"memory":true}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "memory false", body: `{"memory":false}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "body values", body: `{"checkpoint_merge_ref":false,"checkpoint_drop_caches":true}`,
-			want: sandboxcfg.CheckpointPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}, wantStatus: http.StatusNoContent, wantCalls: 1},
+			want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, SnapshotPolicy: sandboxcfg.SnapshotPolicy{MergeRef: boolPtr(false), DropCaches: boolPtr(true)}}, wantStatus: http.StatusNoContent, wantCalls: 1},
 		{name: "body null inherits", body: `{"checkpoint_merge_ref":null,"checkpoint_drop_caches":false}`,
-			want: sandboxcfg.CheckpointPolicy{DropCaches: boolPtr(false)}, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "unknown body field remains accepted", body: `{"future":true}`, wantStatus: http.StatusNoContent, wantCalls: 1},
-		{name: "already paused", body: `{}`, coreErr: ErrAlreadyPaused, wantStatus: http.StatusConflict, wantCalls: 1},
-		{name: "starting", body: `{}`, coreErr: ErrSandboxStarting, wantStatus: http.StatusConflict, wantCalls: 1},
+			want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot, SnapshotPolicy: sandboxcfg.SnapshotPolicy{DropCaches: boolPtr(false)}}, wantStatus: http.StatusNoContent, wantCalls: 1},
+		{name: "already paused", body: `{}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, coreErr: ErrAlreadyPaused, wantStatus: http.StatusConflict, wantCalls: 1},
+		{name: "starting", body: `{}`, want: sandboxcfg.CaptureRequest{Kind: types.CaptureSnapshot}, coreErr: ErrSandboxStarting, wantStatus: http.StatusConflict, wantCalls: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CheckpointPolicy) error {
+			core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CaptureRequest) error {
 				calls++
 				if !reflect.DeepEqual(got, tc.want) {
 					t.Fatalf("Pause override = %+v, want %+v", got, tc.want)
@@ -620,8 +699,9 @@ func TestPauseRequestPolicyAndStatus(t *testing.T) {
 func TestPauseCheckpointHeaderOverlaysBodyPerField(t *testing.T) {
 	headers := http.Header{}
 	headers.Set(checkpointHeader, `{"merge_ref":false,"drop_caches":null}`)
-	core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CheckpointPolicy) error {
-		if got.MergeRef == nil || *got.MergeRef || got.DropCaches == nil || *got.DropCaches {
+	core := &checkpointCoreStub{pause: func(_ context.Context, _, _ string, got sandboxcfg.CaptureRequest) error {
+		if got.Kind != types.CaptureSnapshot || got.SnapshotPolicy.MergeRef == nil || *got.SnapshotPolicy.MergeRef ||
+			got.SnapshotPolicy.DropCaches == nil || *got.SnapshotPolicy.DropCaches {
 			t.Fatalf("merged action override = %+v, want merge=false drop=false", got)
 		}
 		return nil
@@ -640,9 +720,13 @@ func TestPauseRejectsInvalidRequestsBeforeCore(t *testing.T) {
 		body   string
 		header *string
 	}{
-		{name: "memory false", body: `{"memory":false}`},
+		{name: "memory false with merge", body: `{"memory":false,"checkpoint_merge_ref":true}`},
+		{name: "memory false with drop", body: `{"memory":false,"checkpoint_drop_caches":false}`},
+		{name: "memory false with null merge", body: `{"memory":false,"checkpoint_merge_ref":null}`},
+		{name: "memory false with null drop", body: `{"memory":false,"checkpoint_drop_caches":null}`},
+		{name: "memory false with null header field", body: `{"memory":false}`, header: stringPtr(`{"merge_ref":null}`)},
 		{name: "malformed body", body: `{`},
-		{name: "top-level null", body: `null`},
+		{name: "unknown body field", body: `{"future":true}`},
 		{name: "wrong memory type", body: `{"memory":"true"}`},
 		{name: "wrong policy type", body: `{"checkpoint_merge_ref":0}`},
 		{name: "second body value", body: `{} {}`},
@@ -654,7 +738,7 @@ func TestPauseRejectsInvalidRequestsBeforeCore(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error {
+			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CaptureRequest) error {
 				calls++
 				return nil
 			}}
@@ -686,7 +770,7 @@ func TestPauseRejectsOversizedBodyBeforeCore(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error {
+			core := &checkpointCoreStub{pause: func(context.Context, string, string, sandboxcfg.CaptureRequest) error {
 				calls++
 				return nil
 			}}
@@ -1080,7 +1164,7 @@ func TestImportSandboxRejectsOversizedRequestBody(t *testing.T) {
 
 func TestConnectRejectsOversizedMigrationTokenHeader(t *testing.T) {
 	called := false
-	core := &migrationCoreStub{connect: func(context.Context, string, string, string, int) (*types.Sandbox, error) {
+	core := &migrationCoreStub{connect: func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error) {
 		called = true
 		return nil, nil
 	}}
@@ -1095,14 +1179,132 @@ func TestConnectRejectsOversizedMigrationTokenHeader(t *testing.T) {
 	}
 }
 
+func TestConnectPreservesMemoryPresence(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantPresent bool
+		wantMemory  bool
+		wantTimeout int
+	}{
+		{name: "empty body"},
+		{name: "top-level null", body: `null`},
+		{name: "empty object", body: `{}`},
+		{name: "memory null", body: `{"memory":null}`},
+		{name: "memory true", body: `{"memory":true}`, wantPresent: true, wantMemory: true},
+		{name: "memory false", body: `{"memory":false}`, wantPresent: true},
+		{name: "timeout and memory", body: `{"timeout":19,"memory":false}`, wantPresent: true, wantTimeout: 19},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			core := &migrationCoreStub{connect: func(_ context.Context, id, _ string, _ string, options ConnectOptions) (*types.Sandbox, error) {
+				calls++
+				if options.TimeoutSec != test.wantTimeout {
+					t.Fatalf("TimeoutSec = %d, want %d", options.TimeoutSec, test.wantTimeout)
+				}
+				if (options.Memory != nil) != test.wantPresent {
+					t.Fatalf("Memory presence = %t, want %t", options.Memory != nil, test.wantPresent)
+				}
+				if options.Memory != nil && *options.Memory != test.wantMemory {
+					t.Fatalf("Memory = %t, want %t", *options.Memory, test.wantMemory)
+				}
+				return &types.Sandbox{ID: id, Profile: types.ProfileE2B}, nil
+			}}
+			h, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/connect", strings.NewReader(test.body), nil)
+			if response.Code != http.StatusOK || calls != 1 {
+				t.Fatalf("status = %d, calls = %d, body=%s", response.Code, calls, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestConnectRejectsAmbiguousOrMalformedBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "unknown field", body: `{"future":true}`},
+		{name: "duplicate memory", body: `{"memory":true,"memory":false}`},
+		{name: "wrong memory type", body: `{"memory":"false"}`},
+		{name: "malformed", body: `{"memory":`},
+		{name: "trailing object", body: `{} {}`},
+		{name: "null then trailing", body: `null {}`},
+		{name: "array", body: `[]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			core := &migrationCoreStub{connect: func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error) {
+				called = true
+				return nil, nil
+			}}
+			h, apiKey := newMigrationTestHandler(t, core)
+			response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/connect", strings.NewReader(test.body), nil)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+			}
+			if called {
+				t.Fatal("invalid body reached Core.Connect")
+			}
+		})
+	}
+}
+
+func TestConnectRejectsOversizedRequestBody(t *testing.T) {
+	called := false
+	core := &migrationCoreStub{connect: func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error) {
+		called = true
+		return nil, nil
+	}}
+	h, apiKey := newMigrationTestHandler(t, core)
+	body := `{}` + strings.Repeat(" ", maxConnectRequestBytes)
+	response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/connect", strings.NewReader(body), nil)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusRequestEntityTooLarge, response.Body.String())
+	}
+	if called {
+		t.Fatal("oversized body reached Core.Connect")
+	}
+}
+
+func TestConnectModeConflictsAreConflictWithOrWithoutMigration(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		err   error
+		token string
+	}{
+		{name: "memory unavailable", err: types.ErrMemoryUnavailable},
+		{name: "launch mode conflict", err: types.ErrLaunchModeConflict},
+		{name: "memory unavailable after import", err: types.ErrMemoryUnavailable, token: "kmt1.token"},
+		{name: "launch mode conflict after import", err: types.ErrLaunchModeConflict, token: "kmt1.token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core := &migrationCoreStub{connect: func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error) {
+				return nil, test.err
+			}}
+			h, apiKey := newMigrationTestHandler(t, core)
+			headers := http.Header{}
+			if test.token != "" {
+				headers.Set(MigrationTokenHeader, test.token)
+			}
+			response := migrationRequest(t, h, apiKey, http.MethodPost, "/sandboxes/sandbox/connect", strings.NewReader(`{}`), headers)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusConflict, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestStandaloneConnectExistingTargetIgnoresOversizedMigrationHeader(t *testing.T) {
 	called := false
 	core := &connectMMDSCoreStub{
-		migrationCoreStub: migrationCoreStub{connect: func(context.Context, string, string, string, int) (*types.Sandbox, error) {
+		migrationCoreStub: migrationCoreStub{connect: func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error) {
 			t.Fatal("legacy Connect unexpectedly called")
 			return nil, nil
 		}},
-		connectMMDS: func(_ context.Context, id, _ string, token string, _ int, _ map[string]string, header *string) (*types.Sandbox, error) {
+		connectMMDS: func(_ context.Context, id, _ string, token string, _ ConnectOptions, _ map[string]string, header *string) (*types.Sandbox, error) {
 			called = true
 			if len(token) <= migrationtoken.MaxWireSize || header == nil || *header != "not-json" {
 				t.Fatal("standalone input was changed before the existence-aware Core check")
@@ -1283,7 +1485,7 @@ type execSessionCoreStub struct {
 type checkpointCoreStub struct {
 	Core
 	create func(context.Context, CreateReq) (*types.Sandbox, error)
-	pause  func(context.Context, string, string, sandboxcfg.CheckpointPolicy) error
+	pause  func(context.Context, string, string, sandboxcfg.CaptureRequest) error
 }
 
 type buildMMDSCoreStub struct {
@@ -1359,8 +1561,8 @@ func (c *checkpointCoreStub) Create(ctx context.Context, req CreateReq) (*types.
 	return c.create(ctx, req)
 }
 
-func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error {
-	return c.pause(ctx, id, apiKey, override)
+func (c *checkpointCoreStub) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
+	return c.pause(ctx, id, apiKey, request)
 }
 
 func (c *execSessionCoreStub) ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error) {
@@ -1371,16 +1573,16 @@ type migrationCoreStub struct {
 	Core
 	importSandbox func(context.Context, string, string, string) (string, error)
 	exportSandbox func(context.Context, string, string, bool, bool) (string, error)
-	connect       func(context.Context, string, string, string, int) (*types.Sandbox, error)
+	connect       func(context.Context, string, string, string, ConnectOptions) (*types.Sandbox, error)
 }
 
 type connectMMDSCoreStub struct {
 	migrationCoreStub
-	connectMMDS func(context.Context, string, string, string, int, map[string]string, *string) (*types.Sandbox, error)
+	connectMMDS func(context.Context, string, string, string, ConnectOptions, map[string]string, *string) (*types.Sandbox, error)
 }
 
-func (c *connectMMDSCoreStub) ConnectWithMMDS(ctx context.Context, id, apiKey, token string, timeout int, metadata map[string]string, header *string) (*types.Sandbox, error) {
-	return c.connectMMDS(ctx, id, apiKey, token, timeout, metadata, header)
+func (c *connectMMDSCoreStub) ConnectWithMMDS(ctx context.Context, id, apiKey, token string, options ConnectOptions, metadata map[string]string, header *string) (*types.Sandbox, error) {
+	return c.connectMMDS(ctx, id, apiKey, token, options, metadata, header)
 }
 
 type sandboxContractCoreStub struct {
@@ -1578,8 +1780,8 @@ func (c *migrationCoreStub) ExportSandbox(ctx context.Context, apiKey, sid strin
 	return c.exportSandbox(ctx, apiKey, sid, toTemplate, keepSource)
 }
 
-func (c *migrationCoreStub) Connect(ctx context.Context, id, apiKey, token string, timeout int) (*types.Sandbox, error) {
-	return c.connect(ctx, id, apiKey, token, timeout)
+func (c *migrationCoreStub) Connect(ctx context.Context, id, apiKey, token string, options ConnectOptions) (*types.Sandbox, error) {
+	return c.connect(ctx, id, apiKey, token, options)
 }
 
 func newMigrationTestHandler(t *testing.T, core Core) (http.Handler, string) {

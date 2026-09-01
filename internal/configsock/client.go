@@ -161,7 +161,7 @@ func PostBuildPhaseContext(ctx context.Context, socket, runID, buildID, phase, s
 // FetchSandboxTaskSpec fetches one exact-run bootstrap after the caller has
 // locked and written the assigned sandbox task pidfile.
 func FetchSandboxTaskSpec(ctx context.Context, socket, sandboxID, runID string) (*SandboxTaskSpec, error) {
-	body, _ := json.Marshal(SandboxTaskRequest{SandboxID: sandboxID, RunID: runID, Version: SnapshotPrepareSchemaVersion})
+	body, _ := json.Marshal(SandboxTaskRequest{SandboxID: sandboxID, RunID: runID, Version: ArtifactPrepareSchemaVersion})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskSandboxBootstrap, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -185,8 +185,8 @@ func FetchSandboxTaskSpec(ctx context.Context, socket, sandboxID, runID string) 
 // CompleteSandboxPrepare submits an idempotent non-secret summary and waits for
 // the final LaunchSpec. A transport interruption or 5xx is retryable with the
 // same summary; a 409 is definitive.
-func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string, summary SnapshotPrepareSummary) (*LaunchSpec, error) {
-	body, _ := json.Marshal(SnapshotPrepareRequest{SandboxID: sandboxID, RunID: runID, Summary: summary})
+func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string, summary ArtifactPrepareSummary) (*LaunchSpec, error) {
+	body, _ := json.Marshal(ArtifactPrepareRequest{SandboxID: sandboxID, RunID: runID, Summary: summary})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathTaskSandboxPrepare, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -197,7 +197,7 @@ func CompleteSandboxPrepare(ctx context.Context, socket, sandboxID, runID string
 		return nil, &transportError{err: err}
 	}
 	defer resp.Body.Close()
-	var out SnapshotPrepareResponse
+	var out ArtifactPrepareResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, &transportError{err: fmt.Errorf("configsock: decode sandbox prepare response: %w", err)}
 	}
@@ -237,7 +237,7 @@ func FetchBuildTaskSpec(ctx context.Context, socket, buildID, runID string) (*Bu
 // CompleteBuildPrepare submits the immutable task-local root summary and waits
 // for the final BuildSpec. Identical retries are safe after response loss or a
 // conductor restart; conflicts return a non-retryable 409.
-func CompleteBuildPrepare(ctx context.Context, socket, buildID, runID string, summary SnapshotPrepareSummary) (*BuildSpec, error) {
+func CompleteBuildPrepare(ctx context.Context, socket, buildID, runID string, summary ArtifactPrepareSummary) (*BuildSpec, error) {
 	body, _ := json.Marshal(BuildPrepareRequest{
 		BuildID: buildID, RunID: runID, Version: BuildTaskSchemaVersion, Summary: summary,
 	})

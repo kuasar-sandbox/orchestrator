@@ -3,6 +3,8 @@ package orch
 import (
 	"context"
 	"sync"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type exportAttemptState uint8
@@ -19,7 +21,7 @@ const (
 // publish/finalize boundary with a concurrently accepted resume.
 type exportAttempt struct {
 	sid          string
-	sourceRef    string
+	source       types.ResumeSource
 	toTemplate   bool
 	state        exportAttemptState
 	cancelUpload context.CancelCauseFunc
@@ -31,7 +33,7 @@ type exportAttemptGroup struct {
 	active map[string]*exportAttempt
 }
 
-func (g *exportAttemptGroup) Begin(sid, sourceRef string, toTemplate bool, cancelUpload context.CancelCauseFunc) (*exportAttempt, bool) {
+func (g *exportAttemptGroup) Begin(sid string, source types.ResumeSource, toTemplate bool, cancelUpload context.CancelCauseFunc) (*exportAttempt, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.active == nil {
@@ -42,7 +44,7 @@ func (g *exportAttemptGroup) Begin(sid, sourceRef string, toTemplate bool, cance
 	}
 	attempt := &exportAttempt{
 		sid:          sid,
-		sourceRef:    sourceRef,
+		source:       source,
 		toTemplate:   toTemplate,
 		state:        exportPublishing,
 		cancelUpload: cancelUpload,

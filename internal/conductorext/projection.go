@@ -16,8 +16,12 @@ func projectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 		CreatedUnix: sandbox.CreatedUnix, DeadlineUnix: sandbox.DeadlineUnix, Metadata: cloneMap(sandbox.Metadata),
 		RunDir: sandbox.RunDir, BaseDir: sandbox.BaseDir, EnvdUDS: sandbox.EnvdUDS, CIUDS: sandbox.CiUDS,
 		FloatingIP: sandbox.FloatingIP, InnerIP: sandbox.InnerIP, VSwitchPort: sandbox.VswitchPort,
-		PortMAC: sandbox.PortMAC, SnapshotRef: sandbox.SnapshotRef,
-		SnapshotLocation: snapshotLocation(sandbox.SnapshotRef),
+		PortMAC:          sandbox.PortMAC,
+		ResumeSourceKind: conductorextension.ResumeSourceKind(sandbox.ResumeSource.Kind),
+		ResumeSourceRef:  sandbox.ResumeSource.Ref,
+		ArtifactLocation: artifactLocation(sandbox.ResumeSource.Ref),
+		AutoPauseMemory:  sandbox.AutoPauseMemory,
+		LaunchMode:       conductorextension.LaunchMode(sandbox.LaunchMode),
 	}
 	if sandbox.Cluster != nil {
 		view.Cluster = &conductorextension.SandboxClusterView{Group: sandbox.Cluster.Group, RouteKey: sandbox.Cluster.RouteKey}
@@ -33,14 +37,14 @@ func ProjectSandbox(sandbox *types.Sandbox) conductorextension.SandboxView {
 	return projectSandbox(sandbox)
 }
 
-func snapshotLocation(ref string) conductorextension.SnapshotLocation {
+func artifactLocation(ref string) conductorextension.ArtifactLocation {
 	switch {
 	case ref == "":
-		return conductorextension.SnapshotLocationNone
+		return conductorextension.ArtifactLocationNone
 	case types.IsPortableRef(ref):
-		return conductorextension.SnapshotLocationRemote
+		return conductorextension.ArtifactLocationRemote
 	default:
-		return conductorextension.SnapshotLocationLocal
+		return conductorextension.ArtifactLocationLocal
 	}
 }
 
