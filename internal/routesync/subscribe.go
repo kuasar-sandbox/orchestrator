@@ -125,10 +125,11 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	if err := ValidateHello(hello); err != nil {
 		return err
 	}
-	s.sink.SetPolicy(hello.Hello.Policy)
 
-	// Reader: a fresh sync generation, then apply route frames until EOF/error.
+	// Reader: preserve the established BeginSync-before-policy callback order,
+	// then apply route frames until EOF/error.
 	s.sink.BeginSync()
+	s.sink.SetPolicy(hello.Hello.Policy)
 	for {
 		m, err := ReadMsg(resp.Body)
 		if err != nil {
