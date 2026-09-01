@@ -449,6 +449,17 @@ func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
 	}
 	route := testE2BSandboxRecord("/g", "rk", "sb", "n1", StateReserved)
 	route.CreateCredentials = credentials
+	encoded, err := clusterstate.EncodeShardValue(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"stable_id":"sb"`) {
+		t.Fatalf("Registry state omitted stable_id: %s", encoded)
+	}
+	legacyField := strings.Join([]string{"auth", "sandbox", "id"}, "_")
+	if strings.Contains(string(encoded), `"`+legacyField+`"`) {
+		t.Fatalf("Registry state retained legacy identity field %q: %s", legacyField, encoded)
+	}
 	if _, err := stores.PutSandbox(ctx, route); err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +498,7 @@ func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
 		}
 		for _, field := range []string{
 			"api_secret_fingerprint", "manifest_key_fingerprint", "create_credentials",
-			"auth_sandbox_id", "api_secret", "service_secret", "envd_access_token",
+			"stable_id", "api_secret", "service_secret", "envd_access_token",
 			"traffic_access_token", "forward_access_token",
 		} {
 			if _, found := projected[field]; found {

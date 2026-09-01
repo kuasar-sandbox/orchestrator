@@ -619,7 +619,7 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials) error {
 	// PAUSED: resume on the same node (no placement).
 	if found && rec.State == StatePaused && rec.NodeID != "" {
-		_, authSandboxID, err := replacementCredentials(rec)
+		_, stableID, err := replacementCredentials(rec)
 		if err != nil {
 			return err
 		}
@@ -647,7 +647,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.NodeSandboxID,
 			Profile: rec.Profile,
 			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
+				Group: group, RouteKey: routeKey, StableID: stableID,
 			},
 			APISecretFingerprint: rec.APISecretFingerprint,
 		}
@@ -856,18 +856,18 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return err
 		}
 
-		authSandboxID := sandboxID
+		stableID := sandboxID
 		if selectedReplacement != nil {
-			authSandboxID = selectedReplacement.AuthSandboxID
+			stableID = selectedReplacement.StableID
 		}
-		if authSandboxID != sandboxID {
-			return errors.New("registry: sandbox authentication identity does not match stable identity")
+		if stableID != sandboxID {
+			return errors.New("registry: stable ID does not match SandboxID")
 		}
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdCreate, SID: nodeSandboxID,
 			TemplateRef: placement.TemplateRef, Profile: string(template.Profile), Config: config,
 			Cluster: &routesync.ClusterSandboxContext{
-				Group: group, RouteKey: routeKey, AuthSandboxID: authSandboxID,
+				Group: group, RouteKey: routeKey, StableID: stableID,
 			},
 			APISecretFingerprint: placement.APISecretFingerprint,
 		}
@@ -971,7 +971,7 @@ func replacementCredentials(record *SandboxRecord) (*sandboxcfg.Credentials, str
 		return nil, "", errors.New("registry: replacement route credentials are unavailable")
 	}
 	route := &routesync.RouteEntry{
-		Profile: record.Profile, AuthSandboxID: record.AuthSandboxID,
+		Profile: record.Profile, StableID: record.StableID,
 		APISecret: record.APISecret, APISecretFingerprint: record.APISecretFingerprint,
 		ManifestKeyFingerprint: record.ManifestKeyFingerprint,
 		ServiceSecret:          record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
@@ -983,7 +983,7 @@ func replacementCredentials(record *SandboxRecord) (*sandboxcfg.Credentials, str
 	return &sandboxcfg.Credentials{
 		ServiceSecret: record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
 		TrafficAccessToken: record.TrafficAccessToken,
-	}, record.AuthSandboxID, nil
+	}, record.StableID, nil
 }
 
 func copyRouteCredentials(dst, src *SandboxRecord) {
@@ -992,7 +992,7 @@ func copyRouteCredentials(dst, src *SandboxRecord) {
 	}
 	dst.APISecretFingerprint = src.APISecretFingerprint
 	dst.ManifestKeyFingerprint = src.ManifestKeyFingerprint
-	dst.AuthSandboxID = src.AuthSandboxID
+	dst.StableID = src.StableID
 	dst.APISecret = src.APISecret
 	dst.ServiceSecret = src.ServiceSecret
 	dst.EnvdAccessToken = src.EnvdAccessToken
@@ -1083,7 +1083,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, Profile: ref.Profile,
 		APISecretFingerprint:   ref.APISecretFingerprint,
 		ManifestKeyFingerprint: e.ManifestKeyFingerprint,
-		AuthSandboxID:          e.AuthSandboxID,
+		StableID:               e.StableID,
 		APISecret:              e.APISecret,
 		ServiceSecret:          e.ServiceSecret,
 		EnvdAccessToken:        e.EnvdAccessToken,
@@ -1103,7 +1103,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	r.applyLiveRoute(ctx, nodeID, e, rec)
 }
 
-func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint, expectedAuthSandboxID string) error {
+func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerprint, expectedStableID string) error {
 	apiSecretFingerprint, err := nodestore.APISecretHash(e.APISecret)
 	if err != nil || apiSecretFingerprint != e.APISecretFingerprint ||
 		apiSecretFingerprint != expectedAPISecretFingerprint {
@@ -1112,13 +1112,13 @@ func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerpr
 	if !validFullFingerprint(e.ManifestKeyFingerprint) {
 		return errors.New("registry: route manifest key fingerprint is invalid")
 	}
-	if e.AuthSandboxID == "" || !utf8.ValidString(e.AuthSandboxID) {
-		return errors.New("registry: route authentication sandbox ID is invalid")
+	if e.StableID == "" || !utf8.ValidString(e.StableID) {
+		return errors.New("registry: route stable ID is invalid")
 	}
-	if expectedAuthSandboxID != "" && e.AuthSandboxID != expectedAuthSandboxID {
-		return errors.New("registry: route authentication sandbox ID binding is invalid")
+	if expectedStableID != "" && e.StableID != expectedStableID {
+		return errors.New("registry: route stable ID binding is invalid")
 	}
-	if err := keys.VerifyForwardAccessToken(e.ForwardAccessToken, e.ServiceSecret, e.AuthSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(e.ForwardAccessToken, e.ServiceSecret, e.StableID); err != nil {
 		return errors.New("registry: route forward credential is invalid")
 	}
 	if !sandboxcfg.ValidE2BAccessToken(e.EnvdAccessToken) ||
@@ -1143,7 +1143,7 @@ func validateRouteCredentials(e *routesync.RouteEntry, expectedAPISecretFingerpr
 func sameRouteCredentials(a, b *SandboxRecord) bool {
 	return a.APISecretFingerprint == b.APISecretFingerprint &&
 		a.ManifestKeyFingerprint == b.ManifestKeyFingerprint &&
-		a.AuthSandboxID == b.AuthSandboxID &&
+		a.StableID == b.StableID &&
 		constantTimeStringEqual(a.APISecret, b.APISecret) &&
 		constantTimeStringEqual(a.ServiceSecret, b.ServiceSecret) &&
 		constantTimeStringEqual(a.EnvdAccessToken, b.EnvdAccessToken) &&
@@ -1157,7 +1157,7 @@ func constantTimeStringEqual(a, b string) bool {
 
 func hasRouteCredentials(record *SandboxRecord) bool {
 	return record != nil && (record.ManifestKeyFingerprint != "" ||
-		record.AuthSandboxID != "" || record.APISecret != "" ||
+		record.StableID != "" || record.APISecret != "" ||
 		record.ServiceSecret != "" || record.EnvdAccessToken != "" ||
 		record.TrafficAccessToken != "" || record.ForwardAccessToken != "")
 }

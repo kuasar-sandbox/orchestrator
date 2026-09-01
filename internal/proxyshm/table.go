@@ -86,7 +86,7 @@ type mmapRecord struct {
 	EnvdUDS                [maxUDS]byte
 	CiUDS                  [maxUDS]byte
 	FloatingIP             [maxFloatingIP]byte
-	AuthSandboxID          [maxSandboxID]byte
+	StableID               [maxSandboxID]byte
 	APISecret              [maxSecret]byte
 	APISecretFingerprint   [maxFingerprint]byte
 	ManifestKeyFingerprint [maxFingerprint]byte
@@ -557,7 +557,7 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				EnvdUDS:                fixedString(rec.EnvdUDS[:]),
 				CiUDS:                  fixedString(rec.CiUDS[:]),
 				FloatingIP:             fixedString(rec.FloatingIP[:]),
-				AuthSandboxID:          fixedString(rec.AuthSandboxID[:]),
+				StableID:               fixedString(rec.StableID[:]),
 				APISecret:              fixedString(rec.APISecret[:]),
 				APISecretFingerprint:   fixedString(rec.APISecretFingerprint[:]),
 				ManifestKeyFingerprint: fixedString(rec.ManifestKeyFingerprint[:]),
@@ -602,7 +602,7 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	_ = putFixed(rec.EnvdUDS[:], snapshot.entry.EnvdUDS)
 	_ = putFixed(rec.CiUDS[:], snapshot.entry.CiUDS)
 	_ = putFixed(rec.FloatingIP[:], snapshot.entry.FloatingIP)
-	_ = putFixed(rec.AuthSandboxID[:], snapshot.entry.AuthSandboxID)
+	_ = putFixed(rec.StableID[:], snapshot.entry.StableID)
 	_ = putFixed(rec.APISecret[:], snapshot.entry.APISecret)
 	_ = putFixed(rec.APISecretFingerprint[:], snapshot.entry.APISecretFingerprint)
 	_ = putFixed(rec.ManifestKeyFingerprint[:], snapshot.entry.ManifestKeyFingerprint)
@@ -744,7 +744,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"envd_uds", r.EnvdUDS, maxUDS},
 		{"ci_uds", r.CiUDS, maxUDS},
 		{"floatingip", r.FloatingIP, maxFloatingIP},
-		{"auth_sandbox_id", r.AuthSandboxID, maxSandboxID},
+		{"stable_id", r.StableID, maxSandboxID},
 		{"api_secret", r.APISecret, maxSecret},
 		{"api_secret_fingerprint", r.APISecretFingerprint, maxFingerprint},
 		{"manifest_key_fingerprint", r.ManifestKeyFingerprint, maxFingerprint},

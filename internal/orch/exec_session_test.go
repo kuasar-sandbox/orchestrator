@@ -18,22 +18,22 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
+func TestExecSessionMintsTokenForStableID(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	manifestKey := strings.Repeat("a", 64)
 	_, apiKey := defaultTestCredentials(t, manifestKey)
 	sb := &types.Sandbox{
-		ID:                 "stable-g2",
-		Profile:            types.ProfileBare,
-		AuthSandboxIDValue: "stable",
-		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
-		State:              types.StateRunning,
-		APISecret:          deriveTestAPISecret(t, manifestKey),
-		ManifestKey:        manifestKey,
-		RunDir:             filepath.Join(t.TempDir(), "run"),
-		BaseDir:            filepath.Join(t.TempDir(), "lib"),
-		CreatedUnix:        1,
+		ID:            "stable-g2",
+		Profile:       types.ProfileBare,
+		StableIDValue: "stable",
+		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
+		State:         types.StateRunning,
+		APISecret:     deriveTestAPISecret(t, manifestKey),
+		ManifestKey:   manifestKey,
+		RunDir:        filepath.Join(t.TempDir(), "run"),
+		BaseDir:       filepath.Join(t.TempDir(), "lib"),
+		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -47,18 +47,18 @@ func TestExecSessionMintsTokenForAuthenticatedStableSubject(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := time.Now().Unix()
-	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(before+36, 0)); err != nil {
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(before+36, 0)); err != nil {
 		t.Fatalf("minted token before expiry: %v", err)
 	}
-	claims, err := keys.ParseAndVerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(before, 0))
+	claims, err := keys.ParseAndVerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(before, 0))
 	if err != nil || len(claims.Conditions) != 2 || claims.Conditions[0] != conditions[0] || claims.Conditions[1] != conditions[1] {
 		t.Fatalf("token conditions = %+v, %v", claims, err)
 	}
-	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(after+38, 0)); err == nil {
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(after+38, 0)); err == nil {
 		t.Fatal("minted token remained valid after ttl")
 	}
 	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.ID, time.Unix(before, 0)); err == nil {
-		t.Fatal("minted token accepted node-local ID instead of stable AuthSandboxID")
+		t.Fatal("minted token accepted node-local ID instead of StableID")
 	}
 }
 
@@ -82,7 +82,7 @@ func TestExecSessionMintsTokenWithoutRestartingStartingResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Now()); err != nil {
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Now()); err != nil {
 		t.Fatalf("starting exec token: %v", err)
 	}
 	stored, err := o.st.Get(ctx, sb.ID)
@@ -126,10 +126,10 @@ func TestExecSessionTTLStartsAtSigningAfterTargetPreparation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_136, 0)); err != nil {
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(1_800_000_136, 0)); err != nil {
 		t.Fatalf("TTL was consumed before signing: %v", err)
 	}
-	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(1_800_000_137, 0)); err == nil {
+	if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(1_800_000_137, 0)); err == nil {
 		t.Fatal("token accepted at signing time + TTL")
 	}
 }
@@ -274,7 +274,7 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(imported), sandboxCredentials(source))
 	if err := keys.VerifyExecAccessToken(
-		issued.token, imported.ServiceSecret, imported.AuthSandboxID(), time.Now(),
+		issued.token, imported.ServiceSecret, imported.StableID(), time.Now(),
 	); err != nil {
 		t.Fatalf("imported target token: %v", err)
 	}

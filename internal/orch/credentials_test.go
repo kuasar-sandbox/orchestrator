@@ -35,7 +35,7 @@ func TestMaterializeSandboxCredentials(t *testing.T) {
 				t.Fatal(err)
 			}
 			if sb.ServiceSecret != wantService {
-				t.Fatalf("ServiceSecret did not use AuthSandboxID fallback")
+				t.Fatalf("ServiceSecret did not use StableID fallback")
 			}
 			if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, sb.ServiceSecret, sb.ID); err != nil {
 				t.Fatalf("ForwardAccessToken = invalid: %v", err)
@@ -51,11 +51,11 @@ func TestMaterializeSandboxCredentials(t *testing.T) {
 	}
 }
 
-func TestMaterializeSandboxCredentialsUsesOverridesAndStableSubject(t *testing.T) {
+func TestMaterializeSandboxCredentialsUsesOverridesAndStableID(t *testing.T) {
 	serviceSecret := strings.Repeat("2", 64)
 	sb := &types.Sandbox{
 		ID: "node-id", Profile: types.ProfileE2B, APISecret: strings.Repeat("1", 64),
-		AuthSandboxIDValue: "stable-id",
+		StableIDValue: "stable-id",
 	}
 	credentials := sandboxcfg.Credentials{
 		ServiceSecret: serviceSecret, EnvdAccessToken: "envd-override", TrafficAccessToken: "traffic-override",
@@ -67,7 +67,7 @@ func TestMaterializeSandboxCredentialsUsesOverridesAndStableSubject(t *testing.T
 		t.Fatalf("overrides were not preserved: %+v", sb)
 	}
 	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, serviceSecret, "stable-id"); err != nil {
-		t.Fatalf("ForwardAccessToken is not bound to stable AuthSandboxID: %v", err)
+		t.Fatalf("ForwardAccessToken is not bound to StableID: %v", err)
 	}
 	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, serviceSecret, sb.ID); err == nil {
 		t.Fatal("ForwardAccessToken accepted the node-local ID")

@@ -125,6 +125,11 @@ SandboxID;同节点 resume、跨节点迁移和 re-place 不改变它。受保�
 `node_sandbox_id=<sandbox_id>-g<N>`。Router 使用稳定 SandboxID 寻址,只在 node 边界替换为
 NodeSandboxID;公开响应不暴露 NodeSandboxID。
 
+受保护 route 中的 `stable_id` 是同一 sandbox 跨 NodeSandboxID 变化保持的 StableID；cluster
+始终要求 `StableID == SandboxID`。Router 保留该字段作为现有 credential projection，并用它
+校验 KAT `sid`，但 cache/route lookup 仍使用 `(group, route_key, SandboxID)`，不会把 StableID
+当作 node-local lookup key 或建立唯一索引。
+
 create 可在 body metadata 中携 `kuasar-sandbox.resource`、restore、credentials 与 checkpoint。
 `X-Kuasar-Sandbox-Resource` 只覆盖明确出现的 resource leaf;resource 的公开面严格限制为
 capacity/allocatable/startup,并与 group defaults 使用同一 merge helper。restore/credentials
@@ -181,7 +186,7 @@ key:
 value:
 
 ```text
-{node_id, data_endpoint, sandbox_id, node_sandbox_id, profile, auth_sandbox_id,
+{node_id, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id,
  api_secret, api_secret_fingerprint, manifest_key_fingerprint, service_secret,
  envd_access_token, traffic_access_token, forward_access_token,
  target_port, route_revision, expires, last_used}
@@ -350,7 +355,7 @@ Exec CONNECT 使用单独的三阶段 KAT + request admission 合同:
 client CONNECT
   stable SandboxID + service=exec + X-Access-Token=KAT
     ↓ side-effect-free cache/Resolve
-Router verifies stable AuthSandboxID + ServiceSecret, then compiles CEL
+Router verifies StableID + ServiceSecret, then compiles CEL
     ↓ flush public 200; read strict first ctl frame; recheck expiry; evaluate
     ↓ admission passed (no node/Reserve before this point)
 node CONNECT
@@ -374,7 +379,7 @@ paused/starting 路径不增加 Registry 调用.Router 和 Node 都执行完整 
 必须重验 stable lineage/credential 并使用 current NodeSandboxID,不能复用旧 target.
 
 Router 在 public 200 后先执行首帧 gate,通过后才建立下一跳;最终 Node 从本地 route 再次校验
-`AuthSandboxID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
+`StableID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
 activation 和连接 `<run_root>/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
 
 CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL

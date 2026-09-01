@@ -24,11 +24,11 @@ const (
 )
 
 var (
-	// Fixed errors deliberately never include the supplied secret, subject, or
+	// Fixed errors deliberately never include the supplied secret, stable ID, or
 	// token. API handlers map token verification failures to their public error.
 	errInvalidAPISecret          = errors.New("keys: invalid API secret")
 	errInvalidServiceSecret      = errors.New("keys: invalid service secret")
-	errInvalidAuthSandboxID      = errors.New("keys: invalid auth sandbox id")
+	errInvalidStableID           = errors.New("keys: invalid stable ID")
 	errInvalidForwardAccessToken = errors.New("keys: invalid forward access token")
 	errInvalidExecAccessToken    = errors.New("keys: invalid exec access token")
 	errInvalidExecExpiry         = errors.New("keys: invalid exec access token expiry")
@@ -58,32 +58,32 @@ type ExecAccessClaims struct {
 }
 
 // DeriveServiceSecret derives the default sandbox-scoped ServiceSecret from a
-// tenant APISecret and the sandbox's stable authentication subject. Both input
+// tenant APISecret and the sandbox's stable identity. Both input
 // validation and output encoding follow the wire contract: the root and result
 // are 32 bytes represented as canonical lowercase hex.
-func DeriveServiceSecret(apiSecretHex, authSandboxID string) (string, error) {
+func DeriveServiceSecret(apiSecretHex, stableID string) (string, error) {
 	apiSecret, err := decodeCanonicalHex32(apiSecretHex, errInvalidAPISecret)
 	if err != nil {
 		return "", err
 	}
-	if !validAuthSandboxID(authSandboxID) {
-		return "", errInvalidAuthSandboxID
+	if !validStableID(stableID) {
+		return "", errInvalidStableID
 	}
 
 	mac := hmac.New(sha256.New, apiSecret)
 	_, _ = mac.Write([]byte(serviceSecretInfo))
-	_, _ = mac.Write([]byte(authSandboxID))
+	_, _ = mac.Write([]byte(stableID))
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 // MintForwardAccessToken returns the deterministic kat1 forward token bound to
-// authSandboxID and signed by serviceSecretHex.
-func MintForwardAccessToken(serviceSecretHex, authSandboxID string) (string, error) {
+// stableID and signed by serviceSecretHex.
+func MintForwardAccessToken(serviceSecretHex, stableID string) (string, error) {
 	serviceSecret, err := decodeCanonicalHex32(serviceSecretHex, errInvalidServiceSecret)
 	if err != nil {
 		return "", err
 	}
-	payload, err := canonicalForwardPayload(authSandboxID)
+	payload, err := canonicalForwardPayload(stableID)
 	if err != nil {
 		return "", err
 	}
@@ -95,13 +95,13 @@ func MintForwardAccessToken(serviceSecretHex, authSandboxID string) (string, err
 }
 
 // VerifyForwardAccessToken strictly validates token's kat1 wire encoding,
-// canonical forward claims, subject binding, and HMAC-SHA256 signature.
-func VerifyForwardAccessToken(token, serviceSecretHex, authSandboxID string) error {
+// canonical forward claims, StableID binding, and HMAC-SHA256 signature.
+func VerifyForwardAccessToken(token, serviceSecretHex, stableID string) error {
 	serviceSecret, err := decodeCanonicalHex32(serviceSecretHex, errInvalidServiceSecret)
 	if err != nil {
 		return err
 	}
-	wantPayload, err := canonicalForwardPayload(authSandboxID)
+	wantPayload, err := canonicalForwardPayload(stableID)
 	if err != nil {
 		return err
 	}
@@ -129,17 +129,17 @@ func VerifyForwardAccessToken(token, serviceSecretHex, authSandboxID string) err
 }
 
 // MintExecAccessToken returns a new kat1 exec capability bound to
-// authSandboxID. expiresUnix == 0 produces a long-lived token without an exp
+// stableID. expiresUnix == 0 produces a long-lived token without an exp
 // claim; a positive value is encoded verbatim. The UUIDv7 session id remains an
 // internal token claim and is intentionally not returned separately.
-func MintExecAccessToken(serviceSecretHex, authSandboxID string, expiresUnix int64) (string, error) {
-	return MintExecAccessTokenWithConditions(serviceSecretHex, authSandboxID, expiresUnix, nil)
+func MintExecAccessToken(serviceSecretHex, stableID string, expiresUnix int64) (string, error) {
+	return MintExecAccessTokenWithConditions(serviceSecretHex, stableID, expiresUnix, nil)
 }
 
 // MintExecAccessTokenWithConditions returns a new exec capability carrying the
 // ordered condition sources. Empty input is normalized to an omitted claim.
 func MintExecAccessTokenWithConditions(
-	serviceSecretHex, authSandboxID string,
+	serviceSecretHex, stableID string,
 	expiresUnix int64,
 	conditions []string,
 ) (string, error) {
@@ -148,29 +148,29 @@ func MintExecAccessTokenWithConditions(
 		return "", errInvalidExecAccessToken
 	}
 	return mintExecAccessTokenWithConditions(
-		serviceSecretHex, authSandboxID, sessionID.String(), expiresUnix, conditions,
+		serviceSecretHex, stableID, sessionID.String(), expiresUnix, conditions,
 	)
 }
 
 // VerifyExecAccessToken strictly validates token's kat1 wire encoding,
-// canonical exec claims, subject binding, expiry, and HMAC-SHA256 signature.
-func VerifyExecAccessToken(token, serviceSecretHex, authSandboxID string, now time.Time) error {
-	_, err := ParseAndVerifyExecAccessToken(token, serviceSecretHex, authSandboxID, now)
+// canonical exec claims, StableID binding, expiry, and HMAC-SHA256 signature.
+func VerifyExecAccessToken(token, serviceSecretHex, stableID string, now time.Time) error {
+	_, err := ParseAndVerifyExecAccessToken(token, serviceSecretHex, stableID, now)
 	return err
 }
 
 // ParseAndVerifyExecAccessToken verifies HMAC and all canonical/binding claims
 // before returning claims to CEL admission. No condition is interpreted here.
 func ParseAndVerifyExecAccessToken(
-	token, serviceSecretHex, authSandboxID string,
+	token, serviceSecretHex, stableID string,
 	now time.Time,
 ) (ExecAccessClaims, error) {
 	serviceSecret, err := decodeCanonicalHex32(serviceSecretHex, errInvalidServiceSecret)
 	if err != nil {
 		return ExecAccessClaims{}, err
 	}
-	if !validAuthSandboxID(authSandboxID) {
-		return ExecAccessClaims{}, errInvalidAuthSandboxID
+	if !validStableID(stableID) {
+		return ExecAccessClaims{}, errInvalidStableID
 	}
 
 	if len(token) > limits.MaxExecTokenBytes {
@@ -200,7 +200,7 @@ func ParseAndVerifyExecAccessToken(
 	}
 	canonical, err := json.Marshal(claims)
 	if err != nil || !bytes.Equal(payload, canonical) ||
-		claims.Version != 1 || claims.SID != authSandboxID || claims.Audience != execAudience ||
+		claims.Version != 1 || claims.SID != stableID || claims.Audience != execAudience ||
 		!validUUIDv7(claims.SessionID) {
 		return ExecAccessClaims{}, errInvalidExecAccessToken
 	}
@@ -223,14 +223,14 @@ func ParseAndVerifyExecAccessToken(
 	return result, nil
 }
 
-func mintExecAccessToken(serviceSecretHex, authSandboxID, sessionID string, expiresUnix int64) (string, error) {
+func mintExecAccessToken(serviceSecretHex, stableID, sessionID string, expiresUnix int64) (string, error) {
 	return mintExecAccessTokenWithConditions(
-		serviceSecretHex, authSandboxID, sessionID, expiresUnix, nil,
+		serviceSecretHex, stableID, sessionID, expiresUnix, nil,
 	)
 }
 
 func mintExecAccessTokenWithConditions(
-	serviceSecretHex, authSandboxID, sessionID string,
+	serviceSecretHex, stableID, sessionID string,
 	expiresUnix int64,
 	conditions []string,
 ) (string, error) {
@@ -238,8 +238,8 @@ func mintExecAccessTokenWithConditions(
 	if err != nil {
 		return "", err
 	}
-	if !validAuthSandboxID(authSandboxID) {
-		return "", errInvalidAuthSandboxID
+	if !validStableID(stableID) {
+		return "", errInvalidStableID
 	}
 	if !validUUIDv7(sessionID) {
 		return "", errInvalidExecAccessToken
@@ -252,7 +252,7 @@ func mintExecAccessTokenWithConditions(
 		return "", errInvalidExecAccessToken
 	}
 	claims := execPayload{
-		Version: 1, SessionID: sessionID, SID: authSandboxID, Audience: execAudience,
+		Version: 1, SessionID: sessionID, SID: stableID, Audience: execAudience,
 		Conditions: normalizedConditions,
 	}
 	if expiresUnix > 0 {
@@ -277,25 +277,25 @@ func validUUIDv7(value string) bool {
 	return err == nil && id.Version() == 7 && id.Variant() == uuid.RFC4122 && id.String() == value
 }
 
-func canonicalForwardPayload(authSandboxID string) ([]byte, error) {
-	if !validAuthSandboxID(authSandboxID) {
-		return nil, errInvalidAuthSandboxID
+func canonicalForwardPayload(stableID string) ([]byte, error) {
+	if !validStableID(stableID) {
+		return nil, errInvalidStableID
 	}
 	payload, err := json.Marshal(forwardPayload{
 		Version:  1,
-		SID:      authSandboxID,
+		SID:      stableID,
 		Audience: forwardAudience,
 	})
 	if err != nil {
-		// All fields are primitive values and authSandboxID is valid UTF-8, so
+		// All fields are primitive values and stableID is valid UTF-8, so
 		// this is unreachable unless encoding/json's contract changes.
-		return nil, errInvalidAuthSandboxID
+		return nil, errInvalidStableID
 	}
 	return payload, nil
 }
 
-func validAuthSandboxID(authSandboxID string) bool {
-	return authSandboxID != "" && utf8.ValidString(authSandboxID)
+func validStableID(stableID string) bool {
+	return stableID != "" && utf8.ValidString(stableID)
 }
 
 func decodeCanonicalHex32(encoded string, invalid error) ([]byte, error) {

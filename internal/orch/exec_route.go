@@ -27,7 +27,7 @@ func (o *Orchestrator) LookupExec(ctx context.Context, sandboxID string) (proxy.
 
 // ActivateExec is called only after the proxy has verified a KAT against
 // expected. It accepts or joins the common launch attempt and re-reads the
-// node-local identity before returning a ctl.sock target subject.
+// node-local identity before returning a ctl.sock target.
 func (o *Orchestrator) ActivateExec(ctx context.Context, sandboxID string, expected proxy.ExecIdentity) (proxy.ExecIdentity, bool, error) {
 	sb, err := o.lookupExecSandbox(ctx, sandboxID)
 	if err != nil {
@@ -84,7 +84,7 @@ func execIdentity(sb *types.Sandbox) proxy.ExecIdentity {
 	}
 	return proxy.ExecIdentity{
 		NodeSandboxID: sb.ID,
-		AuthSandboxID: sb.AuthSandboxID(),
+		StableID:      sb.StableID(),
 		ServiceSecret: sb.ServiceSecret,
 	}
 }

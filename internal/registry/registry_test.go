@@ -56,7 +56,7 @@ func testE2BRoute(sandboxID, state string) routesync.RouteEntry {
 	}
 	return routesync.RouteEntry{
 		SandboxID: nodeSandboxID, Profile: "e2b", State: state,
-		AuthSandboxID: sandboxID, APISecret: testAPISecret,
+		StableID: sandboxID, APISecret: testAPISecret,
 		APISecretFingerprint: testAPIFingerprint, ManifestKeyFingerprint: fullFingerprint(testMK),
 		ServiceSecret: serviceSecret, EnvdAccessToken: testEnvdAccessToken,
 		TrafficAccessToken: testTrafficAccessToken, ForwardAccessToken: forwardAccessToken,
@@ -69,7 +69,7 @@ func testE2BSandboxRecord(group, routeKey, sid, nodeID string, state SandboxStat
 		Group: group, RouteKey: routeKey, SandboxID: sid, NodeSandboxID: route.SandboxID,
 		SandboxGeneration: 0, NextSandboxGeneration: 1,
 		NodeID: nodeID, State: state, Profile: route.Profile, TemplateID: testTemplateRef,
-		AuthSandboxID: route.AuthSandboxID, APISecret: route.APISecret,
+		StableID: route.StableID, APISecret: route.APISecret,
 		APISecretFingerprint: route.APISecretFingerprint, ManifestKeyFingerprint: route.ManifestKeyFingerprint,
 		ServiceSecret: route.ServiceSecret, EnvdAccessToken: route.EnvdAccessToken,
 		TrafficAccessToken: route.TrafficAccessToken, ForwardAccessToken: route.ForwardAccessToken,
@@ -95,7 +95,7 @@ func testSandboxIdentityRecord(group, routeKey, sandboxID, nodeID string, state 
 func testRouteFromRecord(record *SandboxRecord, sid, state string) routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID: sid, Profile: record.Profile, State: state,
-		AuthSandboxID: record.AuthSandboxID, APISecret: record.APISecret,
+		StableID: record.StableID, APISecret: record.APISecret,
 		APISecretFingerprint:   record.APISecretFingerprint,
 		ManifestKeyFingerprint: record.ManifestKeyFingerprint,
 		ServiceSecret:          record.ServiceSecret, EnvdAccessToken: record.EnvdAccessToken,
@@ -1023,7 +1023,7 @@ func (o *remoteLifecycleOwner) SendCommandAndWait(ctx context.Context, nodeID st
 		if cmd.Cluster == nil {
 			return nil, errors.New("missing cluster sandbox context")
 		}
-		record := testE2BSandboxRecord(cmd.Cluster.Group, cmd.Cluster.RouteKey, cmd.Cluster.AuthSandboxID, nodeID, StateReady)
+		record := testE2BSandboxRecord(cmd.Cluster.Group, cmd.Cluster.RouteKey, cmd.Cluster.StableID, nodeID, StateReady)
 		_, _ = o.reg.stores.PutSandbox(ctx, record)
 	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
@@ -1045,7 +1045,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 			return
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go reg.applyRoute(context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
@@ -1099,7 +1099,7 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 				t.Error("create command is missing cluster context")
 				return
 			}
-			record := testE2BSandboxRecord(cmd.Cluster.Group, cmd.Cluster.RouteKey, cmd.Cluster.AuthSandboxID, "n1", StateReady)
+			record := testE2BSandboxRecord(cmd.Cluster.Group, cmd.Cluster.RouteKey, cmd.Cluster.StableID, "n1", StateReady)
 			_, _ = reg.stores.PutSandbox(context.Background(), record)
 		}()
 	}})
@@ -1161,7 +1161,7 @@ func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
 		onCreate: func(cmd *routesync.Command) {
 			go func() {
 				time.Sleep(20 * time.Millisecond)
-				route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+				route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 				route.TemplateID = cmd.TemplateRef
 				reporter.applyRoute(context.Background(), nodeID, &route)
 			}()
@@ -1196,7 +1196,7 @@ func TestReserveSandboxUsesNodeReportedCredentials(t *testing.T) {
 			return
 		}
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go reg.applyRoute(context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
@@ -1290,7 +1290,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		cp := *cmd
 		got = &cp
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go reg.applyRoute(context.Background(), "n1", &route)
 	}
 	reg.addNode(conn)
@@ -1305,8 +1305,8 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		t.Fatalf("create command did not use placement config: %+v", got)
 	}
 	if got.Profile != "e2b" || got.Cluster == nil || got.Cluster.Group != "/g" || got.Cluster.RouteKey != "rk" ||
-		got.Cluster.AuthSandboxID == got.SID || got.SID != EncodeNodeSandboxID(got.Cluster.AuthSandboxID, 0) {
-		t.Fatalf("create command identity context=%+v, want stable auth subject and g0 node id", got)
+		got.Cluster.StableID == got.SID || got.SID != EncodeNodeSandboxID(got.Cluster.StableID, 0) {
+		t.Fatalf("create command identity context=%+v, want StableID and g0 node ID", got)
 	}
 	if _, ok := got.Config[clusterstate.ObjectMetadataKey]; ok {
 		t.Fatalf("cluster identity leaked into create metadata: %+v", got.Config)
@@ -1365,7 +1365,7 @@ func TestReserveSandboxLeafMergesPlacementAndRequestResources(t *testing.T) {
 		copy.Config = cloneStringMap(cmd.Config)
 		command = &copy
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		go reg.applyRoute(context.Background(), "n1", &route)
 	}})
 
@@ -1789,7 +1789,7 @@ func TestValidateRouteCredentials(t *testing.T) {
 		{name: "API secret", mutate: func(route *routesync.RouteEntry) { route.APISecret = strings.Repeat("0", 64) }},
 		{name: "API fingerprint", mutate: func(route *routesync.RouteEntry) { route.APISecretFingerprint = strings.Repeat("0", 64) }},
 		{name: "manifest fingerprint", mutate: func(route *routesync.RouteEntry) { route.ManifestKeyFingerprint = "bad" }},
-		{name: "auth sandbox ID", mutate: func(route *routesync.RouteEntry) { route.AuthSandboxID = "" }},
+		{name: "stable ID", mutate: func(route *routesync.RouteEntry) { route.StableID = "" }},
 		{name: "service secret", mutate: func(route *routesync.RouteEntry) { route.ServiceSecret = "bad" }},
 		{name: "forward token", mutate: func(route *routesync.RouteEntry) { route.ForwardAccessToken = "bad" }},
 		{name: "missing envd token", mutate: func(route *routesync.RouteEntry) { route.EnvdAccessToken = "" }},
@@ -1831,7 +1831,7 @@ func TestReservedRouteWithMaterializedCredentialsRejectsRebinding(t *testing.T) 
 	rebound := testE2BRoute("sb-resume", routesync.StateRunning)
 	rebound.ServiceSecret = strings.Repeat("1", 64)
 	var err error
-	rebound.ForwardAccessToken, err = keys.MintForwardAccessToken(rebound.ServiceSecret, rebound.AuthSandboxID)
+	rebound.ForwardAccessToken, err = keys.MintForwardAccessToken(rebound.ServiceSecret, rebound.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1924,7 +1924,7 @@ func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
 		createSIDs = append(createSIDs, cmd.SID)
 		go func() {
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-			route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+			route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 			route.SandboxID = cmd.SID
 			reg.applyRoute(ctx, "n1", &route)
 		}()
@@ -2352,7 +2352,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		route := routesync.RouteEntry{
 			SandboxID: cmd.SID, Profile: original.Profile, State: routesync.StateRunning,
-			AuthSandboxID: original.AuthSandboxID, APISecret: original.APISecret,
+			StableID: original.StableID, APISecret: original.APISecret,
 			APISecretFingerprint:   original.APISecretFingerprint,
 			ManifestKeyFingerprint: original.ManifestKeyFingerprint,
 			ServiceSecret:          original.ServiceSecret, EnvdAccessToken: original.EnvdAccessToken,
@@ -2369,8 +2369,8 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if command == nil || command.Cluster == nil || command.Cluster.AuthSandboxID != original.AuthSandboxID {
-		t.Fatal("replacement create did not preserve AuthSandboxID")
+	if command == nil || command.Cluster == nil || command.Cluster.StableID != original.StableID {
+		t.Fatal("replacement create did not preserve StableID")
 	}
 	createCredentials, _, err := sandboxcfg.ExtractCredentials(command.Config)
 	if err != nil {
@@ -2385,7 +2385,7 @@ func TestReadyReplacementPreservesMaterializedCredentials(t *testing.T) {
 		!sameRouteCredentials(reserved, original) {
 		t.Fatal("replacement RESERVED row did not retain materialized credentials")
 	}
-	if result.Route.SandboxID != original.SandboxID || result.Route.NodeSandboxID == original.NodeSandboxID || result.Route.AuthSandboxID != original.AuthSandboxID ||
+	if result.Route.SandboxID != original.SandboxID || result.Route.NodeSandboxID == original.NodeSandboxID || result.Route.StableID != original.StableID ||
 		result.Route.ServiceSecret != original.ServiceSecret || result.Route.EnvdAccessToken != original.EnvdAccessToken ||
 		result.Route.TrafficAccessToken != original.TrafficAccessToken ||
 		result.Route.ForwardAccessToken != original.ForwardAccessToken {
@@ -2447,9 +2447,9 @@ func TestMaterializedReservedRetryPreservesCredentialBinding(t *testing.T) {
 		t.Fatalf("placements=%d commands=%d, want two attempts", placements, len(commands))
 	}
 	for _, cmd := range commands {
-		if cmd.Cluster == nil || cmd.Cluster.AuthSandboxID != original.AuthSandboxID ||
+		if cmd.Cluster == nil || cmd.Cluster.StableID != original.StableID ||
 			cmd.APISecretFingerprint != original.APISecretFingerprint {
-			t.Fatal("replacement retry changed the credential subject or binding")
+			t.Fatal("replacement retry changed the stable ID or credential binding")
 		}
 		credentials, _, err := sandboxcfg.ExtractCredentials(cmd.Config)
 		if err != nil {
@@ -3088,7 +3088,7 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 		creates++
 		createCredentials = append(createCredentials, cmd.Config[sandboxcfg.NsCredentials])
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+		route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 		route.SandboxID = cmd.SID
 		go reg.applyRoute(context.Background(), "n2", &route)
 	}})
@@ -3233,7 +3233,7 @@ func TestReservePausedResume(t *testing.T) {
 			t.Errorf("connect fingerprint=%q", cmd.APISecretFingerprint)
 		}
 		if cmd.Profile != "e2b" || cmd.Cluster == nil || cmd.Cluster.Group != "/g" ||
-			cmd.Cluster.RouteKey != "rk" || cmd.Cluster.AuthSandboxID != original.AuthSandboxID {
+			cmd.Cluster.RouteKey != "rk" || cmd.Cluster.StableID != original.StableID {
 			t.Errorf("connect identity context=%+v", cmd)
 		}
 		if len(cmd.Config) != 0 {
@@ -3251,7 +3251,7 @@ func TestReservePausedResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
 	}
-	if res.Route.SandboxID != original.SandboxID || res.Route.NodeSandboxID != original.NodeSandboxID || res.Route.Profile != "e2b" || res.Route.AuthSandboxID != original.AuthSandboxID ||
+	if res.Route.SandboxID != original.SandboxID || res.Route.NodeSandboxID != original.NodeSandboxID || res.Route.Profile != "e2b" || res.Route.StableID != original.StableID ||
 		res.Route.EnvdAccessToken != want || !constantTimeStringEqual(res.Route.ForwardAccessToken, original.ForwardAccessToken) {
 		t.Fatalf("resume result: %+v", res)
 	}

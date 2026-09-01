@@ -681,6 +681,12 @@ node_link 重建第二条事实传播路径。
 - route 定位键:`(group, route_key)`。
 - 稳定公开身份:`sandbox_id`。Registry 在首次 create 时生成,同节点 resume、跨节点迁移和
   re-place 均不改变;公开 API、Host 和 router cache key 使用该 ID。
+- 稳定 sandbox 身份:`stable_id`。cluster invariant 固定为 `stable_id == sandbox_id`；它在
+  NodeSandboxID 变化时保持不变，并绑定 ServiceSecret 与 KAT `sid`。该重复投影为现有受保护
+  credential state，本次不去重。StableID 不是 node-local lookup key，也不增加唯一索引；
+  身份保持型 migration/copy 可以让多个 node-local sandbox 共享同一 StableID。
+- Registry durable JSON state 直接使用 `stable_id`，不保留旧字段 fallback；pre-release
+  部署必须清理并重建旧 preview state。
 - 节点执行身份:`node_sandbox_id = <sandbox_id>-g<sandbox_generation>`。首个候选为 g0;候选
   冲突/失败或跨节点迁移消费下一个 generation,同节点 resume 保持当前 NodeSandboxID。
   NodeSandboxID 是不透明的 node-local ID,权威映射在 Registry 归属表,组件不从字符串反向解析。
@@ -702,7 +708,7 @@ node_link 重建第二条事实传播路径。
 | `profile` | 创建意图确定的 sandbox profile,与 node 归属及事件事实一致 |
 | `api_secret_fingerprint` | sandbox 业务记录绑定的完整 APISecret 指纹;生命周期命令和归属清理据此防止跨 binding 操作 |
 | `manifest_key_fingerprint` | 与 APISecret 配对的 ManifestKey 完整指纹;route 不保存或投影 ManifestKey 原文 |
-| `auth_sandbox_id` | ServiceSecret 和 KAT token 使用的稳定认证 subject |
+| `stable_id` | 跨 NodeSandboxID 变化保持的 sandbox identity；cluster 中等于 `sandbox_id`，并绑定 ServiceSecret/KAT |
 | `api_secret` | 当前 sandbox 已绑定的 APISecret;仅存在于受保护 route 存储和可信 router/proxy 投影 |
 | `service_secret` | 当前 sandbox 持久化的 service credential;用于签发和验证用途明确的 KAT token |
 | `envd_access_token` | e2b envd 端口使用的数据面 token |
@@ -773,7 +779,7 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
   与 route `target_port` 合并为鉴权目标;exec 逻辑服务不要求 port.Header 携
   `X-Access-Token`,exec 另携
   `E2b-Sandbox-Service: exec`.Registry 对普通目标按 profile/端口选择 EnvdAccessToken
-  或 ForwardAccessToken;exec 则以 stable `AuthSandboxID + ServiceSecret` 验证 KAT.
+  或 ForwardAccessToken;exec 则以 `StableID + ServiceSecret` 验证 KAT.
   鉴权在任何 route CAS/CmdConnect 之前完成.READY 直接返回;
   PAUSED 先 CAS RESERVED 并下发 CmdConnect;RESERVED 等待当前稳定 lineage 的事件。只在获得
   READY 且 DataEndpoint 有效时返回 `Route`。不存在的 route 直接返回 not found,不创建
@@ -860,7 +866,7 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 router 是无状态北向入口,但持本地缓存:
 
 - route resolution cache:`(group, route_key, stable sandbox_id)` -> NodeSandboxID / node endpoint / profile /
-  AuthSandboxID / APISecret / 两项 root fingerprint / ServiceSecret /
+  StableID / APISecret / 两项 root fingerprint / ServiceSecret /
   EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / RouteRevision。
 - build forwarding cache:`(group, build_id)` -> node endpoint;不能只以 build_id 为键。
 - 在途请求只持有自身的 route 副本和计数,不作为新请求的路由 cache,也不阻止新
@@ -930,7 +936,7 @@ Node 负责以本地受信 profile 完成最终 backend 选择;特别地,bare �
 完整的 cluster 透传边界由 [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) 跟踪.
 
 `service=exec` 只接受 CONNECT 并始终 enforce KAT.Router 先做无副作用 Resolve/cache lookup,
-以 stable `AuthSandboxID + ServiceSecret` 验证原始 `X-Access-Token`,并在 HMAC 成功后编译
+以 `StableID + ServiceSecret` 验证原始 `X-Access-Token`,并在 HMAC 成功后编译
 conditions.返回 public CONNECT 200 后,Router 严格读取首个 ExecRequest、重查 expiry 并执行
 conditions;失败不调用 `Reserve(operation=data)`、不连接 node.只有 request admission 成功后,
 已有完整 node target 才直连 node proxy;target 缺失才调用 `Reserve(operation=data)`并在 fresh
@@ -947,7 +953,7 @@ X-Access-Token:      <same KAT>
 Router 将首帧 Raw 原样发送一次.最终 node 不信任 Router,以本地 route 再次验证同一 KAT,
 重新读取并执行完整 ExecRequest gate,之后才能 parking、resume 和连接 `ctl.sock`.
 完整 target 的 cache hot path 不增加 Registry RPC,但 Router/node 两层验证仍保留.
-KAT 绑定 stable AuthSandboxID 而不绑定 NodeSandboxID/generation,因此同一逻辑沙箱的同节点
+KAT 绑定 StableID 而不绑定 NodeSandboxID/generation,因此同一逻辑沙箱的同节点
 resume,跨节点迁移或 re-place 不要求客户端重签;新 CONNECT 始终进入当前 NodeSandboxID.
 typed stale retry 只允许发生在 Raw 尚未写给任何 node 时;node CONNECT 200 且 Raw 已发送后
 禁止 retry/reroute/replay,node 返回的 ctl error 原样中继.
@@ -994,20 +1000,20 @@ node encrypted local key store
 业务记录的凭据对。
 
 ServiceSecret 不是第三个 group root,而是每个 node Sandbox 业务记录的独立 service credential。缺省值由
-该 Sandbox 已绑定的 APISecret 和 `AuthSandboxID()` 以固定 domain 派生;也可由本次 create 的
+该 Sandbox 已绑定的 APISecret 和 `StableID()` 以固定 domain 派生;也可由本次 create 的
 `kuasar-sandbox.credentials` object 显式指定。Registry 在 route/ref/command 副作用前按 placement
 Profile 校验并规范化该 object,node 再次校验、分离后把 ServiceSecret 与 Envd/Traffic/Forward token
 加密写入 Sandbox 业务行。普通 metadata、guest 配置和 node-stub 观测面均不保留 credentials object。
 
 ForwardAccessToken 和 ExecAccessToken 都使用 `kat1`,但 audience 明确分离.
 ExecAccessToken 的 canonical payload 是 `v,session_id,sid,aud[,exp]`,其中 session ID 是
-UUIDv7,`sid=AuthSandboxID`,`aud=exec`,不包含 `iat`;ServiceSecret 解码为 32-byte key 后
+UUIDv7,`sid=StableID`,`aud=exec`,不包含 `iat`;ServiceSecret 解码为 32-byte key 后
 直接执行 HMAC-SHA256,不增加 exec-specific 派生层.create/get/list 不返回缺省
 ExecAccessToken;每个 exec-session API 调用独立签发,服务端不建 session row,revoke
 或 single-use/replay 状态.
 
 Registry 从 node route event 物化受保护 route 时,只采纳 APISecret、两项 root fingerprint、
-AuthSandboxID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文或既有
+StableID、ServiceSecret 和 Envd/Traffic/Forward tokens;不采纳 ManifestKey 原文或既有
 node-link wire 中供节点 proxy/MMDS 使用的 MmdsSecret。Registry 本阶段以明文结构化字段保存
 这些受保护 route 凭据,不增加额外加密层;它们只可由受保护 Reserve/Resolve 返回给可信 router,
 不得进入普通 route watch/list、公开 create/get/list 响应、日志或观测接口。创建请求中的

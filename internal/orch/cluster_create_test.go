@@ -46,7 +46,7 @@ func clusterCreateCommand(fingerprint, sid string) *routesync.Command {
 		CmdID: "create-" + sid, Kind: routesync.CmdCreate, SID: sid,
 		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		Profile:     string(types.ProfileBare), APISecretFingerprint: fingerprint,
-		Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+		Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 	}
 }
 
@@ -326,7 +326,7 @@ func TestPrecheckClusterCheckpointPolicy(t *testing.T) {
 			TemplateRef:          types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 			Profile:              string(types.ProfileBare),
 			APISecretFingerprint: fingerprint,
-			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 			Config:               map[string]string{sandboxcfg.NsCheckpoint: raw},
 		}
 	}
@@ -361,7 +361,7 @@ func TestPrecheckClusterRequiresConsistentProfileAndContext(t *testing.T) {
 			TemplateRef:          templateRef,
 			Profile:              string(types.ProfileBare),
 			APISecretFingerprint: fingerprint,
-			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+			Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 		}
 	}
 
@@ -423,7 +423,7 @@ func TestPrecheckClusterExtractsCredentials(t *testing.T) {
 	cmd := &routesync.Command{
 		SID: "stable-g0", TemplateRef: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), Profile: "e2b",
 		APISecretFingerprint: fingerprint,
-		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+		Cluster:              &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 		Config: map[string]string{
 			sandboxcfg.NsCredentials: `{"service_secret":"` + secret + `","envd_access_token":"envd","traffic_access_token":"traffic"}`,
 			"keep":                   "value",
@@ -443,15 +443,15 @@ func TestPrecheckClusterExtractsCredentials(t *testing.T) {
 
 func TestValidateClusterSandboxContext(t *testing.T) {
 	stored := &types.Sandbox{
-		ID:                 "stable-g0",
-		Profile:            types.ProfileBare,
-		Cluster:            &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
-		AuthSandboxIDValue: "stable",
+		ID:            "stable-g0",
+		Profile:       types.ProfileBare,
+		Cluster:       &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
+		StableIDValue: "stable",
 	}
 	valid := func() *routesync.Command {
 		return &routesync.Command{
 			Profile: string(types.ProfileBare),
-			Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+			Cluster: &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 		}
 	}
 	if err := validateClusterSandboxContext(stored, valid()); err != nil {
@@ -459,10 +459,10 @@ func TestValidateClusterSandboxContext(t *testing.T) {
 	}
 
 	tests := map[string]func(*types.Sandbox, *routesync.Command){
-		"profile": func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Profile = string(types.ProfileE2B) },
-		"group":   func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.Group = "group-b" },
-		"route":   func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.RouteKey = "route-b" },
-		"auth id": func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.AuthSandboxID = "other" },
+		"profile":   func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Profile = string(types.ProfileE2B) },
+		"group":     func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.Group = "group-b" },
+		"route":     func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.RouteKey = "route-b" },
+		"stable ID": func(_ *types.Sandbox, cmd *routesync.Command) { cmd.Cluster.StableID = "other" },
 		"missing stored context": func(sb *types.Sandbox, _ *routesync.Command) {
 			sb.Cluster = nil
 		},
@@ -486,13 +486,13 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 	o := testOrch(t)
 	_, manifestKey, fingerprint := allowlistedBuildIdentity(t, o)
 	sb := &types.Sandbox{
-		ID:                 "stable-g0",
-		Profile:            types.ProfileBare,
-		Cluster:            &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
-		AuthSandboxIDValue: "stable",
-		State:              types.StatePaused,
-		APISecret:          deriveTestAPISecret(t, manifestKey),
-		ManifestKey:        manifestKey,
+		ID:            "stable-g0",
+		Profile:       types.ProfileBare,
+		Cluster:       &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
+		StableIDValue: "stable",
+		State:         types.StatePaused,
+		APISecret:     deriveTestAPISecret(t, manifestKey),
+		ManifestKey:   manifestKey,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
@@ -504,7 +504,7 @@ func TestHandleClusterConnectRejectsContextMismatch(t *testing.T) {
 		SID:                  sb.ID,
 		Profile:              string(types.ProfileBare),
 		APISecretFingerprint: fingerprint,
-		Cluster:              &routesync.ClusterSandboxContext{Group: "other", RouteKey: "route-a", AuthSandboxID: "stable"},
+		Cluster:              &routesync.ClusterSandboxContext{Group: "other", RouteKey: "route-a", StableID: "stable"},
 	})
 	if ack.Status != routesync.AckRejected || !strings.Contains(ack.Reason, "context mismatch") {
 		t.Fatalf("mismatched connect ack = %+v", ack)

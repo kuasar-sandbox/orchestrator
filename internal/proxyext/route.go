@@ -283,7 +283,7 @@ func routeEvent(generation uint64, change routeChange) proxyextension.RouteEvent
 
 func projectRoute(route routesync.RouteEntry, revision uint64) proxyextension.RouteView {
 	return proxyextension.RouteView{
-		SandboxID: route.SandboxID, AuthSandboxID: route.AuthSandboxID,
+		SandboxID: route.SandboxID, StableID: route.StableID,
 		Profile: proxyextension.Profile(route.Profile), TemplateID: route.TemplateID,
 		State: proxyextension.RouteState(route.State), RunID: route.RunID,
 		EnvdUDS: route.EnvdUDS, CIUDS: route.CiUDS, FloatingIP: route.FloatingIP,

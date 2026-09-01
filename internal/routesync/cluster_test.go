@@ -44,12 +44,12 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
 		CmdID: "x1", Kind: CmdCreate, SID: "stable-g0", Profile: "bare",
-		Cluster:     &ClusterSandboxContext{Group: "/c/p/a/g1", RouteKey: "u1:sess1", AuthSandboxID: "stable"},
+		Cluster:     &ClusterSandboxContext{Group: "/c/p/a/g1", RouteKey: "u1:sess1", StableID: "stable"},
 		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), APISecretFingerprint: strings.Repeat("a", 64),
 	}})
 	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.SID != "stable-g0" || c.Cmd.Profile != "bare" ||
 		c.Cmd.Cluster == nil || c.Cmd.Cluster.Group != "/c/p/a/g1" || c.Cmd.Cluster.RouteKey != "u1:sess1" ||
-		c.Cmd.Cluster.AuthSandboxID != "stable" || c.Rev != 42 {
+		c.Cmd.Cluster.StableID != "stable" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
@@ -81,13 +81,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	// deliberately absent.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
 		SandboxID: "s1", State: StateRunning,
-		FloatingIP: "100.100.96.5", AuthSandboxID: "stable-s1",
+		FloatingIP: "100.100.96.5", StableID: "stable-s1",
 		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
 		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
 	}})
 	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning ||
-		r.Route.AuthSandboxID != "stable-s1" || r.Route.APISecret != strings.Repeat("1", 64) ||
+		r.Route.StableID != "stable-s1" || r.Route.APISecret != strings.Repeat("1", 64) ||
 		r.Route.APISecretFingerprint != strings.Repeat("2", 64) ||
 		r.Route.ManifestKeyFingerprint != strings.Repeat("3", 64) ||
 		r.Route.ServiceSecret != strings.Repeat("4", 64) || r.Route.EnvdAccessToken != "envd" ||
@@ -100,6 +100,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 	if bytes.Contains(wire, []byte(`"access_token":`)) {
 		t.Fatalf("route retained generic access_token: %s", wire)
+	}
+	if !bytes.Contains(wire, []byte(`"stable_id":"stable-s1"`)) {
+		t.Fatalf("route omitted stable_id: %s", wire)
+	}
+	legacyField := strings.Join([]string{"auth", "sandbox", "id"}, "_")
+	if bytes.Contains(wire, []byte(`"`+legacyField+`"`)) {
+		t.Fatalf("route retained legacy identity field %q: %s", legacyField, wire)
 	}
 
 	a := roundTrip(t, &Msg{Type: TypeCmdAck, Ack: &CmdAck{CmdID: "x1", Status: AckAccepted}})

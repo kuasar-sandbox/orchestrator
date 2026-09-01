@@ -37,7 +37,7 @@ func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
 		(*conductorextension.Extension)(nil), (*conductorextension.Host)(nil),
 		(*conductorextension.APIWrapper)(nil), (*conductorextension.SandboxHook)(nil), (*conductorextension.BuildHook)(nil),
 		(*conductorextension.SandboxSource)(nil), (*conductorextension.BuildSource)(nil),
-		conductorextension.SandboxView{}, conductorextension.SandboxEvent{},
+		conductorextension.SandboxView{ID: "node-sandbox", StableID: "stable-sandbox"}, conductorextension.SandboxEvent{},
 		conductorextension.BuildView{}, conductorextension.BuildEvent{},
 		conductorextension.SandboxOperation{}, conductorextension.SandboxCreateRequest{},
 		conductorextension.SandboxPauseRequest{}, conductorextension.SandboxResumeRequest{}, conductorextension.SandboxDeleteRequest{},

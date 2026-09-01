@@ -177,7 +177,7 @@ func TestExtractCredentialsRejectsUnknownFields(t *testing.T) {
 		"unknown",
 		"api_secret",
 		"manifest_key",
-		"auth_sandbox_id",
+		"stable_id",
 		"forward_access_token",
 		"exec_access_token",
 	} {

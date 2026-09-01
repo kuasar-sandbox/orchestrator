@@ -20,6 +20,8 @@ The example also binds one trusted, statically linked runtime Extension. Its
 with the process context. `Get` and Watch views are deep-copied, non-secret
 projections. Watch is generation-based eventual convergence, not a durable
 audit stream; discard every generation that does not reach `sync_end`.
+`SandboxView.ID` is node-local; `SandboxView.StableID` remains unchanged when
+an identity-preserving import or cluster re-place changes that local ID.
 
 The same object also implements the optional `APIWrapper` and `SandboxHook`.
 The wrapper adds `/private/extension/health` and calls the canonical handler for

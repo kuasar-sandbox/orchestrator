@@ -61,7 +61,7 @@ func TestClusterExecRejectsInvalidKATBeforeReserve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expired, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, time.Now().Add(-time.Second).Unix())
+	expired, err := keys.MintExecAccessToken(route.ServiceSecret, route.StableID, time.Now().Add(-time.Second).Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestClusterExecSanitizesRouteLookupFailure(t *testing.T) {
 func TestClusterExecSanitizesReserveFailure(t *testing.T) {
 	paused := routerTestRouteResolve(t, "stable", "/g", "rk", "", types.ProfileBare)
 	paused.State = "paused"
-	token, err := keys.MintExecAccessToken(paused.ServiceSecret, paused.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(paused.ServiceSecret, paused.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestClusterExecConditionFailureDoesNotReserveOrDialNode(t *testing.T) {
 			}))
 			defer control.Close()
 			token, err := keys.MintExecAccessTokenWithConditions(
-				route.ServiceSecret, route.AuthSandboxID, 0,
+				route.ServiceSecret, route.StableID, 0,
 				[]string{`request.argv == ['/bin/allowed']`},
 			)
 			if err != nil {
@@ -238,7 +238,7 @@ func TestClusterExecReserveRevalidatesStableLineageBeforeNodeDial(t *testing.T) 
 	initial := routerTestRouteResolve(t, "stable", "/g", "rk", "", types.ProfileBare)
 	initial.State = "paused"
 	changed := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
-	changed.AuthSandboxID = "different-lineage"
+	changed.StableID = "different-lineage"
 	var reserveHits atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -252,7 +252,7 @@ func TestClusterExecReserveRevalidatesStableLineageBeforeNodeDial(t *testing.T) 
 		}
 	}))
 	defer control.Close()
-	token, err := keys.MintExecAccessToken(initial.ServiceSecret, initial.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(initial.ServiceSecret, initial.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestClusterExecRelaysNodeCtlErrorWithoutSynthesizingAnother(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(route)
 	}))
 	defer control.Close()
-	token, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(route.ServiceSecret, route.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestClusterExecReadyCacheRewritesOnlySIDAndPreservesTunnel(t *testing.T) {
 	rt.rememberRoute(&route)
 	front := httptest.NewServer(rt.Handler())
 	defer front.Close()
-	token, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(route.ServiceSecret, route.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestClusterExecKnownNonReadyTargetSkipsReserve(t *testing.T) {
 			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
 			front := httptest.NewServer(rt.Handler())
 			defer front.Close()
-			token, err := keys.MintExecAccessToken(route.ServiceSecret, route.AuthSandboxID, 0)
+			token, err := keys.MintExecAccessToken(route.ServiceSecret, route.StableID, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -446,7 +446,7 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
 	front := httptest.NewServer(rt.Handler())
 	defer front.Close()
-	token, err := keys.MintExecAccessToken(staleRoute.ServiceSecret, staleRoute.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(staleRoute.ServiceSecret, staleRoute.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +501,7 @@ func TestClusterExecPausedReserveRechecksKATAndUsesCurrentNode(t *testing.T) {
 	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
 	front := httptest.NewServer(rt.Handler())
 	defer front.Close()
-	token, err := keys.MintExecAccessToken(paused.ServiceSecret, paused.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(paused.ServiceSecret, paused.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

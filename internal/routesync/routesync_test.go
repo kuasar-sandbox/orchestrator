@@ -190,6 +190,73 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 }
 
+func TestRouteSyncVersionMismatchFailsBeforeBusinessFrames(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	sent := make(chan struct{}, 1)
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := routesync.ReadRegister(r.Body); err != nil {
+			return
+		}
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version - 1}})
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
+			SandboxID: "must-not-apply", State: routesync.StateRunning,
+		}})
+		w.(http.Flusher).Flush()
+		select {
+		case sent <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	sink := newFakeSink()
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go routesync.NewSubscriber(
+		dial,
+		"version-mismatch",
+		routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}},
+		sink,
+		nil,
+		log,
+	).Run(ctx)
+
+	recv(t, sent, "mismatched hello")
+	time.Sleep(100 * time.Millisecond)
+	for name, ch := range map[string]<-chan struct{}{
+		"sync begin": sink.begin,
+		"bookmark":   sink.book,
+	} {
+		select {
+		case <-ch:
+			t.Fatalf("version mismatch reached %s", name)
+		default:
+		}
+	}
+	select {
+	case route := <-sink.up:
+		t.Fatalf("version mismatch applied route %+v", route)
+	default:
+	}
+	select {
+	case policy := <-sink.pol:
+		t.Fatalf("version mismatch applied policy %+v", policy)
+	default:
+	}
+}
+
 func TestRouteSyncApplyFailurePreventsBarrierAck(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "cfg.sock")

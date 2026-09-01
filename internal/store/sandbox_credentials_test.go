@@ -84,7 +84,7 @@ func TestSandboxServiceCredentialsAreInsertBound(t *testing.T) {
 	sb.ServiceSecret = strings.Repeat("3", 64)
 	sb.EnvdAccessToken = "replacement-envd-access-token"
 	sb.TrafficAccessToken = "replacement-traffic-access-token"
-	replacementForward, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.AuthSandboxID())
+	replacementForward, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.StableID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,14 +170,14 @@ func TestSandboxMissingPersistedServiceCredentialIsCorrupt(t *testing.T) {
 	}
 }
 
-func TestSandboxPersistedForwardTokenMustMatchServiceSecretAndSubject(t *testing.T) {
+func TestSandboxPersistedForwardTokenMustMatchServiceSecretAndStableID(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	sb := testSandboxWithServiceCredentials("sandbox-wrong-forward-subject", types.ProfileBare)
+	sb := testSandboxWithServiceCredentials("sandbox-wrong-forward-stable-id", types.ProfileBare)
 	if err := st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	wrongToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, "different-subject")
+	wrongToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, "different-stable-id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +190,6 @@ func TestSandboxPersistedForwardTokenMustMatchServiceSecretAndSubject(t *testing
 		t.Fatal(err)
 	}
 	if _, err := st.Get(ctx, sb.ID); err == nil {
-		t.Fatal("forward token for a different AuthSandboxID was accepted")
+		t.Fatal("forward token for a different StableID was accepted")
 	}
 }

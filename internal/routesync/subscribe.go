@@ -116,8 +116,20 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	}
 	defer resp.Body.Close()
 
-	// Reader: a fresh sync generation, then apply down frames until EOF/error.
+	// The first down frame is the versioned Hello. Fail closed before beginning a
+	// sync generation or applying any route business frame.
+	hello, err := ReadMsg(resp.Body)
+	if err != nil {
+		return err
+	}
+	if err := ValidateHello(hello); err != nil {
+		return err
+	}
+
+	// Reader: preserve the established BeginSync-before-policy callback order,
+	// then apply route frames until EOF/error.
 	s.sink.BeginSync()
+	s.sink.SetPolicy(hello.Hello.Policy)
 	for {
 		m, err := ReadMsg(resp.Body)
 		if err != nil {
@@ -174,9 +186,7 @@ func enqueueUp(ctx context.Context, up chan<- *Msg, m *Msg) bool {
 func (s *Subscriber) apply(ctx context.Context, m *Msg, up chan<- *Msg) error {
 	switch m.Type {
 	case TypeHello:
-		if m.Hello != nil {
-			s.sink.SetPolicy(m.Hello.Policy)
-		}
+		return fmt.Errorf("routesync: unexpected hello frame after handshake")
 	case TypeUpsert:
 		if m.Route != nil {
 			if err := s.sink.ApplyUpsert(*m.Route); err != nil {

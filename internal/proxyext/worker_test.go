@@ -47,7 +47,7 @@ func TestWorkerHostProcessGetRouteAndPublicProjection(t *testing.T) {
 		t.Fatalf("Process=%+v want=%+v", got, process)
 	}
 	view, found := host.GetRoute("s1")
-	if !found || view.SandboxID != "s1" || view.AuthSandboxID != "auth-s1" || view.RunID != "run-1" ||
+	if !found || view.SandboxID != "s1" || view.StableID != "stable-s1" || view.RunID != "run-1" ||
 		view.EnvdUDS != route.EnvdUDS || view.CIUDS != route.CiUDS || view.Revision == 0 ||
 		view.APISecretFingerprint != route.APISecretFingerprint || view.ManifestKeyFingerprint != route.ManifestKeyFingerprint {
 		t.Fatalf("GetRoute=%+v found=%v", view, found)

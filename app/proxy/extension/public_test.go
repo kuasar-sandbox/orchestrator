@@ -40,7 +40,7 @@ func TestPublicContractsCompileOutsidePackage(t *testing.T) {
 		t.Fatal("public extension contracts are nil")
 	}
 	for _, value := range []any{
-		extension.RouteView{}, extension.RouteEvent{}, extension.TrafficView{},
+		extension.RouteView{SandboxID: "node-sandbox", StableID: "stable-sandbox"}, extension.RouteEvent{}, extension.TrafficView{},
 		extension.ProfileBare, extension.RouteStateRunning,
 		extension.RouteSyncInitializing, extension.RouteSyncLost,
 		extension.ErrTrafficUnavailable, extension.ErrTrafficConflict,

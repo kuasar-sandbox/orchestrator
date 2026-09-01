@@ -40,7 +40,7 @@ type RouteResolve struct {
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
 	TemplateID             string `json:"template_id"`
-	AuthSandboxID          string `json:"auth_sandbox_id"`
+	StableID               string `json:"stable_id"`
 	APISecret              string `json:"api_secret"`
 	APISecretFingerprint   string `json:"api_secret_fingerprint"`
 	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
@@ -322,7 +322,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, TemplateID: rec.TemplateID,
-		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
 		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,

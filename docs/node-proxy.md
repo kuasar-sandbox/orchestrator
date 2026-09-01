@@ -44,7 +44,7 @@ node proxy worker
   credential 不能唤醒或占用 traffic parking。
 - **逻辑服务只影响 CONNECT**:普通 HTTP 不解析 `E2b-Sandbox-Service`,应用层
   Header 保持不变;CONNECT 中显式 service 是 backend 选择的权威输入.
-- **Exec 先鉴权后激活**:`service=exec` 始终验证绑定 `AuthSandboxID` 的 KAT;
+- **Exec 先鉴权后激活**:`service=exec` 始终验证绑定 `StableID` 的 KAT;
   CONNECT 200 后还必须授权完整首个 ExecRequest.失败请求不得触发 parking、Wake/resume
   或 backend dial.最终 node proxy 只将双重 gate 通过的请求交给 ctl tunnel helper,
   不向租户开放任意 UDS 或其它 ctl capability.
@@ -282,6 +282,9 @@ SHM route;paused/Delete 先撤销 heap 再更新 SHM,让已采样旧 active row 
 
 本文中 `RouteEntry.SandboxID`、`sid` 和共享表 key 均是 node-local SandboxID.集群路径下,它们是
 Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公开稳定 SandboxID 转换为该值.
+`RouteEntry.StableID` 是跨 NodeSandboxID 变化保持的 sandbox identity，用于 KAT/credential
+binding，不参与共享表 lookup。routesync V3 将该 JSON wire 一次性切换为 `stable_id`；subscriber
+和 node-link client 在首个 Hello 校验版本，不匹配时在处理 route/command 前终止 session。
 
 共享表是固定容量开放寻址 hash 表。master 单写;每条记录带 seqlock,worker 读取时若遇到
 写中状态或版本变化会重试,不会看到半条路由。worker 只依赖共享表本地读取:
@@ -318,14 +321,15 @@ node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配�
 为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
 
 受保护 `RouteEntry` 的 state 为 `starting|running|paused|dead`,并显式携带
-`AuthSandboxID`、`APISecret`、`APISecretFingerprint`、
+`StableID`、`APISecret`、`APISecretFingerprint`、
 `ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
 `ForwardAccessToken`。
 ManifestKey 原文不进入路由。节点 proxy 转发时只按目标选择 EnvdAccessToken 或
 ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关及 e2b 数据面组件,
-不由 node 平台层消费.`AuthSandboxID + ServiceSecret` 用于验证 exec KAT,
+不由 node 平台层消费.`StableID + ServiceSecret` 用于验证 exec KAT,
 其中共享表 key 和本地运行目录仍只使用 NodeSandboxID.既有 `MmdsSecret` 独立服务于
 MMDS token 签名,不等于 route secret values;后者仅经上述可信投影进入 master heap。
+SHM 仅将对应 Go 字段改名；schema、record size、字段顺序和 offset 均保持不变。
 
 初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
 state park,绝不尝试使用这些空字段。node 持久化 network ownership 并完成 YAML/ready.sock
@@ -384,7 +388,7 @@ CONNECT:
 node proxy 的 exec 路径分为三个有序阶段:
 
 1. CONNECT 200 前只做无副作用本地 `LookupExec`,以 route 中的
-   `AuthSandboxID + ServiceSecret` 严格验证 `X-Access-Token` KAT,并在 HMAC 验证成功后
+   `StableID + ServiceSecret` 严格验证 `X-Access-Token` KAT,并在 HMAC 验证成功后
    编译/读取有界缓存中的 CEL programs.该阶段不 parking、不 activation、不拨
    `ctl.sock`;token/identity/expiry/conditions 失败以 HTTP 400/401/404/501 结束.
 2. 返回并 flush CONNECT 200 后,在固定 10 秒 first-request timeout 内读取完整首个 ctl
@@ -444,7 +448,7 @@ proxyForwarder raw relay 和 cluster-router 的 canonical chained CONNECT 都只
 - bare 的任意 legacy 端口,e2b 的其它 legacy 端口和显式 `forward` 使用
   `forwardAccessToken`;
 - `trafficAccessToken` 只供外部网关及 e2b 数据面组件验证,node proxy 不消费;
-- `exec` 只接受以 ServiceSecret 直接 HMAC 签名,绑定 `AuthSandboxID` 且
+- `exec` 只接受以 ServiceSecret 直接 HMAC 签名,绑定 `StableID` 且
   `aud=exec` 的 `kat1` ExecAccessToken.Envd/Forward/Traffic token 不能代替它.
 
 opaque Envd/Forward token 按各自线格式校验;exec KAT 执行严格格式,签名,SID,audience

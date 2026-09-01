@@ -70,7 +70,7 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
 	clusterContext := commandClusterContext(t, cmd)
-	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.Route.SandboxID ||
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.StableID != res.Route.SandboxID ||
 		cmd.SID != res.Route.NodeSandboxID || cmd.Profile != "e2b" {
 		t.Fatalf("relayed command=%+v, reserve=%+v", cmd, res)
 	}
@@ -202,7 +202,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
 	clusterContext := commandClusterContext(t, cmd)
-	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.AuthSandboxID != res.Route.SandboxID ||
+	if clusterContext.Group != "/g" || clusterContext.RouteKey != "rk" || clusterContext.StableID != res.Route.SandboxID ||
 		cmd.SID != res.Route.NodeSandboxID || cmd.Profile != "e2b" {
 		t.Fatalf("redirected command=%+v, reserve=%+v", cmd, res)
 	}
@@ -294,7 +294,7 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 	if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+			route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 			route.SandboxID = cmd.SID
 			n.publish(route)
 		}()
@@ -442,7 +442,7 @@ func (n *relayNodeStub) readLoop(t *testing.T) {
 		}
 		_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
-			route := testE2BRoute(cmd.Cluster.AuthSandboxID, routesync.StateRunning)
+			route := testE2BRoute(cmd.Cluster.StableID, routesync.StateRunning)
 			route.SandboxID = cmd.SID
 			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &route})
 		}

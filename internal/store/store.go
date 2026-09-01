@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   profile              TEXT NOT NULL,
   cluster_group        TEXT NOT NULL DEFAULT '',
   cluster_route_key    TEXT NOT NULL DEFAULT '',
-  auth_sandbox_id      TEXT NOT NULL DEFAULT '',
+  stable_id           TEXT NOT NULL DEFAULT '',
   template_id          TEXT NOT NULL,
   state                TEXT NOT NULL,
   deadline_unix        INTEGER NOT NULL DEFAULT 0,
@@ -341,7 +341,7 @@ func ub(s string) types.BuildOptions {
 // --- sandboxes ---
 
 const sandboxInsertSQL = `
-	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
+	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
 	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix)
 	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
@@ -397,7 +397,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		return nil, fmt.Errorf("encrypt forward access token: %w", err)
 	}
 	return []any{
-		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.AuthSandboxIDValue,
+		sb.ID, string(sb.Profile), clusterGroup, clusterRouteKey, sb.StableIDValue,
 		sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc, sb.SnapshotRef,
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
@@ -412,7 +412,7 @@ func sandboxWriteError(operation string, sb *types.Sandbox, err error) error {
 	return fmt.Errorf("store: %s %s: %w", operation, sb.ID, err)
 }
 
-// Put upserts a sandbox record. Profile, cluster identity, credential subject,
+// Put upserts a sandbox record. Profile, cluster identity, stable identity,
 // tenant credential pair, and sandbox service credentials are written only by
 // the initial insert; later lifecycle updates cannot rebind an existing sandbox.
 func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
@@ -618,7 +618,7 @@ func (s *Store) DeletePreLaunchStarting(ctx context.Context, id string) (bool, e
 	return sandboxUpdateChanged("delete pre-launch starting", id, result)
 }
 
-var cols = `id,profile,cluster_group,cluster_route_key,auth_sandbox_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
+var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,snapshot_ref,
   service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`
 
@@ -626,7 +626,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	var sb types.Sandbox
 	var profile, clusterGroup, clusterRouteKey, st, meta, env, apiHash, apiEnc, manifestHash, manifestEnc string
 	var serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc string
-	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.AuthSandboxIDValue,
+	if err := row.Scan(&sb.ID, &profile, &clusterGroup, &clusterRouteKey, &sb.StableIDValue,
 		&sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
 		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc, &sb.SnapshotRef,
@@ -681,7 +681,7 @@ func validateSandboxServiceCredentials(sb *types.Sandbox) error {
 	if sb.ForwardAccessToken == "" {
 		return errors.New("forward access token is required")
 	}
-	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, sb.ServiceSecret, sb.AuthSandboxID()); err != nil {
+	if err := keys.VerifyForwardAccessToken(sb.ForwardAccessToken, sb.ServiceSecret, sb.StableID()); err != nil {
 		return errors.New("forward access token is invalid")
 	}
 	switch sb.Profile {
