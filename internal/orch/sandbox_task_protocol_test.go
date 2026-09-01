@@ -439,7 +439,7 @@ func TestSandboxTaskBootstrapNormalizesRawLocalRoot(t *testing.T) {
 	}
 	for _, portable := range []string{
 		"manifest://" + strings.Repeat("a", 64),
-		"file://relative.snapshot@sha256:" + strings.Repeat("b", 64),
+		"file://relative.snapshot@digest:" + strings.Repeat("b", 64),
 	} {
 		if got, err := normalizeSandboxTaskRootRef(portable, runDir); err != nil || got != portable {
 			t.Fatalf("portable root %q normalized to %q, %v", portable, got, err)

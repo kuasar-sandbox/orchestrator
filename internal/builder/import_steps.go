@@ -136,7 +136,7 @@ func (p *buildPipeline) useLocalImage(path string) error {
 	if err := stream.Close(); err != nil {
 		return fmt.Errorf("close local image artifact: %w", err)
 	}
-	if scheme != tarstream.DigestSchemeSHA256 {
+	if scheme != tarstream.DigestScheme {
 		return fmt.Errorf("local image artifact has unexpected digest scheme %q", scheme)
 	}
 	ref := manifest.Ref{
