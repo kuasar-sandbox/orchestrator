@@ -127,7 +127,6 @@ snapshot target/current 计算,不由 orchestrator probe 或推导。
 resource_listen:
   enabled: true
   socket: /run/sandbox-resource.sock
-  audit_path: /run/node-ctl/audit.log
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandbox.slice/sandbox-runner.slice
     - /sys/fs/cgroup/sandbox.slice/sandbox-builder.slice
@@ -385,7 +384,8 @@ admission token bucket 限制创建请求洪峰;startup pool 限制创建/恢复
 runtime grant token bucket 限制普通 grow 的节点总速率。high urgency 可使用 emergency
 pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure event 重试。
 
-`resource status`、`resource list`、audit log 和 cluster heartbeat 应同时观察:
+当前 reservation 与恢复状态通过 `resource status`、`resource list` 和 cluster heartbeat
+观察。异常 queue 诊断进入 conductor 标准日志出口,由部署环境统一采集与保留。重点口径包括:
 
 - reserved memory / pool / zone。
 - startup in-flight。

@@ -45,7 +45,7 @@ func runHotPathTraceHelper(t *testing.T) {
 	if err := server.Listen(); err != nil {
 		t.Fatal(err)
 	}
-	admission.SetWiring(state, nil, func(string, ...any) {}, server.BuildAdmitOKFromQueue)
+	admission.SetWiring(state, nil, server.BuildAdmitOKFromQueue)
 	admission.Run()
 	defer admission.Stop()
 

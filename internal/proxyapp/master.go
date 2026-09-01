@@ -9,9 +9,11 @@ import (
 	"sync"
 	"time"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -52,6 +54,24 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	}); err != nil {
 		return fmt.Errorf("proxy: set bootstrap policy: %w", err)
 	}
+	workerIDs := make([]string, cfg.Workers)
+	for index := range workerIDs {
+		workerIDs[index] = fmt.Sprintf("proxy-%d", index)
+	}
+	metricSet := metrics.New()
+	masterStats := proxystats.NewMasterStats(metricSet, workerIDs)
+
+	var routeSink routesync.Sink = view
+	var managementWrapper proxyextension.ManagementWrapper
+	if extension := runtime.MasterExtension; extension != nil {
+		host, observingSink := proxyext.New(view, table, masterStats)
+		routeSink = observingSink
+		if err := extension.Start(masterCtx, host); err != nil {
+			return fmt.Errorf("proxy master extension start: %w", err)
+		}
+		managementWrapper, _ = extension.(proxyextension.ManagementWrapper)
+	}
+
 	proxyNamespace, err := appnet.OpenProxyNetNS(cfg.ProxyNetNS)
 	if err != nil {
 		return err
@@ -65,6 +85,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		return fmt.Errorf("proxy: listen proxy_socket %s: %w", cfg.ProxySocket, err)
 	}
 	defer forwardListener.Close()
+	defer os.Remove(cfg.ProxySocket)
 
 	var dataListener net.Listener
 	if cfg.DataListen != "" {
@@ -81,18 +102,6 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	}
 	defer statsListener.Close()
 	defer os.Remove(cfg.StatsSocket)
-	workerIDs := make([]string, cfg.Workers)
-	for index := range workerIDs {
-		workerIDs[index] = fmt.Sprintf("proxy-%d", index)
-	}
-	metricSet := metrics.New()
-	masterStats := proxystats.NewMasterStats(metricSet, workerIDs)
-	startMasterTask(func() {
-		masterStats.RunGC(masterCtx, func(sandboxID string) bool {
-			_, found := table.Lookup(sandboxID)
-			return found
-		}, time.Minute)
-	})
 	statsServer := proxystats.NewStatsServer(masterStats, table.Synced, func(sandboxID string) (proxystats.RouteIdentity, bool) {
 		route, found := table.Lookup(sandboxID)
 		if !found {
@@ -102,8 +111,21 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			RunID: route.RunID, Profile: types.Profile(route.Profile), State: types.State(route.State),
 		}, true
 	}, logger)
+	managementHandler := statsServer.Handler()
+	if managementWrapper != nil {
+		managementHandler = managementWrapper.WrapManagement(managementHandler)
+		if managementHandler == nil {
+			return fmt.Errorf("proxy master extension returned a nil management handler")
+		}
+	}
 	startMasterTask(func() {
-		if err := statsServer.Serve(masterCtx, statsListener); err != nil && masterCtx.Err() == nil {
+		masterStats.RunGC(masterCtx, func(sandboxID string) bool {
+			_, found := table.Lookup(sandboxID)
+			return found
+		}, time.Minute)
+	})
+	startMasterTask(func() {
+		if err := statsServer.ServeHandler(masterCtx, statsListener, managementHandler); err != nil && masterCtx.Err() == nil {
 			logger.Error("proxy stats socket", "err", err)
 		}
 	})
@@ -120,7 +142,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
 	startMasterTask(func() {
-		routesync.NewSubscriber(dial, routesync.ProxyPluginID, registration, view, view, logger).Run(masterCtx)
+		routesync.NewSubscriber(dial, routesync.ProxyPluginID, registration, routeSink, view, logger).Run(masterCtx)
 	})
 
 	var mmdsListener net.Listener

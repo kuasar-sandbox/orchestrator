@@ -61,7 +61,17 @@ func NewStatsServer(master *MasterStats, synced func() bool, lookup func(string)
 }
 
 func (s *StatsServer) Serve(ctx context.Context, listener net.Listener) error {
-	server := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	return s.ServeHandler(ctx, listener, s.Handler())
+}
+
+// ServeHandler serves a precomposed management handler on listener. It lets a
+// trusted proxy master wrap the built-in stats routes without changing the
+// stats-socket transport or constructing a loopback client.
+func (s *StatsServer) ServeHandler(ctx context.Context, listener net.Listener, handler http.Handler) error {
+	if handler == nil {
+		return errors.New("proxy stats: management handler is required")
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = server.Close()

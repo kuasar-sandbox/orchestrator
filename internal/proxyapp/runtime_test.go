@@ -12,7 +12,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 )
+
+type runtimeTestMasterExtension struct{}
+
+func (runtimeTestMasterExtension) Start(context.Context, proxyextension.MasterHost) error { return nil }
+
+type runtimeTestWorkerExtension struct{}
+
+func (runtimeTestWorkerExtension) Start(context.Context, proxyextension.WorkerHost) error { return nil }
 
 func TestResolveRuntimeTLSProviderKeepsCorePolicy(t *testing.T) {
 	der, signer, certificate := testProxyCertificate(t)
@@ -37,6 +47,28 @@ func TestResolveRuntimeTLSProviderKeepsCorePolicy(t *testing.T) {
 	der[0] ^= 0xff
 	if runtime.DataTLS.Certificates[0].Certificate[0][0] == der[0] {
 		t.Fatal("certificate bytes were not cloned")
+	}
+}
+
+func TestResolveRuntimeCarriesProcessLocalMasterExtension(t *testing.T) {
+	extension := runtimeTestMasterExtension{}
+	runtime, err := ResolveRuntime(context.Background(), testProxyConfig(t), Bindings{MasterExtension: extension})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.MasterExtension != extension {
+		t.Fatal("MasterExtension binding was not retained")
+	}
+}
+
+func TestResolveRuntimeCarriesProcessLocalWorkerExtension(t *testing.T) {
+	extension := runtimeTestWorkerExtension{}
+	runtime, err := ResolveRuntime(context.Background(), testProxyConfig(t), Bindings{WorkerExtension: extension})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.WorkerExtension != extension {
+		t.Fatal("WorkerExtension binding was not retained")
 	}
 }
 

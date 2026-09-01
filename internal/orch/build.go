@@ -17,9 +17,9 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -43,49 +43,9 @@ const maxCABundlePEMSize = 16 * 1024
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
 func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, spec api.RegisterSpec) (*types.Build, error) {
-	if !spec.Profile.Valid() {
-		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, spec.Profile)
-	}
-	if err := spec.Resources.ValidateRequired(); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if _, err := builderResourceProperties(spec.Resources); err != nil {
-		o.recordRegistrationRejection("systemd_encoding")
-		return nil, fmt.Errorf("%w: build resources cannot be enforced by systemd: %v", api.ErrBadRequest, err)
-	}
-	executionLimit, err := configresolve.BuilderExecutionLimit(o.cfg.Builder)
+	request := buildRegisterRequest(spec, "")
+	preliminary, err := o.normalizeBuildRegistration(request, spec.MMDSHeader)
 	if err != nil {
-		return nil, err
-	}
-	if !executionLimit.AllowsOne(spec.Resources) {
-		o.recordRegistrationRejection("execution_fit")
-		return nil, fmt.Errorf("%w: build resources cannot fit builder.admission.execution", api.ErrBadRequest)
-	}
-	metadata := spec.Metadata
-	if _, present := metadata[clusterstate.ObjectMetadataKey]; present {
-		return nil, fmt.Errorf("%w: %s is node-managed cluster context", api.ErrBadRequest, clusterstate.ObjectMetadataKey)
-	}
-	builderOpts := spec.Builder
-	builderOpts.Resources = nil
-	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDS(metadata, spec.MMDSHeader, o.mmdsPolicy())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	phaseResourcePatch := metadata[sandboxcfg.NsResource]
-	if phaseResourcePatch != "" {
-		metadata = cloneStringMapWithout(metadata, sandboxcfg.NsResource)
-	}
-	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
-		return nil, err
-	}
-	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
 	pair, err := o.resolveAllowed(ctx, apiKey)
@@ -104,33 +64,41 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		return nil, fmt.Errorf("orch: new template id: %w", err)
 	}
 	templateID := types.TransientPrefix + tid.String()
-	b := &types.Build{
-		BuildID:            bid.String(),
-		TemplateID:         templateID,
-		APISecret:          pair.APISecret,
-		ManifestKey:        pair.ManifestKey,
-		Profile:            spec.Profile,
-		Kind:               types.KindImg,
-		Status:             types.BuildRegistered,
-		FromImage:          o.imageURIFromMask(templateID, bid.String()),
-		Names:              nonEmpty(spec.Name),
-		Aliases:            append([]string{}, spec.Tags...),
-		Resources:          spec.Resources,
-		PhaseResourcePatch: phaseResourcePatch,
-		Metadata:           metadata,
-		Builder:            builderOpts,
-		CreatedUnix:        time.Now().Unix(),
+	preliminary.templateID = templateID
+	final := preliminary
+	if o.extensionBuildHook != nil {
+		request = buildRegisterRequestFromCandidate(preliminary)
+		operation := newBuildOperation(conductorextension.BuildOperationRegister, conductorextension.BuildOriginDirect, bid.String(), nil)
+		operation.Register = cloneBuildRegisterRequest(request)
+		operationID := operation.ID
+		if err := o.callBuildHook(ctx, operation); err != nil {
+			return nil, err
+		}
+		if err := validateBuildOperationEnvelope(operation, operationID, conductorextension.BuildOperationRegister, conductorextension.BuildOriginDirect, bid.String()); err != nil {
+			return nil, err
+		}
+		request = cloneBuildRegisterRequest(operation.Register)
+		if request == nil {
+			return nil, fmt.Errorf("%w: extension removed build registration candidate", api.ErrBadRequest)
+		}
+		if request.TemplateID != templateID {
+			return nil, fmt.Errorf("%w: extension changed core-owned template identity", api.ErrBadRequest)
+		}
+		secretHeader, err := mmdsSecretHeader(preliminary.mmds)
+		if err != nil {
+			return nil, err
+		}
+		final, err = o.normalizeBuildRegistration(request, secretHeader)
+		if err != nil {
+			return nil, err
+		}
 	}
-	initialMMDS := initialMMDSRouteSecretValues(mmdsDoc)
-	if initialMMDS != nil {
-		transportRow := &types.Sandbox{
-			ID: "build-" + b.BuildID, Profile: b.Profile, TemplateID: b.TemplateID,
-			State: types.StateRunning, RunID: "build-registration-check",
-			APISecret: b.APISecret, ManifestKey: b.ManifestKey, Metadata: b.Metadata,
-		}
-		if err := validateInitialMMDSRouteEntry(transportRow, initialMMDS); err != nil {
-			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-		}
+	final.templateID = templateID
+	b := registeredBuildFromCandidate(bid.String(), pair, final, o.imageURIFromMask(templateID, bid.String()))
+	b.CreatedUnix = time.Now().Unix()
+	initialMMDS, err := o.validateInitialBuildMMDS(b, final.mmds)
+	if err != nil {
+		return nil, err
 	}
 	var routesDigest string
 	var secretValues store.MMDSRouteSecretValues
@@ -142,7 +110,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, err
 	}
-	registered, _, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
+	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
 		return nil, fmt.Errorf("%w: %v", api.ErrBuildAdmission, err)
@@ -151,6 +121,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		return nil, err
 	}
 	o.refreshBuildAdmissionGauges(ctx)
+	if inserted {
+		o.observeBuildUpsert(registered)
+	}
 	return registered, nil
 }
 
@@ -174,18 +147,47 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if b.Status != types.BuildRegistered {
 		return &api.BuildStateConflictError{State: b.Status}
 	}
-	if err := assertBuildResources(b.Resources, spec.ResourceAssertion); err != nil {
-		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	if err := validateBuildTriggerDefinition(b, spec); err != nil {
+		return err
 	}
-	if !b.Profile.Valid() {
-		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
+	if o.extensionBuildHook != nil {
+		precondition := buildPrecondition(b)
+		operation := newBuildOperation(conductorextension.BuildOperationTrigger, conductorextension.BuildOriginDirect, bid, b)
+		operation.Trigger = buildTriggerRequest(spec)
+		operationID := operation.ID
+		if err := o.callBuildHook(ctx, operation); err != nil {
+			return err
+		}
+		if err := validateBuildOperationEnvelope(operation, operationID, conductorextension.BuildOperationTrigger, conductorextension.BuildOriginDirect, bid); err != nil {
+			return err
+		}
+		request := cloneBuildTriggerRequest(operation.Trigger)
+		if request == nil {
+			return fmt.Errorf("%w: extension removed build trigger candidate", api.ErrBadRequest)
+		}
+		spec = internalBuildTriggerRequest(request)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current, err := o.st.GetBuild(ctx, bid)
+		if err != nil {
+			return err
+		}
+		if !ownsBuild(current, apiKey) || current.TemplateID != tid {
+			return api.ErrNotFound
+		}
+		if current.Status != types.BuildRegistered {
+			return &api.BuildStateConflictError{State: current.Status}
+		}
+		if !buildPreconditionMatches(precondition, current) {
+			return api.ErrBuildChanged
+		}
+		b = current
+		if err := validateBuildTriggerDefinition(b, spec); err != nil {
+			return err
+		}
 	}
-	if b.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
-		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
-	}
-	if spec.FromImage != "" && spec.FromTemplate != "" {
-		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
-	}
+	b = cloneBuildForObservation(b)
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
 	// front so the build fails fast instead of mid-pipeline.
@@ -235,7 +237,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		}
 		b.FromImage, b.FromTemplate = fromImage, ""
 	}
-	b.Steps = spec.Steps
+	b.Steps = internalBuildSteps(publicBuildSteps(spec.Steps))
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
 	// Node builder.insecure_registry (plain HTTP) and a per-build registry TLS
@@ -258,11 +260,17 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if b.RegistryAuth, err = o.resolveBuildCreds(ctx, b, auth.PullToken, auth.RegistryUsername, auth.RegistryPassword); err != nil {
 		return err
 	}
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
 	b.Status = types.BuildWaiting
 	b.WaitingUnix = time.Now().Unix()
 	committed, err := o.commitBuildTrigger(ctx, b)
-	if err != nil || committed {
+	if err != nil {
 		return err
+	}
+	if committed {
+		o.observeBuildUpsert(b)
+		return nil
 	}
 	current, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
@@ -272,6 +280,22 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return api.ErrNotFound
 	}
 	return &api.BuildStateConflictError{State: current.Status}
+}
+
+func validateBuildTriggerDefinition(build *types.Build, spec api.TriggerSpec) error {
+	if err := assertBuildResources(build.Resources, spec.ResourceAssertion); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if !build.Profile.Valid() {
+		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, build.Profile)
+	}
+	if build.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
+		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
+	}
+	if spec.FromImage != "" && spec.FromTemplate != "" {
+		return fmt.Errorf("%w: fromImage and fromTemplate are mutually exclusive", api.ErrBadRequest)
+	}
+	return nil
 }
 
 func assertBuildResources(resources types.BuildResources, assertion buildcfg.ResourcePatch) error {
@@ -574,6 +598,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			if err != nil {
 				return
 			}
+			unlockEvent := o.lockExtensionBuildEvent(candidate.BuildID)
 			won, err := o.st.ClaimBuildExecution(ctx, candidate.BuildID, executionLimit, now)
 			if err != nil {
 				finish()
@@ -581,6 +606,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 					reason := "build resources no longer fit configured execution limits"
 					expired, expireErr := o.st.ExpireBuild(ctx, candidate.BuildID, types.BuildWaiting, reason)
 					if expireErr != nil {
+						unlockExtensionEvent(unlockEvent)
 						o.log.Warn("reject permanently unfit build", "bid", candidate.BuildID, "err", expireErr)
 						return
 					}
@@ -588,13 +614,19 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 						o.recordExecutionRejection("configuration")
 						o.refreshBuildAdmissionGauges(ctx)
 						o.publishBuildState(candidate.BuildID, "error", "", reason)
+						failed := cloneBuildForObservation(candidate)
+						markBuildRemoved(failed, reason)
+						o.observeBuildRemove(failed)
 					}
+					unlockExtensionEvent(unlockEvent)
 					continue
 				}
+				unlockExtensionEvent(unlockEvent)
 				o.log.Warn("build execution admission", "bid", candidate.BuildID, "err", err)
 				return
 			}
 			if !won {
+				unlockExtensionEvent(unlockEvent)
 				o.recordExecutionWouldWait(ctx)
 				finish()
 				return
@@ -610,6 +642,8 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			claimed.ExecutionClaimedUnix = now.Unix()
 			claimed.EnforcementStatus = "pending"
 			o.publishBuildState(claimed.BuildID, "building", "", "")
+			o.observeBuildUpsert(claimed)
+			unlockExtensionEvent(unlockEvent)
 			go func() {
 				defer finish()
 				o.executeBuild(ctx, claimed)
@@ -649,8 +683,10 @@ func (o *Orchestrator) expireBuildQueues(ctx context.Context, now time.Time) {
 			if stamp <= 0 || stamp > expiry.before {
 				continue
 			}
+			unlockEvent := o.lockExtensionBuildEvent(build.BuildID)
 			expired, err := o.st.ExpireBuild(ctx, build.BuildID, expiry.state, expiry.reason)
 			if err != nil {
+				unlockExtensionEvent(unlockEvent)
 				o.log.Warn("expire build", "bid", build.BuildID, "err", err)
 				continue
 			}
@@ -658,7 +694,11 @@ func (o *Orchestrator) expireBuildQueues(ctx context.Context, now time.Time) {
 				o.recordBuildExpired(expiry.state)
 				o.refreshBuildAdmissionGauges(ctx)
 				o.publishBuildState(build.BuildID, "error", "", expiry.reason)
+				failed := cloneBuildForObservation(build)
+				markBuildRemoved(failed, expiry.reason)
+				o.observeBuildRemove(failed)
 			}
+			unlockExtensionEvent(unlockEvent)
 		}
 	}
 }
@@ -806,12 +846,14 @@ func (o *Orchestrator) completeBuildWithPublisher(
 			return
 		}
 	}
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
 	switch {
 	case err == nil && res != nil && res.Error != "":
 		if res.FailureStage == "snapshot_prepare" {
 			b.Status, b.Reason = types.BuildError, res.Error
 			if o.persistTerminalBuild(ctx, b) {
-				publish(b.BuildID, "error", "", b.Reason)
+				o.publishTerminalBuild(publish, b, "")
 			}
 			// run-builder emitted the task_snapshot_prepare_error_total event at
 			// the reader failure. Record the terminal stage here without counting
@@ -825,7 +867,7 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		o.log.Warn("build failed", "bid", b.BuildID, "failure_stage", "runtime", "err", res.Error)
 		return
@@ -835,7 +877,7 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		stage := buildFailureStage(err)
 		if stage == "snapshot_prepare" {
@@ -849,14 +891,14 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	if res == nil {
 		b.Status, b.Reason = types.BuildError, "build produced no result"
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		return
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotRef != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		return
 	}
@@ -870,14 +912,14 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		return
 	}
 	if _, err := types.ParseTemplateID(b.PersistID); err != nil {
 		b.Status, b.Reason = types.BuildError, "build produced invalid portable ref: "+err.Error()
 		if o.persistTerminalBuild(ctx, b) {
-			publish(b.BuildID, "error", "", b.Reason)
+			o.publishTerminalBuild(publish, b, "")
 		}
 		return
 	}
@@ -888,8 +930,21 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	if !o.persistTerminalBuild(ctx, b) {
 		return
 	}
-	publish(b.BuildID, "ready", b.PersistID, "")
+	o.publishTerminalBuild(publish, b, b.PersistID)
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
+}
+
+func (o *Orchestrator) publishTerminalBuild(
+	publish func(buildID, state, templateID, reason string),
+	build *types.Build,
+	templateID string,
+) {
+	publish(build.BuildID, string(build.Status), templateID, build.Reason)
+	if build.Status == types.BuildError {
+		o.observeBuildRemove(build)
+		return
+	}
+	o.observeBuildUpsert(build)
 }
 
 func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Build) bool {
@@ -901,7 +956,15 @@ func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Bu
 		if err == nil {
 			build.ExecutionClaimed = false
 			build.ExecutionClaimedUnix = 0
+			build.Phase = ""
+			build.PhaseSandboxID = ""
+			build.RuntimeVswitchPort = ""
+			build.RuntimeFloatingIP = ""
+			build.RuntimePortMAC = ""
+			build.RuntimeEnvdAccessToken = ""
+			build.RuntimePrepareJSON = ""
 			build.ExecutionResult = nil
+			build.Metadata = cloneStringMapWithout(build.Metadata, sandboxcfg.NsMMDS)
 			o.refreshBuildAdmissionGauges(context.Background())
 			return true
 		}
@@ -1043,12 +1106,15 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("network_commit", err)
 	}
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
 	owned, err := o.st.SetBuildRuntimePreparation(buildCtx, b.BuildID, b.RunID,
 		port.Port, port.FloatingIP, port.MAC, envdTok, prepareJSON)
 	if err != nil {
+		unlockExtensionEvent(unlockEvent)
 		return nil, buildFailed("network_commit", err)
 	}
 	if !owned {
+		unlockExtensionEvent(unlockEvent)
 		return nil, buildFailed("network_commit", fmt.Errorf("build: exact-run ownership lost before runtime preparation"))
 	}
 	runtimePersisted = true
@@ -1058,9 +1124,12 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 
 	final, err := o.buildSpecForPending(buildCtx, pend)
 	if err != nil {
+		unlockExtensionEvent(unlockEvent)
 		return nil, buildFailed("config_write", err)
 	}
 	mmdsRow = o.publishBuildFinal(pend, final)
+	o.observeBuildUpsert(b)
+	unlockExtensionEvent(unlockEvent)
 	if mmdsRow != nil {
 		defer func() {
 			o.uncache(mmdsRow.ID)
@@ -1240,6 +1309,8 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 	if effective != properties {
 		return "", fmt.Errorf("build: unit %s resource properties effective=%+v want=%+v", unit, effective, properties)
 	}
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	defer unlockExtensionEvent(unlockEvent)
 	bound, err := o.st.BindBuildRun(ctx, b.BuildID, runID, "cpu,memory")
 	if err != nil {
 		return "", err
@@ -1249,6 +1320,7 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 	}
 	b.RunID = runID
 	b.EnforcementStatus = "cpu,memory"
+	o.observeBuildUpsert(b)
 	return unit, nil
 }
 
@@ -1296,6 +1368,8 @@ type buildRuntimeCleanupProgress struct {
 func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir string, persisted bool) (buildRuntimeCleanupProgress, error) {
 	progress := buildRuntimeCleanupProgress{port: port, dir: dir, persisted: persisted}
 	var cleanupErr error
+	runtimeCleared := false
+	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	func() {
@@ -1324,9 +1398,14 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir str
 				b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimeEnvdAccessToken = "", "", "", ""
 				b.RuntimePrepareJSON = ""
 				progress.port, progress.persisted = "", false
+				runtimeCleared = true
 			}
 		}
 	}()
+	if runtimeCleared {
+		o.observeBuildUpsert(b)
+	}
+	unlockExtensionEvent(unlockEvent)
 	removeAll := o.removeBuildRuntimeDir
 	if removeAll == nil {
 		removeAll = os.RemoveAll

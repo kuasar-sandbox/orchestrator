@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -30,7 +31,7 @@ func (o *Orchestrator) ActivateRoute(ctx context.Context, expected proxy.RouteBi
 	if expected.SandboxID == "" {
 		return proxy.Route{}, false, nil
 	}
-	current, _, err := o.ensureResumeAccepted(ctx, expected.SandboxID, nil, func(sb *types.Sandbox) error {
+	current, _, err := o.ensureResumeAcceptedFrom(ctx, expected.SandboxID, nil, conductorextension.SandboxOriginProxy, func(sb *types.Sandbox) error {
 		// A Sandbox artifact (E) resume source is a cold start owned by explicit
 		// Connect: the in-process router must not auto-boot it on data-plane
 		// traffic (sandboxer#143 §1.3) — same contract as proxyshm.WorkerView.

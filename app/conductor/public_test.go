@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/app/conductor"
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 )
 
 func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
@@ -33,8 +34,48 @@ func TestPublicConductorAPICompilesWithoutInternalTypes(t *testing.T) {
 		conductor.ObjectStoreCredentials{}, (*conductor.App)(nil),
 		(*conductor.TLSMaterialProvider)(nil), (*conductor.EncryptionKeyProvider)(nil),
 		(*conductor.ObjectStoreCredentialsProvider)(nil),
+		(*conductorextension.Extension)(nil), (*conductorextension.Host)(nil),
+		(*conductorextension.APIWrapper)(nil), (*conductorextension.SandboxHook)(nil), (*conductorextension.BuildHook)(nil),
+		(*conductorextension.SandboxSource)(nil), (*conductorextension.BuildSource)(nil),
+		conductorextension.SandboxView{}, conductorextension.SandboxEvent{},
+		conductorextension.BuildView{}, conductorextension.BuildEvent{},
+		conductorextension.SandboxOperation{}, conductorextension.SandboxCreateRequest{},
+		conductorextension.SandboxPauseRequest{}, conductorextension.SandboxResumeRequest{}, conductorextension.SandboxDeleteRequest{},
+		conductorextension.BuildOperation{}, conductorextension.BuildRegisterRequest{}, conductorextension.BuildTriggerRequest{},
 	} {
 		assertNoInternalType(t, reflect.TypeOf(value), seen)
+	}
+}
+
+func TestObjectViewsDoNotCarryRawCredentialsOrEnvironment(t *testing.T) {
+	for name, value := range map[string]any{
+		"sandbox": conductorextension.SandboxView{},
+		"build":   conductorextension.BuildView{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			typeOf := reflect.TypeOf(value)
+			for _, forbidden := range []string{
+				"APISecret", "ManifestKey", "ServiceSecret", "Env", "EnvdAccessToken",
+				"TrafficAccessToken", "ForwardAccessToken", "RegistryAuth",
+				"RuntimeEnvdAccessToken", "RuntimePrepareJSON", "ExecutionResult",
+			} {
+				if _, found := typeOf.FieldByName(forbidden); found {
+					t.Fatalf("%s view exposes forbidden field %s", name, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildHookRequestDoesNotCarryCredentialInputs(t *testing.T) {
+	typeOf := reflect.TypeOf(conductorextension.BuildRegisterRequest{})
+	for _, forbidden := range []string{
+		"MMDS", "MMDSHeader", "MMDSSecrets", "RegistryAuth", "PullToken",
+		"RegistryUsername", "RegistryPassword",
+	} {
+		if _, found := typeOf.FieldByName(forbidden); found {
+			t.Fatalf("BuildRegisterRequest exposes forbidden credential input %s", forbidden)
+		}
 	}
 }
 

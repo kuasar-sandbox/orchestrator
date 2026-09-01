@@ -1,0 +1,93 @@
+package conductor
+
+import conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+
+type Extension = conductorextension.Extension
+type Host = conductorextension.Host
+type APIWrapper = conductorextension.APIWrapper
+type SandboxHook = conductorextension.SandboxHook
+type BuildHook = conductorextension.BuildHook
+type Profile = conductorextension.Profile
+type SandboxSource = conductorextension.SandboxSource
+type SandboxView = conductorextension.SandboxView
+type SandboxClusterView = conductorextension.SandboxClusterView
+type SandboxState = conductorextension.SandboxState
+type SnapshotLocation = conductorextension.SnapshotLocation
+type SandboxEvent = conductorextension.SandboxEvent
+type SandboxEventKind = conductorextension.SandboxEventKind
+type BuildSource = conductorextension.BuildSource
+type BuildView = conductorextension.BuildView
+type BuildKind = conductorextension.BuildKind
+type BuildState = conductorextension.BuildState
+type BuildResources = conductorextension.BuildResources
+type BuildStep = conductorextension.BuildStep
+type BuildOptions = conductorextension.BuildOptions
+type BuildRefererOptions = conductorextension.BuildRefererOptions
+type BuildRegistryOptions = conductorextension.BuildRegistryOptions
+type BuildRegistryTLSOptions = conductorextension.BuildRegistryTLSOptions
+type BuildEvent = conductorextension.BuildEvent
+type BuildEventKind = conductorextension.BuildEventKind
+type SandboxOperation = conductorextension.SandboxOperation
+type SandboxOperationKind = conductorextension.SandboxOperationKind
+type SandboxOperationOrigin = conductorextension.SandboxOperationOrigin
+type SandboxCreateRequest = conductorextension.SandboxCreateRequest
+type SandboxPauseRequest = conductorextension.SandboxPauseRequest
+type SandboxResumeRequest = conductorextension.SandboxResumeRequest
+type SandboxDeleteRequest = conductorextension.SandboxDeleteRequest
+type BuildOperation = conductorextension.BuildOperation
+type BuildOperationKind = conductorextension.BuildOperationKind
+type BuildOperationOrigin = conductorextension.BuildOperationOrigin
+type BuildRegisterRequest = conductorextension.BuildRegisterRequest
+type BuildTriggerRequest = conductorextension.BuildTriggerRequest
+type BuildResourcePatch = conductorextension.BuildResourcePatch
+
+var ErrRejected = conductorextension.ErrRejected
+
+const (
+	ProfileE2B  = conductorextension.ProfileE2B
+	ProfileBare = conductorextension.ProfileBare
+
+	SandboxStateStarting = conductorextension.SandboxStateStarting
+	SandboxStateRunning  = conductorextension.SandboxStateRunning
+	SandboxStatePaused   = conductorextension.SandboxStatePaused
+	SandboxStateDead     = conductorextension.SandboxStateDead
+
+	SnapshotLocationNone   = conductorextension.SnapshotLocationNone
+	SnapshotLocationLocal  = conductorextension.SnapshotLocationLocal
+	SnapshotLocationRemote = conductorextension.SnapshotLocationRemote
+
+	SandboxSyncBegin = conductorextension.SandboxSyncBegin
+	SandboxUpsert    = conductorextension.SandboxUpsert
+	SandboxDelete    = conductorextension.SandboxDelete
+	SandboxSyncEnd   = conductorextension.SandboxSyncEnd
+
+	BuildKindImage    = conductorextension.BuildKindImage
+	BuildKindSnapshot = conductorextension.BuildKindSnapshot
+
+	BuildStateRegistered = conductorextension.BuildStateRegistered
+	BuildStateWaiting    = conductorextension.BuildStateWaiting
+	BuildStateBuilding   = conductorextension.BuildStateBuilding
+	BuildStateReady      = conductorextension.BuildStateReady
+	BuildStateError      = conductorextension.BuildStateError
+
+	BuildSyncBegin = conductorextension.BuildSyncBegin
+	BuildUpsert    = conductorextension.BuildUpsert
+	BuildRemove    = conductorextension.BuildRemove
+	BuildSyncEnd   = conductorextension.BuildSyncEnd
+
+	SandboxOperationCreate = conductorextension.SandboxOperationCreate
+	SandboxOperationPause  = conductorextension.SandboxOperationPause
+	SandboxOperationResume = conductorextension.SandboxOperationResume
+	SandboxOperationDelete = conductorextension.SandboxOperationDelete
+
+	SandboxOriginDirect  = conductorextension.SandboxOriginDirect
+	SandboxOriginCluster = conductorextension.SandboxOriginCluster
+	SandboxOriginProxy   = conductorextension.SandboxOriginProxy
+	SandboxOriginExec    = conductorextension.SandboxOriginExec
+
+	BuildOperationRegister = conductorextension.BuildOperationRegister
+	BuildOperationTrigger  = conductorextension.BuildOperationTrigger
+
+	BuildOriginDirect  = conductorextension.BuildOriginDirect
+	BuildOriginCluster = conductorextension.BuildOriginCluster
+)

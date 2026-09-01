@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -198,7 +199,7 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 			return
 		}
 		unlock()
-		if _, _, err := o.ensureResumeAccepted(ctx, sid, nil, nil); err != nil {
+		if _, _, err := o.ensureResumeAcceptedFrom(ctx, sid, nil, conductorextension.SandboxOriginProxy, nil); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 		}
 	case types.StateStarting:

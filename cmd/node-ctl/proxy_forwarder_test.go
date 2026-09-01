@@ -40,9 +40,9 @@ func (s connectStubRouter) ActivateRoute(_ context.Context, _ proxy.RouteBinding
 	return s.r, true, nil
 }
 
-// TestProxyForwarderConnectRelay drives a chained CONNECT end to end: client ->
-// proxyForwarder -> proxy UDS -> backend. It exercises the explicit chained
-// CONNECT path used by the external proxy fallback.
+// TestProxyForwarderConnectRelay drives CONNECT end to end: client ->
+// proxyForwarder -> proxy UDS -> backend. It exercises the transparent
+// CONNECT relay used by the external proxy fallback.
 func TestProxyForwarderConnectRelay(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -107,7 +107,7 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	fmt.Fprintf(c, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\nE2b-Sandbox-Service: forward\r\nE2b-Sandbox-Port: %s\r\nX-Access-Token: tok\r\n\r\n", bport, bport, bport)
+	fmt.Fprintf(c, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\nE2b-Sandbox-Service: forward\r\nE2b-Sandbox-Port: %s\r\nX-Access-Token: tok\r\n\r\nping\n", bport, bport, bport)
 	br := bufio.NewReader(c)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
@@ -115,9 +115,6 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("relayed CONNECT = %d (want 200)", resp.StatusCode)
-	}
-	if _, err := io.WriteString(c, "ping\n"); err != nil {
-		t.Fatal(err)
 	}
 	line, _ := br.ReadString('\n')
 	if strings.TrimSpace(line) != "ping" {
@@ -127,8 +124,14 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 		t.Fatalf("worker target = %#v, want %#v", workerTarget, want)
 	}
 	waitForwarderTraffic(t, masterStats, 0, 1)
-	if err := c.Close(); err != nil {
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatal(err)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("half-close relay read error = %v, want EOF", err)
 	}
 	waitForwarderTraffic(t, masterStats, 0, 0)
 }
@@ -204,7 +207,7 @@ func TestProxyForwarderPreservesPortlessLogicalService(t *testing.T) {
 	}
 }
 
-func TestProxyForwarderOrdinaryHTTPKeepsServiceInsideLegacyTunnel(t *testing.T) {
+func TestProxyForwarderOrdinaryHTTPIsSentDirectlyOnce(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	workerSock := filepath.Join(t.TempDir(), "px.sock")
 	wln, err := net.Listen("unix", workerSock)
@@ -214,43 +217,24 @@ func TestProxyForwarderOrdinaryHTTPKeepsServiceInsideLegacyTunnel(t *testing.T) 
 	defer wln.Close()
 
 	type observedRequest struct {
-		outerService string
-		outerPort    string
-		innerService string
+		method  string
+		path    string
+		service string
+		port    string
+		body    string
 	}
 	observed := make(chan observedRequest, 1)
 	wsrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			t.Error("worker response writer cannot hijack")
-			return
-		}
-		conn, rw, err := hj.Hijack()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		defer conn.Close()
-		if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-			t.Error(err)
-			return
-		}
-		if err := rw.Flush(); err != nil {
-			t.Error(err)
-			return
-		}
-		inner, err := http.ReadRequest(rw.Reader)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
 			return
 		}
 		observed <- observedRequest{
-			outerService: r.Header.Get(proxy.HeaderSandboxService),
-			outerPort:    r.Header.Get(proxy.HeaderSandboxPort),
-			innerService: inner.Header.Get(proxy.HeaderSandboxService),
+			method: r.Method, path: r.URL.RequestURI(), body: string(body),
+			service: r.Header.Get(proxy.HeaderSandboxService), port: r.Header.Get(proxy.HeaderSandboxPort),
 		}
-		_, _ = rw.WriteString("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-		_ = rw.Flush()
+		w.WriteHeader(http.StatusNoContent)
 	})}
 	go wsrv.Serve(wln)
 	defer wsrv.Close()
@@ -261,7 +245,7 @@ func TestProxyForwarderOrdinaryHTTPKeepsServiceInsideLegacyTunnel(t *testing.T) 
 	ts := httptest.NewServer(pf)
 	defer ts.Close()
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/status", nil)
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/status?probe=1", strings.NewReader("streamed-once"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,9 +262,142 @@ func TestProxyForwarderOrdinaryHTTPKeepsServiceInsideLegacyTunnel(t *testing.T) 
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 	got := <-observed
-	want := observedRequest{outerPort: "49983", innerService: "application-defined"}
+	want := observedRequest{
+		method: http.MethodPost, path: "/status?probe=1", service: "application-defined",
+		port: "49983", body: "streamed-once",
+	}
 	if got != want {
 		t.Fatalf("worker request = %#v, want %#v", got, want)
+	}
+}
+
+func TestProxyForwarderLetsPrivateRawRequestReachWorker(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	workerSock := filepath.Join(t.TempDir(), "px.sock")
+	listener, err := net.Listen("unix", workerSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	observed := make(chan string, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed <- r.Header.Get("X-Sandbox-Id") + " " + r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+
+	registry := configsock.NewRegistry()
+	registry.Add(&configsock.Plugin{ID: "px0", Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: workerSock}}}})
+	forwarder := httptest.NewServer(newProxyForwarder(registry, metrics.New(), log))
+	defer forwarder.Close()
+	request, err := http.NewRequest(http.MethodGet, forwarder.URL+"/private/sandboxes/s1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "private.invalid"
+	request.Header.Set("X-Sandbox-Id", "s1")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || <-observed != "s1 /private/sandboxes/s1" {
+		t.Fatalf("response=%d", response.StatusCode)
+	}
+}
+
+func TestProxyForwarderAffinityIsStableForCanonicalAndRawRequests(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := configsock.NewRegistry()
+	servers := make([]*http.Server, 0, 2)
+	for index := 0; index < 2; index++ {
+		workerID := strconv.Itoa(index)
+		socket := filepath.Join(t.TempDir(), "px.sock")
+		listener, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Worker-Id", workerID)
+			w.WriteHeader(http.StatusNoContent)
+		})}
+		servers = append(servers, server)
+		go server.Serve(listener)
+		defer listener.Close()
+		registry.Add(&configsock.Plugin{ID: "px" + workerID, Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: socket}}}})
+	}
+	defer func() {
+		for _, server := range servers {
+			_ = server.Close()
+		}
+	}()
+	forwarder := httptest.NewServer(newProxyForwarder(registry, metrics.New(), log))
+	defer forwarder.Close()
+
+	do := func(path, host string, canonical bool) string {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, forwarder.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Host = host
+		if canonical {
+			request.Header.Set(proxy.HeaderSandboxID, "stable-s1")
+			request.Header.Set(proxy.HeaderSandboxPort, "8080")
+		} else {
+			request.Header.Set("X-Sandbox-Id", "private-s1")
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		return response.Header.Get("X-Worker-Id")
+	}
+	rawFirst := do("/private?revision=1", "private.example", false)
+	rawSecond := do("/private?revision=2", "private.example", false)
+	if rawFirst == "" || rawSecond != rawFirst {
+		t.Fatalf("raw affinity changed: first=%q second=%q", rawFirst, rawSecond)
+	}
+	canonicalFirst := do("/one", "one.example", true)
+	canonicalSecond := do("/different", "different.example", true)
+	if canonicalFirst == "" || canonicalSecond != canonicalFirst {
+		t.Fatalf("canonical affinity changed: first=%q second=%q", canonicalFirst, canonicalSecond)
+	}
+}
+
+func TestProxyForwarderWithoutExtensionKeepsBuiltInParserError(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	workerSock := filepath.Join(t.TempDir(), "px.sock")
+	listener, err := net.Listen("unix", workerSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &http.Server{Handler: proxy.New(connectStubRouter{}, nil, log, nil)}
+	go server.Serve(listener)
+	defer server.Close()
+	registry := configsock.NewRegistry()
+	registry.Add(&configsock.Plugin{ID: "px0", Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: workerSock}}}})
+	forwarder := httptest.NewServer(newProxyForwarder(registry, metrics.New(), log))
+	defer forwarder.Close()
+	request, err := http.NewRequest(http.MethodGet, forwarder.URL+"/invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "not-canonical"
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest || response.Header.Get(proxy.HeaderProxyError) != proxy.ProxyErrorBadRequest || string(body) != "bad sandbox host\n" {
+		t.Fatalf("response=%d headers=%v body=%q", response.StatusCode, response.Header, body)
 	}
 }
 

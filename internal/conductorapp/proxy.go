@@ -1,9 +1,11 @@
 package conductorapp
 
 import (
+	"bufio"
 	"context"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"net/http"
 
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
@@ -44,8 +46,9 @@ func (p *ExternalTrafficProvider) SandboxTrafficStats(ctx context.Context, sandb
 	return results[0].Stats, nil
 }
 
-// ProxyForwarder is the conductor's external-mode fallback. Each request uses
-// a fresh chained CONNECT to a registered proxy UDS.
+// ProxyForwarder is the conductor's external-mode fallback. Each request is
+// sent unchanged over a fresh connection to one registered proxy UDS; the
+// worker's raw ingress wrapper and built-in handler are the final parsers.
 type ProxyForwarder struct {
 	registry *configsock.Registry
 	metrics  *metrics.M
@@ -57,22 +60,6 @@ func NewProxyForwarder(registry *configsock.Registry, mx *metrics.M, logger *slo
 }
 
 func (p *ProxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var (
-		sandboxID string
-		target    proxy.ConnectTarget
-		ok        bool
-	)
-	if r.Method == http.MethodConnect {
-		sandboxID, target, ok = proxy.ParseConnect(r)
-	} else {
-		var port int
-		sandboxID, port, ok = proxy.ParseSandbox(r)
-		target = proxy.LegacyTarget(port)
-	}
-	if !ok {
-		http.Error(w, "bad sandbox host", http.StatusBadRequest)
-		return
-	}
 	targets := p.registry.ProxyTargets()
 	if len(targets) == 0 {
 		p.metrics.Inc(`proxy_forwarder_total{result="no_proxy"}`)
@@ -80,38 +67,73 @@ func (p *ProxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(sandboxID))
-	p.forward(w, r, targets[hash.Sum32()%uint32(len(targets))], sandboxID, target)
+	_, _ = hash.Write([]byte(proxyAffinityKey(r)))
+	p.forward(w, r, targets[hash.Sum32()%uint32(len(targets))])
 }
 
-func (p *ProxyForwarder) forward(w http.ResponseWriter, r *http.Request, socket, sandboxID string, target proxy.ConnectTarget) {
-	backend, buffered, response, err := proxy.DialSandboxConnect(r.Context(), "unix", socket, sandboxID, target, r.Header.Get(proxy.HeaderAccessToken))
+func proxyAffinityKey(r *http.Request) string {
+	if r.Method == http.MethodConnect {
+		if sandboxID, _, ok := proxy.ParseConnect(r); ok {
+			return "sandbox\x00" + sandboxID
+		}
+	} else if sandboxID, _, ok := proxy.ParseSandbox(r); ok {
+		return "sandbox\x00" + sandboxID
+	}
+	path := ""
+	if r.URL != nil {
+		path = r.URL.EscapedPath()
+		if path == "" {
+			path = r.URL.Path
+		}
+	}
+	return "raw\x00" + r.Host + "\x00" + r.Method + "\x00" + path
+}
+
+func (p *ProxyForwarder) forward(w http.ResponseWriter, r *http.Request, socket string) {
+	backend, err := (&net.Dialer{}).DialContext(r.Context(), "unix", socket)
 	if err != nil {
 		p.metrics.Inc(`proxy_forwarder_total{result="error"}`)
 		http.Error(w, "proxy unreachable", http.StatusBadGateway)
 		return
 	}
-	if response.StatusCode != http.StatusOK {
+	outbound := r.Clone(r.Context())
+	outbound.RequestURI = ""
+	if r.Method == http.MethodConnect {
+		// CONNECT payload starts only after the worker accepts the tunnel. In
+		// particular, an HTTP/2 request Body is the downstream duplex stream and
+		// must not be consumed while writing the HTTP/1.1 handshake to the UDS.
+		outbound.Body = http.NoBody
+		outbound.ContentLength = 0
+		outbound.TransferEncoding = nil
+	}
+	if err := outbound.Write(backend); err != nil {
 		backend.Close()
 		p.metrics.Inc(`proxy_forwarder_total{result="error"}`)
-		http.Error(w, "connect refused by worker", response.StatusCode)
+		http.Error(w, "proxy unreachable", http.StatusBadGateway)
 		return
 	}
-	if r.Method == http.MethodConnect {
+	buffered := bufio.NewReader(backend)
+	response, err := http.ReadResponse(buffered, outbound)
+	if err != nil {
+		backend.Close()
+		p.metrics.Inc(`proxy_forwarder_total{result="error"}`)
+		http.Error(w, "proxy unreachable", http.StatusBadGateway)
+		return
+	}
+	if r.Method == http.MethodConnect && response.StatusCode == http.StatusOK {
 		p.metrics.Inc(`proxy_forwarder_total{result="ok"}`)
 		proxy.TunnelBuffered(w, r, backend, buffered)
 		return
 	}
 	defer backend.Close()
-	innerResponse, err := proxy.ForwardHTTPOnce(r, backend, buffered, nil)
-	if err != nil {
+	defer response.Body.Close()
+	if (response.StatusCode != http.StatusOK && r.Method == http.MethodConnect) ||
+		response.Header.Get(proxy.HeaderProxyError) != "" {
 		p.metrics.Inc(`proxy_forwarder_total{result="error"}`)
-		http.Error(w, "proxy unreachable", http.StatusBadGateway)
-		return
+	} else {
+		p.metrics.Inc(`proxy_forwarder_total{result="ok"}`)
 	}
-	defer innerResponse.Body.Close()
-	p.metrics.Inc(`proxy_forwarder_total{result="ok"}`)
-	proxy.WriteHTTPResponse(w, innerResponse)
+	proxy.WriteHTTPResponse(w, response)
 }
 
 func buildDataPlane(cfg *publicconfig.Conductor, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, workerStats *proxystats.WorkerStats, logger *slog.Logger, proxyNS *netns.NetNS) http.Handler {

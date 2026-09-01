@@ -475,6 +475,7 @@ custom main 只需要公共包；完整可编译版本见 `examples/custom-condu
 app := conductor.New(conductor.Hooks{
     Configure: func(ctx context.Context, cfg *conductor.Config, rt *conductor.Runtime) error {
         // 替换/调整 declarative Config；绑定启动期 Runtime provider。
+        rt.Extension = myExtension
         return nil
     },
 })
@@ -486,7 +487,7 @@ if err := app.Run(); err != nil {
 `New` 无副作用，`Run` one-shot 并处理 SIGINT/SIGTERM；托管方可用 `RunContext`。App 不调用
 `os.Exit`。执行顺序固定为：decode bootstrap → clone Config → `Configure` exactly once →
 校验 `paths.conductor_executable` 未改变 → final declarative validation → 再 clone/freeze →
-解析 Runtime 材料 → 启动共享 conductor core。Hook/provider/final-validation 失败时尚未打开
+解析 Runtime 材料 → 启动共享 conductor core。Configure/provider/final-validation 失败时尚未打开
 durable store、listener、systemd launcher/unit 或 node-link。Hook 可整体替换 Config，但必须
 恢复最初冻结的 executable；Hook 后不会重新应用默认值。
 
@@ -496,18 +497,38 @@ handler、读取 bootstrap FD 或启动 goroutine 之前返回明确错误。`no
 诊断进程 EUID 代替实际 service owner policy；custom 模式明确提示 runtime owner 与 final
 validation 均延后到 component startup。
 
-`Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，V1 只开放 logger、
-TLS material、AES-256 ordered key set 与 builder files-storage neutral credentials provider。
+`Config` 只含可序列化声明；`Runtime` 是禁止 JSON 序列化的进程对象，开放 logger、
+TLS material、AES-256 ordered key set、builder files-storage neutral credentials provider，
+以及一个可信、静态编译的 `Extension`。
 TLS provider 返回 DER certificate chain、`crypto.Signer` 与 root/client CA pool，不能返回任意
 `*tls.Config`；最低 TLS 版本、ALPN、mTLS/client verification 仍由 core 固定。所有 provider
 只在启动/SDK credential refresh 使用，不进入请求热路径；provider 非 nil 即为权威来源，
 任何错误都不回退文件、环境或静态 credential。V1 不支持热更新。
 
+Extension 的 `Start(ctx, Host)` 在 store/launcher/core 构造后、InstallUnits/reconcile/pool/
+node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取消通知 Extension 自有 goroutine
+退出。`Host` 提供 Sandbox/Build `Get+Watch` 非秘密深拷贝视图。Watch 使用
+`sync_begin → snapshot → sync_end → live` generation；慢 watcher 只使自己的 generation
+失效并自动 full resync，不保证观察每个中间变化，也不是 durable audit。完整合同见
+[extensions.md](extensions.md)。
+
+同一 Extension 可选实现 `SandboxHook`、`BuildHook` 与 `APIWrapper`；这些能力只在 Start
+成功后检查一次并冻结。生命周期 Hook 都在认证后、durable/runner/network/snapshot 副作用前
+调用，并采用“锁内捕获 precondition → 锁外 Hook → 锁内权威重读/重验 → commit”。普通显式
+Delete 可拒绝，TTL/rollback/reconcile/shutdown 等 mandatory cleanup 永远绕过 Hook。
+Build Register Hook 位于 capacity transaction 前，Trigger Hook 位于最终 registry credential
+解析和 registered→waiting CAS 前；waiting→building claim 无 Hook。cluster BuildRegister 的
+exact replay 不重复执行可变 Hook。`APIWrapper` 可增加、改写或覆盖任意 core API route；同一
+wrapped handler 同时服务公网 API 与 config-socket API fallback，config-socket internal route
+不经过它。Hook 的 `ErrRejected` 映射固定 policy rejection，其他错误映射固定 503，不回显私有
+细节。
+
 xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runner/builder systemd unit
 仍执行该 node-ctl；`sandbox-ctl`、`connector-ctl`、`flatten-ctl`、`manifest-ctl` 的相邻目录
 解析也以 node-ctl 发行目录为准，不以 xconductor 目录为准。custom component 与 node-ctl
-必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/API handler/Router，不引入
-Go plugin、运行时发现、全局 registry、middleware、生命周期 hook 或 DI container；
+必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/Router；API 只以
+`http.Handler` next 形式交给可信 wrapper，不暴露 internal 类型。它不引入 Go plugin、运行时
+发现、全局 registry、动态 middleware 注册或 DI container；
 `proxy.mode=internal` 仍只使用 conductor 内置标准 proxy，没有独立定制入口。
 
 ### 3.2 静态定制 external proxy
@@ -518,18 +539,40 @@ Go plugin、运行时发现、全局 registry、middleware、生命周期 hook �
 到 xproxy，失败不回退。xproxy 必须经 `node-ctl proxy serve` 启动，不能独立运行。公共
 `app/proxy` 只开放 `New(Hooks)`、one-shot `Run`/`RunContext`、master-only `Configure` 及
 master/every-worker `BindRuntime`；`Config` 是声明式值，`Runtime` 是不可序列化的 logger/TLS
-material provider。provider 非 nil 时权威，错误不回退文件，TLS policy 仍由 core 固定。
+material provider，并可在 master/worker 分别绑定一个可信、静态编译的
+`MasterExtension`/`WorkerExtension`。provider 非 nil
+时权威，错误不回退文件，TLS policy 仍由 core 固定。
+
+master 创建共享 route table 与 traffic aggregate 后、绑定任何 listener 或启动 routesync/worker
+前，恰好调用一次 `MasterExtension.Start(ctx, MasterHost)`；失败清理 SHM 并中止。Host 的
+RouteSource 提供 applied route `Get+Watch+SyncState`，generation/resync 允许重复且不是 durable
+audit；TrafficSource 直接读进程内聚合，不走 stats UDS。observer 只在 core apply 成功后有界、
+非阻塞发布，慢 callback 不影响 SHM、routesync、barrier ACK、Wake 或 worker。Start 后同一对象
+的可选 `ManagementWrapper` 可添加、覆盖或透传 `stats_socket` route；没有 namespace 或 conflict
+registry。公共 View 不复制原始 secret/token，也不新增 route metadata 或 SHM schema。详见
+[extensions.md](extensions.md)。
 
 master 在 Configure/final validation 后 deep-clone、canonical serialize 并 digest 冻结
 EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式是 node-ctl，custom 模式是
 xproxy。worker 通过 sealed bootstrap 验证 config digest、role/id/epoch、FD mapping 和 executable
 identity，调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync；它不读取
-`proxy.yaml`，不调用 `Configure`。配置中的 executable 仅选择 node-ctl → master，用户 Hook
+`proxy.yaml`，不调用 `Configure`。每个 worker epoch 的 `BindRuntime` 必须创建新 Extension；
+初始 route sync 后 core 调用其 `Start` 一次，再冻结可选 `IngressWrapper`，成功后才开放 data 与
+`proxy_socket` listener。wrapper 在 canonical parser 前接收 raw request，两个 listener 共用同一
+handler，MMDS 不经过它。`GetRoute` 只提供当前 SHM 点查副本，不提供 worker Watch。
+
+已完成私有认证的 wrapper 可调用拥有 HTTP 响应的 `ForwardAuthorized`，复用 lookup、parking、
+activation/Wake、binding revalidation、dial 和 traffic 生命周期；它不验证 Kuasar token。
+`Revalidate` 在 activation 后、dial 前 fence 私有 revision，`Rewrite` 只修改 ordinary HTTP 的
+guest clone，CONNECT 不调用它；generic helper 拒绝 native exec，标准 `next` 仍走 KAT/CEL。
+配置中的 executable 仅选择 node-ctl → master，用户 Hook
 不得改变它。V1 不支持热更新，custom component 与 node-ctl 必须来自兼容版本。完整 API、
 示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy.md) §2.1。
 
-该扩展仅覆盖 external proxy；internal proxy 不增加独立 factory，也不开放 listener、SHM、
-Router/routesync/stats 或请求热路径 Hook，不引入 plugin、middleware、生命周期 hook 或 DI。
+该扩展仅覆盖 external proxy；internal proxy 和 cluster-router/registry/placer 不增加 Extension。
+除上述 master management 与 worker ingress wrapper 外，不开放 listener、原始
+SHM/Router/routesync/stats，也不引入 namespace、plugin registry、动态加载、通用生命周期 hook
+或 DI。WebSocket 不属于 Issue #256，由 Issue #269 独立跟踪。
 
 Builder 配置为未发布 schema 的直接切换,不保留 alias:
 
@@ -1674,11 +1717,14 @@ external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 
 ### 9.3 proxyForwarder
 
 数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 经
-已注册的 `proxy_socket` UDS 建立一次性 chained CONNECT,由 proxy worker 照常处理(含鉴权)。
-链式请求显式复用 `E2b-Sandbox-Id`,可选 `E2b-Sandbox-Service`/
-`E2b-Sandbox-Port` 和原始 `X-Access-Token`,不创造内部 token Header.普通 HTTP 在该隧道内
-发送一条请求,CONNECT 则直接 splice 客户端与 worker;无 proxy 注册时回 502.
-链式隧道与转发细节见 node-proxy.md §5.
+已注册的 `proxy_socket` UDS 只写一次原始 ordinary HTTP/CONNECT，由 proxy worker raw wrapper
+与 core handler 作最终 parse/auth。能无副作用解析 canonical SID 时继续按 SID 选择 worker；不能
+解析时按 `Host + method + URL path` 稳定 hash，parse failure 只影响 affinity，不再拒绝私有
+Header/path。请求 body 不整包缓存，发送后不自动重放。CONNECT 200 后保留 client/UDS 双方
+buffered bytes 并沿用 half-close tunnel，非 200 转发 worker response；无 proxy 注册时回 502。
+没有 WorkerExtension 时，最终 worker 仍产生既有 canonical parser/token 错误。该透明行为只属
+node-local external fallback；cluster ingress 必须在外层 canonicalize，且不增加 cluster
+Extension。转发细节见 node-proxy.md §5。
 
 ## 10. 集群接入(node-link)
 
@@ -2213,7 +2259,7 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
 external master/worker resync/rotation;handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
-proxyForwarder 链式 relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
+proxyForwarder raw HTTP/CONNECT relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
 

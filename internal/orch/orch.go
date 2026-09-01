@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 
+	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
@@ -121,6 +122,12 @@ type Orchestrator struct {
 	resourceControllerSocketIdentity string
 	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
 	removeBuildRuntimeDir            func(string) error
+	// extensionObserver is nil in the built-in path. The one nil branch at each
+	// committed transition avoids hubs, queues, and background work otherwise.
+	extensionObserver    ExtensionObserver
+	extensionBuildEvents keyedLockGroup
+	extensionSandboxHook conductorextension.SandboxHook
+	extensionBuildHook   conductorextension.BuildHook
 
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
@@ -237,57 +244,9 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if pair.APISecret == "" {
 		return nil, api.ErrNotAllowed
 	}
-	tmpl, err := types.ParseTemplateID(req.TemplateID)
+	tmpl, meta, mmdsDoc, credentials, err := o.normalizeSandboxCreateDefinition(ctx, req.APIKey, req.TemplateID, req.Metadata, req.MMDSHeader)
 	if err != nil {
-		// Not a canonical persistent id — resolve the transient register id the SDK
-		// reports (BuildInfo.template_id), or a build name/alias, to its persist id.
-		persist := o.resolveTemplateAlias(ctx, req.APIKey, req.TemplateID)
-		if persist == "" {
-			return nil, err
-		}
-		if tmpl, err = types.ParseTemplateID(persist); err != nil {
-			return nil, err
-		}
-	}
-	// Layer the template's declared config under this create request. Restore,
-	// credentials, and checkpoint policy are deliberately request-scoped, so
-	// template metadata values in those namespaces are not inherited.
-	var templateMetadata map[string]string
-	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
-		templateMetadata = tb.Metadata
-	}
-	meta, err := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	mmdsDoc, meta, err := sandboxcfg.ExtractMMDS(meta, req.MMDSHeader, o.mmdsPolicy())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	// Validate request-scoped policy before allocating an identity, minting
-	// credentials, creating directories, attaching networking, or starting a
-	// process. Normalization also gives every later trust boundary one canonical
-	// value to parse.
-	meta, err = sandboxcfg.NormalizeRestoreMetadata(meta)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	meta, err = sandboxcfg.NormalizeCheckpointMetadata(meta)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	credentials, meta, err := sandboxcfg.ExtractCredentials(meta)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if err := o.validateCreateCheckpointMode(meta); err != nil {
 		return nil, err
-	}
-	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 
 	id, err := uuid.NewV7()
@@ -295,6 +254,31 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		return nil, fmt.Errorf("orch: new id: %w", err)
 	}
 	sid := id.String()
+
+	if o.extensionSandboxHook != nil {
+		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginDirect, sid, &conductorextension.SandboxCreateRequest{
+			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: req.TimeoutSec,
+			Metadata: cloneStringMap(req.Metadata), Env: cloneStringMap(req.EnvVars), Secure: req.Secure, MMDS: cloneString(req.MMDSHeader),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if candidate.TimeoutSeconds <= 0 {
+			candidate.TimeoutSeconds = o.cfg.Sandbox.TimeoutSec
+		}
+		if candidate.TimeoutSeconds <= 0 {
+			return nil, fmt.Errorf("%w: sandbox timeout must be positive", api.ErrBadRequest)
+		}
+		finalTemplate, finalMetadata, finalMMDS, finalCredentials, err := o.normalizeSandboxCreateDefinition(ctx, req.APIKey, candidate.TemplateID, candidate.Metadata, candidate.MMDS)
+		if err != nil {
+			return nil, err
+		}
+		if finalTemplate.Profile != tmpl.Profile {
+			return nil, fmt.Errorf("%w: extension changed core-owned sandbox profile", api.ErrBadRequest)
+		}
+		tmpl, meta, mmdsDoc, credentials = finalTemplate, finalMetadata, finalMMDS, finalCredentials
+		req.TimeoutSec, req.EnvVars, req.Secure, req.MMDSHeader = candidate.TimeoutSeconds, cloneStringMap(candidate.Env), candidate.Secure, cloneString(candidate.MMDS)
+	}
 
 	sb := &types.Sandbox{
 		ID:           sid,
@@ -324,6 +308,61 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	o.logLaunchPhase(nil, accepted, "admission_duration", time.Since(admissionStarted))
 	return cloneSandbox(accepted), nil
+}
+
+// normalizeSandboxCreateDefinition is pure validation and projection. It may be
+// called before and after a Hook; credentials and MMDS values are not persisted
+// or materialized until the final call has succeeded.
+func (o *Orchestrator) normalizeSandboxCreateDefinition(
+	ctx context.Context,
+	apiKey, templateRef string,
+	requestMetadata map[string]string,
+	mmdsHeader *string,
+) (types.TemplateID, map[string]string, sandboxcfg.MMDSDocument, sandboxcfg.Credentials, error) {
+	tmpl, err := types.ParseTemplateID(templateRef)
+	if err != nil {
+		persist := o.resolveTemplateAlias(ctx, apiKey, templateRef)
+		if persist == "" {
+			return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, err
+		}
+		if tmpl, err = types.ParseTemplateID(persist); err != nil {
+			return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, err
+		}
+	}
+	var templateMetadata map[string]string
+	if build := o.templateBuild(ctx, apiKey, templateRef); build != nil && len(build.Metadata) > 0 {
+		templateMetadata = build.Metadata
+	}
+	metadata, err := sandboxcfg.MergeCreateMetadata(templateMetadata, requestMetadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	mmdsDocument, metadata, err := sandboxcfg.ExtractMMDS(metadata, mmdsHeader, o.mmdsPolicy())
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	metadata, err = sandboxcfg.NormalizeRestoreMetadata(metadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	metadata, err = sandboxcfg.NormalizeCheckpointMetadata(metadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	credentials, metadata, err := sandboxcfg.ExtractCredentials(metadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := o.validateCreateCheckpointMode(metadata); err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, err
+	}
+	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	return tmpl, metadata, mmdsDocument, credentials, nil
 }
 
 // acceptFreshLaunch is the common standalone/cluster create admission. The
@@ -392,6 +431,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	initial := cloneSandbox(sb)
 	o.cache(initial)
 	o.publishUpsert(initial)
+	o.observeSandboxUpsert(initial)
 	if barrier != nil {
 		barrierStarted := time.Now()
 		o.publishRouteBarrier(barrier.ID())
@@ -444,8 +484,13 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 			if !changed {
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
 			}
+			deleted := o.lookup(sid)
 			o.uncache(sid)
 			o.publishDelete(sid)
+			if deleted == nil {
+				deleted = &types.Sandbox{ID: sid}
+			}
+			o.observeSandboxDelete(deleted)
 			return firstErr
 		}
 		if firstErr == nil {
@@ -607,7 +652,6 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		}
 		return launchFailed("resources", ownershipErr)
 	}
-
 	p := o.sandboxParams(sb, tmpl, spec, network, preparation.Resources)
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return launchFailed("config", err)
@@ -624,6 +668,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if getErr == nil && current != nil && current.State == types.StateStarting && current.RunID == "" && current.VswitchPort == sb.VswitchPort {
 		o.cache(current)
 		o.publishUpsert(current)
+		o.observeSandboxUpsert(current)
 	}
 	unlock()
 	if getErr != nil {
@@ -670,6 +715,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		// Publish the incarnation-bound starting route first so an external MMDS
 		// worker can mint tokens during mandatory envd initialization.
 		o.publishUpsert(bound)
+		o.observeSandboxUpsert(bound)
 		commitFinished = time.Now()
 		return nil
 	})
@@ -760,6 +806,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	sb.State = types.StateRunning
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
+	o.observeSandboxUpsert(running)
 	return nil
 }
 
@@ -923,8 +970,18 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			return errors.Join(firstCleanupErr, firstStoreErr)
 		}
 		if attempt.Kind() == launchCreate {
+			dead, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				o.log.Error("reload rolled-back sandbox failed", "sid", sb.ID, "err", getErr)
+			}
 			o.uncache(sb.ID)
 			o.publishDelete(sb.ID)
+			if dead == nil {
+				dead = cloneSandbox(sb)
+				dead.State = types.StateDead
+				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
+			}
+			o.observeSandboxUpsert(dead)
 			unlock()
 			cancel()
 			return errors.Join(firstCleanupErr, firstStoreErr)
@@ -944,6 +1001,7 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 				}
 				o.cache(paused)
 				o.publishUpsert(paused)
+				o.observeSandboxUpsert(paused)
 				unlock()
 				cancel()
 				return errors.Join(firstCleanupErr, firstStoreErr)
@@ -990,6 +1048,9 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 }
 
 func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error) {
+	if o.extensionSandboxHook != nil {
+		return o.killWithExtension(ctx, id, apiKey)
+	}
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return false, err
@@ -1003,9 +1064,64 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
-	attempt, launchActive := o.launches.Lookup(id)
-	o.launches.Cancel(id)
-	if err := o.st.Delete(ctx, id); err != nil {
+	return o.killSandboxLocked(ctx, sb)
+}
+
+func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string) (bool, error) {
+	unlock, err := o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	sandbox, err := o.st.Get(ctx, id)
+	if err != nil {
+		unlock()
+		return false, err
+	}
+	if !ownsSandbox(sandbox, apiKey) {
+		unlock()
+		return false, nil
+	}
+	precondition := sandboxPrecondition(sandbox)
+	operation := newSandboxOperation(conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginDirect, id, sandbox)
+	operation.Delete = &conductorextension.SandboxDeleteRequest{Reason: "explicit API delete"}
+	operationID := operation.ID
+	unlock()
+
+	if err := o.callSandboxHook(ctx, operation); err != nil {
+		return false, err
+	}
+	if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginDirect, id); err != nil {
+		return false, err
+	}
+	if cloneSandboxDeleteRequest(operation.Delete) == nil {
+		return false, fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
+	}
+
+	unlock, err = o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	current, err := o.st.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !ownsSandbox(current, apiKey) {
+		return false, nil
+	}
+	if !sandboxPreconditionMatches(precondition, current) {
+		return false, api.ErrSandboxChanged
+	}
+	return o.killSandboxLocked(ctx, current)
+}
+
+// killSandboxLocked performs an already-authorized ordinary delete while the
+// target's lifecycle lock is held. Mandatory cleanup paths do not call it and
+// therefore never depend on the optional Extension Hook.
+func (o *Orchestrator) killSandboxLocked(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	attempt, launchActive := o.launches.Lookup(sb.ID)
+	o.launches.Cancel(sb.ID)
+	if err := o.st.Delete(ctx, sb.ID); err != nil {
 		return false, err
 	}
 	if sb.State == types.StateStarting && launchActive {
@@ -1025,13 +1141,17 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 		}
 		cancel()
 	}
-	o.clearDeadlineIntent(id)
-	o.uncache(id)
-	o.publishDelete(id) // tell external proxies the route is gone
+	o.clearDeadlineIntent(sb.ID)
+	o.uncache(sb.ID)
+	o.publishDelete(sb.ID) // tell external proxies the route is gone
+	o.observeSandboxDelete(sb)
 	return true, nil
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
+	if o.extensionSandboxHook != nil {
+		return o.pauseWithExtension(ctx, id, apiKey, actionOverride)
+	}
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return err
@@ -1053,6 +1173,75 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 		return err
 	}
 	return o.pauseSandboxLocked(ctx, sb, policy)
+}
+
+func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
+	unlock, err := o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return err
+	}
+	sandbox, err := o.st.Get(ctx, id)
+	if err != nil {
+		unlock()
+		return err
+	}
+	if !ownsSandbox(sandbox, apiKey) {
+		unlock()
+		return api.ErrNotFound
+	}
+	if sandbox.State == types.StateStarting {
+		unlock()
+		return api.ErrSandboxStarting
+	}
+	if sandbox.State == types.StatePaused {
+		unlock()
+		return api.ErrAlreadyPaused
+	}
+	if _, err := o.resolveCheckpointPolicy(sandbox.Metadata, actionOverride); err != nil {
+		unlock()
+		return err
+	}
+	precondition := sandboxPrecondition(sandbox)
+	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
+	operation.Pause = &conductorextension.SandboxPauseRequest{
+		CheckpointMergeRef: cloneBool(actionOverride.MergeRef), CheckpointDropCaches: cloneBool(actionOverride.DropCaches),
+	}
+	operationID := operation.ID
+	unlock()
+
+	if err := o.callSandboxHook(ctx, operation); err != nil {
+		return err
+	}
+	if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id); err != nil {
+		return err
+	}
+	candidate := cloneSandboxPauseRequest(operation.Pause)
+	if candidate == nil {
+		return fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
+	}
+
+	unlock, err = o.lockLifecycleMutation(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := o.st.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ownsSandbox(current, apiKey) {
+		return api.ErrNotFound
+	}
+	if !sandboxPreconditionMatches(precondition, current) {
+		return api.ErrSandboxChanged
+	}
+	finalPolicy, err := o.resolveCheckpointPolicy(current.Metadata, sandboxcfg.CheckpointPolicy{
+		MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
+	})
+	if err != nil {
+		return err
+	}
+	return o.pauseSandboxLocked(ctx, current, finalPolicy)
 }
 
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
@@ -1145,6 +1334,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		o.log.Warn("pause: detach vswitch port", "sid", paused.ID, "port", paused.VswitchPort, "err", err)
 	}
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
+	o.observeSandboxUpsert(paused)
 	return nil
 }
 
@@ -1340,7 +1530,17 @@ func (o *Orchestrator) ensureResumeAccepted(
 	requestedDeadline *int64,
 	validate func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
-	return o.ensureResumeAcceptedPrepared(ctx, sid, requestedDeadline, validate, nil)
+	return o.ensureResumeAcceptedFrom(ctx, sid, requestedDeadline, conductorextension.SandboxOriginDirect, validate)
+}
+
+func (o *Orchestrator) ensureResumeAcceptedFrom(
+	ctx context.Context,
+	sid string,
+	requestedDeadline *int64,
+	origin conductorextension.SandboxOperationOrigin,
+	validate func(*types.Sandbox) error,
+) (*types.Sandbox, *launchAttempt, error) {
+	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, nil)
 }
 
 // ensureResumeAcceptedPrepared adds a lightweight operation-specific prepare
@@ -1352,6 +1552,17 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 	ctx context.Context,
 	sid string,
 	requestedDeadline *int64,
+	validate func(*types.Sandbox) error,
+	prepare func(*types.Sandbox) error,
+) (*types.Sandbox, *launchAttempt, error) {
+	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, conductorextension.SandboxOriginDirect, validate, prepare)
+}
+
+func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
+	ctx context.Context,
+	sid string,
+	requestedDeadline *int64,
+	origin conductorextension.SandboxOperationOrigin,
 	validate func(*types.Sandbox) error,
 	prepare func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
@@ -1389,7 +1600,11 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 				return nil, nil, err
 			}
 			sb.DeadlineUnix = *requestedDeadline
-			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			updated := o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			if updated == nil {
+				updated = sb
+			}
+			o.observeSandboxUpsert(updated)
 		}
 		return cloneSandbox(sb), nil, nil
 	case types.StateStarting:
@@ -1403,7 +1618,11 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 				return nil, nil, err
 			}
 			sb.DeadlineUnix = *requestedDeadline
-			o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			updated := o.mutateCached(sid, func(cached *types.Sandbox) { cached.DeadlineUnix = *requestedDeadline })
+			if updated == nil {
+				updated = sb
+			}
+			o.observeSandboxUpsert(updated)
 		}
 		attempt, found := o.launches.Lookup(sid)
 		if !found {
@@ -1428,7 +1647,58 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 			if waitErr := previous.wait(ctx); waitErr != nil && ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			return o.ensureResumeAcceptedPrepared(ctx, sid, requestedDeadline, validate, prepare)
+			return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, prepare)
+		}
+		if o.extensionSandboxHook != nil {
+			precondition := sandboxPrecondition(sb)
+			operation := newSandboxOperation(conductorextension.SandboxOperationResume, origin, sid, sb)
+			operation.Resume = &conductorextension.SandboxResumeRequest{RequestedDeadlineUnix: cloneInt64(requestedDeadline)}
+			operationID := operation.ID
+			unlock()
+			locked = false
+			if err := o.callSandboxHook(ctx, operation); err != nil {
+				return nil, nil, err
+			}
+			if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationResume, origin, sid); err != nil {
+				return nil, nil, err
+			}
+			candidate := cloneSandboxResumeRequest(operation.Resume)
+			if candidate == nil {
+				return nil, nil, fmt.Errorf("%w: extension removed resume candidate", api.ErrBadRequest)
+			}
+			if candidate.RequestedDeadlineUnix != nil && *candidate.RequestedDeadlineUnix < 0 {
+				return nil, nil, fmt.Errorf("%w: resume deadline must be non-negative", api.ErrBadRequest)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			unlock = o.lifecycle.Lock(sid)
+			locked = true
+			current, err := o.st.Get(ctx, sid)
+			if err != nil {
+				return nil, nil, err
+			}
+			if current == nil {
+				return nil, nil, api.ErrNotFound
+			}
+			if validate != nil {
+				if err := validate(current); err != nil {
+					return nil, nil, err
+				}
+			}
+			if current.State == types.StateRunning || current.State == types.StateStarting {
+				// A competing admission won while the Hook ran. Never apply its
+				// stale result to that incarnation; re-enter with the original
+				// request so the established idempotent path can join it.
+				unlock()
+				locked = false
+				return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, prepare)
+			}
+			if !sandboxPreconditionMatches(precondition, current) {
+				return nil, nil, api.ErrSandboxChanged
+			}
+			sb = current
+			requestedDeadline = cloneInt64(candidate.RequestedDeadlineUnix)
 		}
 		// Stored metadata is trusted only after its pure parsers succeed. Do not
 		// make starting durable if the worker could never consume its inputs.
@@ -1490,6 +1760,7 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 		starting.PortMAC = ""
 		o.cache(starting)
 		o.publishUpsert(starting)
+		o.observeSandboxUpsert(starting)
 		work := cloneSandbox(starting)
 		o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
 			return o.runLaunch(launchCtx, current, work, tmpl, launchPreparation)
@@ -1520,7 +1791,11 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		return false, err
 	}
 	sb.DeadlineUnix = deadline
-	o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
+	updated := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
+	if updated == nil {
+		updated = sb
+	}
+	o.observeSandboxUpsert(updated)
 	if sb.State == types.StatePaused {
 		o.markDeadlineIntent(id)
 	} else if sb.State == types.StateStarting {
@@ -1982,6 +2257,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		}
 		if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
+			o.observeSandboxUpsert(sb)
 		} else {
 			dead = append(dead, sb)
 		}
@@ -2021,13 +2297,26 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			// restart. The intent is consumed by the next exact-run success.
 			o.markDeadlineIntent(sb.ID)
 		}
+		if changed {
+			updated, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				return getErr
+			}
+			if updated != nil {
+				o.observeSandboxUpsert(updated)
+			}
+		}
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
 		}
-		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
+		if err := o.st.SetState(ctx, sb.ID, types.StateDead); err == nil {
+			updated := cloneSandbox(sb)
+			updated.State = types.StateDead
+			o.observeSandboxUpsert(updated)
+		}
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
 	// pool instance because their old WaitAssignment request belonged to the

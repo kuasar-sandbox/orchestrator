@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/componentexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
@@ -24,22 +25,6 @@ import (
 
 // Config is the public external proxy declarative configuration.
 type Config = publicconfig.Proxy
-
-// Role identifies the current Proxy App process.
-type Role string
-
-const (
-	RoleMaster Role = "master"
-	RoleWorker Role = "worker"
-)
-
-// Process identifies the process-local Runtime binding invocation. WorkerID
-// and WorkerEpoch are zero values for the master.
-type Process struct {
-	Role        Role
-	WorkerID    string
-	WorkerEpoch uint64
-}
 
 // TLSMaterial contains DER-encoded leaf-first certificates, a matching signer,
 // and optional client trust. The core owns TLS versions, ALPN, and client-auth
@@ -68,6 +53,13 @@ func (f TLSMaterialProviderFunc) TLSMaterial(ctx context.Context) (TLSMaterial, 
 type Runtime struct {
 	Logger *slog.Logger
 	TLS    TLSMaterialProvider
+	// MasterExtension is the one trusted, statically linked extension used by
+	// the master process. Worker processes ignore this field.
+	MasterExtension proxyextension.MasterExtension
+	// WorkerExtension is the one trusted, statically linked extension used by
+	// this worker epoch. The master process ignores this field. BindRuntime must
+	// construct a fresh instance for every worker invocation.
+	WorkerExtension proxyextension.WorkerExtension
 }
 
 // MarshalJSON rejects accidental process-runtime serialization.
@@ -256,7 +248,10 @@ func decodeConfig(raw []byte, out *publicconfig.Proxy) error {
 }
 
 func freezeRuntime(runtime *Runtime) proxyapp.Bindings {
-	bindings := proxyapp.Bindings{Logger: runtime.Logger}
+	bindings := proxyapp.Bindings{
+		Logger: runtime.Logger, MasterExtension: runtime.MasterExtension,
+		WorkerExtension: runtime.WorkerExtension,
+	}
 	if runtime.TLS != nil {
 		provider := runtime.TLS
 		bindings.TLSMaterial = func(ctx context.Context) (proxyapp.TLSMaterial, error) {

@@ -1,5 +1,5 @@
 name: Component Release
-run-name: Release ${{ inputs.version }}
+run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]
 
 on:
   workflow_dispatch:
@@ -20,12 +20,28 @@ on:
         description: Published sandboxer version used to build this release
         required: true
         type: string
+      source_ref:
+        description: Exact source branch selected by the platform release controller
+        required: true
+        type: string
+      source_sha:
+        description: Exact source commit selected from source_ref
+        required: true
+        type: string
+      aggregate_version:
+        description: Owning aggregate Preview; required when version is a Preview
+        required: false
+        type: string
+      aggregate_sha:
+        description: Platform commit selecting aggregate_version; required for a Preview
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: component-release-${{ github.repository }}-${{ inputs.version }}
+  group: component-mutation-${{ github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -38,9 +54,11 @@ jobs:
       accelerator_version: ${{ steps.request.outputs.accelerator_version }}
       connector_version: ${{ steps.request.outputs.connector_version }}
       sandboxer_version: ${{ steps.request.outputs.sandboxer_version }}
+      source_ref: ${{ steps.request.outputs.source_ref }}
+      source_sha: ${{ steps.request.outputs.source_sha }}
       version: ${{ steps.request.outputs.version }}
     steps:
-      - name: Require main release source
+      - name: Require trusted release controller
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] \
@@ -61,6 +79,10 @@ jobs:
           ACCELERATOR_VERSION: ${{ inputs.accelerator_version }}
           CONNECTOR_VERSION: ${{ inputs.connector_version }}
           SANDBOXER_VERSION: ${{ inputs.sandboxer_version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
+          AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: x86_64
         run: |
@@ -71,11 +93,17 @@ jobs:
             || { echo "connector_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
           [[ "$SANDBOXER_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8})?$ ]] \
             || { echo "sandboxer_version must match vX.Y.Z or vX.Y.Z-preview.YYYYMMDD" >&2; exit 1; }
+          bash scripts/validate-release-source.sh \
+            "$SOURCE_REF" "$SOURCE_SHA" "$VERSION" orchestrator
+          bash scripts/validate-preview-line.sh \
+            orchestrator "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh check "$VERSION" "$TARGET_ARCH"
           {
             echo "accelerator_version=$ACCELERATOR_VERSION"
             echo "connector_version=$CONNECTOR_VERSION"
             echo "sandboxer_version=$SANDBOXER_VERSION"
+            echo "source_ref=$SOURCE_REF"
+            echo "source_sha=$SOURCE_SHA"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
 
@@ -140,7 +168,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/orchestrator
-          ref: ${{ github.sha }}
+          ref: ${{ needs.preflight.outputs.source_sha }}
           path: src/orchestrator
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -150,7 +178,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/orchestrator
-          ref: ${{ github.sha }}
+          ref: ${{ needs.preflight.outputs.source_sha }}
           path: src/orchestrator
           token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
@@ -258,9 +286,9 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
+          [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
           export SOURCE_DATE_EPOCH
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
           bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
 
       - name: Upload validated release bundle
@@ -276,9 +304,6 @@ jobs:
       - preflight
       - build
     runs-on: [self-hosted, Linux, X64, kuasar-control]
-    concurrency:
-      group: component-publish-${{ github.repository }}
-      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
@@ -301,11 +326,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
+          AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
+          RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}
           TARGET_ARCH: x86_64
         run: |
           set -euo pipefail
+          bash scripts/validate-preview-line.sh \
+            orchestrator "$VERSION" "$AGGREGATE_VERSION" "$AGGREGATE_SHA"
           bash scripts/publish-release.sh publish \
-            "$VERSION" "$TARGET_ARCH" "$GITHUB_SHA" release-bundle
+            "$VERSION" "$TARGET_ARCH" "$SOURCE_SHA" release-bundle "$SOURCE_REF"
 
   cleanup:
     needs: publish

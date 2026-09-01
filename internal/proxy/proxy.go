@@ -67,6 +67,7 @@ const (
 	ProxyErrorNotFound      = "not_found"
 	ProxyErrorDenied        = "denied"
 	ProxyErrorUnauthorized  = "unauthorized"
+	ProxyErrorStale         = "stale"
 	ProxyErrorUpstreamError = "upstream_error"
 	ProxyErrorPausedCold    = "paused_cold"
 )
@@ -96,6 +97,16 @@ const (
 type ConnectTarget struct {
 	Service ConnectService
 	Port    int
+}
+
+// AuthorizedForwardRequest is the internal adapter used by the public worker
+// Host after its caller has completed private authentication. It deliberately
+// contains no Kuasar access-token credential.
+type AuthorizedForwardRequest struct {
+	SandboxID  string
+	Target     ConnectTarget
+	Revalidate func(context.Context) error
+	Rewrite    func(*http.Request) error
 }
 
 // LegacyTarget builds the target used by ordinary HTTP and service-less CONNECT.
@@ -329,30 +340,85 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ForwardAuthorized owns w and completes one privately authenticated ordinary
+// HTTP or CONNECT response. It reuses route lookup, parking, activation,
+// binding revalidation, dialing, transport, and traffic accounting without
+// checking X-Access-Token. Native exec remains exclusive to ServeHTTP.
+func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, request AuthorizedForwardRequest) {
+	if r == nil || request.SandboxID == "" || !validConnectTarget(request.Target) {
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		writeProxyError(w, http.StatusBadRequest, "invalid private forward request", ProxyErrorBadRequest)
+		return
+	}
+	if request.Target.Service == ConnectServiceExec {
+		p.mx.Inc(`data_requests_total{result="denied"}`)
+		writeProxyError(w, http.StatusNotImplemented, "native exec requires the built-in handler", ProxyErrorDenied)
+		return
+	}
+	binding, ok := p.lookupRoute(w, r, request.SandboxID, request.Target)
+	if !ok {
+		return
+	}
+	route, flow, ok := p.activateRoute(w, r, binding)
+	if !ok {
+		return
+	}
+	defer flow.Close()
+	if request.Revalidate != nil {
+		if err := request.Revalidate(r.Context()); err != nil {
+			if p.log != nil {
+				p.log.Warn("proxy extension private authorization became stale",
+					"sandbox_id", request.SandboxID, "service", request.Target.Service,
+					"port", request.Target.Port, "err", err)
+			}
+			p.mx.Inc(`data_requests_total{result="route_error"}`)
+			writeProxyError(w, http.StatusConflict, "private authorization became stale", ProxyErrorStale)
+			return
+		}
+	}
+	backend, err := p.dial(r.Context(), route)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+		return
+	}
+	backend = flow.AttachBackend(backend)
+	if r.Method == http.MethodConnect {
+		p.mx.Inc(`data_requests_total{result="ok"}`)
+		Tunnel(w, r, backend)
+		return
+	}
+	defer backend.Close()
+	outbound := cloneForwardHTTPRequest(r)
+	if request.Rewrite != nil {
+		if err := request.Rewrite(outbound); err != nil {
+			if p.log != nil {
+				p.log.Warn("proxy extension guest request rewrite failed",
+					"sandbox_id", request.SandboxID, "service", request.Target.Service,
+					"port", request.Target.Port, "err", err)
+			}
+			p.mx.Inc(`data_requests_total{result="badrequest"}`)
+			writeProxyError(w, http.StatusBadRequest, "guest request rewrite rejected", ProxyErrorBadRequest)
+			return
+		}
+	}
+	resp, err := forwardClonedHTTPOnce(outbound, backend, nil)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+		return
+	}
+	defer resp.Body.Close()
+	p.mx.Inc(`data_requests_total{result="ok"}`)
+	WriteHTTPResponse(w, resp)
+}
+
 // admitRoute is the common ordinary HTTP/non-exec CONNECT admission sequence:
 // side-effect-free lookup, authorization, binding-revalidating activation, then
 // a freshly resolved dial route.
 func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, TrafficFlow, bool) {
-	binding, found, err := p.router.LookupRoute(r.Context(), sid, target)
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-		return Route{}, nil, false
-	}
-	if !found {
-		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
-		return Route{}, nil, false
-	}
-	switch binding.Kind {
-	case KindDeny:
-		p.mx.Inc(`data_requests_total{result="denied"}`)
-		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
-		return Route{}, nil, false
-	case KindUDS, KindTCP:
-	default:
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+	binding, ok := p.lookupRoute(w, r, sid, target)
+	if !ok {
 		return Route{}, nil, false
 	}
 	if !p.authorized(r, binding) {
@@ -360,6 +426,36 @@ func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, t
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return Route{}, nil, false
 	}
+	return p.activateRoute(w, r, binding)
+}
+
+func (p *Proxy) lookupRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (RouteBinding, bool) {
+	binding, found, err := p.router.LookupRoute(r.Context(), sid, target)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+		return RouteBinding{}, false
+	}
+	if !found {
+		p.mx.Inc(`data_requests_total{result="notfound"}`)
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
+		return RouteBinding{}, false
+	}
+	switch binding.Kind {
+	case KindDeny:
+		p.mx.Inc(`data_requests_total{result="denied"}`)
+		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
+		return RouteBinding{}, false
+	case KindUDS, KindTCP:
+	default:
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
+		return RouteBinding{}, false
+	}
+	return binding, true
+}
+
+func (p *Proxy) activateRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding) (Route, TrafficFlow, bool) {
 	flow := p.traffic.BeginParking(binding.SandboxID, trafficService(binding))
 	if flow == nil {
 		flow = noopTrafficFlow{}
