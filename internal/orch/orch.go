@@ -2559,12 +2559,10 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 	return ref, nil
 }
 
-const envdInitAttemptTimeout = 50 * time.Millisecond
-
-// udsClient builds a bounded HTTP client that dials the envd --connect UDS.
+// udsClient builds an HTTP client for envd. The request context carries the
+// shared launch timeout.
 func udsClient(sock string) *http.Client {
 	return &http.Client{
-		Timeout: envdInitAttemptTimeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
