@@ -70,7 +70,7 @@ func TestServeReserveExecSessionCarriesQueryAndReturnsTypedResult(t *testing.T) 
 		command.TTLSeconds != 37 || command.MigrationToken != "kmt1.opaque" || command.TimeoutSeconds != 0 ||
 		len(command.ExecConditions) != 1 || command.ExecConditions[0] != "request.cwd == '/workspace'" ||
 		command.Cluster == nil || command.Cluster.Group != record.Group || command.Cluster.RouteKey != record.RouteKey ||
-		command.Cluster.AuthSandboxID != record.AuthSandboxID {
+		command.Cluster.StableID != record.StableID {
 		t.Fatalf("exec-session command = %+v", command)
 	}
 	if command.APISecretType != "" || command.APISecret != "" || command.APISecretRef != "" ||

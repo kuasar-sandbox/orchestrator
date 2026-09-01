@@ -13,19 +13,19 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestLookupExecIsSideEffectFreeAndUsesStableCredentialSubject(t *testing.T) {
+func TestLookupExecIsSideEffectFreeAndUsesStableID(t *testing.T) {
 	o := testOrch(t)
 	sb := &types.Sandbox{
-		ID:                 "node-s1",
-		AuthSandboxIDValue: "stable-s1",
-		Profile:            types.ProfileBare,
-		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
-		State:              types.StatePaused,
-		APISecret:          strings.Repeat("2", 64),
-		ManifestKey:        strings.Repeat("3", 64),
-		RunDir:             filepath.Join(t.TempDir(), "run", "node-s1"),
-		BaseDir:            filepath.Join(t.TempDir(), "base", "node-s1"),
-		CreatedUnix:        1,
+		ID:            "node-s1",
+		StableIDValue: "stable-s1",
+		Profile:       types.ProfileBare,
+		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
+		State:         types.StatePaused,
+		APISecret:     strings.Repeat("2", 64),
+		ManifestKey:   strings.Repeat("3", 64),
+		RunDir:        filepath.Join(t.TempDir(), "run", "node-s1"),
+		BaseDir:       filepath.Join(t.TempDir(), "base", "node-s1"),
+		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(context.Background(), sb); err != nil {
@@ -38,11 +38,11 @@ func TestLookupExecIsSideEffectFreeAndUsesStableCredentialSubject(t *testing.T) 
 	}
 	want := (proxy.ExecIdentity{
 		NodeSandboxID: sb.ID,
-		AuthSandboxID: sb.AuthSandboxID(),
+		StableID:      sb.StableID(),
 		ServiceSecret: sb.ServiceSecret,
 	})
 	if identity != want {
-		t.Fatalf("identity = %+v, want node/auth identity", identity)
+		t.Fatalf("identity = %+v, want node-local and stable identity", identity)
 	}
 	if cached := o.lookup(sb.ID); cached != nil {
 		t.Fatal("side-effect-free exec lookup populated the lifecycle cache")
@@ -64,16 +64,16 @@ func TestActivateExecRequiresExpectedIdentityThenUsesExistingResume(t *testing.T
 	manifestKey := strings.Repeat("a", 64)
 	sid := "exec-paused"
 	sb := &types.Sandbox{
-		ID:                 sid,
-		AuthSandboxIDValue: "stable-exec",
-		Profile:            types.ProfileBare,
-		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
-		State:              types.StatePaused,
-		APISecret:          deriveTestAPISecret(t, manifestKey),
-		ManifestKey:        manifestKey,
-		RunDir:             filepath.Join(cfg.Paths.RunRoot, sid),
-		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, sid),
-		CreatedUnix:        1,
+		ID:            sid,
+		StableIDValue: "stable-exec",
+		Profile:       types.ProfileBare,
+		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
+		State:         types.StatePaused,
+		APISecret:     deriveTestAPISecret(t, manifestKey),
+		ManifestKey:   manifestKey,
+		RunDir:        filepath.Join(cfg.Paths.RunRoot, sid),
+		BaseDir:       filepath.Join(cfg.Paths.BaseRoot, sid),
+		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -88,7 +88,7 @@ func TestActivateExecRequiresExpectedIdentityThenUsesExistingResume(t *testing.T
 	}
 
 	wrong := identity
-	wrong.AuthSandboxID = "different-lineage"
+	wrong.StableID = "different-lineage"
 	if got, found, err := o.ActivateExec(ctx, sid, wrong); err != nil || found || got != (proxy.ExecIdentity{}) {
 		t.Fatalf("ActivateExec(wrong identity) = %+v, %v, %v", got, found, err)
 	}

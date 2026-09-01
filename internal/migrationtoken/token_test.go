@@ -24,7 +24,7 @@ const (
 	testMigrationKey        = "efc3f9ac75d63ece0a9065ab26bb24e6429bc78ef12ba07865bb99544c5e89b7"
 	testServiceSecret       = "0213051156fc06b40aebdeb333caeb9c95866d91f08298264901787551897989"
 	testForwardToken        = "kat1.eyJ2IjoxLCJzaWQiOiJzYW5kYm94LTAxIiwiYXVkIjoiZm9yd2FyZCJ9.uk154F30--e531Hogd4pgj0oGFsuIJJT0nWr17gkdSw"
-	testGoldenTokenSHA256   = "0178aa5983d3d861af6edb774a3470c8a9d3c2848751906b59c0b3f1cd971c43"
+	testGoldenTokenSHA256   = "d0db333b19b381485a828a3feb947fef9e8545ceef77f69fbffbef3e8877c6bb"
 )
 
 var testMaterial = KeyMaterial{APISecret: testAPISecret, ManifestKey: testManifestKey}
@@ -33,7 +33,7 @@ func validPayload() MigrationTokenPayloadV1 {
 	return MigrationTokenPayloadV1{
 		Version:                1,
 		NodeSandboxID:          "sandbox-01-g7",
-		AuthSandboxID:          "sandbox-01",
+		StableID:               "sandbox-01",
 		APISecretFingerprint:   testAPIFingerprint,
 		ManifestKeyFingerprint: testManifestFingerprint,
 		TemplateID:             types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
@@ -187,20 +187,28 @@ func TestOpenStrictJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	withoutVersion := strings.Replace(string(canonical), `"v":1,`, "", 1)
+	legacyField := "auth" + "SandboxID"
+	legacyStableID := strings.Replace(
+		string(canonical),
+		`"stableID":"sandbox-01"`,
+		`"`+legacyField+`":"sandbox-01"`,
+		1,
+	)
 	tests := map[string]string{
-		"not object":           `[]`,
-		"null object":          `null`,
-		"unknown field":        strings.TrimSuffix(string(canonical), "}") + `,"extra":true}`,
-		"duplicate field":      strings.Replace(string(canonical), `"v":1`, `"v":1,"v":1`, 1),
-		"missing field":        withoutVersion,
-		"trailing object":      string(canonical) + `{}`,
-		"trailing scalar":      string(canonical) + ` 1`,
-		"null field":           strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":null`, 1),
-		"wrong field type":     strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":7`, 1),
-		"duplicate env key":    strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":"C.UTF-8","LANG":"other"}`, 1),
-		"null env":             strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":null`, 1),
-		"null env value":       strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":null}`, 1),
-		"non string env value": strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":1}`, 1),
+		"not object":             `[]`,
+		"null object":            `null`,
+		"unknown field":          strings.TrimSuffix(string(canonical), "}") + `,"extra":true}`,
+		"duplicate field":        strings.Replace(string(canonical), `"v":1`, `"v":1,"v":1`, 1),
+		"missing field":          withoutVersion,
+		"legacy stable ID field": legacyStableID,
+		"trailing object":        string(canonical) + `{}`,
+		"trailing scalar":        string(canonical) + ` 1`,
+		"null field":             strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":null`, 1),
+		"wrong field type":       strings.Replace(string(canonical), `"nodeSandboxID":"sandbox-01-g7"`, `"nodeSandboxID":7`, 1),
+		"duplicate env key":      strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":"C.UTF-8","LANG":"other"}`, 1),
+		"null env":               strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":null`, 1),
+		"null env value":         strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":null}`, 1),
+		"non string env value":   strings.Replace(string(canonical), `"env":{"LANG":"C.UTF-8"}`, `"env":{"LANG":1}`, 1),
 	}
 	for name, plaintext := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -265,7 +273,7 @@ func TestOpenValidatesPayloadSemantics(t *testing.T) {
 	tests := map[string]func(*MigrationTokenPayloadV1){
 		"version":              func(p *MigrationTokenPayloadV1) { p.Version = 2 },
 		"node sandbox ID":      func(p *MigrationTokenPayloadV1) { p.NodeSandboxID = "" },
-		"auth sandbox ID":      func(p *MigrationTokenPayloadV1) { p.AuthSandboxID = "" },
+		"stable ID":            func(p *MigrationTokenPayloadV1) { p.StableID = "" },
 		"API fingerprint":      func(p *MigrationTokenPayloadV1) { p.APISecretFingerprint = strings.ToUpper(p.APISecretFingerprint) },
 		"manifest fingerprint": func(p *MigrationTokenPayloadV1) { p.ManifestKeyFingerprint = p.ManifestKeyFingerprint[:62] },
 		"profile":              func(p *MigrationTokenPayloadV1) { p.Profile = "unknown" },
@@ -273,15 +281,15 @@ func TestOpenValidatesPayloadSemantics(t *testing.T) {
 		"template profile": func(p *MigrationTokenPayloadV1) {
 			p.TemplateID = types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()
 		},
-		"runtime":         func(p *MigrationTokenPayloadV1) { p.RuntimeDigest = strings.Repeat("B", 64) },
-		"snapshot":        func(p *MigrationTokenPayloadV1) { p.SnapshotRef = "/local/snapshot" },
-		"created":         func(p *MigrationTokenPayloadV1) { p.CreatedUnix = 0 },
-		"deadline":        func(p *MigrationTokenPayloadV1) { p.DeadlineUnix = -1 },
-		"service secret":  func(p *MigrationTokenPayloadV1) { p.ServiceSecret = strings.Repeat("S", 64) },
-		"envd token":      func(p *MigrationTokenPayloadV1) { p.EnvdAccessToken = "" },
-		"traffic token":   func(p *MigrationTokenPayloadV1) { p.TrafficAccessToken = "" },
-		"forward token":   func(p *MigrationTokenPayloadV1) { p.ForwardAccessToken = "" },
-		"forward subject": func(p *MigrationTokenPayloadV1) { p.AuthSandboxID = "other-sandbox" },
+		"runtime":           func(p *MigrationTokenPayloadV1) { p.RuntimeDigest = strings.Repeat("B", 64) },
+		"snapshot":          func(p *MigrationTokenPayloadV1) { p.SnapshotRef = "/local/snapshot" },
+		"created":           func(p *MigrationTokenPayloadV1) { p.CreatedUnix = 0 },
+		"deadline":          func(p *MigrationTokenPayloadV1) { p.DeadlineUnix = -1 },
+		"service secret":    func(p *MigrationTokenPayloadV1) { p.ServiceSecret = strings.Repeat("S", 64) },
+		"envd token":        func(p *MigrationTokenPayloadV1) { p.EnvdAccessToken = "" },
+		"traffic token":     func(p *MigrationTokenPayloadV1) { p.TrafficAccessToken = "" },
+		"forward token":     func(p *MigrationTokenPayloadV1) { p.ForwardAccessToken = "" },
+		"forward stable ID": func(p *MigrationTokenPayloadV1) { p.StableID = "other-sandbox" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -410,7 +418,7 @@ func TestTenantFingerprintBinding(t *testing.T) {
 func TestValidateExpectations(t *testing.T) {
 	payload := validPayload()
 	matching := Expectations{
-		AuthSandboxID: payload.AuthSandboxID,
+		StableID:      payload.StableID,
 		TemplateID:    payload.TemplateID,
 		Profile:       types.Profile(payload.Profile),
 		RuntimeDigest: payload.RuntimeDigest,
@@ -424,11 +432,11 @@ func TestValidateExpectations(t *testing.T) {
 	}
 
 	tests := map[string]Expectations{
-		"subject":  {AuthSandboxID: "other"},
-		"template": {TemplateID: "other"},
-		"profile":  {Profile: types.ProfileBare},
-		"runtime":  {RuntimeDigest: strings.Repeat("d", 64)},
-		"snapshot": {SnapshotRef: "manifest://" + strings.Repeat("e", 64)},
+		"stable ID": {StableID: "other"},
+		"template":  {TemplateID: "other"},
+		"profile":   {Profile: types.ProfileBare},
+		"runtime":   {RuntimeDigest: strings.Repeat("d", 64)},
+		"snapshot":  {SnapshotRef: "manifest://" + strings.Repeat("e", 64)},
 	}
 	for name, expected := range tests {
 		t.Run(name, func(t *testing.T) {

@@ -531,7 +531,7 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	if execService {
 		var err error
 		execClaims, err = keys.ParseAndVerifyExecAccessToken(
-			r.Header.Get("X-Access-Token"), sb.ServiceSecret, sb.AuthSandboxID, time.Now(),
+			r.Header.Get("X-Access-Token"), sb.ServiceSecret, sb.StableID, time.Now(),
 		)
 		if err != nil {
 			http.Error(w, "invalid access token", http.StatusUnauthorized)
@@ -989,11 +989,11 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 	}
 	metadata = cloneStringMap(metadata)
 	delete(metadata, clusterstate.ObjectMetadataKey)
-	authSandboxID := cmd.Cluster.AuthSandboxID
-	if authSandboxID == "" {
-		authSandboxID = cmd.SID
+	stableID := cmd.Cluster.StableID
+	if stableID == "" {
+		stableID = cmd.SID
 	}
-	materialized, err := materializeStubCredentials(profile, pair.APISecret, authSandboxID, credentials)
+	materialized, err := materializeStubCredentials(profile, pair.APISecret, stableID, credentials)
 	if err != nil {
 		return ack(cmd, routesync.AckRejected, "sandbox credential materialization failed")
 	}
@@ -1001,7 +1001,7 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 	sb := &stubSandbox{
 		SID: cmd.SID, Profile: string(profile), Metadata: metadata, State: "creating",
 		TemplateID:             cmd.TemplateRef,
-		AuthSandboxID:          authSandboxID,
+		StableID:               stableID,
 		APISecret:              pair.APISecret,
 		APISecretFingerprint:   pair.APISecretFingerprint,
 		ManifestKeyFingerprint: pair.ManifestKeyFingerprint,
@@ -1101,13 +1101,13 @@ func (n *stubNode) handleExecSession(cmd *routesync.Command) *routesync.CmdAck {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "sandbox context binding is incomplete")
 	}
-	authSandboxID := cmd.Cluster.AuthSandboxID
-	if authSandboxID == "" {
-		authSandboxID = cmd.SID
+	stableID := cmd.Cluster.StableID
+	if stableID == "" {
+		stableID = cmd.SID
 	}
 	if sb.Profile != string(profile) || sb.Cluster == nil ||
 		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
-		sb.AuthSandboxID != authSandboxID {
+		sb.StableID != stableID {
 		n.mu.Unlock()
 		return ack(cmd, routesync.AckRejected, "sandbox context binding mismatch")
 	}
@@ -1126,7 +1126,7 @@ func (n *stubNode) handleExecSession(cmd *routesync.Command) *routesync.CmdAck {
 		return ack(cmd, routesync.AckRejected, "invalid exec session ttl")
 	}
 	token, err := keys.MintExecAccessTokenWithConditions(
-		sb.ServiceSecret, sb.AuthSandboxID, expiresUnix, cmd.ExecConditions,
+		sb.ServiceSecret, sb.StableID, expiresUnix, cmd.ExecConditions,
 	)
 	if err != nil {
 		n.mu.Unlock()
@@ -1672,7 +1672,7 @@ type stubSandbox struct {
 	Metadata               map[string]string
 	State                  string
 	TemplateID             string
-	AuthSandboxID          string
+	StableID               string
 	APISecret              string `json:"-"`
 	APISecretFingerprint   string
 	ManifestKeyFingerprint string
@@ -1722,7 +1722,7 @@ func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 		SandboxID: s.SID, State: s.State,
 		TemplateID:             s.TemplateID,
 		Profile:                s.Profile,
-		AuthSandboxID:          s.AuthSandboxID,
+		StableID:               s.StableID,
 		APISecret:              s.APISecret,
 		APISecretFingerprint:   s.APISecretFingerprint,
 		ManifestKeyFingerprint: s.ManifestKeyFingerprint,
@@ -1783,19 +1783,19 @@ type stubCredentials struct {
 	ForwardAccessToken string
 }
 
-func materializeStubCredentials(profile types.Profile, apiSecret, authSandboxID string, overrides sandboxcfg.Credentials) (stubCredentials, error) {
+func materializeStubCredentials(profile types.Profile, apiSecret, stableID string, overrides sandboxcfg.Credentials) (stubCredentials, error) {
 	if err := sandboxcfg.ValidateCredentialsForProfile(profile, overrides); err != nil {
 		return stubCredentials{}, err
 	}
 	serviceSecret := overrides.ServiceSecret
 	var err error
 	if serviceSecret == "" {
-		serviceSecret, err = keys.DeriveServiceSecret(apiSecret, authSandboxID)
+		serviceSecret, err = keys.DeriveServiceSecret(apiSecret, stableID)
 		if err != nil {
 			return stubCredentials{}, err
 		}
 	}
-	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, stableID)
 	if err != nil {
 		return stubCredentials{}, err
 	}
@@ -1827,7 +1827,7 @@ func sameStubClusterContext(a, b *routesync.ClusterSandboxContext) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return a.Group == b.Group && a.RouteKey == b.RouteKey && a.AuthSandboxID == b.AuthSandboxID
+	return a.Group == b.Group && a.RouteKey == b.RouteKey && a.StableID == b.StableID
 }
 
 func (s *stubSandbox) snapshot(nodeID string) sandboxSnapshot {

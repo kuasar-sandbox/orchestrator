@@ -16,7 +16,7 @@ func TestNodeLinkConnectCommandRoundTripPreservesMigrationToken(t *testing.T) {
 		CmdID: "connect-1", Kind: CmdConnect, SID: "stable-g1", Profile: "e2b",
 		APISecretFingerprint: "api-secret-fingerprint",
 		Cluster: &ClusterSandboxContext{
-			Group: "/tenant/workloads", RouteKey: "route-stable", AuthSandboxID: "stable",
+			Group: "/tenant/workloads", RouteKey: "route-stable", StableID: "stable",
 		},
 		MigrationToken: "kmt1.opaque-migration-token",
 		TimeoutSeconds: 37,
@@ -24,7 +24,7 @@ func TestNodeLinkConnectCommandRoundTripPreservesMigrationToken(t *testing.T) {
 	got := roundTrip(t, &Msg{Type: TypeCommand, Rev: 9, Cmd: want})
 	if got.Cmd == nil || got.Cmd.Kind != CmdConnect || got.Cmd.SID != want.SID ||
 		got.Cmd.MigrationToken != want.MigrationToken || got.Cmd.TimeoutSeconds != want.TimeoutSeconds || got.Cmd.Cluster == nil ||
-		got.Cmd.Cluster.AuthSandboxID != want.Cluster.AuthSandboxID || got.Rev != 9 {
+		got.Cmd.Cluster.StableID != want.Cluster.StableID || got.Rev != 9 {
 		t.Fatalf("connect command round-trip: %+v rev=%d", got.Cmd, got.Rev)
 	}
 }
@@ -61,7 +61,7 @@ func TestNodeLinkExecSessionCommandAndAckRoundTrip(t *testing.T) {
 		CmdID: "exec-1", Kind: CmdExecSession, SID: "stable-g2", Profile: "bare",
 		APISecretFingerprint: "api-secret-fingerprint",
 		Cluster: &ClusterSandboxContext{
-			Group: "/tenant/workloads", RouteKey: "route-stable", AuthSandboxID: "stable",
+			Group: "/tenant/workloads", RouteKey: "route-stable", StableID: "stable",
 		},
 		MigrationToken: "kmt1.opaque-migration-token",
 		TTLSeconds:     37,

@@ -27,7 +27,7 @@ func TestReserveExecDataRejectsKATBeforePausedMutationOrCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expired, err := keys.MintExecAccessToken(record.ServiceSecret, record.AuthSandboxID, time.Now().Add(-time.Second).Unix())
+	expired, err := keys.MintExecAccessToken(record.ServiceSecret, record.StableID, time.Now().Add(-time.Second).Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestReserveExecDataAcceptsKATAndIgnoresOptionalPortForAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
-	token, err := keys.MintExecAccessToken(record.ServiceSecret, record.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(record.ServiceSecret, record.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestRouteLinkReserveDataCarriesExecServiceHeaderWithoutBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
-	token, err := keys.MintExecAccessToken(record.ServiceSecret, record.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(record.ServiceSecret, record.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

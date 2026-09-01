@@ -32,7 +32,7 @@ func TestWorkerLookupExecIsSideEffectFreeAndRequiresCompleteLiveIdentity(t *test
 		execWorkerRoute("running", routesync.StateRunning),
 		execWorkerRoute("dead", routesync.StateDead),
 		{SandboxID: "missing-auth", State: routesync.StatePaused, ServiceSecret: workerExecServiceSecret},
-		{SandboxID: "missing-secret", State: routesync.StateRunning, AuthSandboxID: "stable-missing-secret"},
+		{SandboxID: "missing-secret", State: routesync.StateRunning, StableID: "stable-missing-secret"},
 	} {
 		if err := tbl.Upsert(route); err != nil {
 			t.Fatal(err)
@@ -459,7 +459,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 		var wakes atomic.Int32
 		view := NewWorkerView(tbl, nil, func(string) { wakes.Add(1) }, 50*time.Millisecond)
 		expected := execWorkerIdentity(route.SandboxID)
-		expected.AuthSandboxID = "different-lineage"
+		expected.StableID = "different-lineage"
 		got, found, err := view.ActivateExec(context.Background(), route.SandboxID, expected)
 		if err != nil || found || got != (proxy.ExecIdentity{}) {
 			t.Fatalf("ActivateExec(mismatch) = %+v, %v, %v", got, found, err)
@@ -496,7 +496,7 @@ func TestWorkerActivateExecRejectsMismatchWithoutWakeAndDriftAfterWake(t *testin
 			t.Fatal("activation did not wake paused sandbox")
 		}
 		route.State = routesync.StateRunning
-		route.AuthSandboxID = "replacement-lineage"
+		route.StableID = "replacement-lineage"
 		if err := tbl.Upsert(route); err != nil {
 			t.Fatal(err)
 		}
@@ -577,7 +577,7 @@ func TestExternalExecConditionDenialDoesNotWakeOrDial(t *testing.T) {
 			return nil, fmt.Errorf("unexpected dial")
 		}, t.TempDir())
 	token, err := keys.MintExecAccessTokenWithConditions(
-		workerExecServiceSecret, route.AuthSandboxID, 0,
+		workerExecServiceSecret, route.StableID, 0,
 		[]string{`request.argv == ['/bin/allowed']`},
 	)
 	if err != nil {
@@ -626,7 +626,7 @@ func execWorkerRoute(sid, state string) routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID:     sid,
 		State:         state,
-		AuthSandboxID: "stable-" + sid,
+		StableID:      "stable-" + sid,
 		ServiceSecret: workerExecServiceSecret,
 	}
 }
@@ -634,7 +634,7 @@ func execWorkerRoute(sid, state string) routesync.RouteEntry {
 func execWorkerIdentity(sid string) proxy.ExecIdentity {
 	return proxy.ExecIdentity{
 		NodeSandboxID: sid,
-		AuthSandboxID: "stable-" + sid,
+		StableID:      "stable-" + sid,
 		ServiceSecret: workerExecServiceSecret,
 	}
 }

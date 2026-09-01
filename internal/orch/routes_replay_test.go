@@ -20,7 +20,7 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 	apiSecret := strings.Repeat("1", 64)
 	manifestKey := strings.Repeat("2", 64)
 	sb := &types.Sandbox{
-		ID: "node-s1", AuthSandboxIDValue: "stable-s1", Profile: types.ProfileE2B,
+		ID: "node-s1", StableIDValue: "stable-s1", Profile: types.ProfileE2B,
 		TemplateID: "template", State: types.StateRunning,
 		EnvdUDS: "/run/s1/envd.sock", CiUDS: "/run/s1/ci.sock", FloatingIP: "100.100.0.2",
 		APISecret: apiSecret, ManifestKey: manifestKey, ServiceSecret: strings.Repeat("3", 64),
@@ -37,7 +37,7 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 	}
 
 	got := (&Orchestrator{}).routeEntry(sb)
-	if got.SandboxID != sb.ID || got.AuthSandboxID != "stable-s1" ||
+	if got.SandboxID != sb.ID || got.StableID != "stable-s1" ||
 		got.APISecret != apiSecret || got.APISecretFingerprint != apiFingerprint ||
 		got.ManifestKeyFingerprint != manifestFingerprint || got.ServiceSecret != sb.ServiceSecret ||
 		got.EnvdAccessToken != "envd" || got.TrafficAccessToken != "traffic" ||

@@ -46,7 +46,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
 		got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
 		got.RouteRevision <= 0 ||
-		got.AuthSandboxID != want.AuthSandboxID || got.APISecret != want.APISecret ||
+		got.StableID != want.StableID || got.APISecret != want.APISecret ||
 		got.APISecretFingerprint != want.APISecretFingerprint ||
 		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||
 		got.ServiceSecret != want.ServiceSecret || got.EnvdAccessToken != want.EnvdAccessToken ||

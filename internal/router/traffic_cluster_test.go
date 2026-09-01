@@ -95,7 +95,7 @@ func TestClusterKnownTargetCountsOnlyFinalNodeWorker(t *testing.T) {
 	route.State = "paused"
 	route.ForwardAccessToken = "forward-token"
 	target := proxypkg.LegacyTarget(8080)
-	nodeRouter.binding = proxypkg.BindRoute(route.NodeSandboxID, route.AuthSandboxID, types.ProfileBare, "envd-token", route.ForwardAccessToken, target)
+	nodeRouter.binding = proxypkg.BindRoute(route.NodeSandboxID, route.StableID, types.ProfileBare, "envd-token", route.ForwardAccessToken, target)
 	nodeRouter.route = proxypkg.Route{Kind: proxypkg.KindTCP, Addr: "final-backend"}
 
 	var reserveHits atomic.Int32

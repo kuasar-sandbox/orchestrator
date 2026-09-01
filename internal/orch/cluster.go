@@ -862,20 +862,20 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 	meta := clusterSandboxMetadata(metadata)
 
 	sb := &types.Sandbox{
-		ID:                 cmd.SID,
-		Profile:            tmpl.Profile,
-		Cluster:            &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
-		AuthSandboxIDValue: cmd.Cluster.AuthSandboxID,
-		TemplateID:         tmpl.String(),
-		State:              types.StateStarting,
-		RunDir:             o.cfg.Paths.RunRoot + "/" + cmd.SID,
-		BaseDir:            o.cfg.Paths.BaseRoot + "/" + cmd.SID,
-		APISecret:          pair.APISecret,
-		ManifestKey:        pair.ManifestKey,
-		Metadata:           meta,
-		Env:                environment,
-		CreatedUnix:        time.Now().Unix(),
-		DeadlineUnix:       time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
+		ID:            cmd.SID,
+		Profile:       tmpl.Profile,
+		Cluster:       &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
+		StableIDValue: cmd.Cluster.StableID,
+		TemplateID:    tmpl.String(),
+		State:         types.StateStarting,
+		RunDir:        o.cfg.Paths.RunRoot + "/" + cmd.SID,
+		BaseDir:       o.cfg.Paths.BaseRoot + "/" + cmd.SID,
+		APISecret:     pair.APISecret,
+		ManifestKey:   pair.ManifestKey,
+		Metadata:      meta,
+		Env:           environment,
+		CreatedUnix:   time.Now().Unix(),
+		DeadlineUnix:  time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
 	}
 	if err := materializeSandboxCredentials(sb, credentials); err != nil {
 		return nil, nil, fmt.Errorf("cluster create: %w", err)
@@ -962,13 +962,13 @@ func validateClusterSandboxContext(sb *types.Sandbox, cmd *routesync.Command) er
 	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
 		return fmt.Errorf("cluster connect: group and route key are required")
 	}
-	authSandboxID := cmd.Cluster.AuthSandboxID
-	if authSandboxID == "" {
-		authSandboxID = cmd.SID
+	stableID := cmd.Cluster.StableID
+	if stableID == "" {
+		stableID = cmd.SID
 	}
 	if sb.Profile != profile || sb.Cluster == nil ||
 		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
-		sb.AuthSandboxID() != authSandboxID {
+		sb.StableID() != stableID {
 		return fmt.Errorf("cluster connect: sandbox context mismatch")
 	}
 	return nil
@@ -1010,16 +1010,16 @@ func (o *Orchestrator) prepareClusterConnect(ctx context.Context, cmd *routesync
 	if err != nil {
 		return nil, err
 	}
-	authSandboxID := cmd.Cluster.AuthSandboxID
-	if authSandboxID == "" {
-		authSandboxID = cmd.SID
+	stableID := cmd.Cluster.StableID
+	if stableID == "" {
+		stableID = cmd.SID
 	}
 	sb, err = o.importSandboxWithKey(
 		ctx,
 		pair,
 		cmd.MigrationToken,
 		cmd.SID,
-		migrationtoken.Expectations{AuthSandboxID: authSandboxID, Profile: profile},
+		migrationtoken.Expectations{StableID: stableID, Profile: profile},
 		&types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
 		requestedDeadline,
 	)

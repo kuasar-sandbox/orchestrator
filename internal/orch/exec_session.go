@@ -113,7 +113,7 @@ func mintExecSessionToken(sb *types.Sandbox, ttlSeconds int64, conditions []stri
 		return "", err
 	}
 	token, err := keys.MintExecAccessTokenWithConditions(
-		sb.ServiceSecret, sb.AuthSandboxID(), expiresUnix, conditions,
+		sb.ServiceSecret, sb.StableID(), expiresUnix, conditions,
 	)
 	if err != nil {
 		return "", fmt.Errorf("exec session: mint access token: %w", err)

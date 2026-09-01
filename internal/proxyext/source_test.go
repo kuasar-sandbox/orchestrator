@@ -57,7 +57,7 @@ func newTestHost(t *testing.T, capacity int, stats *proxystats.MasterStats) (*Ho
 
 func testRoute(sandboxID, runID string) routesync.RouteEntry {
 	return routesync.RouteEntry{
-		SandboxID: sandboxID, AuthSandboxID: "auth-" + sandboxID,
+		SandboxID: sandboxID, StableID: "stable-" + sandboxID,
 		Profile: "bare", TemplateID: "tmpl-1",
 		State: routesync.StateRunning, RunID: runID,
 		FloatingIP: "10.0.0.2", SnapshotLocation: "remote",
@@ -84,7 +84,8 @@ func TestObservingSinkPublishesOnlyAfterCoreApply(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("Get after core apply: found=%v err=%v", found, err)
 	}
-	if view.Revision == 0 || view.APISecretFingerprint != route.APISecretFingerprint || view.ManifestKeyFingerprint != route.ManifestKeyFingerprint {
+	if view.Revision == 0 || view.StableID != route.StableID ||
+		view.APISecretFingerprint != route.APISecretFingerprint || view.ManifestKeyFingerprint != route.ManifestKeyFingerprint {
 		t.Fatalf("projected route = %+v", view)
 	}
 	view.RunID = "mutated"

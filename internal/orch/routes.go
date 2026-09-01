@@ -58,7 +58,7 @@ func routeEntryBase(sb *types.Sandbox) routesync.RouteEntry {
 		EnvdUDS:                sb.EnvdUDS,
 		CiUDS:                  sb.CiUDS,
 		FloatingIP:             sb.FloatingIP,
-		AuthSandboxID:          sb.AuthSandboxID(),
+		StableID:               sb.StableID(),
 		APISecret:              sb.APISecret,
 		APISecretFingerprint:   apiSecretFingerprint,
 		ManifestKeyFingerprint: manifestKeyFingerprint,

@@ -22,6 +22,8 @@ adds `GET /private/route?sandbox_id=...` on the existing 0600 stats socket while
 passing every unmatched request to the built-in handler. The route response is
 the public non-secret projection; raw route credentials are not copied into
 ordinary Watch events.
+In each route projection, `SandboxID` is the node-local lookup key and
+`StableID` is the identity preserved across node-local replacements.
 
 The worker wrapper sees raw requests before Kuasar parses the canonical
 `E2b-Sandbox-*` host/header contract. It demonstrates two private shapes:

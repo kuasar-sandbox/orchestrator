@@ -33,16 +33,16 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		t.Fatal(err)
 	}
 	sb := &types.Sandbox{
-		ID:                 "stable-g1",
-		Profile:            types.ProfileBare,
-		Cluster:            &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
-		AuthSandboxIDValue: "stable",
-		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		State:              types.StateRunning,
-		DeadlineUnix:       1_900_000_000,
-		APISecret:          apiSecret,
-		ManifestKey:        manifestKey,
-		CreatedUnix:        1,
+		ID:            "stable-g1",
+		Profile:       types.ProfileBare,
+		Cluster:       &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"},
+		StableIDValue: "stable",
+		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		State:         types.StateRunning,
+		DeadlineUnix:  1_900_000_000,
+		APISecret:     apiSecret,
+		ManifestKey:   manifestKey,
+		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -61,7 +61,7 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 				CmdID: "connect-" + name, Kind: routesync.CmdConnect, SID: sb.ID,
 				Profile: string(sb.Profile), APISecretFingerprint: fingerprint,
 				Cluster: &routesync.ClusterSandboxContext{
-					Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable",
+					Group: "group-a", RouteKey: "route-a", StableID: "stable",
 				},
 				MigrationToken: token,
 			})
@@ -87,7 +87,7 @@ func TestHandleClusterConnectExistingTargetIgnoresWithinLimitMigrationToken(t *t
 		CmdID: "connect-oversized", Kind: routesync.CmdConnect, SID: sb.ID,
 		Profile: string(sb.Profile), APISecretFingerprint: fingerprint,
 		Cluster: &routesync.ClusterSandboxContext{
-			Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable",
+			Group: "group-a", RouteKey: "route-a", StableID: "stable",
 		},
 		MigrationToken: strings.Repeat("!", migrationtoken.MaxWireSize+1),
 	})
@@ -132,7 +132,7 @@ func TestHandleClusterConnectMissingTargetRequiresMigrationToken(t *testing.T) {
 		CmdID: "connect-missing", Kind: routesync.CmdConnect, SID: "stable-g1",
 		Profile: string(types.ProfileBare), APISecretFingerprint: strings.Repeat("a", 64),
 		Cluster: &routesync.ClusterSandboxContext{
-			Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable",
+			Group: "group-a", RouteKey: "route-a", StableID: "stable",
 		},
 	})
 	if ack.Status != routesync.AckRejected || !strings.Contains(ack.Reason, "sandbox not found") {
@@ -231,18 +231,18 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 
 	manifestKey := strings.Repeat("6", 64)
 	sb := &types.Sandbox{
-		ID:                 "cluster-timeout-target",
-		Profile:            types.ProfileBare,
-		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
-		AuthSandboxIDValue: "stable",
-		TemplateID:         types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
-		State:              types.StatePaused,
-		APISecret:          deriveTestAPISecret(t, manifestKey),
-		ManifestKey:        manifestKey,
-		RunDir:             filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
-		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, "cluster-timeout-target"),
-		CreatedUnix:        1,
-		DeadlineUnix:       10,
+		ID:            "cluster-timeout-target",
+		Profile:       types.ProfileBare,
+		Cluster:       &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		StableIDValue: "stable",
+		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(),
+		State:         types.StatePaused,
+		APISecret:     deriveTestAPISecret(t, manifestKey),
+		ManifestKey:   manifestKey,
+		RunDir:        filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
+		BaseDir:       filepath.Join(cfg.Paths.BaseRoot, "cluster-timeout-target"),
+		CreatedUnix:   1,
+		DeadlineUnix:  10,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -259,7 +259,7 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 			TimeoutSeconds: timeout,
 			Cluster: &routesync.ClusterSandboxContext{
 				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey,
-				AuthSandboxID: sb.AuthSandboxID(),
+				StableID: sb.StableID(),
 			},
 		}
 	}
@@ -356,17 +356,17 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 	const sid = "stable-g0"
 	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileE2B,
-		Cluster:            &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
-		AuthSandboxIDValue: "stable",
-		TemplateID:         types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		State:              types.StatePaused,
-		APISecret:          apiSecret,
-		ManifestKey:        manifestKey,
-		RunDir:             filepath.Join(cfg.Paths.RunRoot, sid),
-		BaseDir:            filepath.Join(cfg.Paths.BaseRoot, sid),
-		EnvdUDS:            filepath.Join(cfg.Paths.RunRoot, sid, "envd.sock"),
-		CiUDS:              filepath.Join(cfg.Paths.RunRoot, sid, "ci.sock"),
-		CreatedUnix:        1,
+		Cluster:       &types.ClusterSandboxContext{Group: "/tenant/workloads", RouteKey: "route-stable"},
+		StableIDValue: "stable",
+		TemplateID:    types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
+		State:         types.StatePaused,
+		APISecret:     apiSecret,
+		ManifestKey:   manifestKey,
+		RunDir:        filepath.Join(cfg.Paths.RunRoot, sid),
+		BaseDir:       filepath.Join(cfg.Paths.BaseRoot, sid),
+		EnvdUDS:       filepath.Join(cfg.Paths.RunRoot, sid, "envd.sock"),
+		CiUDS:         filepath.Join(cfg.Paths.RunRoot, sid, "ci.sock"),
+		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -381,7 +381,7 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 			CmdID: cmdID, Kind: routesync.CmdConnect, SID: sid,
 			Profile: string(types.ProfileE2B), APISecretFingerprint: fingerprint,
 			Cluster: &routesync.ClusterSandboxContext{
-				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey, AuthSandboxID: sb.AuthSandboxID(),
+				Group: sb.Cluster.Group, RouteKey: sb.Cluster.RouteKey, StableID: sb.StableID(),
 			},
 		})
 		if ack.Status != routesync.AckAccepted || ack.Connect == nil {
@@ -472,7 +472,7 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 		t.Fatalf("imported row is not visible after Ack: sandbox=%+v err=%v", got, err)
 	}
 	if got.ID != "stable-g1" || got.State != types.StateStarting || got.RunID != "" || got.Profile != fixture.source.Profile ||
-		got.AuthSandboxID() != fixture.source.AuthSandboxID() || got.CreatedUnix != fixture.source.CreatedUnix {
+		got.StableID() != fixture.source.StableID() || got.CreatedUnix != fixture.source.CreatedUnix {
 		t.Fatalf("imported identity/state = %+v", got)
 	}
 	if got.DeadlineUnix < deadlineFloor || got.DeadlineUnix > time.Now().Add(38*time.Second).Unix() {
@@ -548,8 +548,8 @@ func TestPrepareClusterConnectRejectsTokenMismatchBeforeInsert(t *testing.T) {
 			cmd.Profile = string(types.ProfileBare)
 			return migrationtoken.ErrIncompatible
 		},
-		"authentication subject": func(_ *testing.T, _ *clusterConnectFixture, cmd *routesync.Command) error {
-			cmd.Cluster.AuthSandboxID = "other-stable"
+		"stable ID": func(_ *testing.T, _ *clusterConnectFixture, cmd *routesync.Command) error {
+			cmd.Cluster.StableID = "other-stable"
 			return migrationtoken.ErrIncompatible
 		},
 		"API secret fingerprint": func(t *testing.T, fixture *clusterConnectFixture, cmd *routesync.Command) error {
@@ -658,7 +658,7 @@ func TestHandleClusterConnectRejectsInvalidTargetID(t *testing.T) {
 			ack := o.HandleCommand(context.Background(), &routesync.Command{
 				CmdID: "connect-invalid", Kind: routesync.CmdConnect, SID: sid,
 				Profile: string(types.ProfileE2B), APISecretFingerprint: strings.Repeat("a", 64),
-				Cluster:        &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", AuthSandboxID: "stable"},
+				Cluster:        &routesync.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a", StableID: "stable"},
 				MigrationToken: "kmt1.invalid",
 			})
 			if ack.Status != routesync.AckRejected || !strings.Contains(ack.Reason, "valid sandbox id") {
@@ -711,7 +711,7 @@ func newClusterConnectFixture(t *testing.T) *clusterConnectFixture {
 		t.Fatal(err)
 	}
 	source := migrationSandbox(t, dir, "stable-g0", pair.ManifestKey, "manifest://"+strings.Repeat("b", 64))
-	source.AuthSandboxIDValue = "stable"
+	source.StableIDValue = "stable"
 	source.CreatedUnix = 1_700_000_000
 	source.DeadlineUnix = 1_900_000_000
 	source.Env = map[string]string{"SOURCE": "stable-g0"}
@@ -734,7 +734,7 @@ func (f *clusterConnectFixture) command(targetID, token string) *routesync.Comma
 		CmdID: "connect-" + targetID, Kind: routesync.CmdConnect, SID: targetID,
 		Profile: string(f.source.Profile), APISecretFingerprint: f.fingerprint,
 		Cluster: &routesync.ClusterSandboxContext{
-			Group: "/tenant/workloads", RouteKey: "route-stable", AuthSandboxID: f.source.AuthSandboxID(),
+			Group: "/tenant/workloads", RouteKey: "route-stable", StableID: f.source.StableID(),
 		},
 		MigrationToken: token,
 	}

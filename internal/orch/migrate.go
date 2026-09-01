@@ -188,7 +188,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	}
 	if current == nil || current.State != types.StatePaused || current.SnapshotRef != attempt.sourceRef ||
 		current.CreatedUnix != source.CreatedUnix || current.TemplateID != source.TemplateID ||
-		current.AuthSandboxID() != source.AuthSandboxID() {
+		current.StableID() != source.StableID() {
 		return "", exportPreemptedError(sid)
 	}
 	exportKind := "kmt"
@@ -270,7 +270,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 		migrationtoken.MigrationTokenPayloadV1{
 			Version:                1,
 			NodeSandboxID:          sb.ID,
-			AuthSandboxID:          sb.AuthSandboxID(),
+			StableID:               sb.StableID(),
 			APISecretFingerprint:   apiFingerprint,
 			ManifestKeyFingerprint: manifestFingerprint,
 			TemplateID:             sb.TemplateID,
@@ -314,7 +314,7 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token, targetI
 
 // importSandboxWithKey is the shared synchronous KMT import core. expected and
 // cluster are trusted caller inputs: standalone import passes zero values, while
-// cluster commands can constrain the token subject/profile/runtime and attach
+// cluster commands can constrain the token StableID/profile/runtime and attach
 // system-owned Group/RouteKey state. A positive deadlineOverride is written as
 // part of the insert; zero preserves the token deadline. The token never
 // supplies trusted cluster context.
@@ -404,7 +404,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		ID:                 targetID,
 		Profile:            profile,
 		Cluster:            trustedCluster,
-		AuthSandboxIDValue: payload.AuthSandboxID,
+		StableIDValue:      payload.StableID,
 		TemplateID:         payload.TemplateID,
 		State:              types.StatePaused,
 		DeadlineUnix:       payload.DeadlineUnix,
