@@ -169,7 +169,7 @@ func TestUseLocalImageQualifiesTarstreamIdentity(t *testing.T) {
 	if closeErr != nil {
 		t.Fatal(closeErr)
 	}
-	if scheme != tarstream.DigestSchemeSHA256 {
+	if scheme != tarstream.DigestScheme {
 		t.Fatalf("fixture scheme = %q", scheme)
 	}
 
@@ -199,7 +199,7 @@ func TestUseLocalImageQualifiesTarstreamIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.DigestScheme != tarstream.DigestSchemeSHA256 || ref.Digest != digest {
+	if ref.DigestScheme != tarstream.DigestScheme || ref.Digest != digest {
 		t.Fatalf("qualified ref = %+v", ref)
 	}
 }
@@ -311,7 +311,7 @@ func TestPrepareBundleTemplateBaseUsesPublishedManifest(t *testing.T) {
 		spec:         &configsock.BuildSpec{CheckpointMode: "bundle"},
 		imagePath:    "/build/image.img",
 		baseImageRef: ref,
-		baseRef:      "file:///build/image.img@sha256:" + strings.Repeat("b", 64),
+		baseRef:      "file:///build/image.img@digest:" + strings.Repeat("b", 64),
 	}
 	if err := p.prepareBundleTemplateBase(); err != nil {
 		t.Fatal(err)
