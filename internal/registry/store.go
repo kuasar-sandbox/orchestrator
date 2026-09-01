@@ -80,7 +80,7 @@ type SandboxRecord struct {
 	APISecretFingerprint   string                    `json:"api_secret_fingerprint,omitempty"`
 	ManifestKeyFingerprint string                    `json:"manifest_key_fingerprint,omitempty"`
 	CreateCredentials      *sandboxcfg.Credentials   `json:"create_credentials,omitempty"`
-	AuthSandboxID          string                    `json:"auth_sandbox_id,omitempty"`
+	StableID               string                    `json:"stable_id,omitempty"`
 	APISecret              string                    `json:"api_secret,omitempty"`
 	ServiceSecret          string                    `json:"service_secret,omitempty"`
 	EnvdAccessToken        string                    `json:"envd_access_token,omitempty"`

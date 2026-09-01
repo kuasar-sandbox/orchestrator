@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,17 +131,17 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	default:
 		return ack
 	}
-	authSandboxID := cmd.SID
-	if cmd.Cluster != nil && cmd.Cluster.AuthSandboxID != "" {
-		authSandboxID = cmd.Cluster.AuthSandboxID
+	stableID := cmd.SID
+	if cmd.Cluster != nil && cmd.Cluster.StableID != "" {
+		stableID = cmd.Cluster.StableID
 	}
-	serviceSecret, err := keys.DeriveServiceSecret(keyPair.APISecret, authSandboxID)
+	serviceSecret, err := keys.DeriveServiceSecret(keyPair.APISecret, stableID)
 	if err != nil {
 		ack.Status = routesync.AckRejected
 		ack.Reason = "invalid service credentials"
 		return ack
 	}
-	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, stableID)
 	if err != nil {
 		ack.Status = routesync.AckRejected
 		ack.Reason = "invalid forward credentials"
@@ -150,7 +151,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		SandboxID:              cmd.SID,
 		Profile:                cmd.Profile,
 		State:                  routesync.StateRunning,
-		AuthSandboxID:          authSandboxID,
+		StableID:               stableID,
 		APISecret:              keyPair.APISecret,
 		APISecretFingerprint:   keyPair.APISecretFingerprint,
 		ManifestKeyFingerprint: keyPair.ManifestKeyFingerprint,
@@ -288,12 +289,12 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	if got := node.createFingerprint(); got != apiFingerprint {
 		t.Fatalf("create APISecretFingerprint=%q, placement fingerprint=%q", got, apiFingerprint)
 	}
-	if route.AuthSandboxID != route.SandboxID || route.APISecret != testAPISecret ||
+	if route.StableID != route.SandboxID || route.APISecret != testAPISecret ||
 		route.APISecretFingerprint != apiFingerprint || route.ManifestKeyFingerprint != manifestFingerprint ||
 		route.EnvdAccessToken != testEnvdAccessToken || route.TrafficAccessToken != testTrafficAccessToken {
 		t.Fatal("reserve result did not preserve explicit route credentials")
 	}
-	if err := keys.VerifyForwardAccessToken(route.ForwardAccessToken, route.ServiceSecret, route.AuthSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(route.ForwardAccessToken, route.ServiceSecret, route.StableID); err != nil {
 		t.Fatalf("reserve ForwardAccessToken: %v", err)
 	}
 }
@@ -353,6 +354,50 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 			t.Fatal("node never registered after redirect")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNodeLinkVersionMismatchRejectsCommands(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		msg, err := routesync.ReadMsg(req.Body)
+		if err != nil || msg.Type != routesync.TypeNodeRegister {
+			http.Error(w, "bad node register", http.StatusBadRequest)
+			return
+		}
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
+			Version: routesync.Version - 1,
+		}})
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
+			CmdID: "must-not-run", Kind: routesync.CmdKeyPut,
+			APISecretFingerprint: strings.Repeat("a", 64),
+		}})
+		w.(http.Flusher).Flush()
+		<-req.Context().Done()
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+
+	node := newFakeNode()
+	client := NewWithEndpoint(
+		srv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+		},
+		routesync.NodeRegister{NodeID: "n1"},
+		node,
+		time.Hour,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		false,
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.session(ctx, srv.URL); err == nil || !strings.Contains(err.Error(), "protocol version mismatch") {
+		t.Fatalf("node-link version mismatch error = %v", err)
+	}
+	if _, ok := node.installedKeyPair(strings.Repeat("a", 64)); ok {
+		t.Fatal("node-link processed a command after version mismatch")
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 var requiredPayloadFields = map[string]struct{}{
 	"v":                      {},
 	"nodeSandboxID":          {},
-	"authSandboxID":          {},
+	"stableID":               {},
 	"apiSecretFingerprint":   {},
 	"manifestKeyFingerprint": {},
 	"templateID":             {},
@@ -87,8 +87,8 @@ func decodePayloadField(payload *MigrationTokenPayloadV1, field string, raw json
 		return decodeStrict(raw, &payload.Version)
 	case "nodeSandboxID":
 		return decodeStrict(raw, &payload.NodeSandboxID)
-	case "authSandboxID":
-		return decodeStrict(raw, &payload.AuthSandboxID)
+	case "stableID":
+		return decodeStrict(raw, &payload.StableID)
 	case "apiSecretFingerprint":
 		return decodeStrict(raw, &payload.APISecretFingerprint)
 	case "manifestKeyFingerprint":

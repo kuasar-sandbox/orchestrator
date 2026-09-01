@@ -109,12 +109,12 @@ type BuildEvent struct {
 
 // ClusterSandboxContext carries Registry-owned sandbox identity to a node. The
 // node persists Group and RouteKey separately from user metadata, and stores the
-// optional AuthSandboxID as the stable credential subject. It never derives any
+// optional StableID as the stable sandbox identity. It never derives any
 // of these values from Command.SID.
 type ClusterSandboxContext struct {
-	Group         string `json:"group"`
-	RouteKey      string `json:"route_key"`
-	AuthSandboxID string `json:"auth_sandbox_id,omitempty"`
+	Group    string `json:"group"`
+	RouteKey string `json:"route_key"`
+	StableID string `json:"stable_id,omitempty"`
 }
 
 // CmdAck statuses.
@@ -214,7 +214,7 @@ type Command struct {
 	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register
 	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
 	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
-	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/auth identity
+	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/stable identity
 	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
 	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time

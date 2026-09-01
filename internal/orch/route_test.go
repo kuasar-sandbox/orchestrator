@@ -60,7 +60,7 @@ func TestLookupRouteIsSideEffectFreeAndActivateRevalidatesBinding(t *testing.T) 
 
 	rotated := cloneSandbox(sb)
 	rotated.ServiceSecret = strings.Repeat("6", 64)
-	rotated.ForwardAccessToken, err = keys.MintForwardAccessToken(rotated.ServiceSecret, rotated.AuthSandboxID())
+	rotated.ForwardAccessToken, err = keys.MintForwardAccessToken(rotated.ServiceSecret, rotated.StableID())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ func sandboxInsertFixture(id string, candidate int) *types.Sandbox {
 		ID:                 id,
 		Profile:            types.ProfileE2B,
 		Cluster:            &types.ClusterSandboxContext{Group: fmt.Sprintf("/group-%d", candidate), RouteKey: fmt.Sprintf("route-%d", candidate)},
-		AuthSandboxIDValue: fmt.Sprintf("stable-%d", candidate),
+		StableIDValue:      fmt.Sprintf("stable-%d", candidate),
 		TemplateID:         types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat(hexDigit, 64)}.String(),
 		State:              types.StateRunning,
 		DeadlineUnix:       int64(100 + candidate),
@@ -41,7 +41,7 @@ func sandboxInsertFixture(id string, candidate int) *types.Sandbox {
 		EnvdAccessToken:    fmt.Sprintf("envd-%d", candidate),
 		TrafficAccessToken: fmt.Sprintf("traffic-%d", candidate),
 	}
-	forwardToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.AuthSandboxID())
+	forwardToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.StableID())
 	if err != nil {
 		panic(err)
 	}

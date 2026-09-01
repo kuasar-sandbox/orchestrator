@@ -16,7 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T) {
+func TestPrepareClusterExecSessionImportsAndMintsStableIDToken(t *testing.T) {
 	fixture := newClusterConnectFixture(t)
 	blockClusterExecLaunch(t, fixture)
 	cmd := fixture.command("stable-g1", fixture.token)
@@ -35,26 +35,26 @@ func TestPrepareClusterExecSessionImportsAndMintsStableSubjectToken(t *testing.T
 	}
 	if sb == nil || sb.ID != cmd.SID || sb.State != types.StateStarting || sb.Cluster == nil ||
 		sb.Cluster.Group != cmd.Cluster.Group || sb.Cluster.RouteKey != cmd.Cluster.RouteKey ||
-		sb.AuthSandboxID() != cmd.Cluster.AuthSandboxID {
+		sb.StableID() != cmd.Cluster.StableID {
 		t.Fatalf("prepared sandbox = %+v", sb)
 	}
 	if result == nil || result.ExecAccessToken == "" {
 		t.Fatalf("exec-session result = %+v", result)
 	}
 	claims, err := keys.ParseAndVerifyExecAccessToken(
-		result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+36, 0),
+		result.ExecAccessToken, sb.ServiceSecret, sb.StableID(), time.Unix(signing+36, 0),
 	)
 	if err != nil || len(claims.Conditions) != 1 || claims.Conditions[0] != cmd.ExecConditions[0] {
 		t.Fatalf("token conditions = %+v, %v", claims, err)
 	}
-	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+36, 0)); err != nil {
+	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.StableID(), time.Unix(signing+36, 0)); err != nil {
 		t.Fatalf("token before expiry: %v", err)
 	}
-	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(signing+37, 0)); err == nil {
+	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.StableID(), time.Unix(signing+37, 0)); err == nil {
 		t.Fatal("token accepted at expiry")
 	}
 	if err := keys.VerifyExecAccessToken(result.ExecAccessToken, sb.ServiceSecret, sb.ID, time.Unix(signing, 0)); err == nil {
-		t.Fatal("token accepted NodeSandboxID instead of stable AuthSandboxID")
+		t.Fatal("token accepted NodeSandboxID instead of StableID")
 	}
 }
 
@@ -79,7 +79,7 @@ func TestPrepareClusterExecSessionMintsPerCommandLongLivedTokens(t *testing.T) {
 		t.Fatal("different commands minted the same exec access token")
 	}
 	for _, token := range []string{firstResult.ExecAccessToken, secondResult.ExecAccessToken} {
-		if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.AuthSandboxID(), time.Unix(math.MaxInt64, 0)); err != nil {
+		if err := keys.VerifyExecAccessToken(token, sb.ServiceSecret, sb.StableID(), time.Unix(math.MaxInt64, 0)); err != nil {
 			t.Fatalf("long-lived token: %v", err)
 		}
 	}
@@ -111,7 +111,7 @@ func TestHandleClusterExecSessionReturnsBeforeAsynchronousResume(t *testing.T) {
 	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
 		t.Fatalf("synchronously imported target = %+v, %v", stored, err)
 	}
-	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.AuthSandboxID(), time.Now()); err != nil {
+	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.StableID(), time.Now()); err != nil {
 		t.Fatalf("ack token = %v", err)
 	}
 	select {

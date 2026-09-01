@@ -23,12 +23,12 @@ func materializeSandboxCredentials(sb *types.Sandbox, credentials sandboxcfg.Cre
 	serviceSecret := credentials.ServiceSecret
 	var err error
 	if serviceSecret == "" {
-		serviceSecret, err = keys.DeriveServiceSecret(sb.APISecret, sb.AuthSandboxID())
+		serviceSecret, err = keys.DeriveServiceSecret(sb.APISecret, sb.StableID())
 		if err != nil {
 			return fmt.Errorf("derive service secret: %w", err)
 		}
 	}
-	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, sb.AuthSandboxID())
+	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, sb.StableID())
 	if err != nil {
 		return fmt.Errorf("mint forward access token: %w", err)
 	}

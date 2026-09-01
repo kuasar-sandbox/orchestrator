@@ -36,7 +36,7 @@ func testKeyPair(apiDigit, manifestDigit string) KeyPair {
 
 func setTestSandboxServiceCredentials(sb *types.Sandbox) {
 	sb.ServiceSecret = strings.Repeat("7", 64)
-	forwardToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.AuthSandboxID())
+	forwardToken, err := keys.MintForwardAccessToken(sb.ServiceSecret, sb.StableID())
 	if err != nil {
 		panic(err)
 	}

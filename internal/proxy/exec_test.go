@@ -71,7 +71,7 @@ func (r *execTestRouter) ActivateExec(ctx context.Context, _ string, expected pr
 func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
-		AuthSandboxID: "stable-s1",
+		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
 	router := &execTestRouter{
@@ -122,10 +122,10 @@ func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *test
 func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
-		AuthSandboxID: "stable-s1",
+		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,11 +179,11 @@ func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 func TestExecConditionFailureHasNoParkingActivationOrDial(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-condition",
-		AuthSandboxID: "stable-condition",
+		StableID:      "stable-condition",
 		ServiceSecret: execTestServiceSecret,
 	}
 	token, err := keys.MintExecAccessTokenWithConditions(
-		identity.ServiceSecret, identity.AuthSandboxID, 0,
+		identity.ServiceSecret, identity.StableID, 0,
 		[]string{`request.argv == ['/bin/allowed']`},
 	)
 	if err != nil {
@@ -224,14 +224,14 @@ func TestExecConditionFailureHasNoParkingActivationOrDial(t *testing.T) {
 func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
-		AuthSandboxID: "stable-s1",
+		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
-	forwardToken, err := keys.MintForwardAccessToken(execTestServiceSecret, identity.AuthSandboxID)
+	forwardToken, err := keys.MintForwardAccessToken(execTestServiceSecret, identity.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	validToken, err := keys.MintExecAccessToken(execTestServiceSecret, identity.AuthSandboxID, 0)
+	validToken, err := keys.MintExecAccessToken(execTestServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 	}{
 		{name: "forward audience", token: forwardToken, activateIdentity: identity, wantStatus: http.StatusUnauthorized, wantActivations: 0, wantProxyError: proxy.ProxyErrorUnauthorized},
 		{name: "identity changed after activation", token: validToken, activateIdentity: proxy.ExecIdentity{
-			NodeSandboxID: "node-s1", AuthSandboxID: "other", ServiceSecret: execTestServiceSecret,
+			NodeSandboxID: "node-s1", StableID: "other", ServiceSecret: execTestServiceSecret,
 		}, wantStatus: http.StatusOK, wantActivations: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -288,10 +288,10 @@ func TestExecRejectsForwardTokenAndChangedIdentityBeforeDial(t *testing.T) {
 func TestExecActivationFailureReturnsGenericPostAcceptErrorBeforeDial(t *testing.T) {
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
-		AuthSandboxID: "stable-s1",
+		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
-		AuthSandboxID: "stable-s1",
+		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
 	backend, backendDone := startExecBackend(t, runRoot, identity.NodeSandboxID, []byte("exec-response-tail"))
@@ -346,7 +346,7 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-h2",
-		AuthSandboxID: "stable-h2",
+		StableID:      "stable-h2",
 		ServiceSecret: execTestServiceSecret,
 	}
 	backend, backendDone := startExecBackend(t, runRoot, identity.NodeSandboxID, []byte("h2-response-tail"))
@@ -432,7 +432,7 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	ts.StartTLS()
 	defer ts.Close()
 
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -490,7 +490,7 @@ func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-gate",
-		AuthSandboxID: "stable-gate",
+		StableID:      "stable-gate",
 		ServiceSecret: execTestServiceSecret,
 	}
 	router := &execTestRouter{
@@ -506,7 +506,7 @@ func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 		}, runRoot).WithTrafficTracker(traffic)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +548,7 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-cancel",
-		AuthSandboxID: "stable-cancel",
+		StableID:      "stable-cancel",
 		ServiceSecret: execTestServiceSecret,
 	}
 	dir := filepath.Join(runRoot, identity.NodeSandboxID)
@@ -593,7 +593,7 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
 	defer ts.Close()
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {
 	runRoot := t.TempDir()
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-close",
-		AuthSandboxID: "stable-close",
+		StableID:      "stable-close",
 		ServiceSecret: execTestServiceSecret,
 	}
 	dir := filepath.Join(runRoot, identity.NodeSandboxID)
@@ -692,7 +692,7 @@ func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {
 		px.ServeHTTP(w, r)
 	}))
 	defer ts.Close()
-	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,7 +811,7 @@ func discardExecLogger() *slog.Logger {
 }
 
 func TestExecUnavailableWithoutTrustedRunRoot(t *testing.T) {
-	identity := proxy.ExecIdentity{NodeSandboxID: "node-s1", AuthSandboxID: "stable-s1", ServiceSecret: execTestServiceSecret}
+	identity := proxy.ExecIdentity{NodeSandboxID: "node-s1", StableID: "stable-s1", ServiceSecret: execTestServiceSecret}
 	router := &execTestRouter{identity: identity, found: true, activateResult: identity, activateFound: true}
 	px := proxy.New(router, func() string { return "enforce" }, discardExecLogger(), nil)
 	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", strings.NewReader("unused"))

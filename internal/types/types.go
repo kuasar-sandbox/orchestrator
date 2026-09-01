@@ -148,7 +148,7 @@ type Sandbox struct {
 	ID                 string
 	Profile            Profile
 	Cluster            *ClusterSandboxContext
-	AuthSandboxIDValue string // optional stable credential subject; empty falls back to ID
+	StableIDValue      string // optional stable identity; empty falls back to ID
 	TemplateID         string
 	State              State
 	DeadlineUnix       int64 // 0 = no deadline
@@ -181,16 +181,16 @@ type ClusterSandboxContext struct {
 	RouteKey string
 }
 
-// AuthSandboxID returns the stable subject used by sandbox service credentials.
-// Standalone sandboxes normally leave AuthSandboxIDValue empty and therefore use
-// their local ID. Imports may preserve a non-local subject without becoming
+// StableID returns the sandbox identity preserved across node-local ID changes.
+// Standalone sandboxes normally leave StableIDValue empty and therefore use
+// their local ID. Imports may preserve a source StableID without becoming
 // cluster-owned.
-func (s *Sandbox) AuthSandboxID() string {
+func (s *Sandbox) StableID() string {
 	if s == nil {
 		return ""
 	}
-	if s.AuthSandboxIDValue != "" {
-		return s.AuthSandboxIDValue
+	if s.StableIDValue != "" {
+		return s.StableIDValue
 	}
 	return s.ID
 }

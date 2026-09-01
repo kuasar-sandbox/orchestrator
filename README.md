@@ -23,6 +23,13 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 **bare**(无 envd,仅 floatingip)。全部纯 Go,`CGO_ENABLED=0`,无 gRPC/protobuf(协议为
 帧化 JSON over h2c)。
 
+身份约定：`StableID` 是 sandbox 在 node-local ID 变化时保持不变的身份，`NodeSandboxID`
+是当前节点实例 ID。standalone 普通 create 的 `StableID` 回退为本地 ID；显式 import 可以
+改变 target 本地 ID 而保留 source `StableID`。cluster 对外 `SandboxID` 等于 `StableID`，
+node 内部 `Sandbox.ID` 等于 `NodeSandboxID`。身份保持型 migration/copy 可以让多个
+node-local sandbox 共享 `StableID`；它不是本地 lookup key，也没有唯一索引。KAT 的
+canonical `sid` claim 绑定 `StableID`。
+
 ## 组成
 
 | 路径 | 角色 |

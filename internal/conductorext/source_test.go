@@ -36,7 +36,8 @@ func TestSourcesGetReturnIndependentRedactedViews(t *testing.T) {
 		t.Fatalf("sandbox Get found=%t err=%v", found, err)
 	}
 	if firstSandbox.APISecretFingerprint == "" || firstSandbox.ManifestKeyFingerprint == "" ||
-		firstSandbox.APISecretFingerprint == sandbox.APISecret || firstSandbox.ManifestKeyFingerprint == sandbox.ManifestKey {
+		firstSandbox.APISecretFingerprint == sandbox.APISecret || firstSandbox.ManifestKeyFingerprint == sandbox.ManifestKey ||
+		firstSandbox.ID != sandbox.ID || firstSandbox.StableID != sandbox.StableID() {
 		t.Fatalf("sandbox fingerprints were not projected: %+v", firstSandbox)
 	}
 	firstSandbox.Metadata["key"] = "mutated"
@@ -515,13 +516,14 @@ func testStore(t *testing.T) *store.Store {
 }
 
 func testSandbox(id string, created int64) *types.Sandbox {
+	stableID := "stable-" + id
 	serviceSecret := strings.Repeat("3", 64)
-	forward, err := keys.MintForwardAccessToken(serviceSecret, id)
+	forward, err := keys.MintForwardAccessToken(serviceSecret, stableID)
 	if err != nil {
 		panic(err)
 	}
 	return &types.Sandbox{
-		ID: id, Profile: types.ProfileBare,
+		ID: id, Profile: types.ProfileBare, StableIDValue: stableID,
 		Cluster:    &types.ClusterSandboxContext{Group: "group", RouteKey: "route"},
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
 		State:      types.StateRunning, DeadlineUnix: created + 100, RunDir: "/run/" + id, BaseDir: "/base/" + id,

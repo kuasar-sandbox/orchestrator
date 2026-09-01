@@ -90,7 +90,7 @@ type routeResolve struct {
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
 	TemplateID             string `json:"template_id"`
-	AuthSandboxID          string `json:"auth_sandbox_id"`
+	StableID               string `json:"stable_id"`
 	APISecret              string `json:"api_secret"`
 	APISecretFingerprint   string `json:"api_secret_fingerprint"`
 	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
@@ -1151,7 +1151,7 @@ func (rt *Router) serveExecData(w http.ResponseWriter, r *http.Request) {
 
 	token := r.Header.Get(HeaderAccessTok)
 	claims, err := keys.ParseAndVerifyExecAccessToken(
-		token, rr.ServiceSecret, rr.AuthSandboxID, time.Now(),
+		token, rr.ServiceSecret, rr.StableID, time.Now(),
 	)
 	if err != nil {
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
@@ -1444,11 +1444,11 @@ func (rt *Router) execRouteStillAuthorized(
 ) bool {
 	if current == nil || stable == nil ||
 		!routeMatchesIdentity(current, stable.Group, stable.RouteKey, sandboxID) ||
-		current.AuthSandboxID != stable.AuthSandboxID {
+		current.StableID != stable.StableID {
 		return false
 	}
 	got, err := keys.ParseAndVerifyExecAccessToken(
-		token, current.ServiceSecret, current.AuthSandboxID, time.Now(),
+		token, current.ServiceSecret, current.StableID, time.Now(),
 	)
 	return err == nil && sameExecAccessClaims(got, want)
 }

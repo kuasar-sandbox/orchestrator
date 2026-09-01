@@ -37,7 +37,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 
 	sid := "stable-sandbox-g0"
 	sb := migrationSandbox(t, dir, sid, mk, "manifest://"+strings.Repeat("b", 64))
-	sb.AuthSandboxIDValue = "stable-sandbox"
+	sb.StableIDValue = "stable-sandbox"
 	sb.DeadlineUnix = 1_900_000_000
 	sb.Env = map[string]string{"FOO": "bar"}
 	sb.Metadata = map[string]string{
@@ -71,7 +71,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	if err != nil {
 		t.Fatalf("open exported token: %v", err)
 	}
-	if payload.NodeSandboxID != sid || payload.AuthSandboxID != sb.AuthSandboxID() ||
+	if payload.NodeSandboxID != sid || payload.StableID != sb.StableID() ||
 		payload.TemplateID != sb.TemplateID || payload.Profile != string(sb.Profile) ||
 		payload.SnapshotRef != sb.SnapshotRef || payload.CreatedUnix != sb.CreatedUnix ||
 		payload.DeadlineUnix != sb.DeadlineUnix {
@@ -94,7 +94,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 		t.Fatalf("import: imported=%q err=%v", imported, err)
 	}
 	got, _ := o.st.Get(ctx, imported)
-	if got == nil || got.ID != sid || got.AuthSandboxID() != sb.AuthSandboxID() || got.Cluster != nil ||
+	if got == nil || got.ID != sid || got.StableID() != sb.StableID() || got.Cluster != nil ||
 		got.State != types.StatePaused || got.Profile != sb.Profile || got.TemplateID != sb.TemplateID ||
 		got.SnapshotRef != sb.SnapshotRef || got.CreatedUnix != sb.CreatedUnix ||
 		got.DeadlineUnix != sb.DeadlineUnix || !reflect.DeepEqual(got.Env, sb.Env) ||
@@ -218,7 +218,7 @@ func TestExportSandboxReturnsTypedClientErrors(t *testing.T) {
 	}
 }
 
-func TestImportExplicitTargetPreservesAuthSubjectAndCredentials(t *testing.T) {
+func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	ctx := context.Background()
@@ -228,7 +228,7 @@ func TestImportExplicitTargetPreservesAuthSubjectAndCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := migrationSandbox(t, dir, "logical-g0", mk, "manifest://"+strings.Repeat("b", 64))
-	source.AuthSandboxIDValue = "logical"
+	source.StableIDValue = "logical"
 	source.Metadata = map[string]string{
 		"ordinary":               "preserved",
 		sandboxcfg.NsCredentials: `{"service_secret":"must-not-reenter"}`,
@@ -253,8 +253,8 @@ func TestImportExplicitTargetPreservesAuthSubjectAndCredentials(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("get explicit target: %v", err)
 	}
-	if got.AuthSandboxID() != source.AuthSandboxID() || got.ID == source.ID {
-		t.Fatal("explicit target changed the authentication subject or retained the source node ID")
+	if got.StableID() != source.StableID() || got.ID == source.ID {
+		t.Fatal("explicit target changed the stable ID or retained the source node ID")
 	}
 	if got.Metadata["ordinary"] != "preserved" {
 		t.Fatal("standalone import lost ordinary metadata")
@@ -302,7 +302,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	source := migrationSandbox(t, dir, "logical-g0", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
-	source.AuthSandboxIDValue = "logical"
+	source.StableIDValue = "logical"
 	source.Metadata = map[string]string{
 		"ordinary":                     "preserved",
 		clusterstate.ObjectMetadataKey: "untrusted-binding",
@@ -323,7 +323,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 	imported, err := o.importSandboxWithKey(context.Background(), store.KeyPair{
 		APISecret: source.APISecret, ManifestKey: source.ManifestKey,
 	}, token, "logical-g1", migrationtoken.Expectations{
-		AuthSandboxID: source.AuthSandboxID(),
+		StableID:      source.StableID(),
 		TemplateID:    source.TemplateID,
 		Profile:       source.Profile,
 		RuntimeDigest: digest,
@@ -333,7 +333,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.Group = "/mutated"
-	if imported.ID != "logical-g1" || imported.AuthSandboxID() != "logical" || imported.Cluster == nil ||
+	if imported.ID != "logical-g1" || imported.StableID() != "logical" || imported.Cluster == nil ||
 		imported.Cluster.Group != "/tenant/workloads" || imported.Cluster.RouteKey != "route-1" {
 		t.Fatal("trusted import context was not preserved")
 	}
@@ -376,10 +376,10 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	})
 
 	for name, expected := range map[string]migrationtoken.Expectations{
-		"subject":  {AuthSandboxID: "different-subject"},
-		"template": {TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("c", 64)}.String()},
-		"profile":  {Profile: types.ProfileBare},
-		"snapshot": {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
+		"stable-id": {StableID: "different-stable-id"},
+		"template":  {TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("c", 64)}.String()},
+		"profile":   {Profile: types.ProfileBare},
+		"snapshot":  {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil, 0)

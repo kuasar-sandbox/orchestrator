@@ -980,7 +980,7 @@ Header 中存在完整 credentials object 时覆盖 metadata object,不做字段
 `service_secret`、`envd_access_token`、`traffic_access_token`;unknown、duplicate、null、
 非字符串及 trailing value 均拒绝。bare 显式指定 Envd/Traffic token 返回 400。
 Envd/Traffic override 必须是有效 UTF-8 且各不超过 256 bytes。
-ServiceSecret 缺省从 APISecret 与 `AuthSandboxID()` 派生;Forward token 始终由最终
+ServiceSecret 缺省从 APISecret 与 `StableID()` 派生;Forward token 始终由最终
 ServiceSecret 自动签发,不能由请求指定。credentials 在验证后立即从普通 metadata 分离。
 
 Checkpoint policy 也支持 metadata 与 Create header 两个入口:
@@ -1002,7 +1002,7 @@ policy 解析、覆盖和副作用边界。
 
 `kuasar-sandbox.cluster` 不属于上述租户配置命名空间。cluster Build 的 group 使用独立
 持久系统字段,不会进入 portable template metadata;普通 sandbox 的 `Profile`、`Group`、`RouteKey` 和可选
-`AuthSandboxID` 则通过 node-link 的结构化系统上下文下发并独立持久化,不进入用户
+`StableID` 则通过 node-link 的结构化系统上下文下发并独立持久化,不进入用户
 metadata。node 不在事件中回传 Registry 自有的 group、route key 或认证主体;Registry
 通过节点归属记录恢复这些信息。
 
@@ -1314,6 +1314,17 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
 
 ## 7. 密钥与归属模型(APISecret + ManifestKey 凭据对,加密存 sqlite)
 
+- **StableID 与本地 ID**:`Sandbox.ID` 是当前 node-local store/runtime/route lookup key；
+  `StableID()` 是跨 node-local ID 变化保持不变的 sandbox identity。standalone 普通 create
+  未显式物化 `StableIDValue`，因此 helper 回退为本地 `Sandbox.ID`；standalone import
+  指定不同 target ID 时只改变 `Sandbox.ID`，保留 source StableID 和全部 service
+  credential。身份保持型 migration/copy 可以产生多个共享 StableID 的 node-local row，
+  `stable_id` 没有 UNIQUE constraint，也不提供本地反向 lookup。cluster 中本地 ID 是
+  NodeSandboxID，StableID 等于 Registry 的公开 SandboxID。同节点 resume 保持两者；跨节点
+  migration/re-place 只更换 NodeSandboxID。Forward/Exec KAT 的 canonical `sid` claim 始终
+  绑定 StableID；这不把 copy 定义为 independently authorized fork。
+- SQLite schema 直接使用 `stable_id`，不探测或迁移旧列，也没有双读/双写；pre-release
+  部署必须清理并重建旧 preview database。
 - **根凭据分工**:APISecret 与 ManifestKey 是同一租户范围内用途分离的根凭据,都是
   32B / 64-lowercase-hex。APISecret 用于 API 请求认证和派生 Sandbox ServiceSecret;
   ManifestKey 是 manifest 内容键(`MANIFEST_KEY` env / `manifest.key`),也用于封装镜像
@@ -1370,17 +1381,17 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
   node-link 原子下发完整凭据对,
   两者同样仅入加密存储 + 运行期内存(§10)。
 - 每个 Sandbox 持久化独立 ServiceSecret。未 override 时按
-  `HMAC-SHA256(APISecret,"kuasar-service-secret-v1:"+AuthSandboxID())` 派生;保存后不再重建。
+  `HMAC-SHA256(APISecret,"kuasar-service-secret-v1:"+StableID())` 派生;保存后不再重建。
   e2b 的 `envdAccessToken`/`trafficAccessToken` 可 override,否则分别随机生成;bare 两项恒空。
   EnvdAccessToken 用于 e2b 49983/49999,TrafficAccessToken 仅供外部网关及 e2b 数据面组件
   验证,不由 node 平台层消费。两个 e2b opaque token 均限制为有效 UTF-8、最多 256 bytes,
   在写业务行前校验。e2b/bare 的 `forwardAccessToken` 均为 ServiceSecret 签发、绑定
-  AuthSandboxID 且 `aud=forward` 的严格 `kat1`,用于其他 forward 目标。四项凭据均加密
+  StableID 且 `aud=forward` 的严格 `kat1`,用于其他 forward 目标。四项凭据均加密
   落盘并在 lifecycle upsert 中不可重绑。
   ExecAccessToken 不在 create/get/list 中缺省生成,也不写 Sandbox 业务行;它只由
   `POST /sandboxes/{id}/exec-sessions` 按次签发.每个 token 使用 UUIDv7 `session_id`,
   线格式为 `kat1.<base64url-no-padding(payload)>.<base64url-no-padding(signature)>`,
-  payload 的 canonical field 顺序为 `v,session_id,sid,aud[,exp][,conditions]`,其中 `sid=AuthSandboxID()`,
+  payload 的 canonical field 顺序为 `v,session_id,sid,aud[,exp][,conditions]`,其中 `sid=StableID()`,
   `aud=exec`,不包含 `iat`.signature 以解码后的 32-byte ServiceSecret 直接执行
   HMAC-SHA256,不另派生 exec key.`conditions` 是按 API 顺序保存的紧凑字符串数组,
   unrestricted 时省略;它与其它 payload 字段一起受 HMAC 覆盖,不另加 digest.KAT holder
@@ -1582,8 +1593,8 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
 - **迁移 token**:`export-sandbox <sid>` 确保 portable 后导出
   `kmt1.<base64url-no-padding(nonce|ciphertext)>`。ManifestKey 经
   `HMAC-SHA256(decodeHex(ManifestKey),"kuasar-migration-token-v1")` 派生 AES-256-GCM
-  key,每次 export 使用随机 12-byte nonce。完整 wire 上限 512 KiB,旧 plain-base64
-  token 不再接受。
+  key,每次 export 使用随机 12-byte nonce。plaintext V1 只接受 `stableID`；不接受旧字段
+  或 fallback。完整 wire 上限 512 KiB,旧 plain-base64 token 不再接受。
 - **Export / Resume 并发**:local publish 不持有长 lifecycle lock。`BeginResume` 成功提交
   `paused -> starting` 是 Resume 获胜点;Export finalizer 在同一 per-SID lock 内完成
   exact attempt、paused state 与原 SnapshotRef 校验是另一个获胜点。Resume 先获胜时,
@@ -1596,7 +1607,7 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   关闭 store/launcher 前 drain 全部已受理 Export。`keepSource=false` 在删除 row 前按
   Stop/Reset/detach/RunDir 顺序回收持久 ownership;任一步失败都保留 row、cache 与 local
   snapshot 供重试,不制造无法由 Reconcile 发现的 orphan unit/port。
-- **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`AuthSandboxID()`、Profile、
+- **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`StableID()`、Profile、
   template/canonical portable SnapshotRef/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
   以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
   MMDS route secret value、host absolute path、Group/RouteKey 或 generation。routes-only
@@ -1604,7 +1615,7 @@ WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且�
   token、snapshot 或 template。目标 node 从本地 key 表取得完整 pair,
   校验 fingerprints/runtime/Profile/Forward KAT 后原样落库,不重新派生或生成 service credential。
 - **target 与冲突**:standalone import 省略 `sandboxID` 时复用 source NodeSandboxID;显式 target
-  只替换本地 ID,保留 AuthSandboxID 与全部 credential。ID 使用 1..57 bytes 的 lowercase
+  只替换本地 ID,保留 StableID 与全部 credential。ID 使用 1..57 bytes 的 lowercase
   DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
   已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
   目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
@@ -1790,7 +1801,7 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 ```text
 sandbox{
   sid, profile, state(starting|running|paused|dead), snap_loc, template_id,
-  auth_sandbox_id, api_secret, api_secret_fingerprint,
+  stable_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
   mmds_secret
@@ -1827,7 +1838,7 @@ CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network own
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,auth_sandbox_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
+  | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
   | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成 paused→starting、旧 network/run 清理与 deadline 持久化.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
   | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
@@ -2152,7 +2163,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
-               profile, cluster_group, cluster_route_key, auth_sandbox_id,
+               profile, cluster_group, cluster_route_key, stable_id,
                template_id, state(starting|running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,

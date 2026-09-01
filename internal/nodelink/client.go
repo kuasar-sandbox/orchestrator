@@ -189,6 +189,9 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if err != nil {
 		return err
 	}
+	if err := routesync.ValidateHello(hello); err != nil {
+		return fmt.Errorf("node-link handshake: %w", err)
+	}
 	if redir := nodeLinkRedirectFromHello(hello); len(redir.targets) > 0 {
 		return redir
 	}
@@ -198,9 +201,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
 	// stream routes; onUp dispatches commands.
 	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
-	if hello.Type == routesync.TypeHello && hello.Hello != nil {
-		reg.ResumeFrom = hello.Hello.ResumeFrom
-	}
+	reg.ResumeFrom = hello.Hello.ResumeFrom
 	outbox := make(chan *routesync.Msg)
 	highOut := make(chan *routesync.Msg, 32)
 	hbUpdate := make(chan struct{}, 1)

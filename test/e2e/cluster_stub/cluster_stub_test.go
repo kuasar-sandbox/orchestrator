@@ -329,7 +329,7 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
 	if create.Cluster == nil || create.Cluster.Group != testGroup || create.Cluster.RouteKey != routeKey ||
-		create.Cluster.AuthSandboxID != created.SandboxID ||
+		create.Cluster.StableID != created.SandboxID ||
 		create.SID != registry.EncodeNodeSandboxID(created.SandboxID, 0) || create.Profile != "e2b" ||
 		create.TemplateRef != testTemplateRef || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
@@ -356,16 +356,16 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 		t.Fatalf("ready create Reserve returned a connect result: %+v", reserved.Connect)
 	}
 	reservedRoute := &reserved.Route
-	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, create.Cluster.AuthSandboxID)
+	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, create.Cluster.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, create.Cluster.AuthSandboxID)
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, create.Cluster.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reservedRoute.RouteRevision <= 0 || reservedRoute.SandboxID != created.SandboxID || reservedRoute.NodeSandboxID != create.SID ||
-		reservedRoute.AuthSandboxID != create.Cluster.AuthSandboxID || reservedRoute.APISecret != testAPISecret ||
+		reservedRoute.StableID != create.Cluster.StableID || reservedRoute.APISecret != testAPISecret ||
 		reservedRoute.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		reservedRoute.ManifestKeyFingerprint != fullFingerprint(t, testMK) ||
 		reservedRoute.ServiceSecret != serviceSecret || reservedRoute.EnvdAccessToken != testEnvdAccessToken ||
@@ -377,7 +377,7 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 	}
 	resolved, found, err := h.reg.ResolveSID(h.ctx, testGroup, routeKey, created.SandboxID)
 	if err != nil || !found || resolved.SandboxID != created.SandboxID ||
-		resolved.NodeSandboxID != create.SID || resolved.AuthSandboxID != create.Cluster.AuthSandboxID ||
+		resolved.NodeSandboxID != create.SID || resolved.StableID != create.Cluster.StableID ||
 		resolved.APISecret != testAPISecret || resolved.APISecretFingerprint != fullFingerprint(t, testAPISecret) ||
 		resolved.ManifestKeyFingerprint != fullFingerprint(t, testMK) || resolved.ServiceSecret != serviceSecret ||
 		resolved.EnvdAccessToken != testEnvdAccessToken || resolved.TrafficAccessToken != testTrafficAccessToken ||
@@ -579,15 +579,15 @@ func (n *nodeStub) readLoop() {
 
 func routeForCommand(t *testing.T, cmd *routesync.Command) routesync.RouteEntry {
 	t.Helper()
-	authSandboxID := cmd.SID
-	if cmd.Cluster != nil && cmd.Cluster.AuthSandboxID != "" {
-		authSandboxID = cmd.Cluster.AuthSandboxID
+	stableID := cmd.SID
+	if cmd.Cluster != nil && cmd.Cluster.StableID != "" {
+		stableID = cmd.Cluster.StableID
 	}
-	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, authSandboxID)
+	serviceSecret, err := keys.DeriveServiceSecret(testAPISecret, stableID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	forwardAccessToken, err := keys.MintForwardAccessToken(serviceSecret, stableID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func routeForCommand(t *testing.T, cmd *routesync.Command) routesync.RouteEntry 
 		TemplateID:             cmd.TemplateRef,
 		Profile:                cmd.Profile,
 		State:                  routesync.StateRunning,
-		AuthSandboxID:          authSandboxID,
+		StableID:               stableID,
 		APISecret:              testAPISecret,
 		APISecretFingerprint:   fullFingerprint(t, testAPISecret),
 		ManifestKeyFingerprint: fullFingerprint(t, testMK),

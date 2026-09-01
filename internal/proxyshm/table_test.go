@@ -12,11 +12,27 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestStableIDRenamePreservesRecordLayout(t *testing.T) {
+	if schema != 6 {
+		t.Fatalf("schema = %d, want unchanged schema 6", schema)
+	}
+	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1127 {
+		t.Fatalf("StableID offset = %d, want unchanged offset 1127", got)
+	}
+	if got := unsafe.Offsetof(mmapRecord{}.APISecret); got != 1255 {
+		t.Fatalf("APISecret offset = %d, want unchanged offset 1255", got)
+	}
+	if got := unsafe.Sizeof(mmapRecord{}); got != 2568 {
+		t.Fatalf("mmapRecord size = %d, want unchanged size 2568", got)
+	}
+}
 
 func TestTableSharedLookupAndDelete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
@@ -34,7 +50,7 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	entry := routesync.RouteEntry{
 		SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning,
 		TemplateID: "tmpl", EnvdUDS: "/run/s1/envd.sock", CiUDS: "/run/s1/ci.sock",
-		FloatingIP: "100.100.0.2", AuthSandboxID: "stable-s1",
+		FloatingIP: "100.100.0.2", StableID: "stable-s1",
 		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
 		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
@@ -68,7 +84,7 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	if !ok || status != statusEmpty {
 		t.Fatalf("deleted record status=%d ok=%v", status, ok)
 	}
-	if deleted.SandboxID != "" || deleted.AuthSandboxID != "" || deleted.APISecret != "" || deleted.APISecretFingerprint != "" ||
+	if deleted.SandboxID != "" || deleted.StableID != "" || deleted.APISecret != "" || deleted.APISecretFingerprint != "" ||
 		deleted.ManifestKeyFingerprint != "" || deleted.ServiceSecret != "" ||
 		deleted.EnvdAccessToken != "" || deleted.TrafficAccessToken != "" ||
 		deleted.ForwardAccessToken != "" || deleted.MmdsSecret != "" {
@@ -404,7 +420,7 @@ func TestTableCredentialFieldBoundariesAndOverwrite(t *testing.T) {
 		set  func(*routesync.RouteEntry, string)
 		get  func(routesync.RouteEntry) string
 	}{
-		{"auth_sandbox_id", maxSandboxID, func(r *routesync.RouteEntry, v string) { r.AuthSandboxID = v }, func(r routesync.RouteEntry) string { return r.AuthSandboxID }},
+		{"stable_id", maxSandboxID, func(r *routesync.RouteEntry, v string) { r.StableID = v }, func(r routesync.RouteEntry) string { return r.StableID }},
 		{"api_secret", maxSecret, func(r *routesync.RouteEntry, v string) { r.APISecret = v }, func(r routesync.RouteEntry) string { return r.APISecret }},
 		{"api_secret_fingerprint", maxFingerprint, func(r *routesync.RouteEntry, v string) { r.APISecretFingerprint = v }, func(r routesync.RouteEntry) string { return r.APISecretFingerprint }},
 		{"manifest_key_fingerprint", maxFingerprint, func(r *routesync.RouteEntry, v string) { r.ManifestKeyFingerprint = v }, func(r routesync.RouteEntry) string { return r.ManifestKeyFingerprint }},
@@ -503,7 +519,7 @@ func TestWorkerLookupRouteIsPassiveAndActivationUsesFreshRoute(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	entry := routesync.RouteEntry{
-		SandboxID: "s1", AuthSandboxID: "stable-s1", Profile: "e2b", State: routesync.StatePaused,
+		SandboxID: "s1", StableID: "stable-s1", Profile: "e2b", State: routesync.StatePaused,
 		EnvdUDS: "/run/s1/old.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
 	}
 	if err := tbl.Upsert(entry); err != nil {
@@ -644,7 +660,7 @@ func TestWorkerActivateRouteFailsClosedOnBindingChange(t *testing.T) {
 	wakeSeen := make(chan string, 1)
 	worker := NewWorkerView(tbl, updates, func(sid string) { wakeSeen <- sid }, time.Second)
 	entry := routesync.RouteEntry{
-		SandboxID: "s1", AuthSandboxID: "stable-s1", Profile: "e2b", State: routesync.StatePaused,
+		SandboxID: "s1", StableID: "stable-s1", Profile: "e2b", State: routesync.StatePaused,
 		EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
 	}
 	tbl.BeginSync()
@@ -696,7 +712,7 @@ func TestWorkerStartingActivationWaitsWithoutWakeAndFailsOnRollback(t *testing.T
 			var wakes atomic.Int32
 			worker := NewWorkerView(tbl, updates, func(string) { wakes.Add(1) }, time.Second)
 			entry := routesync.RouteEntry{
-				SandboxID: "s1", AuthSandboxID: "stable-s1", Profile: "e2b", State: routesync.StateStarting,
+				SandboxID: "s1", StableID: "stable-s1", Profile: "e2b", State: routesync.StateStarting,
 				EnvdUDS: "/run/s1/envd.sock", EnvdAccessToken: "envd", ForwardAccessToken: "forward",
 			}
 			tbl.BeginSync()
@@ -752,12 +768,12 @@ func TestWorkerRouteBindingSelectsPurposeSpecificAccessToken(t *testing.T) {
 	tbl.BeginSync()
 	for _, route := range []routesync.RouteEntry{
 		{
-			SandboxID: "e2b", AuthSandboxID: "e2b", Profile: "e2b", State: routesync.StateRunning,
+			SandboxID: "e2b", StableID: "e2b", Profile: "e2b", State: routesync.StateRunning,
 			EnvdUDS: "/run/e2b/envd.sock", CiUDS: "/run/e2b/ci.sock", FloatingIP: "100.100.0.2",
 			EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
 		},
 		{
-			SandboxID: "bare", AuthSandboxID: "bare", Profile: "bare", State: routesync.StateRunning,
+			SandboxID: "bare", StableID: "bare", Profile: "bare", State: routesync.StateRunning,
 			FloatingIP: "100.100.0.3", EnvdAccessToken: "unused-envd",
 			TrafficAccessToken: "unused-traffic", ForwardAccessToken: "bare-forward",
 		},
@@ -807,7 +823,7 @@ func TestWorkerKnownUnsupportedServiceDoesNotWakePausedRoute(t *testing.T) {
 	master := NewMasterView(tbl, 50*time.Millisecond, nil)
 	tbl.BeginSync()
 	if err := tbl.Upsert(routesync.RouteEntry{
-		SandboxID: "s1", AuthSandboxID: "s1", Profile: "e2b", State: routesync.StatePaused,
+		SandboxID: "s1", StableID: "s1", Profile: "e2b", State: routesync.StatePaused,
 	}); err != nil {
 		t.Fatal(err)
 	}

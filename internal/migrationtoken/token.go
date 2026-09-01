@@ -43,7 +43,7 @@ var (
 	// fingerprints carried by an otherwise authenticated payload.
 	ErrCredentialMismatch = errors.New("migrationtoken: credential mismatch")
 	// ErrIncompatible identifies a valid token that does not match target-owned
-	// profile, template, runtime, snapshot, or authentication-subject state.
+	// profile, template, runtime, snapshot, or stable-ID state.
 	ErrIncompatible = errors.New("migrationtoken: incompatible target")
 	// ErrInvalidKeyMaterial identifies a non-canonical tenant root supplied by the
 	// trusted caller. Errors never include the supplied material.
@@ -66,7 +66,7 @@ type MigrationTokenPayloadV1 struct {
 	Version uint16 `json:"v"`
 
 	NodeSandboxID string `json:"nodeSandboxID"`
-	AuthSandboxID string `json:"authSandboxID"`
+	StableID      string `json:"stableID"`
 
 	APISecretFingerprint   string `json:"apiSecretFingerprint"`
 	ManifestKeyFingerprint string `json:"manifestKeyFingerprint"`
@@ -91,7 +91,7 @@ type MigrationTokenPayloadV1 struct {
 // Expectations contains target-owned state that, when present, must match a
 // decrypted token. Empty fields are not target constraints.
 type Expectations struct {
-	AuthSandboxID string
+	StableID      string
 	TemplateID    string
 	Profile       types.Profile
 	RuntimeDigest string
@@ -197,8 +197,8 @@ func Open(material KeyMaterial, token string) (MigrationTokenPayloadV1, error) {
 // ValidateExpectations compares an already authenticated payload with trusted
 // target-owned compatibility constraints.
 func ValidateExpectations(payload MigrationTokenPayloadV1, expected Expectations) error {
-	if expected.AuthSandboxID != "" && payload.AuthSandboxID != expected.AuthSandboxID {
-		return fmt.Errorf("%w: authentication subject", ErrIncompatible)
+	if expected.StableID != "" && payload.StableID != expected.StableID {
+		return fmt.Errorf("%w: stable ID", ErrIncompatible)
 	}
 	if expected.TemplateID != "" && payload.TemplateID != expected.TemplateID {
 		return fmt.Errorf("%w: template", ErrIncompatible)
@@ -222,8 +222,8 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 	if !types.ValidLocalSandboxID(payload.NodeSandboxID) {
 		return invalidPayload("node sandbox ID")
 	}
-	if !validRequiredString(payload.AuthSandboxID) {
-		return invalidPayload("authentication subject")
+	if !validRequiredString(payload.StableID) {
+		return invalidPayload("stable ID")
 	}
 	if !validHexDigest(payload.APISecretFingerprint) || !validHexDigest(payload.ManifestKeyFingerprint) {
 		return invalidPayload("credential fingerprint")
@@ -270,7 +270,7 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 	if err := keys.VerifyForwardAccessToken(
 		payload.ForwardAccessToken,
 		payload.ServiceSecret,
-		payload.AuthSandboxID,
+		payload.StableID,
 	); err != nil {
 		return invalidPayload("forward access token")
 	}

@@ -298,7 +298,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	}
 	var sourceWinner *types.Sandbox
 	for _, source := range sources {
-		if winner.AuthSandboxID() == source.AuthSandboxID() {
+		if winner.StableID() == source.StableID() {
 			sourceWinner = source
 			break
 		}
@@ -308,7 +308,7 @@ func TestConcurrentConnectImportUsesSingleCompleteWinner(t *testing.T) {
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(winner), sandboxCredentials(sourceWinner))
 	for _, sb := range connected {
-		if sb.AuthSandboxID() != winner.AuthSandboxID() || sb.Metadata["winner"] != winner.Metadata["winner"] {
+		if sb.StableID() != winner.StableID() || sb.Metadata["winner"] != winner.Metadata["winner"] {
 			t.Fatalf("Connect returned a non-winning record: got=%+v winner=%+v", sb, winner)
 		}
 		if sb.State != types.StateStarting {

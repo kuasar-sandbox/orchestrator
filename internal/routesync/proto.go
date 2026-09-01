@@ -31,13 +31,15 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 )
 
 // Version is the protocol version announced by the authority in Hello.
-const Version = 2
+// Version 3 is the hard cut from the former route identity field to stable_id.
+const Version = 3
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -99,7 +101,7 @@ type RouteEntry struct {
 	// proxy/registry subscribers use the roots and fingerprints for local request
 	// authentication; data-plane forwarding selects EnvdAccessToken for the e2b
 	// control ports and ForwardAccessToken for other forwarded ports.
-	AuthSandboxID          string `json:"auth_sandbox_id,omitempty"`
+	StableID               string `json:"stable_id,omitempty"`
 	APISecret              string `json:"api_secret,omitempty"`
 	APISecretFingerprint   string `json:"api_secret_fingerprint,omitempty"`
 	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"`
@@ -176,6 +178,18 @@ type Hello struct {
 	Policy     Policy            `json:"policy,omitempty"`
 	ResumeFrom string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
 	Redirect   *NodeLinkRedirect `json:"redirect,omitempty"`
+}
+
+// ValidateHello enforces the single supported protocol version before a client
+// processes route or command frames from the session.
+func ValidateHello(m *Msg) error {
+	if m == nil || m.Type != TypeHello || m.Hello == nil {
+		return errors.New("routesync: expected hello frame")
+	}
+	if m.Hello.Version != Version {
+		return fmt.Errorf("routesync: protocol version mismatch: got %d, want %d", m.Hello.Version, Version)
+	}
+	return nil
 }
 
 // Register is the subscriber's first up-frame: the capabilities it wants wired. The

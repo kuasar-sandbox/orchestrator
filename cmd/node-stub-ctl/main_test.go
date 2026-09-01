@@ -305,18 +305,18 @@ func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *tes
 		t.Fatalf("exec_session ack = %+v", got)
 	}
 	if err := keys.VerifyExecAccessToken(
-		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now(),
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.StableID, time.Now(),
 	); err != nil {
 		t.Fatalf("exec access token = invalid: %v", err)
 	}
 	claims, err := keys.ParseAndVerifyExecAccessToken(
-		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now(),
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.StableID, time.Now(),
 	)
 	if err != nil || len(claims.Conditions) != 1 || claims.Conditions[0] != command.ExecConditions[0] {
 		t.Fatalf("exec token conditions = %+v, %v", claims, err)
 	}
 	if err := keys.VerifyExecAccessToken(
-		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID, issuedAt.Add(time.Minute),
+		got.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.StableID, issuedAt.Add(time.Minute),
 	); err == nil {
 		t.Fatal("TTL-bound exec access token remained valid after expiry")
 	}
@@ -345,7 +345,7 @@ func TestExecSessionMintsBoundTokensAndResumesPausedSandboxAsynchronously(t *tes
 		t.Fatalf("second exec_session ack = %+v", second)
 	}
 	if err := keys.VerifyExecAccessToken(
-		second.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.AuthSandboxID,
+		second.ExecSession.ExecAccessToken, sandbox.ServiceSecret, sandbox.StableID,
 		issuedAt.Add(365*24*time.Hour),
 	); err != nil {
 		t.Fatalf("long-lived exec access token = invalid: %v", err)
@@ -449,25 +449,25 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 	}
 
 	expired, err := keys.MintExecAccessToken(
-		sandbox.ServiceSecret, sandbox.AuthSandboxID, time.Now().Add(-time.Second).Unix(),
+		sandbox.ServiceSecret, sandbox.StableID, time.Now().Add(-time.Second).Unix(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongSubject, err := keys.MintExecAccessToken(sandbox.ServiceSecret, "other-stable", 0)
+	wrongStableID, err := keys.MintExecAccessToken(sandbox.ServiceSecret, "other-stable", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongAudience, err := keys.MintForwardAccessToken(sandbox.ServiceSecret, sandbox.AuthSandboxID)
+	wrongAudience, err := keys.MintForwardAccessToken(sandbox.ServiceSecret, sandbox.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for name, token := range map[string]string{
-		"missing":        "",
-		"malformed":      "not-a-kat",
-		"expired":        expired,
-		"wrong subject":  wrongSubject,
-		"wrong audience": wrongAudience,
+		"missing":         "",
+		"malformed":       "not-a-kat",
+		"expired":         expired,
+		"wrong stable ID": wrongStableID,
+		"wrong audience":  wrongAudience,
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", nil)
@@ -494,7 +494,7 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 		})
 	}
 
-	token, err := keys.MintExecAccessToken(sandbox.ServiceSecret, sandbox.AuthSandboxID, 0)
+	token, err := keys.MintExecAccessToken(sandbox.ServiceSecret, sandbox.StableID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 func TestExecDataConditionFailureReturnsGenericCtlErrorWithoutHit(t *testing.T) {
 	service, _, sandbox, _ := newExecStubFixture(t, routesync.StateRunning, 0)
 	token, err := keys.MintExecAccessTokenWithConditions(
-		sandbox.ServiceSecret, sandbox.AuthSandboxID, 0,
+		sandbox.ServiceSecret, sandbox.StableID, 0,
 		[]string{`request.argv == ['/bin/allowed']`},
 	)
 	if err != nil {
@@ -652,7 +652,7 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	create := &routesync.Command{
 		CmdID: "create-1", Kind: routesync.CmdCreate, SID: "sb1",
 		TemplateRef: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(), Profile: "e2b",
-		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "sb1"},
+		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", StableID: "sb1"},
 		APISecretFingerprint: apiSecretFingerprint,
 		Config: map[string]string{
 			"stub.create_result":           "timeout",
@@ -671,14 +671,14 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	forwardToken := storedSandbox.ForwardAccessToken
 	commandMetadata := node.commands[len(node.commands)-1].Metadata
 	node.mu.Unlock()
-	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, create.Cluster.AuthSandboxID)
+	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, create.Cluster.StableID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if serviceSecret != wantServiceSecret || envdToken != "envd-override" || trafficToken != "traffic-override" {
 		t.Fatal("stub did not materialize the expected credential overrides")
 	}
-	if err := keys.VerifyForwardAccessToken(forwardToken, serviceSecret, create.Cluster.AuthSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(forwardToken, serviceSecret, create.Cluster.StableID); err != nil {
 		t.Fatalf("stub forward access token = invalid: %v", err)
 	}
 	if storedSandbox.Profile != create.Profile || !sameStubClusterContext(storedSandbox.Cluster, create.Cluster) {
@@ -694,7 +694,7 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 		t.Fatalf("stub command log exposed credentials metadata: %+v", commandMetadata)
 	}
 	route := storedSandbox.routeEntry()
-	if route.AuthSandboxID != create.Cluster.AuthSandboxID || route.APISecret != apiSecret ||
+	if route.StableID != create.Cluster.StableID || route.APISecret != apiSecret ||
 		route.APISecretFingerprint != apiSecretFingerprint || route.ManifestKeyFingerprint != manifestKeyFingerprint ||
 		route.ServiceSecret != serviceSecret || route.EnvdAccessToken != envdToken ||
 		route.TrafficAccessToken != trafficToken || route.ForwardAccessToken != forwardToken {
@@ -744,7 +744,7 @@ func TestKeyPutStoresPairAndStrictLifecycleUsesAPISecretFingerprint(t *testing.T
 	wrongContext.CmdID = "connect-wrong-context"
 	wrongContext.APISecretFingerprint = apiSecretFingerprint
 	wrongContext.Profile = create.Profile
-	wrongContext.Cluster = &routesync.ClusterSandboxContext{Group: "/other", RouteKey: "rk", AuthSandboxID: "sb1"}
+	wrongContext.Cluster = &routesync.ClusterSandboxContext{Group: "/other", RouteKey: "rk", StableID: "sb1"}
 	if got := node.HandleCommand(context.Background(), &wrongContext); got.Status != routesync.AckRejected {
 		t.Fatalf("connect with wrong context ack = %+v", got)
 	}
@@ -818,7 +818,7 @@ func TestNodeSnapshotRedactsCredentialMaterial(t *testing.T) {
 		Profile:                string(types.ProfileE2B),
 		Metadata:               map[string]string{sandboxcfg.NsCredentials: `{"service_secret":"` + serviceSecret + `"}`, "visible": "value"},
 		State:                  routesync.StateRunning,
-		AuthSandboxID:          "stable-sandbox",
+		StableID:               "stable-sandbox",
 		APISecret:              apiSecret,
 		APISecretFingerprint:   testStubFingerprint(t, apiSecret),
 		ManifestKeyFingerprint: testStubFingerprint(t, manifestKey),
@@ -851,13 +851,13 @@ func TestNodeSnapshotRedactsCredentialMaterial(t *testing.T) {
 
 func TestStubCredentialProfilesAndPublicResponses(t *testing.T) {
 	apiSecret := strings.Repeat("ab", 32)
-	authSandboxID := "stable-sandbox"
+	stableID := "stable-sandbox"
 
-	e2b, err := materializeStubCredentials(types.ProfileE2B, apiSecret, authSandboxID, sandboxcfg.Credentials{})
+	e2b, err := materializeStubCredentials(types.ProfileE2B, apiSecret, stableID, sandboxcfg.Credentials{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, authSandboxID)
+	wantServiceSecret, err := keys.DeriveServiceSecret(apiSecret, stableID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -865,7 +865,7 @@ func TestStubCredentialProfilesAndPublicResponses(t *testing.T) {
 		e2b.EnvdAccessToken == e2b.TrafficAccessToken {
 		t.Fatalf("e2b credential defaults were not independently materialized")
 	}
-	if err := keys.VerifyForwardAccessToken(e2b.ForwardAccessToken, e2b.ServiceSecret, authSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(e2b.ForwardAccessToken, e2b.ServiceSecret, stableID); err != nil {
 		t.Fatalf("e2b forward access token = invalid: %v", err)
 	}
 	e2bResponse := (&stubSandbox{
@@ -881,14 +881,14 @@ func TestStubCredentialProfilesAndPublicResponses(t *testing.T) {
 	assertNoInternalCredentialFields(t, e2bResponse)
 
 	override := strings.Repeat("cd", 32)
-	bare, err := materializeStubCredentials(types.ProfileBare, apiSecret, authSandboxID, sandboxcfg.Credentials{ServiceSecret: override})
+	bare, err := materializeStubCredentials(types.ProfileBare, apiSecret, stableID, sandboxcfg.Credentials{ServiceSecret: override})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bare.ServiceSecret != override || bare.EnvdAccessToken != "" || bare.TrafficAccessToken != "" {
 		t.Fatalf("bare credentials did not preserve the profile contract")
 	}
-	if err := keys.VerifyForwardAccessToken(bare.ForwardAccessToken, bare.ServiceSecret, authSandboxID); err != nil {
+	if err := keys.VerifyForwardAccessToken(bare.ForwardAccessToken, bare.ServiceSecret, stableID); err != nil {
 		t.Fatalf("bare forward access token = invalid: %v", err)
 	}
 	bareResponse := (&stubSandbox{
@@ -908,11 +908,11 @@ func TestStubCredentialProfilesAndPublicResponses(t *testing.T) {
 
 	detailResponse := (&stubSandbox{
 		SID: "node-sandbox", Profile: string(types.ProfileE2B), TemplateID: "e2b-img-template",
-		State: routesync.StateRunning, AuthSandboxID: authSandboxID,
+		State: routesync.StateRunning, StableID: stableID,
 		APISecret: apiSecret, APISecretFingerprint: testStubFingerprint(t, apiSecret),
 		ServiceSecret: e2b.ServiceSecret, EnvdAccessToken: e2b.EnvdAccessToken,
 		TrafficAccessToken: e2b.TrafficAccessToken, ForwardAccessToken: e2b.ForwardAccessToken,
-		Cluster:  &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: authSandboxID},
+		Cluster:  &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", StableID: stableID},
 		Metadata: map[string]string{sandboxcfg.NsCredentials: `{"envd_access_token":"private"}`, "visible": "value"},
 	}).publicDetailResponse("n1")
 	if detailResponse["sandboxID"] != "node-sandbox" || detailResponse["clientID"] != "n1" {
@@ -944,7 +944,7 @@ func TestStubCreateRejectsUnavailableAPISecretMaterial(t *testing.T) {
 		CmdID: "create-ref", Kind: routesync.CmdCreate, SID: "node-sandbox",
 		TemplateRef: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), Profile: string(types.ProfileBare),
 		APISecretFingerprint: apiFingerprint,
-		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", AuthSandboxID: "stable-sandbox"},
+		Cluster:              &routesync.ClusterSandboxContext{Group: "/g", RouteKey: "rk", StableID: "stable-sandbox"},
 	}
 	got := node.HandleCommand(context.Background(), create)
 	if got.Status != routesync.AckRejected || got.Reason != "API secret material unavailable" {
@@ -959,7 +959,7 @@ func assertNoInternalCredentialFields(t *testing.T, response map[string]any) {
 	t.Helper()
 	for _, field := range []string{
 		"accessToken", "apiSecret", "apiSecretFingerprint", "manifestKey", "manifestKeyFingerprint",
-		"serviceSecret", "authSandboxID", "nodeSandboxID", "execAccessToken", "cluster", "behavior",
+		"serviceSecret", "stableID", "nodeSandboxID", "execAccessToken", "cluster", "behavior",
 	} {
 		if _, ok := response[field]; ok {
 			t.Fatalf("public response exposed %s", field)
@@ -1032,21 +1032,21 @@ func newExecStubFixture(
 	svc := newService("", log)
 	node := newStubNode(stubNodeOptions{ID: "n1", CreateDelay: resumeDelay}, svc)
 	svc.addNode(node)
-	authSandboxID := "stable-sandbox"
+	stableID := "stable-sandbox"
 	serviceSecret := strings.Repeat("ab", 32)
-	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, authSandboxID)
+	forwardToken, err := keys.MintForwardAccessToken(serviceSecret, stableID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cluster := &routesync.ClusterSandboxContext{
-		Group: "/g", RouteKey: "rk", AuthSandboxID: authSandboxID,
+		Group: "/g", RouteKey: "rk", StableID: stableID,
 	}
 	sandbox := &stubSandbox{
 		SID:                    "stable-sandbox-g0",
 		Profile:                string(types.ProfileBare),
 		State:                  state,
 		TemplateID:             types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("a", 64)}.String(),
-		AuthSandboxID:          authSandboxID,
+		StableID:               stableID,
 		APISecretFingerprint:   strings.Repeat("c", 64),
 		ManifestKeyFingerprint: strings.Repeat("d", 64),
 		ServiceSecret:          serviceSecret,

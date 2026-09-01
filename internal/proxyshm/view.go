@@ -373,10 +373,10 @@ func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.Connect
 		return proxy.RouteBinding{}, false
 	}
 	binding := proxy.BindRoute(
-		r.SandboxID, r.AuthSandboxID, types.Profile(r.Profile),
+		r.SandboxID, r.StableID, types.Profile(r.Profile),
 		r.EnvdAccessToken, r.ForwardAccessToken, target,
 	)
-	if binding.SandboxID == "" || binding.AuthSandboxID == "" {
+	if binding.SandboxID == "" || binding.StableID == "" {
 		return proxy.RouteBinding{}, false
 	}
 	return binding, true
@@ -492,10 +492,10 @@ func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity,
 	}
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: r.SandboxID,
-		AuthSandboxID: r.AuthSandboxID,
+		StableID:      r.StableID,
 		ServiceSecret: r.ServiceSecret,
 	}
-	if identity.NodeSandboxID == "" || identity.AuthSandboxID == "" || identity.ServiceSecret == "" {
+	if identity.NodeSandboxID == "" || identity.StableID == "" || identity.ServiceSecret == "" {
 		return proxy.ExecIdentity{}, false
 	}
 	return identity, true

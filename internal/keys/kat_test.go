@@ -16,7 +16,7 @@ import (
 
 const (
 	testAPISecret     = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-	testAuthSandboxID = "sandbox-01"
+	testStableID      = "sandbox-01"
 	testServiceSecret = "0213051156fc06b40aebdeb333caeb9c95866d91f08298264901787551897989"
 	testForwardToken  = "kat1.eyJ2IjoxLCJzaWQiOiJzYW5kYm94LTAxIiwiYXVkIjoiZm9yd2FyZCJ9.uk154F30--e531Hogd4pgj0oGFsuIJJT0nWr17gkdSw"
 	testExecSessionID = "01890f35-7b2c-7cc6-98c4-dc0c0c07398f"
@@ -49,7 +49,7 @@ func TestMintSecretCanonicalHex(t *testing.T) {
 }
 
 func TestDeriveServiceSecretGoldenVector(t *testing.T) {
-	got, err := DeriveServiceSecret(testAPISecret, testAuthSandboxID)
+	got, err := DeriveServiceSecret(testAPISecret, testStableID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,16 +57,16 @@ func TestDeriveServiceSecretGoldenVector(t *testing.T) {
 		t.Fatalf("DeriveServiceSecret() = %q, want golden vector", got)
 	}
 
-	again, err := DeriveServiceSecret(testAPISecret, testAuthSandboxID)
+	again, err := DeriveServiceSecret(testAPISecret, testStableID)
 	if err != nil || again != got {
 		t.Fatal("DeriveServiceSecret is not deterministic")
 	}
-	other, err := DeriveServiceSecret(testAPISecret, testAuthSandboxID+"-other")
+	other, err := DeriveServiceSecret(testAPISecret, testStableID+"-other")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if other == got {
-		t.Fatal("different AuthSandboxID values derived the same ServiceSecret")
+		t.Fatal("different StableID values derived the same ServiceSecret")
 	}
 }
 
@@ -79,30 +79,30 @@ func TestDeriveServiceSecretRejectsNonCanonicalInputs(t *testing.T) {
 		strings.Repeat("z", 64),
 	}
 	for _, secret := range badSecrets {
-		if _, err := DeriveServiceSecret(secret, testAuthSandboxID); !errors.Is(err, errInvalidAPISecret) {
+		if _, err := DeriveServiceSecret(secret, testStableID); !errors.Is(err, errInvalidAPISecret) {
 			t.Errorf("DeriveServiceSecret(bad APISecret) error = %v, want fixed invalid-secret error", err)
 		}
 	}
 	for _, sid := range []string{"", string([]byte{0xff})} {
-		if _, err := DeriveServiceSecret(testAPISecret, sid); !errors.Is(err, errInvalidAuthSandboxID) {
+		if _, err := DeriveServiceSecret(testAPISecret, sid); !errors.Is(err, errInvalidStableID) {
 			t.Errorf("DeriveServiceSecret(bad SID) error = %v, want fixed invalid-SID error", err)
 		}
 	}
 }
 
 func TestForwardAccessTokenGoldenVector(t *testing.T) {
-	token, err := MintForwardAccessToken(testServiceSecret, testAuthSandboxID)
+	token, err := MintForwardAccessToken(testServiceSecret, testStableID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token != testForwardToken {
 		t.Fatalf("MintForwardAccessToken() = %q, want golden vector", token)
 	}
-	if err := VerifyForwardAccessToken(token, testServiceSecret, testAuthSandboxID); err != nil {
+	if err := VerifyForwardAccessToken(token, testServiceSecret, testStableID); err != nil {
 		t.Fatalf("VerifyForwardAccessToken(golden) = %v", err)
 	}
 
-	again, err := MintForwardAccessToken(testServiceSecret, testAuthSandboxID)
+	again, err := MintForwardAccessToken(testServiceSecret, testStableID)
 	if err != nil || again != token {
 		t.Fatal("forward token is not deterministic for the same ServiceSecret and SID")
 	}
@@ -132,7 +132,7 @@ func TestForwardAccessTokenStrictWire(t *testing.T) {
 	}
 	for name, token := range tests {
 		t.Run(name, func(t *testing.T) {
-			if err := VerifyForwardAccessToken(token, testServiceSecret, testAuthSandboxID); !errors.Is(err, errInvalidForwardAccessToken) {
+			if err := VerifyForwardAccessToken(token, testServiceSecret, testStableID); !errors.Is(err, errInvalidForwardAccessToken) {
 				t.Fatalf("VerifyForwardAccessToken() error = %v, want fixed invalid-token error", err)
 			}
 		})
@@ -156,7 +156,7 @@ func TestForwardAccessTokenRequiresCanonicalClaims(t *testing.T) {
 	for name, payload := range payloads {
 		t.Run(name, func(t *testing.T) {
 			token := signedRawPayload(t, []byte(payload), testServiceSecret)
-			if err := VerifyForwardAccessToken(token, testServiceSecret, testAuthSandboxID); !errors.Is(err, errInvalidForwardAccessToken) {
+			if err := VerifyForwardAccessToken(token, testServiceSecret, testStableID); !errors.Is(err, errInvalidForwardAccessToken) {
 				t.Fatalf("VerifyForwardAccessToken() error = %v, want fixed invalid-token error", err)
 			}
 		})
@@ -181,40 +181,40 @@ func TestForwardAccessTokenRejectsNonCanonicalPayloadBase64(t *testing.T) {
 
 func TestForwardAccessTokenBindingAndInputValidation(t *testing.T) {
 	otherSecret := strings.Repeat("a", 64)
-	if err := VerifyForwardAccessToken(testForwardToken, otherSecret, testAuthSandboxID); !errors.Is(err, errInvalidForwardAccessToken) {
+	if err := VerifyForwardAccessToken(testForwardToken, otherSecret, testStableID); !errors.Is(err, errInvalidForwardAccessToken) {
 		t.Fatalf("wrong ServiceSecret error = %v, want invalid token", err)
 	}
 	if err := VerifyForwardAccessToken(testForwardToken, testServiceSecret, "sandbox-02"); !errors.Is(err, errInvalidForwardAccessToken) {
-		t.Fatalf("wrong AuthSandboxID error = %v, want invalid token", err)
+		t.Fatalf("wrong StableID error = %v, want invalid token", err)
 	}
 
 	for _, badSecret := range []string{"", strings.ToUpper(testServiceSecret), strings.Repeat("z", 64)} {
-		if _, err := MintForwardAccessToken(badSecret, testAuthSandboxID); !errors.Is(err, errInvalidServiceSecret) {
+		if _, err := MintForwardAccessToken(badSecret, testStableID); !errors.Is(err, errInvalidServiceSecret) {
 			t.Errorf("MintForwardAccessToken(bad secret) error = %v", err)
 		}
-		if err := VerifyForwardAccessToken(testForwardToken, badSecret, testAuthSandboxID); !errors.Is(err, errInvalidServiceSecret) {
+		if err := VerifyForwardAccessToken(testForwardToken, badSecret, testStableID); !errors.Is(err, errInvalidServiceSecret) {
 			t.Errorf("VerifyForwardAccessToken(bad secret) error = %v", err)
 		}
 	}
 	for _, sid := range []string{"", string([]byte{0xff})} {
-		if _, err := MintForwardAccessToken(testServiceSecret, sid); !errors.Is(err, errInvalidAuthSandboxID) {
+		if _, err := MintForwardAccessToken(testServiceSecret, sid); !errors.Is(err, errInvalidStableID) {
 			t.Errorf("MintForwardAccessToken(bad SID) error = %v", err)
 		}
-		if err := VerifyForwardAccessToken(testForwardToken, testServiceSecret, sid); !errors.Is(err, errInvalidAuthSandboxID) {
+		if err := VerifyForwardAccessToken(testForwardToken, testServiceSecret, sid); !errors.Is(err, errInvalidStableID) {
 			t.Errorf("VerifyForwardAccessToken(bad SID) error = %v", err)
 		}
 	}
 }
 
 func TestExecAccessTokenGoldenVector(t *testing.T) {
-	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry)
+	token, err := mintExecAccessToken(testServiceSecret, testStableID, testExecSessionID, testExecExpiry)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token != testExecToken {
 		t.Fatalf("mintExecAccessToken() = %q, want golden vector", token)
 	}
-	if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0)); err != nil {
+	if err := VerifyExecAccessToken(token, testServiceSecret, testStableID, time.Unix(testExecExpiry-1, 0)); err != nil {
 		t.Fatalf("VerifyExecAccessToken(golden) = %v", err)
 	}
 }
@@ -222,7 +222,7 @@ func TestExecAccessTokenGoldenVector(t *testing.T) {
 func TestMintExecAccessTokenUsesUUIDv7AndOptionalExpiry(t *testing.T) {
 	tokens := make(map[string]bool)
 	for _, expiry := range []int64{0, testExecExpiry} {
-		token, err := MintExecAccessToken(testServiceSecret, testAuthSandboxID, expiry)
+		token, err := MintExecAccessToken(testServiceSecret, testStableID, expiry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -231,7 +231,7 @@ func TestMintExecAccessTokenUsesUUIDv7AndOptionalExpiry(t *testing.T) {
 		}
 		tokens[token] = true
 		claims := execClaimsFromToken(t, token)
-		if claims.Version != 1 || claims.SID != testAuthSandboxID || claims.Audience != execAudience ||
+		if claims.Version != 1 || claims.SID != testStableID || claims.Audience != execAudience ||
 			!validUUIDv7(claims.SessionID) {
 			t.Fatalf("minted exec claims = %+v", claims)
 		}
@@ -250,7 +250,7 @@ func TestExecAccessTokenConditionsCanonicalClaims(t *testing.T) {
 		`request.cwd == '/' || request.cwd == '/workspace'`,
 	}
 	token, err := mintExecAccessTokenWithConditions(
-		testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+		testServiceSecret, testStableID, testExecSessionID, testExecExpiry, conditions,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestExecAccessTokenConditionsCanonicalClaims(t *testing.T) {
 		t.Fatalf("conditions payload = %s\nwant = %s", payload, want)
 	}
 	claims, err := ParseAndVerifyExecAccessToken(
-		token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0),
+		token, testServiceSecret, testStableID, time.Unix(testExecExpiry-1, 0),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -276,7 +276,7 @@ func TestExecAccessTokenConditionsCanonicalClaims(t *testing.T) {
 	}
 	claims.Conditions[0] = "mutated"
 	again, err := ParseAndVerifyExecAccessToken(
-		token, testServiceSecret, testAuthSandboxID, time.Unix(testExecExpiry-1, 0),
+		token, testServiceSecret, testStableID, time.Unix(testExecExpiry-1, 0),
 	)
 	if err != nil || again.Conditions[0] != conditions[0] {
 		t.Fatalf("claims slice was not defensive: %+v, %v", again, err)
@@ -285,13 +285,13 @@ func TestExecAccessTokenConditionsCanonicalClaims(t *testing.T) {
 
 func TestExecAccessTokenEmptyConditionsMatchOmittedWire(t *testing.T) {
 	omitted, err := mintExecAccessTokenWithConditions(
-		testServiceSecret, testAuthSandboxID, testExecSessionID, 0, nil,
+		testServiceSecret, testStableID, testExecSessionID, 0, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	empty, err := mintExecAccessTokenWithConditions(
-		testServiceSecret, testAuthSandboxID, testExecSessionID, 0, []string{},
+		testServiceSecret, testStableID, testExecSessionID, 0, []string{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -299,7 +299,7 @@ func TestExecAccessTokenEmptyConditionsMatchOmittedWire(t *testing.T) {
 	if empty != omitted {
 		t.Fatalf("empty conditions token differs from omitted:\nempty=%s\nomitted=%s", empty, omitted)
 	}
-	claims, err := ParseAndVerifyExecAccessToken(empty, testServiceSecret, testAuthSandboxID, time.Unix(1, 0))
+	claims, err := ParseAndVerifyExecAccessToken(empty, testServiceSecret, testStableID, time.Unix(1, 0))
 	if err != nil || claims.Conditions != nil {
 		t.Fatalf("unrestricted claims = %+v, %v", claims, err)
 	}
@@ -307,7 +307,7 @@ func TestExecAccessTokenEmptyConditionsMatchOmittedWire(t *testing.T) {
 
 func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
 	token, err := mintExecAccessTokenWithConditions(
-		testServiceSecret, testAuthSandboxID, testExecSessionID, 0,
+		testServiceSecret, testStableID, testExecSessionID, 0,
 		[]string{`request.cwd == '/'`},
 	)
 	if err != nil {
@@ -320,7 +320,7 @@ func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
 	}
 	tamperedPayload := bytes.Replace(payload, []byte(`request.cwd == '/'`), []byte(`request.cwd == '/x'`), 1)
 	tampered := "kat1." + base64.RawURLEncoding.EncodeToString(tamperedPayload) + "." + parts[2]
-	if _, err := ParseAndVerifyExecAccessToken(tampered, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+	if _, err := ParseAndVerifyExecAccessToken(tampered, testServiceSecret, testStableID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 		t.Fatalf("tampered conditions error = %v", err)
 	}
 
@@ -338,7 +338,7 @@ func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
 		tooMany[index] = "true"
 	}
 	rawTooMany, err := json.Marshal(execPayload{
-		Version: 1, SessionID: testExecSessionID, SID: testAuthSandboxID,
+		Version: 1, SessionID: testExecSessionID, SID: testStableID,
 		Audience: execAudience, Conditions: tooMany,
 	})
 	if err != nil {
@@ -350,7 +350,7 @@ func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
 		totalTooLarge[index] = strings.Repeat("x", limits.MaxConditionBytes/4)
 	}
 	rawTotalTooLarge, err := json.Marshal(execPayload{
-		Version: 1, SessionID: testExecSessionID, SID: testAuthSandboxID,
+		Version: 1, SessionID: testExecSessionID, SID: testStableID,
 		Audience: execAudience, Conditions: totalTooLarge,
 	})
 	if err != nil {
@@ -360,20 +360,20 @@ func TestExecAccessTokenConditionsTamperAndBounds(t *testing.T) {
 	for name, raw := range payloads {
 		t.Run(name, func(t *testing.T) {
 			candidate := signedRawPayload(t, []byte(raw), testServiceSecret)
-			if _, err := ParseAndVerifyExecAccessToken(candidate, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+			if _, err := ParseAndVerifyExecAccessToken(candidate, testServiceSecret, testStableID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 				t.Fatalf("ParseAndVerifyExecAccessToken() = %v", err)
 			}
 		})
 	}
 	if _, err := ParseAndVerifyExecAccessToken(
-		strings.Repeat("x", limits.MaxExecTokenBytes+1), testServiceSecret, testAuthSandboxID, time.Unix(1, 0),
+		strings.Repeat("x", limits.MaxExecTokenBytes+1), testServiceSecret, testStableID, time.Unix(1, 0),
 	); !errors.Is(err, errInvalidExecAccessToken) {
 		t.Fatalf("oversized token error = %v", err)
 	}
 }
 
 func TestExecAccessTokenStrictWire(t *testing.T) {
-	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, 0)
+	token, err := mintExecAccessToken(testServiceSecret, testStableID, testExecSessionID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestExecAccessTokenStrictWire(t *testing.T) {
 	}
 	for name, candidate := range tests {
 		t.Run(name, func(t *testing.T) {
-			if err := VerifyExecAccessToken(candidate, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+			if err := VerifyExecAccessToken(candidate, testServiceSecret, testStableID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 				t.Fatalf("VerifyExecAccessToken() error = %v, want fixed invalid-token error", err)
 			}
 		})
@@ -422,7 +422,7 @@ func TestExecAccessTokenRequiresCanonicalClaims(t *testing.T) {
 	for name, payload := range payloads {
 		t.Run(name, func(t *testing.T) {
 			token := signedRawPayload(t, []byte(payload), testServiceSecret)
-			if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+			if err := VerifyExecAccessToken(token, testServiceSecret, testStableID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 				t.Fatalf("VerifyExecAccessToken() error = %v, want fixed invalid-token error", err)
 			}
 		})
@@ -430,38 +430,38 @@ func TestExecAccessTokenRequiresCanonicalClaims(t *testing.T) {
 }
 
 func TestExecAccessTokenExpiryAndBinding(t *testing.T) {
-	token, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, 100)
+	token, err := mintExecAccessToken(testServiceSecret, testStableID, testExecSessionID, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(99, 0)); err != nil {
+	if err := VerifyExecAccessToken(token, testServiceSecret, testStableID, time.Unix(99, 0)); err != nil {
 		t.Fatalf("token before expiry: %v", err)
 	}
 	for _, now := range []int64{100, 101} {
-		if err := VerifyExecAccessToken(token, testServiceSecret, testAuthSandboxID, time.Unix(now, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+		if err := VerifyExecAccessToken(token, testServiceSecret, testStableID, time.Unix(now, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 			t.Fatalf("token at now=%d error=%v, want expired", now, err)
 		}
 	}
-	if err := VerifyExecAccessToken(token, strings.Repeat("a", 64), testAuthSandboxID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
+	if err := VerifyExecAccessToken(token, strings.Repeat("a", 64), testStableID, time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
 		t.Fatalf("wrong ServiceSecret error = %v", err)
 	}
 	if err := VerifyExecAccessToken(token, testServiceSecret, "sandbox-02", time.Unix(1, 0)); !errors.Is(err, errInvalidExecAccessToken) {
-		t.Fatalf("wrong AuthSandboxID error = %v", err)
+		t.Fatalf("wrong StableID error = %v", err)
 	}
-	if _, err := mintExecAccessToken(testServiceSecret, testAuthSandboxID, testExecSessionID, -1); !errors.Is(err, errInvalidExecExpiry) {
+	if _, err := mintExecAccessToken(testServiceSecret, testStableID, testExecSessionID, -1); !errors.Is(err, errInvalidExecExpiry) {
 		t.Fatalf("negative expiry error = %v", err)
 	}
 }
 
 func TestKATErrorsDoNotEchoInputs(t *testing.T) {
 	badToken := "kat1.secret-token-fragment.bad"
-	err := VerifyForwardAccessToken(badToken, testServiceSecret, testAuthSandboxID)
+	err := VerifyForwardAccessToken(badToken, testServiceSecret, testStableID)
 	if err == nil || strings.Contains(err.Error(), badToken) || strings.Contains(err.Error(), testServiceSecret) {
 		t.Fatalf("verification error leaks token or secret: %v", err)
 	}
 
 	badSecret := strings.Repeat("S", 64)
-	_, err = DeriveServiceSecret(badSecret, testAuthSandboxID)
+	_, err = DeriveServiceSecret(badSecret, testStableID)
 	if err == nil || strings.Contains(err.Error(), badSecret) {
 		t.Fatalf("derivation error leaks secret: %v", err)
 	}
@@ -473,7 +473,7 @@ func BenchmarkMintMaximumExecConditionsToken(b *testing.B) {
 		conditions[index] = strings.Repeat("x", limits.MaxConditionBytes/limits.MaxConditions-1) + strconv.Itoa(index%10)
 	}
 	token, err := mintExecAccessTokenWithConditions(
-		testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+		testServiceSecret, testStableID, testExecSessionID, testExecExpiry, conditions,
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -483,7 +483,7 @@ func BenchmarkMintMaximumExecConditionsToken(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		if _, err := mintExecAccessTokenWithConditions(
-			testServiceSecret, testAuthSandboxID, testExecSessionID, testExecExpiry, conditions,
+			testServiceSecret, testStableID, testExecSessionID, testExecExpiry, conditions,
 		); err != nil {
 			b.Fatal(err)
 		}

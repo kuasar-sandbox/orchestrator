@@ -44,7 +44,7 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	// X-Access-Token value.
 	token := r.Header.Get(HeaderAccessToken)
 	claims, err := keys.ParseAndVerifyExecAccessToken(
-		token, identity.ServiceSecret, identity.AuthSandboxID, time.Now(),
+		token, identity.ServiceSecret, identity.StableID, time.Now(),
 	)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)

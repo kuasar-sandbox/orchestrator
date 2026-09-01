@@ -486,7 +486,7 @@ assert connected.get("sid") == created.get("sid") == stable_sid + "-g0", (create
 cluster = connected.get("cluster", {})
 assert cluster.get("group") == group, connected
 assert cluster.get("route_key") == "user1/session1", connected
-assert cluster.get("auth_sandbox_id") == stable_sid, connected
+assert cluster.get("stable_id") == stable_sid, connected
 PY
 
 step "checking cluster exec-session issuance through Registry CmdExecSession"
@@ -535,7 +535,7 @@ assert command.get("profile") == "e2b", command
 cluster = command.get("cluster", {})
 assert cluster.get("group") == group, command
 assert cluster.get("route_key") == "user1/session1", command
-assert cluster.get("auth_sandbox_id") == stable_sid, command
+assert cluster.get("stable_id") == stable_sid, command
 observed = json.dumps({"commands": commands, "events": events}, separators=(",", ":"))
 observed += "".join(path.read_text() for path in pathlib.Path(work_dir).glob("*.log"))
 assert token not in observed, "exec access token appeared in node-stub observations"
@@ -651,7 +651,7 @@ assert hit.get("host") == "exec", hit
 cluster = hit.get("cluster", {})
 assert cluster.get("group") == group, hit
 assert cluster.get("route_key") == "user1/session1", hit
-assert cluster.get("auth_sandbox_id") == stable_sid, hit
+assert cluster.get("stable_id") == stable_sid, hit
 assert "/bin/true" not in json.dumps(exec_hits, separators=(",", ":")), exec_hits
 PY
 

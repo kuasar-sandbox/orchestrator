@@ -108,7 +108,7 @@ func TestValidLocalSandboxID(t *testing.T) {
 	}
 }
 
-func TestSandboxAuthSandboxID(t *testing.T) {
+func TestSandboxStableID(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		sb   *Sandbox
@@ -116,24 +116,24 @@ func TestSandboxAuthSandboxID(t *testing.T) {
 	}{
 		{name: "nil", want: ""},
 		{name: "standalone fallback", sb: &Sandbox{ID: "local"}, want: "local"},
-		{name: "standalone imported subject", sb: &Sandbox{ID: "target", AuthSandboxIDValue: "source"}, want: "source"},
+		{name: "standalone imported StableID", sb: &Sandbox{ID: "target", StableIDValue: "source"}, want: "source"},
 		{
 			name: "cluster fallback",
 			sb:   &Sandbox{ID: "stable-g1", Cluster: &ClusterSandboxContext{Group: "/g", RouteKey: "rk"}},
 			want: "stable-g1",
 		},
 		{
-			name: "cluster stable subject",
+			name: "cluster explicit StableID",
 			sb: &Sandbox{
 				ID: "stable-g1", Cluster: &ClusterSandboxContext{Group: "/g", RouteKey: "rk"},
-				AuthSandboxIDValue: "stable",
+				StableIDValue: "stable",
 			},
 			want: "stable",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.sb.AuthSandboxID(); got != tt.want {
-				t.Fatalf("AuthSandboxID() = %q, want %q", got, tt.want)
+			if got := tt.sb.StableID(); got != tt.want {
+				t.Fatalf("StableID() = %q, want %q", got, tt.want)
 			}
 		})
 	}

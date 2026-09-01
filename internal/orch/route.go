@@ -12,7 +12,7 @@ import (
 
 var errRouteBindingChanged = errors.New("ordinary route binding changed")
 
-// LookupRoute reads the credential subject for an ordinary route without
+// LookupRoute reads the stable sandbox identity for an ordinary route without
 // caching, resuming, publishing, or touching a backend.
 func (o *Orchestrator) LookupRoute(ctx context.Context, sandboxID string, target proxy.ConnectTarget) (proxy.RouteBinding, bool, error) {
 	sb, err := o.lookupRouteSandbox(ctx, sandboxID)
@@ -80,10 +80,10 @@ func routeBinding(sb *types.Sandbox, target proxy.ConnectTarget) (proxy.RouteBin
 		return proxy.RouteBinding{}, false
 	}
 	binding := proxy.BindRoute(
-		sb.ID, sb.AuthSandboxID(), sb.Profile,
+		sb.ID, sb.StableID(), sb.Profile,
 		sb.EnvdAccessToken, sb.ForwardAccessToken, target,
 	)
-	if binding.SandboxID == "" || binding.AuthSandboxID == "" {
+	if binding.SandboxID == "" || binding.StableID == "" {
 		return proxy.RouteBinding{}, false
 	}
 	return binding, true

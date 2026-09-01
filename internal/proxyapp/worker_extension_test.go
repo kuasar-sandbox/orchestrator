@@ -262,7 +262,7 @@ func TestPreparedWorkerWaitsForSyncThenUsesOneWrapperForBothListeners(t *testing
 	}
 	harness.table.BeginSync()
 	if err := harness.table.Upsert(routesync.RouteEntry{
-		SandboxID: "s1", AuthSandboxID: "s1", Profile: "e2b", State: routesync.StateRunning,
+		SandboxID: "s1", StableID: "s1", Profile: "e2b", State: routesync.StateRunning,
 		RunID: "run-1", FloatingIP: "127.0.0.1", ForwardAccessToken: "core-token",
 	}); err != nil {
 		t.Fatal(err)

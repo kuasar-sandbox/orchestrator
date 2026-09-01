@@ -45,7 +45,7 @@ func TestPublicAPICompilesWithoutInternalTypes(t *testing.T) {
 		_ = value
 	}
 	for _, value := range []any{
-		proxy.RouteView{}, proxy.RouteEvent{}, proxy.TrafficView{}, proxy.ProfileBare,
+		proxy.RouteView{SandboxID: "node-sandbox", StableID: "stable-sandbox"}, proxy.RouteEvent{}, proxy.TrafficView{}, proxy.ProfileBare,
 		proxy.RouteStateRunning, proxy.RouteSyncSynced, proxy.RouteSyncLost,
 		proxy.ErrTrafficUnavailable, proxy.ErrTrafficConflict,
 		proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 8080}, proxy.ForwardRequest{},

@@ -41,13 +41,13 @@ type Route struct {
 	Addr string // KindTCP, host:port
 }
 
-// RouteBinding is the stable credential subject and exact logical target that an
+// RouteBinding is the stable sandbox identity and exact logical target that an
 // ordinary data-plane authorization covers. Lifecycle state, backend addresses,
 // run identity, and route revisions deliberately do not participate: they may
 // change during a legitimate activation.
 type RouteBinding struct {
 	SandboxID           string
-	AuthSandboxID       string
+	StableID            string
 	Profile             types.Profile
 	Target              ConnectTarget
 	Kind                Kind
@@ -118,7 +118,7 @@ type Router interface {
 // or returned to the client.
 type ExecIdentity struct {
 	NodeSandboxID string
-	AuthSandboxID string
+	StableID      string
 	ServiceSecret string
 }
 
@@ -163,13 +163,13 @@ type RouteDialer func(context.Context, Route) (net.Conn, error)
 
 // BindRoute selects the credential and logical backend kind for an exact target.
 // It intentionally contains no dial address.
-func BindRoute(sandboxID, authSandboxID string, profile types.Profile, envdAccessToken, forwardAccessToken string, target ConnectTarget) RouteBinding {
+func BindRoute(sandboxID, stableID string, profile types.Profile, envdAccessToken, forwardAccessToken string, target ConnectTarget) RouteBinding {
 	binding := RouteBinding{
-		SandboxID:     sandboxID,
-		AuthSandboxID: authSandboxID,
-		Profile:       profile,
-		Target:        target,
-		Kind:          routeKindForTarget(profile, target),
+		SandboxID: sandboxID,
+		StableID:  stableID,
+		Profile:   profile,
+		Target:    target,
+		Kind:      routeKindForTarget(profile, target),
 	}
 	switch binding.Kind {
 	case KindUDS:

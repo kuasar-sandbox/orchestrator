@@ -144,7 +144,7 @@ func authenticateRecordAccessToken(rec *SandboxRecord, requestedPort int, servic
 		return ErrSandboxNotFound
 	}
 	if service == reserveDataServiceExec {
-		if err := keys.VerifyExecAccessToken(accessToken, rec.ServiceSecret, rec.AuthSandboxID, now); err != nil {
+		if err := keys.VerifyExecAccessToken(accessToken, rec.ServiceSecret, rec.StableID, now); err != nil {
 			return ErrReserveUnauthorized
 		}
 		return nil
@@ -270,7 +270,7 @@ func connectCommand(req SandboxReserveRequest, rec *SandboxRecord) *routesync.Co
 		CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.NodeSandboxID,
 		Profile: rec.Profile, APISecretFingerprint: rec.APISecretFingerprint,
 		Cluster: &routesync.ClusterSandboxContext{
-			Group: rec.Group, RouteKey: rec.RouteKey, AuthSandboxID: rec.AuthSandboxID,
+			Group: rec.Group, RouteKey: rec.RouteKey, StableID: rec.StableID,
 		},
 		MigrationToken: req.MigrationToken,
 		TimeoutSeconds: req.TimeoutSeconds,
@@ -402,7 +402,7 @@ func execSessionCommand(req SandboxReserveRequest, rec *SandboxRecord) *routesyn
 		CmdID: newID(), Kind: routesync.CmdExecSession, SID: rec.NodeSandboxID,
 		Profile: rec.Profile, APISecretFingerprint: rec.APISecretFingerprint,
 		Cluster: &routesync.ClusterSandboxContext{
-			Group: rec.Group, RouteKey: rec.RouteKey, AuthSandboxID: rec.AuthSandboxID,
+			Group: rec.Group, RouteKey: rec.RouteKey, StableID: rec.StableID,
 		},
 		MigrationToken: req.MigrationToken,
 		TTLSeconds:     req.TTLSeconds,
@@ -851,7 +851,7 @@ func (r *Registry) routeFromRecord(ctx context.Context, rec *SandboxRecord, rout
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, TemplateID: rec.TemplateID,
-		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
+		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
 		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, ForwardAccessToken: rec.ForwardAccessToken,
