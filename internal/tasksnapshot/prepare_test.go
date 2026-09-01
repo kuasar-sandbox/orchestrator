@@ -33,19 +33,19 @@ func TestPrepareReadsOnlyRootAndCollectsFlattenedClosure(t *testing.T) {
 metadata:
   kuasar-sandbox.network: '{"hostname":"inherited"}'
 from_refs:
-  - file://parent.snapshot@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824
+  - file://parent.snapshot@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824
 boot:
-  runtime_ref: file://runtime.bundle@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  runtime_ref: file://runtime.bundle@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   root:
     base: self
     base_from_refs:
-      - file://root.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002-20260824
-      - file://root-old.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003-20260824
+      - file://root.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11102-7234-9abc-012345670002-20260824
+      - file://root-old.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11103-7234-9abc-012345670003-20260824
       - manifest://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   disks:
-    - base_ref: file://data.image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
+    - base_ref: file://data.image@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11104-7234-9abc-012345670004-20260824
       overlay:
-        base: file://data.overlay@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
+        base: file://data.overlay@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11105-7234-9abc-012345670005-20260824
         base_from_refs:
           - manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 `
@@ -84,7 +84,7 @@ boot:
 	}
 	// The parent path intentionally does not exist. Success proves the task did
 	// not reinterpret flattened FromRefs as snapshot.cfg graph edges.
-	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824" {
+	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824" {
 		t.Fatalf("root config changed: %+v", result.RootCfg.FromRefs)
 	}
 	if result.ConfigReadDuration <= 0 || result.PrepareDuration < result.ConfigReadDuration {
@@ -98,7 +98,7 @@ func TestPrepareLocatedRootBuildsPathMappingBeforeRead(t *testing.T) {
 	digest := strings.TrimSuffix(base, filepath.Ext(base))
 	ref := manifest.Ref{
 		Scheme: manifest.RefSchemeFile, Path: base, Location: "0198f7a11107-7234-9abc-012345670007-20260824",
-		DigestScheme: "sha256", Digest: digest,
+		DigestScheme: "digest", Digest: digest,
 	}
 	location, err := reflocation.Resolve("file:///tmp/task-snapshot-locations", ref.Location)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestPrepareRelativeAndRawRootResolution(t *testing.T) {
 	dir, rootPath := writeTaskSnapshot(t, "resources:\n  capacity: {cpu: 1, memory: 64MiB}\nboot: {}\n")
 	base := filepath.Base(rootPath)
 	digest := strings.TrimSuffix(base, filepath.Ext(base))
-	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: base, DigestScheme: "sha256", Digest: digest}.String()
+	ref := manifest.Ref{Scheme: manifest.RefSchemeFile, Path: base, DigestScheme: "digest", Digest: digest}.String()
 
 	if _, err := Prepare(context.Background(), configsock.SnapshotPrepareSpec{RootRef: ref, MaxRefs: 4}); err == nil || !strings.Contains(err.Error(), "relative_dir") {
 		t.Fatalf("relative ref without directory error = %v", err)
@@ -374,7 +374,7 @@ func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
 	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	runtimeRef := projected.Boot.RuntimeRef
 	if runtimeRef == "" {
-		runtimeRef = "file://sandbox-runtime.bundle@sha256:" + digest
+		runtimeRef = "file://sandbox-runtime.bundle@digest:" + digest
 	}
 	root := sandboxconfig.PortableRootConfig{
 		Base:         projected.Boot.Root.Base,
@@ -425,7 +425,7 @@ func taskSandboxSource(t testing.TB, raw string) (sparse.Source, []string) {
 			Allocatable: sandboxconfig.AllocatableConfig{CPU: float64(cpu), Memory: memory},
 		},
 		Boot: sandboxconfig.PortableBootConfig{
-			Kernel: "file://vmlinux@sha256:" + digest, Runtime: runtimeRef, Root: root, Disks: disks,
+			Kernel: "file://vmlinux@digest:" + digest, Runtime: runtimeRef, Root: root, Disks: disks,
 		},
 		Launch: sandboxconfig.PortableLaunchConfig{
 			Exec: "/bin/true", Workdir: "/", Restart: "never", CgroupControl: projected.Launch.CgroupControl,

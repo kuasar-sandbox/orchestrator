@@ -17,12 +17,12 @@ plaintext_tarstream_ref() {
         return 1
     fi
 
-    marker_count="$(grep -Ec '^\.kuasar\.sha256\.[0-9a-f]{64}$' <<<"$listing" || true)"
+    marker_count="$(grep -Ec '^\.kuasar\.digest\.[0-9a-f]{64}$' <<<"$listing" || true)"
     if [ "$marker_count" -ne 1 ]; then
         echo "plaintext tarstream must contain exactly one digest marker: $path" >&2
         return 1
     fi
-    marker="$(grep -E '^\.kuasar\.sha256\.[0-9a-f]{64}$' <<<"$listing")"
-    digest="${marker#.kuasar.sha256.}"
-    printf 'file://%s@sha256:%s\n' "$path" "$digest"
+    marker="$(grep -E '^\.kuasar\.digest\.[0-9a-f]{64}$' <<<"$listing")"
+    digest="${marker#.kuasar.digest.}"
+    printf 'file://%s@digest:%s\n' "$path" "$digest"
 }

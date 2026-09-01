@@ -239,7 +239,7 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 // uploads, not the day the orchestrator resolved the spec. now is a parameter
 // so tests can pin the clock across midnight.
 func uploadSnapshotArgs(spec *configsock.BuildSpec, bundle string, now time.Time) ([]string, error) {
-	args := []string{"upload-snapshot", "--quiet"}
+	args := []string{"upload-snapshot", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
 	if spec.PublishLocationParent != "" {
 		locName := reflocation.PublicationName(spec.BuildID, now)
 		location, err := reflocation.Resolve(spec.PublishLocationParent, locName)
@@ -247,8 +247,6 @@ func uploadSnapshotArgs(spec *configsock.BuildSpec, bundle string, now time.Time
 			return nil, fmt.Errorf("publish location for %s: %w", locName, err)
 		}
 		args = append(args, "--to-ref-location", locName+"="+location.URI)
-	} else {
-		args = append(args, "--manifest-config", spec.Paths.ManifestConfig)
 	}
 	return append(args, bundle), nil
 }

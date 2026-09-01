@@ -66,7 +66,7 @@ func TestTemplateIDRejectsNonPortableOrWrongArtifact(t *testing.T) {
 }
 
 func TestTemplateIDLengthLimits(t *testing.T) {
-	fixed := "file://" + strings.Repeat("a", 64) + ".snapshot@sha256:" +
+	fixed := "file://" + strings.Repeat("a", 64) + ".snapshot@digest:" +
 		strings.Repeat("b", 64) + "@location:"
 	ref := fixed + strings.Repeat("c", MaxPortableRefBytes-len(fixed))
 	id := TemplateID{Profile: ProfileBare, Kind: KindSnp, Ref: ref}.String()

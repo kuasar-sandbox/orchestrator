@@ -1570,9 +1570,10 @@ location URI  = <parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<nam
 管理面 GC 组件负责。conductor 与 task reader 共用 `internal/reflocation` 一条规则,
 name 自足(ref 携带即可恢复,无需任何额外状态)。
 
-随后用 `upload-snapshot --to-ref-location` 发布,tarstream 得到
-`file://<digest>.snapshot@location:<publication-name>`,Bundle 得到
-`file://<root-key>.bundle@location:<publication-name>`。没有 parent 时发布到 Manifest Store。
+随后用 `upload-snapshot --to-ref-location` 发布,plaintext/encrypted tarstream 分别得到
+`file://<digest>.snapshot@digest:<digest>@location:<publication-name>` 或
+`file://<digest>.snapshot@hmac:<digest>@location:<publication-name>`,Bundle 得到
+`file://<root-key>.bundle@manifest:<root-key>@location:<publication-name>`。没有 parent 时发布到 Manifest Store。
 两者都是 canonical portable ref.第一阶段只读 local checkpoint 并产生 portable ref,
 不改变 source row/cache/route 或本机文件;第二阶段取得 lifecycle finalizer 后才提交
 source retention 并删除明确的本机 checkpoint。located 目录绝不进入本机 cleanup。
@@ -1876,8 +1877,9 @@ plugin 平面,机群路由经 registry 聚合。
 - 单一 **`sandbox-runtime.bundle`** 由 `guest-runtime` 构建:把 `sandboxer` 产出的
   `sandbox-init` 打成 virtio-pmem/DAX runtime,并在 `/opt/sandbox-runtime/bin/`
   内置固定版本 `envd`、`flatten-ctl`、`mkfs.erofs`。runtime bundle 保持 raw EROFS
-  从 offset 0 开始,随后是 zero padding 和只含空 `.kuasar.sha256.<hex>` marker 的
-  ZIP;摘要覆盖 EROFS+padding,构建时一次生成,启动/恢复从 EOF 直接读取。成品总长
+  从 offset 0 开始,随后是 zero padding 和只含空 `.kuasar.digest.<hex>` marker 的
+  ZIP;该runtime carrier的identity覆盖EROFS+padding,构建时一次生成,启动/恢复从 EOF
+  直接读取。成品总长
   **补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor 报
   `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部 padding/ZIP 对 guest mount
   不可见)。

@@ -56,6 +56,9 @@ func TestUploadSnapshotArgsMintPublicationDateAtUploadTime(t *testing.T) {
 		if !strings.Contains(v, "/"+tc.day+"/") {
 			t.Fatalf("--to-ref-location %q URI does not use the %s bucket", v, tc.day)
 		}
+		if i := indexOf(tc.args, "--manifest-config"); i < 0 || i+1 >= len(tc.args) || tc.args[i+1] != spec.Paths.ManifestConfig {
+			t.Fatalf("location publication argv %q lacks Bundle manifest configuration", tc.args)
+		}
 	}
 }
 
