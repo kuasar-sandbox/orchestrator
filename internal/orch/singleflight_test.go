@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestLaunchGroupClaimCancelAndCleanupFence(t *testing.T) {
@@ -39,22 +40,22 @@ func TestLaunchGroupClaimCancelAndCleanupFence(t *testing.T) {
 	}
 }
 
-func TestLaunchAttemptSnapshotPrepareReplayAndFinalResult(t *testing.T) {
+func TestLaunchAttemptArtifactPrepareReplayAndFinalResult(t *testing.T) {
 	var g launchGroup
 	attempt, err := g.Claim(context.Background(), "sid", launchResume)
 	if err != nil {
 		t.Fatal(err)
 	}
 	attempt.SetRunID("run-1")
-	summary := configsock.SnapshotPrepareSummary{
-		SchemaVersion:    configsock.SnapshotPrepareSchemaVersion,
-		Capacity:         configsock.SnapshotCapacity{CPU: 2, Memory: "2GiB"},
+	summary := configsock.ArtifactPrepareSummary{
+		SchemaVersion:    configsock.ArtifactPrepareSchemaVersion,
+		Capacity:         configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
 		ResolutionDigest: "digest", RequiredRefCount: 3,
 	}
 	if replay, err := attempt.SubmitPrepare("run-1", summary); err != nil || replay {
 		t.Fatalf("first SubmitPrepare = replay %t, err %v", replay, err)
 	}
-	if got, err := attempt.WaitPrepare(context.Background()); err != nil || got != summary {
+	if got, err := attempt.WaitPrepare(context.Background()); err != nil || !configsock.EqualArtifactPrepareSummary(got, summary) {
 		t.Fatalf("WaitPrepare = %+v, %v", got, err)
 	}
 	if replay, err := attempt.SubmitPrepare("run-1", summary); err != nil || !replay {
@@ -82,20 +83,70 @@ func TestLaunchAttemptSnapshotPrepareReplayAndFinalResult(t *testing.T) {
 	g.Finish(attempt, nil)
 }
 
-func TestLaunchAttemptSnapshotPrepareConflictCancelsExactRun(t *testing.T) {
+func TestLaunchAttemptArtifactPrepareClonesNetworkSummary(t *testing.T) {
+	var g launchGroup
+	attempt, err := g.Claim(context.Background(), "sid", launchResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.SetRunID("run-1")
+	summary := configsock.ArtifactPrepareSummary{
+		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
+		PreparedSourceKind: "sandbox",
+		Network: configsock.ArtifactNetwork{
+			Hostname: "sandbox.local",
+			DNS:      []string{"1.1.1.1"},
+		},
+		ResolutionDigest: "digest",
+		RequiredRefCount: 1,
+	}
+	summary.DiskTopology = validArtifactDiskTopology()
+	dataDisk := summary.DiskTopology.Root
+	dataDisk.Name = "data"
+	summary.DiskTopology.Disks = []types.ArtifactDiskShape{dataDisk}
+	if _, err := attempt.SubmitPrepare("run-1", summary); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutating either the caller-owned request or a returned copy must not
+	// change the accepted replay identity stored by the launch attempt.
+	summary.Network.DNS[0] = "9.9.9.9"
+	summary.DiskTopology.Disks[0].Name = "mutated"
+	got, err := attempt.WaitPrepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Network.DNS) != 1 || got.Network.DNS[0] != "1.1.1.1" {
+		t.Fatalf("accepted network DNS = %v, want immutable original", got.Network.DNS)
+	}
+	if len(got.DiskTopology.Disks) != 1 || got.DiskTopology.Disks[0].Name != "data" {
+		t.Fatalf("accepted disk topology = %+v, want immutable original", got.DiskTopology)
+	}
+	got.Network.DNS[0] = "8.8.8.8"
+	got.DiskTopology.Disks[0].Name = "returned-copy-mutation"
+	replay := configsock.CloneArtifactPrepareSummary(got)
+	replay.Network.DNS[0] = "1.1.1.1"
+	replay.DiskTopology.Disks[0].Name = "data"
+	if identical, err := attempt.SubmitPrepare("run-1", replay); err != nil || !identical {
+		t.Fatalf("immutable replay = %t, %v", identical, err)
+	}
+	g.Finish(attempt, nil)
+}
+
+func TestLaunchAttemptArtifactPrepareConflictCancelsExactRun(t *testing.T) {
 	var g launchGroup
 	attempt, err := g.Claim(context.Background(), "sid", launchCreate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	attempt.SetRunID("run-1")
-	first := configsock.SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: "first"}
+	first := configsock.ArtifactPrepareSummary{SchemaVersion: 1, ResolutionDigest: "first"}
 	if _, err := attempt.SubmitPrepare("run-1", first); err != nil {
 		t.Fatal(err)
 	}
 	conflict := first
 	conflict.ResolutionDigest = "different"
-	if _, err := attempt.SubmitPrepare("run-1", conflict); !errors.Is(err, errSnapshotPrepareConflict) {
+	if _, err := attempt.SubmitPrepare("run-1", conflict); !errors.Is(err, errArtifactPrepareConflict) {
 		t.Fatalf("conflicting replay error = %v", err)
 	}
 	select {

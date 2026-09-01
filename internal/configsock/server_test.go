@@ -22,22 +22,26 @@ import (
 // --- plane stubs ---
 
 type stubProvider struct {
-	pidFile       string
-	assignmentErr error
-	buildSpecErr  error
-	buildPrepErr  error
-	resultErr     error
-	phaseErr      error
-	sandboxAuth   SandboxTaskAuth
-	bootstrapHits *atomic.Int32
-	prepareHits   *atomic.Int32
-	prepareErr    error
-	buildAuthHits *atomic.Int32
-	buildSpecHits *atomic.Int32
-	buildPrepHits *atomic.Int32
+	pidFile         string
+	assignmentErr   error
+	buildSpecErr    error
+	buildPrepErr    error
+	resultErr       error
+	phaseErr        error
+	sandboxAuth     SandboxTaskAuth
+	sandboxAuthHits *atomic.Int32
+	bootstrapHits   *atomic.Int32
+	prepareHits     *atomic.Int32
+	prepareErr      error
+	buildAuthHits   *atomic.Int32
+	buildSpecHits   *atomic.Int32
+	buildPrepHits   *atomic.Int32
 }
 
 func (s stubProvider) SandboxTaskAuth(_ context.Context, sandboxID, runID string) (SandboxTaskAuth, bool, error) {
+	if s.sandboxAuthHits != nil {
+		s.sandboxAuthHits.Add(1)
+	}
 	if sandboxID != "x" || runID != "sr-test" {
 		return SandboxTaskAuth{}, false, nil
 	}
@@ -61,7 +65,7 @@ func (s stubProvider) SandboxTaskSpecFor(_ context.Context, sandboxID, runID str
 	}, true, nil
 }
 
-func (s stubProvider) CompleteSandboxPrepare(_ context.Context, sandboxID, runID string, _ SnapshotPrepareSummary) (*LaunchSpec, error) {
+func (s stubProvider) CompleteSandboxPrepare(_ context.Context, sandboxID, runID string, _ ArtifactPrepareSummary) (*LaunchSpec, error) {
 	if s.prepareHits != nil {
 		s.prepareHits.Add(1)
 	}
@@ -69,7 +73,7 @@ func (s stubProvider) CompleteSandboxPrepare(_ context.Context, sandboxID, runID
 		return nil, s.prepareErr
 	}
 	if sandboxID != "x" || runID != "sr-test" {
-		return nil, RejectSnapshotPrepare(os.ErrNotExist)
+		return nil, RejectArtifactPrepare(os.ErrNotExist)
 	}
 	return &LaunchSpec{Exec: "/bin/true", Args: []string{"run"}}, nil
 }
@@ -100,7 +104,7 @@ func (s stubProvider) BuildTaskSpecFor(_ context.Context, buildID, runID string)
 	}, true, nil
 }
 
-func (s stubProvider) CompleteBuildPrepare(_ context.Context, buildID, runID string, _ SnapshotPrepareSummary) (*BuildSpec, error) {
+func (s stubProvider) CompleteBuildPrepare(_ context.Context, buildID, runID string, _ ArtifactPrepareSummary) (*BuildSpec, error) {
 	if s.buildPrepHits != nil {
 		s.buildPrepHits.Add(1)
 	}
@@ -252,6 +256,17 @@ func rawPost(t *testing.T, client *http.Client, path string, body any) (int, []b
 	return resp.StatusCode, rb
 }
 
+func rawPostBytes(t *testing.T, client *http.Client, path string, body []byte) (int, []byte) {
+	t.Helper()
+	resp, err := client.Post("http://localhost"+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, rb
+}
+
 func adminPost(t *testing.T, client *http.Client, req AdminKeyRequest) AdminKeyResponse {
 	t.Helper()
 	_, body := rawPost(t, client, PathAdminManifestKey, req)
@@ -297,12 +312,91 @@ func TestSandboxBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
+func TestSandboxBootstrapRejectsV1SchemaBeforeProviders(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "task.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	var authCalls, secretCalls atomic.Int32
+	_, client := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, sandboxAuthHits: &authCalls, bootstrapHits: &secretCalls,
+	}})
+	status, _ := rawPost(t, client, PathTaskSandboxBootstrap, SandboxTaskRequest{
+		SandboxID: "x", RunID: "sr-test", Version: 1,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("unsupported sandbox bootstrap status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if authCalls.Load() != 0 || secretCalls.Load() != 0 {
+		t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+	}
+}
+
+func TestTaskRequestsRejectAmbiguousOrOversizedBodiesBeforeProviders(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "task.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	var sandboxAuthCalls, buildAuthCalls atomic.Int32
+	_, client := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, sandboxAuthHits: &sandboxAuthCalls, buildAuthHits: &buildAuthCalls,
+	}})
+
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name: "sandbox bootstrap duplicate", path: PathTaskSandboxBootstrap,
+			body:       `{"sandbox_id":"x","sandbox_id":"other","run_id":"sr-test","version":1}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "sandbox prepare trailing", path: PathTaskSandboxPrepare,
+			body:       `{"sandbox_id":"x","run_id":"sr-test","summary":{}} {}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "build bootstrap unknown", path: PathTaskBuildBootstrap,
+			body:       `{"build_id":"x","run_id":"br-test","version":2,"extra":true}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "build prepare duplicate nested", path: PathTaskBuildPrepare,
+			body:       `{"build_id":"x","run_id":"br-test","version":2,"summary":{"schema_version":1,"schema_version":1}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "sandbox bootstrap oversized", path: PathTaskSandboxBootstrap,
+			body:       `{"sandbox_id":"x","run_id":"sr-test","version":1,"padding":"` + strings.Repeat("x", int(taskBootstrapRequestMaxBytes)) + `"}`,
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name: "build prepare oversized", path: PathTaskBuildPrepare,
+			body:       strings.Repeat(" ", int(taskPrepareRequestMaxBytes)+1),
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _ := rawPostBytes(t, client, tt.path, []byte(tt.body))
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", status, tt.wantStatus)
+			}
+		})
+	}
+	if got := sandboxAuthCalls.Load(); got != 0 {
+		t.Fatalf("malformed sandbox requests reached auth provider %d times", got)
+	}
+	if got := buildAuthCalls.Load(); got != 0 {
+		t.Fatalf("malformed build requests reached auth provider %d times", got)
+	}
+}
+
 func TestSandboxPrepareAuthenticatesBeforeCompletionProvider(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "task.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
 	var completionCalls atomic.Int32
 	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf, prepareHits: &completionCalls}})
-	summary := SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
+	summary := ArtifactPrepareSummary{SchemaVersion: ArtifactPrepareSchemaVersion, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
 	if _, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", summary); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("unauthorized completion error = %v", err)
 	}
@@ -324,9 +418,9 @@ func TestSandboxPrepareConflictIsDefinitive(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "task.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
 	sock, _ := startTestServer(t, Deps{Provider: stubProvider{
-		pidFile: pf, prepareErr: RejectSnapshotPrepare(errors.New("conflicting replay")),
+		pidFile: pf, prepareErr: RejectArtifactPrepare(errors.New("conflicting replay")),
 	}})
-	_, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", SnapshotPrepareSummary{})
+	_, err := CompleteSandboxPrepare(context.Background(), sock, "x", "sr-test", ArtifactPrepareSummary{})
 	if err == nil || IsRetryableError(err) || err.Error() != "conflicting replay" {
 		t.Fatalf("conflict error = %v, retryable=%t", err, IsRetryableError(err))
 	}
@@ -369,7 +463,7 @@ func TestBuildPrepareAuthenticatesBeforeCompletionProvider(t *testing.T) {
 	var completionCalls atomic.Int32
 	provider := stubProvider{pidFile: pf, buildPrepHits: &completionCalls}
 	sock, _ := startTestServer(t, Deps{Provider: provider})
-	summary := SnapshotPrepareSummary{SchemaVersion: 1, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
+	summary := ArtifactPrepareSummary{SchemaVersion: ArtifactPrepareSchemaVersion, ResolutionDigest: strings.Repeat("0", 64), RequiredRefCount: 1}
 	if _, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", summary); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("unauthorized build completion error = %v", err)
 	}
@@ -395,8 +489,8 @@ func TestBuildPrepareRejectsUnversionedV1BeforeProviders(t *testing.T) {
 		pidFile: pf, buildAuthHits: &authCalls, buildPrepHits: &completionCalls,
 	}})
 	status, _ := rawPost(t, client, PathTaskBuildPrepare, BuildPrepareRequest{
-		BuildID: "x", RunID: "br-test", Summary: SnapshotPrepareSummary{
-			SchemaVersion: SnapshotPrepareSchemaVersion,
+		BuildID: "x", RunID: "br-test", Summary: ArtifactPrepareSummary{
+			SchemaVersion: ArtifactPrepareSchemaVersion,
 		},
 	})
 	if status != http.StatusBadRequest {
@@ -466,7 +560,7 @@ func TestBuildRetryClassification(t *testing.T) {
 			return err
 		},
 		"build prepare": func(sock string) error {
-			_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", SnapshotPrepareSummary{})
+			_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", ArtifactPrepareSummary{})
 			return err
 		},
 		"result": func(sock string) error {
@@ -505,7 +599,7 @@ func TestBuildRetryClassification(t *testing.T) {
 	t.Run("reject build prepare", func(t *testing.T) {
 		provider := stubProvider{pidFile: pf, buildPrepErr: RejectBuildPrepare(errors.New("prepare digest conflict"))}
 		sock, _ := startTestServer(t, Deps{Provider: provider})
-		_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", SnapshotPrepareSummary{})
+		_, err := CompleteBuildPrepare(context.Background(), sock, "x", "br-test", ArtifactPrepareSummary{})
 		if err == nil || IsRetryableError(err) || err.Error() != "prepare digest conflict" {
 			t.Fatalf("prepare rejection = %v, retryable=%t", err, IsRetryableError(err))
 		}

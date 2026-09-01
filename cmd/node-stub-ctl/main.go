@@ -1763,7 +1763,7 @@ type sandboxRouteObservation struct {
 	Profile          string `json:"profile,omitempty"`
 	TemplateID       string `json:"template_id,omitempty"`
 	State            string `json:"state,omitempty"`
-	SnapshotLocation string `json:"snap_loc,omitempty"`
+	ArtifactLocation string `json:"artifact_location,omitempty"`
 }
 
 func routeObservation(entry routesync.RouteEntry) sandboxRouteObservation {
@@ -1772,7 +1772,7 @@ func routeObservation(entry routesync.RouteEntry) sandboxRouteObservation {
 		Profile:          entry.Profile,
 		TemplateID:       entry.TemplateID,
 		State:            entry.State,
-		SnapshotLocation: entry.SnapshotLocation,
+		ArtifactLocation: entry.ArtifactLocation,
 	}
 }
 

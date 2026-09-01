@@ -12,7 +12,9 @@ type SandboxSource = conductorextension.SandboxSource
 type SandboxView = conductorextension.SandboxView
 type SandboxClusterView = conductorextension.SandboxClusterView
 type SandboxState = conductorextension.SandboxState
-type SnapshotLocation = conductorextension.SnapshotLocation
+type ArtifactLocation = conductorextension.ArtifactLocation
+type ResumeSourceKind = conductorextension.ResumeSourceKind
+type LaunchMode = conductorextension.LaunchMode
 type SandboxEvent = conductorextension.SandboxEvent
 type SandboxEventKind = conductorextension.SandboxEventKind
 type BuildSource = conductorextension.BuildSource
@@ -33,6 +35,9 @@ type SandboxOperationOrigin = conductorextension.SandboxOperationOrigin
 type SandboxCreateRequest = conductorextension.SandboxCreateRequest
 type SandboxPauseRequest = conductorextension.SandboxPauseRequest
 type SandboxResumeRequest = conductorextension.SandboxResumeRequest
+type CaptureKind = conductorextension.CaptureKind
+type ResumeMode = conductorextension.ResumeMode
+type ResumeTrigger = conductorextension.ResumeTrigger
 type SandboxDeleteRequest = conductorextension.SandboxDeleteRequest
 type BuildOperation = conductorextension.BuildOperation
 type BuildOperationKind = conductorextension.BuildOperationKind
@@ -52,9 +57,16 @@ const (
 	SandboxStatePaused   = conductorextension.SandboxStatePaused
 	SandboxStateDead     = conductorextension.SandboxStateDead
 
-	SnapshotLocationNone   = conductorextension.SnapshotLocationNone
-	SnapshotLocationLocal  = conductorextension.SnapshotLocationLocal
-	SnapshotLocationRemote = conductorextension.SnapshotLocationRemote
+	ArtifactLocationNone   = conductorextension.ArtifactLocationNone
+	ArtifactLocationLocal  = conductorextension.ArtifactLocationLocal
+	ArtifactLocationRemote = conductorextension.ArtifactLocationRemote
+
+	ResumeSourceSandbox  = conductorextension.ResumeSourceSandbox
+	ResumeSourceSnapshot = conductorextension.ResumeSourceSnapshot
+
+	LaunchModeImage  = conductorextension.LaunchModeImage
+	LaunchModeCold   = conductorextension.LaunchModeCold
+	LaunchModeMemory = conductorextension.LaunchModeMemory
 
 	SandboxSyncBegin = conductorextension.SandboxSyncBegin
 	SandboxUpsert    = conductorextension.SandboxUpsert
@@ -79,6 +91,19 @@ const (
 	SandboxOperationPause  = conductorextension.SandboxOperationPause
 	SandboxOperationResume = conductorextension.SandboxOperationResume
 	SandboxOperationDelete = conductorextension.SandboxOperationDelete
+
+	CaptureKindSnapshot = conductorextension.CaptureKindSnapshot
+	CaptureKindSandbox  = conductorextension.CaptureKindSandbox
+
+	ResumeModeAuto   = conductorextension.ResumeModeAuto
+	ResumeModeMemory = conductorextension.ResumeModeMemory
+	ResumeModeCold   = conductorextension.ResumeModeCold
+
+	ResumeTriggerConnect     = conductorextension.ResumeTriggerConnect
+	ResumeTriggerWake        = conductorextension.ResumeTriggerWake
+	ResumeTriggerRoute       = conductorextension.ResumeTriggerRoute
+	ResumeTriggerExec        = conductorextension.ResumeTriggerExec
+	ResumeTriggerExecSession = conductorextension.ResumeTriggerExecSession
 
 	SandboxOriginDirect  = conductorextension.SandboxOriginDirect
 	SandboxOriginCluster = conductorextension.SandboxOriginCluster

@@ -73,7 +73,8 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	}
 	if payload.NodeSandboxID != sid || payload.StableID != sb.StableID() ||
 		payload.TemplateID != sb.TemplateID || payload.Profile != string(sb.Profile) ||
-		payload.SnapshotRef != sb.SnapshotRef || payload.CreatedUnix != sb.CreatedUnix ||
+		payload.ResumeSourceKind != sb.ResumeSource.Kind || payload.ResumeSourceRef != sb.ResumeSource.Ref ||
+		payload.CreatedUnix != sb.CreatedUnix ||
 		payload.DeadlineUnix != sb.DeadlineUnix {
 		t.Fatal("exported payload lost one or more portable sandbox fields")
 	}
@@ -96,12 +97,72 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	got, _ := o.st.Get(ctx, imported)
 	if got == nil || got.ID != sid || got.StableID() != sb.StableID() || got.Cluster != nil ||
 		got.State != types.StatePaused || got.Profile != sb.Profile || got.TemplateID != sb.TemplateID ||
-		got.SnapshotRef != sb.SnapshotRef || got.CreatedUnix != sb.CreatedUnix ||
+		got.ResumeSource != sb.ResumeSource || got.CreatedUnix != sb.CreatedUnix ||
 		got.DeadlineUnix != sb.DeadlineUnix || !reflect.DeepEqual(got.Env, sb.Env) ||
 		!reflect.DeepEqual(got.Metadata, sb.Metadata) {
 		t.Fatal("imported row lost one or more portable sandbox fields")
 	}
 	assertMigrationCredentialsEqual(t, sandboxCredentials(got), sandboxCredentials(sb))
+}
+
+func TestArtifactKindRoundTripsThroughTemplateAndMigrationToken(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		sourceKind      types.ResumeSourceKind
+		templateKind    types.Kind
+		autoPauseMemory bool
+	}{
+		{name: "sandbox", sourceKind: types.ResumeSourceSandbox, templateKind: types.KindSbx, autoPauseMemory: false},
+		{name: "snapshot", sourceKind: types.ResumeSourceSnapshot, templateKind: types.KindSnp, autoPauseMemory: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			o := migrationOrchestrator(t, dir, []byte("artifact-kind-runtime"))
+			ctx := context.Background()
+			mk := strings.Repeat("6", 64)
+			apiSecret, apiKey := defaultTestCredentials(t, mk)
+			if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
+				t.Fatal(err)
+			}
+			sourceRef := "manifest://" + strings.Repeat(map[types.ResumeSourceKind]string{
+				types.ResumeSourceSandbox:  "b",
+				types.ResumeSourceSnapshot: "c",
+			}[test.sourceKind], 64)
+			source := migrationSandbox(t, dir, "source-"+test.name, mk, sourceRef)
+			source.ResumeSource.Kind = test.sourceKind
+			source.AutoPauseMemory = test.autoPauseMemory
+			if err := o.st.Put(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+			o.cache(source)
+
+			templateID, err := o.ExportSandbox(ctx, apiKey, source.ID, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			template, err := types.ParseTemplateID(templateID)
+			if err != nil || template.Kind != test.templateKind || template.Ref != sourceRef {
+				t.Fatalf("template = %+v, %v; want kind=%s ref=%s", template, err, test.templateKind, sourceRef)
+			}
+
+			token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetID := "target-" + test.name
+			if got, err := o.ImportSandbox(ctx, apiKey, token, targetID); err != nil || got != targetID {
+				t.Fatalf("ImportSandbox = %q, %v", got, err)
+			}
+			imported, err := o.st.Get(ctx, targetID)
+			if err != nil || imported == nil {
+				t.Fatalf("imported row = %+v, %v", imported, err)
+			}
+			if imported.ResumeSource != source.ResumeSource || imported.AutoPauseMemory != test.autoPauseMemory ||
+				imported.State != types.StatePaused || imported.LaunchMode != "" {
+				t.Fatalf("imported lifecycle = %+v, want source=%+v auto_pause_memory=%t", imported, source.ResumeSource, test.autoPauseMemory)
+			}
+		})
+	}
 }
 
 func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
@@ -113,7 +174,7 @@ func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
 		"ordinary":            "preserved",
 	}
 
-	token, err := o.mintSandboxToken(sb, sb.SnapshotRef)
+	token, err := o.mintSandboxToken(sb, sb.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +192,7 @@ func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
 	}
 
 	sb.Metadata[sandboxcfg.NsResource] = `{"control":{"controller":"/run/foreign.sock"}}`
-	if _, err := o.mintSandboxToken(sb, sb.SnapshotRef); err == nil || !strings.Contains(err.Error(), "node-managed") {
+	if _, err := o.mintSandboxToken(sb, sb.ResumeSource); err == nil || !strings.Contains(err.Error(), "node-managed") {
 		t.Fatalf("node-owned migration resource error = %v", err)
 	}
 }
@@ -160,7 +221,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	source.Metadata = map[string]string{
 		sandboxcfg.NsResource: `{"capacity":{"cpu":2,"memory":"8GiB"},"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`,
 	}
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +241,7 @@ func TestMigrationRestoreReappliesTargetNodeResourcePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resources, err := o.resolveRestoredResources(preparation.Spec, rtconfig.CapacityConfig{CPU: 2, Memory: "8GiB"})
+	resources, err := o.resolveArtifactResources(preparation.Spec, rtconfig.CapacityConfig{CPU: 2, Memory: "8GiB"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +339,7 @@ func TestImportIsInsertOnlyAndMapsDuplicateToAlreadyExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := migrationSandbox(t, dir, "source", mk, "manifest://"+strings.Repeat("b", 64))
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +372,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
 		t.Fatal(err)
 	}
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +388,7 @@ func TestImportWithTrustedExpectationsAndClusterContext(t *testing.T) {
 		TemplateID:    source.TemplateID,
 		Profile:       source.Profile,
 		RuntimeDigest: digest,
-		SnapshotRef:   source.SnapshotRef,
+		ResumeSource:  source.ResumeSource,
 	}, cluster, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -352,7 +413,7 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime-a"))
 	source := migrationSandbox(t, dir, "source", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +440,9 @@ func TestImportRejectsTenantRuntimeAndTrustedExpectationMismatch(t *testing.T) {
 		"stable-id": {StableID: "different-stable-id"},
 		"template":  {TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("c", 64)}.String()},
 		"profile":   {Profile: types.ProfileBare},
-		"snapshot":  {SnapshotRef: "manifest://" + strings.Repeat("d", 64)},
+		"resume-source": {ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("d", 64),
+		}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := o.importSandboxWithKey(context.Background(), pair, token, name+"-mismatch", expected, nil, 0)
@@ -401,7 +464,7 @@ func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	source := migrationSandbox(t, dir, "source", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,57 +482,131 @@ func TestImportRejectsInvalidExplicitTarget(t *testing.T) {
 func TestMintSandboxTokenRejectsProfileThatDoesNotMatchTemplate(t *testing.T) {
 	o := testOrch(t)
 	sb := &types.Sandbox{Profile: types.ProfileBare, TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String()}
-	if _, err := o.mintSandboxToken(sb, "manifest://"+strings.Repeat("b", 64)); err == nil ||
+	if _, err := o.mintSandboxToken(sb, types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64),
+	}); err == nil ||
 		!strings.Contains(err.Error(), "does not match template profile") {
 		t.Fatalf("mint mismatch error = %v", err)
 	}
 }
 
-func TestExportPromotesLocalSnapshotState(t *testing.T) {
+func TestExportPromotesLocalSandboxAndSnapshotState(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		sourceKind   types.ResumeSourceKind
+		templateKind types.Kind
+		suffix       string
+	}{
+		{name: "sandbox", sourceKind: types.ResumeSourceSandbox, templateKind: types.KindSbx, suffix: ".sandbox"},
+		{name: "snapshot", sourceKind: types.ResumeSourceSnapshot, templateKind: types.KindSnp, suffix: ".snapshot"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			o := testOrch(t)
+			o.cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+			ctx := context.Background()
+			mk := strings.Repeat("7", 64)
+			_, apiKey := defaultTestCredentials(t, mk)
+			sid := "promote-" + test.name
+			localRef := makeLocalArtifact(t, dir, sid, test.suffix)
+			mref := "manifest://" + strings.Repeat("c", 64)
+			argsPath := filepath.Join(dir, "publish.args")
+			installPromoteRecordingStub(t, mref, argsPath)
+
+			sb := migrationSandbox(t, dir, sid, mk, localRef)
+			sb.ResumeSource.Kind = test.sourceKind
+			if err := o.st.Put(ctx, sb); err != nil {
+				t.Fatal(err)
+			}
+			o.cache(sb)
+			events, cancel := o.Subscribe()
+			defer cancel()
+
+			templateID, err := o.ExportSandbox(ctx, apiKey, sid, true, true)
+			if err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			template, err := types.ParseTemplateID(templateID)
+			if err != nil || template.Kind != test.templateKind || template.Ref != mref {
+				t.Fatalf("template = %+v, %v", template, err)
+			}
+			args, err := os.ReadFile(argsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(args), "publish --quiet") || !strings.Contains(string(args), localRef) ||
+				strings.Contains(string(args), "upload-snapshot") {
+				t.Fatalf("publication argv = %q", args)
+			}
+			wantSource := types.ResumeSource{Kind: test.sourceKind, Ref: mref}
+			stored, err := o.st.Get(ctx, sid)
+			if err != nil || stored == nil || stored.ResumeSource != wantSource {
+				t.Fatalf("stored resume source was not promoted: %+v, %v", stored, err)
+			}
+			if cached := o.lookup(sid); cached == nil || cached.ResumeSource != wantSource {
+				t.Fatal("cached resume source was not promoted")
+			}
+			select {
+			case ev := <-events:
+				if ev.Kind != "upsert" || ev.Route.ArtifactLocation != "remote" {
+					t.Fatal("promote published the wrong route event")
+				}
+			default:
+				t.Fatal("promote did not publish a remote upsert")
+			}
+			if _, err := os.Stat(filepath.Dir(localRef)); !os.IsNotExist(err) {
+				t.Fatalf("redundant local artifact directory still exists: %v", err)
+			}
+		})
+	}
+}
+
+func TestExportRejectsUnownedLocalArtifactBeforePublishOrCleanup(t *testing.T) {
 	dir := t.TempDir()
-	o := testOrch(t)
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
-	sid := "sbx-promote-ok"
-	localRef := makeLocalSnapshot(t, dir, sid)
-	mref := "manifest://" + strings.Repeat("c", 64)
-	installPromoteStub(t, mref)
-
-	sb := migrationSandbox(t, dir, sid, mk, localRef)
+	sid := "unowned-local-artifact"
+	outsideDir := filepath.Join(dir, "outside", sid)
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideRef := filepath.Join(outsideDir, sid+".snapshot")
+	if err := os.WriteFile(outsideRef, []byte("must remain"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb := migrationSandbox(t, dir, sid, mk, outsideRef)
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	events, cancel := o.Subscribe()
-	defer cancel()
+	publishCalled := false
+	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error) {
+		publishCalled = true
+		return types.ResumeSource{}, nil
+	}
 
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err != nil {
-		t.Fatalf("export: %v", err)
+	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil ||
+		!strings.Contains(err.Error(), "outside its owned capture path") {
+		t.Fatalf("unowned local artifact error = %v", err)
+	}
+	if publishCalled {
+		t.Fatal("unowned local artifact reached publisher")
+	}
+	if _, err := os.Stat(outsideRef); err != nil {
+		t.Fatalf("unowned local artifact was removed: %v", err)
 	}
 	stored, err := o.st.Get(ctx, sid)
-	if err != nil || stored == nil || stored.SnapshotRef != mref {
-		t.Fatalf("stored snapshot ref was not promoted: %v", err)
-	}
-	if cached := o.lookup(sid); cached == nil || cached.SnapshotRef != mref {
-		t.Fatal("cached snapshot ref was not promoted")
-	}
-	select {
-	case ev := <-events:
-		if ev.Kind != "upsert" || ev.Route.SnapshotLocation != "remote" {
-			t.Fatal("promote published the wrong route event")
-		}
-	default:
-		t.Fatal("promote did not publish a remote upsert")
-	}
-	if _, err := os.Stat(filepath.Dir(localRef)); !os.IsNotExist(err) {
-		t.Fatalf("redundant local snapshot directory still exists: %v", err)
+	if err != nil || stored == nil || stored.ResumeSource != sb.ResumeSource {
+		t.Fatalf("unowned local artifact changed durable row: %+v, %v", stored, err)
 	}
 }
 
 func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{}
+	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
 	o := testOrchCfg(t, cfg)
 	// Pin the publication clock so the expected name is a constant even if
@@ -549,7 +686,9 @@ func mustRefLocationURI(t *testing.T, cfg *config.Config, name string) string {
 func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
-	o := testOrchCfgAt(t, &config.Config{}, dbPath)
+	cfg := &config.Config{}
+	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	o := testOrchCfgAt(t, cfg, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("8", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
@@ -562,18 +701,18 @@ func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 		t.Fatal(err)
 	}
 	o.cache(sb)
-	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_snapshot_ref BEFORE UPDATE OF snapshot_ref ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced snapshot ref failure'); END`)
+	installStoreTrigger(t, dbPath, `CREATE TRIGGER fail_resume_source BEFORE UPDATE OF resume_source_kind, resume_source_ref ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced resume source failure'); END`)
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil || !strings.Contains(err.Error(), "persist promoted snapshot ref") {
+	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil || !strings.Contains(err.Error(), "persist promoted artifact source") {
 		t.Fatalf("export error = %v; want persisted-ref failure", err)
 	}
 	stored, err := o.st.Get(ctx, sid)
-	if err != nil || stored == nil || stored.SnapshotRef != localRef {
+	if err != nil || stored == nil || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
 		t.Fatalf("stored snapshot changed after failure: %v", err)
 	}
-	if cached := o.lookup(sid); cached == nil || cached.SnapshotRef != localRef {
+	if cached := o.lookup(sid); cached == nil || cached.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
 		t.Fatal("cached snapshot changed after failure")
 	}
 	if _, err := os.Stat(localRef); err != nil {
@@ -595,6 +734,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	cfg.Sandbox.Boot.Runtime = runtimePath
+	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
 	o := testOrchCfgAt(t, cfg, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("9", 64)
@@ -616,7 +756,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 		t.Fatalf("move export returned the wrong token/error state: %v", err)
 	}
 	stored, getErr := o.st.Get(ctx, sid)
-	if getErr != nil || stored == nil || stored.SnapshotRef != localRef {
+	if getErr != nil || stored == nil || stored.ResumeSource != (types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef}) {
 		t.Fatalf("source row lost after failed delete: %v", getErr)
 	}
 	if cached := o.lookup(sid); cached == nil {
@@ -636,7 +776,8 @@ func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 	t.Helper()
 	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileE2B, TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), State: types.StatePaused,
-		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
+		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: ref}, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
 	}
 	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
@@ -655,6 +796,7 @@ func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrat
 	cfg.Sandbox.Boot.Runtime = runtimePath
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
+	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
 	return testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
 }
 
@@ -692,12 +834,17 @@ func assertMigrationCredentialsEqual(t *testing.T, got, want migrationCredential
 
 func makeLocalSnapshot(t *testing.T, dir, sid string) string {
 	t.Helper()
+	return makeLocalArtifact(t, dir, sid, ".snapshot")
+}
+
+func makeLocalArtifact(t *testing.T, dir, sid, suffix string) string {
+	t.Helper()
 	localDir := filepath.Join(dir, "saved", sid)
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ref := filepath.Join(localDir, sid+".snapshot")
-	if err := os.WriteFile(ref, []byte("snapshot"), 0o644); err != nil {
+	ref := filepath.Join(localDir, sid+suffix)
+	if err := os.WriteFile(ref, []byte("artifact"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return ref
@@ -708,6 +855,17 @@ func installPromoteStub(t *testing.T, mref string) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sandbox-ctl")
 	script := "#!/bin/sh\nprintf '%s\\n' '" + mref + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installPromoteRecordingStub(t *testing.T, mref, argsPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sandbox-ctl")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\nprintf '%s\\n' '" + mref + "'\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

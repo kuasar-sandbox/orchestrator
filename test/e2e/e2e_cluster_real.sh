@@ -874,8 +874,8 @@ run_cluster_flow() {
     node_yaml="$(find "$WORK/cr" -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | head -1)"
     [ -n "$node_yaml" ] || fail "cluster node generated no sandbox YAML"
     assert_cluster_resource_yaml "$node_yaml" || fail "cluster cold-create resource policy differs from standalone"
-    step "pausing sandbox, then reusing the same KAT to wake the current node-local generation"
-    code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY")"
+    step "capturing Sandbox E through router, then reusing the same KAT for a cold Wake"
+    code="$(router_req POST "/sandboxes/$sid/pause" "$CLUSTER_API_KEY" "$ROUTE_KEY" '{"memory":false}')"
     [ "$code" = "204" ] || { cat "$WORK/router-resp.body"; fail "pause returned $code"; }
     exec_argv_denied_through_cluster "$sid" "$exec_token"
     wait_cluster_traffic_stats "$sid" paused \
@@ -893,7 +893,7 @@ run_cluster_flow() {
         || fail "cluster exec traffic did not converge to idle"
     assert_cluster_resource_yaml "$node_yaml" || fail "cluster restore resource policy differs from cold create"
     unset exec_token
-    step "PASS: paused stable-SID exec went directly to the final node, where traffic transitioned parking -> idle"
+    step "PASS: cluster Pause(memory=false) produced wakeable E; stable-SID exec cold-resumed it with traffic parking -> idle"
 
     step "checking SID-addressed envd data request with X-Access-Token"
     code="$(retry_data_by_sid "$sid" "$envd_token" || true)"

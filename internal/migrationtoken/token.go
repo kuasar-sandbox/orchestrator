@@ -43,7 +43,7 @@ var (
 	// fingerprints carried by an otherwise authenticated payload.
 	ErrCredentialMismatch = errors.New("migrationtoken: credential mismatch")
 	// ErrIncompatible identifies a valid token that does not match target-owned
-	// profile, template, runtime, snapshot, or stable-ID state.
+	// profile, template, runtime, resume source, or stable-ID state.
 	ErrIncompatible = errors.New("migrationtoken: incompatible target")
 	// ErrInvalidKeyMaterial identifies a non-canonical tenant root supplied by the
 	// trusted caller. Errors never include the supplied material.
@@ -71,16 +71,18 @@ type MigrationTokenPayloadV1 struct {
 	APISecretFingerprint   string `json:"apiSecretFingerprint"`
 	ManifestKeyFingerprint string `json:"manifestKeyFingerprint"`
 
-	TemplateID    string `json:"templateID"`
-	Profile       string `json:"profile"`
-	RuntimeDigest string `json:"runtimeDigest"`
-	SnapshotRef   string `json:"snapshotRef"`
+	TemplateID       string                 `json:"templateID"`
+	Profile          string                 `json:"profile"`
+	RuntimeDigest    string                 `json:"runtimeDigest"`
+	ResumeSourceKind types.ResumeSourceKind `json:"resumeSourceKind"`
+	ResumeSourceRef  string                 `json:"resumeSourceRef"`
 
 	Env      map[string]string `json:"env,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
 
-	CreatedUnix  int64 `json:"createdUnix"`
-	DeadlineUnix int64 `json:"deadlineUnix"`
+	CreatedUnix     int64 `json:"createdUnix"`
+	DeadlineUnix    int64 `json:"deadlineUnix"`
+	AutoPauseMemory bool  `json:"autoPauseMemory"`
 
 	ServiceSecret      string `json:"serviceSecret"`
 	EnvdAccessToken    string `json:"envdAccessToken"`
@@ -95,7 +97,7 @@ type Expectations struct {
 	TemplateID    string
 	Profile       types.Profile
 	RuntimeDigest string
-	SnapshotRef   string
+	ResumeSource  types.ResumeSource
 }
 
 // Seal validates payload and key ownership, then encrypts a fresh kmt1 token
@@ -209,8 +211,9 @@ func ValidateExpectations(payload MigrationTokenPayloadV1, expected Expectations
 	if expected.RuntimeDigest != "" && payload.RuntimeDigest != expected.RuntimeDigest {
 		return fmt.Errorf("%w: runtime", ErrIncompatible)
 	}
-	if expected.SnapshotRef != "" && payload.SnapshotRef != expected.SnapshotRef {
-		return fmt.Errorf("%w: snapshot", ErrIncompatible)
+	if !expected.ResumeSource.Empty() &&
+		(payload.ResumeSourceKind != expected.ResumeSource.Kind || payload.ResumeSourceRef != expected.ResumeSource.Ref) {
+		return fmt.Errorf("%w: resume source", ErrIncompatible)
 	}
 	return nil
 }
@@ -240,8 +243,8 @@ func validatePayload(payload MigrationTokenPayloadV1) error {
 	if !validHexDigest(payload.RuntimeDigest) {
 		return invalidPayload("runtime digest")
 	}
-	if !validSnapshotRef(payload.SnapshotRef) {
-		return invalidPayload("snapshot reference")
+	if !validResumeSource(types.ResumeSource{Kind: payload.ResumeSourceKind, Ref: payload.ResumeSourceRef}) {
+		return invalidPayload("resume source")
 	}
 	if payload.CreatedUnix <= 0 || payload.DeadlineUnix < 0 {
 		return invalidPayload("timestamp")
@@ -332,10 +335,22 @@ func validStringMap(values map[string]string) bool {
 	return true
 }
 
-func validSnapshotRef(raw string) bool {
-	ref, err := types.ParsePortableRef(raw)
-	return err == nil && (ref.Scheme != "file" ||
-		strings.HasSuffix(ref.Path, ".snapshot") || strings.HasSuffix(ref.Path, ".bundle"))
+func validResumeSource(source types.ResumeSource) bool {
+	if !source.Valid() {
+		return false
+	}
+	ref, err := types.ParsePortableRef(source.Ref)
+	if err != nil || ref.Scheme != "file" {
+		return err == nil
+	}
+	switch source.Kind {
+	case types.ResumeSourceSandbox:
+		return strings.HasSuffix(ref.Path, ".sandbox") || strings.HasSuffix(ref.Path, ".bundle")
+	case types.ResumeSourceSnapshot:
+		return strings.HasSuffix(ref.Path, ".snapshot") || strings.HasSuffix(ref.Path, ".bundle")
+	default:
+		return false
+	}
 }
 
 func invalidPayload(field string) error {

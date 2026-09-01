@@ -3,20 +3,31 @@ package sandboxcfg
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// CheckpointPolicy controls one local checkpoint capture. Nil means that the
+// SnapshotPolicy controls one local checkpoint capture. Nil means that the
 // current source does not specify the field, so a lower-priority source (or the
 // sandbox-ctl default) remains in effect.
-type CheckpointPolicy struct {
+type SnapshotPolicy struct {
 	MergeRef   *bool `json:"merge_ref,omitempty"`
 	DropCaches *bool `json:"drop_caches,omitempty"`
 }
 
+type CaptureRequest struct {
+	Kind           types.CaptureKind
+	SnapshotPolicy SnapshotPolicy
+}
+
+type CaptureResult struct {
+	Source types.ResumeSource
+}
+
 // Empty reports whether neither checkpoint field is specified.
-func (p CheckpointPolicy) Empty() bool {
+func (p SnapshotPolicy) Empty() bool {
 	return p.MergeRef == nil && p.DropCaches == nil
 }
 
@@ -29,18 +40,18 @@ func CloneBool(v *bool) *bool {
 	return &clone
 }
 
-// CloneCheckpointPolicy returns a policy without sharing mutable bool pointers.
-func CloneCheckpointPolicy(p CheckpointPolicy) CheckpointPolicy {
-	return CheckpointPolicy{
+// CloneSnapshotPolicy returns a policy without sharing mutable bool pointers.
+func CloneSnapshotPolicy(p SnapshotPolicy) SnapshotPolicy {
+	return SnapshotPolicy{
 		MergeRef:   CloneBool(p.MergeRef),
 		DropCaches: CloneBool(p.DropCaches),
 	}
 }
 
-// OverlayCheckpointPolicy overlays higher onto base one field at a time. Nil
+// OverlaySnapshotPolicy overlays higher onto base one field at a time. Nil
 // fields in higher inherit base; concrete true and false values replace it.
-func OverlayCheckpointPolicy(base, higher CheckpointPolicy) CheckpointPolicy {
-	out := CloneCheckpointPolicy(base)
+func OverlaySnapshotPolicy(base, higher SnapshotPolicy) SnapshotPolicy {
+	out := CloneSnapshotPolicy(base)
 	if higher.MergeRef != nil {
 		out.MergeRef = CloneBool(higher.MergeRef)
 	}
@@ -50,29 +61,24 @@ func OverlayCheckpointPolicy(base, higher CheckpointPolicy) CheckpointPolicy {
 	return out
 }
 
-// ParseCheckpointPolicyJSON strictly parses the checkpoint metadata/header
+// ParseSnapshotPolicyJSON strictly parses the checkpoint metadata/header
 // representation. The top level must be exactly one object containing only
 // merge_ref and drop_caches, whose values may be true, false, or null.
-func ParseCheckpointPolicyJSON(raw string) (CheckpointPolicy, error) {
+func ParseSnapshotPolicyJSON(raw string) (SnapshotPolicy, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed[0] != '{' {
-		return CheckpointPolicy{}, fmt.Errorf("checkpoint policy must be a JSON object")
+		return SnapshotPolicy{}, fmt.Errorf("checkpoint policy must be a JSON object")
 	}
 
-	dec := json.NewDecoder(strings.NewReader(trimmed))
+	if err := strictjson.RejectDuplicateKeys([]byte(trimmed)); err != nil {
+		return SnapshotPolicy{}, fmt.Errorf("invalid checkpoint policy: %w", err)
+	}
 	var object map[string]json.RawMessage
-	if err := dec.Decode(&object); err != nil {
-		return CheckpointPolicy{}, fmt.Errorf("invalid checkpoint policy: %w", err)
-	}
-	var trailing any
-	if err := dec.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return CheckpointPolicy{}, fmt.Errorf("checkpoint policy must contain exactly one JSON object")
-		}
-		return CheckpointPolicy{}, fmt.Errorf("invalid trailing checkpoint policy data: %w", err)
+	if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
+		return SnapshotPolicy{}, fmt.Errorf("invalid checkpoint policy: %w", err)
 	}
 
-	var policy CheckpointPolicy
+	var policy SnapshotPolicy
 	for field, value := range object {
 		var target **bool
 		switch field {
@@ -81,18 +87,18 @@ func ParseCheckpointPolicyJSON(raw string) (CheckpointPolicy, error) {
 		case "drop_caches":
 			target = &policy.DropCaches
 		default:
-			return CheckpointPolicy{}, fmt.Errorf("checkpoint policy contains unknown field %q", field)
+			return SnapshotPolicy{}, fmt.Errorf("checkpoint policy contains unknown field %q", field)
 		}
 		if err := json.Unmarshal(value, target); err != nil {
-			return CheckpointPolicy{}, fmt.Errorf("checkpoint policy field %q must be true, false, or null: %w", field, err)
+			return SnapshotPolicy{}, fmt.Errorf("checkpoint policy field %q must be true, false, or null: %w", field, err)
 		}
 	}
 	return policy, nil
 }
 
-// MarshalCheckpointPolicyJSON returns the canonical checkpoint JSON. Nil
+// MarshalSnapshotPolicyJSON returns the canonical checkpoint JSON. Nil
 // fields are omitted, so an empty policy marshals as {}.
-func MarshalCheckpointPolicyJSON(policy CheckpointPolicy) (string, error) {
+func MarshalSnapshotPolicyJSON(policy SnapshotPolicy) (string, error) {
 	body, err := json.Marshal(policy)
 	if err != nil {
 		return "", fmt.Errorf("marshal checkpoint policy: %w", err)
@@ -109,7 +115,7 @@ func NormalizeCheckpointMetadata(meta map[string]string) (map[string]string, err
 	if !ok {
 		return out, nil
 	}
-	policy, err := ParseCheckpointPolicyJSON(raw)
+	policy, err := ParseSnapshotPolicyJSON(raw)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: metadata[%q]: %w", NsCheckpoint, err)
 	}
@@ -117,7 +123,7 @@ func NormalizeCheckpointMetadata(meta map[string]string) (map[string]string, err
 		delete(out, NsCheckpoint)
 		return out, nil
 	}
-	canonical, err := MarshalCheckpointPolicyJSON(policy)
+	canonical, err := MarshalSnapshotPolicyJSON(policy)
 	if err != nil {
 		return nil, fmt.Errorf("sandboxcfg: metadata[%q]: %w", NsCheckpoint, err)
 	}

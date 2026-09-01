@@ -461,7 +461,7 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 // reserveCreate resolves (group, route_key) to a running sandbox, placing +
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md).
-func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
+func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, autoPauseMemory bool) (*ReserveResult, error) {
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
@@ -502,7 +502,7 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		r.mu.Unlock()
 	}()
 
-	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials); err != nil {
+	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig, createCredentials, autoPauseMemory); err != nil {
 		r.finish(key, nil, err)
 		if fence, ok := r.reserveRollbackFence(key); ok {
 			dropCurrentRef := !errors.Is(err, errNodeSandboxIDConflict)
@@ -616,7 +616,7 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials) error {
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, autoPauseMemory bool) error {
 	// PAUSED: resume on the same node (no placement).
 	if found && rec.State == StatePaused && rec.NodeID != "" {
 		_, stableID, err := replacementCredentials(rec)
@@ -673,14 +673,14 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		copy := *rec
 		replaceReady = &copy
 	}
-	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, createCredentials, replaceReady, autoPauseMemory)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord) error {
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, createCredentials *sandboxcfg.Credentials, replaceReady *SandboxRecord, autoPauseMemory bool) error {
 	if _, found := createConfig[sandboxcfg.NsCredentials]; found {
 		return errors.New("registry: create credentials were not separated from config")
 	}
@@ -700,6 +700,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return err
 		}
+		// A Ready replacement continues the same logical sandbox. Freeze the
+		// original TTL capture policy together with its stable identity and
+		// materialized credentials instead of adopting a retrying Create body.
+		autoPauseMemory = replaceReady.AutoPauseMemory
 	}
 	excluded := placementExclusions{}
 	casConflicts := 0
@@ -732,9 +736,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		binding := workflowReplacement
 		if curFound && cur.State == StateReserved {
 			// The first committed RESERVED row freezes the create credential
-			// selection. A retry or competing Reserve must not adopt credentials
-			// from its own request after that point.
+			// selection and TTL capture policy. A retry or competing Reserve must
+			// not adopt either value from its own request after that point.
 			binding = cur
+			autoPauseMemory = cur.AutoPauseMemory
 			if hasRouteCredentials(cur) {
 				selectedCredentials, _, err = replacementCredentials(cur)
 				if err != nil {
@@ -821,6 +826,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			APISecretFingerprint: placement.APISecretFingerprint,
 			CreateCredentials:    cloneCreateCredentials(selectedCredentials),
 			TargetPort:           placement.TargetPort,
+			AutoPauseMemory:      autoPauseMemory,
 		}
 		copyRouteCredentials(reserved, selectedReplacement)
 		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
@@ -870,6 +876,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 				Group: group, RouteKey: routeKey, StableID: stableID,
 			},
 			APISecretFingerprint: placement.APISecretFingerprint,
+			AutoPauseMemory:      cloneOptionalBool(&autoPauseMemory),
 		}
 		if r.nodeOwner == nil {
 			if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
@@ -1080,7 +1087,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		Group: ref.Group, RouteKey: ref.RouteKey,
 		SandboxID: ref.SandboxID, NodeSandboxID: ref.NodeSandboxID,
 		SandboxGeneration: ref.SandboxGeneration, NodeID: nodeID,
-		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, Profile: ref.Profile,
+		ArtifactLocation: e.ArtifactLocation, TemplateID: e.TemplateID, Profile: ref.Profile,
 		APISecretFingerprint:   ref.APISecretFingerprint,
 		ManifestKeyFingerprint: e.ManifestKeyFingerprint,
 		StableID:               e.StableID,
@@ -1232,6 +1239,7 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	if rec.TargetPort == 0 {
 		rec.TargetPort = cur.TargetPort
 	}
+	rec.AutoPauseMemory = cur.AutoPauseMemory
 	rec.NextSandboxGeneration = cur.NextSandboxGeneration
 	committedRev, ok, err := r.stores.CASSandbox(ctx, rec, rev)
 	if err != nil || !ok {

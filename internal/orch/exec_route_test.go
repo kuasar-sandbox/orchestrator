@@ -21,6 +21,7 @@ func TestLookupExecIsSideEffectFreeAndUsesStableID(t *testing.T) {
 		Profile:       types.ProfileBare,
 		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("1", 64)}.String(),
 		State:         types.StatePaused,
+		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("4", 64)},
 		APISecret:     strings.Repeat("2", 64),
 		ManifestKey:   strings.Repeat("3", 64),
 		RunDir:        filepath.Join(t.TempDir(), "run", "node-s1"),
@@ -69,6 +70,7 @@ func TestActivateExecRequiresExpectedIdentityThenUsesExistingResume(t *testing.T
 		Profile:       types.ProfileBare,
 		TemplateID:    types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:         types.StatePaused,
+		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:     deriveTestAPISecret(t, manifestKey),
 		ManifestKey:   manifestKey,
 		RunDir:        filepath.Join(cfg.Paths.RunRoot, sid),
@@ -130,7 +132,8 @@ func TestStartingWithoutLaunchOwnerFailsClosed(t *testing.T) {
 		ID: "ownerless-starting", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
 		State:      types.StateStarting, FloatingIP: "192.0.2.30",
-		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		LaunchMode: types.LaunchImage,
+		APISecret:  deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -163,7 +166,8 @@ func TestStartingInternalRouteAndExecWaitHonorCallerCancellation(t *testing.T) {
 		ID: "cancel-starting", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("f", 64)}.String(),
 		State:      types.StateStarting, FloatingIP: "192.0.2.31",
-		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		LaunchMode: types.LaunchImage,
+		APISecret:  deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)

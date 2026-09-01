@@ -334,7 +334,8 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	createConfig, err := createSandboxMetadata(w, r)
+	var autoPauseMemory *bool
+	createConfig, err := createSandboxMetadataWithAutoPauseMemory(w, r, &autoPauseMemory)
 	if err != nil {
 		status := http.StatusBadRequest
 		var maxBytesErr *http.MaxBytesError
@@ -345,7 +346,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, nil,
+		r.Context(), "create", group, routeKey, "", 0, 0, createConfig, autoPauseMemory, nil, nil,
 		map[string]string{HeaderAPIKey: apiKeyFromRequest(r)},
 	)
 	if err != nil {
@@ -383,35 +384,46 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 // checkpoint is overlaid fieldwise. The body is always decoded and validated so
 // a valid higher-priority header cannot hide malformed lower-priority metadata.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	return createSandboxMetadataWithAutoPauseMemory(w, r, nil)
+}
+
+func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool) (map[string]string, error) {
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
 	checkpointRaw, checkpointHeader := createHeaderValue(r.Header, HeaderCheckpoint)
-	checkpointHeaderPolicy := sandboxcfg.CheckpointPolicy{}
+	checkpointHeaderPolicy := sandboxcfg.SnapshotPolicy{}
 	if checkpointHeader {
 		var err error
-		checkpointHeaderPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(checkpointRaw)
+		checkpointHeaderPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(checkpointRaw)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", HeaderCheckpoint, err)
 		}
 	}
 	var body struct {
-		Metadata map[string]string `json:"metadata"`
+		Metadata        map[string]string `json:"metadata"`
+		AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
 	}
 	if r.Body != nil {
 		if r.ContentLength > maxClusterCreateBodyBytes {
 			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxClusterCreateBodyBytes)
-		err := json.NewDecoder(r.Body).Decode(&body)
-		if err != nil && !errors.Is(err, io.EOF) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
 			return nil, fmt.Errorf("bad create body: %w", err)
 		}
-		// Decode stops after the first complete JSON value. Drain the bounded
-		// reader so trailing bytes count toward the advertised body limit while
-		// preserving the endpoint's existing single-value decode semantics.
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
-			return nil, fmt.Errorf("bad create body: %w", err)
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null")) {
+			if trimmed[0] != '{' {
+				return nil, fmt.Errorf("bad create body: request body must be a JSON object")
+			}
+			if err := strictjson.DecodeAllowUnknown(trimmed, &body); err != nil {
+				return nil, fmt.Errorf("bad create body: %w", err)
+			}
 		}
+	}
+	if autoPauseMemory != nil {
+		*autoPauseMemory = sandboxcfg.CloneBool(body.AutoPauseMemory)
 	}
 	selected := map[string]string{}
 	var bodyResource map[string]string
@@ -441,19 +453,19 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 		selected[sandboxcfg.NsCredentials] = credentialsRaw
 	}
 	if checkpointHeader {
-		bodyPolicy := sandboxcfg.CheckpointPolicy{}
+		bodyPolicy := sandboxcfg.SnapshotPolicy{}
 		if raw, ok := selected[sandboxcfg.NsCheckpoint]; ok {
 			var err error
-			bodyPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(raw)
+			bodyPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(raw)
 			if err != nil {
 				return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 			}
 		}
-		policy := sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, checkpointHeaderPolicy)
+		policy := sandboxcfg.OverlaySnapshotPolicy(bodyPolicy, checkpointHeaderPolicy)
 		if policy.Empty() {
 			delete(selected, sandboxcfg.NsCheckpoint)
 		} else {
-			canonical, err := sandboxcfg.MarshalCheckpointPolicyJSON(policy)
+			canonical, err := sandboxcfg.MarshalSnapshotPolicyJSON(policy)
 			if err != nil {
 				return nil, err
 			}
@@ -771,7 +783,8 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Timeout int `json:"timeout"`
+		Timeout int   `json:"timeout"`
+		Memory  *bool `json:"memory,omitempty"`
 	}
 	if r.ContentLength > maxClusterConnectBodyBytes {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
@@ -779,24 +792,22 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, maxClusterConnectBodyBytes)
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		raw, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
 			var maxBytesErr *http.MaxBytesError
-			if errors.As(err, &maxBytesErr) {
+			if errors.As(readErr, &maxBytesErr) {
 				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			} else {
 				http.Error(w, "invalid request body", http.StatusBadRequest)
 			}
 			return
 		}
-		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(err, &maxBytesErr) {
-				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			} else {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null")) {
+			if trimmed[0] != '{' || strictjson.DecodeAllowNull(trimmed, &body) != nil {
 				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return
 			}
-			return
 		}
 	}
 	headers := map[string]string{HeaderAPIKey: apiKeyFromRequest(r)}
@@ -804,7 +815,7 @@ func (rt *Router) handleConnect(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, nil, headers,
+		r.Context(), "connect", group, routeKey, sandboxID, 0, body.Timeout, nil, nil, body.Memory, nil, headers,
 	)
 	if err != nil {
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -881,7 +892,7 @@ func (rt *Router) handleExecSession(w http.ResponseWriter, r *http.Request) {
 		headers[HeaderMigration] = migrationToken
 	}
 	res, err := rt.routeLinkReserve(
-		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, nil,
+		r.Context(), "exec-session", group, routeKey, sandboxID, 0, 0, nil, nil, nil,
 		&registry.SandboxReserveExecSessionReq{
 			TTLSeconds: request.TTLSeconds,
 			Conditions: request.Expressions(),
@@ -1309,7 +1320,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// verified above, so its protected token is used only for the outer CONNECT.
 	if !hasDirectNodeTarget(rr) && rr.Group != "" {
 		res, err := rt.routeLinkReserve(
-			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil,
+			r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil,
 			map[string]string{HeaderAccessTok: connectToken},
 		)
 		if err != nil {
@@ -1333,7 +1344,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// request was sent. ReserveData is the stale-route fallback and validates the
 	// same admitted credential against the Registry's current lineage.
 	res, err := rt.routeLinkReserve(
-		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil,
+		r.Context(), "data", rr.Group, rr.RouteKey, sid, effectivePort, 0, nil, nil, nil, nil,
 		map[string]string{HeaderAccessTok: connectToken},
 	)
 	if err != nil {
@@ -1420,7 +1431,7 @@ func (rt *Router) reserveExecDataRoute(
 	claims keys.ExecAccessClaims,
 ) (*routeResolve, error) {
 	result, err := rt.routeLinkReserve(
-		ctx, "data", stable.Group, stable.RouteKey, sandboxID, target.Port, 0, nil, nil,
+		ctx, "data", stable.Group, stable.RouteKey, sandboxID, target.Port, 0, nil, nil, nil, nil,
 		map[string]string{
 			HeaderAccessTok:               token,
 			proxypkg.HeaderSandboxService: string(target.Service),
@@ -1749,6 +1760,7 @@ func (rt *Router) routeLinkReserve(
 	operation, group, routeKey, sandboxID string,
 	port, timeout int,
 	config map[string]string,
+	autoPauseMemory, memory *bool,
 	execSession *registry.SandboxReserveExecSessionReq,
 	headers map[string]string,
 ) (*reserveResult, error) {
@@ -1769,7 +1781,13 @@ func (rt *Router) routeLinkReserve(
 	path := registry.RouteLinkReservePath + "?" + query.Encode()
 	var body []byte
 	if operation == "create" {
-		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config})
+		body, _ = json.Marshal(registry.SandboxReserveReq{Config: config, AutoPauseMemory: sandboxcfg.CloneBool(autoPauseMemory)})
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		headers["Content-Type"] = "application/json"
+	} else if operation == "connect" && memory != nil {
+		body, _ = json.Marshal(registry.SandboxReserveReq{Memory: sandboxcfg.CloneBool(memory)})
 		if headers == nil {
 			headers = map[string]string{}
 		}

@@ -14,9 +14,9 @@ require (
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.4
-	github.com/kuasar-sandbox/accelerator v0.0.0
-	github.com/kuasar-sandbox/connector v0.0.0
-	github.com/kuasar-sandbox/sandboxer v0.1.1-preview.20260826.0.20260827095218-17179c4eda18
+	github.com/kuasar-sandbox/accelerator v0.1.3-0.20260901175355-0c9aa0853d72
+	github.com/kuasar-sandbox/connector v0.1.1
+	github.com/kuasar-sandbox/sandboxer v0.1.3-preview.20260901.0.20260901193900-9f366420b662
 	golang.org/x/net v0.49.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.40.0

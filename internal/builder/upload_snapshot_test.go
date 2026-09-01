@@ -19,21 +19,21 @@ func publishSpec(parent string) *configsock.BuildSpec {
 	}
 }
 
-// TestUploadSnapshotArgsMintPublicationDateAtUploadTime pins the bucketing
+// TestPublishArtifactArgsMintPublicationDateAtUploadTime pins the bucketing
 // clock to the moment the argv is built: the same spec resolved before and
 // after UTC midnight must publish into different date buckets. This is the
 // regression test for minting the name at spec-resolution time, which froze
 // the date before the (potentially multi-hour) build ran.
-func TestUploadSnapshotArgsMintPublicationDateAtUploadTime(t *testing.T) {
+func TestPublishArtifactArgsMintPublicationDateAtUploadTime(t *testing.T) {
 	spec := publishSpec("file:///mnt/shared/snapshots")
 	lateEvening := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
 	earlyNextDay := time.Date(2026, 8, 25, 0, 1, 0, 0, time.UTC)
 
-	before, err := uploadSnapshotArgs(spec, "/work/build", lateEvening)
+	before, err := publishArtifactArgs(spec, "/work/build", lateEvening)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, err := uploadSnapshotArgs(spec, "/work/build", earlyNextDay)
+	after, err := publishArtifactArgs(spec, "/work/build", earlyNextDay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,16 +62,16 @@ func TestUploadSnapshotArgsMintPublicationDateAtUploadTime(t *testing.T) {
 	}
 }
 
-// TestUploadSnapshotArgsWithoutPublishParent verifies the manifest-mode
+// TestPublishArtifactArgsWithoutPublishParent verifies the manifest-mode
 // fallback is unchanged: no ref-location flag, the manifest config path is
 // passed instead.
-func TestUploadSnapshotArgsWithoutPublishParent(t *testing.T) {
+func TestPublishArtifactArgsWithoutPublishParent(t *testing.T) {
 	spec := publishSpec("")
-	args, err := uploadSnapshotArgs(spec, "/work/build", time.Unix(0, 0))
+	args, err := publishArtifactArgs(spec, "/work/build", time.Unix(0, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"upload-snapshot", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml", "/work/build"}
+	want := []string{"publish", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml", "/work/build"}
 	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %#v, want %#v", args, want)
 	}

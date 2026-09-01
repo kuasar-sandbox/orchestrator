@@ -119,6 +119,8 @@ fi
 # lifecycle tests; every ordinary create/restore still uses the real KVM stack.
 ORCH_BIN_DIR="$WORK/orch-bin"
 SNAPSHOT_ARGV_LOG="$WORK/snapshot-argv.jsonl"
+EXPORT_ARGV_LOG="$WORK/export-argv.jsonl"
+RUN_ARGV_LOG="$WORK/run-argv.jsonl"
 mkdir -p "$ORCH_BIN_DIR"
 cp "$BIN/node-ctl" "$ORCH_BIN_DIR/node-ctl"
 for b in connector-ctl flatten-ctl manifest-ctl; do
@@ -134,12 +136,29 @@ with open(sys.argv[1], "a", encoding="utf-8") as output:
     output.write(json.dumps(sys.argv[2:]) + "\\n")
 PY
 fi
+if [ "\${1:-}" = "export" ]; then
+    python3 - "$EXPORT_ARGV_LOG" "\$@" <<'PY'
+import json, sys
+with open(sys.argv[1], "a", encoding="utf-8") as output:
+    output.write(json.dumps(sys.argv[2:]) + "\n")
+PY
+fi
+if [ "\${1:-}" = "run" ]; then
+    python3 - "$RUN_ARGV_LOG" "\$@" <<'PY'
+import json, sys
+with open(sys.argv[1], "a", encoding="utf-8") as output:
+    output.write(json.dumps(sys.argv[2:]) + "\n")
+PY
+fi
 if [ "\${1:-}" = "run" ] && [ -f "$WORK/inject-sandbox-run" ]; then
     mode="\$(<"$WORK/inject-sandbox-run")"
     case "\$mode" in
         hold)
             while [ -f "$WORK/inject-sandbox-run" ]; do sleep 0.05; done
             exit 44
+            ;;
+        park)
+            while [ -f "$WORK/inject-sandbox-run" ]; do sleep 0.05; done
             ;;
         runtime-wire-failure)
             python3 - "\$@" <<'PY'
@@ -457,6 +476,69 @@ if not os.path.exists(path):
 else:
     with open(path, encoding="utf-8") as source:
         print(sum(1 for line in source if line.strip()))
+PY
+}
+
+argv_log_count() { # $1=jsonl path
+    python3 - "$1" <<'PY'
+import os, sys
+path = sys.argv[1]
+if not os.path.exists(path):
+    print(0)
+else:
+    with open(path, encoding="utf-8") as source:
+        print(sum(1 for line in source if line.strip()))
+PY
+}
+
+export_argv_count() { argv_log_count "$EXPORT_ARGV_LOG"; }
+run_argv_count() { argv_log_count "$RUN_ARGV_LOG"; }
+
+assert_export_argv() { # $1=index, remaining args=expected argv
+    local index="$1"
+    shift
+    python3 - "$EXPORT_ARGV_LOG" "$index" "$@" <<'PY'
+import json, sys
+path, index, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+with open(path, encoding="utf-8") as source:
+    calls = [json.loads(line) for line in source if line.strip()]
+if index >= len(calls):
+    raise SystemExit(f"missing export call {index}; captured {len(calls)}")
+if calls[index] != expected:
+    raise SystemExit(f"export call {index}={calls[index]!r}, want {expected!r}")
+PY
+}
+
+assert_run_source_mode() { # $1=index, $2=sid, $3=from|restore
+    python3 - "$RUN_ARGV_LOG" "$1" "$2" "$3" <<'PY'
+import json, sys
+path, index, sid, want = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(path, encoding="utf-8") as source:
+    calls = [json.loads(line) for line in source if line.strip()]
+if index >= len(calls):
+    raise SystemExit(f"missing run call {index}; captured {len(calls)}")
+call = calls[index]
+
+def option(name):
+    for i, arg in enumerate(call):
+        if arg == name:
+            if i + 1 >= len(call):
+                raise SystemExit(f"run option {name} has no value: {call!r}")
+            return call[i + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return ""
+
+if option("--sandbox-id") != sid:
+    raise SystemExit(f"run call {index} belongs to {option('--sandbox-id')!r}, want {sid!r}: {call!r}")
+selected = option("--" + want)
+other = option("--restore" if want == "from" else "--from")
+if not selected or other:
+    raise SystemExit(f"run source mode={want!r} selected={selected!r} other={other!r}: {call!r}")
+if want == "from" and not (".sandbox" in selected or selected.startswith("manifest://") or "@manifest:" in selected):
+    raise SystemExit(f"run --from did not select Sandbox E: {selected!r}")
+if want == "restore" and not (".snapshot" in selected or selected.startswith("manifest://") or "@manifest:" in selected):
+    raise SystemExit(f"run --restore did not select Snapshot S: {selected!r}")
 PY
 }
 
@@ -1770,7 +1852,7 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "echo $W_DISK_PERSIST > /home/user/working-set-disk.txt" >"$WORK/w-disk-write.out" 2>&1 || true
 grep -q 'EXIT_CODE 0' "$WORK/w-disk-write.out" \
     || { sed 's/^/  guest| /' "$WORK/w-disk-write.out"; fail "write W-only disk marker"; }
-# Removing B's old root-disk top before promotion proves upload-snapshot treats
+# Removing B's old root-disk top before promotion proves publish treats
 # B.snapshot as an opaque memory lower instead of recursively publishing B's
 # stale disk graph.
 PORTABLE_W_CALL=$(snapshot_argv_count)
@@ -1848,8 +1930,13 @@ case "$PROMOTION_TOKEN" in kmt1.*) ;; *) fail "export-sandbox returned a non-KMT
 PORTABLE_W_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute("select snapshot_ref from sandboxes where id=?", (sys.argv[2],)).fetchone()
-print(row[0] if row else "")
+    row = db.execute(
+        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+if row and row[0] != "snapshot":
+    raise SystemExit(f"promoted W source kind={row[0]!r}, want 'snapshot'")
+print(row[1] if row else "")
 PY
 )
 PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
@@ -2060,19 +2147,65 @@ if "kuasar-sandbox.checkpoint" in (info.get("Metadata") or {}):
 PY
 echo "==> PASS: Pause header null inherited body, explicit false flags reached local capture, W self remains separate from its memory lower"
 
-RESUME_MARK="POLICY_W_RESUME_$RANDOM"
-exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
-resumed=""
-for _ in $(seq 1 90); do
-    code=$(curl -sS --max-time 1 --unix-socket "$ENVD_SOCK" \
-        -o /dev/null -w '%{http_code}' http://envd/health 2>/dev/null || true)
-    case "$code" in 200|204) resumed=1; break ;; esac
-    sleep 0.5
-done
-[ -n "$resumed" ] || fail "policy W did not restore locally"
+S_COLD_RUN_CALL=$(run_argv_count)
+code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":113,"memory":false}')
+[ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "Snapshot cold Connect=$code (want 200)"; }
+wait_sandbox_state "$SID" running 1200 || fail "Snapshot S cold selection did not reach running"
+assert_run_source_mode "$S_COLD_RUN_CALL" "$SID" from \
+    || fail "Connect(memory=false) on Snapshot S did not execute sandbox-ctl run --from E"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/policy-persist.txt" >"$WORK/policy-read.out" 2>&1 || true
-grep -q "$POLICY_PERSIST" "$WORK/policy-read.out" || { sed 's/^/  guest| /' "$WORK/policy-read.out"; fail "policy W lost guest state"; }
-echo "==> PASS: policy W restored locally with guest state intact"
+grep -q "$POLICY_PERSIST" "$WORK/policy-read.out" || { sed 's/^/  guest| /' "$WORK/policy-read.out"; fail "Snapshot S cold launch lost E disk state"; }
+echo "==> PASS: Connect(memory=false) selected E from Snapshot S and cold-launched its disk state"
+
+E_LOCAL_EXPORT_CALL=$(export_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "local Sandbox E pause=$code (want 204)"; }
+assert_export_argv "$E_LOCAL_EXPORT_CALL" \
+    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    || fail "Pause(memory=false) did not execute sandbox-ctl export in local mode"
+E_LOCAL="$CHECKPOINT_DIR/$SID/$SID.sandbox"
+[ -e "$E_LOCAL" ] || fail "Pause(memory=false) did not create $E_LOCAL"
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$E_LOCAL" <<'PY' \
+    || fail "local Sandbox E durable source is incorrect"
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute(
+        "select state, resume_source_kind, resume_source_ref, launch_mode from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+want = ("paused", "sandbox", sys.argv[3], "")
+if row != want:
+    raise SystemExit(f"durable E row={row!r}, want={want!r}")
+PY
+code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"memory":true}')
+[ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "Sandbox E Connect(memory=true)=$code (want 409)"; }
+[ "$(sandbox_state "$SID")" = "paused" ] || fail "memory-unavailable conflict changed paused Sandbox E state"
+
+printf '%s\n' park >"$WORK/inject-sandbox-run"
+E_WAKE_RUN_CALL=$(run_argv_count)
+(
+    code=$(DP_MAX_TIME=180 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+    printf '%s\n' "$code" >"$WORK/e-wake-data.code"
+) &
+IMMEDIATE_DATA_PID=$!
+wait_sandbox_state "$SID" starting 120 || fail "Sandbox E traffic Wake was not durably accepted"
+wait_internal_traffic_stats "$SID" parking \
+    || fail "first Sandbox E Wake request was not parked while cold launch was starting"
+assert_run_source_mode "$E_WAKE_RUN_CALL" "$SID" from \
+    || fail "Sandbox E traffic Wake did not execute sandbox-ctl run --from"
+rm -f "$WORK/inject-sandbox-run"
+e_wake_status=0
+wait "$IMMEDIATE_DATA_PID" || e_wake_status=$?
+IMMEDIATE_DATA_PID=""
+[ "$e_wake_status" = 0 ] || fail "parked Sandbox E Wake client exited $e_wake_status"
+code=$(cat "$WORK/e-wake-data.code")
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; fail "parked Sandbox E Wake request=$code"; }
+wait_sandbox_state "$SID" running 1200 || fail "Sandbox E cold Wake did not reach running"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/policy-persist.txt" >"$WORK/e-wake-read.out" 2>&1 || true
+grep -q "$POLICY_PERSIST" "$WORK/e-wake-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/e-wake-read.out"; fail "Sandbox E Wake lost disk state"; }
+echo "==> PASS: E rejected memory resume, then the original traffic request parked through cold --from and forwarded after running"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill policy sandbox=$code"
 unset EXEC_TOKEN
 SID_POLICY="$SID"
@@ -2115,8 +2248,81 @@ assert_snapshot_argv "$AUTO_CALL" \
 [ -f "$CHECKPOINT_DIR/$SID/$SID.snapshot" ] || fail "auto-pause did not create local W"
 echo "==> PASS: reaper auto-pause used metadata merge_ref=false and node drop_caches=false"
 
-# ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill auto-paused sandbox=$code (want 204)"
+
+# autoPauseMemory=false affects only TTL capture. An explicit omitted-memory
+# Pause must still produce Snapshot S; after its default memory Wake, expiry
+# must produce Sandbox E without carrying snapshot-only policy flags.
+AUTO_E_BODY=$(python3 - "$TEMPLATE" <<'PY'
+import json, sys
+print(json.dumps({
+    "templateID": sys.argv[1],
+    "timeout": 120,
+    "autoPauseMemory": False,
+}))
+PY
+)
+code=$(req POST /sandboxes "$AK" "$AUTO_E_BODY")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false create=$code"; }
+SID=$(json_field "$WORK/resp.body" sandboxID)
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
+ENVD_SOCK="$WORK/run/$SID/envd.sock"
+EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "autoPauseMemory=false exec capability"
+exec_through_connect "$SID" "$EXEC_TOKEN" "AUTO_E_START_$RANDOM"
+wait_sandbox_state "$SID" running 1200 || fail "autoPauseMemory=false sandbox did not reach running"
+
+AUTO_E_EXPLICIT_S_CALL=$(snapshot_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false explicit Pause({})=$code"; }
+assert_snapshot_argv "$AUTO_E_EXPLICIT_S_CALL" \
+    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    --merge-ref=true --drop-caches=false \
+    || fail "explicit Pause({}) inherited AutoPauseMemory=false instead of capturing Snapshot S"
+python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
+    || fail "explicit Pause({}) on autoPauseMemory=false did not persist Snapshot S"
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute(
+        "select state, resume_source_kind, auto_pause_memory from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+if row != ("paused", "snapshot", 0):
+    raise SystemExit(f"explicit pause row={row!r}, want ('paused', 'snapshot', 0)")
+PY
+AUTO_E_MEMORY_RUN_CALL=$(run_argv_count)
+exec_through_connect "$SID" "$EXEC_TOKEN" "AUTO_E_MEMORY_WAKE_$RANDOM"
+wait_sandbox_state "$SID" running 1200 || fail "explicit Snapshot S did not resume"
+assert_run_source_mode "$AUTO_E_MEMORY_RUN_CALL" "$SID" restore \
+    || fail "ordinary Wake of explicit Snapshot S did not default to memory restore"
+
+AUTO_E_TTL_CALL=$(export_argv_count)
+code=$(req POST "/sandboxes/$SID/timeout" "$AK" '{"timeout":15}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "arm autoPauseMemory=false timeout=$code"; }
+AUTO_E_PAUSED=""
+for _ in $(seq 1 180); do
+    [ "$(sandbox_state "$SID")" = "paused" ] && { AUTO_E_PAUSED=1; break; }
+    sleep 0.5
+done
+[ -n "$AUTO_E_PAUSED" ] || fail "autoPauseMemory=false TTL did not pause"
+assert_export_argv "$AUTO_E_TTL_CALL" \
+    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    || fail "autoPauseMemory=false TTL did not capture Sandbox E"
+python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
+    || fail "autoPauseMemory=false TTL durable source is incorrect"
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute(
+        "select state, resume_source_kind, auto_pause_memory, launch_mode from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+if row != ("paused", "sandbox", 0, ""):
+    raise SystemExit(f"TTL row={row!r}, want ('paused', 'sandbox', 0, '')")
+PY
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill autoPauseMemory=false sandbox=$code"
+unset EXEC_TOKEN
+echo "==> PASS: explicit Pause({}) remained S while autoPauseMemory=false TTL captured E"
+
+# ---- teardown -------------------------------------------------------------
 echo "==> PASS: all local checkpoint-policy sandboxes killed"
 
 # ---- bundle Pause -> local restore -> exact Store promotion ---------------
@@ -2272,8 +2478,13 @@ case "$BUNDLE_TOKEN" in kmt1.*) ;; *) fail "bundle export returned a non-KMT res
 BUNDLE_REMOTE_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute("select snapshot_ref from sandboxes where id=?", (sys.argv[2],)).fetchone()
-print(row[0] if row else "")
+    row = db.execute(
+        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+if row and row[0] != "snapshot":
+    raise SystemExit(f"promoted Bundle source kind={row[0]!r}, want 'snapshot'")
+print(row[1] if row else "")
 PY
 )
 [ "$BUNDLE_REMOTE_REF" = "manifest://$BUNDLE_ROOT_KEY" ] \
@@ -2288,9 +2499,46 @@ python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "cat /home/user/bundle-persist.txt" >"$WORK/bundle-store-read.out" 2>&1 || true
 grep -q "$BUNDLE_PERSIST" "$WORK/bundle-store-read.out" \
     || { sed 's/^/  guest| /' "$WORK/bundle-store-read.out"; fail "Store-only Bundle C restore lost A state"; }
+
+E_BUNDLE_EXPORT_CALL=$(export_argv_count)
+code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
+[ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "Bundle Sandbox E pause=$code"; }
+assert_export_argv "$E_BUNDLE_EXPORT_CALL" \
+    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    || fail "Pause(memory=false) did not execute Bundle export"
+E_BUNDLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.sandbox"
+[ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E did not retain $E_BUNDLE_LOCAL symlink"
+E_BUNDLE_TARGET=$(readlink -f "$E_BUNDLE_LOCAL")
+case "$E_BUNDLE_TARGET" in *.bundle) ;; *) fail "Bundle Sandbox E target is not .bundle: $E_BUNDLE_TARGET" ;; esac
+E_BUNDLE_TOKEN=$(E2B_API_KEY="$AK" "$ORCH_BIN_DIR/node-ctl" export-sandbox "$SID" \
+    --keep-source --socket "$WORK/node-ctl.socket") \
+    || fail "Bundle Sandbox E publish failed"
+case "$E_BUNDLE_TOKEN" in kmt1.*) ;; *) fail "Bundle Sandbox E export returned a non-KMT result" ;; esac
+E_BUNDLE_REMOTE_REF=$(python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute(
+        "select resume_source_kind, resume_source_ref from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone()
+if not row or row[0] != "sandbox" or not row[1].startswith("manifest://"):
+    raise SystemExit(f"published Bundle E source={row!r}")
+print(row[1])
+PY
+) || fail "Bundle Sandbox E kind/ref was not preserved by publish"
+[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "Bundle Sandbox E publish retained redundant local directory"
+E_BUNDLE_RUN_CALL=$(run_argv_count)
+exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_E_WAKE_$RANDOM"
+wait_sandbox_state "$SID" running 1200 || fail "published Bundle Sandbox E did not cold Wake"
+assert_run_source_mode "$E_BUNDLE_RUN_CALL" "$SID" from \
+    || fail "published Bundle Sandbox E Wake did not execute run --from"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "cat /home/user/bundle-persist.txt" >"$WORK/bundle-e-read.out" 2>&1 || true
+grep -q "$BUNDLE_PERSIST" "$WORK/bundle-e-read.out" \
+    || { sed 's/^/  guest| /' "$WORK/bundle-e-read.out"; fail "published Bundle Sandbox E lost disk state"; }
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill bundle sandbox=$code"
 unset EXEC_TOKEN
-echo "==> PASS: checkpoint.mode=bundle drove self-contained A->B->C restore, exact promotion, and remote read"
+echo "==> PASS: Bundle drove self-contained S chain plus E capture, exact publish, and cold Wake from $E_BUNDLE_REMOTE_REF"
 
 echo
-echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle $BUNDLE_REMOTE_REF)"
+echo "==> e2e_execute: OK   (template $TEMPLATE, portable $PORTABLE_W_REF, all-unset $SID_UNSET, policy $SID_POLICY, bundle-S $BUNDLE_REMOTE_REF, bundle-E $E_BUNDLE_REMOTE_REF)"

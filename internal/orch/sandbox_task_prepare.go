@@ -3,7 +3,6 @@ package orch
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,27 +18,26 @@ import (
 )
 
 const (
-	maxRequiredSnapshotRefs       = 1024
-	maxSnapshotNetworkMetadataLen = 1 << 20
+	maxRequiredArtifactRefs = 1024
 )
 
 type prepareWaitResult struct {
-	summary configsock.SnapshotPrepareSummary
+	summary configsock.ArtifactPrepareSummary
 	err     error
 }
 
-// launchRestoreSandbox owns the host half of the exact-run two-stage protocol.
+// launchArtifactSandbox owns the host half of the exact-run two-stage protocol.
 // The conductor consumes only the task's non-secret summary; it never opens or
-// parses a snapshot artifact.
-func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
+// parses a tenant Artifact.
+func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
 	prepareStarted := time.Now()
 	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return launchFailed("snapshot_prepare", fmt.Errorf("orch: mkdir %s: %w", dir, err))
+			return launchFailed("artifact_prepare", fmt.Errorf("orch: mkdir %s: %w", dir, err))
 		}
 	}
 	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
-		return launchFailed("snapshot_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
+		return launchFailed("artifact_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
 	}
 
 	// The listener exists before assignment becomes visible. node-ctl connects
@@ -47,7 +45,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 	// observable EOF instead of a launch-wide timeout.
 	readyListener, err := listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
 	if err != nil {
-		return launchFailed("snapshot_prepare", err)
+		return launchFailed("artifact_prepare", err)
 	}
 	defer readyListener.Close()
 
@@ -95,7 +93,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 		o.logLaunchPhase(attempt, sb, "runner_commit_duration", commitFinished.Sub(commitStarted))
 	}
 	if err != nil {
-		return launchFailed("snapshot_prepare", err)
+		return launchFailed("artifact_prepare", err)
 	}
 	if sb.RunID == "" {
 		sb.RunID = runID
@@ -105,7 +103,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 
 	deadline := attempt.Deadline()
 	if deadline.IsZero() {
-		return launchFailed("snapshot_prepare", errors.New("orch: restore launch deadline was not initialized"))
+		return launchFailed("artifact_prepare", errors.New("orch: artifact launch deadline was not initialized"))
 	}
 	launchCtx, cancelLaunch := context.WithDeadline(ctx, deadline)
 	defer cancelLaunch()
@@ -130,34 +128,37 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 		prepareResult <- prepareWaitResult{summary: summary, err: waitErr}
 	}()
 
-	var summary configsock.SnapshotPrepareSummary
+	var summary configsock.ArtifactPrepareSummary
 	select {
 	case result := <-prepareResult:
 		if result.err != nil {
-			return launchFailed("snapshot_prepare", result.err)
+			return launchFailed("artifact_prepare", result.err)
 		}
 		summary = result.summary
 	case readyErr := <-readinessResult:
 		if readyErr == nil {
-			readyErr = errors.New("orch: runtime readiness completed before snapshot preparation")
+			readyErr = errors.New("orch: runtime readiness completed before artifact preparation")
 		}
-		return launchFailed("snapshot_prepare", readyErr)
+		return launchFailed("artifact_prepare", readyErr)
 	case <-launchCtx.Done():
-		return launchFailed("snapshot_prepare", launchCtx.Err())
+		return launchFailed("artifact_prepare", launchCtx.Err())
 	}
 
-	snapshotCapacity, inheritedNetwork, err := validateSandboxPrepareSummary(summary)
+	artifactCapacity, inheritedNetwork, err := validateArtifactPrepareSummary(summary, sb.LaunchMode)
 	if err != nil {
-		return launchFailed("snapshot_prepare", err)
+		return launchFailed("artifact_prepare", err)
+	}
+	if artifactTopologyNeedsTemplate(summary.DiskTopology) && strings.TrimSpace(o.cfg.Sandbox.Boot.OverlayDiffTemplate) == "" {
+		return launchFailed("artifact_prepare", errors.New("orch: artifact disk topology requires sandbox.boot.overlay_diff_template"))
 	}
 	hostPrepareStarted := time.Now()
-	o.log.Info("sandbox task snapshot prepared",
+	o.log.Info("sandbox task artifact prepared",
 		"sid", sb.ID,
 		"run_id", sb.RunID,
-		"task_snapshot_ref_count", summary.RequiredRefCount,
-		"snapshot_prepare_handoff_duration", time.Since(prepareStarted))
+		"task_artifact_ref_count", summary.RequiredRefCount,
+		"artifact_prepare_handoff_duration", time.Since(prepareStarted))
 
-	resources, err := o.resolveRestoredResources(preparation.Spec, snapshotCapacity)
+	resources, err := o.resolveArtifactResources(preparation.Spec, artifactCapacity)
 	if err != nil {
 		return launchFailed("resource_resolve", fmt.Errorf("orch: resolve restored sandbox resources: %w", err))
 	}
@@ -193,6 +194,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
 	}
 	p := o.sandboxParams(sb, tmpl, preparation.Spec, network, resources)
+	p.ArtifactDisks = summary.DiskTopology
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		unlock()
 		return launchFailed("config_write", err)
@@ -254,59 +256,108 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
 	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
 		cached.State = types.StateRunning
 		cached.RunID = sb.RunID
+		cached.LaunchMode = ""
 	})
 	if running == nil {
 		running = cloneSandbox(sb)
 		running.State = types.StateRunning
+		running.LaunchMode = ""
 		o.cache(running)
 	}
 	sb.State = types.StateRunning
+	sb.LaunchMode = ""
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
 	o.observeSandboxUpsert(running)
 	return nil
 }
 
-func (o *Orchestrator) resolveRestoredResources(spec sandboxcfg.SandboxSpec, snapshotCapacity rtconfig.CapacityConfig) (rtconfig.ResourcesConfig, error) {
+func (o *Orchestrator) resolveArtifactResources(spec sandboxcfg.SandboxSpec, artifactCapacity rtconfig.CapacityConfig) (rtconfig.ResourcesConfig, error) {
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	return sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
 		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
 		Patch:                    spec.Resource,
 		Restore:                  true,
-		SnapshotCapacity:         &snapshotCapacity,
+		ArtifactCapacity:         &artifactCapacity,
 		Dynamic:                  dynamic,
 		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
 	})
 }
 
-func validateSandboxPrepareSummary(summary configsock.SnapshotPrepareSummary) (rtconfig.CapacityConfig, sandboxcfg.NetworkSpec, error) {
-	if summary.SchemaVersion != configsock.SnapshotPrepareSchemaVersion {
-		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: unsupported snapshot prepare schema %d", summary.SchemaVersion)
+func validateArtifactPrepareSummary(summary configsock.ArtifactPrepareSummary, mode types.LaunchMode) (rtconfig.CapacityConfig, sandboxcfg.NetworkSpec, error) {
+	if summary.SchemaVersion != configsock.ArtifactPrepareSchemaVersion {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: unsupported artifact prepare schema %d", summary.SchemaVersion)
 	}
-	if summary.RequiredRefCount < 1 || summary.RequiredRefCount > maxRequiredSnapshotRefs {
-		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: snapshot required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredSnapshotRefs)
+	if summary.RequiredRefCount < 1 || summary.RequiredRefCount > maxRequiredArtifactRefs {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: artifact required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredArtifactRefs)
+	}
+	wantKind := types.ResumeSourceSandbox
+	if mode == types.LaunchMemory {
+		wantKind = types.ResumeSourceSnapshot
+	} else if mode != types.LaunchCold {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: invalid durable artifact launch mode %q", mode)
+	}
+	if types.ResumeSourceKind(summary.PreparedSourceKind) != wantKind {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf(
+			"orch: prepared source kind %q conflicts with launch mode %q", summary.PreparedSourceKind, mode)
 	}
 	digest, err := hex.DecodeString(summary.ResolutionDigest)
 	if err != nil || len(digest) != 32 {
-		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: snapshot resolution digest is not SHA-256")
-	}
-	if len(summary.RawNetworkMetadata) > maxSnapshotNetworkMetadataLen {
-		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: snapshot network metadata exceeds %d bytes", maxSnapshotNetworkMetadataLen)
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: artifact resolution digest is not SHA-256")
 	}
 	capacity := rtconfig.CapacityConfig{CPU: summary.Capacity.CPU, Memory: summary.Capacity.Memory}
 	if capacity.CPU <= 0 || strings.TrimSpace(capacity.Memory) == "" {
-		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: snapshot config has no usable resources.capacity")
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, errors.New("orch: artifact config has no usable resources.capacity")
 	}
-	var inherited sandboxcfg.NetworkSpec
-	if raw := strings.TrimSpace(summary.RawNetworkMetadata); raw != "" {
-		// Sandbox inheritance intentionally remains best-effort: malformed legacy
-		// metadata behaves as an empty inherited network.
-		var parsed sandboxcfg.NetworkSpec
-		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
-			inherited = parsed
-		}
+	inherited := artifactNetworkSpec(summary.Network)
+	if err := sandboxcfg.ValidateNetworkSpec(inherited); err != nil {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("orch: artifact network summary: %w", err)
+	}
+	if err := validateArtifactDiskTopology(summary.DiskTopology); err != nil {
+		return rtconfig.CapacityConfig{}, sandboxcfg.NetworkSpec{}, err
 	}
 	return capacity, inherited, nil
+}
+
+func validateArtifactDiskTopology(topology types.ArtifactDiskTopology) error {
+	if topology.Root.Name != "" || !topology.Root.Mode.Valid() {
+		return errors.New("orch: artifact root disk topology is invalid")
+	}
+	if len(topology.Disks) > rtconfig.MaxDataDisks {
+		return fmt.Errorf("orch: artifact data disk count %d exceeds %d", len(topology.Disks), rtconfig.MaxDataDisks)
+	}
+	seen := make(map[string]struct{}, len(topology.Disks))
+	for i, disk := range topology.Disks {
+		if disk.Name == "" || !disk.Mode.Valid() {
+			return fmt.Errorf("orch: artifact data disk %d topology is invalid", i)
+		}
+		if _, duplicate := seen[disk.Name]; duplicate {
+			return fmt.Errorf("orch: artifact data disk %d duplicates name %q", i, disk.Name)
+		}
+		seen[disk.Name] = struct{}{}
+	}
+	return nil
+}
+
+func artifactTopologyNeedsTemplate(topology types.ArtifactDiskTopology) bool {
+	if !topology.Root.HasActiveBase {
+		return true
+	}
+	for _, disk := range topology.Disks {
+		if !disk.HasActiveBase {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactNetworkSpec(network configsock.ArtifactNetwork) sandboxcfg.NetworkSpec {
+	return sandboxcfg.NetworkSpec{
+		Hostname: network.Hostname, DNS: append([]string(nil), network.DNS...),
+		InnerIP: network.InnerIP, Nexthop: network.Nexthop,
+		TransitGatewayIP: network.TransitGatewayIP, TransitGeneveVNI: network.TransitGeneveVNI,
+		TransitMAC: network.TransitMAC,
+	}
 }
 
 func (o *Orchestrator) detachUncommittedLaunchPort(sb *types.Sandbox, port string, cause error) error {

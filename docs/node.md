@@ -127,11 +127,11 @@ master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才�
 parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
 已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
 `starting,run_id=""` 行并发布 Delete。cold image 后台路径保持原有单阶段 fast path:先完成
-resource/network/YAML,再从 runner pool 分配 run-id。restore 路径先建目录和绑定
+resource/network/YAML,再从 runner pool 分配 run-id。artifact launch 路径先建目录和绑定
 `ready.sock`,再由 pool commit callback 以 `starting AND run_id=''` CAS 绑定 exact run-id;
 task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootstrap。认证通过后
-ManifestKey 覆盖进程环境,task 在本进程读取一次根 `snapshot.cfg`,提交 capacity/network/ref
-closure 的非秘密 summary。唯一 launch worker随后 resolve resource/network→attach→以
+ManifestKey 覆盖进程环境,task 按 E/S kind 与 LaunchMode 打开 root、选择 PreparedSource 并提交
+capacity/network/ref closure 的非秘密 summary。唯一 launch worker随后 resolve resource/network→attach→以
 `starting AND run_id=<exact>` CAS 持久化 ownership→写非密 YAML→返回最终 LaunchSpec。
 runner追加本地保留的 ref-location并以同一 PID `execve sandbox-ctl run`→起 microVM→
 严格完成 runtime readiness wire→(e2b)直接
@@ -247,9 +247,10 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
 - **run-sandbox**:取得 sid 后立即连接固定的
   `<run_root>/<sid>/ready.sock`(此时 readiness fd 保持 `FD_CLOEXEC`)→ 锁
   `<run_root>/<sid>/<sid>.pid`→以 sid + exact run-id 取 bootstrap。cold image bootstrap
-  直接带最终 LaunchSpec,只需一次 RPC。restore bootstrap 带 task-local prepare spec与
-  authoritative `MANIFEST_KEY`;runner 覆盖继承环境,在本进程读取一次根 `snapshot.cfg`,
-  提交同一 completion并等待最终 LaunchSpec。它保留根 cfg导出的 sorted ref-location,
+  直接带最终 LaunchSpec,只需一次 RPC。E/S artifact bootstrap 带 task-local
+  `ArtifactPrepareSpec` 与 authoritative `MANIFEST_KEY`;runner 覆盖继承环境,在本进程按
+  source kind 与 durable LaunchMode 打开 E/S,提交同一 completion并等待最终 LaunchSpec。
+  它保留 task-local `PreparedSource`、carrier binding 和 sorted ref-location,
   显式关闭 reader/fetcher后才 `chdir(workdir)`、剥除 `TASK_*`、合入 task/spec env。
   仅在最后一次 `execve` 前清 readiness fd 的 `FD_CLOEXEC`,向 argv 追加其实际编号
   `--ready-fd=<fd>`并替换为 `sandbox-ctl run`。目标继承本 PID、单元 cgroup、pidfile
@@ -257,9 +258,9 @@ PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者
 - **run-builder**:取得 bid 后锁
   `<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,以 bid + exact run-id 取 bootstrap。
   fromImage 与 img fromTemplate 在这一次 RPC 中直接取得最终 BuildSpec；snp fromTemplate
-  则安装 authoritative `MANIFEST_KEY`,在本进程只读一次根 `snapshot.cfg`,保留 root disk/
+  则安装 authoritative `MANIFEST_KEY`,在本进程执行同一 Artifact prepare,保留 root disk/
   start/ready 与 sorted ref-location，提交非秘密 summary 并等待最终 BuildSpec。reader/fetcher
-  在提交前已显式关闭，conductor 不读取任何 snapshot 工件。run-builder 将本地保留结果合入
+  在提交前已显式关闭，conductor 不读取任何 tenant artifact。run-builder 将本地保留结果合入
   final spec 后**驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
   整个构建计入本单元 cgroup;结束把结果
   `{image_ref|snapshot_ref, start_cmd, ready_cmd, error, failure_stage}` 经 config-socket 回传。根cfg读取、
@@ -338,11 +339,12 @@ node-ctl import-sandbox <token> [--socket S]
 
 - `export-sandbox <sid>`:打印单行 `kmt1.` opaque 迁移 token.成功进入 source
   finalizer 后默认删除源沙箱;`--keep-source` 保留 paused source.
-- `export-sandbox <sid> --to-template`:发布远程快照并打印持久 templateID(扇出用).
+- `export-sandbox <sid> --to-template`:发布 paused Sandbox E 或 Snapshot S 并打印对应的
+  持久 `sbx` / `snp` templateID(扇出用).
   `--keep-source` 使用相同的 source retention 语义;未指定时同样删除源沙箱.
-- local snapshot 上传期间统一允许 Resume,不增加额外开关。Resume 先受理时,KMT
+- local artifact 上传期间统一允许 Resume,不增加额外开关。Resume 先受理时,KMT
   Export 取消上传并返回 409;Template Export 继续上传并返回 templateID。两者都放弃
-  source finalizer,不更新/删除 source,也不删除 local snapshot.
+  source finalizer,不更新/删除 source,也不删除 local artifact.
 - `import-sandbox <token>`:缺省复用 token 中的 source NodeSandboxID,以 insert-only 方式
   写入 paused 行并打印 sid;目标已存在返回 409。API body 可通过可选 `sandboxID` 指定另一
   个 node-local target,但不会改变逻辑认证主体或既有 service credential。随后调用
@@ -437,7 +439,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle(§8.1) |
-| `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录 |
+| `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机 Sandbox E / Snapshot S capture 目录 |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
 | `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute `file://` URI,只用于 `export-sandbox`/Builder promote 的 ref-location 发布;不改变 Pause capture mode |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2,node-proxy.md §7):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
@@ -614,16 +616,21 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` Header(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);`X-Kuasar-Sandbox-MMDS`/`metadata["kuasar-sandbox.mmds"]` 可声明 routes 与 initial secrets(§4.6);201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars, autoPauseMemory?}` + 可选 `X-Kuasar-Sandbox-*` Header;`autoPauseMemory` omitted/null/true 使 TTL capture S,false 使 TTL capture E,且不改变显式 Pause 缺省;201 表示 durable starting acceptance,不等待 runner/runtime/envd;e2b 回 Envd/Traffic/Forward token,bare 只回 Forward token |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
-| resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;paused 在返回前原子变为 `starting,run_id=""` 并清空旧网络 ownership;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 restore |
+| resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool|null}`;`memory` 是 Kuasar extension:nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
-| pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停或正在 starting 回 **409**;starting 不调用 snapshot/ctl.sock |
+| pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;已暂停或正在 starting 回 409 |
 | timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL;starting 允许窄字段更新 |
+
+兼容边界以 E2B 官方 OpenAPI、JS/Python SDK 与测试为准:`autoPauseMemory` 和 Pause 的
+`memory` 是 E2B 兼容输入;E2B 当前公开 Connect 没有 `memory` 选择,因此
+`connect.memory` 明确标记为 Kuasar extension。Kuasar 保留所有 paused E/S 都能被授权流量
+Wake 的既有能力;本实现不宣称完整实现 E2B `autoResume` policy。
 
 create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<base64url-ref>`,§4.4)、注册期
 transient id、或已 ready 构建的 name/alias——后两者解析到持久 id 再走统一路径。
@@ -800,13 +807,14 @@ sandbox、连接 `ctl.sock` 并原样转发首帧;详见
 
 ```
 persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
-                                                profile∈{e2b,bare}; kind∈{img,snp}
+                                            profile∈{e2b,bare}; kind∈{img,sbx,snp}
 transient templateID = transient-<uuidv7>       构建注册期临时句柄,build 完即弃
 ```
 
 - **持久 id 自描述**:payload 是 `manifest://<key>` 或
   `file://<content-addressed-basename>@location:<name>`;运行期解析 profile(选
-  runtime erofs)、kind(img = 冷启,snp = restore)和 canonical portable ref。
+  runtime erofs)、kind(img = image cold,sbx = Sandbox E cold,snp = Snapshot S memory restore)
+  和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
   local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
 - **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
   之后只用持久 id。
@@ -1036,10 +1044,10 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   `节点默认 ⊕ 模板配置 ⊕ create 配置` 的 whole-namespace 行为。模板 portable patch
   来自 `builds.metadata_json`。Build resources 与该 patch 完全独立,不互相默认、比较或推导;
   trigger 的 `cpuCount`/`memoryMB` 只可断言不可变 Build resources。
-- **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
-  快照**。restore 的同步请求只校验 patch 结构;runner task 读取根 cfg 后,request 显式相同
+- **capacity**:img create 自由(create/模板/默认);sbx/snp create、paused resume 与迁移导入以
+  Sandbox E 的 portable capacity 为权威。同步请求只校验 patch 结构;runner task prepare 后,request 显式相同
   Capacity 可作为 assertion,任一 leaf 不同则异步 `resource_resolve` failure。无法可靠读取
-  snapshot Capacity 时任务异步失败;runner 已经 Assign,但尚未 Attach network、写 YAML、
+  artifact Capacity 时任务异步失败;runner 已经 Assign,但尚未 Attach network、写 YAML、
   创建 controller reservation/cgroup 或启动 VM,且绝不回退 node defaults。restore initial
   reservation 严格等于 sandboxer 从 CH snapshot target/current 推导的
   `BudgetAtSnapshot`;startup headroom 不参与,也不接受 partial grant。
@@ -1107,11 +1115,11 @@ Delegate=yes                  # phase ctl/vmm 子 cgroup 与可信 VMM cgroup FD
 
 两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
 业务 id。runner 取得 sid 后立即连接 readiness,再锁 `<run_root>/<sid>/<sid>.pid`,以
-exact run-id取 bootstrap;restore task在进程内准备根 cfg并完成第二阶段后才取最终 LaunchSpec,
+exact run-id取 bootstrap;artifact task在进程内完成 E/S prepare 和第二阶段后才取最终 LaunchSpec,
 随后 `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
 sd_notify);builder 取得 bid 后再锁
-`<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 exact-run bootstrap；snapshot source
-完成task-local root prepare和第二阶段后再取最终BuildSpec，image路径在bootstrap内直接取final，
+`<run_root>/build-<bid 的 96-bit 摘要>/builder.pid`,取 exact-run bootstrap；artifact source
+完成 task-local root prepare 和第二阶段后再取最终 BuildSpec,image 路径在 bootstrap 内直接取 final,
 **驻留**驱动三阶段流水线(§12),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
@@ -1224,32 +1232,33 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
 各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
 
-**① task 平面** — 启动器取工作规约。sandbox 与 snapshot builder 都使用 exact-run
+**① task 平面** — 启动器取工作规约。sandbox 与 artifact-backed builder 都使用 exact-run
 两阶段端点，cold/image 路径保持单次 bootstrap fast path:
 
 - `POST /internal/task/sandbox/bootstrap`(run-sandbox;req `{sandbox_id,run_id,version}`)
   先取得不含秘密的 exact-run pidfile identity,完成 `SO_PEERCRED` + pidfile认证后才调用
-  secret-bearing provider。cold image返回 `Final LaunchSpec`;restore返回
-  `SnapshotPrepareSpec` + env。task读根 cfg后向
+  secret-bearing provider。cold image返回 `Final LaunchSpec`;artifact launch返回
+  `ArtifactPrepareSpec` + env。task完成 E/S prepare 后向
   `POST /internal/task/sandbox/prepare` 提交 `{sandbox_id,run_id,summary}`并等待最终
   **LaunchSpec** `{exec,args,workdir}`。相同 digest replay等待/返回同一final result且不重复
   host side effect;冲突 replay返回409并fail closed;单次HTTP断开只取消该wait。
   `exec=sandbox-ctl`,`args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml
-  --manifest-config <shared> --run-root <run_root> (--restore <ref>)
+  --manifest-config <shared> --run-root <run_root> (--from <E>|--restore <S>)
   (--connect <uds:ip:port>)…]`。`--run-root` 把 sandbox-ctl
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
   pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。node-ctl 在最终 exec
   时另行强制追加本机 `--cgroup-path=fd=N`,不允许 LaunchSpec 覆盖。
 - `POST /internal/task/build/bootstrap`(run-builder;req `{build_id,run_id,version}`)
-  当前 BuildTask schema 为 v2(`checkpoint_mode` 自 v2 起必需),与仍为 v1 的 sandbox
-  snapshot-prepare schema 独立；bootstrap 和 build prepare 的版本不匹配均在读取
+  当前 BuildTask schema 为 v2(`checkpoint_mode` 自 v2 起必需),sandbox ArtifactPrepare
+  schema 也为 v2(以 typed E/S、durable LaunchMode 和 bounded network/disk summary 取代旧 v1
+  Snapshot-only wire),两个版本号独立演进；bootstrap 和 build prepare 的版本不匹配均在读取
   secret-bearing provider 前返回 400,
   防止旧 run-builder 忽略新字段后静默按 local 执行。认证后返回 task env 与 exactly one of
   `Final|Prepare`。Final 是
   **BuildSpec(构建工作单)**:`{build_id, profile, workdir, from_image | from_template
   (+kind), checkpoint_mode, steps[], start_cmd, ready_cmd, paths, net, resources,
   mmds_enabled, envd_token, insecure, platform, timeouts}`；task env 含
-  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。snapshot Prepare 含 root ref、manifest config、
+  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据。artifact Prepare 含 source kind/ref、LaunchMode、manifest config、
   ref-location parent、ref 上限和从 execution claim 起算的绝对 deadline。task 读取根 cfg 后向
   `POST /internal/task/build/prepare` 提交 `{build_id,run_id,version,summary}`；相同 digest replay 返回同一 final result，
   冲突返回 409，HTTP waiter 取消不撤销已接受 summary。`paths` 是宿主侧工件与工具
@@ -1413,244 +1422,248 @@ MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 rout
 
 ## 8. 生命周期与状态机
 
-```
-create(img: cold boot / snp: restore)
-  │
-  ▼
-starting ──success──► running ──pause / TTL──► paused
-  │                     │                       │
-  │                     └──kill──► row deleted  │ connect / data wake
-  │                                             ▼
-  └──create failure──► dead                  starting
-                                                │
-                          running ◄──success─────┤
-                                                └──resume failure──► paused
-```
-
-- 操作映射:create(img = 冷启 / snp = restore)、connect = resume、pause = snapshot、
-  timeout = 续期、TTL 到期 = auto-suspend(pause)、kill = 销毁(删行)。重启对账可把
-  失联的 running 标为 `dead`(§15);paused/dead 行中,paused 可再拉起,kill 删行。
-  集群下,这些操作另由 node-link 命令触发(create/connect/exec_session/delete,§10),并把
-  状态变化作为事件上报 registry。
-- `starting` 是一个持久业务生命周期状态,不是 runner 状态或 e2b readiness。它从请求已被
-  durable insert 开始,连续覆盖资源/snapshot/network/YAML/ready.sock 准备、runner pool
-  排队和分配、sandbox-ctl/VMM 启动、runtime readiness 与 mandatory `/init`;对外不增加
-  queued/assigned/booting/initializing。初始行为 `starting,run_id=""`,pool commit callback
-  以 `state=starting AND run_id=''` 绑定 run-id;最终 running commit 和分配后 rollback 均要求
-  exact run-id,分配前 rollback 则要求空 run-id。create 失败到 dead 并发布 Delete;resume
-  失败清空本次 runner/network ownership、回到 paused 并发布 paused Upsert。默认 list 隐藏
-  starting/dead,显式 state 过滤仍可用于诊断。
-- external fresh Create 的 initial starting 在成为 durable acceptance 前还必须通过
-  route-applied barrier。barrier waiter 在 Upsert 发布前注册,master 只有成功写共享表并通知
-  worker 后才 ACK;ACK 绑定当前 registration epoch。失败时后台 launch 尚未开始,store 仅在
-  `state=starting AND run_id=''` 且网络 ownership 全空时删除,cache 清除并发布 Delete,API/cluster
-  admission 返回 503。当前 participant set 为单 master,完成算法仍是 all-of而非 quorum。
-- 所有 fresh Create、snapshot-template Create、paused resume、KMT restore、cluster
-  Create/Connect、data Wake 与 native exec activation 共用一个进程内 launch group。每个 SID
-  在 starting 持久化/发布前先 claim 唯一 owner;Kill/Delete 的 Cancel 只发取消信号,claim
-  要等该 attempt 完成 runner/network/local resource cleanup 才释放。waiter 被唤醒前终态
-  store/cache/route 已收敛,并且 waiter 始终重读权威状态。若 store 为 starting 但进程内没有
-  attempt,节点记录 invariant violation 并 fail closed,不得再分配第二个 runner;重启 Reconcile
-  或终态操作负责收敛。Stop/Reset/detach/local cleanup 任一步失败时按有界退避重试,在全部
-  成功前不清空 durable runner/network ownership、不提交 dead/paused、也不释放 claim。
-- cold image仍在runner分配前以 `starting AND run_id=''` CAS持久化network ownership。
-  restore先绑定runner,task summary到达后才attach,并以
-  `starting AND run_id=<exact run>` CAS持久化ownership;CAS丢失时立即detach本地port。
-  两条路径都只在durable commit后发布enriched starting;CAS丢失者不写cache/route或启动VM。初始 starting
-  route 没有 FloatingIP,预先确定的 UDS 路径也尚未绑定,因而没有可用 backend endpoint;
-  普通数据面只能 park。enriched starting 才可供 guest MMDS `/init` 查到完整身份。后台只使用
-  窄 CAS,不得用 admission 时的旧 Sandbox 整行覆盖
-  并发 SetTimeout/Kill/Connect 更新。
-- ordinary envd、forward 和 native exec 数据面在 running 前不得转发。internal proxy 对
-  starting 只等待当前 attempt;paused 先完成同一个 durable resume acceptance 再等待。external
-  worker 见 starting 时只 park 等待 running/dead/Delete/paused 更新,不发送第二次 Wake;
-  回滚为 paused/Delete 时立即结束等待,只有初始 missing/paused 请求最多发一次 Wake。所有
-  waiter 以权威终态决定 not-found/route-error,不向普通数据面泄漏 raw launch error。
-- Create/Connect handler 返回后的 launch 使用 node lifecycle root,不继承 HTTP request context;
-  node shutdown 和 Kill 可取消 attempt。conductor 关闭 store/systemd launcher 前会 drain
-  launch group,保证所有已受理 attempt 已完成终态发布与 cleanup;永久不可用的 cleanup 依赖
-  由外层 service-manager stop budget 最终约束。Pause starting 明确返回 409,不接触 ctl.sock;
-  SetTimeout starting 只更新 deadline;Connect starting 不重复 launch。Reaper 仍只扫描 running,
-  Sandbox TTL 的既有定义在本改动中不变。
-- `POST /sandboxes/{id}/pause` body 可为空或为:
-
-  ```json
-  {"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":null}
-  ```
-
-  `memory` 缺失/`null`/`true` 均表示内存 checkpoint;`false` 在调用 Core 前返回 400。
-  两个 checkpoint 字段仅覆盖本次动作,不写回 metadata。可同时携
-  `X-Kuasar-Sandbox-Checkpoint`;Header 的具体 `true`/`false` 按字段覆盖 body,
-  Header `null`/缺失继续继承 body。body/header 解析失败均无 Pause 副作用。
-- **auto-suspend**:reaper(5s 周期)发现 `deadline` 已过 → 对运行中 sandbox-ctl 封
-  快照(按 `checkpoint.mode`,§8.1)→ 记 `snapshot_ref`、标 paused → `StopUnit` →
-  detach。路由表保留 paused 路由,后续数据面流量可唤醒。
-- **auto-resume**:数据面流量打到 paused 沙箱 → 读库 → 重走 launch(建目录 + attach
-  + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
-  - **launch ownership**:同一 sid 的并发 Connect/Wake/exec activation 与 create/resume 均由
-    上述 launch group 合并,杜绝重复 IP 分配、attach 或 StartUnit。internal 模式 proxy 在
-    请求内接受/等待;external 模式经 routesync `Wake` 上行。集群数据面激活另由 registry
-    route CAS 和稳定 lineage wait 收敛,但 node-local CmdConnect 仍使用同一 launch owner。
-  - 数据面 auto-resume 等待恢复完成后再转发;`POST /sandboxes/{id}/connect` 则只同步
-    完成鉴权、可选 KMT import 和凭据读取,接受/加入同一 launch attempt 后立即返回;
-    带 `timeout` 时该期限在恢复后仍覆盖节点缺省 TTL。
-  - exec-session 签发同步完成可选 import、对象/凭据校验、CEL 编译和 KAT 签名,
-    然后只接受异步 resume 并立即返回;目标已 starting 时可继续签发但不重复 resume。
-    CEL 编译或 KAT 签名失败时不启动 resume;
-    后续数据面的无效 KAT、非法首帧或 condition=false/error/unknown/cost/cancel 也不能
-    parking、刷新 activity 或触发本地恢复.
-- **phase timing**:launch 以低基数 `kind=create|resume`、`profile=e2b|bare`、
-  `result=success|failure` 和 bounded `failure_stage` 记录 admission/prepare/runner_wait/
-  runner_commit/runner_handoff/runtime_ready/envd_init/starting_total duration;task另以结构化字段
-  记录 `task_snapshot_prepare_duration`、`task_snapshot_cfg_read_duration`、
-  `task_snapshot_ref_count`、prepare replay和分阶段error。failure stage包含
-  `snapshot_prepare/resource_resolve/network_attach/network_commit/config_write/runtime/init`。
-  snapshot builder复用同一task reader字段；managed build prepare的目标/断言为
-  `sandbox-ctl info`子进程0、root cfg parse每task 1、parent cfg parse 0。image/fromImage
-  bootstrap不产生prepare RPC；snapshot completion replay只等待同一host final result。
-  external Create
-  另记录 `proxy_route_ack_duration` 与 bounded result。sandbox ID 和
-  run ID 只进入结构化日志字段,不作为 metric label。`runner_wait` 从调用 Assign 到 commit
-  callback 首次拿到 run-id,`runner_commit` 只计窄 Bind/cache,`runtime_ready` 从 handoff 完成
-  到 readiness wire 完整成功,`starting_total` 从 durable starting 到终态 commit。
-- `running` 仅表示 orchestrator runtime readiness 与 mandatory e2b `/init` 已完成,不保证
-  code interpreter、forward 业务端口或用户应用 HTTP/TCP health 已监听。通用业务 backend
-  readiness/dial retry 仍由 [#125](https://github.com/kuasar-sandbox/orchestrator/issues/125)
-  独立跟踪。
-- **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
-  §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
-  门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
-  restore时runner task读回快照内的raw逻辑网络metadata,serve按best-effort语义解析后填
-  create未指定的字段(显式create胜)。
-
-### 8.1 暂停态分层、转模板与跨机迁移
-
-`checkpoint.mode` 只接受 `local|bundle`,缺省 `local`。Pause 总是在本机执行:
+生命周期遵循四条固定规则:
 
 ```text
-sandbox-ctl snapshot --sandbox-id <sid> --output <checkpoint.local_dir>/<sid> \
-  --mode <local|bundle> --run-root <run-root>
+Pause decides what is saved.
+Resume decides what is used.
+Wake only triggers Resume.
+LaunchMode records what will actually run.
 ```
 
-两种模式都把 `<sid>.snapshot` symlink 存为 node-local `snapshot_ref`。`local` 保持现有
-tarstream;`bundle` 生成一个 `<root-memory-manifest-key>.bundle`,内存根、当前根盘层和
-各数据盘当前层进入同一个 multi-Manifest ZIP Bundle。capture 按字段解析 working-set policy:
+`CaptureKind`、`ResumeSource`、`ResumeMode`、`LaunchMode` 和 `ResumeTrigger` 是彼此独立的概念:
+
+| 概念 | 值 | 职责 |
+|---|---|---|
+| `CaptureKind` | `snapshot` / `sandbox` | 本次 Pause 保存 Snapshot S 还是 Sandbox E |
+| `ResumeSource` | `{kind:snapshot|sandbox, ref}` | paused 行持有的可恢复根制品 |
+| `ResumeMode` | `auto` / `memory` / `cold` | 调用方对本次 Resume 的选择 |
+| `LaunchMode` | `image` / `memory` / `cold` | 解析完成并将在本次 starting 中实际执行的模式 |
+| `ResumeTrigger` | `connect` / `wake` / `route` / `exec` / `exec-session` | 低基数日志与指标来源,不参与模式或权限判断 |
+
+Image 是只读镜像根;Sandbox E 是不含 guest 内存、但包含 portable `sandbox.runtime.cfg` 和磁盘
+状态的执行制品;Snapshot S 是内存制品,其 `snapshot.cfg.sandbox_ref` 指向权威 Sandbox E。
+Snapshot S 始终携有效内存状态,其 cfg 不使用 memory 开关表达 E。模板 kind 与启动映射为:
 
 ```text
-Pause Header > Pause body > sandbox metadata > node config > sandbox-ctl default
+img -> LaunchImage  -> sandbox-ctl run
+sbx -> LaunchCold   -> sandbox-ctl run --from <E>
+snp -> LaunchMemory -> sandbox-ctl run --restore <S>
 ```
 
-API 先把 body 与 Header 合为 action override;Core 在 lifecycle lock 内重读 sandbox row,
-严格解析历史 metadata 后再逐字段叠加。reaper 没有 action override,所以使用
-`sandbox metadata > node config > sandbox-ctl default`。某字段最终为 `nil` 时完全不传
-对应 flag;只有显式值才在基础 argv 后追加 `--merge-ref=true|false` 或
-`--drop-caches=true|false`。两字段全未设置时不追加 policy flag,缺省行为由 sandbox-ctl
-决定。policy 校验完成前不会 cancel resume、snapshot、停 unit、detach 或改库。
-snapshot 成功后才写 ref/paused state;Pause 本身不执行 promote。Build/template 的 snapshot
-命令使用同一个 `checkpoint.mode`,但不接入这两个 flag,也不把 ready/start command 解释为
-working-set warm-up。Bundle 模式的 Builder 在 Phase C 前先把本次新导出的只读平台镜像发布为
-`manifest://`,使 byte-identical `snapshot.cfg` 自身选择既有的远端 `base_ref` 策略;后续 Bundle
-exact upload 仍只发布 snapshot layer,不改写 cfg。Bundle restore 期间根 Bundle 保持打开;Bundle 内 Manifest 使用完整本地
-Chunk 闭包,Manifest 未命中时整层走远端,不存在 Chunk 级 fallback。
-
-portable publish 与 Pause mode 独立。若配置
-`checkpoint.remote.ref_location_parent`,`export-sandbox` 在发布时构造 publication
-name(实体 ID + 等宽发布日期后缀 `<sb.ID>-<YYYYMMDD>`,`reflocation.PublicationName`;
-UTC,同日重试同名收敛,跨日重试使用新日期的 name/目录):
+状态机如下:
 
 ```text
-location name = <entity-id>-<YYYYMMDD>   (发布日期 = publication 日期,非实体创建日期)
-location URI  = <parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>
+Create(img|sbx|snp)
+  |
+  v
+starting --success--> running --Pause/TTL--> paused(source=E|S)
+  |                      |                       |
+  |                      +--Kill--> deleted     | Resume(auto|memory|cold)
+  |                                              v
+  +--fresh failure--> dead                    starting(launch_mode=cold|memory)
+                                                   |
+                              running <--success---+
+                                                   +--failure--> paused(original E|S)
 ```
 
-首层日期目录是按发布时间有序的分区(字典序=日期序),为未来的 GC 候选发现提供
-有序布局;hash 两级扇出原样保留(限制单目录条目)。发布日期取自 name 后缀而非
-实体 ID 内嵌时间——晚导出的实体(创建久远但刚发布)落在当前日期分区。GC 策略与
-删除流程(retention、可达性、在途发布处理、删除安全)不在本仓库范围,由未来的
-管理面 GC 组件负责。conductor 与 task reader 共用 `internal/reflocation` 一条规则,
-name 自足(ref 携带即可恢复,无需任何额外状态)。
+`starting` 是持久业务状态,覆盖 admission、artifact prepare、resource/network、runner pool、
+runtime readiness 和 mandatory e2b `/init`。fresh Create 必须持久化 `launch_mode=image|cold|memory`;
+paused Resume 必须在接受 `paused -> starting` 的同一原子更新中持久化 `cold|memory`。running、paused、
+dead 均清空 `launch_mode`。running 可保留最近的 `resume_source` 用于本机制品 ownership;下一次成功
+Pause 原子覆盖它。
 
-随后用 `upload-snapshot --to-ref-location` 发布,plaintext/encrypted tarstream 分别得到
-`file://<digest>.snapshot@digest:<digest>@location:<publication-name>` 或
-`file://<digest>.snapshot@hmac:<digest>@location:<publication-name>`,Bundle 得到
-`file://<root-key>.bundle@manifest:<root-key>@location:<publication-name>`。没有 parent 时发布到 Manifest Store。
-两者都是 canonical portable ref.第一阶段只读 local checkpoint 并产生 portable ref,
-不改变 source row/cache/route 或本机文件;第二阶段取得 lifecycle finalizer 后才提交
-source retention 并删除明确的本机 checkpoint。located 目录绝不进入本机 cleanup。
-没有 parent 时独立发布到 manifest。Bundle→Store 走 exact object upload:强制验证 recorded
-WriteAdmission、physical SHA-256 与 salt domain,根 Manifest 最后上传且根 key 和
-`snapshot.cfg` 不改写。全部基于 sandbox-ctl 原语(`snapshot --mode local|bundle --output`、
-`upload-snapshot`、`run --restore`)。
+同一 SID 的 Create、Connect、Wake、route activation、native exec、exec-session 和 migration import
+共用 launch group。每次 admission 先在 per-SID lifecycle lock 内重读 durable row,再执行授权、
+模式解析和 Store CAS,最后创建或加入 launch attempt。attempt 中的 mode 只是 durable
+`launch_mode` 的缓存。Kill/Delete 取消 attempt 后仍等待 exact runner/network/local cleanup 完成;
+waiter 被唤醒前 Store、cache 和 route 已收敛。external fresh Create 还必须在启动资源前通过
+route-applied barrier;失败以 exact empty-owner CAS 删除 starting 行并发布 Delete。
 
-`export-sandbox` / `import-sandbox`(CLI 形式见 §2.7)是 api 平面端点
-`POST /sandboxes/{id}/export`、`POST /sandboxes/import` 的客户端;两端点在 TLS
-`api.listen` 上同样可达(api-key 已按租户隔离),晋升/导出/插行全由 daemon 进程内
-完成,无第二写者。
+### 8.1 Artifact lifecycle、转模板与迁移
 
-- **晋升 / 转模板**(`--to-template`,须 paused):确保 portable 后,把完整 SnapshotRef
-  以 base64url-no-padding 编进 `<profile>-snp-<payload>`(不写 builds 表)。之后
-  `e2b sandbox create <id>` 即从该快照创建新身份沙箱(新 sid)。`keepSource` 与输出类型
-  独立:无 Resume 时 `false` 删除 source,`true` 保留并把权威 ref 切换为 portable.
-- **迁移 token**:`export-sandbox <sid>` 确保 portable 后导出
-  `kmt1.<base64url-no-padding(nonce|ciphertext)>`。ManifestKey 经
-  `HMAC-SHA256(decodeHex(ManifestKey),"kuasar-migration-token-v1")` 派生 AES-256-GCM
-  key,每次 export 使用随机 12-byte nonce。plaintext V1 只接受 `stableID`；不接受旧字段
-  或 fallback。完整 wire 上限 512 KiB,旧 plain-base64 token 不再接受。
-- **Export / Resume 并发**:local publish 不持有长 lifecycle lock。`BeginResume` 成功提交
-  `paused -> starting` 是 Resume 获胜点;Export finalizer 在同一 per-SID lock 内完成
-  exact attempt、paused state 与原 SnapshotRef 校验是另一个获胜点。Resume 先获胜时,
-  KMT publish 被取消且 Export 返回 409;Template publish 保持运行并返回 templateID,但
-  两者都跳过 source/local 收尾。finalizer 先获胜时,Resume 只等待短收尾:`keepSource=true`
-  随后从 portable ref 恢复,`keepSource=false` 因 source 已删除返回 404。其他 source
-  lifecycle mutation 继续等待 active Export;Resume launch 的内部 commit/rollback 不等待
-  detached Template upload。node lifecycle shutdown 同步关闭新 Export admission 并取消仍在
-  第一阶段的 publish;已经赢得 source finalizer 的 Export 继续完成有界收尾。conductor 在
-  关闭 store/launcher 前 drain 全部已受理 Export。`keepSource=false` 在删除 row 前按
-  Stop/Reset/detach/RunDir 顺序回收持久 ownership;任一步失败都保留 row、cache 与 local
-  snapshot 供重试,不制造无法由 Reconcile 发现的 orphan unit/port。
-- **迁移内容与连续性**:GCM payload 携 source NodeSandboxID、`StableID()`、Profile、
-  template/canonical portable SnapshotRef/runtime、env/metadata、创建/截止时间、两个 tenant root 的完整指纹,
-  以及既有 ServiceSecret、Envd/Traffic/Forward token。它不携 APISecret/ManifestKey 原文、
-  MMDS route secret value、host absolute path、Group/RouteKey 或 generation。routes-only
-  `kuasar-sandbox.mmds` 可随 portable metadata 移动,但 secret plaintext 永不进入 migration
-  token、snapshot 或 template。目标 node 从本地 key 表取得完整 pair,
-  校验 fingerprints/runtime/Profile/Forward KAT 后原样落库,不重新派生或生成 service credential。
-- **target 与冲突**:standalone import 省略 `sandboxID` 时复用 source NodeSandboxID;显式 target
-  只替换本地 ID,保留 StableID 与全部 credential。ID 使用 1..57 bytes 的 lowercase
-  DNS-label 子集 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`。插入为原子 insert-only,
-  已存在返回 409且不覆盖。token 可在现有授权下重复用于不同 target,不增加 single-use 状态。
-  目标机须预装匹配的 tenant pair;manifest ref 依赖同一 store,located ref 依赖同一
-  `ref_location_parent` 部署映射。迁移token仍只携根ref。restore runner先为located根建立
-  reader path mapping;若根文件是Manifest Bundle,它只读取根文件从offset 0开始的metadata
-  prefix,从平面的 `bundle/refs` 收集全部 `@location` 名称并在打开根cfg前补全mapping。
-  无location的sibling ref相对根Bundle目录解析,无需独立mapping;runner不打开refs Bundle,
-  也不递归读取其 `bundle/refs`。随后只读取根 `snapshot.cfg`一次,再从
-  `root + FromRefs + ArtifactRefs()` 收集flattened逻辑closure;`FromRefs`是已展平memory
-  chain、disk `BaseFromRefs`同理,不递归读取parent cfg。逻辑ref上限和Bundle profile内
-  refs上限各为1024;所有location name去重排序,路径与CLI URI均按
-  `<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`确定性派生
-  (日期段取自 name 自带的发布日期后缀,与 §8.1 的 dated 布局一致)。
-- **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
-  <token>})`——path sid 是明确 target。目标不存在时,connect 在当前请求内同步完成
-  decrypt/validate/insert并读取 response credential,接受异步 resume 后返回同一 sid;
-  standalone/node-local 请求可同时用 `X-Kuasar-Sandbox-MMDS` 或 metadata 只注入
-  `{secrets:{...}}`;routes 权威只能来自 token,请求只要出现 `routes` key(包括 `[]`)即 400,
-  每个 initial name 必须被 token 的 secret route 引用,业务 row/routes metadata/secret blob
-  原子写入。目标已存在时完全忽略 token 和 MMDS secret 输入,不解析、不校验、不更新。
-  超过 512 KiB 的 Header 返回 431;独立 import body/token
-  超限返回 413。`import-sandbox` CLI 保留作显式预导入。
-- **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
-  路由流下发(node-proxy.md §4);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
-  沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
-  MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据;`keepSource=false` 且 finalizer 获胜时
-  会回收源行,故按需铸造、绝不随路由广播。
-- 限制:token 不含 tenant raw root,但携带沙箱自有 env 与数据面 credential,按"沙箱级敏感"对待;
-  快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
+#### 8.1.1 Capture 与 Pause
 
-上述 secrets-only 注入只属于 standalone CONNECT import。cluster CONNECT 不透传 MMDS
-config,node-link command schema、registry/router/placer 不理解 MMDS,本阶段也没有 cluster
-MMDS Secret API、placement/admission/retry 或 cluster MMDS E2E。现有通用 metadata 偶然携带
-routes 不构成 cluster 支持合同。
+Create body 的 E2B 兼容字段 `autoPauseMemory` 使用三态解析:
+
+```text
+omitted/null -> true
+true         -> true
+false        -> false
+```
+
+解析结果作为独立 `auto_pause_memory` 业务字段持久化,只供 TTL reaper 决定 CaptureKind。它不进入
+`kuasar-sandbox.checkpoint` 或 `snapshot.cfg`。standalone 和 cluster 使用同一 typed 字段链:
+public Router -> route-link reserve -> Registry reserve state -> node-link command -> node CreateReq ->
+durable Sandbox row,不通过 metadata 隧道传递。
+
+显式 `POST /sandboxes/{id}/pause` 的 body 可为空或为:
+
+```json
+{"memory":false,"checkpoint_merge_ref":null,"checkpoint_drop_caches":null}
+```
+
+`memory` omitted/null/true 选择 `CaptureSnapshot`;false 选择 `CaptureSandbox`。显式 Pause 的缺省始终
+是 Snapshot S,不继承 `autoPauseMemory`。因此 `Create(autoPauseMemory=false) + Pause({})` 保存 S,
+而同一 Sandbox TTL 到期保存 E。`checkpoint_merge_ref` 和 `checkpoint_drop_caches` 只属于
+`SnapshotPolicy`;若 `memory=false` 同时携任一字段,API 在 guest freeze、capture 或 lifecycle
+副作用前返回 400。`X-Kuasar-Sandbox-Checkpoint` 与 `kuasar-sandbox.checkpoint` 仍只接受
+`merge_ref`、`drop_caches`,不接受 `memory`。
+
+`checkpoint.mode` 只接受 `local|bundle`,两种 CaptureKind 都支持两种 carrier:
+
+```text
+CaptureSnapshot:
+  sandbox-ctl snapshot --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+    --run-root <run-root> [--merge-ref=...] [--drop-caches=...]
+  -> ResumeSource{kind:snapshot, ref:<dir>/<sid>.snapshot}
+
+CaptureSandbox:
+  sandbox-ctl export --sandbox-id <sid> --output <dir> --mode <local|bundle> \
+    --run-root <run-root>
+  -> ResumeSource{kind:sandbox, ref:<dir>/<sid>.sandbox}
+```
+
+Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
+`CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
+publish paused route。commit 原子写 `state=paused` 与 source kind/ref;之后 runner 和 network ownership
+分别以 exact CAS 清理,使中断后 Reconcile 能独立重试。capture 失败保持 state=running、旧 source、
+runner 和 network 不变,不创建成功 alias,也不从 S 降级为 E。
+
+#### 8.1.2 Resume admission、Connect 与 Wake
+
+Connect body 是严格、限长的 JSON object,在既有 `timeout` 上增加 Kuasar 扩展
+`memory?: boolean|null`。E2B 当前公开 Connect 没有该字段;它不是 E2B 兼容声明。
+API 映射为 omitted/null -> `ResumeAuto`,true -> `ResumeMemory`,false -> `ResumeCold`,随后按 durable
+source 解析:
+
+| paused source | request | LaunchMode | sandbox-ctl |
+|---|---|---|---|
+| Snapshot S | omitted/null/auto | `memory` | `run --restore <S>` |
+| Snapshot S | true/memory | `memory` | `run --restore <S>` |
+| Snapshot S | false/cold | `cold` | 解析 `S.snapshot.cfg.sandbox_ref`,再 `run --from <E>` |
+| Sandbox E | omitted/null/auto | `cold` | `run --from <E>` |
+| Sandbox E | false/cold | `cold` | `run --from <E>` |
+| Sandbox E | true/memory | conflict | 409 `memory unavailable` |
+
+running Connect 保持幂等,显式 false 不会重启。starting resume 上,omitted/null 加入当前 attempt;
+显式值与 durable `launch_mode` 一致时加入,冲突时返回 409,不会修改已经接受的模式。cluster
+Connect 在 Router、route-link、Registry 和 node-link 间保留 `*bool` 的存在性。
+
+`BeginResume(id, deadline, LaunchMode)` 原子写 `state=starting, launch_mode` 并清理上一代已经释放的
+runner/network ownership。`CommitStartingRunning`、`RollbackStartingPaused`、
+`RollbackStartingDead` 清空 `launch_mode`。失败的 S+cold 恢复原 paused S,不会改写成 E,所以之后
+仍可选择 memory。conductor 重启遇到 starting resume 时从 durable source + `launch_mode` 重建
+attempt;例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。
+
+普通 ingress Wake、internal `ActivateRoute`、external `OnWake`、native `ActivateExec` 和
+`ExecSession` 全部只传 `ResumeAuto`:S 默认 memory,E 默认 cold。两种 source 都保留既有 Wake 能力;
+proxy SHM 不携 source kind 或 cold gate。已鉴权的首个 E 请求保持 parked,直到 node
+完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。未来的 `autoResume=false`
+若实现,必须是独立 traffic policy,不能从 E/S kind 推导。本变更不宣称完整实现 E2B autoResume。
+
+#### 8.1.3 Task-local artifact prepare 与三种 config
+
+artifact launch 的 tenant task 先执行 `internal/taskartifact`。`ArtifactPrepareSpec` 至少携 root
+source kind/ref、durable launch mode、manifest config、ref-location parent、relative dir、max refs
+和 absolute deadline。task 持有 `MANIFEST_KEY`,由官方 sandboxer reader 实际打开/解密制品;
+conductor 不读取、解密或解析 tenant artifact。
+
+prepare 路径为:
+
+```text
+E + cold   -> open E, parse sandbox.runtime.cfg, compute disk closure, prepared=E
+S + memory -> open S, open S.sandbox_ref E, compute memory+disk closure, prepared=S
+S + cold   -> open S, resolve/open S.sandbox_ref E, compute disk closure, prepared=E
+E + memory -> fail before runner/VM side effects
+```
+
+remote Manifest 的 S+cold 选择 `manifest://E`;local tarstream 解析相对、content-identified E file ref;
+Manifest Bundle 生成指向同一 Bundle file 并以 E Manifest key 为 selector 的 file ref,不假设远端
+Store 已有 E。Result 中的 `PreparedSource`、ref-location URI、carrier/Bundle binding 和 cfg 只留在
+task 进程。task 在本地严格解析 artifact network metadata,拒绝 duplicate/unknown/malformed 字段,
+只把 typed network topology 与 capacity、required ref count、`resolution_digest` 组成 bounded summary
+交给 conductor;原始 metadata 不跨 task 边界。digest 覆盖 root source、launch mode、selected source、
+closure、locations、carrier binding、capacity/network summary。相同 runID + digest replay 返回同一结果;
+冲突 replay fail closed。
+最终 `taskrun` 只根据 task-local `PreparedSource` 追加 `--from <E>` 或 `--restore <S>`。
+
+运行配置使用三种明确 DTO,不以一份完整 `SandboxConfig` YAML 服务所有模式:
+
+- `ImageColdConfig`:用于 `run --config`;可包含 image root、writable diff template、launch/env/files、
+  mounts/init/plugin、resources/network/metadata。
+- `SandboxHostConfig`:用于 `run --from E --config`;只声明 `ApplyFromRules` 允许的 host/instance 字段,
+  包括 kernel/runtime 实际 binding、active diff binding、resource controller/host policy、network provider
+  和实例 IP/MAC/hostname、timeout、允许的 persistent override、`ephemeral_files`、
+  `launch.ephemeral_env`。它不能声明 immutable root/data disk graph。paused E 或 S+cold 时 E 的 C0
+  权威,不重放 row 中旧 launch/env/files;只有 fresh `KindSbx` Create 可有意提交 create-time persistent
+  override。
+- `SnapshotHostConfig`:用于 `run --restore S --config`;只声明 `ApplyRestoreRules` 允许的 kernel/runtime、
+  active diff、resource controller/allocatable、network provider/实例字段、restore policy 和 timeout。
+  类型本身不包含 launch、files、ephemeral files、init/plugin、mounts、metadata、boot cmdline 或 disk graph。
+
+node 生成的 `/etc/hosts`、`/etc/resolv.conf` 在 cold 路径进入 `ephemeral_files`,不写 portable C0;
+memory restore 不声称重新注入它们。persistent env/files 只随明确的 C0 override;ephemeral env/files
+只影响本次 cold launch。renderer 输出须通过 `LoadMergedWithPresence` 后分别被 `ApplyFromRules`、
+`ApplyRestoreRules` 接受,且多 data-disk name/order/mount topology 保持由 E 权威定义。
+
+#### 8.1.4 Publish、template 与 migration
+
+本机 E/S 都通过同一命令发布:
+
+```text
+sandbox-ctl publish --manifest-config <cfg> [--to-ref-location <name>=<uri>] <artifact>
+```
+
+`promoteArtifact` 接受并返回 `ResumeSource`,kind 不变。没有 named location 时发布到 Manifest Store;
+配置 `checkpoint.remote.ref_location_parent` 时,publication name 为
+`<entity-id>-<YYYYMMDD>`,URI 为
+`<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
+`.sandbox`/`.snapshot`:plaintext carrier 使用 `@digest:<digest>`,encrypted carrier 使用
+`@hmac:<digest>`。Bundle 得到使用 `@manifest:<root-key>` 选择 root Manifest 的 located `.bundle`。
+即使发布到 named location 也始终传 `--manifest-config`,因为 Bundle exact publication 仍须验证并
+发布其 Manifest graph。Bundle->Store 验证 recorded admission、physical digest 和 salt domain,
+根 Manifest 最后提交。
+
+首层日期目录按实际 publication 日期有序分区,再用 name 的 SHA-256 两级扇出限制单目录条目;
+晚发布的旧实体落入当前日期分区。GC retention、可达性、在途发布和安全删除策略不属于 node
+生命周期职责。conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析,
+location name 自足,恢复不依赖额外 side table。
+
+`TemplateID` 为 `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
+
+```text
+img: manifest ref,或 located .image
+sbx: manifest ref,或 located .sandbox/.bundle
+snp: manifest ref,或 located .snapshot/.bundle
+```
+
+paused E 转模板得到 `KindSbx`;paused S 得到 `KindSnp`。两者均可 publish,不会因 E 无内存而拒绝。
+build pipeline 的 Snapshot 输出仍是 `snp`,但 publication 同样调用 `sandbox-ctl publish`,不依赖
+单独的 Snapshot publication 命令。
+
+KMT V1 payload 直接携 `resumeSourceKind`、`resumeSourceRef` 和 `autoPauseMemory`,不接受旧
+`snapshotRef` payload。Import 原样恢复 E/S kind/ref、deadline、portable env/metadata 和既有
+ServiceSecret/Envd/Traffic/Forward token;目标 node 从本地 trusted key table 取得 APISecret +
+ManifestKey 并校验 fingerprints、runtime digest 和 profile。token 不携 raw tenant roots、host path、
+MMDS secret value、cluster Group/RouteKey 或 generation。
+
+Export 第一阶段 publish 不持有长 lifecycle lock;第二阶段在 per-SID lock 内以 exact original
+`ResumeSource` 赢得 finalizer。Resume 先成功 `BeginResume` 时,KMT export 被取消并返回 409;
+template publish 可 detached 完成并返回 TemplateID,但不清理 source。finalizer 先获胜时,
+`keepSource=true` 把 row 的 source 切为 portable 并删除明确的 local artifact directory;
+`keepSource=false` 先 exact teardown ownership,再删除 row/cache/route/local artifact。任何 teardown
+或 Store 失败都保留可重试的 durable ownership。located/remote artifact 永不被本机 cleanup 删除。
+
+standalone import 省略 target 时复用 source NodeSandboxID;显式 target 只替换 node-local ID,保留
+StableID 和 service credentials。insert 是原子的 insert-only,冲突返回 409。Connect 可携
+`X-Kuasar-Migration-Token` 在目标缺失时同步 import 后接受同一 Resume;目标已存在时不解析 token。
+paused route 只投影与 kind 正交的 `artifact_location=local|remote`,供可信迁移组件判断节点绑定;
+proxy 不读取 kind。Migration token 是 sandbox 级敏感凭据,不会随 route 广播。
+
+`running` 仅表示 runtime readiness 与 mandatory e2b `/init` 已完成,不保证用户应用端口健康。
+通用 backend health/dial retry 仍由独立工作跟踪。cluster 的 create/connect 复用上述 node-local
+原语;secrets-only CONNECT import 仍只属于 standalone,node-link 不传 MMDS secret plaintext。
 
 ## 9. 数据面装配(serve 侧)
 
@@ -1693,7 +1706,7 @@ serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill �
 **routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy master 与路由
 观察者如平台 agent)。proxy master 把路由投影到共享内存,worker 只读;观察者持只读缓存
 感知状态。广播逐条 upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
-`RouteEntry` 字段(含驱动迁移的 `snap_loc`、MMDS 使用的 `mmds_secret`)见 node-proxy.md §4;
+`RouteEntry` 字段(含驱动迁移的 `artifact_location`、MMDS 使用的 `mmds_secret`)见 node-proxy.md §4;
 plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
 把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
 
@@ -1801,7 +1814,7 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 
 ```text
 sandbox{
-  sid, profile, state(starting|running|paused|dead), snap_loc, template_id,
+  sid, profile, state(starting|running|paused|dead), artifact_location, template_id,
   stable_id, api_secret, api_secret_fingerprint,
   manifest_key_fingerprint, service_secret,
   envd_access_token, traffic_access_token, forward_access_token,
@@ -1908,10 +1921,10 @@ plugin 平面,机群路由经 registry 聚合。
 - **guest 须有 `/etc/hosts`**:展平的 docker 镜像不带它(docker 仅在容器运行时注入),
   而 guest 内 `socket.getfqdn(hostname)` 类调用(许多服务器在 bind 后、listen 前调它,
   如 Python `http.server.server_bind`)查无本地条目即落到 DNS,解析主机名阻塞约 20s,
-  表象是"host→floatingip 应用端口转发失败"。serve 经 SANDBOX_CONFIG 既有
-  `files:` 机制注入 `/etc/hosts`(`127.0.1.1 <hostname>` 条目)与 `/etc/resolv.conf`
-  (`sandbox.network.dns`),并经 `network.hostname` sethostname;launch 与 restore
-  均生效。
+  表象是"host→floatingip 应用端口转发失败"。serve 在 cold launch 的 SANDBOX_CONFIG
+  中通过 `ephemeral_files:` 注入 `/etc/hosts`(`127.0.1.1 <hostname>` 条目)与
+  `/etc/resolv.conf`(`sandbox.network.dns`),并经 `network.hostname` sethostname。
+  这些 node-derived 文件不进入 portable C0;memory restore 不重新注入它们。
 - host 在 runtime readiness wire 完成后直接调 mandatory **`POST /init`**(经 UDS):置
   `envVars`、默认用户 `user`/workdir `/home/user`,时间戳;仅 `mmds.enabled` 时携带
   `accessToken`(node-proxy.md §7).envd socket 尚未可拨由上述短退避传输重试吸收,
@@ -2044,10 +2057,10 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 快照构建是唯一提前发布点:若 Phase B/Import 产生本地 `image.img`,在 Phase C 前先执行同一
 `manifest-ctl store`,并把所得 ref 作为平台 `base_ref`;这是 base_ref 的既有 manifest 策略,
 不是把 snapshot-layer Bundle 地址写进 cfg。随后快照收尾仍只执行**一条**
-`sandbox-ctl upload-snapshot <snapshot>`;exact upload不重写根。Phase C 的 capture 使用
+`sandbox-ctl publish <artifact>`;Bundle exact publication 不重写根。Phase C 的 capture 使用
 与 Pause 相同的 `checkpoint.mode`,但不继承 Pause-only merge/drop policy。配置
 `ref_location_parent` 时以 publication name(build ID + UTC 发布日期后缀,
-`reflocation.PublicationName`,builder 在 upload 开始前才铸造)发布到 named location,
+`reflocation.PublicationName`,builder 在 publication 开始前才铸造)发布到 named location,
 否则发布到 manifest;Bundle 上传保持原始根 ManifestKey 与 byte-identical `snapshot.cfg`。结果
 `{image_ref|snapshot_ref, start_cmd, ready_cmd, error}` 经 config-socket 回传;
 快照模板的 start/ready 与模板有效 `NetworkSpec` 同时记进 snapshot.cfg metadata,
@@ -2143,7 +2156,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … [--restore] [--connect]`;run-builder 以直接子进程 `run --ready-fd=<pipe-fd>` 启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流),收尾 `snapshot --mode local|bundle --output` / `upload-snapshot`;serve 的 Pause 同样调用 `snapshot --mode local|bundle --output` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
+| `sandbox-ctl`(runtime) | run-sandbox(单元)最终 `execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力,收尾 `snapshot --mode local\|bundle --output` / `publish`;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);dynamic sandbox 自动使用同一 canonical `SocketIdentity` 拨号(`pkg/resource` 协议) | `resource_listen` 是唯一 endpoint 来源;每个 runner 的 `vmm/` 是沙箱资源 cgroup,FD 由 run-sandbox 注入;controller disabled = static cgroup |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
@@ -2169,7 +2182,8 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                template_id, state(starting|running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
-               manifest_key_hash, manifest_key_enc, snapshot_ref,
+               manifest_key_hash, manifest_key_enc,
+               resume_source_kind, resume_source_ref, auto_pause_memory, launch_mode,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
                created_unix
@@ -2198,6 +2212,10 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
 ```
 
 `builds` 兼任模板登记(§4.4),也是 registration/execution 两级准入的持久真相。
+`resume_source_kind/ref` 是 paused E/S 的 typed root;`auto_pause_memory` 只决定 TTL CaptureKind;
+`launch_mode` 是 starting 中已接受的实际 image/cold/memory 模式。项目尚未正式发布,生命周期
+schema 直接替换旧单字符串 lifecycle 模型,不保留双读/双写或迁移 shim;已有开发数据库须重建。
+
 `resources_*` 是不可变 Build resources;`phase_resource_json` 是 A/B/C 普通 Sandbox 的独立
 ResourcePatch;二者不互相推导。`execution_claimed` 及 runtime/phase 字段使重启后可重建
 用量并先收敛活单元再释放 claim。`runtime_prepare_json` 通过启动时的 additive SQLite migration
@@ -2214,27 +2232,27 @@ AES-256-GCM、两项 `*_hash` 均为
 serve 在开放 API、routesync、node-link 和数据面前先以
 `ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
 
-- 库内 starting 不收养为 running,也不装入 cache。`run_id=""` 表示进程中断于 runner
-  assignment 前;非空则先 Stop/Reset exact runner。两种情况都 detach 已持久化的新 network
-  ownership、清理 stale ready.sock/run dir;有 `snapshot_ref` 表示被中断的 resume,按 exact
-  空/非空 run-id CAS 回 paused 并保留 base/snapshot identity,否则是被中断的 fresh create,
-  按同一 fence CAS 为 dead 并清理其 base dir。任一 Stop/Reset/detach/目录 cleanup 失败时
-  Reconcile 直接使节点启动失败并保留原 starting ownership,不得先清字段或开放 API;
-  resume 回 paused 后在本次 conductor 进程内把 durable deadline 保守恢复为显式 intent,
-  直到下次 exact-run 成功;paused 后再次重启的持久 discriminator 由 #139 跟踪;
+- 库内 starting 不直接收养为 running。fresh Create 先 Stop/Reset exact runner、detach network、
+  清理 stale ready.sock/run dir,再以 exact run-id CAS 到 dead。带合法 `ResumeSource` 的 starting
+  是已接受 resume:同样先释放旧 ownership,但保持 `state=starting`、source 和 durable
+  `launch_mode`,清空 run-id 后排入恢复队列,用原 cold/memory 决定重新启动。任一
+  Stop/Reset/detach/目录 cleanup 失败时 Reconcile 使节点启动失败并保留 ownership,不得先清字段
+  或开放 API;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
 - 无 running 行对应的 runner 单元属于上一个 pool 的 idle/orphan run-id ⇒
   `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
-- `run_root` 为 tmpfs ⇒ 整机重启后 running 全部判 dead;`paused` 行与 snp 模板保留,
-  可被 connect/auto-resume 重新拉起(本机快照存于磁盘 `checkpoint.local_dir`)。
+- paused 行若还持有 capture commit 后未清完的 exact runner/network ownership,Reconcile 分别
+  重试 Stop/Reset、detach 和 CAS,source 不变。`run_root` 为 tmpfs ⇒ 整机重启后失联 running
+  判 dead;paused E/S 与 sbx/snp template 保留,可被 Connect/Wake 重新拉起(本机制品位于
+  持久 `checkpoint.local_dir`)。
 
 Builder 在同一次 startup gate 内对账，所有 live owner重建完成后才允许 task bootstrap/result
 跨过 `buildRecoveryReady`：
 
 - `run_id`已绑定且port为空是合法 preparing。新conductor收养同一live run-builder，重建
-  completion owner；snapshot task可重取bootstrap或重交同一summary，conductor不读工件；
+  completion owner；artifact task可重取bootstrap或重交同一summary，conductor不读工件；
 - port与合法`runtime_prepare_json`同时存在是prepared/pipeline-running。新conductor从其中冻结的
   network/resources重建final BuildSpec，相同digest重试不再次attach，也不受当前node defaults漂移；
 - port存在而preparation缺失、损坏或schema未知时先fence exact unit，再detach并终态失败，不能

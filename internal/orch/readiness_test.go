@@ -559,11 +559,16 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileBare, "rollback")
 	sb.State = types.StatePaused
+	sb.LaunchMode = ""
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
 
-	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, types.ResumeRequest{
+		Trigger: types.ResumeTriggerConnect,
+		Mode:    types.ResumeAuto,
+	}, nil)
 	if err == nil {
 		err = attempt.wait(ctx)
 	}
@@ -589,7 +594,8 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 	sb, _ := launchTestSandbox(t, cfg, types.ProfileE2B, "init-rollback")
 	sb.State = types.StatePaused
-	sb.SnapshotRef = "manifest://" + strings.Repeat("c", 64)
+	sb.LaunchMode = ""
+	sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +607,10 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 	events, cancel := o.Subscribe()
 	defer cancel()
 
-	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, nil)
+	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, types.ResumeRequest{
+		Trigger: types.ResumeTriggerConnect,
+		Mode:    types.ResumeAuto,
+	}, nil)
 	if err == nil {
 		err = attempt.wait(ctx)
 	}
@@ -649,7 +658,7 @@ func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, 
 	manifestKey := strings.Repeat("a", 64)
 	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}
 	sb := &types.Sandbox{
-		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateStarting,
+		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateStarting, LaunchMode: types.LaunchImage,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(cfg.Paths.RunRoot, sid), BaseDir: filepath.Join(cfg.Paths.BaseRoot, sid),
 		CreatedUnix: 1,

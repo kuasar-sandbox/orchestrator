@@ -3,7 +3,7 @@ package configsock
 import "errors"
 
 // BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
-// SnapshotPrepareSchemaVersion. Version 2 adds BuildSpec.CheckpointMode; an old
+// ArtifactPrepareSchemaVersion. Version 2 adds BuildSpec.CheckpointMode; an old
 // run-builder must fail closed instead of silently defaulting that field.
 const BuildTaskSchemaVersion = 2
 
@@ -23,7 +23,7 @@ type BuildTaskSpec struct {
 	Workdir string               `json:"workdir"`
 	Env     map[string]string    `json:"env,omitempty"`
 	Final   *BuildSpec           `json:"final,omitempty"`
-	Prepare *SnapshotPrepareSpec `json:"prepare,omitempty"`
+	Prepare *ArtifactPrepareSpec `json:"prepare,omitempty"`
 	Error   string               `json:"error,omitempty"`
 }
 
@@ -37,7 +37,7 @@ type BuildPrepareRequest struct {
 	BuildID string                 `json:"build_id"`
 	RunID   string                 `json:"run_id"`
 	Version int                    `json:"version,omitempty"`
-	Summary SnapshotPrepareSummary `json:"summary"`
+	Summary ArtifactPrepareSummary `json:"summary"`
 }
 
 type BuildPrepareResponse struct {

@@ -44,6 +44,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/unixcred"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"golang.org/x/net/http2"
@@ -67,6 +68,13 @@ const (
 	PathAdminBuilderAdmission      = "/internal/admin/builder-admission"
 	PathAdminMMDSRouteSecretPut    = "PUT /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
 	PathAdminMMDSRouteSecretDelete = "DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}"
+
+	// Bootstrap requests carry only exact task identifiers. Prepare requests may
+	// additionally carry up to 1 MiB of decoded artifact network metadata; the
+	// larger wire bound accommodates JSON string escaping while keeping parsing
+	// bounded before any task authentication or provider call.
+	taskBootstrapRequestMaxBytes int64 = 64 << 10
+	taskPrepareRequestMaxBytes   int64 = 8 << 20
 )
 
 // journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
@@ -167,10 +175,10 @@ type Provider interface {
 	// CompleteSandboxPrepare so an unauthorized peer cannot trigger secret reads.
 	SandboxTaskAuth(ctx context.Context, sandboxID, runID string) (auth SandboxTaskAuth, ok bool, err error)
 	SandboxTaskSpecFor(ctx context.Context, sandboxID, runID string) (resp *SandboxTaskSpec, ok bool, err error)
-	CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary SnapshotPrepareSummary) (*LaunchSpec, error)
+	CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary ArtifactPrepareSummary) (*LaunchSpec, error)
 	BuildTaskAuth(ctx context.Context, buildID, runID string) (auth BuildTaskAuth, ok bool, err error)
 	BuildTaskSpecFor(ctx context.Context, buildID, runID string) (resp *BuildTaskSpec, ok bool, err error)
-	CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary SnapshotPrepareSummary) (*BuildSpec, error)
+	CompleteBuildPrepare(ctx context.Context, buildID, runID string, summary ArtifactPrepareSummary) (*BuildSpec, error)
 	RunPidFile(kind, runID string) (pidFile string, ok bool)
 	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
 	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
@@ -194,7 +202,7 @@ type BuildSpec struct {
 	// root SnapshotCfg. It is intentionally absent from the conductor wire.
 	SnapshotPreparation *BuildSnapshotPreparation `json:"-"`
 	// PublishLocationParent, when non-empty, publishes the final snapshot to
-	// a named ref location (upload-snapshot --to-ref-location). The builder
+	// a named ref location (publish --to-ref-location). The builder
 	// derives the publication name and URI itself right before the upload
 	// starts, so the date bucket always reflects the actual publication time.
 	PublishLocationParent string                   `json:"publish_location_parent,omitempty"`
@@ -480,8 +488,11 @@ func (s *Server) handleSandboxBootstrap(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req SandboxTaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SandboxID == "" || req.RunID == "" || req.Version != SnapshotPrepareSchemaVersion {
-		writeJSON(w, http.StatusBadRequest, &SandboxTaskSpec{Error: "bad request"})
+	if status := decodeTaskRequest(w, r, taskBootstrapRequestMaxBytes, &req); status != 0 || req.SandboxID == "" || req.RunID == "" || req.Version != ArtifactPrepareSchemaVersion {
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, &SandboxTaskSpec{Error: "bad request"})
 		return
 	}
 	auth, found, err := s.deps.Provider.SandboxTaskAuth(r.Context(), req.SandboxID, req.RunID)
@@ -516,38 +527,41 @@ func (s *Server) handleSandboxBootstrap(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleSandboxPrepare(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerFrom(r.Context())
 	if !ok {
-		writeJSON(w, http.StatusForbidden, &SnapshotPrepareResponse{Error: "no peer credentials"})
+		writeJSON(w, http.StatusForbidden, &ArtifactPrepareResponse{Error: "no peer credentials"})
 		return
 	}
-	var req SnapshotPrepareRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SandboxID == "" || req.RunID == "" {
-		writeJSON(w, http.StatusBadRequest, &SnapshotPrepareResponse{Error: "bad request"})
+	var req ArtifactPrepareRequest
+	if status := decodeTaskRequest(w, r, taskPrepareRequestMaxBytes, &req); status != 0 || req.SandboxID == "" || req.RunID == "" {
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, &ArtifactPrepareResponse{Error: "bad request"})
 		return
 	}
 	auth, found, err := s.deps.Provider.SandboxTaskAuth(r.Context(), req.SandboxID, req.RunID)
 	if err != nil {
 		s.log.Warn("configsock sandbox prepare auth provider", "sid", req.SandboxID, "run_id", req.RunID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, &SnapshotPrepareResponse{Error: "internal error"})
+		writeJSON(w, http.StatusInternalServerError, &ArtifactPrepareResponse{Error: "internal error"})
 		return
 	}
 	if !found {
-		writeJSON(w, http.StatusNotFound, &SnapshotPrepareResponse{Error: "unknown task"})
+		writeJSON(w, http.StatusNotFound, &ArtifactPrepareResponse{Error: "unknown task"})
 		return
 	}
 	if !s.taskAuthed("sandbox-prepare:"+req.SandboxID+":"+req.RunID, auth.PidFile, peer) {
-		writeJSON(w, http.StatusForbidden, &SnapshotPrepareResponse{Error: "not authorized"})
+		writeJSON(w, http.StatusForbidden, &ArtifactPrepareResponse{Error: "not authorized"})
 		return
 	}
 	final, err := s.deps.Provider.CompleteSandboxPrepare(r.Context(), req.SandboxID, req.RunID, req.Summary)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if IsSnapshotPrepareRejection(err) {
+		if IsArtifactPrepareRejection(err) {
 			status = http.StatusConflict
 		}
-		writeJSON(w, status, &SnapshotPrepareResponse{Error: err.Error()})
+		writeJSON(w, status, &ArtifactPrepareResponse{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, &SnapshotPrepareResponse{Final: final})
+	writeJSON(w, http.StatusOK, &ArtifactPrepareResponse{Final: final})
 }
 
 // handleBuildBootstrap authenticates the exact assigned task before invoking
@@ -560,8 +574,11 @@ func (s *Server) handleBuildBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req BuildTaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
-		writeJSON(w, http.StatusBadRequest, &BuildTaskSpec{Error: "bad request"})
+	if status := decodeTaskRequest(w, r, taskBootstrapRequestMaxBytes, &req); status != 0 || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, &BuildTaskSpec{Error: "bad request"})
 		return
 	}
 	auth, found, err := s.deps.Provider.BuildTaskAuth(r.Context(), req.BuildID, req.RunID)
@@ -598,8 +615,11 @@ func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req BuildPrepareRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
-		writeJSON(w, http.StatusBadRequest, &BuildPrepareResponse{Error: "bad request"})
+	if status := decodeTaskRequest(w, r, taskPrepareRequestMaxBytes, &req); status != 0 || req.BuildID == "" || req.RunID == "" || req.Version != BuildTaskSchemaVersion {
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, &BuildPrepareResponse{Error: "bad request"})
 		return
 	}
 	auth, found, err := s.deps.Provider.BuildTaskAuth(r.Context(), req.BuildID, req.RunID)
@@ -627,6 +647,22 @@ func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, &BuildPrepareResponse{Final: final})
+}
+
+func decodeTaskRequest(w http.ResponseWriter, r *http.Request, maxBytes int64, out any) int {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return http.StatusRequestEntityTooLarge
+		}
+		return http.StatusBadRequest
+	}
+	if err := strictjson.Decode(raw, out); err != nil {
+		return http.StatusBadRequest
+	}
+	return 0
 }
 
 func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {

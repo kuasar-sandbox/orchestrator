@@ -71,7 +71,9 @@ func TestExecSessionMintsTokenWithoutRestartingStartingResume(t *testing.T) {
 		ID: "starting-exec", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(),
 		State:      types.StateStarting, RunID: "starting-run",
-		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64)},
+		LaunchMode:   types.LaunchMemory,
+		APISecret:    deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -144,7 +146,9 @@ func TestExecSessionPreparationWaitsForPreviousCleanupFence(t *testing.T) {
 			Profile: types.ProfileBare, Kind: types.KindImg,
 			Ref: "manifest://" + strings.Repeat("c", 64),
 		}.String(),
-		State: types.StatePaused, SnapshotRef: "manifest://" + strings.Repeat("d", 64),
+		State: types.StatePaused, ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("d", 64),
+		},
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
 	}
@@ -166,7 +170,10 @@ func TestExecSessionPreparationWaitsForPreviousCleanupFence(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		current, _, err := o.ensureResumeAcceptedPrepared(ctx, sb.ID, nil, func(*types.Sandbox) error {
+		current, _, err := o.ensureResumeAcceptedPrepared(ctx, sb.ID, nil, types.ResumeRequest{
+			Trigger: types.ResumeTriggerExecSession,
+			Mode:    types.ResumeAuto,
+		}, func(*types.Sandbox) error {
 			validateOnce.Do(func() { close(validated) })
 			return nil
 		}, func(*types.Sandbox) error {
@@ -238,12 +245,14 @@ func TestExecSessionImportsBeforeReturningAndResumesAsynchronously(t *testing.T)
 	source := &types.Sandbox{
 		ID: "exec-portable-source", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("d", 64)}.String(), State: types.StatePaused,
-		SnapshotRef: "manifest://" + strings.Repeat("e", 64),
-		APISecret:   apiSecret, ManifestKey: manifestKey,
+		ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("e", 64),
+		},
+		APISecret: apiSecret, ManifestKey: manifestKey,
 		CreatedUnix: 1, DeadlineUnix: 100,
 	}
 	materializeTestSandboxCredentials(t, source)
-	migrationToken, err := o.mintSandboxToken(source, source.SnapshotRef)
+	migrationToken, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +338,9 @@ func TestExecSessionRejectsInvalidConditionsBeforeActivation(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "paused-invalid-condition", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
-		State:      types.StatePaused, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		State:      types.StatePaused, ResumeSource: types.ResumeSource{
+			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64),
+		}, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)

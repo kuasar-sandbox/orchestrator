@@ -12,13 +12,29 @@ const (
 	SandboxStateDead     SandboxState = "dead"
 )
 
-// SnapshotLocation classifies a persisted checkpoint reference.
-type SnapshotLocation string
+// ArtifactLocation classifies a persisted resume artifact reference. Location
+// is independent of whether the artifact is a Sandbox or Snapshot.
+type ArtifactLocation string
 
 const (
-	SnapshotLocationNone   SnapshotLocation = ""
-	SnapshotLocationLocal  SnapshotLocation = "local"
-	SnapshotLocationRemote SnapshotLocation = "remote"
+	ArtifactLocationNone   ArtifactLocation = ""
+	ArtifactLocationLocal  ArtifactLocation = "local"
+	ArtifactLocationRemote ArtifactLocation = "remote"
+)
+
+type ResumeSourceKind string
+
+const (
+	ResumeSourceSandbox  ResumeSourceKind = "sandbox"
+	ResumeSourceSnapshot ResumeSourceKind = "snapshot"
+)
+
+type LaunchMode string
+
+const (
+	LaunchModeImage  LaunchMode = "image"
+	LaunchModeCold   LaunchMode = "cold"
+	LaunchModeMemory LaunchMode = "memory"
 )
 
 // SandboxClusterView is the durable cluster ownership projection. A nil value
@@ -50,8 +66,11 @@ type SandboxView struct {
 	InnerIP                string
 	VSwitchPort            string
 	PortMAC                string
-	SnapshotRef            string
-	SnapshotLocation       SnapshotLocation
+	ResumeSourceKind       ResumeSourceKind
+	ResumeSourceRef        string
+	ArtifactLocation       ArtifactLocation
+	AutoPauseMemory        bool
+	LaunchMode             LaunchMode
 	APISecretFingerprint   string
 	ManifestKeyFingerprint string
 }

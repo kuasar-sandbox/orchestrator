@@ -210,13 +210,15 @@ type Command struct {
 	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdExecSession | CmdDelete | CmdKey* | CmdBuildRegister
 	SID   string `json:"sid,omitempty"`
 	// create and lifecycle credential binding
-	TemplateRef          string                 `json:"template_ref,omitempty"`           // snapshot template ref (cold start = fast restore)
+	TemplateRef          string                 `json:"template_ref,omitempty"`           // canonical img/sbx/snp template ref
 	Profile              string                 `json:"profile,omitempty"`                // sandbox profile; also used by build_register
 	APISecretFingerprint string                 `json:"api_secret_fingerprint,omitempty"` // create selects an installed pair; later commands match the existing row
 	Config               map[string]string      `json:"config,omitempty"`                 // merged sandbox config (node default ⊕ group ⊕ create)
 	Cluster              *ClusterSandboxContext `json:"cluster,omitempty"`                // Registry-owned group/route/stable identity
 	MigrationToken       string                 `json:"migration_token,omitempty"`        // connect import when the exact target is absent
 	TimeoutSeconds       int                    `json:"timeout_seconds,omitempty"`        // connect: positive requested lifetime applied before acknowledgement
+	Memory               *bool                  `json:"memory,omitempty"`                 // connect: nil=auto, true=memory, false=cold
+	AutoPauseMemory      *bool                  `json:"auto_pause_memory,omitempty"`      // create: nil defaults true
 	TTLSeconds           int64                  `json:"ttl_seconds,omitempty"`            // exec_session: 0 is long-lived; positive is relative to node time
 	ExecConditions       []string               `json:"exec_conditions,omitempty"`        // exec_session: ordered CEL sources; empty is unrestricted
 	// key_put / key_drop

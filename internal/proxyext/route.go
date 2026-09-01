@@ -287,7 +287,7 @@ func projectRoute(route routesync.RouteEntry, revision uint64) proxyextension.Ro
 		Profile: proxyextension.Profile(route.Profile), TemplateID: route.TemplateID,
 		State: proxyextension.RouteState(route.State), RunID: route.RunID,
 		EnvdUDS: route.EnvdUDS, CIUDS: route.CiUDS, FloatingIP: route.FloatingIP,
-		SnapshotLocation:       proxyextension.SnapshotLocation(route.SnapshotLocation),
+		ArtifactLocation:       proxyextension.ArtifactLocation(route.ArtifactLocation),
 		APISecretFingerprint:   route.APISecretFingerprint,
 		ManifestKeyFingerprint: route.ManifestKeyFingerprint, Revision: revision,
 	}

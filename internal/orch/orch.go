@@ -77,6 +77,8 @@ type Orchestrator struct {
 
 	deadlineIntentMu sync.Mutex
 	deadlineIntents  map[string]struct{} // paused sandboxes whose next resume must preserve an explicit deadline
+	recoveryMu       sync.Mutex
+	recoveredResumes []*types.Sandbox // cleaned durable starting resumes awaiting run-pool startup
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -120,7 +122,7 @@ type Orchestrator struct {
 	// listener starts. The raw resource_listen socket is never a sandbox policy
 	// source.
 	resourceControllerSocketIdentity string
-	snapshotPublisher                func(context.Context, *types.Sandbox, string) (string, error)
+	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error)
 	removeBuildRuntimeDir            func(string) error
 	// extensionObserver is nil in the built-in path. The one nil branch at each
 	// committed transition avoids hubs, queues, and background work otherwise.
@@ -215,7 +217,7 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 	if err := o.builderRunPool.Start(ctx); err != nil {
 		return fmt.Errorf("start builder pool: %w", err)
 	}
-	return nil
+	return o.startRecoveredResumes(ctx)
 }
 
 // SetProxyRouteBarrierCoordinator wires the external proxy registration lease
@@ -258,7 +260,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if o.extensionSandboxHook != nil {
 		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginDirect, sid, &conductorextension.SandboxCreateRequest{
 			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: req.TimeoutSec,
-			Metadata: cloneStringMap(req.Metadata), Env: cloneStringMap(req.EnvVars), Secure: req.Secure, MMDS: cloneString(req.MMDSHeader),
+			Metadata: cloneStringMap(req.Metadata), Env: cloneStringMap(req.EnvVars), Secure: req.Secure,
+			AutoPauseMemory: cloneBool(req.AutoPauseMemory), MMDS: cloneString(req.MMDSHeader),
 		})
 		if err != nil {
 			return nil, err
@@ -277,22 +280,33 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 			return nil, fmt.Errorf("%w: extension changed core-owned sandbox profile", api.ErrBadRequest)
 		}
 		tmpl, meta, mmdsDoc, credentials = finalTemplate, finalMetadata, finalMMDS, finalCredentials
-		req.TimeoutSec, req.EnvVars, req.Secure, req.MMDSHeader = candidate.TimeoutSeconds, cloneStringMap(candidate.Env), candidate.Secure, cloneString(candidate.MMDS)
+		req.TimeoutSec, req.EnvVars, req.Secure, req.AutoPauseMemory, req.MMDSHeader =
+			candidate.TimeoutSeconds, cloneStringMap(candidate.Env), candidate.Secure, cloneBool(candidate.AutoPauseMemory), cloneString(candidate.MMDS)
+	}
+	launchMode, err := types.LaunchModeForTemplate(tmpl.Kind)
+	if err != nil {
+		return nil, err
+	}
+	autoPauseMemory := true
+	if req.AutoPauseMemory != nil {
+		autoPauseMemory = *req.AutoPauseMemory
 	}
 
 	sb := &types.Sandbox{
-		ID:           sid,
-		Profile:      tmpl.Profile,
-		TemplateID:   tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
-		State:        types.StateStarting,
-		RunDir:       o.cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:      o.cfg.Paths.BaseRoot + "/" + sid,
-		APISecret:    pair.APISecret,
-		ManifestKey:  pair.ManifestKey,
-		Metadata:     meta,
-		Env:          req.EnvVars,
-		CreatedUnix:  time.Now().Unix(),
-		DeadlineUnix: time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
+		ID:              sid,
+		Profile:         tmpl.Profile,
+		TemplateID:      tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
+		State:           types.StateStarting,
+		LaunchMode:      launchMode,
+		AutoPauseMemory: autoPauseMemory,
+		RunDir:          o.cfg.Paths.RunRoot + "/" + sid,
+		BaseDir:         o.cfg.Paths.BaseRoot + "/" + sid,
+		APISecret:       pair.APISecret,
+		ManifestKey:     pair.ManifestKey,
+		Metadata:        meta,
+		Env:             req.EnvVars,
+		CreatedUnix:     time.Now().Unix(),
+		DeadlineUnix:    time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),
 	}
 	if err := materializeSandboxCredentials(sb, credentials); err != nil {
 		return nil, fmt.Errorf("orch: create credentials: %w", err)
@@ -413,6 +427,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err != nil {
 		return nil, nil, err
 	}
+	attempt.SetLaunchMode(sb.LaunchMode)
 	if err := lifecycleCtx.Err(); err != nil {
 		o.launches.Finish(attempt, err)
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
@@ -599,8 +614,8 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	if preparation == nil {
 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
 	}
-	if preparation.RestoreRef != "" {
-		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation)
+	if preparation.Source.Valid() {
+		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation)
 	}
 	prepareStarted := time.Now()
 	prepareLogged := false
@@ -785,6 +800,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	running := o.mutateCached(sb.ID, func(cached *types.Sandbox) {
 		cached.State = types.StateRunning
 		cached.RunID = sb.RunID
+		cached.LaunchMode = ""
 	})
 	if running == nil {
 		running, err = o.st.Get(ctx, sb.ID)
@@ -795,15 +811,18 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 			o.log.Error("reload committed sandbox failed", "sid", sb.ID, "run_id", sb.RunID, "err", err)
 			running = cloneSandbox(sb)
 			running.State = types.StateRunning
+			running.LaunchMode = ""
 		}
 		if running == nil || running.State != types.StateRunning || running.RunID != sb.RunID {
 			o.log.Error("committed sandbox cache invariant failed", "sid", sb.ID, "run_id", sb.RunID)
 			running = cloneSandbox(sb)
 			running.State = types.StateRunning
+			running.LaunchMode = ""
 		}
 		o.cache(running)
 	}
 	sb.State = types.StateRunning
+	sb.LaunchMode = ""
 	sb.DeadlineUnix = running.DeadlineUnix
 	o.publishUpsert(running)
 	o.observeSandboxUpsert(running)
@@ -1148,9 +1167,12 @@ func (o *Orchestrator) killSandboxLocked(ctx context.Context, sb *types.Sandbox)
 	return true, nil
 }
 
-func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
+func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
+	if err := validateCaptureRequest(request); err != nil {
+		return err
+	}
 	if o.extensionSandboxHook != nil {
-		return o.pauseWithExtension(ctx, id, apiKey, actionOverride)
+		return o.pauseWithExtension(ctx, id, apiKey, request)
 	}
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
@@ -1168,14 +1190,16 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, actionOverr
 	if sb.State == types.StateStarting {
 		return api.ErrSandboxStarting
 	}
-	policy, err := o.resolveCheckpointPolicy(sb.Metadata, actionOverride)
-	if err != nil {
-		return err
+	if request.Kind == types.CaptureSnapshot {
+		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, request.SnapshotPolicy)
+		if err != nil {
+			return err
+		}
 	}
-	return o.pauseSandboxLocked(ctx, sb, policy)
+	return o.pauseSandboxLocked(ctx, sb, request)
 }
 
-func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, actionOverride sandboxcfg.CheckpointPolicy) error {
+func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
 	unlock, err := o.lockLifecycleMutation(ctx, id)
 	if err != nil {
 		return err
@@ -1197,14 +1221,17 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 		unlock()
 		return api.ErrAlreadyPaused
 	}
-	if _, err := o.resolveCheckpointPolicy(sandbox.Metadata, actionOverride); err != nil {
-		unlock()
-		return err
+	if request.Kind == types.CaptureSnapshot {
+		if _, err := o.resolveSnapshotPolicy(sandbox.Metadata, request.SnapshotPolicy); err != nil {
+			unlock()
+			return err
+		}
 	}
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationPause, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Pause = &conductorextension.SandboxPauseRequest{
-		CheckpointMergeRef: cloneBool(actionOverride.MergeRef), CheckpointDropCaches: cloneBool(actionOverride.DropCaches),
+		CaptureKind:        conductorextension.CaptureKind(request.Kind),
+		CheckpointMergeRef: cloneBool(request.SnapshotPolicy.MergeRef), CheckpointDropCaches: cloneBool(request.SnapshotPolicy.DropCaches),
 	}
 	operationID := operation.ID
 	unlock()
@@ -1218,6 +1245,9 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	candidate := cloneSandboxPauseRequest(operation.Pause)
 	if candidate == nil {
 		return fmt.Errorf("%w: extension removed pause candidate", api.ErrBadRequest)
+	}
+	if types.CaptureKind(candidate.CaptureKind) != request.Kind {
+		return fmt.Errorf("%w: extension changed core-owned pause capture kind", api.ErrBadRequest)
 	}
 
 	unlock, err = o.lockLifecycleMutation(ctx, id)
@@ -1235,17 +1265,26 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 	if !sandboxPreconditionMatches(precondition, current) {
 		return api.ErrSandboxChanged
 	}
-	finalPolicy, err := o.resolveCheckpointPolicy(current.Metadata, sandboxcfg.CheckpointPolicy{
-		MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
-	})
-	if err != nil {
+	finalRequest := sandboxcfg.CaptureRequest{
+		Kind: types.CaptureKind(candidate.CaptureKind),
+		SnapshotPolicy: sandboxcfg.SnapshotPolicy{
+			MergeRef: cloneBool(candidate.CheckpointMergeRef), DropCaches: cloneBool(candidate.CheckpointDropCaches),
+		},
+	}
+	if err := validateCaptureRequest(finalRequest); err != nil {
 		return err
 	}
-	return o.pauseSandboxLocked(ctx, current, finalPolicy)
+	if finalRequest.Kind == types.CaptureSnapshot {
+		finalRequest.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, finalRequest.SnapshotPolicy)
+		if err != nil {
+			return err
+		}
+	}
+	return o.pauseSandboxLocked(ctx, current, finalRequest)
 }
 
-// pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
-// and the reaper's auto-suspend (no api key: the caller has already authorized).
+// pauseSandbox captures a running sandbox and stops it — the work behind the
+// reaper's auto-suspend (no API key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
 	unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
 	if err != nil {
@@ -1266,14 +1305,28 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if current.State == types.StateStarting {
 		return api.ErrSandboxStarting
 	}
-	policy, err := o.resolveCheckpointPolicy(current.Metadata, sandboxcfg.CheckpointPolicy{})
-	if err != nil {
-		return err
+	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
+	if current.AutoPauseMemory {
+		request.Kind = types.CaptureSnapshot
+		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(current.Metadata, sandboxcfg.SnapshotPolicy{})
+		if err != nil {
+			return err
+		}
 	}
-	return o.pauseSandboxLocked(ctx, current, policy)
+	return o.pauseSandboxLocked(ctx, current, request)
 }
 
-func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) error {
+func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
+	if !request.Kind.Valid() {
+		return fmt.Errorf("%w: invalid capture kind %q", api.ErrBadRequest, request.Kind)
+	}
+	if request.Kind == types.CaptureSandbox && !request.SnapshotPolicy.Empty() {
+		return fmt.Errorf("%w: snapshot-only checkpoint options require snapshot capture", api.ErrBadRequest)
+	}
+	return nil
+}
+
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) error {
 	if sb.State == types.StatePaused {
 		return api.ErrAlreadyPaused
 	}
@@ -1285,16 +1338,17 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		return err
 	}
 	defer finish()
-	o.log.Info("checkpoint policy resolved",
+	o.log.Info("pause capture resolved",
 		"sid", sb.ID,
+		"capture_kind", request.Kind,
 		"mode", o.cfg.Checkpoint.Mode,
-		"merge_ref", checkpointPolicyValue(policy.MergeRef),
-		"drop_caches", checkpointPolicyValue(policy.DropCaches))
-	ref, err := o.snapshot(opCtx, sb, policy)
+		"merge_ref", checkpointPolicyValue(request.SnapshotPolicy.MergeRef),
+		"drop_caches", checkpointPolicyValue(request.SnapshotPolicy.DropCaches))
+	result, err := o.capture(opCtx, sb, request)
 	if err != nil {
 		return err
 	}
-	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, ref)
+	changed, err := o.st.CommitRunningPaused(opCtx, sb.ID, sb.RunID, result.Source)
 	if err != nil {
 		return fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
 	}
@@ -1302,26 +1356,75 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		return fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
 	}
 	paused := cloneSandbox(sb)
-	paused.SnapshotRef = ref
+	paused.ResumeSource = result.Source
+	paused.LaunchMode = ""
 	paused.State = types.StatePaused
-	o.cache(paused)
 
 	cleanupCtx, cancel := cleanupContext()
 	defer cancel()
-	if paused.RunID != "" {
-		if err := o.lc.Stop(cleanupCtx, o.runnerUnit(paused.RunID)); err != nil {
-			o.log.Warn("pause: stop runner", "sid", paused.ID, "run_id", paused.RunID, "err", err)
-		}
-		if err := o.lc.ResetFailed(cleanupCtx, o.runnerUnit(paused.RunID)); err != nil {
-			o.log.Warn("pause: reset runner", "sid", paused.ID, "run_id", paused.RunID, "err", err)
-		}
+	if err := o.cleanupPausedOwnership(cleanupCtx, paused); err != nil {
+		// Capture and the paused transition are already committed. Retain every
+		// uncleared exact ownership field for admission/restart reconciliation;
+		// returning a cleanup error here would misleadingly invite a second Pause.
+		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
 	}
-	if err := o.vs.Detach(cleanupCtx, paused.VswitchPort); err != nil {
-		o.log.Warn("pause: detach vswitch port", "sid", paused.ID, "port", paused.VswitchPort, "err", err)
-	}
+	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	o.observeSandboxUpsert(paused)
 	return nil
+}
+
+// cleanupPausedOwnership releases and then exact-CAS-clears each resource
+// independently. A successful detach must never leave a reusable port in the
+// row merely because runner cleanup failed, and vice versa.
+func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.Sandbox) error {
+	if sb == nil || sb.State != types.StatePaused {
+		return errors.New("orch: paused ownership cleanup requires a paused sandbox")
+	}
+	var cleanupErrs []error
+	if runID := sb.RunID; runID != "" {
+		stopErr := o.lc.Stop(ctx, o.runnerUnit(runID))
+		resetErr := o.lc.ResetFailed(ctx, o.runnerUnit(runID))
+		if stopErr == nil && resetErr == nil {
+			changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
+			if err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			} else if !changed {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: paused runner ownership changed for %s", sb.ID))
+			} else {
+				sb.RunID = ""
+			}
+		} else {
+			cleanupErrs = append(cleanupErrs,
+				errors.Join(
+					wrapCleanupError("stop paused runner", stopErr),
+					wrapCleanupError("reset paused runner", resetErr),
+				),
+			)
+		}
+	}
+	if port := sb.VswitchPort; port != "" {
+		if err := o.vs.Detach(ctx, port); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: detach paused port %s: %w", port, err))
+		} else {
+			changed, err := o.st.ClearPausedNetwork(ctx, sb.ID, port)
+			if err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			} else if !changed {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: paused network ownership changed for %s", sb.ID))
+			} else {
+				sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
+			}
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func wrapCleanupError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("orch: %s: %w", operation, err)
 }
 
 func (o *Orchestrator) beginPauseOperation(requestCtx context.Context) (context.Context, func(), error) {
@@ -1335,9 +1438,9 @@ func (o *Orchestrator) beginPauseOperation(requestCtx context.Context) (context.
 	if err != nil {
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
 	}
-	// A snapshot request is not canceled by closing its ctl.sock client. Once
+	// A capture request is not canceled by closing its ctl.sock client. Once
 	// accepted, killing that client only loses the completion response while the
-	// runtime continues to commit the snapshot and destroy the VM.
+	// runtime continues to commit the E/S artifact and destroy the VM.
 	return context.WithoutCancel(requestCtx), finish, nil
 }
 
@@ -1351,21 +1454,21 @@ func checkpointPolicyValue(value *bool) string {
 	return "false"
 }
 
-func (o *Orchestrator) nodeCheckpointPolicy() sandboxcfg.CheckpointPolicy {
-	return sandboxcfg.CloneCheckpointPolicy(sandboxcfg.CheckpointPolicy{
+func (o *Orchestrator) nodeSnapshotPolicy() sandboxcfg.SnapshotPolicy {
+	return sandboxcfg.CloneSnapshotPolicy(sandboxcfg.SnapshotPolicy{
 		MergeRef:   o.cfg.Checkpoint.MergeRef,
 		DropCaches: o.cfg.Checkpoint.DropCaches,
 	})
 }
 
-func checkpointMetadataPolicy(metadata map[string]string) (sandboxcfg.CheckpointPolicy, error) {
+func checkpointMetadataPolicy(metadata map[string]string) (sandboxcfg.SnapshotPolicy, error) {
 	raw, ok := metadata[sandboxcfg.NsCheckpoint]
 	if !ok {
-		return sandboxcfg.CheckpointPolicy{}, nil
+		return sandboxcfg.SnapshotPolicy{}, nil
 	}
-	policy, err := sandboxcfg.ParseCheckpointPolicyJSON(raw)
+	policy, err := sandboxcfg.ParseSnapshotPolicyJSON(raw)
 	if err != nil {
-		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("metadata[%q]: %w", sandboxcfg.NsCheckpoint, err)
+		return sandboxcfg.SnapshotPolicy{}, fmt.Errorf("metadata[%q]: %w", sandboxcfg.NsCheckpoint, err)
 	}
 	return policy, nil
 }
@@ -1378,33 +1481,34 @@ func (o *Orchestrator) validateCreateCheckpointMode(metadata map[string]string) 
 	return nil
 }
 
-// resolveCheckpointPolicy validates historical metadata under the lifecycle
+// resolveSnapshotPolicy validates historical metadata under the lifecycle
 // lock and resolves capture policy field by field: node < metadata < action.
-func (o *Orchestrator) resolveCheckpointPolicy(metadata map[string]string, actionOverride sandboxcfg.CheckpointPolicy) (sandboxcfg.CheckpointPolicy, error) {
+func (o *Orchestrator) resolveSnapshotPolicy(metadata map[string]string, actionOverride sandboxcfg.SnapshotPolicy) (sandboxcfg.SnapshotPolicy, error) {
 	metadataPolicy, err := checkpointMetadataPolicy(metadata)
 	if err != nil {
-		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		return sandboxcfg.SnapshotPolicy{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	switch o.cfg.Checkpoint.Mode {
 	case config.CheckpointLocal, config.CheckpointBundle:
-		policy := sandboxcfg.OverlayCheckpointPolicy(o.nodeCheckpointPolicy(), metadataPolicy)
-		return sandboxcfg.OverlayCheckpointPolicy(policy, actionOverride), nil
+		policy := sandboxcfg.OverlaySnapshotPolicy(o.nodeSnapshotPolicy(), metadataPolicy)
+		return sandboxcfg.OverlaySnapshotPolicy(policy, actionOverride), nil
 	default:
-		return sandboxcfg.CheckpointPolicy{}, fmt.Errorf("%w: unsupported checkpoint.mode %q", api.ErrBadRequest, o.cfg.Checkpoint.Mode)
+		return sandboxcfg.SnapshotPolicy{}, fmt.Errorf("%w: unsupported checkpoint.mode %q", api.ErrBadRequest, o.cfg.Checkpoint.Mode)
 	}
 }
 
-func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
+func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, options api.ConnectOptions) (*types.Sandbox, error) {
 	_, err := o.prepareStandaloneTarget(ctx, id, apiKey, migrationToken)
 	if err != nil {
 		return nil, err
 	}
 	var requestedDeadline *int64
-	if timeoutSec > 0 {
-		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if options.TimeoutSec > 0 {
+		deadline := time.Now().Add(time.Duration(options.TimeoutSec) * time.Second).Unix()
 		requestedDeadline = &deadline
 	}
-	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, func(current *types.Sandbox) error {
+	request := types.ResumeRequest{Trigger: types.ResumeTriggerConnect, Mode: types.ResumeModeForMemory(options.Memory)}
+	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, request, func(current *types.Sandbox) error {
 		if !ownsSandbox(current, apiKey) {
 			return api.ErrNotFound
 		}
@@ -1420,13 +1524,13 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 // are checked before the migration token or MMDS request is parsed and ignore
 // both completely. A real import admits routes only from the token and accepts
 // request-side initial secret values only.
-func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int, metadata map[string]string, header *string) (*types.Sandbox, error) {
+func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, options api.ConnectOptions, metadata map[string]string, header *string) (*types.Sandbox, error) {
 	existing, err := o.st.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if existing != nil || migrationToken == "" {
-		return o.Connect(ctx, id, apiKey, "", timeoutSec)
+		return o.Connect(ctx, id, apiKey, "", options)
 	}
 	if len(migrationToken) > migrationtoken.MaxWireSize {
 		return nil, migrationtoken.ErrTokenTooLarge
@@ -1435,11 +1539,12 @@ func (o *Orchestrator) ConnectWithMMDS(ctx context.Context, id, apiKey, migratio
 		return nil, err
 	}
 	var requestedDeadline *int64
-	if timeoutSec > 0 {
-		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+	if options.TimeoutSec > 0 {
+		deadline := time.Now().Add(time.Duration(options.TimeoutSec) * time.Second).Unix()
 		requestedDeadline = &deadline
 	}
-	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, func(current *types.Sandbox) error {
+	request := types.ResumeRequest{Trigger: types.ResumeTriggerConnect, Mode: types.ResumeModeForMemory(options.Memory)}
+	sb, _, err := o.ensureResumeAccepted(ctx, id, requestedDeadline, request, func(current *types.Sandbox) error {
 		if !ownsSandbox(current, apiKey) {
 			return api.ErrNotFound
 		}
@@ -1507,19 +1612,21 @@ func (o *Orchestrator) ensureResumeAccepted(
 	ctx context.Context,
 	sid string,
 	requestedDeadline *int64,
+	request types.ResumeRequest,
 	validate func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
-	return o.ensureResumeAcceptedFrom(ctx, sid, requestedDeadline, conductorextension.SandboxOriginDirect, validate)
+	return o.ensureResumeAcceptedFrom(ctx, sid, requestedDeadline, request, conductorextension.SandboxOriginDirect, validate)
 }
 
 func (o *Orchestrator) ensureResumeAcceptedFrom(
 	ctx context.Context,
 	sid string,
 	requestedDeadline *int64,
+	request types.ResumeRequest,
 	origin conductorextension.SandboxOperationOrigin,
 	validate func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
-	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, nil)
+	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, origin, validate, nil)
 }
 
 // ensureResumeAcceptedPrepared adds a lightweight operation-specific prepare
@@ -1531,20 +1638,25 @@ func (o *Orchestrator) ensureResumeAcceptedPrepared(
 	ctx context.Context,
 	sid string,
 	requestedDeadline *int64,
+	request types.ResumeRequest,
 	validate func(*types.Sandbox) error,
 	prepare func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
-	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, conductorextension.SandboxOriginDirect, validate, prepare)
+	return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, conductorextension.SandboxOriginDirect, validate, prepare)
 }
 
 func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 	ctx context.Context,
 	sid string,
 	requestedDeadline *int64,
+	request types.ResumeRequest,
 	origin conductorextension.SandboxOperationOrigin,
 	validate func(*types.Sandbox) error,
 	prepare func(*types.Sandbox) error,
 ) (*types.Sandbox, *launchAttempt, error) {
+	if !request.Trigger.Valid() || !request.Mode.Valid() {
+		return nil, nil, fmt.Errorf("%w: invalid resume request trigger=%q mode=%q", api.ErrBadRequest, request.Trigger, request.Mode)
+	}
 	admissionStarted := time.Now()
 	unlock := o.lifecycle.Lock(sid)
 	locked := true
@@ -1587,6 +1699,15 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		}
 		return cloneSandbox(sb), nil, nil
 	case types.StateStarting:
+		if sb.ResumeSource.Valid() && request.Mode != types.ResumeAuto {
+			requestedLaunch := types.LaunchCold
+			if request.Mode == types.ResumeMemory {
+				requestedLaunch = types.LaunchMemory
+			}
+			if sb.LaunchMode != requestedLaunch {
+				return nil, nil, fmt.Errorf("%w: starting launch mode is %s", types.ErrLaunchModeConflict, sb.LaunchMode)
+			}
+		}
 		if prepare != nil {
 			if err := prepare(sb); err != nil {
 				return nil, nil, err
@@ -1605,7 +1726,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		}
 		attempt, found := o.launches.Lookup(sid)
 		if !found {
-			if requestedDeadline != nil && sb.SnapshotRef != "" {
+			if requestedDeadline != nil && sb.ResumeSource.Valid() {
 				o.markDeadlineIntent(sid)
 			}
 			o.log.Error("sandbox starting without active launch attempt", "sid", sid, "invariant", "starting_without_launch_owner")
@@ -1626,12 +1747,29 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			if waitErr := previous.wait(ctx); waitErr != nil && ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, prepare)
+			return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, origin, validate, prepare)
+		}
+		// A crash or partial cleanup after CommitRunningPaused may leave exact
+		// runner/network ownership on the durable paused row. Reconcile it before
+		// BeginResume can clear those fields and lose the cleanup identities.
+		if sb.RunID != "" || sb.VswitchPort != "" {
+			cleanupCtx, cancel := cleanupContext()
+			cleanupErr := o.cleanupPausedOwnership(cleanupCtx, sb)
+			cancel()
+			if cleanupErr != nil {
+				return nil, nil, cleanupErr
+			}
+			o.cache(sb)
+			o.publishUpsert(sb)
+			o.observeSandboxUpsert(sb)
 		}
 		if o.extensionSandboxHook != nil {
 			precondition := sandboxPrecondition(sb)
 			operation := newSandboxOperation(conductorextension.SandboxOperationResume, origin, sid, sb)
-			operation.Resume = &conductorextension.SandboxResumeRequest{RequestedDeadlineUnix: cloneInt64(requestedDeadline)}
+			operation.Resume = &conductorextension.SandboxResumeRequest{
+				RequestedDeadlineUnix: cloneInt64(requestedDeadline),
+				Mode:                  conductorextension.ResumeMode(request.Mode), Trigger: conductorextension.ResumeTrigger(request.Trigger),
+			}
 			operationID := operation.ID
 			unlock()
 			locked = false
@@ -1647,6 +1785,9 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			}
 			if candidate.RequestedDeadlineUnix != nil && *candidate.RequestedDeadlineUnix < 0 {
 				return nil, nil, fmt.Errorf("%w: resume deadline must be non-negative", api.ErrBadRequest)
+			}
+			if types.ResumeTrigger(candidate.Trigger) != request.Trigger || types.ResumeMode(candidate.Mode) != request.Mode {
+				return nil, nil, fmt.Errorf("%w: extension changed core-owned resume trigger or mode", api.ErrBadRequest)
 			}
 			if err := ctx.Err(); err != nil {
 				return nil, nil, err
@@ -1671,7 +1812,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 				// request so the established idempotent path can join it.
 				unlock()
 				locked = false
-				return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, origin, validate, prepare)
+				return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, origin, validate, prepare)
 			}
 			if !sandboxPreconditionMatches(precondition, current) {
 				return nil, nil, api.ErrSandboxChanged
@@ -1679,6 +1820,11 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			sb = current
 			requestedDeadline = cloneInt64(candidate.RequestedDeadlineUnix)
 		}
+		launchMode, err := types.ResolveLaunchMode(sb.ResumeSource, request.Mode)
+		if err != nil {
+			return nil, nil, err
+		}
+		sb.LaunchMode = launchMode
 		// Stored metadata is trusted only after its pure parsers succeed. Do not
 		// make starting durable if the worker could never consume its inputs.
 		tmpl, err := types.ParseTemplateID(sb.TemplateID)
@@ -1698,23 +1844,31 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 				return nil, nil, err
 			}
 		}
-		attempt, err := o.launches.Claim(lifecycleCtx, sid, launchResume)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := lifecycleCtx.Err(); err != nil {
-			o.launches.Finish(attempt, err)
-			return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
-		}
 		deadline := o.resumeDeadline(sb, requestedDeadline)
-		changed, err := o.st.BeginResume(ctx, sid, deadline)
+		changed, err := o.st.BeginResume(ctx, sid, deadline, launchMode)
 		if err != nil {
-			o.launches.Finish(attempt, err)
 			return nil, nil, err
 		}
 		if !changed {
-			o.launches.Finish(attempt, errLaunchOwnershipLost)
 			return nil, nil, errLaunchOwnershipLost
+		}
+		// The durable row is authoritative: create the process-local attempt only
+		// after BeginResume has atomically persisted starting + launch_mode. Claim
+		// cannot normally fail while the per-SID lifecycle lock is held; if the
+		// lifecycle root closes in this narrow window, return the exact empty-owner
+		// starting row to its original paused source.
+		attempt, err := o.launches.Claim(lifecycleCtx, sid, launchResume)
+		if err != nil {
+			cleanupCtx, cancel := cleanupContext()
+			rolledBack, rollbackErr := o.st.RollbackStartingPaused(cleanupCtx, sid, "")
+			cancel()
+			if rollbackErr != nil {
+				return nil, nil, errors.Join(err, fmt.Errorf("orch: rollback unowned accepted resume %s: %w", sid, rollbackErr))
+			}
+			if !rolledBack {
+				return nil, nil, errors.Join(err, fmt.Errorf("orch: rollback unowned accepted resume %s: %w", sid, errLaunchOwnershipLost))
+			}
+			return nil, nil, err
 		}
 		if exportState, found := o.exports.ResumeAccepted(sid, api.ErrExportPreempted); found {
 			outcome := "preempted"
@@ -1729,8 +1883,10 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			o.markDeadlineIntent(sid)
 		}
 		attempt.SetAcceptedAt(time.Now())
+		attempt.SetLaunchMode(launchMode)
 		starting := cloneSandbox(sb)
 		starting.State = types.StateStarting
+		starting.LaunchMode = launchMode
 		starting.DeadlineUnix = deadline
 		starting.RunID = ""
 		starting.FloatingIP = ""
@@ -1778,7 +1934,7 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 	if sb.State == types.StatePaused {
 		o.markDeadlineIntent(id)
 	} else if sb.State == types.StateStarting {
-		if attempt, found := o.launches.Lookup(id); (found && attempt.Kind() == launchResume) || (!found && sb.SnapshotRef != "") {
+		if attempt, found := o.launches.Lookup(id); (found && attempt.Kind() == launchResume) || (!found && sb.ResumeSource.Valid()) {
 			o.markDeadlineIntent(id)
 		}
 	}
@@ -1811,10 +1967,10 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 // acceptance. It is built before route publication, network attach, resource
 // controller admission, cgroup creation, or runner assignment.
 type launchPreparation struct {
-	Spec       sandboxcfg.SandboxSpec
-	RestoreRef string
-	Network    sandboxcfg.NetworkSpec
-	Resources  rtconfig.ResourcesConfig
+	Spec      sandboxcfg.SandboxSpec
+	Source    types.ResumeSource
+	Network   sandboxcfg.NetworkSpec
+	Resources rtconfig.ResourcesConfig
 }
 
 func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*launchPreparation, error) {
@@ -1825,12 +1981,12 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 	if err != nil {
 		return nil, err
 	}
-	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
-	if restoreRef != "" {
-		// Snapshot content is intentionally unavailable during synchronous
+	source := sandboxcfg.SourceForLaunch(sb, tmpl)
+	if source.Valid() {
+		// Artifact content is intentionally unavailable during synchronous
 		// admission. Request-owned fields and immutable node defaults are still
 		// checked here; inherited fields and capacity arrive asynchronously from
-		// the exact runner's task-local root reader.
+		// the exact runner's task-local E/S reader.
 		dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 		if spec.Resource.Startup != nil && !dynamic {
 			return nil, fmt.Errorf("%w: %s.startup requires dynamic resource control", api.ErrBadRequest, sandboxcfg.NsResource)
@@ -1838,7 +1994,7 @@ func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandb
 		if _, err := o.resolveNetwork(tmpl.Profile, spec.Network, o.cfg.Sandbox.Network.Hostname); err != nil {
 			return nil, err
 		}
-		return &launchPreparation{Spec: spec, RestoreRef: restoreRef}, nil
+		return &launchPreparation{Spec: spec, Source: source}, nil
 	}
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
@@ -1968,7 +2124,7 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	locations, err := o.singleRefLocations(sandboxcfg.RestoreRefFor(sb, tmpl))
+	locations, err := o.singleRefLocations(tmpl.Ref)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -2021,8 +2177,8 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		Workdir:   sb.RunDir,
 		Env:       sandboxTaskEnv(sb),
 	}
-	restoreRef := sandboxcfg.RestoreRefFor(sb, tmpl)
-	if restoreRef == "" {
+	source := sandboxcfg.SourceForLaunch(sb, tmpl)
+	if !source.Valid() {
 		locations, err := o.singleRefLocations(tmpl.Ref)
 		if err != nil {
 			return nil, false, err
@@ -2041,16 +2197,18 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 			return nil, false, fmt.Errorf("orch: absolute manifest config path: %w", err)
 		}
 	}
-	taskRootRef, err := normalizeSandboxTaskRootRef(restoreRef, sb.RunDir)
+	taskRootRef, err := normalizeSandboxTaskRootRef(source.Ref, sb.RunDir)
 	if err != nil {
 		return nil, false, err
 	}
-	response.Prepare = &configsock.SnapshotPrepareSpec{
+	response.Prepare = &configsock.ArtifactPrepareSpec{
+		RootSourceKind:           string(source.Kind),
 		RootRef:                  taskRootRef,
+		LaunchMode:               string(sb.LaunchMode),
 		ManifestConfig:           manifestConfig,
 		RefLocationParent:        o.cfg.Checkpoint.Remote.RefLocationParent,
 		RelativeDir:              sb.RunDir,
-		MaxRefs:                  maxRequiredSnapshotRefs,
+		MaxRefs:                  maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: deadline.UnixNano(),
 	}
 	return response, true, nil
@@ -2064,7 +2222,7 @@ func normalizeSandboxTaskRootRef(raw, relativeDir string) (string, error) {
 		return filepath.Clean(raw), nil
 	}
 	if !filepath.IsAbs(relativeDir) {
-		return "", fmt.Errorf("orch: relative local snapshot root requires an absolute sandbox run directory")
+		return "", fmt.Errorf("orch: relative local artifact root requires an absolute sandbox run directory")
 	}
 	return filepath.Clean(filepath.Join(relativeDir, raw)), nil
 }
@@ -2077,18 +2235,18 @@ func sandboxTaskEnv(sb *types.Sandbox) map[string]string {
 	}
 }
 
-func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary configsock.SnapshotPrepareSummary) (*configsock.LaunchSpec, error) {
+func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error) {
 	attempt, ok := o.launches.Lookup(sandboxID)
 	if !ok || attempt.RunID() != runID {
-		return nil, configsock.RejectSnapshotPrepare(errLaunchOwnershipLost)
+		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
 	replay, err := attempt.SubmitPrepare(runID, summary)
 	if err != nil {
-		return nil, configsock.RejectSnapshotPrepare(err)
+		return nil, configsock.RejectArtifactPrepare(err)
 	}
 	if replay {
-		o.log.Info("sandbox task snapshot prepare replay", "sid", sandboxID, "run_id", runID,
-			"task_snapshot_prepare_replay_total", 1)
+		o.log.Info("sandbox task artifact prepare replay", "sid", sandboxID, "run_id", runID,
+			"task_artifact_prepare_replay_total", 1)
 	}
 	return attempt.WaitFinalSpec(ctx)
 }
@@ -2106,7 +2264,7 @@ func (o *Orchestrator) singleRefLocations(raw string) (map[string]string, error)
 
 func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.TemplateID, cfgSpec sandboxcfg.SandboxSpec, locations map[string]string) *configsock.LaunchSpec {
 	// The fully resolved network was already rendered by the unique launch
-	// worker. This pure builder only supplies restore/connect CLI arguments.
+	// worker. Artifact selection remains task-local and is never included here.
 	p := o.sandboxParams(sb, tmpl, cfgSpec, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{})
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
@@ -2117,6 +2275,7 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		"--config", o.sandboxConfigPath(sb),
 		"--manifest-config", o.cfg.ManifestConfig,
 		"--run-root", o.cfg.Paths.RunRoot,
+		"--base-root", o.cfg.Paths.BaseRoot,
 		// Route the sandbox's stdio + kernel dmesg to journald from this run-id
 		// unit. App stdout/stderr is tagged "sandbox" with KUASAR_SANDBOX_ID; guest
 		// dmesg is tagged "console" for host-only diagnostics.
@@ -2125,9 +2284,6 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		"--console", "journald=" + configsock.ConsoleTag,
 	}
 	args = appendRefLocationArgs(args, locations)
-	if r := p.RestoreRef(); r != "" {
-		args = append(args, "--restore", r)
-	}
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)
 	}
@@ -2186,10 +2342,10 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 }
 
 // ReconcileSandboxes adopts/cleans sandboxes after an orchestrator restart,
-// using the systemd unit set as the liveness authority. A starting row is never
-// adopted: launch completion was not committed, so an interrupted resume
-// returns to its durable paused snapshot and an interrupted fresh create
-// becomes dead.
+// using the systemd unit set as the liveness authority. Interrupted fresh
+// creates become dead. Interrupted resumes release their old exact runner and
+// network ownership but remain starting with their durable launch_mode; run-pool
+// startup retries that same accepted cold or memory decision.
 func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	units, err := o.lc.List(ctx, o.runnerPattern())
 	if err != nil {
@@ -2204,8 +2360,17 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
 	// collect the dead ones and tear them down after the scan, since teardown +
 	// SetState write the store and must not run while the read cursor is open.
-	var interrupted, dead []*types.Sandbox
+	var paused, interrupted, dead []*types.Sandbox
 	knownRuns := make(map[string]bool)
+	if err := o.st.RangeByState(ctx, types.StatePaused, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
+		paused = append(paused, sb)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if err := o.st.RangeByState(ctx, types.StateStarting, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
@@ -2229,37 +2394,58 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	for _, sb := range interrupted {
-		target := types.StateDead
-		if sb.SnapshotRef != "" {
-			target = types.StatePaused
+	for _, sb := range paused {
+		if sb.RunID != "" || sb.VswitchPort != "" {
+			o.log.Info("reconcile: incomplete paused ownership", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
+			if err := o.cleanupPausedOwnership(ctx, sb); err != nil {
+				return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
+			}
 		}
-		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target)
+		o.cache(sb)
+		o.observeSandboxUpsert(sb)
+	}
+	for _, sb := range interrupted {
+		resume := sb.ResumeSource.Valid()
+		target := types.StateDead
+		if resume {
+			target = types.StateStarting
+		}
+		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target, "launch_mode", sb.LaunchMode)
 		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
 			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
+		}
+		if resume {
+			changed, resetErr := o.st.ResetStartingOwnershipForRecovery(ctx, sb.ID, sb.RunID)
+			if resetErr != nil {
+				return resetErr
+			}
+			if !changed {
+				o.log.Warn("reconcile: interrupted resume ownership changed", "sid", sb.ID, "run_id", sb.RunID)
+				continue
+			}
+			recovered, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				return getErr
+			}
+			if recovered == nil || recovered.State != types.StateStarting || recovered.RunID != "" || recovered.LaunchMode != sb.LaunchMode {
+				return fmt.Errorf("reconcile: recovered resume %s lost durable starting mode", sb.ID)
+			}
+			o.markDeadlineIntent(sb.ID)
+			o.queueRecoveredResume(recovered)
+			o.observeSandboxUpsert(recovered)
+			continue
 		}
 		if target == types.StateDead {
 			if err := os.RemoveAll(sb.BaseDir); err != nil {
 				return fmt.Errorf("reconcile: remove interrupted sandbox base dir %s: %w", sb.ID, err)
 			}
 		}
-		var changed bool
-		if target == types.StatePaused {
-			changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, sb.RunID)
-		} else {
-			changed, err = o.st.RollbackStartingDead(ctx, sb.ID, sb.RunID)
-		}
+		changed, err := o.st.RollbackStartingDead(ctx, sb.ID, sb.RunID)
 		if err != nil {
 			return err
 		}
 		if !changed {
 			o.log.Warn("reconcile: interrupted launch state changed", "sid", sb.ID, "run_id", sb.RunID)
-		} else if target == types.StatePaused {
-			// V1 has no persistent explicit-deadline marker. Conservatively retain
-			// the durable deadline of every interrupted resume so a caller-selected
-			// Connect/SetTimeout value cannot be replaced by the node default after
-			// restart. The intent is consumed by the next exact-run success.
-			o.markDeadlineIntent(sb.ID)
 		}
 		if changed {
 			updated, getErr := o.st.Get(ctx, sb.ID)
@@ -2294,6 +2480,74 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 		_ = o.lc.Stop(ctx, u.Name)
 		_ = o.lc.ResetFailed(ctx, u.Name)
 	}
+	return nil
+}
+
+func (o *Orchestrator) queueRecoveredResume(sb *types.Sandbox) {
+	if sb == nil {
+		return
+	}
+	o.recoveryMu.Lock()
+	o.recoveredResumes = append(o.recoveredResumes, cloneSandbox(sb))
+	o.recoveryMu.Unlock()
+}
+
+func (o *Orchestrator) startRecoveredResumes(ctx context.Context) error {
+	o.recoveryMu.Lock()
+	recovered := o.recoveredResumes
+	o.recoveredResumes = nil
+	o.recoveryMu.Unlock()
+	for i, sb := range recovered {
+		if err := o.startRecoveredResume(ctx, sb); err != nil {
+			o.recoveryMu.Lock()
+			o.recoveredResumes = append(recovered[i:], o.recoveredResumes...)
+			o.recoveryMu.Unlock()
+			return fmt.Errorf("start recovered resume %s: %w", sb.ID, err)
+		}
+	}
+	return nil
+}
+
+func (o *Orchestrator) startRecoveredResume(ctx context.Context, recovered *types.Sandbox) error {
+	if recovered == nil || recovered.ID == "" {
+		return errors.New("recovered resume is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tmpl, err := types.ParseTemplateID(recovered.TemplateID)
+	if err != nil {
+		return err
+	}
+	preparation, err := o.prepareSandboxLaunch(ctx, recovered, tmpl)
+	if err != nil {
+		return err
+	}
+
+	unlock := o.lifecycle.Lock(recovered.ID)
+	defer unlock()
+	current, err := o.st.Get(ctx, recovered.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.State != types.StateStarting || current.RunID != "" ||
+		current.ResumeSource != recovered.ResumeSource || current.LaunchMode != recovered.LaunchMode {
+		return errLaunchOwnershipLost
+	}
+	attempt, err := o.launches.Claim(o.launchContext(), current.ID, launchResume)
+	if err != nil {
+		return err
+	}
+	attempt.SetAcceptedAt(time.Now())
+	attempt.SetLaunchMode(current.LaunchMode)
+	o.markDeadlineIntent(current.ID)
+	o.cache(current)
+	o.publishUpsert(current)
+	o.observeSandboxUpsert(current)
+	work := cloneSandbox(current)
+	o.launches.Start(attempt, func(launchCtx context.Context, owner *launchAttempt) error {
+		return o.runLaunch(launchCtx, owner, work, tmpl, preparation)
+	})
 	return nil
 }
 
@@ -2490,23 +2744,35 @@ func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types
 	return nil
 }
 
-// snapshot pauses+captures the running sandbox via sandbox-ctl and returns its
-// node-local restore ref. The client dials <run-root>/<sid>/ctl.sock and captures
-// either the legacy tarstream or the Manifest Bundle selected by checkpoint.mode.
-func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
-	// Named-location publishing is deliberately outside the VM pause/capture
-	// operation. Pause writes a local checkpoint; export or template finalization
-	// later upgrades it to the configured portable location.
-	return o.snapshotLocal(ctx, sb, policy)
+// capture dispatches one typed pause request. Publication remains outside this
+// runtime operation; both capture paths first create a node-local artifact.
+func (o *Orchestrator) capture(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest) (sandboxcfg.CaptureResult, error) {
+	if err := validateCaptureRequest(request); err != nil {
+		return sandboxcfg.CaptureResult{}, err
+	}
+	var source types.ResumeSource
+	var err error
+	switch request.Kind {
+	case types.CaptureSnapshot:
+		source.Ref, err = o.snapshotLocal(ctx, sb, request.SnapshotPolicy)
+		source.Kind = types.ResumeSourceSnapshot
+	case types.CaptureSandbox:
+		source.Ref, err = o.exportSandboxLocal(ctx, sb)
+		source.Kind = types.ResumeSourceSandbox
+	}
+	if err != nil {
+		return sandboxcfg.CaptureResult{}, err
+	}
+	return sandboxcfg.CaptureResult{Source: source}, nil
 }
 
 // snapshotLocal writes the selected checkpoint format to checkpoint.local_dir/<sid>/
 // and returns its stable .snapshot symlink (node-bound; restorable only on this node). The lower
 // chain (the base template) stays remote, carried by reference.
-func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.CheckpointPolicy) (string, error) {
+func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.SnapshotPolicy) (string, error) {
 	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
 	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
-	args = appendCheckpointPolicyArgs(args, policy)
+	args = appendSnapshotPolicyArgs(args, policy)
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
@@ -2516,7 +2782,19 @@ func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, pol
 	return filepath.Join(dir, sb.ID+".snapshot"), nil
 }
 
-func appendCheckpointPolicyArgs(args []string, policy sandboxcfg.CheckpointPolicy) []string {
+func (o *Orchestrator) exportSandboxLocal(ctx context.Context, sb *types.Sandbox) (string, error) {
+	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
+	args := []string{"export", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
+	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("orch: export sandbox %s (mode %s): %w: %s", sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
+	}
+	return filepath.Join(dir, sb.ID+".sandbox"), nil
+}
+
+func appendSnapshotPolicyArgs(args []string, policy sandboxcfg.SnapshotPolicy) []string {
 	if policy.MergeRef != nil {
 		args = append(args, fmt.Sprintf("--merge-ref=%t", *policy.MergeRef))
 	}
@@ -2526,10 +2804,13 @@ func appendCheckpointPolicyArgs(args []string, policy sandboxcfg.CheckpointPolic
 	return args
 }
 
-// promote publishes a local checkpoint graph without booting it. The configured
+// promote publishes a local Sandbox or Snapshot graph without booting it. The configured
 // publisher is either manifest storage or a named ref location.
-func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
-	args := []string{"upload-snapshot", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
+func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source types.ResumeSource) (types.ResumeSource, error) {
+	if !source.Valid() {
+		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: invalid resume source", sb.ID)
+	}
+	args := []string{"publish", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		// Publication location name: the sandbox id plus the publication
 		// date. The date suffix is what the time-ordered layout buckets by;
@@ -2538,25 +2819,35 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath
 		locName := reflocation.PublicationName(sb.ID, o.now())
 		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
-			return "", fmt.Errorf("orch: promote %s: %w", sb.ID, err)
+			return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w", sb.ID, err)
 		}
 		args = append(args, "--to-ref-location", locName+"="+uri)
 	}
-	args = append(args, localPath)
+	args = append(args, source.Ref)
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
 	}
 	ref := strings.TrimSpace(out.String())
 	parsed, err := types.ParsePortableRef(ref)
-	if err != nil || (parsed.Scheme == "file" &&
-		!strings.HasSuffix(parsed.Path, ".snapshot") && !strings.HasSuffix(parsed.Path, ".bundle")) {
-		return "", fmt.Errorf("orch: promote %s: invalid snapshot ref %q", sb.ID, ref)
+	validSuffix := true
+	if err == nil && parsed.Scheme == "file" {
+		switch source.Kind {
+		case types.ResumeSourceSandbox:
+			validSuffix = strings.HasSuffix(parsed.Path, ".sandbox") || strings.HasSuffix(parsed.Path, ".bundle")
+		case types.ResumeSourceSnapshot:
+			validSuffix = strings.HasSuffix(parsed.Path, ".snapshot") || strings.HasSuffix(parsed.Path, ".bundle")
+		default:
+			validSuffix = false
+		}
 	}
-	return ref, nil
+	if err != nil || !validSuffix {
+		return types.ResumeSource{}, fmt.Errorf("orch: promote %s: invalid %s ref %q", sb.ID, source.Kind, ref)
+	}
+	return types.ResumeSource{Kind: source.Kind, Ref: ref}, nil
 }
 
 // udsClient builds an HTTP client for envd. The request context carries the

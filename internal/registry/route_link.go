@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,7 +28,11 @@ const (
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
+	maxConnectReserveBody     = 64 << 10
+	maxCreateReserveBody      = 16 << 20
 )
+
+var errReserveBodyTooLarge = errors.New("reserve body is too large")
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
@@ -58,7 +63,9 @@ type RouteResolve struct {
 // admits portable resource plus request-scoped restore, credentials, and
 // checkpoint namespaces into it.
 type SandboxReserveReq struct {
-	Config map[string]string `json:"config,omitempty"`
+	Config          map[string]string `json:"config,omitempty"`
+	AutoPauseMemory *bool             `json:"auto_pause_memory,omitempty"`
+	Memory          *bool             `json:"memory,omitempty"`
 }
 
 // SandboxReserveExecSessionReq is the dedicated Router-to-Registry
@@ -194,10 +201,18 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	}
 	var body SandboxReserveReq
 	var execSessionBody SandboxReserveExecSessionReq
-	if operation == ReserveCreate && req.Body != nil {
-		err = json.NewDecoder(req.Body).Decode(&body)
-		if err != nil && !errors.Is(err, io.EOF) {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+	if (operation == ReserveCreate || operation == ReserveConnect) && req.Body != nil {
+		limit := int64(maxConnectReserveBody)
+		if operation == ReserveCreate {
+			limit = maxCreateReserveBody
+		}
+		err = decodeOptionalReserveBody(req.Body, limit, &body)
+		if errors.Is(err, errReserveBodyTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
+		if err != nil {
+			http.Error(w, "invalid reserve body", http.StatusBadRequest)
 			return
 		}
 	} else if operation == ReserveExecSession {
@@ -234,6 +249,14 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	if operation == ReserveCreate && body.Memory != nil {
+		http.Error(w, "create reserve cannot select resume memory", http.StatusBadRequest)
+		return
+	}
+	if operation == ReserveConnect && (len(body.Config) != 0 || body.AutoPauseMemory != nil) {
+		http.Error(w, "connect reserve contains create fields", http.StatusBadRequest)
+		return
+	}
 	res, err := r.ReserveSandbox(req.Context(), SandboxReserveRequest{
 		Operation:         operation,
 		Group:             group,
@@ -248,12 +271,35 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		Service:           req.Header.Get("E2b-Sandbox-Service"),
 		MigrationToken:    req.Header.Get("X-Kuasar-Migration-Token"),
 		Config:            body.Config,
+		AutoPauseMemory:   cloneOptionalBool(body.AutoPauseMemory),
+		Memory:            cloneOptionalBool(body.Memory),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 	writeJSON(w, res)
+}
+
+func decodeOptionalReserveBody(reader io.Reader, limit int64, out any) error {
+	if reader == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) > limit {
+		return errReserveBodyTooLarge
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if trimmed[0] != '{' && !bytes.Equal(trimmed, []byte("null")) {
+		return errors.New("reserve body must be an object or null")
+	}
+	return strictjson.DecodeAllowNull(trimmed, out)
 }
 
 func reserveQueryInt(value, field string) (int, error) {

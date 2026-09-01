@@ -34,7 +34,7 @@ func mmdsMigrationFixture(t *testing.T) (*Orchestrator, string, string, *types.S
 	}
 	source := migrationSandbox(t, dir, "source", manifestKey, "manifest://"+strings.Repeat("b", 64))
 	source.Metadata = map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"},{"path":"/later","type":"secret","secret":"later"}]}`}
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestStandaloneImportFailureLeavesNoSecretRow(t *testing.T) {
 func TestStandaloneImportRejectsInvalidTokenRoutesWithoutRows(t *testing.T) {
 	o, _, apiKey, source, _ := mmdsMigrationFixture(t)
 	source.Metadata[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/invalid/"}]}`
-	token, err := o.mintSandboxToken(source, source.SnapshotRef)
+	token, err := o.mintSandboxToken(source, source.ResumeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestConnectExistingTargetIgnoresMMDSInputAndToken(t *testing.T) {
 	o.cache(source)
 	malformedHeader := "not-json"
 	got, err := o.ConnectWithMMDS(
-		context.Background(), source.ID, apiKey, strings.Repeat("x", migrationtoken.MaxWireSize+1), 0,
+		context.Background(), source.ID, apiKey, strings.Repeat("x", migrationtoken.MaxWireSize+1), api.ConnectOptions{},
 		map[string]string{sandboxcfg.NsMMDS: `{"routes":[],"secrets":{"key":"new"}}`}, &malformedHeader,
 	)
 	if err != nil || got == nil || got.ID != source.ID {

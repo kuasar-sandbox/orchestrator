@@ -112,12 +112,12 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 		}
 		meta[item.metaKey] = h.Get(item.header)
 	}
-	bodyPolicy := sandboxcfg.CheckpointPolicy{}
+	bodyPolicy := sandboxcfg.SnapshotPolicy{}
 	bodyPresent := false
 	if raw, ok := meta[sandboxcfg.NsCheckpoint]; ok {
 		bodyPresent = true
 		var err error
-		bodyPolicy, err = sandboxcfg.ParseCheckpointPolicyJSON(raw)
+		bodyPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(raw)
 		if err != nil {
 			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
 		}
@@ -128,17 +128,17 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	}
 	policy := bodyPolicy
 	if headerPresent {
-		headerPolicy, err := sandboxcfg.ParseCheckpointPolicyJSON(h.Get(checkpointHeader))
+		headerPolicy, err := sandboxcfg.ParseSnapshotPolicyJSON(h.Get(checkpointHeader))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", checkpointHeader, err)
 		}
-		policy = sandboxcfg.OverlayCheckpointPolicy(bodyPolicy, headerPolicy)
+		policy = sandboxcfg.OverlaySnapshotPolicy(bodyPolicy, headerPolicy)
 	}
 	if policy.Empty() {
 		delete(meta, sandboxcfg.NsCheckpoint)
 		return meta, nil
 	}
-	canonical, err := sandboxcfg.MarshalCheckpointPolicyJSON(policy)
+	canonical, err := sandboxcfg.MarshalSnapshotPolicyJSON(policy)
 	if err != nil {
 		return nil, err
 	}
@@ -319,25 +319,34 @@ type BuildLogEntry struct {
 
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
-	TemplateID string            `json:"templateID"`
-	TimeoutSec int               `json:"timeout"`
-	Metadata   map[string]string `json:"metadata"`
-	EnvVars    map[string]string `json:"envVars"`
-	Secure     bool              `json:"secure"`
-	APIKey     string            `json:"-"` // injected from X-API-KEY
-	MMDSHeader *string           `json:"-"` // nil = header absent; preserves top-level merge presence
+	TemplateID      string            `json:"templateID"`
+	TimeoutSec      int               `json:"timeout"`
+	Metadata        map[string]string `json:"metadata"`
+	EnvVars         map[string]string `json:"envVars"`
+	Secure          bool              `json:"secure"`
+	AutoPauseMemory *bool             `json:"autoPauseMemory,omitempty"`
+	APIKey          string            `json:"-"` // injected from X-API-KEY
+	MMDSHeader      *string           `json:"-"` // nil = header absent; preserves top-level merge presence
 }
 
-// PauseRequest carries action-scoped local checkpoint policy. Nil fields inherit
-// lower-priority sandbox/node policy. memory=false is unsupported because Pause
-// always captures memory.
+// PauseRequest carries the E2B capture selector and action-scoped Snapshot-only
+// policy. A nil Memory value has the E2B default true.
 type PauseRequest struct {
 	Memory               *bool `json:"memory,omitempty"`
 	CheckpointMergeRef   *bool `json:"checkpoint_merge_ref,omitempty"`
 	CheckpointDropCaches *bool `json:"checkpoint_drop_caches,omitempty"`
 }
 
-const maxPauseRequestBytes = 4 << 10
+type ConnectOptions struct {
+	TimeoutSec int
+	Memory     *bool
+}
+
+const (
+	maxCreateRequestBytes  = 16 << 20
+	maxPauseRequestBytes   = 4 << 10
+	maxConnectRequestBytes = 64 << 10
+)
 
 // Core is the orchestrator behaviour the API needs. Every per-resource method
 // takes the raw API key; Core verifies it against the encrypted APISecret saved
@@ -348,9 +357,9 @@ type Core interface {
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
 	List(ctx context.Context, apiKey, state string, limit int, cursor string) ([]*types.Sandbox, string, error)
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
-	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
+	Connect(ctx context.Context, id, apiKey, migrationToken string, options ConnectOptions) (*types.Sandbox, error)
 	ExecSession(ctx context.Context, id, apiKey, migrationToken string, ttlSeconds int64, conditions []string) (string, error)
-	Pause(ctx context.Context, id, apiKey string, override sandboxcfg.CheckpointPolicy) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
+	Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error // ErrAlreadyPaused / ErrSandboxStarting / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 	ResourceStats(ctx context.Context, id, apiKey string) (*ResourceStats, error)
 	TrafficStats(ctx context.Context, id, apiKey string) (*TrafficStats, error)
@@ -373,8 +382,9 @@ type Core interface {
 	FilesUpload(ctx context.Context, apiKey, templateID, hash string) (present bool, url string, err error)
 
 	// Sandbox export/import (orchestrator extension to the e2b surface). Export
-	// publishes a paused snapshot as a reusable template (toTemplate) or an opaque
-	// kmt1 migration token; keepSource independently controls source finalization.
+	// publishes a paused Sandbox E or Snapshot S as a same-kind reusable template
+	// (toTemplate) or an opaque kmt1 migration token; keepSource independently
+	// controls source finalization.
 	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
 	ImportSandbox(ctx context.Context, apiKey, token, targetID string) (string, error)
 }
@@ -383,7 +393,7 @@ type Core interface {
 // MMDS secrets. Cluster router implementations intentionally do not implement
 // it, so no CONNECT config is added to node-link or cluster command schemas.
 type ConnectMMDSCore interface {
-	ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int, metadata map[string]string, header *string) (*types.Sandbox, error)
+	ConnectWithMMDS(ctx context.Context, id, apiKey, migrationToken string, options ConnectOptions, metadata map[string]string, header *string) (*types.Sandbox, error)
 }
 
 // Resources are the node-uniform VM resources surfaced in e2b list/get responses.
@@ -510,12 +520,27 @@ func apiKeyFrom(ctx context.Context) string {
 
 func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	var req CreateReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if r.ContentLength > maxCreateRequestBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCreateRequestBytes)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' || strictjson.DecodeAllowUnknown(trimmed, &req) != nil {
 		writeErr(w, 400, "bad body")
 		return
 	}
 	req.APIKey = apiKeyFrom(r.Context())
-	var err error
 	req.MMDSHeader, err = singleOptionalHeader(r.Header, mmdsHeader)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -601,11 +626,23 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Timeout  int               `json:"timeout"`
 		Metadata map[string]string `json:"metadata"`
+		Memory   *bool             `json:"memory,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if r.ContentLength > maxConnectRequestBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxConnectRequestBytes)
+	if err := decodeOptionalStrictObject(r.Body, &body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "bad body")
 		return
 	}
+	options := ConnectOptions{TimeoutSec: body.Timeout, Memory: body.Memory}
 	// CONNECT must let an already-existing target ignore MMDS input completely.
 	// Defer duplicate/value validation to the standalone import path; an empty
 	// sentinel is malformed if import really happens and harmless if ignored.
@@ -613,14 +650,14 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 	var sb *types.Sandbox
 	var err error
 	if standalone, ok := a.core.(ConnectMMDSCore); ok {
-		sb, err = standalone.ConnectWithMMDS(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout, body.Metadata, header)
+		sb, err = standalone.ConnectWithMMDS(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, options, body.Metadata, header)
 	} else {
 		// Cluster remains intentionally unaware of CONNECT MMDS config.
 		if len(migrationToken) > migrationtoken.MaxWireSize {
 			writeErr(w, http.StatusRequestHeaderFieldsTooLarge, migrationtoken.ErrTokenTooLarge.Error())
 			return
 		}
-		sb, err = a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout)
+		sb, err = a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, options)
 	}
 	if err != nil {
 		if errors.Is(err, migrationtoken.ErrTokenTooLarge) {
@@ -709,7 +746,7 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxPauseRequestBytes)
-	req, err := decodePauseRequest(r.Body)
+	req, presence, err := decodePauseRequest(r.Body)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -719,25 +756,34 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad body")
 		return
 	}
+	kind := types.CaptureSnapshot
 	if req.Memory != nil && !*req.Memory {
-		writeErr(w, http.StatusBadRequest, "memory=false is not supported")
-		return
+		kind = types.CaptureSandbox
 	}
-	override := sandboxcfg.CheckpointPolicy{
+	override := sandboxcfg.SnapshotPolicy{
 		MergeRef:   req.CheckpointMergeRef,
 		DropCaches: req.CheckpointDropCaches,
 	}
+	snapshotOptionsPresent := presence.checkpointMergeRef || presence.checkpointDropCaches
 	if _, present := r.Header[http.CanonicalHeaderKey(checkpointHeader)]; present {
-		headerPolicy, parseErr := sandboxcfg.ParseCheckpointPolicyJSON(r.Header.Get(checkpointHeader))
+		rawHeader := r.Header.Get(checkpointHeader)
+		headerPolicy, parseErr := sandboxcfg.ParseSnapshotPolicyJSON(rawHeader)
 		if parseErr != nil {
 			writeErr(w, http.StatusBadRequest, parseErr.Error())
 			return
 		}
-		override = sandboxcfg.OverlayCheckpointPolicy(override, headerPolicy)
+		snapshotOptionsPresent = snapshotOptionsPresent || snapshotPolicyFieldsPresent(rawHeader)
+		override = sandboxcfg.OverlaySnapshotPolicy(override, headerPolicy)
 	} else {
-		override = sandboxcfg.CloneCheckpointPolicy(override)
+		override = sandboxcfg.CloneSnapshotPolicy(override)
 	}
-	err = a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), override)
+	if kind == types.CaptureSandbox && snapshotOptionsPresent {
+		writeErr(w, http.StatusBadRequest, "snapshot-only checkpoint options require memory=true")
+		return
+	}
+	err = a.core.Pause(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), sandboxcfg.CaptureRequest{
+		Kind: kind, SnapshotPolicy: override,
+	})
 	switch {
 	case errors.Is(err, ErrAlreadyPaused):
 		w.WriteHeader(409)
@@ -750,31 +796,66 @@ func (a *API) pause(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func decodePauseRequest(body io.Reader) (PauseRequest, error) {
-	dec := json.NewDecoder(body)
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
-		if errors.Is(err, io.EOF) {
-			return PauseRequest{}, nil
-		}
-		return PauseRequest{}, err
-	}
-	var trailing any
-	if err := dec.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return PauseRequest{}, ErrBadRequest
-		}
-		return PauseRequest{}, err
+type pauseRequestPresence struct {
+	checkpointMergeRef   bool
+	checkpointDropCaches bool
+}
+
+func decodePauseRequest(body io.Reader) (PauseRequest, pauseRequestPresence, error) {
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		return PauseRequest{}, pauseRequestPresence{}, err
 	}
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return PauseRequest{}, ErrBadRequest
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return PauseRequest{}, pauseRequestPresence{}, nil
 	}
+	if trimmed[0] != '{' {
+		return PauseRequest{}, pauseRequestPresence{}, ErrBadRequest
+	}
+
 	var req PauseRequest
-	if err := json.Unmarshal(trimmed, &req); err != nil {
-		return PauseRequest{}, err
+	if err := strictjson.DecodeAllowNull(trimmed, &req); err != nil {
+		return PauseRequest{}, pauseRequestPresence{}, err
 	}
-	return req, nil
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return PauseRequest{}, pauseRequestPresence{}, err
+	}
+	_, mergeRef := fields["checkpoint_merge_ref"]
+	_, dropCaches := fields["checkpoint_drop_caches"]
+	return req, pauseRequestPresence{
+		checkpointMergeRef:   mergeRef,
+		checkpointDropCaches: dropCaches,
+	}, nil
+}
+
+func snapshotPolicyFieldsPresent(raw string) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return false // ParseSnapshotPolicyJSON validates the same input first.
+	}
+	_, mergeRef := fields["merge_ref"]
+	_, dropCaches := fields["drop_caches"]
+	return mergeRef || dropCaches
+}
+
+func decodeOptionalStrictObject(body io.Reader, out any) error {
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] != '{' {
+		return ErrBadRequest
+	}
+	return strictjson.DecodeAllowNull(trimmed, out)
 }
 
 func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
@@ -1166,6 +1247,10 @@ func (a *API) failMigrate(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, ErrExportPreempted.Error())
 	case errors.Is(err, ErrAlreadyExists):
 		writeErr(w, http.StatusConflict, "target sandbox already exists")
+	case errors.Is(err, types.ErrMemoryUnavailable):
+		writeErr(w, http.StatusConflict, types.ErrMemoryUnavailable.Error())
+	case errors.Is(err, types.ErrLaunchModeConflict):
+		writeErr(w, http.StatusConflict, types.ErrLaunchModeConflict.Error())
 	case errors.Is(err, migrationtoken.ErrIncompatible):
 		writeErr(w, http.StatusConflict, "target environment incompatible")
 	case errors.Is(err, migrationtoken.ErrAuthentication),
@@ -1271,6 +1356,10 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, ErrSandboxChanged.Error())
 	case errors.Is(err, ErrBuildChanged):
 		writeErr(w, http.StatusConflict, ErrBuildChanged.Error())
+	case errors.Is(err, types.ErrMemoryUnavailable):
+		writeErr(w, http.StatusConflict, types.ErrMemoryUnavailable.Error())
+	case errors.Is(err, types.ErrLaunchModeConflict):
+		writeErr(w, http.StatusConflict, types.ErrLaunchModeConflict.Error())
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):
