@@ -196,6 +196,13 @@ func TestTerminalRetentionSurvivesRestart(t *testing.T) {
 	if err := st.Put(context.Background(), retentionDeadSandbox("restart-dead", 10)); err != nil {
 		t.Fatal(err)
 	}
+	explicitDelete := retentionDeadSandbox("restart-deleting", 10)
+	if err := st.Put(context.Background(), explicitDelete); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.BeginSandboxDelete(context.Background(), explicitDelete); err != nil || !changed {
+		t.Fatalf("begin explicit delete of dead history = %t, %v", changed, err)
+	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +211,10 @@ func TestTerminalRetentionSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	deleting, err := st.Get(context.Background(), explicitDelete.ID)
+	if err != nil || deleting == nil || deleting.State != types.StateDeleting || deleting.DeadUnix != 0 {
+		t.Fatalf("restarted explicit delete row = %+v, %v", deleting, err)
+	}
 	candidates, err := st.TerminalBuildsForRetention(context.Background(), 20, 1)
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("restart candidates = %+v, %v", candidates, err)

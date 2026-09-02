@@ -789,7 +789,7 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 		return false, errors.New("store: begin sandbox delete requires a sandbox")
 	}
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes SET state=?, launch_mode=''
+		UPDATE sandboxes SET state=?, launch_mode='', dead_unix=0
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
