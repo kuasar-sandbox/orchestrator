@@ -41,7 +41,6 @@ type Process = proxyextension.Process
 
 type workerFDMapping struct {
 	Data    int `json:"data"`
-	Forward int `json:"forward"`
 	MMDS    int `json:"mmds"`
 	Wake    int `json:"wake"`
 	Notify  int `json:"notify"`
@@ -114,8 +113,8 @@ func (b *WorkerBootstrap) VerifyExecutable() error {
 	return componentexec.VerifyCurrentExecutable(b.executableIdentity)
 }
 
-// WorkerBootstrapPresent reports whether this process was designated as an
-// internal proxy worker. Any present value is consumed as worker state and
+// WorkerBootstrapPresent reports whether this process was designated as a
+// Proxy worker process. Any present value is consumed as worker state and
 // fails closed if malformed; it never falls back to CLI dispatch.
 func WorkerBootstrapPresent() bool {
 	_, ok := os.LookupEnv(workerBootstrapEnvironment)
@@ -264,14 +263,13 @@ func validateWorkerIdentity(workerID string, epoch uint64) error {
 }
 
 func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
-	seen := make(map[int]string, 7)
+	seen := make(map[int]string, 6)
 	for _, field := range []struct {
 		name     string
 		fd       int
 		optional bool
 	}{
-		{name: "data", fd: fds.Data, optional: true},
-		{name: "forward", fd: fds.Forward},
+		{name: "data", fd: fds.Data},
 		{name: "mmds", fd: fds.MMDS, optional: true},
 		{name: "wake", fd: fds.Wake},
 		{name: "notify", fd: fds.Notify},
@@ -331,7 +329,7 @@ func writeWorkerPayload(writer io.Writer, payload []byte) error {
 func withoutWorkerEnvironment(environment []string) []string {
 	internalNames := map[string]struct{}{
 		workerBootstrapEnvironment: {},
-		"KUASAR_PROXY_DATA_FD":     {}, "KUASAR_PROXY_FORWARD_FD": {}, "KUASAR_PROXY_MMDS_FD": {},
+		"KUASAR_PROXY_DATA_FD":     {}, "KUASAR_PROXY_MMDS_FD": {},
 		"KUASAR_PROXY_WAKE_FD": {}, "KUASAR_PROXY_NOTIFY_FD": {}, "KUASAR_PROXY_STATS_FD": {},
 		"KUASAR_PROXY_MMDSRPC_FD": {}, "KUASAR_PROXY_WORKER_ID": {}, "KUASAR_PROXY_WORKER_EPOCH": {},
 	}

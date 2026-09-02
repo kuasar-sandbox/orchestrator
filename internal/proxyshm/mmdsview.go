@@ -11,7 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
-// MMDSView is the external proxy master's bounded confidential heap. Routes
+// MMDSView is the independent Proxy master's bounded confidential heap. Routes
 // and values for one sandbox are replaced under one lock. BeginSync and
 // Invalidate discard the entire view immediately, so no disconnected worker
 // can keep receiving an old secret.
@@ -176,7 +176,7 @@ func cloneBytesMap(values map[string][]byte) map[string][]byte {
 	return out
 }
 
-// WaitPolicy blocks only during external-proxy startup, until the first
+// WaitPolicy blocks only during Proxy startup, until the first
 // conductor Hello has supplied the authoritative MMDS listener policy.
 func (v *MasterView) WaitPolicy(ctx context.Context) (*routesync.MMDSProxyPolicy, bool) {
 	select {

@@ -14,12 +14,26 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }
+
+type immediateRouteBarrierCoordinator struct{}
+
+func (immediateRouteBarrierCoordinator) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
+	return immediateRouteBarrier{}, nil
+}
+
+type immediateRouteBarrier struct{}
+
+func (immediateRouteBarrier) ID() string                 { return "test-immediate-route-barrier" }
+func (immediateRouteBarrier) Wait(context.Context) error { return nil }
+func (immediateRouteBarrier) Commit() error              { return nil }
+func (immediateRouteBarrier) Cancel()                    {}
 
 func testBuildResources() types.BuildResources {
 	return types.BuildResources{CPU: 2000, Memory: 2 << 30}
@@ -83,6 +97,7 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	}
 	t.Cleanup(func() { st.Close() })
 	o := New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	// General unit fixtures model a controller after startup reconciliation.
 	// Recovery-boundary tests construct Orchestrator directly and control this
 	// gate explicitly.

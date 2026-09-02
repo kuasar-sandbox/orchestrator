@@ -7,10 +7,6 @@ package config
 import publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 
 const (
-	ProxyInternal = publicconfig.ProxyInternal
-	ProxyExternal = publicconfig.ProxyExternal
-	ProxyOff      = publicconfig.ProxyOff
-
 	AuthOff     = publicconfig.AuthOff
 	AuthLog     = publicconfig.AuthLog
 	AuthEnforce = publicconfig.AuthEnforce

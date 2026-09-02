@@ -193,27 +193,32 @@ func TestE2BLaunchInitializesEnvdAfterRuntime(t *testing.T) {
 		t.Fatal("runner did not receive assignment")
 	}
 	var assignedRunID string
-	for index := 0; index < 3; index++ {
+	startingIndex := 0
+	for index, wantKind := range []string{routesync.TypeUpsert, routesync.TypeRouteBarrier, routesync.TypeUpsert, routesync.TypeUpsert} {
 		select {
 		case event := <-events:
+			if wantKind == routesync.TypeRouteBarrier {
+				if event.Kind != routesync.TypeRouteBarrier {
+					t.Fatalf("pre-init launch event %d = %+v, want route barrier", index, event)
+				}
+				continue
+			}
 			if event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
 				t.Fatalf("pre-init launch event %d = %+v, want starting upsert", index, event)
 			}
-			if index < 2 && event.Route.RunID != "" {
+			if startingIndex < 2 && event.Route.RunID != "" {
 				t.Fatalf("pre-assignment launch event %d has run ID %q", index, event.Route.RunID)
 			}
-			if index == 2 {
+			if startingIndex == 2 {
 				assignedRunID = event.Route.RunID
 				if assignedRunID == "" {
 					t.Fatal("assigned starting route did not publish its run ID before envd init")
 				}
 			}
+			startingIndex++
 		case <-time.After(time.Second):
 			t.Fatalf("missing pre-init starting upsert %d", index)
 		}
-	}
-	if incarnation, ok := o.Incarnation(sb.ID); !ok || incarnation != assignedRunID {
-		t.Fatalf("pre-init MMDS incarnation = %q ok=%v, want %q", incarnation, ok, assignedRunID)
 	}
 	requests := make(chan string, 4)
 	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -508,15 +513,22 @@ func TestFailedCreateEnvdInitTransitionsStartingToDead(t *testing.T) {
 	if lc.stops.Load() == 0 {
 		t.Fatal("failed create did not stop its runner")
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.StateStarting, routesync.StateStarting, routesync.TypeDelete} {
 		select {
 		case event := <-events:
-			if want == routesync.TypeDelete {
+			switch want {
+			case routesync.TypeRouteBarrier:
+				if event.Kind != routesync.TypeRouteBarrier {
+					t.Fatalf("failed-create barrier event = %+v", event)
+				}
+			case routesync.TypeDelete:
 				if event.Kind != routesync.TypeDelete || event.SID != sb.ID {
 					t.Fatalf("terminal failed-create event = %+v, want delete", event)
 				}
-			} else if event.Kind != routesync.TypeUpsert || event.Route.State != want {
-				t.Fatalf("failed-create event = %+v, want upsert %s", event, want)
+			default:
+				if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+					t.Fatalf("failed-create event = %+v, want upsert %s", event, want)
+				}
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("failed create did not publish %s", want)

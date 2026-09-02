@@ -1010,7 +1010,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 				reserveBuildResources.Memory = int64(resources["memory"].(float64))
 			}
 			_ = json.NewEncoder(w).Encode(buildReserveResult{
-				BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost, Profile: types.ProfileE2B,
+				BuildID: "b1", TemplateID: "t1", NodeID: "n1", APIEndpoint: nodeHost, Profile: types.ProfileE2B,
 			})
 		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)

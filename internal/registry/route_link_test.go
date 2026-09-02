@@ -20,7 +20,7 @@ import (
 func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	ctx := context.Background()
 	reg := New(NewStores(), nil, 0, nil)
-	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:8443"}); err != nil {
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "127.0.0.1:7443", DataEndpoint: "127.0.0.1:8443"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
@@ -44,7 +44,7 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
-		got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
+		got.Profile != want.Profile || got.APIEndpoint != "127.0.0.1:7443" || got.DataEndpoint != "127.0.0.1:8443" ||
 		got.RouteRevision <= 0 ||
 		got.StableID != want.StableID || got.APISecret != want.APISecret ||
 		got.APISecretFingerprint != want.APISecretFingerprint ||

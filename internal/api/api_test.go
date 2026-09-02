@@ -1735,7 +1735,7 @@ func TestFailMapsProxyUnavailableToServiceUnavailable(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", response.Code)
 	}
-	if got := response.Body.String(); got != "{\"message\":\"external proxy temporarily unavailable\"}\n" {
+	if got := response.Body.String(); got != "{\"message\":\"proxy temporarily unavailable\"}\n" {
 		t.Fatalf("public response = %q", got)
 	}
 }

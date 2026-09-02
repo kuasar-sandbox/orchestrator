@@ -3316,6 +3316,7 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 		NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10,
 		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{MaxBuilds: 16, Resources: &routesync.BuildResources{CPU: 64000}},
 		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{MaxBuilds: 4, Resources: &routesync.BuildResources{CPU: 16000}},
+		APIEndpoint:               "10.0.0.1:7443",
 		DataEndpoint:              "10.0.0.1:8443", RuntimeDigest: "rt1", LastHeartbeatUnix: lastBeat,
 		Allocated: 99, Pool: 100, Counts: 7,
 		BuildRegistrationUsage: &routesync.BuildAdmissionUsage{Builds: 3},
@@ -3343,7 +3344,7 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	if err := json.Unmarshal(put.Value, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw["node_id"] != "n1" || raw["data_endpoint"] == "" || raw["runtime_digest"] != "rt1" {
+	if raw["node_id"] != "n1" || raw["api_endpoint"] != "10.0.0.1:7443" || raw["data_endpoint"] != "10.0.0.1:8443" || raw["runtime_digest"] != "rt1" {
 		t.Fatalf("node_list value = %v", raw)
 	}
 	if _, ok := raw["build_registration_capacity"].(map[string]any); !ok {
@@ -3825,7 +3826,7 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	stores := cluster["n1"]
 	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	seed := &NodeRecord{NodeID: "node-q", Labels: map[string]string{"pool": "p"}, DataEndpoint: "10.0.0.1:8443"}
+	seed := &NodeRecord{NodeID: "node-q", Labels: map[string]string{"pool": "p"}, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443"}
 	seedNodeProfileShardRecord(t, ctx, cluster["n1"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
 	seedNodeProfileShardRecord(t, ctx, cluster["n3"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
 	if !localShardHasRecord(t, ctx, cluster["n1"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
@@ -3836,7 +3837,7 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetNode found=%v err=%v", found, err)
 	}
-	if got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" {
+	if got.APIEndpoint != "10.0.0.1:7443" || got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" {
 		t.Fatalf("node from quorum = %+v", got)
 	}
 	if !localShardHasRecord(t, ctx, cluster["n2"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
@@ -3952,15 +3953,20 @@ func TestClaimedNodeProfileRejectsStaleRuntimeWriters(t *testing.T) {
 	if _, found, err := reg.stores.GetNodeProfile(ctx, nodeID); err != nil || found {
 		t.Fatalf("runtime update recreated claimed profile: found=%v err=%v", found, err)
 	}
-	stale.DataEndpoint = "stale"
+	stale.APIEndpoint = "stale-api"
+	stale.DataEndpoint = "stale-data"
 	if _, ok, err := reg.stores.casNodeProfileShard(ctx, stale, stale.Meta.Rev); err != nil || ok {
 		t.Fatalf("stale registration CAS ok=%v err=%v", ok, err)
 	}
-	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "fresh"})
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID:       nodeID,
+		APIEndpoint:  "fresh-api",
+		DataEndpoint: "fresh-data",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registered.DataEndpoint != "fresh" || len(registered.Sandboxes) != 0 {
+	if registered.APIEndpoint != "fresh-api" || registered.DataEndpoint != "fresh-data" || len(registered.Sandboxes) != 0 {
 		t.Fatalf("registration reused stale node view: %+v", registered)
 	}
 }
@@ -3969,7 +3975,11 @@ func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	const nodeID = "runtime-generation-fence"
-	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "old"}); err != nil {
+	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID:       nodeID,
+		APIEndpoint:  "old-api",
+		DataEndpoint: "old-data",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var interleaveErr error
@@ -3982,7 +3992,11 @@ func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
 				interleaveErr = fmt.Errorf("claim=%v err=%w", claimed, claimErr)
 				return
 			}
-			_, interleaveErr = reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "fresh"})
+			_, interleaveErr = reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+				NodeID:       nodeID,
+				APIEndpoint:  "fresh-api",
+				DataEndpoint: "fresh-data",
+			})
 		}
 		rec.ResumeToken = "stale-session"
 	})
@@ -3993,7 +4007,7 @@ func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
 		t.Fatalf("stale runtime writer found=%v err=%v", found, err)
 	}
 	profile, found, err := reg.stores.GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.DataEndpoint != "fresh" || profile.ResumeToken != "" {
+	if err != nil || !found || profile.APIEndpoint != "fresh-api" || profile.DataEndpoint != "fresh-data" || profile.ResumeToken != "" {
 		t.Fatalf("fresh profile=%+v found=%v err=%v", profile, found, err)
 	}
 }

@@ -851,6 +851,7 @@ func (r *Registry) routeWithDataEndpoint(ctx context.Context, rec *SandboxRecord
 	if !found || runtime == nil || runtime.DataEndpoint == "" {
 		return nil, ErrNodeGone
 	}
+	route.APIEndpoint = runtime.APIEndpoint
 	route.DataEndpoint = runtime.DataEndpoint
 	return route, nil
 }
@@ -865,7 +866,8 @@ func (r *Registry) routeFromRecord(ctx context.Context, rec *SandboxRecord, rout
 	return &RouteResolve{
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, TemplateID: rec.TemplateID,
+		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID), DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
+		Profile: rec.Profile, TemplateID: rec.TemplateID,
 		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
 		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,

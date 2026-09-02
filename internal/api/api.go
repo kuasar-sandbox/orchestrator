@@ -205,9 +205,9 @@ var ErrSandboxStarting = errors.New("sandbox starting")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
-// ErrProxyUnavailable means external Create could not establish its route-applied
+// ErrProxyUnavailable means Create could not establish its route-applied
 // barrier. It is a temporary admission failure, not an accepted sandbox.
-var ErrProxyUnavailable = errors.New("external proxy temporarily unavailable")
+var ErrProxyUnavailable = errors.New("proxy temporarily unavailable")
 
 // ErrExtensionUnavailable is the fixed internal classification for a Hook
 // error other than extension.ErrRejected. The original error is logged by the

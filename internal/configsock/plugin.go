@@ -14,7 +14,7 @@ import (
 
 // --- plugin plane: subscriber registry + registration handler ---
 //
-// A subscriber (the external proxy master, or a route observer such as the platform
+// A subscriber (the independent Proxy master, or a route observer such as the platform
 // agent) holds a single PUT /internal/plugin/{id}/register request open: that
 // connection is its lease + its route stream. Closing it deregisters; a second
 // registration with the same id evicts (and closes the stream of) the first.
@@ -29,9 +29,8 @@ type Plugin struct {
 }
 
 // Registry tracks live plugin registrations. The plugin-plane handler Adds on
-// register and Removes on disconnect; the external-mode proxyForwarder reads
-// ProxyTargets to forward data-plane requests to a registered proxy endpoint.
-// Concurrency-safe and shared between the config-socket server and the proxyForwarder.
+// register and Removes on disconnect. It also coordinates the trusted Proxy
+// route barrier and exposes that registration's traffic-stats socket.
 type Registry struct {
 	mu        sync.Mutex
 	m         map[string]*Plugin
@@ -40,9 +39,9 @@ type Registry struct {
 }
 
 var (
-	ErrProxyRouteUnavailable  = errors.New("configsock: external proxy route stream unavailable")
-	ErrProxyRouteDisconnected = errors.New("configsock: external proxy route stream disconnected")
-	ErrProxyRouteLeaseChanged = errors.New("configsock: external proxy route lease changed")
+	ErrProxyRouteUnavailable  = errors.New("configsock: proxy route stream unavailable")
+	ErrProxyRouteDisconnected = errors.New("configsock: proxy route stream disconnected")
+	ErrProxyRouteLeaseChanged = errors.New("configsock: proxy route lease changed")
 )
 
 func NewRegistry() *Registry {
@@ -123,7 +122,7 @@ func (r *Registry) BeginProxyRouteBarrier() (routesync.RouteBarrier, error) {
 func proxyRouteParticipantReady(p *Plugin) bool {
 	return p != nil && p.ready && p.ID == routesync.ProxyPluginID &&
 		p.Caps.Subscribe != nil && p.Caps.Subscribe.Kind == routesync.KindRouteWake &&
-		p.Caps.Proxy != nil && p.Caps.Proxy.Socket.Path != ""
+		p.Caps.Proxy != nil
 }
 
 func (r *Registry) beginRouteBarrierLocked(required []*Plugin) (*proxyRouteBarrier, error) {
@@ -248,25 +247,6 @@ func (b *proxyRouteBarrier) failLocked(err error) {
 		b.err = err
 	}
 	b.signalLocked()
-}
-
-// ProxyTargets returns the data-forward UDS paths of registered proxy plugins, in
-// stable id order.
-func (r *Registry) ProxyTargets() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]string, 0, len(r.m))
-	for id, p := range r.m {
-		if p.Caps.Proxy != nil && p.Caps.Proxy.Socket.Path != "" {
-			ids = append(ids, id)
-		}
-	}
-	slices.Sort(ids)
-	out := make([]string, len(ids))
-	for i, id := range ids {
-		out[i] = r.m[id].Caps.Proxy.Socket.Path
-	}
-	return out
 }
 
 // ProxyStatsTarget returns the master-only stats endpoint from the current

@@ -156,15 +156,22 @@ func TestClusterCreatePreAssignmentFailurePublishesDelete(t *testing.T) {
 	if dead.RunID != "" || dead.VswitchPort != "" {
 		t.Fatalf("failed cluster create retained ownership: %+v", dead)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.TypeDelete} {
 		select {
 		case event := <-events:
-			if want == routesync.TypeDelete {
+			switch want {
+			case routesync.TypeRouteBarrier:
+				if event.Kind != routesync.TypeRouteBarrier {
+					t.Fatalf("cluster failure barrier event = %+v", event)
+				}
+			case routesync.TypeDelete:
 				if event.Kind != routesync.TypeDelete || event.SID != cmd.SID {
 					t.Fatalf("cluster failure event = %+v", event)
 				}
-			} else if event.Kind != routesync.TypeUpsert || event.Route.State != want {
-				t.Fatalf("cluster failure event = %+v", event)
+			default:
+				if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+					t.Fatalf("cluster failure event = %+v", event)
+				}
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("missing cluster %s event", want)
@@ -273,6 +280,9 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	}
 	if event := <-events; event.Kind != routesync.TypeUpsert || event.Route.State != routesync.StateStarting {
 		t.Fatalf("cluster create initial event = %+v", event)
+	}
+	if event := <-events; event.Kind != routesync.TypeRouteBarrier {
+		t.Fatalf("cluster create barrier event = %+v", event)
 	}
 	select {
 	case <-vs.entered:

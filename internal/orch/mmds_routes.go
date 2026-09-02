@@ -2,11 +2,8 @@ package orch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
-	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -122,77 +119,4 @@ func (o *Orchestrator) mmdsRouteProjection(ctx context.Context, sb *types.Sandbo
 		out[name] = append([]byte(nil), value...)
 	}
 	return raw, out, nil
-}
-
-// Incarnation binds MMDSv2 tokens to one live launch/resume. A paused or dead
-// sandbox and a starting record without an assigned run id both fail closed.
-func (o *Orchestrator) Incarnation(sandboxID string) (string, bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	sb := o.reg[sandboxID]
-	if sb == nil || sb.RunID == "" || (sb.State != types.StateStarting && sb.State != types.StateRunning) {
-		return "", false
-	}
-	return sb.RunID, true
-}
-
-// MMDSAvailable implements mmds.Source for the in-process proxy. Unlike an
-// external worker it has no route-sync cache; per-route store failures are
-// surfaced by MMDSRoute and mapped to 503.
-func (o *Orchestrator) MMDSAvailable() bool { return true }
-
-// MMDSRoute resolves a single exact path from the internal proxy's conductor
-// view. Secret values come from the encrypted store on each request; services
-// come only from the conductor-owned, pre-parsed Unix-socket registry.
-func (o *Orchestrator) MMDSRoute(ctx context.Context, sandboxID, exactPath string) (mmds.MMDSRoute, bool, error) {
-	o.mu.Lock()
-	sb := cloneSandbox(o.reg[sandboxID])
-	o.mu.Unlock()
-	if sb == nil || (sb.State != types.StateStarting && sb.State != types.StateRunning) {
-		return mmds.MMDSRoute{}, false, nil
-	}
-	raw, present := sb.Metadata[sandboxcfg.NsMMDS]
-	if !present {
-		return mmds.MMDSRoute{}, false, nil
-	}
-	routes, err := sandboxcfg.DecodePersistedMMDSRoutes(raw)
-	if err != nil {
-		return mmds.MMDSRoute{}, false, fmt.Errorf("decode MMDS routes: %w", err)
-	}
-	route, found := sandboxcfg.LookupMMDSRoute(routes, exactPath)
-	if !found {
-		return mmds.MMDSRoute{}, false, nil
-	}
-	switch route.Type {
-	case "", sandboxcfg.MMDSRouteStatic:
-		return mmds.MMDSRoute{
-			Type:        sandboxcfg.MMDSRouteStatic,
-			ContentType: sandboxcfg.MMDSRuntimeContentType(route),
-			Body:        []byte(route.Data),
-		}, true, nil
-	case sandboxcfg.MMDSRouteSecret:
-		kind, ownerID := o.mmdsRouteSecretOwner(sandboxID)
-		values, _, stored, err := o.st.GetMMDSRouteSecretValues(ctx, kind, ownerID, sandboxcfg.MMDSRoutesDigest(raw))
-		if err != nil {
-			return mmds.MMDSRoute{}, false, err
-		}
-		value, configured := values[route.Secret]
-		return mmds.MMDSRoute{
-			Type:        sandboxcfg.MMDSRouteSecret,
-			ContentType: sandboxcfg.MMDSRuntimeContentType(route),
-			Body:        append([]byte(nil), value...),
-			Present:     stored && configured,
-		}, true, nil
-	case sandboxcfg.MMDSRouteService:
-		socketPath := o.mmdsServices[route.Service]
-		result := mmdssvc.Call(ctx, socketPath, route.Service, route.Path, sandboxID)
-		return mmds.MMDSRoute{
-			Type:        sandboxcfg.MMDSRouteService,
-			StatusCode:  result.StatusCode,
-			ContentType: result.ContentType,
-			Body:        result.Body,
-		}, true, nil
-	default:
-		return mmds.MMDSRoute{}, false, errors.New("invalid persisted MMDS route type")
-	}
 }

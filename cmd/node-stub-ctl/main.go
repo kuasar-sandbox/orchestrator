@@ -1,6 +1,6 @@
 // Command node-stub-ctl runs controllable node-link stubs for cluster e2e tests.
-// It starts real node_link clients and exposes local admin/data HTTP endpoints,
-// but does not launch microVMs.
+// It starts real node_link clients and exposes separate local admin, node API,
+// and sandbox data HTTP endpoints, but does not launch microVMs.
 package main
 
 import (
@@ -111,6 +111,7 @@ func runServe(args []string, log *slog.Logger) error {
 	nodes := fs.Int("nodes", 1, "number of simulated nodes")
 	prefix := fs.String("node-prefix", "stub", "simulated node id prefix")
 	adminListen := fs.String("admin-listen", "127.0.0.1:0", "admin API listen address")
+	apiListen := fs.String("api-listen", "127.0.0.1:0", "node conductor API stub listen address")
 	dataListen := fs.String("data-listen", "127.0.0.1:0", "data-plane stub listen address")
 	capacity := fs.Int("capacity", 100, "sandbox capacity per node")
 	registrationBuildCPU := fs.Int("registration-build-cpu", 4000, "registration Build CPU capacity in milli-cores")
@@ -142,6 +143,11 @@ func runServe(args []string, log *slog.Logger) error {
 	defer stop()
 
 	svc := newService(*nodeLink, log)
+	apiLn, err := net.Listen("tcp", *apiListen)
+	if err != nil {
+		return fmt.Errorf("API listen %s: %w", *apiListen, err)
+	}
+	defer apiLn.Close()
 	dataLn, err := net.Listen("tcp", *dataListen)
 	if err != nil {
 		return fmt.Errorf("data listen %s: %w", *dataListen, err)
@@ -152,11 +158,18 @@ func runServe(args []string, log *slog.Logger) error {
 		return fmt.Errorf("admin listen %s: %w", *adminListen, err)
 	}
 	defer adminLn.Close()
+	svc.apiEndpoint = publicAddr(apiLn.Addr().String())
 	svc.dataEndpoint = publicAddr(dataLn.Addr().String())
 	svc.adminURL = "http://" + publicAddr(adminLn.Addr().String())
 
+	apiSrv := &http.Server{Handler: http.HandlerFunc(svc.serveAPI)}
 	dataSrv := &http.Server{Handler: http.HandlerFunc(svc.serveData)}
 	adminSrv := &http.Server{Handler: svc}
+	go func() {
+		if err := apiSrv.Serve(apiLn); err != nil && err != http.ErrServerClosed {
+			log.Error("node-stub API server", "err", err)
+		}
+	}()
 	go func() {
 		if err := dataSrv.Serve(dataLn); err != nil && err != http.ErrServerClosed {
 			log.Error("node-stub data server", "err", err)
@@ -167,6 +180,7 @@ func runServe(args []string, log *slog.Logger) error {
 			log.Error("node-stub admin server", "err", err)
 		}
 	}()
+	defer apiSrv.Close()
 	defer dataSrv.Close()
 	defer adminSrv.Close()
 
@@ -179,6 +193,7 @@ func runServe(args []string, log *slog.Logger) error {
 		node := newStubNode(stubNodeOptions{
 			ID:           fmt.Sprintf("%s-%d", *prefix, i),
 			NodeLink:     *nodeLink,
+			APIEndpoint:  svc.apiEndpoint,
 			DataEndpoint: svc.dataEndpoint,
 			Labels:       labels,
 			Capacity:     *capacity,
@@ -198,9 +213,9 @@ func runServe(args []string, log *slog.Logger) error {
 		node.start(ctx)
 	}
 
-	ready := map[string]any{"admin": svc.adminURL, "data": svc.dataEndpoint, "nodes": *nodes}
+	ready := map[string]any{"admin": svc.adminURL, "api": svc.apiEndpoint, "data": svc.dataEndpoint, "nodes": *nodes}
 	_ = json.NewEncoder(os.Stdout).Encode(ready)
-	log.Info("node-stub-ctl serve", "admin", svc.adminURL, "data", svc.dataEndpoint, "nodes", *nodes, "node_link", *nodeLink)
+	log.Info("node-stub-ctl serve", "admin", svc.adminURL, "api", svc.apiEndpoint, "data", svc.dataEndpoint, "nodes", *nodes, "node_link", *nodeLink)
 	<-ctx.Done()
 	return nil
 }
@@ -231,6 +246,7 @@ func publicAddr(addr string) string {
 type service struct {
 	nodeLink     string
 	adminURL     string
+	apiEndpoint  string
 	dataEndpoint string
 	log          *slog.Logger
 
@@ -502,10 +518,6 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
-	if strings.HasPrefix(host, "api.") {
-		s.serveControlStub(w, r)
-		return
-	}
 	execService := r.Header.Get("E2b-Sandbox-Service") == "exec"
 	if execService && r.Method != http.MethodConnect {
 		w.Header().Set("Allow", http.MethodConnect)
@@ -568,6 +580,18 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	if body != "" {
 		_, _ = io.WriteString(w, body)
 	}
+}
+
+func (s *service) serveAPI(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	if r.Method == http.MethodConnect || !strings.HasPrefix(host, "api.") {
+		http.NotFound(w, r)
+		return
+	}
+	s.serveControlStub(w, r)
 }
 
 func (s *service) serveExecDataConnect(
@@ -711,6 +735,7 @@ func (s *service) findSandbox(sid string) (*stubNode, *stubSandbox) {
 type stubNodeOptions struct {
 	ID                        string
 	NodeLink                  string
+	APIEndpoint               string
 	DataEndpoint              string
 	Labels                    map[string]string
 	Capacity                  int
@@ -783,6 +808,7 @@ func (n *stubNode) start(parent context.Context) {
 		NodeID: n.ID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
 		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		APIEndpoint:               n.APIEndpoint,
 		DataEndpoint:              n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
 	}
 	n.mu.Unlock()
@@ -1597,7 +1623,7 @@ func (n *stubNode) snapshot() nodeSnapshot {
 	defer n.mu.Unlock()
 	return nodeSnapshot{
 		NodeID: n.ID, Online: n.online, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
-		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.draining,
+		APIEndpoint: n.APIEndpoint, DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.draining,
 		LinkEndpoint: n.linkEndpoint, RedirectMemberID: n.redirectTo.MemberID, RedirectEndpoint: n.redirectTo.Endpoint,
 		Sandboxes: n.sandboxSnapshotsLocked(), Builds: n.buildSnapshotsLocked(), KeyPairs: n.keyPairSnapshotsLocked(),
 		CommandCounts: n.commandCountsLocked(),
@@ -2085,6 +2111,7 @@ type nodeSnapshot struct {
 	Online           bool                  `json:"online"`
 	Labels           map[string]string     `json:"labels,omitempty"`
 	Capacity         int                   `json:"capacity,omitempty"`
+	APIEndpoint      string                `json:"api_endpoint,omitempty"`
 	DataEndpoint     string                `json:"data_endpoint,omitempty"`
 	RuntimeDigest    string                `json:"runtime_digest,omitempty"`
 	Draining         bool                  `json:"draining,omitempty"`

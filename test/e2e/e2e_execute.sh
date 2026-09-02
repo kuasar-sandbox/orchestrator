@@ -43,17 +43,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$SCRIPT_DIR/lib/vmm_cgroup.sh"
+. "$SCRIPT_DIR/lib/proxy.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
+PROXY_PORT="${PROXY_PORT:-}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 if [ -z "${ZOT_BIN:-}" ]; then
     ZOT_BIN="$(command -v zot || true)"
 fi
 SW_NETNS="${SW_NETNS:-e2e_sw}"
-PROXY_NETNS="${PROXY_NETNS:-e2e_proxy_int}"
+PROXY_NETNS="${PROXY_NETNS:-e2e_proxy}"
 PROXY_VETH_HOST="${PROXY_VETH_HOST:-e2eih0}"
 PROXY_VETH_NS="${PROXY_VETH_NS:-e2ein0}"
 PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.253.1}"
@@ -226,6 +228,7 @@ chmod +x "$ORCH_BIN_DIR/sandbox-ctl"
 declare -a PIDS=()
 declare -a TAGS=()
 IMMEDIATE_DATA_PID=""
+PROXY_PID=""
 SW_STARTED=""
 ORIG_IP_FORWARD=""
 cleanup() {
@@ -249,6 +252,7 @@ cleanup() {
 trap cleanup EXIT
 
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
+[ -n "$PROXY_PORT" ] || PROXY_PORT="$(free_port)"
 wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; sleep 0.5; done; fail "$3 did not open $1:$2"; }
 wait_mmds_listener() {
     local hex
@@ -257,7 +261,7 @@ wait_mmds_listener() {
         ip netns exec "$PROXY_NETNS" awk -v p=":$hex" '$2 ~ p && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null && return 0
         sleep 0.5
     done
-    fail "internal mmds listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
+    fail "Proxy MMDS listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
 }
 setup_proxy_netns() {
     ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
@@ -294,7 +298,7 @@ req() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
-wait_internal_traffic_stats() { # $1=sid, $2=parking|idle|paused
+wait_proxy_traffic_stats() { # $1=sid, $2=parking|idle|paused
     local sid="$1" mode="$2" code=""
     for _ in $(seq 1 240); do
         code="$(req GET "/sandboxes/$sid/stats/traffic" "$AK" || true)"
@@ -740,7 +744,7 @@ PY
 exec_argv_allowed_through_connect() {
     local sid="$1" token="$2" argv0="$3" diagnostics="$WORK/native-exec-condition-allowed.log"
     timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --proxy "http://127.0.0.1:$PORT" \
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
@@ -750,7 +754,7 @@ exec_argv_allowed_through_connect() {
 exec_argv_denied_through_connect() {
     local sid="$1" token="$2" diagnostics="$WORK/native-exec-condition-denied.log"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --proxy "http://127.0.0.1:$PORT" \
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
@@ -772,7 +776,7 @@ exec_through_connect() {
     : >"$output"
     : >"$error_output"
     if timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
-        --proxy "http://127.0.0.1:$PORT" \
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
@@ -829,7 +833,7 @@ exec_pty_resize_through_connect() {
     local status=0
 
     python3 - "$output" "$BIN/sandbox-ctl" exec \
-        --proxy "http://127.0.0.1:$PORT" \
+        --proxy "http://127.0.0.1:$PROXY_PORT" \
         --proxy-header "E2b-Sandbox-Id: $sid" \
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
@@ -882,7 +886,7 @@ dp() {
     local port_sid="$1" path="$2" token="${3:-}"
     local args=(-sS --max-time "${DP_MAX_TIME:-120}" --noproxy '*' -o "$WORK/dp.body" -w '%{http_code}' -H "Host: $port_sid.$DOMAIN")
     [ -n "$token" ] && args+=(-H "X-Access-Token: $token")
-    curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+    curl "${args[@]}" "http://127.0.0.1:$PROXY_PORT$path"
 }
 
 # ---- store + zot + creds + orchestrator (same as the build e2e) -----------
@@ -982,7 +986,7 @@ ip addr replace "$MGMT_VIP/32" dev "${SWITCH}m0" \
     || fail "configure management VIP on ${SWITCH}m0"
 allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
-echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; internal proxy_netns=$PROXY_NETNS reaches $FIP_CIDR)"
+echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; Proxy netns=$PROXY_NETNS reaches $FIP_CIDR)"
 
 cat > "$WORK/manifest.yaml" <<EOF
 manifest: { key: "" }
@@ -1029,7 +1033,7 @@ write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=l
     esac
     cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS, park_timeout: 120s }
+proxy: { auth: enforce, park_timeout: 120s }
 mmds:
   enabled: true
   listen: "$PROXY_NS_IP:$MMDS_PORT"
@@ -1080,11 +1084,29 @@ start_orchestrator() { # $1=log path
         sleep 0.5
     done
     [ -n "$ready" ] || { sed 's/^/  /' "$log_path"; fail "orchestrator health did not become ready"; }
+
+    write_proxy_config "$WORK/proxy.yaml" \
+        "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" \
+        "$PROXY_NETNS" "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" \
+        1024 2 enforce 120s -
+    start_proxy "$ORCH_BIN_DIR/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
+    PROXY_PID="$PROXY_HELPER_PID"
+    PIDS+=("$PROXY_PID")
+    wait_proxy_ready "$PROXY_PID" 127.0.0.1 "$PROXY_PORT" "$WORK/proxy-stats.sock" "$WORK/proxy.log" \
+        || fail "Proxy did not become ready"
     return 0
 }
 
 stop_orchestrator() {
     [ -n "$ORCH_PID" ] || return 0
+    if [ -n "$PROXY_PID" ]; then
+        local stopped_proxy_pid="$PROXY_PID"
+        stop_proxy "$stopped_proxy_pid"
+        for i in "${!PIDS[@]}"; do
+            [ "${PIDS[$i]}" = "$stopped_proxy_pid" ] && unset 'PIDS[i]'
+        done
+        PROXY_PID=""
+    fi
     local stopped_pid="$ORCH_PID"
     kill -TERM "$stopped_pid" 2>/dev/null || true
     wait "$stopped_pid" 2>/dev/null || true
@@ -1098,7 +1120,7 @@ write_orchestrator_config unset static
 start_orchestrator "$WORK/orch.log"
 echo "==> node-ctl up (:$PORT)"
 wait_mmds_listener
-echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
+echo "==> PASS: Proxy mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
@@ -1508,7 +1530,7 @@ echo "==> issue data request immediately after Create; starting must park until 
     printf '%s\n' "$code" >"$WORK/immediate-data.code"
 ) &
 IMMEDIATE_DATA_PID=$!
-wait_internal_traffic_stats "$SID" parking \
+wait_proxy_traffic_stats "$SID" parking \
     || { sed 's/^/  orch| /' "$WORK/orch.log"; fail "immediate post-Create request was not reported as parking"; }
 immediate_data_status=0
 wait "$IMMEDIATE_DATA_PID" || immediate_data_status=$?
@@ -1518,7 +1540,7 @@ code=$(cat "$WORK/immediate-data.code")
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } \
     || { cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "immediate post-Create data request=$code"; }
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
-wait_internal_traffic_stats "$SID" idle || fail "internal traffic did not converge to idle"
+wait_proxy_traffic_stats "$SID" idle || fail "Proxy traffic did not converge to idle"
 wait_resource_stats "$SID" || fail "controller resource stats were not reported"
 assert_resolved_resource_yaml "$WORK/run/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
     || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
@@ -1739,8 +1761,8 @@ done
     || { sed 's/^/  cgroup| /' "$WORK/cgroup-topology.out"; fail "delegated envd cgroup topology"; }
 echo "==> PASS: real /app is empty; /init + envd user/ptys/socats and cpu/memory/io delegation verified"
 
-# ---- internal proxy_netns -> floatingip user port -------------------------
-USER_MARK="internal-proxy-netns-user-port-$RANDOM"
+# ---- Proxy netns -> floatingip user port ----------------------------------
+USER_MARK="proxy-netns-user-port-$RANDOM"
 python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
     "mkdir -p /home/user/e2e-site; echo '$USER_MARK' > /home/user/e2e-site/index.html; cd /home/user/e2e-site; python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/e2e-http-8000.log 2>&1 &" \
     >"$WORK/start-user-port.out" 2>&1 || true
@@ -1751,8 +1773,8 @@ for _ in $(seq 1 30); do
     grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
     sleep 0.5
 done
-[ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "internal proxy_netns -> floatingip user port did not return marker"; }
-echo "==> PASS: internal proxy per-dial proxy_netns reached sandbox floatingip:8000 (marker=$USER_MARK)"
+[ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; collect_proxy_log "$WORK/proxy.log"; fail "Proxy netns -> floatingip user port did not return marker"; }
+echo "==> PASS: Proxy worker reached sandbox floatingip:8000 from proxy_netns (marker=$USER_MARK)"
 
 # ---- local Pause, all policy fields unset -> exact legacy argv + restore ---
 # Write a marker file in the guest BEFORE pausing; after resume it must still be
@@ -1790,7 +1812,7 @@ wait_sandbox_state "$SID" paused 1200 || {
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     fail "accepted local Pause did not commit after caller cancellation"
 }
-wait_internal_traffic_stats "$SID" paused || fail "paused traffic stats were not stable"
+wait_proxy_traffic_stats "$SID" paused || fail "paused traffic stats were not stable"
 # Pause commits the durable paused state before StopUnit makes sandboxer release
 # its live controller reservation. During that bounded cleanup window, returning
 # the still-real report is valid; the stable paused state must converge to 409.
@@ -1972,7 +1994,7 @@ echo "==> PASS: independent promotion published distinct W self and opaque B mem
 exec_argv_denied_through_connect "$SID" "$EXACT_EXEC_TOKEN"
 wait_sandbox_state "$SID" paused 20 \
     || fail "condition-denied direct exec resumed the paused sandbox"
-wait_internal_traffic_stats "$SID" paused \
+wait_proxy_traffic_stats "$SID" paused \
     || fail "condition-denied direct exec changed paused traffic accounting"
 RESUME_MARK="PORTABLE_W_RESUME_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK"
@@ -2019,23 +2041,23 @@ echo "==> PASS: portable W restored envd-managed PID/listener (frozen delta=$FRE
 if [ "$MMDS_ROUTES_E2E" = 1 ]; then
     source "$SCRIPT_DIR/lib/mmds_static_guest.sh"
     source "$SCRIPT_DIR/lib/mmds_secret_guest.sh"
-    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
-        || fail "internal MMDS static exact route"
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" proxy \
+        || fail "Proxy MMDS static exact route"
     run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
-        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" internal \
-        || fail "internal MMDS initial/unresolved/update/delete lifecycle"
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" proxy \
+        || fail "Proxy MMDS initial/unresolved/update/delete lifecycle"
     run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
-        "$ENVD_TOKEN" "$WORK" internal \
-        || fail "internal MMDS conductor-owned local service"
+        "$ENVD_TOKEN" "$WORK" proxy \
+        || fail "Proxy MMDS conductor-owned local service"
     for value in MMDS_SECRET_INITIAL_GUEST_E2E MMDS_SECRET_UPDATED_GUEST_E2E MMDS_SECRET_ROTATED_GUEST_E2E; do
         for artifact in "$WORK"/orch*.log "$WORK"/mmds-*.out "$WORK"/mmds-service.requests \
             "$WORK"/lib/node-ctl.db*; do
             [ -f "$artifact" ] || continue
             grep -a -F -q -- "$value" "$artifact" \
-                && fail "MMDS secret plaintext appeared in internal E2E artifact $artifact"
+                && fail "MMDS secret plaintext appeared in Proxy E2E artifact $artifact"
         done
     done
-    echo "==> PASS: internal real guest covered static, initial/unresolved/rotated/deleted secret, and local service"
+    echo "==> PASS: real guest Proxy covered static, initial/unresolved/rotated/deleted secret, and local service"
 fi
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
@@ -2189,7 +2211,7 @@ E_WAKE_RUN_CALL=$(run_argv_count)
 ) &
 IMMEDIATE_DATA_PID=$!
 wait_sandbox_state "$SID" starting 120 || fail "Sandbox E traffic Wake was not durably accepted"
-wait_internal_traffic_stats "$SID" parking \
+wait_proxy_traffic_stats "$SID" parking \
     || fail "first Sandbox E Wake request was not parked while cold launch was starting"
 assert_run_source_mode "$E_WAKE_RUN_CALL" "$SID" from \
     || fail "Sandbox E traffic Wake did not execute sandbox-ctl run --from"

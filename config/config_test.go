@@ -741,51 +741,59 @@ sandbox:
 	}
 }
 
-func TestLoadAcceptsInternalProxyNetNS(t *testing.T) {
-	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
-	path := writeConfig(t, `
-api:
-  domain: example.test
-encryption_key: test-key
-proxy:
-  mode: internal
-  proxy_netns: sw0_mgmt
-sandbox:
-  boot:
-    kernel: /opt/sandbox/vmlinux
-    runtime: /opt/sandbox/sandbox-runtime.bundle
-`)
-
-	cfg, err := LoadConductor(path)
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	if got := cfg.Proxy.ProxyNetNS; got != "sw0_mgmt" {
-		t.Fatalf("proxy.proxy_netns = %q", got)
+func TestLoadConductorRejectsRemovedProxyFields(t *testing.T) {
+	for _, field := range []string{"mode: internal", "data_listen: 127.0.0.1:8443", "proxy_netns: sw0_mgmt"} {
+		t.Run(strings.Fields(field)[0], func(t *testing.T) {
+			t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+			path := writeConfig(t, "proxy:\n  "+field+"\n")
+			if _, err := LoadConductor(path); err == nil {
+				t.Fatalf("LoadConductor accepted removed proxy field %q", field)
+			}
+		})
 	}
 }
 
-func TestLoadRejectsExternalConductorProxyNetNS(t *testing.T) {
-	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
-	path := writeConfig(t, `
+func TestClusterAdvertisedEndpointsAreExplicitAndDistinctFromBindDefaults(t *testing.T) {
+	base := `
 api:
   domain: example.test
+  listen: ":443"
 encryption_key: test-key
-proxy:
-  mode: external
-  proxy_netns: sw0_mgmt
 sandbox:
-  boot:
-    kernel: /opt/sandbox/vmlinux
-    runtime: /opt/sandbox/sandbox-runtime.bundle
-`)
-
-	_, err := LoadConductor(path)
-	if err == nil {
-		t.Fatal("Load succeeded with proxy.proxy_netns in external mode")
-	}
-	if !strings.Contains(err.Error(), "proxy.proxy_netns") {
-		t.Fatalf("error %q does not mention proxy.proxy_netns", err)
+  boot: { kernel: /kernel, runtime: /runtime }
+cluster:
+  node_link: { endpoint: registry.test:7700 }
+`
+	for _, test := range []struct {
+		name   string
+		fields string
+		want   string
+	}{
+		{name: "missing both", want: "cluster.api_endpoint"},
+		{name: "missing data", fields: "  api_endpoint: node-api.test:8443\n", want: "cluster.data_endpoint"},
+		{name: "missing API", fields: "  data_endpoint: node-data.test:9443\n", want: "cluster.api_endpoint"},
+		{name: "API URL", fields: "  api_endpoint: http://node.test:8443\n  data_endpoint: node-data.test:9443\n", want: "cluster.api_endpoint"},
+		{name: "data bind address", fields: "  api_endpoint: node-api.test:8443\n  data_endpoint: :9443\n", want: "cluster.data_endpoint"},
+		{name: "valid", fields: "  api_endpoint: node-api.test:8443\n  data_endpoint: node-data.test:9443\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := LoadConductor(writeConfig(t, base+test.fields))
+			if err == nil {
+				err = ValidateConductorFinal(cfg)
+			}
+			if test.want != "" {
+				if err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("LoadConductor error=%v, want %s", err, test.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Cluster.APIEndpoint != "node-api.test:8443" || cfg.Cluster.DataEndpoint != "node-data.test:9443" {
+				t.Fatalf("cluster endpoints = API %q Data %q", cfg.Cluster.APIEndpoint, cfg.Cluster.DataEndpoint)
+			}
+		})
 	}
 }
 
@@ -830,10 +838,6 @@ func TestLoadProxyStatsSocketValidation(t *testing.T) {
 			body: "paths: { run_root: /run/sandbox }\nconfig_socket: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
 		},
 		{
-			name: "proxy conflict",
-			body: "paths: { run_root: /run/sandbox }\nproxy_socket: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
-		},
-		{
 			name: "shm conflict",
 			body: "paths: { run_root: /run/sandbox }\nshm_path: /tmp/same.sock\nstats_socket: /tmp/same.sock\n",
 		},
@@ -855,6 +859,16 @@ func TestLoadProxyStatsSocketValidation(t *testing.T) {
 				t.Fatalf("LoadProxy stats_socket=%q err=%v, want %q", cfg.StatsSocket, err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadProxyRejectsRemovedProxySocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("proxy_socket: /tmp/proxy.sock\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProxy(path); err == nil || !strings.Contains(err.Error(), "proxy_socket") {
+		t.Fatalf("LoadProxy removed proxy_socket error = %v", err)
 	}
 }
 
@@ -894,8 +908,6 @@ func TestLoadMMDSRoutesAndConductorServiceRegistry(t *testing.T) {
 api:
   domain: example.test
 encryption_key: test-key
-proxy:
-  mode: internal
 sandbox:
   boot:
     kernel: /opt/sandbox/vmlinux

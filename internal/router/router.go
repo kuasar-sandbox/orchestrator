@@ -87,6 +87,7 @@ type routeResolve struct {
 	Group                  string `json:"group"`
 	RouteKey               string `json:"route_key"`
 	NodeID                 string `json:"node_id"`
+	APIEndpoint            string `json:"api_endpoint"`
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
 	TemplateID             string `json:"template_id"`
@@ -525,11 +526,11 @@ func createHeaderValue(header http.Header, name string) (string, bool) {
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
 // build/template ids + places the build, §7.5).
 type buildReserveResult struct {
-	BuildID      string        `json:"build_id"`
-	TemplateID   string        `json:"template_id"`
-	NodeID       string        `json:"node_id"`
-	DataEndpoint string        `json:"data_endpoint"`
-	Profile      types.Profile `json:"profile"`
+	BuildID     string        `json:"build_id"`
+	TemplateID  string        `json:"template_id"`
+	NodeID      string        `json:"node_id"`
+	APIEndpoint string        `json:"api_endpoint"`
+	Profile     types.Profile `json:"profile"`
 }
 
 // handleBuildRegister asks the registry to assign identities and choose an
@@ -662,7 +663,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rt.buildsMu.Lock()
-	rt.builds[buildCacheKey(group, res.BuildID)] = buildEntry{node: res.DataEndpoint, at: time.Now()}
+	rt.builds[buildCacheKey(group, res.BuildID)] = buildEntry{node: res.APIEndpoint, at: time.Now()}
 	rt.buildsMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -708,11 +709,11 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	node := e.node
 	if !ok {
 		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid)
-		if rerr != nil || res.DataEndpoint == "" {
+		if rerr != nil || res.APIEndpoint == "" {
 			http.Error(w, "unknown build "+bid, http.StatusNotFound)
 			return
 		}
-		node = res.DataEndpoint
+		node = res.APIEndpoint
 		rt.buildsMu.Lock()
 		rt.builds[cacheKey] = buildEntry{node: node, at: time.Now()}
 		rt.buildsMu.Unlock()
@@ -727,19 +728,19 @@ func buildCacheKey(group, buildID string) string {
 // forwardBuild proxies a build control call (trigger / status / files) to the node
 // holding the build (Host api.<domain>; the client's X-API-KEY passes through for
 // the node's build auth).
-func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpoint string) {
-	target := &url.URL{Scheme: "http", Host: dataEndpoint}
+func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, apiEndpoint string) {
+	target := &url.URL{Scheme: "http", Host: apiEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = rt.fwdTransport
 	apiHost := "api." + rt.domain
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "http"
-		req.URL.Host = dataEndpoint
+		req.URL.Host = apiEndpoint
 		req.Host = apiHost
 		req.Header.Del(HeaderAccessTok) // builds authorize via X-API-KEY, not a client token
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
-		rt.log.Warn("router: build forward", "node", dataEndpoint, "err", e)
+		rt.log.Warn("router: build forward", "node", apiEndpoint, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, r)
@@ -960,7 +961,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rr := rt.resolveRoute(r.Context(), group, routeKey, sid)
-	if rr == nil || rr.DataEndpoint == "" {
+	if rr == nil || rr.APIEndpoint == "" {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -1022,13 +1023,13 @@ func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sandboxID s
 // forwardToNode proxies a control request to a node's e2b control plane (Host
 // api.<domain>; the client's X-API-KEY passes through for the node's auth).
 func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, rr *routeResolve, nodePath string, adaptSandboxIdentity bool) {
-	target := &url.URL{Scheme: "http", Host: rr.DataEndpoint}
+	target := &url.URL{Scheme: "http", Host: rr.APIEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = rt.fwdTransport
 	apiHost := "api." + rt.domain
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "http"
-		req.URL.Host = rr.DataEndpoint
+		req.URL.Host = rr.APIEndpoint
 		req.URL.Path = nodePath
 		req.URL.RawPath = ""
 		req.Host = apiHost
@@ -1045,7 +1046,7 @@ func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, rr *rout
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, rr.SandboxID, rr.NodeSandboxID)
-		rt.log.Warn("router: control forward", "node", rr.DataEndpoint, "err", e)
+		rt.log.Warn("router: control forward", "node", rr.APIEndpoint, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, r)

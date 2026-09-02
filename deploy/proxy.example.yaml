@@ -1,7 +1,7 @@
 # node-ctl proxy master config — node-ctl proxy serve --config /etc/node-ctl/proxy.yaml.
-# Used only in external data-plane mode (conductor.yaml proxy.mode: external). A
-# single master registers on conductor's plugin plane, owns listener sockets, and
-# supervises worker processes that read a shared-memory route table.
+# A single independent Proxy master registers on conductor's plugin plane, owns
+# listener sockets, and supervises worker processes that read a shared-memory
+# route table.
 # See orchestrator/docs/node-proxy.md §2. Validate with
 # `node-ctl config proxy --config proxy.yaml`.
 
@@ -12,7 +12,7 @@ config_socket: /run/sandbox/node-ctl.socket
 # Sandbox runtime root. Workers use <run_root>/<sid>/ctl.sock for native exec.
 # Configure this locally on the proxy; it is not projected over route sync.
 paths:
-  # Optional statically customized external-proxy App. Used only for node-ctl ->
+  # Optional statically customized Proxy App. Used only for node-ctl ->
   # master dispatch; every worker reexecs the master's current executable and
   # receives a frozen config snapshot, so workers never reread this YAML.
   # Runtime owner policy accepts root ownership or, for non-root node-ctl, its
@@ -20,26 +20,28 @@ paths:
   # proxy_executable: /opt/kuasar/bin/xproxy
   run_root: /run/sandbox
 
-# Data-plane ingress. The master binds once and passes the same listener fd to all
-# workers. "" = serve only proxy-forwards over proxy_socket.
-data_listen: ":443"
+# Required data-plane ingress. The master binds once and passes the same listener
+# fd to all workers. This is the node's only sandbox data entry point. The paired
+# conductor example uses :3000, so both services can run on one node.
+data_listen: ":3443"
 
 # Forwarding plane netns. Set this to the connector --mgmt-extract netns so workers'
 # floatingip dials and the conductor-projected MMDS listener live with the vswitch
 # management plane. data_listen stays in the master process's current netns.
 # proxy_netns: sw0_mgmt
 
-proxy_socket: /run/sandbox/proxy.sock
 stats_socket: /run/sandbox/proxy-stats.sock
 shm_path: /run/sandbox/proxy-routes.shm
 route_capacity: 65536
 workers: 2
 
-# Data-plane listener cert — the same wildcard cert serve presents (*.<domain>).
-# Omit for h2c (dev / when fronted by a TLS terminator).
-tls:
-  cert: /etc/node-ctl/tls/fullchain.pem
-  key: /etc/node-ctl/tls/privkey.pem
+# Cluster Router currently dials DataEndpoint with plaintext HTTP/CONNECT, so
+# this paired example leaves TLS disabled and terminates public TLS at Router/a
+# load balancer. For standalone direct TLS, bind a non-conflicting address and
+# uncomment the material below.
+# tls:
+#   cert: /etc/node-ctl/tls/fullchain.pem
+#   key: /etc/node-ctl/tls/privkey.pem
 
 # Bootstrap fallbacks, used only until serve pushes its authoritative policy over the
 # registration handshake: auth = X-Access-Token check (off|log|enforce), park_timeout

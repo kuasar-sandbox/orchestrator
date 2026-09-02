@@ -98,9 +98,8 @@ func receiveCreateRouteEvent(t *testing.T, events <-chan routesync.Event, want s
 	}
 }
 
-func TestExternalCreateWaitsForRouteBarrierBeforeLaunch(t *testing.T) {
+func TestCreateWaitsForRouteBarrierBeforeLaunch(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Proxy.Mode = config.ProxyExternal
 	cfg.Proxy.ParkTimeout = "1s"
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
 	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
@@ -157,7 +156,7 @@ func TestExternalCreateWaitsForRouteBarrierBeforeLaunch(t *testing.T) {
 	}, "running after route ACK")
 }
 
-func TestExternalCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
+func TestCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		waitErr   error
@@ -168,7 +167,6 @@ func TestExternalCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := &config.Config{}
-			cfg.Proxy.Mode = config.ProxyExternal
 			cfg.Proxy.ParkTimeout = "1s"
 			o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
 			blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
@@ -243,7 +241,7 @@ func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) 
 	}
 }
 
-func TestExternalCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
+func TestCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		park            string
@@ -256,7 +254,6 @@ func TestExternalCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := &config.Config{}
-			cfg.Proxy.Mode = config.ProxyExternal
 			cfg.Proxy.ParkTimeout = test.park
 			o, lifecycleCtx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
 			barrier := newFakeRouteBarrier(nil, nil)
@@ -313,10 +310,13 @@ func TestExternalCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
 	}
 }
 
-func TestExternalCreateWithoutProxyRejectsBeforeInsert(t *testing.T) {
+func TestCreateWithoutProxyRejectsBeforeInsert(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Proxy.Mode = config.ProxyExternal
-	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+	o.vs = blocked
+	o.SetProxyRouteBarrierCoordinator(nil)
 	created, err := o.Create(ctx, createRequestFixture(t, o, "d"))
 	if created != nil || !errors.Is(err, api.ErrProxyUnavailable) {
 		t.Fatalf("Create = %+v, %v", created, err)
@@ -330,5 +330,25 @@ func TestExternalCreateWithoutProxyRejectsBeforeInsert(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("Create without proxy inserted %d rows", count)
+	}
+	o.mu.Lock()
+	cacheCount := len(o.reg)
+	o.mu.Unlock()
+	if cacheCount != 0 {
+		t.Fatalf("Create without proxy retained %d cache entries", cacheCount)
+	}
+	if got := lc.starts.Load(); got != 0 {
+		t.Fatalf("Create without proxy started %d runners", got)
+	}
+	select {
+	case <-blocked.entered:
+		t.Fatal("Create without proxy attached a network port")
+	default:
+	}
+	o.launches.mu.Lock()
+	launchClaims := len(o.launches.m)
+	o.launches.mu.Unlock()
+	if launchClaims != 0 {
+		t.Fatalf("Create without proxy retained %d launch claims", launchClaims)
 	}
 }

@@ -167,6 +167,7 @@ node_list 由 registry 的 node owner 投影低频节点字段:
 - node_id
 - labels
 - runtime_digest
+- api_endpoint
 - data_endpoint
 - registration/execution Build configured capacity(usage/headroom 不进入低频视图)
 - draining

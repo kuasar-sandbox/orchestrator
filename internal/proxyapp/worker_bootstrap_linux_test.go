@@ -89,7 +89,12 @@ func TestReceiveWorkerBootstrapRejectsMalformedInput(t *testing.T) {
 		},
 		"missing required fd": func() []byte {
 			value := base
-			value.FDs.Forward = -1
+			value.FDs.Data = -1
+			return marshalWorkerEnvelope(t, value)
+		},
+		"out of range fd": func() []byte {
+			value := base
+			value.FDs.Data = 1<<20 + 1
 			return marshalWorkerEnvelope(t, value)
 		},
 		"noncanonical config": func() []byte {
@@ -189,7 +194,7 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	descriptors := make([]int, 7)
+	descriptors := make([]int, 6)
 	for index := range descriptors {
 		descriptors[index], err = unix.Dup(int(file.Fd()))
 		if err != nil {
@@ -197,8 +202,8 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 		}
 	}
 	bootstrap := &WorkerBootstrap{fds: workerFDMapping{
-		Data: descriptors[0], Forward: descriptors[1], MMDS: descriptors[2], Wake: descriptors[3],
-		Notify: descriptors[4], Stats: descriptors[5], MMDSRPC: descriptors[6],
+		Data: descriptors[0], MMDS: descriptors[1], Wake: descriptors[2],
+		Notify: descriptors[3], Stats: descriptors[4], MMDSRPC: descriptors[5],
 	}}
 	if err := bootstrap.Close(); err != nil {
 		t.Fatal(err)
@@ -234,7 +239,7 @@ func validWorkerEnvelope(t *testing.T) workerEnvelope {
 }
 
 func validWorkerFDMapping() workerFDMapping {
-	return workerFDMapping{Data: -1, Forward: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104}
+	return workerFDMapping{Data: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104}
 }
 
 func marshalWorkerEnvelope(t *testing.T, value workerEnvelope) []byte {

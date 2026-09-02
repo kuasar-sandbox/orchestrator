@@ -54,8 +54,8 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
    ManifestKey 只经认证后的 task bootstrap 注入单租户 runner/builder 进程的 authoritative
    env,sandbox launch的conductor路径不用它打开或解析snapshot,也不进入guest(§6、§7)。集群下经node-link
    下行的凭据对同样仅加密落盘(§10)。
-5. **本节点路由权威,数据面可外置,集群可接入**:serve 是**本节点**路由与生命周期的
-   权威;数据面 proxy 可内置(单二进制)或外置为独立 worker(§9)。接入集群时,机群级
+5. **本节点路由权威,独立数据面,集群可接入**:conductor 是**本节点**路由与生命周期的
+   权威;独立 Proxy 是唯一 sandbox data ingress(§9).接入集群时,机群级
    路由权威是 registry——serve 经 node-link 上报沙箱事件、受理集群命令(§10),不与
    集群争路由权威。
 6. **重启可对账**:状态在 sqlite + systemd 单元集,serve 重启后以单元集为
@@ -94,36 +94,32 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 ### 1.5 架构与数据通路
 
 ```
-          e2b SDK / CLI                                    cluster-ctl (cluster.md)
-               │ https://api.<domain>          │           registry · router · placer
-               ▼                                ▼                    ▲
-      ┌─ node-ctl conductor serve ──────────────────────┐   ┌─ data plane ──┐ │ node-link (§10):
-      │ api: e2b control plane (REST)         │   │ proxy         │ │  up: register/HB/
-      │   sandboxes create/connect/exec/...   │   │ (internal /   │ │      sandbox events
-      │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
-      │ host:                                 │   │  workers,     │ │       exec_session/delete/
-      │   vswitch PREPARE/attach → floatingip           │   │  route-synced)│ │       key_put/key_drop
-      │   assign sandbox-runner@<run-id>      │   │ 49983/49999   │ └─ node-link client ───┐
-      │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
-      │ build: builds table → pool →          │   │ forward → TCP │◄── cluster-ctl router  │
-      │   assign sandbox-builder@<run-id>     │   │ exec → ctl UDS│    forwards data plane  │
-      │ [resource_listen]: resource ctrl      │   └──────┬────────┘                        │
-      └──────┬───────────────┬────────────────┘         │                                 │
-             │ D-Bus         │ UDS config-socket         │                                 │
-             ▼               ▼ (LaunchSpec / BuildSpec,  │                                 │
-      systemd units            secrets in env)           │                                 │
-      + slices         run-sandbox → execve sandbox-ctl  │                                 │
-                       run-builder → 3-phase build (§12) │                                 │
-                             │                            ▼                                 │
-                       cloud-hypervisor microVM ◄── tap ── vswitch (eBPF) ◄─────────────────┘
-                         guest: sandbox-init + envd
+             client / cluster router
+                    │ control
+                    ▼
+             APIEndpoint
+                    │
+      ┌─ conductor ─┴────────────────────────┐
+      │ API, lifecycle, route authority      │
+      │ sandbox/build ownership and systemd  │
+      └──────────────┬───────────────────────┘
+                     │ config_socket
+                     │ route sync / Wake / barrier / MMDS / stats registration
+                     ▼
+      ┌─ proxy master + workers ─────────────┐
+      │ DataEndpoint: HTTP / CONNECT / exec  │◄── client / cluster router
+      │ MMDS and traffic observation         │
+      └──────────────┬───────────────────────┘
+                     │ UDS / TCP / ctl.sock
+                     ▼
+              sandbox backend
 ```
 
 create 同步受理流程只做请求校验/纯解析、身份和 token 生成、进程内 launch ownership claim,
-然后 insert `starting, run_id=""`(网络字段为空)并 cache/publish starting。internal 模式可立即
-调度后台 launch;external 模式还在同一有序 routesync 下发 `route_barrier`,等待当前 proxy
+然后 insert `starting, run_id=""`(网络字段为空)并 cache/publish starting,在同一有序 routesync
+下发 `route_barrier`,等待当前 proxy
 master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才调度 launch并返回 HTTP
-201。201 表示资源已被持久接受,且 external proxy 已具备用该 starting identity 鉴权并
+201.201 表示资源已被持久接受,且 proxy 已具备用该 starting identity 鉴权并
 parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
 已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
 `starting,run_id=""` 行并发布 Delete。cold image 后台路径保持原有单阶段 fast path:先完成
@@ -151,8 +147,7 @@ legacy `(sid, port)`.e2b profile 的 49983/49999 使用 EnvdAccessToken,拨 sand
 恢复副作用之前完成 KAT 校验,最终进入 `<run_root>/<NodeSandboxID>/ctl.sock`.
 TrafficAccessToken 仅供外部网关及 e2b
 数据面组件使用,node 平台层不消费。对 paused
-沙箱的请求触发自动 resume(与其它入口共用 launch owner,§8)。部署形态
-(internal/external/off)见 §9.1,
+沙箱的请求触发自动 resume(与其它入口共用 launch owner,§8).独立 Proxy 是唯一节点数据面,
 转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
 把公开稳定 SandboxID 转换为当前 NodeSandboxID,再注入 `E2b-Sandbox-Id` +
 `X-Access-Token` 转发进本节点 proxy(cluster-router.md)。
@@ -165,8 +160,8 @@ TrafficAccessToken 仅供外部网关及 e2b
 
 | 子命令 | 用途 |
 |---|---|
-| `serve` | 启动 daemon:控制面 + 数据面 + 本机控制 socket + reaper + 构建池;配 `cluster` 则起 node-link 客户端(§10),配 `resource_listen` 则内置资源控制器(node-resource.md) |
-| `proxy` | 外置数据面 worker(`proxy.mode=external`;见 §2.3 与 node-proxy.md) |
+| `serve` | 启动 conductor:控制面 + 本机控制 socket + reaper + 构建池;配 `cluster` 则起 node-link 客户端(§10),配 `resource_listen` 则内置资源控制器(node-resource.md) |
+| `proxy` | 启动独立数据面 master/worker(见 §2.3 与 node-proxy.md) |
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
 | `resource` | `status`/`list`/`drain`:reservation 控制器巡检与 admission 排空(node-resource.md §2) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
@@ -196,7 +191,7 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 2) e2b SDK/CLI 直接指向本机
 export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
-# dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
+# dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
 集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md),无须手动
@@ -210,21 +205,20 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config` | `/etc/node-ctl/conductor.yaml` | 配置文件(§3);`proxy.mode` 等一律以文件为准 |
+| `--config` | `/etc/node-ctl/conductor.yaml` | conductor 配置文件(§3) |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
 重启对账(§15)→ 起 reaper(TTL,5s 周期)→(配 `resource_listen` 则起内置资源控制器,
 node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 runner/builder 预启动池与
-构建准入循环(§12)→ 按 `proxy.mode` 装配
-数据面(§9)→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,§10)→
-监听 `api.listen`。`api.<domain>`(及任何 `api.` 前缀 Host)路由到控制面,其余 Host
-进数据面。TLS 证书缺省时以明文 h2c 服务(dev:SDK 走 `E2B_API_URL`/`E2B_SANDBOX_URL`)。
+构建准入循环(§12)→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,§10)→
+监听 `api.listen`.该 listener 只服务 wrapped control API;sandbox data Host 或 CONNECT
+不会转发到 backend.TLS 证书缺省时以明文 h2c 服务(dev:SDK 控制面走 `E2B_API_URL`).
 
 随仓 systemd 单元模板:`deploy/node-ctl.service`。
 
 ### 2.3 `node-ctl proxy`
 
-外置数据面 master(`proxy.mode=external`);运维带外起、与 serve 同节点。配置文件驱动
+独立数据面 master;运维带外起,与 conductor 同节点.配置文件驱动
 (`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),worker 由 master
 从自己的当前 executable 内部 reexec 和监督；worker 不经过 node-ctl CLI，也不重新读取配置:
 
@@ -232,11 +226,11 @@ node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 run
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-进程端点与 bootstrap 策略(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/
+进程端点与 bootstrap 策略(`config_socket`/`data_listen`/`proxy_netns`/
 `stats_socket`/`shm_path`/`workers`/`tls`/`auth`/`park_timeout`)在 `proxy.yaml`;
 MMDS listen 与 service registry 只配置在 conductor。master 在 plugin 平面注册一次,
-由握手取得 MMDS policy,维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
-node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
+由握手取得 MMDS policy,维护共享路由视图并把唯一 Data listener fd 传给 worker.拓扑见
+node-proxy.md §2,§5;conductor 与 Proxy 必须成对部署.
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
@@ -394,19 +388,16 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文。custom Runtime TLS provider 非 nil 时为权威材料源，core 仍固定 TLS version/ALPN/client-auth 策略 |
-| `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §3) |
-| `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
-| `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段,external native exec 另要求 `proxy.yaml` 必填 `paths.run_root` |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §4) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §6) |
-| `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
+| `proxy.metrics_listen` | 空(关) | conductor 进程的全局 Prometheus 文本端点;Proxy worker 数据面指标在 `proxy.yaml` 的 `metrics_listen` |
 | `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。`node-ctl config` 只诊断 regular/executable、非 group/world-writable、非 node-ctl same-file 元数据，不按诊断 EUID 判断 owner；实际 dispatch 中 root node-ctl 只接受 root-owned，非 root node-ctl 接受 root-owned 或本 EUID-owned。它执行已打开并校验的同一 FD，失败绝不回退 |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
-| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI 与 external proxy / 平台 agent 的连接点 |
+| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI,Proxy 与平台 agent 的连接点 |
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
@@ -455,7 +446,8 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md) |
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
-| `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
+| `cluster.api_endpoint` | (接入集群必填) | conductor control API 的显式 `host:port` advertised endpoint;不得从 `api.listen` 推导 |
+| `cluster.data_endpoint` | (接入集群必填) | Proxy sandbox data 的显式 `host:port` advertised endpoint;不得从 `proxy.data_listen` 推导 |
 | `resource_listen` | 缺省(不内置) | controller endpoint 的唯一配置源:`socket` 解析为 bind 用的绝对 `Listen` 与 owner/inventory/lease/sandbox.yaml 使用的 canonical `SocketIdentity`;sandbox client 经 canonical path 连接同一 socket inode。`enabled` 开关及其余调参见 node-resource.md §3.2。省略或 disabled = 静态 cgroup |
 
 ### 3.1 静态定制 conductor
@@ -530,10 +522,9 @@ xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runne
 解析也以 node-ctl 发行目录为准，不以 xconductor 目录为准。custom component 与 node-ctl
 必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/Router；API 只以
 `http.Handler` next 形式交给可信 wrapper，不暴露 internal 类型。它不引入 Go plugin、运行时
-发现、全局 registry、动态 middleware 注册或 DI container；
-`proxy.mode=internal` 仍只使用 conductor 内置标准 proxy，没有独立定制入口。
+发现,全局 registry,动态 middleware 注册或 DI container.conductor 始终只服务 control API.
 
-### 3.2 静态定制 external proxy
+### 3.2 静态定制 Proxy
 
 `paths.proxy_executable` 为空时 `node-ctl proxy` 在 declarative decode 后显式 final validate并
 运行内置 App；非空时 node-ctl 校验 protected absolute executable 的 runtime owner/mode/identity，
@@ -559,9 +550,9 @@ EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式�
 xproxy。worker 通过 sealed bootstrap 验证 config digest、role/id/epoch、FD mapping 和 executable
 identity，调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync；它不读取
 `proxy.yaml`，不调用 `Configure`。每个 worker epoch 的 `BindRuntime` 必须创建新 Extension；
-初始 route sync 后 core 调用其 `Start` 一次，再冻结可选 `IngressWrapper`，成功后才开放 data 与
-`proxy_socket` listener。wrapper 在 canonical parser 前接收 raw request，两个 listener 共用同一
-handler，MMDS 不经过它。`GetRoute` 只提供当前 SHM 点查副本，不提供 worker Watch。
+初始 route sync 后 core 调用其 `Start` 一次,再冻结可选 `IngressWrapper`,成功后才开放
+Data listener.wrapper 在 canonical parser 前接收 raw request,只服务节点 sandbox data ingress;
+MMDS 不经过它.`GetRoute` 只提供当前 SHM 点查副本,不提供 worker Watch.
 
 已完成私有认证的 wrapper 可调用拥有 HTTP 响应的 `ForwardAuthorized`，复用 lookup、parking、
 activation/Wake、binding revalidation、dial 和 traffic 生命周期；它不验证 Kuasar token。
@@ -571,7 +562,7 @@ guest clone，CONNECT 不调用它；generic helper 拒绝 native exec，标准 
 不得改变它。V1 不支持热更新，custom component 与 node-ctl 必须来自兼容版本。完整 API、
 示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy.md) §2.1。
 
-该扩展仅覆盖 external proxy；internal proxy 和 cluster-router/registry/placer 不增加 Extension。
+该扩展仅覆盖独立 Proxy;cluster-router/registry/placer 不增加 Extension.
 除上述 master management 与 worker ingress wrapper 外，不开放 listener、原始
 SHM/Router/routesync/stats，也不引入 namespace、plugin registry、动态加载、通用生命周期 hook
 或 DI。WebSocket 不属于 Issue #256，由 Issue #269 独立跟踪。
@@ -592,11 +583,10 @@ resolved execution。现有开发数据库按当前 schema 直接重建,没有�
 `kuasar-sandbox.restore` 命名空间决定(§4.6)。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
-proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
-proxy 组件);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service endpoint
-必须是 absolute Unix socket URI。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
-配置 `proxy_netns`。external 模式无须静态 worker 列表——proxy master 经 plugin 平面注册,
-proxyForwarder 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
+Proxy 是唯一数据面闸门);`mmds.routes.enabled=true` 还要求 `mmds.enabled=true`,service endpoint
+必须是 absolute Unix socket URI.`proxy_netns` 和 worker 数只配置在 `proxy.yaml`.
+配 `cluster.node_link.endpoint` 时 `cluster.node_id`,`cluster.api_endpoint` 和
+`cluster.data_endpoint` 都必填;配
 `resource_listen.enabled=true` 时 node-ctl 在启动阶段解析一次 canonical controller
 identity并自动写入每个 dynamic sandbox YAML;没有第二个
 `sandbox.resources.control_socket` 配置源。startup 对 static/dynamic 使用同一 headroom
@@ -754,8 +744,7 @@ e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
 starting/paused 返回 inflight 但不返回顶层 idle。V1 不返回 idle bool/duration、last
 open/close、累计连接数、bytes/延迟/端口明细或 worker 信息。
 
-internal proxy 在同进程聚合;external conductor 经当前 trusted proxy registration 的
-`stats_socket` 读取 master cache,查询时不扇出 worker。proxy mode=off 为 501;master 未注册、
+conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
 完整 worker-local 状态机、绝对快照 stream 和故障窗口见 [node-proxy.md](node-proxy.md) §8。
 
@@ -831,7 +820,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
-- routesync(external proxy / 路由观察者):版本 2,帧 `[4B LE len][JSON]`,消息
+- routesync(Proxy / 路由观察者):版本 5,帧 `[4B LE len][JSON]`,消息
   `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
@@ -1293,26 +1282,27 @@ DELETE /internal/admin/sandboxes/{id}/mmds/secrets/{name}
 `mmds.routes.max_secret_value_bytes` 限制的 opaque bytes,完整替换当前 value;DELETE
 幂等。成功均回 204,不返回 plaintext。API 不定义 TTL/expiration 参数或 header,不从请求
 Content-Type 派生 value metadata;响应 Content-Type 始终属于 route。store CAS 成功后才
-发布 Upsert 使 external proxy 收敛,失败时不发布伪状态。日志只记录 sid/name/outcome,
+发布 Upsert 使 Proxy 收敛,失败时不发布伪状态.日志只记录 sid/name/outcome,
 绝不记录 body。鉴权仍是本 socket 的 0600 + SO_PEERCRED + 可选 admin pidfile。
 
-**③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
+**③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(Proxy
 master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
 租约 + 路由流(routesync,线格式见 node-proxy.md §4).请求体首帧是 `register{caps}`,之后(route_wake)是
 `wake` 或 `route_barrier_ack` 上行;响应体下行
 `hello(policy) → upsert* → bookmark → upsert/delete/route_barrier`。Wake 与 barrier ACK
 经同一个上行 writer 串行发送。能力相互
-**独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
-(声明 serve proxyForwarder 转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
+**独立,不强制组合**:`subscribe`(`route` | `route_wake`),`proxy{stats_socket?}`
+(可信 Proxy registration marker 及可选 traffic stats endpoint),`mmds`.route barrier participant
+只要求固定 `proxy` id,`route_wake` subscription 与 `proxy` marker,不依赖 stats socket.**断连即反注册**;同
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
-其中,未配则仅靠 socket 0600(同 admin)。external proxy master、平台 agent 均经此订阅。
+其中,未配则仅靠 socket 0600(同 admin).Proxy master,平台 agent 均经此订阅.
 此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
 
 MMDS confidential 投影不是任意 plugin 自报的权限。只有 id 精确为 `proxy`,且同时满足
 `subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true` 的 registration 才收到 conductor
 MMDS service registry、`mmds_routes` 与 `mmds_route_secret_values`;普通 route observer
 两者均不收,node-link/cluster stream 也不收。伪装为其它 id 的 `mmds=true` registration
-被拒绝。external master 在完整 Bookmark 前 fail closed,断流即清空可变 route/value/service
+被拒绝.Proxy master 在完整 Bookmark 前 fail closed,断流即清空可变 route/value/service
 视图,不会无限期服务断连前的 secret。
 
 **④ api 平面** — 其余路径回落到 e2b 控制面 handler(与 TLS `api.listen` **同一个**
@@ -1477,7 +1467,7 @@ Pause 原子覆盖它。
 共用 launch group。每次 admission 先在 per-SID lifecycle lock 内重读 durable row,再执行授权、
 模式解析和 Store CAS,最后创建或加入 launch attempt。attempt 中的 mode 只是 durable
 `launch_mode` 的缓存。Kill/Delete 取消 attempt 后仍等待 exact runner/network/local cleanup 完成;
-waiter 被唤醒前 Store、cache 和 route 已收敛。external fresh Create 还必须在启动资源前通过
+waiter 被唤醒前 Store,cache 和 route 已收敛.每次 fresh Create 必须在启动资源前通过
 route-applied barrier;失败以 exact empty-owner CAS 删除 starting 行并发布 Delete。
 
 ### 8.1 Artifact lifecycle、转模板与迁移
@@ -1556,8 +1546,11 @@ runner/network ownership。`CommitStartingRunning`、`RollbackStartingPaused`、
 仍可选择 memory。conductor 重启遇到 starting resume 时从 durable source + `launch_mode` 重建
 attempt;例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。
 
-普通 ingress Wake、internal `ActivateRoute`、external `OnWake`、native `ActivateExec` 和
-`ExecSession` 全部只传 `ResumeAuto`:S 默认 memory,E 默认 cold。两种 source 都保留既有 Wake 能力;
+Proxy 的 ordinary ingress 和 native exec activation 都经 `OnWake` 使用
+`ResumeTriggerWake`;`ExecSession` 使用 `ResumeTriggerExecSession`.公开的
+`ResumeTriggerRoute` / `ResumeTriggerExec` 常量继续保留扩展契约,但 conductor 不再承载
+对应的数据面 adapter.这些入口全部只传 `ResumeAuto`:S 默认 memory,E 默认 cold.两种 source
+都保留既有 Wake 能力;
 proxy SHM 不携 source kind 或 cold gate。已鉴权的首个 E 请求保持 parked,直到 node
 完成 cold launch、route 变为 running 并成功拨通 backend 后才继续转发。未来的 `autoResume=false`
 若实现,必须是独立 traffic policy,不能从 E/S kind 推导。本变更不宣称完整实现 E2B autoResume。
@@ -1665,45 +1658,42 @@ proxy 不读取 kind。Migration token 是 sandbox 级敏感凭据,不会随 rou
 通用 backend health/dial retry 仍由独立工作跟踪。cluster 的 create/connect 复用上述 node-local
 原语;secrets-only CONNECT import 仍只属于 standalone,node-link 不传 MMDS secret plaintext。
 
-## 9. 数据面装配(serve 侧)
+## 9. 数据面边界
 
 数据面**转发层**——L7 反代:按 `(sid, port)` 路由到 guest envd / floatingip,逐请求
 鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [node-proxy.md](node-proxy.md)。
-本节只讲 serve 控制面对数据面的三项职责:按 `proxy.mode` 装配承载、作本节点路由
-权威向订阅者广播、以及 proxyForwarder。
+conductor 只服务控制 API,生命周期和本节点路由权威;它不构造 proxy,不监听数据口,
+不接收或转发 sandbox data.独立 `node-ctl proxy` 的必填 `data_listen` 是唯一节点数据入口.
 
-### 9.1 按 proxy.mode 装配
+### 9.1 APIEndpoint 与 DataEndpoint
 
-serve 启动末段按 `proxy.mode`(§3)装配数据面;控制面 `api.<domain>` 始终由
-`api.listen` 提供,按 Host 与数据面(`<port>-<sid>.<domain>`)分流:
+独立部署和集群部署都必须把两个 endpoint 分开:
 
-| 模式 | 数据面承载 | 进程 |
+| Endpoint | Owner | 用途 |
 |---|---|---|
-| **internal**(默认) | serve 进程内 proxy(与控制面同一 `http.Handler`,按 Host 分流) | 单二进制 |
-| **external** | 独立 `node-ctl proxy` master 注册一次,内部 worker 共享继承 listener fd 与 shm 路由视图 | serve + proxy master + N×worker |
-| **off** | 拒绝(501) | – |
+| `APIEndpoint` | conductor `api.listen` | Sandbox/Build control HTTP |
+| `DataEndpoint` | Proxy `data_listen` | ordinary HTTP,CONNECT 与 native exec CONNECT |
 
-internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改为在 plugin 平面(§6)
-接受 proxy master 注册并向其广播路由(§9.2),数据面字节流不经 serve.#63 的
-legacy/explicit forward,envd 和 CI 转发判定由两模式共用.native exec 也在最终
-node proxy 执行 KAT + ExecRequest gate 和 sandboxer ctl tunnel:internal 使用 conductor `paths.run_root`,
-external worker 使用 master 冻结的 EffectiveConfig 中必填且与 conductor 一致的
-`paths.run_root` 本地构造
+集群节点注册显式携带两者,不从 bind address 推导.cluster Router 的 control/build 转发只拨
+`APIEndpoint`,data/exec 只拨 `DataEndpoint`;任一缺失都 fail closed,不跨平面回退.native exec
+由 Proxy worker 执行 KAT + ExecRequest gate 和 sandboxer ctl tunnel,并使用 master 冻结的
+EffectiveConfig 中必填的 `paths.run_root` 本地构造
 `<run_root>/<NodeSandboxID>/ctl.sock`.该路径不通过 routesync `Policy` 或共享路由视图传递.
-部署拓扑见 node-proxy.md §3,共享内存路由视图见 §4,转发判定与隧道详细见 §5.集群下,
-cluster-ctl router 把数据面转发进本节点的
-数据端点(internal 的 `api.listen`/`data_listen` 或 external proxy master 的数据口),节点侧
-按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md),无须区分来源。
 
-两种 proxy mode 都使用相同的 traffic flow 状态机。external master 额外注册
-`stats_socket`,每个 worker 经独立 socketpair 推送 Prometheus counter 与 per-sandbox
-traffic 绝对值;serve 的 traffic API 只查询 master 聚合 cache。proxyForwarder 与 cluster
-第二跳只是内部中继,不重复计数,每条 logical ingress 只在最终 node worker 统计一次。
+当前 Router→node 跳使用明文 HTTP/CONNECT,因此集群注册的两个 endpoint 必须指向不同的
+明文内部 listener,不能指向启用 TLS 的 node listener.随附部署样例使用 conductor `:3000`
+和 Proxy `:3443`,对外 TLS 在 cluster Router 或负载均衡器终止.这不改变 node-link 自身的
+mTLS.
+
+Proxy master 注册可选 `stats_socket`,每个 worker 经独立 socketpair 推送 Prometheus counter
+与 per-sandbox traffic 绝对值;conductor traffic API 只查询当前 trusted Proxy registration 的
+stats endpoint.route barrier participation 不依赖 stats socket.每条 logical ingress 只在最终
+node worker 统计一次.
 
 ### 9.2 路由权威与广播
 
 serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill 实时更新路由,经
-**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy master 与路由
+**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(Proxy master 与路由
 观察者如平台 agent)。proxy master 把路由投影到共享内存,worker 只读;观察者持只读缓存
 感知状态。广播逐条 upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
 `RouteEntry` 字段(含驱动迁移的 `artifact_location`、MMDS 使用的 `mmds_secret`)见 node-proxy.md §4;
@@ -1713,17 +1703,15 @@ plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(clust
 广播前执行服务端投影:受信 MMDS proxy 的 Upsert 额外携 `mmds_routes` 与
 `mmds_route_secret_values`,二者在同一 event 中原子替换;普通 observer 不收到这些字段,
 cluster/node-link 也绝不收到 value。conductor-owned `mmds.services` 仅放在受信 proxy 的
-Hello policy,不广播给 route observer。internal proxy 直接读 conductor 内存 registry;
-external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 Unix socket endpoint,
+Hello policy,不广播给 route observer.Proxy master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 Unix socket endpoint,
 不读取 `proxy.yaml` 中的第二份配置。
 
-- **auto-resume launch owner**:数据面打到 paused 沙箱触发 resume——internal 在请求内完成
-  durable acceptance 并等待,external 经 routesync `Wake` 上行;同一 sid 的 Connect/Wake/
-  exec activation 与其它 launch 入口共用唯一 attempt(§8)。
+- **auto-resume launch owner**:数据面打到 paused 沙箱时,Proxy 经 routesync `Wake` 上行;同一 sid 的
+  Connect,Proxy Wake,ExecSession 与其它 launch 入口共用唯一 attempt(§8)。
 - **starting 投影**:初始 `starting,run_id=""` durable insert 后即广播,此时没有 FloatingIP
   或可用 endpoint;network ownership 已 CAS 持久化且 YAML/ready.sock 已准备后再广播 enriched
-  starting,供 internal/external MMDS 完成 envd `/init`。starting 不开放普通数据面,也不触发
-  Wake。external Create 在初始 Upsert 后发送 ordered route barrier;master apply+ACK且 lease
+  starting,供 Proxy MMDS 完成 envd `/init`.starting 不开放普通数据面,也不触发
+  Wake.每次 Create 在初始 Upsert 后发送 ordered route barrier;master apply+ACK且 lease
   复核成功后才返回 201并启动 launch,因此 201 后的首个合法请求应直接看到 starting并
   parking,不再把正常 route propagation gap 当作 missing。launch 成功广播 running;create
   失败广播 Delete,resume 失败广播 paused。
@@ -1731,18 +1719,6 @@ external master 原子替换 registry,worker 经本机 MMDS RPC 取得已解析 
   是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
   `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
   token,使快照扇出沙箱数据面可用.姿态对比与 MMDS 两段式协议见 node-proxy.md §7.
-
-### 9.3 proxyForwarder
-
-数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 经
-已注册的 `proxy_socket` UDS 只写一次原始 ordinary HTTP/CONNECT，由 proxy worker raw wrapper
-与 core handler 作最终 parse/auth。能无副作用解析 canonical SID 时继续按 SID 选择 worker；不能
-解析时按 `Host + method + URL path` 稳定 hash，parse failure 只影响 affinity，不再拒绝私有
-Header/path。请求 body 不整包缓存，发送后不自动重放。CONNECT 200 后保留 client/UDS 双方
-buffered bytes 并沿用 half-close tunnel，非 200 转发 worker response；无 proxy 注册时回 502。
-没有 WorkerExtension 时，最终 worker 仍产生既有 canonical parser/token 错误。该透明行为只属
-node-local external fallback；cluster ingress 必须在外层 canonicalize，且不增加 cluster
-Extension。转发细节见 node-proxy.md §5。
 
 ## 10. 集群接入(node-link)
 
@@ -1780,6 +1756,7 @@ register{
   capacity,
   build_registration_capacity,
   build_execution_capacity,
+  api_endpoint,
   data_endpoint,
   runtime_digest,
   accept_redirect
@@ -2147,10 +2124,12 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 ## 13. DNS / TLS
 
 生产:`*.<domain>` + `api.<domain>` 通配 DNS + TLS(operator 提供,on-prem/离线
-友好)。控制面与数据面可同口(`api.listen`)或分口(`proxy.data_listen` /
-external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL`/
-`E2B_SANDBOX_URL` 指向明文 http(h2c),无需证书与通配 DNS。集群下 cluster-ctl router
-持对外通配证书,node-link 用独立的 `cluster.node_link.tls` mTLS(§10)。
+友好).控制面由 conductor `api.listen` 承载,数据面由独立 Proxy `data_listen` 承载;
+二者必须是不同 listener.独立模式可让两者直接终止 TLS;若都使用端口 443,必须绑定不同
+地址或由外部负载均衡器按域名转发.dev:`E2B_API_URL`/`E2B_SANDBOX_URL` 分别指向
+明文 http(h2c) listener.集群下 cluster-ctl router 持对外通配证书,Router→node 的
+`APIEndpoint`/`DataEndpoint` 跳当前为明文,node-link 则用独立的
+`cluster.node_link.tls` mTLS(§10).
 
 ## 14. 契约边界
 
@@ -2165,7 +2144,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、§12) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
-| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点,运维带外起;proxy master 注册一次,worker 共享继承 listener fd + shm 路由视图；master 冻结的 EffectiveConfig 含 `paths.run_root`，worker 不重读 `proxy.yaml`(node-proxy.md §2.1/§3/§4) |
+| `node-ctl proxy` | UDS routesync(双向 h2c 帧化 JSON)+ 独立 Data listener | 同节点,运维带外起;Proxy master 注册一次,worker 共享继承 Data listener fd + shm 路由视图;master 冻结的 EffectiveConfig 含 `paths.run_root`,worker 不重读 `proxy.yaml`(node-proxy.md §2.1/§3/§4) |
 
 公共导出面仅为 `config`、`app/conductor` 与 `app/proxy` 的启动期契约；
 `CGO_ENABLED=0`;内部 core 继续保持 `internal/*` 依赖边界。
@@ -2229,7 +2208,7 @@ AES-256-GCM、两项 `*_hash` 均为
 
 ### 15.2 重启对账
 
-serve 在开放 API、routesync、node-link 和数据面前先以
+conductor 在开放 API、config-socket routesync 和 node-link 前先以
 `ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
 
 - 库内 starting 不直接收养为 running。fresh Create 先 Stop/Reset exact runner、detach network、
@@ -2239,7 +2218,7 @@ serve 在开放 API、routesync、node-link 和数据面前先以
   Stop/Reset/detach/目录 cleanup 失败时 Reconcile 使节点启动失败并保留 ownership,不得先清字段
   或开放 API;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
-  external 模式随快照重新推给 worker;集群下经 node-link 重报);
+  随快照重新推给 Proxy worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
 - 无 running 行对应的 runner 单元属于上一个 pool 的 idle/orphan run-id ⇒
   `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
@@ -2269,11 +2248,11 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 
 | 故障 | 影响 | 自愈 |
 |---|---|---|
-| serve 崩溃/重启 | 控制面与 internal 数据面中断;沙箱(microVM/单元)不受影响 | systemd 重启 → 重启对账收养;external proxy master 仍可用共享路由视图服务 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
-| proxy worker 崩溃(external) | 该 worker 上的连接断;其余 worker 继续接新连接 | proxy master 重启该 worker;worker 重新读取共享路由视图 |
-| proxy master 崩溃(external) | external 数据面中断,plugin 租约断开 | systemd 重启 master → 重新注册、重建共享表、启动 worker |
+| conductor 崩溃/重启 | 控制面中断;沙箱(microVM/单元)与 running 数据流不受影响 | systemd 重启 → 重启对账收养;Proxy master 仍可用共享路由视图服务 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
+| Proxy worker 崩溃 | 该 worker 上的连接断;其余 worker 继续接新连接 | Proxy master 重启该 worker;worker 重新读取共享路由视图 |
+| Proxy master 崩溃 | 数据面中断,plugin 租约断开,Create fail closed | systemd 重启 master → 重新注册,重建共享表,启动 worker |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
-| routesync 断流 | external 固定数据面视图停更;MMDS route/value/service 立即不可用 | proxy master 清空 confidential heap 并指数退避重连重注册,完整同步 bookmark 后才重新服务(node-proxy.md §4) |
+| routesync 断流 | Proxy 数据面视图停更;MMDS route/value/service 立即不可用 | Proxy master 清空 confidential heap 并指数退避重连重注册,完整同步 bookmark 后才重新服务(node-proxy.md §4) |
 | node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
@@ -2281,9 +2260,9 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 
 单元测试:`make test`(MMDS strict parser/top-level merge/minimal persistence、route value
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
-external master/worker resync/rotation;handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
+Proxy master/worker resync/rotation;handler 路由,apikey/secretbox/regcreds,routesync(注册/bookmark
 往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
-proxyForwarder raw HTTP/CONNECT relay,Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
+Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).
 
@@ -2303,10 +2282,10 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、exact-run bootstrap、cold单阶段/restore两阶段、execve、`TASK_*`和重复MANIFEST_KEY剥除;`config` CLI 往返 |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;Build Register MMDS、终态 cleanup、日志/DB/image 隔离 |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、local Pause→resume 与恢复策略 |
-| `e2e_mmds_routes_internal.sh` | 复用 execute 拓扑覆盖 internal static、secret 生命周期与 local UDS service |
-| `e2e_mmds_routes_external.sh` | 复用 external proxy 拓扑覆盖同一合同及 full resync/fail-closed 恢复 |
-| `e2e_orchestrator_proxy.sh` | external proxy master/worker、路由同步、数据面鉴权、auto-resume 与 CONNECT relay |
-| `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,覆盖 node-link、Reserve、路由、稳定 SandboxID、ExecSession 与成员变更 |
+| `e2e_mmds_routes.sh` | 复用 execute 的 Proxy 拓扑覆盖 static,secret 生命周期与 local UDS service |
+| `e2e_mmds_routes_proxy_restart.sh` | 复用 Proxy 拓扑覆盖 MMDS full resync/fail-closed 恢复 |
+| `e2e_orchestrator_proxy.sh` | Proxy master/worker,唯一 data ingress,路由同步,数据面鉴权,auto-resume 与 CONNECT relay |
+| `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,以不同 API/Data listener 覆盖 node-link,Reserve,control/data/exec/build 路由,稳定 SandboxID 与成员变更 |
 | `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry 和 node-link redirect |
 | `e2e_density.sh` | 节点资源准入、回收与密度行为 |
 | `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
@@ -2316,8 +2295,8 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 
 ## 17. See Also
 
-- [node-proxy.md](node-proxy.md) —— 数据面转发层:路由判定 / 部署模式(internal/external/off)/
-  routesync / 数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 装配的转发层实现,集群下 router 转发进入)
+- [node-proxy.md](node-proxy.md) —— 独立数据面转发层:路由判定 / routesync /
+  数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 的唯一数据入口,集群下 router 转发进入)
 - [node-resource.md](node-resource.md) —— 节点资源控制协议、sandbox resource policy
   与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,

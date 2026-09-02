@@ -17,7 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, forwardListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) error {
+func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) error {
 	if effective == nil || logger == nil {
 		return fmt.Errorf("proxy worker process: unresolved startup state")
 	}
@@ -30,42 +30,37 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 	if err != nil {
 		return err
 	}
-	forwardFile, err := listenerFile(forwardListener)
+	mmdsFile, err := listenerFile(mmdsListener)
 	if err != nil {
 		closeFiles([]*os.File{dataFile})
 		return err
 	}
-	mmdsFile, err := listenerFile(mmdsListener)
-	if err != nil {
-		closeFiles([]*os.File{dataFile, forwardFile})
-		return err
-	}
 	wakeRead, wakeWrite, err := os.Pipe()
 	if err != nil {
-		closeFiles([]*os.File{dataFile, forwardFile, mmdsFile})
+		closeFiles([]*os.File{dataFile, mmdsFile})
 		return err
 	}
 	notifyRead, notifyWrite, err := os.Pipe()
 	if err != nil {
-		closeFiles([]*os.File{dataFile, forwardFile, mmdsFile, wakeRead, wakeWrite})
+		closeFiles([]*os.File{dataFile, mmdsFile, wakeRead, wakeWrite})
 		return err
 	}
 	statsMaster, statsWorker, err := newSocketPair("proxy-stats")
 	if err != nil {
-		closeFiles([]*os.File{dataFile, forwardFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite})
+		closeFiles([]*os.File{dataFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite})
 		return err
 	}
 	mmdsRPCMaster, mmdsRPCWorker, err := newSocketPair("proxy-mmdsrpc")
 	if err != nil {
 		closeFiles([]*os.File{
-			dataFile, forwardFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite,
+			dataFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite,
 			statsMaster, statsWorker,
 		})
 		return err
 	}
 	parentFiles := []*os.File{wakeRead, notifyWrite, statsMaster, mmdsRPCMaster}
 	defer closeFiles(parentFiles)
-	workerFiles := make([]*os.File, 0, 8)
+	workerFiles := make([]*os.File, 0, 7)
 	nextDescriptor := 3
 	addWorkerFile := func(file *os.File) int {
 		if file == nil {
@@ -77,7 +72,7 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 		return descriptor
 	}
 	fds := workerFDMapping{
-		Data: addWorkerFile(dataFile), Forward: addWorkerFile(forwardFile), MMDS: addWorkerFile(mmdsFile),
+		Data: addWorkerFile(dataFile), MMDS: addWorkerFile(mmdsFile),
 		Wake: addWorkerFile(wakeWrite), Notify: addWorkerFile(notifyRead), Stats: addWorkerFile(statsWorker),
 		MMDSRPC: addWorkerFile(mmdsRPCWorker),
 	}

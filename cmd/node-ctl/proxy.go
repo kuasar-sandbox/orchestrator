@@ -14,7 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyapp"
 )
 
-// runProxy is the node-ctl entry for the external proxy master. Workers are
+// runProxy is the node-ctl entry for the independent Proxy master. Workers are
 // private re-executions detected before CLI parsing in main.
 func runProxy(args []string, logger *slog.Logger) error {
 	flags := flag.NewFlagSet("proxy serve", flag.ContinueOnError)

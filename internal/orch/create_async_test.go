@@ -310,15 +310,22 @@ func TestCreateBackgroundFailureReturnsAcceptedThenPublishesDelete(t *testing.T)
 	if dead.RunID != "" || dead.VswitchPort != "" {
 		t.Fatalf("failed create retained ownership: %+v", dead)
 	}
-	for _, want := range []string{routesync.StateStarting, routesync.TypeDelete} {
+	for _, want := range []string{routesync.StateStarting, routesync.TypeRouteBarrier, routesync.TypeDelete} {
 		select {
 		case event := <-events:
-			if want == routesync.TypeDelete {
+			switch want {
+			case routesync.TypeRouteBarrier:
+				if event.Kind != routesync.TypeRouteBarrier {
+					t.Fatalf("failure barrier event = %+v", event)
+				}
+			case routesync.TypeDelete:
 				if event.Kind != routesync.TypeDelete || event.SID != accepted.ID {
 					t.Fatalf("failure event = %+v, want Delete", event)
 				}
-			} else if event.Kind != routesync.TypeUpsert || event.Route.State != want {
-				t.Fatalf("failure event = %+v, want %s", event, want)
+			default:
+				if event.Kind != routesync.TypeUpsert || event.Route.State != want {
+					t.Fatalf("failure event = %+v, want %s", event, want)
+				}
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("missing %s event", want)

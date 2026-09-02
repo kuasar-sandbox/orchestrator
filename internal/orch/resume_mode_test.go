@@ -11,7 +11,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -216,66 +215,20 @@ func TestAutoResumeTriggersUseDurableSourceKind(t *testing.T) {
 				finishAcceptedAutoLaunch(t, fixture, source.want)
 			})
 
-			t.Run("internal ordinary route", func(t *testing.T) {
-				fixture := newResumeModeFixture(t, source.kind, true)
-				target := proxy.LegacyTarget(8080)
-				binding, found, err := fixture.o.LookupRoute(fixture.ctx, fixture.sb.ID, target)
-				if err != nil || !found {
-					t.Fatalf("LookupRoute = %+v, %v, %v", binding, found, err)
-				}
-				type result struct {
-					route proxy.Route
-					found bool
-					err   error
-				}
-				done := make(chan result, 1)
-				go func() {
-					route, found, err := fixture.o.ActivateRoute(fixture.ctx, binding)
-					done <- result{route: route, found: found, err: err}
-				}()
-				waitForLauncherStart(t, fixture.started)
-				assertAcceptedAutoLaunch(t, fixture, source.want)
-				close(fixture.startGate)
-				assertArtifactLaunchMode(t, fixture.launchModes, source.want)
-				select {
-				case got := <-done:
-					if got.err != nil || !got.found || got.route.Kind != proxy.KindTCP {
-						t.Fatalf("ActivateRoute = %+v, %v, %v", got.route, got.found, got.err)
+			for _, trigger := range []types.ResumeTrigger{types.ResumeTriggerRoute, types.ResumeTriggerExec} {
+				t.Run(string(trigger)+" trigger", func(t *testing.T) {
+					fixture := newResumeModeFixture(t, source.kind, true)
+					accepted, attempt, err := fixture.o.ensureResumeAccepted(
+						fixture.ctx, fixture.sb.ID, nil,
+						types.ResumeRequest{Trigger: trigger, Mode: types.ResumeAuto}, nil,
+					)
+					if err != nil || accepted == nil || attempt == nil {
+						t.Fatalf("ensureResumeAccepted(%s) = %+v, %+v, %v", trigger, accepted, attempt, err)
 					}
-				case <-time.After(2 * time.Second):
-					t.Fatal("authorized route did not remain parked through launch")
-				}
-			})
-
-			t.Run("native exec", func(t *testing.T) {
-				fixture := newResumeModeFixture(t, source.kind, true)
-				identity, found, err := fixture.o.LookupExec(fixture.ctx, fixture.sb.ID)
-				if err != nil || !found {
-					t.Fatalf("LookupExec = %+v, %v, %v", identity, found, err)
-				}
-				type result struct {
-					identity proxy.ExecIdentity
-					found    bool
-					err      error
-				}
-				done := make(chan result, 1)
-				go func() {
-					ready, found, err := fixture.o.ActivateExec(fixture.ctx, fixture.sb.ID, identity)
-					done <- result{identity: ready, found: found, err: err}
-				}()
-				waitForLauncherStart(t, fixture.started)
-				assertAcceptedAutoLaunch(t, fixture, source.want)
-				close(fixture.startGate)
-				assertArtifactLaunchMode(t, fixture.launchModes, source.want)
-				select {
-				case got := <-done:
-					if got.err != nil || !got.found || got.identity != identity {
-						t.Fatalf("ActivateExec = %+v, %v, %v", got.identity, got.found, got.err)
-					}
-				case <-time.After(2 * time.Second):
-					t.Fatal("authorized exec did not remain parked through launch")
-				}
-			})
+					assertAcceptedAutoLaunch(t, fixture, source.want)
+					finishAcceptedAutoLaunch(t, fixture, source.want)
+				})
+			}
 
 			t.Run("exec session", func(t *testing.T) {
 				fixture := newResumeModeFixture(t, source.kind, true)

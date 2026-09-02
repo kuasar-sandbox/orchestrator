@@ -1,9 +1,10 @@
-# node-ctl daemon unit — the e2b-compatible node host + in-process node resource
-# controller. It launches sandbox/build runner template instances keyed by run-id
+# node-ctl conductor unit — the API/control host + optional node resource controller.
+# It launches sandbox/build runner template instances keyed by run-id
 # over systemd D-Bus, so it needs the system bus and cgroup write access. Start
-# after the data-plane daemons.
+# independently of the Proxy data service. node-proxy.service starts after this
+# unit so it can register through config_socket; do not add a reverse dependency.
 [Unit]
-Description=kuasar node-ctl (e2b host + node resource control)
+Description=kuasar node-ctl conductor (API + lifecycle + node resource control)
 After=network-online.target cache-ctl.service store-ctl.service
 Wants=network-online.target
 

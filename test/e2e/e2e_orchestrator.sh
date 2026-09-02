@@ -24,6 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/lib/proxy.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 SWITCH="${SWITCH:-sw0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -42,6 +43,7 @@ for b in node-ctl sandbox-ctl e2b-key-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 [ -d /run/systemd/system ] || skip "systemd is not PID1 (node-ctl drives units over D-Bus)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -49,6 +51,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-orch-XXXXXX)"
+PROXY_PORT="${PROXY_PORT:-$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')}"
 UNIT_DIR="$WORK/units"           # transient unit_dir (not /etc) so the test is self-contained
 mkdir -p "$UNIT_DIR"
 declare -a PIDS=()
@@ -131,6 +134,14 @@ for i in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; skip "node-ctl conductor serve exited (see log)"; }
     sleep 0.5
 done
+
+write_proxy_config "$WORK/proxy.yaml" \
+    "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" - \
+    "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" 1024 1 enforce 30s -
+start_proxy "$BIN/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
+PIDS+=("$PROXY_HELPER_PID")
+wait_proxy_ready "$PROXY_HELPER_PID" 127.0.0.1 "$PROXY_PORT" "$WORK/proxy-stats.sock" "$WORK/proxy.log" \
+    || fail "Proxy did not become ready"
 
 # Allowlist MK so it may create/build — now via serve's admin plane on the control
 # socket (the daemon owns the manifest_keys credential-pair table), so it runs AFTER serve is up.
