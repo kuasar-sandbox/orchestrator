@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
@@ -119,7 +120,7 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 			}
 			ctlRoute := Route{
 				Kind: KindUDS,
-				UDS:  filepath.Join(p.execRunRoot, ready.NodeSandboxID, "ctl.sock"),
+				UDS:  filepath.Join(nodepath.SandboxRunDir(p.execRunRoot, ready.NodeSandboxID), "ctl.sock"),
 			}
 			ctlConn, err := p.dial(ctx, ctlRoute)
 			if err != nil {

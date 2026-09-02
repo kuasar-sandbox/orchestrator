@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -205,7 +206,7 @@ func TestHandleClusterConnectResumeModeMatrix(t *testing.T) {
 					Kind: test.sourceKind, Ref: "file://" + strings.Repeat("8", 64) + extension + "@location:cluster-mode",
 				},
 				APISecret: apiSecret, ManifestKey: manifestKey,
-				RunDir: filepath.Join(cfg.Paths.RunRoot, "cluster-resume-mode"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "cluster-resume-mode"), CreatedUnix: 1,
+				RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "cluster-resume-mode"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "cluster-resume-mode"), CreatedUnix: 1,
 			}
 			materializeTestSandboxCredentials(t, sb)
 			if err := o.st.Put(ctx, sb); err != nil {
@@ -326,8 +327,8 @@ func TestLaterClusterConnectTimeoutWinsAfterAsyncResume(t *testing.T) {
 		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
 		APISecret:     deriveTestAPISecret(t, manifestKey),
 		ManifestKey:   manifestKey,
-		RunDir:        filepath.Join(cfg.Paths.RunRoot, "cluster-timeout-target"),
-		BaseDir:       filepath.Join(cfg.Paths.BaseRoot, "cluster-timeout-target"),
+		RunDir:        nodepath.SandboxRunDir(cfg.Paths.RunRoot, "cluster-timeout-target"),
+		BaseDir:       nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "cluster-timeout-target"),
 		CreatedUnix:   1,
 		DeadlineUnix:  10,
 	}
@@ -450,10 +451,10 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64)},
 		APISecret:     apiSecret,
 		ManifestKey:   manifestKey,
-		RunDir:        filepath.Join(cfg.Paths.RunRoot, sid),
-		BaseDir:       filepath.Join(cfg.Paths.BaseRoot, sid),
-		EnvdUDS:       filepath.Join(cfg.Paths.RunRoot, sid, "envd.sock"),
-		CiUDS:         filepath.Join(cfg.Paths.RunRoot, sid, "ci.sock"),
+		RunDir:        nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:       nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
+		EnvdUDS:       filepath.Join(nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid), "envd.sock"),
+		CiUDS:         filepath.Join(nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid), "ci.sock"),
 		CreatedUnix:   1,
 	}
 	materializeTestSandboxCredentials(t, sb)

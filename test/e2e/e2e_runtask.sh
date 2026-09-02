@@ -73,13 +73,13 @@ systemctl show-environment >/dev/null 2>&1 || skip "systemd manager is unavailab
 SOCK="$WORK/node-ctl.socket"
 RUN_ID="sr-00000000-0000-7000-8000-000000000001"
 RUN_ROOT="$WORK/runroot"
-PIDFILE="$RUN_ROOT/runs/$RUN_ID.pid"
-TASK_PIDFILE="$RUN_ROOT/probe/probe.pid"
+PIDFILE="$RUN_ROOT/runners/$RUN_ID.pid"
+TASK_PIDFILE="$RUN_ROOT/sandboxes/probe/probe.pid"
 OUTFILE="$WORK/marker.out"
-READY_SOCK="$RUN_ROOT/probe/ready.sock"
+READY_SOCK="$RUN_ROOT/sandboxes/probe/ready.sock"
 READY_WIRE="$WORK/ready.wire"
 ORDER_FILE="$WORK/order.log"
-mkdir -p "$WORK/wd" "$RUN_ROOT/runs" "$RUN_ROOT/probe"
+mkdir -p "$WORK/wd" "$RUN_ROOT/runners" "$RUN_ROOT/sandboxes/probe"
 
 cat > "$WORK/marker.sh" <<EOF
 #!/usr/bin/env bash

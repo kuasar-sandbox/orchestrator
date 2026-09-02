@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -143,9 +144,10 @@ func TestPhaseSandboxDoneBroadcastAndTeardownAfterExit(t *testing.T) {
 func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 	dir := t.TempDir()
 	script := writeSandboxCtlTestScript(t, dir)
+	runDir, baseDir := filepath.Join(dir, "run"), filepath.Join(dir, "base")
 	p := &buildPipeline{
 		spec: &configsock.BuildSpec{
-			BuildID: "build-123456", RunID: "run-1", Workdir: dir,
+			BuildID: "build-123456", RunID: "run-1", RunDir: runDir, BaseDir: baseDir,
 			Paths: configsock.BuildPaths{SandboxCtl: script},
 		},
 		log: testBuilderLogger(), vmmCgroup: testVMMCgroupFD(t),
@@ -155,6 +157,22 @@ func TestStartSandboxPassesReadinessFDAndClosesParentWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sb.teardown()
+	wantSID := phaseSandboxID("a", p.spec.BuildID)
+	wantConfig := filepath.Join(runDir, "a", "sandbox.yaml")
+	wantArgs := []string{
+		"run", "--config", wantConfig,
+		"--run-root", runDir, "--base-root", baseDir,
+		"--path-id", "a", "--sandbox-id", wantSID,
+	}
+	if got := sb.cmd.Args[1 : 1+len(wantArgs)]; !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("phase launch prefix = %#v, want %#v", got, wantArgs)
+	}
+	if sb.sid != wantSID || sb.pathID != "a" || sb.runRoot != runDir {
+		t.Fatalf("phase identity = sid %q pathID %q root %q", sb.sid, sb.pathID, sb.runRoot)
+	}
+	if _, err := os.Stat(wantConfig); err != nil {
+		t.Fatalf("phase config is not in Phase RunDir: %v", err)
+	}
 
 	var readyArg string
 	for _, arg := range sb.cmd.Args {
@@ -186,7 +204,7 @@ func TestStartSandboxFailureClosesReadinessPipe(t *testing.T) {
 	}
 	p := &buildPipeline{
 		spec: &configsock.BuildSpec{
-			BuildID: "build-failure", Workdir: t.TempDir(),
+			BuildID: "build-failure", RunDir: t.TempDir(), BaseDir: t.TempDir(),
 			Paths: configsock.BuildPaths{SandboxCtl: "/definitely/missing/sandbox-ctl"},
 		},
 		log: testBuilderLogger(), vmmCgroup: vmmCgroup,
@@ -208,13 +226,14 @@ func TestStartSandboxFailureClosesReadinessPipe(t *testing.T) {
 func TestPhaseImportUsesRuntimeEventsWithoutExecProbe(t *testing.T) {
 	dir := t.TempDir()
 	script := writeSandboxCtlTestScript(t, dir)
+	runDir, baseDir := filepath.Join(dir, "run"), filepath.Join(dir, "base")
 	logPath := filepath.Join(dir, "sandbox-ctl.log")
 	t.Setenv("BUILDER_TEST_SANDBOX_CTL_LOG", logPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	p := &buildPipeline{
 		spec: &configsock.BuildSpec{
-			BuildID: "build-123456", RunID: "run-1", Workdir: dir, FromImage: "example.invalid/image:latest",
+			BuildID: "build-123456", RunID: "run-1", RunDir: runDir, BaseDir: baseDir, FromImage: "example.invalid/image:latest",
 			Paths:    configsock.BuildPaths{SandboxCtl: script},
 			Timeouts: configsock.BuildTimeouts{PullSec: 1},
 		},

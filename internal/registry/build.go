@@ -87,6 +87,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if buildID == "" {
 		buildID = "bld-" + newID()
 	}
+	if err := types.ValidateBuildID(buildID); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrReserveBadRequest, err)
+	}
 	ref, err := clusterstate.NodeBuildRefFromMetadata(buildID, metadata)
 	if err != nil {
 		return nil, err

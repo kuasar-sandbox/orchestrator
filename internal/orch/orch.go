@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -121,7 +122,8 @@ type Orchestrator struct {
 	// source.
 	resourceControllerSocketIdentity string
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error)
-	removeBuildRuntimeDir            func(string) error
+	removeBuildRunDir                func(string) error
+	removeBuildBaseDir               func(string) error
 	// extensionObserver is nil in the built-in path. The one nil branch at each
 	// committed transition avoids hubs, queues, and background work otherwise.
 	extensionObserver    ExtensionObserver
@@ -187,7 +189,8 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		buildEvents:               make(chan *routesync.BuildEvent, 64),
 		mmdsBuildOwners:           map[string]string{},
 		commitBuildTrigger:        st.CommitBuildTrigger,
-		removeBuildRuntimeDir:     os.RemoveAll,
+		removeBuildRunDir:         os.RemoveAll,
+		removeBuildBaseDir:        os.RemoveAll,
 		now:                       time.Now,
 		files:                     files,
 	}
@@ -292,8 +295,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		State:           types.StateStarting,
 		LaunchMode:      launchMode,
 		AutoPauseMemory: autoPauseMemory,
-		RunDir:          o.cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:         o.cfg.Paths.BaseRoot + "/" + sid,
+		RunDir:          nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid),
+		BaseDir:         nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sid),
 		APISecret:       pair.APISecret,
 		ManifestKey:     pair.ManifestKey,
 		Metadata:        meta,
@@ -2184,7 +2187,8 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 			return nil, false, fmt.Errorf("orch: absolute manifest config path: %w", err)
 		}
 	}
-	taskRootRef, err := normalizeSandboxTaskRootRef(source.Ref, sb.RunDir)
+	checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
+	taskRootRef, err := normalizeSandboxTaskRootRef(source.Ref, checkpointDir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -2194,7 +2198,7 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		LaunchMode:               string(sb.LaunchMode),
 		ManifestConfig:           manifestConfig,
 		RefLocationParent:        o.cfg.Checkpoint.Remote.RefLocationParent,
-		RelativeDir:              sb.RunDir,
+		RelativeDir:              checkpointDir,
 		MaxRefs:                  maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: deadline.UnixNano(),
 	}
@@ -2209,7 +2213,7 @@ func normalizeSandboxTaskRootRef(raw, relativeDir string) (string, error) {
 		return filepath.Clean(raw), nil
 	}
 	if !filepath.IsAbs(relativeDir) {
-		return "", fmt.Errorf("orch: relative local artifact root requires an absolute sandbox run directory")
+		return "", fmt.Errorf("orch: relative local artifact root requires an absolute artifact directory")
 	}
 	return filepath.Clean(filepath.Join(relativeDir, raw)), nil
 }
@@ -2254,15 +2258,15 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 	// worker. Artifact selection remains task-local and is never included here.
 	p := o.sandboxParams(sb, tmpl, cfgSpec, sandboxcfg.NetworkSpec{}, rtconfig.ResourcesConfig{})
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
-	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
-	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
-	// /run/sandbox, splitting the dirs (snapshot/pause then can't reach ctl.sock).
+	// ordinary Sandbox roots, so the persisted RunDir/BaseDir match the exact
+	// directories sandbox-ctl owns and local control commands find ctl.sock.
 	args := []string{
 		"run", "--sandbox-id", sb.ID,
+		"--path-id", sb.ID,
 		"--config", o.sandboxConfigPath(sb),
 		"--manifest-config", o.cfg.ManifestConfig,
-		"--run-root", o.cfg.Paths.RunRoot,
-		"--base-root", o.cfg.Paths.BaseRoot,
+		"--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot),
+		"--base-root", nodepath.SandboxBaseRoot(o.cfg.Paths.BaseRoot),
 		// Route the sandbox's stdio + kernel dmesg to journald from this run-id
 		// unit. App stdout/stderr is tagged "sandbox" with KUASAR_SANDBOX_ID; guest
 		// dmesg is tagged "console" for host-only diagnostics.
@@ -2711,12 +2715,12 @@ func (o *Orchestrator) capture(ctx context.Context, sb *types.Sandbox, request s
 	return sandboxcfg.CaptureResult{Source: source}, nil
 }
 
-// snapshotLocal writes the selected checkpoint format to checkpoint.local_dir/<sid>/
-// and returns its stable .snapshot symlink (node-bound; restorable only on this node). The lower
+// snapshotLocal writes the selected checkpoint format to BaseDir/checkpoint and
+// returns its stable .snapshot symlink (node-bound; restorable only on this node). The lower
 // chain (the base template) stays remote, carried by reference.
 func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, policy sandboxcfg.SnapshotPolicy) (string, error) {
-	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
-	args := []string{"snapshot", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
+	dir := filepath.Join(sb.BaseDir, "checkpoint")
+	args := []string{"snapshot", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
 	args = appendSnapshotPolicyArgs(args, policy)
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	var errb bytes.Buffer
@@ -2728,8 +2732,8 @@ func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox, pol
 }
 
 func (o *Orchestrator) exportSandboxLocal(ctx context.Context, sb *types.Sandbox) (string, error) {
-	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
-	args := []string{"export", "--sandbox-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", o.cfg.Paths.RunRoot}
+	dir := filepath.Join(sb.BaseDir, "checkpoint")
+	args := []string{"export", "--path-id", sb.ID, "--output", dir, "--mode", o.cfg.Checkpoint.Mode, "--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot)}
 	cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb

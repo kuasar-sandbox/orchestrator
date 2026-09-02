@@ -168,8 +168,8 @@ encryption_key: "000000000000000000000000000000000000000000000000000000000000000
 manifest_config: /opt/sandbox/manifest.yaml
 paths:
   # conductor_executable: /opt/kuasar/bin/xconductor # root- or non-root service-UID-owned App; validated-FD exec + sealed bootstrap
-  run_root: /run/sandbox
-  base_root: /var/lib/sandbox
+  run_root: /run/sandbox                         # node RunRoot: runners/, sandboxes/, builds/ volatile state
+  base_root: /var/lib/sandbox                    # node BaseRoot: sandboxes/, builds/ persistent data
   config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + manifest-key admin + plugin + api plane (h2c)
   # db_path: /var/lib/sandbox/node-ctl.db    # default = <base_root>/node-ctl.db
   # admin_pidfile: /run/sandbox/node-ctl-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms
@@ -260,7 +260,6 @@ builder:                                           # Build resources are separat
 #   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
 checkpoint:                                        # paused-state capture
   mode: local                                     # local | bundle
-  local_dir: /var/lib/sandbox-saved
   # merge_ref: false                              # omit/null => sandbox-ctl default
   # drop_caches: false                            # omit/null => sandbox-ctl default
   # remote:
@@ -299,7 +298,7 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 paths:
   # proxy_executable: /opt/kuasar/bin/xproxy         # root- or non-root service-UID-owned App; only node-ctl -> master
-  run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
+  run_root: /run/sandbox                        # node RunRoot containing sandboxes/<sid>/ctl.sock (required)
 data_listen: ":3443"                             # required plaintext sandbox ingress; distinct from conductor :3000
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + MMDS listener; "" = current netns
 stats_socket: /run/sandbox/proxy-stats.sock      # master-only traffic stats UDS registered for conductor queries

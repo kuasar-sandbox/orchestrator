@@ -32,6 +32,48 @@ node 内部 `Sandbox.ID` 等于 `NodeSandboxID`。身份保持型 migration/copy
 node-local sandbox 共享 `StableID`；它不是本地 lookup key，也没有唯一索引。KAT 的
 canonical `sid` claim 绑定 `StableID`。
 
+## 节点目录与身份
+
+`paths.run_root` 是节点级 **RunRoot**，只承载可随重启丢失的小型运行态；
+`paths.base_root` 是节点级 **BaseRoot**，承载 writable diff、checkpoint 与其他大体积本地数据。
+对象的实际目录称为 **RunDir/BaseDir**，统一布局如下：
+
+```text
+<RunRoot>/
+├── node-level files
+├── runners/<RunID>.pid
+├── sandboxes/<SandboxID>/
+└── builds/<BuildID>/
+    ├── builder.pid
+    ├── a/
+    ├── b/
+    └── c/
+
+<BaseRoot>/
+├── node-level persistent files
+├── sandboxes/<SandboxID>/checkpoint/
+└── builds/<BuildID>/
+    ├── checkpoint/
+    ├── a/
+    ├── b/
+    └── c/
+```
+
+普通 Sandbox row 持久化精确的 `RunDir=<RunRoot>/sandboxes/<SandboxID>` 与
+`BaseDir=<BaseRoot>/sandboxes/<SandboxID>`。`SandboxID` 是逻辑身份；调用 sandboxer 时
+`PathID` 是相应 root 下的目录 leaf。普通 Sandbox 两者相同；Build phase 的逻辑
+`SandboxID` 仍全局唯一，而 `PathID` 固定为 `a`、`b`、`c`。`RunID` 只标识 runner
+execution，pidfile 位于 `runners/`。
+
+`BuildID` 是 Build 业务身份，统一限制为 `[A-Za-z0-9_-]{1,48}` 并原样作为目录名；
+`BuildRunDir`/`BuildBaseDir` 由 BuildID 与两个 root 唯一派生，不存入 Build row，也没有
+hash、路径 fallback 或旧目录迁移。registered/waiting Build 不创建对象目录，execution
+claim 后才创建；镜像、Sandbox/Snapshot artifact 全部进入
+`BuildBaseDir/checkpoint`。本机 Sandbox snapshot/export 固定写入
+`BaseDir/checkpoint`，不再配置独立的 `checkpoint.local_dir`。自定义 RunRoot 必须让最大
+SandboxID 的 sandboxer socket 与最大 BuildID 的最长 phase socket 都不超过 Linux 107-byte
+pathname 上限；配置加载会 fail closed。
+
 ## 组成
 
 | 路径 | 角色 |

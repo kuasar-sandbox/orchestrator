@@ -56,8 +56,8 @@ paths:
   # bootstrap. It must use app/conductor and cannot run standalone. Empty uses
   # the built-in conductor.
   # conductor_executable: /opt/kuasar/bin/xconductor
-  run_root: /run/sandbox                          # tmpfs run state
-  base_root: /var/lib/sandbox                     # persistent state
+  run_root: /run/sandbox                          # node RunRoot: runners/, sandboxes/, builds/ volatile state
+  base_root: /var/lib/sandbox                     # node BaseRoot: sandboxes/, builds/ persistent data
   # Local control socket — one UDS over h2c: run assignment/result, task specs,
   # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
@@ -160,10 +160,10 @@ builder:
 
 # Paused-state capture. mode=local writes the existing tarstream; mode=bundle writes
 # one multi-Manifest ZIP Bundle. Optional bools are tri-state: omit/null delegates
-# to sandbox-ctl, while true/false is passed explicitly. Publish separately via export.
+# to sandbox-ctl, while true/false is passed explicitly. Local capture is always
+# written below the owning Sandbox BaseDir/checkpoint; publish separately via export.
 checkpoint:
   mode: local
-  local_dir: /var/lib/sandbox-saved
   # merge_ref: false
   # drop_caches: false
   # remote:

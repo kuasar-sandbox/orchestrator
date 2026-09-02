@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
 // InstallUnits generates and installs the systemd template units (+ slices)
@@ -66,8 +67,8 @@ CollectMode=inactive-or-failed
 [Service]
 Type=exec
 WorkingDirectory=%s
-ExecStart=%s run-sandbox --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%%i
-ExecStopPost=/bin/rm -f %s/runs/%%i.pid
+ExecStart=%s run-sandbox --pidfile=%s --config-socket=%s --run-id=%%i
+ExecStopPost=/bin/rm -f %s
 # One process per sandbox, stateful: a crash means the sandbox is gone, not retryable.
 Restart=no
 KillMode=control-group
@@ -77,7 +78,7 @@ Slice=sandbox-runner.slice
 # after exec, sandbox-ctl stays there while node-ctl creates vmm/ for CH.
 Delegate=yes
 # KillMode=control-group recursively covers both delegated subgroups.
-`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
+`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
 }
 
 func (o *Orchestrator) builderUnitFile() string {
@@ -102,14 +103,14 @@ LogRateLimitIntervalSec=0
 # result back to the socket. Its phase sandboxes (sandbox-ctl run +
 # cloud-hypervisor) are direct children, so the whole build accounts to this
 # unit's cgroup under sandbox-builder.slice.
-ExecStart=%s run-builder --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%%i
-ExecStopPost=/bin/rm -f %s/runs/%%i.pid
+ExecStart=%s run-builder --pidfile=%s --config-socket=%s --run-id=%%i
+ExecStopPost=/bin/rm -f %s
 KillMode=control-group
 Slice=sandbox-builder.slice
 # run-builder moves itself to ctl/ and hands the sibling vmm/ cgroup to each
 # strictly serial phase sandbox by inherited descriptor.
 Delegate=yes
-`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
+`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
 }
 
 func sliceFile(desc, caps string) string {

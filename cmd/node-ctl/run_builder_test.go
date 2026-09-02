@@ -13,21 +13,22 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 func TestBuilderAssignmentPidfileMatchesBuildSpecRuntimeIdentity(t *testing.T) {
 	runRoot := filepath.Join(t.TempDir(), "run")
-	runPidfile := filepath.Join(runRoot, "runs", "br-test.pid")
+	runPidfile := nodepath.RunnerPID(runRoot, "br-test")
 	buildID := strings.Repeat("b", 36)
 
 	got := builderAssignmentPidfile(runPidfile, buildID)
-	want := configsock.BuildPidfile(runRoot, buildID)
+	want := filepath.Join(nodepath.BuildRunDir(runRoot, buildID), "builder.pid")
 	if got != want {
 		t.Fatalf("assignment pidfile = %q, want %q", got, want)
 	}
-	if filepath.Base(got) != "builder.pid" || filepath.Dir(got) != configsock.BuildRuntimeDir(runRoot, buildID) {
-		t.Fatalf("assignment pidfile does not use compact build runtime identity: %q", got)
+	if filepath.Base(got) != "builder.pid" || filepath.Dir(got) != nodepath.BuildRunDir(runRoot, buildID) {
+		t.Fatalf("assignment pidfile does not use BuildRunDir: %q", got)
 	}
 }
 

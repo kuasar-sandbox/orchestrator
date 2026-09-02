@@ -3,9 +3,10 @@ package configsock
 import "errors"
 
 // BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
-// ArtifactPrepareSchemaVersion. Version 2 adds BuildSpec.CheckpointMode; an old
-// run-builder must fail closed instead of silently defaulting that field.
-const BuildTaskSchemaVersion = 2
+// ArtifactPrepareSchemaVersion. Version 3 replaces the ambiguous build workdir
+// with explicit volatile RunDir and persistent BaseDir paths; old workers fail
+// closed instead of writing large artifacts below RunRoot.
+const BuildTaskSchemaVersion = 3
 
 // BuildTaskRequest identifies one exact assigned run-builder incarnation.
 type BuildTaskRequest struct {
@@ -20,7 +21,6 @@ type BuildTaskRequest struct {
 type BuildTaskSpec struct {
 	BuildID string               `json:"build_id"`
 	RunID   string               `json:"run_id"`
-	Workdir string               `json:"workdir"`
 	Env     map[string]string    `json:"env,omitempty"`
 	Final   *BuildSpec           `json:"final,omitempty"`
 	Prepare *ArtifactPrepareSpec `json:"prepare,omitempty"`

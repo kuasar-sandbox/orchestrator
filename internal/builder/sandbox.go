@@ -27,6 +27,7 @@ import (
 type phaseSandbox struct {
 	p              *buildPipeline
 	sid            string
+	pathID         string
 	runRoot        string
 	cmd            *exec.Cmd
 	done           chan struct{}
@@ -41,11 +42,11 @@ type phaseSandbox struct {
 func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect []string) (*phaseSandbox, error) {
 	s := p.spec
 	sid := phaseSandboxID(phase, s.BuildID)
-	runRoot := filepath.Join(s.Workdir, "run")
-	if err := os.MkdirAll(filepath.Join(runRoot, sid), 0o700); err != nil {
+	phaseRunDir := p.phaseRunDir(phase)
+	if err := os.MkdirAll(phaseRunDir, 0o700); err != nil {
 		return nil, err
 	}
-	yamlPath := filepath.Join(s.Workdir, phase+".yaml")
+	yamlPath := filepath.Join(phaseRunDir, "sandbox.yaml")
 	b, err := yaml.Marshal(doc)
 	if err != nil {
 		return nil, err
@@ -54,7 +55,9 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		return nil, err
 	}
 
-	args := []string{"run", "--config", yamlPath, "--run-root", runRoot, "--sandbox-id", sid,
+	args := []string{"run", "--config", yamlPath,
+		"--run-root", s.RunDir, "--base-root", s.BaseDir,
+		"--path-id", phase, "--sandbox-id", sid,
 		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
 		// our child, in this run-id unit's cgroup). App output is tagged "build"
 		// with KUASAR_BUILD_ID for SDK-visible build logs; kernel output is tagged
@@ -95,7 +98,7 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	// immediately so every pre-ready child exit is observable as EOF by readyR.
 	_ = readyW.Close()
 	sb := &phaseSandbox{
-		p: p, sid: sid, runRoot: runRoot, cmd: cmd,
+		p: p, sid: sid, pathID: phase, runRoot: s.RunDir, cmd: cmd,
 		done: make(chan struct{}), readyR: readyR,
 	}
 	go func() {
@@ -114,11 +117,9 @@ const phaseSandboxDigestBytes = 12
 var phaseSandboxIDEncoding = base32.HexEncoding.WithPadding(base32.NoPadding)
 
 func phaseSandboxID(phase, buildID string) string {
-	// Build IDs are opaque at this boundary (cluster registrations are not
-	// required to be UUIDs). Hash the complete identity so it cannot inject a
-	// path and Builds sharing a short prefix still receive distinct ordinary
-	// Sandbox IDs. A 96-bit digest remains collision-resistant while its compact
-	// base32 form leaves room for sandbox runtime UDS names under sun_path.
+	// BuildID is already validated and is used verbatim only by the directory
+	// layout. The existing digest here derives a distinct logical phase
+	// SandboxID; it is not a directory key or a substitute for BuildID.
 	sum := sha256.Sum256([]byte(buildID))
 	digest := phaseSandboxIDEncoding.EncodeToString(sum[:phaseSandboxDigestBytes])
 	return fmt.Sprintf("bp-%s-%s", phase, strings.ToLower(digest))
@@ -223,7 +224,7 @@ type execOpts struct {
 // exec runs one command in the guest via sandbox-ctl exec and returns the
 // guest exit status as an error when non-zero.
 func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) error {
-	args := []string{"exec", "--sandbox-id", sb.sid, "--run-root", sb.runRoot}
+	args := []string{"exec", "--path-id", sb.pathID, "--run-root", sb.runRoot}
 	for _, e := range o.env {
 		args = append(args, "--env", e)
 	}

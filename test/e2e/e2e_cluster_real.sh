@@ -62,12 +62,12 @@ fail() {
             echo "---- journal $unit ----" >&2
             journalctl -u "$unit" --no-pager -n 100 2>/dev/null | sed 's/^/  unit| /' >&2 || true
         done < <(systemctl list-units 'sandbox-builder@*.service' 'sandbox-runner@*.service' --all --no-legend --no-pager 2>/dev/null | awk '{print $1}')
-        if [ -d "$WORK/cr" ]; then
+        if [ -d "$WORK/cr/sandboxes" ]; then
             while IFS= read -r sid; do
                 [ -n "$sid" ] || continue
                 echo "---- journal sandbox $sid ----" >&2
                 journalctl KUASAR_SANDBOX_ID="$sid" --no-pager -n 100 2>/dev/null | sed 's/^/  sandbox| /' >&2 || true
-            done < <(find "$WORK/cr" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
+            done < <(find "$WORK/cr/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
         fi
     fi
     exit 1
@@ -109,7 +109,7 @@ if ! command -v mkfs.erofs >/dev/null 2>&1; then
     export PATH="$BIN:$PATH"
 fi
 
-WORK="$(mktemp -d /tmp/e2e-cr-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
@@ -568,7 +568,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: local }
 EOF
     step "starting temporary standalone node-ctl for template build (:${BUILD_PORT})"
     "$BIN/node-ctl" conductor serve --config "$WORK/build-node.yaml" > >(tee "$WORK/build-node.log" >&2) 2>&1 &
@@ -808,7 +808,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: local }
 cluster:
   node_link: { endpoint: "127.0.0.1:$CONTROL_PORT" }
   node_id: "$node_id"
@@ -885,7 +885,7 @@ run_cluster_flow() {
     native_mark="CLUSTER_NATIVE_EXEC_$RANDOM"
     exec_through_cluster_connect "$sid" "$exec_token" "$native_mark"
     local node_yaml
-    node_yaml="$(find "$WORK/cr" -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | head -1)"
+    node_yaml="$(find "$WORK/cr/sandboxes" -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | head -1)"
     [ -n "$node_yaml" ] || fail "cluster node generated no sandbox YAML"
     assert_cluster_resource_yaml "$node_yaml" || fail "cluster cold-create resource policy differs from standalone"
     step "capturing Sandbox E through router, then reusing the same KAT for a cold Wake"

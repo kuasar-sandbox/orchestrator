@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -42,7 +43,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := shortOrchestratorTestDir(t)
 			runRoot, sid := filepath.Join(dir, "run"), "sid"
-			if err := os.MkdirAll(filepath.Join(runRoot, sid), 0o700); err != nil {
+			if err := os.MkdirAll(nodepath.SandboxRunDir(runRoot, sid), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			l, err := listenRuntimeReadiness(runRoot, sid)
@@ -101,7 +102,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
 func TestListenRuntimeReadinessReplacesStaleSocket(t *testing.T) {
 	dir := shortOrchestratorTestDir(t)
 	runRoot, sid := filepath.Join(dir, "run"), "stale"
-	if err := os.MkdirAll(filepath.Join(runRoot, sid), 0o700); err != nil {
+	if err := os.MkdirAll(nodepath.SandboxRunDir(runRoot, sid), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	path := configsock.ReadinessSocketPath(runRoot, sid)
@@ -672,7 +673,7 @@ func launchTestSandbox(t *testing.T, cfg *config.Config, profile types.Profile, 
 	sb := &types.Sandbox{
 		ID: sid, Profile: profile, TemplateID: tmpl.String(), State: types.StateStarting, LaunchMode: types.LaunchImage,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, sid), BaseDir: filepath.Join(cfg.Paths.BaseRoot, sid),
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
 		CreatedUnix: 1,
 	}
 	if profile == types.ProfileE2B {

@@ -51,6 +51,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
@@ -179,10 +180,11 @@ func runBuilder(args []string, log *slog.Logger) error {
 		spec.SnapshotPreparation = localPreparation
 		spec.RefLocations = prepared.RefLocationURIs
 	}
-	if spec.Workdir != "" {
-		if err := os.Chdir(spec.Workdir); err != nil {
-			return fmt.Errorf("chdir %s: %w", spec.Workdir, err)
-		}
+	if !filepath.IsAbs(spec.RunDir) || !filepath.IsAbs(spec.BaseDir) {
+		return fmt.Errorf("final build spec requires absolute run_dir and base_dir")
+	}
+	if err := os.Chdir(spec.RunDir); err != nil {
+		return fmt.Errorf("chdir %s: %w", spec.RunDir, err)
 	}
 
 	reportPhase := func(phase, sandboxID, state string) error {
@@ -300,5 +302,5 @@ func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation str
 
 func builderAssignmentPidfile(runPidfile, buildID string) string {
 	runRoot := filepath.Dir(filepath.Dir(runPidfile))
-	return configsock.BuildPidfile(runRoot, buildID)
+	return filepath.Join(nodepath.BuildRunDir(runRoot, buildID), "builder.pid")
 }

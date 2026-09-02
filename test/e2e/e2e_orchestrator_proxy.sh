@@ -73,7 +73,7 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
-WORK="$(mktemp -d /tmp/e2e-orch-proxy-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
@@ -593,7 +593,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: local }
 EOF
 
 # ---- start serve (control plane), then the proxy master -------------------
@@ -693,7 +693,8 @@ echo "==> built template: $TEMPLATE"
 # Every Create requires the current Proxy registration and its route-applied
 # barrier. Removing the master must fail admission before any launch ownership
 # or durable sandbox state is retained.
-find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.before-unavailable"
+{ find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
+    | sort >"$WORK/run-dirs.before-unavailable"
 "$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.before-unavailable.json"
 python3 - "$WORK/vswitch.before-unavailable.json" <<'PY' >"$WORK/vswitch-ports.before-unavailable"
 import json, sys
@@ -710,7 +711,8 @@ python3 - "$WORK/resp.body" <<'PY' || fail "unavailable Create retained durable/
 import json, sys
 assert json.load(open(sys.argv[1])) == []
 PY
-find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.after-unavailable"
+{ find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true; } \
+    | sort >"$WORK/run-dirs.after-unavailable"
 cmp -s "$WORK/run-dirs.before-unavailable" "$WORK/run-dirs.after-unavailable" \
     || fail "unavailable Create allocated a sandbox run directory"
 "$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.after-unavailable.json"
@@ -738,7 +740,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 unset REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
-    SID=$(ls "$WORK/run" 2>/dev/null | grep -v proxy | head -1)
+    SID=$(ls "$WORK/run/sandboxes" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201)"
 fi
@@ -787,7 +789,7 @@ code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
 [ "$code" = "501" ] || { cat "$WORK/resp.body"; fail "disabled resource controller stats=$code (want 501)"; }
 echo "==> PASS: resource stats reports 501 when the controller is disabled"
 
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
 [ -S "$ENVD_SOCK" ] || fail "envd.sock not found at $ENVD_SOCK"
 cat > "$WORK/envd_exec.py" <<'PY'

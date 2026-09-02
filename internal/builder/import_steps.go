@@ -89,7 +89,7 @@ func (p *buildPipeline) phaseImport() (retErr error) {
 	}
 	args = append(args, "--output", "-", importRef)
 
-	imagePath := filepath.Join(s.Workdir, "image.img")
+	imagePath := p.imageFile()
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("import: pulling + flattening %s", importRef)
@@ -189,7 +189,7 @@ func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLook
 	if s.ImportReferer.Owner == "" {
 		return importRefererLookup{}, fmt.Errorf("owner token is empty")
 	}
-	outPath := filepath.Join(s.Workdir, "referer.lookup.json")
+	outPath := filepath.Join(p.phaseRunDir("a"), "referer.lookup.json")
 	args := []string{"referer", "lookup", "--json", "--owner", s.ImportReferer.Owner}
 	args = append(args, p.flattenConfigArg()...)
 	if s.Insecure {
@@ -323,7 +323,7 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 	}
 	ctxv := stepCtxFrom(baseCfg)
 
-	envdUDS := filepath.Join(s.Workdir, "envd-steps.sock")
+	envdUDS := filepath.Join(p.phaseRunDir("b"), "envd-steps.sock")
 	sb, err := p.startSandbox("b", p.stepsYAML(),
 		[]string{envdUDS + ":127.0.0.1:49983"})
 	if err != nil {
@@ -361,7 +361,7 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 	if err != nil {
 		return err
 	}
-	cfgPath := filepath.Join(s.Workdir, "config.json")
+	cfgPath := filepath.Join(p.phaseRunDir("b"), "config.json")
 	if err := os.WriteFile(cfgPath, cfgJSON, 0o600); err != nil {
 		return err
 	}
@@ -369,7 +369,7 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 		"/bin/sh", "-c", "cat > /.kuasar-build/config.json"); err != nil {
 		return fmt.Errorf("write runtime config: %w", err)
 	}
-	newImg := filepath.Join(s.Workdir, "image.new.img")
+	newImg := p.nextImageFile()
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("steps: exporting rootfs")
@@ -379,7 +379,7 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 		"--tmpdir", "/.kuasar-build", "--output", "-", "/"); err != nil {
 		return err
 	}
-	imagePath := filepath.Join(s.Workdir, "image.img")
+	imagePath := p.imageFile()
 	if err := os.Rename(newImg, imagePath); err != nil {
 		return err
 	}
@@ -501,7 +501,7 @@ func (p *buildPipeline) applyCopy(sb *phaseSandbox, c *stepCtx, i int, st config
 	// Use a per-step file sink so sandbox-ctl drains guest stderr before it
 	// exits. Replay it into the build journal, and retain the first line in
 	// the returned error instead of losing it behind a journald-only sink.
-	stderrPath := filepath.Join(p.spec.Workdir, fmt.Sprintf("copy-%d.stderr", i))
+	stderrPath := filepath.Join(p.phaseRunDir("b"), fmt.Sprintf("copy-%d.stderr", i))
 	_ = os.Remove(stderrPath)
 	execErr := sb.exec(ctx, execOpts{stdinFrom: rawTar, stderrTo: stderrPath}, args...)
 	stderr, readErr := os.ReadFile(stderrPath)
@@ -527,9 +527,9 @@ func (p *buildPipeline) applyCopy(sb *phaseSandbox, c *stepCtx, i int, st config
 }
 
 // fetchCopyContext downloads the gzipped context tar from the presigned GET
-// URL and gunzips it to a workdir file (flatten-ctl tar extract takes a plain
-// tar on stdin). The e2b SDK uploads w:gz; we strip the gzip host-side so the
-// image needs no gzip.
+// URL and gunzips it into the phase BaseDir (flatten-ctl tar extract takes a
+// plain tar on stdin). The e2b SDK uploads w:gz; we strip the gzip host-side so
+// the image needs no gzip.
 func (p *buildPipeline) fetchCopyContext(url, hash string) (string, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.PullSec)*time.Second)
 	defer cancel()
@@ -551,7 +551,7 @@ func (p *buildPipeline) fetchCopyContext(url, hash string) (string, error) {
 		return "", fmt.Errorf("context not gzip: %w", err)
 	}
 	defer gz.Close()
-	out := filepath.Join(p.spec.Workdir, "copy-"+hash+".tar")
+	out := filepath.Join(p.phaseBaseDir("b"), "copy-"+hash+".tar")
 	f, err := os.Create(out)
 	if err != nil {
 		return "", err

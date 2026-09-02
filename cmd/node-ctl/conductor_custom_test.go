@@ -11,7 +11,7 @@ import (
 )
 
 func TestCustomConductorExecFailureDoesNotFallbackBuiltIn(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortNodeCtlTestDir(t)
 	component := filepath.Join(dir, "xconductor")
 	if err := os.WriteFile(component, []byte("not an executable image"), 0o500); err != nil {
 		t.Fatal(err)

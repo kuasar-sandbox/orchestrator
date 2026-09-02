@@ -391,7 +391,7 @@ paused/starting 路径不增加 Registry 调用.Router 和 Node 都执行完整 
 
 Router 在 public 200 后先执行首帧 gate,通过后才建立下一跳;最终 Node 从本地 route 再次校验
 `StableID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
-activation 和连接 `<run_root>/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
+activation 和连接 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
 
 CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL
 或 fail-fast 失效.Router→Node CONNECT 的 response reader 已预读字节会随 tunnel 保留;

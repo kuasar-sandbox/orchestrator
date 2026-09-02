@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -28,6 +30,50 @@ func registerTriggerTestBuild(t *testing.T, o *Orchestrator, apiKey string) *typ
 		t.Fatalf("RegisterBuild: %v", err)
 	}
 	return b
+}
+
+func TestRegisteredAndWaitingBuildDoNotCreateObjectDirectories(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
+	ctx := context.Background()
+	apiKey, _, _ := allowlistedBuildIdentity(t, o)
+	b := registerTriggerTestBuild(t, o, apiKey)
+
+	requireBuildDirectoriesAbsent := func(state types.BuildState) {
+		t.Helper()
+		for _, path := range []string{
+			nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID),
+			nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID),
+		} {
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s Build created %s before execution claim: %v", state, path, err)
+			}
+		}
+	}
+	requireBuildDirectoriesAbsent(types.BuildRegistered)
+
+	if err := o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID,
+		api.TriggerSpec{FromImage: "registry.test/no-early-directory:latest"}, api.BuildAuth{}); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	requireBuildDirectoriesAbsent(types.BuildWaiting)
+}
+
+func TestDirectBuildEndpointsRejectInvalidBuildIDAtBoundary(t *testing.T) {
+	o := testOrch(t)
+	for _, buildID := range []string{strings.Repeat("x", 49), "build/id"} {
+		if err := o.TriggerBuild(context.Background(), "unused", "unused", buildID,
+			api.TriggerSpec{}, api.BuildAuth{}); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("TriggerBuild(%q) error = %v, want ErrBadRequest", buildID, err)
+		}
+		if _, err := o.BuildStatus(context.Background(), "unused", "unused", buildID); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("BuildStatus(%q) error = %v, want ErrBadRequest", buildID, err)
+		}
+		if _, err := o.BuildLogs(context.Background(), "unused", "unused", buildID, 0); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("BuildLogs(%q) error = %v, want ErrBadRequest", buildID, err)
+		}
+	}
 }
 
 func requireBuildStateConflict(t *testing.T, err error, want types.BuildState) {

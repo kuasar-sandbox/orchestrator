@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -129,8 +130,8 @@ func TestPausedResumeSnapshotReadFailureReturnsToPausedAsynchronously(t *testing
 		},
 		APISecret:   deriveTestAPISecret(t, strings.Repeat("f", 64)),
 		ManifestKey: strings.Repeat("f", 64),
-		RunDir:      filepath.Join(cfg.Paths.RunRoot, "resource-resume-probe"),
-		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "resource-resume-probe"),
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, "resource-resume-probe"),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "resource-resume-probe"),
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {

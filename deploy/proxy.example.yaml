@@ -9,7 +9,7 @@
 # route table from it (= serve paths.config_socket).
 config_socket: /run/sandbox/node-ctl.socket
 
-# Sandbox runtime root. Workers use <run_root>/<sid>/ctl.sock for native exec.
+# Node RunRoot. Workers use <run_root>/sandboxes/<sid>/ctl.sock for native exec.
 # Configure this locally on the proxy; it is not projected over route sync.
 paths:
   # Optional statically customized Proxy App. Used only for node-ctl ->

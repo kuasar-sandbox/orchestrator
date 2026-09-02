@@ -22,6 +22,9 @@ import (
 // journald is the single sink — no temp files — and journalctl the reader
 // (sdjournal needs CGO; this binary is CGO-free).
 func (o *Orchestrator) BuildLogs(ctx context.Context, apiKey, tid, bid string, offset int) ([]api.BuildLogEntry, error) {
+	if err := validateBuildIDRequest(bid); err != nil {
+		return nil, err
+	}
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return nil, err

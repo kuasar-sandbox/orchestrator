@@ -7,7 +7,7 @@ import (
 
 func TestReadinessSocketPath(t *testing.T) {
 	got := ReadinessSocketPath("/run/sandbox", "sandbox-id")
-	if got != "/run/sandbox/sandbox-id/ready.sock" {
+	if got != "/run/sandbox/sandboxes/sandbox-id/ready.sock" {
 		t.Fatalf("ReadinessSocketPath = %q", got)
 	}
 }

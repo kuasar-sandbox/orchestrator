@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -131,6 +132,8 @@ func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 		attachStarted: make(chan struct{}),
 	}
 	o.vs = vs
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000208")
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
@@ -138,7 +141,7 @@ func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 
 	cleanupDone := make(chan error, 1)
 	go func() {
-		cleanupDone <- o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, t.TempDir(), true)
+		cleanupDone <- o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, true)
 	}()
 	<-vs.detachStarted
 	attachDone := make(chan error, 1)
@@ -178,8 +181,10 @@ func TestBuildPortDetachAndDurableClearFenceNewAllocation(t *testing.T) {
 	}
 }
 
-func TestBuildCleanupWorkdirRetryDoesNotRedetachReleasedPort(t *testing.T) {
+func TestBuildCleanupDirectoryRetryDoesNotRedetachReleasedPort(t *testing.T) {
 	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	vs := &orderedCleanupVS{}
 	o.vs = vs
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000218")
@@ -188,22 +193,39 @@ func TestBuildCleanupWorkdirRetryDoesNotRedetachReleasedPort(t *testing.T) {
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
-	workdir := t.TempDir()
-	removeErr := errors.New("injected workdir removal failure")
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runNodeFile := filepath.Join(o.cfg.Paths.RunRoot, "node.sock")
+	baseNodeFile := filepath.Join(o.cfg.Paths.BaseRoot, "node.db")
+	for _, path := range []string{runNodeFile, baseNodeFile} {
+		if err := os.WriteFile(path, []byte("node-level"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removeErr := errors.New("injected BuildRunDir removal failure")
 	var removeCalls atomic.Int32
-	o.removeBuildRuntimeDir = func(path string) error {
+	o.removeBuildRunDir = func(path string) error {
+		if path != runDir {
+			t.Fatalf("remove run path = %q, want %q", path, runDir)
+		}
 		if removeCalls.Add(1) == 1 {
 			return removeErr
 		}
 		return os.RemoveAll(path)
 	}
 
-	progress, err := o.cleanupBuildRuntimeProgress(build, build.RuntimeVswitchPort, workdir, true)
+	progress, err := o.cleanupBuildRuntimeProgress(build, build.RuntimeVswitchPort, true)
 	if !errors.Is(err, removeErr) {
-		t.Fatalf("first cleanup error=%v, want workdir failure", err)
+		t.Fatalf("first cleanup error=%v, want BuildRunDir failure", err)
 	}
-	if progress.port != "" || progress.persisted || progress.dir != workdir {
-		t.Fatalf("first cleanup progress=%+v, want only workdir pending", progress)
+	if progress.port != "" || progress.persisted {
+		t.Fatalf("first cleanup progress=%+v, want only directory pending", progress)
 	}
 	if got := vs.detachCalls.Load(); got != 1 {
 		t.Fatalf("first cleanup detach calls=%d, want 1", got)
@@ -213,30 +235,45 @@ func TestBuildCleanupWorkdirRetryDoesNotRedetachReleasedPort(t *testing.T) {
 	}
 
 	_, retryErr := o.retryBuildCleanup(context.Background(), build, &buildCleanupPendingError{
-		cleanup: err, port: progress.port, dir: progress.dir, persisted: progress.persisted,
+		cleanup: err, port: progress.port, persisted: progress.persisted,
 	})
 	if retryErr != nil {
 		t.Fatalf("retry cleanup: %v", retryErr)
 	}
 	if got := vs.detachCalls.Load(); got != 1 {
-		t.Fatalf("workdir-only retry detached released port: calls=%d", got)
+		t.Fatalf("directory-only retry detached released port: calls=%d", got)
 	}
 	if got := removeCalls.Load(); got != 2 {
-		t.Fatalf("workdir removal calls=%d, want failure plus retry", got)
+		t.Fatalf("BuildRunDir removal calls=%d, want failure plus retry", got)
+	}
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Build cleanup retained %s: %v", path, err)
+		}
+	}
+	for _, path := range []string{runNodeFile, baseNodeFile} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("Build cleanup removed node-level file %s: %v", path, err)
+		}
 	}
 }
 
 func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	detachErr := errors.New("injected transient build detach failure")
 	vs := &orderedCleanupVS{detachErr: detachErr}
 	o.vs = vs
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000209")
 	build.BuildID = "cleanup-retry-without-restart"
-	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
-	if err := os.MkdirAll(workdir, 0o700); err != nil {
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
@@ -257,14 +294,17 @@ func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	if got := vs.detachCalls.Load(); got != 2 {
 		t.Fatalf("detach attempts = %d, want transient failure plus retry", got)
 	}
-	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("cleanup retry retained workdir: %v", err)
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanup retry retained %s: %v", path, err)
+		}
 	}
 }
 
 func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	runID := "br-00000000-0000-7000-8000-000000000215"
 	unit := o.builderUnit(runID)
 	stopErr := errors.New("injected transient accepted-result stop failure")
@@ -285,8 +325,7 @@ func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 	}
 
 	// This is the same ownership enrichment runBuildUnit's defer performs.
-	err = retainBuildCleanup(err, nil, build.RuntimeVswitchPort,
-		buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), true)
+	err = retainBuildCleanup(err, nil, build.RuntimeVswitchPort, true)
 	o.completeBuild(context.Background(), build, accepted, err)
 
 	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
@@ -305,14 +344,14 @@ func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	vs := &orderedCleanupVS{detachErr: errors.New("injected first detach failure")}
 	o.vs = vs
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000210")
 	build.BuildID = "cleanup-retry-unpersisted-port"
 	build.RuntimeVswitchPort = ""
-	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
-	if err := os.MkdirAll(workdir, 0o700); err != nil {
+	if err := os.MkdirAll(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
@@ -323,7 +362,7 @@ func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 		ImageRef: "manifest://" + strings.Repeat("e", 64),
 	}, &buildCleanupPendingError{
 		cleanup: errors.New("ownership persistence and initial detach failed"),
-		port:    "local-port-21", dir: workdir,
+		port:    "local-port-21",
 	})
 
 	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
@@ -338,14 +377,14 @@ func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	vs := &orderedCleanupVS{detachErr: errors.New("injected first recovered detach failure")}
 	o.vs = vs
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000211")
 	build.BuildID = "recovered-cleanup-retry-unpersisted-port"
 	build.RuntimeVswitchPort = ""
-	workdir := buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID)
-	if err := os.MkdirAll(workdir, 0o700); err != nil {
+	if err := os.MkdirAll(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
@@ -353,7 +392,7 @@ func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) 
 	}
 
 	runErr := o.cleanupRecoveredBuildRuntime(
-		build, errors.New("runtime preparation was not committed"), "recovered-local-port-22", workdir, false,
+		build, errors.New("runtime preparation was not committed"), "recovered-local-port-22", false,
 	)
 	var pending *buildCleanupPendingError
 	if !errors.As(runErr, &pending) || pending.port != "recovered-local-port-22" || pending.persisted {

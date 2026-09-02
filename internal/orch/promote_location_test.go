@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -20,10 +19,9 @@ import (
 // partition) is a constant, not whatever today is.
 func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{}
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	cfg := o.cfg
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
-	o := testOrchCfg(t, cfg)
 	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
 	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()

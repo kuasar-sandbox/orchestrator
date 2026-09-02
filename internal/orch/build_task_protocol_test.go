@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -32,9 +33,10 @@ func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
 	}
-	workdir := filepath.Join(cfg.Paths.RunRoot, "build-work")
+	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
 	o.pend[build.BuildID] = &pendingBuild{
-		build: build, workdir: workdir, snapshotTemplate: true,
+		build: build, runDir: runDir, baseDir: baseDir, snapshotTemplate: true,
 		handoff: newBuildTaskHandoff(true, ""), result: make(chan configsock.BuildResult, 1),
 	}
 
@@ -42,7 +44,7 @@ func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 		t.Fatalf("stale build auth = %t, %v", found, err)
 	}
 	auth, found, err := o.BuildTaskAuth(context.Background(), build.BuildID, build.RunID)
-	if err != nil || !found || auth.PidFile != configsock.BuildPidfile(cfg.Paths.RunRoot, build.BuildID) {
+	if err != nil || !found || auth.PidFile != filepath.Join(runDir, "builder.pid") {
 		t.Fatalf("exact build auth = %+v, %t, %v", auth, found, err)
 	}
 	if _, found, err := o.BuildTaskSpecFor(context.Background(), build.BuildID, "br-stale"); err != nil || found {

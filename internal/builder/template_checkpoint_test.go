@@ -18,9 +18,9 @@ func TestTemplateSnapshotArgsCarryCheckpointModeAndExcludePausePolicy(t *testing
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := []string{
-				"snapshot", "--sandbox-id", "builder-sandbox", "--output", "/work/build", "--mode", tc.want, "--run-root", "/run/sandbox",
+				"snapshot", "--path-id", "c", "--output", "/work/build", "--mode", tc.want, "--run-root", "/run/sandbox",
 			}
-			got := templateSnapshotArgs("builder-sandbox", "/work/build", "/run/sandbox", tc.mode)
+			got := templateSnapshotArgs("c", "/work/build", "/run/sandbox", tc.mode)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("builder snapshot argv = %#v, want %#v", got, want)
 			}

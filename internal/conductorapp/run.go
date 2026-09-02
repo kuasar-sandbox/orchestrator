@@ -21,6 +21,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -110,7 +111,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	}
 
 	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		probe, err := StartResourceController(ctx, cfg.ResourceListen, resolvedResources, cfg.Paths.RunRoot, logger)
+		probe, err := StartResourceController(ctx, cfg.ResourceListen, resolvedResources, nodepath.SandboxRunRoot(cfg.Paths.RunRoot), logger)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
