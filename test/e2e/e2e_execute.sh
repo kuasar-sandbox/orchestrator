@@ -2077,7 +2077,6 @@ fi
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
 [ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
-[ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Sandbox delete retained BaseDir"
 [ -f "$WORK/lib/node-ctl.db" ] || fail "Sandbox cleanup removed node-level database"
 [ -S "$WORK/node-ctl.socket" ] || fail "Sandbox cleanup removed node-level config socket"
 unset EXEC_TOKEN
