@@ -2,7 +2,8 @@
 
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
 不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
-Reserve operation;数据面 cache miss 先 Resolve。只要 route 已有 `NodeSandboxID + DataEndpoint`,
+Reserve operation;数据面 cache miss 先 Resolve.RouteResolve 同时返回 `APIEndpoint` 与
+`DataEndpoint`,用途固定.只要 route 已有 `NodeSandboxID + DataEndpoint`,
 普通数据面即使 paused/starting 也直接连接最终 node proxy,由 node 负责鉴权后的 parking、Wake
 和 backend 建连.Exec CONNECT 是例外:Router 在 public 200 后先读取并授权首个 ctl frame,
 通过后才连接最终 node.`Reserve(operation=data)` 只保留为 request admission 之后的 target
@@ -17,8 +18,10 @@ client
   │ HTTPS e2b control/data
   ▼
 router
+  │ sandbox/build control: APIEndpoint
+  ├────────────────────────────────────► node conductor
   │ ordinary data: known NodeSandboxID + DataEndpoint (ready/paused/starting)
-  ├────────────────────────────────────► node proxy
+  ├────────────────────────────────────► node Proxy
   │                                      auth → parking → Activate/Wake → backend
   │ exec: token gate → public 200 → first-frame gate → node proxy
   │
@@ -114,11 +117,11 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | connect | group + route_key + stable sandbox_id | 调用 `operation=connect` Reserve;registry 经 node-link 下发 CmdConnect,不 Resolve 或转发 node HTTP `/connect` |
 | exec session | group + route_key + stable sandbox_id | 调用 `operation=exec-session` Reserve;Registry 验证 API key,经 node-link 下发 CmdExecSession,只对外返回 ExecAccessToken |
-| get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID,Router 重写路径后转发到 node 控制面;stats body 无 SID,无需响应身份适配 |
+| get/stats/pause/timeout/export | group + route_key + stable sandbox_id | route owner 解析当前 NodeSandboxID 与 APIEndpoint,Router 重写路径后转发到 node conductor;stats body 无 SID,无需响应身份适配;APIEndpoint 缺失时 fail closed |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + stable sandbox_id + target | 已知 NodeSandboxID/DataEndpoint 即直接建立一次性 node CONNECT,包括 paused/starting;target 缺失或 typed stale 才 fallback `operation=data`;miss 先 Resolve |
 | build register | group + build_id | 规范化 body/Builder header 为 Build.Resources,独立解析 phase ResourcePatch,再调用 `ReserveBuild`;选中节点执行最终 registration admission |
-| build status/files | group + build_id | 定位 build node 后转发 |
+| build status/files | group + build_id | ResolveBuild 返回 APIEndpoint;缓存并转发到 node conductor,缺失时不回退 DataEndpoint |
 
 `route_key` 是 group 内 route 定位键,`sandbox_id` 是稳定公开身份。Registry 在首次 create 时生成
 SandboxID;同节点 resume、跨节点迁移和 re-place 不改变它。受保护 route 另携当前
@@ -186,7 +189,7 @@ key:
 value:
 
 ```text
-{node_id, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id,
+{node_id, api_endpoint, data_endpoint, sandbox_id, node_sandbox_id, profile, stable_id,
  api_secret, api_secret_fingerprint, manifest_key_fingerprint, service_secret,
  envd_access_token, traffic_access_token, forward_access_token,
  target_port, route_revision, expires, last_used}
@@ -258,10 +261,14 @@ provider APISecret,connect/exec-session 使用 Sandbox 业务记录已绑定的 
 | kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
 | connect | 调用 `operation=connect` Reserve;Registry 对当前 NodeSandboxID 下发 CmdConnect,验证 typed ConnectResult 后返回;Router 不 Resolve,不二次转发 node HTTP `/connect` |
 | exec session | 严格解析 64 KiB body,调用 `operation=exec-session` Reserve;Registry 验证原始 API key 并下发 CmdExecSession;Router 只投影 ExecAccessToken |
-| get/pause/timeout/export | Resolve 当前 route,把公开 SandboxID 路径替换为 NodeSandboxID 后转发;typed get 响应重写回稳定 SandboxID |
+| get/pause/timeout/export | Resolve 当前 route,只使用 APIEndpoint,把公开 SandboxID 路径替换为 NodeSandboxID 后转发;typed get 响应重写回稳定 SandboxID |
 | get/list | 读 group route_link |
 | build register | 生成稳定 build_id/template_id,严格合并 register resource body/Header/E2B capacity leaf 后调 ReserveBuild;node 在保存 build 前再次校验 |
-| build status/files | 按 group+build_id 定位 node 后转发 |
+| build status/files | 按 group+build_id 定位 node,只缓存和使用 BuildReserveResult.APIEndpoint 后转发 |
+
+Sandbox control,Build follow-up 与 ordinary data/CONNECT/native exec 使用不同的 node endpoint.
+control/build 缺少 APIEndpoint 时不回退 DataEndpoint;data/exec 缺少 DataEndpoint 时不回退
+APIEndpoint.
 
 connect 的 Node Ack 只投影 NodeSandboxID、TemplateID、Profile 和 Envd/Traffic/ForwardAccessToken;不返回
 root 凭据或 fingerprint。Router 校验 Ack 与受保护 Route 一致,再组装仅包含稳定 SandboxID 和
@@ -397,7 +404,8 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 | registry owner 故障 | owner set 内按顺序 failover |
 | Reserve timeout | 返回 503/504;当前请求结束,Router 不保留 Reserve flight |
 | typed stale cache | 淘汰旧 target,ReserveData 重验并刷新后只重试一次 |
-| node data endpoint 失败 | 淘汰 route cache,下一次请求重新 Resolve |
+| node API endpoint 失败 | 当前 control/build 请求失败;后续请求重新 Resolve,不改拨 DataEndpoint |
+| node data endpoint 失败 | 淘汰 route cache,下一次请求重新 Resolve,不改拨 APIEndpoint |
 | 旧代际迟到 | 低 RouteRevision 或同 revision 但不同 NodeSandboxID 不覆盖 cache;旧请求失败不驱逐新代际 |
 
 ## 10. 性能
@@ -406,7 +414,7 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
   router→node CONNECT;parking/Wake 在 node 完成。
 - data miss:一次 registry Resolve;只有 target 缺失或 typed stale 才增加 data Reserve。
 - router 不因 group 总量增长而维护全量 route 流。
-- 控制面转发可使用 HTTP transport 连接池,连接池按 `data_endpoint` 隔离;数据面转发不使用 pooled transport。
+- 控制面转发可使用 HTTP transport 连接池,连接池按 `api_endpoint` 隔离;数据面转发不使用 pooled transport.
 
 ## 11. See Also
 

@@ -1,7 +1,7 @@
-# node-proxy.service — external data-plane proxy master (conductor.yaml proxy.mode=external).
+# node-proxy.service — the node's independent sandbox data-plane Proxy master.
 #
 # Run one master per node. The master registers once on conductor's config-socket
-# plugin plane, owns data/proxy/MMDS listener sockets, and supervises worker
+# plugin plane, owns data/MMDS listener sockets, and supervises worker
 # processes. Worker count and shared-memory route table sizing live in
 # /etc/node-ctl/proxy.yaml.
 [Unit]

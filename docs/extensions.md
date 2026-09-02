@@ -1,14 +1,14 @@
 # Runtime extensions
 
-Kuasar's conductor and external proxy support statically linked runtime
+Kuasar's conductor and independent Proxy support statically linked runtime
 extensions for deployments that need process-local integration without carrying
 a long-lived fork. An extension is trusted code compiled into `xconductor` or
 `xproxy`. It shares the core process address space, UID, lifetime, filesystem,
 and network capabilities. The API organizes ownership and concurrency; it is
 not a security sandbox.
 
-There is one extension object per conductor or external proxy-master process,
-and one fresh object per external proxy-worker epoch. The framework does not
+There is one extension object per conductor or Proxy master process,
+and one fresh object per Proxy worker epoch. The framework does not
 discover or load plugins at runtime, maintain an extension registry, assign
 priorities, provide a dependency-injection container, or reserve URL
 namespaces. A private project can compose any modules it needs behind the one
@@ -185,13 +185,13 @@ require that `next` be called.
 
 The exact wrapped handler is used by both the public `api.<domain>` listener and
 the API fallback on the conductor config socket. Config-socket task, run, admin,
-plugin, and secret-management routes remain outside the wrapper. The data-plane
-handler is also outside it. A nil extension or an extension without
+plugin, and secret-management routes remain outside the wrapper. Conductor has
+no data-plane handler. A nil extension or an extension without
 `APIWrapper` uses the existing core handler object directly.
 
 ## Proxy master extension
 
-An external proxy may set `proxy.Runtime.MasterExtension` from the master
+An independent Proxy may set `proxy.Runtime.MasterExtension` from the master
 invocation of `BindRuntime`. It uses a public leaf contract that does not depend
 on `internal/*`:
 
@@ -287,8 +287,8 @@ type WorkerHost interface {
 
 The worker reconstructs its SHM table, listeners, update/wake channels, and
 process-local clients, constructs the Host, and waits for the required initial
-route sync before calling `Start` exactly once. A Start error prevents both
-ingress listeners from serving and lets the existing master supervisor restart
+route sync before calling `Start` exactly once. A Start error prevents the data
+ingress listener from serving and lets the existing master supervisor restart
 that worker epoch. The supplied context is canceled when the epoch exits.
 
 After Start succeeds, the same object is checked once for the optional raw
@@ -300,8 +300,8 @@ type IngressWrapper interface {
 }
 ```
 
-The resulting handler is frozen for the epoch and used unchanged by both the
-public data listener and conductor-facing `proxy_socket` listener. It receives
+The resulting handler is frozen for the epoch and used unchanged by the node's
+`data_listen`. It receives
 requests before `ParseSandbox`, `ParseConnect`, or core token admission, so it
 may define a private Header/path/authentication contract, rewrite canonical
 `E2b-Sandbox-*` input and call `next`, answer locally, contact another upstream,
@@ -355,26 +355,14 @@ this generic helper: standard exec continues through `next` and its KAT plus
 per-command CEL path. The helper uses the repository's current ordinary HTTP
 and CONNECT transport and does not implement WebSocket support.
 
-## Transparent external fallback
+## Ingress boundary
 
-In external mode the conductor no longer rejects a non-API request merely
-because its Header or path is not canonical. It first selects one registered
-`proxy_socket`: a side-effect-free canonical parse retains stable SandboxID
-affinity when possible; otherwise `Host`, method, and URL path form a stable
-fallback hash. Parse failure changes only this affinity hint.
-
-The conductor writes the original ordinary HTTP or CONNECT request once to that
-socket and reads one response, without buffering the complete body or retrying
-after body bytes have been sent. The worker raw wrapper and built-in handler are
-the final parser. A successful CONNECT reuses the existing buffer-preserving,
-half-close tunnel; a non-200 worker response is forwarded. Without a worker
-extension, the built-in worker still produces the existing canonical parser,
-token, and target errors.
-
-This transparency is node-local. Cluster router, registry, and placer do not
-gain extensions or private ingress: a private deployment must canonicalize a
-cluster request at its outer boundary before using the existing canonical
-cluster path.
+The Worker `IngressWrapper` is reachable only at the Proxy `data_listen`.
+Conductor's public listener and config-socket API fallback both use the wrapped
+control API handler; they never relay ordinary HTTP or CONNECT to a worker.
+Cluster router, registry, and placer do not gain extensions or private ingress:
+a private deployment must canonicalize a cluster request at its outer boundary
+before using the existing canonical cluster path.
 
 ## Boundaries
 

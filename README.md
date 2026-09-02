@@ -2,10 +2,12 @@
 
 e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二进制、一个 e2e 辅助二进制、两层:
 
-- **`node-ctl`**(节点)——计算节点上的单实例常驻 daemon。对外是 **e2b 兼容北向入口**
+- **`node-ctl`** (节点) - 计算节点上的控制面 daemon, 与独立 Proxy 共同组成节点服务. 对外是 **e2b 兼容北向入口**
   (未改造的 e2b SDK/CLI 直接指向即可 create/exec/pause/resume/kill microVM 沙箱、构建
   自定义模板);同时提供显式 ExecAccessToken 签发和 `service=exec` native exec,
-  不依赖 guest envd;内含数据面 proxy(反代 guest envd / floatingip / native exec),可选的**节点资源控制器**
+  不依赖 guest envd.节点由 API-only conductor 与独立 Proxy 组成:conductor 管理控制面,
+  生命周期和路由权威,Proxy 的 `data_listen` 反代 guest envd / floatingip / native exec 并
+  承载 MMDS/traffic observation.conductor 可选内置**节点资源控制器**
   (沙箱准入、内存预算分配、主动回收,在声明资源和节点安全余量范围内提高有效利用率),
   以及 **node-link 客户端**(接入集群)。既可独立运行,也可经 node-link 交由 cluster-ctl 编排。
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
@@ -34,11 +36,11 @@ canonical `sid` claim 绑定 `StableID`。
 
 | 路径 | 角色 |
 | --- | --- |
-| `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` reservation 控制器 + node-link 客户端)/ `proxy`(外置数据面 master + 内部 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain}` / `builder status` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
+| `cmd/node-ctl` | 节点主二进制:`conductor serve`(API/生命周期/路由权威 + 可选 `resource_listen` + node-link)/ `proxy serve`(唯一 sandbox data ingress 的 master + worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain}` / `builder status` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
 | `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(shardkv 执行态 + node_link / route_link / node_list / placer_link)/ `router`(e2b 入口)/ `placer`(provider/importer + WATCH_LIST + Place)/ `config` / `version` |
-| `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,提供 admin/data API 控制重启、清空、沙箱/build 状态和故障注入,不启动 microVM |
+| `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,分离 admin,API 和 Data listener,提供控制重启,清空,沙箱/build 状态和故障注入,不启动 microVM |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `derive-api-secret` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
-| `config`, `app/conductor`, `app/proxy` | 公共 declarative Config 与静态 custom conductor/external-proxy App；node-ctl 用 sealed memfd + 原地 exec 交接，Hook 只在启动期调整 Config/Runtime material |
+| `config`, `app/conductor`, `app/proxy` | 公共 declarative Config 与静态 custom conductor/Proxy App;node-ctl 用 sealed memfd + 原地 exec 交接,Hook 只在启动期调整 Config/Runtime material |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | reservation 控制器:admission、pool/水位与 grant 仲裁、inventory/StateSync 恢复、审计;不介入 sandbox balloon/cgroup 闭环 |
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
@@ -48,7 +50,7 @@ canonical `sid` claim 绑定 `StableID`。
 | `internal/configsock` | 本机控制 socket:task(exact-run sandbox bootstrap/prepare + BuildSpec)/ admin(manifest-key + Sandbox MMDS value + Builder admission status)/ plugin(proxy 注册 + 受控路由流)/ api,SO_PEERCRED + pidfile 鉴权 |
 | `internal/{apikey,secretbox,keys,regcreds}` | APISecret 派生与 api_key MAC,根凭据落盘 AES-GCM,Forward/Exec `kat1` 与数据面 token,ManifestKey 封装的镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys 凭据对) |
-| `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2 + exact route handler、external worker/master 本机查询、HTTP-over-UDS service relay、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
+| `internal/{mmds,mmdsrpc,mmdssvc,metrics,launcher,vswitch,util}` | MMDSv2 + exact route handler,Proxy worker/master 本机查询,HTTP-over-UDS service relay,Prometheus 文本,systemd D-Bus,connector-ctl vswitch 封装,内联工具 |
 | `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy.service`、`cluster-{registry,router,placer}.service`) |
 | `examples/custom-conductor` | 可编译的最小 xconductor；必须由 `node-ctl conductor serve` 进入 |
 | `examples/custom-proxy` | 可编译的最小 xproxy；必须由 `node-ctl proxy serve` 进入，worker 由 master 自 reexec |
@@ -87,9 +89,11 @@ API_SECRET=$(e2b-key-ctl derive-api-secret "$MK")
 node-ctl manifest-key add --api-secret "$API_SECRET" --label tenant-a "$MK"
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
-# 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config conductor --template)
-# conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 即接入集群
+# 先启动 API-only conductor,再启动通过 config_socket 注册的 Proxy.
+# conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 时必须显式
+# 提供不同用途的 api_endpoint 和 data_endpoint.
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
+node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 # 可选:集群控制面——三角色各为独立进程、各自配置文件
 cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
@@ -108,7 +112,7 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 
 - [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
-- [docs/node-proxy.md](docs/node-proxy.md) — 数据面转发层:路由判定 / 部署模式(internal/external/off)/
+- [docs/node-proxy.md](docs/node-proxy.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
   routesync / 数据面鉴权 / MMDS / service-addressed CONNECT / native exec gate.
 - [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。

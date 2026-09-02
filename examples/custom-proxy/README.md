@@ -1,4 +1,4 @@
-# Custom external proxy
+# Custom independent Proxy
 
 Build the example with:
 
@@ -44,8 +44,8 @@ behavior.
 `ForwardAuthorized` is handler-style: it owns the response on success and
 failure, does not return a normal error, and does not verify Kuasar's
 `X-Access-Token`. It supports the current ordinary HTTP and CONNECT transport;
-it does not add WebSocket support. The same wrapped handler serves the data and
-`proxy_socket` listeners, while MMDS remains outside the wrapper.
+it does not add WebSocket support. The wrapped handler serves the node's
+`data_listen` sandbox ingress, while MMDS remains outside the wrapper.
 
 This is process organization for statically linked, same-UID trusted code, not
 a security sandbox or dynamic plugin system. The private route and its lack of
@@ -53,12 +53,11 @@ authentication are deliberately minimal demonstration choices, not
 production-grade authorization. A real deployment must define and enforce its
 own local management authentication policy.
 
-This public App customizes only `proxy.mode=external`; the conductor's internal
-proxy has no customization entry point. Runtime providers are authoritative and
-fail closed, while TLS versions, ALPN, and client-auth policy remain core-owned.
-The conductor external fallback forwards non-canonical private header/path
-requests unchanged to a worker; canonical requests retain SID affinity. Cluster
-ingress still has no Extension and must canonicalize requests at its outer
-boundary before they reach this node-local wrapper. V1 has no configuration or
-material hot reload, worker route Watch, namespace, or dynamic plugin registry.
+This public App customizes the independent Proxy; conductor has no data-plane
+customization entry point. Runtime providers are authoritative and fail closed,
+while TLS versions, ALPN, and client-auth policy remain core-owned. Requests
+reach the wrapper only through the Proxy `data_listen`; conductor is API-only.
+Cluster ingress still has no Extension and must canonicalize requests at its
+outer boundary before they reach this node-local wrapper. V1 has no configuration
+or material hot reload, worker route Watch, namespace, or dynamic plugin registry.
 Deploy `xproxy` and `node-ctl` from compatible orchestrator versions.
