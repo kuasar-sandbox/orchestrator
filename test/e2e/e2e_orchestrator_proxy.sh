@@ -60,7 +60,6 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-command -v go >/dev/null 2>&1 || skip "go not on PATH (custom Proxy Extension build)"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -80,10 +79,27 @@ UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slic
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
-CUSTOM_PROXY_BIN="${CUSTOM_PROXY_BIN:-$WORK/custom-proxy}"
-if [ ! -x "$CUSTOM_PROXY_BIN" ]; then
-    (cd "$REPO_ROOT" && GOWORK=off go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
-        || skip "failed to build examples/custom-proxy"
+CUSTOM_PROXY_EXTENSION_E2E=0
+if [ -n "${CUSTOM_PROXY_BIN:-}" ]; then
+    [ -x "$CUSTOM_PROXY_BIN" ] || skip "CUSTOM_PROXY_BIN is not executable: $CUSTOM_PROXY_BIN"
+    CUSTOM_PROXY_EXTENSION_E2E=1
+else
+    CUSTOM_PROXY_SOURCE_ROOT="$REPO_ROOT"
+    if [ ! -f "$CUSTOM_PROXY_SOURCE_ROOT/examples/custom-proxy/main.go" ]; then
+        PROXY_PLATFORM_ROOT="$(cd "$BIN/../.." && pwd)"
+        if [ -f "$PROXY_PLATFORM_ROOT/../orchestrator/examples/custom-proxy/main.go" ]; then
+            CUSTOM_PROXY_SOURCE_ROOT="$(cd "$PROXY_PLATFORM_ROOT/../orchestrator" && pwd)"
+        fi
+    fi
+    if [ -f "$CUSTOM_PROXY_SOURCE_ROOT/examples/custom-proxy/main.go" ]; then
+        command -v go >/dev/null 2>&1 || skip "go not on PATH (custom Proxy Extension build)"
+        CUSTOM_PROXY_BIN="$WORK/custom-proxy"
+        (cd "$CUSTOM_PROXY_SOURCE_ROOT" && GOWORK=off go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
+            || skip "failed to build examples/custom-proxy"
+        CUSTOM_PROXY_EXTENSION_E2E=1
+    else
+        CUSTOM_PROXY_BIN="$BIN/node-ctl"
+    fi
 fi
 declare -a PIDS=()
 declare -a TAGS=()
@@ -638,16 +654,20 @@ case "$code" in 404|405) ;; *) fail "conductor CONNECT=$code (want API handler m
     || fail "conductor CONNECT reached Proxy"
 echo "==> PASS: conductor API endpoint did not proxy data Host or CONNECT"
 
-# The custom Worker's IngressWrapper is served on data_listen. Its private
-# authentication response differs from the built-in canonical parser.
-code=$(curl -sS --noproxy '*' \
-    -o "$WORK/worker-extension.body" \
-    -w '%{http_code}' \
-    "http://127.0.0.1:$PROXY_PORT/private/sandboxes/private-s1/49983/health")
-[ "$code" = "401" ] || { cat "$WORK/worker-extension.body"; fail "WorkerExtension data ingress=$code (want 401)"; }
-grep -q 'private authentication failed' "$WORK/worker-extension.body" \
-    || fail "data listener did not use the WorkerExtension wrapper"
-echo "==> PASS: Data listener serves the WorkerExtension ingress wrapper"
+if [ "$CUSTOM_PROXY_EXTENSION_E2E" = 1 ]; then
+    # The custom Worker's IngressWrapper is served on data_listen. Its private
+    # authentication response differs from the built-in canonical parser.
+    code=$(curl -sS --noproxy '*' \
+        -o "$WORK/worker-extension.body" \
+        -w '%{http_code}' \
+        "http://127.0.0.1:$PROXY_PORT/private/sandboxes/private-s1/49983/health")
+    [ "$code" = "401" ] || { cat "$WORK/worker-extension.body"; fail "WorkerExtension data ingress=$code (want 401)"; }
+    grep -q 'private authentication failed' "$WORK/worker-extension.body" \
+        || fail "data listener did not use the WorkerExtension wrapper"
+    echo "==> PASS: Data listener serves the WorkerExtension ingress wrapper"
+else
+    echo "==> SKIP: custom WorkerExtension assertion (set CUSTOM_PROXY_BIN when running without component sources)"
+fi
 
 # ---- build a ready e2b template (native v3) --------------------------------
 # The 6GiB Build limit is independent of the phase Sandbox's node-default 2GiB
