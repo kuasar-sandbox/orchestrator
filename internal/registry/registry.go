@@ -95,10 +95,14 @@ type Registry struct {
 	parkTimeout time.Duration
 	log         *slog.Logger
 
-	mu       sync.Mutex
-	nodes    map[string]nodeConn               // node_id -> channel
-	inflight map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
-	acks     map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
+	mu    sync.Mutex
+	nodes map[string]nodeConn // node_id -> channel
+	// buildFrameFences serialize Build projection mutation with replacement of
+	// the active node-link session. Entries remain stable for the process
+	// lifetime so a delayed frame can never escape onto a newly allocated lock.
+	buildFrameFences map[string]*nodeBuildFrameFence
+	inflight         map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
+	acks             map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
 
 	localNodeOwner      NodeOwner
 	nodeOwner           NodeOwner
@@ -201,17 +205,18 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		log = slog.Default()
 	}
 	r := &Registry{
-		stores:          stores,
-		placer:          placer,
-		parkTimeout:     parkTimeout,
-		log:             log,
-		nodes:           make(map[string]nodeConn),
-		inflight:        make(map[string]*reserveCall),
-		acks:            make(map[string]chan *routesync.CmdAck),
-		nodeListProject: make(map[string]clusterstate.NodeListEntry),
-		placerReplicas:  1,
-		minReadyPlacers: 1,
-		placerTimeout:   2 * time.Second,
+		stores:           stores,
+		placer:           placer,
+		parkTimeout:      parkTimeout,
+		log:              log,
+		nodes:            make(map[string]nodeConn),
+		buildFrameFences: make(map[string]*nodeBuildFrameFence),
+		inflight:         make(map[string]*reserveCall),
+		acks:             make(map[string]chan *routesync.CmdAck),
+		nodeListProject:  make(map[string]clusterstate.NodeListEntry),
+		placerReplicas:   1,
+		minReadyPlacers:  1,
+		placerTimeout:    2 * time.Second,
 	}
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
@@ -1570,6 +1575,17 @@ func (r *Registry) node(id string) (nodeConn, bool) {
 	return c, ok
 }
 
+func (r *Registry) nodeBuildFrameFence(id string) *nodeBuildFrameFence {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fence := r.buildFrameFences[id]
+	if fence == nil {
+		fence = &nodeBuildFrameFence{}
+		r.buildFrameFences[id] = fence
+	}
+	return fence
+}
+
 // nodeAPIEndpoint returns a node's control API endpoint, or "" if the node is
 // unknown.
 func (r *Registry) nodeAPIEndpoint(ctx context.Context, nodeID string) string {
@@ -1595,21 +1611,32 @@ func (r *Registry) nodeDataEndpoint(ctx context.Context, nodeID string) string {
 }
 
 func (r *Registry) addNode(c nodeConn) {
+	fence := r.nodeBuildFrameFence(c.id())
+	fence.mu.Lock()
+	defer fence.mu.Unlock()
 	r.mu.Lock()
-	// A second connection for the same node id replaces the first (the old
-	// channel's writer then fails and tears itself down).
+	// A second connection for the same node id replaces the first. Holding the
+	// per-node Build fence makes every mutation from the old read stream finish
+	// before the new session becomes authoritative.
 	r.nodes[c.id()] = c
+	fence.active, _ = c.(*nodeChannel)
 	r.mu.Unlock()
 }
 
 func (r *Registry) removeNode(c nodeConn) {
+	fence := r.nodeBuildFrameFence(c.id())
+	fence.mu.Lock()
 	removed := false
 	r.mu.Lock()
 	if r.nodes[c.id()] == c {
 		delete(r.nodes, c.id())
 		removed = true
 	}
+	if channel, ok := c.(*nodeChannel); ok && fence.active == channel {
+		fence.active = nil
+	}
 	r.mu.Unlock()
+	fence.mu.Unlock()
 	if removed {
 		r.scheduleNodeReap(c.id())
 	}

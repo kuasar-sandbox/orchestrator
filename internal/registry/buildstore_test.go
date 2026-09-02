@@ -282,6 +282,67 @@ func TestBuildDeleteOwnerRefRevisionFencePreservesRefresh(t *testing.T) {
 	}
 }
 
+func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const (
+		nodeID  = "n1"
+		buildID = "reused-after-session-replacement"
+	)
+	oldSession := &nodeChannel{nodeID: nodeID}
+	reg.addNode(oldSession)
+	old := &BuildRecord{Group: "/g", BuildID: buildID, NodeID: nodeID, State: BuildReady, TemplateID: "old"}
+	ref := clusterstate.NodeBuildRef{Group: old.Group, BuildID: buildID}
+	if err := reg.stores.PutBuild(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, nodeID, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.withActiveNodeBuildFrame(oldSession, func() error {
+		return reg.applyBuildDelete(ctx, nodeID, buildID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newSession := &nodeChannel{nodeID: nodeID}
+	reg.addNode(newSession)
+	replacement := &BuildRecord{Group: old.Group, BuildID: buildID, NodeID: nodeID, State: BuildRegistered, TemplateID: "replacement"}
+	if err := reg.stores.PutBuild(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, nodeID, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	err := reg.withActiveNodeBuildFrame(oldSession, func() error {
+		called = true
+		return reg.applyBuildDelete(ctx, nodeID, buildID)
+	})
+	if !errors.Is(err, errSupersededNodeBuildSession) || called {
+		t.Fatalf("superseded BuildDelete called=%v err=%v", called, err)
+	}
+	got, found, err := reg.stores.GetBuildInGroup(ctx, replacement.Group, buildID)
+	if err != nil || !found || got.NodeID != nodeID || got.TemplateID != replacement.TemplateID {
+		t.Fatalf("replacement Build=%+v found=%v err=%v", got, found, err)
+	}
+	if gotRef, found, err := reg.stores.GetNodeBuildRef(ctx, nodeID, buildID); err != nil || !found || gotRef != ref {
+		t.Fatalf("replacement owner ref=%+v found=%v err=%v", gotRef, found, err)
+	}
+
+	// The superseded handler's deferred teardown must not deactivate the new
+	// session after addNode has installed it.
+	reg.removeNode(oldSession)
+	newCalled := false
+	if err := reg.withActiveNodeBuildFrame(newSession, func() error {
+		newCalled = true
+		return nil
+	}); err != nil || !newCalled {
+		t.Fatalf("replacement session active=%v err=%v", newCalled, err)
+	}
+}
+
 func TestBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

@@ -1903,6 +1903,8 @@ Sandbox 全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner �
 当前仍存在的 post-registration Registry Build projection 使用独立 bracket：节点先订阅 live Build
 变化，再发送 `build_sync_begin`、SQLite 中该节点仍保留的全部 cluster Build row、
 `build_sync_end`；集合包含 registered/waiting/building，也包含 retention window 内的 ready/error。
+Registry 以 NodeID session fence 接受这些 frame；新 node-link 生效后，旧重叠连接的 Build frame
+不会再修改 projection。
 snapshot 期间发生的变化在 end 之后按顺序发送，慢订阅者会断线并重做完整 snapshot。Registry 在
 `build_sync_end` 只删除连接建立前 immutable `(NodeID, BuildID)` binding 基线中未出现、且删除时
 仍精确属于该节点的 post-registration projection/ref；Registry-owned `BuildStarting` ambiguous

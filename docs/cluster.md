@@ -1096,7 +1096,8 @@ ready/error status、临时 TemplateID、name/alias 与本机/Registry Build lis
 `builder.terminal_ttl` retention window 内可用。canonical TemplateID 自编码 profile、kind 与 portable
 artifact ref，Build row 删除后仍可长期用于 img/sbx/snp Create；Create 不从旧 Build projection 或
 metadata 恢复 IMG 配置；canonical `fromTemplate` 同样不依赖旧 projection。Registry 不另设 timer，
-也不延长节点定义的窗口。
+也不延长节点定义的窗口。重叠连接期间，Registry 只接受当前 active node-link session 的 Build
+frames；会话替换与 Build store mutation 由同一 NodeID fence 排序，旧连接不能删除新一代同 ID Build。
 
 ## 13. 状态所有权与灾备边界
 

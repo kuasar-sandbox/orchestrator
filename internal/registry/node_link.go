@@ -30,6 +30,17 @@ type nodeChannel struct {
 	flush  func()
 }
 
+// nodeBuildFrameFence is the process-local active-session authority for Build
+// projection frames from one NodeID. Build records intentionally have no
+// session/generation field, so the fence must cover the store mutation rather
+// than perform a racy preflight check.
+type nodeBuildFrameFence struct {
+	mu     sync.Mutex
+	active *nodeChannel
+}
+
+var errSupersededNodeBuildSession = errors.New("node-link: superseded Build session")
+
 func (c *nodeChannel) id() string { return c.nodeID }
 
 func (c *nodeChannel) send(cmd *routesync.Command) error {
@@ -40,6 +51,19 @@ func (c *nodeChannel) send(cmd *routesync.Command) error {
 	}
 	c.flush()
 	return nil
+}
+
+func (r *Registry) withActiveNodeBuildFrame(conn *nodeChannel, apply func() error) error {
+	if conn == nil || apply == nil {
+		return errSupersededNodeBuildSession
+	}
+	fence := r.nodeBuildFrameFence(conn.nodeID)
+	fence.mu.Lock()
+	defer fence.mu.Unlock()
+	if fence.active != conn {
+		return errSupersededNodeBuildSession
+	}
+	return apply()
 }
 
 // ServeNodeLink handles one node's node-link connection (the node DIALS the
@@ -332,39 +356,51 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 		case routesync.TypeCmdAck:
 			// Command receipt wakes the matching node-owner SendCommandAndWait.
 			r.ackCommand(m.Ack)
-		case routesync.TypeBuildSyncBegin:
-			if buildCollecting || buildSynced {
-				return errors.New("node-link: invalid duplicate BuildSyncBegin")
+		case routesync.TypeBuildSyncBegin, routesync.TypeBuildUpsert, routesync.TypeBuildDelete, routesync.TypeBuildSyncEnd:
+			err := r.withActiveNodeBuildFrame(conn, func() error {
+				switch m.Type {
+				case routesync.TypeBuildSyncBegin:
+					if buildCollecting || buildSynced {
+						return errors.New("node-link: invalid duplicate BuildSyncBegin")
+					}
+					buildCollecting = true
+					buildSeen = make(map[string]struct{})
+				case routesync.TypeBuildUpsert:
+					if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
+						return errors.New("node-link: BuildUpsert outside a valid Build sync")
+					}
+					if buildCollecting {
+						buildSeen[m.Build.BuildID] = struct{}{}
+					}
+					if err := r.applyBuildUpsert(ctx, nr.NodeID, m.Build); err != nil {
+						return fmt.Errorf("node-link: apply BuildUpsert: %w", err)
+					}
+				case routesync.TypeBuildDelete:
+					if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
+						return errors.New("node-link: BuildDelete outside a valid Build sync")
+					}
+					if err := r.applyBuildDelete(ctx, nr.NodeID, m.Build.BuildID); err != nil {
+						return fmt.Errorf("node-link: apply BuildDelete: %w", err)
+					}
+				case routesync.TypeBuildSyncEnd:
+					if !buildCollecting || buildSynced {
+						return errors.New("node-link: invalid BuildSyncEnd")
+					}
+					if err := r.applyNodeBuildFullSnapshot(ctx, nr.NodeID, buildExpected, buildSeen); err != nil {
+						return fmt.Errorf("node-link: finish Build full sync: %w", err)
+					}
+					buildCollecting = false
+					buildSynced = true
+					buildSeen = nil
+				}
+				return nil
+			})
+			if errors.Is(err, errSupersededNodeBuildSession) {
+				return nil
 			}
-			buildCollecting = true
-			buildSeen = make(map[string]struct{})
-		case routesync.TypeBuildUpsert:
-			if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
-				return errors.New("node-link: BuildUpsert outside a valid Build sync")
+			if err != nil {
+				return err
 			}
-			if buildCollecting {
-				buildSeen[m.Build.BuildID] = struct{}{}
-			}
-			if err := r.applyBuildUpsert(ctx, nr.NodeID, m.Build); err != nil {
-				return fmt.Errorf("node-link: apply BuildUpsert: %w", err)
-			}
-		case routesync.TypeBuildDelete:
-			if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
-				return errors.New("node-link: BuildDelete outside a valid Build sync")
-			}
-			if err := r.applyBuildDelete(ctx, nr.NodeID, m.Build.BuildID); err != nil {
-				return fmt.Errorf("node-link: apply BuildDelete: %w", err)
-			}
-		case routesync.TypeBuildSyncEnd:
-			if !buildCollecting || buildSynced {
-				return errors.New("node-link: invalid BuildSyncEnd")
-			}
-			if err := r.applyNodeBuildFullSnapshot(ctx, nr.NodeID, buildExpected, buildSeen); err != nil {
-				return fmt.Errorf("node-link: finish Build full sync: %w", err)
-			}
-			buildCollecting = false
-			buildSynced = true
-			buildSeen = nil
 		case routesync.TypeBookmark:
 			if !buildSynced {
 				return errors.New("node-link: Bookmark before Build full sync completed")
