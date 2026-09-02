@@ -342,6 +342,27 @@ PY
     return 1
 }
 
+wait_node_sandbox_finalized() { # $1=node-local sandbox id
+    local sid="$1"
+    for _ in $(seq 1 120); do
+        if [ -f "$WORK/cl/node-ctl.db" ] && \
+           python3 - "$WORK/cl/node-ctl.db" "$sid" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select 1 from sandboxes where id=?", (sys.argv[2],)).fetchone()
+raise SystemExit(0 if row is None else 1)
+PY
+        then
+            if [ ! -e "$WORK/cr/sandboxes/$sid" ] && [ ! -e "$WORK/cl/sandboxes/$sid" ]; then
+                [ -S "$WORK/cn.sock" ] || return 1
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 create_sandbox() {
     local out="$1"
     http_code "$out" \
@@ -944,7 +965,10 @@ sid = sys.argv[2]
 raise SystemExit(0 if all(r.get("sandboxID") != sid for r in rows) else 1)
 PY
         then
-            step "PASS: sandbox delete converged through route_link"
+            wait_node_sandbox_finalized "$sid" \
+                || fail "sandbox delete route converged before node-local row/RunDir/BaseDir finalization"
+            [ -f "$WORK/cl/node-ctl.db" ] || fail "sandbox finalizer removed node-level database"
+            step "PASS: sandbox delete converged through route_link and node-local finalizer"
             return 0
         fi
         sleep 0.25

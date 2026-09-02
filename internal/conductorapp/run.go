@@ -88,6 +88,9 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		if err := core.DrainLaunches(context.Background()); err != nil {
 			logger.Error("drain sandbox launches", "err", err)
 		}
+		if err := core.DrainSandboxDeletes(context.Background()); err != nil {
+			logger.Error("drain sandbox delete finalizers", "err", err)
+		}
 		if err := core.DrainPauses(context.Background()); err != nil {
 			logger.Error("drain accepted sandbox operations", "err", err)
 		}

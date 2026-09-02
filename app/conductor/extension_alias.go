@@ -55,6 +55,7 @@ const (
 	SandboxStateStarting = conductorextension.SandboxStateStarting
 	SandboxStateRunning  = conductorextension.SandboxStateRunning
 	SandboxStatePaused   = conductorextension.SandboxStatePaused
+	SandboxStateDeleting = conductorextension.SandboxStateDeleting
 	SandboxStateDead     = conductorextension.SandboxStateDead
 
 	ArtifactLocationNone   = conductorextension.ArtifactLocationNone

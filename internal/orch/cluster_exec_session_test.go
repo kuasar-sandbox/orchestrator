@@ -107,17 +107,22 @@ func TestHandleClusterExecSessionReturnsBeforeAsynchronousResume(t *testing.T) {
 	if ack.Status != routesync.AckAccepted || ack.ExecSession == nil || ack.ExecSession.ExecAccessToken == "" || ack.Connect != nil {
 		t.Fatalf("exec-session ack = %+v", ack)
 	}
-	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
-	if err != nil || stored == nil || stored.State != types.StateStarting || stored.RunID != "" {
-		t.Fatalf("synchronously imported target = %+v, %v", stored, err)
-	}
-	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.StableID(), time.Now()); err != nil {
-		t.Fatalf("ack token = %v", err)
-	}
 	select {
 	case <-blocker.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("accepted exec session did not schedule asynchronous resume")
+	}
+	select {
+	case <-blocker.returned:
+		t.Fatal("exec-session ack waited for the blocked asynchronous resume")
+	default:
+	}
+	stored, err := fixture.o.st.Get(context.Background(), cmd.SID)
+	if err != nil || stored == nil || stored.State != types.StateStarting || stored.VswitchPort != "" || stored.FloatingIP != "" {
+		t.Fatalf("asynchronously resuming target = %+v, %v", stored, err)
+	}
+	if err := keys.VerifyExecAccessToken(ack.ExecSession.ExecAccessToken, stored.ServiceSecret, stored.StableID(), time.Now()); err != nil {
+		t.Fatalf("ack token = %v", err)
 	}
 	cancel()
 	select {
@@ -221,7 +226,18 @@ func TestClusterExecSessionRejectsDeadLocalTarget(t *testing.T) {
 	if _, _, err := fixture.o.prepareClusterExecSession(context.Background(), initial, func() int64 { return 1 }); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.o.st.SetState(context.Background(), initial.SID, types.StateDead); err != nil {
+	dead, err := fixture.o.st.Get(context.Background(), initial.SID)
+	if err != nil || dead == nil {
+		t.Fatalf("load dead target = %+v, %v", dead, err)
+	}
+	if err := fixture.o.st.Delete(context.Background(), initial.SID); err != nil {
+		t.Fatal(err)
+	}
+	dead.State = types.StateDead
+	dead.RunDir, dead.BaseDir, dead.RunID, dead.EnvdUDS, dead.CiUDS = "", "", "", "", ""
+	dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", ""
+	dead.ResumeSource, dead.LaunchMode = types.ResumeSource{}, ""
+	if err := fixture.o.st.Put(context.Background(), dead); err != nil {
 		t.Fatal(err)
 	}
 

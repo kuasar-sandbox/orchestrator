@@ -548,6 +548,49 @@ func TestClusterDeleteHookCanRejectBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestClusterDeleteHookCommitsDeletingBeforeACK(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "cluster-hook-delete-accepted")
+	fixture.sb.Cluster = &types.ClusterSandboxContext{Group: "group-a", RouteKey: "route-a"}
+	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := store.APISecretHash(fixture.sb.APISecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockCleanup atomic.Bool
+	blockCleanup.Store(true)
+	fixture.o.removeSandboxRunDir = func(path string) error {
+		if blockCleanup.Load() {
+			return errors.New("hold finalizer after durable acceptance")
+		}
+		return os.RemoveAll(path)
+	}
+	var calls atomic.Int32
+	fixture.o.SetExtensionHooks(sandboxHookFunc(func(_ context.Context, operation *conductorextension.SandboxOperation) error {
+		calls.Add(1)
+		if operation.Kind != conductorextension.SandboxOperationDelete || operation.Origin != conductorextension.SandboxOriginCluster {
+			t.Fatalf("cluster Delete operation = %+v", operation)
+		}
+		return nil
+	}), nil)
+
+	ack := fixture.o.HandleCommand(context.Background(), &routesync.Command{
+		CmdID: "cluster-hook-delete-accepted", Kind: routesync.CmdDelete,
+		SID: fixture.sb.ID, APISecretFingerprint: fingerprint,
+	})
+	if ack.Status != routesync.AckAccepted || calls.Load() != 1 {
+		t.Fatalf("cluster Delete ACK/calls = %+v/%d", ack, calls.Load())
+	}
+	assertDeletingOwnership(t, fixture)
+
+	blockCleanup.Store(false)
+	waitForSandboxAbsent(t, fixture.o, context.Background(), fixture.sb.ID, "cluster Hook finalizer")
+	if err := fixture.o.DrainSandboxDeletes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildTriggerHookMutatesFinalWorkOrderAndRevalidatesConcurrentState(t *testing.T) {
 	o := testOrch(t)
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)

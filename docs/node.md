@@ -121,8 +121,9 @@ create 同步受理流程只做请求校验/纯解析、身份和 token 生成�
 master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才调度 launch并返回 HTTP
 201.201 表示资源已被持久接受,且 proxy 已具备用该 starting identity 鉴权并
 parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
-已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
-`starting,run_id=""` 行并发布 Delete。cold image 后台路径保持原有单阶段 fast path:先完成
+已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前删除该对象的
+RunDir/BaseDir，再以 exact owner CAS 将 `starting,run_id=""` 收敛为零 ownership `dead` history
+并发布 route Delete。cold image 后台路径保持原有单阶段 fast path:先完成
 resource/network/YAML,再从 runner pool 分配 run-id。artifact launch 路径先建目录和绑定
 `ready.sock`,再由 pool commit callback 以 `starting AND run_id=''` CAS 绑定 exact run-id;
 task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootstrap。认证通过后
@@ -653,7 +654,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
-| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;starting 会取消当前 launch、删除行并精确清理已持久化的 runner/network ownership |
+| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting` 并从节点 cache/full snapshot 排除，随后 finalizer 取消 launch、fence runner、detach network、删除 RunDir/BaseDir 并 hard-delete row；完成后发布 terminal Delete；pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool|null}`;`memory` 是 Kuasar extension:nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
 | pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;已暂停或正在 starting 回 409 |
@@ -671,7 +672,8 @@ envd,不生成也不返回 Envd/Traffic token;两种 profile 都返回独立的
 `forwardAccessToken`。该 token 在创建时签发并随 Sandbox 记录持久化。
 
 Create 响应保持既有 body(不新增 `state` 字段),且与 cache 和后台 worker 使用不同的对象
-副本。GET 可观察 `starting`;默认 List 仍只列 running/paused,显式 `state=starting|dead`
+副本。GET 可观察 `starting` 或内部 cleanup-pending `deleting`;默认 List 仍只列 running/paused,
+显式 `state=starting|deleting|dead`
 用于诊断。Connect 已是 running 时直接返回;已是 starting 时只应用显式 timeout 的窄更新,
 不重复启动。paused Connect 在返回前完成 durable resume acceptance,因此成功响应可以对应
 starting,但不会仍对应旧 paused 状态。paused/starting 上的显式 deadline intent 在同一
@@ -1493,26 +1495,40 @@ Create(img|sbx|snp)
   v
 starting --success--> running --Pause/TTL--> paused(source=E|S)
   |                      |                       |
-  |                      +--Kill--> deleted     | Resume(auto|memory|cold)
+  |                      +--Kill--> deleting    | Resume(auto|memory|cold)
   |                                              v
   +--fresh failure--> dead                    starting(launch_mode=cold|memory)
                                                    |
                               running <--success---+
                                                    +--failure--> paused(original E|S)
+
+starting|paused|dead --explicit Delete--> deleting --finalizer success--> absent
 ```
 
 `starting` 是持久业务状态,覆盖 admission、artifact prepare、resource/network、runner pool、
 runtime readiness 和 mandatory e2b `/init`。fresh Create 必须持久化 `launch_mode=image|cold|memory`;
 paused Resume 必须在接受 `paused -> starting` 的同一原子更新中持久化 `cold|memory`。running、paused、
-dead 均清空 `launch_mode`。running 可保留最近的 `resume_source` 用于本机制品 ownership;下一次成功
+deleting、dead 均清空 `launch_mode`。running 可保留最近的 `resume_source` 用于本机制品 ownership;下一次成功
 Pause 原子覆盖它。
 
 同一 SID 的 Create、Connect、Wake、route activation、native exec、exec-session 和 migration import
 共用 launch group。每次 admission 先在 per-SID lifecycle lock 内重读 durable row,再执行授权、
 模式解析和 Store CAS,最后创建或加入 launch attempt。attempt 中的 mode 只是 durable
-`launch_mode` 的缓存。Kill/Delete 取消 attempt 后仍等待 exact runner/network/local cleanup 完成;
-waiter 被唤醒前 Store,cache 和 route 已收敛.每次 fresh Create 必须在启动资源前通过
-route-applied barrier;失败以 exact empty-owner CAS 删除 starting 行并发布 Delete。
+`launch_mode` 的缓存。Kill/Delete 在 lifecycle lock 内先 exact-CAS 到 `deleting`，保留 RunID、
+unit identity、port、RunDir、BaseDir 与制品 owner，取消 attempt 并立即撤销节点 cache 与后续 full
+snapshot activation。
+请求在 durable acceptance 后返回；节点 finalizer 等待 late launch owner 退出，再按
+Stop/Reset + inactive readback、Detach、RemoveAll RunDir、RemoveAll BaseDir、exact hard-delete
+收敛。失败不清 ownership，当前进程持续重试，崩溃后由 startup Reconcile 重试。每次 fresh Create 必须在启动资源前通过
+route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收敛为零 ownership `dead`，
+并发布 Delete 撤销 route。
+
+Pause 的 `CommitRunningPaused` 继续原子提交 state 与 source。其后 RunID、port、RunDir 分别只在
+Stop/Reset fence、Detach、RemoveAll 成功后 exact-clear；RunDir CAS 同时清除该目录拥有的 envd/ci
+UDS path。任一步失败都保留尚未完成的字段供当前进程或 startup Reconcile 重试。fully-cleaned paused
+row 只保留 BaseDir/checkpoint 与 source；Resume/Wake/Exec 在取得新 runtime owner 前完成 backlog，
+并在 `paused -> starting` acceptance 中原子恢复 canonical RunDir/UDS。这样 paused BaseDir 永不被
+runtime cleanup 删除，显式 Delete 仍可从 fully-cleaned paused row 删除 BaseDir 后 hard-delete。
 
 ### 8.1 Artifact lifecycle、转模板与迁移
 
@@ -1560,9 +1576,12 @@ CaptureSandbox:
 
 Pause 的顺序固定为 resolve request -> accepted operation -> runtime capture ->
 `CommitRunningPaused(id, exactRunID, ResumeSource)` -> stop/reset exact runner -> detach exact network ->
-publish paused route。commit 原子写 `state=paused` 与 source kind/ref;之后 runner 和 network ownership
-分别以 exact CAS 清理,使中断后 Reconcile 能独立重试。capture 失败保持 state=running、旧 source、
-runner 和 network 不变,不创建成功 alias,也不从 S 降级为 E。
+RemoveAll RunDir -> publish paused route。commit 原子写 `state=paused` 与 source kind/ref;之后非空
+RunID、port 与 RunDir 共同表示 cleanup pending。Stop/Reset 成功后 exact-CAS 清 RunID，Detach 成功后
+exact-CAS 清 network；任一步失败保留尚需重试的字段。RunDir 删除失败不允许新的 Resume/Wake/Exec
+取得 runtime owner，当前进程的下一次 admission 与 startup Reconcile 都会重试。BaseDir 及其中
+checkpoint 始终保留。capture 失败保持 state=running、旧 source、runner 和 network 不变,不创建
+成功 alias,也不从 S 降级为 E。
 
 #### 8.1.2 Resume admission、Connect 与 Wake
 
@@ -1584,8 +1603,9 @@ running Connect 保持幂等,显式 false 不会重启。starting resume 上,omi
 显式值与 durable `launch_mode` 一致时加入,冲突时返回 409,不会修改已经接受的模式。cluster
 Connect 在 Router、route-link、Registry 和 node-link 间保留 `*bool` 的存在性。
 
-`BeginResume(id, deadline, LaunchMode)` 原子写 `state=starting, launch_mode` 并清理上一代已经释放的
-runner/network ownership。`CommitStartingRunning`、`RollbackStartingPaused`、
+`BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS)` 只接受 runner/network/RunDir 已完成
+cleanup 的 paused row，并原子写 `state=starting, launch_mode` 与新一代 canonical RunDir/UDS。
+`CommitStartingRunning`、`RollbackStartingPaused`、
 `RollbackStartingDead` 清空 `launch_mode`。失败的 S+cold 恢复原 paused S,不会改写成 E,所以之后
 仍可选择 memory。conductor 重启遇到 starting resume 时从 durable source + `launch_mode` 重建
 attempt;例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。
@@ -1846,6 +1866,13 @@ delete{sid}
 bookmark{full_sync}
 ```
 
+`deleting` 是 node-local cleanup-pending state，不作为 sandbox upsert 投影。节点一旦持久接纳
+Delete 就立即从本地 cache 和后续 full sync route set 排除；exact unit/network/path finalizer
+完成并 hard-delete 本地 row 后才在既有 live 链路发送 `delete{sid}`。若链路在 cleanup pending
+期间重连，下一代完整 route snapshot 会因该 SID 已被排除而撤下旧 projection；该动作是预期的
+unroute 收敛，不是 node terminal event。node 重启仍能从完整 owner 重试清理，本地 finalizer
+正确性不依赖 Registry projection。
+
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
 物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry
 将它计入 full-sync seen set 但不改写 reserved/paused route;running/paused/delete 才驱动
@@ -1867,16 +1894,17 @@ registry 上行下发命令.serve 复用既有 e2b 生命周期原语(§8 / §8.
 所有 sandbox 操作的 `sid` 均是精确 NodeSandboxID.普通命令受理后回 `cmd_ack`,
 终态经 sandbox/build 事件上报。CmdCreate 只有在唯一 launch owner 已 claim、starting 行已
 insert 且 cache/route starting 已发布后才 Ack;该 Ack 表示 durable acceptance,不表示 READY。
-CmdConnect 在 Ack 前原子完成 paused→starting、清空旧 run/network ownership、提交最终 deadline
-并 cache/publish;CmdExecSession 在 Ack 前完成可选 import、鉴权/签名及同一 resume acceptance。
+CmdConnect 在 Ack 前清理旧 runner/network/RunDir ownership，并在 paused→starting 原子 acceptance
+中恢复 canonical RunDir/UDS、提交最终 deadline 后 cache/publish；CmdExecSession 在 Ack 前完成可选
+import、鉴权/签名及同一 resume acceptance。
 三者随后均由共同 lifecycle root 异步 launch:
 
   | 命令 | 节点动作 |
   |---|---|
   | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
-  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成 paused→starting、旧 network/run 清理与 deadline 持久化.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
+  | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
-  | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致,随后销毁沙箱(§5 kill) |
+  | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致；Ack 表示 exact owner 已持久转为 `deleting`，不等待 node-local finalizer 完成；terminal Delete 在本地 cleanup 和 hard-delete 后发布；pending 重放幂等(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | 节点以同一 canonical Build.Resources 做最终、事务化 registration admission;phase ResourcePatch、portable metadata 与 cluster group 分开持久化。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
 
@@ -1888,6 +1916,10 @@ CmdConnect/ExecSession 的 resume failure 则回滚为 paused 并发 paused Upse
 replacement Delete 分支。Registry 既有 replacement reservation rollback fence 保留:匹配本次
 create 的 Delete 才恢复 Reserve 前旧 route,不能提前删除 reservation 丢失回滚依据。并发
 cluster create/connect/delete 不能取得第二个 node-local launch owner。
+
+standalone 与 cluster Delete 共用同一个 node-local finalizer；node-link command 不拥有另一套
+cleanup 或路径推导。finalizer 失败不会把 `deleting` 作为 ready、
+paused 或 starting 上报。
 
 每个 exec-session API 调用是独立授权,因此使用新 CmdID 并签发新 KAT;resume
 可以继续按 SID 查找同一 launch attempt.`CmdID` 只关联当前 Command 与 Ack waiter,node 不持久化
@@ -2215,7 +2247,7 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, stable_id,
-               template_id, state(starting|running|paused|dead), deadline_unix,
+               template_id, state(starting|running|paused|deleting|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
@@ -2268,19 +2300,27 @@ AES-256-GCM、两项 `*_hash` 均为
 conductor 在开放 API、config-socket routesync 和 node-link 前先以
 `ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
 
+- 库内 `deleting` 是已经接纳、尚未完成的显式删除。Reconcile 先取消同 SID 的 launch owner，
+  fence exact unit、detach exact port、依次删除 canonical RunDir/BaseDir，再 exact hard-delete；
+  任一步失败则启动 fail closed，完整 row 保留供重试。`deleting` 不进入 route full snapshot、
+  Wake、Resume、Exec 或任何 activation；
 - 库内 starting 不直接收养为 running。fresh Create 先 Stop/Reset exact runner、detach network、
-  清理 stale ready.sock/run dir,再以 exact run-id CAS 到 dead。带合法 `ResumeSource` 的 starting
+  清理 RunDir/BaseDir,再以 exact run-id CAS 到 dead。带合法 `ResumeSource` 的 starting
   是已接受 resume:同样先释放旧 ownership,但保持 `state=starting`、source 和 durable
-  `launch_mode`,清空 run-id 后排入恢复队列,用原 cold/memory 决定重新启动。任一
+  `launch_mode`,只删除 RunDir、保留 BaseDir/checkpoint，清空 runtime owner 后排入恢复队列，
+  用原 cold/memory 决定重新启动。任一
   Stop/Reset/detach/目录 cleanup 失败时 Reconcile 使节点启动失败并保留 ownership,不得先清字段
   或开放 API;
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   随快照重新推给 Proxy worker;集群下经 node-link 重报);
-- 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
+- 库内 running 但无对应活单元 ⇒ fence unit、detach network、删除 RunDir/BaseDir，再以 exact
+  owner CAS 原子清空路径、runtime、network、artifact 字段并标 `dead`；`dead` row 只保留历史，
+  绝不拥有本地资源;
 - 无 running 行对应的 runner 单元属于上一个 pool 的 idle/orphan run-id ⇒
   `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
-- paused 行若还持有 capture commit 后未清完的 exact runner/network ownership,Reconcile 分别
-  重试 Stop/Reset、detach 和 CAS,source 不变。`run_root` 为 tmpfs ⇒ 整机重启后失联 running
+- paused 行无论 RunID/port 是否已清空都重试完整 cleanup：Stop/Reset + inactive fence、Detach、
+  exact CAS 和 RunDir RemoveAll；source 与 BaseDir/checkpoint 不变。Resume/Wake/Exec 使用相同
+  admission gate，旧 ownership 未完成时不得进入 `starting`。`run_root` 为 tmpfs ⇒ 整机重启后失联 running
   判 dead;paused E/S 与 sbx/snp template 保留,可被 Connect/Wake 重新拉起(本机制品位于
   持久 `BaseDir/checkpoint`)。
 
@@ -2300,9 +2340,15 @@ Builder 在同一次 startup gate 内对账，所有 live owner重建完成后�
 
 Build row 不存目录字段；Reconcile 只用 BuildID 与当前 RunRoot/BaseRoot 重新派生
 BuildRunDir/BuildBaseDir。任何终态都先 fence exact unit/cgroup、detach port、清 runtime
-ownership，并删除两个目录后才释放 execution claim；phase 子进程的自清理不是最终正确性
+ownership，并删除两个目录；terminal commit 再原子清空 RunID、execution result 并释放
+execution claim。phase 子进程的自清理不是最终正确性
 依据。节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
 `RemoveAll` 影响。
+
+以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
+publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
+权威不变；#46 所定义的 Registry/registered-node binding 与 Build lifecycle projection 边界也不由
+本节改变。这里不执行任何远端 artifact GC，也不增加逐步骤 cleanup stage 或第二份路径权威。
 
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。
@@ -2344,12 +2390,12 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、exact-run bootstrap、cold单阶段/restore两阶段、execve、`TASK_*`和重复MANIFEST_KEY剥除;`config` CLI 往返 |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage/fromTemplate/COPY/bare 链;registered 不建目录、BuildRunDir/BuildBaseDir、PathID a/b/c sibling 隔离、RunRoot 无大工件、终态 cleanup、日志/DB/image 隔离 |
-| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、持久 RunDir/BaseDir、BaseDir writable diff/checkpoint、RunRoot 无大工件、PathID native exec、local Pause→resume 与恢复策略、对象 cleanup 不伤 node-level 文件 |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、持久 RunDir/BaseDir、BaseDir writable diff/checkpoint、RunRoot 无大工件、PathID native exec、local Pause→resume 与恢复策略、failed Create 的 dead 零 ownership、显式 delete finalizer 删除 row/RunDir/BaseDir 且不伤 node-level 文件 |
 | `e2e_mmds_routes.sh` | 复用 execute 的 Proxy 拓扑覆盖 static,secret 生命周期与 local UDS service |
 | `e2e_mmds_routes_proxy_restart.sh` | 复用 Proxy 拓扑覆盖 MMDS full resync/fail-closed 恢复 |
 | `e2e_orchestrator_proxy.sh` | Proxy master/worker,唯一 data ingress,路由同步,数据面鉴权,auto-resume 与 CONNECT relay |
 | `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,以不同 API/Data listener 覆盖 node-link,Reserve,control/data/exec/build 路由,稳定 SandboxID 与成员变更 |
-| `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry 和 node-link redirect |
+| `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry、node-link redirect，以及 cluster Delete 后 Registry route 与节点 row/RunDir/BaseDir 的共同收敛 |
 | `e2e_density.sh` | 节点资源准入、回收与密度行为 |
 | `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
 

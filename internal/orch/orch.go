@@ -68,8 +68,14 @@ type Orchestrator struct {
 	launches    launchGroup            // sole process-local owner of create and resume attempts
 	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
 	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
+	deleteOps   acceptedOperationGroup // durable Sandbox finalizers drain before shared dependencies close
 	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
 	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
+
+	deleteMu            sync.Mutex
+	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
+	pausedCleanupMu     sync.Mutex
+	pausedCleanupActive map[string]struct{} // paused sandbox id -> live retrying ownership cleanup
 
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
@@ -99,11 +105,12 @@ type Orchestrator struct {
 	// bind-to-adoption window.
 	buildRecoveryReady     chan struct{}
 	buildRecoveryReadyOnce sync.Once
-	// networkAllocationMu serializes connector allocation with the Build-only
-	// detach -> durable ownership clear sequence. A detached-but-not-cleared
-	// port blocks new allocations so a crash/retry cannot detach a reused slot.
-	networkAllocationMu       sync.Mutex
-	detachedBuildPortsPending map[string]struct{}
+	// networkAllocationMu serializes connector allocation with durable Sandbox
+	// and Build detach -> ownership-clear/final-delete sequences. A detached but
+	// still-persisted port blocks allocation so a retry cannot detach a reused
+	// connector slot.
+	networkAllocationMu  sync.Mutex
+	detachedPortsPending map[string]struct{}
 
 	runnerPool     *runPool
 	builderRunPool *runPool
@@ -122,6 +129,8 @@ type Orchestrator struct {
 	// source.
 	resourceControllerSocketIdentity string
 	artifactPublisher                func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error)
+	removeSandboxRunDir              func(string) error
+	removeSandboxBaseDir             func(string) error
 	removeBuildRunDir                func(string) error
 	removeBuildBaseDir               func(string) error
 	// extensionObserver is nil in the built-in path. The one nil branch at each
@@ -176,23 +185,27 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, files *filestore.Store, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		sandboxReadyTimeout:       60 * time.Second,
-		reg:                       map[string]*types.Sandbox{},
-		lifecycleCtx:              context.Background(),
-		deadlineIntents:           map[string]struct{}{},
-		subs:                      map[int]chan routesync.Event{},
-		routeFP:                   uuid.NewString(),
-		pend:                      map[string]*pendingBuild{},
-		buildRecoveryReady:        make(chan struct{}),
-		detachedBuildPortsPending: map[string]struct{}{},
-		clusterBuilds:             map[string]*clusterBuild{},
-		buildEvents:               make(chan *routesync.BuildEvent, 64),
-		mmdsBuildOwners:           map[string]string{},
-		commitBuildTrigger:        st.CommitBuildTrigger,
-		removeBuildRunDir:         os.RemoveAll,
-		removeBuildBaseDir:        os.RemoveAll,
-		now:                       time.Now,
-		files:                     files,
+		sandboxReadyTimeout:  60 * time.Second,
+		reg:                  map[string]*types.Sandbox{},
+		lifecycleCtx:         context.Background(),
+		deadlineIntents:      map[string]struct{}{},
+		subs:                 map[int]chan routesync.Event{},
+		routeFP:              uuid.NewString(),
+		pend:                 map[string]*pendingBuild{},
+		buildRecoveryReady:   make(chan struct{}),
+		detachedPortsPending: map[string]struct{}{},
+		deleteActive:         map[string]struct{}{},
+		pausedCleanupActive:  map[string]struct{}{},
+		clusterBuilds:        map[string]*clusterBuild{},
+		buildEvents:          make(chan *routesync.BuildEvent, 64),
+		mmdsBuildOwners:      map[string]string{},
+		commitBuildTrigger:   st.CommitBuildTrigger,
+		removeSandboxRunDir:  os.RemoveAll,
+		removeSandboxBaseDir: os.RemoveAll,
+		removeBuildRunDir:    os.RemoveAll,
+		removeBuildBaseDir:   os.RemoveAll,
+		now:                  time.Now,
+		files:                files,
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -483,25 +496,40 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 	var firstErr error
 	for {
 		ctx, cancel := newCleanupContext()
-		changed, err := o.st.DeletePreLaunchStarting(ctx, sid)
-		cancel()
+		sb, err := o.st.Get(ctx, sid)
+		if err == nil && (sb == nil || sb.State != types.StateStarting || !sb.ResumeSource.Empty()) {
+			cancel()
+			return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact fresh starting ownership for %s", sid))
+		}
 		if err == nil {
-			if !changed {
+			err = o.teardownPersistedOwnership(ctx, sb, true)
+		}
+		if err == nil {
+			var changed bool
+			changed, err = o.st.RollbackStartingDead(ctx, sb)
+			if err == nil && !changed {
+				cancel()
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
 			}
-			deleted := o.lookup(sid)
-			o.uncache(sid)
-			o.publishDelete(sid)
-			if deleted == nil {
-				deleted = &types.Sandbox{ID: sid}
+			if err == nil {
+				o.releaseDetachedPortFence(sb.VswitchPort)
+				o.uncache(sid)
+				o.publishDelete(sid)
+				dead := cloneSandbox(sb)
+				dead.State, dead.LaunchMode = types.StateDead, ""
+				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
+				dead.RunDir, dead.BaseDir, dead.EnvdUDS, dead.CiUDS = "", "", "", ""
+				dead.ResumeSource = types.ResumeSource{}
+				o.observeSandboxUpsert(dead)
+				cancel()
+				return firstErr
 			}
-			o.observeSandboxDelete(deleted)
-			return firstErr
 		}
+		cancel()
 		if firstErr == nil {
 			firstErr = err
 		}
-		o.log.Error("sandbox pre-launch rollback failed; retrying", "sid", sid, "retry_in", delay, "err", err)
+		o.log.Error("sandbox pre-launch cleanup/dead commit failed; retrying", "sid", sid, "retry_in", delay, "err", err)
 		waitLaunchCleanupRetry(delay)
 		delay = nextLaunchCleanupRetry(delay)
 	}
@@ -836,6 +864,7 @@ type launchCleanupProgress struct {
 	unit           string
 	runnerStopped  bool
 	runnerReset    bool
+	runnerFenced   bool
 	port           string
 	portDetached   bool
 	runDir         string
@@ -864,32 +893,57 @@ func (p *launchCleanupProgress) merge(o *Orchestrator, attempt *launchAttempt, s
 }
 
 func (p *launchCleanupProgress) step(ctx context.Context, o *Orchestrator, includeLocal bool) error {
-	if p.unit != "" && !p.runnerStopped {
-		if err := o.lc.Stop(ctx, p.unit); err != nil {
-			return fmt.Errorf("stop %s: %w", p.unit, err)
+	if p.unit != "" && !p.runnerFenced {
+		if !p.runnerStopped {
+			if err := o.lc.Stop(ctx, p.unit); err != nil {
+				active, listErr := o.sandboxUnitActive(ctx, p.unit)
+				if listErr != nil {
+					return errors.Join(fmt.Errorf("stop %s: %w", p.unit, err), listErr)
+				}
+				if active {
+					return fmt.Errorf("stop %s: %w", p.unit, err)
+				}
+			}
+			p.runnerStopped = true
 		}
-		p.runnerStopped = true
-	}
-	if p.unit != "" && p.runnerStopped && !p.runnerReset {
-		if err := o.lc.ResetFailed(ctx, p.unit); err != nil {
-			return fmt.Errorf("reset %s: %w", p.unit, err)
+		if !p.runnerReset {
+			if err := o.lc.ResetFailed(ctx, p.unit); err != nil {
+				return fmt.Errorf("reset %s: %w", p.unit, err)
+			}
+			p.runnerReset = true
 		}
-		p.runnerReset = true
+		active, err := o.sandboxUnitActive(ctx, p.unit)
+		if err != nil {
+			return err
+		}
+		if active {
+			p.runnerStopped, p.runnerReset = false, false
+			return fmt.Errorf("sandbox runner unit %s remained active after stop/reset", p.unit)
+		}
+		p.runnerFenced = true
 	}
 	if p.port != "" && !p.portDetached {
-		if err := o.vs.Detach(ctx, p.port); err != nil {
-			return fmt.Errorf("detach port %s: %w", p.port, err)
+		if err := o.detachSandboxPort(ctx, p.port); err != nil {
+			return err
 		}
 		p.portDetached = true
 	}
 	if includeLocal && p.runDir != "" && !p.runDirRemoved {
-		if err := os.RemoveAll(p.runDir); err != nil {
+		removeRunDir := o.removeSandboxRunDir
+		if removeRunDir == nil {
+			removeRunDir = os.RemoveAll
+		}
+		if err := removeRunDir(p.runDir); err != nil {
 			return fmt.Errorf("remove run dir %s: %w", p.runDir, err)
 		}
 		p.runDirRemoved = true
 	}
 	if includeLocal && p.baseDir != "" && !p.baseDirRemoved {
-		if err := os.RemoveAll(p.baseDir); err != nil {
+		removeBaseDir := o.removeSandboxBaseDir
+		if removeBaseDir == nil {
+			removeBaseDir = os.RemoveAll
+		}
+		if err := removeBaseDir(p.baseDir); err != nil {
 			return fmt.Errorf("remove base dir %s: %w", p.baseDir, err)
 		}
 		p.baseDirRemoved = true
@@ -919,6 +973,43 @@ func waitLaunchCleanupRetry(delay time.Duration) {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C
+}
+
+// sameStartingLaunchIncarnation identifies the one durable starting row whose
+// local resources may be adopted by a failed process-local launch. Network
+// ownership is deliberately excluded: an exact resource CAS can miss because
+// that same incarnation already persisted a different port, and that durable
+// port must be fenced before the terminal transition. Deadline is also omitted
+// because SetTimeout may update it concurrently without changing ownership.
+func sameStartingLaunchIncarnation(attempt *launchAttempt, expected, current *types.Sandbox, expectedRunID string) bool {
+	if attempt == nil || expected == nil || current == nil ||
+		current.ID != expected.ID || current.State != types.StateStarting ||
+		current.RunID != expectedRunID || current.LaunchMode != expected.LaunchMode ||
+		current.CreatedUnix != expected.CreatedUnix || current.Profile != expected.Profile ||
+		current.StableIDValue != expected.StableIDValue || current.TemplateID != expected.TemplateID ||
+		current.RunDir != expected.RunDir || current.BaseDir != expected.BaseDir ||
+		current.EnvdUDS != expected.EnvdUDS || current.CiUDS != expected.CiUDS ||
+		current.APISecret != expected.APISecret || current.ManifestKey != expected.ManifestKey ||
+		current.ServiceSecret != expected.ServiceSecret || current.EnvdAccessToken != expected.EnvdAccessToken ||
+		current.TrafficAccessToken != expected.TrafficAccessToken || current.ForwardAccessToken != expected.ForwardAccessToken ||
+		current.AutoPauseMemory != expected.AutoPauseMemory || !sameClusterSandboxOwner(current.Cluster, expected.Cluster) {
+		return false
+	}
+	switch attempt.Kind() {
+	case launchCreate:
+		return current.ResumeSource.Empty() && expected.ResumeSource.Empty()
+	case launchResume:
+		return current.ResumeSource.Valid() && current.ResumeSource == expected.ResumeSource
+	default:
+		return false
+	}
+}
+
+func sameClusterSandboxOwner(a, b *types.ClusterSandboxContext) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Group == b.Group && a.RouteKey == b.RouteKey
 }
 
 func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox) error {
@@ -956,9 +1047,9 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			err     error
 		)
 		if attempt.Kind() == launchResume {
-			changed, err = o.st.RollbackStartingPaused(ctx, sb.ID, expectedRunID)
+			changed, err = o.st.RollbackStartingPaused(ctx, sb)
 		} else {
-			changed, err = o.st.RollbackStartingDead(ctx, sb.ID, expectedRunID)
+			changed, err = o.st.RollbackStartingDead(ctx, sb)
 		}
 		if err != nil {
 			unlock()
@@ -974,10 +1065,65 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 			continue
 		}
 		if !changed {
+			current, getErr := o.st.Get(ctx, sb.ID)
+			if getErr != nil {
+				unlock()
+				cancel()
+				if firstStoreErr == nil {
+					firstStoreErr = getErr
+				}
+				o.log.Error("reload sandbox after launch rollback CAS miss; retrying",
+					"sid", sb.ID, "run_id", expectedRunID, "kind", attempt.Kind(),
+					"retry_in", retryDelay, "err", getErr)
+				waitLaunchCleanupRetry(retryDelay)
+				retryDelay = nextLaunchCleanupRetry(retryDelay)
+				continue
+			}
+			if !sameStartingLaunchIncarnation(attempt, sb, current, expectedRunID) {
+				// Delete may win after Attach but before SetStartingResources. The
+				// attempt then owns and detaches a process-local port absent from the
+				// deleting row. Release only that unpersisted fence here; a port still
+				// named by the durable row remains excluded until its finalizer commits.
+				if current == nil || current.VswitchPort != sb.VswitchPort {
+					o.releaseDetachedPortFence(sb.VswitchPort)
+				}
+				unlock()
+				cancel()
+				return errors.Join(firstCleanupErr, firstStoreErr)
+			}
+
+			// The exact terminal CAS can miss when this same accepted launch has a
+			// durable owner that was not present in the worker snapshot (notably a
+			// competing exact-run network commit). Never clear that tuple blindly:
+			// adopt it, perform the complete ordered teardown, and retry the exact
+			// terminal transition with the authoritative snapshot.
+			if current.VswitchPort != sb.VswitchPort {
+				o.releaseDetachedPortFence(sb.VswitchPort)
+			}
+			adopted := cloneSandbox(current)
 			unlock()
 			cancel()
-			return errors.Join(firstCleanupErr, firstStoreErr)
+			for {
+				cleanupCtx, cleanupCancel := cleanupContext()
+				cleanupErr := o.teardownPersistedOwnership(cleanupCtx, adopted, attempt.Kind() == launchCreate)
+				cleanupCancel()
+				if cleanupErr == nil {
+					break
+				}
+				if firstCleanupErr == nil {
+					firstCleanupErr = cleanupErr
+				}
+				o.log.Error("adopted sandbox launch cleanup incomplete; retrying",
+					"sid", adopted.ID, "run_id", expectedRunID, "kind", attempt.Kind(),
+					"retry_in", retryDelay, "err", cleanupErr)
+				waitLaunchCleanupRetry(retryDelay)
+				retryDelay = nextLaunchCleanupRetry(retryDelay)
+			}
+			sb = adopted
+			retryDelay = launchCleanupRetryMin
+			continue
 		}
+		o.releaseDetachedPortFence(sb.VswitchPort)
 		if attempt.Kind() == launchCreate {
 			dead, getErr := o.st.Get(ctx, sb.ID)
 			if getErr != nil {
@@ -989,6 +1135,8 @@ func (o *Orchestrator) rollbackLaunch(attempt *launchAttempt, sb *types.Sandbox)
 				dead = cloneSandbox(sb)
 				dead.State = types.StateDead
 				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
+				dead.RunDir, dead.BaseDir, dead.EnvdUDS, dead.CiUDS = "", "", "", ""
+				dead.ResumeSource = types.ResumeSource{}
 			}
 			o.observeSandboxUpsert(dead)
 			unlock()
@@ -1090,6 +1238,11 @@ func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string)
 		unlock()
 		return false, nil
 	}
+	if sandbox.State == types.StateDeleting {
+		deleting, deleteErr := o.killSandboxLocked(ctx, sandbox)
+		unlock()
+		return deleting, deleteErr
+	}
 	precondition := sandboxPrecondition(sandbox)
 	operation := newSandboxOperation(conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginDirect, id, sandbox)
 	operation.Delete = &conductorextension.SandboxDeleteRequest{Reason: "explicit API delete"}
@@ -1118,6 +1271,9 @@ func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string)
 	if !ownsSandbox(current, apiKey) {
 		return false, nil
 	}
+	if current.State == types.StateDeleting {
+		return o.killSandboxLocked(ctx, current)
+	}
 	if !sandboxPreconditionMatches(precondition, current) {
 		return false, api.ErrSandboxChanged
 	}
@@ -1128,33 +1284,7 @@ func (o *Orchestrator) killWithExtension(ctx context.Context, id, apiKey string)
 // target's lifecycle lock is held. Mandatory cleanup paths do not call it and
 // therefore never depend on the optional Extension Hook.
 func (o *Orchestrator) killSandboxLocked(ctx context.Context, sb *types.Sandbox) (bool, error) {
-	attempt, launchActive := o.launches.Lookup(sb.ID)
-	o.launches.Cancel(sb.ID)
-	if err := o.st.Delete(ctx, sb.ID); err != nil {
-		return false, err
-	}
-	if sb.State == types.StateStarting && launchActive {
-		// Share exact runner/network cleanup progress with rollback. Local dirs
-		// remain the worker's responsibility because preparation may still be
-		// returning from a late external call after this synchronous Kill pass.
-		cleanupCtx, cancel := cleanupContext()
-		if err := o.stepLaunchCleanup(cleanupCtx, attempt, sb, false); err != nil {
-			o.log.Error("sandbox kill cleanup incomplete; launch will retry",
-				"sid", sb.ID, "run_id", sb.RunID, "err", err)
-		}
-		cancel()
-	} else {
-		cleanupCtx, cancel := cleanupContext()
-		if err := o.teardown(cleanupCtx, sb); err != nil {
-			o.log.Error("sandbox kill cleanup incomplete", "sid", sb.ID, "run_id", sb.RunID, "err", err)
-		}
-		cancel()
-	}
-	o.clearDeadlineIntent(sb.ID)
-	o.uncache(sb.ID)
-	o.publishDelete(sb.ID) // tell Proxy subscribers the route is gone
-	o.observeSandboxDelete(sb)
-	return true, nil
+	return o.acceptSandboxDeleteLocked(ctx, sb)
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request sandboxcfg.CaptureRequest) error {
@@ -1177,8 +1307,14 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string, request san
 	if !ownsSandbox(sb, apiKey) {
 		return api.ErrNotFound
 	}
-	if sb.State == types.StateStarting {
+	switch sb.State {
+	case types.StateStarting:
 		return api.ErrSandboxStarting
+	case types.StatePaused:
+		return api.ErrAlreadyPaused
+	case types.StateRunning:
+	default:
+		return api.ErrNotFound
 	}
 	if request.Kind == types.CaptureSnapshot {
 		request.SnapshotPolicy, err = o.resolveSnapshotPolicy(sb.Metadata, request.SnapshotPolicy)
@@ -1203,13 +1339,17 @@ func (o *Orchestrator) pauseWithExtension(ctx context.Context, id, apiKey string
 		unlock()
 		return api.ErrNotFound
 	}
-	if sandbox.State == types.StateStarting {
+	switch sandbox.State {
+	case types.StateStarting:
 		unlock()
 		return api.ErrSandboxStarting
-	}
-	if sandbox.State == types.StatePaused {
+	case types.StatePaused:
 		unlock()
 		return api.ErrAlreadyPaused
+	case types.StateRunning:
+	default:
+		unlock()
+		return api.ErrNotFound
 	}
 	if request.Kind == types.CaptureSnapshot {
 		if _, err := o.resolveSnapshotPolicy(sandbox.Metadata, request.SnapshotPolicy); err != nil {
@@ -1289,11 +1429,14 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	if current == nil {
 		return api.ErrNotFound
 	}
-	if current.State == types.StatePaused {
+	switch current.State {
+	case types.StatePaused:
 		return api.ErrAlreadyPaused
-	}
-	if current.State == types.StateStarting {
+	case types.StateStarting:
 		return api.ErrSandboxStarting
+	case types.StateRunning:
+	default:
+		return api.ErrNotFound
 	}
 	request := sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}
 	if current.AutoPauseMemory {
@@ -1322,6 +1465,9 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	}
 	if sb.State == types.StateStarting {
 		return api.ErrSandboxStarting
+	}
+	if sb.State != types.StateRunning {
+		return api.ErrNotFound
 	}
 	opCtx, finish, err := o.beginPauseOperation(ctx)
 	if err != nil {
@@ -1357,6 +1503,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		// uncleared exact ownership field for admission/restart reconciliation;
 		// returning a cleanup error here would misleadingly invite a second Pause.
 		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
+		o.startPausedCleanupRetry(paused.ID)
 	}
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
@@ -1364,57 +1511,72 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	return nil
 }
 
-// cleanupPausedOwnership releases and then exact-CAS-clears each resource
-// independently. A successful detach must never leave a reusable port in the
-// row merely because runner cleanup failed, and vice versa.
+// cleanupPausedOwnership releases ownership in the canonical dependency order.
+// Each exact RunID, port, and RunDir remains durable until its cleanup succeeds;
+// clearing RunDir also clears the UDS paths it owns. BaseDir remains the paused
+// artifact owner and is never touched here.
 func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.Sandbox) error {
 	if sb == nil || sb.State != types.StatePaused {
 		return errors.New("orch: paused ownership cleanup requires a paused sandbox")
 	}
-	var cleanupErrs []error
+	if err := o.validateSandboxCleanupPaths(sb); err != nil {
+		return err
+	}
 	if runID := sb.RunID; runID != "" {
-		stopErr := o.lc.Stop(ctx, o.runnerUnit(runID))
-		resetErr := o.lc.ResetFailed(ctx, o.runnerUnit(runID))
-		if stopErr == nil && resetErr == nil {
-			changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
-			if err != nil {
-				cleanupErrs = append(cleanupErrs, err)
-			} else if !changed {
-				cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: paused runner ownership changed for %s", sb.ID))
-			} else {
-				sb.RunID = ""
-			}
-		} else {
-			cleanupErrs = append(cleanupErrs,
-				errors.Join(
-					wrapCleanupError("stop paused runner", stopErr),
-					wrapCleanupError("reset paused runner", resetErr),
-				),
-			)
+		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
+			return err
 		}
+		changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("orch: paused runner ownership changed for %s", sb.ID)
+		}
+		sb.RunID = ""
 	}
 	if port := sb.VswitchPort; port != "" {
-		if err := o.vs.Detach(ctx, port); err != nil {
-			cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: detach paused port %s: %w", port, err))
-		} else {
-			changed, err := o.st.ClearPausedNetwork(ctx, sb.ID, port)
-			if err != nil {
-				cleanupErrs = append(cleanupErrs, err)
-			} else if !changed {
-				cleanupErrs = append(cleanupErrs, fmt.Errorf("orch: paused network ownership changed for %s", sb.ID))
-			} else {
-				sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
-			}
+		o.networkAllocationMu.Lock()
+		detachErr := o.vs.Detach(ctx, port)
+		if detachErr != nil && !errors.Is(detachErr, vswitch.ErrPortNotAttached) {
+			o.networkAllocationMu.Unlock()
+			return fmt.Errorf("orch: detach paused port %s: %w", port, detachErr)
 		}
+		if o.detachedPortsPending == nil {
+			o.detachedPortsPending = make(map[string]struct{})
+		}
+		o.detachedPortsPending[port] = struct{}{}
+		changed, err := o.st.ClearPausedNetwork(ctx, sb.ID, port)
+		if err == nil && changed {
+			delete(o.detachedPortsPending, port)
+		}
+		o.networkAllocationMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("orch: paused network ownership changed for %s", sb.ID)
+		}
+		sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
 	}
-	return errors.Join(cleanupErrs...)
-}
-
-func wrapCleanupError(operation string, err error) error {
-	if err == nil {
-		return nil
+	removeRunDir := o.removeSandboxRunDir
+	if removeRunDir == nil {
+		removeRunDir = os.RemoveAll
 	}
-	return fmt.Errorf("orch: %s: %w", operation, err)
+	if runDir := sb.RunDir; runDir != "" {
+		if err := removeRunDir(runDir); err != nil {
+			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
+		}
+		changed, err := o.st.ClearPausedRunDir(ctx, sb.ID, runDir, sb.EnvdUDS, sb.CiUDS)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("orch: paused RunDir ownership changed for %s", sb.ID)
+		}
+		sb.RunDir, sb.EnvdUDS, sb.CiUDS = "", "", ""
+	}
+	return nil
 }
 
 func (o *Orchestrator) beginPauseOperation(requestCtx context.Context) (context.Context, func(), error) {
@@ -1740,18 +1902,16 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			return o.ensureResumeAcceptedPreparedFrom(ctx, sid, requestedDeadline, request, origin, validate, prepare)
 		}
 		// A crash or partial cleanup after CommitRunningPaused may leave exact
-		// runner/network ownership on the durable paused row. Reconcile it before
-		// BeginResume can clear those fields and lose the cleanup identities.
-		if sb.RunID != "" || sb.VswitchPort != "" {
-			cleanupCtx, cancel := cleanupContext()
-			cleanupErr := o.cleanupPausedOwnership(cleanupCtx, sb)
-			cancel()
-			if cleanupErr != nil {
-				return nil, nil, cleanupErr
-			}
-			o.cache(sb)
-			o.publishUpsert(sb)
-			o.observeSandboxUpsert(sb)
+		// runner/network/RunDir ownership on the durable paused row. Reconcile it
+		// before BeginResume restores paths and acquires a new runtime owner.
+		beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
+		cleanupCtx, cancel := cleanupContext()
+		cleanupErr := o.cleanupPausedOwnership(cleanupCtx, sb)
+		cancel()
+		o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
+		if cleanupErr != nil {
+			o.startPausedCleanupRetry(sb.ID)
+			return nil, nil, cleanupErr
 		}
 		if o.extensionSandboxHook != nil {
 			precondition := sandboxPrecondition(sb)
@@ -1835,13 +1995,31 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 			}
 		}
 		deadline := o.resumeDeadline(sb, requestedDeadline)
-		changed, err := o.st.BeginResume(ctx, sid, deadline, launchMode)
+		runDir := nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid)
+		envdUDS, ciUDS := "", ""
+		if sb.Profile == types.ProfileE2B {
+			envdUDS = filepath.Join(runDir, "envd.sock")
+			ciUDS = filepath.Join(runDir, "ci.sock")
+		}
+		changed, err := o.st.BeginResume(ctx, sid, deadline, launchMode, runDir, envdUDS, ciUDS)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !changed {
 			return nil, nil, errLaunchOwnershipLost
 		}
+		starting := cloneSandbox(sb)
+		starting.State = types.StateStarting
+		starting.LaunchMode = launchMode
+		starting.DeadlineUnix = deadline
+		starting.RunDir = runDir
+		starting.EnvdUDS = envdUDS
+		starting.CiUDS = ciUDS
+		starting.RunID = ""
+		starting.FloatingIP = ""
+		starting.VswitchPort = ""
+		starting.InnerIP = ""
+		starting.PortMAC = ""
 		// The durable row is authoritative: create the process-local attempt only
 		// after BeginResume has atomically persisted starting + launch_mode. Claim
 		// cannot normally fail while the per-SID lifecycle lock is held; if the
@@ -1850,7 +2028,7 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		attempt, err := o.launches.Claim(lifecycleCtx, sid, launchResume)
 		if err != nil {
 			cleanupCtx, cancel := cleanupContext()
-			rolledBack, rollbackErr := o.st.RollbackStartingPaused(cleanupCtx, sid, "")
+			rolledBack, rollbackErr := o.st.RollbackStartingPaused(cleanupCtx, starting)
 			cancel()
 			if rollbackErr != nil {
 				return nil, nil, errors.Join(err, fmt.Errorf("orch: rollback unowned accepted resume %s: %w", sid, rollbackErr))
@@ -1874,15 +2052,6 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		}
 		attempt.SetAcceptedAt(time.Now())
 		attempt.SetLaunchMode(launchMode)
-		starting := cloneSandbox(sb)
-		starting.State = types.StateStarting
-		starting.LaunchMode = launchMode
-		starting.DeadlineUnix = deadline
-		starting.RunID = ""
-		starting.FloatingIP = ""
-		starting.VswitchPort = ""
-		starting.InnerIP = ""
-		starting.PortMAC = ""
 		o.cache(starting)
 		o.publishUpsert(starting)
 		o.observeSandboxUpsert(starting)
@@ -1911,9 +2080,18 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	switch sb.State {
+	case types.StateStarting, types.StateRunning, types.StatePaused:
+	default:
+		return false, nil
+	}
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	if err := o.st.SetDeadline(ctx, id, deadline); err != nil {
+	changed, err := o.st.SetDeadlineIfState(ctx, id, sb.State, deadline)
+	if err != nil {
 		return false, err
+	}
+	if !changed {
+		return false, nil
 	}
 	sb.DeadlineUnix = deadline
 	updated := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })
@@ -2069,8 +2247,8 @@ func (o *Orchestrator) attachNetwork(ctx context.Context, network sandboxcfg.Net
 	}
 	o.networkAllocationMu.Lock()
 	defer o.networkAllocationMu.Unlock()
-	if len(o.detachedBuildPortsPending) != 0 {
-		return nil, fmt.Errorf("orch: network allocation blocked while detached build ownership awaits durable cleanup")
+	if len(o.detachedPortsPending) != 0 {
+		return nil, fmt.Errorf("orch: network allocation blocked while detached ownership awaits durable cleanup")
 	}
 	return o.vs.Attach(ctx, vswitch.AttachReq{
 		InnerIP:          ip.String(),
@@ -2351,8 +2529,17 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
 	// collect the dead ones and tear them down after the scan, since teardown +
 	// SetState write the store and must not run while the read cursor is open.
-	var paused, interrupted, dead []*types.Sandbox
+	var deleting, paused, interrupted, dead, deadHistory []*types.Sandbox
 	knownRuns := make(map[string]bool)
+	if err := o.st.RangeByState(ctx, types.StateDeleting, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
+		deleting = append(deleting, sb)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if err := o.st.RangeByState(ctx, types.StatePaused, func(sb *types.Sandbox) error {
 		if sb.RunID != "" {
 			knownRuns[sb.RunID] = true
@@ -2385,12 +2572,25 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	if err := o.st.RangeByState(ctx, types.StateDead, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
+		deadHistory = append(deadHistory, sb)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, sb := range deleting {
+		o.log.Info("reconcile: resume deleting sandbox finalizer", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
+		if err := o.finalizeSandboxDeleteOnce(ctx, sb.ID); err != nil {
+			return fmt.Errorf("reconcile: finalize deleting sandbox %s: %w", sb.ID, err)
+		}
+	}
 	for _, sb := range paused {
-		if sb.RunID != "" || sb.VswitchPort != "" {
-			o.log.Info("reconcile: incomplete paused ownership", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
-			if err := o.cleanupPausedOwnership(ctx, sb); err != nil {
-				return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
-			}
+		o.log.Info("reconcile: verify paused ownership cleanup", "sid", sb.ID, "run_id", sb.RunID, "port", sb.VswitchPort)
+		if err := o.cleanupPausedOwnership(ctx, sb); err != nil {
+			return fmt.Errorf("reconcile: cleanup paused sandbox %s: %w", sb.ID, err)
 		}
 		o.cache(sb)
 		o.observeSandboxUpsert(sb)
@@ -2402,7 +2602,7 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			target = types.StateStarting
 		}
 		o.log.Info("reconcile: interrupted sandbox launch", "sid", sb.ID, "target", target, "launch_mode", sb.LaunchMode)
-		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
+		if err := o.teardownPersistedOwnership(ctx, sb, !resume); err != nil {
 			return fmt.Errorf("reconcile: cleanup interrupted sandbox %s: %w", sb.ID, err)
 		}
 		if resume {
@@ -2411,9 +2611,9 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 				return resetErr
 			}
 			if !changed {
-				o.log.Warn("reconcile: interrupted resume ownership changed", "sid", sb.ID, "run_id", sb.RunID)
-				continue
+				return fmt.Errorf("reconcile: interrupted resume ownership changed for %s", sb.ID)
 			}
+			o.releaseDetachedPortFence(sb.VswitchPort)
 			recovered, getErr := o.st.Get(ctx, sb.ID)
 			if getErr != nil {
 				return getErr
@@ -2426,18 +2626,14 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 			o.observeSandboxUpsert(recovered)
 			continue
 		}
-		if target == types.StateDead {
-			if err := os.RemoveAll(sb.BaseDir); err != nil {
-				return fmt.Errorf("reconcile: remove interrupted sandbox base dir %s: %w", sb.ID, err)
-			}
-		}
-		changed, err := o.st.RollbackStartingDead(ctx, sb.ID, sb.RunID)
+		changed, err := o.st.RollbackStartingDead(ctx, sb)
 		if err != nil {
 			return err
 		}
 		if !changed {
-			o.log.Warn("reconcile: interrupted launch state changed", "sid", sb.ID, "run_id", sb.RunID)
+			return fmt.Errorf("reconcile: interrupted launch ownership changed for %s", sb.ID)
 		}
+		o.releaseDetachedPortFence(sb.VswitchPort)
 		if changed {
 			updated, getErr := o.st.Get(ctx, sb.ID)
 			if getErr != nil {
@@ -2450,14 +2646,27 @@ func (o *Orchestrator) ReconcileSandboxes(ctx context.Context) error {
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		if err := o.teardownPersistedOwnership(ctx, sb); err != nil {
+		if err := o.teardownPersistedOwnership(ctx, sb, true); err != nil {
 			return fmt.Errorf("reconcile: cleanup dead sandbox %s: %w", sb.ID, err)
 		}
-		if err := o.st.SetState(ctx, sb.ID, types.StateDead); err == nil {
-			updated := cloneSandbox(sb)
-			updated.State = types.StateDead
+		changed, err := o.st.CommitSandboxDead(ctx, sb)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("reconcile: running sandbox %s changed before dead commit", sb.ID)
+		}
+		o.releaseDetachedPortFence(sb.VswitchPort)
+		updated, err := o.st.Get(ctx, sb.ID)
+		if err != nil {
+			return err
+		}
+		if updated != nil {
 			o.observeSandboxUpsert(updated)
 		}
+	}
+	for _, sb := range deadHistory {
+		o.observeSandboxUpsert(sb)
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
 	// pool instance because their old WaitAssignment request belonged to the
@@ -2647,41 +2856,21 @@ func (o *Orchestrator) mutateCached(id string, fn func(*types.Sandbox)) *types.S
 	return nb
 }
 
-func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
-	// The runner unit owns both ctl/ and vmm/ and uses KillMode=control-group,
-	// so StopUnit kills every straggler (cloud-hypervisor included). No separate
-	// cgroup drain/rmdir is needed.
-	var cleanupErr error
-	if sb.RunID != "" {
-		unit := o.runnerUnit(sb.RunID)
-		if err := o.lc.Stop(ctx, unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop %s: %w", unit, err))
-		}
-		if err := o.lc.ResetFailed(ctx, unit); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset %s: %w", unit, err))
-		}
-	}
-	if sb.VswitchPort != "" {
-		if err := o.vs.Detach(ctx, sb.VswitchPort); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach port %s: %w", sb.VswitchPort, err))
-		}
-	}
-	if err := os.RemoveAll(sb.RunDir); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove run dir %s: %w", sb.RunDir, err))
-	}
-	o.uncache(sb.ID)
-	return cleanupErr
-}
-
 // teardownPersistedOwnership releases resources in dependency order without
 // mutating the durable row. On failure it leaves later resources and the cache
 // untouched so the caller can preserve the row and retry. On success the caller
 // must immediately commit its terminal state or restore the cache if that write
 // fails.
-func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types.Sandbox) error {
+func (o *Orchestrator) teardownPersistedOwnership(ctx context.Context, sb *types.Sandbox, includeBase bool) error {
+	if err := o.validateSandboxCleanupPaths(sb); err != nil {
+		return err
+	}
 	progress := launchCleanupProgress{
 		port:   sb.VswitchPort,
 		runDir: sb.RunDir,
+	}
+	if includeBase {
+		progress.baseDir = sb.BaseDir
 	}
 	if sb.RunID != "" {
 		progress.unit = o.runnerUnit(sb.RunID)

@@ -40,7 +40,11 @@ func (l *orderedCleanupLauncher) ResetFailed(context.Context, string) error {
 	}
 	return nil
 }
-func (*orderedCleanupLauncher) List(context.Context, string) ([]launcher.Unit, error) {
+
+func (l *orderedCleanupLauncher) List(_ context.Context, unit string) ([]launcher.Unit, error) {
+	if l.stopErr != nil && l.stopCalls.Load() == 1 {
+		return []launcher.Unit{{Name: unit, ActiveState: "active"}}, nil
+	}
 	return nil, nil
 }
 func (*orderedCleanupLauncher) Reload(context.Context) error { return nil }
@@ -187,8 +191,8 @@ func TestBuildCleanupDirectoryRetryDoesNotRedetachReleasedPort(t *testing.T) {
 	o.cfg.Paths.BaseRoot = t.TempDir()
 	vs := &orderedCleanupVS{}
 	o.vs = vs
+	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000218")
-	build.RunID = ""
 	port := build.RuntimeVswitchPort
 	if err := o.st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
@@ -230,7 +234,7 @@ func TestBuildCleanupDirectoryRetryDoesNotRedetachReleasedPort(t *testing.T) {
 	if got := vs.detachCalls.Load(); got != 1 {
 		t.Fatalf("first cleanup detach calls=%d, want 1", got)
 	}
-	if _, fenced := o.detachedBuildPortsPending[port]; fenced {
+	if _, fenced := o.detachedPortsPending[port]; fenced {
 		t.Fatal("durably cleared port remained fenced")
 	}
 
@@ -255,6 +259,67 @@ func TestBuildCleanupDirectoryRetryDoesNotRedetachReleasedPort(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("Build cleanup removed node-level file %s: %v", path, err)
 		}
+	}
+}
+
+func TestBuildBaseDirFailureRetainsExecutionClaimUntilRetry(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
+	vs := &orderedCleanupVS{}
+	o.vs = vs
+	o.lc = &orderedCleanupLauncher{}
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000219")
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseErr := errors.New("injected BuildBaseDir removal failure")
+	var calls atomic.Int32
+	o.removeBuildBaseDir = func(path string) error {
+		if path != baseDir {
+			t.Fatalf("remove base path = %q, want %q", path, baseDir)
+		}
+		if calls.Add(1) == 1 {
+			return baseErr
+		}
+		return os.RemoveAll(path)
+	}
+
+	progress, err := o.cleanupBuildRuntimeProgress(build, build.RuntimeVswitchPort, true)
+	if !errors.Is(err, baseErr) || progress.port != "" || progress.persisted {
+		t.Fatalf("first BaseDir cleanup = %+v, %v", progress, err)
+	}
+	stored, getErr := o.st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil || stored == nil || !stored.ExecutionClaimed || stored.Status != types.BuildBuilding {
+		t.Fatalf("BaseDir failure released execution claim: %+v, %v", stored, getErr)
+	}
+	if _, err := os.Stat(runDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed BuildRunDir cleanup = %v", err)
+	}
+	if _, err := os.Stat(baseDir); err != nil {
+		t.Fatalf("failed BuildBaseDir cleanup lost retry owner: %v", err)
+	}
+
+	_, retryErr := o.retryBuildCleanup(context.Background(), build, &buildCleanupPendingError{
+		cleanup: err, port: progress.port, persisted: progress.persisted,
+	})
+	if retryErr != nil {
+		t.Fatalf("retry BuildBaseDir cleanup: %v", retryErr)
+	}
+	o.completeBuild(context.Background(), build, &buildResult{ImageRef: "manifest://" + strings.Repeat("e", 64)}, nil)
+	stored, getErr = o.st.GetBuild(context.Background(), build.BuildID)
+	if getErr != nil || stored == nil || stored.ExecutionClaimed || stored.Status != types.BuildReady {
+		t.Fatalf("terminal Build after BaseDir retry = %+v, %v", stored, getErr)
+	}
+	if _, err := os.Stat(baseDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("BuildBaseDir retry retained directory: %v", err)
 	}
 }
 
@@ -341,6 +406,56 @@ func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 	}
 }
 
+func TestRecoveredBuildPreparationFailureRetainsDirectoriesUntilUnitFence(t *testing.T) {
+	o := testOrch(t)
+	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
+	wantFenceErr := errors.New("injected recovered builder stop failure")
+	lc := &orderedCleanupLauncher{stopErr: wantFenceErr}
+	o.lc = lc
+	build := &types.Build{
+		BuildID: "recovered-build-fence", Status: types.BuildBuilding,
+		RunID: "br-00000000-0000-7000-8000-000000000289", ExecutionClaimed: true,
+	}
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var removeCalls atomic.Int32
+	o.removeBuildRunDir = func(path string) error {
+		removeCalls.Add(1)
+		return os.RemoveAll(path)
+	}
+	o.removeBuildBaseDir = func(path string) error {
+		removeCalls.Add(1)
+		return os.RemoveAll(path)
+	}
+	cause := errors.New("recovered preparation failed")
+	unit := o.builderUnit(build.RunID)
+	err := o.cleanupRecoveredBuildRuntime(build, cause, unit, "", false)
+	var pending *buildCleanupPendingError
+	if !errors.As(err, &pending) || !errors.Is(err, wantFenceErr) || !errors.Is(err, cause) {
+		t.Fatalf("cleanup error = %v, want retained cause and fence failure", err)
+	}
+	if removeCalls.Load() != 0 {
+		t.Fatalf("directory cleanup crossed failed unit fence: calls=%d", removeCalls.Load())
+	}
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed unit fence did not retain %s: %v", path, err)
+		}
+	}
+	if _, retryErr := o.retryBuildCleanup(context.Background(), build, pending); retryErr != nil {
+		t.Fatalf("retry cleanup: %v", retryErr)
+	}
+	if removeCalls.Load() != 2 {
+		t.Fatalf("retry directory cleanup calls=%d, want 2", removeCalls.Load())
+	}
+}
+
 func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
@@ -350,7 +465,8 @@ func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000210")
 	build.BuildID = "cleanup-retry-unpersisted-port"
-	build.RuntimeVswitchPort = ""
+	build.RuntimeVswitchPort, build.RuntimeFloatingIP, build.RuntimePortMAC = "", "", ""
+	build.RuntimeEnvdAccessToken, build.RuntimePrepareJSON = "", ""
 	if err := os.MkdirAll(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +499,8 @@ func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) 
 	o.lc = &orderedCleanupLauncher{}
 	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000211")
 	build.BuildID = "recovered-cleanup-retry-unpersisted-port"
-	build.RuntimeVswitchPort = ""
+	build.RuntimeVswitchPort, build.RuntimeFloatingIP, build.RuntimePortMAC = "", "", ""
+	build.RuntimeEnvdAccessToken, build.RuntimePrepareJSON = "", ""
 	if err := os.MkdirAll(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +509,8 @@ func TestRecoveredBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) 
 	}
 
 	runErr := o.cleanupRecoveredBuildRuntime(
-		build, errors.New("runtime preparation was not committed"), "recovered-local-port-22", false,
+		build, errors.New("runtime preparation was not committed"), o.builderUnit(build.RunID),
+		"recovered-local-port-22", false,
 	)
 	var pending *buildCleanupPendingError
 	if !errors.As(runErr, &pending) || pending.port != "recovered-local-port-22" || pending.persisted {
@@ -476,16 +594,21 @@ func TestReconcileCleanupStopsBeforeLaterOwnership(t *testing.T) {
 	o := &Orchestrator{cfg: cfg, lc: lc, vs: vs}
 
 	root := t.TempDir()
+	cfg.Paths.RunRoot = filepath.Join(root, "run-root")
+	cfg.Paths.BaseRoot = filepath.Join(root, "base-root")
 	sb := &types.Sandbox{
 		ID: "reconcile-ordered-cleanup", RunID: "sr-00000000-0000-7000-8000-000000000002",
 		VswitchPort: "reconcile-ordered-port",
-		RunDir:      filepath.Join(root, "run"),
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, "reconcile-ordered-cleanup"),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "reconcile-ordered-cleanup"),
 	}
-	if err := os.MkdirAll(sb.RunDir, 0o700); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if err := o.teardownPersistedOwnership(context.Background(), sb); !errors.Is(err, stopErr) {
+	if err := o.teardownPersistedOwnership(context.Background(), sb, false); !errors.Is(err, stopErr) {
 		t.Fatalf("reconcile cleanup error = %v, want stop failure", err)
 	}
 	if lc.resetCalls.Load() != 0 || vs.detachCalls.Load() != 0 {

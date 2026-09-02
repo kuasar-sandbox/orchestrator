@@ -369,12 +369,34 @@ wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
     done
     return 1
 }
-build_run_id() { # $1=build id
-    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+build_journal_unit() { # $1=build id
+    journalctl KUASAR_BUILD_ID="$1" --no-pager --output=json 2>/dev/null \
+        | python3 -c 'import json,sys
+for line in sys.stdin:
+    try:
+        unit = json.loads(line).get("_SYSTEMD_UNIT", "")
+    except json.JSONDecodeError:
+        continue
+    if unit.startswith("sandbox-builder@") and unit.endswith(".service"):
+        print(unit)
+        raise SystemExit(0)
+raise SystemExit(1)'
+}
+assert_terminal_build_unowned() { # $1=build id, $2=terminal state
+    python3 - "$WORK/lib/node-ctl.db" "$1" "$2" <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1], timeout=5) as db:
-    row = db.execute("select run_id from builds where build_id=?", (sys.argv[2],)).fetchone()
-print(row[0] if row else "")
+    row = db.execute("""
+        select status, run_id, execution_claimed, execution_claimed_unix,
+               enforcement_status, phase, phase_sandbox_id,
+               runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
+               runtime_envd_access_token_enc, runtime_prepare_json,
+               execution_result_json
+          from builds where build_id=?
+    """, (sys.argv[2],)).fetchone()
+assert row is not None and row[0] == sys.argv[3], row
+assert row[1] == "" and row[2] == 0 and row[3] == 0, row
+assert all(value == "" for value in row[4:]), row
 PY
 }
 build_trigger_signature() { # $1=build id
@@ -919,9 +941,8 @@ PY
 code=$(req POST "/v2/templates/$BF_TID/builds/$BF_BID" "$AK" "$BF_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "BF trigger = $code (want 202)"; }
 wait_error "$BF_TID" "$BF_BID" BF
-BF_RUN_ID=$(build_run_id "$BF_BID")
-[ -n "$BF_RUN_ID" ] || fail "BF error record lost its run id"
-BF_UNIT="sandbox-builder@$BF_RUN_ID.service"
+assert_terminal_build_unowned "$BF_BID" error || fail "BF terminal row retained execution ownership"
+BF_UNIT=$(build_journal_unit "$BF_BID") || fail "BF journal lost its builder unit identity"
 wait_unit_journal_contains "$BF_UNIT" ISSUE178_BUILDER_FAILURE "$WORK/bf.journal" \
     || { diag "$BF_BID"; fail "BF journal was not retained after the business failure"; }
 wait_unit_collected "$BF_UNIT" || fail "$BF_UNIT remained loaded and failed"
@@ -971,6 +992,7 @@ wait_phase_reservation c "$B2_BID" \
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
+assert_terminal_build_unowned "$B2_BID" ready || fail "B2 terminal row retained execution ownership"
 [ ! -e "$WORK/run/builds/$B2_BID" ] || fail "terminal Build retained BuildRunDir"
 [ ! -e "$WORK/lib/builds/$B2_BID" ] || fail "terminal Build retained BuildBaseDir"
 echo "==> PASS: B2 ready → $B2_PERSIST"
@@ -1027,9 +1049,9 @@ code=$(req POST "/v2/templates/$B3_TID/builds/$B3_BID" "$AK" \
 wait_ready "$B3_TID" "$B3_BID" B3
 B3_PERSIST="$PERSIST"
 case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-snp-…)";; esac
-B3_RUN_ID=$(build_run_id "$B3_BID")
-[ -n "$B3_RUN_ID" ] || fail "B3 ready record lost its run id"
-journalctl --no-pager -o cat -u "sandbox-builder@$B3_RUN_ID.service" >"$WORK/b3-builder.journal" 2>&1 || true
+assert_terminal_build_unowned "$B3_BID" ready || fail "B3 terminal row retained execution ownership"
+B3_UNIT=$(build_journal_unit "$B3_BID") || fail "B3 journal lost its builder unit identity"
+journalctl --no-pager -o cat -u "$B3_UNIT" >"$WORK/b3-builder.journal" 2>&1 || true
 B3_ROOT_READS=$(grep -F -c 'build task artifact prepared' "$WORK/b3-builder.journal" || true)
 [ "$B3_ROOT_READS" = "1" ] \
     || { cat "$WORK/b3-builder.journal"; fail "B3 task root snapshot.cfg read count=$B3_ROOT_READS (want 1)"; }

@@ -968,8 +968,10 @@ func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Bu
 		err := o.st.PutBuildTerminal(writeCtx, build)
 		cancel()
 		if err == nil {
+			build.RunID = ""
 			build.ExecutionClaimed = false
 			build.ExecutionClaimedUnix = 0
+			build.EnforcementStatus = ""
 			build.Phase = ""
 			build.PhaseSandboxID = ""
 			build.RuntimeVswitchPort = ""
@@ -1016,6 +1018,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
 	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)
 	var port *vswitch.Port
+	var unit string
 	runtimePersisted := false
 	cleanupSafe := true
 	defer func() {
@@ -1026,6 +1029,15 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		if !cleanupSafe {
 			retErr = retainBuildCleanup(retErr, nil, portID, runtimePersisted)
 			return
+		}
+		// Assignment makes the builder unit the execution owner even before it
+		// receives a final BuildSpec. Every exit path must fence that exact unit
+		// before detaching its port or removing BuildRunDir/BuildBaseDir.
+		if unit != "" {
+			if cleanupErr := o.stopBuilderUnit(unit); cleanupErr != nil {
+				retErr = retainBuildCleanup(retErr, cleanupErr, portID, runtimePersisted)
+				return
+			}
 		}
 		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, runtimePersisted)
 		if cleanupErr != nil {
@@ -1064,7 +1076,6 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	buildCtx, cancelBuild := context.WithDeadline(ctx, deadline)
 	defer cancelBuild()
 
-	var unit string
 	var mmdsRow *types.Sandbox
 	if _, err := o.builderRunPool.Assign(buildCtx, b.BuildID, func(runID string) error {
 		var err error
@@ -1399,22 +1410,22 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 			if err := o.vs.Detach(cleanupCtx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("detach build port %s: %w", port, err))
 			} else if persisted {
-				if o.detachedBuildPortsPending == nil {
-					o.detachedBuildPortsPending = make(map[string]struct{})
+				if o.detachedPortsPending == nil {
+					o.detachedPortsPending = make(map[string]struct{})
 				}
-				o.detachedBuildPortsPending[port] = struct{}{}
+				o.detachedPortsPending[port] = struct{}{}
 			} else {
 				progress.port = ""
 			}
 		}
 		if cleanupErr == nil && persisted {
-			cleared, err := o.st.ClearBuildRuntimeOwnership(cleanupCtx, b.BuildID)
+			cleared, err := o.st.ClearBuildRuntimeOwnership(cleanupCtx, b.BuildID, b.RunID, port)
 			if err != nil {
 				cleanupErr = errors.Join(cleanupErr, err)
 			} else if !cleared {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("build execution ownership lost during cleanup"))
 			} else {
-				delete(o.detachedBuildPortsPending, port)
+				delete(o.detachedPortsPending, port)
 				b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, b.RuntimeEnvdAccessToken = "", "", "", ""
 				b.RuntimePrepareJSON = ""
 				progress.port, progress.persisted = "", false
@@ -1426,21 +1437,24 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 		o.observeBuildUpsert(b)
 	}
 	unlockExtensionEvent(unlockEvent)
+	if cleanupErr != nil {
+		return progress, cleanupErr
+	}
 	removeRunDir := o.removeBuildRunDir
 	if removeRunDir == nil {
 		removeRunDir = os.RemoveAll
 	}
 	if err := removeRunDir(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove BuildRunDir: %w", err))
+		return progress, fmt.Errorf("remove BuildRunDir: %w", err)
 	}
 	removeBaseDir := o.removeBuildBaseDir
 	if removeBaseDir == nil {
 		removeBaseDir = os.RemoveAll
 	}
 	if err := removeBaseDir(nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove BuildBaseDir: %w", err))
+		return progress, fmt.Errorf("remove BuildBaseDir: %w", err)
 	}
-	return progress, cleanupErr
+	return progress, nil
 }
 
 // retryBuildCleanup keeps a live controller making progress after a transient

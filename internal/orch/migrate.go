@@ -224,7 +224,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		}
 	} else {
 		cleanupCtx, cancelCleanup := cleanupContext()
-		cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current)
+		cleanupErr := o.teardownPersistedOwnership(cleanupCtx, current, false)
 		cancelCleanup()
 		if cleanupErr != nil {
 			return "", fmt.Errorf("export-sandbox: teardown source %s: %w", sid, cleanupErr)
@@ -233,6 +233,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 			o.cache(current)
 			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 		}
+		o.releaseDetachedPortFence(current.VswitchPort)
 		o.uncache(sid)
 		o.clearDeadlineIntent(sid)
 		o.publishDelete(sid)

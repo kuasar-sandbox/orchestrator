@@ -401,7 +401,7 @@ func TestExecSessionRejectsDeadAndInconsistentSandbox(t *testing.T) {
 		ID: "dead-exec", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("7", 64)}.String(), State: types.StateDead,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "lib"), CreatedUnix: 1,
+		CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, dead)
 	if err := o.st.Put(ctx, dead); err != nil {
