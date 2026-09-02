@@ -493,25 +493,40 @@ func (o *Orchestrator) rollbackPreLaunchAdmissionWith(sid string, newCleanupCont
 	var firstErr error
 	for {
 		ctx, cancel := newCleanupContext()
-		changed, err := o.st.DeletePreLaunchStarting(ctx, sid)
-		cancel()
+		sb, err := o.st.Get(ctx, sid)
+		if err == nil && (sb == nil || sb.State != types.StateStarting || !sb.ResumeSource.Empty()) {
+			cancel()
+			return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact fresh starting ownership for %s", sid))
+		}
 		if err == nil {
-			if !changed {
+			err = o.teardownPersistedOwnership(ctx, sb, true)
+		}
+		if err == nil {
+			var changed bool
+			changed, err = o.st.RollbackStartingDead(ctx, sb)
+			if err == nil && !changed {
+				cancel()
 				return errors.Join(firstErr, fmt.Errorf("orch: pre-launch rollback lost exact starting ownership for %s", sid))
 			}
-			deleted := o.lookup(sid)
-			o.uncache(sid)
-			o.publishDelete(sid)
-			if deleted == nil {
-				deleted = &types.Sandbox{ID: sid}
+			if err == nil {
+				o.releaseDetachedPortFence(sb.VswitchPort)
+				o.uncache(sid)
+				o.publishDelete(sid)
+				dead := cloneSandbox(sb)
+				dead.State, dead.LaunchMode = types.StateDead, ""
+				dead.RunID, dead.FloatingIP, dead.VswitchPort, dead.InnerIP, dead.PortMAC = "", "", "", "", ""
+				dead.RunDir, dead.BaseDir, dead.EnvdUDS, dead.CiUDS = "", "", "", ""
+				dead.ResumeSource = types.ResumeSource{}
+				o.observeSandboxUpsert(dead)
+				cancel()
+				return firstErr
 			}
-			o.observeSandboxDelete(deleted)
-			return firstErr
 		}
+		cancel()
 		if firstErr == nil {
 			firstErr = err
 		}
-		o.log.Error("sandbox pre-launch rollback failed; retrying", "sid", sid, "retry_in", delay, "err", err)
+		o.log.Error("sandbox pre-launch cleanup/dead commit failed; retrying", "sid", sid, "retry_in", delay, "err", err)
 		waitLaunchCleanupRetry(delay)
 		delay = nextLaunchCleanupRetry(delay)
 	}

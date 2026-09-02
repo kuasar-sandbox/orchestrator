@@ -425,63 +425,6 @@ func TestStartingRollbackRejectsWrongLifecycleKind(t *testing.T) {
 	}
 }
 
-func TestDeletePreLaunchStartingRequiresEmptyOwnership(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-	clearOwnership := func(sb *types.Sandbox) {
-		sb.RunID = ""
-		sb.FloatingIP = ""
-		sb.VswitchPort = ""
-		sb.InnerIP = ""
-		sb.PortMAC = ""
-	}
-	pre := sandboxInsertFixture("delete-pre-launch", 1)
-	pre.State = types.StateStarting
-	pre.ResumeSource = types.ResumeSource{}
-	pre.LaunchMode = types.LaunchImage
-	clearOwnership(pre)
-	if err := st.InsertSandbox(ctx, pre); err != nil {
-		t.Fatal(err)
-	}
-	if changed, err := st.DeletePreLaunchStarting(ctx, pre.ID); err != nil || !changed {
-		t.Fatalf("DeletePreLaunchStarting = %v, %v", changed, err)
-	}
-	if got, err := st.Get(ctx, pre.ID); err != nil || got != nil {
-		t.Fatalf("deleted pre-launch row = %+v, %v", got, err)
-	}
-
-	for _, test := range []struct {
-		name   string
-		mutate func(*types.Sandbox)
-	}{
-		{name: "runner", mutate: func(sb *types.Sandbox) { sb.RunID = "run-1" }},
-		{name: "network", mutate: func(sb *types.Sandbox) { sb.VswitchPort = "port-1" }},
-		{name: "resume", mutate: func(sb *types.Sandbox) {
-			sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: "paused.sandbox"}
-			sb.LaunchMode = types.LaunchCold
-		}},
-		{name: "running", mutate: func(sb *types.Sandbox) { sb.State, sb.LaunchMode = types.StateRunning, "" }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			sb := sandboxInsertFixture("delete-pre-launch-"+test.name, 2)
-			sb.State = types.StateStarting
-			sb.ResumeSource = types.ResumeSource{}
-			sb.LaunchMode = types.LaunchImage
-			clearOwnership(sb)
-			test.mutate(sb)
-			if err := st.InsertSandbox(ctx, sb); err != nil {
-				t.Fatal(err)
-			}
-			if changed, err := st.DeletePreLaunchStarting(ctx, sb.ID); err != nil || changed {
-				t.Fatalf("DeletePreLaunchStarting = %v, %v", changed, err)
-			}
-			if got, err := st.Get(ctx, sb.ID); err != nil || got == nil {
-				t.Fatalf("ownership row removed = %+v, %v", got, err)
-			}
-		})
-	}
-}
-
 func TestListDefaultHidesInternalStatesButExplicitStateRemainsDiagnostic(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

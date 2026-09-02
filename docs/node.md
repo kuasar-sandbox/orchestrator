@@ -121,8 +121,9 @@ create 同步受理流程只做请求校验/纯解析、身份和 token 生成�
 master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才调度 launch并返回 HTTP
 201.201 表示资源已被持久接受,且 proxy 已具备用该 starting identity 鉴权并
 parking 的必要信息;不表示 runner 已分配、runtime 已 ready、backend 已可拨或 e2b `/init`
-已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前精确删除该
-`starting,run_id=""` 行并发布 Delete。cold image 后台路径保持原有单阶段 fast path:先完成
+已完成。barrier 无 proxy、断连、apply 失败或超时时返回 503,在启动任何资源前删除该对象的
+RunDir/BaseDir，再以 exact owner CAS 将 `starting,run_id=""` 收敛为零 ownership `dead` history
+并发布 route Delete。cold image 后台路径保持原有单阶段 fast path:先完成
 resource/network/YAML,再从 runner pool 分配 run-id。artifact launch 路径先建目录和绑定
 `ready.sock`,再由 pool commit callback 以 `starting AND run_id=''` CAS 绑定 exact run-id;
 task 取得 assignment 后立即连接 readiness、锁 task pidfile并取 bootstrap。认证通过后
@@ -1602,8 +1603,9 @@ running Connect 保持幂等,显式 false 不会重启。starting resume 上,omi
 显式值与 durable `launch_mode` 一致时加入,冲突时返回 409,不会修改已经接受的模式。cluster
 Connect 在 Router、route-link、Registry 和 node-link 间保留 `*bool` 的存在性。
 
-`BeginResume(id, deadline, LaunchMode)` 原子写 `state=starting, launch_mode` 并清理上一代已经释放的
-runner/network ownership。`CommitStartingRunning`、`RollbackStartingPaused`、
+`BeginResume(id, deadline, LaunchMode, RunDir, EnvdUDS, CiUDS)` 只接受 runner/network/RunDir 已完成
+cleanup 的 paused row，并原子写 `state=starting, launch_mode` 与新一代 canonical RunDir/UDS。
+`CommitStartingRunning`、`RollbackStartingPaused`、
 `RollbackStartingDead` 清空 `launch_mode`。失败的 S+cold 恢复原 paused S,不会改写成 E,所以之后
 仍可选择 memory。conductor 重启遇到 starting resume 时从 durable source + `launch_mode` 重建
 attempt;例如 S+cold 不会因进程内缓存丢失而错误执行 memory restore。

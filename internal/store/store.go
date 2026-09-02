@@ -859,24 +859,6 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 	return sandboxUpdateChanged("rollback resume starting to paused", sb.ID, result)
 }
 
-// DeletePreLaunchStarting removes a fresh Create admission only while no runner
-// or network resource has taken ownership. It is the exact rollback fence for a
-// route barrier that fails before asynchronous launch begins.
-func (s *Store) DeletePreLaunchStarting(ctx context.Context, id string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
-		DELETE FROM sandboxes
-		 WHERE id=? AND state=? AND run_id=''
-		   AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
-		   AND resume_source_kind='' AND resume_source_ref=''
-		   AND launch_mode IN (?,?,?)`,
-		id, string(types.StateStarting),
-		string(types.LaunchImage), string(types.LaunchCold), string(types.LaunchMemory))
-	if err != nil {
-		return false, fmt.Errorf("store: delete pre-launch starting sandbox %s: %w", id, err)
-	}
-	return sandboxUpdateChanged("delete pre-launch starting", id, result)
-}
-
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,auto_pause_memory,launch_mode,
