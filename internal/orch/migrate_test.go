@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -502,8 +503,7 @@ func TestExportPromotesLocalSandboxAndSnapshotState(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
-			o := testOrch(t)
-			o.cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+			o := migrationOrchestrator(t, dir, []byte("runtime"))
 			ctx := context.Background()
 			mk := strings.Repeat("7", 64)
 			_, apiKey := defaultTestCredentials(t, mk)
@@ -603,12 +603,55 @@ func TestExportRejectsUnownedLocalArtifactBeforePublishOrCleanup(t *testing.T) {
 	}
 }
 
+func TestExportRejectsNonCanonicalBaseDirBeforePublishOrCleanup(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	mk := strings.Repeat("7", 64)
+	_, apiKey := defaultTestCredentials(t, mk)
+	sid := "noncanonical-base-dir"
+	badBaseDir := filepath.Join(dir, "outside", sid)
+	badCheckpointDir := filepath.Join(badBaseDir, "checkpoint")
+	if err := os.MkdirAll(badCheckpointDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badRef := filepath.Join(badCheckpointDir, sid+".snapshot")
+	if err := os.WriteFile(badRef, []byte("must remain"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb := migrationSandbox(t, dir, sid, mk, badRef)
+	sb.BaseDir = badBaseDir
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(sb)
+	publishCalled := false
+	o.artifactPublisher = func(context.Context, *types.Sandbox, types.ResumeSource) (types.ResumeSource, error) {
+		publishCalled = true
+		return types.ResumeSource{}, nil
+	}
+
+	if _, err := o.ExportSandbox(ctx, apiKey, sid, true, true); err == nil ||
+		!strings.Contains(err.Error(), "does not match canonical path") {
+		t.Fatalf("non-canonical BaseDir error = %v", err)
+	}
+	if publishCalled {
+		t.Fatal("non-canonical BaseDir reached publisher")
+	}
+	if _, err := os.Stat(badRef); err != nil {
+		t.Fatalf("artifact under non-canonical BaseDir was removed: %v", err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.ResumeSource != sb.ResumeSource || stored.BaseDir != badBaseDir {
+		t.Fatalf("non-canonical BaseDir changed durable row: %+v, %v", stored, err)
+	}
+}
+
 func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{}
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	cfg := o.cfg
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
-	o := testOrchCfg(t, cfg)
 	// Pin the publication clock so the expected name is a constant even if
 	// the test straddles UTC midnight.
 	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
@@ -687,7 +730,8 @@ func TestExportPromoteStoreFailurePreservesLocalState(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "node.db")
 	cfg := &config.Config{}
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	o := testOrchCfgAt(t, cfg, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("8", 64)
@@ -734,7 +778,8 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	cfg.Sandbox.Boot.Runtime = runtimePath
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	o := testOrchCfgAt(t, cfg, dbPath)
 	ctx := context.Background()
 	mk := strings.Repeat("9", 64)
@@ -777,8 +822,8 @@ func migrationSandbox(t *testing.T, dir, sid, mk, ref string) *types.Sandbox {
 	sb := &types.Sandbox{
 		ID: sid, Profile: types.ProfileE2B, TemplateID: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindSnp, Ref: "manifest://" + strings.Repeat("a", 64)}.String(), State: types.StatePaused,
 		APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
-		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: ref}, RunDir: filepath.Join(dir, "run", sid),
-		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
+		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: ref}, RunDir: nodepath.SandboxRunDir(filepath.Join(dir, "run"), sid),
+		BaseDir: nodepath.SandboxBaseDir(filepath.Join(dir, "lib"), sid), CreatedUnix: 1,
 	}
 	if err := materializeSandboxCredentials(sb, sandboxcfg.Credentials{}); err != nil {
 		t.Fatal(err)
@@ -796,7 +841,6 @@ func migrationOrchestrator(t *testing.T, dir string, runtime []byte) *Orchestrat
 	cfg.Sandbox.Boot.Runtime = runtimePath
 	cfg.Paths.RunRoot = filepath.Join(dir, "run")
 	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
 	return testOrchCfgAt(t, cfg, filepath.Join(dir, "node.db"))
 }
 
@@ -839,7 +883,7 @@ func makeLocalSnapshot(t *testing.T, dir, sid string) string {
 
 func makeLocalArtifact(t *testing.T, dir, sid, suffix string) string {
 	t.Helper()
-	localDir := filepath.Join(dir, "saved", sid)
+	localDir := filepath.Join(nodepath.SandboxBaseDir(filepath.Join(dir, "lib"), sid), "checkpoint")
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

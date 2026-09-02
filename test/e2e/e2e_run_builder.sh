@@ -104,7 +104,7 @@ BUILDER_EXECUTION_CPU_MILLI=$((BUILDER_EXECUTION_CPU * 1000))
 BUILDER_REGISTRATION_CPU=$((BUILDER_CPU * 16))
 BUILDER_REGISTRATION_CPU_MILLI=$((BUILDER_REGISTRATION_CPU * 1000))
 
-WORK="$(mktemp -d /tmp/e2e-builder-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 # Units must live in a real systemd load path; we only remove what we created.
 UNIT_DIR="/run/systemd/system"
@@ -114,7 +114,7 @@ for u in "${UNIT_NAMES[@]}"; do
     [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u already exists (real deployment?); refusing to clobber"
     OURS+=("$UNIT_DIR/$u")
 done
-mkdir -p "$WORK/run" "$WORK/lib" "$WORK/saved" "$WORK/store" "$WORK/zot" "$WORK/vgw"
+mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot" "$WORK/vgw"
 declare -a PIDS=() TAGS=()
 cleanup() {
     set +e
@@ -310,7 +310,7 @@ resource_listen:
     physical_cpu: auto
     host_reserved: { memory: 1GiB, cpu: 0.5 }
   admission: { rate: 50, burst: 50, startup_ttl: 180s, queue_ttl: 30s, queue_max_depth: 256 }
-checkpoint: { mode: bundle, local_dir: $WORK/saved }
+checkpoint: { mode: bundle }
 EOF
 
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
@@ -526,6 +526,10 @@ register() { # name [profile] → sets TID/BID
     got_profile=$(json_field "$WORK/resp.body" profile)
     [ "$got_profile" = "$expected_profile" ] \
         || fail "register $1 profile=$got_profile (want $expected_profile)"
+    [ ! -e "$WORK/run/builds/$BID" ] \
+        || fail "registered Build created BuildRunDir before execution claim"
+    [ ! -e "$WORK/lib/builds/$BID" ] \
+        || fail "registered Build created BuildBaseDir before execution claim"
 }
 assert_active_build_accounting() { # $1=tid, $2=bid, $3=expected phase
     local tid="$1" bid="$2" expected_phase="$3" code="" phase="" sid="" run_id="" reservation_json=""
@@ -590,6 +594,18 @@ PY
     done
     [ -n "$reservation_json" ] || fail "phase $phase/$sid did not become the sole precise nodectl reservation"
 
+    local build_run_dir="$WORK/run/builds/$bid"
+    local build_base_dir="$WORK/lib/builds/$bid"
+    [ "$sid" != "$phase" ] || fail "phase PathID replaced logical SandboxID ($sid)"
+    [ -f "$build_run_dir/builder.pid" ] || fail "BuildRunDir is missing builder.pid"
+    [ -S "$build_run_dir/$phase/ctl.sock" ] || fail "phase $phase ctl.sock is outside its PathID RunDir"
+    [ -d "$build_base_dir/$phase" ] || fail "phase $phase BaseDir is missing"
+    [ -d "$build_base_dir/checkpoint" ] || fail "Build checkpoint directory is missing from BuildBaseDir"
+    if find "$build_run_dir" -type f \( -name '*.img' -o -name '*.diff' -o -name '*.sandbox' -o -name '*.snapshot' \) -print -quit | grep -q .; then
+        find "$build_run_dir" -type f -print >&2
+        fail "BuildRunDir contains a large image/diff/checkpoint artifact"
+    fi
+
     "$BIN/node-ctl" builder status --socket "$WORK/node-ctl.socket" >"$WORK/builder-status.json" \
         || fail "node-ctl builder status"
     python3 - "$WORK/builder-status.json" "$BUILDER_CPU_MILLI" "$BUILDER_EXECUTION_CPU_MILLI" "$BUILDER_REGISTRATION_CPU_MILLI" <<'PY' || fail "durable Builder admission status"
@@ -617,7 +633,7 @@ assert status["execution"]["used_resources"] == {
 PY
 
     local build_pid sandbox_ctl_pid vmm_path ctl_path unit_path slice_path memory_high=""
-    build_pid=$(cat "$WORK/run/runs/$run_id.pid")
+    build_pid=$(cat "$WORK/run/runners/$run_id.pid")
     sandbox_ctl_pid=$(python3 - "$WORK/phase-reservations.json" "$sid" <<'PY'
 import json, sys
 for row in json.load(open(sys.argv[1])):
@@ -676,7 +692,7 @@ assert_cpu(vmm, 2000)
 PY
     echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified (memory.high=$memory_high)"
 }
-diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
+diag() { # bid — failure diagnostics (BuildRunDir/BuildBaseDir are reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
     tail -40 "$WORK/orch.log" 2>/dev/null | sed 's/^/    /'
     echo "---- journal build $1 (tail) ----"
@@ -944,11 +960,19 @@ EOF
 code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
 assert_active_build_accounting "$B2_TID" "$B2_BID" b
+# A has already self-cleaned. Plant a marker in its sibling path while B is
+# active; observing it after C starts proves B cleanup was scoped to PathID=b.
+mkdir -p "$WORK/run/builds/$B2_BID/a"
+touch "$WORK/run/builds/$B2_BID/a/sibling-proof"
 wait_phase_reservation c "$B2_BID" \
     || fail "B2 phase C never exposed a connected settled nodectl reservation"
+[ -f "$WORK/run/builds/$B2_BID/a/sibling-proof" ] \
+    || fail "phase B cleanup removed sibling phase A"
 wait_ready "$B2_TID" "$B2_BID" B2
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
+[ ! -e "$WORK/run/builds/$B2_BID" ] || fail "terminal Build retained BuildRunDir"
+[ ! -e "$WORK/lib/builds/$B2_BID" ] || fail "terminal Build retained BuildBaseDir"
 echo "==> PASS: B2 ready → $B2_PERSIST"
 
 # Deep asserts through the artifact chain: the uploaded snapshot.cfg names its

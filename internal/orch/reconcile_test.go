@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -146,8 +147,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: "sandbox-1", TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		Profile: types.ProfileBare, State: types.StateRunning, RunID: knownRun,
-		RunDir:    filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
-		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
+		RunDir:    nodepath.SandboxRunDir(cfg.Paths.RunRoot, "sandbox-1"),
+		BaseDir:   nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "sandbox-1"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -160,8 +161,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	createStarting.RunID = createStartingRun
 	createStarting.ResumeSource = types.ResumeSource{}
 	createStarting.LaunchMode = types.LaunchImage
-	createStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, createStarting.ID)
-	createStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, createStarting.ID)
+	createStarting.RunDir = nodepath.SandboxRunDir(cfg.Paths.RunRoot, createStarting.ID)
+	createStarting.BaseDir = nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, createStarting.ID)
 	createStarting.VswitchPort = "create-assigned-port"
 	createStarting.FloatingIP = "192.0.2.10"
 	materializeTestSandboxCredentials(t, &createStarting)
@@ -175,8 +176,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeStarting.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)}
 	resumeStarting.LaunchMode = types.LaunchMemory
 	resumeStarting.DeadlineUnix = 1_900_000_111
-	resumeStarting.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeStarting.ID)
-	resumeStarting.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeStarting.ID)
+	resumeStarting.RunDir = nodepath.SandboxRunDir(cfg.Paths.RunRoot, resumeStarting.ID)
+	resumeStarting.BaseDir = nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, resumeStarting.ID)
 	resumeStarting.VswitchPort = "resume-assigned-port"
 	resumeStarting.FloatingIP = "192.0.2.11"
 	materializeTestSandboxCredentials(t, &resumeStarting)
@@ -188,8 +189,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	createEmpty.RunID = ""
 	createEmpty.VswitchPort = "create-empty-port"
 	createEmpty.FloatingIP = "192.0.2.12"
-	createEmpty.RunDir = filepath.Join(cfg.Paths.RunRoot, createEmpty.ID)
-	createEmpty.BaseDir = filepath.Join(cfg.Paths.BaseRoot, createEmpty.ID)
+	createEmpty.RunDir = nodepath.SandboxRunDir(cfg.Paths.RunRoot, createEmpty.ID)
+	createEmpty.BaseDir = nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, createEmpty.ID)
 	materializeTestSandboxCredentials(t, &createEmpty)
 	if err := st.Put(context.Background(), &createEmpty); err != nil {
 		t.Fatal(err)
@@ -200,8 +201,8 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	resumeEmpty.DeadlineUnix = 1_900_000_222
 	resumeEmpty.VswitchPort = "resume-empty-port"
 	resumeEmpty.FloatingIP = "192.0.2.13"
-	resumeEmpty.RunDir = filepath.Join(cfg.Paths.RunRoot, resumeEmpty.ID)
-	resumeEmpty.BaseDir = filepath.Join(cfg.Paths.BaseRoot, resumeEmpty.ID)
+	resumeEmpty.RunDir = nodepath.SandboxRunDir(cfg.Paths.RunRoot, resumeEmpty.ID)
+	resumeEmpty.BaseDir = nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, resumeEmpty.ID)
 	materializeTestSandboxCredentials(t, &resumeEmpty)
 	if err := st.Put(context.Background(), &resumeEmpty); err != nil {
 		t.Fatal(err)
@@ -316,7 +317,7 @@ func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
 		State:      types.StatePaused, ResumeSource: source,
 		RunID: runID, VswitchPort: "paused-old-port", FloatingIP: "192.0.2.66",
 		InnerIP: "198.51.100.66/31", PortMAC: "02:00:00:00:00:66",
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-interrupted-cleanup"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-interrupted-cleanup"),
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "paused-interrupted-cleanup"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "paused-interrupted-cleanup"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey, CreatedUnix: 1, AutoPauseMemory: true,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -379,8 +380,8 @@ func TestReconcileRetriesSnapshotColdResumeWithDurableLaunchMode(t *testing.T) {
 		}.String(),
 		State: types.StateStarting, ResumeSource: source, LaunchMode: types.LaunchCold,
 		RunID: oldRunID, VswitchPort: "old-port", FloatingIP: "192.0.2.77",
-		RunDir:    filepath.Join(cfg.Paths.RunRoot, "recover-snapshot-cold"),
-		BaseDir:   filepath.Join(cfg.Paths.BaseRoot, "recover-snapshot-cold"),
+		RunDir:    nodepath.SandboxRunDir(cfg.Paths.RunRoot, "recover-snapshot-cold"),
+		BaseDir:   nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "recover-snapshot-cold"),
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
 		CreatedUnix: 1, DeadlineUnix: time.Now().Add(time.Hour).Unix(), AutoPauseMemory: true,
 	}
@@ -453,8 +454,13 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	runID := "br-00000000-0000-7000-8000-000000000001"
 	unit := "sandbox-builder@" + runID + ".service"
 	build := buildReconcileRow(t, runID)
-	if err := os.MkdirAll(buildRuntimeDir(runRoot, build.BuildID), 0o700); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{
+		nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID),
+		nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID),
+	} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
@@ -539,8 +545,13 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	if len(vs.detached) != 1 || vs.detached[0] != "17" {
 		t.Fatalf("detached ports = %v", vs.detached)
 	}
-	if _, err := os.Stat(buildRuntimeDir(runRoot, build.BuildID)); !os.IsNotExist(err) {
-		t.Fatalf("recovered workdir remains: %v", err)
+	for _, path := range []string{
+		nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID),
+		nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("recovered build directory %s remains: %v", path, err)
+		}
 	}
 }
 
@@ -556,11 +567,15 @@ func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	runRoot := filepath.Join(t.TempDir(), "run")
+	cfg := buildReconcileConfig(runRoot)
 	runID := "br-00000000-0000-7000-8000-000000000211"
 	build := buildReconcileRow(t, runID)
-	workdir := buildRuntimeDir(runRoot, build.BuildID)
-	if err := os.MkdirAll(workdir, 0o700); err != nil {
-		t.Fatal(err)
+	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
@@ -572,7 +587,7 @@ func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
 	}
 
 	vs := &reconcileVS{}
-	o := New(buildReconcileConfig(runRoot), st, &reconcileLauncher{}, vs,
+	o := New(cfg, st, &reconcileLauncher{}, vs,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := o.ReconcileBuilds(context.Background()); err != nil {
 		t.Fatal(err)
@@ -589,8 +604,10 @@ func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
 	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
 		t.Fatalf("recovered accepted-result ports = %v", vs.detached)
 	}
-	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("accepted-result workdir remains: %v", err)
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("accepted-result build directory %s remains: %v", path, err)
+		}
 	}
 }
 
@@ -606,15 +623,19 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 	t.Cleanup(func() { _ = st.Close() })
 
 	runRoot := filepath.Join(t.TempDir(), "run")
+	cfg := buildReconcileConfig(runRoot)
 	runID := "br-00000000-0000-7000-8000-000000000215"
 	unit := "sandbox-builder@" + runID + ".service"
 	build := buildReconcileRow(t, runID)
 	// This deliberately cannot be parsed if recovery tries to reconstruct a
 	// completed pipeline. The already-acknowledged result must win first.
 	build.PhaseResourcePatch = `{"capacity":`
-	workdir := buildRuntimeDir(runRoot, build.BuildID)
-	if err := os.MkdirAll(workdir, 0o700); err != nil {
-		t.Fatal(err)
+	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutBuild(context.Background(), build); err != nil {
 		t.Fatal(err)
@@ -633,7 +654,7 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 		},
 	}
 	vs := &reconcileVS{}
-	o := New(buildReconcileConfig(runRoot), st, lc, vs,
+	o := New(cfg, st, lc, vs,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := o.ReconcileBuilds(context.Background()); err != nil {
 		t.Fatal(err)
@@ -653,8 +674,10 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 	if len(vs.detached) != 1 || vs.detached[0] != build.RuntimeVswitchPort {
 		t.Fatalf("accepted-result runtime detach = %v", vs.detached)
 	}
-	if _, err := os.Stat(workdir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("accepted-result workdir remains: %v", err)
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("accepted-result build directory %s remains: %v", path, err)
+		}
 	}
 }
 
@@ -1373,7 +1396,7 @@ func buildReconcileConfig(runRoot string) *config.Config {
 	policy.ApplyDefaults()
 	maxBuilds := int64(2)
 	return &config.Config{
-		Paths: config.PathsConfig{RunRoot: runRoot},
+		Paths: config.PathsConfig{RunRoot: runRoot, BaseRoot: filepath.Join(filepath.Dir(runRoot), "base")},
 		Units: config.UnitsConfig{
 			Runner: "sandbox-runner@.service", Builder: "sandbox-builder@.service", PoolWaitTimeout: "5s",
 		},
@@ -1449,8 +1472,8 @@ func TestReconcileCleanupFailurePreservesStartingOwnership(t *testing.T) {
 		}.String(),
 		State: types.StateStarting, RunID: runID,
 		LaunchMode:  types.LaunchImage,
-		RunDir:      filepath.Join(cfg.Paths.RunRoot, "cleanup-failure"),
-		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "cleanup-failure"),
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, "cleanup-failure"),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "cleanup-failure"),
 		VswitchPort: "still-owned-port", FloatingIP: "192.0.2.99",
 		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
 		CreatedUnix: 1,

@@ -44,9 +44,9 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 	requireCollectModeInUnitSection(t, "runner", runner)
 	for _, want := range []string{
 		"WorkingDirectory=/run/kuasar-test",
-		"run-sandbox --pidfile=/run/kuasar-test/runs/%i.pid",
+		"run-sandbox --pidfile=/run/kuasar-test/runners/%i.pid",
 		"--run-id=%i",
-		"ExecStopPost=/bin/rm -f /run/kuasar-test/runs/%i.pid",
+		"ExecStopPost=/bin/rm -f /run/kuasar-test/runners/%i.pid",
 		"KillMode=control-group",
 		"Delegate=yes",
 	} {
@@ -62,9 +62,9 @@ func TestGeneratedUnitsUseRunIDAssignment(t *testing.T) {
 	requireCollectModeInUnitSection(t, "builder", builder)
 	for _, want := range []string{
 		"WorkingDirectory=/run/kuasar-test",
-		"run-builder --pidfile=/run/kuasar-test/runs/%i.pid",
+		"run-builder --pidfile=/run/kuasar-test/runners/%i.pid",
 		"--run-id=%i",
-		"ExecStopPost=/bin/rm -f /run/kuasar-test/runs/%i.pid",
+		"ExecStopPost=/bin/rm -f /run/kuasar-test/runners/%i.pid",
 	} {
 		if !strings.Contains(builder, want) {
 			t.Fatalf("builder unit missing %q:\n%s", want, builder)

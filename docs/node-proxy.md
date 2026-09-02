@@ -18,7 +18,7 @@ node proxy worker
   │ shared route view (read-only mmap)
   ├─ e2b legacy 49983/49999 ─► envd / ci UDS
   ├─ forward:port ───────────► floatingip:port
-  └─ exec ──────────────────► <run_root>/<sid>/ctl.sock
+  └─ exec ──────────────────► <run_root>/sandboxes/<sid>/ctl.sock
 ```
 
 ### 1.1 设计原则
@@ -67,7 +67,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
 | `paths.proxy_executable` | 空 | 静态定制 Proxy master 的绝对 executable;空使用内置实现.静态 config 诊断检查 regular/executable,非 group/world-writable 和 same-file,不按诊断 EUID 判断 owner;实际 root dispatch 只接受 root-owned,非 root dispatch 接受 root-owned 或本 EUID-owned.只用于 node-ctl → master,不用于选择 worker executable |
-| `paths.run_root` | (必填) | 本机 sandbox 运行目录根;worker 本地构造 `<run_root>/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
+| `paths.run_root` | (必填) | 节点 RunRoot;worker 本地构造 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
 | `data_listen` | (必填) | 节点唯一 sandbox 数据入口;master 绑定一次并把同一 listener FD 交给 worker |
 | `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns.非空时 worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/SHM 路径冲突,权限 0600 |
@@ -349,7 +349,7 @@ CONNECT 显式携带 `E2b-Sandbox-Service` 时,service 取代 legacy 端口推�
 | `forward` | e2b / bare | `floatingip:port` | 必须由 `E2b-Sandbox-Port`,legacy Host 或 CONNECT authority 之一提供 |
 | `e2b:envd` | e2b | envd UDS | 可携带,但不参与 backend 选择 |
 | `e2b:code-interpreter` | e2b | CI UDS | 可携带,但不参与 backend 选择 |
-| `exec` | e2b / bare | `<run_root>/<NodeSandboxID>/ctl.sock` | 可携带,但不参与 backend 选择 |
+| `exec` | e2b / bare | `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` | 可携带,但不参与 backend 选择 |
 
 bare 显式请求 `e2b:envd` 或 `e2b:code-interpreter` 返回 501.unknown/空 service 返回 400.
 service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显式 service.
@@ -408,7 +408,7 @@ KAT 在 CONNECT admission 时校验,并在首帧授权时重新检查 expiry;进
 新 CONNECT 在 route 切换后自动进入当前 NodeSandboxID,已建立 tunnel 不迁移.
 
 worker 在本进程执行上述完整 token + request + backend gate,用 frozen EffectiveConfig 的
-`paths.run_root` 构造 `ctl.sock` 路径.路径和 CEL programs 不经 routesync `Policy` 或 SHM
+`paths.run_root` 构造 `sandboxes/<NodeSandboxID>/ctl.sock` 路径.路径和 CEL programs 不经 routesync `Policy` 或 SHM
 记录.conductor 不解析,不选择也不转发 ordinary HTTP,CONNECT 或 exec 字节;误发到
 APIEndpoint 的数据请求只得到 API handler 的自然响应.cluster-router 的 canonical chained
 CONNECT 只是中继,traffic 统计只发生在建立最终 sandbox backend 的 node worker.

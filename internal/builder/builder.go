@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -85,13 +86,33 @@ type buildPipeline struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	imagePath           string // workdir/image.img once a local image exists
+	imagePath           string // BuildBaseDir/checkpoint/image.img once a local image exists
 	baseImageRef        string // portable ref for an already-published base image
 	baseRef             string // phase B/C boot.root.base ("file://..." | "manifest://...")
 	overlayBase         string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
 	overlayBaseFromRefs []string
 	startCmd            string // effective (request else template-inherited)
 	readyCmd            string
+}
+
+func (p *buildPipeline) phaseRunDir(pathID string) string {
+	return filepath.Join(p.spec.RunDir, pathID)
+}
+
+func (p *buildPipeline) phaseBaseDir(pathID string) string {
+	return filepath.Join(p.spec.BaseDir, pathID)
+}
+
+func (p *buildPipeline) checkpointDir() string {
+	return filepath.Join(p.spec.BaseDir, "checkpoint")
+}
+
+func (p *buildPipeline) imageFile() string {
+	return filepath.Join(p.checkpointDir(), "image.img")
+}
+
+func (p *buildPipeline) nextImageFile() string {
+	return filepath.Join(p.checkpointDir(), "image.next.img")
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"

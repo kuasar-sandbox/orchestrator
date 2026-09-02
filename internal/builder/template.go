@@ -40,7 +40,7 @@ func (p *buildPipeline) prepareBundleTemplateBase() error {
 
 func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	s := p.spec
-	envdUDS := filepath.Join(s.Workdir, "envd.sock")
+	envdUDS := filepath.Join(p.phaseRunDir("c"), "envd.sock")
 	doc, err := p.templateYAML()
 	if err != nil {
 		return "", err
@@ -110,11 +110,12 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 		return "", err
 	}
 
-	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, templateSnapshotArgs(sb.sid, s.Workdir, sb.runRoot, s.CheckpointMode)...)
+	checkpointDir := p.checkpointDir()
+	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, templateSnapshotArgs(sb.pathID, checkpointDir, sb.runRoot, s.CheckpointMode)...)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w (%s)", err, firstLine(out))
 	}
-	bundle := filepath.Join(s.Workdir, sb.sid+".snapshot")
+	bundle := filepath.Join(checkpointDir, sb.sid+".snapshot")
 	if _, err := os.Stat(bundle); err != nil {
 		return "", fmt.Errorf("snapshot bundle missing: %w", err)
 	}
@@ -122,11 +123,11 @@ func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	return bundle, nil
 }
 
-func templateSnapshotArgs(sandboxID, output, runRoot, mode string) []string {
+func templateSnapshotArgs(pathID, output, runRoot, mode string) []string {
 	if mode == "" {
 		mode = "local"
 	}
-	return []string{"snapshot", "--sandbox-id", sandboxID, "--output", output, "--mode", mode, "--run-root", runRoot}
+	return []string{"snapshot", "--path-id", pathID, "--output", output, "--mode", mode, "--run-root", runRoot}
 }
 
 // waitEnvd polls envd's /health within the phase boot context. Runtime events

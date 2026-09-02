@@ -1226,6 +1226,9 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return ackHTTP(cmd, routesync.AckRejected, "build_id and template_ref are required", http.StatusBadRequest)
 	}
+	if err := types.ValidateBuildID(cmd.BuildID); err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
+	}
 	if !types.Profile(cmd.Profile).Valid() {
 		return ackHTTP(cmd, routesync.AckRejected, "valid profile is required", http.StatusBadRequest)
 	}

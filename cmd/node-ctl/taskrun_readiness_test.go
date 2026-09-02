@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"golang.org/x/sys/unix"
@@ -60,7 +61,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 	}
 
 	runRoot := filepath.Join(t.TempDir(), "run")
-	runPidfile := filepath.Join(runRoot, "runs", "run-1.pid")
+	runPidfile := nodepath.RunnerPID(runRoot, "run-1")
 	execErr := errors.New("exec failed")
 	err = runAssignedSandbox(runPidfile, "/config.sock", "run-1", runSandboxOps{
 		lockPidfile: func(path string) error {
@@ -72,7 +73,7 @@ func TestRunAssignedSandboxReadinessFDOrderingAndExecArg(t *testing.T) {
 		},
 		lockTaskPidfile: func(path string) error {
 			order = append(order, "sandbox pidfile")
-			if path != filepath.Join(runRoot, "sid-1", "sid-1.pid") {
+			if path != filepath.Join(nodepath.SandboxRunDir(runRoot, "sid-1"), "sid-1.pid") {
 				t.Fatalf("sandbox pidfile = %q", path)
 			}
 			assertCloseOnExec("sandbox pidfile", true)
@@ -291,7 +292,7 @@ func TestRunAssignedSandboxPreExecFailureClosesReadinessFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErr := errors.New("fetch failed")
-	err = runAssignedSandbox("/run/sandbox/runs/run.pid", "/config.sock", "run", runSandboxOps{
+	err = runAssignedSandbox("/run/sandbox/runners/run.pid", "/config.sock", "run", runSandboxOps{
 		lockPidfile:     func(string) error { return nil },
 		lockTaskPidfile: func(string) error { return nil },
 		prepareCgroup:   func() (*os.File, error) { return vmmCgroup, nil },

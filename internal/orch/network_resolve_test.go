@@ -295,9 +295,11 @@ func TestBuildSpecCarriesResolvedAndTemplateNetworks(t *testing.T) {
 	}
 	templateNetwork := runtimeNetwork
 	templateNetwork.Hostname = "sandbox"
+	runDir, baseDir := t.TempDir(), t.TempDir()
 	o.pend[b.BuildID] = &pendingBuild{
 		build:           b,
-		workdir:         t.TempDir(),
+		runDir:          runDir,
+		baseDir:         baseDir,
 		network:         runtimeNetwork,
 		templateNetwork: templateNetwork,
 		resources: rtconfig.ResourcesConfig{

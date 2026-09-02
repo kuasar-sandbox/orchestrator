@@ -27,7 +27,7 @@ import (
 
 func startCtlSocket(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortNodeCtlTestDir(t)
 	sock := filepath.Join(dir, "ctl.sock")
 	for _, f := range []string{"k", "e", "b", "o", "manifest.yaml"} {
 		if err := os.WriteFile(filepath.Join(dir, f), []byte("key: \"\"\n"), 0o644); err != nil {

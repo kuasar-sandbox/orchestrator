@@ -114,6 +114,37 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	}
 }
 
+func TestReserveBuildUsesSharedBuildIDBoundary(t *testing.T) {
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+	ctx := context.Background()
+
+	for index, buildID := range []string{"A", strings.Repeat("z", 48)} {
+		result, err := reg.ReserveBuild(ctx, BuildReserveReq{
+			Group: "/valid-" + fmt.Sprint(index), BuildID: buildID,
+			Profile: types.ProfileBare, Resources: testWireBuildResources(),
+		})
+		if err != nil || result.BuildID != buildID {
+			t.Fatalf("valid BuildID %q reserve = %+v, %v", buildID, result, err)
+		}
+	}
+
+	commandCount := len(owner.commands)
+	for _, buildID := range []string{strings.Repeat("z", 49), "build/id"} {
+		if result, err := reg.ReserveBuild(ctx, BuildReserveReq{
+			Group: "/invalid", BuildID: buildID,
+			Profile: types.ProfileBare, Resources: testWireBuildResources(),
+		}); !errors.Is(err, ErrReserveBadRequest) || result != nil {
+			t.Fatalf("invalid BuildID %q reserve = %+v, %v", buildID, result, err)
+		}
+	}
+	if len(owner.commands) != commandCount {
+		t.Fatalf("invalid BuildID crossed placement/dispatch boundary: commands=%d, want %d", len(owner.commands), commandCount)
+	}
+}
+
 func TestReserveBuildRejectsRuntimeOwnedResourceBeforePlacement(t *testing.T) {
 	reg := testReg(t)
 	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{

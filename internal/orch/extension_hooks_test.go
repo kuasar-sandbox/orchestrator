@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/conductorext"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -124,7 +124,10 @@ func TestCreateHookRejectsBeforeDurableOrHostSideEffects(t *testing.T) {
 	if launcher.starts.Load() != 0 || vs.attaches.Load() != 0 {
 		t.Fatalf("rejected Create start/attach = %d/%d", launcher.starts.Load(), vs.attaches.Load())
 	}
-	for _, path := range []string{filepath.Join(cfg.Paths.RunRoot, sandboxID), filepath.Join(cfg.Paths.BaseRoot, sandboxID)} {
+	for _, path := range []string{
+		nodepath.SandboxRunDir(cfg.Paths.RunRoot, sandboxID),
+		nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sandboxID),
+	} {
 		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 			t.Fatalf("rejected Create materialized %s: %v", path, statErr)
 		}

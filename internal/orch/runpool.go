@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"slices"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
 type runPool struct {
@@ -91,11 +91,11 @@ func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string
 }
 
 func (p *runPool) runPidFile(runID string) string {
-	return filepath.Join(p.runRoot, "runs", runID+".pid")
+	return nodepath.RunnerPID(p.runRoot, runID)
 }
 
 func (p *runPool) Start(ctx context.Context) error {
-	if err := os.MkdirAll(filepath.Join(p.runRoot, "runs"), 0o700); err != nil {
+	if err := os.MkdirAll(nodepath.RunnerRoot(p.runRoot), 0o700); err != nil {
 		return fmt.Errorf("run pool: create pidfile directory: %w", err)
 	}
 	go p.controlLoop(ctx)

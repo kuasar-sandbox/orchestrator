@@ -120,15 +120,23 @@ exit 1
 		t.Fatal(err)
 	}
 
+	runDir := t.TempDir()
+	baseDir := t.TempDir()
 	p := &buildPipeline{
 		ctx: context.Background(),
 		spec: &configsock.BuildSpec{
-			Workdir:  workdir,
+			RunDir:   runDir,
+			BaseDir:  baseDir,
 			Paths:    configsock.BuildPaths{SandboxCtl: sandboxCtl},
 			Timeouts: configsock.BuildTimeouts{PullSec: 5, StepSec: 5},
 		},
 	}
-	sb := &phaseSandbox{p: p, sid: "copy-test", runRoot: workdir}
+	for _, dir := range []string{p.phaseRunDir("b"), p.phaseBaseDir("b")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sb := &phaseSandbox{p: p, sid: "copy-test", pathID: "b", runRoot: runDir}
 	err := p.applyCopy(sb, &stepCtx{}, 1, configsock.BuildStep{
 		Args:      []string{"hello.txt", "/opt/ct2/", "1000:1000"},
 		FilesHash: "context",

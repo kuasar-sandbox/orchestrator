@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
@@ -551,7 +552,7 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 		StableID:      "stable-cancel",
 		ServiceSecret: execTestServiceSecret,
 	}
-	dir := filepath.Join(runRoot, identity.NodeSandboxID)
+	dir := nodepath.SandboxRunDir(runRoot, identity.NodeSandboxID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +649,7 @@ func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {
 		StableID:      "stable-close",
 		ServiceSecret: execTestServiceSecret,
 	}
-	dir := filepath.Join(runRoot, identity.NodeSandboxID)
+	dir := nodepath.SandboxRunDir(runRoot, identity.NodeSandboxID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -747,7 +748,7 @@ func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {
 
 func startExecBackend(t *testing.T, runRoot, sid string, response []byte) (<-chan []byte, <-chan error) {
 	t.Helper()
-	dir := filepath.Join(runRoot, sid)
+	dir := nodepath.SandboxRunDir(runRoot, sid)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
