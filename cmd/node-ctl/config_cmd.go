@@ -148,18 +148,15 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 // external binaries (sandbox-ctl, connector-ctl, flatten-ctl, ...) are auto-discovered
 // next to node-ctl then on PATH.
 const conductorConfigSkeleton = `# node-ctl conductor serve config — node-ctl conductor serve --config <this>.
-# The unmodified e2b SDK reaches this node via E2B_DOMAIN/E2B_API_KEY (dev:
-# E2B_API_URL/E2B_SANDBOX_URL http). Required: api.domain + encryption_key.
+# The unmodified e2b SDK reaches this control endpoint via E2B_DOMAIN/E2B_API_KEY
+# (dev: E2B_API_URL). Sandbox data goes to the independent Proxy endpoint.
+# Required: api.domain + encryption_key.
 api:
   domain: sandboxes.example.com
   listen: ":443"                                 # dev: ":3000" (plain http/h2c)
   tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
-proxy:                                           # data-plane policy (<port>-<sid>.<domain>)
-  mode: internal                                 # internal | external | off
+proxy:                                           # policy pushed to the independent Proxy
   auth: enforce                                  # off | log | enforce: validate X-Access-Token
-  # data_listen: ":8443"                          # internal-mode dedicated listener; "" = share api.listen.
-  #                                               # external mode: data config lives in proxy.yaml; master freezes it for workers.
-  # proxy_netns: sw0_mgmt                         # internal-mode forwarding netns for floatingip dials + MMDS listen.
   # park_timeout: 30s
   # metrics_listen: ":9900"                       # serve's own Prometheus text endpoint
 # AES-256 keys for tenant credentials at rest (":"-separated, first active). Prefer the
@@ -286,23 +283,23 @@ checkpoint:                                        # paused-state capture
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
-#   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen
+#   api_endpoint: node.example.com:443            # required with node_link.endpoint; conductor control API
+#   data_endpoint: sandbox.example.com:443         # required with node_link.endpoint; Proxy sandbox ingress
 #   heartbeat_interval: 10s
 `
 
 // proxyConfigSkeleton is the commented authoring template for proxy.yaml
 // (deploy/proxy.example.yaml is the curated copy).
 const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy serve --config <this>.
-# External data-plane mode (serve's proxy.mode: external). A single master registers
-# on conductor's plugin plane, owns listener sockets, and supervises workers that
-# read a shared-memory route table.
+# Independent sandbox data plane. A single master registers on the conductor's
+# plugin plane, owns the data listener, and supervises workers that read a
+# shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 paths:
   # proxy_executable: /opt/kuasar/bin/xproxy         # root- or non-root service-UID-owned App; only node-ctl -> master
   run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
-data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
-# proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + conductor MMDS listen; "" = current netns
-proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
+data_listen: ":443"                              # required master-owned sandbox data ingress passed to workers
+# proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + MMDS listener; "" = current netns
 stats_socket: /run/sandbox/proxy-stats.sock      # master-only traffic stats UDS registered for conductor queries
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots

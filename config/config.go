@@ -1,5 +1,5 @@
 // Package config defines the public declarative configuration for the node
-// conductor and external proxy.
+// conductor and independent proxy.
 //
 // The YAML is grouped by concern: api / proxy / paths / units / sandbox (the
 // sandbox-instance defaults, sub-grouped resources/network/boot) / builder /
@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path"
@@ -26,15 +27,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
-)
-
-// Proxy modes select how the node serves sandbox data-plane traffic
-// (<port>-<sid>.<domain>). See docs/proxy.md §5 (deployment modes);
-// docs/orchestrator.md §9 covers how serve assembles the chosen mode.
-const (
-	ProxyInternal = "internal" // in-process proxy (default)
-	ProxyExternal = "external" // offloaded to node-ctl proxy master + workers
-	ProxyOff      = "off"      // data plane disabled on this node
 )
 
 // Data-plane auth modes: the proxy validates X-Access-Token (= envdAccessToken).
@@ -266,6 +258,7 @@ type ClusterConfig struct {
 	NodeLink          ClusterNodeLink   `yaml:"node_link" json:"node_link"`                   // how to reach registry node_link
 	NodeID            string            `yaml:"node_id" json:"node_id"`                       // this node's id; "" = hostname
 	Labels            map[string]string `yaml:"labels" json:"labels"`                         // zone / pool / slot / node (nodeSelectors)
+	APIEndpoint       string            `yaml:"api_endpoint" json:"api_endpoint"`             // host:port the router forwards node control requests to
 	DataEndpoint      string            `yaml:"data_endpoint" json:"data_endpoint"`           // host:port the router forwards the data plane to
 	HeartbeatInterval string            `yaml:"heartbeat_interval" json:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
 }
@@ -296,13 +289,10 @@ type TLSConfig struct {
 	Key  string `yaml:"key" json:"key"`
 }
 
-// ProxyConfig is the data-plane proxy. mode ∈ {internal,external,off}. In external
-// mode conductor forwards fallback data-plane requests to the proxy master's
-// registered UDS; the proxy master owns data-plane listener sockets.
+// ProxyConfig is the conductor-owned sandbox data-plane policy and the
+// conductor's existing global metrics listener. The independent proxy owns all
+// data-plane listeners.
 type ProxyConfig struct {
-	Mode          string `yaml:"mode" json:"mode"`                     // internal (default) | external | off
-	DataListen    string `yaml:"data_listen" json:"data_listen"`       // dedicated data-plane listener; "" = share api.listen
-	ProxyNetNS    string `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and internal MMDS listen
 	ParkTimeout   string `yaml:"park_timeout" json:"park_timeout"`     // hold a data-plane request awaiting route/resume; default 30s
 	Auth          string `yaml:"auth" json:"auth"`                     // off | log | enforce (default): validate X-Access-Token
 	MetricsListen string `yaml:"metrics_listen" json:"metrics_listen"` // optional Prometheus text endpoint; "" = off
@@ -312,9 +302,9 @@ type ProxyConfig struct {
 // serves so envd (run in FC mode, i.e. without -isnotfc) can re-key its access token
 // to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
 // enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
-// X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
-// (internal: serve binds Listen; external: the proxy master receives Listen from
-// the conductor and shares that listener fd with workers). envd
+// X-Access-Token as the sole gate. The MMDS is hosted by the independent Proxy.
+// Its master receives Listen from the conductor and shares that listener fd with
+// workers. envd
 // hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
 // Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
 // mgmt dev.
@@ -943,7 +933,6 @@ func (c *Conductor) applyDefaults() {
 		}
 	}
 	def(&c.API.Listen, ":443")
-	def(&c.Proxy.Mode, ProxyInternal)
 	def(&c.Proxy.Auth, AuthEnforce)
 	def(&c.Proxy.ParkTimeout, "30s")
 	def(&c.ManifestConfig, "/opt/sandbox/manifest.yaml")
@@ -1052,7 +1041,30 @@ func ValidateConductorFinal(c *Conductor) error {
 	if c.Sandbox.Boot.Runtime == "" {
 		return fmt.Errorf("config: sandbox.boot.runtime is required")
 	}
+	if c.Cluster.NodeLink.Endpoint != "" {
+		if err := validateAdvertisedEndpoint("cluster.api_endpoint", c.Cluster.APIEndpoint); err != nil {
+			return err
+		}
+		if err := validateAdvertisedEndpoint("cluster.data_endpoint", c.Cluster.DataEndpoint); err != nil {
+			return err
+		}
+	}
 	return c.validateDeclarative()
+}
+
+func validateAdvertisedEndpoint(name, endpoint string) error {
+	if endpoint == "" {
+		return fmt.Errorf("config: %s is required when cluster.node_link.endpoint is set", name)
+	}
+	host, rawPort, err := net.SplitHostPort(endpoint)
+	if err != nil || host == "" {
+		return fmt.Errorf("config: %s must be host:port", name)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("config: %s must be host:port", name)
+	}
+	return nil
 }
 
 func (c *Conductor) validateDeclarative() error {
@@ -1183,31 +1195,16 @@ func parseAbsoluteFileURI(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// validateProxy checks the proxy-mode + mmds invariants.
+// validateProxy checks the conductor-owned proxy policy and MMDS invariants.
 func (c *Conductor) validateProxy() error {
-	switch c.Proxy.Mode {
-	case ProxyInternal, ProxyExternal, ProxyOff:
-	default:
-		return fmt.Errorf("config: proxy.mode %q (want internal|external|off)", c.Proxy.Mode)
-	}
 	switch c.Proxy.Auth {
 	case AuthOff, AuthLog, AuthEnforce:
 	default:
 		return fmt.Errorf("config: proxy.auth %q (want off|log|enforce)", c.Proxy.Auth)
 	}
-	// proxy.mode=external needs no static socket list: the proxy master registers
-	// its proxy_socket on the config-socket plugin plane, so there is nothing to
-	// require here.
-	if c.Proxy.ProxyNetNS != "" && c.Proxy.Mode != ProxyInternal {
-		return fmt.Errorf("config: proxy.proxy_netns requires proxy.mode=internal (external mode uses proxy.yaml proxy_netns)")
-	}
-
 	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
 	if !c.MMDS.Enabled && c.Proxy.Auth != AuthEnforce {
 		return fmt.Errorf("config: mmds.enabled=false requires proxy.auth=enforce (envd runs non-secure; the proxy is the only data-plane gate)")
-	}
-	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
-		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
 	}
 	if c.MMDS.Routes.Enabled && !c.MMDS.Enabled {
 		return fmt.Errorf("config: mmds.routes.enabled=true requires mmds.enabled=true")
@@ -1218,17 +1215,16 @@ func (c *Conductor) validateProxy() error {
 	return nil
 }
 
-// Proxy is the external data-plane proxy master's declarative config
+// Proxy is the independent data-plane Proxy master's declarative config
 // (node-ctl proxy serve --config <this>). The master owns the routesync
-// subscription, shared route table, listener fds, and worker supervision. Serve
-// still pushes the authoritative auth/park policy over the registration stream;
+// subscription, shared route table, listener fds, and worker supervision. The
+// conductor pushes the authoritative auth/park policy over the registration stream;
 // local values are bootstrap fallbacks until that handshake completes.
 type Proxy struct {
 	ConfigSocket  string           `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
 	Paths         ProxyPathsConfig `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
-	DataListen    string           `yaml:"data_listen" json:"data_listen"`       // data-plane ingress; "" = UDS-only proxyForwarder
-	ProxyNetNS    string           `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and conductor-pushed MMDS listen
-	ProxySocket   string           `yaml:"proxy_socket" json:"proxy_socket"`     // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
+	DataListen    string           `yaml:"data_listen" json:"data_listen"`       // required sandbox data ingress
+	ProxyNetNS    string           `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and MMDS listen
 	StatsSocket   string           `yaml:"stats_socket" json:"stats_socket"`     // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
 	ShmPath       string           `yaml:"shm_path" json:"shm_path"`             // shared route table path; default <dir(config_socket)>/proxy-routes.shm
 	RouteCapacity int              `yaml:"route_capacity" json:"route_capacity"` // fixed shared route slots; default 65536
@@ -1239,7 +1235,7 @@ type Proxy struct {
 	MetricsListen string           `yaml:"metrics_listen" json:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
 }
 
-// Clone returns a deep copy of the external proxy configuration.
+// Clone returns a deep copy of the independent proxy configuration.
 func (p *Proxy) Clone() *Proxy {
 	if p == nil {
 		return nil
@@ -1248,7 +1244,7 @@ func (p *Proxy) Clone() *Proxy {
 	return &out
 }
 
-// ProxyPathsConfig contains only paths consumed by the external proxy. It is
+// ProxyPathsConfig contains only paths consumed by the independent proxy. It is
 // deliberately separate from the conductor's broader PathsConfig.
 type ProxyPathsConfig struct {
 	ProxyExecutable string `yaml:"proxy_executable,omitempty" json:"proxy_executable,omitempty"` // custom proxy binary; empty uses node-ctl's built-in app
@@ -1297,9 +1293,6 @@ func (p *Proxy) applyDefaults() {
 	if p.ConfigSocket == "" {
 		p.ConfigSocket = "/run/sandbox/node-ctl.socket"
 	}
-	if p.ProxySocket == "" {
-		p.ProxySocket = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy.sock")
-	}
 	if p.StatsSocket == "" {
 		p.StatsSocket = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy-stats.sock")
 	}
@@ -1320,7 +1313,7 @@ func (p *Proxy) applyDefaults() {
 	}
 }
 
-// ValidateProxyFinal validates a fully configured external proxy without
+// ValidateProxyFinal validates a fully configured independent proxy without
 // applying defaults. Custom proxy Apps call it after their master-only
 // Configure hook and before freezing the effective worker configuration.
 func ValidateProxyFinal(p *Proxy) error {
@@ -1332,6 +1325,9 @@ func ValidateProxyFinal(p *Proxy) error {
 	}
 	if p.Paths.RunRoot == "" {
 		return fmt.Errorf("proxy config: paths.run_root is required")
+	}
+	if p.DataListen == "" {
+		return fmt.Errorf("proxy config: data_listen is required")
 	}
 	return p.validateDeclarative()
 }
@@ -1359,7 +1355,6 @@ func (p *Proxy) validateDeclarative() error {
 	}
 	for name, path := range map[string]string{
 		"config_socket": p.ConfigSocket,
-		"proxy_socket":  p.ProxySocket,
 		"shm_path":      p.ShmPath,
 	} {
 		if filepath.Clean(path) == filepath.Clean(p.StatsSocket) {

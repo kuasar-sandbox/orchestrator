@@ -47,6 +47,31 @@ func TestProxyConfigTemplateDocumentsCustomExecutable(t *testing.T) {
 	}
 }
 
+func TestConfigTemplatesDescribeSplitEndpointsAndSingleProxyIngress(t *testing.T) {
+	for _, want := range []string{"api_endpoint: node.example.com:443", "data_endpoint: sandbox.example.com:443"} {
+		if !strings.Contains(conductorConfigSkeleton, want) {
+			t.Errorf("conductor template does not contain %q", want)
+		}
+	}
+	start := strings.Index(conductorConfigSkeleton, "\nproxy:")
+	if start < 0 {
+		t.Fatal("conductor template has no proxy policy block")
+	}
+	end := strings.Index(conductorConfigSkeleton[start+1:], "\nencryption_key:")
+	if end < 0 {
+		t.Fatal("conductor template has no proxy policy block")
+	}
+	proxyPolicyBlock := conductorConfigSkeleton[start : start+1+end]
+	for _, removed := range []string{"\n  mode:", "\n  data_listen:", "\n  proxy_netns:"} {
+		if strings.Contains(proxyPolicyBlock, removed) {
+			t.Errorf("conductor template still contains removed Proxy field %q", removed)
+		}
+	}
+	if !strings.Contains(proxyConfigSkeleton, "data_listen: \":443\"") {
+		t.Fatal("proxy template does not document required data_listen")
+	}
+}
+
 func TestConductorConfigTemplateOmitsRemovedResourceAuditField(t *testing.T) {
 	if strings.Contains(conductorConfigSkeleton, "audit_path") {
 		t.Fatal("conductor template still contains removed resource_listen.audit_path")
@@ -349,6 +374,12 @@ func TestConfigCommandAppliesFinalValidationOnlyForBuiltInComponents(t *testing.
 	}
 	if _, err := renderProxyConfig(false, proxyPath); err == nil || !strings.Contains(err.Error(), "paths.run_root") {
 		t.Fatalf("built-in proxy final validation error = %v", err)
+	}
+	if err := os.WriteFile(proxyPath, []byte("paths:\n  run_root: /run/sandbox\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := renderProxyConfig(false, proxyPath); err == nil || !strings.Contains(err.Error(), "data_listen") {
+		t.Fatalf("built-in proxy data_listen validation error = %v", err)
 	}
 }
 

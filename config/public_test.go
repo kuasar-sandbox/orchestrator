@@ -14,6 +14,15 @@ func TestDecodeConductorStrictAndCustomBootstrap(t *testing.T) {
 	if _, err := config.DecodeConductor(strings.NewReader("future: true\n")); err == nil || !strings.Contains(err.Error(), "future") {
 		t.Fatalf("unknown field error = %v", err)
 	}
+	for _, body := range []string{
+		`{"proxy":{"mode":"internal"}}`,
+		`{"proxy":{"data_listen":"127.0.0.1:8443"}}`,
+		`{"proxy":{"proxy_netns":"sw0_mgmt"}}`,
+	} {
+		if _, err := config.DecodeConductor(strings.NewReader(body)); err == nil {
+			t.Fatalf("JSON conductor accepted removed field: %s", body)
+		}
+	}
 	if _, err := config.DecodeConductor(strings.NewReader("paths:\n  conductor_executable: relative\n")); err == nil || !strings.Contains(err.Error(), "must be absolute") {
 		t.Fatalf("relative executable error = %v", err)
 	}
@@ -36,7 +45,7 @@ func TestDecodeConductorStrictAndCustomBootstrap(t *testing.T) {
 		t.Fatalf("multiple document error = %v", err)
 	}
 	for name, body := range map[string]string{
-		"enum":     "proxy:\n  mode: future\n",
+		"removed":  "proxy:\n  mode: internal\n",
 		"duration": "units:\n  pool_wait_timeout: later\n",
 		"range":    "sandbox:\n  resources:\n    capacity: { cpu: -1 }\n",
 	} {
@@ -52,6 +61,9 @@ func TestDecodeConductorStrictAndCustomBootstrap(t *testing.T) {
 func TestDecodeProxyStrictAndCustomBootstrap(t *testing.T) {
 	if _, err := config.DecodeProxy(strings.NewReader("future: true\n")); err == nil || !strings.Contains(err.Error(), "future") {
 		t.Fatalf("unknown field error = %v", err)
+	}
+	if _, err := config.DecodeProxy(strings.NewReader(`{"proxy_socket":"/tmp/proxy.sock"}`)); err == nil || !strings.Contains(err.Error(), "proxy_socket") {
+		t.Fatalf("JSON proxy removed-field error = %v", err)
 	}
 	if _, err := config.DecodeProxy(strings.NewReader("paths:\n  proxy_executable: relative\n")); err == nil || !strings.Contains(err.Error(), "must be absolute") {
 		t.Fatalf("relative executable error = %v", err)
@@ -120,12 +132,6 @@ func TestFinalValidationRunsAfterCustomConfigurationWithoutDefaults(t *testing.T
 	if conductor.EncryptionKey != "" {
 		t.Fatalf("test unexpectedly has YAML encryption material: %q", conductor.EncryptionKey)
 	}
-	conductor.Proxy.Mode = ""
-	if err := config.ValidateConductorFinal(conductor); err == nil || !strings.Contains(err.Error(), "proxy.mode") {
-		t.Fatalf("final validation reapplied a default instead of rejecting an explicit zero: %v", err)
-	}
-	conductor.Proxy.Mode = config.ProxyInternal
-
 	proxy, err := config.DecodeProxy(strings.NewReader("paths:\n  proxy_executable: /opt/kuasar/xproxy\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +140,10 @@ func TestFinalValidationRunsAfterCustomConfigurationWithoutDefaults(t *testing.T
 		t.Fatalf("incomplete final proxy error = %v", err)
 	}
 	proxy.Paths.RunRoot = "/run/custom"
+	if err := config.ValidateProxyFinal(proxy); err == nil || !strings.Contains(err.Error(), "data_listen") {
+		t.Fatalf("incomplete final proxy data listener error = %v", err)
+	}
+	proxy.DataListen = "127.0.0.1:8443"
 	if err := config.ValidateProxyFinal(proxy); err != nil {
 		t.Fatalf("configured proxy: %v", err)
 	}
