@@ -201,6 +201,12 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		o.cache(sb)
 		o.publishUpsert(sb)
 		unlock()
+	case types.StateDeleting:
+		// Delete acceptance already removed the local cache. Do not publish the
+		// terminal route event until the durable finalizer has fenced and removed
+		// every exact local owner and hard-deleted the row.
+		o.uncache(sid)
+		unlock()
 	default: // dead
 		o.uncache(sid)
 		o.publishDelete(sid)

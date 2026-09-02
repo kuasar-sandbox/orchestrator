@@ -214,6 +214,7 @@ const (
 	StateStarting State = "starting"
 	StateRunning  State = "running"
 	StatePaused   State = "paused"
+	StateDeleting State = "deleting"
 	StateDead     State = "dead"
 )
 

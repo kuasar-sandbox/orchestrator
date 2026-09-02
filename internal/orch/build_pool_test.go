@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -266,6 +267,95 @@ func TestRunBuildUnitCleansDirectoriesWhenRequestResolutionFails(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("request-resolution failure retained %s: %v", path, err)
 		}
+	}
+}
+
+func TestRunBuildUnitFencesAssignedUnitBeforePreNetworkDirectoryCleanup(t *testing.T) {
+	cfg := buildNetworkTestConfig()
+	cfg.Paths.RunRoot = t.TempDir()
+	cfg.Paths.BaseRoot = t.TempDir()
+	cfg.Units.Builder = "sandbox-builder@.service"
+	cfg.Units.PoolWaitTimeout = "1s"
+	cfg.Builder.TotalTimeoutSec = 30
+	o := testOrchCfg(t, cfg)
+	lc := newRunPoolTestLauncher()
+	var fenced atomic.Bool
+	lc.stopFn = func(context.Context, string) error {
+		fenced.Store(true)
+		return nil
+	}
+	o.lc = lc
+	o.builderRunPool = newRunPool(runKindBuild, 0, time.Second, cfg.Paths.RunRoot, lc,
+		o.builderUnit, o.log.With("pool", "builder-test"))
+	poolCtx, cancelPool := context.WithCancel(context.Background())
+	t.Cleanup(cancelPool)
+	if err := o.builderRunPool.Start(poolCtx); err != nil {
+		t.Fatal(err)
+	}
+	wantAttachErr := errors.New("injected attach failure after assignment")
+	o.vs = failingCreateVS{err: wantAttachErr}
+
+	manifestKey := strings.Repeat("f", 64)
+	build := &types.Build{
+		BuildID: "build-assigned-fence-order", TemplateID: "transient-build-assigned-fence-order",
+		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
+		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildBuilding,
+		FromImage: "example.invalid/base:latest", Resources: testBuildResources(),
+		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), CreatedUnix: time.Now().Unix(),
+	}
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
+	var removed atomic.Int32
+	o.removeBuildRunDir = func(path string) error {
+		if !fenced.Load() {
+			t.Fatal("BuildRunDir removal preceded assigned-unit fence")
+		}
+		if path != runDir {
+			t.Fatalf("BuildRunDir cleanup path = %q, want %q", path, runDir)
+		}
+		removed.Add(1)
+		return os.RemoveAll(path)
+	}
+	o.removeBuildBaseDir = func(path string) error {
+		if !fenced.Load() {
+			t.Fatal("BuildBaseDir removal preceded assigned-unit fence")
+		}
+		if path != baseDir {
+			t.Fatalf("BuildBaseDir cleanup path = %q, want %q", path, baseDir)
+		}
+		removed.Add(1)
+		return os.RemoveAll(path)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := o.runBuildUnit(context.Background(), build)
+		done <- err
+	}()
+	var unit string
+	select {
+	case unit = <-lc.started:
+	case <-time.After(time.Second):
+		t.Fatal("builder unit was not started")
+	}
+	runID := o.builderUnitToRunID(unit)
+	assigned, ok, err := o.WaitAssignment(context.Background(), runKindBuild, runID)
+	if err != nil || !ok || assigned != build.BuildID {
+		t.Fatalf("builder assignment = %q, %t, %v", assigned, ok, err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantAttachErr) {
+			t.Fatalf("runBuildUnit error = %v, want %v", err, wantAttachErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runBuildUnit did not finish")
+	}
+	if !fenced.Load() || removed.Load() != 2 {
+		t.Fatalf("cleanup observations: fenced=%t removed=%d", fenced.Load(), removed.Load())
 	}
 }
 

@@ -3,7 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -156,7 +157,7 @@ func TestCreateWaitsForRouteBarrierBeforeLaunch(t *testing.T) {
 	}, "running after route ACK")
 }
 
-func TestCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
+func TestCreateBarrierFailureCommitsZeroOwnerDeadHistory(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		waitErr   error
@@ -188,8 +189,16 @@ func TestCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
 				t.Fatalf("Delete = %+v, initial = %+v", deleted, upsert)
 			}
 			stored, getErr := o.st.Get(ctx, deleted.SID)
-			if getErr != nil || stored != nil || o.lookup(deleted.SID) != nil {
-				t.Fatalf("failed admission retained state: store=%+v cache=%+v err=%v", stored, o.lookup(deleted.SID), getErr)
+			if getErr != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) || o.lookup(deleted.SID) != nil {
+				t.Fatalf("failed admission dead history: store=%+v cache=%+v err=%v", stored, o.lookup(deleted.SID), getErr)
+			}
+			for _, path := range []string{
+				nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, deleted.SID),
+				nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, deleted.SID),
+			} {
+				if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("failed admission retained local path %s: %v", path, statErr)
+				}
 			}
 			if _, found := o.launches.Lookup(deleted.SID); found {
 				t.Fatal("failed admission retained launch claim")
@@ -203,7 +212,7 @@ func TestCreateBarrierFailureDeletesPreLaunchAdmission(t *testing.T) {
 	}
 }
 
-func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) {
+func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDeadCommit(t *testing.T) {
 	o := testOrch(t)
 	manifestKey := strings.Repeat("a", 64)
 	sb := &types.Sandbox{
@@ -212,9 +221,15 @@ func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) 
 		State:      types.StateStarting,
 		LaunchMode: types.LaunchImage,
 		APISecret:  deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(t.TempDir(), "run"), BaseDir: filepath.Join(t.TempDir(), "base"), CreatedUnix: 1,
+		RunDir:  nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, "retry-pre-launch-delete"),
+		BaseDir: nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, "retry-pre-launch-delete"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
+	for _, path := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := o.st.InsertSandbox(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
@@ -236,8 +251,13 @@ func TestPreLaunchRollbackRefreshesCleanupContextUntilExactDelete(t *testing.T) 
 		t.Fatalf("cleanup context attempts = %d, want 2", attempts)
 	}
 	stored, getErr := o.st.Get(context.Background(), sb.ID)
-	if getErr != nil || stored != nil || o.lookup(sb.ID) != nil {
-		t.Fatalf("pre-launch rollback retained state: store=%+v cache=%+v err=%v", stored, o.lookup(sb.ID), getErr)
+	if getErr != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) || o.lookup(sb.ID) != nil {
+		t.Fatalf("pre-launch rollback dead history: store=%+v cache=%+v err=%v", stored, o.lookup(sb.ID), getErr)
+	}
+	for _, path := range []string{sb.RunDir, sb.BaseDir} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("pre-launch rollback retained local path %s: %v", path, statErr)
+		}
 	}
 }
 
@@ -302,9 +322,9 @@ func TestCreateBarrierTimeoutAndCancellationRollback(t *testing.T) {
 			if deleted.SID != upsert.Route.SandboxID {
 				t.Fatalf("Delete = %+v, initial = %+v", deleted, upsert)
 			}
-			stored, err := o.st.Get(lifecycleCtx, deleted.SID)
-			if err != nil || stored != nil {
-				t.Fatalf("barrier failure retained row = %+v, %v", stored, err)
+			stored, err := o.st.Get(context.Background(), deleted.SID)
+			if err != nil || stored == nil || stored.State != types.StateDead || sandboxHasLocalOwnership(stored) {
+				t.Fatalf("barrier failure dead history = %+v, %v", stored, err)
 			}
 		})
 	}

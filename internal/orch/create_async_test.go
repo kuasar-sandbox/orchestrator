@@ -418,9 +418,7 @@ func TestKillDuringCreateAttachFencesClaimUntilLateCleanup(t *testing.T) {
 	if err := attempt.wait(ctx); err == nil {
 		t.Fatal("killed launch reported success")
 	}
-	if stored, err := o.st.Get(ctx, accepted.ID); err != nil || stored != nil {
-		t.Fatalf("late attach resurrected deleted sandbox: %+v, %v", stored, err)
-	}
+	waitForSandboxAbsent(t, o, ctx, accepted.ID, "delete after late attach cleanup")
 	next, err := o.launches.Claim(ctx, accepted.ID, launchCreate)
 	if err != nil {
 		t.Fatalf("claim after cleanup: %v", err)
@@ -472,8 +470,12 @@ func TestCreateResourceCASLossRetriesFailedImmediateDetach(t *testing.T) {
 	if got := vs.detachCalls.Load(); got != 2 {
 		t.Fatalf("detach calls = %d, want immediate attempt plus rollback retry", got)
 	}
-	if stored, err := o.st.Get(ctx, accepted.ID); err != nil || stored != nil {
-		t.Fatalf("resource CAS loss resurrected sandbox: %+v, %v", stored, err)
+	waitForSandboxAbsent(t, o, ctx, accepted.ID, "delete after resource CAS cleanup")
+	o.networkAllocationMu.Lock()
+	pendingPorts := len(o.detachedPortsPending)
+	o.networkAllocationMu.Unlock()
+	if pendingPorts != 0 {
+		t.Fatalf("late unpersisted port left %d allocation fences", pendingPorts)
 	}
 	next, err := o.launches.Claim(ctx, accepted.ID, launchCreate)
 	if err != nil {

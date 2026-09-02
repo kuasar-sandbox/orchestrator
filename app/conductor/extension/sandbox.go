@@ -9,6 +9,7 @@ const (
 	SandboxStateStarting SandboxState = "starting"
 	SandboxStateRunning  SandboxState = "running"
 	SandboxStatePaused   SandboxState = "paused"
+	SandboxStateDeleting SandboxState = "deleting"
 	SandboxStateDead     SandboxState = "dead"
 )
 

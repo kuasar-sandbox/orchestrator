@@ -444,7 +444,13 @@ func TestBuildExpiryReleasesRegistrationAndRuntimeOwnershipIsEncrypted(t *testin
 		"8", "192.0.2.8", "02:00:00:00:00:08", "other-token", prepareJSON); err != nil || owned {
 		t.Fatalf("second runtime preparation = %t, %v", owned, err)
 	}
-	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID); err != nil || !cleared {
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, "br-stale", "7"); err != nil || cleared {
+		t.Fatalf("stale-run runtime clear = %t, %v", cleared, err)
+	}
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.RunID, "8"); err != nil || cleared {
+		t.Fatalf("stale-port runtime clear = %t, %v", cleared, err)
+	}
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, runtime.BuildID, runtime.RunID, "7"); err != nil || !cleared {
 		t.Fatalf("clear runtime preparation = %t, %v", cleared, err)
 	}
 	loaded, err = st.GetBuild(ctx, runtime.BuildID)
@@ -496,17 +502,36 @@ func TestAcceptBuildResultIsDurableIdempotentAndClaimBound(t *testing.T) {
 	if err != nil || loaded.ExecutionResult == nil || *loaded.ExecutionResult != result {
 		t.Fatalf("durable result = %+v, err=%v", loaded, err)
 	}
+	if owned, err := st.SetBuildRuntimePreparation(ctx, b.BuildID, b.RunID,
+		"7", "192.0.2.7", "02:00:00:00:00:07", "runtime-token", `{"schema_version":1}`); err != nil || !owned {
+		t.Fatalf("persist runtime ownership before terminal = %t, %v", owned, err)
+	}
+	loaded, err = st.GetBuild(ctx, b.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	loaded.Status = types.BuildError
-	loaded.RuntimeVswitchPort = "7"
-	loaded.RuntimeFloatingIP = "192.0.2.7"
-	loaded.RuntimePortMAC = "02:00:00:00:00:07"
-	loaded.RuntimeEnvdAccessToken = "runtime-token"
-	loaded.RuntimePrepareJSON = `{"schema_version":1}`
+	if err := st.PutBuildTerminal(ctx, loaded); err == nil || !strings.Contains(err.Error(), "runtime ownership cleanup is incomplete") {
+		t.Fatalf("terminal build with runtime ownership error = %v", err)
+	}
+	retained, err := st.GetBuild(ctx, b.BuildID)
+	if err != nil || retained == nil || !retained.ExecutionClaimed || retained.RuntimeVswitchPort != "7" || retained.ExecutionResult == nil {
+		t.Fatalf("rejected terminal lost cleanup ownership = %+v, %v", retained, err)
+	}
+	if cleared, err := st.ClearBuildRuntimeOwnership(ctx, b.BuildID, b.RunID, "7"); err != nil || !cleared {
+		t.Fatalf("clear runtime ownership before terminal = %t, %v", cleared, err)
+	}
+	loaded, err = st.GetBuild(ctx, b.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Status = types.BuildError
 	if err := st.PutBuildTerminal(ctx, loaded); err != nil {
 		t.Fatal(err)
 	}
 	terminal, err := st.GetBuild(ctx, b.BuildID)
-	if err != nil || terminal.ExecutionResult != nil || terminal.ExecutionClaimed ||
+	if err != nil || terminal.RunID != "" || terminal.EnforcementStatus != "" ||
+		terminal.ExecutionResult != nil || terminal.ExecutionClaimed ||
 		terminal.RuntimeVswitchPort != "" || terminal.RuntimeEnvdAccessToken != "" || terminal.RuntimePrepareJSON != "" {
 		t.Fatalf("terminal result cleanup = %+v, err=%v", terminal, err)
 	}

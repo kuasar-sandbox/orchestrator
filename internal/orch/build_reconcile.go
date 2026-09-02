@@ -315,7 +315,7 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 		result, port, runtimePersisted, mmdsRow, runErr = o.continueRecoveredBuildPreparation(ctx, build, pend, unit)
 	}
 	if !errors.Is(runErr, errBuildCleanupPending) {
-		runErr = o.cleanupRecoveredBuildRuntime(build, runErr, port, runtimePersisted)
+		runErr = o.cleanupRecoveredBuildRuntime(build, runErr, unit, port, runtimePersisted)
 	}
 	o.completeBuild(ctx, build, result, runErr)
 }
@@ -323,9 +323,16 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 func (o *Orchestrator) cleanupRecoveredBuildRuntime(
 	build *types.Build,
 	cause error,
+	unit string,
 	port string,
 	persisted bool,
 ) error {
+	// An adopted builder remains an execution owner even when preparation fails
+	// before its connector is durable. Re-establish the exact unit fence before
+	// detaching or deleting either derived Build directory on every exit path.
+	if err := o.stopBuilderUnit(unit); err != nil {
+		return retainBuildCleanup(cause, err, port, persisted)
+	}
 	progress, cleanupErr := o.cleanupBuildRuntimeProgress(build, port, persisted)
 	if cleanupErr == nil {
 		return cause

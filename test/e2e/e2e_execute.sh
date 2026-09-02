@@ -607,6 +607,20 @@ with sqlite3.connect(sys.argv[1], timeout=5) as db:
 print(row[0] if row else "missing")
 PY
 }
+assert_dead_no_ownership() { # $1=sandbox id
+    python3 - "$WORK/lib/node-ctl.db" "$1" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("""
+        select state, run_id, vswitch_port, floatingip, inner_ip, port_mac,
+               run_dir, base_dir, envd_uds, ci_uds,
+               resume_source_kind, resume_source_ref
+          from sandboxes where id=?
+    """, (sys.argv[2],)).fetchone()
+if row is None or row[0] != "dead" or any(row[1:]):
+    raise SystemExit(f"dead sandbox retained local ownership: {row!r}")
+PY
+}
 wait_sandbox_state() { # $1=sandbox id, $2=state, $3=attempts(optional)
     local sid="$1" want="$2" attempts="${3:-120}" state=""
     for _ in $(seq 1 "$attempts"); do
@@ -615,6 +629,35 @@ wait_sandbox_state() { # $1=sandbox id, $2=state, $3=attempts(optional)
         sleep 0.1
     done
     echo "sandbox $sid state=$state, want $want" >&2
+    return 1
+}
+wait_paused_cleanup() { # $1=sandbox id, $2=attempts(optional)
+    local sid="$1" attempts="${2:-120}"
+    for _ in $(seq 1 "$attempts"); do
+        if python3 - "$WORK/lib/node-ctl.db" "$sid" "$WORK/lib/sandboxes/$sid" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("""
+        select state, run_id, vswitch_port, floatingip, inner_ip, port_mac,
+               run_dir, envd_uds, ci_uds, base_dir
+          from sandboxes where id=?
+    """, (sys.argv[2],)).fetchone()
+want = ("paused", "", "", "", "", "", "", "", "", sys.argv[3])
+raise SystemExit(0 if row == want else 1)
+PY
+        then
+            [ ! -e "$WORK/run/sandboxes/$sid" ] && [ -d "$WORK/lib/sandboxes/$sid" ] && return 0
+        fi
+        sleep 0.1
+    done
+    python3 - "$WORK/lib/node-ctl.db" "$sid" <<'PY' >&2 || true
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    print("paused cleanup row:", db.execute(
+        "select state,run_id,vswitch_port,run_dir,base_dir,envd_uds,ci_uds from sandboxes where id=?",
+        (sys.argv[2],),
+    ).fetchone())
+PY
     return 1
 }
 wait_unit_journal_contains() { # $1=unit, $2=fixed string, $3=output file
@@ -1428,6 +1471,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 RUNNER_TIMEOUT_SID=$(json_field "$WORK/resp.body" sandboxID)
 RUNNER_TIMEOUT_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 wait_sandbox_state "$RUNNER_TIMEOUT_SID" dead 200 || fail "runner-timeout sandbox did not roll back to dead"
+assert_dead_no_ownership "$RUNNER_TIMEOUT_SID" || fail "runner-timeout dead ownership"
 [ -z "$(sandbox_run_id "$RUNNER_TIMEOUT_SID")" ] || fail "runner-timeout rollback retained run_id"
 code=$(DP_MAX_TIME=10 dp "49983-$RUNNER_TIMEOUT_SID" /health "$RUNNER_TIMEOUT_TOKEN" || true)
 [ "$code" = "404" ] || fail "runner-timeout route=$code (want prompt 404 after Delete)"
@@ -1445,6 +1489,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 RUNTIME_FAILURE_SID=$(json_field "$WORK/resp.body" sandboxID)
 RUNTIME_FAILURE_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 wait_sandbox_state "$RUNTIME_FAILURE_SID" dead 120 || fail "runtime protocol failure did not roll back to dead"
+assert_dead_no_ownership "$RUNTIME_FAILURE_SID" || fail "runtime protocol failure dead ownership"
 rm -f "$WORK/inject-sandbox-run"
 code=$(DP_MAX_TIME=10 dp "49983-$RUNTIME_FAILURE_SID" /health "$RUNTIME_FAILURE_TOKEN" || true)
 [ "$code" = "404" ] || fail "runtime-failure route=$code (want prompt 404)"
@@ -1458,6 +1503,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 ENVD_FAILURE_SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_FAILURE_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 wait_sandbox_state "$ENVD_FAILURE_SID" dead 120 || fail "envd init failure did not roll back to dead"
+assert_dead_no_ownership "$ENVD_FAILURE_SID" || fail "envd init failure dead ownership"
 rm -f "$WORK/inject-sandbox-run"
 code=$(DP_MAX_TIME=10 dp "49983-$ENVD_FAILURE_SID" /health "$ENVD_FAILURE_TOKEN" || true)
 [ "$code" = "404" ] || fail "envd-failure route=$code (want prompt 404)"
@@ -1832,6 +1878,7 @@ wait_proxy_traffic_stats "$SID" paused || fail "paused traffic stats were not st
 # its live controller reservation. During that bounded cleanup window, returning
 # the still-real report is valid; the stable paused state must converge to 409.
 wait_resource_status "$SID" 409 || fail "paused resource stats did not converge to 409"
+wait_paused_cleanup "$SID" || fail "paused runtime ownership did not durably clear"
 # Keep the sandbox durably paused for longer than several service counter ticks.
 # On restore the counter must resume from the frozen snapshot rather than track
 # this host wall-clock interval.
@@ -2076,7 +2123,9 @@ if [ "$MMDS_ROUTES_E2E" = 1 ]; then
 fi
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
+wait_sandbox_state "$SID" missing 120 || fail "Sandbox delete finalizer retained durable row"
 [ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
+[ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Sandbox delete retained BaseDir"
 [ -f "$WORK/lib/node-ctl.db" ] || fail "Sandbox cleanup removed node-level database"
 [ -S "$WORK/node-ctl.socket" ] || fail "Sandbox cleanup removed node-level config socket"
 unset EXEC_TOKEN
@@ -2102,6 +2151,7 @@ grep -q "$PERSIST" "$WORK/kmt-read.out" \
 wait_sandbox_state "$SID" running 20 || fail "KMT restore did not commit running"
 echo "==> PASS: KMT Connect returned at $KMT_RETURN_STATE; immediate native exec parked and portable state restored"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill KMT-imported sandbox=$code (want 204)"
+wait_sandbox_state "$SID" missing 120 || fail "KMT sandbox delete finalizer retained durable row"
 unset KMT_EXEC_TOKEN
 SID_UNSET="$SID"
 
@@ -2281,6 +2331,7 @@ PY
     sleep 0.5
 done
 [ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
+wait_paused_cleanup "$SID" || fail "auto-paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_CALL" \
     snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
@@ -2314,6 +2365,7 @@ wait_sandbox_state "$SID" running 1200 || fail "autoPauseMemory=false sandbox di
 AUTO_E_EXPLICIT_S_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false explicit Pause({})=$code"; }
+wait_paused_cleanup "$SID" || fail "explicit paused runtime ownership did not durably clear"
 assert_snapshot_argv "$AUTO_E_EXPLICIT_S_CALL" \
     snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=true --drop-caches=false \
@@ -2344,6 +2396,7 @@ for _ in $(seq 1 180); do
     sleep 0.5
 done
 [ -n "$AUTO_E_PAUSED" ] || fail "autoPauseMemory=false TTL did not pause"
+wait_paused_cleanup "$SID" || fail "TTL paused runtime ownership did not durably clear"
 assert_export_argv "$AUTO_E_TTL_CALL" \
     export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "autoPauseMemory=false TTL did not capture Sandbox E"

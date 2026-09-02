@@ -205,7 +205,7 @@ func (l *countingLauncher) taskError() error {
 	return l.lastTaskError
 }
 
-func (l *countingLauncher) Stop(ctx context.Context, _ string) error {
+func (l *countingLauncher) Stop(ctx context.Context, unit string) error {
 	l.stops.Add(1)
 	if l.stopEntered != nil {
 		select {
@@ -220,10 +220,19 @@ func (l *countingLauncher) Stop(ctx context.Context, _ string) error {
 			return ctx.Err()
 		}
 	}
+	l.resourceMu.Lock()
+	for i := range l.listedUnits {
+		if l.listedUnits[i].Name == unit {
+			l.listedUnits[i].ActiveState = "inactive"
+		}
+	}
+	l.resourceMu.Unlock()
 	return nil
 }
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
+	l.resourceMu.Lock()
+	defer l.resourceMu.Unlock()
 	return append([]launcher.Unit(nil), l.listedUnits...), nil
 }
 func (l *countingLauncher) Reload(context.Context) error { return nil }

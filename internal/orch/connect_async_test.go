@@ -492,10 +492,7 @@ func TestKillCancelsStartingResumeWithoutWaitingOrResurrection(t *testing.T) {
 		t.Fatal("Kill waited for the blocked starting resume")
 	}
 	close(f.startGate)
-	stored, err := f.o.st.Get(f.ctx, f.sb.ID)
-	if err != nil || stored != nil {
-		t.Fatalf("sandbox was resurrected after Kill: %+v, %v", stored, err)
-	}
+	waitForSandboxAbsent(t, f.o, f.ctx, f.sb.ID, "delete after canceled resume")
 	if cached := f.o.lookup(f.sb.ID); cached != nil {
 		t.Fatalf("deleted sandbox remained cached: %+v", cached)
 	}
@@ -546,9 +543,7 @@ func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *tes
 	if err := attempt.wait(ctx); err == nil {
 		t.Fatal("canceled readiness launch reported success")
 	}
-	if stored, err := o.st.Get(ctx, sb.ID); err != nil || stored != nil {
-		t.Fatalf("assigned launch resurrected after Kill: %+v, %v", stored, err)
-	}
+	waitForSandboxAbsent(t, o, ctx, sb.ID, "delete after canceled readiness")
 	if got := lc.stops.Load(); got == 0 {
 		t.Fatal("Kill did not stop the assigned runner")
 	}
@@ -774,6 +769,28 @@ func waitForSandbox(
 		case <-ticker.C:
 		case <-timeout.C:
 			t.Fatalf("sandbox did not become %s: %+v", description, sb)
+		}
+	}
+}
+
+func waitForSandboxAbsent(t *testing.T, o *Orchestrator, ctx context.Context, id, description string) {
+	t.Helper()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	for {
+		sb, err := o.st.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get sandbox while waiting for %s: %v", description, err)
+		}
+		if sb == nil {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("sandbox did not become absent for %s: %+v", description, sb)
 		}
 	}
 }
