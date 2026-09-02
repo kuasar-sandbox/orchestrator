@@ -51,6 +51,7 @@ func routerTestRouteResolve(t *testing.T, sid, group, routeKey, endpoint string,
 		ManifestKeyFingerprint: routerTestFingerprint(t, routerTestManifestKey),
 		ServiceSecret:          serviceSecret,
 		ForwardAccessToken:     forwardAccessToken,
+		APIEndpoint:            endpoint,
 		DataEndpoint:           endpoint,
 		State:                  "ready",
 	}

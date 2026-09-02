@@ -216,7 +216,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	node := newFakeNode()
 	client := New(
 		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
-		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
+		routesync.NodeRegister{NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
 		node, 50*time.Millisecond, nil, log,
 	)
 	go client.Run(ctx)
@@ -340,14 +340,14 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 		func(ctx context.Context, endpoint string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
-		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
+		routesync.NodeRegister{NodeID: "n1", APIEndpoint: "10.0.0.1:8442", DataEndpoint: "10.0.0.1:8443"},
 		node, 50*time.Millisecond, nil, log, true,
 	)
 	go client.Run(ctx)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if got, found, _ := reg.Stores().GetNode(ctx, "n1"); found && got.DataEndpoint == "10.0.0.1:8443" {
+		if got, found, _ := reg.Stores().GetNode(ctx, "n1"); found && got.APIEndpoint == "10.0.0.1:8442" && got.DataEndpoint == "10.0.0.1:8443" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -357,7 +357,10 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	}
 }
 
-func TestNodeLinkVersionMismatchRejectsCommands(t *testing.T) {
+func TestNodeLinkRejectsVersion4BeforeCommands(t *testing.T) {
+	if routesync.Version != 5 {
+		t.Fatalf("routesync.Version=%d, want 5", routesync.Version)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
 		msg, err := routesync.ReadMsg(req.Body)
@@ -366,7 +369,7 @@ func TestNodeLinkVersionMismatchRejectsCommands(t *testing.T) {
 			return
 		}
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
-			Version: routesync.Version - 1,
+			Version: 4,
 		}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
 			CmdID: "must-not-run", Kind: routesync.CmdKeyPut,

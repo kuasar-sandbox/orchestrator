@@ -436,6 +436,48 @@ func TestStubRejectsExplicitEmptyExecConditionsOnOtherCommandKinds(t *testing.T)
 	}
 }
 
+func TestStubAPIAndDataListenersAreIsolated(t *testing.T) {
+	service, _, sandbox, _ := newExecStubFixture(t, routesync.StateRunning, 0)
+
+	control := httptest.NewRequest(http.MethodGet, "http://api.test/sandboxes/"+sandbox.SID, nil)
+	control.Host = "api.test"
+	controlResponse := httptest.NewRecorder()
+	service.serveAPI(controlResponse, control)
+	if controlResponse.Code != http.StatusOK {
+		t.Fatalf("API listener control response = %d, want 200", controlResponse.Code)
+	}
+
+	dataOnAPI := httptest.NewRequest(http.MethodGet, "http://sandbox.test/health", nil)
+	dataOnAPI.Host = "49983-" + sandbox.SID + ".test"
+	dataOnAPIResponse := httptest.NewRecorder()
+	service.serveAPI(dataOnAPIResponse, dataOnAPI)
+	if dataOnAPIResponse.Code != http.StatusNotFound {
+		t.Fatalf("API listener data response = %d, want 404", dataOnAPIResponse.Code)
+	}
+
+	connectOnAPI := httptest.NewRequest(http.MethodConnect, "http://api.test/sandboxes/"+sandbox.SID, nil)
+	connectOnAPI.Host = "api.test"
+	connectOnAPIResponse := httptest.NewRecorder()
+	service.serveAPI(connectOnAPIResponse, connectOnAPI)
+	if connectOnAPIResponse.Code != http.StatusNotFound {
+		t.Fatalf("API listener CONNECT response = %d, want 404", connectOnAPIResponse.Code)
+	}
+
+	controlOnData := httptest.NewRequest(http.MethodGet, "http://api.test/sandboxes/"+sandbox.SID, nil)
+	controlOnData.Host = "api.test"
+	controlOnDataResponse := httptest.NewRecorder()
+	service.serveData(controlOnDataResponse, controlOnData)
+	if controlOnDataResponse.Code != http.StatusBadRequest {
+		t.Fatalf("data listener control response = %d, want 400", controlOnDataResponse.Code)
+	}
+	service.mu.Lock()
+	hits := len(service.dataHits)
+	service.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("cross-plane requests produced %d data hits", hits)
+	}
+}
+
 func TestExecDataGateRequiresConnectAndValidExecKAT(t *testing.T) {
 	service, node, sandbox, _ := newExecStubFixture(t, routesync.StateRunning, 0)
 

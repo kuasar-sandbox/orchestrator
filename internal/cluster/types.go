@@ -53,6 +53,7 @@ type NodeRecord struct {
 	Capacity                  int                            `json:"capacity,omitempty"`
 	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
 	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	APIEndpoint               string                         `json:"api_endpoint,omitempty"`
 	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
 	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
 	Zone                      string                         `json:"zone,omitempty"`
@@ -111,6 +112,7 @@ type NodeListEntry struct {
 	Capacity                  int                            `json:"capacity,omitempty"`
 	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
 	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	APIEndpoint               string                         `json:"api_endpoint,omitempty"`
 	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
 	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
 	Draining                  bool                           `json:"draining,omitempty"`
@@ -121,7 +123,8 @@ func ProjectNodeList(n NodeRecord) NodeListEntry {
 	return NodeListEntry{
 		SourceMeta: n.Meta, NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
-		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity), DataEndpoint: n.DataEndpoint,
+		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		APIEndpoint:               n.APIEndpoint, DataEndpoint: n.DataEndpoint,
 		RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}
 }

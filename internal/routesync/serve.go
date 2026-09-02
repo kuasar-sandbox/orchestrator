@@ -59,7 +59,7 @@ type StreamHooks struct {
 
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
 // config-socket plugin handler calls this before ServeAuthority so it can register
-// the subscriber (and its proxy target) before streaming.
+// the subscriber and its declared capabilities before streaming.
 func ReadRegister(r io.Reader) (Register, error) {
 	m, err := ReadMsg(r)
 	if err != nil {

@@ -1157,7 +1157,7 @@ func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
 		Meta:   n.SourceMeta,
 		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity,
 		BuildRegistrationCapacity: n.BuildRegistrationCapacity, BuildExecutionCapacity: n.BuildExecutionCapacity,
-		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
+		APIEndpoint: n.APIEndpoint, DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}, true
 }
 

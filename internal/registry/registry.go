@@ -1525,6 +1525,7 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	if err != nil {
 		return nil, false, err
 	}
+	route.APIEndpoint = node.APIEndpoint
 	route.DataEndpoint = node.DataEndpoint
 	return &ReserveResult{Route: *route}, true, nil
 }
@@ -1569,8 +1570,20 @@ func (r *Registry) node(id string) (nodeConn, bool) {
 	return c, ok
 }
 
-// nodeDataEndpoint returns a node's data-plane endpoint (the router forwards to
-// it), or "" if the node is unknown.
+// nodeAPIEndpoint returns a node's control API endpoint, or "" if the node is
+// unknown.
+func (r *Registry) nodeAPIEndpoint(ctx context.Context, nodeID string) string {
+	if r.nodeOwner == nil {
+		return ""
+	}
+	if n, found, _ := r.nodeOwner.Runtime(ctx, nodeID); found && n != nil {
+		return n.APIEndpoint
+	}
+	return ""
+}
+
+// nodeDataEndpoint returns a node's data-plane endpoint, or "" if the node is
+// unknown.
 func (r *Registry) nodeDataEndpoint(ctx context.Context, nodeID string) string {
 	if r.nodeOwner == nil {
 		return ""
@@ -1611,6 +1624,7 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 		rec.Capacity = nr.Capacity
 		rec.BuildRegistrationCapacity = nr.BuildRegistrationCapacity
 		rec.BuildExecutionCapacity = nr.BuildExecutionCapacity
+		rec.APIEndpoint = nr.APIEndpoint
 		rec.DataEndpoint = nr.DataEndpoint
 		rec.RuntimeDigest = nr.RuntimeDigest
 		rec.LastHeartbeatUnix = time.Now().Unix()

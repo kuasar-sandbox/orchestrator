@@ -27,11 +27,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		NodeID: "n1", Labels: map[string]string{"zone": "z1", "slot": "c01-s03"},
 		BuildRegistrationCapacity: &BuildAdmissionLimit{MaxBuilds: 16, Resources: &BuildResources{CPU: 64000, Memory: 256 << 30, Storage: 1 << 40}},
 		BuildExecutionCapacity:    &BuildAdmissionLimit{MaxBuilds: 4, Resources: &BuildResources{CPU: 16000, Memory: 64 << 30, Storage: 256 << 30}},
+		APIEndpoint:               "10.0.0.1:8442",
 		DataEndpoint:              "10.0.0.1:8443", AcceptRedirect: true,
 	}})
 	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" ||
 		nr.NodeReg.BuildRegistrationCapacity.Resources.Memory != 256<<30 ||
-		nr.NodeReg.BuildExecutionCapacity.MaxBuilds != 4 || !nr.NodeReg.AcceptRedirect {
+		nr.NodeReg.BuildExecutionCapacity.MaxBuilds != 4 || nr.NodeReg.APIEndpoint != "10.0.0.1:8442" ||
+		nr.NodeReg.DataEndpoint != "10.0.0.1:8443" || !nr.NodeReg.AcceptRedirect {
 		t.Fatalf("node_register round-trip: %+v", nr.NodeReg)
 	}
 
@@ -131,7 +133,6 @@ func TestProxyStatsCapabilityRoundTrip(t *testing.T) {
 	got := roundTrip(t, &Msg{Type: TypeRegister, Register: &Register{
 		Subscribe: &Subscribe{Kind: KindRouteWake},
 		Proxy: &Proxy{
-			Socket:      Socket{Path: "/run/proxy.sock"},
 			StatsSocket: &Socket{Path: "/run/proxy-stats.sock"},
 		},
 	}})

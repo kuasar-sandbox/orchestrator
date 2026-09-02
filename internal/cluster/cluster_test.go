@@ -23,3 +23,14 @@ func TestMemberViewOwnersStableAndCapped(t *testing.T) {
 		t.Fatalf("owners len=%d, want capped to 3", len(a))
 	}
 }
+
+func TestProjectNodeListPreservesSplitEndpoints(t *testing.T) {
+	entry := ProjectNodeList(NodeRecord{
+		NodeID:       "n1",
+		APIEndpoint:  "10.0.0.1:7443",
+		DataEndpoint: "10.0.0.1:8443",
+	})
+	if entry.APIEndpoint != "10.0.0.1:7443" || entry.DataEndpoint != "10.0.0.1:8443" {
+		t.Fatalf("projected endpoints: api=%q data=%q", entry.APIEndpoint, entry.DataEndpoint)
+	}
+}

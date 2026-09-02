@@ -151,7 +151,7 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	stores := NewStores()
 	node := &NodeRecord{
 		NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10,
-		DataEndpoint: "10.0.0.1:8443", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1",
+		APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1",
 	}
 	if err := stores.putNodeProfileShard(ctx, node); err != nil {
 		t.Fatalf("putNodeProfileShard: %v", err)
@@ -170,7 +170,7 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("getNodeShard found=%v err=%v", found, err)
 	}
-	if got.NodeID != "n1" || got.Labels["pool"] != "p" || len(got.Sandboxes) != 1 || len(got.Builds) != 1 || len(got.KeyPairs) != 1 {
+	if got.NodeID != "n1" || got.APIEndpoint != "10.0.0.1:7443" || got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" || len(got.Sandboxes) != 1 || len(got.Builds) != 1 || len(got.KeyPairs) != 1 {
 		t.Fatalf("node view=%+v", got)
 	}
 	if err := stores.dropNodeKeyPairShard(ctx, "n1", pair.APISecretFingerprint); err != nil {
@@ -190,7 +190,7 @@ func TestNodeReapProfileFenceAcrossOwners(t *testing.T) {
 	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 3, 1, 3)
 	const nodeID = "node-reconnect-fence"
 	if err := cluster["a"].PutNode(ctx, &NodeRecord{
-		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), LinkOwner: "a",
+		NodeID: nodeID, APIEndpoint: "old-api", DataEndpoint: "old-data", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), LinkOwner: "a",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,8 @@ func TestNodeReapProfileFenceAcrossOwners(t *testing.T) {
 		t.Fatalf("stale profile found=%v err=%v", found, err)
 	}
 	fresh := *stale
-	fresh.DataEndpoint = "new"
+	fresh.APIEndpoint = "new-api"
+	fresh.DataEndpoint = "new-data"
 	fresh.LastHeartbeatUnix = time.Now().Unix()
 	fresh.LinkOwner = "b"
 	if err := cluster["b"].putNodeProfileShard(ctx, &fresh); err != nil {
@@ -213,7 +214,7 @@ func TestNodeReapProfileFenceAcrossOwners(t *testing.T) {
 		t.Fatal("stale owner claimed a profile advanced by the reconnecting owner")
 	}
 	got, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || got.DataEndpoint != "new" || got.LinkOwner != "b" {
+	if err != nil || !found || got.APIEndpoint != "new-api" || got.DataEndpoint != "new-data" || got.LinkOwner != "b" {
 		t.Fatalf("fresh profile=%+v found=%v err=%v", got, found, err)
 	}
 }
@@ -224,7 +225,7 @@ func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
 	const nodeID = "node-reap-wins"
 	oldRef := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
 	if err := cluster["a"].PutNode(ctx, &NodeRecord{
-		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
+		NodeID: nodeID, APIEndpoint: "old-api", DataEndpoint: "old-data", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
 		LinkOwner: "a", Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
 	}); err != nil {
 		t.Fatal(err)
@@ -246,7 +247,7 @@ func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
 	}
 
 	regB := New(cluster["b"], nil, time.Second, nil)
-	registered, err := regB.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "new"})
+	registered, err := regB.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, APIEndpoint: "new-api", DataEndpoint: "new-data"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,12 +268,12 @@ func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
 		t.Fatalf("stale child cleanup deleted reconnect ref: deleted=%v err=%v", deleted, err)
 	}
 	profile, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.LinkOwner != "b" || profile.DataEndpoint != "new" {
+	if err != nil || !found || profile.LinkOwner != "b" || profile.APIEndpoint != "new-api" || profile.DataEndpoint != "new-data" {
 		t.Fatalf("reconnect profile=%+v found=%v err=%v", profile, found, err)
 	}
 	found = false
 	if err := cluster["a"].RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
-		if entry.NodeID == nodeID && entry.DataEndpoint == "new" {
+		if entry.NodeID == nodeID && entry.APIEndpoint == "new-api" && entry.DataEndpoint == "new-data" {
 			found = true
 		}
 		return nil
@@ -791,6 +792,7 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	if err := cluster["b"].PutNode(ctx, &NodeRecord{
 		NodeID: nodeID, LinkOwner: "remote", Capacity: 10,
 		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 1000}},
+		APIEndpoint:               "127.0.0.1:12344",
 		DataEndpoint:              "127.0.0.1:12345",
 	}); err != nil {
 		t.Fatalf("seed node: %v", err)
@@ -800,13 +802,13 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 		t.Fatalf("non-owner full GetNode err=%v, want ErrInvalidView", err)
 	}
 	profile, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:12345" || profile.LinkOwner != "remote" {
+	if err != nil || !found || profile.APIEndpoint != "127.0.0.1:12344" || profile.DataEndpoint != "127.0.0.1:12345" || profile.LinkOwner != "remote" {
 		t.Fatalf("profile=%+v found=%v err=%v", profile, found, err)
 	}
 
 	reg := New(cluster["a"], nil, time.Second, nil)
 	reg.addNode(&fakeConn{nodeID: nodeID})
-	if node, found, err := reg.localNodeOwner.Runtime(ctx, nodeID); err != nil || !found || node.DataEndpoint != "127.0.0.1:12345" {
+	if node, found, err := reg.localNodeOwner.Runtime(ctx, nodeID); err != nil || !found || node.APIEndpoint != "127.0.0.1:12344" || node.DataEndpoint != "127.0.0.1:12345" {
 		t.Fatalf("local runtime profile=%+v found=%v err=%v", node, found, err)
 	}
 	remote := &routingNodeOwnerRecorder{allow: true}
@@ -892,17 +894,17 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
 	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
 	nodeID := nodeNotOwnedBy(t, view, "a")
-	if err := cluster["b"].PutNode(ctx, &NodeRecord{NodeID: nodeID, LinkOwner: "b", DataEndpoint: "old"}); err != nil {
+	if err := cluster["b"].PutNode(ctx, &NodeRecord{NodeID: nodeID, LinkOwner: "b", APIEndpoint: "old-api", DataEndpoint: "old-data"}); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
 	reg := New(cluster["a"], nil, time.Second, nil)
 	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "new", Labels: map[string]string{"pool": "p"},
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "new-api", DataEndpoint: "new-data", Labels: map[string]string{"pool": "p"},
 	}); err != nil {
 		t.Fatalf("non-owner node register: %v", err)
 	}
 	profile, found, err := cluster["b"].GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.LinkOwner != "a" || profile.DataEndpoint != "new" {
+	if err != nil || !found || profile.LinkOwner != "a" || profile.APIEndpoint != "new-api" || profile.DataEndpoint != "new-data" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
 	}
 }
@@ -911,7 +913,7 @@ func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID: "n1", Capacity: 10, DataEndpoint: "127.0.0.1:19001",
+		NodeID: "n1", Capacity: 10, APIEndpoint: "127.0.0.1:19000", DataEndpoint: "127.0.0.1:19001",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -966,7 +968,7 @@ func TestRegisteredNodeProjectionDoesNotReReadProfile(t *testing.T) {
 	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
 	reg := New(cluster["a"], nil, time.Second, nil)
 	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001",
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "127.0.0.1:19000", DataEndpoint: "127.0.0.1:19001",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -999,7 +1001,7 @@ func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) 
 	reg := New(stores, nil, time.Second, nil)
 
 	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "127.0.0.1:19000", DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatalf("updateNodeRegister should keep node_link alive when node_list projection fails: %v", err)
@@ -1007,7 +1009,7 @@ func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) 
 	reg.addNode(&fakeConn{nodeID: nodeID})
 	reg.projectRegisteredNode(ctx, registered)
 	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
+	if err != nil || !found || profile.APIEndpoint != "127.0.0.1:19000" || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
 	}
 }
@@ -1024,7 +1026,7 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	reg := New(cluster["a"], nil, time.Second, nil)
 
 	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "127.0.0.1:19000", DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatalf("updateNodeRegister: %v", err)
@@ -1048,7 +1050,7 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	for {
 		found := false
 		lastErr = cluster["a"].RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
-			if entry.NodeID == nodeID && entry.DataEndpoint == "127.0.0.1:19001" && entry.Labels["pool"] == "p" {
+			if entry.NodeID == nodeID && entry.APIEndpoint == "127.0.0.1:19000" && entry.DataEndpoint == "127.0.0.1:19001" && entry.Labels["pool"] == "p" {
 				found = true
 			}
 			return nil

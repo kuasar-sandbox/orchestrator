@@ -92,17 +92,22 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"})
 	reg.addNode(buildAckConn(reg, "n1"))
-	admitter := &recordingNodeOwner{allow: true}
+	admitter := &recordingNodeOwner{allow: true, runtime: map[string]*NodeRecord{
+		"n1": {NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"},
+	}}
 	reg.SetNodeOwner(admitter)
 
 	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileBare, Resources: testWireBuildResources()})
 	if err != nil {
 		t.Fatalf("reserve build: %v", err)
 	}
-	if res.Profile != types.ProfileBare || len(admitter.commands) != 1 || admitter.commands[0].Profile != string(types.ProfileBare) {
+	if res.Profile != types.ProfileBare || res.APIEndpoint != "node-api:7443" || len(admitter.commands) != 1 || admitter.commands[0].Profile != string(types.ProfileBare) {
 		t.Fatalf("profile did not reach build_register: result=%q commands=%+v", res.Profile, admitter.commands)
+	}
+	if resolved, found := reg.ResolveBuild(ctx, "/g", res.BuildID); !found || resolved.APIEndpoint != "node-api:7443" {
+		t.Fatalf("ResolveBuild = %+v found=%v", resolved, found)
 	}
 	if got := admitter.commands[0].BuildResources; got == nil || got.CPU != 2000 || got.Memory != 2<<30 {
 		t.Fatalf("build resources did not reach node authority: %+v", got)

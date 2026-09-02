@@ -50,7 +50,7 @@ func (o *rpcNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord,
 	if o.runtimeErr != nil {
 		return nil, false, o.runtimeErr
 	}
-	return &NodeRecord{NodeID: nodeID, DataEndpoint: "10.0.0.1:8443"}, true, nil
+	return &NodeRecord{NodeID: nodeID, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443"}, true, nil
 }
 
 func (o *rpcNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid, apiSecretFingerprint string) error {
@@ -96,7 +96,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, found, err := client.Runtime(ctx, "n1")
-	if err != nil || !found || node.DataEndpoint == "" {
+	if err != nil || !found || node.APIEndpoint != "10.0.0.1:7443" || node.DataEndpoint != "10.0.0.1:8443" {
 		t.Fatalf("runtime node=%+v found=%v err=%v", node, found, err)
 	}
 	if err := client.DeleteSandbox(ctx, "n1", "sb1", strings.Repeat("a", 64)); err != nil {

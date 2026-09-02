@@ -9,11 +9,12 @@ import (
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the execution-state authority (its sandbox routes flow as ID-only
-// Upsert/Delete + Bookmark), while the registry resolves cluster identity from
-// its per-node ownership table and sends Commands the other way. The frame codec and
-// the ServeAuthority loop are the same routesync engine the proxy plane uses;
-// only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
-// differ. Build events arrive with Phase 5.
+// Upsert/Delete + Bookmark), while the registry resolves cluster identity and
+// the current API/data endpoints from its per-node ownership table and sends
+// Commands the other way. The frame codec and the ServeAuthority loop are the
+// same routesync engine the proxy plane uses; only the handshake (NodeRegister
+// vs Hello) and the uplink (Command vs Wake) differ. Build events arrive with
+// Phase 5.
 const (
 	TypeNodeRegister = "node_register" // node -> registry (node identity; first up-frame)
 	TypeHeartbeat    = "heartbeat"     // node -> registry (water level)
@@ -136,7 +137,8 @@ type NodeRegister struct {
 	Capacity                  int                  `json:"capacity,omitempty"` // max sandboxes (headroom signal)
 	BuildRegistrationCapacity *BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
 	BuildExecutionCapacity    *BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
-	DataEndpoint              string               `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
+	APIEndpoint               string               `json:"api_endpoint"`              // host:port the router forwards node control requests to
+	DataEndpoint              string               `json:"data_endpoint"`             // host:port the router forwards data-plane to
 	RuntimeDigest             string               `json:"runtime_digest,omitempty"`  // guest runtime identity
 	AcceptRedirect            bool                 `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
 }
