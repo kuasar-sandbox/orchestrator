@@ -35,7 +35,6 @@ type PreparedWorker struct {
 	notifyFile  *os.File
 	statsConn   net.Conn
 	mmdsRPCConn net.Conn
-	forward     net.Listener
 	data        net.Listener
 	mmds        net.Listener
 	run         atomic.Bool
@@ -96,20 +95,13 @@ func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr err
 		return nil, fmt.Errorf("proxy worker: missing stats stream descriptor")
 	}
 
-	prepared.forward, returnErr = listenerFromFD(fds.Forward, "proxy-forward")
-	delete(owned, fds.Forward)
-	if returnErr != nil {
-		return nil, returnErr
-	}
-	if prepared.forward == nil {
-		return nil, fmt.Errorf("proxy worker: missing forward listener descriptor")
-	}
 	prepared.data, returnErr = listenerFromFD(fds.Data, "proxy-data")
-	if fds.Data >= 0 {
-		delete(owned, fds.Data)
-	}
+	delete(owned, fds.Data)
 	if returnErr != nil {
 		return nil, returnErr
+	}
+	if prepared.data == nil {
+		return nil, fmt.Errorf("proxy worker: missing data listener descriptor")
 	}
 	prepared.mmds, returnErr = listenerFromFD(fds.MMDS, "proxy-mmds")
 	if fds.MMDS >= 0 {
@@ -202,12 +194,9 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 		_, found := worker.table.Lookup(sandboxID)
 		return found
 	}, 5*time.Minute)
-	errorChannel := make(chan error, 4)
+	errorChannel := make(chan error, 3)
 	go func() { errorChannel <- <-senderDone }()
-	go func() { errorChannel <- appnet.Serve(workerCtx, worker.forward, ingressHandler, nil) }()
-	if worker.data != nil {
-		go func() { errorChannel <- appnet.Serve(workerCtx, worker.data, ingressHandler, runtime.DataTLS) }()
-	}
+	go func() { errorChannel <- appnet.Serve(workerCtx, worker.data, ingressHandler, runtime.DataTLS) }()
 	if worker.mmds != nil {
 		go func() { errorChannel <- mmds.New(view, cfg.ParkTimeoutDur(), logger).Serve(workerCtx, worker.mmds) }()
 	}
@@ -255,7 +244,7 @@ func (worker *PreparedWorker) Close() error {
 	worker.closeOnce.Do(func() {
 		worker.closeErr = errors.Join(
 			closeFile(worker.wakeFile), closeFile(worker.notifyFile), closeConn(worker.statsConn),
-			closeConn(worker.mmdsRPCConn), closeListener(worker.forward), closeListener(worker.data),
+			closeConn(worker.mmdsRPCConn), closeListener(worker.data),
 			closeListener(worker.mmds), closeTable(worker.table),
 		)
 	})
@@ -318,8 +307,8 @@ func connectionFromFD(fd int, name string) (net.Conn, error) {
 }
 
 func workerDescriptors(fds workerFDMapping) map[int]struct{} {
-	result := make(map[int]struct{}, 7)
-	for _, fd := range []int{fds.Data, fds.Forward, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC} {
+	result := make(map[int]struct{}, 6)
+	for _, fd := range []int{fds.Data, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC} {
 		if fd >= 0 {
 			result[fd] = struct{}{}
 		}

@@ -13,7 +13,7 @@
 //     manifest-key allowlist management plus bounded secret PUT/DELETE. Authed by
 //     SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the socket's
 //     0600 permissions alone = same uid / root).
-//   - plugin (PUT /internal/plugin/{id}/register): a subscriber (an external proxy
+//   - plugin (PUT /internal/plugin/{id}/register): a subscriber (the independent proxy
 //     master, or a route observer such as the platform agent) registers its
 //     capabilities and holds the connection open as its route stream + lease (see
 //     internal/routesync). Authed by SO_PEERCRED peer pid ∈ plugin_pidfile (or socket
@@ -384,7 +384,7 @@ type Deps struct {
 	API                          http.Handler     // api plane (e2b control plane + export/import); the fallback
 	AdminPidfile                 string           // optional PID allowlist gating the admin plane ("" => socket perms only)
 	RouteSource                  routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
-	Plugins                      *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
+	Plugins                      *Registry        // plugin plane: live registration registry and Proxy route barrier
 	PluginPidfile                string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
 }
 

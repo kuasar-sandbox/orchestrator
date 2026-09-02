@@ -4,11 +4,9 @@
 // ports over the sandbox-ctl --connect UDS, everything else to floatingip:port.
 // Streaming-safe (no buffering).
 //
-// The same Proxy serves both deployment modes — only the Router differs:
-//   - internal: the orchestrator itself resolves the route (shared launch owner);
-//   - external: a proxy worker resolves it from the shared route view written by
-//     the proxy master (parking a request and prompting a Wake until the
-//     orchestrator resumes the sandbox).
+// A Proxy worker resolves routes from the shared view written by the Proxy
+// master, parking a request and prompting a Wake until the conductor resumes
+// the sandbox.
 package proxy
 
 import (
@@ -484,7 +482,7 @@ func trafficService(binding RouteBinding) ConnectService {
 
 // ParseSandbox extracts (sid, port) from the Host header <port>-<sid>.<domain>,
 // falling back to the E2b-Sandbox-Id / E2b-Sandbox-Port headers the SDK always
-// sets. Exported so the external-mode proxyForwarder can shard by sandbox id.
+// sets. Exported for callers that need the canonical ingress identity parser.
 func ParseSandbox(r *http.Request) (sid string, port int, ok bool) {
 	if h := r.Header.Get(HeaderSandboxID); h != "" {
 		sid = h

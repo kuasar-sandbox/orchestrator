@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -61,65 +60,17 @@ func TestArtifactLocationTreatsLocatedRefAsRemote(t *testing.T) {
 	}
 }
 
-func TestInternalRouteSelectsPurposeSpecificAccessToken(t *testing.T) {
-	o := &Orchestrator{reg: map[string]*types.Sandbox{
-		"e2b": {
-			ID: "e2b", Profile: types.ProfileE2B, State: types.StateRunning,
-			EnvdUDS: "/run/e2b/envd.sock", CiUDS: "/run/e2b/ci.sock", FloatingIP: "100.100.0.2",
-			EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
-		},
-		"bare": {
-			ID: "bare", Profile: types.ProfileBare, State: types.StateRunning, FloatingIP: "100.100.0.3",
-			EnvdAccessToken: "unused-envd", TrafficAccessToken: "unused-traffic", ForwardAccessToken: "bare-forward",
-		},
-	}}
-	tests := []struct {
-		sid       string
-		target    proxy.ConnectTarget
-		wantKind  proxy.Kind
-		wantToken string
-	}{
-		{"e2b", proxy.LegacyTarget(49983), proxy.KindUDS, "envd"},
-		{"e2b", proxy.LegacyTarget(49999), proxy.KindUDS, "envd"},
-		{"e2b", proxy.LegacyTarget(8080), proxy.KindTCP, "forward"},
-		{"bare", proxy.LegacyTarget(49983), proxy.KindTCP, "bare-forward"},
-		{"bare", proxy.LegacyTarget(49999), proxy.KindTCP, "bare-forward"},
-		{"bare", proxy.LegacyTarget(8080), proxy.KindTCP, "bare-forward"},
-		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 49983}, proxy.KindTCP, "forward"},
-		{"e2b", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd, Port: 8080}, proxy.KindUDS, "envd"},
-		{"bare", proxy.ConnectTarget{Service: proxy.ConnectServiceE2BEnvd}, proxy.KindDeny, ""},
-	}
-	for _, tc := range tests {
-		binding, found, err := o.LookupRoute(context.Background(), tc.sid, tc.target)
-		if err != nil || !found {
-			t.Fatalf("LookupRoute(%s, %+v): found=%v err=%v", tc.sid, tc.target, found, err)
-		}
-		if binding.Kind != tc.wantKind || binding.ExpectedAccessToken != tc.wantToken {
-			t.Fatalf("LookupRoute(%s, %+v) = %+v, want kind=%v token=%q", tc.sid, tc.target, binding, tc.wantKind, tc.wantToken)
-		}
-	}
-}
-
-func TestStartingSandboxServesMMDSButNotDataPlane(t *testing.T) {
+func TestStartingSandboxProjectsMMDS(t *testing.T) {
 	o := testOrch(t)
 	sb := &types.Sandbox{
 		ID: "starting", Profile: types.ProfileE2B, State: types.StateStarting,
 		TemplateID: "template", FloatingIP: "100.100.0.4", EnvdUDS: "/run/starting/envd.sock",
 		EnvdAccessToken: "envd", ForwardAccessToken: "forward", ManifestKey: strings.Repeat("4", 64),
 	}
-	o.cache(sb)
-	if sid, ok := o.ByFloatingIP(sb.FloatingIP); !ok || sid != sb.ID {
-		t.Fatalf("ByFloatingIP(starting) = %q ok=%v", sid, ok)
-	}
-	if templateID, token, ok := o.SandboxInfo(sb.ID); !ok || templateID != sb.TemplateID || token != sb.EnvdAccessToken {
-		t.Fatalf("SandboxInfo(starting) = %q %q ok=%v", templateID, token, ok)
-	}
-	if secret, ok := o.MmdsSecret(sb.ID); !ok || len(secret) == 0 {
-		t.Fatalf("MmdsSecret(starting) = %x ok=%v", secret, ok)
-	}
-	route, err := activateRouteForTest(context.Background(), o, sb.ID, proxy.LegacyTarget(49983))
-	if err != nil || route.Kind != proxy.KindNotFound {
-		t.Fatalf("Route(starting) = %+v err=%v, want not found until running", route, err)
+	got := o.routeEntry(sb)
+	if got.State != string(types.StateStarting) || got.FloatingIP != sb.FloatingIP ||
+		got.TemplateID != sb.TemplateID || got.EnvdAccessToken != sb.EnvdAccessToken || got.MmdsSecret == "" {
+		t.Fatalf("starting route projection = %+v", got)
 	}
 }
 
@@ -143,16 +94,6 @@ func TestOnWakeDoesNotRepublishDeletedCachedStarting(t *testing.T) {
 	}
 	if cached := o.lookup("deleted-starting"); cached != nil {
 		t.Fatalf("OnWake retained deleted starting cache = %+v", cached)
-	}
-}
-
-func TestInternalKnownExecDoesNotResumePausedSandboxBeforeIssue64(t *testing.T) {
-	o := &Orchestrator{reg: map[string]*types.Sandbox{
-		"paused": {ID: "paused", Profile: types.ProfileBare, State: types.StatePaused},
-	}}
-	binding, found, err := o.LookupRoute(context.Background(), "paused", proxy.ConnectTarget{Service: proxy.ConnectServiceExec})
-	if err != nil || !found || binding.Kind != proxy.KindDeny {
-		t.Fatalf("exec binding = %+v found=%v err=%v, want deny without resume", binding, found, err)
 	}
 }
 

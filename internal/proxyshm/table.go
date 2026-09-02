@@ -1,4 +1,4 @@
-// Package proxyshm stores the external proxy route view in shared memory.
+// Package proxyshm stores the independent Proxy route view in shared memory.
 //
 // The proxy master is the only writer. Worker processes mmap the same file
 // read-only and resolve routes locally on the data path. Each record is protected

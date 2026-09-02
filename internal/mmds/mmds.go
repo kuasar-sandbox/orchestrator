@@ -32,8 +32,8 @@ const (
 	maxHeaderBytes    = 16 * 1024
 )
 
-// Source is the trusted route view used by the internal proxy or an external
-// proxy worker. It must fail closed when its backing sync/store is unavailable.
+// Source is the trusted route view used by an independent proxy worker. It must
+// fail closed when its backing sync/store is unavailable.
 type Source interface {
 	MMDSAvailable() bool
 	ByFloatingIP(ip string) (sandboxID string, ok bool)

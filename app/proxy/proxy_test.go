@@ -43,6 +43,7 @@ func TestMasterConfigureAndBindRuntimeExactlyOnce(t *testing.T) {
 			configureCalls.Add(1)
 			retained = cfg
 			cfg.Paths.RunRoot = "/run/custom-proxy"
+			cfg.DataListen = "127.0.0.1:8443"
 			return nil
 		},
 		BindRuntime: func(_ context.Context, process Process, runtime *Runtime) error {
@@ -81,7 +82,11 @@ func TestMasterHookFailuresPrecedeCoreStartup(t *testing.T) {
 	for name, hooks := range map[string]Hooks{
 		"configure": {Configure: func(context.Context, *Config) error { return errors.New("configure failed") }},
 		"bind": {
-			Configure:   func(_ context.Context, cfg *Config) error { cfg.Paths.RunRoot = "/run/custom"; return nil },
+			Configure: func(_ context.Context, cfg *Config) error {
+				cfg.Paths.RunRoot = "/run/custom"
+				cfg.DataListen = "127.0.0.1:8443"
+				return nil
+			},
 			BindRuntime: func(context.Context, Process, *Runtime) error { return errors.New("bind failed") },
 		},
 	} {

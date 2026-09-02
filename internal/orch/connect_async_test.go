@@ -716,6 +716,7 @@ func newAsyncConnectTestOrchestrator(t *testing.T, cfg *config.Config, lc *count
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o.SetProxyRouteBarrierCoordinator(immediateRouteBarrierCoordinator{})
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

@@ -21,8 +21,8 @@ type routeLogEntry struct {
 }
 
 // This file makes the orchestrator the routesync.Source: it streams the route set,
-// publishes route changes to subscribed route-sync clients (one per external
-// proxy), and resumes a sandbox when a proxy wakes it. The orchestrator is the
+// publishes route changes to subscribed route-sync clients (including the independent
+// Proxy), and resumes a sandbox when that Proxy wakes it. The orchestrator is the
 // single route authority — proxies are caches.
 
 // routeEntry projects a sandbox into the wire route entry pushed to subscribers.
@@ -113,7 +113,7 @@ func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) 
 	}
 	// Builder sandboxes are deliberately synthetic rather than durable sandbox
 	// rows, but they are live MMDS principals for the duration of a build. Include
-	// them in a full snapshot so an external proxy restart converges exactly like
+	// them in a full snapshot so a Proxy restart converges exactly like
 	// the live Upsert path instead of losing builder MMDS until the build exits.
 	o.mu.Lock()
 	buildRows := make([]*types.Sandbox, 0, len(o.mmdsBuildOwners))

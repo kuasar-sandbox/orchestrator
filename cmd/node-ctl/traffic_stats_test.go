@@ -60,7 +60,7 @@ func TestExternalTrafficProviderUsesRegisteredMasterCache(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	plugin := &configsock.Plugin{ID: routesync.ProxyPluginID, Caps: routesync.Register{Proxy: &routesync.Proxy{
-		Socket: routesync.Socket{Path: "/run/proxy.sock"}, StatsSocket: &routesync.Socket{Path: socket},
+		StatsSocket: &routesync.Socket{Path: socket},
 	}}}
 	registry.Add(plugin)
 	stats, err := provider.SandboxTrafficStats(context.Background(), "s1", "run-1", types.ProfileBare, types.StateRunning)

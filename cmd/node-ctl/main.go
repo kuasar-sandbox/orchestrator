@@ -1,7 +1,7 @@
 // Command node-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
 //	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
-//	node-ctl proxy serve --config <proxy.yaml>                  # external data-plane proxy master
+//	node-ctl proxy serve --config <proxy.yaml>                  # independent data-plane Proxy master
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	                                                                    # in-unit launchers (not for humans)

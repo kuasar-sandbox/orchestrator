@@ -34,7 +34,7 @@ type Config = publicconfig.Conductor
 type TLSPurpose string
 
 const (
-	// TLSPurposeAPI requests the conductor's north/data-plane server material.
+	// TLSPurposeAPI requests the conductor's API server material.
 	TLSPurposeAPI TLSPurpose = "api"
 	// TLSPurposeNodeLinkClient requests registry node-link client material.
 	TLSPurposeNodeLinkClient TLSPurpose = "node-link-client"

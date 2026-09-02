@@ -1,6 +1,6 @@
-// Package orch is the orchestrator core. It ties together the store, systemd
-// launcher, vswitch and config generation, and implements api.Core (control
-// plane), proxy.Router (data plane) and configsock.Provider (dynamic config).
+// Package orch is the conductor core. It ties together the store, systemd
+// launcher, vswitch and config generation, and implements the control,
+// lifecycle, route-authority, and config-socket services.
 package orch
 
 import (
@@ -27,11 +27,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
-	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
-	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -84,7 +82,7 @@ type Orchestrator struct {
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
 	subSeq int
 	// routeBarriers is wired before any API or node-link listener starts. It is
-	// consulted only for external-mode fresh Create admission.
+	// consulted for every fresh Create admission.
 	routeBarriers routesync.RouteBarrierCoordinator
 
 	routeLogMu sync.Mutex
@@ -138,11 +136,8 @@ type Orchestrator struct {
 	// synthetic build sandbox id -> durable build owner id. Protected by mu
 	// alongside reg; never persisted or exported.
 	mmdsBuildOwners map[string]string
-	// Parsed once from conductor-owned mmds.services. Values are absolute Unix
-	// socket paths and never come from proxy.yaml or a tenant document.
-	mmdsServices   mmdssvc.Registry
-	buildAdmission buildAdmissionObservability
-	mx             *metrics.M
+	buildAdmission  buildAdmissionObservability
+	mx              *metrics.M
 }
 
 // DrainBuilds prevents new execution work and waits for every claimed or
@@ -177,7 +172,6 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 // provider is validated before this constructor and is never replaced by the
 // YAML or ambient AWS fallback inside the core.
 func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, files *filestore.Store, log *slog.Logger) *Orchestrator {
-	mmdsServices, _ := mmdssvc.BuildRegistry(cfg.MMDS.ServiceEndpoints())
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		sandboxReadyTimeout:       60 * time.Second,
@@ -192,7 +186,6 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		clusterBuilds:             map[string]*clusterBuild{},
 		buildEvents:               make(chan *routesync.BuildEvent, 64),
 		mmdsBuildOwners:           map[string]string{},
-		mmdsServices:              mmdsServices,
 		commitBuildTrigger:        st.CommitBuildTrigger,
 		removeBuildRuntimeDir:     os.RemoveAll,
 		now:                       time.Now,
@@ -220,7 +213,7 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 	return o.startRecoveredResumes(ctx)
 }
 
-// SetProxyRouteBarrierCoordinator wires the external proxy registration lease
+// SetProxyRouteBarrierCoordinator wires the independent Proxy registration lease
 // registry into Create admission. Wiring is immutable after serve starts.
 func (o *Orchestrator) SetProxyRouteBarrierCoordinator(c routesync.RouteBarrierCoordinator) {
 	o.routeBarriers = c
@@ -404,22 +397,18 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, err
 	}
 
-	var barrier routesync.RouteBarrier
-	if o.cfg.Proxy.Mode == config.ProxyExternal {
-		barrierStarted := time.Now()
-		if o.routeBarriers == nil {
-			err := configsock.ErrProxyRouteUnavailable
-			o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
-			return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
-		}
-		var err error
-		barrier, err = o.routeBarriers.BeginProxyRouteBarrier()
-		if err != nil {
-			o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
-			return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
-		}
-		defer barrier.Cancel()
+	barrierStarted := time.Now()
+	if o.routeBarriers == nil {
+		err := configsock.ErrProxyRouteUnavailable
+		o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
+		return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
 	}
+	barrier, err := o.routeBarriers.BeginProxyRouteBarrier()
+	if err != nil {
+		o.logProxyRouteBarrier(sb.ID, err, time.Since(barrierStarted))
+		return nil, nil, errors.Join(api.ErrProxyUnavailable, err)
+	}
+	defer barrier.Cancel()
 
 	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
@@ -447,35 +436,33 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	o.cache(initial)
 	o.publishUpsert(initial)
 	o.observeSandboxUpsert(initial)
-	if barrier != nil {
-		barrierStarted := time.Now()
-		o.publishRouteBarrier(barrier.ID())
-		// The barrier is bounded by proxy policy, caller cancellation, and node
-		// lifecycle shutdown. Its cleanup below deliberately uses an independent
-		// background context after any of these cancellation sources fires.
-		barrierCtx, cancelBarrier := context.WithTimeout(attempt.Context(), o.cfg.ParkTimeoutDur())
-		stopRequestCancel := context.AfterFunc(ctx, cancelBarrier)
-		barrierErr := barrier.Wait(barrierCtx)
-		stopRequestCancel()
-		cancelBarrier()
-		if barrierErr == nil {
-			barrierErr = barrier.Commit()
+	barrierStarted = time.Now()
+	o.publishRouteBarrier(barrier.ID())
+	// The barrier is bounded by proxy policy, caller cancellation, and node
+	// lifecycle shutdown. Its cleanup below deliberately uses an independent
+	// background context after any of these cancellation sources fires.
+	barrierCtx, cancelBarrier := context.WithTimeout(attempt.Context(), o.cfg.ParkTimeoutDur())
+	stopRequestCancel := context.AfterFunc(ctx, cancelBarrier)
+	barrierErr := barrier.Wait(barrierCtx)
+	stopRequestCancel()
+	cancelBarrier()
+	if barrierErr == nil {
+		barrierErr = barrier.Commit()
+	}
+	if barrierErr == nil {
+		if err := ctx.Err(); err != nil {
+			barrierErr = err
+		} else if err := attempt.Context().Err(); err != nil {
+			barrierErr = err
 		}
-		if barrierErr == nil {
-			if err := ctx.Err(); err != nil {
-				barrierErr = err
-			} else if err := attempt.Context().Err(); err != nil {
-				barrierErr = err
-			}
-		}
-		o.logProxyRouteBarrier(sb.ID, barrierErr, time.Since(barrierStarted))
-		if barrierErr != nil {
-			admissionErr := errors.Join(api.ErrProxyUnavailable, barrierErr)
-			rollbackErr := o.rollbackPreLaunchAdmission(sb.ID)
-			terminalErr := errors.Join(admissionErr, rollbackErr)
-			o.launches.Finish(attempt, terminalErr)
-			return nil, nil, terminalErr
-		}
+	}
+	o.logProxyRouteBarrier(sb.ID, barrierErr, time.Since(barrierStarted))
+	if barrierErr != nil {
+		admissionErr := errors.Join(api.ErrProxyUnavailable, barrierErr)
+		rollbackErr := o.rollbackPreLaunchAdmission(sb.ID)
+		terminalErr := errors.Join(admissionErr, rollbackErr)
+		o.launches.Finish(attempt, terminalErr)
+		return nil, nil, terminalErr
 	}
 	work := cloneSandbox(sb)
 	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
@@ -727,7 +714,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 			o.cache(bound)
 		}
 		// Assignment is not visible to the runner until this callback returns.
-		// Publish the incarnation-bound starting route first so an external MMDS
+		// Publish the incarnation-bound starting route first so a Proxy MMDS
 		// worker can mint tokens during mandatory envd initialization.
 		o.publishUpsert(bound)
 		o.observeSandboxUpsert(bound)
@@ -1162,7 +1149,7 @@ func (o *Orchestrator) killSandboxLocked(ctx context.Context, sb *types.Sandbox)
 	}
 	o.clearDeadlineIntent(sb.ID)
 	o.uncache(sb.ID)
-	o.publishDelete(sb.ID) // tell external proxies the route is gone
+	o.publishDelete(sb.ID) // tell Proxy subscribers the route is gone
 	o.observeSandboxDelete(sb)
 	return true, nil
 }
@@ -2654,48 +2641,6 @@ func (o *Orchestrator) mutateCached(id string, fn func(*types.Sandbox)) *types.S
 	fn(nb)
 	o.reg[id] = nb
 	return nb
-}
-
-// ByFloatingIP maps a guest's (SNAT'd) source floating IP to its starting/running
-// sandbox id for the in-process MMDS service (proxy_mode=internal). Starting must
-// be visible because envd consults MMDS during mandatory /init. A paused sandbox's
-// slot/floating IP is freed and may be reused, so paused remains excluded.
-func (o *Orchestrator) ByFloatingIP(ip string) (sandboxID string, ok bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	for _, sb := range o.reg {
-		if sb.FloatingIP == ip && (sb.State == types.StateStarting || sb.State == types.StateRunning) {
-			return sb.ID, true
-		}
-	}
-	return "", false
-}
-
-// SandboxInfo returns a starting/running sid's template id + access token
-// (mmds.Source, GET stage).
-func (o *Orchestrator) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if sb, ok := o.reg[sid]; ok && (sb.State == types.StateStarting || sb.State == types.StateRunning) {
-		return sb.TemplateID, sb.EnvdAccessToken, true
-	}
-	return "", "", false
-}
-
-// MmdsSecret derives sid's per-sandbox MMDS signing key for the in-process MMDS
-// service (proxy_mode=internal); implements mmds.Source. Deterministic from the
-// sandbox's manifest key + id (keys.MmdsSecret) — the same key any proxy worker
-// would derive. Not gated on running state (a GET verifies a token minted moments
-// earlier), but an unknown sandbox / missing manifest key yields ok=false.
-func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	sb, found := o.reg[sid]
-	if !found {
-		return nil, false
-	}
-	s := keys.MmdsSecret(sb.ManifestKey, sid)
-	return s, s != nil
 }
 
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {

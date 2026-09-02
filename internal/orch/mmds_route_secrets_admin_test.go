@@ -86,11 +86,6 @@ func TestMMDSRouteSecretAdminMutationPublishesCommittedValues(t *testing.T) {
 		t.Fatal("replacement value was not projected")
 	}
 
-	route, found, err := o.MMDSRoute(ctx, sb.ID, "/secret")
-	if err != nil || !found || !route.Present || string(route.Body) != "two" || route.ContentType != "application/json" {
-		t.Fatalf("internal route metadata mismatch: found=%t present=%t content-type=%q err=%v", found, route.Present, route.ContentType, err)
-	}
-
 	if err := o.DeleteMMDSRouteSecretValue(ctx, sb.ID, "declared"); err != nil {
 		t.Fatal(err)
 	}
@@ -104,10 +99,12 @@ func TestMMDSRouteSecretAdminMutationPublishesCommittedValues(t *testing.T) {
 	if err := o.DeleteMMDSRouteSecretValue(ctx, sb.ID, "declared"); err != nil {
 		t.Fatal(err)
 	}
-	receiveMMDSAdminUpsert(t, events)
-	route, found, err = o.MMDSRoute(ctx, sb.ID, "/secret")
-	if err != nil || !found || route.Present {
-		t.Fatalf("deleted route metadata mismatch: found=%t present=%t err=%v", found, route.Present, err)
+	idempotent := receiveMMDSAdminUpsert(t, events)
+	if idempotent.MMDSRouteSecretValues == nil {
+		t.Fatal("idempotent delete projected an unavailable value view")
+	}
+	if _, exists := (*idempotent.MMDSRouteSecretValues)["declared"]; exists {
+		t.Fatal("idempotent delete restored the value")
 	}
 }
 

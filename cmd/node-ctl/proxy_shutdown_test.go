@@ -266,13 +266,12 @@ func TestProxyMasterRepeatedShutdownReapsWorkersAndListeners(t *testing.T) {
 paths:
   run_root: %s
 data_listen: %s
-proxy_socket: %s
 shm_path: %s
 route_capacity: 16
 workers: 2
 auth: off
 park_timeout: 100ms
-`, configSocket, filepath.Join(dir, "run"), dataAddr, filepath.Join(dir, "proxy.sock"), filepath.Join(dir, "proxy-routes.shm"))
+`, configSocket, filepath.Join(dir, "run"), dataAddr, filepath.Join(dir, "proxy-routes.shm"))
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -420,13 +419,12 @@ func TestProxyWorkerRuntimeFailureDoesNotBecomeReady(t *testing.T) {
 paths:
   run_root: %s
 data_listen: %s
-proxy_socket: %s
 shm_path: %s
 route_capacity: 16
 workers: 1
 auth: off
 park_timeout: 100ms
-`, configSocket, filepath.Join(dir, "run"), dataAddr, filepath.Join(dir, "proxy.sock"), filepath.Join(dir, "proxy-routes.shm"))
+`, configSocket, filepath.Join(dir, "run"), dataAddr, filepath.Join(dir, "proxy-routes.shm"))
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -165,13 +165,13 @@ func (l *acceptingListener) Accept() (net.Conn, error) {
 }
 
 type preparedWorkerHarness struct {
-	worker        *PreparedWorker
-	table         *proxyshm.Table
-	forward, data *acceptingListener
-	notifyWrite   *os.File
-	wakeRead      *os.File
-	statsMaster   net.Conn
-	mmdsMaster    net.Conn
+	worker      *PreparedWorker
+	table       *proxyshm.Table
+	data        *acceptingListener
+	notifyWrite *os.File
+	wakeRead    *os.File
+	statsMaster net.Conn
+	mmdsMaster  net.Conn
 }
 
 func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
@@ -194,18 +194,13 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 	}
 	statsMaster, statsWorker := net.Pipe()
 	mmdsMaster, mmdsWorker := net.Pipe()
-	forwardBase, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	dataBase, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	forward := &acceptingListener{Listener: forwardBase}
 	data := &acceptingListener{Listener: dataBase}
 	harness := &preparedWorkerHarness{
-		table: table, forward: forward, data: data, notifyWrite: notifyWrite,
+		table: table, data: data, notifyWrite: notifyWrite,
 		wakeRead: wakeRead, statsMaster: statsMaster, mmdsMaster: mmdsMaster,
 	}
 	harness.worker = &PreparedWorker{
@@ -215,7 +210,7 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 		},
 		table: table, wakeFile: wakeWrite, notifyFile: notifyRead,
 		statsConn: statsWorker, mmdsRPCConn: mmdsWorker,
-		forward: forward, data: data,
+		data: data,
 	}
 	go func() { _, _ = io.Copy(io.Discard, statsMaster) }()
 	t.Cleanup(func() {
@@ -228,7 +223,7 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 	return harness
 }
 
-func TestPreparedWorkerWaitsForSyncThenUsesOneWrapperForBothListeners(t *testing.T) {
+func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 	harness := newPreparedWorkerHarness(t)
 	started := make(chan proxyextension.WorkerHost, 1)
 	startContext := make(chan context.Context, 1)
@@ -296,7 +291,6 @@ func TestPreparedWorkerWaitsForSyncThenUsesOneWrapperForBothListeners(t *testing
 			t.Fatalf("response=%d headers=%v", response.StatusCode, response.Header)
 		}
 	}
-	request(harness.forward.Addr().String())
 	request(harness.data.Addr().String())
 	standardRequest, err := http.NewRequest(http.MethodGet, "http://"+harness.data.Addr().String()+"/standard", nil)
 	if err != nil {
@@ -312,8 +306,8 @@ func TestPreparedWorkerWaitsForSyncThenUsesOneWrapperForBothListeners(t *testing
 	if standardResponse.StatusCode != http.StatusUnauthorized || standardResponse.Header.Get(internalproxy.HeaderProxyError) != internalproxy.ProxyErrorUnauthorized {
 		t.Fatalf("standard next response=%d headers=%v", standardResponse.StatusCode, standardResponse.Header)
 	}
-	if extension.calls.Load() != 1 || extension.wrapCalls.Load() != 1 || harness.forward.accepts.Load() == 0 || harness.data.accepts.Load() == 0 {
-		t.Fatalf("Start=%d Wrap=%d forward accepts=%d data accepts=%d", extension.calls.Load(), extension.wrapCalls.Load(), harness.forward.accepts.Load(), harness.data.accepts.Load())
+	if extension.calls.Load() != 1 || extension.wrapCalls.Load() != 1 || harness.data.accepts.Load() == 0 {
+		t.Fatalf("Start=%d Wrap=%d data accepts=%d", extension.calls.Load(), extension.wrapCalls.Load(), harness.data.accepts.Load())
 	}
 	extensionCtx := <-startContext
 	cancel()
@@ -346,7 +340,7 @@ func TestPreparedWorkerStartFailureDoesNotServeListeners(t *testing.T) {
 	if !errors.Is(err, want) {
 		t.Fatalf("Run error=%v", err)
 	}
-	if extension.calls.Load() != 1 || harness.forward.accepts.Load() != 0 || harness.data.accepts.Load() != 0 {
-		t.Fatalf("Start=%d forward accepts=%d data accepts=%d", extension.calls.Load(), harness.forward.accepts.Load(), harness.data.accepts.Load())
+	if extension.calls.Load() != 1 || harness.data.accepts.Load() != 0 {
+		t.Fatalf("Start=%d data accepts=%d", extension.calls.Load(), harness.data.accepts.Load())
 	}
 }

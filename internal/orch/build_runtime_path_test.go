@@ -24,7 +24,7 @@ func TestBuildRuntimeDirUsesCompleteOpaqueIdentityAndBoundsPhaseSockets(t *testi
 		t.Fatalf("opaque BuildID escaped run root: %q", got)
 	}
 
-	// This mirrors the longest external-proxy E2E root and sandbox launch
+	// This mirrors the longest independent-Proxy E2E root and sandbox launch
 	// socket. The previous full-BuildID directory exceeded Linux sun_path even
 	// after phase Sandbox IDs were compacted.
 	runRoot := "/tmp/e2e-orch-proxy-XXXXXX/run"

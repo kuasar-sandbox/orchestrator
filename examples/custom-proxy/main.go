@@ -1,4 +1,4 @@
-// Command custom-proxy is the minimal statically customized external proxy.
+// Command custom-proxy is the minimal statically customized independent Proxy.
 // It must be selected by paths.proxy_executable and invoked through
 // `node-ctl proxy serve`; direct execution is rejected by the App.
 package main
