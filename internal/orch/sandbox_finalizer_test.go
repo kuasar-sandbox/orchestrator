@@ -724,6 +724,90 @@ func TestPauseStartsLiveRetryForRetainedRunDir(t *testing.T) {
 	}
 }
 
+func TestPausedCleanupRetainsOwnershipAtUnitAndNetworkFailures(t *testing.T) {
+	fault := errors.New("injected paused ownership cleanup failure")
+	for _, test := range []struct {
+		name              string
+		inject            func(*sandboxFinalizerFixture)
+		clear             func(*sandboxFinalizerFixture)
+		wantRunnerCleared bool
+	}{
+		{
+			name:   "stop",
+			inject: func(f *sandboxFinalizerFixture) { f.lc.stopErr = fault },
+			clear:  func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+		},
+		{
+			name:   "reset",
+			inject: func(f *sandboxFinalizerFixture) { f.lc.resetErr = fault },
+			clear:  func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+		},
+		{
+			name:              "detach",
+			inject:            func(f *sandboxFinalizerFixture) { f.vs.detachErr = fault },
+			clear:             func(f *sandboxFinalizerFixture) { f.vs.clearFault() },
+			wantRunnerCleared: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSandboxFinalizerFixture(t, "paused-cleanup-"+test.name)
+			fixture.sb.State = types.StatePaused
+			fixture.sb.ResumeSource = types.ResumeSource{
+				Kind: types.ResumeSourceSnapshot,
+				Ref:  "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			}
+			if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+				t.Fatal(err)
+			}
+			originalRunID := fixture.sb.RunID
+			originalPort := fixture.sb.VswitchPort
+			test.inject(&fixture)
+
+			if err := fixture.o.cleanupPausedOwnership(context.Background(), fixture.sb); !errors.Is(err, fault) {
+				t.Fatalf("cleanup error = %v, want %v", err, fault)
+			}
+			retained, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+			if err != nil || retained == nil || retained.State != types.StatePaused ||
+				retained.ResumeSource != fixture.sb.ResumeSource || retained.VswitchPort != originalPort ||
+				retained.RunDir != fixture.sb.RunDir || retained.BaseDir != fixture.sb.BaseDir {
+				t.Fatalf("retained paused ownership = %+v, %v", retained, err)
+			}
+			if test.wantRunnerCleared {
+				if retained.RunID != "" {
+					t.Fatalf("completed runner cleanup retained RunID %q", retained.RunID)
+				}
+			} else if retained.RunID != originalRunID {
+				t.Fatalf("failed runner cleanup changed RunID to %q", retained.RunID)
+			}
+			for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("failed cleanup removed owned path %s: %v", path, err)
+				}
+			}
+
+			test.clear(&fixture)
+			if err := fixture.o.cleanupPausedOwnership(context.Background(), retained); err != nil {
+				t.Fatalf("retry cleanup: %v", err)
+			}
+			cleaned, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+			if err != nil || cleaned == nil || cleaned.State != types.StatePaused || cleaned.RunID != "" ||
+				cleaned.VswitchPort != "" || cleaned.FloatingIP != "" || cleaned.InnerIP != "" ||
+				cleaned.PortMAC != "" || cleaned.RunDir != "" || cleaned.EnvdUDS != "" || cleaned.CiUDS != "" {
+				t.Fatalf("retried paused cleanup = %+v, %v", cleaned, err)
+			}
+			if cleaned.BaseDir != fixture.sb.BaseDir || cleaned.ResumeSource != fixture.sb.ResumeSource {
+				t.Fatalf("retry changed paused artifact ownership = %+v", cleaned)
+			}
+			if _, err := os.Stat(fixture.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("retry retained RunDir: %v", err)
+			}
+			if _, err := os.Stat(fixture.sb.BaseDir); err != nil {
+				t.Fatalf("retry removed BaseDir: %v", err)
+			}
+		})
+	}
+}
+
 func TestKillFinalizesFullyCleanedPausedSandbox(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "delete-clean-paused")
 	runDir := fixture.sb.RunDir
