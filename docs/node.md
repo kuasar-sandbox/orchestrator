@@ -192,8 +192,8 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 不 sanitize，也没有旧路径 fallback/migration。registered/waiting 不建目录，execution claim
 后才创建；所有 Build image 与 Sandbox/Snapshot artifact 位于
 `BuildBaseDir/checkpoint`。本机普通 Sandbox capture 位于 `BaseDir/checkpoint`。配置校验要求
-自定义 RunRoot 在 48-byte BuildID 下仍容纳最长 phase socket（Linux pathname 上限 107 bytes），
-不会按 root 动态改变 BuildID 合同。
+自定义 RunRoot 在最大 SandboxID 下容纳 sandboxer 的最长 socket，并在 48-byte BuildID 下容纳
+最长 phase socket（Linux pathname 上限 107 bytes）；不会按 root 动态改变身份长度合同。
 
 ## 2. 命令行接口
 

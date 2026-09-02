@@ -73,7 +73,7 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
-WORK="$(mktemp -d /tmp/e2e-orch-proxy-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()

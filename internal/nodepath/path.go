@@ -62,6 +62,22 @@ func BuildCheckpointDir(baseRoot, buildID string) string {
 	return filepath.Join(BuildBaseDir(baseRoot, buildID), "checkpoint")
 }
 
+// ValidateSandboxRunRoot verifies that the maximum logical SandboxID still
+// leaves room for sandboxer's longest socket beneath this node RunRoot.
+func ValidateSandboxRunRoot(runRoot string) error {
+	path := maximumSandboxSocketPath(runRoot)
+	if len(path) > MaxUnixSocketPathBytes {
+		return fmt.Errorf("maximum Sandbox socket path is %d bytes (limit %d): %s",
+			len(path), MaxUnixSocketPathBytes, path)
+	}
+	return nil
+}
+
+func maximumSandboxSocketPath(runRoot string) string {
+	sandboxID := strings.Repeat("s", types.MaxLocalSandboxIDBytes)
+	return filepath.Join(SandboxRunDir(runRoot, sandboxID), "vsock.sock_5000")
+}
+
 // ValidateBuildRunRoot verifies that the fixed maximum BuildID still leaves
 // room for the longest phase socket beneath this node RunRoot. BuildID's
 // canonical limit remains independent of operator configuration.

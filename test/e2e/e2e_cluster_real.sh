@@ -109,7 +109,7 @@ if ! command -v mkfs.erofs >/dev/null 2>&1; then
     export PATH="$BIN:$PATH"
 fi
 
-WORK="$(mktemp -d /tmp/e2e-cr-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()

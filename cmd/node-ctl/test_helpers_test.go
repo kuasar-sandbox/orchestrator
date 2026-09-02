@@ -9,7 +9,7 @@ import (
 // when the test name itself is long.
 func shortNodeCtlTestDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "node-ctl-test-")
+	dir, err := os.MkdirTemp("/tmp", "nc-")
 	if err != nil {
 		t.Fatal(err)
 	}

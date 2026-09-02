@@ -71,7 +71,8 @@ hash、路径 fallback 或旧目录迁移。registered/waiting Build 不创建�
 claim 后才创建；镜像、Sandbox/Snapshot artifact 全部进入
 `BuildBaseDir/checkpoint`。本机 Sandbox snapshot/export 固定写入
 `BaseDir/checkpoint`，不再配置独立的 `checkpoint.local_dir`。自定义 RunRoot 必须让最大
-BuildID 的最长 phase socket 不超过 Linux 107-byte pathname 上限；配置加载会 fail closed。
+SandboxID 的 sandboxer socket 与最大 BuildID 的最长 phase socket 都不超过 Linux 107-byte
+pathname 上限；配置加载会 fail closed。
 
 ## 组成
 

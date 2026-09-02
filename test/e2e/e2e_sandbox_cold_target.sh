@@ -67,7 +67,7 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
     TAP_CREATED_BY_TEST=1
 fi
 
-WORK="$(mktemp -d /tmp/e2e-target-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 DAEMON_PID=""
 SBPID=""
 cleanup_target() {

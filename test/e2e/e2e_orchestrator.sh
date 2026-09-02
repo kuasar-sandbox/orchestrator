@@ -50,7 +50,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-WORK="$(mktemp -d /tmp/e2e-orch-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 PROXY_PORT="${PROXY_PORT:-$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')}"
 UNIT_DIR="$WORK/units"           # transient unit_dir (not /etc) so the test is self-contained
 mkdir -p "$UNIT_DIR"

@@ -68,7 +68,7 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run make vmlinux)"
 
-WORK="$(mktemp -d /tmp/e2e-density-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 mkdir -p "$WORK/run" "$WORK/lib"   # serve's run/base roots (sandboxes still use /run/sandbox directly)
 DAEMON_PID=""
 declare -a SANDBOX_PIDS=()

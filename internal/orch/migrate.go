@@ -255,6 +255,10 @@ func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.Res
 	if sb == nil || sb.ID == "" || sb.BaseDir == "" {
 		return "", fmt.Errorf("export-sandbox: local artifact owner is incomplete")
 	}
+	wantBaseDir := nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sb.ID)
+	if sb.BaseDir != wantBaseDir {
+		return "", fmt.Errorf("export-sandbox: sandbox BaseDir %q does not match canonical path %q", sb.BaseDir, wantBaseDir)
+	}
 	var suffix string
 	switch source.Kind {
 	case types.ResumeSourceSandbox:
@@ -264,7 +268,7 @@ func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.Res
 	default:
 		return "", fmt.Errorf("export-sandbox: invalid local resume source kind %q", source.Kind)
 	}
-	dir := filepath.Clean(filepath.Join(sb.BaseDir, "checkpoint"))
+	dir := filepath.Join(wantBaseDir, "checkpoint")
 	wantRef := filepath.Join(dir, sb.ID+suffix)
 	if filepath.Clean(source.Ref) != wantRef {
 		return "", fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", source.Kind)

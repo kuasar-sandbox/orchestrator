@@ -104,7 +104,7 @@ BUILDER_EXECUTION_CPU_MILLI=$((BUILDER_EXECUTION_CPU * 1000))
 BUILDER_REGISTRATION_CPU=$((BUILDER_CPU * 16))
 BUILDER_REGISTRATION_CPU_MILLI=$((BUILDER_REGISTRATION_CPU * 1000))
 
-WORK="$(mktemp -d /tmp/e2e-builder-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 # Units must live in a real systemd load path; we only remove what we created.
 UNIT_DIR="/run/systemd/system"

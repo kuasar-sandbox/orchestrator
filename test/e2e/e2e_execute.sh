@@ -94,7 +94,7 @@ if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 # no longer introduces a second CPU bottleneck around snapshot teardown.
 BUILDER_CPU="$(nproc)"
 
-WORK="$(mktemp -d /tmp/e2e-exec-XXXXXX)"
+WORK="$(mktemp -d /tmp/e-XXXXXX)"
 TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)

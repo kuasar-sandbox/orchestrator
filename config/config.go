@@ -1071,6 +1071,9 @@ func (c *Conductor) validateDeclarative() error {
 	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
 		return fmt.Errorf("config: paths.conductor_executable must be absolute")
 	}
+	if err := nodepath.ValidateSandboxRunRoot(c.Paths.RunRoot); err != nil {
+		return fmt.Errorf("config: paths.run_root: %w", err)
+	}
 	if err := nodepath.ValidateBuildRunRoot(c.Paths.RunRoot); err != nil {
 		return fmt.Errorf("config: paths.run_root: %w", err)
 	}

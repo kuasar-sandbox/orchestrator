@@ -51,6 +51,22 @@ func TestMaximumBuildIDLeavesDefaultPhaseSocketsWithinUnixLimit(t *testing.T) {
 	}
 }
 
+func TestValidateSandboxRunRootBoundsLongestSocket(t *testing.T) {
+	root := "/r"
+	for len(maximumSandboxSocketPath(root)) < MaxUnixSocketPathBytes {
+		root += "r"
+	}
+	if got := len(maximumSandboxSocketPath(root)); got != MaxUnixSocketPathBytes {
+		t.Fatalf("boundary socket path has %d bytes, want %d", got, MaxUnixSocketPathBytes)
+	}
+	if err := ValidateSandboxRunRoot(root); err != nil {
+		t.Fatalf("boundary RunRoot: %v", err)
+	}
+	if err := ValidateSandboxRunRoot(root + "r"); err == nil {
+		t.Fatal("RunRoot producing an overlong Sandbox socket was accepted")
+	}
+}
+
 func TestValidateBuildRunRootBoundsLongestPhaseSocket(t *testing.T) {
 	root := "/r"
 	for len(maximumBuildPhaseSocketPath(root)) < MaxUnixSocketPathBytes {
