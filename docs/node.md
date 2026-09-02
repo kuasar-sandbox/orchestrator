@@ -191,7 +191,9 @@ YAML、runtime config、CH 小型 snap-stage state 与小型临时 JSON。BaseRo
 `BuildRunDir`/`BuildBaseDir` 由两个 root 与 BuildID 唯一派生，不写入 Build row，不 hash、
 不 sanitize，也没有旧路径 fallback/migration。registered/waiting 不建目录，execution claim
 后才创建；所有 Build image 与 Sandbox/Snapshot artifact 位于
-`BuildBaseDir/checkpoint`。本机普通 Sandbox capture 位于 `BaseDir/checkpoint`。
+`BuildBaseDir/checkpoint`。本机普通 Sandbox capture 位于 `BaseDir/checkpoint`。配置校验要求
+自定义 RunRoot 在 48-byte BuildID 下仍容纳最长 phase socket（Linux pathname 上限 107 bytes），
+不会按 root 动态改变 BuildID 合同。
 
 ## 2. 命令行接口
 
@@ -435,7 +437,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `encryption_key` | 内置模式必填 | APISecret/ManifestKey 凭据对落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);优先级为 custom Runtime provider > `NODE_CONFIG_ENCRYPTION_KEY` > YAML，provider 失败不回退 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.conductor_executable` | 空 | 静态定制 conductor 的绝对 executable；空使用内置实现。`node-ctl config` 只诊断 regular/executable、非 group/world-writable、非 node-ctl same-file 元数据，不按诊断 EUID 判断 owner；实际 dispatch 中 root node-ctl 只接受 root-owned，非 root node-ctl 接受 root-owned 或本 EUID-owned。它执行已打开并校验的同一 FD，失败绝不回退 |
-| `paths.run_root` | `/run/sandbox` | 节点 RunRoot:node-level 小文件、`runners/`、`sandboxes/`、`builds/`；通常为 tmpfs(§1.6) |
+| `paths.run_root` | `/run/sandbox` | 节点 RunRoot:node-level 小文件、`runners/`、`sandboxes/`、`builds/`；通常为 tmpfs；必须为最大 BuildID 的最长 phase UDS 留出 107-byte Linux pathname 预算(§1.6) |
 | `paths.base_root` | `/var/lib/sandbox` | 节点 BaseRoot:node-level 持久文件与 `sandboxes/`、`builds/` 大体积数据(§1.6) |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
 | `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI,Proxy 与平台 agent 的连接点 |

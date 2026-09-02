@@ -522,6 +522,13 @@ checkpoint:
 	}
 }
 
+func TestLoadRejectsRunRootTooLongForMaximumBuildID(t *testing.T) {
+	_, err := DecodeConductor(strings.NewReader(fmt.Sprintf("paths: { run_root: /%s }\n", strings.Repeat("r", 80))))
+	if err == nil || !strings.Contains(err.Error(), "maximum Build phase socket path") {
+		t.Fatalf("overlong paths.run_root error = %v", err)
+	}
+}
+
 func TestLoadRejectsUnsupportedCheckpointModes(t *testing.T) {
 	base := `
 api:

@@ -24,6 +24,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"gopkg.in/yaml.v3"
@@ -1069,6 +1070,9 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 func (c *Conductor) validateDeclarative() error {
 	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
 		return fmt.Errorf("config: paths.conductor_executable must be absolute")
+	}
+	if err := nodepath.ValidateBuildRunRoot(c.Paths.RunRoot); err != nil {
+		return fmt.Errorf("config: paths.run_root: %w", err)
 	}
 	dynamicResources := c.ResourceListen != nil && c.ResourceListen.Enabled
 	if err := sandboxcfg.ValidateNodeResourcePolicy(c.Sandbox.Resources.nodeResourcePolicy(), dynamicResources); err != nil {

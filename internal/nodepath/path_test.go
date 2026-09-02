@@ -42,9 +42,27 @@ func TestMaximumBuildIDLeavesDefaultPhaseSocketsWithinUnixLimit(t *testing.T) {
 		filepath.Join(BuildRunDir("/run/sandbox", buildID), "b", "envd-steps.sock"),
 		filepath.Join(BuildRunDir("/run/sandbox", buildID), "c", "envd.sock"),
 	} {
-		// sockaddr_un.sun_path is 108 bytes on Linux, including the terminating NUL.
-		if len(socket) >= 108 {
+		if len(socket) > MaxUnixSocketPathBytes {
 			t.Fatalf("maximum BuildID socket path has %d bytes: %q", len(socket), socket)
 		}
+	}
+	if err := ValidateBuildRunRoot("/run/sandbox"); err != nil {
+		t.Fatalf("default RunRoot: %v", err)
+	}
+}
+
+func TestValidateBuildRunRootBoundsLongestPhaseSocket(t *testing.T) {
+	root := "/r"
+	for len(maximumBuildPhaseSocketPath(root)) < MaxUnixSocketPathBytes {
+		root += "r"
+	}
+	if got := len(maximumBuildPhaseSocketPath(root)); got != MaxUnixSocketPathBytes {
+		t.Fatalf("boundary socket path has %d bytes, want %d", got, MaxUnixSocketPathBytes)
+	}
+	if err := ValidateBuildRunRoot(root); err != nil {
+		t.Fatalf("boundary RunRoot: %v", err)
+	}
+	if err := ValidateBuildRunRoot(root + "r"); err == nil {
+		t.Fatal("RunRoot producing an overlong Build phase socket was accepted")
 	}
 }

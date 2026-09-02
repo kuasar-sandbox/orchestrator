@@ -1,12 +1,22 @@
 // Package nodepath is the single authority for node-local object paths.
 package nodepath
 
-import "path/filepath"
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+)
 
 const (
 	runnersDir   = "runners"
 	sandboxesDir = "sandboxes"
 	buildsDir    = "builds"
+
+	// MaxUnixSocketPathBytes leaves the terminating NUL required by Linux's
+	// 108-byte sockaddr_un.sun_path.
+	MaxUnixSocketPathBytes = 107
 )
 
 // RunnerRoot returns the directory containing run-id pool pidfiles.
@@ -50,4 +60,21 @@ func BuildBaseDir(baseRoot, buildID string) string {
 // BuildCheckpointDir contains Build images and Sandbox/Snapshot artifacts.
 func BuildCheckpointDir(baseRoot, buildID string) string {
 	return filepath.Join(BuildBaseDir(baseRoot, buildID), "checkpoint")
+}
+
+// ValidateBuildRunRoot verifies that the fixed maximum BuildID still leaves
+// room for the longest phase socket beneath this node RunRoot. BuildID's
+// canonical limit remains independent of operator configuration.
+func ValidateBuildRunRoot(runRoot string) error {
+	path := maximumBuildPhaseSocketPath(runRoot)
+	if len(path) > MaxUnixSocketPathBytes {
+		return fmt.Errorf("maximum Build phase socket path is %d bytes (limit %d): %s",
+			len(path), MaxUnixSocketPathBytes, path)
+	}
+	return nil
+}
+
+func maximumBuildPhaseSocketPath(runRoot string) string {
+	buildID := strings.Repeat("B", types.MaxBuildIDBytes)
+	return filepath.Join(BuildRunDir(runRoot, buildID), "b", "envd-steps.sock")
 }
