@@ -39,11 +39,13 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 
 // startSandboxDeleteFinalizer coalesces repeated direct/cluster Delete calls.
 // Once deleting is durable, cleanup outlives the request context and retries
-// until success. DrainSandboxDeletes keeps process dependencies open for these
-// accepted finalizers during orderly shutdown; a crash is recovered from the
-// unchanged deleting row by ReconcileSandboxes.
+// while this node process remains live. Lifecycle shutdown stops later retries
+// after the bounded current attempt; the unchanged deleting row is recovered by
+// ReconcileSandboxes in the next process. DrainSandboxDeletes keeps process
+// dependencies open only until those accepted workers have quiesced.
 func (o *Orchestrator) startSandboxDeleteFinalizer(sid string) {
-	finish, err := o.deleteOps.Begin(context.Background())
+	lifecycleCtx := o.launchContext()
+	finish, err := o.deleteOps.Begin(lifecycleCtx)
 	if err != nil {
 		// Admission can be closed only during shutdown. The deleting row remains
 		// the restart owner, so declining a new goroutine cannot lose cleanup.
@@ -66,10 +68,17 @@ func (o *Orchestrator) startSandboxDeleteFinalizer(sid string) {
 		defer finish()
 		delay := launchCleanupRetryMin
 		for {
-			if err := o.finalizeSandboxDeleteOnce(context.Background(), sid); err != nil {
+			if lifecycleCtx.Err() != nil {
+				o.abandonSandboxDeleteWorker(sid)
+				return
+			}
+			if err := o.finalizeSandboxDeleteOnce(lifecycleCtx, sid); err != nil {
 				o.log.Error("sandbox delete cleanup incomplete; retrying",
 					"sid", sid, "retry_in", delay, "err", err)
-				waitLaunchCleanupRetry(delay)
+				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
+					o.abandonSandboxDeleteWorker(sid)
+					return
+				}
 				delay = nextLaunchCleanupRetry(delay)
 				continue
 			}
@@ -78,7 +87,10 @@ func (o *Orchestrator) startSandboxDeleteFinalizer(sid string) {
 			if err != nil {
 				o.log.Error("sandbox delete worker retirement failed; retrying",
 					"sid", sid, "retry_in", delay, "err", err)
-				waitLaunchCleanupRetry(delay)
+				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
+					o.abandonSandboxDeleteWorker(sid)
+					return
+				}
 				delay = nextLaunchCleanupRetry(delay)
 				continue
 			}
@@ -120,6 +132,16 @@ func (o *Orchestrator) DrainSandboxDeletes(ctx context.Context) error {
 	return o.deleteOps.Drain(ctx)
 }
 
+// abandonSandboxDeleteWorker runs only after lifecycle cancellation. New
+// finalizer admission is closed by that same context, so removing the process-
+// local coalescing entry cannot lose a successor worker. The durable deleting
+// row remains the restart owner.
+func (o *Orchestrator) abandonSandboxDeleteWorker(sid string) {
+	o.deleteMu.Lock()
+	delete(o.deleteActive, sid)
+	o.deleteMu.Unlock()
+}
+
 // startPausedCleanupRetry coalesces cleanup for a paused row whose exact
 // runner, network, or RunDir owner could not yet be released and persisted.
 // The worker is part of acceptedOps so orderly shutdown keeps dependencies
@@ -156,7 +178,7 @@ func (o *Orchestrator) startPausedCleanupRetry(sid string) {
 			if err := o.finalizePausedCleanupOnce(sid); err != nil {
 				o.log.Error("paused sandbox ownership cleanup incomplete; retrying",
 					"sid", sid, "retry_in", delay, "err", err)
-				if !waitPausedCleanupRetry(lifecycleCtx, delay) {
+				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
 					o.abandonPausedCleanupWorker(sid)
 					return
 				}
@@ -168,7 +190,7 @@ func (o *Orchestrator) startPausedCleanupRetry(sid string) {
 			if err != nil {
 				o.log.Error("paused sandbox cleanup worker retirement failed; retrying",
 					"sid", sid, "retry_in", delay, "err", err)
-				if !waitPausedCleanupRetry(lifecycleCtx, delay) {
+				if !waitSandboxCleanupRetry(lifecycleCtx, delay) {
 					o.abandonPausedCleanupWorker(sid)
 					return
 				}
@@ -183,7 +205,7 @@ func (o *Orchestrator) startPausedCleanupRetry(sid string) {
 	}()
 }
 
-func waitPausedCleanupRetry(ctx context.Context, delay time.Duration) bool {
+func waitSandboxCleanupRetry(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {

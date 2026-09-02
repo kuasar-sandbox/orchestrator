@@ -357,6 +357,60 @@ func TestKillDurablyAcceptsDeletingAndRetriesToTerminalObservation(t *testing.T)
 	}
 }
 
+func TestSandboxDeleteRetryQuiescesOnShutdownAndRestartReconciles(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-shutdown-restart")
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(lifecycleCtx)
+	fault := errors.New("injected persistent BaseDir cleanup failure")
+	attempted := make(chan struct{}, 1)
+	fixture.o.removeSandboxBaseDir = func(string) error {
+		select {
+		case attempted <- struct{}{}:
+		default:
+		}
+		return fault
+	}
+
+	if killed, err := fixture.o.Kill(context.Background(), fixture.sb.ID, fixture.apiKey); err != nil || !killed {
+		t.Fatalf("Kill = %t, %v", killed, err)
+	}
+	select {
+	case <-attempted:
+	case <-time.After(time.Second):
+		t.Fatal("delete worker did not reach the persistent cleanup failure")
+	}
+	assertDeletingOwnership(t, fixture)
+
+	// Orderly shutdown must not wait forever for a resource that this process
+	// cannot release. The deleting row is the durable handoff to startup.
+	cancelLifecycle()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
+	defer cancelDrain()
+	if err := fixture.o.DrainSandboxDeletes(drainCtx); err != nil {
+		t.Fatalf("DrainSandboxDeletes after lifecycle cancellation: %v", err)
+	}
+	fixture.o.deleteMu.Lock()
+	_, active := fixture.o.deleteActive[fixture.sb.ID]
+	fixture.o.deleteMu.Unlock()
+	if active {
+		t.Fatal("shutdown retained a process-local delete retry worker")
+	}
+	assertDeletingOwnership(t, fixture)
+
+	lc := &sandboxFinalizerLauncher{unit: fixture.lc.unit, state: "inactive"}
+	vs := &sandboxFinalizerVS{detached: true}
+	restarted := New(fixture.o.cfg, fixture.o.st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := restarted.ReconcileSandboxes(context.Background()); err != nil {
+		t.Fatalf("restart reconcile: %v", err)
+	}
+	if got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID); err != nil || got != nil {
+		t.Fatalf("restart finalizer row = %+v, %v", got, err)
+	}
+	if _, err := os.Stat(fixture.sb.BaseDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restart retained BaseDir: %v", err)
+	}
+}
+
 func TestSandboxDeleteFinalizerRejectsNonCanonicalOwnershipPaths(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "delete-noncanonical-path")
 	nodeFile := filepath.Join(fixture.o.cfg.Paths.RunRoot, "node.sock")
