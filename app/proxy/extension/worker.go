@@ -23,7 +23,7 @@ type Process struct {
 
 // WorkerExtension is the one trusted, statically linked extension for one
 // proxy worker epoch. Start is called exactly once after initial route sync and
-// before either ingress listener starts serving. Cancellation of ctx is the
+// before the sandbox data ingress listener starts serving. Cancellation of ctx is the
 // worker epoch's shutdown notification.
 type WorkerExtension interface {
 	Start(context.Context, WorkerHost) error

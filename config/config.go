@@ -48,7 +48,7 @@ const (
 // bootstrap.
 type Conductor struct {
 	API     APIConfig     `yaml:"api" json:"api"`         // north control plane + TLS
-	Proxy   ProxyConfig   `yaml:"proxy" json:"proxy"`     // data-plane proxy
+	Proxy   ProxyConfig   `yaml:"proxy" json:"proxy"`     // Proxy policy + conductor metrics
 	Paths   PathsConfig   `yaml:"paths" json:"paths"`     // node-local dirs / sockets
 	Units   UnitsConfig   `yaml:"units" json:"units"`     // systemd unit management
 	Sandbox SandboxConfig `yaml:"sandbox" json:"sandbox"` // sandbox-instance defaults
