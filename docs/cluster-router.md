@@ -93,6 +93,10 @@ cache:
 | `cache.idle_timeout` | 活动连接空闲淘汰 |
 | `metrics_listen` | Prometheus 端点 |
 
+Router 对外 ingress 可以终止 TLS,到 registry 的控制连接也可使用独立 mTLS.但当前
+Router→node 的 `APIEndpoint` 和 `DataEndpoint` 固定使用明文 HTTP/CONNECT;节点注册必须
+提供两个不同用途且可达的明文内部 listener,不能把启用 TLS 的 node listener 直接填入这两个字段.
+
 ## 4. Registry Membership
 
 router 启动后通过 bootstrap 拉取 registry membership:

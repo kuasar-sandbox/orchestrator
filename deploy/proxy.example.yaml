@@ -21,8 +21,9 @@ paths:
   run_root: /run/sandbox
 
 # Required data-plane ingress. The master binds once and passes the same listener
-# fd to all workers. This is the node's only sandbox data entry point.
-data_listen: ":443"
+# fd to all workers. This is the node's only sandbox data entry point. The paired
+# conductor example uses :3000, so both services can run on one node.
+data_listen: ":3443"
 
 # Forwarding plane netns. Set this to the connector --mgmt-extract netns so workers'
 # floatingip dials and the conductor-projected MMDS listener live with the vswitch
@@ -34,11 +35,13 @@ shm_path: /run/sandbox/proxy-routes.shm
 route_capacity: 65536
 workers: 2
 
-# Data-plane listener cert — the same wildcard cert serve presents (*.<domain>).
-# Omit for h2c (dev / when fronted by a TLS terminator).
-tls:
-  cert: /etc/node-ctl/tls/fullchain.pem
-  key: /etc/node-ctl/tls/privkey.pem
+# Cluster Router currently dials DataEndpoint with plaintext HTTP/CONNECT, so
+# this paired example leaves TLS disabled and terminates public TLS at Router/a
+# load balancer. For standalone direct TLS, bind a non-conflicting address and
+# uncomment the material below.
+# tls:
+#   cert: /etc/node-ctl/tls/fullchain.pem
+#   key: /etc/node-ctl/tls/privkey.pem
 
 # Bootstrap fallbacks, used only until serve pushes its authoritative policy over the
 # registration handshake: auth = X-Access-Token check (off|log|enforce), park_timeout

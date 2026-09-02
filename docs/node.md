@@ -191,7 +191,7 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 
 # 2) e2b SDK/CLI 直接指向本机
 export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
-# dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
+# dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3443
 ```
 
 集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md),无须手动
@@ -1680,6 +1680,11 @@ conductor 只服务控制 API,生命周期和本节点路由权威;它不构造 
 EffectiveConfig 中必填的 `paths.run_root` 本地构造
 `<run_root>/<NodeSandboxID>/ctl.sock`.该路径不通过 routesync `Policy` 或共享路由视图传递.
 
+当前 Router→node 跳使用明文 HTTP/CONNECT,因此集群注册的两个 endpoint 必须指向不同的
+明文内部 listener,不能指向启用 TLS 的 node listener.随附部署样例使用 conductor `:3000`
+和 Proxy `:3443`,对外 TLS 在 cluster Router 或负载均衡器终止.这不改变 node-link 自身的
+mTLS.
+
 Proxy master 注册可选 `stats_socket`,每个 worker 经独立 socketpair 推送 Prometheus counter
 与 per-sandbox traffic 绝对值;conductor traffic API 只查询当前 trusted Proxy registration 的
 stats endpoint.route barrier participation 不依赖 stats socket.每条 logical ingress 只在最终
@@ -2120,9 +2125,11 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 
 生产:`*.<domain>` + `api.<domain>` 通配 DNS + TLS(operator 提供,on-prem/离线
 友好).控制面由 conductor `api.listen` 承载,数据面由独立 Proxy `data_listen` 承载;
-二者是不同 listener,可使用同一张证书.dev:`E2B_API_URL`/
-`E2B_SANDBOX_URL` 指向明文 http(h2c),无需证书与通配 DNS。集群下 cluster-ctl router
-持对外通配证书,node-link 用独立的 `cluster.node_link.tls` mTLS(§10)。
+二者必须是不同 listener.独立模式可让两者直接终止 TLS;若都使用端口 443,必须绑定不同
+地址或由外部负载均衡器按域名转发.dev:`E2B_API_URL`/`E2B_SANDBOX_URL` 分别指向
+明文 http(h2c) listener.集群下 cluster-ctl router 持对外通配证书,Router→node 的
+`APIEndpoint`/`DataEndpoint` 跳当前为明文,node-link 则用独立的
+`cluster.node_link.tls` mTLS(§10).
 
 ## 14. 契约边界
 

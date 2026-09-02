@@ -2,21 +2,26 @@
 # See orchestrator/docs/node.md §3. Generate a fresh skeleton with
 # `node-ctl config conductor --template`; validate yours with
 # `node-ctl config conductor --config conductor.yaml [--resolve]`.
-# The unmodified e2b SDK reaches this control endpoint via E2B_DOMAIN=<domain>
-# and E2B_API_KEY=<key> (dev: E2B_API_URL=http://host:3000). Configure
-# E2B_SANDBOX_URL for the independent Proxy endpoint.
+# The paired deployment examples use distinct plaintext node upstreams:
+# conductor :3000 and Proxy :3443. Cluster Router dials these endpoints over
+# plain HTTP/CONNECT; terminate public TLS at Router/an external load balancer.
+# A standalone direct-TLS deployment must instead give the two :443 listeners
+# distinct bind addresses. Configure E2B_API_URL and E2B_SANDBOX_URL for direct
+# plaintext development access.
 #
 # Config is grouped by concern. External binaries (sandbox-ctl, connector-ctl,
 # flatten-ctl, …) are auto-discovered next to the node-ctl binary, then on
 # PATH — they are not configured here.
 
-# North control plane + TLS.
+# Node control endpoint (plaintext upstream in this paired example).
 api:
   domain: sandboxes.example.com
-  listen: ":443"                                 # dev: ":3000" (plain http)
-  tls:
-    cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
-    key: /etc/node-ctl/tls/privkey.pem
+  listen: ":3000"
+  # For standalone direct TLS, bind a dedicated address that does not conflict
+  # with Proxy and uncomment the material below.
+  # tls:
+  #   cert: /etc/node-ctl/tls/fullchain.pem # wildcard *.<domain> AND api.<domain>
+  #   key: /etc/node-ctl/tls/privkey.pem
 
 # Data-plane policy distributed to the independent Proxy. The Proxy service in
 # deploy/node-proxy.service owns the only sandbox data listener; this conductor
@@ -197,6 +202,6 @@ checkpoint:
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
-#   api_endpoint: node.example.com:443            # required conductor control API host:port
-#   data_endpoint: sandbox.example.com:443        # required Proxy sandbox ingress host:port
+#   api_endpoint: node.example.com:3000           # required plaintext Router -> conductor host:port
+#   data_endpoint: sandbox.example.com:3443       # required plaintext Router -> Proxy host:port
 #   heartbeat_interval: 10s

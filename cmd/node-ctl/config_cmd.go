@@ -150,11 +150,13 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 const conductorConfigSkeleton = `# node-ctl conductor serve config — node-ctl conductor serve --config <this>.
 # The unmodified e2b SDK reaches this control endpoint via E2B_DOMAIN/E2B_API_KEY
 # (dev: E2B_API_URL). Sandbox data goes to the independent Proxy endpoint.
+# This paired template uses distinct plaintext node upstreams; terminate public
+# TLS at Cluster Router/an external load balancer.
 # Required: api.domain + encryption_key.
 api:
   domain: sandboxes.example.com
-  listen: ":443"                                 # dev: ":3000" (plain http/h2c)
-  tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
+  listen: ":3000"                                # plaintext control upstream
+  # tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
 proxy:                                           # policy pushed to the independent Proxy
   auth: enforce                                  # off | log | enforce: validate X-Access-Token
   # park_timeout: 30s
@@ -283,8 +285,8 @@ checkpoint:                                        # paused-state capture
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
-#   api_endpoint: node.example.com:443            # required with node_link.endpoint; conductor control API
-#   data_endpoint: sandbox.example.com:443         # required with node_link.endpoint; Proxy sandbox ingress
+#   api_endpoint: node.example.com:3000           # required plaintext Router -> conductor endpoint
+#   data_endpoint: sandbox.example.com:3443        # required plaintext Router -> Proxy endpoint
 #   heartbeat_interval: 10s
 `
 
@@ -298,13 +300,13 @@ config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= ser
 paths:
   # proxy_executable: /opt/kuasar/bin/xproxy         # root- or non-root service-UID-owned App; only node-ctl -> master
   run_root: /run/sandbox                        # sandbox runtime root containing <sid>/ctl.sock (required)
-data_listen: ":443"                              # required master-owned sandbox data ingress passed to workers
+data_listen: ":3443"                             # required plaintext sandbox ingress; distinct from conductor :3000
 # proxy_netns: sw0_mgmt                          # forwarding netns for floatingip dials + MMDS listener; "" = current netns
 stats_socket: /run/sandbox/proxy-stats.sock      # master-only traffic stats UDS registered for conductor queries
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots
 workers: 2                                       # worker processes supervised by the master
-tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }   # = serve's wildcard cert; omit = h2c
+# tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem } # standalone direct TLS only
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
 # metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)

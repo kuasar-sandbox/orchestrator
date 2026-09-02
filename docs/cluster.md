@@ -788,6 +788,8 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 `Route` 是受保护结果,同时携稳定 SandboxID,当前 NodeSandboxID,`APIEndpoint`,
 `DataEndpoint` 和 `route_revision`.两个 endpoint 都来自按 NodeID 查询的当前 node runtime/profile,
 不复制进 SandboxRecord;control/build 固定使用 APIEndpoint,data/exec 固定使用 DataEndpoint.
+Router→node 当前固定使用明文 HTTP/CONNECT,所以这两个值必须指向各自可达的明文内部 listener;
+对外 TLS 在 Router 终止,node-link mTLS 与此独立.
 `route_revision` 取当前 group route recordSet 的已提交 revision,供 Router 拒绝迟到的旧节点
 结果。Router 不订阅 route_link 更新。
 

@@ -92,6 +92,7 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 # 先启动 API-only conductor,再启动通过 config_socket 注册的 Proxy.
 # conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 时必须显式
 # 提供不同用途的 api_endpoint 和 data_endpoint.
+# 随附样例分别监听明文 :3000/:3443;生产 TLS 在 Cluster Router/LB 终止.
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
@@ -100,8 +101,9 @@ cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 cluster-ctl router   --config /etc/cluster-ctl/router.yaml
 cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
-# e2b SDK/CLI 直连本机(独立模式)
-export E2B_DOMAIN=sandboxes.example.com     # dev: E2B_API_URL/E2B_SANDBOX_URL http
+# e2b SDK/CLI 直连本机(独立模式开发)
+export E2B_API_URL=http://host:3000
+export E2B_SANDBOX_URL=http://host:3443
 python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s.commands.run("uname -a").stdout)'
 ```
 

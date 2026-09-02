@@ -48,7 +48,7 @@ func TestProxyConfigTemplateDocumentsCustomExecutable(t *testing.T) {
 }
 
 func TestConfigTemplatesDescribeSplitEndpointsAndSingleProxyIngress(t *testing.T) {
-	for _, want := range []string{"api_endpoint: node.example.com:443", "data_endpoint: sandbox.example.com:443"} {
+	for _, want := range []string{"api_endpoint: node.example.com:3000", "data_endpoint: sandbox.example.com:3443"} {
 		if !strings.Contains(conductorConfigSkeleton, want) {
 			t.Errorf("conductor template does not contain %q", want)
 		}
@@ -67,7 +67,10 @@ func TestConfigTemplatesDescribeSplitEndpointsAndSingleProxyIngress(t *testing.T
 			t.Errorf("conductor template still contains removed Proxy field %q", removed)
 		}
 	}
-	if !strings.Contains(proxyConfigSkeleton, "data_listen: \":443\"") {
+	if !strings.Contains(conductorConfigSkeleton, "listen: \":3000\"") {
+		t.Fatal("conductor template does not use its distinct plaintext API listen")
+	}
+	if !strings.Contains(proxyConfigSkeleton, "data_listen: \":3443\"") {
 		t.Fatal("proxy template does not document required data_listen")
 	}
 }
