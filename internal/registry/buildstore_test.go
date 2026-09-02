@@ -257,6 +257,31 @@ func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
 	}
 }
 
+func TestBuildDeleteOwnerRefRevisionFencePreservesRefresh(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	ref := clusterstate.NodeBuildRef{Group: "/g", BuildID: "same-id-replacement"}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+		t.Fatal(err)
+	}
+	got, staleRevision, found, err := reg.lookupNodeBuildRefVersion(ctx, "n1", ref.BuildID)
+	if err != nil || !found || got != ref || staleRevision == 0 {
+		t.Fatalf("captured owner ref=%+v revision=%d found=%v err=%v", got, staleRevision, found, err)
+	}
+
+	// A same-ID registration refreshes the exact node/group ref after an old
+	// delete captured it. The old delete must not remove this newer revision.
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := reg.stores.removeNodeBuildRefShardAtRevision(ctx, "n1", ref.BuildID, staleRevision); err != nil || deleted {
+		t.Fatalf("stale delete removed refreshed owner ref: deleted=%v err=%v", deleted, err)
+	}
+	if got, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", ref.BuildID); err != nil || !found || got != ref {
+		t.Fatalf("replacement owner ref=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

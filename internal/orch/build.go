@@ -558,10 +558,15 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 	return out, nil
 }
 
-// resolveTemplateAlias maps a non-persist template reference — the transient register
-// id the SDK reports as BuildInfo.template_id, or a build name/alias — to its built
-// persist id. Returns "" if no ready build owned by this api key matches.
+// resolveTemplateAlias accepts a canonical TemplateID directly, then maps a
+// retention-bounded reference — the transient register id the SDK reports as
+// BuildInfo.template_id, or a build name/alias — to its built persist id. The
+// canonical form is self-describing and does not depend on a retained Build row.
+// Returns "" if a non-canonical ref has no ready Build owned by this api key.
 func (o *Orchestrator) resolveTemplateAlias(ctx context.Context, apiKey, ref string) string {
+	if template, err := types.ParseTemplateID(ref); err == nil {
+		return template.String()
+	}
 	if b := o.templateBuild(ctx, apiKey, ref); b != nil {
 		return b.PersistID
 	}

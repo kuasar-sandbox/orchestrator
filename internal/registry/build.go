@@ -467,7 +467,7 @@ func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string)
 		return nil
 	}
 	for attempt := 0; attempt < 5; attempt++ {
-		ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, buildID)
+		ref, refRevision, found, err := r.lookupNodeBuildRefVersion(ctx, nodeID, buildID)
 		if err != nil {
 			return fmt.Errorf("lookup build delete owner: %w", err)
 		}
@@ -494,7 +494,10 @@ func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string)
 				continue
 			}
 		}
-		if err := r.stores.RemoveNodeBuildRef(ctx, nodeID, buildID); err != nil {
+		// The route CAS and owner-ref CAS fence different shards. A same-ID
+		// registration may recreate the route and refresh this ref between them;
+		// deleting only the captured revision preserves that replacement.
+		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, buildID, refRevision); err != nil {
 			return fmt.Errorf("remove build %s owner ref: %w", buildID, err)
 		}
 		return nil
@@ -559,21 +562,27 @@ func retryTerminalBuildStore(ctx context.Context, operation func(context.Context
 }
 
 func (r *Registry) lookupNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	ref, _, found, err := r.lookupNodeBuildRefVersion(ctx, nodeID, buildID)
+	return ref, found, err
+}
+
+func (r *Registry) lookupNodeBuildRefVersion(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, uint64, bool, error) {
 	var ref clusterstate.NodeBuildRef
+	var revision uint64
 	var found bool
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
-		ref, found, err = r.stores.GetNodeBuildRef(ctx, nodeID, buildID)
+		ref, revision, found, err = r.stores.getNodeBuildRefShardVersion(ctx, nodeID, buildID)
 		if err == nil || !transientRouteRead(err) {
-			return ref, found, err
+			return ref, revision, found, err
 		}
 		select {
 		case <-ctx.Done():
-			return clusterstate.NodeBuildRef{}, false, ctx.Err()
+			return clusterstate.NodeBuildRef{}, 0, false, ctx.Err()
 		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
 		}
 	}
-	return ref, found, err
+	return ref, revision, found, err
 }
 
 // ResolveBuild maps a group's build_id to its node (router restart recovery: the

@@ -1095,7 +1095,8 @@ cache 始终带 group。
 ready/error status、临时 TemplateID、name/alias 与本机/Registry Build list 只在节点
 `builder.terminal_ttl` retention window 内可用。canonical TemplateID 自编码 profile、kind 与 portable
 artifact ref，Build row 删除后仍可长期用于 img/sbx/snp Create；Create 不从旧 Build projection 或
-metadata 恢复 IMG 配置。Registry 不另设 timer，也不延长节点定义的窗口。
+metadata 恢复 IMG 配置；canonical `fromTemplate` 同样不依赖旧 projection。Registry 不另设 timer，
+也不延长节点定义的窗口。
 
 ## 13. 状态所有权与灾备边界
 

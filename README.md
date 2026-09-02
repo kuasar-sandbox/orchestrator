@@ -89,7 +89,7 @@ cleanup 完成后的 `dead` Sandbox 与 `ready/error` Build 分别写入原子�
 删除；任何 runtime、network、path、artifact、result 或 execution claim ownership 都会阻止
 删除，且不会自动 `VACUUM`。canonical、self-encoded TemplateID 与其 portable artifact 是长期
 launch authority；Build status、transient TemplateID、name/alias 和本机 list 只在 Build row
-保留期内可用，canonical TemplateID Create 不读取旧 Build metadata。
+保留期内可用，canonical TemplateID Create 与 Build `fromTemplate` 不读取旧 Build metadata。
 
 当前保留的 Registry Build projection 由 node SQLite 派生：live `BuildUpsert/BuildDelete` 与每次
 重连的 `BuildSyncBegin`/完整保留集/`BuildSyncEnd` 共同收敛丢失的 Delete。Registry 不运行独立

@@ -856,7 +856,8 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   retention window 内可用。
 - **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
   其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
-  catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox。快照晋升的模板
+  catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox，也可直接作为后续
+  Build 的 `fromTemplate`。快照晋升的模板
   (§8.1)同样无需写 builds 表。
 
 ### 4.5 SDK / CLI 对接与协议 pin
@@ -2216,7 +2217,8 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 ready/error 都是 retention-bounded Build history。终态事务原子写 `finished_unix`；完整
 unit/cgroup、network、runtime/result 与 BuildRunDir/BuildBaseDir cleanup 完成并释放 execution
 claim 后，row 才可能在 `builder.terminal_ttl` 到期时被有界 reaper 删除。status、register-time
-transient TemplateID、name/alias 与本机 list 随 row 消失；返回过的 canonical TemplateID 不受影响。
+transient TemplateID、name/alias 与本机 list 随 row 消失；返回过的 canonical TemplateID 用于
+Create 或 `fromTemplate` 均不受影响。
 
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 

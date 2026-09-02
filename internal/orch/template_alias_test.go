@@ -117,3 +117,54 @@ func TestCanonicalTemplateIDCreatesAllArtifactKindsAfterBuildRetention(t *testin
 		t.Fatal(err)
 	}
 }
+
+func TestCanonicalFromTemplateSurvivesBuildRetention(t *testing.T) {
+	o := testOrchCfg(t, &config.Config{
+		Sandbox: config.SandboxConfig{DeadTTL: "1h"},
+		Builder: config.BuilderConfig{TerminalTTL: "1h"},
+	})
+	ctx := context.Background()
+	manifestKey := strings.Repeat("e", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	canonical := types.TemplateID{
+		Profile: types.ProfileE2B,
+		Kind:    types.KindSnp,
+		Ref:     "manifest://" + strings.Repeat("f", 64),
+	}.String()
+	source := &types.Build{
+		BuildID: "retained-from-template-source", TemplateID: "transient-retained-source", PersistID: canonical,
+		APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileE2B, Kind: types.KindSnp,
+		Status: types.BuildReady, CreatedUnix: 1, FinishedUnix: time.Now().Add(-2 * time.Hour).Unix(),
+	}
+	if err := o.st.PutBuild(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.reapTerminalHistory(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if retained, err := o.st.GetBuild(ctx, source.BuildID); err != nil || retained != nil {
+		t.Fatalf("source Build retained after TTL: %+v, %v", retained, err)
+	}
+
+	target := &types.Build{
+		BuildID: "canonical-from-template-target", TemplateID: "transient-canonical-target",
+		APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileE2B, Kind: types.KindImg,
+		Resources: testBuildResources(), Status: types.BuildRegistered, CreatedUnix: time.Now().Unix(),
+	}
+	if err := o.st.PutBuild(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.TriggerBuild(ctx, apiKey, target.TemplateID, target.BuildID, api.TriggerSpec{
+		FromTemplate: canonical,
+		Steps:        []types.TemplateStep{{Type: "RUN", Args: []string{"echo", "retained"}}},
+	}, api.BuildAuth{}); err != nil {
+		t.Fatalf("TriggerBuild canonical fromTemplate after source retention: %v", err)
+	}
+	got, err := o.st.GetBuild(ctx, target.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Status != types.BuildWaiting || got.FromTemplate != canonical || got.FromImage != "" {
+		t.Fatalf("triggered Build = %+v", got)
+	}
+}
