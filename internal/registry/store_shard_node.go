@@ -249,25 +249,30 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 }
 
 func (s *Stores) getNodeBuildRefShard(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	ref, _, found, err := s.getNodeBuildRefShardVersion(ctx, nodeID, buildID)
+	return ref, found, err
+}
+
+func (s *Stores) getNodeBuildRefShardVersion(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, uint64, bool, error) {
 	if nodeID == "" || buildID == "" {
-		return clusterstate.NodeBuildRef{}, false, nil
+		return clusterstate.NodeBuildRef{}, 0, false, nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
 	if err != nil {
-		return clusterstate.NodeBuildRef{}, false, err
+		return clusterstate.NodeBuildRef{}, 0, false, err
 	}
 	rec, found, err := sh.Get(ctx, clusterstate.NodeBuildRecordKey(buildID))
 	if err != nil || !found {
-		return clusterstate.NodeBuildRef{}, found, err
+		return clusterstate.NodeBuildRef{}, 0, found, err
 	}
 	ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
 	if err != nil {
-		return clusterstate.NodeBuildRef{}, false, err
+		return clusterstate.NodeBuildRef{}, 0, false, err
 	}
 	if ref.BuildID != buildID || ref.Group == "" {
-		return clusterstate.NodeBuildRef{}, false, errors.New("registry: invalid node build ref")
+		return clusterstate.NodeBuildRef{}, 0, false, errors.New("registry: invalid node build ref")
 	}
-	return ref, true, nil
+	return ref, rec.Meta.Rev, true, nil
 }
 
 func (s *Stores) removeNodeBuildRefShard(ctx context.Context, nodeID, buildID string) error {

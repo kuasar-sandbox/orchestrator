@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -58,6 +59,102 @@ func TestRegisteredAndWaitingBuildDoNotCreateObjectDirectories(t *testing.T) {
 		t.Fatalf("TriggerBuild: %v", err)
 	}
 	requireBuildDirectoriesAbsent(types.BuildWaiting)
+}
+
+func TestClusterWaitingProjectionPrecedesConcurrentBuildClaimWithoutExtension(t *testing.T) {
+	o := testOrch(t)
+	o.vs = failingCreateVS{err: errors.New("stop after execution claim")}
+	ctx := context.Background()
+	apiKey, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("waiting-before-building", fingerprint)
+	if ack := o.HandleCommand(ctx, cmd); ack.Status != routesync.AckAccepted {
+		t.Fatalf("BuildRegister ack = %+v", ack)
+	}
+	buildEvents, cancelBuildEvents := o.SubscribeBuilds()
+	defer cancelBuildEvents()
+
+	committed := make(chan struct{})
+	releaseTrigger := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseTrigger)
+			released = true
+		}
+	}()
+	o.commitBuildTrigger = func(ctx context.Context, candidate *types.Build) (bool, error) {
+		won, err := o.st.CommitBuildTrigger(ctx, candidate)
+		if err == nil && won {
+			close(committed)
+			<-releaseTrigger
+		}
+		return won, err
+	}
+	triggerDone := make(chan error, 1)
+	go func() {
+		triggerDone <- o.TriggerBuild(ctx, apiKey, cmd.TemplateRef, cmd.BuildID,
+			api.TriggerSpec{FromImage: "registry.test/waiting-order:latest"}, api.BuildAuth{})
+	}()
+	select {
+	case <-committed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("TriggerBuild did not commit waiting")
+	}
+
+	poolCtx, cancelPool := context.WithCancel(context.Background())
+	poolDone := make(chan struct{})
+	go func() {
+		o.BuildPool(poolCtx, time.Hour)
+		close(poolDone)
+	}()
+	defer func() {
+		if !released {
+			close(releaseTrigger)
+			released = true
+		}
+		cancelPool()
+		<-poolDone
+		if err := o.DrainBuilds(context.Background()); err != nil {
+			t.Errorf("DrainBuilds: %v", err)
+		}
+	}()
+
+	// Wait until BuildPool has selected the durable waiting row and is queued
+	// behind TriggerBuild's publication fence. This makes the old
+	// waiting-after-building race deterministic rather than timing-dependent.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		o.buildEventFences.mu.Lock()
+		lock := o.buildEventFences.locks[cmd.BuildID]
+		refs := 0
+		if lock != nil {
+			refs = lock.refs
+		}
+		o.buildEventFences.mu.Unlock()
+		if refs >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("BuildPool did not wait on the committed Build publication fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseTrigger)
+	released = true
+	if err := <-triggerDone; err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+
+	for index, want := range []types.BuildState{types.BuildWaiting, types.BuildBuilding} {
+		select {
+		case event := <-buildEvents:
+			if event.Kind != routesync.BuildUpsert || event.BuildID != cmd.BuildID || event.State != string(want) {
+				t.Fatalf("Build event %d = %+v, want %s upsert", index, event, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for Build event %d (%s)", index, want)
+		}
+	}
 }
 
 func TestDirectBuildEndpointsRejectInvalidBuildIDAtBoundary(t *testing.T) {
@@ -307,15 +404,40 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 			)}
 		}(i)
 	}
-	for range candidates {
-		select {
-		case <-arrived:
-		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent trigger did not reach the commit barrier")
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first concurrent trigger did not reach the commit barrier")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		o.buildEventFences.mu.Lock()
+		lock := o.buildEventFences.locks[b.BuildID]
+		refs := 0
+		if lock != nil {
+			refs = lock.refs
 		}
+		o.buildEventFences.mu.Unlock()
+		if refs >= len(candidates) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second concurrent trigger did not reach the Build event fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-arrived:
+		t.Fatal("second concurrent trigger bypassed the first trigger publication fence")
+	default:
 	}
 	close(release)
 	released = true
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second concurrent trigger did not reach the commit after publication fence release")
+	}
 
 	winner := -1
 	for range candidates {

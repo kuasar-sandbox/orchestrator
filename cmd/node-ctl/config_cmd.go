@@ -184,6 +184,7 @@ paths:
 #   install: true
 sandbox:                                          # sandbox-instance defaults
   timeout_sec: 300
+  dead_ttl: 24h                                   # owner-free dead-row diagnostic retention
   resources:
     capacity: { cpu: 2, memory: 2GiB }            # guest-visible VM capacity / E2B SKU
     allocatable:
@@ -214,6 +215,7 @@ builder:                                           # Build resources are separat
       resources: { cpu: 16, memory: 64GiB, storage: 256GiB }
   registration_ttl: 1h                           # registered but never triggered
   queue_ttl: 30m                                  # waiting for execution admission
+  terminal_ttl: 24h                              # owner-free ready/error Build history
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4  # build VM writable disk (pull cache + export scratch)
   # Build CPU/memory also enforce each builder service; execution aggregate CPU/memory enforce sandbox-builder.slice.
   # storage is admission-only until a filesystem quota backend is configured in a future change.

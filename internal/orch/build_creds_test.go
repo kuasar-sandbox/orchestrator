@@ -87,6 +87,12 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 	if cfg.Builder.QueueTTL == "" {
 		cfg.Builder.QueueTTL = "30m"
 	}
+	if cfg.Builder.TerminalTTL == "" {
+		cfg.Builder.TerminalTTL = "24h"
+	}
+	if cfg.Sandbox.DeadTTL == "" {
+		cfg.Sandbox.DeadTTL = "24h"
+	}
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)

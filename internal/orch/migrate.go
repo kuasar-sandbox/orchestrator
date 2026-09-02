@@ -492,7 +492,7 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		}
 	}
 	unlockEvent := o.lockExtensionSandboxEvent(sb.ID)
-	defer unlockExtensionEvent(unlockEvent)
+	defer unlockEventFence(unlockEvent)
 	var insertErr error
 	if mmdsImport.routesPresent {
 		insertErr = o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, sb, mmdsImport.routesDigest, mmdsImport.secretValues)

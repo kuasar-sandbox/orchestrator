@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
@@ -18,6 +20,12 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 	}
 	created, err := Open(path, box)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.InsertSandbox(context.Background(), retentionDeadSandbox("legacy-dead", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := created.PutBuild(context.Background(), retentionTerminalBuild("legacy-ready", types.BuildReady, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := created.Close(); err != nil {
@@ -35,6 +43,17 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		_ = db.Close()
 		t.Fatal(err)
 	}
+	for _, statement := range []string{
+		`DROP INDEX idx_sandboxes_dead_retention`,
+		`DROP INDEX idx_builds_terminal_retention`,
+		`ALTER TABLE sandboxes DROP COLUMN dead_unix`,
+		`ALTER TABLE builds DROP COLUMN finished_unix`,
+	} {
+		if _, err := db.ExecContext(context.Background(), statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +63,7 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		t.Fatalf("upgrade legacy database: %v", err)
 	}
 	defer upgraded.Close()
-	for _, column := range []string{"runtime_prepare_json", "registration_request_digest"} {
+	for _, column := range []string{"runtime_prepare_json", "registration_request_digest", "finished_unix"} {
 		var count int
 		if err := upgraded.db.QueryRowContext(context.Background(), `
 			SELECT count(*) FROM pragma_table_info('builds') WHERE name=?`, column).Scan(&count); err != nil {
@@ -53,5 +72,22 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("%s columns = %d, want 1", column, count)
 		}
+	}
+	var deadColumns int
+	if err := upgraded.db.QueryRowContext(context.Background(), `
+		SELECT count(*) FROM pragma_table_info('sandboxes') WHERE name='dead_unix'`).Scan(&deadColumns); err != nil {
+		t.Fatal(err)
+	}
+	if deadColumns != 1 {
+		t.Fatalf("dead_unix columns = %d, want 1", deadColumns)
+	}
+	upgradeUnix := time.Now().Unix()
+	dead, err := upgraded.Get(context.Background(), "legacy-dead")
+	if err != nil || dead == nil || dead.DeadUnix <= 1 || dead.DeadUnix > upgradeUnix {
+		t.Fatalf("legacy dead timestamp = %+v, %v", dead, err)
+	}
+	ready, err := upgraded.GetBuild(context.Background(), "legacy-ready")
+	if err != nil || ready == nil || ready.FinishedUnix <= 1 || ready.FinishedUnix > upgradeUnix {
+		t.Fatalf("legacy ready timestamp = %+v, %v", ready, err)
 	}
 }

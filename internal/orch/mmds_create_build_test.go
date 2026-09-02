@@ -135,6 +135,8 @@ func TestClusterBuildRegisterExtractsMMDSSecretsBeforePersistence(t *testing.T) 
 func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *testing.T) {
 	o := testOrchCfg(t, mmdsFeatureConfig())
 	ctx := context.Background()
+	buildEvents, cancelBuildEvents := o.SubscribeBuilds()
+	defer cancelBuildEvents()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterBuildRegisterCommand("cluster-mmds-policy-replay", fingerprint)
 	cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","type":"secret","secret":"key"}]}`
@@ -143,7 +145,7 @@ func TestClusterBuildRegisterMMDSReplayUsesDurableIdentityAfterPolicyDrift(t *te
 		t.Fatalf("initial BuildRegister ack = %+v", ack)
 	}
 	select {
-	case <-o.buildEvents:
+	case <-buildEvents:
 	case <-time.After(time.Second):
 		t.Fatal("initial registration event was not published")
 	}

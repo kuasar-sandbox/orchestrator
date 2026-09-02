@@ -322,9 +322,14 @@ func (n *redirectNodeStub) Heartbeat() *routesync.Heartbeat {
 	return &routesync.Heartbeat{Counts: len(n.routes)}
 }
 
-func (n *redirectNodeStub) BuildEvents() <-chan *routesync.BuildEvent { return nil }
-func (n *redirectNodeStub) OnWake(ctx context.Context, sid string)    {}
-func (n *redirectNodeStub) Policy() routesync.Policy                  { return routesync.Policy{} }
+func (n *redirectNodeStub) RangeBuilds(context.Context, func(routesync.BuildEvent) error) error {
+	return nil
+}
+func (n *redirectNodeStub) SubscribeBuilds() (<-chan routesync.BuildEvent, func()) {
+	return make(chan routesync.BuildEvent), func() {}
+}
+func (n *redirectNodeStub) OnWake(ctx context.Context, sid string) {}
+func (n *redirectNodeStub) Policy() routesync.Policy               { return routesync.Policy{} }
 
 func (n *redirectNodeStub) publish(route routesync.RouteEntry) {
 	n.mu.Lock()
@@ -420,6 +425,12 @@ func startRelayNodeStub(t *testing.T, ctx context.Context, addr, nodeID string) 
 	}
 	if hello.Type != routesync.TypeHello {
 		t.Fatalf("first response=%+v, want hello", hello)
+	}
+	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBuildSyncBegin}); err != nil {
+		t.Fatal(err)
+	}
+	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBuildSyncEnd}); err != nil {
+		t.Fatal(err)
 	}
 	stub := &relayNodeStub{cancel: cancel, pw: pw, resp: resp, cmdCh: make(chan *routesync.Command, 16)}
 	go stub.readLoop(t)

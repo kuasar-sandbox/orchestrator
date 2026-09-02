@@ -44,6 +44,8 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 	node.mu.Lock()
 	node.builds[cmd.BuildID].State = "ready"
 	node.mu.Unlock()
+	buildEvents, cancelBuildEvents := node.SubscribeBuilds()
+	defer cancelBuildEvents()
 
 	replay := *cmd
 	replay.CmdID = "c2"
@@ -51,7 +53,7 @@ func TestBuildRegisterReplayPreservesIdentityAndState(t *testing.T) {
 		t.Fatalf("identical replay ack = %+v", got)
 	}
 	select {
-	case event := <-node.buildEvents:
+	case event := <-buildEvents:
 		if event.BuildID != cmd.BuildID || event.State != "ready" || event.TemplateID != cmd.TemplateRef {
 			t.Fatalf("terminal replay event = %+v", event)
 		}

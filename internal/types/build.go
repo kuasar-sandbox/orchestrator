@@ -32,8 +32,9 @@ const TransientPrefix = "transient-"
 // IsTransientID reports whether s is a register-time transient templateID.
 func IsTransientID(s string) bool { return strings.HasPrefix(s, TransientPrefix) }
 
-// BuildState is the lifecycle of a template build (persisted in the builds table,
-// which doubles as the template registry — there is no separate templates table).
+// BuildState is the lifecycle of a template build. The builds row is retained
+// only as bounded status/index history; a canonical TemplateID and its portable
+// artifact remain the long-lived launch authority without a templates table.
 type BuildState string
 
 const (
@@ -73,7 +74,8 @@ type TemplateStep struct {
 }
 
 // BuildOptions are build-only controls. They are intentionally separate from
-// Build.Metadata, which becomes the template's default sandbox config.
+// Build.Metadata, which configures artifact construction but is never recovered
+// from a retained Build row by a later canonical TemplateID Create.
 type BuildOptions struct {
 	// Resources is accepted only in the registration-time builder namespace.
 	// Core normalizes it into Build.Resources and clears this definition copy
@@ -119,7 +121,7 @@ type BuildResult struct {
 	FailureStage string `json:"failure_stage,omitempty"`
 }
 
-// Build is one template build, doubling as the template record.
+// Build is one template build plus its retention-bounded status/index history.
 type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
 	TemplateID   string  // transient-<uuidv7>, the register-time handle
@@ -166,8 +168,9 @@ type Build struct {
 	// resolve the A/B/C phase sandboxes on this node. It is not portable template
 	// metadata and therefore cannot affect a later IMG Create.
 	PhaseResourcePatch string
-	// Metadata is portable template metadata. Build-only options and the phase
-	// resource patch are removed before it is stored here.
+	// Metadata configures the portable artifact produced by this Build. Build-only
+	// options and the phase resource patch are removed before it is stored here;
+	// post-Build Create never treats this retained copy as template authority.
 	Metadata map[string]string
 	Builder  BuildOptions
 	// ClusterGroup is node-internal durable ownership for registry-driven
@@ -201,5 +204,6 @@ type Build struct {
 	// execution claim after the unit and host runtime have been reclaimed.
 	ExecutionResult *BuildResult
 
-	CreatedUnix int64
+	CreatedUnix  int64
+	FinishedUnix int64 // terminal ready/error commit time; 0 while nonterminal
 }

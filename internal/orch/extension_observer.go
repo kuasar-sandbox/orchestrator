@@ -45,19 +45,15 @@ func (o *Orchestrator) observeBuildRemove(build *types.Build) {
 	}
 }
 
-// lockExtensionBuildEvent serializes a Build's durable mutation through its
-// existing core delivery and non-blocking Extension publication. Without this
-// fence, two successful CAS writers could publish in the opposite order and a
-// watcher might retain the older projection indefinitely. The nil Extension
-// path neither allocates nor takes a lock.
-func (o *Orchestrator) lockExtensionBuildEvent(buildID string) func() {
-	if o.extensionObserver == nil {
-		return nil
-	}
-	return o.extensionBuildEvents.Lock(buildID)
+// lockBuildEvent serializes a Build's durable mutation through every
+// process-local publication derived from it. The Registry projection exists
+// even when no Extension observer is installed, so this fence is unconditional:
+// a later durable state must never be published before an earlier state.
+func (o *Orchestrator) lockBuildEvent(buildID string) func() {
+	return o.buildEventFences.Lock(buildID)
 }
 
-func unlockExtensionEvent(unlock func()) {
+func unlockEventFence(unlock func()) {
 	if unlock != nil {
 		unlock()
 	}

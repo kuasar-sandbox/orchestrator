@@ -9,8 +9,8 @@ import (
 
 // BuildStore is the registry-facing routing view of build execution state. Builds
 // are stored as route_link build records and tracked through registered →
-// building → ready/error. The node's SQLite state and heartbeat are the
-// authoritative source for admission usage.
+// waiting → building → ready/error. The node's SQLite state and heartbeat are
+// the authoritative source for admission usage.
 
 // BuildState mirrors the node's build lifecycle for placement accounting.
 type BuildState string
@@ -18,12 +18,14 @@ type BuildState string
 const (
 	BuildStarting   BuildState = "starting"
 	BuildRegistered BuildState = "registered"
+	BuildWaiting    BuildState = "waiting"
 	BuildBuilding   BuildState = "building"
 	BuildReady      BuildState = "ready"
 	BuildError      BuildState = "error"
 )
 
-// BuildRecord is the registry's view of a build (the node runs it + reports state).
+// BuildRecord is the Registry's retention-bounded projection of a node Build.
+// It is query/routing state, never the authority for a canonical TemplateID.
 type BuildRecord struct {
 	Group                        string                    `json:"group"`
 	BuildID                      string                    `json:"build_id"`
@@ -49,7 +51,7 @@ type BuildRecord struct {
 // occupies reports whether the registry still considers the build live for node
 // ownership and disconnect reconciliation. It does not calculate admission usage.
 func (b *BuildRecord) occupies() bool {
-	return b.State == BuildStarting || b.State == BuildRegistered || b.State == BuildBuilding
+	return b.State == BuildStarting || b.State == BuildRegistered || b.State == BuildWaiting || b.State == BuildBuilding
 }
 
 func (s *Stores) PutBuild(ctx context.Context, b *BuildRecord) error {

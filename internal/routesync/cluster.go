@@ -94,18 +94,32 @@ const (
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )
 
-// TypeBuildEvent: node -> registry, a build's state transition (cluster.md).
-// The registry converges routing state; durable admission usage is node-owned
-// and follows the node's persisted Build lifecycle rather than this event.
-const TypeBuildEvent = "build_event"
+// Build projection frames flow node -> Registry. BuildSyncBegin/End bracket one
+// complete node SQLite snapshot on every reconnect; live changes use Upsert or
+// Delete. Registry owns no independent terminal-retention clock.
+const (
+	TypeBuildUpsert    = "build_upsert"
+	TypeBuildDelete    = "build_delete"
+	TypeBuildSyncBegin = "build_sync_begin"
+	TypeBuildSyncEnd   = "build_sync_end"
+)
 
-// BuildEvent reports a build's state up the node-link (§5.1). The node-link
-// owner resolves cluster identity from its per-node build table.
+type BuildEventKind string
+
+const (
+	BuildUpsert BuildEventKind = TypeBuildUpsert
+	BuildDelete BuildEventKind = TypeBuildDelete
+)
+
+// BuildEvent is one rebuildable node Build projection. Kind is carried by the
+// enclosing Msg.Type; the node-link owner resolves cluster identity from its
+// per-node immutable build-binding table.
 type BuildEvent struct {
-	BuildID    string `json:"build_id"`
-	State      string `json:"state"`
-	TemplateID string `json:"template_id,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Kind       BuildEventKind `json:"-"`
+	BuildID    string         `json:"build_id"`
+	State      string         `json:"state"`
+	TemplateID string         `json:"template_id,omitempty"`
+	Reason     string         `json:"reason,omitempty"`
 }
 
 // ClusterSandboxContext carries Registry-owned sandbox identity to a node. The
