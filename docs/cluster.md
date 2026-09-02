@@ -1090,7 +1090,9 @@ node owner 的 admission 以 `(node_id,build_id)` 记账;同一 build_id 出现�
 余量不足则直接拒绝,route owner 重新调度。BuildUpsert/Delete 只携带 node-local Build 投影，nodelink
 owner 以 immutable `(node_id,build_id)` ref 查得 group；终态 Upsert 调用
 `ReleaseBuild(node_id,build_id)`，节点 TTL 的 Delete 再删除 exact projection/ref。北向查询和 router
-cache 始终带 group。
+cache 始终带 group。节点把每次 Build durable transition 与对应 live publication 放在无条件的
+per-Build fence 内；该顺序不依赖 conductor Extension 是否启用，因此 waiting 不会在 building/terminal
+之后迟到覆盖 Registry projection。
 
 ready/error status、临时 TemplateID、name/alias 与本机/Registry Build list 只在节点
 `builder.terminal_ttl` retention window 内可用。canonical TemplateID 自编码 profile、kind 与 portable
@@ -1098,6 +1100,8 @@ artifact ref，Build row 删除后仍可长期用于 img/sbx/snp Create；Create
 metadata 恢复 IMG 配置；canonical `fromTemplate` 同样不依赖旧 projection。Registry 不另设 timer，
 也不延长节点定义的窗口。重叠连接期间，Registry 只接受当前 active node-link session 的 Build
 frames；会话替换与 Build store mutation 由同一 NodeID fence 排序，旧连接不能删除新一代同 ID Build。
+reconnect snapshot 期间，节点仍通过同一个 stream writer 有界穿插 command ACK/heartbeat；Build live
+changes 继续缓存在独立 subscription 中，必须等 `build_sync_end` 后才发送。
 
 ## 13. 状态所有权与灾备边界
 

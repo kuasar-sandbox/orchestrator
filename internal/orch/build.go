@@ -123,8 +123,8 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	}
 	unlockRetention := o.buildRetention.Lock(b.BuildID)
 	defer unlockRetention()
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
-	defer unlockExtensionEvent(unlockEvent)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
+	defer unlockEventFence(unlockEvent)
 	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
@@ -276,8 +276,8 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if b.RegistryAuth, err = o.resolveBuildCreds(ctx, b, auth.PullToken, auth.RegistryUsername, auth.RegistryPassword); err != nil {
 		return err
 	}
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
-	defer unlockExtensionEvent(unlockEvent)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
+	defer unlockEventFence(unlockEvent)
 	b.Status = types.BuildWaiting
 	b.WaitingUnix = time.Now().Unix()
 	committed, err := o.commitBuildTrigger(ctx, b)
@@ -623,7 +623,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			if err != nil {
 				return
 			}
-			unlockEvent := o.lockExtensionBuildEvent(candidate.BuildID)
+			unlockEvent := o.lockBuildEvent(candidate.BuildID)
 			won, err := o.st.ClaimBuildExecution(ctx, candidate.BuildID, executionLimit, now)
 			if err != nil {
 				finish()
@@ -631,7 +631,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 					reason := "build resources no longer fit configured execution limits"
 					expired, expireErr := o.st.ExpireBuild(ctx, candidate.BuildID, types.BuildWaiting, reason)
 					if expireErr != nil {
-						unlockExtensionEvent(unlockEvent)
+						unlockEventFence(unlockEvent)
 						o.log.Warn("reject permanently unfit build", "bid", candidate.BuildID, "err", expireErr)
 						return
 					}
@@ -643,15 +643,15 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 						markBuildRemoved(failed, reason)
 						o.observeBuildRemove(failed)
 					}
-					unlockExtensionEvent(unlockEvent)
+					unlockEventFence(unlockEvent)
 					continue
 				}
-				unlockExtensionEvent(unlockEvent)
+				unlockEventFence(unlockEvent)
 				o.log.Warn("build execution admission", "bid", candidate.BuildID, "err", err)
 				return
 			}
 			if !won {
-				unlockExtensionEvent(unlockEvent)
+				unlockEventFence(unlockEvent)
 				o.recordExecutionWouldWait(ctx)
 				finish()
 				return
@@ -668,7 +668,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			claimed.EnforcementStatus = "pending"
 			o.publishBuildState(claimed.BuildID, "building", "", "")
 			o.observeBuildUpsert(claimed)
-			unlockExtensionEvent(unlockEvent)
+			unlockEventFence(unlockEvent)
 			go func() {
 				defer finish()
 				o.executeBuild(ctx, claimed)
@@ -708,10 +708,10 @@ func (o *Orchestrator) expireBuildQueues(ctx context.Context, now time.Time) {
 			if stamp <= 0 || stamp > expiry.before {
 				continue
 			}
-			unlockEvent := o.lockExtensionBuildEvent(build.BuildID)
+			unlockEvent := o.lockBuildEvent(build.BuildID)
 			expired, err := o.st.ExpireBuild(ctx, build.BuildID, expiry.state, expiry.reason)
 			if err != nil {
-				unlockExtensionEvent(unlockEvent)
+				unlockEventFence(unlockEvent)
 				o.log.Warn("expire build", "bid", build.BuildID, "err", err)
 				continue
 			}
@@ -723,7 +723,7 @@ func (o *Orchestrator) expireBuildQueues(ctx context.Context, now time.Time) {
 				markBuildRemoved(failed, expiry.reason)
 				o.observeBuildRemove(failed)
 			}
-			unlockExtensionEvent(unlockEvent)
+			unlockEventFence(unlockEvent)
 		}
 	}
 }
@@ -868,8 +868,8 @@ func (o *Orchestrator) completeBuildWithPublisher(
 			return
 		}
 	}
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
-	defer unlockExtensionEvent(unlockEvent)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
+	defer unlockEventFence(unlockEvent)
 	switch {
 	case err == nil && res != nil && res.Error != "":
 		if res.FailureStage == "artifact_prepare" {
@@ -1146,15 +1146,15 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("network_commit", err)
 	}
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
 	owned, err := o.st.SetBuildRuntimePreparation(buildCtx, b.BuildID, b.RunID,
 		port.Port, port.FloatingIP, port.MAC, envdTok, prepareJSON)
 	if err != nil {
-		unlockExtensionEvent(unlockEvent)
+		unlockEventFence(unlockEvent)
 		return nil, buildFailed("network_commit", err)
 	}
 	if !owned {
-		unlockExtensionEvent(unlockEvent)
+		unlockEventFence(unlockEvent)
 		return nil, buildFailed("network_commit", fmt.Errorf("build: exact-run ownership lost before runtime preparation"))
 	}
 	runtimePersisted = true
@@ -1164,12 +1164,12 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 
 	final, err := o.buildSpecForPending(buildCtx, pend)
 	if err != nil {
-		unlockExtensionEvent(unlockEvent)
+		unlockEventFence(unlockEvent)
 		return nil, buildFailed("config_write", err)
 	}
 	mmdsRow = o.publishBuildFinal(pend, final)
 	o.observeBuildUpsert(b)
-	unlockExtensionEvent(unlockEvent)
+	unlockEventFence(unlockEvent)
 	if mmdsRow != nil {
 		defer func() {
 			o.uncache(mmdsRow.ID)
@@ -1349,8 +1349,8 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 	if effective != properties {
 		return "", fmt.Errorf("build: unit %s resource properties effective=%+v want=%+v", unit, effective, properties)
 	}
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
-	defer unlockExtensionEvent(unlockEvent)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
+	defer unlockEventFence(unlockEvent)
 	bound, err := o.st.BindBuildRun(ctx, b.BuildID, runID, "cpu,memory")
 	if err != nil {
 		return "", err
@@ -1408,7 +1408,7 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 	progress := buildRuntimeCleanupProgress{port: port, persisted: persisted}
 	var cleanupErr error
 	runtimeCleared := false
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	func() {
@@ -1444,7 +1444,7 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, 
 	if runtimeCleared {
 		o.observeBuildUpsert(b)
 	}
-	unlockExtensionEvent(unlockEvent)
+	unlockEventFence(unlockEvent)
 	if cleanupErr != nil {
 		return progress, cleanupErr
 	}

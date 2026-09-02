@@ -1904,13 +1904,16 @@ Sandbox 全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner �
 变化，再发送 `build_sync_begin`、SQLite 中该节点仍保留的全部 cluster Build row、
 `build_sync_end`；集合包含 registered/waiting/building，也包含 retention window 内的 ready/error。
 Registry 以 NodeID session fence 接受这些 frame；新 node-link 生效后，旧重叠连接的 Build frame
-不会再修改 projection。
+不会再修改 projection。节点侧每个 Build durable transition 与其 live publication 也由无条件
+per-Build fence 排序，不依赖 conductor Extension。
 snapshot 期间发生的变化在 end 之后按顺序发送，慢订阅者会断线并重做完整 snapshot。Registry 在
 `build_sync_end` 只删除连接建立前 immutable `(NodeID, BuildID)` binding 基线中未出现、且删除时
 仍精确属于该节点的 post-registration projection/ref；Registry-owned `BuildStarting` ambiguous
 dispatch intent 不是节点 projection，空 snapshot 不能将其当作 definitive rejection。同步期间的
 新注册因此不会被误删，丢失的 live
 `build_delete` 会由下次重连收敛。Registry 不运行独立 Build terminal TTL。
+长 Build snapshot 不阻塞控制回执：同一个 stream writer 在 Build snapshot item 之间有界清空
+command ACK 与合并后的 heartbeat；Build live changes 仍等 `build_sync_end` 后发送。
 
 ### 10.4 命令受理
 

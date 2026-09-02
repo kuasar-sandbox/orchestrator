@@ -166,31 +166,30 @@ func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 	}
 }
 
-func TestExtensionEventFencesArePerObjectAndAbsentWithoutObserver(t *testing.T) {
+func TestBuildEventFencesArePerObjectWithoutExtensionObserver(t *testing.T) {
 	var withoutObserver Orchestrator
-	if unlock := withoutObserver.lockExtensionBuildEvent("build"); unlock != nil {
-		t.Fatal("nil observer created a Build event fence")
+	unlockBuild := withoutObserver.lockBuildEvent("build")
+	if unlockBuild == nil {
+		t.Fatal("built-in Registry publication did not create a Build event fence")
 	}
+	unlockEventFence(unlockBuild)
 	if unlock := withoutObserver.lockExtensionSandboxEvent("sandbox"); unlock != nil {
 		t.Fatal("nil observer created a Sandbox event fence")
 	}
-	if withoutObserver.extensionBuildEvents.locks != nil || withoutObserver.lifecycle.locks != nil {
-		t.Fatal("nil observer allocated keyed lock state")
+	if len(withoutObserver.buildEventFences.locks) != 0 || withoutObserver.lifecycle.locks != nil {
+		t.Fatal("released Build fence or nil-observer Sandbox fence retained keyed lock state")
 	}
 
-	o := &Orchestrator{extensionObserver: &objectObserverRecorder{}}
-	unlockFirst := o.lockExtensionBuildEvent("same-build")
-	if unlockFirst == nil {
-		t.Fatal("observer did not create a Build event fence")
-	}
+	o := &Orchestrator{}
+	unlockFirst := o.lockBuildEvent("same-build")
 	sameAcquired := make(chan struct{})
 	sameStarted := make(chan struct{})
 	sameDone := make(chan struct{})
 	go func() {
 		close(sameStarted)
-		unlock := o.lockExtensionBuildEvent("same-build")
+		unlock := o.lockBuildEvent("same-build")
 		close(sameAcquired)
-		unlockExtensionEvent(unlock)
+		unlockEventFence(unlock)
 		close(sameDone)
 	}()
 	waitObserverSignal(t, sameStarted)
@@ -202,12 +201,12 @@ func TestExtensionEventFencesArePerObjectAndAbsentWithoutObserver(t *testing.T) 
 
 	differentAcquired := make(chan struct{})
 	go func() {
-		unlock := o.lockExtensionBuildEvent("different-build")
+		unlock := o.lockBuildEvent("different-build")
 		close(differentAcquired)
-		unlockExtensionEvent(unlock)
+		unlockEventFence(unlock)
 	}()
 	waitObserverSignal(t, differentAcquired)
-	unlockExtensionEvent(unlockFirst)
+	unlockEventFence(unlockFirst)
 	waitObserverSignal(t, sameDone)
 }
 

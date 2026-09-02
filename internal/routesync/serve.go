@@ -155,6 +155,38 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, nil, false, log)
 }
 
+const buildSnapshotOutboxBurst = 32
+
+// drainBuildSnapshotOutbox keeps command ACKs and the coalesced heartbeat
+// moving while the same writer is producing a potentially large retained-Build
+// snapshot. Live Build changes remain buffered until the snapshot bracket is
+// complete.
+func drainBuildSnapshotOutbox(ctx context.Context, w io.Writer, flush func(), outbox <-chan *Msg) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if outbox == nil {
+		return nil
+	}
+	for range buildSnapshotOutboxBurst {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case m, ok := <-outbox:
+			if !ok || m == nil {
+				return io.EOF
+			}
+			if err := WriteMsg(w, m); err != nil {
+				return err
+			}
+			flush()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, onSubscribed func(), includeMMDS bool, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -236,13 +268,22 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		if err := WriteMsg(w, &Msg{Type: TypeBuildSyncBegin}); err != nil {
 			return
 		}
+		if err := drainBuildSnapshotOutbox(sctx, w, flush, outbox); err != nil {
+			return
+		}
 		if err := buildSource.RangeBuilds(sctx, func(event BuildEvent) error {
 			event.Kind = BuildUpsert
-			return writeBuildEvent(w, event)
+			if err := writeBuildEvent(w, event); err != nil {
+				return err
+			}
+			return drainBuildSnapshotOutbox(sctx, w, flush, outbox)
 		}); err != nil {
 			return
 		}
 		if err := WriteMsg(w, &Msg{Type: TypeBuildSyncEnd}); err != nil {
+			return
+		}
+		if err := drainBuildSnapshotOutbox(sctx, w, flush, outbox); err != nil {
 			return
 		}
 	}

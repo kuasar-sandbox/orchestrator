@@ -59,6 +59,7 @@ func (o *Orchestrator) reapTerminalBuilds(ctx context.Context, cutoffUnix int64)
 	var errs []error
 	for _, build := range candidates {
 		unlock := o.buildRetention.Lock(build.BuildID)
+		unlockEvent := o.lockBuildEvent(build.BuildID)
 		deleted, deleteErr := o.st.DeleteTerminalBuildForRetention(ctx, build, cutoffUnix)
 		if deleteErr != nil {
 			errs = append(errs, deleteErr)
@@ -69,6 +70,7 @@ func (o *Orchestrator) reapTerminalBuilds(ctx context.Context, cutoffUnix int64)
 			o.publishBuildDelete(build)
 			o.observeBuildRemove(build)
 		}
+		unlockEventFence(unlockEvent)
 		unlock()
 	}
 	if err := errors.Join(errs...); err != nil {

@@ -135,10 +135,13 @@ type Orchestrator struct {
 	removeBuildBaseDir               func(string) error
 	// extensionObserver is nil in the built-in path. The one nil branch at each
 	// committed transition avoids hubs, queues, and background work otherwise.
-	extensionObserver    ExtensionObserver
-	extensionBuildEvents keyedLockGroup
+	extensionObserver ExtensionObserver
+	// buildEventFences orders each durable Build mutation with both Registry
+	// projection and optional Extension observation.
+	buildEventFences keyedLockGroup
 	// buildRetention orders terminal-row deletion with registration/replay of
-	// the same BuildID, without serializing the established Trigger CAS path.
+	// the same BuildID; buildEventFences separately orders every committed
+	// transition with its process-local publications.
 	buildRetention       keyedLockGroup
 	extensionSandboxHook conductorextension.SandboxHook
 	extensionBuildHook   conductorextension.BuildHook

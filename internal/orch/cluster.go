@@ -358,8 +358,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if initialMMDS != nil {
 		routesDigest, secretValues = initialMMDS.routesDigest, initialMMDS.values
 	}
-	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
-	defer unlockExtensionEvent(unlockEvent)
+	unlockEvent := o.lockBuildEvent(b.BuildID)
+	defer unlockEventFence(unlockEvent)
 	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
 	if errors.Is(err, store.ErrBuildRegistrationCapacity) {
 		o.recordRegistrationRejection("capacity")
