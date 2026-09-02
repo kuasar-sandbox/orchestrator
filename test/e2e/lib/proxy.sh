@@ -44,7 +44,8 @@ start_proxy() {
 
 wait_proxy_ready() {
     local pid="$1" host="$2" port="$3" stats_socket="$4" log="$5"
-    local timeout_seconds="${6:-30}" deadline=$((SECONDS + timeout_seconds))
+    local timeout_seconds="${6:-30}" deadline
+    deadline=$((SECONDS + timeout_seconds))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if ! kill -0 "$pid" 2>/dev/null; then
             collect_proxy_log "$log"
