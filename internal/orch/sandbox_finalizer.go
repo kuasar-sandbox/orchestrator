@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -117,6 +118,154 @@ func (o *Orchestrator) retireSandboxDeleteWorker(sid string) (bool, error) {
 // already-accepted deleting row to reach its hard-delete commit.
 func (o *Orchestrator) DrainSandboxDeletes(ctx context.Context) error {
 	return o.deleteOps.Drain(ctx)
+}
+
+// startPausedCleanupRetry coalesces cleanup for a paused row whose exact
+// runner, network, or RunDir owner could not yet be released and persisted.
+// The worker is part of acceptedOps so orderly shutdown keeps dependencies
+// alive until the current attempt finishes; lifecycle cancellation stops later
+// retries and leaves the durable paused owner for startup reconciliation.
+// Callers invoke this while holding the sandbox lifecycle lock.
+func (o *Orchestrator) startPausedCleanupRetry(sid string) {
+	lifecycleCtx := o.launchContext()
+	finish, err := o.acceptedOps.Begin(lifecycleCtx)
+	if err != nil {
+		return
+	}
+
+	o.pausedCleanupMu.Lock()
+	if o.pausedCleanupActive == nil {
+		o.pausedCleanupActive = make(map[string]struct{})
+	}
+	if _, exists := o.pausedCleanupActive[sid]; exists {
+		o.pausedCleanupMu.Unlock()
+		finish()
+		return
+	}
+	o.pausedCleanupActive[sid] = struct{}{}
+	o.pausedCleanupMu.Unlock()
+
+	go func() {
+		defer finish()
+		delay := launchCleanupRetryMin
+		for {
+			if lifecycleCtx.Err() != nil {
+				o.abandonPausedCleanupWorker(sid)
+				return
+			}
+			if err := o.finalizePausedCleanupOnce(sid); err != nil {
+				o.log.Error("paused sandbox ownership cleanup incomplete; retrying",
+					"sid", sid, "retry_in", delay, "err", err)
+				if !waitPausedCleanupRetry(lifecycleCtx, delay) {
+					o.abandonPausedCleanupWorker(sid)
+					return
+				}
+				delay = nextLaunchCleanupRetry(delay)
+				continue
+			}
+
+			retired, err := o.retirePausedCleanupWorker(sid)
+			if err != nil {
+				o.log.Error("paused sandbox cleanup worker retirement failed; retrying",
+					"sid", sid, "retry_in", delay, "err", err)
+				if !waitPausedCleanupRetry(lifecycleCtx, delay) {
+					o.abandonPausedCleanupWorker(sid)
+					return
+				}
+				delay = nextLaunchCleanupRetry(delay)
+				continue
+			}
+			if retired {
+				return
+			}
+			delay = launchCleanupRetryMin
+		}
+	}()
+}
+
+func waitPausedCleanupRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// finalizePausedCleanupOnce reloads the durable owner while holding the same
+// lifecycle lock used by Delete and Resume. Successful substeps are reflected
+// in cache/observation even when a later substep remains pending.
+func (o *Orchestrator) finalizePausedCleanupOnce(sid string) error {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	sb, err := o.st.Get(ctx, sid)
+	if err != nil {
+		return err
+	}
+	if sb == nil || sb.State != types.StatePaused {
+		return nil
+	}
+	beforeRunID, beforePort, beforeRunDir := sb.RunID, sb.VswitchPort, sb.RunDir
+	err = o.cleanupPausedOwnership(ctx, sb)
+	o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
+	return err
+}
+
+// recordPausedCleanupProgress preserves the established route protocol:
+// runner/network ownership changes are observable, while a RunDir-only clear
+// is an internal durable marker that a paused route never dials.
+func (o *Orchestrator) recordPausedCleanupProgress(sb *types.Sandbox, beforeRunID, beforePort, beforeRunDir string) {
+	changed := sb.RunID != beforeRunID || sb.VswitchPort != beforePort || sb.RunDir != beforeRunDir
+	if !changed {
+		return
+	}
+	o.cache(sb)
+	if sb.RunID != beforeRunID || sb.VswitchPort != beforePort {
+		o.publishUpsert(sb)
+		o.observeSandboxUpsert(sb)
+	}
+}
+
+func pausedCleanupPending(sb *types.Sandbox) bool {
+	return sb != nil && sb.State == types.StatePaused && (sb.RunID != "" || sb.VswitchPort != "" ||
+		sb.FloatingIP != "" || sb.InnerIP != "" || sb.PortMAC != "" || sb.RunDir != "" ||
+		sb.EnvdUDS != "" || sb.CiUDS != "")
+}
+
+// retirePausedCleanupWorker closes the same-ID successor handoff race under
+// the lifecycle lock. A newly pending paused incarnation is consumed by the
+// existing coalesced worker instead of losing its retry owner.
+func (o *Orchestrator) retirePausedCleanupWorker(sid string) (bool, error) {
+	unlock := o.lifecycle.Lock(sid)
+	defer unlock()
+
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	current, err := o.st.Get(ctx, sid)
+	if err != nil {
+		return false, err
+	}
+	if pausedCleanupPending(current) {
+		return false, nil
+	}
+	o.pausedCleanupMu.Lock()
+	delete(o.pausedCleanupActive, sid)
+	o.pausedCleanupMu.Unlock()
+	return true, nil
+}
+
+// abandonPausedCleanupWorker runs only after lifecycle cancellation. New retry
+// admission is then closed by that same context, so removing this entry cannot
+// erase a successor worker. The durable paused row remains the restart owner.
+func (o *Orchestrator) abandonPausedCleanupWorker(sid string) {
+	o.pausedCleanupMu.Lock()
+	delete(o.pausedCleanupActive, sid)
+	o.pausedCleanupMu.Unlock()
 }
 
 // finalizeSandboxDeleteOnce performs one complete, ordered finalizer pass. It

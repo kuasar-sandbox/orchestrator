@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -118,6 +119,7 @@ type sandboxFinalizerFixture struct {
 	o      *Orchestrator
 	sb     *types.Sandbox
 	apiKey string
+	dbPath string
 	lc     *sandboxFinalizerLauncher
 	vs     *sandboxFinalizerVS
 }
@@ -133,7 +135,8 @@ func newSandboxFinalizerFixture(t *testing.T, id string) sandboxFinalizerFixture
 	unit := "sandbox-runner@" + runID + ".service"
 	lc := &sandboxFinalizerLauncher{unit: unit, state: "active"}
 	vs := &sandboxFinalizerVS{}
-	o := testOrchCfg(t, cfg)
+	dbPath := filepath.Join(root, "node.db")
+	o := testOrchCfgAt(t, cfg, dbPath)
 	o.lc, o.vs = lc, vs
 	manifestKey := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
@@ -157,7 +160,7 @@ func newSandboxFinalizerFixture(t *testing.T, id string) sandboxFinalizerFixture
 		}
 	}
 	o.cache(sb)
-	return sandboxFinalizerFixture{o: o, sb: sb, apiKey: apiKey, lc: lc, vs: vs}
+	return sandboxFinalizerFixture{o: o, sb: sb, apiKey: apiKey, dbPath: dbPath, lc: lc, vs: vs}
 }
 
 func beginDeletingForTest(t *testing.T, fixture sandboxFinalizerFixture) {
@@ -320,6 +323,17 @@ func TestKillDurablyAcceptsDeletingAndRetriesToTerminalObservation(t *testing.T)
 	}
 	if err := fixture.o.Pause(context.Background(), deleting.ID, fixture.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("Pause deleting sandbox = %v", err)
+	}
+	oldDeadline := deleting.DeadlineUnix
+	if changed, err := fixture.o.SetTimeout(context.Background(), deleting.ID, fixture.apiKey, 60); err != nil || changed {
+		t.Fatalf("SetTimeout deleting sandbox = %t, %v", changed, err)
+	}
+	stillDeleting, err := fixture.o.st.Get(context.Background(), deleting.ID)
+	if err != nil || stillDeleting == nil || stillDeleting.State != types.StateDeleting || stillDeleting.DeadlineUnix != oldDeadline {
+		t.Fatalf("SetTimeout changed deleting history = %+v, %v", stillDeleting, err)
+	}
+	if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
+		t.Fatalf("SetTimeout re-observed deleting sandbox: %v", kinds)
 	}
 	if killed, err := fixture.o.Kill(context.Background(), deleting.ID, fixture.apiKey); err != nil || !killed {
 		t.Fatalf("repeated Kill = %t, %v", killed, err)
@@ -503,6 +517,156 @@ func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(fixture.sb.BaseDir); err != nil {
 		t.Fatalf("paused cleanup removed BaseDir/checkpoint owner: %v", err)
+	}
+}
+
+func TestPausedNetworkStoreFailureRetriesWithoutAnotherAdmission(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "paused-network-store-retry")
+	fixture.sb.State = types.StatePaused
+	fixture.sb.ResumeSource = types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot,
+		Ref:  "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	}
+	if err := fixture.o.st.Put(context.Background(), fixture.sb); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.cache(fixture.sb)
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = fixture.o.DrainPauses(drainCtx)
+	})
+
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_paused_network_clear BEFORE UPDATE OF vswitch_port ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced paused network clear failure'); END`)
+	if _, err := fixture.o.Connect(context.Background(), fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "forced paused network clear failure") {
+		t.Fatalf("Resume cleanup failure = %v", err)
+	}
+	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StatePaused || stored.RunID != "" ||
+		stored.VswitchPort != fixture.sb.VswitchPort || stored.RunDir != fixture.sb.RunDir {
+		t.Fatalf("partial paused cleanup owner = %+v, %v", stored, err)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if !fenced {
+		t.Fatal("detached paused port was not fenced while its durable clear failed")
+	}
+	fixture.o.pausedCleanupMu.Lock()
+	_, retrying := fixture.o.pausedCleanupActive[fixture.sb.ID]
+	fixture.o.pausedCleanupMu.Unlock()
+	if !retrying {
+		t.Fatal("failed paused cleanup did not start a live retry worker")
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_paused_network_clear`)
+	cleaned := waitForSandbox(t, fixture.o, context.Background(), fixture.sb.ID, func(sb *types.Sandbox) bool {
+		return sb.State == types.StatePaused && sb.RunID == "" && sb.VswitchPort == "" && sb.RunDir == ""
+	}, "fully cleaned paused ownership without another admission")
+	if cleaned.BaseDir != fixture.sb.BaseDir || cleaned.ResumeSource != fixture.sb.ResumeSource {
+		t.Fatalf("paused retry changed portable owner = %+v", cleaned)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		fixture.o.pausedCleanupMu.Lock()
+		_, retrying = fixture.o.pausedCleanupActive[fixture.sb.ID]
+		fixture.o.pausedCleanupMu.Unlock()
+		if !retrying {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("successful paused cleanup retained retry worker")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced = fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("successful paused cleanup retained detached port fence")
+	}
+	if _, err := os.Stat(fixture.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("paused cleanup retry retained RunDir: %v", err)
+	}
+	if _, err := os.Stat(fixture.sb.BaseDir); err != nil {
+		t.Fatalf("paused cleanup retry removed BaseDir: %v", err)
+	}
+
+	cancelLifecycle()
+	if err := fixture.o.DrainPauses(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPauseStartsLiveRetryForRetainedRunDir(t *testing.T) {
+	cfg := checkpointOrchestratorConfig(t, config.CheckpointLocal)
+	o, sb, apiKey, _, _, _ := newCheckpointPauseFixture(t, cfg, "")
+	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sb.BaseDir, "checkpoint-owner"), []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = o.DrainPauses(drainCtx)
+	})
+
+	var failRunDir atomic.Bool
+	failRunDir.Store(true)
+	var removeCalls atomic.Int32
+	o.removeSandboxRunDir = func(path string) error {
+		removeCalls.Add(1)
+		if failRunDir.Load() {
+			return errors.New("forced paused RunDir cleanup failure")
+		}
+		return os.RemoveAll(path)
+	}
+	if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := o.st.Get(context.Background(), sb.ID)
+	if err != nil || paused == nil || paused.State != types.StatePaused || paused.RunID != "" ||
+		paused.VswitchPort != "" || paused.RunDir != sb.RunDir {
+		t.Fatalf("paused row did not retain failed RunDir owner = %+v, %v", paused, err)
+	}
+	o.pausedCleanupMu.Lock()
+	_, retrying := o.pausedCleanupActive[sb.ID]
+	o.pausedCleanupMu.Unlock()
+	if !retrying {
+		t.Fatal("successful Pause did not retain a live cleanup retry owner")
+	}
+
+	failRunDir.Store(false)
+	cleaned := waitForSandbox(t, o, context.Background(), sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StatePaused && current.RunDir == ""
+	}, "paused RunDir cleanup without Resume")
+	if cleaned.BaseDir != sb.BaseDir || !cleaned.ResumeSource.Valid() {
+		t.Fatalf("Pause retry changed checkpoint owner = %+v", cleaned)
+	}
+	if removeCalls.Load() < 2 {
+		t.Fatalf("RunDir removal calls = %d, want failed Pause cleanup plus live retry", removeCalls.Load())
+	}
+	if _, err := os.Stat(sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pause retry retained RunDir: %v", err)
+	}
+	if _, err := os.Stat(sb.BaseDir); err != nil {
+		t.Fatalf("Pause retry removed BaseDir: %v", err)
+	}
+
+	cancelLifecycle()
+	if err := o.DrainPauses(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

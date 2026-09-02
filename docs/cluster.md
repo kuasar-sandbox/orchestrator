@@ -623,8 +623,10 @@ park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 no
 `deleting` 只属于 node-local durable cleanup，不作为 sandbox upsert 投影。节点一旦把 exact
 owner 持久转为 `deleting` 就立即从本地 cache 和后续 full sync route set 排除；unit、network、
 RunDir/BaseDir finalizer 完成并 hard-delete 本地 row 后才发送 terminal Delete。这样节点不会重新
-激活已接纳删除的对象，Registry projection 只在 cleanup 完成后终结，而 node 重启仍能从完整
-owner 重试清理。
+激活已接纳删除的对象。既有 live node-link 上的 terminal Delete 只在 cleanup 完成后发送；若链路
+在此期间重连，下一代完整 route snapshot 会因该 SID 已被排除而撤下旧 projection，这是预期的
+unroute 收敛，不是 node terminal event。node 重启仍从完整 owner 重试本地清理，正确性不依赖
+Registry 是否还保留 projection。
 
 node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
 `starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,

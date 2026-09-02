@@ -1133,6 +1133,23 @@ func (s *Store) SetDeadline(ctx context.Context, id string, unix int64) error {
 	return err
 }
 
+// SetDeadlineIfState updates a live lifecycle row without allowing a stale
+// timeout request to mutate deleting/dead cleanup history. The caller supplies
+// the state it observed while holding the per-sandbox lifecycle lock; the SQL
+// predicate remains the durable fence if another writer bypasses that lock.
+func (s *Store) SetDeadlineIfState(ctx context.Context, id string, expected types.State, unix int64) (bool, error) {
+	switch expected {
+	case types.StateStarting, types.StateRunning, types.StatePaused:
+	default:
+		return false, fmt.Errorf("store: set deadline sandbox %s: invalid state %q", id, expected)
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET deadline_unix=? WHERE id=? AND state=?`, unix, id, string(expected))
+	if err != nil {
+		return false, fmt.Errorf("store: set deadline sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("set deadline", id, result)
+}
+
 // ReplacePausedResumeSource atomically promotes one exact paused source. The
 // old source is part of the CAS so a finalizer can never delete its local
 // artifact after another lifecycle owner changed the durable row.

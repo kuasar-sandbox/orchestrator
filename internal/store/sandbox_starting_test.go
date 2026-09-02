@@ -103,6 +103,38 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 	}
 }
 
+func TestSetDeadlineIfStateRejectsTerminalHistory(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("deadline-state-fence", 0)
+	sb.State = types.StatePaused
+	sb.LaunchMode = ""
+	sb.DeadlineUnix = 100
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.SetDeadlineIfState(ctx, sb.ID, types.StatePaused, 200); err != nil || !changed {
+		t.Fatalf("SetDeadlineIfState paused = %t, %v", changed, err)
+	}
+	current, err := st.Get(ctx, sb.ID)
+	if err != nil || current == nil {
+		t.Fatalf("Get paused deadline owner = %+v, %v", current, err)
+	}
+	if changed, err := st.BeginSandboxDelete(ctx, current); err != nil || !changed {
+		t.Fatalf("BeginSandboxDelete = %t, %v", changed, err)
+	}
+	if changed, err := st.SetDeadlineIfState(ctx, sb.ID, types.StatePaused, 300); err != nil || changed {
+		t.Fatalf("stale paused deadline update = %t, %v", changed, err)
+	}
+	if changed, err := st.SetDeadlineIfState(ctx, sb.ID, types.StateDeleting, 300); err == nil || changed {
+		t.Fatalf("deleting deadline update = %t, %v", changed, err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil || got == nil || got.State != types.StateDeleting || got.DeadlineUnix != 200 {
+		t.Fatalf("terminal deadline history changed = %+v, %v", got, err)
+	}
+}
+
 func TestExactRunStartingResourcesAndNonSecretTaskIdentity(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

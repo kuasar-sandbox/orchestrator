@@ -72,8 +72,10 @@ type Orchestrator struct {
 	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
 	lifecycle   keyedLockGroup         // serialize lifecycle mutations for one sid
 
-	deleteMu     sync.Mutex
-	deleteActive map[string]struct{} // deleting sandbox id -> live retrying finalizer
+	deleteMu            sync.Mutex
+	deleteActive        map[string]struct{} // deleting sandbox id -> live retrying finalizer
+	pausedCleanupMu     sync.Mutex
+	pausedCleanupActive map[string]struct{} // paused sandbox id -> live retrying ownership cleanup
 
 	lifecycleCtxMu sync.RWMutex
 	lifecycleCtx   context.Context // lifecycle admission root; canceled on node shutdown
@@ -193,6 +195,7 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		buildRecoveryReady:   make(chan struct{}),
 		detachedPortsPending: map[string]struct{}{},
 		deleteActive:         map[string]struct{}{},
+		pausedCleanupActive:  map[string]struct{}{},
 		clusterBuilds:        map[string]*clusterBuild{},
 		buildEvents:          make(chan *routesync.BuildEvent, 64),
 		mmdsBuildOwners:      map[string]string{},
@@ -1500,6 +1503,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		// uncleared exact ownership field for admission/restart reconciliation;
 		// returning a cleanup error here would misleadingly invite a second Pause.
 		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
+		o.startPausedCleanupRetry(paused.ID)
 	}
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
@@ -1904,18 +1908,9 @@ func (o *Orchestrator) ensureResumeAcceptedPreparedFrom(
 		cleanupCtx, cancel := cleanupContext()
 		cleanupErr := o.cleanupPausedOwnership(cleanupCtx, sb)
 		cancel()
-		cleanupChanged := sb.RunID != beforeRunID || sb.VswitchPort != beforePort || sb.RunDir != beforeRunDir
-		if cleanupChanged {
-			o.cache(sb)
-		}
-		// Preserve the established route protocol: runner/network cleanup changes
-		// the routable identity and is published, while a RunDir-only clear is an
-		// internal durable marker that a paused route never dials.
-		if cleanupChanged && (sb.RunID != beforeRunID || sb.VswitchPort != beforePort) {
-			o.publishUpsert(sb)
-			o.observeSandboxUpsert(sb)
-		}
+		o.recordPausedCleanupProgress(sb, beforeRunID, beforePort, beforeRunDir)
 		if cleanupErr != nil {
+			o.startPausedCleanupRetry(sb.ID)
 			return nil, nil, cleanupErr
 		}
 		if o.extensionSandboxHook != nil {
@@ -2085,9 +2080,18 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	switch sb.State {
+	case types.StateStarting, types.StateRunning, types.StatePaused:
+	default:
+		return false, nil
+	}
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	if err := o.st.SetDeadline(ctx, id, deadline); err != nil {
+	changed, err := o.st.SetDeadlineIfState(ctx, id, sb.State, deadline)
+	if err != nil {
 		return false, err
+	}
+	if !changed {
+		return false, nil
 	}
 	sb.DeadlineUnix = deadline
 	updated := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = deadline })

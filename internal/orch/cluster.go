@@ -644,9 +644,11 @@ func (o *Orchestrator) DrainLaunches(ctx context.Context) error {
 	return o.launches.Drain(ctx)
 }
 
-// DrainPauses closes admission and waits for accepted pause and export work to
-// stop using shared dependencies. Accepted snapshots finish durable publication;
-// exports cancel publication unless their source finalizer already won.
+// DrainPauses closes admission and waits for accepted pause/export work and
+// live paused-ownership cleanup retries to stop using shared dependencies.
+// Accepted snapshots finish durable publication; exports cancel publication
+// unless their source finalizer already won. The lifecycle root must be
+// canceled first so a pending cleanup retry leaves its durable row to restart.
 func (o *Orchestrator) DrainPauses(ctx context.Context) error {
 	return o.acceptedOps.Drain(ctx)
 }

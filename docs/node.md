@@ -1868,8 +1868,10 @@ bookmark{full_sync}
 
 `deleting` 是 node-local cleanup-pending state，不作为 sandbox upsert 投影。节点一旦持久接纳
 Delete 就立即从本地 cache 和后续 full sync route set 排除；exact unit/network/path finalizer
-完成并 hard-delete 本地 row 后才发送 `delete{sid}`。Registry projection 因而只在 cleanup 完成后
-终结，node 重启仍能从完整 owner 重试清理。
+完成并 hard-delete 本地 row 后才在既有 live 链路发送 `delete{sid}`。若链路在 cleanup pending
+期间重连，下一代完整 route snapshot 会因该 SID 已被排除而撤下旧 projection；该动作是预期的
+unroute 收敛，不是 node terminal event。node 重启仍能从完整 owner 重试清理，本地 finalizer
+正确性不依赖 Registry projection。
 
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
 物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry

@@ -102,6 +102,11 @@ may therefore contain a cleanup-pending `deleting` view. Extensions must treat
 it as diagnostic state and must not try to resume, route, or independently
 clean it.
 
+For route consumers, a reconnecting full snapshot intentionally omits that
+`deleting` sandbox and can therefore withdraw an older projection before the
+live terminal delete exists. That withdrawal is unroute convergence, not a
+node terminal event; durable local cleanup continues from the retained row.
+
 ## Conductor lifecycle hooks
 
 An extension may implement either or both admission callbacks over public,
