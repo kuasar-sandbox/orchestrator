@@ -353,6 +353,8 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 		Referer: config.BuilderRefererConfig{Enabled: true},
 	}})
 	ctx := context.Background()
+	buildEvents, cancelBuildEvents := o.SubscribeBuilds()
+	defer cancelBuildEvents()
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)
 	cmd := clusterBuildRegisterCommand("durable-credential-replay", fingerprint)
 	cmd.Config[buildcfg.NsBuilder] = `{"referer":{"enabled":true}}`
@@ -361,7 +363,7 @@ func TestClusterBuildRegisterExactReplayUsesDurableCredential(t *testing.T) {
 		t.Fatalf("initial BuildRegister ack = %+v", ack)
 	}
 	select {
-	case event := <-o.buildEvents:
+	case event := <-buildEvents:
 		if event.BuildID != cmd.BuildID || event.State != string(types.BuildRegistered) {
 			t.Fatalf("initial BuildEvent = %+v", event)
 		}
@@ -414,6 +416,8 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			o := testOrchCfg(t, mmdsFeatureConfig())
 			ctx := context.Background()
+			buildEvents, cancelBuildEvents := o.SubscribeBuilds()
+			defer cancelBuildEvents()
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
 			cmd := clusterBuildRegisterCommand("terminal-replay-"+tc.name, fingerprint)
 			cmd.Config[sandboxcfg.NsMMDS] = `{"routes":[{"path":"/identity","data":"registered"}]}`
@@ -421,7 +425,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 				t.Fatalf("initial BuildRegister ack = %+v", ack)
 			}
 			select {
-			case <-o.buildEvents: // registered
+			case <-buildEvents: // registered
 			case <-time.After(time.Second):
 				t.Fatal("initial registered event was not published")
 			}
@@ -457,7 +461,7 @@ func TestClusterBuildRegisterTerminalReplayRepublishesDurableState(t *testing.T)
 				t.Fatalf("terminal BuildRegister replay ack = %+v", ack)
 			}
 			select {
-			case event := <-o.buildEvents:
+			case event := <-buildEvents:
 				if event.BuildID != cmd.BuildID || event.State != string(tc.state) ||
 					event.TemplateID != tc.templateID || event.Reason != tc.reason {
 					t.Fatalf("terminal replay BuildEvent = %+v", event)

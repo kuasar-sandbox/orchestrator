@@ -91,7 +91,7 @@ func TestConductorConfigTemplateUsesBuilderTwoStageAdmission(t *testing.T) {
 	for _, want := range []string{
 		"admission:", "registration:", "execution:", "max_builds: 16",
 		"resources: { cpu: 64, memory: 256GiB, storage: 1TiB }",
-		"registration_ttl: 1h", "queue_ttl: 30m", "storage is admission-only",
+		"registration_ttl: 1h", "queue_ttl: 30m", "terminal_ttl: 24h", "storage is admission-only",
 	} {
 		if !strings.Contains(block, want) {
 			t.Errorf("builder template does not contain %q:\n%s", want, block)
@@ -101,6 +101,12 @@ func TestConductorConfigTemplateUsesBuilderTwoStageAdmission(t *testing.T) {
 		if strings.Contains(block, forbidden) {
 			t.Errorf("builder template still contains %q:\n%s", forbidden, block)
 		}
+	}
+}
+
+func TestConductorConfigTemplateDocumentsSandboxDeadRetention(t *testing.T) {
+	if !strings.Contains(conductorConfigSkeleton, "dead_ttl: 24h") {
+		t.Fatal("conductor template does not document sandbox dead retention")
 	}
 }
 

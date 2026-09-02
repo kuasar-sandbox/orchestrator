@@ -40,9 +40,10 @@ import (
 // Version is the protocol version announced by the authority in Hello.
 // Version 3 was the hard cut to stable_id. Version 4 replaced the Snapshot-
 // specific route location field with kind-orthogonal artifact_location. Version
-// 5 splits node API and data endpoints and removes the proxy forwarding socket;
-// mixed peers must fail closed.
-const Version = 5
+// 5 splits node API and data endpoints and removes the proxy forwarding socket.
+// Version 6 adds rebuildable Build upsert/delete events and an explicit Build
+// full-snapshot bracket on every node-link session; mixed peers fail closed.
+const Version = 6
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -173,7 +174,7 @@ type Msg struct {
 	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
 	RevToken string        `json:"rev_token,omitempty"`
 	FullSync bool          `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
-	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
+	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry BuildUpsert/BuildDelete
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.

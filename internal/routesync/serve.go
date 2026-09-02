@@ -27,6 +27,15 @@ type Source interface {
 	Policy() Policy
 }
 
+// BuildSource is the node-link-only extension for the current Registry Build
+// projection. A subscription is installed before RangeBuilds so changes racing
+// the snapshot are delivered after BuildSyncEnd. A lagging subscription closes,
+// forcing reconnect and another complete snapshot.
+type BuildSource interface {
+	RangeBuilds(ctx context.Context, fn func(BuildEvent) error) error
+	SubscribeBuilds() (ch <-chan BuildEvent, cancel func())
+}
+
 // ErrResumeUnavailable tells StreamAuthority to fall back to a full snapshot for
 // this subscription. Other replay errors are treated as stream failures.
 var ErrResumeUnavailable = errors.New("routesync: resume unavailable")
@@ -146,6 +155,38 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	streamAuthority(ctx, w, flush, body, src, reg, onUp, outbox, nil, false, log)
 }
 
+const buildSnapshotOutboxBurst = 32
+
+// drainBuildSnapshotOutbox keeps command ACKs and the coalesced heartbeat
+// moving while the same writer is producing a potentially large retained-Build
+// snapshot. Live Build changes remain buffered until the snapshot bracket is
+// complete.
+func drainBuildSnapshotOutbox(ctx context.Context, w io.Writer, flush func(), outbox <-chan *Msg) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if outbox == nil {
+		return nil
+	}
+	for range buildSnapshotOutboxBurst {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case m, ok := <-outbox:
+			if !ok || m == nil {
+				return io.EOF
+			}
+			if err := WriteMsg(w, m); err != nil {
+				return err
+			}
+			flush()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, onSubscribed func(), includeMMDS bool, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -178,6 +219,18 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	// and replayed as idempotent upserts.
 	ch, cancelSub := src.Subscribe()
 	defer cancelSub()
+	var buildSource BuildSource
+	var buildCh <-chan BuildEvent
+	if reg.Subscribe != nil && reg.Subscribe.Kind == KindRegistry {
+		var ok bool
+		buildSource, ok = src.(BuildSource)
+		if !ok {
+			return
+		}
+		var cancelBuild func()
+		buildCh, cancelBuild = buildSource.SubscribeBuilds()
+		defer cancelBuild()
+	}
 	if onSubscribed != nil {
 		onSubscribed()
 	}
@@ -211,6 +264,29 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			return
 		}
 	}
+	if buildSource != nil {
+		if err := WriteMsg(w, &Msg{Type: TypeBuildSyncBegin}); err != nil {
+			return
+		}
+		if err := drainBuildSnapshotOutbox(sctx, w, flush, outbox); err != nil {
+			return
+		}
+		if err := buildSource.RangeBuilds(sctx, func(event BuildEvent) error {
+			event.Kind = BuildUpsert
+			if err := writeBuildEvent(w, event); err != nil {
+				return err
+			}
+			return drainBuildSnapshotOutbox(sctx, w, flush, outbox)
+		}); err != nil {
+			return
+		}
+		if err := WriteMsg(w, &Msg{Type: TypeBuildSyncEnd}); err != nil {
+			return
+		}
+		if err := drainBuildSnapshotOutbox(sctx, w, flush, outbox); err != nil {
+			return
+		}
+	}
 	bookmark := &Msg{Type: TypeBookmark, FullSync: !resumed}
 	if rev, ok := src.(RevisionSource); ok {
 		bookmark.RevToken = rev.CurrentRevToken()
@@ -227,6 +303,15 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
 			if err := writeEvent(w, ev, includeMMDS); err != nil {
+				return
+			}
+			flush()
+			continue
+		case event, ok := <-buildCh:
+			if !ok {
+				return
+			}
+			if err := writeBuildEvent(w, event); err != nil {
 				return
 			}
 			flush()
@@ -252,7 +337,29 @@ func streamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 				return
 			}
 			flush()
+		case event, ok := <-buildCh:
+			if !ok {
+				return
+			}
+			if err := writeBuildEvent(w, event); err != nil {
+				return
+			}
+			flush()
 		}
+	}
+}
+
+func writeBuildEvent(w io.Writer, event BuildEvent) error {
+	if event.BuildID == "" {
+		return errors.New("routesync: empty build id")
+	}
+	switch event.Kind {
+	case BuildUpsert:
+		return WriteMsg(w, &Msg{Type: TypeBuildUpsert, Build: &event})
+	case BuildDelete:
+		return WriteMsg(w, &Msg{Type: TypeBuildDelete, Build: &event})
+	default:
+		return errors.New("routesync: invalid build event kind")
 	}
 }
 

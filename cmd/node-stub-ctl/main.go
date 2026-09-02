@@ -769,7 +769,8 @@ type stubNode struct {
 	cmdSeq       int64
 	subs         map[int]chan routesync.Event
 	subSeq       int
-	buildEvents  chan *routesync.BuildEvent
+	buildSubs    map[int]chan routesync.BuildEvent
+	buildSubSeq  int
 }
 
 func newStubNode(opts stubNodeOptions, svc *service) *stubNode {
@@ -790,7 +791,7 @@ func newStubNode(opts stubNodeOptions, svc *service) *stubNode {
 		builds:          map[string]*stubBuild{},
 		keyPairs:        map[string]stubKeyPair{},
 		subs:            map[int]chan routesync.Event{},
-		buildEvents:     make(chan *routesync.BuildEvent, 256),
+		buildSubs:       map[int]chan routesync.BuildEvent{},
 	}
 }
 
@@ -1249,7 +1250,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		conflict := !sameStubBuildRegistration(existing, b)
 		terminal := existing.State == "ready" || existing.State == "error"
 		event := &routesync.BuildEvent{
-			BuildID: existing.BuildID, State: existing.State,
+			Kind: routesync.BuildUpsert, BuildID: existing.BuildID, State: existing.State,
 			TemplateID: existing.TemplateID, Reason: existing.Reason,
 		}
 		n.mu.Unlock()
@@ -1257,12 +1258,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 			return ackHTTP(cmd, routesync.AckRejected, "build immutable definition conflicts with existing build", http.StatusConflict)
 		}
 		if terminal {
-			select {
-			case n.buildEvents <- event:
-				n.svc.logEvent(n.ID, "build_event", event)
-			case <-ctx.Done():
-				return nil
-			}
+			n.publishBuildEvent(event)
 		}
 		return ack(cmd, routesync.AckAccepted, "")
 	}
@@ -1378,7 +1374,45 @@ func (n *stubNode) Heartbeat() *routesync.Heartbeat {
 		BuildRegistrationUsage: &registration, BuildExecutionUsage: &execution}
 }
 
-func (n *stubNode) BuildEvents() <-chan *routesync.BuildEvent { return n.buildEvents }
+func (n *stubNode) RangeBuilds(ctx context.Context, fn func(routesync.BuildEvent) error) error {
+	n.mu.Lock()
+	events := make([]routesync.BuildEvent, 0, len(n.builds))
+	for _, build := range n.builds {
+		events = append(events, routesync.BuildEvent{
+			Kind: routesync.BuildUpsert, BuildID: build.BuildID, State: build.State,
+			TemplateID: build.TemplateID, Reason: build.Reason,
+		})
+	}
+	n.mu.Unlock()
+	sort.Slice(events, func(i, j int) bool { return events[i].BuildID < events[j].BuildID })
+	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *stubNode) SubscribeBuilds() (<-chan routesync.BuildEvent, func()) {
+	ch := make(chan routesync.BuildEvent, 256)
+	n.mu.Lock()
+	id := n.buildSubSeq
+	n.buildSubSeq++
+	n.buildSubs[id] = ch
+	n.mu.Unlock()
+	cancel := func() {
+		n.mu.Lock()
+		if current, ok := n.buildSubs[id]; ok {
+			delete(n.buildSubs, id)
+			close(current)
+		}
+		n.mu.Unlock()
+	}
+	return ch, cancel
+}
 
 func (n *stubNode) publishRoute(entry routesync.RouteEntry) {
 	if entry.State == "" {
@@ -1497,7 +1531,7 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	if reason != "" {
 		b.Reason = reason
 	}
-	ev := &routesync.BuildEvent{BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
+	ev := &routesync.BuildEvent{Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
 	n.mu.Unlock()
 	if publish {
 		n.publishBuildEvent(ev)
@@ -1580,7 +1614,7 @@ func (n *stubNode) scheduleBuildExecutions() {
 		b.State = "building"
 		b.ExecutionReady = false
 		events = append(events, &routesync.BuildEvent{
-			BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+			Kind: routesync.BuildUpsert, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
 		})
 	}
 	n.mu.Unlock()
@@ -1590,10 +1624,23 @@ func (n *stubNode) scheduleBuildExecutions() {
 }
 
 func (n *stubNode) publishBuildEvent(event *routesync.BuildEvent) {
-	select {
-	case n.buildEvents <- event:
-	default:
+	if event == nil {
+		return
 	}
+	copy := *event
+	if copy.Kind == "" {
+		copy.Kind = routesync.BuildUpsert
+	}
+	n.mu.Lock()
+	for id, ch := range n.buildSubs {
+		select {
+		case ch <- copy:
+		default:
+			delete(n.buildSubs, id)
+			close(ch)
+		}
+	}
+	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "build_event", event)
 }
 

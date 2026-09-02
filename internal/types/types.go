@@ -349,6 +349,7 @@ type Sandbox struct {
 	Metadata           map[string]string
 	Env                map[string]string
 	CreatedUnix        int64
+	DeadUnix           int64 // diagnostic dead commit time; 0 for every non-dead state
 }
 
 // ClusterSandboxContext is trusted node-local ownership state supplied by the

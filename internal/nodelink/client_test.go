@@ -60,25 +60,26 @@ type fakeNode struct {
 	keyPairs             map[string]routesync.Command
 	createAPIFingerprint string
 	events               chan routesync.Event
+	buildEvents          chan routesync.BuildEvent
 }
 
-type replayingFakeNode struct {
+type syncingFakeNode struct {
 	*fakeNode
-	replays        chan struct{}
-	replayMu       sync.Mutex
-	replayFailures int
+	ranges        chan struct{}
+	rangeMu       sync.Mutex
+	rangeFailures int
 }
 
-func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(ctx context.Context) error {
+func (n *syncingFakeNode) RangeBuilds(ctx context.Context, fn func(routesync.BuildEvent) error) error {
 	select {
-	case n.replays <- struct{}{}:
+	case n.ranges <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	n.replayMu.Lock()
-	defer n.replayMu.Unlock()
-	if n.replayFailures > 0 {
-		n.replayFailures--
+	n.rangeMu.Lock()
+	defer n.rangeMu.Unlock()
+	if n.rangeFailures > 0 {
+		n.rangeFailures--
 		return errors.New("transient durable scan failure")
 	}
 	return nil
@@ -86,9 +87,10 @@ func (n *replayingFakeNode) ReplayClusterBuildTerminalStates(ctx context.Context
 
 func newFakeNode() *fakeNode {
 	return &fakeNode{
-		routes:   map[string]routesync.RouteEntry{},
-		keyPairs: map[string]routesync.Command{},
-		events:   make(chan routesync.Event, 16),
+		routes:      map[string]routesync.RouteEntry{},
+		keyPairs:    map[string]routesync.Command{},
+		events:      make(chan routesync.Event, 16),
+		buildEvents: make(chan routesync.BuildEvent, 16),
 	}
 }
 
@@ -106,7 +108,12 @@ func (n *fakeNode) Subscribe() (<-chan routesync.Event, func()) { return n.event
 func (n *fakeNode) OnWake(ctx context.Context, sid string)      {}
 func (n *fakeNode) Policy() routesync.Policy                    { return routesync.Policy{} }
 func (n *fakeNode) Heartbeat() *routesync.Heartbeat             { return &routesync.Heartbeat{} }
-func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent   { return nil }
+func (n *fakeNode) RangeBuilds(context.Context, func(routesync.BuildEvent) error) error {
+	return nil
+}
+func (n *fakeNode) SubscribeBuilds() (<-chan routesync.BuildEvent, func()) {
+	return n.buildEvents, func() {}
+}
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
@@ -357,9 +364,9 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	}
 }
 
-func TestNodeLinkRejectsVersion4BeforeCommands(t *testing.T) {
-	if routesync.Version != 5 {
-		t.Fatalf("routesync.Version=%d, want 5", routesync.Version)
+func TestNodeLinkRejectsVersion5BeforeCommands(t *testing.T) {
+	if routesync.Version != 6 {
+		t.Fatalf("routesync.Version=%d, want 6", routesync.Version)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
@@ -369,7 +376,7 @@ func TestNodeLinkRejectsVersion4BeforeCommands(t *testing.T) {
 			return
 		}
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
-			Version: 4,
+			Version: 5,
 		}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
 			CmdID: "must-not-run", Kind: routesync.CmdKeyPut,
@@ -404,7 +411,7 @@ func TestNodeLinkRejectsVersion4BeforeCommands(t *testing.T) {
 	}
 }
 
-func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T) {
+func TestNodeLinkRunsBuildFullSyncAfterEveryEstablishedSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	endSession := make(chan struct{})
 	mux := http.NewServeMux()
@@ -432,7 +439,7 @@ func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T)
 		srv.Close()
 	}()
 
-	node := &replayingFakeNode{fakeNode: newFakeNode(), replays: make(chan struct{}, 4)}
+	node := &syncingFakeNode{fakeNode: newFakeNode(), ranges: make(chan struct{}, 4)}
 	client := New(
 		func(ctx context.Context) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
@@ -442,19 +449,19 @@ func TestNodeLinkReplaysTerminalBuildsAfterEveryEstablishedSession(t *testing.T)
 	)
 	go client.Run(ctx)
 	select {
-	case <-node.replays:
+	case <-node.ranges:
 	case <-time.After(3 * time.Second):
-		t.Fatal("terminal replay did not run on first established session")
+		t.Fatal("Build full sync did not run on first established session")
 	}
 	endSession <- struct{}{}
 	select {
-	case <-node.replays:
+	case <-node.ranges:
 	case <-time.After(3 * time.Second):
-		t.Fatal("terminal replay did not run after forced reconnect")
+		t.Fatal("Build full sync did not run after forced reconnect")
 	}
 }
 
-func TestNodeLinkRetriesTerminalBuildReplayWithinEstablishedSession(t *testing.T) {
+func TestNodeLinkReconnectsAfterBuildFullSyncReadFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var sessions int
@@ -481,10 +488,10 @@ func TestNodeLinkRetriesTerminalBuildReplayWithinEstablishedSession(t *testing.T
 		srv.Close()
 	}()
 
-	node := &replayingFakeNode{
-		fakeNode:       newFakeNode(),
-		replays:        make(chan struct{}, 4),
-		replayFailures: 1,
+	node := &syncingFakeNode{
+		fakeNode:      newFakeNode(),
+		ranges:        make(chan struct{}, 4),
+		rangeFailures: 1,
 	}
 	client := New(
 		func(ctx context.Context) (net.Conn, error) {
@@ -496,16 +503,16 @@ func TestNodeLinkRetriesTerminalBuildReplayWithinEstablishedSession(t *testing.T
 	go client.Run(ctx)
 	for i := 0; i < 2; i++ {
 		select {
-		case <-node.replays:
+		case <-node.ranges:
 		case <-time.After(3 * time.Second):
-			t.Fatalf("terminal replay calls=%d, want retry after transient scan failure", i)
+			t.Fatalf("Build full sync calls=%d, want reconnect after transient scan failure", i)
 		}
 	}
 	sessionsMu.Lock()
 	gotSessions := sessions
 	sessionsMu.Unlock()
-	if gotSessions != 1 {
-		t.Fatalf("node-link sessions=%d, want replay retry within one established session", gotSessions)
+	if gotSessions < 2 {
+		t.Fatalf("node-link sessions=%d, want reconnect after failed Build full sync", gotSessions)
 	}
 }
 

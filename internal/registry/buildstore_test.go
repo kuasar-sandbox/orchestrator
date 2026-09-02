@@ -171,7 +171,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if first.NodeID != "n1" {
 		t.Fatalf("first placement=%+v", first)
 	}
-	if err := reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)}); err != nil {
+	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B, Resources: testWireBuildResources()}); !errors.Is(err, errNodeBuildIDConflict) {
@@ -187,7 +187,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	}
 }
 
-func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
+func TestBuildUpsertsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	for _, tc := range []struct {
@@ -205,7 +205,7 @@ func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 		}
 	}
 
-	if err := reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)}); err != nil {
+	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)}); err != nil {
 		t.Fatal(err)
 	}
 	g1, found, err := reg.stores.GetBuildInGroup(ctx, "/g1", "same-build")
@@ -215,6 +215,219 @@ func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	g2, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", "same-build")
 	if err != nil || !found || g2.State != BuildRegistered {
 		t.Fatalf("n1 event changed g2 build=%+v found=%v err=%v", g2, found, err)
+	}
+}
+
+func TestBuildDeleteRemovesExactNodeProjectionAndOwnerRef(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const buildID = "retained-build-delete"
+	record := &BuildRecord{Group: "/g", BuildID: buildID, NodeID: "n1", State: BuildReady, TemplateID: "e2b:img:manifest://ready"}
+	if err := reg.stores.PutBuild(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: record.Group, BuildID: buildID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.applyBuildDelete(ctx, "n1", buildID); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, record.Group, buildID); err != nil || found {
+		t.Fatalf("deleted Build projection found=%v err=%v", found, err)
+	}
+	if _, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", buildID); err != nil || found {
+		t.Fatalf("deleted Build owner ref found=%v err=%v", found, err)
+	}
+
+	// A stale node delete may release its stale ref, but it cannot delete a
+	// replacement projection that is now bound to another node.
+	replacement := &BuildRecord{Group: "/g", BuildID: buildID, NodeID: "n2", State: BuildRegistered, TemplateID: "replacement"}
+	if err := reg.stores.PutBuild(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: replacement.Group, BuildID: buildID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.applyBuildDelete(ctx, "n1", buildID); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := reg.stores.GetBuildInGroup(ctx, replacement.Group, buildID)
+	if err != nil || !found || got.NodeID != "n2" {
+		t.Fatalf("stale delete changed replacement: %+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestBuildDeleteOwnerRefRevisionFencePreservesRefresh(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	ref := clusterstate.NodeBuildRef{Group: "/g", BuildID: "same-id-replacement"}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+		t.Fatal(err)
+	}
+	got, staleRevision, found, err := reg.lookupNodeBuildRefVersion(ctx, "n1", ref.BuildID)
+	if err != nil || !found || got != ref || staleRevision == 0 {
+		t.Fatalf("captured owner ref=%+v revision=%d found=%v err=%v", got, staleRevision, found, err)
+	}
+
+	// A same-ID registration refreshes the exact node/group ref after an old
+	// delete captured it. The old delete must not remove this newer revision.
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := reg.stores.removeNodeBuildRefShardAtRevision(ctx, "n1", ref.BuildID, staleRevision); err != nil || deleted {
+		t.Fatalf("stale delete removed refreshed owner ref: deleted=%v err=%v", deleted, err)
+	}
+	if got, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", ref.BuildID); err != nil || !found || got != ref {
+		t.Fatalf("replacement owner ref=%+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestSupersededNodeLinkBuildDeleteCannotRemoveReplacement(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const (
+		nodeID  = "n1"
+		buildID = "reused-after-session-replacement"
+	)
+	oldSession := &nodeChannel{nodeID: nodeID}
+	reg.addNode(oldSession)
+	old := &BuildRecord{Group: "/g", BuildID: buildID, NodeID: nodeID, State: BuildReady, TemplateID: "old"}
+	ref := clusterstate.NodeBuildRef{Group: old.Group, BuildID: buildID}
+	if err := reg.stores.PutBuild(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, nodeID, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.withActiveNodeBuildFrame(oldSession, func() error {
+		return reg.applyBuildDelete(ctx, nodeID, buildID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newSession := &nodeChannel{nodeID: nodeID}
+	reg.addNode(newSession)
+	replacement := &BuildRecord{Group: old.Group, BuildID: buildID, NodeID: nodeID, State: BuildRegistered, TemplateID: "replacement"}
+	if err := reg.stores.PutBuild(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, nodeID, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	err := reg.withActiveNodeBuildFrame(oldSession, func() error {
+		called = true
+		return reg.applyBuildDelete(ctx, nodeID, buildID)
+	})
+	if !errors.Is(err, errSupersededNodeBuildSession) || called {
+		t.Fatalf("superseded BuildDelete called=%v err=%v", called, err)
+	}
+	got, found, err := reg.stores.GetBuildInGroup(ctx, replacement.Group, buildID)
+	if err != nil || !found || got.NodeID != nodeID || got.TemplateID != replacement.TemplateID {
+		t.Fatalf("replacement Build=%+v found=%v err=%v", got, found, err)
+	}
+	if gotRef, found, err := reg.stores.GetNodeBuildRef(ctx, nodeID, buildID); err != nil || !found || gotRef != ref {
+		t.Fatalf("replacement owner ref=%+v found=%v err=%v", gotRef, found, err)
+	}
+
+	// The superseded handler's deferred teardown must not deactivate the new
+	// session after addNode has installed it.
+	reg.removeNode(oldSession)
+	newCalled := false
+	if err := reg.withActiveNodeBuildFrame(newSession, func() error {
+		newCalled = true
+		return nil
+	}); err != nil || !newCalled {
+		t.Fatalf("replacement session active=%v err=%v", newCalled, err)
+	}
+}
+
+func TestBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	expected := []clusterstate.NodeBuildRef{
+		{Group: "/g", BuildID: "kept-ready"},
+		{Group: "/g", BuildID: "lost-delete-error"},
+	}
+	for index, ref := range expected {
+		state := BuildReady
+		if index == 1 {
+			state = BuildError
+		}
+		if err := reg.stores.PutBuild(ctx, &BuildRecord{Group: ref.Group, BuildID: ref.BuildID, NodeID: "n1", State: state}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", expected, map[string]struct{}{"kept-ready": {}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "kept-ready"); err != nil || !found {
+		t.Fatalf("seen Build was pruned: found=%v err=%v", found, err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "lost-delete-error"); err != nil || found {
+		t.Fatalf("missing Build projection survived reconnect: found=%v err=%v", found, err)
+	}
+	if _, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", "lost-delete-error"); err != nil || found {
+		t.Fatalf("missing Build owner ref survived reconnect: found=%v err=%v", found, err)
+	}
+}
+
+func TestBuildReconnectFullSyncPreservesAmbiguousStartingBinding(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	ref := clusterstate.NodeBuildRef{Group: "/g", BuildID: "starting-ambiguous"}
+	record := &BuildRecord{
+		Group: ref.Group, BuildID: ref.BuildID, NodeID: "n1", State: BuildStarting,
+		RegistrationImageRepo: "registry.test/build", RegistrationRegistryAuth: "sealed-replay-input",
+	}
+	if err := reg.stores.PutBuild(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+		t.Fatal(err)
+	}
+
+	// The node may omit this row because the original command was never
+	// delivered, or because its durable acceptance raced the snapshot. Neither
+	// case is a definitive rejection of the immutable selected-node intent.
+	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{ref}, map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := reg.stores.GetBuildInGroup(ctx, ref.Group, ref.BuildID)
+	if err != nil || !found || got.State != BuildStarting || got.NodeID != "n1" {
+		t.Fatalf("ambiguous BuildStarting intent changed: %+v found=%v err=%v", got, found, err)
+	}
+	if _, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", ref.BuildID); err != nil || !found {
+		t.Fatalf("ambiguous BuildStarting owner ref found=%v err=%v", found, err)
+	}
+}
+
+func TestBuildFullSyncBaselineDoesNotPruneConcurrentRegistration(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	old := clusterstate.NodeBuildRef{Group: "/g", BuildID: "old-missing"}
+	for _, ref := range []clusterstate.NodeBuildRef{old, {Group: "/g", BuildID: "new-after-register"}} {
+		if err := reg.stores.PutBuild(ctx, &BuildRecord{Group: ref.Group, BuildID: ref.BuildID, NodeID: "n1", State: BuildRegistered}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.stores.AddNodeBuildRef(ctx, "n1", ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// expected is the NodeRegister baseline. The second ref appeared after that
+	// point and therefore cannot be inferred absent from this snapshot.
+	if err := reg.applyNodeBuildFullSnapshot(ctx, "n1", []clusterstate.NodeBuildRef{old}, map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", old.BuildID); err != nil || found {
+		t.Fatalf("old missing Build found=%v err=%v", found, err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "new-after-register"); err != nil || !found {
+		t.Fatalf("concurrent registration was pruned: found=%v err=%v", found, err)
 	}
 }
 

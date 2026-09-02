@@ -556,8 +556,8 @@ func (s *Store) DeleteBuildMMDSRouteSecretValues(ctx context.Context, buildID st
 
 // PutBuildTerminal atomically persists a build's terminal state and removes
 // its builder-only execution ownership, MMDS routes, and confidential values.
-// The build row remains as the template/status registry, but no runner or
-// builder input can survive as terminal ownership or template metadata.
+// The build row remains as retention-bounded status/index history, but no runner
+// or builder input can survive as terminal ownership or template metadata.
 func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error {
 	if build == nil {
 		return errors.New("build is required")
@@ -581,7 +581,7 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
 		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',
 		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
-		execution_result_json=''
+		execution_result_json='',finished_unix=unixepoch()
 		WHERE build_id=? AND status=? AND execution_claimed=1
 		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
 		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json=''`,

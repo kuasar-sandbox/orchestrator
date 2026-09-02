@@ -450,7 +450,8 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
-| `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 request/template 覆盖;restore Capacity 由 snapshot 固定 |
+| `sandbox.dead_ttl` | `24h` | 已完成全部本地 cleanup、无任何 owner 的 `dead` Sandbox 诊断记录保留期；必须为正 Go duration |
+| `sandbox.resources.capacity.cpu` / `.memory` | `2` / `2GiB` | guest 可见的 VM 上限/SKU;E2B `cpuCount`/`memoryMB` 继续表示 Capacity。img 冷启可由 create/group 覆盖;restore Capacity 由 snapshot 固定 |
 | `sandbox.resources.allocatable.cpu` / `.memory` | 最终 capacity CPU / 省略时继承 `256MiB` | CPU 是调度权重/保证;memory 是 settled guest headroom,不是 total Budget。conductor 配置省略 memory 时可随最终 Capacity 收敛；operator/custom 显式值（即使等于 `256MiB`）不得静默收敛，越界直接拒绝。request patch 的 pointer schema 与规则不变 |
 | `sandbox.resources.startup.memory` | 最终 `capacity.memory` | cold 首份可信 report 前的 headroom,static/dynamic 均有效,与 settled headroom 独立;restore 不使用 |
 | `sandbox.resources.overhead.memory` | `32MiB` | node-owned host VMM overhead;sandbox-ctl 不在 VMM cgroup 内;request/template 不可覆盖 |
@@ -466,6 +467,7 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `builder.admission.execution.resources.{cpu,memory,storage}` | 不限制 | execution 的聚合资源向量;CPU/memory 同时施加到 `sandbox-builder.slice`,storage V1 仅准入记账 |
 | `builder.admission.registration` | 完整继承 resolved execution | 所有非终态 Build 的注册上限;显式块不做字段级继承,且同一有限维度不得小于 execution |
 | `builder.registration_ttl` / `.queue_ttl` | `1h` / `30m` | 未 Trigger 的 registered Build 与 waiting Build 的持久超时;终态可查询并释放 registration usage |
+| `builder.terminal_ttl` | `24h` | 已完成 cleanup、无 execution/runtime/result owner 的 `ready/error` Build 历史保留期；必须为正 Go duration |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§12) |
@@ -850,9 +852,13 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
   local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
 - **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
-  之后只用持久 id。
-- **无独立 templates 表**:`builds` 表兼任模板登记(§15);持久 id 由构建产物推导。
-  快照晋升的模板(§8.1)甚至不写 builds 表——id 本身即完整引用。
+  之后只用持久 id。Build status、临时 id、name/alias 与本机 list 仅在终态 Build row 的
+  retention window 内可用。
+- **无独立 templates 表**:canonical TemplateID 本身编码 profile、artifact kind 与 portable ref，
+  其制品才是长期 launch authority。`builds` 只承担构建执行、短期 status/index/alias，不是模板
+  catalog；终态 row 删除后 canonical TemplateID 仍可创建 img/sbx/snp Sandbox，也可直接作为后续
+  Build 的 `fromTemplate`。快照晋升的模板
+  (§8.1)同样无需写 builds 表。
 
 ### 4.5 SDK / CLI 对接与协议 pin
 
@@ -864,7 +870,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
-- routesync(Proxy / 路由观察者):版本 5,帧 `[4B LE len][JSON]`,消息
+- routesync(Proxy / 路由观察者):版本 6,帧 `[4B LE len][JSON]`,消息
   `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
@@ -907,15 +913,16 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 
 ```text
 node resource policy
-  < template / group defaults
+  < cluster group defaults
   < create / reserve body resource
   < X-Kuasar-Sandbox-Resource
   < E2B first-class cpuCount / memoryMB (只覆盖 capacity 对应 leaf)
-  < restore snapshot capacity constraint
+  < portable artifact capacity constraint
 ```
 
-五个 leaf 独立 overlay;例如 template 只设 `capacity.memory`,create 只设
-`allocatable.memory` 时两者同时保留。其它 namespace 仍由高层整段覆盖。每一层都先
+五个 leaf 独立 overlay；group 只设 `capacity.memory`、create 只设
+`allocatable.memory` 时两者同时保留。Build row metadata 不是 Create overlay 层。其它
+namespace 仍由高层整段覆盖。每一层都先
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
@@ -1069,15 +1076,16 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   metadata,resource 按 leaf 取 header 优先、其它 namespace 整段取 header 优先)。create
   与模板 register 支持通用配置;trigger 明确拒绝非空通用 metadata/header;
   create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
-  `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
+  `builds.metadata_json`,build-only 配置存 `builds.builder_json`。后两者服务本次 Build 与其
+  制品生成，不是 canonical TemplateID Create 的长期 metadata lookup。
   `restore`、`credentials`、`checkpoint` 是 request-scoped 例外:只接受 create 请求,
   不从模板继承;checkpoint header 不进入模板构建。
   集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
-- **优先级**:resource 使用上面的固定 leaf chain;非 resource 继续
-  `节点默认 ⊕ 模板配置 ⊕ create 配置` 的 whole-namespace 行为。模板 portable patch
-  来自 `builds.metadata_json`。Build resources 与该 patch 完全独立,不互相默认、比较或推导;
+- **优先级**:resource 使用上面的固定 leaf chain；非 resource 使用节点/cluster group 与本次
+  create 配置的 whole-namespace 行为。canonical TemplateID Create 不读取
+  `builds.metadata_json`。Build resources 与 Sandbox patch 完全独立,不互相默认、比较或推导;
   trigger 的 `cpuCount`/`memoryMB` 只可断言不可变 Build resources。
-- **capacity**:img create 自由(create/模板/默认);sbx/snp create、paused resume 与迁移导入以
+- **capacity**:img create 自由(create/group/节点默认);sbx/snp create、paused resume 与迁移导入以
   Sandbox E 的 portable capacity 为权威。同步请求只校验 patch 结构;runner task prepare 后,request 显式相同
   Capacity 可作为 assertion,任一 leaf 不同则异步 `resource_resolve` failure。无法可靠读取
   artifact Capacity 时任务异步失败;runner 已经 Assign,但尚未 Attach network、写 YAML、
@@ -1091,11 +1099,10 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   Build 的临时 VM 与最终模板分别从同一个 `NetworkSpec` 解析:未声明 hostname 时前者使用
   `build-<short-build-id>`,后者使用 `sandbox.network.hostname`;故临时 hostname 不进入模板。
   C 阶段把模板的完整有效 `NetworkSpec` 写入同一 snapshot metadata,使仅持有 snapshot
-  制品、没有原 `builds` 记录的 create/restore 仍能恢复网络语义。`builds.metadata_json`
-  保留 register/trigger 声明,承担控制面索引和模板默认配置;snapshot metadata 承担制品
-  自描述。两者同时存在时先按既有 namespace 规则得到 create/模板声明,再以该声明字段覆盖
-  snapshot 字段,最后补 node/profile 默认值。img-only(包括 bare)没有 snapshot metadata
-  通道,仍由 `builds.metadata_json` 与运行节点默认值提供模板网络。迁移 token 同样携带
+  制品、没有原 `builds` 记录的 create/restore 仍能恢复网络语义。snapshot metadata 承担制品
+  自描述；本次 create 声明覆盖其中相同字段，最后补 node/profile 默认值。img-only（包括 bare）
+  没有 snapshot metadata 通道，因此只使用本次 create/group 声明与运行节点默认值，绝不从仍
+  在 retention window 内的旧 Build row 隐式恢复 IMG 配置。迁移 token 同样携带
   metadata。除 host-side restore/checkpoint policy 外,其余命名空间只在冷启生效或已冻入快照,故只
   network 需随快照。
 - **host policy 不随快照或模板**:`kuasar-sandbox.restore` 与
@@ -1103,7 +1110,8 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
   不把它们渲染进运行 YAML;snp create、pause 后 resume 和 migration import 在存在
   restore ref 时重新渲染 restore policy;checkpoint 始终只由 host Pause 路径读取,
   不进入 `SANDBOX_CONFIG`/`snapshot.cfg`。connect/resume 不提供临时覆盖。
-- **持久化**:`sandboxes.metadata_json` / `builds.metadata_json` / `builds.builder_json`。
+- **持久化**:`sandboxes.metadata_json` 是 Sandbox launch 配置；`builds.metadata_json` /
+  `builds.builder_json` 是 retention-bounded Build 执行记录。后两者不会成为另一份模板权威。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
 
@@ -1797,7 +1805,8 @@ Hello policy,不广播给 route observer.Proxy master 原子替换 registry,work
 node-ctl conductor serve
   │ dial registry node_link endpoint
   │ register node profile
-  │ stream heartbeat + sandbox/build events
+  │ stream heartbeat + sandbox route events
+  │ stream Build full snapshot + live BuildUpsert/BuildDelete
   │ receive create/connect/exec_session/delete/key/build commands
   ▼
 registry node_link owner or relay holder
@@ -1805,7 +1814,7 @@ registry node_link owner or relay holder
 
 集群下两条到节点的路径:
 
-- **node-link**:注册、心跳、sandbox/build 事件、命令、manifest key 租约。
+- **node-link**:注册、心跳、sandbox route 事件、Build snapshot/delta、命令、manifest key 租约。
 - **router 转发到本节点 e2b 控制面 / 数据面**:pause/kill/timeout、build status/files 转发本机 e2b
   控制面;数据面经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 后进入本机 proxy(node-proxy.md)。
 
@@ -1849,7 +1858,7 @@ NodeReservation 之和,`pool` 是 node allocatable pool；两者都不是 host
 node_list；首次注册和 draining 变化驱动低频目录投影。registry node owner 持有的当前连接是 placement
 提交时唯一的存活判断。
 
-### 10.3 sandbox/build 事件
+### 10.3 Sandbox 与 Build 投影
 
 节点作为权威上报本机执行态:
 
@@ -1861,8 +1870,11 @@ sandbox{
   envd_access_token, traffic_access_token, forward_access_token,
   mmds_secret
 }
-build{build_id, state, template_id?, reason?}
 delete{sid}
+build_sync_begin{}
+build_upsert{build_event:{build_id, state, template_id?, reason?}}
+build_delete{build_event:{build_id}}
+build_sync_end{}
 bookmark{full_sync}
 ```
 
@@ -1884,15 +1896,30 @@ node 不在 sandbox event 中自报 Registry-owned 的 cluster context。nodelin
 Registry 以 `<stable-sandbox-id>-g<N>` 分配.node 不接收 SandboxGeneration,不解析该 ID;稳定 SandboxID
 和代际由 Registry 归属表恢复,不存在跨 group 的 SandboxID 索引.
 
-全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner 仅将本轮出现的 sid 与
+Sandbox 全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner 仅将本轮出现的 sid 与
 订阅建立前捕获的本节点归属表基线比较;清理前再次确认当前表项仍与基线一致,避免删除
 同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token。
+
+当前仍存在的 post-registration Registry Build projection 使用独立 bracket：节点先订阅 live Build
+变化，再发送 `build_sync_begin`、SQLite 中该节点仍保留的全部 cluster Build row、
+`build_sync_end`；集合包含 registered/waiting/building，也包含 retention window 内的 ready/error。
+Registry 以 NodeID session fence 接受这些 frame；新 node-link 生效后，旧重叠连接的 Build frame
+不会再修改 projection。节点侧每个 Build durable transition 与其 live publication 也由无条件
+per-Build fence 排序，不依赖 conductor Extension。
+snapshot 期间发生的变化在 end 之后按顺序发送，慢订阅者会断线并重做完整 snapshot。Registry 在
+`build_sync_end` 只删除连接建立前 immutable `(NodeID, BuildID)` binding 基线中未出现、且删除时
+仍精确属于该节点的 post-registration projection/ref；Registry-owned `BuildStarting` ambiguous
+dispatch intent 不是节点 projection，空 snapshot 不能将其当作 definitive rejection。同步期间的
+新注册因此不会被误删，丢失的 live
+`build_delete` 会由下次重连收敛。Registry 不运行独立 Build terminal TTL。
+长 Build snapshot 不阻塞控制回执：同一个 stream writer 在 Build snapshot item 之间有界清空
+command ACK 与合并后的 heartbeat；Build live changes 仍等 `build_sync_end` 后发送。
 
 ### 10.4 命令受理
 
 registry 上行下发命令.serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,
 所有 sandbox 操作的 `sid` 均是精确 NodeSandboxID.普通命令受理后回 `cmd_ack`,
-终态经 sandbox/build 事件上报。CmdCreate 只有在唯一 launch owner 已 claim、starting 行已
+终态经 sandbox route 或 BuildUpsert 事件上报。CmdCreate 只有在唯一 launch owner 已 claim、starting 行已
 insert 且 cache/route starting 已发布后才 Ack;该 Ack 表示 durable acceptance,不表示 READY。
 CmdConnect 在 Ack 前清理旧 runner/network/RunDir ownership，并在 paused→starting 原子 acceptance
 中恢复 canonical RunDir/UDS、提交最终 deadline 后 cache/publish；CmdExecSession 在 Ack 前完成可选
@@ -1929,8 +1956,9 @@ Exec Session 可以签发新 KAT.
 
 ### 10.5 断线与安全
 
-断线后节点指数退避重连并重注册,带 `resume_from=<rev>` 请求增量重放。registry/node 留存窗口内只补增量,
-否则逐条全量 + bookmark。registry 重启亦然。
+断线后节点指数退避重连并重注册,带 `resume_from=<rev>` 请求 Sandbox route 增量重放。
+registry/node 留存窗口内只补该 route 增量,否则逐条 route 全量 + bookmark；Build projection 在
+每个新 session 都执行上述完整 bracket，不依赖 route resume token。registry 重启亦然。
 
 node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 APISecret+ManifestKey 凭据对及创建期
 credentials 只进入加密存储和运行期内存;沙箱级 token 属敏感数据,仅在可信链路内传输。
@@ -2191,6 +2219,12 @@ admission-only。`node-ctl builder status` 和 metrics 暴露配置、持久用�
 Admit/heartbeat/Release,并在 teardown/Release 完成后才进入下一阶段。Build.Resources 不进入
 nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在双重记账。
 
+ready/error 都是 retention-bounded Build history。终态事务原子写 `finished_unix`；完整
+unit/cgroup、network、runtime/result 与 BuildRunDir/BuildBaseDir cleanup 完成并释放 execution
+claim 后，row 才可能在 `builder.terminal_ttl` 到期时被有界 reaper 删除。status、register-time
+transient TemplateID、name/alias 与本机 list 随 row 消失；返回过的 canonical TemplateID 用于
+Create 或 `fromTemplate` 均不受影响。
+
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 
 1. **任务级 pull token**:SDK `api_headers` 头 `X-Kuasar-Pull-Token`,值为
@@ -2226,7 +2260,7 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 |---|---|---|
 | `sandbox-ctl`(runtime) | run-sandbox(单元)最终 `execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力,收尾 `snapshot --mode local\|bundle --output` / `publish`;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);dynamic sandbox 自动使用同一 canonical `SocketIdentity` 拨号(`pkg/resource` 协议) | `resource_listen` 是唯一 endpoint 来源;每个 runner 的 `vmm/` 是沙箱资源 cgroup,FD 由 run-sandbox 注入;controller disabled = static cgroup |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/Sandbox route 与 Build full-sync/upsert/delete，受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;Build projection 无 Registry-side TTL;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
@@ -2247,7 +2281,7 @@ nodectl,因此 active phase 只出现一条普通 Sandbox reservation,不存在�
 ```
 sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                profile, cluster_group, cluster_route_key, stable_id,
-               template_id, state(starting|running|paused|deleting|dead), deadline_unix,
+               template_id, state(starting|running|paused|deleting|dead), deadline_unix, dead_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
                inner_ip, port_mac, api_secret_hash, api_secret_enc,
                manifest_key_hash, manifest_key_enc,
@@ -2268,7 +2302,7 @@ builds         build_id PK, template_id(transient-…), persist_id(<profile>-<ki
                enforcement_status, phase, phase_sandbox_id,
                runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
                runtime_envd_access_token_enc, runtime_prepare_json,
-               execution_result_json, created_unix
+               execution_result_json, created_unix, finished_unix
 sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
@@ -2279,7 +2313,8 @@ manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
                manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
 
-`builds` 兼任模板登记(§4.4),也是 registration/execution 两级准入的持久真相。
+`builds` 是 registration/execution 两级准入与执行状态的持久真相，也是 retention window 内的
+status/index/alias；它不是长期模板 catalog（§4.4）。
 `resume_source_kind/ref` 是 paused E/S 的 typed root;`auto_pause_memory` 只决定 TTL CaptureKind;
 `launch_mode` 是 starting 中已接受的实际 image/cold/memory 模式。项目尚未正式发布,生命周期
 schema 直接替换旧单字符串 lifecycle 模型,不保留双读/双写或迁移 shim;已有开发数据库须重建。
@@ -2293,7 +2328,8 @@ AES-256-GCM、两项 `*_hash` 均为
 完整 SHA-256。`substr(api_secret_hash,1,24)` 仅建候选预筛索引(§7)。
 两张 MMDS value 表每 owner 最多一行,只保存 secretbox ciphertext;AAD 与事务/CAS/cleanup
 语义见 §7。既有数据库在启动时用 `CREATE TABLE IF NOT EXISTS` 原地增加两表，并以幂等
-`ALTER TABLE ADD COLUMN`补入`runtime_prepare_json`;无需plaintext 回填或兼容双写。
+`ALTER TABLE ADD COLUMN`补入`runtime_prepare_json`、`dead_unix`、`finished_unix`；迁移时已存在的
+terminal row 从迁移时刻开始取得完整保留窗口，无 plaintext 回填或兼容双写。
 
 ### 15.2 重启对账
 
@@ -2345,10 +2381,20 @@ execution claim。phase 子进程的自清理不是最终正确性
 依据。节点级数据库、config socket 与 runner pidfile 不位于对象目录内，不受 Sandbox/Build
 `RemoveAll` 影响。
 
+同一个 conductor reaper 每 5 秒执行一次终态保留清理，不增加 systemd timer/unit。Sandbox
+进入 `dead` 与 Build 进入 `ready/error` 的 store transition 分别原子写 `dead_unix` 与
+`finished_unix`；每轮每类最多处理 128 条。只有到达 `sandbox.dead_ttl` /
+`builder.terminal_ttl` 且完全 owner-free 的行才 exact-delete：Sandbox 不能仍有 unit、network、
+RunDir/BaseDir、UDS、ResumeSource 或 launch owner；Build 不能仍有 execution claim、unit/cgroup、
+phase、network、runtime prepare/result owner。候选扫描后的并发变化会使 delete CAS 失败并保留行，
+进程重启后按数据库时间继续。实现不自动 `VACUUM`，也不触碰任何远端 artifact。
+
 以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
 publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
-权威不变；#46 所定义的 Registry/registered-node binding 与 Build lifecycle projection 边界也不由
-本节改变。这里不执行任何远端 artifact GC，也不增加逐步骤 cleanup stage 或第二份路径权威。
+权威不变；当前 main 仍有 post-registration Build projection，故 node-link 用 v6 Build full sync +
+live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
+节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
+cleanup stage 或第二份路径权威。
 
 因此 RouteSource.Range 与后续全量同步不会看到遗留 starting 被误发布为 running;初始 starting
 已经持久化 network 但尚未分配 runner 的 crash 也能确定性释放端口并收敛到 dead/paused。
@@ -2395,6 +2441,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 | `e2e_mmds_routes_proxy_restart.sh` | 复用 Proxy 拓扑覆盖 MMDS full resync/fail-closed 恢复 |
 | `e2e_orchestrator_proxy.sh` | Proxy master/worker,唯一 data ingress,路由同步,数据面鉴权,auto-resume 与 CONNECT relay |
 | `e2e_cluster_stub.sh` | 真实 registry/router/placer + node-stub-ctl,以不同 API/Data listener 覆盖 node-link,Reserve,control/data/exec/build 路由,稳定 SandboxID 与成员变更 |
+| `go test ./test/e2e/cluster_stub` | 可执行的 h2c node-link/Registry/Router/Placer 集成；覆盖 Build live projection、连接中丢失 Delete 后以空 Build full snapshot 删除 projection 与 exact owner ref |
 | `e2e_cluster_real.sh` | 真实 cluster 控制面、node-ctl 与 microVM,覆盖单 registry、node-link redirect，以及 cluster Delete 后 Registry route 与节点 row/RunDir/BaseDir 的共同收敛 |
 | `e2e_density.sh` | 节点资源准入、回收与密度行为 |
 | `e2e_sandbox_cold_target.sh` | node-ctl 资源控制器驱动 production-shaped sandbox target 冷启动 |
