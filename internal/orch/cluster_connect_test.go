@@ -430,7 +430,10 @@ func TestClusterConnectLateResumeFailureRestoresPausedRouteAndAllowsRetry(t *tes
 	started := make(chan struct{}, 2)
 	lc := &countingLauncher{started: started}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
-	o.sandboxReadyTimeout = 10 * time.Millisecond
+	// Keep the failure late (after resource and runner publication) even under
+	// the race detector; the missing readiness connection remains the terminal
+	// trigger, so a tiny scheduler-sensitive timeout adds no coverage.
+	o.sandboxReadyTimeout = time.Second
 
 	manifestKey := strings.Repeat("6", 64)
 	apiSecret := deriveTestAPISecret(t, manifestKey)
@@ -554,13 +557,13 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 	}
 
 	// HandleCommand may return Accepted only after KMT authentication, import,
-	// and the atomic paused -> starting transition have completed. The blocked
-	// Attach keeps the launch in its durable pre-assignment state for this check.
+	// and the atomic paused -> starting transition have completed. The async
+	// worker is allowed to bind RunID immediately after that acceptance.
 	got, err := fixture.o.st.Get(context.Background(), cmd.SID)
 	if err != nil || got == nil {
 		t.Fatalf("imported row is not visible after Ack: sandbox=%+v err=%v", got, err)
 	}
-	if got.ID != "stable-g1" || got.State != types.StateStarting || got.RunID != "" || got.Profile != fixture.source.Profile ||
+	if got.ID != "stable-g1" || got.State != types.StateStarting || got.Profile != fixture.source.Profile ||
 		got.StableID() != fixture.source.StableID() || got.CreatedUnix != fixture.source.CreatedUnix {
 		t.Fatalf("imported identity/state = %+v", got)
 	}
@@ -587,6 +590,11 @@ func TestHandleClusterConnectImportsBeforeAckAndResumesAsynchronously(t *testing
 			launchErr = attempt.result()
 		}
 		t.Fatalf("accepted cluster connect did not schedule asynchronous resume: current=%+v get=%v active=%t launch=%v task=%v starts=%d stops=%d", current, getErr, active, launchErr, fixture.launcher.taskError(), fixture.launcher.starts.Load(), fixture.launcher.stops.Load())
+	}
+	blocked, err := fixture.o.st.Get(context.Background(), cmd.SID)
+	if err != nil || blocked == nil || blocked.State != types.StateStarting || blocked.RunID == "" ||
+		blocked.VswitchPort != "" || blocked.FloatingIP != "" {
+		t.Fatalf("blocked asynchronous resume ownership = %+v, %v", blocked, err)
 	}
 	cancel()
 	select {

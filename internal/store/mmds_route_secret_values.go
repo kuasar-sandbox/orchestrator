@@ -555,9 +555,9 @@ func (s *Store) DeleteBuildMMDSRouteSecretValues(ctx context.Context, buildID st
 }
 
 // PutBuildTerminal atomically persists a build's terminal state and removes
-// its builder-only MMDS routes and confidential values. The build row remains
-// as the template/status registry, but neither part of the builder MMDS input
-// can become template metadata.
+// its builder-only execution ownership, MMDS routes, and confidential values.
+// The build row remains as the template/status registry, but no runner or
+// builder input can survive as terminal ownership or template metadata.
 func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error {
 	if build == nil {
 		return errors.New("build is required")
@@ -567,27 +567,33 @@ func (s *Store) PutBuildTerminal(ctx context.Context, build *types.Build) error 
 	if terminal.Status != types.BuildReady && terminal.Status != types.BuildError {
 		return fmt.Errorf("store: finish build %s: status %s is not terminal", build.BuildID, terminal.Status)
 	}
+	if terminal.RuntimeVswitchPort != "" || terminal.RuntimeFloatingIP != "" || terminal.RuntimePortMAC != "" ||
+		terminal.RuntimeEnvdAccessToken != "" || terminal.RuntimePrepareJSON != "" {
+		return fmt.Errorf("store: finish build %s: runtime ownership cleanup is incomplete", build.BuildID)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE builds SET
-		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id=?,
+		persist_id=?,kind=?,start_cmd=?,ready_cmd=?,status=?,reason=?,run_id='',
 		names_json=?,aliases_json=?,metadata_json=?,execution_claimed=0,
-		execution_claimed_unix=0,phase='',phase_sandbox_id='',
+		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',
 		runtime_vswitch_port='',runtime_floating_ip='',runtime_port_mac='',runtime_envd_access_token_enc='',runtime_prepare_json='',
 		execution_result_json=''
-		WHERE build_id=? AND status=? AND execution_claimed=1`,
+		WHERE build_id=? AND status=? AND execution_claimed=1
+		  AND runtime_vswitch_port='' AND runtime_floating_ip='' AND runtime_port_mac=''
+		  AND runtime_envd_access_token_enc='' AND runtime_prepare_json=''`,
 		terminal.PersistID, string(terminal.Kind), terminal.StartCmd, terminal.ReadyCmd,
-		string(terminal.Status), terminal.Reason, terminal.RunID, mjs(terminal.Names), mjs(terminal.Aliases),
+		string(terminal.Status), terminal.Reason, mjs(terminal.Names), mjs(terminal.Aliases),
 		mj(terminal.Metadata), terminal.BuildID, string(types.BuildBuilding))
 	if err != nil {
 		return fmt.Errorf("store: finish build %s: %w", build.BuildID, err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil || changed != 1 {
-		return fmt.Errorf("store: finish build %s: execution ownership lost", build.BuildID)
+		return fmt.Errorf("store: finish build %s: execution ownership is not clean or was lost", build.BuildID)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM build_mmds_route_secret_values WHERE build_id=?`, build.BuildID); err != nil {
 		return fmt.Errorf("store: finish build %s MMDS cleanup: %w", build.BuildID, err)

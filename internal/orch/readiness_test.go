@@ -589,7 +589,8 @@ func TestResumeReadinessFailureRollsBackAndTearsDown(t *testing.T) {
 		t.Fatalf("resume error = %v", err)
 	}
 	stored, getErr := o.st.Get(ctx, sb.ID)
-	if getErr != nil || stored == nil || stored.State != types.StatePaused {
+	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.RunID != "" ||
+		stored.VswitchPort != "" || stored.RunDir != "" || stored.EnvdUDS != "" || stored.CiUDS != "" {
 		t.Fatalf("stored sandbox after failed resume = %+v, %v", stored, getErr)
 	}
 	if lc.stops.Load() == 0 {
@@ -613,10 +614,6 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attempts atomic.Int64
-	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts.Add(1)
-		http.Error(w, "init rejected", http.StatusInternalServerError)
-	}))
 	events, cancel := o.Subscribe()
 	defer cancel()
 
@@ -624,6 +621,12 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 		Trigger: types.ResumeTriggerConnect,
 		Mode:    types.ResumeAuto,
 	}, nil)
+	// Resume admission must remove the old paused RunDir before a new runner
+	// owns it. Model the new runner's envd socket only after that cleanup gate.
+	startEnvdTestServer(t, sb.EnvdUDS, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "init rejected", http.StatusInternalServerError)
+	}))
 	if err == nil {
 		err = attempt.wait(ctx)
 	}
@@ -631,7 +634,8 @@ func TestResumeEnvdInitFailurePublishesStartingThenPaused(t *testing.T) {
 		t.Fatalf("resume error = %v, want mandatory envd /init failure", err)
 	}
 	stored, getErr := o.st.Get(ctx, sb.ID)
-	if getErr != nil || stored == nil || stored.State != types.StatePaused {
+	if getErr != nil || stored == nil || stored.State != types.StatePaused || stored.RunID != "" ||
+		stored.VswitchPort != "" || stored.RunDir != "" || stored.EnvdUDS != "" || stored.CiUDS != "" {
 		t.Fatalf("stored sandbox after failed resume = %+v, %v", stored, getErr)
 	}
 	if lc.stops.Load() == 0 {

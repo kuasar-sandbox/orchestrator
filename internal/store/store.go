@@ -450,9 +450,17 @@ func validateSandboxLifecycle(sb *types.Sandbox) error {
 		if sb.LaunchMode != want {
 			return fmt.Errorf("fresh starting sandbox launch mode %q does not match template kind %q", sb.LaunchMode, tmpl.Kind)
 		}
-	case types.StateRunning, types.StateDead:
+	case types.StateRunning, types.StateDeleting:
 		if sb.LaunchMode != "" {
 			return fmt.Errorf("%s sandbox must not have a launch mode", sb.State)
+		}
+	case types.StateDead:
+		if sb.LaunchMode != "" {
+			return errors.New("dead sandbox must not have a launch mode")
+		}
+		if sb.RunID != "" || sb.VswitchPort != "" || sb.FloatingIP != "" || sb.InnerIP != "" || sb.PortMAC != "" ||
+			sb.RunDir != "" || sb.BaseDir != "" || sb.EnvdUDS != "" || sb.CiUDS != "" || !sb.ResumeSource.Empty() {
+			return errors.New("dead sandbox must not retain runtime, path, network, or artifact ownership")
 		}
 	default:
 		return fmt.Errorf("invalid sandbox state %q", sb.State)
@@ -522,22 +530,34 @@ func sandboxUpdateChanged(operation, id string, result sql.Result) (bool, error)
 	return n == 1, nil
 }
 
-// BeginResume atomically accepts a paused resume. The previous runner and
-// network fields are cleared in the same update because a paused FloatingIP may
-// already have been released and reused while starting/running MMDS lookups are
-// allowed.
-func (s *Store) BeginResume(ctx context.Context, id string, deadlineUnix int64, mode types.LaunchMode) (bool, error) {
+// BeginResume atomically accepts a fully cleaned paused sandbox and restores
+// the canonical runtime paths for its next incarnation. Runner, network, and
+// RunDir ownership must already have been fenced, released, and exact-cleared;
+// this CAS must never discard identities still needed by the paused finalizer.
+func (s *Store) BeginResume(
+	ctx context.Context,
+	id string,
+	deadlineUnix int64,
+	mode types.LaunchMode,
+	runDir, envdUDS, ciUDS string,
+) (bool, error) {
 	if mode != types.LaunchCold && mode != types.LaunchMemory {
 		return false, fmt.Errorf("store: begin resume sandbox %s: invalid launch mode %q", id, mode)
 	}
+	if runDir == "" {
+		return false, fmt.Errorf("store: begin resume sandbox %s: empty run dir", id)
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
-		   SET state=?, deadline_unix=?, launch_mode=?, run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac=''
+		   SET state=?, deadline_unix=?, launch_mode=?, run_dir=?, envd_uds=?, ci_uds=?
 		 WHERE id=? AND state=?
+		   AND run_id='' AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
+		   AND run_dir='' AND envd_uds='' AND ci_uds=''
 		   AND resume_source_ref<>''
 		   AND ((?=? AND resume_source_kind=?) OR
 		        (?=? AND resume_source_kind IN (?,?)))`,
-		string(types.StateStarting), deadlineUnix, string(mode), id, string(types.StatePaused),
+		string(types.StateStarting), deadlineUnix, string(mode), runDir, envdUDS, ciUDS,
+		id, string(types.StatePaused),
 		string(mode), string(types.LaunchMemory), string(types.ResumeSourceSnapshot),
 		string(mode), string(types.LaunchCold), string(types.ResumeSourceSnapshot), string(types.ResumeSourceSandbox))
 	if err != nil {
@@ -705,35 +725,138 @@ func (s *Store) ClearPausedNetwork(ctx context.Context, id, expectedPort string)
 	return sandboxUpdateChanged("clear paused network", id, result)
 }
 
-func (s *Store) RollbackStartingDead(ctx context.Context, id, expectedRunID string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE sandboxes
-		   SET state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac=''
-		 WHERE id=? AND state=? AND run_id=?
-		   AND resume_source_kind='' AND resume_source_ref=''
-		   AND launch_mode IN (?,?,?)`,
-		string(types.StateDead), id, string(types.StateStarting), expectedRunID,
-		string(types.LaunchImage), string(types.LaunchCold), string(types.LaunchMemory))
-	if err != nil {
-		return false, fmt.Errorf("store: rollback fresh starting sandbox %s to dead: %w", id, err)
+// ClearPausedRunDir records that the exact paused RunDir has been removed. Its
+// UDS paths are part of the same ownership and are cleared atomically. Requiring
+// empty runner/network fields prevents callers from advancing directory cleanup
+// before the process and port fences have completed.
+func (s *Store) ClearPausedRunDir(ctx context.Context, id, expectedRunDir, expectedEnvdUDS, expectedCiUDS string) (bool, error) {
+	if expectedRunDir == "" {
+		return false, fmt.Errorf("store: clear paused run dir sandbox %s: empty run dir", id)
 	}
-	return sandboxUpdateChanged("rollback fresh starting to dead", id, result)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes SET run_dir='', envd_uds='', ci_uds=''
+		 WHERE id=? AND state=?
+		   AND run_id='' AND floatingip='' AND vswitch_port='' AND inner_ip='' AND port_mac=''
+		   AND run_dir=? AND envd_uds=? AND ci_uds=?`,
+		id, string(types.StatePaused), expectedRunDir, expectedEnvdUDS, expectedCiUDS)
+	if err != nil {
+		return false, fmt.Errorf("store: clear paused run dir sandbox %s: %w", id, err)
+	}
+	return sandboxUpdateChanged("clear paused run dir", id, result)
 }
 
-func (s *Store) RollbackStartingPaused(ctx context.Context, id, expectedRunID string) (bool, error) {
+// BeginSandboxDelete is the durable acceptance fence for an explicit delete.
+// It changes only lifecycle state (and clears the no-longer-actionable launch
+// mode), preserving every exact runner, network, and path identity needed by a
+// retrying node-local finalizer. The complete ownership tuple is part of the
+// CAS so a stale API or node-link command cannot delete a newer incarnation.
+func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.ID == "" {
+		return false, errors.New("store: begin sandbox delete requires a sandbox")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes SET state=?, launch_mode=''
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND created_unix=?`,
+		string(types.StateDeleting), sb.ID, string(sb.State), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.CreatedUnix)
+	if err != nil {
+		return false, fmt.Errorf("store: begin sandbox delete %s: %w", sb.ID, err)
+	}
+	return sandboxUpdateChanged("begin delete", sb.ID, result)
+}
+
+// DeleteFinalizedSandbox hard-deletes only the exact deleting row whose local
+// ownership the caller has already fenced and removed. Cleanup fields remain
+// unchanged until this final CAS, so a process crash always leaves sufficient
+// information for startup reconciliation.
+func (s *Store) DeleteFinalizedSandbox(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.ID == "" || sb.State != types.StateDeleting {
+		return false, errors.New("store: finalize sandbox delete requires a deleting sandbox")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM sandboxes
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND created_unix=?`,
+		sb.ID, string(types.StateDeleting), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.CreatedUnix)
+	if err != nil {
+		return false, fmt.Errorf("store: finalize sandbox delete %s: %w", sb.ID, err)
+	}
+	return sandboxUpdateChanged("finalize delete", sb.ID, result)
+}
+
+func (s *Store) RollbackStartingDead(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.State != types.StateStarting || !sb.ResumeSource.Empty() {
+		return false, nil
+	}
+	return s.CommitSandboxDead(ctx, sb)
+}
+
+// CommitSandboxDead records non-delete terminal history only after the caller
+// has fenced and removed every local resource. It accepts a starting launch
+// failure or a running sandbox found without a live unit and clears all
+// ownership atomically.
+func (s *Store) CommitSandboxDead(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.ID == "" {
+		return false, errors.New("store: commit sandbox dead requires a sandbox")
+	}
+	if sb.State != types.StateStarting && sb.State != types.StateRunning {
+		return false, fmt.Errorf("store: commit sandbox %s dead from invalid state %q", sb.ID, sb.State)
+	}
+	if sb.State == types.StateStarting && !sb.ResumeSource.Empty() {
+		return false, fmt.Errorf("store: commit resumed sandbox %s dead", sb.ID)
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
-		   SET state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac=''
-		 WHERE id=? AND state=? AND run_id=? AND resume_source_ref<>''
+		   SET state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac='',
+		       run_dir='', base_dir='', envd_uds='', ci_uds='', resume_source_kind='', resume_source_ref=''
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND created_unix=?`,
+		string(types.StateDead), sb.ID, string(sb.State), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.CreatedUnix)
+	if err != nil {
+		return false, fmt.Errorf("store: commit sandbox %s dead: %w", sb.ID, err)
+	}
+	return sandboxUpdateChanged("commit dead", sb.ID, result)
+}
+
+func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.State != types.StateStarting || !sb.ResumeSource.Valid() {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac='',
+		       run_dir='', envd_uds='', ci_uds=''
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND created_unix=?
 		   AND ((launch_mode=? AND resume_source_kind=?) OR
 		        (launch_mode=? AND resume_source_kind IN (?,?)))`,
-		string(types.StatePaused), id, string(types.StateStarting), expectedRunID,
+		string(types.StatePaused), sb.ID, string(types.StateStarting), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.CreatedUnix,
 		string(types.LaunchMemory), string(types.ResumeSourceSnapshot),
 		string(types.LaunchCold), string(types.ResumeSourceSnapshot), string(types.ResumeSourceSandbox))
 	if err != nil {
-		return false, fmt.Errorf("store: rollback resume starting sandbox %s to paused: %w", id, err)
+		return false, fmt.Errorf("store: rollback resume starting sandbox %s to paused: %w", sb.ID, err)
 	}
-	return sandboxUpdateChanged("rollback resume starting to paused", id, result)
+	return sandboxUpdateChanged("rollback resume starting to paused", sb.ID, result)
 }
 
 // DeletePreLaunchStarting removes a fresh Create admission only while no runner
@@ -910,7 +1033,7 @@ func (s *Store) RangeSandboxes(ctx context.Context, fn func(*types.Sandbox) erro
 // a pre-filter; the caller must verify the API-key MAC against every candidate.
 // An empty ownerCandidateHash disables only the owner filter. When state is
 // empty, List returns the public running/paused states and hides internal
-// starting/dead lifecycle records.
+// starting/deleting/dead lifecycle records.
 func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limit int, cursor string) ([]*types.Sandbox, string, error) {
 	if limit <= 0 {
 		limit = 100 // default page
@@ -926,7 +1049,7 @@ func (s *Store) List(ctx context.Context, state, ownerCandidateHash string, limi
 		args = append(args, state)
 	} else {
 		// Match the upstream E2B list contract: an omitted state means the two
-		// public states, not internal starting/dead lifecycle records.
+		// public states, not internal starting/deleting/dead lifecycle records.
 		conds = append(conds, "state IN (?,?)")
 		args = append(args, string(types.StateRunning), string(types.StatePaused))
 	}
@@ -996,8 +1119,8 @@ func (s *Store) RangeByState(ctx context.Context, state types.State, fn func(*ty
 }
 
 func (s *Store) SetState(ctx context.Context, id string, st types.State) error {
-	if st != types.StateRunning && st != types.StateDead {
-		return fmt.Errorf("store: SetState only supports running or dead; use lifecycle CAS for %q", st)
+	if st != types.StateRunning {
+		return fmt.Errorf("store: SetState only supports running; use a typed terminal transition for %q", st)
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET state=?, launch_mode='' WHERE id=?`, string(st), id)
 	return err
@@ -1008,7 +1131,7 @@ func (s *Store) SetState(ctx context.Context, id string, st types.State) error {
 // from changing a deleted, recreated, or subsequently launched sandbox with the
 // same ID.
 func (s *Store) CASRunState(ctx context.Context, id, runID string, from, to types.State) (bool, error) {
-	if to == types.StatePaused || to == types.StateStarting {
+	if to == types.StatePaused || to == types.StateStarting || to == types.StateDeleting || to == types.StateDead {
 		return false, fmt.Errorf("store: CASRunState cannot enter %q; use the typed lifecycle transition", to)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET state=?, launch_mode='' WHERE id=? AND run_id=? AND state=?`,

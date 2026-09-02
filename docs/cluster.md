@@ -620,11 +620,21 @@ RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
+`deleting` 只属于 node-local durable cleanup，不作为 sandbox upsert 投影。节点一旦把 exact
+owner 持久转为 `deleting` 就立即从本地 cache 和后续 full sync route set 排除；unit、network、
+RunDir/BaseDir finalizer 完成并 hard-delete 本地 row 后才发送 terminal Delete。这样节点不会重新
+激活已接纳删除的对象，Registry projection 只在 cleanup 完成后终结，而 node 重启仍能从完整
+owner 重试清理。
+
 node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
 `starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,
 不是 READY。后续资源准备/runner/runtime failure 以 matching Delete 驱动上述 reservation
-rollback。CmdConnect Ack 前则完成 paused→starting、清空旧 run/network ownership、提交 deadline
-并发布 starting;其 restore failure 发布 paused Upsert,不得进入 fresh-create Delete 分支。
+rollback。CmdConnect Ack 前则完成旧 runner/network/RunDir ownership cleanup，在 paused→starting
+原子 acceptance 中恢复 canonical RunDir/UDS 并提交 deadline，再发布 starting；其 restore failure
+发布 paused Upsert,不得进入 fresh-create Delete 分支。
+CmdDelete Ack 表示 node 已持久接纳 `deleting`，不等待 node-local finalizer 完成；
+pending 重放幂等。standalone 与 cluster Delete 使用同一 finalizer，node-link 不拥有另一套 cleanup
+或路径推导；finalizer 失败期间不发布 terminal Delete。
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
@@ -752,7 +762,8 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
   排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、可选
-  import、paused→starting、旧 run/network ownership 清理、deadline 持久化和凭据读取,Ack
+  import、旧 runner/network/RunDir ownership 清理、paused→starting 时恢复 canonical RunDir/UDS、
+  deadline 持久化和凭据读取,Ack
   返回 typed `ConnectResult`;Registry 校验其
   NodeSandboxID/TemplateID/Profile/三项公开 token 与 route 一致后返回 `Route + Connect`。
   resume 异步进行,connect 不等待 READY,也不在 Router 合并不同请求。

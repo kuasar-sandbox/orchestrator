@@ -167,9 +167,7 @@ func TestRestoreCancelAfterAssignmentBeforeBootstrap(t *testing.T) {
 		t.Fatalf("Kill = %t, %v", killed, err)
 	}
 	close(gate)
-	if stored, err := o.st.Get(ctx, created.ID); err != nil || stored != nil {
-		t.Fatalf("canceled assigned restore = %+v, %v", stored, err)
-	}
+	waitForSandboxAbsent(t, o, ctx, created.ID, "delete after canceled restore bootstrap")
 }
 
 func TestRestoreCancelAfterAttachBeforeCASDetachesOwnedPort(t *testing.T) {
@@ -292,13 +290,85 @@ func TestRestoreExactRunNetworkCASMissDetachesUncommittedPort(t *testing.T) {
 	if dead.RunID != "" || dead.VswitchPort != "" {
 		t.Fatalf("rollback retained ownership: %+v", dead)
 	}
-	select {
-	case port := <-vs.detached:
-		if port != "restore-worker-port" {
-			t.Fatalf("detached port = %q", port)
+	for index, want := range []string{"restore-worker-port", "foreign-port"} {
+		select {
+		case port := <-vs.detached:
+			if port != want {
+				t.Fatalf("detach %d port = %q, want %q", index+1, port, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("detach %d for %q did not occur", index+1, want)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("uncommitted worker port was not detached")
+	}
+	if got := vs.detaches.Load(); got != 2 {
+		t.Fatalf("network detaches = %d, want worker plus durable competing port", got)
+	}
+}
+
+func TestResumeExactRunNetworkCASMissCleansDurablePortBeforePaused(t *testing.T) {
+	cfg := &config.Config{}
+	lc := &countingLauncher{}
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	vs := newBlockedRestoreVS()
+	o.vs = vs
+	sb, _ := launchTestSandbox(t, cfg, types.ProfileBare, "resume-network-cas")
+	sb.State = types.StatePaused
+	sb.LaunchMode = ""
+	sb.ResumeSource = types.ResumeSource{
+		Kind: types.ResumeSourceSnapshot,
+		Ref:  "manifest://" + strings.Repeat("6", 64),
+	}
+	if err := o.st.Put(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	_, attempt, err := o.ensureResumeAccepted(ctx, sb.ID, nil, types.ResumeRequest{
+		Trigger: types.ResumeTriggerConnect,
+		Mode:    types.ResumeAuto,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-vs.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume did not reach network attach")
+	}
+	bound := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateStarting && current.RunID != ""
+	}, "resume exact runner binding")
+	foreign := store.StartingResources{
+		VswitchPort: "resume-foreign-port", FloatingIP: "192.0.2.98",
+		InnerIP: "169.254.1.1/31", PortMAC: "02:00:00:00:00:98",
+	}
+	changed, err := o.st.SetStartingResourcesForRun(ctx, sb.ID, bound.RunID, foreign)
+	if err != nil || !changed {
+		t.Fatalf("install competing resume ownership = %t, %v", changed, err)
+	}
+	close(vs.release)
+	if err := attempt.wait(ctx); !errors.Is(err, errLaunchOwnershipLost) {
+		t.Fatalf("resume result = %v, want ownership loss", err)
+	}
+	paused := waitForSandbox(t, o, ctx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StatePaused
+	}, "paused after resume network CAS miss")
+	if paused.RunID != "" || paused.VswitchPort != "" || paused.RunDir != "" ||
+		paused.EnvdUDS != "" || paused.CiUDS != "" || paused.BaseDir != sb.BaseDir ||
+		paused.ResumeSource != sb.ResumeSource {
+		t.Fatalf("resume rollback ownership = %+v", paused)
+	}
+	for index, want := range []string{"restore-worker-port", "resume-foreign-port"} {
+		select {
+		case port := <-vs.detached:
+			if port != want {
+				t.Fatalf("detach %d port = %q, want %q", index+1, port, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("detach %d for %q did not occur", index+1, want)
+		}
+	}
+	if got := vs.detaches.Load(); got != 2 {
+		t.Fatalf("network detaches = %d, want worker plus durable competing port", got)
 	}
 }
 

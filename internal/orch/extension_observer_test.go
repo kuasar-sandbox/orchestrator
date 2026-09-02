@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	_ "modernc.org/sqlite"
 )
@@ -114,6 +115,8 @@ func TestTerminalObserverRunsAfterCorePublicationAndNotAfterFailedPersistence(t 
 
 func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 	o := testOrch(t)
+	o.cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	o.cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "base")
 	recorder := &objectObserverRecorder{}
 	o.SetExtensionObserver(recorder)
 	manifestKey := strings.Repeat("a", 64)
@@ -129,6 +132,8 @@ func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 		State:      types.StatePaused, APISecret: apiSecret, ManifestKey: manifestKey,
 		ResumeSource:  types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("d", 64)},
 		ServiceSecret: serviceSecret, ForwardAccessToken: forward, CreatedUnix: time.Now().Unix(),
+		RunDir:   nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, "observer-sandbox"),
+		BaseDir:  nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, "observer-sandbox"),
 		Metadata: map[string]string{"key": "value"}, Env: map[string]string{"hidden": "value"},
 	}
 	if err := o.st.Put(context.Background(), sandbox); err != nil {
@@ -152,6 +157,9 @@ func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 	}
 	if killed, err := o.Kill(context.Background(), sandbox.ID, apiKey); err != nil || !killed {
 		t.Fatalf("Kill killed=%t err=%v", killed, err)
+	}
+	if err := o.DrainSandboxDeletes(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if got := recorder.sandboxKinds(); len(got) != 1 || got[0] != "delete" {
 		t.Fatalf("delete events=%v", got)

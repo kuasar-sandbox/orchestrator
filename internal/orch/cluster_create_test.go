@@ -315,16 +315,13 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	if ack := o.HandleCommand(ctx, deleteCmd); ack.Status != routesync.AckAccepted {
 		t.Fatalf("cluster Delete ack = %+v", ack)
 	}
+	if current, err := o.st.Get(ctx, create.SID); err != nil || current == nil || current.State != types.StateDeleting {
+		t.Fatalf("cluster ACK preceded durable deleting row: %+v, %v", current, err)
+	}
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
-			t.Fatalf("cluster Delete event = %+v", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("cluster Delete did not publish its terminal event")
-	}
-	if current, err := o.st.Get(ctx, create.SID); err != nil || current != nil {
-		t.Fatalf("cluster row after Delete = %+v, %v", current, err)
+		t.Fatalf("cluster terminal event preceded local cleanup: %+v", event)
+	default:
 	}
 	if _, err := o.launches.Claim(ctx, create.SID, launchCreate); !errors.Is(err, errLaunchClaimed) {
 		t.Fatalf("claim before late attach cleanup = %v, want cleanup fence", err)
@@ -342,8 +339,14 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	if err := attempt.wait(ctx); err == nil {
 		t.Fatal("deleted cluster create reported launch success")
 	}
-	if stored, err := o.st.Get(ctx, create.SID); err != nil || stored != nil {
-		t.Fatalf("cluster launch resurrected after Delete: %+v, %v", stored, err)
+	waitForSandboxAbsent(t, o, ctx, create.SID, "cluster delete after late launch cleanup")
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
+			t.Fatalf("cluster terminal event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cluster cleanup did not publish its terminal event")
 	}
 	next, err := o.launches.Claim(ctx, create.SID, launchCreate)
 	if err != nil {

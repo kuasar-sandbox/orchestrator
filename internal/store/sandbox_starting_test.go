@@ -27,11 +27,27 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := st.BeginResume(ctx, sb.ID, 200, types.LaunchCold)
-	if err != nil || !changed {
-		t.Fatalf("BeginResume = %v, %v", changed, err)
+	changed, err := st.BeginResume(ctx, sb.ID, 200, types.LaunchCold, sb.RunDir, sb.EnvdUDS, sb.CiUDS)
+	if err != nil || changed {
+		t.Fatalf("BeginResume with cleanup ownership = %v, %v; want CAS miss", changed, err)
 	}
-	if changed, err := st.BeginResume(ctx, sb.ID, 201, types.LaunchCold); err != nil || changed {
+	if changed, err := st.ClearPausedRunner(ctx, sb.ID, sb.RunID); err != nil || !changed {
+		t.Fatalf("ClearPausedRunner = %v, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedNetwork(ctx, sb.ID, sb.VswitchPort); err != nil || !changed {
+		t.Fatalf("ClearPausedNetwork = %v, %v", changed, err)
+	}
+	if changed, err := st.BeginResume(ctx, sb.ID, 200, types.LaunchCold, sb.RunDir, sb.EnvdUDS, sb.CiUDS); err != nil || changed {
+		t.Fatalf("BeginResume with RunDir ownership = %v, %v; want CAS miss", changed, err)
+	}
+	if changed, err := st.ClearPausedRunDir(ctx, sb.ID, sb.RunDir, sb.EnvdUDS, sb.CiUDS); err != nil || !changed {
+		t.Fatalf("ClearPausedRunDir = %v, %v", changed, err)
+	}
+	changed, err = st.BeginResume(ctx, sb.ID, 200, types.LaunchCold, sb.RunDir, sb.EnvdUDS, sb.CiUDS)
+	if err != nil || !changed {
+		t.Fatalf("BeginResume after ownership cleanup = %v, %v", changed, err)
+	}
+	if changed, err := st.BeginResume(ctx, sb.ID, 201, types.LaunchCold, sb.RunDir, sb.EnvdUDS, sb.CiUDS); err != nil || changed {
 		t.Fatalf("second BeginResume = %v, %v; want CAS miss", changed, err)
 	}
 	got, err := st.Get(ctx, sb.ID)
@@ -39,7 +55,8 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.State != types.StateStarting || got.DeadlineUnix != 200 || got.RunID != "" ||
-		got.FloatingIP != "" || got.VswitchPort != "" || got.InnerIP != "" || got.PortMAC != "" {
+		got.FloatingIP != "" || got.VswitchPort != "" || got.InnerIP != "" || got.PortMAC != "" ||
+		got.RunDir != sb.RunDir || got.EnvdUDS != sb.EnvdUDS || got.CiUDS != sb.CiUDS {
 		t.Fatalf("accepted resume retained stale ownership: %+v", got)
 	}
 	if got.ResumeSource != sb.ResumeSource || got.LaunchMode != types.LaunchCold || got.TemplateID != sb.TemplateID ||
@@ -81,7 +98,7 @@ func TestStartingCASLifecyclePreservesConcurrentFields(t *testing.T) {
 		got.DeadlineUnix != 300 || got.VswitchPort != resources.VswitchPort {
 		t.Fatalf("running row lost concurrent deadline/resources: %+v, %v", got, err)
 	}
-	if changed, err := st.RollbackStartingPaused(ctx, sb.ID, "run-current"); err != nil || changed {
+	if changed, err := st.RollbackStartingPaused(ctx, sb); err != nil || changed {
 		t.Fatalf("late rollback after running = %v, %v; want CAS miss", changed, err)
 	}
 }
@@ -215,12 +232,32 @@ func TestPausedOwnershipCleanupUsesIndependentExactCAS(t *testing.T) {
 	if err := st.InsertSandbox(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if changed, err := st.ClearPausedRunner(canceled, sb.ID, sb.RunID); err == nil || changed {
+		t.Fatalf("failed runner clear = %t, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedNetwork(canceled, sb.ID, sb.VswitchPort); err == nil || changed {
+		t.Fatalf("failed network clear = %t, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedRunDir(canceled, sb.ID, sb.RunDir, sb.EnvdUDS, sb.CiUDS); err == nil || changed {
+		t.Fatalf("failed RunDir clear = %t, %v", changed, err)
+	}
+	unchanged, err := st.Get(ctx, sb.ID)
+	if err != nil || unchanged == nil || unchanged.RunID != sb.RunID || unchanged.VswitchPort != sb.VswitchPort ||
+		unchanged.FloatingIP != sb.FloatingIP || unchanged.InnerIP != sb.InnerIP || unchanged.PortMAC != sb.PortMAC ||
+		unchanged.RunDir != sb.RunDir || unchanged.EnvdUDS != sb.EnvdUDS || unchanged.CiUDS != sb.CiUDS {
+		t.Fatalf("failed cleanup store transition changed ownership: %+v, %v", unchanged, err)
+	}
 
 	if changed, err := st.ClearPausedRunner(ctx, sb.ID, "run-stale"); err != nil || changed {
 		t.Fatalf("stale runner clear = %t, %v", changed, err)
 	}
 	if changed, err := st.ClearPausedNetwork(ctx, sb.ID, "port-stale"); err != nil || changed {
 		t.Fatalf("stale network clear = %t, %v", changed, err)
+	}
+	if changed, err := st.ClearPausedRunDir(ctx, sb.ID, "run-dir-stale", sb.EnvdUDS, sb.CiUDS); err != nil || changed {
+		t.Fatalf("stale RunDir clear = %t, %v", changed, err)
 	}
 	if changed, err := st.ClearPausedNetwork(ctx, sb.ID, sb.VswitchPort); err != nil || !changed {
 		t.Fatalf("exact network clear = %t, %v", changed, err)
@@ -236,8 +273,12 @@ func TestPausedOwnershipCleanupUsesIndependentExactCAS(t *testing.T) {
 	if changed, err := st.ClearPausedRunner(ctx, sb.ID, sb.RunID); err != nil || !changed {
 		t.Fatalf("exact runner clear = %t, %v", changed, err)
 	}
+	if changed, err := st.ClearPausedRunDir(ctx, sb.ID, sb.RunDir, sb.EnvdUDS, sb.CiUDS); err != nil || !changed {
+		t.Fatalf("exact RunDir clear = %t, %v", changed, err)
+	}
 	got, err := st.Get(ctx, sb.ID)
 	if err != nil || got == nil || got.State != types.StatePaused || got.RunID != "" ||
+		got.RunDir != "" || got.EnvdUDS != "" || got.CiUDS != "" ||
 		got.ResumeSource != sb.ResumeSource || got.LaunchMode != "" {
 		t.Fatalf("cleaned paused row = %+v, %v", got, err)
 	}
@@ -285,7 +326,12 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 	if err := st.InsertSandbox(ctx, pre); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.RollbackStartingDead(ctx, pre.ID, ""); err != nil || !changed {
+	stalePre := *pre
+	stalePre.BaseDir += "-stale"
+	if changed, err := st.RollbackStartingDead(ctx, &stalePre); err != nil || changed {
+		t.Fatalf("stale pre-assignment rollback = %v, %v; want exact-owner CAS miss", changed, err)
+	}
+	if changed, err := st.RollbackStartingDead(ctx, pre); err != nil || !changed {
 		t.Fatalf("pre-assignment rollback = %v, %v", changed, err)
 	}
 	got, err := st.Get(ctx, pre.ID)
@@ -300,14 +346,17 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 	if err := st.InsertSandbox(ctx, post); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.RollbackStartingPaused(ctx, post.ID, "run-stale"); err != nil || changed {
+	stalePost := *post
+	stalePost.RunID = "run-stale"
+	if changed, err := st.RollbackStartingPaused(ctx, &stalePost); err != nil || changed {
 		t.Fatalf("stale post-assignment rollback = %v, %v; want CAS miss", changed, err)
 	}
-	if changed, err := st.RollbackStartingPaused(ctx, post.ID, "run-current"); err != nil || !changed {
+	if changed, err := st.RollbackStartingPaused(ctx, post); err != nil || !changed {
 		t.Fatalf("post-assignment rollback = %v, %v", changed, err)
 	}
 	got, err = st.Get(ctx, post.ID)
-	if err != nil || got == nil || got.State != types.StatePaused || got.RunID != "" || got.VswitchPort != "" {
+	if err != nil || got == nil || got.State != types.StatePaused || got.RunID != "" || got.VswitchPort != "" ||
+		got.RunDir != "" || got.EnvdUDS != "" || got.CiUDS != "" {
 		t.Fatalf("post-assignment rollback row = %+v, %v", got, err)
 	}
 
@@ -331,8 +380,8 @@ func TestStartingRollbackFencesPreAssignmentPostAssignmentAndDelete(t *testing.T
 		}},
 		{"bind", func() (bool, error) { return st.BindStartingRunner(ctx, deleted.ID, "late-run") }},
 		{"commit", func() (bool, error) { return st.CommitStartingRunning(ctx, deleted.ID, "late-run") }},
-		{"dead rollback", func() (bool, error) { return st.RollbackStartingDead(ctx, deleted.ID, "") }},
-		{"paused rollback", func() (bool, error) { return st.RollbackStartingPaused(ctx, deleted.ID, "") }},
+		{"dead rollback", func() (bool, error) { return st.RollbackStartingDead(ctx, deleted) }},
+		{"paused rollback", func() (bool, error) { return st.RollbackStartingPaused(ctx, deleted) }},
 	}
 	for _, check := range checks {
 		if changed, err := check.fn(); err != nil || changed {
@@ -353,7 +402,7 @@ func TestStartingRollbackRejectsWrongLifecycleKind(t *testing.T) {
 	if err := st.InsertSandbox(ctx, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.RollbackStartingPaused(ctx, fresh.ID, fresh.RunID); err != nil || changed {
+	if changed, err := st.RollbackStartingPaused(ctx, fresh); err != nil || changed {
 		t.Fatalf("fresh rollback to paused = %v, %v; want lifecycle-kind CAS miss", changed, err)
 	}
 
@@ -364,7 +413,7 @@ func TestStartingRollbackRejectsWrongLifecycleKind(t *testing.T) {
 	if err := st.InsertSandbox(ctx, resume); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := st.RollbackStartingDead(ctx, resume.ID, resume.RunID); err != nil || changed {
+	if changed, err := st.RollbackStartingDead(ctx, resume); err != nil || changed {
 		t.Fatalf("resume rollback to dead = %v, %v; want lifecycle-kind CAS miss", changed, err)
 	}
 
@@ -433,14 +482,20 @@ func TestDeletePreLaunchStartingRequiresEmptyOwnership(t *testing.T) {
 	}
 }
 
-func TestListDefaultHidesStartingAndDeadButExplicitStateRemainsDiagnostic(t *testing.T) {
+func TestListDefaultHidesInternalStatesButExplicitStateRemainsDiagnostic(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	for i, state := range []types.State{types.StateRunning, types.StatePaused, types.StateStarting, types.StateDead} {
+	for i, state := range []types.State{
+		types.StateRunning, types.StatePaused, types.StateStarting, types.StateDeleting, types.StateDead,
+	} {
 		sb := sandboxInsertFixture("list-state-"+string(rune('a'+i)), i)
 		sb.State = state
 		if state == types.StateStarting {
 			sb.LaunchMode = types.LaunchCold
+		} else if state == types.StateDead {
+			sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS, sb.CiUDS = "", "", "", "", ""
+			sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", ""
+			sb.ResumeSource = types.ResumeSource{}
 		}
 		if err := st.InsertSandbox(ctx, sb); err != nil {
 			t.Fatal(err)
@@ -453,10 +508,160 @@ func TestListDefaultHidesStartingAndDeadButExplicitStateRemainsDiagnostic(t *tes
 	if len(rows) != 2 || rows[0].State != types.StateRunning || rows[1].State != types.StatePaused {
 		t.Fatalf("default list states = %+v", rows)
 	}
-	for _, state := range []types.State{types.StateStarting, types.StateDead} {
+	for _, state := range []types.State{types.StateStarting, types.StateDeleting, types.StateDead} {
 		rows, _, err := st.List(ctx, string(state), "", 10, "")
 		if err != nil || len(rows) != 1 || rows[0].State != state {
 			t.Fatalf("explicit %s list = %+v, %v", state, rows, err)
 		}
+	}
+}
+
+func TestSandboxDeletingTransitionPreservesExactCleanupOwnership(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("delete-durable-owner", 0)
+	sb.State = types.StateStarting
+	sb.LaunchMode = types.LaunchCold
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`
+		CREATE TRIGGER fail_begin_sandbox_delete
+		BEFORE UPDATE OF state ON sandboxes
+		WHEN OLD.id='delete-durable-owner'
+		BEGIN SELECT RAISE(ABORT, 'forced delete transition failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.BeginSandboxDelete(ctx, sb); err == nil || changed {
+		t.Fatalf("forced BeginSandboxDelete = %t, %v", changed, err)
+	}
+	unchanged, err := st.Get(ctx, sb.ID)
+	if err != nil || unchanged == nil || unchanged.State != sb.State || unchanged.RunID != sb.RunID ||
+		unchanged.VswitchPort != sb.VswitchPort || unchanged.RunDir != sb.RunDir || unchanged.BaseDir != sb.BaseDir {
+		t.Fatalf("failed delete transition changed exact owner: %+v, %v", unchanged, err)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER fail_begin_sandbox_delete`); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := *sb
+	stale.ResumeSource.Ref = "stale-source"
+	if changed, err := st.BeginSandboxDelete(ctx, &stale); err != nil || changed {
+		t.Fatalf("stale BeginSandboxDelete = %t, %v", changed, err)
+	}
+	if changed, err := st.BeginSandboxDelete(ctx, sb); err != nil || !changed {
+		t.Fatalf("BeginSandboxDelete = %t, %v", changed, err)
+	}
+	deleting, err := st.Get(ctx, sb.ID)
+	if err != nil || deleting == nil {
+		t.Fatalf("deleting row = %+v, %v", deleting, err)
+	}
+	if deleting.State != types.StateDeleting || deleting.LaunchMode != "" ||
+		deleting.RunID != sb.RunID || deleting.VswitchPort != sb.VswitchPort ||
+		deleting.RunDir != sb.RunDir || deleting.BaseDir != sb.BaseDir || deleting.ResumeSource != sb.ResumeSource {
+		t.Fatalf("delete transition lost cleanup ownership: %+v", deleting)
+	}
+	if changed, err := st.BeginSandboxDelete(ctx, deleting); err != nil || !changed {
+		t.Fatalf("repeated BeginSandboxDelete = %t, %v", changed, err)
+	}
+	staleDeleting := *deleting
+	staleDeleting.BaseDir += "-stale"
+	if changed, err := st.DeleteFinalizedSandbox(ctx, &staleDeleting); err != nil || changed {
+		t.Fatalf("stale DeleteFinalizedSandbox = %t, %v", changed, err)
+	}
+	if _, err := st.db.Exec(`
+		CREATE TRIGGER fail_finalize_sandbox_delete
+		BEFORE DELETE ON sandboxes
+		WHEN OLD.id='delete-durable-owner'
+		BEGIN SELECT RAISE(ABORT, 'forced delete finalization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.DeleteFinalizedSandbox(ctx, deleting); err == nil || changed {
+		t.Fatalf("forced DeleteFinalizedSandbox = %t, %v", changed, err)
+	}
+	if retained, err := st.Get(ctx, sb.ID); err != nil || retained == nil || retained.State != types.StateDeleting ||
+		retained.RunID != sb.RunID || retained.VswitchPort != sb.VswitchPort || retained.RunDir != sb.RunDir || retained.BaseDir != sb.BaseDir {
+		t.Fatalf("failed hard delete lost exact owner: %+v, %v", retained, err)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER fail_finalize_sandbox_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.DeleteFinalizedSandbox(ctx, deleting); err != nil || !changed {
+		t.Fatalf("DeleteFinalizedSandbox = %t, %v", changed, err)
+	}
+	if got, err := st.Get(ctx, sb.ID); err != nil || got != nil {
+		t.Fatalf("hard-deleted row = %+v, %v", got, err)
+	}
+}
+
+func TestSandboxDeleteTransitionFailureLeavesOriginalOwner(t *testing.T) {
+	st := testStore(t)
+	sb := sandboxInsertFixture("delete-transition-failure", 0)
+	if err := st.InsertSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if changed, err := st.BeginSandboxDelete(ctx, sb); err == nil || changed {
+		t.Fatalf("canceled BeginSandboxDelete = %t, %v", changed, err)
+	}
+	got, err := st.Get(context.Background(), sb.ID)
+	if err != nil || got == nil || got.State != types.StateRunning || got.RunID != sb.RunID ||
+		got.VswitchPort != sb.VswitchPort || got.RunDir != sb.RunDir || got.BaseDir != sb.BaseDir {
+		t.Fatalf("failed delete transition changed owner: %+v, %v", got, err)
+	}
+}
+
+func TestCommitSandboxDeadAtomicallyClearsAllLocalOwnership(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := sandboxInsertFixture("dead-cleanup-commit", 0)
+	if err := st.InsertSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	stale := *sb
+	stale.VswitchPort = "stale-port"
+	if changed, err := st.CommitSandboxDead(ctx, &stale); err != nil || changed {
+		t.Fatalf("stale CommitSandboxDead = %t, %v", changed, err)
+	}
+	if changed, err := st.CommitSandboxDead(ctx, sb); err != nil || !changed {
+		t.Fatalf("CommitSandboxDead = %t, %v", changed, err)
+	}
+	dead, err := st.Get(ctx, sb.ID)
+	if err != nil || dead == nil || dead.State != types.StateDead {
+		t.Fatalf("dead row = %+v, %v", dead, err)
+	}
+	if dead.RunID != "" || dead.VswitchPort != "" || dead.FloatingIP != "" || dead.InnerIP != "" || dead.PortMAC != "" ||
+		dead.RunDir != "" || dead.BaseDir != "" || dead.EnvdUDS != "" || dead.CiUDS != "" || !dead.ResumeSource.Empty() {
+		t.Fatalf("dead row retained local ownership: %+v", dead)
+	}
+}
+
+func TestDeadSandboxRejectsCleanupOwnership(t *testing.T) {
+	st := testStore(t)
+	for _, field := range []string{"runner", "port", "run-dir", "base-dir", "artifact"} {
+		t.Run(field, func(t *testing.T) {
+			sb := sandboxInsertFixture("dead-owner-"+field, 2)
+			sb.State = types.StateDead
+			sb.LaunchMode = ""
+			sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS, sb.CiUDS = "", "", "", "", ""
+			sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC = "", "", "", ""
+			sb.ResumeSource = types.ResumeSource{}
+			switch field {
+			case "runner":
+				sb.RunID = "owned-run"
+			case "port":
+				sb.VswitchPort = "owned-port"
+			case "run-dir":
+				sb.RunDir = "/owned/run"
+			case "base-dir":
+				sb.BaseDir = "/owned/base"
+			case "artifact":
+				sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "owned.snapshot"}
+			}
+			if err := st.InsertSandbox(context.Background(), sb); err == nil {
+				t.Fatal("dead sandbox accepted cleanup ownership")
+			}
+		})
 	}
 }

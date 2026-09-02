@@ -103,23 +103,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return acceptExecSession(cmd, result)
 	case routesync.CmdDelete:
-		sb, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
-		if err != nil {
+		if err := o.acceptClusterDelete(ctx, cmd); err != nil {
 			return reject(cmd, err)
 		}
-		if o.extensionSandboxHook != nil {
-			deleteAccepted, err := o.prepareClusterDelete(ctx, cmd)
-			if err != nil {
-				return reject(cmd, err)
-			}
-			go deleteAccepted()
-			return accept(cmd)
-		}
-		go func() {
-			if err := o.deleteCluster(o.asyncCtx(), sb); err != nil {
-				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
-			}
-		}()
 		return accept(cmd)
 	case routesync.CmdKeyPut:
 		if err := o.putClusterKeyPair(ctx, cmd); err != nil {
@@ -1168,33 +1154,13 @@ func clusterConnectResult(sb *types.Sandbox) (*routesync.ConnectResult, error) {
 	}, nil
 }
 
-func (o *Orchestrator) deleteCluster(ctx context.Context, sb *types.Sandbox) error {
-	unlock, err := o.lockLifecycleMutation(ctx, sb.ID)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	o.launches.Cancel(sb.ID)
-
-	current, err := o.st.Get(ctx, sb.ID)
-	if err != nil {
-		return err
-	}
-	if current == nil {
-		return nil
-	}
-	return o.deleteClusterLocked(ctx, current)
-}
-
-// prepareClusterDelete runs the policy Hook synchronously so a rejection can
-// become the command ACK, then hands an already fenced delete to the existing
-// asynchronous cleanup path. The lifecycle lock remains held until the worker
-// starts, so the checked incarnation cannot change between ACK admission and
-// its durable delete.
-func (o *Orchestrator) prepareClusterDelete(ctx context.Context, cmd *routesync.Command) (func(), error) {
+// acceptClusterDelete runs policy synchronously and commits the exact deleting
+// owner before ACK. Physical cleanup remains asynchronous in the common
+// finalizer started by acceptSandboxDeleteLocked.
+func (o *Orchestrator) acceptClusterDelete(ctx context.Context, cmd *routesync.Command) error {
 	unlock, err := o.lockLifecycleMutation(ctx, cmd.SID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	locked := true
 	defer func() {
@@ -1205,7 +1171,13 @@ func (o *Orchestrator) prepareClusterDelete(ctx context.Context, cmd *routesync.
 
 	current, err := o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	if current.State == types.StateDeleting {
+		return o.deleteClusterLocked(ctx, current)
+	}
+	if o.extensionSandboxHook == nil {
+		return o.deleteClusterLocked(ctx, current)
 	}
 	precondition := sandboxPrecondition(current)
 	operation := newSandboxOperation(conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginCluster, cmd.SID, current)
@@ -1215,62 +1187,36 @@ func (o *Orchestrator) prepareClusterDelete(ctx context.Context, cmd *routesync.
 	locked = false
 
 	if err := o.callSandboxHook(ctx, operation); err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateSandboxOperationEnvelope(operation, operationID, conductorextension.SandboxOperationDelete, conductorextension.SandboxOriginCluster, cmd.SID); err != nil {
-		return nil, err
+		return err
 	}
 	if cloneSandboxDeleteRequest(operation.Delete) == nil {
-		return nil, fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
+		return fmt.Errorf("%w: extension removed delete candidate", api.ErrBadRequest)
 	}
 
 	unlock, err = o.lockLifecycleMutation(ctx, cmd.SID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	locked = true
 	current, err = o.clusterSandbox(ctx, cmd.SID, cmd.APISecretFingerprint)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	if current.State == types.StateDeleting {
+		return o.deleteClusterLocked(ctx, current)
 	}
 	if !sandboxPreconditionMatches(precondition, current) {
-		return nil, api.ErrSandboxChanged
+		return api.ErrSandboxChanged
 	}
-	locked = false
-	return func() {
-		defer unlock()
-		if err := o.deleteClusterLocked(o.asyncCtx(), current); err != nil {
-			o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
-		}
-	}, nil
+	return o.deleteClusterLocked(ctx, current)
 }
 
 func (o *Orchestrator) deleteClusterLocked(ctx context.Context, current *types.Sandbox) error {
-	attempt, launchActive := o.launches.Lookup(current.ID)
-	o.launches.Cancel(current.ID)
-	if err := o.st.Delete(ctx, current.ID); err != nil {
-		return err
-	}
-	if current.State == types.StateStarting && launchActive {
-		cleanupCtx, cancel := cleanupContext()
-		if err := o.stepLaunchCleanup(cleanupCtx, attempt, current, false); err != nil {
-			o.log.Error("cluster sandbox delete cleanup incomplete; launch will retry",
-				"sid", current.ID, "run_id", current.RunID, "err", err)
-		}
-		cancel()
-	} else {
-		cleanupCtx, cancel := cleanupContext()
-		if err := o.teardown(cleanupCtx, current); err != nil {
-			o.log.Error("cluster sandbox delete cleanup incomplete",
-				"sid", current.ID, "run_id", current.RunID, "err", err)
-		}
-		cancel()
-	}
-	o.clearDeadlineIntent(current.ID)
-	o.uncache(current.ID)
-	o.publishDelete(current.ID)
-	o.observeSandboxDelete(current)
-	return nil
+	_, err := o.acceptSandboxDeleteLocked(ctx, current)
+	return err
 }
 
 // putClusterKeyPair validates and atomically installs one inline tenant pair.

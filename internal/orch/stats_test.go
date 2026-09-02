@@ -155,7 +155,7 @@ func TestTrafficStatsDisabledAndProviderErrors(t *testing.T) {
 func TestTrafficStatsTerminalStateConflictsBeforeProvider(t *testing.T) {
 	o := testOrch(t)
 	sb := &types.Sandbox{
-		ID: "traffic-dead", RunID: "run-1", Profile: types.ProfileBare, State: types.StateDead,
+		ID: "traffic-dead", Profile: types.ProfileBare, State: types.StateDead,
 		APISecret: strings.Repeat("b", 64), ManifestKey: strings.Repeat("c", 64),
 	}
 	materializeTestSandboxCredentials(t, sb)

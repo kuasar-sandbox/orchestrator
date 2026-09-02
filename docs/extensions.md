@@ -55,7 +55,10 @@ otherwise access.
 `AutoPauseMemory`, and `LaunchMode`. `ArtifactLocation` is orthogonal to E/S
 kind, and a running row may retain a source for node-local artifact ownership.
 `LaunchMode` is non-empty only while `starting`; it is the durable, already
-resolved launch decision rather than the trigger that requested it.
+resolved launch decision rather than the trigger that requested it. The
+internal `deleting` state is durable cleanup ownership: it is never a route or
+activation state, and it retains exact runner, network, RunDir, and BaseDir
+fields until the core finalizer succeeds.
 
 `SandboxSource.Watch` covers all durable sandbox rows. `BuildSource.Watch`
 covers the current `registered`, `waiting`, `building`, and `ready` set. A live
@@ -89,6 +92,15 @@ context cancellation returns `ctx.Err()`.
 
 Do not use Watch as an audit, billing, or exactly-once delivery mechanism. Those
 requirements need a separately designed durable outbox.
+
+An explicit delete removes the sandbox from the node cache and future full
+snapshots at durable `deleting` acceptance, but publishes the terminal route
+delete only after local cleanup and hard deletion. The conductor object source
+emits its terminal sandbox removal only after the
+exact unit/network/path cleanup and hard delete succeed. A restart-time snapshot
+may therefore contain a cleanup-pending `deleting` view. Extensions must treat
+it as diagnostic state and must not try to resume, route, or independently
+clean it.
 
 ## Conductor lifecycle hooks
 

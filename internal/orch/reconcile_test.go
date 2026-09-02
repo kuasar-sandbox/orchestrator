@@ -155,6 +155,11 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 	if err := st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	for _, path := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	createStarting := *sb
 	createStarting.ID = "create-starting"
 	createStarting.State = types.StateStarting
@@ -324,6 +329,11 @@ func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
 	if err := st.Put(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
+	for _, path := range []string{sb.RunDir, sb.BaseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	unit := "sandbox-runner@" + runID + ".service"
 	lc := &reconcileLauncher{units: []launcher.Unit{{Name: unit, ActiveState: "active"}}}
 	vs := &reconcileVS{}
@@ -334,7 +344,8 @@ func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
 
 	got, err := st.Get(context.Background(), sb.ID)
 	if err != nil || got == nil || got.State != types.StatePaused || got.ResumeSource != source ||
-		got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" || got.InnerIP != "" || got.PortMAC != "" {
+		got.RunID != "" || got.VswitchPort != "" || got.FloatingIP != "" || got.InnerIP != "" || got.PortMAC != "" ||
+		got.RunDir != "" || got.EnvdUDS != "" || got.CiUDS != "" {
 		t.Fatalf("reconciled paused row = %+v, %v", got, err)
 	}
 	if !containsString(lc.stopped, unit) || !containsString(lc.reset, unit) {
@@ -343,8 +354,15 @@ func TestReconcileCompletesPausedExactOwnershipCleanup(t *testing.T) {
 	if !containsString(vs.detached, "paused-old-port") {
 		t.Fatalf("paused network cleanup = %v", vs.detached)
 	}
-	if cached := o.lookup(sb.ID); cached == nil || cached.RunID != "" || cached.VswitchPort != "" || cached.ResumeSource != source {
+	if cached := o.lookup(sb.ID); cached == nil || cached.RunID != "" || cached.VswitchPort != "" ||
+		cached.RunDir != "" || cached.ResumeSource != source {
 		t.Fatalf("reconciled paused cache = %+v", cached)
+	}
+	if _, err := os.Stat(sb.RunDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("paused reconcile retained RunDir: %v", err)
+	}
+	if _, err := os.Stat(sb.BaseDir); err != nil {
+		t.Fatalf("paused reconcile removed BaseDir: %v", err)
 	}
 }
 
@@ -829,6 +847,72 @@ func TestReconcileRetainsExecutionClaimUntilInterruptedCleanupSucceeds(t *testin
 	}
 	if stored.Status != types.BuildError || stored.ExecutionClaimed || stored.RuntimeVswitchPort != "" {
 		t.Fatalf("successful retry did not terminally release: %+v", stored)
+	}
+}
+
+func TestReconcileRetriesBuildDirectoryCleanupAfterRestart(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("3", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "node.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
+	build := buildReconcileRow(t, "br-00000000-0000-7000-8000-000000000220")
+	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
+	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
+	for _, path := range []string{runDir, baseDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+
+	removeErr := errors.New("injected BuildBaseDir removal failure")
+	first := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	first.removeBuildBaseDir = func(path string) error {
+		if path != baseDir {
+			t.Fatalf("remove base path = %q, want %q", path, baseDir)
+		}
+		return removeErr
+	}
+	if err := first.ReconcileBuilds(context.Background()); !errors.Is(err, removeErr) {
+		t.Fatalf("first reconcile error = %v, want BaseDir failure", err)
+	}
+	stored, err := st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil || stored.Status != types.BuildBuilding || !stored.ExecutionClaimed {
+		t.Fatalf("failed directory cleanup released execution claim: %+v, %v", stored, err)
+	}
+	if stored.RuntimeVswitchPort != "" {
+		t.Fatalf("completed runtime cleanup was not durably recorded: %+v", stored)
+	}
+	if _, err := os.Stat(runDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed BuildRunDir cleanup = %v", err)
+	}
+	if _, err := os.Stat(baseDir); err != nil {
+		t.Fatalf("failed BuildBaseDir cleanup lost retry owner: %v", err)
+	}
+
+	// A new controller has no process-local cleanup state. It must recover the
+	// exact directories from BuildID plus the configured roots.
+	restarted := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := restarted.ReconcileBuilds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = st.GetBuild(context.Background(), build.BuildID)
+	if err != nil || stored == nil || stored.Status != types.BuildError || stored.ExecutionClaimed {
+		t.Fatalf("restart did not terminally release Build ownership: %+v, %v", stored, err)
+	}
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("restart retained Build directory %s: %v", path, err)
+		}
 	}
 }
 
