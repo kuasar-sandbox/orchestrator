@@ -5,10 +5,12 @@
 //   - run    (POST /internal/run/assignment, /internal/run/build-result):
 //     prestarted run-id units wait for their sandbox/build assignment; run-builder
 //     posts its result back here. Authed by SO_PEERCRED peer pid == the run-id
-//     pidfile (/run/sandbox/runs/<run-id>.pid).
+//     pidfile (/run/sandbox/runners/<run-id>.pid).
 //   - task   (POST /internal/task/{sandbox,build}/{bootstrap,prepare}):
 //     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
-//     SO_PEERCRED peer pid == the task pidfile (/run/sandbox/<id>/<id>.pid).
+//     SO_PEERCRED peer pid == the task pidfile
+//     (/run/sandbox/sandboxes/<sid>/<sid>.pid or
+//     /run/sandbox/builds/<build-id>/builder.pid).
 //   - admin  (/internal/admin/manifest-keys and sandbox MMDS route-value paths):
 //     manifest-key allowlist management plus bounded secret PUT/DELETE. Authed by
 //     SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the socket's
@@ -192,7 +194,8 @@ type BuildSpec struct {
 	BuildID          string            `json:"build_id"`
 	Profile          string            `json:"profile"`
 	RunID            string            `json:"run_id,omitempty"`
-	Workdir          string            `json:"workdir"` // build scratch dir (artifacts, run roots)
+	RunDir           string            `json:"run_dir"`  // volatile BuildRunDir
+	BaseDir          string            `json:"base_dir"` // persistent BuildBaseDir
 	FromImage        string            `json:"from_image,omitempty"`
 	FromTemplateRef  string            `json:"from_template_ref,omitempty"`
 	FromTemplateKind string            `json:"from_template_kind,omitempty"`

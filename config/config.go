@@ -787,12 +787,12 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 	return time.Hour
 }
 
-// CheckpointConfig is the paused-state capture policy. Mode and LocalDir apply
-// to both CaptureSnapshot and CaptureSandbox; MergeRef and DropCaches apply only
-// to CaptureSnapshot and override sandbox-ctl's snapshot defaults when set.
+// CheckpointConfig is the paused-state capture policy. Mode applies to both
+// CaptureSnapshot and CaptureSandbox, whose local output is always the owning
+// Sandbox BaseDir/checkpoint; MergeRef and DropCaches apply only to
+// CaptureSnapshot and override sandbox-ctl's snapshot defaults when set.
 type CheckpointConfig struct {
 	Mode       string                 `yaml:"mode" json:"mode"`               // local (default) | bundle
-	LocalDir   string                 `yaml:"local_dir" json:"local_dir"`     // local checkpoint files dir; default /var/lib/sandbox-saved
 	MergeRef   *bool                  `yaml:"merge_ref" json:"merge_ref"`     // nil delegates to sandbox-ctl
 	DropCaches *bool                  `yaml:"drop_caches" json:"drop_caches"` // nil delegates to sandbox-ctl
 	Remote     CheckpointRemoteConfig `yaml:"remote" json:"remote"`
@@ -990,7 +990,6 @@ func (c *Conductor) applyDefaults() {
 		c.Builder.Referer.Key = c.Builder.Referer.Desc
 	}
 	def(&c.Checkpoint.Mode, CheckpointLocal)
-	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
 	if c.MMDS.Routes.MaxRoutesPerSandbox == 0 {
 		c.MMDS.Routes.MaxRoutesPerSandbox = 32

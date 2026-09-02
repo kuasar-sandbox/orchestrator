@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -46,6 +47,9 @@ func (o *Orchestrator) reconcileBuilds(ctx context.Context) error {
 	// read is transiently unavailable, startup can retry without canceling
 	// monitors that this same reconciliation pass already started.
 	for _, build := range building {
+		if err := types.ValidateBuildID(build.BuildID); err != nil {
+			return fmt.Errorf("reconcile build: %w", err)
+		}
 		if !build.ExecutionClaimed {
 			return fmt.Errorf("reconcile build %s: building row has no execution claim", build.BuildID)
 		}
@@ -157,7 +161,9 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build,
 	}
 	prep.durable = &durable
 	preflightPending := &pendingBuild{
-		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID),
+		build:            build,
+		runDir:           nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
+		baseDir:          nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
 		snapshotTemplate: prep.snapshotTemplate,
 		spec:             prep.spec, resources: durable.Resources,
 		network: durable.Network, templateNetwork: durable.TemplateNetwork,
@@ -207,7 +213,9 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 		expectedDigest = prep.durable.PrepareDigest
 	}
 	pend := &pendingBuild{
-		build: build, workdir: buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID),
+		build:            build,
+		runDir:           nodepath.BuildRunDir(o.cfg.Paths.RunRoot, build.BuildID),
+		baseDir:          nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
 		snapshotTemplate: prep.snapshotTemplate,
 		handoff:          newBuildTaskHandoff(prep.snapshotTemplate, expectedDigest),
 		spec:             prep.spec, resources: prep.resources,
@@ -254,8 +262,7 @@ func (o *Orchestrator) finishRecoveredBuildResult(ctx context.Context, build *ty
 	if build.ExecutionResult == nil {
 		return fmt.Errorf("reconcile build %s: missing accepted result", build.BuildID)
 	}
-	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort,
-		buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
+	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, build.RuntimeVswitchPort != ""); err != nil {
 		return fmt.Errorf("reconcile build %s accepted-result cleanup: %w", build.BuildID, err)
 	}
 	result := *build.ExecutionResult
@@ -308,7 +315,7 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 		result, port, runtimePersisted, mmdsRow, runErr = o.continueRecoveredBuildPreparation(ctx, build, pend, unit)
 	}
 	if !errors.Is(runErr, errBuildCleanupPending) {
-		runErr = o.cleanupRecoveredBuildRuntime(build, runErr, port, pend.workdir, runtimePersisted)
+		runErr = o.cleanupRecoveredBuildRuntime(build, runErr, port, runtimePersisted)
 	}
 	o.completeBuild(ctx, build, result, runErr)
 }
@@ -316,14 +323,14 @@ func (o *Orchestrator) monitorRecoveredBuild(ctx context.Context, build *types.B
 func (o *Orchestrator) cleanupRecoveredBuildRuntime(
 	build *types.Build,
 	cause error,
-	port, dir string,
+	port string,
 	persisted bool,
 ) error {
-	progress, cleanupErr := o.cleanupBuildRuntimeProgress(build, port, dir, persisted)
+	progress, cleanupErr := o.cleanupBuildRuntimeProgress(build, port, persisted)
 	if cleanupErr == nil {
 		return cause
 	}
-	return retainBuildCleanup(cause, cleanupErr, progress.port, progress.dir, progress.persisted)
+	return retainBuildCleanup(cause, cleanupErr, progress.port, progress.persisted)
 }
 
 func (o *Orchestrator) continueRecoveredBuildPreparation(
@@ -430,7 +437,7 @@ func (o *Orchestrator) waitRecoveredBuild(ctx context.Context, build *types.Buil
 }
 
 func (o *Orchestrator) failInterruptedBuild(ctx context.Context, build *types.Build, reason string) error {
-	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, buildRuntimeDir(o.cfg.Paths.RunRoot, build.BuildID), build.RuntimeVswitchPort != ""); err != nil {
+	if err := o.cleanupBuildRuntime(build, build.RuntimeVswitchPort, build.RuntimeVswitchPort != ""); err != nil {
 		return fmt.Errorf("reconcile build %s cleanup: %w", build.BuildID, err)
 	}
 	unlockEvent := o.lockExtensionBuildEvent(build.BuildID)

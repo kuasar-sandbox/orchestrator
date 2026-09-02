@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -166,6 +167,7 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	o.cfg.Builder.TotalTimeoutSec = 1
 	b := &types.Build{
 		BuildID: "build-expired-before-assignment", Profile: types.ProfileBare,
@@ -178,8 +180,13 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	if b.RunID != "" || b.RuntimeVswitchPort != "" {
 		t.Fatalf("expired build acquired runtime ownership: %+v", b)
 	}
-	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired build workdir remained: %v", err)
+	for _, path := range []string{
+		nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID),
+		nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID),
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expired build directory %s remained: %v", path, err)
+		}
 	}
 }
 
@@ -217,19 +224,48 @@ func TestWaitBuildResultRechecksAcceptedResultAfterInactiveReadback(t *testing.T
 	}
 }
 
-func TestRunBuildUnitCleansWorkdirWhenRequestResolutionFails(t *testing.T) {
+func TestRunBuildUnitCleansDirectoriesWhenRequestResolutionFails(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = t.TempDir()
+	o.cfg.Paths.BaseRoot = t.TempDir()
 	b := &types.Build{
 		BuildID: "build-invalid-request-input", Profile: types.ProfileBare,
-		Status: types.BuildBuilding, PhaseResourcePatch: `{"capacity":`,
+		Status: types.BuildBuilding, ExecutionClaimed: true, PhaseResourcePatch: `{"capacity":`,
+	}
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)
+	seenRunDir, seenBaseDir := false, false
+	o.removeBuildRunDir = func(path string) error {
+		if path != runDir {
+			t.Fatalf("BuildRunDir cleanup path = %q, want %q", path, runDir)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("execution claim did not create BuildRunDir: %v", err)
+		}
+		seenRunDir = true
+		return os.RemoveAll(path)
+	}
+	o.removeBuildBaseDir = func(path string) error {
+		if path != baseDir {
+			t.Fatalf("BuildBaseDir cleanup path = %q, want %q", path, baseDir)
+		}
+		if _, err := os.Stat(nodepath.BuildCheckpointDir(o.cfg.Paths.BaseRoot, b.BuildID)); err != nil {
+			t.Fatalf("execution claim did not create Build checkpoint directory: %v", err)
+		}
+		seenBaseDir = true
+		return os.RemoveAll(path)
 	}
 
 	if _, err := o.runBuildUnit(context.Background(), b); err == nil {
 		t.Fatal("malformed phase resource patch was accepted")
 	}
-	if _, err := os.Stat(buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("request-resolution failure retained build workdir: %v", err)
+	if !seenRunDir || !seenBaseDir {
+		t.Fatalf("execution claim directory observations: run=%t base=%t", seenRunDir, seenBaseDir)
+	}
+	for _, path := range []string{runDir, baseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("request-resolution failure retained %s: %v", path, err)
+		}
 	}
 }
 

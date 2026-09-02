@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -100,7 +101,7 @@ func (s stubProvider) BuildTaskSpecFor(_ context.Context, buildID, runID string)
 	}
 	return &BuildTaskSpec{
 		BuildID: buildID, RunID: runID,
-		Final: &BuildSpec{BuildID: buildID, RunID: runID, Workdir: "/tmp"},
+		Final: &BuildSpec{BuildID: buildID, RunID: runID, RunDir: "/run/build", BaseDir: "/base/build"},
 	}, true, nil
 }
 
@@ -114,7 +115,7 @@ func (s stubProvider) CompleteBuildPrepare(_ context.Context, buildID, runID str
 	if buildID != "x" || runID != "br-test" {
 		return nil, RejectBuildPrepare(os.ErrNotExist)
 	}
-	return &BuildSpec{BuildID: buildID, RunID: runID, Workdir: "/tmp"}, nil
+	return &BuildSpec{BuildID: buildID, RunID: runID, RunDir: "/run/build", BaseDir: "/base/build"}, nil
 }
 
 func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
@@ -439,21 +440,25 @@ func TestBuildBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
-func TestBuildBootstrapRejectsV1SchemaBeforeProviders(t *testing.T) {
+func TestBuildBootstrapRejectsPreV3SchemasBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	var authCalls, secretCalls atomic.Int32
-	_, client := startTestServer(t, Deps{Provider: stubProvider{
-		pidFile: pf, buildAuthHits: &authCalls, buildSpecHits: &secretCalls,
-	}})
-	status, _ := rawPost(t, client, PathTaskBuildBootstrap, BuildTaskRequest{
-		BuildID: "x", RunID: "br-test", Version: 1,
-	})
-	if status != http.StatusBadRequest {
-		t.Fatalf("unsupported build bootstrap status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if authCalls.Load() != 0 || secretCalls.Load() != 0 {
-		t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			var authCalls, secretCalls atomic.Int32
+			_, client := startTestServer(t, Deps{Provider: stubProvider{
+				pidFile: pf, buildAuthHits: &authCalls, buildSpecHits: &secretCalls,
+			}})
+			status, _ := rawPost(t, client, PathTaskBuildBootstrap, BuildTaskRequest{
+				BuildID: "x", RunID: "br-test", Version: version,
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("unsupported build bootstrap status = %d, want %d", status, http.StatusBadRequest)
+			}
+			if authCalls.Load() != 0 || secretCalls.Load() != 0 {
+				t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+			}
+		})
 	}
 }
 
@@ -498,6 +503,27 @@ func TestBuildPrepareRejectsUnversionedV1BeforeProviders(t *testing.T) {
 	}
 	if authCalls.Load() != 0 || completionCalls.Load() != 0 {
 		t.Fatalf("unversioned build prepare reached providers: auth=%d completion=%d",
+			authCalls.Load(), completionCalls.Load())
+	}
+}
+
+func TestBuildPrepareRejectsV2BeforeProviders(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "builder.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	var authCalls, completionCalls atomic.Int32
+	_, client := startTestServer(t, Deps{Provider: stubProvider{
+		pidFile: pf, buildAuthHits: &authCalls, buildPrepHits: &completionCalls,
+	}})
+	status, _ := rawPost(t, client, PathTaskBuildPrepare, BuildPrepareRequest{
+		BuildID: "x", RunID: "br-test", Version: 2, Summary: ArtifactPrepareSummary{
+			SchemaVersion: ArtifactPrepareSchemaVersion,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("v2 build prepare status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if authCalls.Load() != 0 || completionCalls.Load() != 0 {
+		t.Fatalf("v2 build prepare reached providers: auth=%d completion=%d",
 			authCalls.Load(), completionCalls.Load())
 	}
 }

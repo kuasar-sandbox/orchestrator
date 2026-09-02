@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -33,6 +34,13 @@ import (
 )
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func validateBuildIDRequest(buildID string) error {
+	if err := types.ValidateBuildID(buildID); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	return nil
+}
 
 // maxCABundlePEMSize bounds the inline CA bundle a build may register. Larger
 // bundles and a general build-input upload facility are tracked separately.
@@ -58,6 +66,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	bid, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("orch: new build id: %w", err)
+	}
+	if err := types.ValidateBuildID(bid.String()); err != nil {
+		return nil, fmt.Errorf("orch: generated build id: %w", err)
 	}
 	tid, err := uuid.NewV7()
 	if err != nil {
@@ -137,6 +148,9 @@ func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey string, spec ap
 // image + steps + e2b start command and queue the build for the pool. Bare
 // builds reject start/ready commands and always produce an image.
 func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
+	if err := validateBuildIDRequest(bid); err != nil {
+		return err
+	}
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return err
@@ -513,6 +527,9 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 
 // BuildStatus handles GET /templates/{tid}/builds/{bid}/status.
 func (o *Orchestrator) BuildStatus(ctx context.Context, apiKey, tid, bid string) (*types.Build, error) {
+	if err := validateBuildIDRequest(bid); err != nil {
+		return nil, err
+	}
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return nil, err
@@ -739,7 +756,6 @@ type buildCleanupPendingError struct {
 	cause     error
 	cleanup   error
 	port      string
-	dir       string
 	persisted bool
 }
 
@@ -762,9 +778,9 @@ func (e *buildCleanupPendingError) Unwrap() []error {
 // failures. In particular, a durably accepted worker result has no pipeline
 // cause: a transient failure to fence its unit must not turn that result into a
 // failed Build once a retry establishes the fence.
-func retainBuildCleanup(err, cleanup error, port, dir string, persisted bool) *buildCleanupPendingError {
+func retainBuildCleanup(err, cleanup error, port string, persisted bool) *buildCleanupPendingError {
 	pending := &buildCleanupPendingError{
-		cause: err, cleanup: cleanup, port: port, dir: dir, persisted: persisted,
+		cause: err, cleanup: cleanup, port: port, persisted: persisted,
 	}
 	var existing *buildCleanupPendingError
 	if !errors.As(err, &existing) {
@@ -775,9 +791,6 @@ func retainBuildCleanup(err, cleanup error, port, dir string, persisted bool) *b
 	if pending.port == "" {
 		pending.port = existing.port
 	}
-	if pending.dir == "" {
-		pending.dir = existing.dir
-	}
 	pending.persisted = pending.persisted || existing.persisted
 	return pending
 }
@@ -787,7 +800,8 @@ func retainBuildCleanup(err, cleanup error, port, dir string, persisted bool) *b
 // network/resources, final handoff, and result channel for the pipeline.
 type pendingBuild struct {
 	build            *types.Build
-	workdir          string
+	runDir           string
+	baseDir          string
 	snapshotTemplate bool
 	handoff          *buildTaskHandoff
 	spec             sandboxcfg.SandboxSpec
@@ -816,9 +830,9 @@ func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
 // node-ctl run-builder waits for a build assignment, fetches the BuildSpec over
 // the config-socket, and drives import/steps/template sandboxes itself (as direct
 // children, in the unit's cgroup). This side owns what spans the unit: the
-// workdir, one vswitch slot the phases reuse sequentially, and — for the template
-// phase under mmds.enabled — a synthetic route entry so the build sandbox's
-// FC-mode envd can resolve itself.
+// BuildRunDir/BuildBaseDir, one vswitch slot the phases reuse sequentially, and —
+// for the template phase under mmds.enabled — a synthetic route entry so the
+// build sandbox's FC-mode envd can resolve itself.
 func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	res, err := o.runBuildUnit(ctx, b)
 	o.completeBuild(ctx, b, res, err)
@@ -989,6 +1003,9 @@ func (o *Orchestrator) persistTerminalBuild(ctx context.Context, build *types.Bu
 }
 
 func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result *buildResult, retErr error) {
+	if err := types.ValidateBuildID(b.BuildID); err != nil {
+		return nil, buildFailed("resource_resolve", err)
+	}
 	if !b.Profile.Valid() {
 		return nil, buildFailed("resource_resolve", fmt.Errorf("build: unknown profile %q", b.Profile))
 	}
@@ -996,10 +1013,8 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
-	dir := buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, buildFailed("artifact_prepare", err)
-	}
+	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
+	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)
 	var port *vswitch.Port
 	runtimePersisted := false
 	cleanupSafe := true
@@ -1009,20 +1024,26 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			portID = port.Port
 		}
 		if !cleanupSafe {
-			retErr = retainBuildCleanup(retErr, nil, portID, dir, runtimePersisted)
+			retErr = retainBuildCleanup(retErr, nil, portID, runtimePersisted)
 			return
 		}
-		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, dir, runtimePersisted)
+		progress, cleanupErr := o.cleanupBuildRuntimeProgress(b, portID, runtimePersisted)
 		if cleanupErr != nil {
-			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.dir, progress.persisted)
+			retErr = retainBuildCleanup(retErr, cleanupErr, progress.port, progress.persisted)
 		}
 	}()
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return nil, buildFailed("artifact_prepare", fmt.Errorf("create BuildRunDir: %w", err))
+	}
+	if err := os.MkdirAll(nodepath.BuildCheckpointDir(o.cfg.Paths.BaseRoot, b.BuildID), 0o700); err != nil {
+		return nil, buildFailed("artifact_prepare", fmt.Errorf("create Build checkpoint directory: %w", err))
+	}
 	spec, resources, err := o.resolveBuildRequestInputs(b)
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
 	pend := &pendingBuild{
-		build: b, workdir: dir, snapshotTemplate: snapshotTemplate,
+		build: b, runDir: runDir, baseDir: baseDir, snapshotTemplate: snapshotTemplate,
 		handoff: newBuildTaskHandoff(snapshotTemplate, ""),
 		spec:    spec, resources: resources,
 		result: make(chan configsock.BuildResult, 1),
@@ -1198,7 +1219,7 @@ func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild,
 				return configsock.ArtifactPrepareSummary{}, result, nil
 			}
 			if stopErr != nil {
-				return configsock.ArtifactPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
+				return configsock.ArtifactPrepareSummary{}, nil, retainBuildCleanup(ctx.Err(), stopErr, "", false)
 			}
 			return configsock.ArtifactPrepareSummary{}, nil, ctx.Err()
 		case <-tick.C:
@@ -1222,7 +1243,7 @@ func (o *Orchestrator) waitBuildResult(ctx context.Context, pend *pendingBuild, 
 		case <-pend.handoff.Conflict():
 			conflict := pend.handoff.ConflictErr()
 			if err := o.stopBuilderUnit(unit); err != nil {
-				return nil, retainBuildCleanup(conflict, err, "", "", false)
+				return nil, retainBuildCleanup(conflict, err, "", false)
 			}
 			return nil, conflict
 		case <-ctx.Done():
@@ -1235,7 +1256,7 @@ func (o *Orchestrator) waitBuildResult(ctx context.Context, pend *pendingBuild, 
 				return result, resultErr
 			}
 			if stopErr != nil {
-				return nil, retainBuildCleanup(ctx.Err(), stopErr, "", "", false)
+				return nil, retainBuildCleanup(ctx.Err(), stopErr, "", false)
 			}
 			return nil, ctx.Err()
 		case <-tick.C:
@@ -1354,19 +1375,18 @@ func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build) (sandboxcfg.San
 	return spec, resources, nil
 }
 
-func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port, dir string, persisted bool) error {
-	_, err := o.cleanupBuildRuntimeProgress(b, port, dir, persisted)
+func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port string, persisted bool) error {
+	_, err := o.cleanupBuildRuntimeProgress(b, port, persisted)
 	return err
 }
 
 type buildRuntimeCleanupProgress struct {
 	port      string
-	dir       string
 	persisted bool
 }
 
-func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir string, persisted bool) (buildRuntimeCleanupProgress, error) {
-	progress := buildRuntimeCleanupProgress{port: port, dir: dir, persisted: persisted}
+func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port string, persisted bool) (buildRuntimeCleanupProgress, error) {
+	progress := buildRuntimeCleanupProgress{port: port, persisted: persisted}
 	var cleanupErr error
 	runtimeCleared := false
 	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
@@ -1406,14 +1426,19 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir str
 		o.observeBuildUpsert(b)
 	}
 	unlockExtensionEvent(unlockEvent)
-	removeAll := o.removeBuildRuntimeDir
-	if removeAll == nil {
-		removeAll = os.RemoveAll
+	removeRunDir := o.removeBuildRunDir
+	if removeRunDir == nil {
+		removeRunDir = os.RemoveAll
 	}
-	if err := removeAll(dir); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove build workdir: %w", err))
-	} else {
-		progress.dir = ""
+	if err := removeRunDir(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove BuildRunDir: %w", err))
+	}
+	removeBaseDir := o.removeBuildBaseDir
+	if removeBaseDir == nil {
+		removeBaseDir = os.RemoveAll
+	}
+	if err := removeBaseDir(nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove BuildBaseDir: %w", err))
 	}
 	return progress, cleanupErr
 }
@@ -1425,11 +1450,7 @@ func (o *Orchestrator) cleanupBuildRuntimeProgress(b *types.Build, port, dir str
 func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pending *buildCleanupPendingError) (error, error) {
 	cause := pending.cause
 	port := pending.port
-	dir := pending.dir
 	persisted := pending.persisted
-	if dir == "" {
-		dir = buildRuntimeDir(o.cfg.Paths.RunRoot, b.BuildID)
-	}
 	if port == "" && b.RuntimeVswitchPort != "" {
 		port = b.RuntimeVswitchPort
 		persisted = true
@@ -1442,8 +1463,8 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pe
 		}
 		if cleanupErr == nil {
 			var progress buildRuntimeCleanupProgress
-			progress, cleanupErr = o.cleanupBuildRuntimeProgress(b, port, dir, persisted)
-			port, dir, persisted = progress.port, progress.dir, progress.persisted
+			progress, cleanupErr = o.cleanupBuildRuntimeProgress(b, port, persisted)
+			port, persisted = progress.port, progress.persisted
 		}
 		if cleanupErr == nil {
 			return cause, nil
@@ -1457,7 +1478,7 @@ func (o *Orchestrator) retryBuildCleanup(ctx context.Context, b *types.Build, pe
 			timer.Stop()
 			return cause, &buildCleanupPendingError{
 				cause: cause, cleanup: cleanupErr,
-				port: port, dir: dir, persisted: persisted,
+				port: port, persisted: persisted,
 			}
 		case <-timer.C:
 		}
@@ -1513,7 +1534,7 @@ func (o *Orchestrator) fenceAcceptedBuildResult(unit string, result buildResult)
 func (o *Orchestrator) fenceAcceptedBuildResultWithin(unit string, result buildResult, timeout time.Duration) (*buildResult, error) {
 	if err := o.waitBuilderUnitExit(context.Background(), unit, timeout); err != nil {
 		if stopErr := o.stopBuilderUnit(unit); stopErr != nil {
-			return &result, retainBuildCleanup(nil, errors.Join(err, stopErr), "", "", false)
+			return &result, retainBuildCleanup(nil, errors.Join(err, stopErr), "", false)
 		}
 	}
 	return &result, nil
@@ -1545,11 +1566,14 @@ func (o *Orchestrator) stopBuilderUnit(unit string) error {
 // performed before configsock reads the task pidfile and before BuildTaskSpecFor
 // can expose MANIFEST_KEY or registry credentials.
 func (o *Orchestrator) BuildTaskAuth(ctx context.Context, buildID, runID string) (configsock.BuildTaskAuth, bool, error) {
+	if err := types.ValidateBuildID(buildID); err != nil {
+		return configsock.BuildTaskAuth{}, false, err
+	}
 	found, err := o.st.BuildingTaskIdentity(ctx, buildID, runID)
 	if err != nil || !found {
 		return configsock.BuildTaskAuth{}, found, err
 	}
-	return configsock.BuildTaskAuth{PidFile: configsock.BuildPidfile(o.cfg.Paths.RunRoot, buildID)}, true, nil
+	return configsock.BuildTaskAuth{PidFile: filepath.Join(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, buildID), "builder.pid")}, true, nil
 }
 
 func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID string) (*configsock.BuildTaskSpec, bool, error) {
@@ -1563,9 +1587,7 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 		return nil, false, nil
 	}
 	b := pend.build
-	response := &configsock.BuildTaskSpec{
-		BuildID: buildID, RunID: runID, Workdir: pend.workdir, Env: buildTaskEnv(b),
-	}
+	response := &configsock.BuildTaskSpec{BuildID: buildID, RunID: runID, Env: buildTaskEnv(b)}
 	if !pend.snapshotTemplate {
 		final, err := pend.handoff.WaitFinal(ctx)
 		if err != nil {
@@ -1585,7 +1607,8 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 			return nil, false, fmt.Errorf("build: absolute manifest config path: %w", err)
 		}
 	}
-	rootRef, err := normalizeSandboxTaskRootRef(tmpl.Ref, pend.workdir)
+	checkpointDir := filepath.Join(pend.baseDir, "checkpoint")
+	rootRef, err := normalizeSandboxTaskRootRef(tmpl.Ref, checkpointDir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1593,7 +1616,7 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 		RootSourceKind: string(types.ResumeSourceSnapshot),
 		RootRef:        rootRef, LaunchMode: string(types.LaunchMemory), ManifestConfig: manifestConfig,
 		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
-		RelativeDir:       pend.workdir, MaxRefs: maxRequiredArtifactRefs,
+		RelativeDir:       checkpointDir, MaxRefs: maxRequiredArtifactRefs,
 		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
 	}
 	return response, true, nil
@@ -1653,7 +1676,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	return spec, configsock.BuildPidfile(o.cfg.Paths.RunRoot, pend.build.BuildID), true, nil
+	return spec, filepath.Join(nodepath.BuildRunDir(o.cfg.Paths.RunRoot, pend.build.BuildID), "builder.pid"), true, nil
 }
 
 func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBuild) (*configsock.BuildSpec, error) {
@@ -1708,7 +1731,8 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		BuildID:               b.BuildID,
 		Profile:               string(b.Profile),
 		RunID:                 b.RunID,
-		Workdir:               pend.workdir,
+		RunDir:                pend.runDir,
+		BaseDir:               pend.baseDir,
 		FromImage:             b.FromImage,
 		FromTemplateRef:       fromTemplateRef,
 		FromTemplateKind:      fromTemplateKind,

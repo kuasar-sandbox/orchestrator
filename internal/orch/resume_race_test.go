@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -293,8 +294,8 @@ func TestResumeRace_ConnectAndConcurrentAdmissionSingleLaunch(t *testing.T) {
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:    apiSecret,
 		ManifestKey:  mk,
-		RunDir:       cfg.Paths.RunRoot + "/" + sid,
-		BaseDir:      cfg.Paths.BaseRoot + "/" + sid,
+		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:      nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
 		CreatedUnix:  1,
 	}
 	materializeTestSandboxCredentials(t, sb)

@@ -187,9 +187,10 @@ def value(name):
     raise SystemExit("missing " + name)
 
 sid = value("--sandbox-id")
+path_id = value("--path-id")
 run_root = value("--run-root")
 ready_fd = int(value("--ready-fd"))
-envd_path = os.path.join(run_root, sid, "envd.sock")
+envd_path = os.path.join(run_root, path_id, "envd.sock")
 try:
     os.unlink(envd_path)
 except FileNotFoundError:
@@ -1010,7 +1011,7 @@ BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export
 truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
-CHECKPOINT_DIR="$WORK/checkpoints"
+CHECKPOINT_ROOT="$WORK/lib/sandboxes"
 write_orchestrator_config() { # $1=unset|node-policy, $2=static|controller, $3=local|bundle
     local policy_mode="$1"
     local resource_mode="${2:-controller}"
@@ -1057,7 +1058,6 @@ builder:
 $resource_controller_config
 checkpoint:
   mode: $checkpoint_mode
-  local_dir: $CHECKPOINT_DIR
 EOF
     if [ "$policy_mode" = "node-policy" ]; then
         cat >> "$WORK/config.yaml" <<'EOF'
@@ -1513,7 +1513,7 @@ unset REQ_NET_HEADER REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
-    SID=$(ls "$WORK/run" 2>/dev/null | head -1)
+    SID=$(ls "$WORK/run/sandboxes" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201 durable acceptance)"
 fi
@@ -1524,6 +1524,15 @@ assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed 
 CREATE_RETURN_STATE="$(sandbox_state "$SID")"
 case "$CREATE_RETURN_STATE" in starting|running) ;; *) fail "state immediately after 201=$CREATE_RETURN_STATE";; esac
 echo "==> PASS: Create 201 durably accepted sandbox $SID (observed state=$CREATE_RETURN_STATE)"
+python3 - "$WORK/lib/node-ctl.db" "$SID" "$WORK/run/sandboxes/$SID" "$WORK/lib/sandboxes/$SID" <<'PY' \
+    || fail "durable Sandbox RunDir/BaseDir layout"
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    row = db.execute("select run_dir, base_dir from sandboxes where id=?", (sys.argv[2],)).fetchone()
+want = (sys.argv[3], sys.argv[4])
+if row != want:
+    raise SystemExit(f"durable Sandbox directories={row!r}, want={want!r}")
+PY
 echo "==> issue data request immediately after Create; starting must park until running"
 (
     code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
@@ -1542,10 +1551,16 @@ code=$(cat "$WORK/immediate-data.code")
 wait_sandbox_state "$SID" running 20 || fail "sandbox was not running after parked data request"
 wait_proxy_traffic_stats "$SID" idle || fail "Proxy traffic did not converge to idle"
 wait_resource_stats "$SID" || fail "controller resource stats were not reported"
-assert_resolved_resource_yaml "$WORK/run/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
+assert_resolved_resource_yaml "$WORK/run/sandboxes/$SID/$SID.yaml" 2560MiB 2560MiB "$WORK/sandbox-resource.sock" \
     || fail "snapshot restore resource YAML did not preserve capacity and target-node defaults"
 assert_resource_lease "$SID" 2684354560 268435456 2684354560 \
     || fail "snapshot restore lease did not match generated YAML"
+[ -f "$WORK/lib/sandboxes/$SID/$SID.overlay.diff" ] \
+    || fail "Sandbox writable diff is outside BaseDir or lost logical SandboxID filename"
+if find "$WORK/run/sandboxes/$SID" -type f \( -name '*.img' -o -name '*.diff' -o -name '*.sandbox' -o -name '*.snapshot' \) -print -quit | grep -q .; then
+    find "$WORK/run/sandboxes/$SID" -type f -print >&2
+    fail "Sandbox RunDir contains a large image/diff/checkpoint artifact"
+fi
 echo "==> PASS: post-Create data request was reported parking through readiness, then idle; resource stats are live (code=$code)"
 
 # ---- list -----------------------------------------------------------------
@@ -1585,7 +1600,7 @@ exec_pty_resize_through_connect "$SID" "$PTY_EXEC_TOKEN" "$PTY_MARK"
 echo "==> PASS: real sandbox-ctl CONNECT enforced omitted/[]/exact/OR/cwd/user/tty conditions and preserved stdio, PTY resize, exit status"
 
 # ---- execute a command in the guest via envd (Connect-RPC over envd.sock) --
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 [ -S "$ENVD_SOCK" ] || fail "envd.sock not found at $ENVD_SOCK"
 cat > "$WORK/envd_exec.py" <<'PY'
 import http.client, socket, struct, json, base64, sys
@@ -1736,7 +1751,7 @@ for _ in $(seq 1 40); do
 done
 [ -n "$service_ready" ] || { cat "$WORK/dp.body" 2>/dev/null || true; fail "envd freeze service did not listen"; }
 
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/run" -- /bin/sh -ceu '
+"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$WORK/run/sandboxes" -- /bin/sh -ceu '
 pid=$1
 global=/proc/1/root/sys/fs/cgroup
 real=$global/app
@@ -1822,9 +1837,9 @@ wait_resource_status "$SID" 409 || fail "paused resource stats did not converge 
 # this host wall-clock interval.
 sleep 3
 assert_snapshot_argv "$UNSET_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "all-unset local Pause did not pass the configured mode"
-B_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+B_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -f "$B_LOCAL" ] || fail "local Pause did not create $B_LOCAL"
 B_ARTIFACT="$(readlink -f "$B_LOCAL")"
 [ -f "$B_ARTIFACT" ] || fail "local B target is missing: $B_ARTIFACT"
@@ -1886,10 +1901,10 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
     '{"memory":true,"checkpoint_merge_ref":false,"checkpoint_drop_caches":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "portable W pause=$code (want 204)"; }
 assert_snapshot_argv "$PORTABLE_W_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "portable W Pause policy did not reach sandbox-ctl exactly"
-W_PORTABLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+W_PORTABLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -f "$W_PORTABLE_LOCAL" ] || fail "working-set Pause did not create $W_PORTABLE_LOCAL"
 W_PORTABLE_ARTIFACT="$(readlink -f "$W_PORTABLE_LOCAL")"
 [ "$W_PORTABLE_ARTIFACT" != "$B_ARTIFACT" ] || fail "working-set W reused B memory self"
@@ -1940,7 +1955,7 @@ if (
 print(relative)
 PY
 ) || fail "local B/W graph validation failed"
-B_ROOT_TOP_PATH="$CHECKPOINT_DIR/$SID/$B_ROOT_TOP_BASENAME"
+B_ROOT_TOP_PATH="$CHECKPOINT_ROOT/$SID/checkpoint/$B_ROOT_TOP_BASENAME"
 [ -f "$B_ROOT_TOP_PATH" ] || fail "B root disk top is missing before minimal-set test: $B_ROOT_TOP_PATH"
 rm -f -- "$B_ROOT_TOP_PATH"
 echo "==> PASS: W -> local B is separate; B root disk top was merged and removed"
@@ -1964,7 +1979,7 @@ PY
 PORTABLE_W_KEY="${PORTABLE_W_REF#manifest://}"
 [[ "$PORTABLE_W_REF" == manifest://* && "$PORTABLE_W_KEY" =~ ^[0-9a-f]{64}$ ]] \
     || fail "promoted W ref is not manifest://<64hex>: $PORTABLE_W_REF"
-[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "promotion retained redundant local checkpoint directory"
+[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "promotion retained redundant local checkpoint directory"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$PORTABLE_W_REF" >"$WORK/w-portable-manifest.json" \
     || fail "promoted W is not readable from the manifest store"
@@ -2021,7 +2036,7 @@ grep -q "$PERSIST" "$WORK/portable-read.out" || { sed 's/^/  guest| /' "$WORK/po
 # The working-set memory intentionally retained guest cache, so evict it before
 # reading the W-only file. This makes the assertion prove the published disk
 # artifact, independently of the restored memory self/lower chain.
-"$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$WORK/run" -- /bin/sh -c \
+"$BIN/sandbox-ctl" exec --path-id "$SID" --run-root "$WORK/run/sandboxes" -- /bin/sh -c \
     'sync && echo 3 > /proc/sys/vm/drop_caches && cat /home/user/working-set-disk.txt' \
     >"$WORK/portable-disk-read.out" 2>&1 || true
 grep -q "$W_DISK_PERSIST" "$WORK/portable-disk-read.out" \
@@ -2061,6 +2076,10 @@ if [ "$MMDS_ROUTES_E2E" = 1 ]; then
 fi
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill first sandbox before KMT import=$code (want 204)"
+[ ! -e "$WORK/run/sandboxes/$SID" ] || fail "Sandbox delete retained RunDir"
+[ ! -e "$WORK/lib/sandboxes/$SID" ] || fail "Sandbox delete retained BaseDir"
+[ -f "$WORK/lib/node-ctl.db" ] || fail "Sandbox cleanup removed node-level database"
+[ -S "$WORK/node-ctl.socket" ] || fail "Sandbox cleanup removed node-level config socket"
 unset EXEC_TOKEN
 
 echo "==> KMT missing import -> paused -> durable starting -> asynchronous restore"
@@ -2132,7 +2151,7 @@ if got != want:
 PY
 echo "==> PASS: Create checkpoint header overlaid body per field and persisted canonical metadata"
 
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue policy sandbox exec capability"
 POLICY_START_MARK="POLICY_CREATE_ACTIVATION_$RANDOM"
 exec_through_connect "$SID" "$EXEC_TOKEN" "$POLICY_START_MARK"
@@ -2151,10 +2170,10 @@ code=$(req POST "/sandboxes/$SID/pause" "$AK" \
 unset REQ_CHECKPOINT_HEADER
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "policy pause=$code (want 204)"; }
 assert_snapshot_argv "$POLICY_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "Pause body/header policy did not reach sandbox-ctl exactly"
-W_POLICY="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+W_POLICY="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -f "$W_POLICY" ] || fail "policy Pause did not create $W_POLICY"
 "$BIN/sandbox-ctl" info --json "$W_POLICY" >"$WORK/w-policy.json" || fail "policy W is unreadable"
 python3 - "$WORK/w-policy.json" <<'PY'
@@ -2183,9 +2202,9 @@ E_LOCAL_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "local Sandbox E pause=$code (want 204)"; }
 assert_export_argv "$E_LOCAL_EXPORT_CALL" \
-    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "Pause(memory=false) did not execute sandbox-ctl export in local mode"
-E_LOCAL="$CHECKPOINT_DIR/$SID/$SID.sandbox"
+E_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -e "$E_LOCAL" ] || fail "Pause(memory=false) did not create $E_LOCAL"
 python3 - "$WORK/lib/node-ctl.db" "$SID" "$E_LOCAL" <<'PY' \
     || fail "local Sandbox E durable source is incorrect"
@@ -2264,10 +2283,10 @@ PY
 done
 [ -n "$AUTO_PAUSED" ] || { sed 's/^/  orch| /' "$WORK/orch-node-policy.log"; fail "reaper did not auto-pause policy sandbox (last state=$state)"; }
 assert_snapshot_argv "$AUTO_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=false --drop-caches=false \
     || fail "auto-pause did not resolve metadata > node fieldwise"
-[ -f "$CHECKPOINT_DIR/$SID/$SID.snapshot" ] || fail "auto-pause did not create local W"
+[ -f "$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot" ] || fail "auto-pause did not create local W"
 echo "==> PASS: reaper auto-pause used metadata merge_ref=false and node drop_caches=false"
 
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill auto-paused sandbox=$code (want 204)"
@@ -2288,7 +2307,7 @@ code=$(req POST /sandboxes "$AK" "$AUTO_E_BODY")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "autoPauseMemory=false exec capability"
 exec_through_connect "$SID" "$EXEC_TOKEN" "AUTO_E_START_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "autoPauseMemory=false sandbox did not reach running"
@@ -2297,7 +2316,7 @@ AUTO_E_EXPLICIT_S_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "autoPauseMemory=false explicit Pause({})=$code"; }
 assert_snapshot_argv "$AUTO_E_EXPLICIT_S_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     --merge-ref=true --drop-caches=false \
     || fail "explicit Pause({}) inherited AutoPauseMemory=false instead of capturing Snapshot S"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
@@ -2327,7 +2346,7 @@ for _ in $(seq 1 180); do
 done
 [ -n "$AUTO_E_PAUSED" ] || fail "autoPauseMemory=false TTL did not pause"
 assert_export_argv "$AUTO_E_TTL_CALL" \
-    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode local --run-root "$WORK/run" \
+    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode local --run-root "$WORK/run/sandboxes" \
     || fail "autoPauseMemory=false TTL did not capture Sandbox E"
 python3 - "$WORK/lib/node-ctl.db" "$SID" <<'PY' \
     || fail "autoPauseMemory=false TTL durable source is incorrect"
@@ -2360,7 +2379,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "bundle create=$code"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK")" || fail "issue bundle sandbox exec capability"
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_START_$RANDOM"
 wait_sandbox_state "$SID" running 20 || fail "bundle sandbox did not reach running"
@@ -2374,10 +2393,10 @@ BUNDLE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle pause=$code"; }
 assert_snapshot_argv "$BUNDLE_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle Pause did not pass --mode bundle exactly"
-BUNDLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.snapshot"
+BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.snapshot"
 [ -L "$BUNDLE_LOCAL" ] || fail "bundle Pause did not retain $BUNDLE_LOCAL symlink"
 BUNDLE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
 case "$BUNDLE_TARGET" in *.bundle) ;; *) fail "bundle symlink target is not .bundle: $BUNDLE_TARGET" ;; esac
@@ -2397,7 +2416,7 @@ BUNDLE_B_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle B pause=$code"; }
 assert_snapshot_argv "$BUNDLE_B_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle B Pause did not pass --mode bundle exactly"
 BUNDLE_B_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -2450,7 +2469,7 @@ BUNDLE_PROMOTE_CALL=$(snapshot_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "bundle C promote pause=$code"; }
 assert_snapshot_argv "$BUNDLE_PROMOTE_CALL" \
-    snapshot --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    snapshot --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     --merge-ref=false \
     || fail "bundle C Pause did not pass --mode bundle exactly"
 BUNDLE_PROMOTE_TARGET=$(readlink -f "$BUNDLE_LOCAL")
@@ -2511,7 +2530,7 @@ PY
 )
 [ "$BUNDLE_REMOTE_REF" = "manifest://$BUNDLE_ROOT_KEY" ] \
     || fail "bundle promote changed the root ManifestKey: local=$BUNDLE_ROOT_KEY remote=$BUNDLE_REMOTE_REF"
-[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "bundle promote retained redundant local checkpoint directory"
+[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "bundle promote retained redundant local checkpoint directory"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$BUNDLE_REMOTE_REF" >"$WORK/bundle-remote.json" \
     || fail "promoted Bundle root is unreadable from Store"
@@ -2526,9 +2545,9 @@ E_BUNDLE_EXPORT_CALL=$(export_argv_count)
 code=$(req POST "/sandboxes/$SID/pause" "$AK" '{"memory":false}')
 [ "$code" = "204" ] || { cat "$WORK/resp.body"; fail "Bundle Sandbox E pause=$code"; }
 assert_export_argv "$E_BUNDLE_EXPORT_CALL" \
-    export --sandbox-id "$SID" --output "$CHECKPOINT_DIR/$SID" --mode bundle --run-root "$WORK/run" \
+    export --path-id "$SID" --output "$CHECKPOINT_ROOT/$SID/checkpoint" --mode bundle --run-root "$WORK/run/sandboxes" \
     || fail "Pause(memory=false) did not execute Bundle export"
-E_BUNDLE_LOCAL="$CHECKPOINT_DIR/$SID/$SID.sandbox"
+E_BUNDLE_LOCAL="$CHECKPOINT_ROOT/$SID/checkpoint/$SID.sandbox"
 [ -L "$E_BUNDLE_LOCAL" ] || fail "Bundle Sandbox E did not retain $E_BUNDLE_LOCAL symlink"
 E_BUNDLE_TARGET=$(readlink -f "$E_BUNDLE_LOCAL")
 case "$E_BUNDLE_TARGET" in *.bundle) ;; *) fail "Bundle Sandbox E target is not .bundle: $E_BUNDLE_TARGET" ;; esac
@@ -2548,7 +2567,7 @@ if not row or row[0] != "sandbox" or not row[1].startswith("manifest://"):
 print(row[1])
 PY
 ) || fail "Bundle Sandbox E kind/ref was not preserved by publish"
-[ ! -e "$CHECKPOINT_DIR/$SID" ] || fail "Bundle Sandbox E publish retained redundant local directory"
+[ ! -e "$CHECKPOINT_ROOT/$SID/checkpoint" ] || fail "Bundle Sandbox E publish retained redundant local directory"
 E_BUNDLE_RUN_CALL=$(run_argv_count)
 exec_through_connect "$SID" "$EXEC_TOKEN" "BUNDLE_E_WAKE_$RANDOM"
 wait_sandbox_state "$SID" running 1200 || fail "published Bundle Sandbox E did not cold Wake"

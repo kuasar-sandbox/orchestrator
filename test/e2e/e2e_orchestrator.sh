@@ -116,7 +116,7 @@ units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }
   boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.bundle }
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: local }
 EOF
 mkdir -p "$WORK/run" "$WORK/lib"
 # minimal shared manifest config (endpoints; key empty) so serve can read it
@@ -155,8 +155,8 @@ grep -q "run-sandbox .*--run-id=%i" "$UNIT_DIR/sandbox-runner@.service" || fail 
 grep -q '^Delegate=yes$' "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not delegate its cgroup"
 ! grep -q '^DelegateSubgroup=' "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit requires non-portable DelegateSubgroup"
 grep -q "run-builder .*--run-id=%i" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-id based"
-grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not clean its run pidfile"
-grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit does not clean its run pidfile"
+grep -q "ExecStopPost=/bin/rm -f .*runners/%i.pid" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not clean its run pidfile"
+grep -q "ExecStopPost=/bin/rm -f .*runners/%i.pid" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit does not clean its run pidfile"
 grep -q "StandardOutput=file:" "$UNIT_DIR/sandbox-builder@.service" && fail "builder unit still uses obsolete result-file capture"
 echo "==> PASS: unit auto-install (runner+builder+slices; run-id assignment + config-socket build result)"
 

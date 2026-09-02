@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -13,6 +15,7 @@ func TestSandboxLaunchSpecNeverCarriesTaskLocalArtifactRef(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ManifestConfig = "/tmp/manifest.yaml"
 	cfg.Paths.RunRoot = "/tmp/run"
+	cfg.Paths.BaseRoot = "/tmp/base"
 
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
@@ -25,8 +28,8 @@ func TestSandboxLaunchSpecNeverCarriesTaskLocalArtifactRef(t *testing.T) {
 		Profile:     types.ProfileBare,
 		TemplateID:  types.TemplateID{Profile: types.ProfileBare, Kind: types.KindSnp, Ref: "manifest://" + key}.String(),
 		State:       types.StateRunning,
-		RunDir:      "/tmp/run/" + sid,
-		BaseDir:     "/tmp/base/" + sid,
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
 		APISecret:   deriveTestAPISecret(t, manifestKey),
 		ManifestKey: manifestKey,
 	}
@@ -42,6 +45,7 @@ func TestSandboxLaunchSpecNeverCarriesTaskLocalArtifactRef(t *testing.T) {
 	if hasArg(spec.Args, "--restore") || hasArg(spec.Args, "--from") {
 		t.Fatalf("conductor launch spec leaked task-local Artifact selection: %v", spec.Args)
 	}
+	assertSandboxPathArgs(t, cfg, sb, spec)
 	assertNoCgroupArgs(t, spec.Args)
 }
 
@@ -49,6 +53,7 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ManifestConfig = "/tmp/manifest.yaml"
 	cfg.Paths.RunRoot = "/tmp/run"
+	cfg.Paths.BaseRoot = "/tmp/base"
 
 	o := testOrchCfg(t, cfg)
 	o.vs = stubVS{}
@@ -60,8 +65,8 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 		Profile:     types.ProfileBare,
 		TemplateID:  types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("b", 64)}.String(),
 		State:       types.StateRunning,
-		RunDir:      "/tmp/run/" + sid,
-		BaseDir:     "/tmp/base/" + sid,
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, sid),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, sid),
 		APISecret:   deriveTestAPISecret(t, manifestKey),
 		ManifestKey: manifestKey,
 	}
@@ -77,7 +82,18 @@ func TestSandboxLaunchSpecColdBootHasNoRestoreArg(t *testing.T) {
 	if hasArg(spec.Args, "--restore") {
 		t.Fatalf("cold boot should not carry restore args: %v", spec.Args)
 	}
+	assertSandboxPathArgs(t, cfg, sb, spec)
 	assertNoCgroupArgs(t, spec.Args)
+}
+
+func assertSandboxPathArgs(t *testing.T, cfg *config.Config, sb *types.Sandbox, spec *configsock.LaunchSpec) {
+	t.Helper()
+	if spec.Workdir != sb.RunDir ||
+		!hasArgPair(spec.Args, "--path-id", sb.ID) ||
+		!hasArgPair(spec.Args, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)) ||
+		!hasArgPair(spec.Args, "--base-root", nodepath.SandboxBaseRoot(cfg.Paths.BaseRoot)) {
+		t.Fatalf("sandbox directory launch contract = workdir %q args %v", spec.Workdir, spec.Args)
+	}
 }
 
 func assertNoCgroupArgs(t *testing.T, args []string) {

@@ -105,6 +105,20 @@ func TestRegisterBuildRejectsCPUThatSystemdCannotEncode(t *testing.T) {
 	})
 }
 
+func TestClusterBuildRegisterRejectsInvalidBuildID(t *testing.T) {
+	o := testOrch(t)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	for _, buildID := range []string{strings.Repeat("x", 49), "build/id"} {
+		cmd := clusterBuildRegisterCommand(buildID, fingerprint)
+		if err := o.registerClusterBuild(context.Background(), cmd); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("registerClusterBuild(%q) error = %v, want ErrBadRequest", buildID, err)
+		}
+		if stored, err := o.st.GetBuild(context.Background(), buildID); err != nil || stored != nil {
+			t.Fatalf("invalid cluster BuildID %q persisted = %+v, %v", buildID, stored, err)
+		}
+	}
+}
+
 func TestRegisterBuildValidatesPhaseResourcesAgainstNodePolicy(t *testing.T) {
 	o := testOrch(t)
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
@@ -176,8 +190,9 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	cfg.Checkpoint.Mode = config.CheckpointBundle
 	o := testOrchCfg(t, cfg)
 	b := &types.Build{BuildID: "build-bare", Profile: types.ProfileBare}
+	runDir, baseDir := t.TempDir(), t.TempDir()
 	o.pend[b.BuildID] = &pendingBuild{
-		build: b, workdir: t.TempDir(),
+		build: b, runDir: runDir, baseDir: baseDir,
 		network: sandboxcfg.NetworkSpec{
 			InnerIP: "169.254.1.1/31",
 			Nexthop: "169.254.1.0",

@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"golang.org/x/sys/unix"
 )
 
@@ -77,7 +78,7 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	// chdir, argv, or exec failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
-	taskPidfile := filepath.Join(runRoot, sid, sid+".pid")
+	taskPidfile := filepath.Join(nodepath.SandboxRunDir(runRoot, sid), sid+".pid")
 	if ops.lockTaskPidfile == nil {
 		return fmt.Errorf("sandbox task pidfile locker is not configured")
 	}

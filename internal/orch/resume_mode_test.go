@@ -3,7 +3,6 @@ package orch
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -124,7 +124,7 @@ func TestRunningConnectMemoryDoesNotRestart(t *testing.T) {
 		State:        types.StateRunning,
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64)},
 		APISecret:    deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "running-memory-option"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "running-memory-option"),
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "running-memory-option"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "running-memory-option"),
 		CreatedUnix: 1, DeadlineUnix: 100,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -163,7 +163,7 @@ func TestSnapshotColdFailureRollsBackOriginalSnapshot(t *testing.T) {
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("f", 64)}.String(),
 		State:      types.StatePaused, ResumeSource: source,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "snapshot-cold-failure"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "snapshot-cold-failure"), CreatedUnix: 1,
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "snapshot-cold-failure"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "snapshot-cold-failure"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -318,7 +318,7 @@ func newResumeModeFixture(t *testing.T, sourceKind types.ResumeSourceKind, block
 			Ref:  "file://" + strings.Repeat("8", 64) + extension + "@location:resume-mode",
 		},
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "resume-mode-target"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "resume-mode-target"), CreatedUnix: 1,
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "resume-mode-target"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "resume-mode-target"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {

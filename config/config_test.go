@@ -507,6 +507,21 @@ checkpoint:
 	}
 }
 
+func TestLoadRejectsRemovedCheckpointLocalDir(t *testing.T) {
+	_, err := LoadConductor(writeConfig(t, `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+checkpoint:
+  mode: local
+  local_dir: /var/lib/legacy-checkpoints
+`))
+	if err == nil || !strings.Contains(err.Error(), "field local_dir not found") {
+		t.Fatalf("checkpoint.local_dir error = %v", err)
+	}
+}
+
 func TestLoadRejectsUnsupportedCheckpointModes(t *testing.T) {
 	base := `
 api:

@@ -1,6 +1,27 @@
 package types
 
-import "strings"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// MaxBuildIDBytes keeps a verbatim BuildID directory leaf and its longest
+// phase socket within the supported Unix-domain socket path on default roots.
+const MaxBuildIDBytes = 48
+
+var buildIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,48}$`)
+
+// ValidateBuildID enforces the one shared direct/cluster Build business
+// identity contract. The accepted value is also the verbatim builds/ leaf.
+func ValidateBuildID(id string) error {
+	if !buildIDRe.MatchString(id) {
+		return fmt.Errorf("build ID must match [A-Za-z0-9_-]{1,%d}", MaxBuildIDBytes)
+	}
+	return nil
+}
+
+func ValidBuildID(id string) bool { return ValidateBuildID(id) == nil }
 
 // TransientPrefix marks the register-time templateID the e2b SDK first receives,
 // "transient-<uuidv7>". It is a throwaway handle: once the build is ready, the

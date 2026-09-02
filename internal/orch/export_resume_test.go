@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -74,7 +75,7 @@ type exportResumeFixture struct {
 
 func newExportResumeFixture(t *testing.T) exportResumeFixture {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortOrchestratorTestDir(t)
 	runtimePath := filepath.Join(dir, "runtime.erofs")
 	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)
@@ -83,7 +84,8 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 	cfg.Sandbox.Boot.Runtime = runtimePath
 	cfg.Sandbox.TimeoutSec = 900
 	cfg.Checkpoint.Mode = config.CheckpointLocal
-	cfg.Checkpoint.LocalDir = filepath.Join(dir, "saved")
+	cfg.Paths.RunRoot = filepath.Join(dir, "run")
+	cfg.Paths.BaseRoot = filepath.Join(dir, "lib")
 	lc := &countingLauncher{}
 	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, lc)
 
@@ -99,8 +101,8 @@ func newExportResumeFixture(t *testing.T) exportResumeFixture {
 		APISecret:    apiSecret,
 		ManifestKey:  manifestKey,
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: localRef},
-		RunDir:       filepath.Join(o.cfg.Paths.RunRoot, sid),
-		BaseDir:      filepath.Join(o.cfg.Paths.BaseRoot, sid),
+		RunDir:       nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, sid),
+		BaseDir:      nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, sid),
 		CreatedUnix:  1,
 		DeadlineUnix: time.Now().Add(time.Hour).Unix(),
 	}

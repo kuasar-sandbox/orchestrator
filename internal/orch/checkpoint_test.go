@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -113,7 +114,8 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			if err := o.Pause(context.Background(), sb.ID, apiKey, orchSnapshotCapture(tc.action)); err != nil {
 				t.Fatal(err)
 			}
-			want := []string{"snapshot", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", tc.mode, "--run-root", cfg.Paths.RunRoot}
+			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
+			want := []string{"snapshot", "--path-id", sb.ID, "--output", checkpointDir, "--mode", tc.mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
 			want = append(want, tc.wantTail...)
 			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
 				t.Fatalf("snapshot argv = %#v, want %#v", got, want)
@@ -124,7 +126,7 @@ func TestPauseCheckpointModeAndPolicyArgv(t *testing.T) {
 			}
 			if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
 				Kind: types.ResumeSourceSnapshot,
-				Ref:  filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot"),
+				Ref:  filepath.Join(checkpointDir, sb.ID+".snapshot"),
 			}) {
 				t.Fatalf("paused sandbox = %+v", stored)
 			}
@@ -143,13 +145,14 @@ func TestPauseSandboxCaptureAndTTLAutoPauseSelection(t *testing.T) {
 			if err := o.Pause(context.Background(), sb.ID, apiKey, sandboxcfg.CaptureRequest{Kind: types.CaptureSandbox}); err != nil {
 				t.Fatal(err)
 			}
-			want := []string{"export", "--sandbox-id", sb.ID, "--output", filepath.Join(cfg.Checkpoint.LocalDir, sb.ID), "--mode", mode, "--run-root", cfg.Paths.RunRoot}
+			checkpointDir := filepath.Join(sb.BaseDir, "checkpoint")
+			want := []string{"export", "--path-id", sb.ID, "--output", checkpointDir, "--mode", mode, "--run-root", nodepath.SandboxRunRoot(cfg.Paths.RunRoot)}
 			if got := readCheckpointArgs(t, argsPath); !reflect.DeepEqual(got, want) {
 				t.Fatalf("export argv = %#v, want %#v", got, want)
 			}
 			stored, err := o.st.Get(context.Background(), sb.ID)
 			if err != nil || stored == nil || stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
-				Kind: types.ResumeSourceSandbox, Ref: filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".sandbox"),
+				Kind: types.ResumeSourceSandbox, Ref: filepath.Join(checkpointDir, sb.ID+".sandbox"),
 			}) || stored.RunID != "" || stored.VswitchPort != "" {
 				t.Fatalf("paused Sandbox E = %+v, %v", stored, err)
 			}
@@ -343,7 +346,7 @@ func TestAcceptedPauseSurvivesCancellationAndDrainsAtShutdown(t *testing.T) {
 	}
 	if stored.State != types.StatePaused || stored.ResumeSource != (types.ResumeSource{
 		Kind: types.ResumeSourceSnapshot,
-		Ref:  filepath.Join(cfg.Checkpoint.LocalDir, sb.ID, sb.ID+".snapshot"),
+		Ref:  filepath.Join(sb.BaseDir, "checkpoint", sb.ID+".snapshot"),
 	}) {
 		t.Fatalf("pause after cancellation was not committed: %+v", stored)
 	}
@@ -379,8 +382,8 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 		}.String(),
 		State: types.StateRunning, RunID: "pause-connect-old-run", VswitchPort: "pause-connect-old-port",
 		APISecret: apiSecret, ManifestKey: manifestKey,
-		RunDir:      filepath.Join(cfg.Paths.RunRoot, "pause-connect-fence"),
-		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "pause-connect-fence"),
+		RunDir:      nodepath.SandboxRunDir(cfg.Paths.RunRoot, "pause-connect-fence"),
+		BaseDir:     nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "pause-connect-fence"),
 		CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -538,7 +541,7 @@ func checkpointOrchestratorConfig(t *testing.T, mode string) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	return &config.Config{
-		Checkpoint: config.CheckpointConfig{Mode: mode, LocalDir: filepath.Join(dir, "checkpoints")},
+		Checkpoint: config.CheckpointConfig{Mode: mode},
 		Paths:      config.PathsConfig{RunRoot: filepath.Join(dir, "run"), BaseRoot: filepath.Join(dir, "base")},
 		Units:      config.UnitsConfig{Runner: "sandbox-runner@.service"},
 	}
@@ -557,6 +560,8 @@ func newCheckpointPauseFixture(t *testing.T, cfg *config.Config, metadataRaw str
 		ID: "checkpoint-sandbox", Profile: types.ProfileBare,
 		TemplateID: types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: "manifest://" + strings.Repeat("2", 64)}.String(),
 		State:      types.StateRunning, RunID: "checkpoint-run", VswitchPort: "checkpoint-port",
+		RunDir:          nodepath.SandboxRunDir(cfg.Paths.RunRoot, "checkpoint-sandbox"),
+		BaseDir:         nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "checkpoint-sandbox"),
 		AutoPauseMemory: true,
 		APISecret:       apiSecret, ManifestKey: manifestKey, CreatedUnix: 1,
 	}

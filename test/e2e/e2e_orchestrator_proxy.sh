@@ -593,7 +593,7 @@ sandbox:
 builder:
   insecure_registry: true
   diff_template: $BLD
-checkpoint: { mode: local, local_dir: $WORK/saved }
+checkpoint: { mode: local }
 EOF
 
 # ---- start serve (control plane), then the proxy master -------------------
@@ -738,7 +738,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 unset REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
-    SID=$(ls "$WORK/run" 2>/dev/null | grep -v proxy | head -1)
+    SID=$(ls "$WORK/run/sandboxes" 2>/dev/null | head -1)
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201)"
 fi
@@ -787,7 +787,7 @@ code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
 [ "$code" = "501" ] || { cat "$WORK/resp.body"; fail "disabled resource controller stats=$code (want 501)"; }
 echo "==> PASS: resource stats reports 501 when the controller is disabled"
 
-ENVD_SOCK="$WORK/run/$SID/envd.sock"
+ENVD_SOCK="$WORK/run/sandboxes/$SID/envd.sock"
 for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
 [ -S "$ENVD_SOCK" ] || fail "envd.sock not found at $ENVD_SOCK"
 cat > "$WORK/envd_exec.py" <<'PY'

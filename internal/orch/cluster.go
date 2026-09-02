@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -172,6 +173,9 @@ func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
 func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return fmt.Errorf("build_register: missing build_id / template_id")
+	}
+	if err := types.ValidateBuildID(cmd.BuildID); err != nil {
+		return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 	}
 	profile, err := types.ParseProfile(cmd.Profile)
 	if err != nil {
@@ -894,8 +898,8 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		State:           types.StateStarting,
 		LaunchMode:      launchMode,
 		AutoPauseMemory: autoPauseMemory,
-		RunDir:          o.cfg.Paths.RunRoot + "/" + cmd.SID,
-		BaseDir:         o.cfg.Paths.BaseRoot + "/" + cmd.SID,
+		RunDir:          nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, cmd.SID),
+		BaseDir:         nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, cmd.SID),
 		APISecret:       pair.APISecret,
 		ManifestKey:     pair.ManifestKey,
 		Metadata:        meta,

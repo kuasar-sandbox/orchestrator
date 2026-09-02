@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 )
 
 const (
@@ -18,9 +20,10 @@ const (
 
 // ReadinessSocketPath is the one-shot runtime readiness socket shared by the
 // orchestrator and node-ctl. It deliberately is not part of LaunchSpec: the
-// assigned sandbox ID and run root already define the path for both processes.
+// assigned SandboxID and node RunRoot already define the SandboxRunDir for both
+// processes.
 func ReadinessSocketPath(runRoot, sandboxID string) string {
-	return filepath.Join(runRoot, sandboxID, readinessSocketName)
+	return filepath.Join(nodepath.SandboxRunDir(runRoot, sandboxID), readinessSocketName)
 }
 
 // ReadReadiness consumes the complete sandbox-ctl readiness stream. The wire is

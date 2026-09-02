@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -75,7 +76,7 @@ func TestPausedAdmissionWaitsForFinishingLaunchOwner(t *testing.T) {
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("c", 64),
 		},
 		APISecret: deriveTestAPISecret(t, strings.Repeat("a", 64)), ManifestKey: strings.Repeat("a", 64),
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "paused-finishing-owner"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "paused-finishing-owner"),
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "paused-finishing-owner"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "paused-finishing-owner"),
 		CreatedUnix: 1, DeadlineUnix: 100,
 	}
 	materializeTestSandboxCredentials(t, sb)
@@ -351,8 +352,8 @@ func TestConnectExplicitTimeoutWinsAfterAsyncResume(t *testing.T) {
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("2", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
-		RunDir:       filepath.Join(cfg.Paths.RunRoot, "timeout-target"),
-		BaseDir:      filepath.Join(cfg.Paths.BaseRoot, "timeout-target"),
+		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, "timeout-target"),
+		BaseDir:      nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "timeout-target"),
 		CreatedUnix:  1,
 		DeadlineUnix: 10,
 	}
@@ -409,7 +410,7 @@ func TestExplicitResumeDeadlineIntentSurvivesFailureUntilSuccess(t *testing.T) {
 		State:      types.StatePaused, ResumeSource: types.ResumeSource{
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("3", 64),
 		}, APISecret: deriveTestAPISecret(t, mk), ManifestKey: mk,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "deadline-retry"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "deadline-retry"), CreatedUnix: 1,
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "deadline-retry"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "deadline-retry"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -513,7 +514,7 @@ func TestKillAssignedStartingResumeInterruptsReadinessWithoutResurrection(t *tes
 		State:      types.StatePaused, ResumeSource: types.ResumeSource{
 			Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("b", 64),
 		}, APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		RunDir: filepath.Join(cfg.Paths.RunRoot, "kill-readiness"), BaseDir: filepath.Join(cfg.Paths.BaseRoot, "kill-readiness"), CreatedUnix: 1,
+		RunDir: nodepath.SandboxRunDir(cfg.Paths.RunRoot, "kill-readiness"), BaseDir: nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "kill-readiness"), CreatedUnix: 1,
 	}
 	materializeTestSandboxCredentials(t, sb)
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -679,8 +680,8 @@ func newBlockedResumeFixture(t *testing.T) blockedResumeFixture {
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("8", 64)},
 		APISecret:    deriveTestAPISecret(t, mk),
 		ManifestKey:  mk,
-		RunDir:       filepath.Join(cfg.Paths.RunRoot, "blocked-resume-target"),
-		BaseDir:      filepath.Join(cfg.Paths.BaseRoot, "blocked-resume-target"),
+		RunDir:       nodepath.SandboxRunDir(cfg.Paths.RunRoot, "blocked-resume-target"),
+		BaseDir:      nodepath.SandboxBaseDir(cfg.Paths.BaseRoot, "blocked-resume-target"),
 		CreatedUnix:  1,
 		DeadlineUnix: 10,
 	}

@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -100,7 +101,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	artifact := source.ResumeSource
 	localArtifactDir := ""
 	if !types.IsPortableRef(artifact.Ref) {
-		localArtifactDir, err = o.ownedLocalArtifactDir(sid, artifact)
+		localArtifactDir, err = o.ownedLocalArtifactDir(source, artifact)
 		if err != nil {
 			return "", err
 		}
@@ -250,7 +251,10 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 // capture invariant, not a value trusted merely because it was persisted in a
 // row: malformed state must fail closed before sandbox-ctl reads it or cleanup
 // derives a broader deletion target from it.
-func (o *Orchestrator) ownedLocalArtifactDir(sid string, source types.ResumeSource) (string, error) {
+func (o *Orchestrator) ownedLocalArtifactDir(sb *types.Sandbox, source types.ResumeSource) (string, error) {
+	if sb == nil || sb.ID == "" || sb.BaseDir == "" {
+		return "", fmt.Errorf("export-sandbox: local artifact owner is incomplete")
+	}
 	var suffix string
 	switch source.Kind {
 	case types.ResumeSourceSandbox:
@@ -260,8 +264,8 @@ func (o *Orchestrator) ownedLocalArtifactDir(sid string, source types.ResumeSour
 	default:
 		return "", fmt.Errorf("export-sandbox: invalid local resume source kind %q", source.Kind)
 	}
-	dir := filepath.Clean(filepath.Join(o.cfg.Checkpoint.LocalDir, sid))
-	wantRef := filepath.Join(dir, sid+suffix)
+	dir := filepath.Clean(filepath.Join(sb.BaseDir, "checkpoint"))
+	wantRef := filepath.Join(dir, sb.ID+suffix)
 	if filepath.Clean(source.Ref) != wantRef {
 		return "", fmt.Errorf("export-sandbox: local %s source is outside its owned capture path", source.Kind)
 	}
@@ -450,8 +454,8 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 		State:         types.StatePaused,
 		DeadlineUnix:  payload.DeadlineUnix,
 		CreatedUnix:   payload.CreatedUnix,
-		RunDir:        filepath.Join(o.cfg.Paths.RunRoot, targetID),
-		BaseDir:       filepath.Join(o.cfg.Paths.BaseRoot, targetID),
+		RunDir:        nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, targetID),
+		BaseDir:       nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, targetID),
 		APISecret:     pair.APISecret,
 		ManifestKey:   pair.ManifestKey,
 		ResumeSource: types.ResumeSource{
