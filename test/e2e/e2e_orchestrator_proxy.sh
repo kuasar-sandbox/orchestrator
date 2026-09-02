@@ -693,7 +693,7 @@ echo "==> built template: $TEMPLATE"
 # Every Create requires the current Proxy registration and its route-applied
 # barrier. Removing the master must fail admission before any launch ownership
 # or durable sandbox state is retained.
-find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.before-unavailable"
+find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.before-unavailable"
 "$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.before-unavailable.json"
 python3 - "$WORK/vswitch.before-unavailable.json" <<'PY' >"$WORK/vswitch-ports.before-unavailable"
 import json, sys
@@ -710,7 +710,7 @@ python3 - "$WORK/resp.body" <<'PY' || fail "unavailable Create retained durable/
 import json, sys
 assert json.load(open(sys.argv[1])) == []
 PY
-find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.after-unavailable"
+find "$WORK/run/sandboxes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.after-unavailable"
 cmp -s "$WORK/run-dirs.before-unavailable" "$WORK/run-dirs.after-unavailable" \
     || fail "unavailable Create allocated a sandbox run directory"
 "$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.after-unavailable.json"

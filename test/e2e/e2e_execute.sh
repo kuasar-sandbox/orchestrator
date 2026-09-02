@@ -1245,7 +1245,7 @@ run_low_allocatable_case() { # $1=iteration
     LOW_ELAPSED_MS=$(( $(date +%s%3N) - LOW_START_MS ))
     [ "$LOW_ELAPSED_MS" -le 65000 ] || fail "low-allocatable[$iteration] startup took ${LOW_ELAPSED_MS}ms"
     wait_sandbox_state "$LOW_SID" running 20 || fail "low-allocatable[$iteration] sandbox not running"
-    assert_resolved_resource_yaml "$WORK/run/$LOW_SID/$LOW_SID.yaml" 8GiB 8GiB - \
+    assert_resolved_resource_yaml "$WORK/run/sandboxes/$LOW_SID/$LOW_SID.yaml" 8GiB 8GiB - \
         || fail "low-allocatable[$iteration] static resolved resource YAML"
     LOW_RUN_ID=$(sandbox_run_id "$LOW_SID")
     [ -n "$LOW_RUN_ID" ] || fail "low-allocatable[$iteration] sandbox has no run_id"
@@ -1271,7 +1271,7 @@ run_low_allocatable_case() { # $1=iteration
 
     local LOW_VM_INFO="$WORK/low-allocatable-$iteration.vm-info.json"
     curl --silent --show-error --fail --max-time 2 \
-        --unix-socket "$WORK/run/$LOW_SID/ch.sock" \
+        --unix-socket "$WORK/run/sandboxes/$LOW_SID/ch.sock" \
         http://localhost/api/v1/vm.info >"$LOW_VM_INFO" \
         || fail "low-allocatable[$iteration] vm.info"
     python3 - "$LOW_VM_INFO" <<'PY' || fail "cold target=0 did not retain a CH balloon device"
@@ -1347,7 +1347,7 @@ code=$(DP_MAX_TIME=65 dp "49983-$DEFAULT_SID" /health "$DEFAULT_TOKEN" || true)
 { [ "$code" = "204" ] || [ "$code" = "200" ]; } \
     || { cat "$WORK/dp.body"; fail "default-policy cold health=$code"; }
 wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy cold sandbox not running"
-assert_resolved_resource_yaml "$WORK/run/$DEFAULT_SID/$DEFAULT_SID.yaml" \
+assert_resolved_resource_yaml "$WORK/run/sandboxes/$DEFAULT_SID/$DEFAULT_SID.yaml" \
     2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy dynamic resolved resource YAML"
 wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing"
 assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
@@ -1368,7 +1368,7 @@ for _ in $(seq 1 240); do
 done
 [ -n "$default_resumed" ] || fail "default-policy envd did not recover after resume"
 wait_sandbox_state "$DEFAULT_SID" running 200 || fail "default-policy resumed sandbox not running"
-assert_resolved_resource_yaml "$WORK/run/$DEFAULT_SID/$DEFAULT_SID.yaml" \
+assert_resolved_resource_yaml "$WORK/run/sandboxes/$DEFAULT_SID/$DEFAULT_SID.yaml" \
     2GiB 2GiB "$WORK/sandbox-resource.sock" || fail "default-policy restore resource YAML"
 wait_resource_stats "$DEFAULT_SID" || fail "default-policy resource stats missing after resume"
 assert_resource_lease "$DEFAULT_SID" 2147483648 268435456 2147483648 \
@@ -1396,7 +1396,7 @@ wait_sandbox_state "$SMALL_SID" running 600 || {
     journalctl KUASAR_SANDBOX_ID="$SMALL_SID" --no-pager -n 120 2>/dev/null || true
     fail "small-capacity bare sandbox did not reach running"
 }
-assert_resolved_resource_yaml "$WORK/run/$SMALL_SID/$SMALL_SID.yaml" \
+assert_resolved_resource_yaml "$WORK/run/sandboxes/$SMALL_SID/$SMALL_SID.yaml" \
     192MiB 192MiB "$WORK/sandbox-resource.sock" 192MiB - \
     || fail "capacity<256MiB did not normalize inherited headroom"
 assert_resource_lease "$SMALL_SID" 201326592 201326592 201326592 \
