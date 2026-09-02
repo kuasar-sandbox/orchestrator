@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# e2e_orchestrator_proxy.sh — exercise proxy_mode=external end to end with REAL
+# e2e_orchestrator_proxy.sh — exercise the proxy-only data plane end to end with REAL
 # components: node-ctl conductor serve (control plane), a separate node-ctl
 # proxy master that REGISTERS once on the config-socket plugin plane, syncs routes
 # into shared memory, supervises workers, a REAL microVM sandbox with REAL envd, and
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
 #
-#   serve(proxy_mode=external)                          # control plane on :PORT
+#   conductor serve                                      # control plane on :PORT
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
 #         # workers run in PROXY_NETNS; conductor policy supplies MMDS listen
@@ -14,12 +14,12 @@
 #                       exec requests park across runner boot and init without retry
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
-#   GET <conductor>/private/... with a non-canonical private Header reaches the
-#                       worker raw ingress; built-in worker remains final parser
+#   data-shaped HTTP/CONNECT sent to <conductor> stays on its API-only handler
+#   GET <proxy>/private/... reaches the custom WorkerExtension ingress wrapper
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
 #   GET <proxy> for an unknown sandbox -> passive propagation wait, no Wake
 #   POST /sandboxes/<sid>/exec-sessions -> KAT; service=exec CONNECT through the
-#                                          external proxy -> real guest exec
+#                                          Proxy -> real guest exec
 #   pause -> GET <proxy> -> wake -> auto-resume -> forwarded
 #   /metrics on the proxy master reports worker data-plane counters
 #
@@ -31,6 +31,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/lib/proxy.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 MMDS_ROUTES_E2E="${MMDS_ROUTES_E2E:-0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
@@ -59,6 +60,7 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/sandbox-runtime.bundle" ] || skip "missing $BIN/sandbox-runtime.bundle"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
+command -v go >/dev/null 2>&1 || skip "go not on PATH (custom Proxy Extension build)"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
@@ -78,7 +80,11 @@ UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slic
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
-PROXY_SOCK="$WORK/run/proxy.sock"
+CUSTOM_PROXY_BIN="${CUSTOM_PROXY_BIN:-$WORK/custom-proxy}"
+if [ ! -x "$CUSTOM_PROXY_BIN" ]; then
+    (cd "$REPO_ROOT" && GOWORK=off go build -o "$CUSTOM_PROXY_BIN" ./examples/custom-proxy) \
+        || skip "failed to build examples/custom-proxy"
+fi
 declare -a PIDS=()
 declare -a TAGS=()
 MMDS_ROUTES_CONFIG=""
@@ -151,7 +157,7 @@ child_worker_pids() {
         ppid="$(printf '%s\n' "$stat" | awk '{print $4}')"
         [ "$ppid" = "$parent" ] || continue
         cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null || true)"
-        case "$cmd" in *"node-ctl proxy serve"*"--worker"*) printf '%s\n' "$p";; esac
+        case "$cmd" in *" proxy serve --worker "*) printf '%s\n' "$p";; esac
     done
 }
 dump_proxy_startup_state() {
@@ -189,7 +195,7 @@ fail_proxy_startup() {
     dump_proxy_startup_state
     fail "$*"
 }
-wait_external_proxy_ready() {
+wait_proxy_topology_ready() {
     local master="$1" deadline now endpoint target data_ready mmds_ready workers_ready
     local workers worker_count worker_ns wp got state last_state=""
     endpoint="$(python3 - "$PROXY_NS_IP" "$MMDS_PORT" <<'PY'
@@ -235,7 +241,33 @@ PY
         [ "$now" -lt "$deadline" ] || break
         sleep 0.1
     done
-    fail_proxy_startup "external proxy readiness timed out after 30s (master=$master data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns)"
+    fail_proxy_startup "Proxy readiness timed out after 30s (master=$master data=$data_ready mmds=$mmds_ready workers=$worker_count/$PROXY_WORKERS workers_netns=$worker_ns)"
+}
+
+stop_proxy_master() {
+    local old_pid="$PROXY_MASTER_PID" old_workers worker
+    [ -n "$old_pid" ] || return 0
+    PROXY_TIMELINE_START_MS="$(monotonic_ms)"
+    old_workers="$(child_worker_pids "$old_pid")"
+    proxy_timeline "terminating master pid=$old_pid with workers=[$(printf '%s' "$old_workers" | tr '\n' ' ')]"
+    stop_proxy "$old_pid"
+    PIDS[$PROXY_MASTER_PID_SLOT]=""
+    PROXY_MASTER_PID=""
+    for worker in $old_workers; do
+        process_live "$worker" && fail_proxy_startup "proxy worker $worker survived master pid $old_pid shutdown"
+    done
+    proxy_timeline "master pid=$old_pid exited and inherited listeners were released"
+}
+
+restart_proxy_master_fresh() {
+    local log="$1" old_pid="$PROXY_MASTER_PID"
+    stop_proxy_master || return 1
+    start_proxy "$BIN/node-ctl" "$WORK/proxy.yaml" "$log"
+    PROXY_MASTER_PID="$PROXY_HELPER_PID"
+    PIDS+=("$PROXY_MASTER_PID")
+    PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
+    proxy_timeline "replacement master pid=$PROXY_MASTER_PID launched after pid=$old_pid exited"
+    wait_proxy_topology_ready "$PROXY_MASTER_PID"
 }
 setup_proxy_netns() {
     ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
@@ -365,10 +397,10 @@ exec_argv_denied_through_proxy() {
         --proxy-header "E2b-Sandbox-Service: exec" \
         --proxy-header "X-Access-Token: $token" \
         -- /bin/true >"$diagnostics" 2>&1; then
-        fail "external proxy executed a condition-denied argv"
+        fail "Proxy executed a condition-denied argv"
     fi
     grep -Fq "exec: remote exec rejected" "$diagnostics" \
-        || { sed 's/^/  client| /' "$diagnostics"; fail "external proxy denial was not redacted"; }
+        || { sed 's/^/  client| /' "$diagnostics"; fail "Proxy denial was not redacted"; }
 }
 exec_through_proxy_connect() {
     local sid="$1" token="$2" marker="$3"
@@ -525,10 +557,10 @@ BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export
 truncate -s 2G "$BLD"
 "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
-# ---- orchestrator config: proxy_mode=external -----------------------------
+# ---- conductor config ------------------------------------------------------
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: external, auth: enforce, park_timeout: 120s }
+proxy: { auth: enforce, park_timeout: 120s }
 mmds:
   enabled: true
   listen: "$PROXY_NS_IP:$MMDS_PORT"
@@ -550,7 +582,7 @@ EOF
 
 # ---- start serve (control plane), then the proxy master -------------------
 # The proxy master DIALS serve's config-socket to register, so serve comes up first.
-echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
+echo "==> node-ctl conductor serve (API control :$PORT)"
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 CONDUCTOR_PID="${PIDS[-1]}"
@@ -567,45 +599,55 @@ echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_
 # The master reads local worker/bootstrap settings from proxy.yaml and receives
 # MMDS listen/services only from the conductor registration policy. It then supervises
 # workers that inherit listener fds and read the shared route table. h2c here (no tls),
-# matching serve's plain-http listener. proxy_netns exercises external direct mode:
+# matching the deployment's plain HTTP ingress. proxy_netns exercises direct mode:
 # workers run inside that netns, so floatingip TCP dials need its route table.
-cat > "$WORK/proxy.yaml" <<EOF
-config_socket: $WORK/node-ctl.socket
-paths:
-  run_root: $WORK/run
-data_listen: 127.0.0.1:$PROXY_PORT
-proxy_netns: $PROXY_NETNS
-proxy_socket: $PROXY_SOCK
-shm_path: $WORK/run/proxy-routes.shm
-route_capacity: 1024
-workers: $PROXY_WORKERS
-auth: enforce
-park_timeout: 120s
-metrics_listen: 127.0.0.1:$METRICS_PORT
-EOF
-"$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
-PIDS+=($!)
-PROXY_MASTER_PID="${PIDS[-1]}"
+write_proxy_config "$WORK/proxy.yaml" \
+    "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" \
+    "$PROXY_NETNS" "$WORK/run/proxy-stats.sock" "$WORK/run/proxy-routes.shm" \
+    1024 "$PROXY_WORKERS" enforce 120s "127.0.0.1:$METRICS_PORT" - - "$CUSTOM_PROXY_BIN"
+start_proxy "$BIN/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
+PROXY_MASTER_PID="$PROXY_HELPER_PID"
+PIDS+=("$PROXY_MASTER_PID")
 PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
 proxy_timeline "master pid=$PROXY_MASTER_PID launched"
-wait_external_proxy_ready "$PROXY_MASTER_PID"
+wait_proxy_topology_ready "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
-echo "==> PASS: external proxy workers and conductor-owned MMDS listener are in proxy_netns=$PROXY_NETNS"
+echo "==> PASS: Proxy workers and MMDS listener are in proxy_netns=$PROXY_NETNS"
 
-# A non-canonical private Header/path must cross the conductor external fallback
-# and be rejected by the built-in worker parser, not by the conductor affinity
-# hint. X-Kuasar-Proxy-Error is produced only by the worker core in this path.
+# The conductor listener is API-only: neither a data-shaped Host nor CONNECT
+# reaches the Proxy. Its response is the unmodified API handler's natural miss.
 code=$(curl -sS --noproxy '*' \
-    -D "$WORK/raw-fallback.headers" \
-    -o "$WORK/raw-fallback.body" \
+    -D "$WORK/conductor-data.headers" \
+    -o "$WORK/conductor-data.body" \
     -w '%{http_code}' \
-    -H 'Host: private.invalid' \
+    -H "Host: 49983-private-s1.$DOMAIN" \
     -H 'X-Sandbox-Id: private-s1' \
-    "http://127.0.0.1:$PORT/private/sandboxes/private-s1")
-[ "$code" = "400" ] || { cat "$WORK/raw-fallback.body"; dump_logs; fail "raw external fallback=$code (want worker 400)"; }
-grep -Eiq '^X-Kuasar-Proxy-Error:[[:space:]]*bad_request' "$WORK/raw-fallback.headers" \
-    || { cat "$WORK/raw-fallback.headers"; fail "raw external fallback did not reach worker parser"; }
-echo "==> PASS: non-canonical private Header/path reached worker raw ingress through conductor fallback"
+    "http://127.0.0.1:$PORT/private/sandboxes/private-s1/49983/health")
+[ "$code" = "404" ] || { cat "$WORK/conductor-data.body"; fail "conductor data Host=$code (want API 404)"; }
+! grep -Eiq '^X-Kuasar-Proxy-Error:' "$WORK/conductor-data.headers" \
+    || fail "conductor data Host reached Proxy"
+code=$(curl -sS --noproxy '*' \
+    -D "$WORK/conductor-connect.headers" \
+    -o "$WORK/conductor-connect.body" \
+    -w '%{http_code}' \
+    -X CONNECT \
+    -H 'Host: 49983-private-s1.invalid' \
+    "http://127.0.0.1:$PORT/private-connect")
+case "$code" in 404|405) ;; *) fail "conductor CONNECT=$code (want API handler miss)";; esac
+! grep -Eiq '^X-Kuasar-Proxy-Error:' "$WORK/conductor-connect.headers" \
+    || fail "conductor CONNECT reached Proxy"
+echo "==> PASS: conductor API endpoint did not proxy data Host or CONNECT"
+
+# The custom Worker's IngressWrapper is served on data_listen. Its private
+# authentication response differs from the built-in canonical parser.
+code=$(curl -sS --noproxy '*' \
+    -o "$WORK/worker-extension.body" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:$PROXY_PORT/private/sandboxes/private-s1/49983/health")
+[ "$code" = "401" ] || { cat "$WORK/worker-extension.body"; fail "WorkerExtension data ingress=$code (want 401)"; }
+grep -q 'private authentication failed' "$WORK/worker-extension.body" \
+    || fail "data listener did not use the WorkerExtension wrapper"
+echo "==> PASS: Data listener serves the WorkerExtension ingress wrapper"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 # The 6GiB Build limit is independent of the phase Sandbox's node-default 2GiB
@@ -628,6 +670,47 @@ done
 [ -n "$TEMPLATE" ] || fail "build did not become ready"
 echo "==> built template: $TEMPLATE"
 
+# Every Create requires the current Proxy registration and its route-applied
+# barrier. Removing the master must fail admission before any launch ownership
+# or durable sandbox state is retained.
+find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.before-unavailable"
+"$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.before-unavailable.json"
+python3 - "$WORK/vswitch.before-unavailable.json" <<'PY' >"$WORK/vswitch-ports.before-unavailable"
+import json, sys
+print(json.load(open(sys.argv[1]))["ports_used"])
+PY
+systemctl list-units --all --type=service --no-legend --no-pager 'sandbox-runner@*.service' \
+    | sort >"$WORK/runners.before-unavailable"
+stop_proxy_master
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+[ "$code" = "503" ] || { cat "$WORK/resp.body"; fail "Create without Proxy=$code (want 503)"; }
+code=$(req GET /v2/sandboxes "$AK")
+[ "$code" = "200" ] || fail "list after unavailable Create=$code"
+python3 - "$WORK/resp.body" <<'PY' || fail "unavailable Create retained durable/cache state"
+import json, sys
+assert json.load(open(sys.argv[1])) == []
+PY
+find "$WORK/run" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort >"$WORK/run-dirs.after-unavailable"
+cmp -s "$WORK/run-dirs.before-unavailable" "$WORK/run-dirs.after-unavailable" \
+    || fail "unavailable Create allocated a sandbox run directory"
+"$BIN/connector-ctl" vswitch status "$SWITCH" >"$WORK/vswitch.after-unavailable.json"
+python3 - "$WORK/vswitch.after-unavailable.json" <<'PY' >"$WORK/vswitch-ports.after-unavailable"
+import json, sys
+print(json.load(open(sys.argv[1]))["ports_used"])
+PY
+cmp -s "$WORK/vswitch-ports.before-unavailable" "$WORK/vswitch-ports.after-unavailable" \
+    || fail "unavailable Create attached a network port"
+systemctl list-units --all --type=service --no-legend --no-pager 'sandbox-runner@*.service' \
+    | sort >"$WORK/runners.after-unavailable"
+cmp -s "$WORK/runners.before-unavailable" "$WORK/runners.after-unavailable" \
+    || fail "unavailable Create assigned a sandbox runner"
+if ps -eo args= | grep -F 'cloud-hypervisor' | grep -F "$WORK/run" >/dev/null; then
+    fail "unavailable Create started a VMM"
+fi
+echo "==> PASS: Proxy absent -> Create 503 with no durable/cache/run-dir/runner/VMM side effect"
+restart_proxy_master_fresh "$WORK/proxy-after-unavailable.log"
+echo "==> PASS: Proxy re-registered after admission failure"
+
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
 REQ_ATTACH_MMDS="$MMDS_ROUTES_E2E"
@@ -645,17 +728,17 @@ FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
     || fail "missing sandboxID/envdAccessToken/forwardAccessToken in create response"
 assert_no_default_exec_token "$WORK/resp.body" || fail "create response exposed a default exec token"
-echo "==> PASS: sandbox $SID durably accepted after external route ACK (tokens captured; no default exec token)"
-echo "==> issue native exec capability immediately and park its external CONNECT from starting"
+echo "==> PASS: sandbox $SID durably accepted after Proxy route ACK (tokens captured; no default exec token)"
+echo "==> issue native exec capability immediately and park its Proxy CONNECT from starting"
 EXEC_TOKEN="$(issue_exec_session "$SID" "$AK" "{\"conditions\":[{\"expr\":\"request.argv[0] == '/bin/sh'\"}]}")" \
     || fail "issue conditioned immediate native exec capability"
 rm -f "$WORK/exec-session.secret"
-IMMEDIATE_NATIVE_MARK="EXTERNAL_PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
+IMMEDIATE_NATIVE_MARK="PROXY_IMMEDIATE_NATIVE_EXEC_$RANDOM"
 (
     exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$IMMEDIATE_NATIVE_MARK" 1 130
 ) &
 IMMEDIATE_EXEC_PID=$!
-echo "==> request envd immediately through external proxy; ACKed starting route must park to running"
+echo "==> request envd immediately through Proxy; ACKed starting route must park to running"
 (
     code=$(DP_MAX_TIME=120 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
     printf '%s\n' "$code" >"$WORK/immediate-data.code"
@@ -663,22 +746,22 @@ echo "==> request envd immediately through external proxy; ACKed starting route 
 ) &
 IMMEDIATE_DATA_PID=$!
 wait_traffic_stats "$SID" parking \
-    || { dump_logs; fail "external starting request was not visible as parking"; }
-echo "==> PASS: external master cache observed authorized starting ingress as parking"
+    || { dump_logs; fail "Proxy starting request was not visible as parking"; }
+echo "==> PASS: Proxy master cache observed authorized starting ingress as parking"
 immediate_data_status=0
 wait "$IMMEDIATE_DATA_PID" || immediate_data_status=$?
 IMMEDIATE_DATA_PID=""
 code="$(<"$WORK/immediate-data.code")"
 [ "$immediate_data_status" = "0" ] \
-    || { cat "$WORK/dp.body"; dump_logs; fail "immediate external proxy request=$code"; }
-echo "==> PASS: external proxy parked post-Create request through starting to running (code=$code)"
+    || { cat "$WORK/dp.body"; dump_logs; fail "immediate Proxy request=$code"; }
+echo "==> PASS: Proxy parked post-Create request through starting to running (code=$code)"
 immediate_exec_status=0
 wait "$IMMEDIATE_EXEC_PID" || immediate_exec_status=$?
 IMMEDIATE_EXEC_PID=""
-[ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate external native exec did not park to running"; }
-echo "==> PASS: external native exec parked post-Create CONNECT from ACKed starting to running"
-wait_traffic_stats "$SID" idle || { dump_logs; fail "external traffic did not converge to idle"; }
-echo "==> PASS: external master cache converged parking/egress to idle"
+[ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate Proxy native exec did not park to running"; }
+echo "==> PASS: Proxy native exec parked post-Create CONNECT from ACKed starting to running"
+wait_traffic_stats "$SID" idle || { dump_logs; fail "Proxy traffic did not converge to idle"; }
+echo "==> PASS: Proxy master cache converged parking/egress to idle"
 
 code=$(req GET "/sandboxes/$SID/stats/resource" "$AK")
 [ "$code" = "501" ] || { cat "$WORK/resp.body"; fail "disabled resource controller stats=$code (want 501)"; }
@@ -738,33 +821,6 @@ sys.stdout.buffer.write(out)
 sys.stdout.write("\nOUTPUT_END\n")
 PY
 
-stop_external_proxy() {
-    local old_pid="$PROXY_MASTER_PID" old_workers worker
-    [ -n "$old_pid" ] || return 0
-    PROXY_TIMELINE_START_MS="$(monotonic_ms)"
-    old_workers="$(child_worker_pids "$old_pid")"
-    proxy_timeline "terminating master pid=$old_pid with workers=[$(printf '%s' "$old_workers" | tr '\n' ' ')]"
-    kill -TERM "$old_pid" 2>/dev/null || true
-    wait "$old_pid" 2>/dev/null || true
-    PIDS[$PROXY_MASTER_PID_SLOT]=""
-    PROXY_MASTER_PID=""
-    for worker in $old_workers; do
-        process_live "$worker" && fail_proxy_startup "proxy worker $worker survived master pid $old_pid shutdown"
-    done
-    proxy_timeline "master pid=$old_pid exited and inherited listeners were released"
-}
-
-restart_external_proxy_fresh() {
-    local log="$1" old_pid="$PROXY_MASTER_PID"
-    stop_external_proxy || return 1
-    "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$log" 2>&1 &
-    PROXY_MASTER_PID=$!
-    PIDS+=("$PROXY_MASTER_PID")
-    PROXY_MASTER_PID_SLOT=$((${#PIDS[@]} - 1))
-    proxy_timeline "replacement master pid=$PROXY_MASTER_PID launched after pid=$old_pid exited"
-    wait_external_proxy_ready "$PROXY_MASTER_PID"
-}
-
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
 ok=""
 for _ in $(seq 1 20); do
@@ -784,7 +840,17 @@ echo "==> PASS: proxy enforces X-Access-Token (missing -> 401)"
 
 code=$(dp "49983-$SID" /health "wrong-token")
 [ "$code" = "401" ] || { dump_logs; fail "envd /health via proxy with WRONG token = $code (want 401)"; }
-echo "==> PASS: proxy rejects a wrong token (401)"
+code=$(curl -sS --noproxy '*' \
+    -D "$WORK/typed-error.headers" \
+    -o "$WORK/typed-error.body" \
+    -w '%{http_code}' \
+    -H "Host: 49983-$SID.$DOMAIN" \
+    -H 'X-Access-Token: wrong-token' \
+    "http://127.0.0.1:$PROXY_PORT/health")
+[ "$code" = "401" ] || { cat "$WORK/typed-error.body"; fail "typed unauthorized response=$code"; }
+grep -Eiq '^X-Kuasar-Proxy-Error:[[:space:]]*unauthorized' "$WORK/typed-error.headers" \
+    || { cat "$WORK/typed-error.headers"; fail "DataEndpoint omitted the typed unauthorized proxy error"; }
+echo "==> PASS: Proxy rejects a wrong token with the typed DataEndpoint error"
 wait_traffic_stats "$SID" idle || { dump_logs; fail "invalid credentials changed traffic inflight"; }
 IDLE_AFTER_INVALID="$(traffic_idle_since "$SID")"
 [ "$IDLE_AFTER_INVALID" = "$IDLE_BEFORE_INVALID" ] \
@@ -804,6 +870,41 @@ for _ in $(seq 1 30); do
 done
 [ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; dump_logs; fail "user port via proxy_netns -> floatingip did not return marker"; }
 echo "==> PASS: proxy_netns worker reached sandbox floatingip:8000 (real user port, marker=$USER_MARK)"
+
+# A signed envd /files request carries no X-Access-Token. Both the Proxy and
+# envd verify the same signature; the file bytes still travel only through the
+# independent DataEndpoint.
+SIGNED_FILE="/tmp/kuasar-proxy-signed-$RANDOM.txt"
+SIGNED_MARK="PROXY_SIGNED_FILE_$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "printf '%s' '$SIGNED_MARK' > '$SIGNED_FILE'" >"$WORK/write-signed-file.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/write-signed-file.out" \
+    || { sed 's/^/  envd| /' "$WORK/write-signed-file.out"; fail "create signed-file fixture"; }
+SIGNED_QUERY=$(python3 - "$SIGNED_FILE" "$ENVD_TOKEN" <<'PY'
+import base64, hashlib, sys, urllib.parse
+path, token = sys.argv[1:]
+digest = hashlib.sha256(f"{path}:read::{token}".encode()).digest()
+signature = "v1_" + base64.b64encode(digest).decode().rstrip("=")
+print(urllib.parse.urlencode({"path": path, "signature": signature}))
+PY
+)
+code=$(curl -sS --noproxy '*' \
+    -o "$WORK/signed-file.body" \
+    -w '%{http_code}' \
+    -H "Host: 49983-$SID.$DOMAIN" \
+    "http://127.0.0.1:$PROXY_PORT/files?$SIGNED_QUERY")
+[ "$code" = "200" ] && grep -Fq "$SIGNED_MARK" "$WORK/signed-file.body" \
+    || { cat "$WORK/signed-file.body"; dump_logs; fail "signed /files through DataEndpoint=$code"; }
+echo "==> PASS: signed /files crossed only the independent Proxy DataEndpoint"
+
+# Restart the whole master with a live sandbox. The replacement starts from a
+# fresh SHM table and must complete a full route sync before serving the route.
+restart_proxy_master_fresh "$WORK/proxy-full-resync.log"
+code=$(DP_MAX_TIME=30 dp "49983-$SID" /health "$ENVD_TOKEN" || true)
+{ [ "$code" = "204" ] || [ "$code" = "200" ]; } \
+    || { cat "$WORK/dp.body"; dump_logs; fail "data request after Proxy full resync=$code"; }
+wait_traffic_stats "$SID" idle || { dump_logs; fail "traffic stats missing after Proxy full resync"; }
+echo "==> PASS: replacement Proxy master full-synced the live route before ingress"
 
 # ---- (2) initially missing route waits passively without unauthorized Wake -
 # The full passive propagation window is 120s. Cancel this probe after two
@@ -830,7 +931,7 @@ else dump_logs; fail "proxy master /metrics did not report data_requests_total";
 # only after the supervisor has reaped it.
 mapfile -t CRASH_WORKERS < <(child_worker_pids "$PROXY_MASTER_PID")
 CRASH_WORKER="${CRASH_WORKERS[0]:-}"
-[ -n "$CRASH_WORKER" ] || fail "no external proxy worker available for crash test"
+[ -n "$CRASH_WORKER" ] || fail "no Proxy worker available for crash test"
 kill -KILL "$CRASH_WORKER"
 SEEN_STATS_503=""
 for _ in $(seq 1 120); do
@@ -840,7 +941,7 @@ for _ in $(seq 1 120); do
 done
 [ -n "$SEEN_STATS_503" ] || { dump_logs; fail "worker crash did not create a traffic-stats 503 window"; }
 wait_traffic_stats "$SID" idle || { dump_logs; fail "traffic stats did not recover after replacement ready"; }
-wait_external_proxy_ready "$PROXY_MASTER_PID"
+wait_proxy_topology_ready "$PROXY_MASTER_PID"
 echo "==> PASS: worker crash returned 503 until replacement epoch was stats-ready"
 
 # ---- (3b) CONNECT tunnel THROUGH the proxy to envd control -----------------
@@ -887,20 +988,20 @@ else
     fail "CONNECT tunnel through proxy failed: $cc"
 fi
 
-# ---- (4) native exec capability THROUGH the external proxy ----------------
+# ---- (4) native exec capability THROUGH the Proxy -------------------------
 echo "==> reuse the explicit native exec capability after the sandbox is running"
-NATIVE_MARK="EXTERNAL_PROXY_NATIVE_EXEC_$RANDOM"
+NATIVE_MARK="PROXY_NATIVE_EXEC_$RANDOM"
 exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$NATIVE_MARK"
-echo "==> PASS: real sandbox-ctl CONNECT through the external proxy verified stdin/stdout/stderr and exit status"
+echo "==> PASS: real sandbox-ctl CONNECT through the Proxy verified stdin/stdout/stderr and exit status"
 
 # ---- (5) auto-resume THROUGH the proxy ------------------------------------
-echo "==> pause $SID, then reuse the same exec KAT through the external proxy"
+echo "==> pause $SID, then reuse the same exec KAT through the Proxy"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
     exec_argv_denied_through_proxy "$SID" "$EXEC_TOKEN"
     wait_traffic_stats "$SID" paused \
-        || { dump_logs; fail "condition-denied external exec changed paused state or traffic"; }
-    RESUME_MARK="EXTERNAL_PROXY_EXEC_RESUME_$RANDOM"
+        || { dump_logs; fail "condition-denied Proxy exec changed paused state or traffic"; }
+    RESUME_MARK="PROXY_EXEC_RESUME_$RANDOM"
     exec_through_proxy_connect "$SID" "$EXEC_TOKEN" "$RESUME_MARK" 40
     ok=""
     for _ in $(seq 1 40); do
@@ -908,7 +1009,7 @@ if [ "$code" = "204" ]; then
         { [ "$code" = "204" ] || [ "$code" = "200" ]; } && { ok=1; break; }
         sleep 0.5
     done
-    if [ -n "$ok" ]; then echo "==> PASS: same KAT woke the paused sandbox through external proxy (envd code=$code)"
+    if [ -n "$ok" ]; then echo "==> PASS: same KAT woke the paused sandbox through Proxy (envd code=$code)"
     else dump_logs; fail "auto-resume via proxy did not complete, last code=$code"; fi
 else dump_logs; fail "pause returned $code (want 204 before auto-resume check)"; fi
 unset EXEC_TOKEN
@@ -916,35 +1017,35 @@ unset EXEC_TOKEN
 if [ "$MMDS_ROUTES_E2E" = 1 ]; then
     source "$SCRIPT_DIR/lib/mmds_static_guest.sh"
     source "$SCRIPT_DIR/lib/mmds_secret_guest.sh"
-    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
-        || { dump_logs; fail "external MMDS static exact route"; }
+    run_mmds_static_guest_get "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" proxy \
+        || { dump_logs; fail "Proxy MMDS static exact route"; }
     mmds_secret_restart_proxy() {
-        echo "==> restart external proxy from an empty heap; wait for full route/value/service resync"
-        restart_external_proxy_fresh "$WORK/proxy-mmds-restart.log"
+        echo "==> restart Proxy from an empty heap; wait for full route/value/service resync"
+        restart_proxy_master_fresh "$WORK/proxy-mmds-restart.log"
     }
     MMDS_SECRET_AFTER_UPDATE_HOOK=mmds_secret_restart_proxy
     run_mmds_secret_standalone_e2e "$WORK/node-ctl.socket" "$SID" "$WORK/envd_exec.py" \
-        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" external \
-        || { dump_logs; fail "external MMDS initial/unresolved/update/resync/rotation/delete lifecycle"; }
+        "$ENVD_SOCK" "$ENVD_TOKEN" "$WORK" proxy \
+        || { dump_logs; fail "Proxy MMDS initial/unresolved/update/resync/rotation/delete lifecycle"; }
     unset MMDS_SECRET_AFTER_UPDATE_HOOK
     run_mmds_service_standalone_e2e "$SID" "$WORK/envd_exec.py" "$ENVD_SOCK" \
-        "$ENVD_TOKEN" "$WORK" external \
-        || { dump_logs; fail "external MMDS conductor-only service registry"; }
+        "$ENVD_TOKEN" "$WORK" proxy \
+        || { dump_logs; fail "Proxy MMDS conductor-only service registry"; }
     for value in MMDS_SECRET_INITIAL_GUEST_E2E MMDS_SECRET_UPDATED_GUEST_E2E MMDS_SECRET_ROTATED_GUEST_E2E; do
         for artifact in "$WORK"/orch*.log "$WORK"/proxy*.log "$WORK"/mmds-*.out \
             "$WORK"/mmds-service.requests "$WORK"/lib/node-ctl.db* "$WORK"/run/proxy-routes.shm; do
             [ -f "$artifact" ] || continue
             grep -a -F -q -- "$value" "$artifact" \
-                && fail "MMDS secret plaintext appeared in external E2E artifact $artifact"
+                && fail "MMDS secret plaintext appeared in Proxy E2E artifact $artifact"
         done
     done
-    echo "==> PASS: external real guest covered proxy restart/full resync, secret rotation/delete, and conductor-only service"
+    echo "==> PASS: real guest covered Proxy restart/full resync, secret rotation/delete, and conductor-only service"
 fi
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || { dump_logs; fail "kill=$code (want 204)"; }
 echo "==> PASS: sandbox killed"
-stop_external_proxy || { dump_logs; fail "proxy master shutdown left a worker alive"; }
+stop_proxy_master || { dump_logs; fail "proxy master shutdown left a worker alive"; }
 echo "==> PASS: proxy master shutdown reaped all worker processes"
 echo
-echo "==> e2e_orchestrator_proxy: OK   (template $TEMPLATE, sandbox $SID, external proxy on :$PROXY_PORT)"
+echo "==> e2e_orchestrator_proxy: OK   (template $TEMPLATE, sandbox $SID, Proxy on :$PROXY_PORT)"

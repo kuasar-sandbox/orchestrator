@@ -20,6 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/lib/proxy.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
@@ -763,6 +764,7 @@ for idx in range(1, 80):
         "node_register": {
             "node_id": node_id,
             "labels": {"pool": "probe"},
+            "api_endpoint": "127.0.0.1:2",
             "data_endpoint": "127.0.0.1:1",
             "capacity": 1,
             "accept_redirect": True,
@@ -791,6 +793,7 @@ PY
 
 start_cluster_node() {
     NODE_PORT="$(free_port)"
+    NODE_DATA_PORT="$(free_port)"
     local node_id="$1"
     cat > "$WORK/cluster-node.yaml" <<EOF
 api: { domain: $DOMAIN, listen: "127.0.0.1:$NODE_PORT" }
@@ -809,14 +812,25 @@ checkpoint: { mode: local, local_dir: $WORK/saved }
 cluster:
   node_link: { endpoint: "127.0.0.1:$CONTROL_PORT" }
   node_id: "$node_id"
-  data_endpoint: "127.0.0.1:$NODE_PORT"
+  api_endpoint: "127.0.0.1:$NODE_PORT"
+  data_endpoint: "127.0.0.1:$NODE_DATA_PORT"
   heartbeat_interval: "500ms"
   labels: { pool: "real" }
 EOF
-    step "starting cluster node-ctl node_id=$node_id (:${NODE_PORT}, no manual manifest-key add)"
+    step "starting cluster conductor node_id=$node_id (API :${NODE_PORT}, no manual manifest-key add)"
     "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" > >(tee "$WORK/cluster-node.log" >&2) 2>&1 &
     PIDS+=("$!")
     wait_api_health "$NODE_PORT" "cluster node-ctl"
+    write_proxy_config "$WORK/cluster-proxy.yaml" \
+        "$WORK/cn.sock" "$WORK/cr" "127.0.0.1:$NODE_DATA_PORT" - \
+        "$WORK/cluster-proxy-stats.sock" "$WORK/cluster-proxy-routes.shm" \
+        1024 2 enforce 180s -
+    start_proxy "$BIN/node-ctl" "$WORK/cluster-proxy.yaml" "$WORK/cluster-proxy.log"
+    PIDS+=("$PROXY_HELPER_PID")
+    wait_proxy_ready "$PROXY_HELPER_PID" 127.0.0.1 "$NODE_DATA_PORT" \
+        "$WORK/cluster-proxy-stats.sock" "$WORK/cluster-proxy.log" \
+        || fail "cluster Proxy did not become ready"
+    step "cluster Proxy data endpoint ready (:${NODE_DATA_PORT})"
     if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
         for _ in $(seq 1 80); do
             if grep -q "redirecting to node owner" "$WORK/cluster-node.log"; then
