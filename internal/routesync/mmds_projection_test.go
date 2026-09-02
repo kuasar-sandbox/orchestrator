@@ -24,6 +24,12 @@ func (s *mmdsProjectionSource) Range(_ context.Context, fn func(RouteEntry) erro
 func (s *mmdsProjectionSource) Subscribe() (<-chan Event, func()) {
 	return s.events, func() {}
 }
+func (*mmdsProjectionSource) RangeBuilds(context.Context, func(BuildEvent) error) error {
+	return nil
+}
+func (*mmdsProjectionSource) SubscribeBuilds() (<-chan BuildEvent, func()) {
+	return make(chan BuildEvent), func() {}
+}
 func (*mmdsProjectionSource) OnWake(context.Context, string) {}
 func (s *mmdsProjectionSource) Policy() Policy               { return s.policy }
 func (*mmdsProjectionSource) SourceFingerprint() string      { return "mmds-source" }
@@ -149,9 +155,11 @@ func TestDirectAuthorityNeverProjectsMMDSForNodeLink(t *testing.T) {
 	go StreamAuthority(ctx, downWriter, func() {}, upReader, source, reg, nil, nil, nil)
 
 	upsert := readTestMessage(t, downReader)
+	buildBegin := readTestMessage(t, downReader)
+	buildEnd := readTestMessage(t, downReader)
 	bookmark := readTestMessage(t, downReader)
-	if upsert.Type != TypeUpsert || bookmark.Type != TypeBookmark {
-		t.Fatalf("stream types = %q %q", upsert.Type, bookmark.Type)
+	if upsert.Type != TypeUpsert || buildBegin.Type != TypeBuildSyncBegin || buildEnd.Type != TypeBuildSyncEnd || bookmark.Type != TypeBookmark {
+		t.Fatalf("stream types = %q %q %q %q", upsert.Type, buildBegin.Type, buildEnd.Type, bookmark.Type)
 	}
 	if upsert.Route.MMDSRoutes != "" || upsert.Route.MMDSRouteSecretValues != nil {
 		t.Fatal("direct node-link authority projected MMDS state")

@@ -122,7 +122,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		// record with the registry's ids + resolved key, durably retain encrypted
 		// registration image-pull credentials for exact replay, and report
 		// `registered` up. The e2b trigger (router-forwarded) then runs it; state
-		// flows back as build events.
+		// flows back as BuildUpsert and retention eventually emits BuildDelete.
 		if err := o.registerClusterBuild(ctx, cmd); err != nil {
 			return reject(cmd, err)
 		}
@@ -163,6 +163,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err := types.ValidateBuildID(cmd.BuildID); err != nil {
 		return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 	}
+	unlockRetention := o.buildRetention.Lock(cmd.BuildID)
+	defer unlockRetention()
 	profile, err := types.ParseProfile(cmd.Profile)
 	if err != nil {
 		return fmt.Errorf("build_register: %w", err)
@@ -390,9 +392,63 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	return nil
 }
 
-// BuildEvents is the node-link client's source of build state transitions
-// (nodelink.Node); the client streams them to the registry (§5.1).
-func (o *Orchestrator) BuildEvents() <-chan *routesync.BuildEvent { return o.buildEvents }
+// RangeBuilds streams the complete retained cluster Build projection for one
+// node-link reconnect snapshot, including ready/error rows inside their node
+// retention window. Direct-node Builds are never projected.
+func (o *Orchestrator) RangeBuilds(ctx context.Context, fn func(routesync.BuildEvent) error) error {
+	return o.st.RangeClusterBuilds(ctx, func(build *types.Build) error {
+		return fn(buildProjectionEvent(build))
+	})
+}
+
+// SubscribeBuilds installs the live half of the Build snapshot protocol before
+// RangeBuilds starts. A lagging subscriber is closed so reconnect full sync,
+// rather than a lossy event buffer, restores the exact SQLite set.
+func (o *Orchestrator) SubscribeBuilds() (<-chan routesync.BuildEvent, func()) {
+	ch := make(chan routesync.BuildEvent, 256)
+	o.buildSubsMu.Lock()
+	id := o.buildSubSeq
+	o.buildSubSeq++
+	o.buildSubs[id] = ch
+	o.buildSubsMu.Unlock()
+	cancel := func() {
+		o.buildSubsMu.Lock()
+		if current, ok := o.buildSubs[id]; ok {
+			delete(o.buildSubs, id)
+			close(current)
+		}
+		o.buildSubsMu.Unlock()
+	}
+	return ch, cancel
+}
+
+func buildProjectionEvent(build *types.Build) routesync.BuildEvent {
+	event := routesync.BuildEvent{Kind: routesync.BuildUpsert}
+	if build == nil {
+		return event
+	}
+	event.BuildID = build.BuildID
+	event.State = string(build.Status)
+	event.Reason = build.Reason
+	if build.Status == types.BuildReady {
+		event.TemplateID = build.PersistID
+	}
+	return event
+}
+
+func (o *Orchestrator) publishBuildEvent(event routesync.BuildEvent) {
+	o.buildSubsMu.Lock()
+	defer o.buildSubsMu.Unlock()
+	for id, ch := range o.buildSubs {
+		select {
+		case ch <- event:
+		default:
+			delete(o.buildSubs, id)
+			close(ch)
+			o.log.Warn("node-link Build subscriber lagged; dropped for full resync", "sub", id)
+		}
+	}
+}
 
 // buildStateEvent constructs an event only for a cluster-owned Build. The
 // process-local map is a fast path; durable ClusterGroup is authoritative after
@@ -416,7 +472,7 @@ func (o *Orchestrator) buildStateEvent(ctx context.Context, buildID, state, temp
 			return nil, false, nil // direct-node build
 		}
 	}
-	return &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true, nil
+	return &routesync.BuildEvent{Kind: routesync.BuildUpsert, BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}, true, nil
 }
 
 func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
@@ -428,11 +484,9 @@ func (o *Orchestrator) forgetTerminalClusterBuild(buildID, state string) {
 	o.clusterBuildMu.Unlock()
 }
 
-// publishBuildState emits a build event for a cluster build (no-op for a non-
-// cluster, e.g. single-node, build). Intermediate lifecycle transitions are a
-// lossy notification, while a durable terminal result waits for node-link or
-// controller cancellation. Startup reconciliation uses the explicitly
-// best-effort helper below and is followed by a complete SQLite-backed replay.
+// publishBuildState emits a rebuildable upsert for a cluster Build. SQLite and
+// reconnect full sync remain authoritative; a slow stream is closed instead of
+// turning this notification into a second lifecycle commit.
 func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
 	if state == string(types.BuildReady) || state == string(types.BuildError) {
 		if err := o.publishBuildStateRequired(o.launchContext(), buildID, state, templateID, reason); err != nil {
@@ -452,17 +506,13 @@ func (o *Orchestrator) publishBuildStateBestEffort(buildID, state, templateID, r
 	if !ok {
 		return
 	}
-	select {
-	case o.buildEvents <- ev:
-	default:
-	}
+	o.publishBuildEvent(*ev)
 	o.forgetTerminalClusterBuild(buildID, state)
 }
 
-// publishBuildStateRequired queues the durable terminal result before an exact
-// BuildRegister replay is acknowledged. If the node-link cannot drain events,
-// returning without an ACK keeps the Registry pinned to this node; a later
-// identical retry can safely repeat the event.
+// publishBuildStateRequired resolves durable cluster ownership before an exact
+// BuildRegister replay is acknowledged. Publication itself is non-blocking: a
+// slow subscriber reconnects and receives the complete retained Build set.
 func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, state, templateID, reason string) error {
 	delay := 20 * time.Millisecond
 	for {
@@ -471,13 +521,9 @@ func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, s
 			if !ok {
 				return nil
 			}
-			select {
-			case o.buildEvents <- ev:
-				o.forgetTerminalClusterBuild(buildID, state)
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			o.publishBuildEvent(*ev)
+			o.forgetTerminalClusterBuild(buildID, state)
+			return nil
 		}
 		// A transient SQLite read failure after restart is not evidence that this
 		// is a direct-node Build. Retain the terminal result and retry ownership
@@ -498,33 +544,11 @@ func (o *Orchestrator) publishBuildStateRequired(ctx context.Context, buildID, s
 	}
 }
 
-// ReplayClusterBuildTerminalStates republishes every durable cluster terminal
-// result after each node-link session is established. Startup reconciliation
-// can terminally fail an arbitrary number of interrupted builders before
-// node-link begins draining its bounded event channel, and a connection reset
-// can lose a session-local outbox item. Rebuilding this stream from SQLite
-// prevents either bounded optimization from becoming a correctness limit.
-// Replays are idempotent at the Registry.
-func (o *Orchestrator) ReplayClusterBuildTerminalStates(ctx context.Context) error {
-	for _, state := range []types.BuildState{types.BuildReady, types.BuildError} {
-		builds, err := o.st.BuildsByStatus(ctx, state)
-		if err != nil {
-			return fmt.Errorf("replay cluster builds in state %s: %w", state, err)
-		}
-		for _, build := range builds {
-			if build.ClusterGroup == "" {
-				continue
-			}
-			templateID := ""
-			if state == types.BuildReady {
-				templateID = build.PersistID
-			}
-			if err := o.publishBuildStateRequired(ctx, build.BuildID, string(state), templateID, build.Reason); err != nil {
-				return fmt.Errorf("replay cluster build %s: %w", build.BuildID, err)
-			}
-		}
+func (o *Orchestrator) publishBuildDelete(build *types.Build) {
+	if build == nil || build.ClusterGroup == "" {
+		return
 	}
-	return nil
+	o.publishBuildEvent(routesync.BuildEvent{Kind: routesync.BuildDelete, BuildID: build.BuildID})
 }
 
 // clusterBuildCreds returns a cluster build's image-pull credentials. The

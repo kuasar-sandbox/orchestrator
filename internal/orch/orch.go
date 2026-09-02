@@ -137,12 +137,17 @@ type Orchestrator struct {
 	// committed transition avoids hubs, queues, and background work otherwise.
 	extensionObserver    ExtensionObserver
 	extensionBuildEvents keyedLockGroup
+	// buildRetention orders terminal-row deletion with registration/replay of
+	// the same BuildID, without serializing the established Trigger CAS path.
+	buildRetention       keyedLockGroup
 	extensionSandboxHook conductorextension.SandboxHook
 	extensionBuildHook   conductorextension.BuildHook
 
 	clusterBuildMu sync.Mutex
-	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
-	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
+	clusterBuilds  map[string]*clusterBuild // build_id -> transient cluster image-pull creds (§7.5)
+	buildSubsMu    sync.Mutex
+	buildSubs      map[int]chan routesync.BuildEvent // node-link Build projection subscribers
+	buildSubSeq    int
 
 	// synthetic build sandbox id -> durable build owner id. Protected by mu
 	// alongside reg; never persisted or exported.
@@ -197,7 +202,7 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 		deleteActive:         map[string]struct{}{},
 		pausedCleanupActive:  map[string]struct{}{},
 		clusterBuilds:        map[string]*clusterBuild{},
-		buildEvents:          make(chan *routesync.BuildEvent, 64),
+		buildSubs:            map[int]chan routesync.BuildEvent{},
 		mmdsBuildOwners:      map[string]string{},
 		commitBuildTrigger:   st.CommitBuildTrigger,
 		removeSandboxRunDir:  os.RemoveAll,
@@ -352,11 +357,10 @@ func (o *Orchestrator) normalizeSandboxCreateDefinition(
 			return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, err
 		}
 	}
-	var templateMetadata map[string]string
-	if build := o.templateBuild(ctx, apiKey, templateRef); build != nil && len(build.Metadata) > 0 {
-		templateMetadata = build.Metadata
-	}
-	metadata, err := sandboxcfg.MergeCreateMetadata(templateMetadata, requestMetadata)
+	// A canonical TemplateID is self-describing and its portable artifact is the
+	// long-lived launch authority. Build rows are retention-bounded status/alias
+	// history, so Create must never recover runtime metadata from one.
+	metadata, err := sandboxcfg.MergeCreateMetadata(nil, requestMetadata)
 	if err != nil {
 		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -2465,7 +2469,9 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 
 // --- reaper / reconcile ---
 
-// Reaper enforces TTLs: idle past deadline -> auto-suspend (pause).
+// Reaper enforces active idle TTLs and bounded terminal-history retention:
+// idle past deadline -> auto-suspend, then owner-free dead/ready/error rows
+// past their configured diagnostic window -> exact durable delete.
 func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -2473,11 +2479,11 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case tick := <-t.C:
 			// Collect past-deadline sandboxes (read-only scan), then pause them
 			// after the scan — pauseSandbox writes the store, which must not run
 			// while RangeByState's read cursor is open.
-			now := time.Now().Unix()
+			now := tick.Unix()
 			var due []*types.Sandbox
 			_ = o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
 				if sb.DeadlineUnix > 0 && now >= sb.DeadlineUnix {
@@ -2494,6 +2500,9 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 				o.log.Warn("reaper prune key pairs", "err", err)
 			} else if n > 0 {
 				o.log.Info("reaper pruned expired key pairs", "n", n)
+			}
+			if err := o.reapTerminalHistory(ctx, tick); err != nil {
+				o.log.Warn("reaper prune terminal history", "err", err)
 			}
 		}
 	}

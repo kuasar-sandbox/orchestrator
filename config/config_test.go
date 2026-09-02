@@ -8,9 +8,55 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
+
+func TestTerminalRetentionDefaultsOverridesAndValidation(t *testing.T) {
+	header := `
+api: { domain: example.test }
+encryption_key: test-key
+`
+	base := header + `
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+`
+	defaults, err := LoadConductor(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.Sandbox.DeadTTL != "24h" || defaults.Sandbox.DeadTTLDur() != 24*time.Hour {
+		t.Fatalf("sandbox dead TTL = %q (%s), want 24h", defaults.Sandbox.DeadTTL, defaults.Sandbox.DeadTTLDur())
+	}
+	if defaults.Builder.TerminalTTL != "24h" || defaults.Builder.TerminalTTLDur() != 24*time.Hour {
+		t.Fatalf("builder terminal TTL = %q (%s), want 24h", defaults.Builder.TerminalTTL, defaults.Builder.TerminalTTLDur())
+	}
+
+	configured, err := LoadConductor(writeConfig(t, header+`
+sandbox: { dead_ttl: 2h, boot: { kernel: /kernel, runtime: /runtime } }
+builder: { terminal_ttl: 3h }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.Sandbox.DeadTTLDur() != 2*time.Hour || configured.Builder.TerminalTTLDur() != 3*time.Hour {
+		t.Fatalf("configured terminal TTLs = sandbox %s, builder %s", configured.Sandbox.DeadTTLDur(), configured.Builder.TerminalTTLDur())
+	}
+
+	for name, extra := range map[string]string{
+		"zero sandbox":   "sandbox: { dead_ttl: 0s, boot: { kernel: /kernel, runtime: /runtime } }\n",
+		"bad sandbox":    "sandbox: { dead_ttl: forever, boot: { kernel: /kernel, runtime: /runtime } }\n",
+		"zero builder":   "sandbox: { boot: { kernel: /kernel, runtime: /runtime } }\nbuilder: { terminal_ttl: 0s }\n",
+		"negative build": "sandbox: { boot: { kernel: /kernel, runtime: /runtime } }\nbuilder: { terminal_ttl: -1h }\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadConductor(writeConfig(t, header+extra)); err == nil || !strings.Contains(err.Error(), "must be a positive duration") {
+				t.Fatalf("Load error = %v, want positive-duration rejection", err)
+			}
+		})
+	}
+}
 
 func TestResourceListenDefaultsScanManagedRunnerSlice(t *testing.T) {
 	var cfg ResourceListenConfig

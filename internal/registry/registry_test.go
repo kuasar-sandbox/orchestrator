@@ -3600,6 +3600,12 @@ func TestNodeLinkResumeTokenReturnedOnReconnect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBuildSyncBegin}); err != nil {
+			t.Fatal(err)
+		}
+		if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBuildSyncEnd}); err != nil {
+			t.Fatal(err)
+		}
 		if bookmark != "" {
 			if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeBookmark, RevToken: bookmark}); err != nil {
 				t.Fatal(err)

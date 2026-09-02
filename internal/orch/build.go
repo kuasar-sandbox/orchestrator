@@ -121,6 +121,8 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, err
 	}
+	unlockRetention := o.buildRetention.Lock(b.BuildID)
+	defer unlockRetention()
 	unlockEvent := o.lockExtensionBuildEvent(b.BuildID)
 	defer unlockExtensionEvent(unlockEvent)
 	registered, inserted, err := o.st.RegisterBuildWithMMDSRouteSecretValues(ctx, b, registrationLimit, routesDigest, secretValues)
@@ -283,6 +285,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return err
 	}
 	if committed {
+		o.publishBuildState(b.BuildID, string(types.BuildWaiting), "", "")
 		o.observeBuildUpsert(b)
 		return nil
 	}
@@ -565,9 +568,9 @@ func (o *Orchestrator) resolveTemplateAlias(ctx context.Context, apiKey, ref str
 	return ""
 }
 
-// templateBuild resolves a template ref (persist id, transient id, name, or alias)
-// to its build record within the tenant's templates, or nil if none matches. Used
-// to recover a template's declared config (builds.metadata_json) at create time.
+// templateBuild resolves a retention-bounded template ref (persist id,
+// transient id, name, or alias) to its ready Build row. It supports status-window
+// conveniences only; canonical Create never treats this row as template data.
 func (o *Orchestrator) templateBuild(ctx context.Context, apiKey, ref string) *types.Build {
 	builds, err := o.ListTemplates(ctx, apiKey)
 	if err != nil {

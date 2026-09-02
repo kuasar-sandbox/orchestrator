@@ -165,6 +165,18 @@ func (s *Stores) deleteRouteBuildShard(ctx context.Context, group, buildID strin
 	return shardDeleteIfFound(ctx, sh, clusterstate.RouteBuildRecordKey(buildID))
 }
 
+func (s *Stores) deleteRouteBuildShardIfRevision(ctx context.Context, group, buildID string, expectRev uint64) (bool, error) {
+	if group == "" || buildID == "" || expectRev == 0 {
+		return false, nil
+	}
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteBuild)
+	if err != nil {
+		return false, err
+	}
+	_, ok, err := sh.Delete(ctx, clusterstate.RouteBuildRecordKey(buildID), expectRev)
+	return ok, err
+}
+
 func (s *Stores) rangeRouteSandboxesShard(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
 	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {

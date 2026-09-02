@@ -286,7 +286,8 @@ func (s *Store) ExpireBuild(ctx context.Context, buildID string, from types.Buil
 		return false, fmt.Errorf("store: expire build %s metadata: %w", buildID, err)
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE builds SET status=?,reason=?,execution_claimed=0,
-		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',metadata_json=?
+		execution_claimed_unix=0,enforcement_status='',phase='',phase_sandbox_id='',metadata_json=?,
+		finished_unix=unixepoch()
 		WHERE build_id=? AND status=? AND execution_claimed=0`,
 		string(types.BuildError), reason, metadataJSON, buildID, string(from))
 	if err != nil {

@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -286,6 +287,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	// nodeChannel.mu; Hello goes out first while this is still the only writer.
 	resumeFrom := registered.ResumeToken
 	fullExpected := append([]clusterstate.NodeSandboxRef(nil), registered.Sandboxes...)
+	buildExpected := append([]clusterstate.NodeBuildRef(nil), registered.Builds...)
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
 		return nil
 	}
@@ -302,6 +304,9 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 
 	collectingFull := true
 	fullSeen := map[string]struct{}{}
+	buildCollecting := false
+	buildSynced := false
+	var buildSeen map[string]struct{}
 	for {
 		m, err := routesync.ReadMsg(body)
 		if err != nil {
@@ -327,17 +332,43 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 		case routesync.TypeCmdAck:
 			// Command receipt wakes the matching node-owner SendCommandAndWait.
 			r.ackCommand(m.Ack)
-		case routesync.TypeBuildEvent:
-			// Build state transition: converge the BuildStore (§7.5); a terminal
-			// state releases the build's reserved node resources. Persistence
-			// failure ends this unacknowledged stream so the node reconnects and
-			// replays its durable terminal rows without blocking unrelated frames.
-			if m.Build != nil {
-				if err := r.applyBuildEvent(ctx, nr.NodeID, m.Build); err != nil {
-					return fmt.Errorf("node-link: apply build event: %w", err)
-				}
+		case routesync.TypeBuildSyncBegin:
+			if buildCollecting || buildSynced {
+				return errors.New("node-link: invalid duplicate BuildSyncBegin")
 			}
+			buildCollecting = true
+			buildSeen = make(map[string]struct{})
+		case routesync.TypeBuildUpsert:
+			if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
+				return errors.New("node-link: BuildUpsert outside a valid Build sync")
+			}
+			if buildCollecting {
+				buildSeen[m.Build.BuildID] = struct{}{}
+			}
+			if err := r.applyBuildUpsert(ctx, nr.NodeID, m.Build); err != nil {
+				return fmt.Errorf("node-link: apply BuildUpsert: %w", err)
+			}
+		case routesync.TypeBuildDelete:
+			if (!buildCollecting && !buildSynced) || m.Build == nil || m.Build.BuildID == "" {
+				return errors.New("node-link: BuildDelete outside a valid Build sync")
+			}
+			if err := r.applyBuildDelete(ctx, nr.NodeID, m.Build.BuildID); err != nil {
+				return fmt.Errorf("node-link: apply BuildDelete: %w", err)
+			}
+		case routesync.TypeBuildSyncEnd:
+			if !buildCollecting || buildSynced {
+				return errors.New("node-link: invalid BuildSyncEnd")
+			}
+			if err := r.applyNodeBuildFullSnapshot(ctx, nr.NodeID, buildExpected, buildSeen); err != nil {
+				return fmt.Errorf("node-link: finish Build full sync: %w", err)
+			}
+			buildCollecting = false
+			buildSynced = true
+			buildSeen = nil
 		case routesync.TypeBookmark:
+			if !buildSynced {
+				return errors.New("node-link: Bookmark before Build full sync completed")
+			}
 			if collectingFull && m.FullSync {
 				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen)
 			}

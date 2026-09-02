@@ -2,9 +2,15 @@ package orch
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -38,5 +44,76 @@ func TestResolveTemplateAlias(t *testing.T) {
 	other := mintTestAPIKey(t, strings.Repeat("05", 32))
 	if got := o.resolveTemplateAlias(ctx, other, "my-app"); got != "" {
 		t.Errorf(`wrong tenant should be "", got %q`, got)
+	}
+}
+
+func TestCanonicalTemplateIDCreatesAllArtifactKindsAfterBuildRetention(t *testing.T) {
+	cfg := &config.Config{
+		Paths: config.PathsConfig{
+			RunRoot:  filepath.Join(t.TempDir(), "run"),
+			BaseRoot: filepath.Join(t.TempDir(), "base"),
+		},
+		Sandbox: config.SandboxConfig{DeadTTL: "1h"},
+		Builder: config.BuilderConfig{TerminalTTL: "1h"},
+	}
+	lc := &countingLauncher{}
+	o, lifecycleCtx := newAsyncConnectTestOrchestrator(t, cfg, lc)
+	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
+	o.vs = blocked
+	manifestKey := strings.Repeat("d", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, manifestKey)
+	if _, err := o.st.AddKeyPair(context.Background(), store.KeyPair{APISecret: apiSecret, ManifestKey: manifestKey}, "retention", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	for index, kind := range []types.Kind{types.KindImg, types.KindSbx, types.KindSnp} {
+		canonical := types.TemplateID{
+			Profile: types.ProfileBare,
+			Kind:    kind,
+			Ref:     "manifest://" + strings.Repeat(string(rune('a'+index)), 64),
+		}.String()
+		build := &types.Build{
+			BuildID:    "canonical-after-retention-" + string(rune('a'+index)),
+			TemplateID: "transient-retention-" + string(rune('a'+index)), PersistID: canonical,
+			APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileBare, Kind: kind,
+			Status: types.BuildReady, Names: []string{canonical}, Aliases: []string{canonical},
+			Metadata:    map[string]string{sandboxcfg.NsNetwork: `{"hostname":"must-not-be-inherited"}`},
+			CreatedUnix: 1, FinishedUnix: time.Now().Add(-2 * time.Hour).Unix(),
+		}
+		if err := o.st.PutBuild(context.Background(), build); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.reapTerminalHistory(context.Background(), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if retained, err := o.st.GetBuild(context.Background(), build.BuildID); err != nil || retained != nil {
+			t.Fatalf("%s Build retained after TTL: %+v, %v", kind, retained, err)
+		}
+
+		created, err := o.Create(lifecycleCtx, api.CreateReq{
+			APIKey: apiKey, TemplateID: canonical, TimeoutSec: 60,
+			Metadata: map[string]string{"request-metadata": "kept"},
+		})
+		if err != nil || created == nil {
+			t.Fatalf("Create %s canonical TemplateID after Build deletion = %+v, %v", kind, created, err)
+		}
+		wantMode, err := types.LaunchModeForTemplate(kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created.TemplateID != canonical || created.LaunchMode != wantMode || created.Metadata["request-metadata"] != "kept" {
+			t.Fatalf("Create %s result = %+v", kind, created)
+		}
+		if _, inherited := created.Metadata[sandboxcfg.NsNetwork]; inherited {
+			t.Fatalf("Create %s implicitly recovered IMG/Build metadata: %+v", kind, created.Metadata)
+		}
+	}
+
+	// Release all asynchronous Create workers before the Store test cleanup.
+	close(blocked.gate)
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+	if err := o.DrainLaunches(drainCtx); err != nil {
+		t.Fatal(err)
 	}
 }

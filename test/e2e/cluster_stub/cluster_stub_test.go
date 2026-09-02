@@ -56,13 +56,15 @@ type harness struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reg      *registry.Registry
-	links    *httptest.Server
-	router   *httptest.Server
-	node     *nodeStub
-	apiKey   string
-	apiHits  chan string
-	dataHits chan string
+	reg              *registry.Registry
+	links            *httptest.Server
+	router           *httptest.Server
+	node             *nodeStub
+	apiKey           string
+	apiHits          chan string
+	dataHits         chan string
+	apiNodeEndpoint  string
+	dataNodeEndpoint string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -173,12 +175,14 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		ctx: ctx, cancel: cancel, reg: reg, links: links, router: routerSrv,
 		node: node, apiKey: apiKey, apiHits: apiHits, dataHits: dataHits,
+		apiNodeEndpoint:  strings.TrimPrefix(apiHTTP.URL, "http://"),
+		dataNodeEndpoint: strings.TrimPrefix(dataHTTP.URL, "http://"),
 	}
 	t.Cleanup(func() {
 		cancel()
 		_ = observer.Shutdown()
 		_ = placerGroup.Shutdown()
-		node.close()
+		h.node.close()
 		placerSrv.Close()
 		routerSrv.Close()
 		links.Close()
@@ -497,6 +501,52 @@ func TestClusterStubBuildRegister(t *testing.T) {
 	}
 }
 
+func TestClusterStubBuildReconnectFullSyncRepairsLostDelete(t *testing.T) {
+	h := newHarness(t)
+	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/v3/templates", strings.NewReader(`{"name":"ttl-reconnect","profile":"bare","cpuCount":1,"memoryMB":1024}`))
+	req.Host = "api." + testDomain
+	req.Header.Set(router.HeaderGroup, testGroup)
+	req.Header.Set(router.HeaderAPIKey, h.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("build register status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	cmd := h.node.waitCommand(t, routesync.CmdBuildRegister)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if resolved, found := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID); found && resolved.BuildID == cmd.BuildID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Build %s projection did not become visible", cmd.BuildID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Model a node-side TTL delete whose live BuildDelete was lost with the
+	// connection. The replacement session's empty Build snapshot is authoritative.
+	h.node.close()
+	h.node = startNodeStub(t, h.ctx, h.links.URL, h.apiNodeEndpoint, h.dataNodeEndpoint)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		_, found := h.reg.ResolveBuild(h.ctx, testGroup, cmd.BuildID)
+		_, refFound, refErr := h.reg.Stores().GetNodeBuildRef(h.ctx, "n1", cmd.BuildID)
+		if !found && !refFound && refErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lost BuildDelete did not converge after reconnect: projection=%v ref=%v ref_err=%v", found, refFound, refErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestClusterStubUnownedReportDoesNotDeleteNodeSandbox(t *testing.T) {
 	h := newHarness(t)
 
@@ -580,6 +630,8 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, d
 	if hello.Type != routesync.TypeHello {
 		t.Fatalf("node-link first response=%+v, want hello", hello)
 	}
+	stub.write(t, &routesync.Msg{Type: routesync.TypeBuildSyncBegin})
+	stub.write(t, &routesync.Msg{Type: routesync.TypeBuildSyncEnd})
 	go stub.readLoop()
 	return stub
 }
@@ -606,8 +658,8 @@ func (n *nodeStub) readLoop() {
 		case routesync.CmdCreate, routesync.CmdConnect:
 			n.sendRoute(n.t, routeForCommand(n.t, &cmd))
 		case routesync.CmdBuildRegister:
-			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildEvent, Build: &routesync.BuildEvent{
-				BuildID: cmd.BuildID, State: string(registry.BuildBuilding),
+			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildUpsert, Build: &routesync.BuildEvent{
+				Kind: routesync.BuildUpsert, BuildID: cmd.BuildID, State: string(registry.BuildBuilding),
 			}})
 		}
 	}

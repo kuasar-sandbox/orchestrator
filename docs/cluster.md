@@ -593,7 +593,8 @@ node_link 维护以下 recordSet:
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`key_pair`
 recordSet。sandbox/build 表由 cluster 在任务下发前写入。build 终态只释放容量,归属记录保留到对应
-build record 删除;key_pair 由 selector patch 更新。
+node terminal retention 删除 Build row 并发送 `BuildDelete`；Registry 随后 exact-delete 对应
+Build projection 与 owner ref。key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
 build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
 
@@ -604,10 +605,10 @@ record,保持稳定 `sandbox_id`,消费下一个 `sandbox_generation` 并生成�
 
 node_link 流按事件重要性处理:
 
-- `upsert/delete` route event、`cmd_ack` 和 build event 是收敛关键事件,必须在读循环中立即处理。
+- `upsert/delete` route event、`cmd_ack` 和 `BuildUpsert/BuildDelete` 是收敛关键事件,必须在读循环中立即处理。
 - heartbeat 是最新值语义。registry 读循环只把最新 heartbeat 投递给每 node 一个异步合并 updater;updater 慢时
   旧 heartbeat 可被覆盖。
-- node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
+- node 侧发送也分优先级:command ack 与 Build delta 先进 high-priority outbox;heartbeat 只保留最新一条。
 - `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
 
 这样 Reserve 的 READY route report 不会被心跳持久化阻塞。node-local `starting` upsert
@@ -653,6 +654,15 @@ fingerprint 匹配且 changelog 可用时 replay 增量;否则全量 resync。no
 基线中未按 node_sandbox_id 出现的条目;清理前再次读取并确认当前完整稳定/节点代际归属
 仍等于基线,从而保护
 同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token,不做缺失清理。
+
+Build projection 不使用 route replay window。每个 node-link session 都要求
+`BuildSyncBegin → BuildUpsert* → BuildSyncEnd`，其中 snapshot 包含节点 SQLite 仍保留的全部 cluster
+Build（registered/waiting/building 以及 retention 内 ready/error）；节点在 range 前先订阅 live delta，
+所以同步期间的 Upsert/Delete 排在 End 后且不会丢失。nodelink owner 同样只清理连接建立前捕获、
+End 时仍保持 exact `(NodeID, BuildID)` binding、且本轮未出现的 post-registration 基线 ref；
+Registry-owned `BuildStarting` ambiguous dispatch intent 不属于节点 projection，空 snapshot 不能删除。
+这样 live Delete 丢失可由重连修复，而同步期间新注册/换绑不会被旧 snapshot 删除。缺 Begin/End、重复 bracket 或 Bookmark
+先于 End 都 fail closed；Registry 不运行独立 Build terminal TTL。
 
 ## 7. node_list
 
@@ -1061,7 +1071,10 @@ route_link build record CAS
 node_link build_register command
   │
   ▼
-node build_event releases/adapts state
+node BuildUpsert projects state
+  │ terminal retention expires after node cleanup
+  ▼
+node BuildDelete removes projection/ref
 ```
 
 `ReserveBuild` 返回当前 node 的 `APIEndpoint`;Router 的 build status/trigger/files/log 等后续
@@ -1074,8 +1087,15 @@ BuildSpec;缺失或非法值直接拒绝,不得静默改写。bare build 只允�
 start/ready 命令。
 
 node owner 的 admission 以 `(node_id,build_id)` 记账;同一 build_id 出现在不同 node 时互不影响。若资源
-余量不足则直接拒绝,route owner 重新调度。build event 只携带 build_id,nodelink owner 查本节点归属表
-得到 group;终态调用 `ReleaseBuild(node_id,build_id)`。北向查询和 router cache 始终带 group。
+余量不足则直接拒绝,route owner 重新调度。BuildUpsert/Delete 只携带 node-local Build 投影，nodelink
+owner 以 immutable `(node_id,build_id)` ref 查得 group；终态 Upsert 调用
+`ReleaseBuild(node_id,build_id)`，节点 TTL 的 Delete 再删除 exact projection/ref。北向查询和 router
+cache 始终带 group。
+
+ready/error status、临时 TemplateID、name/alias 与本机/Registry Build list 只在节点
+`builder.terminal_ttl` retention window 内可用。canonical TemplateID 自编码 profile、kind 与 portable
+artifact ref，Build row 删除后仍可长期用于 img/sbx/snp Create；Create 不从旧 Build projection 或
+metadata 恢复 IMG 配置。Registry 不另设 timer，也不延长节点定义的窗口。
 
 ## 13. 状态所有权与灾备边界
 
@@ -1136,7 +1156,7 @@ node,但不启动 microVM.每个进程使用彼此不同的 admin,API 和 Data l
 - 注册 node、心跳、drain、水位和 build 预算。
 - 接收 `key_put/key_drop/create/connect/exec_session/delete/build_register` 命令并返回 ack.
 - 按 sandbox 行为配置发布 READY/dead route event。
-- 发布 build event。
+- 发布 Build full snapshot、BuildUpsert 与 BuildDelete；可在重连时用空 snapshot 收敛丢失的 Delete。
 - admin listener 只提供 node-stub-ctl 管理查询;API listener 只模拟 conductor control API;
   Data listener 只模拟 ordinary data,CONNECT 与 exec.
 - 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
@@ -1146,7 +1166,7 @@ node,但不启动 microVM.每个进程使用彼此不同的 admin,API 和 Data l
 import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、SandboxID 与 NodeSandboxID
 转换,control/build 命中 API listener,data/exec 命中 Data listener,ExecSession Reserve/CmdExecSession 签发,
 `service=exec` KAT 拒绝/双层校验与第二跳 buffered tunnel,route cache,BuildRegister,
-孤儿 route 清理和节点清空收敛.
+孤儿 route 清理、Build Delete 丢失后的 reconnect full-sync 收敛和节点清空收敛.
 
 ## 17. See Also
 

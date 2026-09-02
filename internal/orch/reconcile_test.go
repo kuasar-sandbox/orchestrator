@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -953,7 +954,7 @@ func TestReconcileTreatsAlreadyDetachedBuildPortAsCompletedCleanup(t *testing.T)
 	}
 }
 
-func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
+func TestRangeClusterBuildsAfterReconcileExceedsSubscriberBuffer(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -966,7 +967,7 @@ func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
 
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	total := cap(o.buildEvents) + 5
+	const total = 300
 	for i := 0; i < total; i++ {
 		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
 		build.BuildID = fmt.Sprintf("00000000-0000-7000-8000-%012d", i)
@@ -983,38 +984,22 @@ func TestReplayClusterBuildTerminalStatesExceedsEventBuffer(t *testing.T) {
 	if err := o.ReconcileBuilds(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(o.buildEvents); got != cap(o.buildEvents) {
-		t.Fatalf("recovery did not exercise the bounded event channel: len=%d cap=%d", got, cap(o.buildEvents))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
 	seen := make(map[string]bool, total)
-	doneCh := (<-chan error)(done)
-	for len(seen) < total || doneCh != nil {
-		select {
-		case event := <-o.buildEvents:
-			if event.State != string(types.BuildError) || event.Reason != "build unit was not live after controller restart" {
-				t.Fatalf("replayed terminal event = %+v", event)
-			}
-			seen[event.BuildID] = true
-		case err := <-doneCh:
-			if err != nil {
-				t.Fatal(err)
-			}
-			doneCh = nil
-		case <-ctx.Done():
-			t.Fatalf("terminal replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+	if err := o.RangeBuilds(context.Background(), func(event routesync.BuildEvent) error {
+		if event.Kind != routesync.BuildUpsert || event.State != string(types.BuildError) || event.Reason != "build unit was not live after controller restart" {
+			t.Fatalf("full-sync terminal event = %+v", event)
 		}
+		seen[event.BuildID] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if len(seen) != total {
-		t.Fatalf("terminal replay delivered %d/%d unique builds", len(seen), total)
+		t.Fatalf("Build full sync delivered %d/%d unique builds", len(seen), total)
 	}
 }
 
-func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
+func TestRangeClusterBuildsAfterAcceptedResultReconcileExceedsSubscriberBuffer(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("8", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -1027,7 +1012,7 @@ func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
 
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	total := cap(o.buildEvents) + 5
+	const total = 300
 	result := configsock.BuildResult{ImageRef: "manifest://" + strings.Repeat("a", 64)}
 	wantTemplateID := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: result.ImageRef}.String()
 	for i := 0; i < total; i++ {
@@ -1050,9 +1035,6 @@ func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
 	if err := o.ReconcileBuilds(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(o.buildEvents); got != cap(o.buildEvents) {
-		t.Fatalf("accepted-result recovery did not fill the bounded channel: len=%d cap=%d", got, cap(o.buildEvents))
-	}
 	ready, err := st.BuildsByStatus(context.Background(), types.BuildReady)
 	if err != nil {
 		t.Fatal(err)
@@ -1066,27 +1048,18 @@ func TestReconcileAcceptedResultsExceedsEventBuffer(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- o.ReplayClusterBuildTerminalStates(ctx) }()
 	seen := make(map[string]bool, total)
-	doneCh := (<-chan error)(done)
-	for len(seen) < total || doneCh != nil {
-		select {
-		case event := <-o.buildEvents:
-			if event.State != string(types.BuildReady) || event.TemplateID != wantTemplateID || event.Reason != "" {
-				t.Fatalf("replayed accepted-result event = %+v", event)
-			}
-			seen[event.BuildID] = true
-		case err := <-doneCh:
-			if err != nil {
-				t.Fatal(err)
-			}
-			doneCh = nil
-		case <-ctx.Done():
-			t.Fatalf("accepted-result replay timed out after %d/%d unique builds: %v", len(seen), total, ctx.Err())
+	if err := o.RangeBuilds(context.Background(), func(event routesync.BuildEvent) error {
+		if event.Kind != routesync.BuildUpsert || event.State != string(types.BuildReady) || event.TemplateID != wantTemplateID || event.Reason != "" {
+			t.Fatalf("full-sync accepted-result event = %+v", event)
 		}
+		seen[event.BuildID] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != total {
+		t.Fatalf("Build full sync delivered %d/%d accepted results", len(seen), total)
 	}
 }
 

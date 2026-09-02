@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   forward_access_token_enc TEXT NOT NULL,
   metadata_json        TEXT NOT NULL DEFAULT '{}',
   env_json             TEXT NOT NULL DEFAULT '{}',
-  created_unix         INTEGER NOT NULL
+  created_unix         INTEGER NOT NULL,
+  dead_unix            INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_ashash ON sandboxes(api_secret_hash);
@@ -116,7 +117,8 @@ CREATE TABLE IF NOT EXISTS builds (
   runtime_port_mac TEXT NOT NULL DEFAULT '',
   runtime_envd_access_token_enc TEXT NOT NULL DEFAULT '',
   runtime_prepare_json TEXT NOT NULL DEFAULT '',
-  execution_result_json TEXT NOT NULL DEFAULT ''
+  execution_result_json TEXT NOT NULL DEFAULT '',
+  finished_unix INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_ashash ON builds(api_secret_hash);
@@ -174,6 +176,28 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if err := ensureColumn(ctx, db, "builds", "registration_request_digest", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "dead_unix", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(ctx, db, "builds", "finished_unix", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Existing terminal history receives a fresh retention window on the one-way
+	// additive schema upgrade. New terminal transitions set these timestamps in
+	// the same UPDATE that publishes the terminal state.
+	for _, statement := range []string{
+		`UPDATE sandboxes SET dead_unix=unixepoch() WHERE state='dead' AND dead_unix=0`,
+		`UPDATE builds SET finished_unix=unixepoch() WHERE status IN ('ready','error') AND finished_unix=0`,
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_dead_retention ON sandboxes(state,dead_unix)`,
+		`CREATE INDEX IF NOT EXISTS idx_builds_terminal_retention ON builds(status,finished_unix)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: initialize terminal retention: %w", err)
+		}
 	}
 	return &Store{db: db, box: box}, nil
 }
@@ -347,8 +371,8 @@ const sandboxInsertSQL = `
 	INSERT INTO sandboxes (id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
 	  floatingip,vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
 	  resume_source_kind,resume_source_ref,auto_pause_memory,launch_mode,
-	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const sandboxUpsertSQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO UPDATE SET
@@ -358,7 +382,8 @@ ON CONFLICT(id) DO UPDATE SET
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
   resume_source_kind=excluded.resume_source_kind, resume_source_ref=excluded.resume_source_ref,
   auto_pause_memory=excluded.auto_pause_memory, launch_mode=excluded.launch_mode,
-  metadata_json=excluded.metadata_json, env_json=excluded.env_json`
+  metadata_json=excluded.metadata_json, env_json=excluded.env_json,
+  dead_unix=excluded.dead_unix`
 
 const sandboxInsertOnlySQL = sandboxInsertSQL + `
 ON CONFLICT(id) DO NOTHING`
@@ -369,6 +394,9 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 	}
 	if !types.ValidLocalSandboxID(sb.ID) {
 		return nil, errors.New("invalid sandbox id")
+	}
+	if sb.State == types.StateDead && sb.DeadUnix == 0 {
+		sb.DeadUnix = time.Now().Unix()
 	}
 	if err := validateSandboxLifecycle(sb); err != nil {
 		return nil, err
@@ -410,7 +438,7 @@ func (s *Store) prepareSandboxInsert(sb *types.Sandbox) ([]any, error) {
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, apiHash, apiEnc, manifestHash, manifestEnc,
 		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.AutoPauseMemory, string(sb.LaunchMode),
 		serviceSecretEnc, envdAccessTokenEnc, trafficAccessTokenEnc, forwardAccessTokenEnc,
-		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix,
+		mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix, sb.DeadUnix,
 	}, nil
 }
 
@@ -455,6 +483,9 @@ func validateSandboxLifecycle(sb *types.Sandbox) error {
 			return fmt.Errorf("%s sandbox must not have a launch mode", sb.State)
 		}
 	case types.StateDead:
+		if sb.DeadUnix <= 0 {
+			return errors.New("dead sandbox requires a terminal timestamp")
+		}
 		if sb.LaunchMode != "" {
 			return errors.New("dead sandbox must not have a launch mode")
 		}
@@ -464,6 +495,9 @@ func validateSandboxLifecycle(sb *types.Sandbox) error {
 		}
 	default:
 		return fmt.Errorf("invalid sandbox state %q", sb.State)
+	}
+	if sb.State != types.StateDead && sb.DeadUnix != 0 {
+		return fmt.Errorf("%s sandbox must not have a terminal timestamp", sb.State)
 	}
 	return nil
 }
@@ -818,7 +852,8 @@ func (s *Store) CommitSandboxDead(ctx context.Context, sb *types.Sandbox) (bool,
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE sandboxes
 		   SET state=?, launch_mode='', run_id='', floatingip='', vswitch_port='', inner_ip='', port_mac='',
-		       run_dir='', base_dir='', envd_uds='', ci_uds='', resume_source_kind='', resume_source_ref=''
+		       run_dir='', base_dir='', envd_uds='', ci_uds='', resume_source_kind='', resume_source_ref='',
+		       dead_unix=unixepoch()
 		 WHERE id=? AND state=? AND launch_mode=?
 		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
 		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
@@ -862,7 +897,7 @@ func (s *Store) RollbackStartingPaused(ctx context.Context, sb *types.Sandbox) (
 var cols = `id,profile,cluster_group,cluster_route_key,stable_id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,
   resume_source_kind,resume_source_ref,auto_pause_memory,launch_mode,
-  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix`
+  service_secret_enc,envd_access_token_enc,traffic_access_token_enc,forward_access_token_enc,metadata_json,env_json,created_unix,dead_unix`
 
 func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error) {
 	var sb types.Sandbox
@@ -876,7 +911,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 		&apiHash, &apiEnc, &manifestHash, &manifestEnc,
 		&resumeSourceKind, &sb.ResumeSource.Ref, &autoPauseMemory, &launchMode,
 		&serviceSecretEnc, &envdAccessTokenEnc, &trafficAccessTokenEnc, &forwardAccessTokenEnc,
-		&meta, &env, &sb.CreatedUnix); err != nil {
+		&meta, &env, &sb.CreatedUnix, &sb.DeadUnix); err != nil {
 		return nil, err
 	}
 	pair, err := s.decryptVerifiedKeyPair(apiHash, apiEnc, manifestHash, manifestEnc)
@@ -1182,7 +1217,7 @@ var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
   resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json`
+  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
@@ -1194,7 +1229,7 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.RegistrationRequestDigest, &b.ClusterGroup,
 		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
-		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON); err != nil {
+		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON, &b.FinishedUnix); err != nil {
 		return nil, err
 	}
 	b.ExecutionClaimed = executionClaimed != 0
@@ -1244,8 +1279,8 @@ const buildInsertSQL = `
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
 	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
-	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 const buildUpsertSQL = buildInsertSQL + `
 	ON CONFLICT(build_id) DO UPDATE SET
@@ -1269,13 +1304,21 @@ const buildUpsertSQL = buildInsertSQL + `
 	  runtime_port_mac=excluded.runtime_port_mac,
 	  runtime_envd_access_token_enc=excluded.runtime_envd_access_token_enc,
 	  runtime_prepare_json=excluded.runtime_prepare_json,
-	  execution_result_json=excluded.execution_result_json`
+	  execution_result_json=excluded.execution_result_json,
+	  finished_unix=excluded.finished_unix`
 
 const buildInsertOnlySQL = buildInsertSQL + ` ON CONFLICT(build_id) DO NOTHING`
 
 func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 	if b == nil || b.BuildID == "" {
 		return nil, errors.New("build is required")
+	}
+	terminal := b.Status == types.BuildReady || b.Status == types.BuildError
+	if terminal && b.FinishedUnix == 0 {
+		b.FinishedUnix = time.Now().Unix()
+	}
+	if !terminal && b.FinishedUnix != 0 {
+		return nil, fmt.Errorf("store: put build %s: nonterminal state %s has a terminal timestamp", b.BuildID, b.Status)
 	}
 	apiHash, apiEnc, err := s.encSecret("API secret", b.APISecret)
 	if err != nil {
@@ -1328,7 +1371,7 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
-		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON,
+		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON, b.FinishedUnix,
 	}, nil
 }
 
@@ -1441,6 +1484,34 @@ func (s *Store) RangeBuilds(ctx context.Context, fn func(*types.Build) error) er
 	return nil
 }
 
+// RangeClusterBuilds streams every still-retained cluster-owned Build,
+// including ready/error history. It is the node SQLite source for reconnect
+// Build full sync; callers must remain read-only until the cursor closes.
+func (s *Store) RangeClusterBuilds(ctx context.Context, fn func(*types.Build) error) error {
+	if fn == nil {
+		return errors.New("store: range cluster builds callback is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds
+		WHERE cluster_group<>'' ORDER BY build_id ASC`)
+	if err != nil {
+		return fmt.Errorf("store: range cluster builds: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		build, err := s.scanBuild(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(build); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: range cluster builds: %w", err)
+	}
+	return nil
+}
+
 // GetClaimedBuildIDByRunID resolves an already-published builder assignment from
 // durable execution ownership. It is the idempotent replay path when the
 // config-socket response was interrupted after BindBuildRun committed.
@@ -1545,6 +1616,9 @@ func (s *Store) SetBuildRunID(ctx context.Context, buildID, runID string) error 
 // CASBuildStatus atomically moves a build from one status to another, returning
 // whether it won the transition (lets multiple pool workers race for a build).
 func (s *Store) CASBuildStatus(ctx context.Context, buildID string, from, to types.BuildState) (bool, error) {
+	if to == types.BuildReady || to == types.BuildError {
+		return false, fmt.Errorf("store: CASBuildStatus cannot enter terminal state %q; use a typed terminal transition", to)
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET status=? WHERE build_id=? AND status=?`,
 		string(to), buildID, string(from))
 	if err != nil {

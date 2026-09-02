@@ -409,11 +409,17 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 	}
 }
 
-// applyBuildEvent converges the registry's routing view from a node's build event.
-// Admission usage remains node-owned and comes from the node's durable heartbeat.
-func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routesync.BuildEvent) error {
+// applyBuildUpsert converges the Registry's rebuildable routing/query projection
+// from one retained node Build. Admission usage remains node-owned and comes
+// from the node's durable heartbeat.
+func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *routesync.BuildEvent) error {
 	if e == nil || e.BuildID == "" {
 		return nil
+	}
+	switch BuildState(e.State) {
+	case BuildRegistered, BuildWaiting, BuildBuilding, BuildReady, BuildError:
+	default:
+		return fmt.Errorf("invalid build %s projection state %q", e.BuildID, e.State)
 	}
 	ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, e.BuildID)
 	if err != nil {
@@ -449,6 +455,79 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 	}
 	if writeErr != nil {
 		return fmt.Errorf("persist build %s state %s: %w", rec.BuildID, rec.State, writeErr)
+	}
+	return nil
+}
+
+// applyBuildDelete removes only the projection bound to this exact node. The
+// node's SQLite deletion is the lifecycle decision; Registry has no terminal
+// timer of its own.
+func (r *Registry) applyBuildDelete(ctx context.Context, nodeID, buildID string) error {
+	if nodeID == "" || buildID == "" {
+		return nil
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, buildID)
+		if err != nil {
+			return fmt.Errorf("lookup build delete owner: %w", err)
+		}
+		if !found {
+			return nil
+		}
+		record, revision, recordFound, err := r.stores.getRouteBuildShard(ctx, ref.Group, buildID)
+		if err != nil {
+			return fmt.Errorf("read build delete projection: %w", err)
+		}
+		if recordFound && record.NodeID == nodeID {
+			// BuildStarting is the Registry's immutable pre-accept dispatch
+			// intent, not a projection of a node row. An empty reconnect snapshot
+			// cannot prove that an ambiguously delivered registration had no side
+			// effect, so only a definitive command result may remove this binding.
+			if record.State == BuildStarting {
+				return nil
+			}
+			deleted, err := r.stores.deleteRouteBuildShardIfRevision(ctx, ref.Group, buildID, revision)
+			if err != nil {
+				return fmt.Errorf("delete build %s projection: %w", buildID, err)
+			}
+			if !deleted {
+				continue
+			}
+		}
+		if err := r.stores.RemoveNodeBuildRef(ctx, nodeID, buildID); err != nil {
+			return fmt.Errorf("remove build %s owner ref: %w", buildID, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("delete build %s projection conflicted", buildID)
+}
+
+// applyNodeBuildFullSnapshot prunes only post-registration projection refs
+// present in the reconnect baseline. A Build registration added after
+// NodeRegister is therefore never mistaken for a missing snapshot row, while
+// applyBuildDelete preserves an ambiguous BuildStarting dispatch intent.
+// Re-reading the exact ref also fences replacement.
+func (r *Registry) applyNodeBuildFullSnapshot(ctx context.Context, nodeID string, expected []clusterstate.NodeBuildRef, seen map[string]struct{}) error {
+	if nodeID == "" {
+		return nil
+	}
+	for _, baseline := range expected {
+		if baseline.Group == "" || baseline.BuildID == "" {
+			continue
+		}
+		if _, ok := seen[baseline.BuildID]; ok {
+			continue
+		}
+		current, found, err := r.lookupNodeBuildRef(ctx, nodeID, baseline.BuildID)
+		if err != nil {
+			return err
+		}
+		if !found || current != baseline {
+			continue
+		}
+		if err := r.applyBuildDelete(ctx, nodeID, baseline.BuildID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

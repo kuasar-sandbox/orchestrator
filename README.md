@@ -84,6 +84,18 @@ canonical RunDir/UDS，BaseDir/checkpoint 始终保留。非删除终态 `dead` 
 BaseDir 或 artifact owner。Build 同样只在 exact unit/cgroup、network 与两个派生目录均清理后
 释放 execution claim；phase 子进程自清理不承担最终正确性。
 
+cleanup 完成后的 `dead` Sandbox 与 `ready/error` Build 分别写入原子终态时间，默认保留
+24 小时（`sandbox.dead_ttl`、`builder.terminal_ttl`），随后由 conductor 每轮最多 128 条地
+删除；任何 runtime、network、path、artifact、result 或 execution claim ownership 都会阻止
+删除，且不会自动 `VACUUM`。canonical、self-encoded TemplateID 与其 portable artifact 是长期
+launch authority；Build status、transient TemplateID、name/alias 和本机 list 只在 Build row
+保留期内可用，canonical TemplateID Create 不读取旧 Build metadata。
+
+当前保留的 Registry Build projection 由 node SQLite 派生：live `BuildUpsert/BuildDelete` 与每次
+重连的 `BuildSyncBegin`/完整保留集/`BuildSyncEnd` 共同收敛丢失的 Delete。Registry 不运行独立
+Build terminal TTL，并始终按 immutable registered-node binding 更新或删除 projection；这不为
+#46 未来删除 post-registration projection 预留双路径。
+
 ## 组成
 
 | 路径 | 角色 |

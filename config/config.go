@@ -379,10 +379,16 @@ func (u UnitsConfig) PoolWaitDuration() time.Duration {
 // SandboxConfig is the sandbox-instance defaults, sub-grouped for clarity.
 type SandboxConfig struct {
 	TimeoutSec int             `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
+	DeadTTL    string          `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
 	Capacity   int             `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
 	Resources  ResourcesConfig `yaml:"resources" json:"resources"`     // capacity + resource control
 	Network    NetworkConfig   `yaml:"network" json:"network"`         // vswitch + inner IP
 	Boot       BootConfig      `yaml:"boot" json:"boot"`               // boot artifacts (kernel / guest runtime / overlay)
+}
+
+func (s SandboxConfig) DeadTTLDur() time.Duration {
+	d, _ := time.ParseDuration(s.DeadTTL)
+	return d
 }
 
 // ResourcesConfig is the conductor-owned sandbox resource policy. It is a
@@ -566,6 +572,7 @@ type BuilderConfig struct {
 	Admission        BuilderAdmissionConfig `yaml:"admission" json:"admission"`
 	RegistrationTTL  string                 `yaml:"registration_ttl" json:"registration_ttl"`   // default 1h
 	QueueTTL         string                 `yaml:"queue_ttl" json:"queue_ttl"`                 // default 30m
+	TerminalTTL      string                 `yaml:"terminal_ttl" json:"terminal_ttl"`           // ready/error history retention; default 24h
 	InsecureRegistry bool                   `yaml:"insecure_registry" json:"insecure_registry"` // pull base images over plain HTTP (dev/local registry)
 	Platform         string                 `yaml:"platform" json:"platform"`                   // e.g. "linux/amd64"; "" = host default
 	// ImageURIMask is the image the e2b CLI pushes its client-built rootfs to,
@@ -740,6 +747,11 @@ func (b BuilderConfig) RegistrationTTLDur() time.Duration {
 
 func (b BuilderConfig) QueueTTLDur() time.Duration {
 	d, _ := time.ParseDuration(b.QueueTTL)
+	return d
+}
+
+func (b BuilderConfig) TerminalTTLDur() time.Duration {
+	d, _ := time.ParseDuration(b.TerminalTTL)
 	return d
 }
 
@@ -954,6 +966,7 @@ func (c *Conductor) applyDefaults() {
 	if c.Sandbox.TimeoutSec == 0 {
 		c.Sandbox.TimeoutSec = 300
 	}
+	def(&c.Sandbox.DeadTTL, "24h")
 	c.Sandbox.Resources.applyDefaults()
 	def(&c.Sandbox.Network.Switch, "sw0")
 	def(&c.Sandbox.Network.Hostname, "sandbox")
@@ -973,6 +986,7 @@ func (c *Conductor) applyDefaults() {
 	}
 	def(&c.Builder.RegistrationTTL, "1h")
 	def(&c.Builder.QueueTTL, "30m")
+	def(&c.Builder.TerminalTTL, "24h")
 	if c.Builder.PullTimeoutSec <= 0 {
 		c.Builder.PullTimeoutSec = 600
 	}
@@ -1107,8 +1121,10 @@ func (c *Conductor) validateDeclarative() error {
 		}
 	}
 	for name, raw := range map[string]string{
+		"sandbox.dead_ttl":         c.Sandbox.DeadTTL,
 		"builder.registration_ttl": c.Builder.RegistrationTTL,
 		"builder.queue_ttl":        c.Builder.QueueTTL,
+		"builder.terminal_ttl":     c.Builder.TerminalTTL,
 	} {
 		duration, err := time.ParseDuration(raw)
 		if err != nil || duration <= 0 {
