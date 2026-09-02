@@ -61,6 +61,7 @@ type harness struct {
 	router   *httptest.Server
 	node     *nodeStub
 	apiKey   string
+	apiHits  chan string
 	dataHits chan string
 }
 
@@ -137,12 +138,24 @@ func newHarness(t *testing.T) *harness {
 	go svc.RegisterLoop(ctx, "s1", placerSrv.URL, "placer.default")
 
 	dataHits := make(chan string, 16)
-	nodeHTTP := newClusterDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dataHTTP := newClusterDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dataHits <- r.Host
 		w.WriteHeader(http.StatusNoContent)
 	}))
+	apiHits := make(chan string, 16)
+	apiHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiHits <- r.Method + " " + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		sid := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
+		_ = json.NewEncoder(w).Encode(map[string]string{"sandboxID": sid})
+	}))
+	t.Cleanup(apiHTTP.Close)
 
-	node := startNodeStub(t, ctx, links.URL, strings.TrimPrefix(nodeHTTP.URL, "http://"))
+	node := startNodeStub(
+		t, ctx, links.URL,
+		strings.TrimPrefix(apiHTTP.URL, "http://"),
+		strings.TrimPrefix(dataHTTP.URL, "http://"),
+	)
 	waitForPlacement(t, ctx, httpPlacer, links.URL)
 	rt := router.New(linkAddr, testDomain, time.Minute, nil, log)
 	rt.SetDataPlaneAuth("off")
@@ -159,7 +172,7 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{
 		ctx: ctx, cancel: cancel, reg: reg, links: links, router: routerSrv,
-		node: node, apiKey: apiKey, dataHits: dataHits,
+		node: node, apiKey: apiKey, apiHits: apiHits, dataHits: dataHits,
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -385,6 +398,28 @@ func TestClusterStubCreateAndDataPlane(t *testing.T) {
 		t.Fatalf("resolved route did not preserve explicit node-reported credentials: found=%v err=%v", found, err)
 	}
 
+	controlReq, _ := http.NewRequest(http.MethodGet, h.router.URL+"/sandboxes/"+created.SandboxID, nil)
+	controlReq.Host = "api." + testDomain
+	controlReq.Header.Set(router.HeaderGroup, testGroup)
+	controlReq.Header.Set(router.HeaderRouteKey, routeKey)
+	controlReq.Header.Set(router.HeaderAPIKey, h.apiKey)
+	controlResp, err := http.DefaultClient.Do(controlReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlResp.Body.Close()
+	if controlResp.StatusCode != http.StatusOK {
+		t.Fatalf("sandbox control status=%d, want 200", controlResp.StatusCode)
+	}
+	select {
+	case hit := <-h.apiHits:
+		if hit != "GET /sandboxes/"+create.SID {
+			t.Fatalf("node API hit=%q, want rewritten node sandbox ID", hit)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("router never forwarded sandbox control to node API endpoint")
+	}
+
 	resp = h.doDataBySID(t, created.SandboxID, routeKey, created.EnvdAccessToken)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
@@ -496,7 +531,7 @@ type nodeStub struct {
 	cmdCh   chan *routesync.Command
 }
 
-func startNodeStub(t *testing.T, ctx context.Context, controlURL, dataEndpoint string) *nodeStub {
+func startNodeStub(t *testing.T, ctx context.Context, controlURL, apiEndpoint, dataEndpoint string) *nodeStub {
 	t.Helper()
 	nctx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
@@ -525,6 +560,7 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, dataEndpoint s
 		NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
 		BuildRegistrationCapacity: &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
 		BuildExecutionCapacity:    &routesync.BuildAdmissionLimit{Resources: &routesync.BuildResources{CPU: 4000, Memory: 4 << 30}},
+		APIEndpoint:               apiEndpoint,
 		DataEndpoint:              dataEndpoint,
 		RuntimeDigest:             "runtime-stub",
 	}})

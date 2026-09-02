@@ -34,14 +34,14 @@ const (
 
 var errReserveBodyTooLarge = errors.New("reserve body is too large")
 
-// RouteResolve is the data-plane forwarding target the router needs for a sid
-// (the hot path: client -> router -> node DataEndpoint -> guest).
+// RouteResolve projects the current node control and data targets for a sid.
 type RouteResolve struct {
 	SandboxID              string `json:"sandbox_id"`
 	NodeSandboxID          string `json:"node_sandbox_id"`
 	Group                  string `json:"group"`
 	RouteKey               string `json:"route_key"`
 	NodeID                 string `json:"node_id"`
+	APIEndpoint            string `json:"api_endpoint"`
 	DataEndpoint           string `json:"data_endpoint"`
 	Profile                string `json:"profile"`
 	TemplateID             string `json:"template_id"`
@@ -367,7 +367,8 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	return &RouteResolve{
 		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
 		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile, TemplateID: rec.TemplateID,
+		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID), DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
+		Profile: rec.Profile, TemplateID: rec.TemplateID,
 		StableID: rec.StableID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
 		ServiceSecret: rec.ServiceSecret, EnvdAccessToken: rec.EnvdAccessToken,

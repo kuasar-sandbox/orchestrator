@@ -17,7 +17,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -252,10 +251,10 @@ func (stubVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) 
 func (stubVS) Detach(context.Context, string) error { return nil }
 func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
 
-// TestResumeRace_ConnectAndRouteSingleLaunch is the regression guard for the
-// control-plane resume race: an asynchronous /connect resume held inside its
-// launch attempt and concurrent data-plane Route calls must still launch once.
-func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
+// TestResumeRace_ConnectAndConcurrentAdmissionSingleLaunch guards the common
+// lifecycle admission race: an asynchronous /connect resume and concurrent
+// joiners of that attempt must still launch once.
+func TestResumeRace_ConnectAndConcurrentAdmissionSingleLaunch(t *testing.T) {
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +303,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	}
 
 	// Connect returns while its asynchronous resume is blocked in launcher.Start.
-	// That guarantees the Route calls below join the same active attempt.
+	// That guarantees the admissions below join the same active attempt.
 	connected, err := o.Connect(ctx, sid, apiKey, "", api.ConnectOptions{TimeoutSec: 60})
 	if err != nil || connected == nil || connected.State != types.StateStarting {
 		t.Fatalf("Connect = %+v, %v; want durable starting result", connected, err)
@@ -316,17 +315,25 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
+	join := func() error {
+		_, attempt, err := o.ensureResumeAccepted(ctx, sid, nil, types.ResumeRequest{
+			Trigger: types.ResumeTriggerRoute, Mode: types.ResumeAuto,
+		}, nil)
+		if err == nil && attempt != nil {
+			err = attempt.wait(ctx)
+		}
+		return err
+	}
 	for i := 0; i < 7; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := activateRouteForTest(ctx, o, sid, proxy.LegacyTarget(49983))
-			errs <- err
+			errs <- join()
 		}()
 	}
-	// Execute one Route in this goroutine while the Connect attempt is known to
-	// be active. The timer channel releases launcher.Start; until then Route must
-	// be waiting on that same attempt rather than starting a second resume.
+	// Execute one join in this goroutine while the Connect attempt is known to be
+	// active. The timer releases launcher.Start; until then the join must wait on
+	// that same attempt rather than starting a second resume.
 	released := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseStart := func() {
@@ -336,7 +343,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		})
 	}
 	timer := time.AfterFunc(100*time.Millisecond, releaseStart)
-	_, routeErr := activateRouteForTest(ctx, o, sid, proxy.LegacyTarget(49983))
+	routeErr := join()
 	returnedBeforeRelease := timer.Stop()
 	if returnedBeforeRelease {
 		releaseStart()
@@ -348,18 +355,18 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		if err != nil {
-			t.Fatalf("Route during Connect resume: %v", err)
+			t.Fatalf("admission during Connect resume: %v", err)
 		}
 	}
 	if returnedBeforeRelease {
-		t.Fatal("Route returned while the asynchronous Connect resume was still blocked")
+		t.Fatal("admission returned while the asynchronous Connect resume was still blocked")
 	}
 	waitForSandbox(t, o, ctx, sid, func(sb *types.Sandbox) bool {
 		return sb.State == types.StateRunning
-	}, "running after Connect/Route resume")
+	}, "running after concurrent resume admission")
 
 	if got := lc.starts.Load(); got != 1 {
-		t.Fatalf("launch (lc.Start) called %d times; want exactly 1 — concurrent connect+route must collapse to one resume", got)
+		t.Fatalf("launch (lc.Start) called %d times; want exactly 1 for concurrent admissions", got)
 	}
 	got, err := st.Get(ctx, sid)
 	if err != nil || got == nil || got.State != types.StateRunning {

@@ -45,6 +45,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+. "$SCRIPT_DIR/lib/proxy.sh"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
@@ -259,10 +260,11 @@ API_SECRET="$("$BIN/e2b-key-ctl" derive-api-secret "$MK")"
 AK="$("$BIN/e2b-key-ctl" gen-apikey "$API_SECRET")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 PORT="$(free_port)"
+PROXY_PORT="$(free_port)"
 
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: internal, auth: enforce }
+proxy: { auth: enforce }
 mmds:
   enabled: true
   listen: "$MGMT_VIP:$MMDS_PORT"
@@ -318,8 +320,15 @@ for _ in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
     sleep 0.5
 done
+write_proxy_config "$WORK/proxy.yaml" \
+    "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" - \
+    "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" 1024 2 enforce 30s -
+start_proxy "$BIN/node-ctl" "$WORK/proxy.yaml" "$WORK/proxy.log"
+PIDS+=("$PROXY_HELPER_PID")
+wait_proxy_ready "$PROXY_HELPER_PID" 127.0.0.1 "$PROXY_PORT" "$WORK/proxy-stats.sock" "$WORK/proxy.log" \
+    || fail "Proxy did not become ready"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
-echo "==> orchestrator up (dev http :$PORT); tenant allowlisted"
+echo "==> conductor API :$PORT and Proxy data :$PROXY_PORT up; tenant allowlisted"
 
 req() { # method path key [body]
     local method="$1" path="$2" key="$3" body="${4:-}"

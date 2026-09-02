@@ -67,7 +67,7 @@ func TestEffectiveConfigFromRawRejectsTamperAndNonCanonicalJSON(t *testing.T) {
 
 func testProxyConfig(t *testing.T) *publicconfig.Proxy {
 	t.Helper()
-	cfg, err := publicconfig.DecodeProxy(strings.NewReader("paths:\n  run_root: /run/test-proxy\nworkers: 2\nroute_capacity: 16\nauth: enforce\npark_timeout: 1s\n"))
+	cfg, err := publicconfig.DecodeProxy(strings.NewReader("paths:\n  run_root: /run/test-proxy\ndata_listen: 127.0.0.1:0\nworkers: 2\nroute_capacity: 16\nauth: enforce\npark_timeout: 1s\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

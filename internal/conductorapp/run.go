@@ -19,12 +19,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
-	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
-	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
@@ -98,14 +95,11 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 	if err != nil {
 		return err
 	}
-	var apiHandler http.Handler
-	if startedExtension != nil {
-		apiHandler = newAPIHandler(cfg, core, logger)
-		if startedExtension.api != nil {
-			apiHandler, err = wrapExtensionAPI(startedExtension.api, apiHandler)
-			if err != nil {
-				return err
-			}
+	apiHandler := newAPIHandler(cfg, core, logger)
+	if startedExtension != nil && startedExtension.api != nil {
+		apiHandler, err = wrapExtensionAPI(startedExtension.api, apiHandler)
+		if err != nil {
+			return err
 		}
 	}
 	if err := core.InstallUnits(ctx); err != nil {
@@ -132,10 +126,6 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		if nodeID == "" {
 			nodeID, _ = os.Hostname()
 		}
-		dataEndpoint := cfg.Cluster.DataEndpoint
-		if dataEndpoint == "" {
-			dataEndpoint = cfg.API.Listen
-		}
 		registryAddress := cfg.Cluster.NodeLink.Endpoint
 		heartbeatInterval := 10 * time.Second
 		if cfg.Cluster.HeartbeatInterval != "" {
@@ -158,7 +148,8 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 				return (&net.Dialer{}).DialContext(dialCtx, "tcp", endpoint)
 			},
 			routesync.NodeRegister{
-				NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint,
+				NodeID: nodeID, Labels: cfg.Cluster.Labels,
+				APIEndpoint: cfg.Cluster.APIEndpoint, DataEndpoint: cfg.Cluster.DataEndpoint,
 				Capacity: capacity, BuildRegistrationCapacity: registrationCapacity,
 				BuildExecutionCapacity: executionCapacity, RuntimeDigest: runtimeDigest,
 			},
@@ -170,39 +161,7 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		}
 	}
 
-	var internalWorkerStats *proxystats.WorkerStats
-	switch cfg.Proxy.Mode {
-	case publicconfig.ProxyInternal:
-		internalWorkerStats = proxystats.NewWorkerStats()
-		masterStats := proxystats.NewMasterStats(mx, []string{"internal"})
-		if err := masterStats.BeginWorker("internal", 1); err != nil {
-			return err
-		}
-		senderDone, err := internalWorkerStats.StartSender(ctx, "internal", 1, func(frame proxystats.Frame) error {
-			return masterStats.Receive("internal", 1, frame)
-		})
-		if err != nil {
-			return err
-		}
-		go func() {
-			if err := <-senderDone; err != nil && ctx.Err() == nil {
-				logger.Error("internal proxy stats sender", "err", err)
-			}
-		}()
-		routeExists := func(sandboxID string) bool {
-			_, found, err := core.LookupExec(ctx, sandboxID)
-			return err != nil || found
-		}
-		go internalWorkerStats.RunGC(ctx, routeExists, 5*time.Minute)
-		go masterStats.RunGC(ctx, routeExists, time.Minute)
-		core.SetSandboxTrafficProvider(masterStats)
-	case publicconfig.ProxyExternal:
-		core.SetSandboxTrafficProvider(&ExternalTrafficProvider{Plugins: plugins})
-	}
-
-	if apiHandler == nil {
-		apiHandler = newAPIHandler(cfg, core, logger)
-	}
+	core.SetSandboxTrafficProvider(&ExternalTrafficProvider{Plugins: plugins})
 	configServer := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider: core, Admin: core, MMDSRouteSecretAdmin: core, BuilderAdmissionAdmin: core,
 		MaxMMDSRouteSecretValueBytes: cfg.MMDS.Routes.MaxSecretValueBytes,
@@ -240,66 +199,19 @@ func Run(parent context.Context, cfg *publicconfig.Conductor, nodeCtlExecutable 
 		startNodeLink()
 	}
 
-	var proxyNS *netns.NetNS
-	if cfg.Proxy.Mode == publicconfig.ProxyInternal && cfg.Proxy.ProxyNetNS != "" {
-		proxyNS, err = appnet.OpenProxyNetNS(cfg.Proxy.ProxyNetNS)
-		if err != nil {
-			return err
-		}
-		defer proxyNS.Close()
-		logger.Info("node-ctl internal proxy forwarding netns", "proxy_netns", cfg.Proxy.ProxyNetNS)
-	}
-	dataHandler := buildDataPlane(cfg, core, plugins, mx, internalWorkerStats, logger, proxyNS)
-	mux := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		host := request.Host
-		if index := strings.IndexByte(host, ':'); index >= 0 {
-			host = host[:index]
-		}
-		if host == "api."+cfg.API.Domain || strings.HasPrefix(host, "api.") {
-			apiHandler.ServeHTTP(w, request)
-			return
-		}
-		dataHandler.ServeHTTP(w, request)
-	})
-
 	if cfg.Proxy.MetricsListen != "" {
 		go appnet.ServeMetrics(ctx, cfg.Proxy.MetricsListen, mx, logger)
 	}
-	if cfg.Proxy.Mode != publicconfig.ProxyExternal && cfg.Proxy.DataListen != "" {
-		listener, err := net.Listen("tcp", cfg.Proxy.DataListen)
-		if err != nil {
-			return fmt.Errorf("data_listen %s: %w", cfg.Proxy.DataListen, err)
-		}
-		logger.Info("node-ctl data-plane listener", "data_listen", cfg.Proxy.DataListen)
-		go func() {
-			if err := appnet.Serve(ctx, listener, dataHandler, runtime.APITLS); err != nil {
-				logger.Error("data-plane listener", "err", err)
-			}
-		}()
-	}
-
-	if cfg.MMDS.Enabled && cfg.Proxy.Mode == publicconfig.ProxyInternal {
-		listener, err := appnet.ListenTCPInNetNS(proxyNS, cfg.MMDS.Listen)
-		if err != nil {
-			return fmt.Errorf("mmds listen %s: %w", cfg.MMDS.Listen, err)
-		}
-		logger.Info("mmds metadata service", "listen", cfg.MMDS.Listen, "proxy_netns", cfg.Proxy.ProxyNetNS)
-		go func() {
-			if err := mmds.New(core, cfg.ParkTimeoutDur(), logger).Serve(ctx, listener); err != nil {
-				logger.Error("mmds service", "err", err)
-			}
-		}()
-	}
 
 	if runtime.APITLS == nil {
-		logger.Info("serving plain HTTP (dev): point the SDK with E2B_API_URL/E2B_SANDBOX_URL")
+		logger.Info("serving plain HTTP API (dev): point E2B_API_URL at this listener")
 	}
 	listener, err := net.Listen("tcp", cfg.API.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
 	}
-	logger.Info("node-ctl serving", "listen", cfg.API.Listen, "domain", cfg.API.Domain, "proxy_mode", cfg.Proxy.Mode)
-	return appnet.Serve(ctx, listener, mux, runtime.APITLS)
+	logger.Info("node-ctl conductor serving API", "listen", cfg.API.Listen, "domain", cfg.API.Domain)
+	return appnet.Serve(ctx, listener, apiHandler, runtime.APITLS)
 }
 
 type startedExtension struct {

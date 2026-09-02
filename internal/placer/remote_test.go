@@ -715,6 +715,21 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 	sink.bookmark()
 }
 
+func TestDecodeNodeListPreservesSplitEndpoints(t *testing.T) {
+	raw, err := json.Marshal(clusterstate.NodeListEntry{
+		NodeID:       "n1",
+		APIEndpoint:  "10.0.0.1:7443",
+		DataEndpoint: "10.0.0.1:8443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := decodeNodeList(raw)
+	if !ok || node.APIEndpoint != "10.0.0.1:7443" || node.DataEndpoint != "10.0.0.1:8443" {
+		t.Fatalf("decoded node=%+v ok=%v", node, ok)
+	}
+}
+
 func waitForNodeKeyPair(t *testing.T, ctx context.Context, reg *registry.Registry, nodeID string, want bool) {
 	t.Helper()
 	for i := 0; i < 200; i++ {

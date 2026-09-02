@@ -1,5 +1,5 @@
 // Package proxy exposes the narrow startup API for statically customized
-// external proxy masters and their internally re-executed workers.
+// independent proxy masters and their internally re-executed workers.
 package proxy
 
 import (
@@ -23,7 +23,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
-// Config is the public external proxy declarative configuration.
+// Config is the public independent proxy declarative configuration.
 type Config = publicconfig.Proxy
 
 // TLSMaterial contains DER-encoded leaf-first certificates, a matching signer,
@@ -79,7 +79,7 @@ type Hooks struct {
 	BindRuntime func(context.Context, Process, *Runtime) error
 }
 
-// App is a one-shot external proxy application. New has no side effects.
+// App is a one-shot independent Proxy application. New has no side effects.
 type App struct {
 	hooks       Hooks
 	initialized bool

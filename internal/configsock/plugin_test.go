@@ -9,15 +9,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-func proxyCaps(path string) routesync.Register {
+func proxyCaps() routesync.Register {
 	return routesync.Register{
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: path}},
+		Proxy:     &routesync.Proxy{},
 	}
 }
 
-func addReadyPlugin(r *Registry, id, path string) *Plugin {
-	p := &Plugin{ID: id, Caps: proxyCaps(path), cancel: func() {}}
+func addReadyPlugin(r *Registry, id string) *Plugin {
+	p := &Plugin{ID: id, Caps: proxyCaps(), cancel: func() {}}
 	r.Add(p)
 	r.markRouteStreamReady(p)
 	return p
@@ -28,7 +28,15 @@ func TestProxyRouteBarrierRequiresCurrentReadyTrustedLease(t *testing.T) {
 	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
 		t.Fatalf("barrier without proxy = %v", err)
 	}
-	p := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: func() {}}
+	observer := &Plugin{ID: routesync.ProxyPluginID, Caps: routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}, Proxy: &routesync.Proxy{},
+	}, cancel: func() {}}
+	r.Add(observer)
+	r.markRouteStreamReady(observer)
+	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
+		t.Fatalf("barrier with ordinary observer = %v", err)
+	}
+	p := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: func() {}}
 	r.Add(p)
 	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
 		t.Fatalf("barrier before route subscription = %v", err)
@@ -46,12 +54,19 @@ func TestProxyRouteBarrierRequiresCurrentReadyTrustedLease(t *testing.T) {
 	if err := b.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	r.routeBarrierAck(p, b.ID()) // late ACK after Commit is a no-op.
+	r.mu.Lock()
+	remaining := len(r.barriers)
+	r.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("late ACK recreated %d barrier(s)", remaining)
+	}
 }
 
 func TestProxyRouteBarrierAllOfParticipants(t *testing.T) {
 	r := NewRegistry()
-	first := addReadyPlugin(r, "proxy-a", "/run/a.sock")
-	second := addReadyPlugin(r, "proxy-b", "/run/b.sock")
+	first := addReadyPlugin(r, "proxy-a")
+	second := addReadyPlugin(r, "proxy-b")
 	r.mu.Lock()
 	b, err := r.beginRouteBarrierLocked([]*Plugin{first, second})
 	r.mu.Unlock()
@@ -84,12 +99,12 @@ func TestProxyRouteBarrierFailsOnDisconnectAndReplacement(t *testing.T) {
 	}{
 		{name: "disconnect", fail: func(r *Registry, p *Plugin) { r.Remove(p) }, want: ErrProxyRouteDisconnected},
 		{name: "replacement", fail: func(r *Registry, _ *Plugin) {
-			r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/new.sock"), cancel: func() {}})
+			r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: func() {}})
 		}, want: ErrProxyRouteLeaseChanged},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := NewRegistry()
-			p := addReadyPlugin(r, routesync.ProxyPluginID, "/run/proxy.sock")
+			p := addReadyPlugin(r, routesync.ProxyPluginID)
 			b, err := r.BeginProxyRouteBarrier()
 			if err != nil {
 				t.Fatal(err)
@@ -105,7 +120,7 @@ func TestProxyRouteBarrierFailsOnDisconnectAndReplacement(t *testing.T) {
 
 func TestProxyRouteBarrierCommitRevalidatesAckedLease(t *testing.T) {
 	r := NewRegistry()
-	p := addReadyPlugin(r, routesync.ProxyPluginID, "/run/proxy.sock")
+	p := addReadyPlugin(r, routesync.ProxyPluginID)
 	b, err := r.BeginProxyRouteBarrier()
 	if err != nil {
 		t.Fatal(err)
@@ -115,37 +130,9 @@ func TestProxyRouteBarrierCommitRevalidatesAckedLease(t *testing.T) {
 	if err := b.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/new.sock"), cancel: func() {}})
+	r.Add(&Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: func() {}})
 	if err := b.Commit(); !errors.Is(err, ErrProxyRouteLeaseChanged) {
 		t.Fatalf("Commit after replacement = %v", err)
-	}
-}
-
-func eq(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// TestRegistryProxyTargetsStableSorted: ProxyTargets returns only proxy plugins'
-// sockets, in stable id order (so sandbox-id sharding is consistent), excluding
-// pure observers.
-func TestRegistryProxyTargetsStableSorted(t *testing.T) {
-	r := NewRegistry()
-	noop := func() {}
-	r.Add(&Plugin{ID: "px2", Caps: proxyCaps("/run/px2.sock"), cancel: noop})
-	r.Add(&Plugin{ID: "px0", Caps: proxyCaps("/run/px0.sock"), cancel: noop})
-	// An observer (route only, no proxy socket) must not be a forward target.
-	r.Add(&Plugin{ID: "agent", Caps: routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute}}, cancel: noop})
-
-	if got, want := r.ProxyTargets(), []string{"/run/px0.sock", "/run/px2.sock"}; !eq(got, want) {
-		t.Fatalf("ProxyTargets = %v, want %v", got, want)
 	}
 }
 
@@ -155,8 +142,8 @@ func TestRegistryProxyTargetsStableSorted(t *testing.T) {
 func TestRegistryEvictsSameID(t *testing.T) {
 	r := NewRegistry()
 	evicted := make(chan struct{}, 1)
-	first := &Plugin{ID: "px0", Caps: proxyCaps("/run/a.sock"), cancel: func() { evicted <- struct{}{} }}
-	second := &Plugin{ID: "px0", Caps: proxyCaps("/run/b.sock"), cancel: func() {}}
+	first := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: func() { evicted <- struct{}{} }}
+	second := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: func() {}}
 
 	r.Add(first)
 	r.Add(second) // same id -> first.cancel() fires (closes its stream)
@@ -165,31 +152,31 @@ func TestRegistryEvictsSameID(t *testing.T) {
 	default:
 		t.Fatal("re-register did not evict (cancel) the prior same-id plugin")
 	}
-	if got := r.ProxyTargets(); len(got) != 1 || got[0] != "/run/b.sock" {
-		t.Fatalf("after eviction targets = %v, want [/run/b.sock]", got)
-	}
+	r.markRouteStreamReady(second)
 
 	// The evicted plugin's deferred Remove must be a no-op (not its successor's).
 	r.Remove(first)
-	if got := r.ProxyTargets(); len(got) != 1 || got[0] != "/run/b.sock" {
-		t.Fatalf("evicted Remove dropped the successor: targets = %v", got)
+	barrier, err := r.BeginProxyRouteBarrier()
+	if err != nil {
+		t.Fatalf("evicted Remove dropped the successor: %v", err)
 	}
+	barrier.Cancel()
 	r.Remove(second)
-	if got := r.ProxyTargets(); len(got) != 0 {
-		t.Fatalf("after final remove targets = %v, want []", got)
+	if _, err := r.BeginProxyRouteBarrier(); !errors.Is(err, ErrProxyRouteUnavailable) {
+		t.Fatalf("after final remove barrier = %v", err)
 	}
 }
 
 func TestRegistryProxyStatsTargetFollowsRegistrationLease(t *testing.T) {
 	r := NewRegistry()
 	noop := func() {}
-	withoutStats := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps("/run/proxy.sock"), cancel: noop}
+	withoutStats := &Plugin{ID: routesync.ProxyPluginID, Caps: proxyCaps(), cancel: noop}
 	r.Add(withoutStats)
 	if path, found := r.ProxyStatsTarget(); found || path != "" {
 		t.Fatalf("stats target without capability = %q/%t", path, found)
 	}
 
-	withStatsCaps := proxyCaps("/run/proxy.sock")
+	withStatsCaps := proxyCaps()
 	withStatsCaps.Proxy.StatsSocket = &routesync.Socket{Path: "/run/proxy-stats.sock"}
 	withStats := &Plugin{ID: routesync.ProxyPluginID, Caps: withStatsCaps, cancel: noop}
 	r.Add(withStats)
@@ -207,7 +194,7 @@ func TestRegistryProxyStatsTargetFollowsRegistrationLease(t *testing.T) {
 }
 
 func TestTrustedMMDSProxyRegistrationShape(t *testing.T) {
-	trusted := proxyCaps("/run/proxy.sock")
+	trusted := proxyCaps()
 	trusted.Mmds = true
 	if !isTrustedMMDSProxyRegistration(routesync.ProxyPluginID, trusted) {
 		t.Fatal("exact trusted registration rejected")

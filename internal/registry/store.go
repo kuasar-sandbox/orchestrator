@@ -43,6 +43,7 @@ type NodeRecord struct {
 	Capacity                  int                            `json:"capacity,omitempty"`
 	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
 	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	APIEndpoint               string                         `json:"api_endpoint,omitempty"`
 	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
 	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
 	Zone                      string                         `json:"zone,omitempty"`
@@ -1032,6 +1033,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		Capacity:                  n.Capacity,
 		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
 		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		APIEndpoint:               n.APIEndpoint,
 		DataEndpoint:              n.DataEndpoint,
 		RuntimeDigest:             n.RuntimeDigest,
 		Zone:                      n.Zone,
@@ -1061,6 +1063,7 @@ func cloneNodeRecord(n *NodeRecord) *NodeRecord {
 		Capacity:                  n.Capacity,
 		BuildRegistrationCapacity: cloneBuildAdmissionLimit(n.BuildRegistrationCapacity),
 		BuildExecutionCapacity:    cloneBuildAdmissionLimit(n.BuildExecutionCapacity),
+		APIEndpoint:               n.APIEndpoint,
 		DataEndpoint:              n.DataEndpoint,
 		RuntimeDigest:             n.RuntimeDigest,
 		Zone:                      n.Zone,

@@ -36,7 +36,6 @@ func startCtlSocket(t *testing.T) string {
 	}
 	yaml := "" +
 		"api: { domain: dev.local, listen: \":0\" }\n" +
-		"proxy: { mode: internal }\n" +
 		"encryption_key: \"0000000000000000000000000000000000000000000000000000000000000000\"\n" +
 		"manifest_config: " + dir + "/manifest.yaml\n" +
 		"paths: { run_root: " + dir + ", base_root: " + dir + ", config_socket: " + sock + " }\n" +

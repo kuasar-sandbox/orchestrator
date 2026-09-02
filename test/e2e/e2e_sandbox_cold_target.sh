@@ -91,7 +91,7 @@ start_resource_controller() {
     cat > "$WORK/node-ctl.yaml" <<EOF
 api: { domain: cold-target.local, listen: "127.0.0.1:0" }
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
-proxy: { mode: internal, auth: enforce }
+proxy: { auth: enforce }
 sandbox:
   boot:
     kernel: $VMLINUX

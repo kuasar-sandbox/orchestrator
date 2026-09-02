@@ -414,7 +414,12 @@ func TestClusterExecKnownNonReadyTargetSkipsReserve(t *testing.T) {
 }
 
 func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
-	var staleHits, reserveHits atomic.Int32
+	var staleHits, reserveHits, apiHits atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		apiHits.Add(1)
+		http.Error(w, "exec reached API endpoint", http.StatusTeapot)
+	}))
+	defer api.Close()
 	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		staleHits.Add(1)
 		w.Header().Set(proxypkg.HeaderProxyError, proxypkg.ProxyErrorNotFound)
@@ -424,8 +429,10 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	fresh, observed, backendInput := newExecTunnelNode(t, "", "fresh-tail")
 	defer fresh.Close()
 	staleRoute := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(stale.URL, "http://"), types.ProfileBare)
+	staleRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	staleRoute.State = "starting"
 	freshRoute := routerTestRouteResolve(t, "stable", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
+	freshRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	freshRoute.NodeSandboxID = "stable-g1"
 	freshRoute.RouteRevision = 2
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -454,8 +461,8 @@ func TestClusterExecTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	if status != http.StatusOK || string(output) != "fresh-tail" {
 		t.Fatalf("CONNECT status=%d output=%q", status, output)
 	}
-	if staleHits.Load() != 1 || reserveHits.Load() != 1 {
-		t.Fatalf("stale hits=%d reserve hits=%d", staleHits.Load(), reserveHits.Load())
+	if staleHits.Load() != 1 || reserveHits.Load() != 1 || apiHits.Load() != 0 {
+		t.Fatalf("stale hits=%d reserve hits=%d API hits=%d", staleHits.Load(), reserveHits.Load(), apiHits.Load())
 	}
 	got := <-observed
 	if got.sid != freshRoute.NodeSandboxID || got.service != string(proxypkg.ConnectServiceExec) || got.token != token {

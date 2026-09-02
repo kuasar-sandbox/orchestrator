@@ -30,6 +30,9 @@ Create timeout before the core performs final normalization. The private route
 has no production authentication; it is deliberately only a wiring example.
 Wrappers may override canonical routes, so production code owns the resulting
 URL and authentication contract. Mandatory cleanup never depends on a Hook.
+The wrapped handler is served by both the public API listener and config-socket
+API fallback; sandbox data and CONNECT ingress belong only to the independent
+Proxy and never enter this App.
 
 There is no dynamic plugin loader or extension registry. A nil Extension keeps
 the built-in behavior and creates no observation hub or watcher goroutine. See

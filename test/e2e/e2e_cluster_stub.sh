@@ -238,6 +238,7 @@ for i in $(seq 1 "$SCALERS"); do
 done
 alloc_port ROUTER_PORT router
 alloc_port ADMIN_PORT node-stub-admin
+alloc_port API_PORT node-stub-api
 alloc_port DATA_PORT node-stub-data
 
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
@@ -403,12 +404,26 @@ step "starting node-stub-ctl with $NODES nodes"
     --nodes "$NODES" \
     --node-prefix stub \
     --admin-listen "127.0.0.1:$ADMIN_PORT" \
+    --api-listen "127.0.0.1:$API_PORT" \
     --data-listen "127.0.0.1:$DATA_PORT" \
     --label pool=stub \
     --heartbeat 500ms > >(tee "$WORK/node-stub.log" >&2) 2>&1 &
 PIDS+=("$!")
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
 wait_http "$ADMIN/healthz" "node-stub admin"
+
+python3 - "$ADMIN" "$API_PORT" "$DATA_PORT" <<'PY' || fail "stub nodes did not register distinct API/Data endpoints"
+import json, sys, time, urllib.request
+admin, api_port, data_port = sys.argv[1:]
+for _ in range(200):
+    nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
+    if nodes and all(n.get("api_endpoint") == "127.0.0.1:" + api_port and
+                     n.get("data_endpoint") == "127.0.0.1:" + data_port and
+                     n.get("api_endpoint") != n.get("data_endpoint") for n in nodes):
+        sys.exit(0)
+    time.sleep(0.05)
+raise SystemExit(nodes)
+PY
 
 step "starting router"
 "$CLUSTER_CTL" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
@@ -452,6 +467,20 @@ code="$(create_sandbox "user1/session1" "$WORK/create-session1.body" || true)"
 [ "$code" = "201" ] || fail "create user1/session1 returned $code: $(cat "$WORK/create-session1.body")"
 IFS=$'\t' read -r SESSION1_SID SESSION1_ENVD_TOKEN \
     < <(sandbox_credentials "$WORK/create-session1.body" "user1/session1") || fail "invalid create response for user1/session1"
+
+step "checking sandbox control forwarding through the node API endpoint"
+code="$(http_code "$WORK/get-session1.body" \
+    -H "Host: api.$DOMAIN" \
+    -H "X-Kuasar-Sandbox-Group: $GROUP" \
+    -H "X-Kuasar-Route-Key: user1/session1" \
+    -H "X-API-KEY: $API_KEY" \
+    "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SESSION1_SID" || true)"
+[ "$code" = "200" ] || fail "sandbox control GET returned $code: $(cat "$WORK/get-session1.body")"
+python3 - "$WORK/get-session1.body" "$SESSION1_SID" <<'PY' || fail "sandbox control response did not preserve the stable ID"
+import json, sys
+response = json.load(open(sys.argv[1]))
+assert response.get("sandboxID") == sys.argv[2], response
+PY
 
 step "checking stable SID connect through Registry CmdConnect"
 code="$(http_code "$WORK/connect-session1.body" -X POST \
@@ -807,6 +836,23 @@ code="$(http_code "$WORK/build.body" -X POST \
     --data '{"name":"stub-template","cpuCount":1,"memoryMB":128}' \
     "http://127.0.0.1:$ROUTER_PORT/v3/templates" || true)"
 [ "$code" = "202" ] || fail "build register returned $code: $(cat "$WORK/build.body")"
+
+IFS=$'\t' read -r BUILD_ID TEMPLATE_ID < <(python3 - "$WORK/build.body" <<'PY'
+import json, sys
+response = json.load(open(sys.argv[1]))
+build_id, template_id = response.get("buildID"), response.get("templateID")
+assert isinstance(build_id, str) and build_id, response
+assert isinstance(template_id, str) and template_id, response
+print(build_id + "\t" + template_id)
+PY
+) || fail "build register response omitted identifiers"
+step "checking build follow-up forwarding through the node API endpoint"
+code="$(retry_code 200 "$WORK/build-status.body" \
+    -H "Host: api.$DOMAIN" \
+    -H "X-Kuasar-Sandbox-Group: $GROUP" \
+    -H "X-API-KEY: $API_KEY" \
+    "http://127.0.0.1:$ROUTER_PORT/v2/templates/$TEMPLATE_ID/builds/$BUILD_ID/status" || true)"
+[ "$code" = "200" ] || fail "build status follow-up returned $code: $(cat "$WORK/build-status.body")"
 
 python3 - "$ADMIN" <<'PY' || fail "build_register command with default e2b profile was not observed"
 import json, sys, urllib.request

@@ -122,7 +122,7 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 		respCh <- resp
 	}()
 	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: nodeID, DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
+		NodeID: nodeID, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 
 	node := newRedirectNodeStub(nodeID)
 	client := nodelink.NewWithEndpoint(ingressSrv.Listener.Addr().String(), testNodeLinkDial, routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19191",
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "127.0.0.1:18181", DataEndpoint: "127.0.0.1:19191",
 	}, node, 20*time.Millisecond, nil, log, true)
 	go client.Run(ctx)
 
@@ -197,7 +197,7 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve through redirected node-link: %v", err)
 	}
-	if res.Route.NodeID != nodeID || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) || res.Route.DataEndpoint != "127.0.0.1:19191" {
+	if res.Route.NodeID != nodeID || res.Route.SandboxID == "" || res.Route.NodeSandboxID != EncodeNodeSandboxID(res.Route.SandboxID, 0) || res.Route.APIEndpoint != "127.0.0.1:18181" || res.Route.DataEndpoint != "127.0.0.1:19191" {
 		t.Fatalf("reserve result=%+v, want node %s endpoint 127.0.0.1:19191", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
@@ -402,7 +402,7 @@ func startRelayNodeStub(t *testing.T, ctx context.Context, addr, nodeID string) 
 		respCh <- resp
 	}()
 	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "10.0.0.1:8443",
+		NodeID: nodeID, Capacity: 10, APIEndpoint: "10.0.0.1:7443", DataEndpoint: "10.0.0.1:8443",
 	}}); err != nil {
 		t.Fatal(err)
 	}

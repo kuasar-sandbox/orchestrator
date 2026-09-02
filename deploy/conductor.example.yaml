@@ -2,36 +2,35 @@
 # See orchestrator/docs/node.md §3. Generate a fresh skeleton with
 # `node-ctl config conductor --template`; validate yours with
 # `node-ctl config conductor --config conductor.yaml [--resolve]`.
-# The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
-# (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
+# The paired deployment examples use distinct plaintext node upstreams:
+# conductor :3000 and Proxy :3443. Cluster Router dials these endpoints over
+# plain HTTP/CONNECT; terminate public TLS at Router/an external load balancer.
+# A standalone direct-TLS deployment must instead give the two :443 listeners
+# distinct bind addresses. Configure E2B_API_URL and E2B_SANDBOX_URL for direct
+# plaintext development access.
 #
 # Config is grouped by concern. External binaries (sandbox-ctl, connector-ctl,
 # flatten-ctl, …) are auto-discovered next to the node-ctl binary, then on
 # PATH — they are not configured here.
 
-# North control plane + TLS.
+# Node control endpoint (plaintext upstream in this paired example).
 api:
   domain: sandboxes.example.com
-  listen: ":443"                                 # dev: ":3000" (plain http)
-  tls:
-    cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
-    key: /etc/node-ctl/tls/privkey.pem
+  listen: ":3000"
+  # For standalone direct TLS, bind a dedicated address that does not conflict
+  # with Proxy and uncomment the material below.
+  # tls:
+  #   cert: /etc/node-ctl/tls/fullchain.pem # wildcard *.<domain> AND api.<domain>
+  #   key: /etc/node-ctl/tls/privkey.pem
 
-# Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
-#   internal (default) — in-process proxy (single binary, no extra moving parts).
-#   external           — offload to node-ctl proxy master (deploy/proxy.example.yaml
-#                        + node-proxy.service): the master owns the data-plane port,
-#                        registers one proxy_socket, and supervises workers. The data
-#                        port lives in proxy.yaml, NOT here.
-#   off                — reject data-plane traffic on this node.
+# Data-plane policy distributed to the independent Proxy. The Proxy service in
+# deploy/node-proxy.service owns the only sandbox data listener; this conductor
+# listener remains API-only.
 # auth: the proxy validates X-Access-Token (= envdAccessToken) — enforce (default)
 # rejects mismatches (401); log warns but forwards; off disables. park_timeout bounds
 # how long a request is held while a route syncs / a paused sandbox auto-resumes.
 proxy:
-  mode: internal
   auth: enforce
-  # data_listen: ""                              # internal-mode dedicated addr; "" = share api.listen
-  # proxy_netns: sw0_mgmt                        # internal-mode floatingip dials + MMDS listen netns
   # park_timeout: 30s
   # metrics_listen: 127.0.0.1:9095               # serve's own metrics; "" = off
 
@@ -62,7 +61,7 @@ paths:
   # Local control socket — one UDS over h2c: run assignment/result, task specs,
   # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
-  # manifest-key / export-sandbox / import-sandbox CLIs and the external proxy master are
+  # manifest-key / export-sandbox / import-sandbox CLIs and the Proxy master are
   # clients of this socket — they do not open the DB or read this config.
   config_socket: /run/sandbox/node-ctl.socket
   # db_path: /var/lib/sandbox/node-ctl.db     # default = <base_root>/node-ctl.db
@@ -177,8 +176,8 @@ checkpoint:
 #   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
 #     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
 #     translates the metadata VIP to the listener (connector-ctl vswitch start --mgmt-service ...).
-#     Requires proxy.mode != off. In external mode the proxy master receives the
-#     listener and service registry over its trusted config-socket registration.
+#     The Proxy master receives the listener and service registry over its trusted
+#     config-socket registration.
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254
@@ -203,5 +202,6 @@ checkpoint:
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
-#   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen
+#   api_endpoint: node.example.com:3000           # required plaintext Router -> conductor host:port
+#   data_endpoint: sandbox.example.com:3443       # required plaintext Router -> Proxy host:port
 #   heartbeat_interval: 10s

@@ -95,6 +95,7 @@ type NodeProfileRecord struct {
 	Capacity                  int                            `json:"capacity,omitempty"`
 	BuildRegistrationCapacity *routesync.BuildAdmissionLimit `json:"build_registration_capacity,omitempty"`
 	BuildExecutionCapacity    *routesync.BuildAdmissionLimit `json:"build_execution_capacity,omitempty"`
+	APIEndpoint               string                         `json:"api_endpoint,omitempty"`
 	DataEndpoint              string                         `json:"data_endpoint,omitempty"`
 	RuntimeDigest             string                         `json:"runtime_digest,omitempty"`
 	Zone                      string                         `json:"zone,omitempty"`

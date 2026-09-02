@@ -1,5 +1,5 @@
-// Package routesync is the orchestrator's route-distribution protocol used in
-// proxy_mode=external (and by any other subscriber, e.g. a platform agent). A
+// Package routesync is the orchestrator's route-distribution protocol used by
+// the independent proxy (and by any other subscriber, e.g. a platform agent). A
 // subscriber registers on the orchestrator's config-socket plugin plane —
 // PUT /internal/plugin/{id}/register — and that single long-lived, bidirectional
 // h2c request carries the stream both ways:
@@ -38,10 +38,11 @@ import (
 )
 
 // Version is the protocol version announced by the authority in Hello.
-// Version 3 was the hard cut to stable_id. Version 4 replaces the Snapshot-
-// specific route location field with kind-orthogonal artifact_location; mixed
-// peers must fail closed instead of silently losing migration placement state.
-const Version = 4
+// Version 3 was the hard cut to stable_id. Version 4 replaced the Snapshot-
+// specific route location field with kind-orthogonal artifact_location. Version
+// 5 splits node API and data endpoints and removes the proxy forwarding socket;
+// mixed peers must fail closed.
+const Version = 5
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -53,7 +54,7 @@ const pluginPathPrefix = "/internal/plugin/"
 // PluginRegisterPath is the registration path for a given plugin id.
 func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/register" }
 
-// ProxyPluginID is the one trusted external proxy registration identity.
+// ProxyPluginID is the one trusted independent Proxy registration identity.
 const ProxyPluginID = "proxy"
 
 // Subscribe kinds (Register.Subscribe.Kind).
@@ -146,7 +147,7 @@ type Policy struct {
 	MMDS          *MMDSProxyPolicy `json:"mmds,omitempty"`
 }
 
-// MMDSProxyPolicy is conductor-owned external-proxy configuration delivered in
+// MMDSProxyPolicy is conductor-owned Proxy configuration delivered in
 // Hello. Services maps an operator name to its validated unix:// endpoint.
 type MMDSProxyPolicy struct {
 	Enabled  bool              `json:"enabled"`
@@ -201,7 +202,7 @@ func ValidateHello(m *Msg) error {
 // are all the subscriber's own call).
 type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
-	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
+	Proxy     *Proxy     `json:"proxy,omitempty"`     // trusted independent proxy registration marker and stats capability
 	Mmds      bool       `json:"mmds,omitempty"`      // trusted proxy requests MMDS routes/values + policy projection
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
@@ -215,10 +216,9 @@ type Subscribe struct {
 	Kind string `json:"kind"` // KindRoute | KindRouteWake
 }
 
-// Proxy declares the UDS the orchestrator's proxyForwarder forwards
-// data-plane requests to (this subscriber serves them from its synced table).
+// Proxy marks the trusted independent proxy registration and optionally exposes
+// its master-only traffic stats socket.
 type Proxy struct {
-	Socket      Socket  `json:"socket"`
 	StatsSocket *Socket `json:"stats_socket,omitempty"`
 }
 

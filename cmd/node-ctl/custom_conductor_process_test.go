@@ -83,7 +83,7 @@ func TestNodeCtlExecsCustomProxyMasterInPlace(t *testing.T) {
 	component := filepath.Join(directory, "xproxy")
 	copyExecutable(t, source, component)
 	configPath := filepath.Join(directory, "proxy.yaml")
-	body := "paths:\n  proxy_executable: " + component + "\n  run_root: " + filepath.Join(directory, "run") + "\nauth: log\n"
+	body := "paths:\n  proxy_executable: " + component + "\n  run_root: " + filepath.Join(directory, "run") + "\ndata_listen: 127.0.0.1:8443\nauth: log\n"
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

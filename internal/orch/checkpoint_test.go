@@ -445,24 +445,12 @@ func TestAcceptedPauseCancellationFencesImmediateConnectAndExecActivation(t *tes
 		t.Fatalf("Connect after canceled Pause = %+v, %v", connected.sb, connected.err)
 	}
 
-	identity, found, err := o.LookupExec(lifecycleCtx, sb.ID)
-	if err != nil || !found {
-		t.Fatalf("LookupExec after Connect = %+v, %v, %v", identity, found, err)
-	}
-	ready, found, err := o.ActivateExec(lifecycleCtx, sb.ID, identity)
-	if err != nil || !found || ready != identity {
-		current, getErr := o.st.Get(lifecycleCtx, sb.ID)
-		attempt, active := o.launches.Lookup(sb.ID)
-		var launchErr error
-		if active {
-			launchErr = attempt.result()
-		}
-		t.Fatalf("ActivateExec after Connect = %+v, %v, %v; current=%+v getErr=%v launchActive=%v launchErr=%v; want matching running identity",
-			ready, found, err, current, getErr, active, launchErr)
-	}
+	waitForSandbox(t, o, lifecycleCtx, sb.ID, func(current *types.Sandbox) bool {
+		return current.State == types.StateRunning
+	}, "running after Connect")
 	stored, err = o.st.Get(lifecycleCtx, sb.ID)
 	if err != nil || stored == nil || stored.State != types.StateRunning {
-		t.Fatalf("sandbox after exec activation = %+v, %v; want running", stored, err)
+		t.Fatalf("sandbox after Connect = %+v, %v; want running", stored, err)
 	}
 }
 

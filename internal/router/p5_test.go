@@ -995,7 +995,12 @@ func TestServeDataKnownNonReadyTargetSkipsReserve(t *testing.T) {
 }
 
 func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
-	var staleHits, reserveHits atomic.Int32
+	var staleHits, reserveHits, apiHits atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		apiHits.Add(1)
+		http.Error(w, "data reached API endpoint", http.StatusTeapot)
+	}))
+	defer api.Close()
 	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		staleHits.Add(1)
 		w.Header().Set(proxypkg.HeaderProxyError, proxypkg.ProxyErrorNotFound)
@@ -1008,8 +1013,10 @@ func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	staleRoute := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(stale.URL, "http://"), types.ProfileBare)
+	staleRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	staleRoute.State = "paused"
 	freshRoute := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(fresh.URL, "http://"), types.ProfileBare)
+	freshRoute.APIEndpoint = strings.TrimPrefix(api.URL, "http://")
 	freshRoute.NodeSandboxID = "sb-1-g1"
 	freshRoute.RouteRevision = 2
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1046,8 +1053,8 @@ func TestServeDataTypedStaleTargetRefreshesThroughReserve(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d, want 204", resp.StatusCode)
 	}
-	if staleHits.Load() != 1 || reserveHits.Load() != 1 || innerSID != freshRoute.NodeSandboxID {
-		t.Fatalf("stale hits=%d reserve hits=%d inner sid=%q", staleHits.Load(), reserveHits.Load(), innerSID)
+	if staleHits.Load() != 1 || reserveHits.Load() != 1 || apiHits.Load() != 0 || innerSID != freshRoute.NodeSandboxID {
+		t.Fatalf("stale hits=%d reserve hits=%d API hits=%d inner sid=%q", staleHits.Load(), reserveHits.Load(), apiHits.Load(), innerSID)
 	}
 }
 

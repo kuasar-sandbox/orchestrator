@@ -584,7 +584,7 @@ membership 重新解析 owner。
 
 node_link 维护以下 recordSet:
 
-- `profile`:node_id、labels、runtime_digest、data_endpoint、Build registration/execution capacity 与 durable usage、draining、liveness、link_owner；heartbeat 的 `allocated` memory 是本节点全部 sandbox 的 NodeReservation 之和,`pool` 是 node allocatable pool,不是 host `memory.current`、VMM charge 或 guest demand；其中低频 `node_list` 投影仅包含 capacity，usage 保留在 node owner 的实时 profile 中。
+- `profile`:node_id,labels,runtime_digest,api_endpoint,data_endpoint,Build registration/execution capacity 与 durable usage,draining,liveness,link_owner;heartbeat 的 `allocated` memory 是本节点全部 sandbox 的 NodeReservation 之和,`pool` 是 node allocatable pool,不是 host `memory.current`,VMM charge 或 guest demand;其中低频 `node_list` 投影包含两个 endpoint 与 capacity,usage 保留在 node owner 的实时 profile 中.
 - `sandbox`:该 node 上 sandbox 的
   `node_sandbox_id -> {sandbox_id,sandbox_generation,group,route_key,profile,api_secret_fingerprint}`
   完整归属表。
@@ -785,7 +785,11 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
   READY 且 DataEndpoint 有效时返回 `Route`。不存在的 route 直接返回 not found,不创建
   sandbox。
 
-`Route` 是受保护结果,同时携稳定 SandboxID、当前 NodeSandboxID 和 `route_revision`。
+`Route` 是受保护结果,同时携稳定 SandboxID,当前 NodeSandboxID,`APIEndpoint`,
+`DataEndpoint` 和 `route_revision`.两个 endpoint 都来自按 NodeID 查询的当前 node runtime/profile,
+不复制进 SandboxRecord;control/build 固定使用 APIEndpoint,data/exec 固定使用 DataEndpoint.
+Router→node 当前固定使用明文 HTTP/CONNECT,所以这两个值必须指向各自可达的明文内部 listener;
+对外 TLS 在 Router 终止,node-link mTLS 与此独立.
 `route_revision` 取当前 group route recordSet 的已提交 revision,供 Router 拒绝迟到的旧节点
 结果。Router 不订阅 route_link 更新。
 
@@ -865,10 +869,10 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰;已复制到现有 sandbo
 
 router 是无状态北向入口,但持本地缓存:
 
-- route resolution cache:`(group, route_key, stable sandbox_id)` -> NodeSandboxID / node endpoint / profile /
+- route resolution cache:`(group, route_key, stable sandbox_id)` -> NodeSandboxID / APIEndpoint / DataEndpoint / profile /
   StableID / APISecret / 两项 root fingerprint / ServiceSecret /
   EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / RouteRevision。
-- build forwarding cache:`(group, build_id)` -> node endpoint;不能只以 build_id 为键。
+- build forwarding cache:`(group, build_id)` -> APIEndpoint;不能只以 build_id 为键.
 - 在途请求只持有自身的 route 副本和计数,不作为新请求的路由 cache,也不阻止新
   RouteRevision 替换旧 NodeSandboxID。
 
@@ -888,8 +892,9 @@ node proxy 在 CONNECT 握手返回 typed `not_found`/`unauthorized` 时,Router 
 credential 调用一次 `ReserveData` 复验并刷新 route,然后只重试一次。普通连接失败只淘汰 cache。
 
 未知 route 的数据面请求在 Resolve 后返回 not found,不会触发 sandbox 创建。
-命中 route 后,Router 在 node 边界把公开 SandboxID 转换为 NodeSandboxID:控制面重写路径,
-数据面外层 CONNECT、Host 和已有 sandbox identity Header 使用 NodeSandboxID。公开 create/connect/list/get
+命中 route 后,Router 在 node 边界把公开 SandboxID 转换为 NodeSandboxID:控制面重写路径并只拨
+APIEndpoint,数据面外层 CONNECT,Host 和已有 sandbox identity Header 使用 NodeSandboxID 并只拨
+DataEndpoint.任一 endpoint 缺失都 fail closed,不跨平面回退.公开 create/connect/list/get
 结果仍只呈现稳定 SandboxID。
 
 Router 接收新 route 时,不允许更低 RouteRevision 覆盖 cache,也不允许相同 RouteRevision 以不同
@@ -1046,6 +1051,9 @@ node_link build_register command
 node build_event releases/adapts state
 ```
 
+`ReserveBuild` 返回当前 node 的 `APIEndpoint`;Router 的 build status/trigger/files/log 等后续
+control HTTP 只缓存并拨该地址.结果不保留旧 `DataEndpoint` alias,BuildRecord 也不复制 endpoint.
+
 北向 `/v3/templates` 将省略的 profile 按 e2b 端点语义解析为 `e2b`;进入集群内部后 profile 必须
 显式存在。route owner 将其与 placement 返回的 `APISecretFingerprint` 持久化进 BuildRecord,
 并随 `build_register` 下发,节点按该完整指纹从同一凭据对写入本地 build,同时将 profile 写入
@@ -1109,19 +1117,21 @@ sandbox-group 配置、placement hint、APISecret、ManifestKey 仍由 placer/pr
 ## 16. 集群 stub e2e
 
 `node-stub-ctl` 是本仓 cluster e2e 节点桩。它使用真实 node_link 协议接入 registry,一个进程可模拟多个
-node,但不启动 microVM。除 microVM/应用进程外,它模拟节点控制面行为:
+node,但不启动 microVM.每个进程使用彼此不同的 admin,API 和 Data listener;ready JSON 返回
+`admin`,`api`,`data`,每个 node 注册 APIEndpoint 与 DataEndpoint.除 microVM/应用进程外,它模拟节点控制面行为:
 
 - 注册 node、心跳、drain、水位和 build 预算。
 - 接收 `key_put/key_drop/create/connect/exec_session/delete/build_register` 命令并返回 ack.
 - 按 sandbox 行为配置发布 READY/dead route event。
 - 发布 build event。
-- 提供 admin/data API 查询节点、sandbox、build、key、command 和 data hit。
+- admin listener 只提供 node-stub-ctl 管理查询;API listener 只模拟 conductor control API;
+  Data listener 只模拟 ordinary data,CONNECT 与 exec.
 - 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
 
 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/placer` 与 `node-stub-ctl`。
 `test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
 import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、SandboxID 与 NodeSandboxID
-转换,按稳定 SID 数据面转发,ExecSession Reserve/CmdExecSession 签发,
+转换,control/build 命中 API listener,data/exec 命中 Data listener,ExecSession Reserve/CmdExecSession 签发,
 `service=exec` KAT 拒绝/双层校验与第二跳 buffered tunnel,route cache,BuildRegister,
 孤儿 route 清理和节点清空收敛.
 

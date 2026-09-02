@@ -301,7 +301,7 @@ func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPar
 }
 
 // NewMMDSWorkerView adds the inherited master RPC connection used only by an
-// external proxy worker. Existing non-MMDS callers retain NewWorkerView.
+// independent Proxy worker. Existing non-MMDS callers retain NewWorkerView.
 func NewMMDSWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, client *mmdsrpc.Client) *WorkerView {
 	view := NewWorkerView(table, updates, wake, defaultPark)
 	view.mmdsClient = client

@@ -33,7 +33,7 @@ const mmdsSecretInfo = "kuasar-mmds-v1:"
 // MmdsSecret derives the per-sandbox HMAC key the MMDS service signs session tokens
 // with. It is deterministic: every proxy worker (and the orchestrator) derives the
 // same 32-byte key from the sandbox's manifest key + id, so a token minted by one
-// process verifies in any other — which is what makes a multi-worker external proxy
+// process verifies in any other — which is what makes a multi-worker independent Proxy
 // (and node failover) coherent, unlike a per-process random secret. manifestKeyHex
 // is the tenant manifest key (hex); an empty or non-hex key yields nil (the caller
 // treats that as "no secret available").

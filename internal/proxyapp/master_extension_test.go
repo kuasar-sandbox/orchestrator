@@ -108,7 +108,7 @@ func TestRunMasterWrapsManagementHandlerOnce(t *testing.T) {
 		})
 	}()
 
-	statsSocket := paths[2]
+	statsSocket := paths[1]
 	response := requestUnixEventually(t, statsSocket, http.MethodGet, "/private/health", nil)
 	if response.StatusCode != http.StatusNoContent {
 		response.Body.Close()
@@ -194,18 +194,17 @@ func testMasterEffective(t *testing.T) (*EffectiveConfig, []string) {
 	temp := t.TempDir()
 	cfg := testProxyConfig(t)
 	cfg.ConfigSocket = filepath.Join(temp, "config.sock")
-	cfg.ProxySocket = filepath.Join(temp, "proxy.sock")
 	cfg.StatsSocket = filepath.Join(temp, "stats.sock")
 	cfg.ShmPath = filepath.Join(temp, "routes.shm")
 	cfg.Paths.RunRoot = filepath.Join(temp, "run")
 	cfg.ProxyNetNS = ""
-	cfg.DataListen = ""
+	cfg.DataListen = "127.0.0.1:0"
 	cfg.MetricsListen = ""
 	effective, err := FreezeConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return effective, []string{cfg.ConfigSocket, cfg.ProxySocket, cfg.StatsSocket, cfg.ShmPath}
+	return effective, []string{cfg.ConfigSocket, cfg.StatsSocket, cfg.ShmPath}
 }
 
 func testMasterLogger() *slog.Logger {

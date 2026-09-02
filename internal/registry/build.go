@@ -20,11 +20,11 @@ import (
 // BuildReserveResult is the registry-assigned identity + placement for a build
 // (the router returns these to the e2b client + routes its follow-ups by build_id).
 type BuildReserveResult struct {
-	BuildID      string        `json:"build_id"`
-	TemplateID   string        `json:"template_id"`
-	NodeID       string        `json:"node_id"`
-	DataEndpoint string        `json:"data_endpoint"`
-	Profile      types.Profile `json:"profile"`
+	BuildID     string        `json:"build_id"`
+	TemplateID  string        `json:"template_id"`
+	NodeID      string        `json:"node_id"`
+	APIEndpoint string        `json:"api_endpoint"`
+	Profile     types.Profile `json:"profile"`
 }
 
 // BuildReserveReq is the router's build-register ask: the group + profile, the
@@ -398,11 +398,11 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 		return nil
 	}
 	return &BuildReserveResult{
-		BuildID:      rec.BuildID,
-		TemplateID:   rec.TemplateID,
-		NodeID:       rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
-		Profile:      rec.Profile,
+		BuildID:     rec.BuildID,
+		TemplateID:  rec.TemplateID,
+		NodeID:      rec.NodeID,
+		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID),
+		Profile:     rec.Profile,
 	}
 }
 
@@ -504,6 +504,6 @@ func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*Bu
 	}
 	return &BuildReserveResult{
 		BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, b.NodeID), Profile: b.Profile,
+		APIEndpoint: r.nodeAPIEndpoint(ctx, b.NodeID), Profile: b.Profile,
 	}, true
 }

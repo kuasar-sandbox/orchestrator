@@ -80,21 +80,11 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		defer proxyNamespace.Close()
 	}
 
-	forwardListener, err := listenUnix(cfg.ProxySocket)
+	dataListener, err := net.Listen("tcp", cfg.DataListen)
 	if err != nil {
-		return fmt.Errorf("proxy: listen proxy_socket %s: %w", cfg.ProxySocket, err)
+		return fmt.Errorf("proxy: listen data_listen %s: %w", cfg.DataListen, err)
 	}
-	defer forwardListener.Close()
-	defer os.Remove(cfg.ProxySocket)
-
-	var dataListener net.Listener
-	if cfg.DataListen != "" {
-		dataListener, err = net.Listen("tcp", cfg.DataListen)
-		if err != nil {
-			return fmt.Errorf("proxy: listen data_listen %s: %w", cfg.DataListen, err)
-		}
-		defer dataListener.Close()
-	}
+	defer dataListener.Close()
 
 	statsListener, err := listenUnix(cfg.StatsSocket)
 	if err != nil {
@@ -133,7 +123,6 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	registration := routesync.Register{
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
 		Proxy: &routesync.Proxy{
-			Socket:      routesync.Socket{Path: cfg.ProxySocket},
 			StatsSocket: &routesync.Socket{Path: cfg.StatsSocket},
 		},
 		Mmds: true,
@@ -167,14 +156,13 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	for index := 0; index < cfg.Workers; index++ {
 		workerIndex := index
 		startMasterTask(func() {
-			superviseWorker(masterCtx, workerIndex, effective, proxyNamespace, dataListener, forwardListener, mmdsListener, view, masterStats, logger)
+			superviseWorker(masterCtx, workerIndex, effective, proxyNamespace, dataListener, mmdsListener, view, masterStats, logger)
 		})
 	}
 
 	logger.Info("proxy master serving",
 		"workers", cfg.Workers,
 		"data_listen", cfg.DataListen,
-		"proxy_socket", cfg.ProxySocket,
 		"stats_socket", cfg.StatsSocket,
 		"mmds_listen", mmdsListen,
 		"proxy_netns", cfg.ProxyNetNS,
@@ -186,12 +174,12 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	return nil
 }
 
-func superviseWorker(ctx context.Context, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, forwardListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) {
+func superviseWorker(ctx context.Context, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", index)
 	var epoch uint64
 	for ctx.Err() == nil {
 		epoch++
-		err := runWorkerProcess(ctx, workerID, epoch, effective, proxyNamespace, dataListener, forwardListener, mmdsListener, view, stats, logger)
+		err := runWorkerProcess(ctx, workerID, epoch, effective, proxyNamespace, dataListener, mmdsListener, view, stats, logger)
 		if ctx.Err() != nil {
 			return
 		}
