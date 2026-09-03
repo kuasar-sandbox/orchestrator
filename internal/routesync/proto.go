@@ -83,7 +83,9 @@ const (
 	TypeRegister = "register" // subscriber -> orchestrator (caps; first up-frame)
 	TypeHello    = "hello"    // orchestrator -> subscriber (carries Policy)
 	TypeUpsert   = "upsert"   // orchestrator -> subscriber (one route added/changed)
-	TypeDelete   = "delete"   // orchestrator -> subscriber (one route removed)
+	// TypeDelete withdraws one route projection. It does not prove that the
+	// sandbox's unit, network, paths, or durable business row are finalized.
+	TypeDelete   = "delete"   // orchestrator -> subscriber
 	TypeBookmark = "bookmark" // orchestrator -> subscriber (initial route stream complete; synced)
 	TypeWake     = "wake"     // subscriber -> orchestrator (resume this sandbox)
 	// RouteBarrier follows one or more route mutations on the same ordered down
