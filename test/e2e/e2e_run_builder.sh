@@ -1289,12 +1289,21 @@ B8_REF=$(persist_ref "$B8_PERSIST") || fail "B8 persistent id is invalid"
 MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
     "$B8_REF" >"$WORK/b8-snapshot.json" 2>"$WORK/b8-snapshot.err" \
     || { cat "$WORK/b8-snapshot.err"; fail "sandbox-ctl info B8 Snapshot"; }
-python3 - "$WORK/b8-snapshot.json" "$B7_REF" <<'PY' \
+# Snapshot info is intentionally a narrow compatibility view. Follow its new
+# SandboxRef and inspect E for the complete shared cold/portable configuration.
+B8_SANDBOX_REF=$(json_field "$WORK/b8-snapshot.json" SandboxRef)
+[ -n "$B8_SANDBOX_REF" ] && [ "$B8_SANDBOX_REF" != "$B7_REF" ] \
+    || fail "B8 Snapshot did not point at a newly captured Sandbox E"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B8_SANDBOX_REF" >"$WORK/b8-sandbox.json" 2>"$WORK/b8-sandbox.err" \
+    || { cat "$WORK/b8-sandbox.err"; fail "sandbox-ctl info B8 Sandbox"; }
+python3 - "$WORK/b8-snapshot.json" "$WORK/b8-sandbox.json" "$B7_REF" <<'PY' \
     || fail "B8 Snapshot retained source E or lost shared cold configuration"
 import json, sys
-config = json.load(open(sys.argv[1]))
-encoded = json.dumps(config, sort_keys=True)
-assert sys.argv[2] not in encoded, encoded
+snapshot = json.load(open(sys.argv[1]))
+config = json.load(open(sys.argv[2]))
+encoded = json.dumps([snapshot, config], sort_keys=True)
+assert sys.argv[3] not in encoded, encoded
 assert config["Resources"]["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, config["Resources"]
 assert config["Launch"]["Env"]["BUILD_TARGET_ENV"] == "portable-e2e", config["Launch"]
 metadata = config.get("Metadata") or {}

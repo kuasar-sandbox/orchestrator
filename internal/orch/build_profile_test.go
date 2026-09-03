@@ -231,6 +231,25 @@ func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing
 		resolved.Startup == nil || resolved.Startup.Memory != "4GiB" {
 		t.Fatalf("resolved source target resources = %+v", resolved)
 	}
+
+	disabled := false
+	lowered, err := sandboxcfg.ParseSpec(map[string]string{
+		sandboxcfg.NsResource: `{"allocatable":{"memory":"4GiB"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err = o.resolveBuildTargetResources(lowered, &configsock.ArtifactCapacity{
+		CPU: 4, Memory: "8GiB", AllocatableCPU: 4, AllocatableMemory: "8GiB",
+		DeflateOnOOM: &disabled,
+	})
+	if err != nil {
+		t.Fatalf("lower allocatable with inherited deflate=false: %v", err)
+	}
+	if resolved.Allocatable.Memory != "4GiB" || resolved.Allocatable.DeflateOnOOM == nil ||
+		!*resolved.Allocatable.DeflateOnOOM {
+		t.Fatalf("registration allocation did not supersede incompatible source deflate flag: %+v", resolved.Allocatable)
+	}
 }
 
 func TestDirectBuildRegisterRejectsClusterSystemMetadata(t *testing.T) {

@@ -1049,9 +1049,18 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if !b.Profile.Valid() {
 		return nil, buildFailed("resource_resolve", fmt.Errorf("build: unknown profile %q", b.Profile))
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, buildFailed("runtime", err)
+	}
 	sourceTemplate, err := buildUsesSandboxTemplate(b)
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
+	}
+	if direct, handled, err := directImageBuildResult(b); handled {
+		if err != nil {
+			return nil, buildFailed("resource_resolve", err)
+		}
+		return direct, nil
 	}
 	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
 	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)
@@ -1250,6 +1259,32 @@ func buildUsesSandboxTemplate(b *types.Build) (bool, error) {
 	default:
 		return false, fmt.Errorf("build: unsupported source template kind %q", tmpl.Kind)
 	}
+}
+
+// directImageBuildResult completes the phase-free identity case without
+// assigning a runner or attaching a network. An unchanged Image template is
+// already the required top-level artifact; all other sources or targets still
+// use the normal durable worker pipeline.
+func directImageBuildResult(build *types.Build) (*buildResult, bool, error) {
+	if build == nil || build.FromImage != "" || build.FromTemplate == "" || len(build.Steps) != 0 {
+		return nil, false, nil
+	}
+	template, err := types.ParseTemplateID(build.FromTemplate)
+	if err != nil || template.Kind != types.KindImg {
+		return nil, false, nil
+	}
+	target := types.ResolveBuildTarget(build.Builder.Target, build.StartCmd, build.ReadyCmd)
+	if target.Kind != types.BuildTargetImage {
+		return nil, false, nil
+	}
+	result := &buildResult{
+		Target: target, ImageRef: template.Ref,
+		StartCmd: build.StartCmd, ReadyCmd: build.ReadyCmd,
+	}
+	if err := validateBuildResult(build, *result); err != nil {
+		return nil, true, err
+	}
+	return result, true, nil
 }
 
 func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
@@ -1498,11 +1533,22 @@ func (o *Orchestrator) resolveBuildTargetResources(spec sandboxcfg.SandboxSpec, 
 		}
 	}
 	resources, err := o.resolveBuildResources(patch, source)
-	if err == nil && source != nil && source.DeflateOnOOM != nil {
+	if err != nil {
+		return rtconfig.ResourcesConfig{}, err
+	}
+	if source != nil && source.DeflateOnOOM != nil {
+		resolved := resources.Allocatable.DeflateOnOOM
 		value := *source.DeflateOnOOM
 		resources.Allocatable.DeflateOnOOM = &value
+		dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
+		if err := sandboxcfg.ValidateResolvedResources(resources, dynamic); err != nil {
+			// A registration override can make the inherited false value
+			// incompatible (for example by lowering allocatable memory). In that
+			// case the higher-priority resolved allocation keeps its derived true.
+			resources.Allocatable.DeflateOnOOM = resolved
+		}
 	}
-	return resources, err
+	return resources, nil
 }
 
 func (o *Orchestrator) resolveBuildResources(patch sandboxcfg.ResourcePatch, _ *configsock.ArtifactCapacity) (rtconfig.ResourcesConfig, error) {

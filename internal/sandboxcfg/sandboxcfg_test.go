@@ -47,8 +47,17 @@ func TestParseSpecNamespaces(t *testing.T) {
 	}
 	// stop_signal (snake_case) must bind via the runtime config's yaml tags.
 	if s.Launch == nil || s.Launch.Exec != "/app" || s.Launch.StopSignal != "SIGINT" ||
-		s.Launch.User != "1000:1000" || !s.Launch.CgroupControl {
+		s.Launch.User != "1000:1000" || !s.Launch.CgroupControl ||
+		s.LaunchCgroupControl == nil || !*s.LaunchCgroupControl {
 		t.Fatalf("launch parsed wrong: %+v", s.Launch)
+	}
+	omitted, err := ParseSpec(map[string]string{NsLaunch: `{"exec":"/new-app"}`})
+	if err != nil || omitted.LaunchCgroupControl != nil {
+		t.Fatalf("omitted launch.cgroup_control presence = %v, %v", omitted.LaunchCgroupControl, err)
+	}
+	explicitFalse, err := ParseSpec(map[string]string{NsLaunch: `{"cgroup_control":false}`})
+	if err != nil || explicitFalse.LaunchCgroupControl == nil || *explicitFalse.LaunchCgroupControl {
+		t.Fatalf("explicit false launch.cgroup_control presence = %v, %v", explicitFalse.LaunchCgroupControl, err)
 	}
 	if len(s.Mounts) != 1 || s.Mounts[0].Target != "/data" || s.Mounts[0].Type != "tmpfs" {
 		t.Fatalf("mounts parsed wrong: %+v", s.Mounts)
@@ -248,6 +257,20 @@ func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
 	if len(runtime.Mounts) != 0 || len(runtime.Files) != 0 || len(runtime.Init) != 0 ||
 		len(runtime.Metadata) != 0 {
 		t.Fatalf("source collections survived replacement: %#v", runtime)
+	}
+}
+
+func TestMergeBareBuildLaunchPreservesOmittedCgroupControl(t *testing.T) {
+	dst := rtconfig.LaunchConfig{Exec: "/source", CgroupControl: true}
+	mergeBareBuildLaunch(&dst, &rtconfig.LaunchConfig{Exec: "/registered"}, nil, nil)
+	if dst.Exec != "/registered" || !dst.CgroupControl {
+		t.Fatalf("partial launch override erased source boolean: %+v", dst)
+	}
+
+	explicitFalse := false
+	mergeBareBuildLaunch(&dst, &rtconfig.LaunchConfig{Exec: "/registered"}, &explicitFalse, nil)
+	if dst.CgroupControl {
+		t.Fatalf("explicit launch.cgroup_control=false was ignored: %+v", dst)
 	}
 }
 

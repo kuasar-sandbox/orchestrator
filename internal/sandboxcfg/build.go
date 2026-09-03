@@ -100,7 +100,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 		launch.Env = mergeStr(merged.Launch.Env, projected.Launch.Env)
 		merged.Launch = launch
 	} else {
-		mergeBareBuildLaunch(&merged.Launch, p.Spec.Launch, p.EnvVars)
+		mergeBareBuildLaunch(&merged.Launch, p.Spec.Launch, p.Spec.LaunchCgroupControl, p.EnvVars)
 	}
 	if p.NamespacePresent[NsMounts] {
 		merged.Mounts = append([]rtconfig.MountConfig(nil), p.Spec.Mounts...)
@@ -128,7 +128,7 @@ func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	return &merged, nil
 }
 
-func mergeBareBuildLaunch(dst *rtconfig.LaunchConfig, override *rtconfig.LaunchConfig, env map[string]string) {
+func mergeBareBuildLaunch(dst *rtconfig.LaunchConfig, override *rtconfig.LaunchConfig, cgroupControl *bool, env map[string]string) {
 	dst.Env = mergeStr(dst.Env, env)
 	if override == nil {
 		return
@@ -151,7 +151,9 @@ func mergeBareBuildLaunch(dst *rtconfig.LaunchConfig, override *rtconfig.LaunchC
 	if override.StopSignal != "" {
 		dst.StopSignal = override.StopSignal
 	}
-	dst.CgroupControl = override.CgroupControl
+	if explicit := cgroupControl; explicit != nil {
+		dst.CgroupControl = *explicit
+	}
 	if len(override.Plugin) > 0 {
 		dst.Plugin = append([]rtconfig.PluginConfig(nil), override.Plugin...)
 	}

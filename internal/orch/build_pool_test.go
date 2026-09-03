@@ -192,6 +192,35 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	}
 }
 
+func TestRunBuildUnitReusesUnchangedImageWithoutRuntimeSideEffects(t *testing.T) {
+	o := testOrch(t)
+	vs := &resourcePreflightVS{}
+	o.vs = vs
+	ref := "manifest://" + strings.Repeat("d", 64)
+	target := &types.BuildTarget{Kind: types.BuildTargetImage}
+	b := &types.Build{
+		BuildID: "build-phase-free-image", Profile: types.ProfileE2B,
+		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: ref}.String(),
+		Builder:      types.BuildOptions{Target: target},
+	}
+
+	result, err := o.runBuildUnit(context.Background(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Target != *target || result.ImageRef != ref {
+		t.Fatalf("phase-free image result = %+v", result)
+	}
+	if vs.attaches.Load() != 0 || b.RunID != "" || b.RuntimeVswitchPort != "" {
+		t.Fatalf("phase-free image acquired runtime state: attaches=%d build=%+v", vs.attaches.Load(), b)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := o.runBuildUnit(canceled, b); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled phase-free image = %v, want context canceled", err)
+	}
+}
+
 func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Builder.TotalTimeoutSec = 75
