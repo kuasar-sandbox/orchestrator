@@ -16,7 +16,9 @@ import (
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	internalproxy "github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -324,6 +326,9 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker Run did not stop")
 	}
+	if !harness.worker.admissionEscaped.Load() {
+		t.Fatal("serving worker did not retain admission mapping for process lifetime")
+	}
 }
 
 func TestPreparedWorkerStartFailureDoesNotServeListeners(t *testing.T) {
@@ -343,4 +348,44 @@ func TestPreparedWorkerStartFailureDoesNotServeListeners(t *testing.T) {
 	if extension.calls.Load() != 1 || harness.data.accepts.Load() != 0 {
 		t.Fatalf("Start=%d data accepts=%d", extension.calls.Load(), harness.data.accepts.Load())
 	}
+}
+
+func TestPreparedWorkerCloseRetainsEscapedAdmissionUntilProcessExit(t *testing.T) {
+	master, err := proxyadmission.NewMaster(2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	if err := master.BeginWorker(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	file, err := master.DupFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := proxyadmission.OpenWorker(file, 2, 1, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admission.Close()
+	update, err := master.PrepareUpsert("s1", "identity-1", publicconfig.MaxInflight{Total: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := update.Binding()
+	update.Commit()
+
+	prepared := &PreparedWorker{admission: admission}
+	prepared.admissionEscaped.Store(true)
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !admission.Valid(binding) {
+		t.Fatal("Close unmapped admission after it escaped to a serving handler")
+	}
+	lease, err := admission.TryAcquire(binding, proxyadmission.ServiceForward)
+	if err != nil {
+		t.Fatalf("retained admission TryAcquire: %v", err)
+	}
+	lease.Release()
 }

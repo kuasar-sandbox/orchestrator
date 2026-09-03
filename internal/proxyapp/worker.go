@@ -40,8 +40,13 @@ type PreparedWorker struct {
 	data        net.Listener
 	mmds        net.Listener
 	run         atomic.Bool
-	closeOnce   sync.Once
-	closeErr    error
+	// admissionEscaped is set before the admission-backed handler is exposed to
+	// an extension or listener. HTTP/1 hijacked handlers are not awaited by
+	// http.Server.Shutdown, so their mapping must remain valid until process
+	// exit even after Run returns and Close releases the other worker resources.
+	admissionEscaped atomic.Bool
+	closeOnce        sync.Once
+	closeErr         error
 }
 
 // PrepareWorker reconstructs the shared table, inherited listeners, pipes, and
@@ -195,6 +200,11 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 			view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
 		).WithTrafficTracker(workerStats)
 	}
+	// A CONNECT handler may outlive appnet.Serve because HTTP/1 hijacked
+	// connections are outside http.Server.Shutdown's wait set. Keep the mmap
+	// process-owned from this point; the kernel tears it down after every
+	// handler has necessarily stopped at process exit.
+	worker.admissionEscaped.Store(true)
 	var ingressHandler http.Handler = proxyHandler
 	if runtime.WorkerExtension != nil {
 		ingressHandler, err = startWorkerIngress(
@@ -256,11 +266,18 @@ func (worker *PreparedWorker) Close() error {
 		return nil
 	}
 	worker.closeOnce.Do(func() {
+		admission := worker.admission
+		if worker.admissionEscaped.Load() {
+			// Do not Munmap while an HTTP/1 hijacked handler can still execute
+			// Worker.Valid or Lease.Release. This is a worker subprocess; process
+			// exit is the safe and deterministic reclamation boundary.
+			admission = nil
+		}
 		worker.closeErr = errors.Join(
 			closeFile(worker.wakeFile), closeFile(worker.notifyFile), closeConn(worker.statsConn),
 			closeConn(worker.mmdsRPCConn), closeListener(worker.data),
 			closeListener(worker.mmds), closeTable(worker.table),
-			closeAdmission(worker.admission),
+			closeAdmission(admission),
 		)
 	})
 	return worker.closeErr

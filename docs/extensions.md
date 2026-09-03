@@ -283,9 +283,10 @@ RouteBarrier ACK, or affect Wake/activation.
 `TrafficSource.Get` combines the current applied route identity and its effective
 per-Sandbox `maxInflight` policy with `MasterStats` directly in process; it does
 not query the stats UDS or derive limits from the conductor Sandbox row. Returned
-maps and time pointers are independent copies. V1 intentionally has no traffic
-Watch. A route retained during reconnect remains queryable, so callers that
-require freshness also inspect `Routes().SyncState()`.
+`TrafficView.MaxInflight` uses the canonical `config.MaxInflight` shape; maps and
+time pointers are independent copies. V1 intentionally has no traffic Watch. A
+route retained during reconnect remains queryable, so callers that require
+freshness also inspect `Routes().SyncState()`.
 
 ## Proxy worker extension
 

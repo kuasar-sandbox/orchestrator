@@ -62,13 +62,20 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 }
 
 func TestRouteEntryFailsClosedOnCorruptPersistedTraffic(t *testing.T) {
-	sb := &types.Sandbox{
-		ID: "corrupt", Profile: types.ProfileBare, State: types.StateRunning,
-		Metadata: map[string]string{sandboxcfg.NsTraffic: `{"max_inflight":{"total":null}}`},
-	}
-	entry := (&Orchestrator{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).routeEntry(sb)
-	if entry.State != routesync.StateDead || entry.MaxInflightPatch != nil {
-		t.Fatalf("corrupt traffic projection = %+v", entry)
+	for name, raw := range map[string]string{
+		"syntax":  `{"max_inflight":{"total":null}}`,
+		"profile": `{"max_inflight":{"e2b:envd":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			sb := &types.Sandbox{
+				ID: "corrupt-" + name, Profile: types.ProfileBare, State: types.StateRunning,
+				Metadata: map[string]string{sandboxcfg.NsTraffic: raw},
+			}
+			entry := (&Orchestrator{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).routeEntry(sb)
+			if entry.State != routesync.StateDead || entry.MaxInflightPatch != nil {
+				t.Fatalf("corrupt traffic projection = %+v", entry)
+			}
+		})
 	}
 }
 

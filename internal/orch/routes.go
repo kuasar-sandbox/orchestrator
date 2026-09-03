@@ -75,9 +75,13 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	}
 	if raw, present := sb.Metadata[sandboxcfg.NsTraffic]; present {
 		patch, err := sandboxcfg.ParseTrafficPatch(raw)
+		if err == nil {
+			err = sandboxcfg.ValidateTrafficForProfile(sb.Profile, patch)
+		}
 		if err != nil {
 			// Persisted metadata is validated before insertion. A corrupted row
-			// must nevertheless fail closed instead of becoming unlimited.
+			// must nevertheless fail closed instead of becoming unlimited or
+			// repeatedly breaking the Proxy's full route synchronization.
 			e.State = routesync.StateDead
 			return e, fmt.Errorf("project traffic metadata for %s: %w", sb.ID, err)
 		}
