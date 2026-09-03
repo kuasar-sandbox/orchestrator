@@ -18,6 +18,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -82,6 +84,12 @@ func (l *sandboxFinalizerLauncher) clearFaults() {
 	l.mu.Lock()
 	l.stopErr, l.resetErr, l.listErr = nil, nil, nil
 	l.mu.Unlock()
+}
+
+func (l *sandboxFinalizerLauncher) stopSnapshot() (string, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.state, l.stops
 }
 
 type sandboxFinalizerVS struct {
@@ -263,36 +271,89 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 	}
 }
 
-func TestKillDurablyAcceptsDeletingAndRetriesToTerminalObservation(t *testing.T) {
+func TestKillWithdrawsProxyRouteBeforeFinalizerAndObservesAfterHardDelete(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "delete-live-retry")
 	recorder := &objectObserverRecorder{}
 	fixture.o.SetExtensionObserver(recorder)
-	events, cancel := fixture.o.Subscribe()
-	defer cancel()
-	var failRunDir atomic.Bool
-	failRunDir.Store(true)
-	var removeCalls atomic.Int32
-	fixture.o.removeSandboxRunDir = func(path string) error {
-		removeCalls.Add(1)
-		if failRunDir.Load() {
-			return errors.New("transient RunDir failure")
-		}
-		return os.RemoveAll(path)
+	events, stopEvents := fixture.o.Subscribe()
+	defer stopEvents()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
+		defer cancelDrain()
+		_ = fixture.o.DrainSandboxDeletes(drainCtx)
+	})
+
+	routePath := filepath.Join(t.TempDir(), "routes.shm")
+	routeTable, err := proxyshm.Create(routePath, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer routeTable.Close()
+	proxyWorkerTable, err := proxyshm.Open(routePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyWorkerTable.Close()
+	proxyMaster := proxyshm.NewMasterView(routeTable, time.Second, nil)
+	proxyWorker := proxyshm.NewWorkerView(proxyWorkerTable, nil, nil, time.Second)
+	proxyMaster.BeginSync()
+	if err := proxyMaster.ApplyUpsert(fixture.o.routeEntry(fixture.sb)); err != nil {
+		t.Fatal(err)
+	}
+	proxyMaster.Bookmark()
+	target := proxy.LegacyTarget(8080)
+	binding, found, err := proxyWorker.LookupRoute(context.Background(), fixture.sb.ID, target)
+	if err != nil || !found {
+		t.Fatalf("initial Proxy LookupRoute = %+v, %t, %v", binding, found, err)
+	}
+	if route, active, err := proxyWorker.ActivateRoute(context.Background(), binding); err != nil || !active || route.Kind != proxy.KindTCP {
+		t.Fatalf("initial Proxy ActivateRoute = %+v, %t, %v", route, active, err)
 	}
 
+	stopErr := errors.New("transient Stop failure")
+	fixture.lc.mu.Lock()
+	fixture.lc.stopErr = stopErr
+	fixture.lc.mu.Unlock()
 	if killed, err := fixture.o.Kill(context.Background(), fixture.sb.ID, fixture.apiKey); err != nil || !killed {
 		t.Fatalf("Kill = %t, %v", killed, err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for removeCalls.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
+			t.Fatalf("delete acceptance route withdrawal = %+v", event)
+		}
+		proxyMaster.ApplyDelete(event.SID)
+	case <-time.After(time.Second):
+		t.Fatal("delete acceptance did not withdraw the live route")
 	}
-	if removeCalls.Load() == 0 {
-		t.Fatal("delete finalizer did not reach injected RunDir failure")
+
+	deadline := time.Now().Add(time.Second)
+	state, stopCalls := fixture.lc.stopSnapshot()
+	for stopCalls == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		state, stopCalls = fixture.lc.stopSnapshot()
+	}
+	if stopCalls == 0 {
+		t.Fatal("delete finalizer did not reach injected Stop failure")
+	}
+	if state != "active" {
+		t.Fatalf("failed Stop changed runner state to %q", state)
 	}
 	deleting := assertDeletingOwnership(t, fixture)
 	if kinds := recorder.sandboxKinds(); len(kinds) != 0 {
 		t.Fatalf("terminal observer published before cleanup: %v", kinds)
+	}
+	if _, found := proxyWorkerTable.Lookup(deleting.ID); found {
+		t.Fatal("Proxy SHM retained deleting sandbox route")
+	}
+	if got, found, err := proxyWorker.LookupRoute(context.Background(), deleting.ID, target); err != nil || found {
+		t.Fatalf("Proxy LookupRoute after withdrawal = %+v, %t, %v", got, found, err)
+	}
+	if route, active, err := proxyWorker.ActivateRoute(context.Background(), binding); err != nil || active {
+		t.Fatalf("Proxy ActivateRoute after withdrawal = %+v, %t, %v", route, active, err)
 	}
 	var routed []routesync.RouteEntry
 	if err := fixture.o.Range(context.Background(), func(entry routesync.RouteEntry) error {
@@ -318,7 +379,7 @@ func TestKillDurablyAcceptsDeletingAndRetriesToTerminalObservation(t *testing.T)
 	}
 	select {
 	case event := <-events:
-		t.Fatalf("terminal route event published before cleanup: %+v", event)
+		t.Fatalf("unexpected extra route event before repeated acceptance: %+v", event)
 	default:
 	}
 	if err := fixture.o.Pause(context.Background(), deleting.ID, fixture.apiKey, orchSnapshotCapture(sandboxcfg.SnapshotPolicy{})); !errors.Is(err, api.ErrNotFound) {
@@ -338,22 +399,75 @@ func TestKillDurablyAcceptsDeletingAndRetriesToTerminalObservation(t *testing.T)
 	if killed, err := fixture.o.Kill(context.Background(), deleting.ID, fixture.apiKey); err != nil || !killed {
 		t.Fatalf("repeated Kill = %t, %v", killed, err)
 	}
+	select {
+	case event := <-events:
+		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
+			t.Fatalf("repeated delete acceptance route withdrawal = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repeated delete acceptance did not reassert route withdrawal")
+	}
 
-	failRunDir.Store(false)
+	fixture.lc.clearFaults()
 	waitForSandboxAbsent(t, fixture.o, context.Background(), fixture.sb.ID, "live finalizer retry")
 	if err := fixture.o.DrainSandboxDeletes(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != fixture.sb.ID {
-			t.Fatalf("terminal route event = %+v", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("completed delete did not publish its terminal route event")
+		t.Fatalf("delete finalizer published a second route withdrawal: %+v", event)
+	default:
 	}
 	if kinds := recorder.sandboxKinds(); len(kinds) != 1 || kinds[0] != "delete" {
 		t.Fatalf("terminal observer events = %v", kinds)
+	}
+	if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if kinds := recorder.sandboxKinds(); len(kinds) != 1 || kinds[0] != "delete" {
+		t.Fatalf("repeated finalizer terminal observer events = %v", kinds)
+	}
+}
+
+func TestKillDoesNotWithdrawRouteWhenDeleteAcceptanceFails(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-acceptance-failure")
+	events, cancel := fixture.o.Subscribe()
+	defer cancel()
+	installStoreTrigger(t, fixture.dbPath, `
+		CREATE TRIGGER fail_begin_sandbox_delete
+		BEFORE UPDATE OF state ON sandboxes
+		WHEN OLD.id='delete-acceptance-failure'
+		BEGIN SELECT RAISE(ABORT, 'forced delete acceptance failure'); END`)
+
+	if killed, err := fixture.o.Kill(context.Background(), fixture.sb.ID, fixture.apiKey); err == nil || killed {
+		t.Fatalf("Kill with failed durable acceptance = %t, %v", killed, err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("failed durable acceptance published route event: %+v", event)
+	default:
+	}
+	stored, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("failed durable acceptance row = %+v, %v", stored, err)
+	}
+	var routed bool
+	if err := fixture.o.Range(context.Background(), func(entry routesync.RouteEntry) error {
+		if entry.SandboxID == fixture.sb.ID {
+			routed = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !routed {
+		t.Fatal("failed durable acceptance withdrew full-snapshot route")
+	}
+	fixture.o.deleteMu.Lock()
+	_, finalizing := fixture.o.deleteActive[fixture.sb.ID]
+	fixture.o.deleteMu.Unlock()
+	if finalizing {
+		t.Fatal("failed durable acceptance started a delete finalizer")
 	}
 }
 

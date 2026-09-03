@@ -93,19 +93,18 @@ context cancellation returns `ctx.Err()`.
 Do not use Watch as an audit, billing, or exactly-once delivery mechanism. Those
 requirements need a separately designed durable outbox.
 
-An explicit delete removes the sandbox from the node cache and future full
-snapshots at durable `deleting` acceptance, but publishes the terminal route
-delete only after local cleanup and hard deletion. The conductor object source
-emits its terminal sandbox removal only after the
-exact unit/network/path cleanup and hard delete succeed. A restart-time snapshot
-may therefore contain a cleanup-pending `deleting` view. Extensions must treat
-it as diagnostic state and must not try to resume, route, or independently
-clean it.
+An explicit delete removes the sandbox from the node cache and publishes a
+route delete as soon as the durable `deleting` transition succeeds. That route
+delete is projection withdrawal only; it does not prove that the unit, network,
+paths, or durable row have been finalized. The conductor object source emits its
+terminal sandbox removal only after the exact local cleanup and hard delete
+succeed. A restart-time snapshot may therefore contain a cleanup-pending
+`deleting` view. Extensions must treat it as diagnostic state and must not try
+to resume, route, or independently clean it.
 
-For route consumers, a reconnecting full snapshot intentionally omits that
-`deleting` sandbox and can therefore withdraw an older projection before the
-live terminal delete exists. That withdrawal is unroute convergence, not a
-node terminal event; durable local cleanup continues from the retained row.
+For route consumers, both the live delete and omission from a reconnecting full
+snapshot withdraw an older projection. Durable local cleanup continues from the
+retained row independently of either route convergence path.
 
 ## Conductor lifecycle hooks
 

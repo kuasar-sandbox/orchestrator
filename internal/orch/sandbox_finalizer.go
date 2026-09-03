@@ -15,9 +15,9 @@ import (
 
 // acceptSandboxDeleteLocked commits the only durable delete acceptance point.
 // The caller holds the sandbox lifecycle lock. The local cache is withdrawn
-// after the transition and Range excludes deleting rows. The terminal route
-// event is intentionally delayed until the common finalizer has removed every
-// exact local owner and hard-deleted the row.
+// after the transition, Range excludes deleting rows, and the live route
+// withdrawal is published before the request returns. Physical cleanup and
+// terminal object observation remain the common finalizer's responsibility.
 func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.Sandbox) (bool, error) {
 	if sb == nil {
 		return false, nil
@@ -33,6 +33,7 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 	o.launches.Cancel(sb.ID)
 	o.clearDeadlineIntent(sb.ID)
 	o.uncache(sb.ID)
+	o.publishDelete(sb.ID)
 	o.startSandboxDeleteFinalizer(sb.ID)
 	return true, nil
 }
@@ -358,7 +359,6 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 	}
 	o.clearDeadlineIntent(sid)
 	o.uncache(sid)
-	o.publishDelete(sid)
 	o.observeSandboxDelete(sb)
 	return nil
 }

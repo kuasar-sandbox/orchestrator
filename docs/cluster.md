@@ -621,13 +621,12 @@ RESERVED 行使旧 route 失去回滚锚点。sandbox 事件携带 NodeSandboxID
 SandboxID、SandboxGeneration 和 group/route_key,再更新 route_link。若 READY 晚于
 park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
-`deleting` 只属于 node-local durable cleanup，不作为 sandbox upsert 投影。节点一旦把 exact
-owner 持久转为 `deleting` 就立即从本地 cache 和后续 full sync route set 排除；unit、network、
-RunDir/BaseDir finalizer 完成并 hard-delete 本地 row 后才发送 terminal Delete。这样节点不会重新
-激活已接纳删除的对象。既有 live node-link 上的 terminal Delete 只在 cleanup 完成后发送；若链路
-在此期间重连，下一代完整 route snapshot 会因该 SID 已被排除而撤下旧 projection，这是预期的
-unroute 收敛，不是 node terminal event。node 重启仍从完整 owner 重试本地清理，正确性不依赖
-Registry 是否还保留 projection。
+`deleting` 只属于 node-local durable cleanup,不作为 sandbox upsert 投影.节点一旦把 exact owner
+持久转为 `deleting`,就立即从本地 cache 和后续 full sync route set 排除,并在既有 live node-link
+上发送 Delete 撤销 projection.该 Delete 不是 unit,network,RunDir/BaseDir cleanup 或 hard-delete
+的完成证明.若进程在 durable transition 与增量发布之间退出,旧 stream 随进程失效;下一代完整
+route snapshot 因该 SID 已被排除而撤下旧 projection.node 重启仍从完整 owner 重试本地清理,
+正确性不依赖 Registry 是否还保留 projection;finalizer 完成时不再发送第二个 route Delete.
 
 node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
 `starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,
@@ -635,9 +634,10 @@ node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert d
 rollback。CmdConnect Ack 前则完成旧 runner/network/RunDir ownership cleanup，在 paused→starting
 原子 acceptance 中恢复 canonical RunDir/UDS 并提交 deadline，再发布 starting；其 restore failure
 发布 paused Upsert,不得进入 fresh-create Delete 分支。
-CmdDelete Ack 表示 node 已持久接纳 `deleting`，不等待 node-local finalizer 完成；
-pending 重放幂等。standalone 与 cluster Delete 使用同一 finalizer，node-link 不拥有另一套 cleanup
-或路径推导；finalizer 失败期间不发布 terminal Delete。
+CmdDelete Ack 表示 node 已持久接纳 `deleting`,不等待 node-local finalizer 完成;
+pending 重放幂等.standalone 与 cluster Delete 使用同一 finalizer,node-link 不拥有另一套 cleanup
+或路径推导;Ack 返回前已发布 route Delete 撤销既有 projection,terminal object observation 仍只在
+hard-delete 后发送.
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
