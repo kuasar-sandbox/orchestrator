@@ -660,7 +660,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
-| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting` 并从节点 cache/full snapshot 排除，随后 finalizer 取消 launch、fence runner、detach network、删除 RunDir/BaseDir 并 hard-delete row；完成后发布 terminal Delete；pending 时重复调用幂等 |
+| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,detach network,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool|null}`;`memory` 是 Kuasar extension:nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
 | pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;已暂停或正在 starting 回 409 |
@@ -1236,9 +1236,10 @@ Builder execution 配置 CPU 或 memory 聚合上限时不允许保留长期 idl
 属性。这样未 claim 的 idle RSS/CPU 不会侵占 `sandbox-builder.slice` 为 active Build 保留的
 完整 aggregate ceiling，也不需要引入隐藏的 idle 资源预算。
 
-- **kill**:在 SID lifecycle fence 内取消 active launch→删除 durable row→
-  `StopUnit`(连 CH 一并 SIGKILL)→`ResetFailedUnit`→tapfd `RELEASE` 或
-  `connector-ctl vswitch detach`→删运行目录/cache→发布 Delete。launch claim 仍保留到旧
+- **kill**:在 SID lifecycle fence 内把完整 owner exact-CAS 为 `deleting`→取消 active launch→
+  撤销 cache 并发布 route Delete→异步 `StopUnit`(连 CH 一并 SIGKILL)→`ResetFailedUnit`→
+  tapfd `RELEASE` 或 `connector-ctl vswitch detach`→删运行目录→hard-delete row.route Delete 不等待
+  这些 finalizer 步骤.launch claim 仍保留到旧
   attempt 完成其局部资源清理,因此迟到 CAS 不能复活该行,同 SID 也不能提前启动后继 attempt。
   `kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:serve 在分配 runner 前先绑定 `<RunDir>/ready.sock`(目录 0700、
@@ -1581,12 +1582,13 @@ Pause 原子覆盖它。
 同一 SID 的 Create、Connect、Wake、route activation、native exec、exec-session 和 migration import
 共用 launch group。每次 admission 先在 per-SID lifecycle lock 内重读 durable row,再执行授权、
 模式解析和 Store CAS,最后创建或加入 launch attempt。attempt 中的 mode 只是 durable
-`launch_mode` 的缓存。Kill/Delete 在 lifecycle lock 内先 exact-CAS 到 `deleting`，保留 RunID、
-unit identity、port、RunDir、BaseDir 与制品 owner，取消 attempt 并立即撤销节点 cache 与后续 full
-snapshot activation。
-请求在 durable acceptance 后返回；节点 finalizer 等待 late launch owner 退出，再按
+`launch_mode` 的缓存.Kill/Delete 在 lifecycle lock 内先 exact-CAS 到 `deleting`,保留 RunID,
+unit identity,port,RunDir,BaseDir 与制品 owner,取消 attempt 并立即撤销节点 cache 与后续 full
+snapshot activation,同时发布 route Delete 撤销既有 live projection.该 Delete 不证明本地资源已完成清理.
+请求在 durable acceptance 后返回;节点 finalizer 等待 late launch owner 退出,再按
 Stop/Reset + inactive readback、Detach、RemoveAll RunDir、RemoveAll BaseDir、exact hard-delete
-收敛。失败不清 ownership，当前进程持续重试，崩溃后由 startup Reconcile 重试。每次 fresh Create 必须在启动资源前通过
+收敛.hard-delete 后才发送 Extension/object terminal observation,不再发布第二次 route Delete.
+失败不清 ownership,当前进程持续重试,崩溃后由 startup Reconcile 重试.每次 fresh Create 必须在启动资源前通过
 route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收敛为零 ownership `dead`，
 并发布 Delete 撤销 route。
 
@@ -1942,12 +1944,12 @@ build_sync_end{}
 bookmark{full_sync}
 ```
 
-`deleting` 是 node-local cleanup-pending state，不作为 sandbox upsert 投影。节点一旦持久接纳
-Delete 就立即从本地 cache 和后续 full sync route set 排除；exact unit/network/path finalizer
-完成并 hard-delete 本地 row 后才在既有 live 链路发送 `delete{sid}`。若链路在 cleanup pending
-期间重连，下一代完整 route snapshot 会因该 SID 已被排除而撤下旧 projection；该动作是预期的
-unroute 收敛，不是 node terminal event。node 重启仍能从完整 owner 重试清理，本地 finalizer
-正确性不依赖 Registry projection。
+`deleting` 是 node-local cleanup-pending state,不作为 sandbox upsert 投影.节点一旦持久接纳
+Delete,就立即从本地 cache 和后续 full sync route set 排除,并在既有 live 链路发送
+`delete{sid}`.该事件只撤销 route projection,不证明 unit/network/path cleanup 或 hard-delete 已完成.
+若进程在 durable transition 与增量发布之间退出,旧 stream 随进程失效;下一代完整 route snapshot
+因该 SID 已被排除而撤下旧 projection.node 重启仍能从完整 owner 重试清理,本地 finalizer 正确性
+不依赖 Registry projection,也不在完成时发送第二个 route Delete.
 
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
 物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry
@@ -1995,7 +1997,7 @@ import、鉴权/签名及同一 resume acceptance。
   | `create{cmd_id, sid, template_ref, profile, api_secret_fingerprint, config, cluster}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = fresh Create 的快照恢复快启);完整 APISecret 指纹选择本机已安装的凭据对;`cluster={group,route_key,stable_id?}` 与 profile 作为系统字段独立持久化;credentials namespace 在写业务行前解析并剥离;Ack 前已是 `starting,run_id=""` 且有 active attempt |
   | `connect{cmd_id, sid, profile, api_secret_fingerprint, cluster, migration_token?, timeout_seconds?}` | `sid` 是 NodeSandboxID.target 已存在时忽略 token,校验完整指纹、profile 和 cluster context;target 缺失且带 KMT1 时,先用本机 matching pair 同步校验并以命令 sid/context insert paused 行;再于 Ack 前完成旧 runner/network/RunDir 清理，并在 paused→starting acceptance 中恢复 canonical RunDir/UDS、持久化 deadline.Ack 携 `ConnectResult{NodeSandboxID,TemplateID,Profile,EnvdAccessToken,TrafficAccessToken,ForwardAccessToken}` 且不携 root/fingerprint;restore 异步,缺失且无 token 则拒绝 |
   | `exec_session{cmd_id, sid, profile, api_secret_fingerprint, cluster, ttl_seconds, exec_conditions, migration_token?}` | 复用 connect 的精确目标,可选同步 import,profile/cluster context 和完整 APISecret 指纹校验;原始 API key 不进入 node-link.节点权威编译 `exec_conditions`,再生成 UUIDv7 session ID,以实际签发时间计算可选 `exp`,Ack 仅携 `ExecSessionResult{ExecAccessToken}`;随后按既有合同异步 resume,不等待 READY;conditions 不写 Sandbox row/route/event/metadata |
-  | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致；Ack 表示 exact owner 已持久转为 `deleting`，不等待 node-local finalizer 完成；terminal Delete 在本地 cleanup 和 hard-delete 后发布；pending 重放幂等(§5 kill) |
+  | `delete{cmd_id, sid, api_secret_fingerprint}` | 完整指纹必须与既有 Sandbox 业务行绑定一致;Ack 仍只表示 exact owner 已持久转为 `deleting`,不等待 node-local finalizer 完成;route Delete 在 Ack 返回前发布且不是 cleanup 完成证明;pending 重放幂等(§5 kill) |
   | `key_put{api_secret_fingerprint, api_secret_type, api_secret?, api_secret_ref?, manifest_key_fingerprint, manifest_key_type, manifest_key?, manifest_key_ref?, expires_unix}` / `key_drop{api_secret_fingerprint}` | `key_put` 原子校验并写入 / 重发续租完整凭据对;两项指纹均为 64-hex SHA-256。`key_drop` 按完整 APISecret 指纹 best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, api_secret_fingerprint, config}` | `config.builder.target` 是 canonical register-only requested target，参与 replay digest/node validation；节点以同一 canonical Build.Resources 做最终、事务化 registration admission。最终 Sandbox Create 配置/resources、build-only options 与 cluster group 分开持久化；A/B resources 不从 target Sandbox resources 推导。definitive 无副作用拒绝才可换候选,歧义结果固定同节点/BuildID重试 |
 
@@ -2008,9 +2010,9 @@ replacement Delete 分支。Registry 既有 replacement reservation rollback fen
 create 的 Delete 才恢复 Reserve 前旧 route,不能提前删除 reservation 丢失回滚依据。并发
 cluster create/connect/delete 不能取得第二个 node-local launch owner。
 
-standalone 与 cluster Delete 共用同一个 node-local finalizer；node-link command 不拥有另一套
-cleanup 或路径推导。finalizer 失败不会把 `deleting` 作为 ready、
-paused 或 starting 上报。
+standalone 与 cluster Delete 共用同一个 node-local finalizer;node-link command 不拥有另一套
+cleanup 或路径推导.finalizer 失败不会把 `deleting` 作为 ready,paused 或 starting 上报,
+也不会延迟或重复 route withdrawal;terminal object observation 仍等待 hard-delete.
 
 每个 exec-session API 调用是独立授权,因此使用新 CmdID 并签发新 KAT;resume
 可以继续按 SID 查找同一 launch attempt.`CmdID` 只关联当前 Command 与 Ack waiter,node 不持久化

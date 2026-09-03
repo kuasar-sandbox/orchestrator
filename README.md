@@ -74,10 +74,11 @@ claim 后才创建；镜像、Sandbox/Snapshot artifact 全部进入
 SandboxID 的 sandboxer socket 与最大 BuildID 的最长 phase socket 都不超过 Linux 107-byte
 pathname 上限；配置加载会 fail closed。
 
-Sandbox 显式删除先把完整 owner 原子转为内部 `deleting`，立即从节点 cache 与后续 route full
-snapshot 撤下，再由节点 finalizer 按 exact runner fence、network detach、RunDir、BaseDir、
-hard-delete 的顺序收敛；terminal Delete 只在收敛完成后发布。
-任一步失败都保留同一 row 供当前进程或下次启动重试。Pause 仍先原子提交 paused 与
+Sandbox 显式删除先把完整 owner 原子转为内部 `deleting`,立即从节点 cache 与后续 route full
+snapshot 撤下并发布 route Delete 撤销既有 live projection,再由节点 finalizer 按 exact runner
+fence,network detach,RunDir,BaseDir,hard-delete 的顺序收敛.route Delete 只表示 projection
+withdrawal;terminal object observation 仍在 hard-delete 后发送.任一步失败都保留同一 row 供当前
+进程或下次启动重试.Pause 仍先原子提交 paused 与
 checkpoint source；旧 RunID、port、RunDir 是 cleanup-pending owner，Resume/Wake/Exec 必须先
 完成其清理；RunDir 删除成功后连同其 UDS 路径 exact-clear，下一次 Resume acceptance 原子恢复
 canonical RunDir/UDS，BaseDir/checkpoint 始终保留。非删除终态 `dead` 不持有 unit、network、RunDir、

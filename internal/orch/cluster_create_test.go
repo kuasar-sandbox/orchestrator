@@ -320,8 +320,11 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	}
 	select {
 	case event := <-events:
-		t.Fatalf("cluster terminal event preceded local cleanup: %+v", event)
-	default:
+		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
+			t.Fatalf("cluster delete acceptance route withdrawal = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cluster delete did not publish route withdrawal before ACK")
 	}
 	if _, err := o.launches.Claim(ctx, create.SID, launchCreate); !errors.Is(err, errLaunchClaimed) {
 		t.Fatalf("claim before late attach cleanup = %v, want cleanup fence", err)
@@ -342,11 +345,8 @@ func TestClusterCreateConnectDeleteShareLaunchOwnerAndCleanupFence(t *testing.T)
 	waitForSandboxAbsent(t, o, ctx, create.SID, "cluster delete after late launch cleanup")
 	select {
 	case event := <-events:
-		if event.Kind != routesync.TypeDelete || event.SID != create.SID {
-			t.Fatalf("cluster terminal event = %+v", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("cluster cleanup did not publish its terminal event")
+		t.Fatalf("cluster delete finalizer published a second route withdrawal: %+v", event)
+	default:
 	}
 	next, err := o.launches.Claim(ctx, create.SID, launchCreate)
 	if err != nil {
