@@ -369,6 +369,256 @@ func TestMaxInflightHTTPContextCancellationReleases(t *testing.T) {
 	harness.assertAvailable(t, binding.Admission, proxyadmission.ServiceForward)
 }
 
+func TestMaxInflightH1ConnectHalfCloseHoldsLeaseUntilBackendTail(t *testing.T) {
+	harness := newLimitedTrafficHarness(t)
+	target := proxy.LegacyTarget(8080)
+	binding := proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target)
+	binding.Admission = harness.bind(t, binding.SandboxID, publicconfig.MaxInflight{Forward: 1})
+	router := &admissionRouter{
+		binding: binding, route: proxy.Route{Kind: proxy.KindTCP, Addr: "unused"}, found: true, activateOK: true,
+	}
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backendReadEOF := make(chan struct{})
+	releaseTail := make(chan struct{})
+	releaseBackend := func() {
+		select {
+		case <-releaseTail:
+		default:
+			close(releaseTail)
+		}
+	}
+	backendDone := make(chan error, 1)
+	go func() {
+		conn, err := backendListener.Accept()
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		defer conn.Close()
+		input, err := io.ReadAll(conn)
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		if string(input) != "client-tail" {
+			backendDone <- fmt.Errorf("backend input = %q", input)
+			return
+		}
+		close(backendReadEOF)
+		<-releaseTail
+		_, err = io.WriteString(conn, "backend-tail")
+		if err == nil {
+			if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+				err = closer.CloseWrite()
+			}
+		}
+		backendDone <- err
+	}()
+
+	px := proxy.NewWithDialer(router, nil, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			return net.Dial("tcp", backendListener.Addr().String())
+		}, "").WithTrafficTracker(harness.traffic)
+	handlerDone := make(chan struct{})
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		px.ServeHTTP(w, r)
+	}))
+	defer front.Close()
+	defer releaseBackend()
+	conn, err := net.Dial("tcp", front.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConn := conn.(*net.TCPConn)
+	defer tcpConn.Close()
+	_ = tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
+	request := "CONNECT sandbox:8080 HTTP/1.1\r\n" +
+		"Host: sandbox:8080\r\n" +
+		proxy.HeaderSandboxID + ": node-s1\r\n" +
+		proxy.HeaderSandboxPort + ": 8080\r\n" +
+		proxy.HeaderAccessToken + ": forward\r\n\r\n"
+	if _, err := io.WriteString(tcpConn, request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(tcpConn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", response.StatusCode)
+	}
+	if _, err := io.WriteString(tcpConn, "client-tail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tcpConn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backendReadEOF:
+	case err := <-backendDone:
+		t.Fatalf("backend ended before half-close tail: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("backend did not observe client half-close")
+	}
+	if _, err := harness.worker.TryAcquire(binding.Admission, proxyadmission.ServiceForward); !errors.Is(err, proxyadmission.ErrLimitReached) {
+		t.Fatalf("half-close released admission before backend tail: %v", err)
+	}
+	releaseBackend()
+	output, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output) != "backend-tail" {
+		t.Fatalf("backend tail = %q", output)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("CONNECT handler did not finish after the backend tail")
+	}
+	harness.assertAvailable(t, binding.Admission, proxyadmission.ServiceForward)
+}
+
+func TestMaxInflightH2ConnectHalfCloseHoldsLeaseUntilBackendTail(t *testing.T) {
+	harness := newLimitedTrafficHarness(t)
+	target := proxy.LegacyTarget(8080)
+	binding := proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target)
+	binding.Admission = harness.bind(t, binding.SandboxID, publicconfig.MaxInflight{Forward: 1})
+	router := &admissionRouter{
+		binding: binding, route: proxy.Route{Kind: proxy.KindTCP, Addr: "unused"}, found: true, activateOK: true,
+	}
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendListener.Close()
+	backendReadEOF := make(chan struct{})
+	releaseTail := make(chan struct{})
+	releaseBackend := func() {
+		select {
+		case <-releaseTail:
+		default:
+			close(releaseTail)
+		}
+	}
+	backendDone := make(chan error, 1)
+	go func() {
+		conn, err := backendListener.Accept()
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		defer conn.Close()
+		input, err := io.ReadAll(conn)
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		if string(input) != "client-tail" {
+			backendDone <- fmt.Errorf("backend input = %q", input)
+			return
+		}
+		close(backendReadEOF)
+		<-releaseTail
+		_, err = io.WriteString(conn, "backend-tail")
+		if err == nil {
+			if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+				err = closer.CloseWrite()
+			}
+		}
+		backendDone <- err
+	}()
+
+	px := proxy.NewWithDialer(router, nil, nil, nil,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			return net.Dial("tcp", backendListener.Addr().String())
+		}, "").WithTrafficTracker(harness.traffic)
+	handlerDone := make(chan struct{})
+	front := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		px.ServeHTTP(w, r)
+	}))
+	front.EnableHTTP2 = true
+	front.StartTLS()
+	defer front.Close()
+	defer releaseBackend()
+	bodyReader, bodyWriter := io.Pipe()
+	request, err := http.NewRequest(http.MethodConnect, front.URL, bodyReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "sandbox:8080"
+	request.Header.Set(proxy.HeaderSandboxID, binding.SandboxID)
+	request.Header.Set(proxy.HeaderSandboxPort, "8080")
+	request.Header.Set(proxy.HeaderAccessToken, "forward")
+	closeRequest := make(chan struct{})
+	finishRequest := func() {
+		select {
+		case <-closeRequest:
+		default:
+			close(closeRequest)
+		}
+	}
+	defer finishRequest()
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(bodyWriter, "client-tail")
+		<-closeRequest
+		if closeErr := bodyWriter.Close(); err == nil {
+			err = closeErr
+		}
+		requestDone <- err
+	}()
+	response, err := front.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.ProtoMajor != 2 || response.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT response = %s %d", response.Proto, response.StatusCode)
+	}
+	finishRequest()
+	select {
+	case <-backendReadEOF:
+	case err := <-backendDone:
+		t.Fatalf("backend ended before half-close tail: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("backend did not observe request EOF")
+	}
+	if _, err := harness.worker.TryAcquire(binding.Admission, proxyadmission.ServiceForward); !errors.Is(err, proxyadmission.ErrLimitReached) {
+		t.Fatalf("H2 request EOF released admission before backend tail: %v", err)
+	}
+	releaseBackend()
+	output, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output) != "backend-tail" {
+		t.Fatalf("backend tail = %q", output)
+	}
+	if err := <-requestDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-backendDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("CONNECT handler did not finish after the backend tail")
+	}
+	harness.assertAvailable(t, binding.Admission, proxyadmission.ServiceForward)
+}
+
 func TestIngressWrapperNextAcquiresOnceAndOrdinaryResponseReleases(t *testing.T) {
 	harness := newLimitedTrafficHarness(t)
 	target := proxy.LegacyTarget(8080)

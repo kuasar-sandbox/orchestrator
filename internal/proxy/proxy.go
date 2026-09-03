@@ -376,7 +376,7 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 		return
 	}
 	backend = flow.AttachBackend(backend)
-	if !binding.Admission.Unlimited() {
+	if !binding.Admission.Unlimited() && (r.Method != http.MethodConnect || r.ProtoMajor == 2) {
 		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
 		defer stopContextClose()
 	}

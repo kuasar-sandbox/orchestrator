@@ -60,7 +60,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	backend = flow.AttachBackend(backend)
-	if !admission.Unlimited() {
+	if !admission.Unlimited() && r.ProtoMajor == 2 {
 		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
 		defer stopContextClose()
 	}
