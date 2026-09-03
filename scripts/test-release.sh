@@ -76,6 +76,21 @@ for entrypoint in test/e2e/e2e_cluster_real.sh test/e2e/e2e_cluster_stub.sh \
     || fail "$entrypoint is not executable in the Git index"
 done
 
+PROXY_E2E="$ROOT/test/e2e/e2e_orchestrator_proxy.sh"
+grep -Fq 'CUSTOM_PROXY_BIN="-"' "$PROXY_E2E" \
+  || fail "exact-assets Proxy E2E does not select the built-in App"
+if grep -Fq 'CUSTOM_PROXY_BIN="$BIN/node-ctl"' "$PROXY_E2E"; then
+  fail "exact-assets Proxy E2E configures node-ctl as its own custom executable"
+fi
+. "$ROOT/test/e2e/lib/proxy.sh"
+write_proxy_config "$TMP/built-in-proxy.yaml" \
+  /run/test/node-ctl.socket /run/test 127.0.0.1:3443 \
+  - /run/test/proxy-stats.sock /run/test/proxy-routes.shm \
+  16 1 enforce 30s - - - -
+if grep -Fq 'proxy_executable:' "$TMP/built-in-proxy.yaml"; then
+  fail "built-in Proxy sentinel emitted paths.proxy_executable"
+fi
+
 mkdir -p "$TMP/bin" "$TMP/src"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
 GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
