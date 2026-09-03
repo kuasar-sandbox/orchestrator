@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -606,7 +607,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, nil, nil, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,8 +995,13 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
 	var reserveProfiles []string
 	var reserveResource string
+	var reserveBuilder string
+	var reserveNetwork string
 	var reserveMMDS string
 	var reserveMMDSSecrets map[string]string
+	var reserveCredentials sandboxcfg.Credentials
+	var reserveEnv map[string]string
+	var reserveSecure bool
 	var reserveBuildResources routesync.BuildResources
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1029,8 +1035,20 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 			reserveProfiles = append(reserveProfiles, profile)
 			if metadata, ok := body["metadata"].(map[string]any); ok {
 				reserveResource, _ = metadata[sandboxcfg.NsResource].(string)
+				reserveBuilder, _ = metadata[buildcfg.NsBuilder].(string)
+				reserveNetwork, _ = metadata[sandboxcfg.NsNetwork].(string)
 				reserveMMDS, _ = metadata[sandboxcfg.NsMMDS].(string)
 			}
+			if credentials, ok := body["credentials"].(map[string]any); ok {
+				reserveCredentials.EnvdAccessToken, _ = credentials["envd_access_token"].(string)
+			}
+			if env, ok := body["env"].(map[string]any); ok {
+				reserveEnv = make(map[string]string, len(env))
+				for name, value := range env {
+					reserveEnv[name], _ = value.(string)
+				}
+			}
+			reserveSecure, _ = body["secure"].(bool)
 			if secrets, ok := body["mmds_secrets"].(map[string]any); ok {
 				reserveMMDSSecrets = make(map[string]string, len(secrets))
 				for name, value := range secrets {
@@ -1043,6 +1061,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(buildReserveResult{
 				BuildID: "b1", TemplateID: "t1", NodeID: "n1", APIEndpoint: nodeHost, Profile: types.ProfileE2B,
+				Target: &types.BuildTarget{Kind: types.BuildTargetImage},
 			})
 		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
@@ -1109,34 +1128,60 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	if duplicateMMDSResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
 		t.Fatalf("duplicate MMDS Header status=%d reserveProfiles=%v", duplicateMMDSResp.StatusCode, reserveProfiles)
 	}
+	autoPauseReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"cpuCount":4,"memoryMB":8192,"autoPauseMemory":null}`))
+	autoPauseReq.Host = "api.test.local"
+	autoPauseReq.Header.Set(HeaderGroup, "/g")
+	autoPauseReq.Header.Set(HeaderAPIKey, "e2b_test")
+	autoPauseResp, err := http.DefaultClient.Do(autoPauseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	autoPauseResp.Body.Close()
+	if autoPauseResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+		t.Fatalf("autoPauseMemory status=%d reserveProfiles=%v", autoPauseResp.StatusCode, reserveProfiles)
+	}
 
 	// register a build via the router (control plane: Host api.<domain> + group).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(
-		`{"cpuCount":4,"memoryMB":8192,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}","kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/token\",\"type\":\"secret\",\"secret\":\"token\"}],\"secrets\":{\"token\":\"body-value\"}}"}}`,
+		`{"cpuCount":4,"memoryMB":8192,"envVars":{"REGISTERED":"yes"},"secure":true,"metadata":{"kuasar-sandbox.resource":"{\"capacity\":{\"memory\":\"4GiB\"},\"allocatable\":{\"cpu\":0.5}}","kuasar-sandbox.mmds":"{\"routes\":[{\"path\":\"/token\",\"type\":\"secret\",\"secret\":\"token\"}],\"secrets\":{\"token\":\"body-value\"}}"}}`,
 	))
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderAPIKey, "e2b_test")
 	req.Header.Set(HeaderResource, `{"allocatable":{"memory":"512MiB"},"startup":{"memory":"1GiB"}}`)
+	req.Header.Set(HeaderBuilder, `{"target":{"kind":"sandbox","memory":true}}`)
+	req.Header.Set(HeaderNetwork, `{"hostname":"built"}`)
+	req.Header.Set(HeaderCredentials, `{"envd_access_token":"registered-envd"}`)
 	req.Header.Set(HeaderMMDS, `{"secrets":{"token":"header-value"}}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var reg struct {
-		BuildID string `json:"buildID"`
-		Profile string `json:"profile"`
+		BuildID string             `json:"buildID"`
+		Profile string             `json:"profile"`
+		Target  *types.BuildTarget `json:"target"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&reg)
 	resp.Body.Close()
-	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
+	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || reg.Target == nil ||
+		*reg.Target != (types.BuildTarget{Kind: types.BuildTargetImage}) ||
+		len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
 		t.Fatalf("register result=%+v reserveProfiles=%v", reg, reserveProfiles)
+	}
+	if reserveBuilder != `{"target":{"kind":"sandbox","memory":true}}` {
+		t.Fatalf("cluster canonical Builder = %q", reserveBuilder)
 	}
 	if want := `{"capacity":{"memory":"4GiB"},"allocatable":{"cpu":0.5,"memory":"512MiB"},"startup":{"memory":"1GiB"}}`; reserveResource != want {
 		t.Fatalf("cluster build resource = %s, want %s", reserveResource, want)
 	}
 	if reserveBuildResources.CPU != 4000 || reserveBuildResources.Memory != 8192<<20 {
 		t.Fatalf("cluster build resources = %+v", reserveBuildResources)
+	}
+	if reserveNetwork != `{"hostname":"built"}` || reserveEnv["REGISTERED"] != "yes" ||
+		!reserveSecure || reserveCredentials.EnvdAccessToken != "registered-envd" {
+		t.Fatalf("cluster Create config network=%q env=%v secure=%t credentials=%+v",
+			reserveNetwork, reserveEnv, reserveSecure, reserveCredentials)
 	}
 	if reserveMMDS != `{"routes":[{"path":"/token","type":"secret","secret":"token"}]}` ||
 		reserveMMDSSecrets["token"] != "header-value" || strings.Contains(reserveMMDS, "body-value") {

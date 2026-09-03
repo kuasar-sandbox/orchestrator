@@ -37,11 +37,12 @@ type BuildOperation struct {
 type BuildRegisterRequest struct {
 	TemplateID string
 	Profile    Profile
-	Kind       BuildKind
 	Names      []string
 	Aliases    []string
 	Resources  BuildResources
 	Metadata   map[string]string
+	Env        map[string]string
+	Secure     bool
 	Builder    BuildOptions
 }
 

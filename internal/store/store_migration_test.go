@@ -91,3 +91,37 @@ func TestOpenAddsCompatibilityColumnsToExistingDatabase(t *testing.T) {
 		t.Fatalf("legacy ready timestamp = %+v, %v", ready, err)
 	}
 }
+
+func TestOpenRejectsPreBuildTargetSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-build-target.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(context.Background(), `CREATE TABLE builds (
+		build_id TEXT PRIMARY KEY,
+		status TEXT NOT NULL,
+		api_secret_hash TEXT NOT NULL,
+		manifest_key_hash TEXT NOT NULL
+	)`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(path, box)
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("Open returned a Store for a pre-build-target schema")
+	}
+	if err == nil || !strings.Contains(err.Error(), "missing instance_config_enc") {
+		t.Fatalf("Open error = %v, want explicit pre-release schema rejection", err)
+	}
+}

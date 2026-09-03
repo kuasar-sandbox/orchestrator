@@ -36,6 +36,12 @@ func ValidateCredentialsForProfile(profile types.Profile, credentials Credential
 	if !profile.Valid() {
 		return fmt.Errorf("sandboxcfg: unknown sandbox profile %q", profile)
 	}
+	if credentials.ServiceSecret != "" {
+		decoded, err := hex.DecodeString(credentials.ServiceSecret)
+		if err != nil || len(decoded) != 32 || credentials.ServiceSecret != strings.ToLower(credentials.ServiceSecret) {
+			return errors.New("sandboxcfg: service_secret must be 64 lowercase hex characters")
+		}
+	}
 	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
 		return errors.New("sandboxcfg: envd_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
 	}
@@ -132,17 +138,8 @@ func parseCredentials(raw string) (Credentials, error) {
 		return Credentials{}, credentialsError("contains trailing content")
 	}
 
-	if credentials.ServiceSecret != "" {
-		decoded, err := hex.DecodeString(credentials.ServiceSecret)
-		if err != nil || len(decoded) != 32 || credentials.ServiceSecret != strings.ToLower(credentials.ServiceSecret) {
-			return Credentials{}, credentialsError("service_secret must be 64 lowercase hex characters")
-		}
-	}
-	if !ValidE2BAccessToken(credentials.EnvdAccessToken) {
-		return Credentials{}, credentialsError("envd_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
-	}
-	if !ValidE2BAccessToken(credentials.TrafficAccessToken) {
-		return Credentials{}, credentialsError("traffic_access_token must be valid UTF-8 without NUL bytes and at most 256 bytes")
+	if err := ValidateCredentialsForProfile(types.ProfileE2B, credentials); err != nil {
+		return Credentials{}, credentialsError(strings.TrimPrefix(err.Error(), "sandboxcfg: "))
 	}
 	return credentials, nil
 }

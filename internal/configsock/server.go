@@ -188,40 +188,50 @@ type Provider interface {
 }
 
 // BuildSpec is the final work order an authenticated run-builder receives:
-// everything the three-phase pipeline (import → steps → template snapshot)
-// needs. Secrets ride in BuildTaskSpec.Env, never on disk.
+// everything its target-selected import/materialize/capture pipeline needs.
+// Secrets ride in BuildTaskSpec.Env, never on disk.
 type BuildSpec struct {
-	BuildID          string            `json:"build_id"`
-	Profile          string            `json:"profile"`
-	RunID            string            `json:"run_id,omitempty"`
-	RunDir           string            `json:"run_dir"`  // volatile BuildRunDir
-	BaseDir          string            `json:"base_dir"` // persistent BuildBaseDir
-	FromImage        string            `json:"from_image,omitempty"`
-	FromTemplateRef  string            `json:"from_template_ref,omitempty"`
-	FromTemplateKind string            `json:"from_template_kind,omitempty"`
-	RefLocations     map[string]string `json:"ref_locations,omitempty"`
-	CheckpointMode   string            `json:"checkpoint_mode"`
-	// SnapshotPreparation is populated only inside run-builder from its retained
-	// root SnapshotCfg. It is intentionally absent from the conductor wire.
-	SnapshotPreparation *BuildSnapshotPreparation `json:"-"`
-	// PublishLocationParent, when non-empty, publishes the final snapshot to
+	BuildID          string             `json:"build_id"`
+	Profile          string             `json:"profile"`
+	RunID            string             `json:"run_id,omitempty"`
+	RunDir           string             `json:"run_dir"`  // volatile BuildRunDir
+	BaseDir          string             `json:"base_dir"` // persistent BuildBaseDir
+	FromImage        string             `json:"from_image,omitempty"`
+	FromTemplateRef  string             `json:"from_template_ref,omitempty"`
+	FromTemplateKind string             `json:"from_template_kind,omitempty"`
+	RefLocations     map[string]string  `json:"ref_locations,omitempty"`
+	CheckpointMode   string             `json:"checkpoint_mode"`
+	RequestedTarget  *types.BuildTarget `json:"requested_target,omitempty"`
+	// Source* is populated only inside run-builder after task-local preparation.
+	// A Snapshot source has already converged to its cold Sandbox E at this boundary.
+	SourceSandboxRef    string                          `json:"-"`
+	SourceSandboxConfig *rtconfig.PortableSandboxConfig `json:"-"`
+	SourceImageConfig   []byte                          `json:"-"`
+	// PublishLocationParent, when non-empty, publishes the final artifact to
 	// a named ref location (publish --to-ref-location). The builder
 	// derives the publication name and URI itself right before the upload
 	// starts, so the date bucket always reflects the actual publication time.
-	PublishLocationParent string                   `json:"publish_location_parent,omitempty"`
-	Steps                 []BuildStep              `json:"steps,omitempty"`
-	StartCmd              string                   `json:"start_cmd,omitempty"`
-	ReadyCmd              string                   `json:"ready_cmd,omitempty"`
-	Env                   map[string]string        `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
-	Paths                 BuildPaths               `json:"paths"`
-	Net                   BuildNet                 `json:"net"`
-	TemplateNetwork       sandboxcfg.NetworkSpec   `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
-	Resources             rtconfig.ResourcesConfig `json:"resources"`
-	MMDSEnabled           bool                     `json:"mmds_enabled"`
-	EnvdToken             string                   `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure              bool                     `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform              string                   `json:"platform,omitempty"`
-	ImportReferer         BuildImportReferer       `json:"import_referer,omitempty"`
+	PublishLocationParent string                    `json:"publish_location_parent,omitempty"`
+	Steps                 []BuildStep               `json:"steps,omitempty"`
+	StartCmd              string                    `json:"start_cmd,omitempty"`
+	ReadyCmd              string                    `json:"ready_cmd,omitempty"`
+	Env                   map[string]string         `json:"env,omitempty"` // run-builder local only after merging authenticated BuildTaskSpec.Env
+	Paths                 BuildPaths                `json:"paths"`
+	Net                   BuildNet                  `json:"net"`
+	TemplateNetwork       sandboxcfg.NetworkSpec    `json:"template_network"` // persisted in phase-C snapshot metadata; not guest BuildNet
+	Resources             rtconfig.ResourcesConfig  `json:"resources"`        // A/B execution resources
+	SandboxResources      rtconfig.ResourcesConfig  `json:"sandbox_resources"`
+	SandboxSpec           sandboxcfg.SandboxSpec    `json:"sandbox_spec"`
+	SandboxNamespaces     []string                  `json:"sandbox_namespaces,omitempty"`
+	SandboxEnv            map[string]string         `json:"sandbox_env,omitempty"`
+	HasSandboxConfig      bool                      `json:"has_sandbox_config,omitempty"`
+	HasInstanceConfig     bool                      `json:"has_instance_config,omitempty"`
+	CheckpointPolicy      sandboxcfg.SnapshotPolicy `json:"checkpoint_policy,omitempty"`
+	MMDSEnabled           bool                      `json:"mmds_enabled"`
+	EnvdToken             string                    `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure              bool                      `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform              string                    `json:"platform,omitempty"`
+	ImportReferer         BuildImportReferer        `json:"import_referer,omitempty"`
 	// RegistryTLS carries the per-build registry TLS trust (inline CA bundle
 	// PEM and/or skip-verify) projected into the Phase A import sandbox as a
 	// flatten-ctl config YAML. Nil = use system root CAs. Register-time only;

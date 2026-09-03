@@ -11,14 +11,12 @@ import (
 
 func buildTriggerFixture(id string, status types.BuildState) *types.Build {
 	enabled := true
-	return &types.Build{
+	build := &types.Build{
 		BuildID:      id,
 		TemplateID:   "transient-original",
-		PersistID:    "e2b:img:manifest://original",
 		APISecret:    strings.Repeat("2", 64),
 		ManifestKey:  strings.Repeat("1", 64),
 		Profile:      types.ProfileE2B,
-		Kind:         types.KindImg,
 		FromImage:    "registry.test/original:latest",
 		FromTemplate: "",
 		RegistryAuth: "original-registry-auth",
@@ -36,6 +34,11 @@ func buildTriggerFixture(id string, status types.BuildState) *types.Build {
 		}},
 		CreatedUnix: 12345,
 	}
+	if status == types.BuildReady {
+		build.Kind = types.KindImg
+		build.PersistID = "e2b:img:manifest://original"
+	}
+	return build
 }
 
 func buildTriggerCandidate(base *types.Build, label string) *types.Build {
@@ -53,8 +56,8 @@ func buildTriggerCandidate(base *types.Build, label string) *types.Build {
 	candidate.Names = []string{"name-candidate-" + label}
 	candidate.Aliases = []string{"alias-candidate-" + label}
 	candidate.CreatedUnix = 99999
+	candidate.Kind = ""
 
-	candidate.Kind = types.KindSnp
 	candidate.FromImage = "registry.test/image-" + label + ":latest"
 	candidate.FromTemplate = "template-" + label
 	candidate.RegistryAuth = "registry-auth-" + label
@@ -68,7 +71,6 @@ func buildTriggerCandidate(base *types.Build, label string) *types.Build {
 }
 
 func applyTriggerWorkOrder(dst, src *types.Build) {
-	dst.Kind = src.Kind
 	dst.FromImage = src.FromImage
 	dst.FromTemplate = src.FromTemplate
 	dst.RegistryAuth = src.RegistryAuth
@@ -205,6 +207,27 @@ func TestCommitBuildTriggerConcurrentHasCompleteSingleWinner(t *testing.T) {
 	}
 }
 
+func TestCommitBuildTriggerRejectsPreResolvedKind(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	original := buildTriggerFixture("build-pre-resolved-kind", types.BuildRegistered)
+	if err := st.PutBuild(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	candidate := buildTriggerCandidate(original, "pre-resolved")
+	candidate.Kind = types.KindSnp
+	if committed, err := st.CommitBuildTrigger(ctx, candidate); err == nil || committed || !strings.Contains(err.Error(), "kind must remain unset") {
+		t.Fatalf("CommitBuildTrigger pre-resolved kind: committed=%t err=%v", committed, err)
+	}
+	stored, err := st.GetBuild(ctx, original.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != types.BuildRegistered || stored.Kind != "" {
+		t.Fatalf("rejected trigger mutated build: %+v", stored)
+	}
+}
+
 func TestCommitBuildTriggerAssignsDurableFIFOSequence(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -242,8 +265,8 @@ func TestSetBuildRunIDPreservesBuildingStatus(t *testing.T) {
 		BuildID: "build-1", TemplateID: "transient-1",
 		APISecret:   strings.Repeat("2", 64),
 		ManifestKey: strings.Repeat("1", 64),
-		Profile:     types.ProfileE2B, Kind: types.KindImg,
-		Status: types.BuildWaiting, CreatedUnix: 1,
+		Profile:     types.ProfileE2B,
+		Status:      types.BuildWaiting, CreatedUnix: 1,
 	}
 	if err := st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
@@ -261,5 +284,49 @@ func TestSetBuildRunIDPreservesBuildingStatus(t *testing.T) {
 	}
 	if got.Status != types.BuildBuilding || got.RunID != "br-test" {
 		t.Fatalf("build after assignment = status %q run_id %q", got.Status, got.RunID)
+	}
+}
+
+func TestBuildInstanceConfigIsEncryptedAndRoundTrips(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	b := buildTriggerFixture("build-instance-config", types.BuildRegistered)
+	b.Env = map[string]string{"VISIBLE_NAME": "distinct-instance-env-value"}
+	b.Secure = true
+	b.ServiceSecret = "distinct-service-secret"
+	b.EnvdAccessToken = "distinct-envd-token"
+	b.TrafficAccessToken = "distinct-traffic-token"
+	if err := st.PutBuild(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	var ciphertext string
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT instance_config_enc FROM builds WHERE build_id=?`, b.BuildID,
+	).Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if ciphertext == "" {
+		t.Fatal("instance config ciphertext is empty")
+	}
+	for _, plaintext := range []string{
+		"distinct-instance-env-value",
+		b.ServiceSecret,
+		b.EnvdAccessToken,
+		b.TrafficAccessToken,
+	} {
+		if strings.Contains(ciphertext, plaintext) {
+			t.Fatalf("instance config ciphertext contains plaintext %q", plaintext)
+		}
+	}
+
+	got, err := st.GetBuild(ctx, b.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Env, b.Env) || got.Secure != b.Secure ||
+		got.ServiceSecret != b.ServiceSecret || got.EnvdAccessToken != b.EnvdAccessToken ||
+		got.TrafficAccessToken != b.TrafficAccessToken {
+		t.Fatalf("instance config round trip:\n got: %#v\nwant: %#v", got, b)
 	}
 }

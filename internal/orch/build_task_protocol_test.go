@@ -14,7 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
+func TestBuildTaskBootstrapUsesExactRunAndSourceTwoStage(t *testing.T) {
 	cfg := &config.Config{ManifestConfig: filepath.Join(t.TempDir(), "manifest.yaml")}
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Builder.TotalTimeoutSec = 90
@@ -36,7 +36,7 @@ func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
 	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
 	o.pend[build.BuildID] = &pendingBuild{
-		build: build, runDir: runDir, baseDir: baseDir, snapshotTemplate: true,
+		build: build, runDir: runDir, baseDir: baseDir, sourceTemplate: true,
 		handoff: newBuildTaskHandoff(true, ""), result: make(chan configsock.BuildResult, 1),
 	}
 
@@ -52,12 +52,12 @@ func TestBuildTaskBootstrapUsesExactRunAndSnapshotTwoStage(t *testing.T) {
 	}
 	task, found, err := o.BuildTaskSpecFor(context.Background(), build.BuildID, build.RunID)
 	if err != nil || !found || task.Prepare == nil || task.Final != nil {
-		t.Fatalf("snapshot build bootstrap = %+v, %t, %v", task, found, err)
+		t.Fatalf("source build bootstrap = %+v, %t, %v", task, found, err)
 	}
 	wantDeadline := time.Unix(build.ExecutionClaimedUnix, 0).Add(90 * time.Second).UnixNano()
 	if task.Env["MANIFEST_KEY"] != manifestKey || task.Prepare.RootRef == "" ||
 		task.Prepare.AbsoluteDeadlineUnixNano != wantDeadline {
-		t.Fatalf("snapshot build bootstrap content = %+v", task)
+		t.Fatalf("source build bootstrap content = %+v", task)
 	}
 }
 
@@ -79,7 +79,7 @@ func TestCompleteBuildPrepareExactRunReplayAndConflict(t *testing.T) {
 	o := testOrch(t)
 	build := &types.Build{BuildID: "build-complete", RunID: "br-complete"}
 	handoff := newBuildTaskHandoff(true, "")
-	o.pend[build.BuildID] = &pendingBuild{build: build, snapshotTemplate: true, handoff: handoff}
+	o.pend[build.BuildID] = &pendingBuild{build: build, sourceTemplate: true, handoff: handoff}
 	want := &configsock.BuildSpec{BuildID: build.BuildID, RunID: build.RunID}
 	summary := validBuildPrepareSummary()
 

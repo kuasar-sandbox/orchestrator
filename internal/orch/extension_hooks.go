@@ -247,6 +247,11 @@ func clonePublicBuildResources(resources *conductorextension.BuildResources) *co
 
 func publicBuildOptions(options types.BuildOptions) conductorextension.BuildOptions {
 	out := conductorextension.BuildOptions{Resources: clonePublicBuildResources(nil)}
+	if options.Target != nil {
+		out.Target = &conductorextension.BuildTarget{
+			Kind: conductorextension.BuildTargetKind(options.Target.Kind), Memory: options.Target.Memory,
+		}
+	}
 	if options.Resources != nil {
 		resources := cloneBuildResources(*options.Resources)
 		out.Resources = &resources
@@ -270,6 +275,11 @@ func publicBuildOptions(options types.BuildOptions) conductorextension.BuildOpti
 
 func internalBuildOptions(options conductorextension.BuildOptions) types.BuildOptions {
 	out := types.BuildOptions{}
+	if options.Target != nil {
+		out.Target = &types.BuildTarget{
+			Kind: types.BuildTargetKind(options.Target.Kind), Memory: options.Target.Memory,
+		}
+	}
 	if options.Resources != nil {
 		resources := internalBuildResources(*options.Resources)
 		out.Resources = &resources
@@ -329,6 +339,7 @@ func cloneBuildRegisterRequest(request *conductorextension.BuildRegisterRequest)
 	out.Names = append([]string(nil), request.Names...)
 	out.Aliases = append([]string(nil), request.Aliases...)
 	out.Metadata = cloneStringMap(request.Metadata)
+	out.Env = cloneStringMap(request.Env)
 	out.Builder = clonePublicBuildOptions(request.Builder)
 	return &out
 }

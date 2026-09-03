@@ -28,8 +28,8 @@ func prepareReportedBuildPhase(t *testing.T, o *Orchestrator) (*types.Build, str
 	b := &types.Build{
 		BuildID: "phase-release-build", TemplateID: "transient-phase-release-build",
 		APISecret: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
-		Profile: types.ProfileE2B, Kind: types.KindSnp,
-		Status: types.BuildBuilding, ExecutionClaimed: true,
+		Profile: types.ProfileE2B,
+		Status:  types.BuildBuilding, ExecutionClaimed: true,
 		RunID: "br-phase-release", Resources: testBuildResources(), CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(context.Background(), b); err != nil {

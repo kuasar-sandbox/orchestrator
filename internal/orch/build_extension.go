@@ -18,16 +18,17 @@ import (
 )
 
 type normalizedBuildRegistration struct {
-	templateID         string
-	profile            types.Profile
-	kind               types.Kind
-	names              []string
-	aliases            []string
-	resources          types.BuildResources
-	metadata           map[string]string
-	builder            types.BuildOptions
-	phaseResourcePatch string
-	mmds               sandboxcfg.MMDSDocument
+	templateID  string
+	profile     types.Profile
+	names       []string
+	aliases     []string
+	resources   types.BuildResources
+	metadata    map[string]string
+	env         map[string]string
+	secure      bool
+	builder     types.BuildOptions
+	mmds        sandboxcfg.MMDSDocument
+	credentials sandboxcfg.Credentials
 }
 
 func buildRegisterRequest(spec api.RegisterSpec, templateID string) *conductorextension.BuildRegisterRequest {
@@ -39,31 +40,26 @@ func buildRegisterRequest(spec api.RegisterSpec, templateID string) *conductorex
 	return &conductorextension.BuildRegisterRequest{
 		TemplateID: templateID,
 		Profile:    conductorextension.Profile(spec.Profile),
-		Kind:       conductorextension.BuildKindImage,
 		Names:      nonEmpty(spec.Name),
 		Aliases:    append([]string(nil), spec.Tags...),
 		Resources:  cloneBuildResources(spec.Resources),
 		Metadata:   cloneStringMap(spec.Metadata),
+		Env:        cloneStringMap(spec.EnvVars),
+		Secure:     spec.Secure,
 		Builder:    publicBuildOptions(builder),
 	}
 }
 
 func buildRegisterRequestFromBuild(build *types.Build) *conductorextension.BuildRegisterRequest {
-	metadata := cloneStringMap(build.Metadata)
-	if build.PhaseResourcePatch != "" {
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
-		metadata[sandboxcfg.NsResource] = build.PhaseResourcePatch
-	}
 	return &conductorextension.BuildRegisterRequest{
 		TemplateID: build.TemplateID,
 		Profile:    conductorextension.Profile(build.Profile),
-		Kind:       conductorextension.BuildKind(build.Kind),
 		Names:      append([]string(nil), build.Names...),
 		Aliases:    append([]string(nil), build.Aliases...),
 		Resources:  cloneBuildResources(build.Resources),
-		Metadata:   metadata,
+		Metadata:   cloneStringMap(build.Metadata),
+		Env:        cloneStringMap(build.Env),
+		Secure:     build.Secure,
 		Builder:    publicBuildOptions(build.Builder),
 	}
 }
@@ -71,10 +67,11 @@ func buildRegisterRequestFromBuild(build *types.Build) *conductorextension.Build
 func buildRegisterRequestFromCandidate(candidate *normalizedBuildRegistration) *conductorextension.BuildRegisterRequest {
 	build := &types.Build{
 		TemplateID: candidate.templateID,
-		Profile:    candidate.profile, Kind: candidate.kind,
-		Names: candidate.names, Aliases: candidate.aliases,
-		Resources: candidate.resources, PhaseResourcePatch: candidate.phaseResourcePatch,
-		Metadata: candidate.metadata, Builder: candidate.builder,
+		Profile:    candidate.profile,
+		Names:      candidate.names, Aliases: candidate.aliases,
+		Resources: candidate.resources,
+		Metadata:  candidate.metadata, Env: candidate.env, Secure: candidate.secure,
+		Builder: candidate.builder,
 	}
 	return buildRegisterRequestFromBuild(build)
 }
@@ -89,12 +86,6 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	profile := types.Profile(request.Profile)
 	if !profile.Valid() {
 		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, request.Profile)
-	}
-	kind := types.Kind(request.Kind)
-	switch kind {
-	case types.KindImg, types.KindSnp:
-	default:
-		return nil, fmt.Errorf("%w: unknown build kind %q", api.ErrBadRequest, request.Kind)
 	}
 	resources := internalBuildResources(request.Resources)
 	if err := resources.ValidateRequired(); err != nil {
@@ -120,15 +111,34 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if builder.Resources != nil {
 		return nil, fmt.Errorf("%w: build builder.resources must be normalized into resources", api.ErrBadRequest)
 	}
+	if builder.Target != nil {
+		if err := builder.Target.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+	}
 	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDS(metadata, cloneString(mmdsHeader), o.mmdsPolicy())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	credentials, metadata, err := sandboxcfg.ExtractCredentials(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if _, present := metadata[sandboxcfg.NsRestore]; present {
+		return nil, fmt.Errorf("%w: %s is not valid for template builds", api.ErrBadRequest, sandboxcfg.NsRestore)
 	}
 	metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	metadata, err = sandboxcfg.NormalizeCheckpointMetadata(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -139,23 +149,51 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	phaseResourcePatch := metadata[sandboxcfg.NsResource]
-	if phaseResourcePatch != "" {
-		metadata = cloneStringMapWithout(metadata, sandboxcfg.NsResource)
-	}
-	if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
-		return nil, err
+	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec.Launch); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	if err := o.validateBuildOptions(builder, false); err != nil {
 		return nil, err
 	}
+	if err := validateExplicitBuildTargetConfig(builder.Target, metadata, request.Env, request.Secure, mmdsDoc, credentials); err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	return &normalizedBuildRegistration{
 		templateID: request.TemplateID,
-		profile:    profile, kind: kind,
-		names: append([]string(nil), request.Names...), aliases: append([]string(nil), request.Aliases...),
-		resources: resources, metadata: metadata, builder: builder,
-		phaseResourcePatch: phaseResourcePatch, mmds: mmdsDoc,
+		profile:    profile,
+		names:      append([]string(nil), request.Names...), aliases: append([]string(nil), request.Aliases...),
+		resources: resources, metadata: metadata,
+		env: cloneStringMap(request.Env), secure: request.Secure, builder: builder,
+		mmds: mmdsDoc, credentials: credentials,
 	}, nil
+}
+
+func validateExplicitBuildTargetConfig(target *types.BuildTarget, metadata, env map[string]string, secure bool, mmds sandboxcfg.MMDSDocument, credentials sandboxcfg.Credentials) error {
+	if target == nil {
+		return nil
+	}
+	instanceOnly := secure || credentials != (sandboxcfg.Credentials{}) ||
+		mmds.RoutesPresent || mmds.SecretsPresent || metadata[sandboxcfg.NsTraffic] != "" ||
+		metadata[sandboxcfg.NsCheckpoint] != ""
+	switch {
+	case target.Kind == types.BuildTargetImage:
+		for _, namespace := range []string{
+			sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
+			sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
+			sandboxcfg.NsFiles, sandboxcfg.NsMetadata, sandboxcfg.NsCheckpoint,
+			sandboxcfg.NsMMDS,
+		} {
+			if _, present := metadata[namespace]; present {
+				return fmt.Errorf("explicit image target cannot carry Sandbox configuration %s", namespace)
+			}
+		}
+		if len(env) != 0 || instanceOnly {
+			return fmt.Errorf("explicit image target cannot carry Sandbox instance configuration")
+		}
+	case target.Kind == types.BuildTargetSandbox && !target.Memory && instanceOnly:
+		return fmt.Errorf("sandbox target with memory=false cannot carry traffic, credentials, MMDS, secure, or checkpoint configuration")
+	}
+	return nil
 }
 
 // mmdsSecretHeader retains request-scoped initial MMDS values entirely inside
@@ -180,15 +218,37 @@ func mmdsSecretHeader(document sandboxcfg.MMDSDocument) (*string, error) {
 	return &header, nil
 }
 
+// retainBuildRegistrationCredentials keeps secret-bearing registration input
+// outside the Extension projection while rebinding it to the post-Hook
+// candidate for the final canonical validation pass.
+func retainBuildRegistrationCredentials(request *conductorextension.BuildRegisterRequest, credentials sandboxcfg.Credentials) error {
+	if request == nil || credentials == (sandboxcfg.Credentials{}) {
+		return nil
+	}
+	raw, err := json.Marshal(credentials)
+	if err != nil {
+		return fmt.Errorf("encode retained build credentials: %w", err)
+	}
+	if request.Metadata == nil {
+		request.Metadata = map[string]string{}
+	}
+	request.Metadata[sandboxcfg.NsCredentials] = string(raw)
+	return nil
+}
+
 func registeredBuildFromCandidate(buildID string, pair store.KeyPair, candidate *normalizedBuildRegistration, fromImage string) *types.Build {
 	return &types.Build{
 		BuildID: buildID, TemplateID: candidate.templateID,
 		APISecret: pair.APISecret, ManifestKey: pair.ManifestKey,
-		Profile: candidate.profile, Kind: candidate.kind,
-		Status: types.BuildRegistered, FromImage: fromImage,
+		Profile: candidate.profile,
+		Status:  types.BuildRegistered, FromImage: fromImage,
 		Names: candidate.names, Aliases: candidate.aliases,
-		Resources: candidate.resources, PhaseResourcePatch: candidate.phaseResourcePatch,
-		Metadata: candidate.metadata, Builder: candidate.builder,
+		Resources: candidate.resources,
+		Metadata:  candidate.metadata, Env: candidate.env, Secure: candidate.secure,
+		ServiceSecret:      candidate.credentials.ServiceSecret,
+		EnvdAccessToken:    candidate.credentials.EnvdAccessToken,
+		TrafficAccessToken: candidate.credentials.TrafficAccessToken,
+		Builder:            candidate.builder,
 	}
 }
 
@@ -222,6 +282,9 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		RegistryAuth         string
 		Resources            *routesync.BuildResources
 		Config               map[string]string
+		Env                  map[string]string
+		Secure               bool
+		Credentials          *sandboxcfg.Credentials
 		MMDSSecrets          map[string]string
 	}
 	payload, err := json.Marshal(identity{
@@ -229,6 +292,8 @@ func clusterBuildRegistrationRequestDigest(manifestKey string, command *routesyn
 		APISecretFingerprint: command.APISecretFingerprint,
 		ImageRepo:            command.ImageRepo, RegistryAuth: command.RegistryAuth,
 		Resources: command.BuildResources, Config: cloneStringMap(command.Config),
+		Env: cloneStringMap(command.BuildEnv), Secure: command.BuildSecure,
+		Credentials: command.BuildCredentials,
 		MMDSSecrets: cloneStringMap(command.BuildMMDSSecrets),
 	})
 	if err != nil {

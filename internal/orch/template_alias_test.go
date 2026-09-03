@@ -148,7 +148,7 @@ func TestCanonicalFromTemplateSurvivesBuildRetention(t *testing.T) {
 
 	target := &types.Build{
 		BuildID: "canonical-from-template-target", TemplateID: "transient-canonical-target",
-		APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileE2B, Kind: types.KindImg,
+		APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileE2B,
 		Resources: testBuildResources(), Status: types.BuildRegistered, CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, target); err != nil {

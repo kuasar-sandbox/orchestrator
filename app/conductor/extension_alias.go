@@ -24,6 +24,8 @@ type BuildState = conductorextension.BuildState
 type BuildResources = conductorextension.BuildResources
 type BuildStep = conductorextension.BuildStep
 type BuildOptions = conductorextension.BuildOptions
+type BuildTarget = conductorextension.BuildTarget
+type BuildTargetKind = conductorextension.BuildTargetKind
 type BuildRefererOptions = conductorextension.BuildRefererOptions
 type BuildRegistryOptions = conductorextension.BuildRegistryOptions
 type BuildRegistryTLSOptions = conductorextension.BuildRegistryTLSOptions
@@ -74,8 +76,11 @@ const (
 	SandboxDelete    = conductorextension.SandboxDelete
 	SandboxSyncEnd   = conductorextension.SandboxSyncEnd
 
-	BuildKindImage    = conductorextension.BuildKindImage
-	BuildKindSnapshot = conductorextension.BuildKindSnapshot
+	BuildKindImage     = conductorextension.BuildKindImage
+	BuildKindSandbox   = conductorextension.BuildKindSandbox
+	BuildKindSnapshot  = conductorextension.BuildKindSnapshot
+	BuildTargetImage   = conductorextension.BuildTargetImage
+	BuildTargetSandbox = conductorextension.BuildTargetSandbox
 
 	BuildStateRegistered = conductorextension.BuildStateRegistered
 	BuildStateWaiting    = conductorextension.BuildStateWaiting

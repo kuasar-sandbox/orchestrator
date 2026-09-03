@@ -17,8 +17,10 @@ import (
 func validBuildPrepareSummary() configsock.ArtifactPrepareSummary {
 	return configsock.ArtifactPrepareSummary{
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
-		PreparedSourceKind: string(types.ResumeSourceSnapshot),
-		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		PreparedSourceKind: string(types.ResumeSourceSandbox),
+		Capacity: configsock.ArtifactCapacity{
+			CPU: 2, Memory: "2GiB", AllocatableCPU: 1.5, AllocatableMemory: "1GiB",
+		},
 		Network: configsock.ArtifactNetwork{
 			Hostname: "source", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1",
 		},
@@ -91,24 +93,40 @@ func TestRecoveredBuildTaskHandoffAcceptsOnlyDurableDigest(t *testing.T) {
 func TestValidateBuildPrepareSummaryIsStrict(t *testing.T) {
 	summary := validBuildPrepareSummary()
 	wantNetwork := sandboxcfg.NetworkSpec{Hostname: "source", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1"}
-	if got, err := validateBuildPrepareSummary(summary); err != nil || !reflect.DeepEqual(got, wantNetwork) {
-		t.Fatalf("valid summary network = %+v, %v", got, err)
+	capacity, got, err := validateBuildPrepareSummary(summary)
+	if err != nil || !reflect.DeepEqual(got, wantNetwork) || capacity != summary.Capacity {
+		t.Fatalf("valid summary = capacity %+v network %+v, %v", capacity, got, err)
 	}
 
 	badNetwork := summary
 	badNetwork.Network.InnerIP = "not-a-cidr"
-	if _, err := validateBuildPrepareSummary(badNetwork); err == nil {
+	if _, _, err := validateBuildPrepareSummary(badNetwork); err == nil {
 		t.Fatal("malformed source-template network was accepted")
 	}
 	badMemory := summary
 	badMemory.Capacity.Memory = "not-a-size"
-	if _, err := validateBuildPrepareSummary(badMemory); err == nil {
+	if _, _, err := validateBuildPrepareSummary(badMemory); err == nil {
 		t.Fatal("invalid snapshot capacity was accepted")
+	}
+	badAllocatableCPU := summary
+	badAllocatableCPU.Capacity.AllocatableCPU = 3
+	if _, _, err := validateBuildPrepareSummary(badAllocatableCPU); err == nil {
+		t.Fatal("allocatable CPU above capacity was accepted")
+	}
+	badAllocatableMemory := summary
+	badAllocatableMemory.Capacity.AllocatableMemory = "3GiB"
+	if _, _, err := validateBuildPrepareSummary(badAllocatableMemory); err == nil {
+		t.Fatal("allocatable memory above capacity was accepted")
 	}
 	uppercaseDigest := summary
 	uppercaseDigest.ResolutionDigest = strings.Repeat("A", 64)
-	if _, err := validateBuildPrepareSummary(uppercaseDigest); err == nil {
+	if _, _, err := validateBuildPrepareSummary(uppercaseDigest); err == nil {
 		t.Fatal("non-canonical snapshot resolution digest was accepted")
+	}
+	dataDisk := summary
+	dataDisk.DiskTopology.Disks = []types.ArtifactDiskShape{{Name: "data", Mode: types.ArtifactDiskSingle, HasActiveBase: true}}
+	if _, _, err := validateBuildPrepareSummary(dataDisk); err == nil || !strings.Contains(err.Error(), "data disks") {
+		t.Fatalf("source data disk validation = %v", err)
 	}
 }
 
@@ -122,6 +140,12 @@ func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 		},
 		Resources: rtconfig.ResourcesConfig{
 			Capacity: rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+		},
+		SandboxResources: rtconfig.ResourcesConfig{
+			Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
+		},
+		CheckpointPolicy: sandboxcfg.SnapshotPolicy{
+			MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true),
 		},
 	}
 	raw, err := encodeBuildRuntimePreparation(want)
@@ -138,6 +162,19 @@ func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 	if _, err := decodeBuildRuntimePreparation(`{"schema_version":1}`); err == nil {
 		t.Fatal("incomplete durable preparation was accepted")
 	}
+
+	// Image outputs have no target Sandbox resources. Their durable record
+	// still freezes the independent A/B execution resources.
+	image := want
+	image.SandboxResources = rtconfig.ResourcesConfig{}
+	if _, err := encodeBuildRuntimePreparation(image); err != nil {
+		t.Fatalf("image runtime preparation = %v", err)
+	}
+	partial := image
+	partial.SandboxResources.Capacity.Memory = "1GiB"
+	if _, err := encodeBuildRuntimePreparation(partial); err == nil {
+		t.Fatal("partial sandbox resources were accepted")
+	}
 }
 
 func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
@@ -146,6 +183,7 @@ func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
 	b := &types.Build{
 		BuildID: "build-final-route-order", TemplateID: "transient-build-final-route-order",
 		Profile: types.ProfileE2B, RunID: "br-final-route-order", CreatedUnix: time.Now().Unix(),
+		Builder: types.BuildOptions{Target: &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}},
 	}
 	handoff := newBuildTaskHandoff(false, "")
 	pend := &pendingBuild{build: b, handoff: handoff}
@@ -181,6 +219,30 @@ func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
 	o.uncache(mmdsRow.ID)
 	o.publishDelete(mmdsRow.ID)
 	o.setMMDSBuildOwner(mmdsRow.ID, "")
+}
+
+func TestPublishBuildFinalSkipsPhaseCMMDSRouteForNonMemoryTargets(t *testing.T) {
+	for _, target := range []*types.BuildTarget{
+		{Kind: types.BuildTargetImage},
+		{Kind: types.BuildTargetSandbox},
+	} {
+		t.Run(string(target.Kind), func(t *testing.T) {
+			o := testOrch(t)
+			o.cfg.MMDS.Enabled = true
+			b := &types.Build{
+				BuildID: "build-final-no-route-" + string(target.Kind),
+				Profile: types.ProfileE2B,
+				Builder: types.BuildOptions{Target: target},
+			}
+			pend := &pendingBuild{build: b, handoff: newBuildTaskHandoff(false, "")}
+			if row := o.publishBuildFinal(pend, &configsock.BuildSpec{BuildID: b.BuildID}); row != nil {
+				t.Fatalf("non-memory target published Phase C MMDS row: %+v", row)
+			}
+			if o.lookup("build-"+b.BuildID) != nil {
+				t.Fatal("non-memory target retained a synthetic MMDS route")
+			}
+		})
+	}
 }
 
 func TestArtifactPrepareFailureResultIsVisibleWithoutBuildJournal(t *testing.T) {

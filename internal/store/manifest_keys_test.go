@@ -269,8 +269,8 @@ func TestBusinessCredentialsAreEncryptedImmutableAndIndependentOfAllowlist(t *te
 	b := &types.Build{
 		BuildID: "build-1", TemplateID: "transient-1",
 		APISecret: initial.APISecret, ManifestKey: initial.ManifestKey,
-		Profile: types.ProfileE2B, Kind: types.KindImg,
-		Status: types.BuildRegistered, CreatedUnix: 1,
+		Profile: types.ProfileE2B,
+		Status:  types.BuildRegistered, CreatedUnix: 1,
 	}
 	if err := st.PutBuild(ctx, b); err != nil {
 		t.Fatal(err)
@@ -382,7 +382,6 @@ func TestBuildOptionsRoundTrip(t *testing.T) {
 		APISecret:   strings.Repeat("2", 64),
 		ManifestKey: strings.Repeat("3", 64),
 		Profile:     types.ProfileE2B,
-		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
 		Builder: types.BuildOptions{
 			Referer: &types.BuildRefererOptions{

@@ -71,7 +71,7 @@ func TestBuildAndInitialMMDSRouteSecretValuesRollbackTogether(t *testing.T) {
 	build := &types.Build{
 		BuildID: "mmds-build-rollback", TemplateID: "transient-mmds-build-rollback",
 		APISecret: strings.Repeat("4", 64), ManifestKey: strings.Repeat("5", 64),
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding, CreatedUnix: 1,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding, CreatedUnix: 1,
 		ExecutionClaimed: true,
 	}
 	if err := st.InsertBuildWithMMDSRouteSecretValues(ctx, build, "digest", MMDSRouteSecretValues{"key": []byte("value")}); err == nil {
@@ -119,7 +119,7 @@ func TestMMDSRouteSecretValuesAADRejectsSubstitution(t *testing.T) {
 		build := &types.Build{
 			BuildID: ownerID, TemplateID: "transient-aad-owner-kind",
 			APISecret: strings.Repeat("7", 64), ManifestKey: strings.Repeat("8", 64),
-			Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildRegistered, CreatedUnix: 1,
+			Profile: types.ProfileE2B, Status: types.BuildRegistered, CreatedUnix: 1,
 		}
 		if err := st.InsertBuildWithMMDSRouteSecretValues(ctx, build, "digest", MMDSRouteSecretValues{"key": []byte("build-value")}); err != nil {
 			t.Fatal(err)
@@ -218,7 +218,7 @@ func TestBuildMMDSRouteSecretValuesTerminalCleanup(t *testing.T) {
 	build := &types.Build{
 		BuildID: "mmds-build", TemplateID: "transient-mmds-build",
 		APISecret: strings.Repeat("2", 64), ManifestKey: strings.Repeat("3", 64),
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding, CreatedUnix: 1,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding, CreatedUnix: 1,
 		ExecutionClaimed: true,
 		Metadata: map[string]string{
 			sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}]}`,

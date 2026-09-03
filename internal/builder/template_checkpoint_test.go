@@ -2,33 +2,36 @@ package builder
 
 import (
 	"reflect"
-	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
-func TestTemplateSnapshotArgsCarryCheckpointModeAndExcludePausePolicy(t *testing.T) {
+func TestTemplateSnapshotArgsCarryCheckpointModeAndPolicy(t *testing.T) {
+	merge, drop := false, true
 	for _, tc := range []struct {
-		name string
-		mode string
-		want string
+		name   string
+		mode   string
+		want   string
+		policy sandboxcfg.SnapshotPolicy
 	}{
 		{name: "default", want: "local"},
 		{name: "local", mode: "local", want: "local"},
-		{name: "bundle", mode: "bundle", want: "bundle"},
+		{name: "bundle", mode: "bundle", want: "bundle", policy: sandboxcfg.SnapshotPolicy{MergeRef: &merge, DropCaches: &drop}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := []string{
 				"snapshot", "--path-id", "c", "--output", "/work/build", "--mode", tc.want, "--run-root", "/run/sandbox",
 			}
-			got := templateSnapshotArgs("c", "/work/build", "/run/sandbox", tc.mode)
+			if tc.policy.MergeRef != nil {
+				want = append(want, "--merge-ref=false")
+			}
+			if tc.policy.DropCaches != nil {
+				want = append(want, "--drop-caches=true")
+			}
+			got := templateSnapshotArgs("c", "/work/build", "/run/sandbox", tc.mode, tc.policy)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("builder snapshot argv = %#v, want %#v", got, want)
-			}
-			joined := strings.Join(got, " ")
-			for _, forbidden := range []string{"--merge-ref", "--drop-caches"} {
-				if strings.Contains(joined, forbidden) {
-					t.Fatalf("builder snapshot argv contains %s: %#v", forbidden, got)
-				}
 			}
 		})
 	}

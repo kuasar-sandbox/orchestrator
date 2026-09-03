@@ -7,11 +7,12 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// ArtifactPrepareSchemaVersion 2 replaces the v1 Snapshot-only prepare wire
-// with typed E/S sources, durable launch mode, a selected prepared source, and
-// bounded network/disk topology summaries. Old runners must fail closed before
-// the secret-bearing bootstrap provider is called.
-const ArtifactPrepareSchemaVersion = 2
+// ArtifactPrepareSchemaVersion 3 adds portable allocatable/deflate resource
+// defaults and an explicit Build-only source-image config read. Version 2
+// replaced the v1 Snapshot-only wire with typed E/S sources, durable launch
+// mode, a selected prepared source, and bounded network/disk topology summaries.
+// Old runners fail closed before the secret-bearing provider call.
+const ArtifactPrepareSchemaVersion = 3
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -32,6 +33,7 @@ type ArtifactPrepareSpec struct {
 	RefLocationParent        string `json:"ref_location_parent,omitempty"`
 	RelativeDir              string `json:"relative_dir,omitempty"`
 	MaxRefs                  int    `json:"max_refs"`
+	ReadSourceImageConfig    bool   `json:"read_source_image_config,omitempty"`
 	AbsoluteDeadlineUnixNano int64  `json:"absolute_deadline_unix_nano"`
 }
 
@@ -49,8 +51,11 @@ type SandboxTaskSpec struct {
 }
 
 type ArtifactCapacity struct {
-	CPU    int    `json:"cpu"`
-	Memory string `json:"memory"`
+	CPU               int     `json:"cpu"`
+	Memory            string  `json:"memory"`
+	AllocatableCPU    float64 `json:"allocatable_cpu,omitempty"`
+	AllocatableMemory string  `json:"allocatable_memory,omitempty"`
+	DeflateOnOOM      *bool   `json:"deflate_on_oom,omitempty"`
 }
 
 // ArtifactNetwork is the bounded, non-secret network projection produced by
@@ -82,6 +87,10 @@ type ArtifactPrepareSummary struct {
 // CloneArtifactPrepareSummary isolates every slice-bearing summary field so an
 // HTTP caller cannot mutate an accepted replay identity after admission.
 func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepareSummary {
+	if summary.Capacity.DeflateOnOOM != nil {
+		value := *summary.Capacity.DeflateOnOOM
+		summary.Capacity.DeflateOnOOM = &value
+	}
 	summary.Network.DNS = append([]string(nil), summary.Network.DNS...)
 	summary.DiskTopology.Disks = append([]types.ArtifactDiskShape(nil), summary.DiskTopology.Disks...)
 	return summary
@@ -91,7 +100,7 @@ func CloneArtifactPrepareSummary(summary ArtifactPrepareSummary) ArtifactPrepare
 func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 	return a.SchemaVersion == b.SchemaVersion &&
 		a.PreparedSourceKind == b.PreparedSourceKind &&
-		a.Capacity == b.Capacity &&
+		equalArtifactCapacity(a.Capacity, b.Capacity) &&
 		a.Network.Hostname == b.Network.Hostname &&
 		slices.Equal(a.Network.DNS, b.Network.DNS) &&
 		a.Network.InnerIP == b.Network.InnerIP &&
@@ -103,6 +112,15 @@ func EqualArtifactPrepareSummary(a, b ArtifactPrepareSummary) bool {
 		slices.Equal(a.DiskTopology.Disks, b.DiskTopology.Disks) &&
 		a.ResolutionDigest == b.ResolutionDigest &&
 		a.RequiredRefCount == b.RequiredRefCount
+}
+
+func equalArtifactCapacity(a, b ArtifactCapacity) bool {
+	if a.CPU != b.CPU || a.Memory != b.Memory || a.AllocatableCPU != b.AllocatableCPU ||
+		a.AllocatableMemory != b.AllocatableMemory {
+		return false
+	}
+	return (a.DeflateOnOOM == nil && b.DeflateOnOOM == nil) ||
+		(a.DeflateOnOOM != nil && b.DeflateOnOOM != nil && *a.DeflateOnOOM == *b.DeflateOnOOM)
 }
 
 type ArtifactPrepareRequest struct {

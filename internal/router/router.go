@@ -37,6 +37,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -49,6 +50,12 @@ const (
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderResource    = "X-Kuasar-Sandbox-Resource"
 	HeaderTraffic     = "X-Kuasar-Sandbox-Traffic"
+	HeaderNetwork     = "X-Kuasar-Sandbox-Network"
+	HeaderLaunch      = "X-Kuasar-Sandbox-Launch"
+	HeaderInit        = "X-Kuasar-Sandbox-Init"
+	HeaderMounts      = "X-Kuasar-Sandbox-Mounts"
+	HeaderFiles       = "X-Kuasar-Sandbox-Files"
+	HeaderMetadata    = "X-Kuasar-Sandbox-Metadata"
 	HeaderBuilder     = "X-Kuasar-Sandbox-Builder"
 	HeaderMMDS        = "X-Kuasar-Sandbox-MMDS"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
@@ -544,6 +551,96 @@ func mergeTrafficHeader(metadata map[string]string, header http.Header) (map[str
 	return merged, nil
 }
 
+// mergeBuildRegistrationHeaders mirrors the conductor Build Register adapter:
+// portable Create namespaces share the normal header precedence, while
+// restore/credentials/checkpoint retain their request-scoped rules. MMDS and
+// builder are handled separately because their secret and build-only portions
+// use distinct cluster envelopes.
+func mergeBuildRegistrationHeaders(metadata map[string]string, header http.Header) (map[string]string, error) {
+	out, err := sandboxcfg.MergeMetadata(nil, metadata)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range []struct {
+		header string
+		key    string
+		leaf   bool
+	}{
+		{HeaderResource, sandboxcfg.NsResource, true},
+		{HeaderTraffic, sandboxcfg.NsTraffic, true},
+		{HeaderNetwork, sandboxcfg.NsNetwork, false},
+		{HeaderLaunch, sandboxcfg.NsLaunch, false},
+		{HeaderInit, sandboxcfg.NsInit, false},
+		{HeaderMounts, sandboxcfg.NsMounts, false},
+		{HeaderFiles, sandboxcfg.NsFiles, false},
+		{HeaderMetadata, sandboxcfg.NsMetadata, false},
+	} {
+		values, present := header[http.CanonicalHeaderKey(item.header)]
+		if !present {
+			continue
+		}
+		if item.leaf && len(values) != 1 {
+			return nil, fmt.Errorf("%s must appear exactly once", item.header)
+		}
+		value := header.Get(item.header)
+		if item.leaf {
+			value = values[0]
+		} else if value == "" {
+			continue
+		}
+		out, err = sandboxcfg.MergeMetadata(out, map[string]string{item.key: value})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", item.header, err)
+		}
+	}
+	for _, item := range []struct{ header, key string }{
+		{HeaderRestore, sandboxcfg.NsRestore},
+		{HeaderCredentials, sandboxcfg.NsCredentials},
+	} {
+		if _, present := header[http.CanonicalHeaderKey(item.header)]; !present {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[item.key] = header.Get(item.header)
+	}
+	bodyPolicy := sandboxcfg.SnapshotPolicy{}
+	bodyPresent := false
+	if raw, present := out[sandboxcfg.NsCheckpoint]; present {
+		bodyPresent = true
+		bodyPolicy, err = sandboxcfg.ParseSnapshotPolicyJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("metadata %s: %w", sandboxcfg.NsCheckpoint, err)
+		}
+	}
+	_, headerPresent := header[http.CanonicalHeaderKey(HeaderCheckpoint)]
+	if !bodyPresent && !headerPresent {
+		return out, nil
+	}
+	policy := bodyPolicy
+	if headerPresent {
+		headerPolicy, err := sandboxcfg.ParseSnapshotPolicyJSON(header.Get(HeaderCheckpoint))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", HeaderCheckpoint, err)
+		}
+		policy = sandboxcfg.OverlaySnapshotPolicy(bodyPolicy, headerPolicy)
+	}
+	if policy.Empty() {
+		delete(out, sandboxcfg.NsCheckpoint)
+		return out, nil
+	}
+	canonical, err := sandboxcfg.MarshalSnapshotPolicyJSON(policy)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = map[string]string{}
+	}
+	out[sandboxcfg.NsCheckpoint] = canonical
+	return out, nil
+}
+
 func createHeaderValue(header http.Header, name string) (string, bool) {
 	_, present := header[http.CanonicalHeaderKey(name)]
 	return header.Get(name), present
@@ -554,11 +651,12 @@ func createHeaderValue(header http.Header, name string) (string, bool) {
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
 // build/template ids + places the build, §7.5).
 type buildReserveResult struct {
-	BuildID     string        `json:"build_id"`
-	TemplateID  string        `json:"template_id"`
-	NodeID      string        `json:"node_id"`
-	APIEndpoint string        `json:"api_endpoint"`
-	Profile     types.Profile `json:"profile"`
+	BuildID     string             `json:"build_id"`
+	TemplateID  string             `json:"template_id"`
+	NodeID      string             `json:"node_id"`
+	APIEndpoint string             `json:"api_endpoint"`
+	Profile     types.Profile      `json:"profile"`
+	Target      *types.BuildTarget `json:"target"`
 }
 
 // handleBuildRegister asks the registry to assign identities and choose an
@@ -577,14 +675,17 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name       string            `json:"name"`
-		Tags       []string          `json:"tags"`
-		Profile    string            `json:"profile"`
-		CPUCount   json.RawMessage   `json:"cpuCount"`
-		CPUCountSn json.RawMessage   `json:"cpu_count"`
-		MemoryMB   json.RawMessage   `json:"memoryMB"`
-		MemoryMBSn json.RawMessage   `json:"memory_mb"`
-		Metadata   map[string]string `json:"metadata"`
+		Name            string            `json:"name"`
+		Tags            []string          `json:"tags"`
+		Profile         string            `json:"profile"`
+		CPUCount        json.RawMessage   `json:"cpuCount"`
+		CPUCountSn      json.RawMessage   `json:"cpu_count"`
+		MemoryMB        json.RawMessage   `json:"memoryMB"`
+		MemoryMBSn      json.RawMessage   `json:"memory_mb"`
+		Metadata        map[string]string `json:"metadata"`
+		EnvVars         map[string]string `json:"envVars"`
+		Secure          bool              `json:"secure"`
+		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
 	}
 	rawBody, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
 	if err != nil || len(rawBody) > 1<<20 {
@@ -599,6 +700,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if len(body.AutoPauseMemory) != 0 {
+		http.Error(w, "autoPauseMemory is not valid for template builds; select builder.target.memory", http.StatusBadRequest)
+		return
+	}
 	profile := types.ProfileE2B
 	if body.Profile != "" {
 		var err error
@@ -608,12 +713,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	metadata, err := mergeResourceHeader(body.Metadata, r.Header)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	metadata, err = mergeTrafficHeader(metadata, r.Header)
+	metadata, err := mergeBuildRegistrationHeaders(body.Metadata, r.Header)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -629,6 +729,15 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	mmdsDoc, metadata, err := sandboxcfg.ExtractMMDSReplay(metadata, mmdsHeader)
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	credentials, metadata, err := sandboxcfg.ExtractCredentials(metadata)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := sandboxcfg.ValidateCredentialsForProfile(profile, credentials); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -689,7 +798,14 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	for name, value := range mmdsDoc.SecretValues {
 		mmdsSecrets[name] = string(value)
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, metadata, mmdsSecrets)
+	var credentialEnvelope *sandboxcfg.Credentials
+	if credentials != (sandboxcfg.Credentials{}) {
+		credentialEnvelope = &credentials
+	}
+	res, err := rt.routeLinkReserveBuild(
+		r.Context(), group, profile, resources, metadata, body.EnvVars, body.Secure,
+		credentialEnvelope, mmdsSecrets,
+	)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		writeRouteLinkError(w, err, http.StatusServiceUnavailable)
@@ -703,7 +819,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"templateID": res.TemplateID, "buildID": res.BuildID,
 		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
-		"profile": res.Profile,
+		"profile": res.Profile, "target": res.Target,
 	})
 }
 
@@ -1848,10 +1964,17 @@ func (rt *Router) routeLinkReserve(
 	return &res, nil
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, mmdsSecrets map[string]string) (*buildReserveResult, error) {
-	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources, "metadata": metadata,
-		"mmds_secrets": mmdsSecrets,
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata, env map[string]string, secure bool, credentials *sandboxcfg.Credentials, mmdsSecrets map[string]string) (*buildReserveResult, error) {
+	var wireResources *routesync.BuildResources
+	if resources != nil {
+		wireResources = &routesync.BuildResources{
+			CPU: resources.CPU, Memory: resources.Memory, Storage: resources.Storage,
+		}
+	}
+	reqBody, _ := json.Marshal(registry.BuildReserveReq{
+		Group: group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
+		Profile: profile, Resources: wireResources,
+		Metadata: metadata, Env: env, Secure: secure, Credentials: credentials, MMDSSecrets: mmdsSecrets,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -119,22 +120,135 @@ func TestClusterBuildRegisterRejectsInvalidBuildID(t *testing.T) {
 	}
 }
 
-func TestRegisterBuildValidatesPhaseResourcesAgainstNodePolicy(t *testing.T) {
+func TestRegisterBuildDefersAutoTargetResourcesUntilTargetResolution(t *testing.T) {
 	o := testOrch(t)
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
-	_, err := o.RegisterBuild(context.Background(), apiKey, api.RegisterSpec{
+	b, err := o.RegisterBuild(context.Background(), apiKey, api.RegisterSpec{
 		Profile:   types.ProfileE2B,
 		Resources: testBuildResources(),
 		Metadata: map[string]string{
 			sandboxcfg.NsResource: `{"allocatable":{"memory":"16GiB"}}`,
 		},
 	})
-	if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "phase sandbox resources") {
-		t.Fatalf("RegisterBuild error = %v, want node-policy resource rejection", err)
+	if err != nil {
+		t.Fatalf("RegisterBuild: %v", err)
+	}
+	if b.Kind != "" || b.Metadata[sandboxcfg.NsResource] != `{"allocatable":{"memory":"16GiB"}}` {
+		t.Fatalf("registered unresolved target = %+v", b)
 	}
 	usage, usageErr := o.st.BuildUsage(context.Background())
-	if usageErr != nil || usage.RegistrationBuilds != 0 {
-		t.Fatalf("invalid phase resources consumed registration admission: %+v, %v", usage, usageErr)
+	if usageErr != nil || usage.RegistrationBuilds != 1 {
+		t.Fatalf("registered auto build usage = %+v, %v", usage, usageErr)
+	}
+}
+
+func TestOfflineBuildTargetRejectsTrafficConfiguration(t *testing.T) {
+	o := testOrch(t)
+	apiKey, _, _ := allowlistedBuildIdentity(t, o)
+	offline := types.BuildTarget{Kind: types.BuildTargetSandbox}
+	_, err := o.RegisterBuild(context.Background(), apiKey, api.RegisterSpec{
+		Profile:   types.ProfileE2B,
+		Resources: testBuildResources(),
+		Metadata: map[string]string{
+			sandboxcfg.NsTraffic: `{"max_inflight":{"total":1}}`,
+		},
+		Builder: types.BuildOptions{Target: &offline},
+	})
+	if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "memory=false") {
+		t.Fatalf("RegisterBuild traffic error = %v, want offline instance-only rejection", err)
+	}
+}
+
+func TestBuildRegisterRejectsE2BLaunchOverrideBeforePersistence(t *testing.T) {
+	ctx := context.Background()
+	t.Run("direct", func(t *testing.T) {
+		o := testOrch(t)
+		apiKey, _, _ := allowlistedBuildIdentity(t, o)
+		_, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
+			Profile: types.ProfileE2B, Resources: testBuildResources(),
+			Metadata: map[string]string{sandboxcfg.NsLaunch: "{\"exec\":\"/tenant\"}"},
+			Builder: types.BuildOptions{Target: &types.BuildTarget{
+				Kind: types.BuildTargetSandbox, Memory: true,
+			}},
+		})
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "envd owns launch") {
+			t.Fatalf("RegisterBuild launch error = %v, want e2b ownership rejection", err)
+		}
+		usage, usageErr := o.st.BuildUsage(ctx)
+		if usageErr != nil || usage.RegistrationBuilds != 0 {
+			t.Fatalf("invalid launch consumed registration admission: %+v, %v", usage, usageErr)
+		}
+	})
+
+	t.Run("cluster", func(t *testing.T) {
+		o := testOrch(t)
+		_, _, fingerprint := allowlistedBuildIdentity(t, o)
+		cmd := clusterBuildRegisterCommand("build-e2b-launch", fingerprint)
+		cmd.Config[sandboxcfg.NsLaunch] = "{\"exec\":\"/tenant\"}"
+		err := o.registerClusterBuild(ctx, cmd)
+		if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "envd owns launch") {
+			t.Fatalf("registerClusterBuild launch error = %v, want e2b ownership rejection", err)
+		}
+		stored, getErr := o.st.GetBuild(ctx, cmd.BuildID)
+		if getErr != nil || stored != nil {
+			t.Fatalf("invalid cluster launch persisted = %+v, %v", stored, getErr)
+		}
+	})
+}
+
+func TestSourceBuildDefersTargetResourcesUntilPortableCapacityArrives(t *testing.T) {
+	policy := sandboxcfg.NodeResourcePolicy{
+		Capacity: sandboxcfg.NodeCapacityPolicy{CPU: 2, Memory: "2GiB"},
+	}
+	policy.ApplyDefaults()
+	o := testOrchCfg(t, &config.Config{
+		Sandbox: config.SandboxConfig{Resources: configresolve.PublicSandboxResources(policy)},
+	})
+	b := &types.Build{
+		Resources: testBuildResources(),
+		Metadata: map[string]string{
+			sandboxcfg.NsResource: `{"startup":{"memory":"4GiB"}}`,
+		},
+		Builder: types.BuildOptions{Target: &types.BuildTarget{Kind: types.BuildTargetSandbox}},
+	}
+
+	spec, _, unresolved, err := o.resolveBuildRequestInputs(b, true)
+	if err != nil {
+		t.Fatalf("resolveBuildRequestInputs rejected request before source capacity arrived: %v", err)
+	}
+	if unresolved.Capacity.CPU != 0 || unresolved.Capacity.Memory != "" || unresolved.Startup != nil {
+		t.Fatalf("source target resources resolved against node defaults: %+v", unresolved)
+	}
+
+	resolved, err := o.resolveBuildTargetResources(spec, &configsock.ArtifactCapacity{
+		CPU: 4, Memory: "8GiB", AllocatableCPU: 4, AllocatableMemory: "8GiB",
+	})
+	if err != nil {
+		t.Fatalf("resolveBuildTargetResources with source capacity: %v", err)
+	}
+	if resolved.Capacity.CPU != 4 || resolved.Capacity.Memory != "8GiB" ||
+		resolved.Allocatable.CPU != 4 || resolved.Allocatable.Memory != "8GiB" ||
+		resolved.Startup == nil || resolved.Startup.Memory != "4GiB" {
+		t.Fatalf("resolved source target resources = %+v", resolved)
+	}
+
+	disabled := false
+	lowered, err := sandboxcfg.ParseSpec(map[string]string{
+		sandboxcfg.NsResource: `{"allocatable":{"memory":"4GiB"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err = o.resolveBuildTargetResources(lowered, &configsock.ArtifactCapacity{
+		CPU: 4, Memory: "8GiB", AllocatableCPU: 4, AllocatableMemory: "8GiB",
+		DeflateOnOOM: &disabled,
+	})
+	if err != nil {
+		t.Fatalf("lower allocatable with inherited deflate=false: %v", err)
+	}
+	if resolved.Allocatable.Memory != "4GiB" || resolved.Allocatable.DeflateOnOOM == nil ||
+		!*resolved.Allocatable.DeflateOnOOM {
+		t.Fatalf("registration allocation did not supersede incompatible source deflate flag: %+v", resolved.Allocatable)
 	}
 }
 
@@ -177,7 +291,7 @@ func TestTriggerBareBuildRejectsCommandsAndQueuesImage(t *testing.T) {
 		t.Fatalf("TriggerBuild image-only: %v", err)
 	}
 	stored, err := o.st.GetBuild(ctx, b.BuildID)
-	if err != nil || stored == nil || stored.Profile != types.ProfileBare || stored.Kind != types.KindImg || stored.Status != types.BuildWaiting {
+	if err != nil || stored == nil || stored.Profile != types.ProfileBare || stored.Kind != "" || stored.Status != types.BuildWaiting {
 		t.Fatalf("queued bare build = %+v, err=%v", stored, err)
 	}
 }
@@ -253,7 +367,7 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	if err != nil || stored == nil || stored.Profile != types.ProfileBare {
 		t.Fatalf("cluster build = %+v, err=%v", stored, err)
 	}
-	if got, want := stored.PhaseResourcePatch, `{"capacity":{"memory":"8GiB"},"allocatable":{"memory":"512MiB"}}`; got != want {
+	if got, want := stored.Metadata[sandboxcfg.NsResource], `{"capacity":{"memory":"8GiB"},"allocatable":{"memory":"512MiB"}}`; got != want {
 		t.Fatalf("cluster build resource = %s, want %s", got, want)
 	}
 	if stored.ClusterGroup != "/test" {
@@ -345,6 +459,75 @@ func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
 	}
 	if stored, err := o.st.GetBuild(ctx, malformedBuilder.BuildID); err != nil || stored != nil {
 		t.Fatalf("malformed builder config stored build = %+v, err=%v", stored, err)
+	}
+}
+
+func TestClusterBuildRegisterPersistsConfidentialInstanceConfig(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := clusterBuildRegisterCommand("cluster-instance-config", fingerprint)
+	cmd.Config[buildcfg.NsBuilder] = `{"target":{"kind":"sandbox","memory":true}}`
+	cmd.Config[sandboxcfg.NsNetwork] = `{"hostname":"cluster-build"}`
+	cmd.BuildEnv = map[string]string{"BUILD_NAME": "cluster-build"}
+	cmd.BuildSecure = true
+	cmd.BuildCredentials = &sandboxcfg.Credentials{
+		ServiceSecret: strings.Repeat("a", 64), EnvdAccessToken: "cluster-envd",
+		TrafficAccessToken: "cluster-traffic",
+	}
+
+	if err := o.registerClusterBuild(ctx, cmd); err != nil {
+		t.Fatalf("registerClusterBuild: %v", err)
+	}
+	stored, err := o.st.GetBuild(ctx, cmd.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.Env["BUILD_NAME"] != "cluster-build" || !stored.Secure ||
+		stored.ServiceSecret != cmd.BuildCredentials.ServiceSecret ||
+		stored.EnvdAccessToken != cmd.BuildCredentials.EnvdAccessToken ||
+		stored.TrafficAccessToken != cmd.BuildCredentials.TrafficAccessToken ||
+		stored.Metadata[sandboxcfg.NsNetwork] != `{"hostname":"cluster-build"}` {
+		t.Fatalf("stored cluster instance config = %+v", stored)
+	}
+	if _, present := stored.Metadata[sandboxcfg.NsCredentials]; present {
+		t.Fatalf("confidential credentials leaked into portable metadata: %+v", stored.Metadata)
+	}
+	if err := o.registerClusterBuild(ctx, cmd); err != nil {
+		t.Fatalf("exact registration replay: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*routesync.Command){
+		"environment": func(candidate *routesync.Command) {
+			candidate.BuildEnv = map[string]string{"BUILD_NAME": "changed"}
+		},
+		"secure": func(candidate *routesync.Command) { candidate.BuildSecure = false },
+		"credentials": func(candidate *routesync.Command) {
+			changed := *candidate.BuildCredentials
+			changed.EnvdAccessToken = "changed-envd"
+			candidate.BuildCredentials = &changed
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *cmd
+			mutate(&candidate)
+			if err := o.registerClusterBuild(ctx, &candidate); err == nil {
+				t.Fatal("changed immutable registration was accepted")
+			} else if status, _ := clusterCommandRejection(err); status != http.StatusConflict {
+				t.Fatalf("immutable conflict status = %d, want 409: %v", status, err)
+			}
+		})
+	}
+
+	embedded := *cmd
+	embedded.BuildID = "cluster-embedded-credentials"
+	embedded.TemplateRef = "transient-cluster-embedded-credentials"
+	embedded.BuildCredentials = nil
+	embedded.Config = cloneStringMap(cmd.Config)
+	embedded.Config[sandboxcfg.NsCredentials] = `{"service_secret":"` + strings.Repeat("b", 64) + `"}`
+	if err := o.registerClusterBuild(ctx, &embedded); !errors.Is(err, api.ErrBadRequest) ||
+		!strings.Contains(err.Error(), "confidential command envelope") {
+		t.Fatalf("metadata credentials error = %v, want confidential-envelope rejection", err)
 	}
 }
 
@@ -497,7 +680,7 @@ func TestPublishBuildStateRequiredDoesNotTreatStoreFailureAsDirectBuild(t *testi
 	}
 }
 
-func TestIMGCreateDoesNotInheritBuildPhaseResourcePatch(t *testing.T) {
+func TestIMGCreateDoesNotInheritRetainedBuildSandboxConfig(t *testing.T) {
 	policy := sandboxcfg.NodeResourcePolicy{}
 	policy.ApplyDefaults()
 	cfg := &config.Config{Sandbox: config.SandboxConfig{Resources: configresolve.PublicSandboxResources(policy)}}
@@ -520,9 +703,11 @@ func TestIMGCreateDoesNotInheritBuildPhaseResourcePatch(t *testing.T) {
 		BuildID: "phase-resource-isolation", TemplateID: "transient-phase-resource-isolation",
 		PersistID: persistID, APISecret: apiSecret, ManifestKey: manifestKey,
 		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildReady,
-		Resources:          types.BuildResources{CPU: 8000, Memory: 16 << 30},
-		PhaseResourcePatch: `{"capacity":{"cpu":8,"memory":"8GiB"},"allocatable":{"memory":"1GiB"}}`,
-		CreatedUnix:        time.Now().Unix(),
+		Resources: types.BuildResources{CPU: 8000, Memory: 16 << 30},
+		Metadata: map[string]string{
+			sandboxcfg.NsResource: `{"capacity":{"cpu":8,"memory":"8GiB"},"allocatable":{"memory":"1GiB"}}`,
+		},
+		CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, build); err != nil {
 		t.Fatal(err)

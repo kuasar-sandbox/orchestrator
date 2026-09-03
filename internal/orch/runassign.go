@@ -61,6 +61,9 @@ func (o *Orchestrator) PostBuildResult(ctx context.Context, runID, buildID strin
 	if pend.build.RunID != runID {
 		return configsock.RejectBuildReport(fmt.Errorf("build %s assigned to run %s, got %s", buildID, pend.build.RunID, runID))
 	}
+	if err := validateBuildResult(pend.build, result); err != nil {
+		return configsock.RejectBuildReport(fmt.Errorf("build %s result: %w", buildID, err))
+	}
 	pend.resultMu.Lock()
 	defer pend.resultMu.Unlock()
 	if pend.resultClosed {

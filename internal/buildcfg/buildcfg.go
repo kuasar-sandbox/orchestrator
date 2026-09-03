@@ -49,6 +49,7 @@ func Marshal(opts types.BuildOptions) (string, error) {
 }
 
 type optionsInput struct {
+	Target    json.RawMessage `json:"target"`
 	Resources json.RawMessage `json:"resources"`
 	Referer   json.RawMessage `json:"referer"`
 	Registry  json.RawMessage `json:"registry"`
@@ -67,6 +68,19 @@ func parseOptions(raw []byte) (types.BuildOptions, error) {
 		return types.BuildOptions{}, fmt.Errorf("builder configuration must be a JSON object")
 	}
 	var out types.BuildOptions
+	if len(input.Target) != 0 {
+		if bytes.Equal(bytes.TrimSpace(input.Target), []byte("null")) {
+			return types.BuildOptions{}, fmt.Errorf("%s.target must not be null", NsBuilder)
+		}
+		var target types.BuildTarget
+		if err := strictjson.Decode(input.Target, &target); err != nil {
+			return types.BuildOptions{}, fmt.Errorf("%s.target: %w", NsBuilder, err)
+		}
+		if err := target.Validate(); err != nil {
+			return types.BuildOptions{}, fmt.Errorf("%s.target: %w", NsBuilder, err)
+		}
+		out.Target = &target
+	}
 	if len(input.Resources) != 0 {
 		patch, err := ParseResourceObject(NsBuilder+".resources", input.Resources)
 		if err != nil {

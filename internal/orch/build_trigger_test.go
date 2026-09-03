@@ -230,7 +230,7 @@ func TestTriggerBuildStateMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatalf("TriggerBuild: %v", err)
 				}
-				if after.Status != types.BuildWaiting || after.Kind != types.KindSnp ||
+				if after.Status != types.BuildWaiting || after.Kind != "" ||
 					after.FromImage != spec.FromImage || after.StartCmd != spec.StartCmd ||
 					after.ReadyCmd != spec.ReadyCmd || !reflect.DeepEqual(after.Steps, spec.Steps) {
 					t.Fatalf("committed trigger work order = %#v", after)
@@ -460,7 +460,7 @@ func TestTriggerBuildConcurrentHasSingleCompleteWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := candidates[winner]
-	if got.Status != types.BuildWaiting || got.Kind != types.KindSnp ||
+	if got.Status != types.BuildWaiting || got.Kind != "" ||
 		got.FromImage != want.spec.FromImage || got.FromTemplate != "" ||
 		got.StartCmd != want.spec.StartCmd || got.ReadyCmd != want.spec.ReadyCmd ||
 		!reflect.DeepEqual(got.Steps, want.spec.Steps) {

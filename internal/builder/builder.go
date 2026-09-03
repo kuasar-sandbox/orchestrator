@@ -17,13 +17,12 @@
 //	             (ARG substitutes only); then flatten-ctl exports the rootfs
 //	             (its tmpdir/output home is a self-bind mountpoint, excluded
 //	             by --skip-mounts) and streams the new image artifact back.
-//	C template — a PRODUCTION-runtime sandbox cold-booted from the final
-//	             image (the runtime ref freezes into the snapshot — template
-//	             children must not inherit the builder toolchain); startCmd
-//	             launches THROUGH ENVD and stays an envd-MANAGED process in
-//	             the snapshot (the stream is held until ready, then dropped
-//	             — envd never kills on stream loss), readyCmd polls every 2s
-//	             to success, then sandbox-ctl snapshot writes the bundle.
+//	C memory  — only for target={sandbox,memory:true}: a production-runtime
+//	            sandbox cold-booted from the final image. For a Sandbox source,
+//	            run --from E --replace-boot preserves portable non-boot defaults
+//	            while installing that image as the complete boot. startCmd runs
+//	            through envd; readyCmd polls every 2s, or its absence causes a
+//	            cancelable fixed 20-second wait, before the memory snapshot.
 //
 // Two guest channels, deliberately distinct: e2b-SEMANTIC commands
 // (steps/startCmd/readyCmd) go through envd exactly as e2b's own template
@@ -31,12 +30,10 @@
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// Publication normally happens at the finale. A Bundle snapshot build is the
-// one deliberate exception: its newly built platform base image is published
-// before phase C so the byte-identical snapshot.cfg can retain the existing
-// manifest:// base_ref strategy; the finale then exact-uploads the snapshot
-// layers without rewriting that config. The result returns to the orchestrator
-// over the config-socket.
+// A Sandbox output fixes the final image's manifest identity before offline E
+// assembly or Phase C, so neither output retains the source E/S graph. The
+// target then selects exactly one returned image, Sandbox, or Snapshot ref for
+// the orchestrator's fail-closed result validation.
 package builder
 
 import (
@@ -49,6 +46,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -66,11 +64,13 @@ func Run(parent context.Context, spec *configsock.BuildSpec, vmmCgroup *os.File,
 
 // Result mirrors orch.buildResult.
 type Result struct {
-	ImageRef    string `json:"image_ref,omitempty"`
-	SnapshotRef string `json:"snapshot_ref,omitempty"`
-	StartCmd    string `json:"start_cmd,omitempty"`
-	ReadyCmd    string `json:"ready_cmd,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Target      types.BuildTarget `json:"target"`
+	ImageRef    string            `json:"image_ref,omitempty"`
+	SandboxRef  string            `json:"sandbox_ref,omitempty"`
+	SnapshotRef string            `json:"snapshot_ref,omitempty"`
+	StartCmd    string            `json:"start_cmd,omitempty"`
+	ReadyCmd    string            `json:"ready_cmd,omitempty"`
+	Error       string            `json:"error,omitempty"`
 }
 
 type buildPipeline struct {
@@ -86,13 +86,12 @@ type buildPipeline struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	imagePath           string // BuildBaseDir/checkpoint/image.img once a local image exists
-	baseImageRef        string // portable ref for an already-published base image
-	baseRef             string // phase B/C boot.root.base ("file://..." | "manifest://...")
-	overlayBase         string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
-	overlayBaseFromRefs []string
-	startCmd            string // effective (request else template-inherited)
-	readyCmd            string
+	imagePath    string // BuildBaseDir/checkpoint/image.img once a local image exists
+	baseImageRef string // portable ref for an already-published base image
+	baseRef      string // phase B/C boot.root.base ("file://..." | "manifest://...")
+	startCmd     string // effective (request else template-inherited)
+	readyCmd     string
+	target       types.BuildTarget
 }
 
 func (p *buildPipeline) phaseRunDir(pathID string) string {
@@ -162,21 +161,24 @@ func (p *buildPipeline) run() (res Result) {
 	if err := p.resolveBase(); err != nil {
 		return fail(err)
 	}
+	if err := p.resolveTarget(); err != nil {
+		return fail(err)
+	}
 
 	if s.FromImage != "" {
 		if err := p.runPhase("a", p.phaseImport); err != nil {
 			return fail(fmt.Errorf("import: %w", err))
 		}
 	}
-	if len(s.Steps) > 0 {
+	if len(s.Steps) > 0 || s.SourceSandboxConfig != nil {
 		if err := p.runPhase("b", p.phaseSteps); err != nil {
 			return fail(fmt.Errorf("steps: %w", err))
 		}
 	}
 	var bundle string
-	if p.profile == types.ProfileE2B && p.startCmd != "" {
-		if err := p.prepareBundleTemplateBase(); err != nil {
-			return fail(fmt.Errorf("template base: %w", err))
+	if p.target.Kind == types.BuildTargetSandbox && p.target.Memory {
+		if err := p.prepareFinalImageRef(); err != nil {
+			return fail(fmt.Errorf("final image: %w", err))
 		}
 		var b string
 		err := p.runPhase("c", func() error {
@@ -190,24 +192,34 @@ func (p *buildPipeline) run() (res Result) {
 		bundle = b
 	}
 
-	// Finale: upload what was produced. Bundle template bases may already have
-	// been published immediately before phase C; uploadImage reuses that ref.
+	// Finale is selected only by the resolved target; returned fields never
+	// reverse-infer or alter it.
 	switch {
-	case bundle != "":
+	case p.target.Kind == types.BuildTargetSandbox && p.target.Memory:
+		if bundle == "" {
+			return fail(fmt.Errorf("memory Sandbox target produced no snapshot"))
+		}
 		key, err := p.publishSnapshot(bundle)
 		if err != nil {
 			return fail(fmt.Errorf("publish snapshot: %w", err))
 		}
 		res.SnapshotRef = key
-	case p.imagePath != "" || p.baseImageRef != "":
+	case p.target.Kind == types.BuildTargetSandbox:
+		ref, err := p.publishOfflineSandbox()
+		if err != nil {
+			return fail(fmt.Errorf("publish Sandbox: %w", err))
+		}
+		res.SandboxRef = ref
+	case p.target.Kind == types.BuildTargetImage:
 		ref, err := p.uploadImage()
 		if err != nil {
 			return fail(fmt.Errorf("upload image: %w", err))
 		}
 		res.ImageRef = ref
 	default:
-		return fail(fmt.Errorf("nothing produced (no image, no snapshot)"))
+		return fail(fmt.Errorf("unsupported resolved build target %+v", p.target))
 	}
+	res.Target = p.target
 	res.StartCmd, res.ReadyCmd = p.startCmd, p.readyCmd
 	return res
 }
@@ -280,7 +292,7 @@ func validateBuildProfile(s *configsock.BuildSpec) (types.Profile, error) {
 }
 
 // resolveBase fixes the phase B/C base ref and inherits start/ready from a
-// base template's snapshot.cfg metadata (e2b.start_cmd / e2b.ready_cmd).
+// task-local source E's portable metadata (e2b.start_cmd / e2b.ready_cmd).
 func (p *buildPipeline) resolveBase() error {
 	s := p.spec
 	switch {
@@ -288,21 +300,42 @@ func (p *buildPipeline) resolveBase() error {
 		return nil // base = the imported local image (set by phaseImport)
 	case s.FromTemplateKind == "img":
 		p.baseRef = s.FromTemplateRef
+		p.baseImageRef = s.FromTemplateRef
 		return nil
-	default: // snp: run-builder retained the only parsed root SnapshotCfg
-		prepared := s.SnapshotPreparation
-		if prepared == nil || prepared.BaseRef == "" {
-			return fmt.Errorf("base template %s: task-local snapshot preparation is missing", s.FromTemplateRef)
+	case s.FromTemplateKind == "sbx", s.FromTemplateKind == "snp":
+		if s.SourceSandboxConfig == nil || s.SourceSandboxRef == "" {
+			return fmt.Errorf("base template %s: task-local Sandbox E preparation is missing", s.FromTemplateRef)
 		}
-		p.baseRef = prepared.BaseRef
-		p.overlayBase = prepared.OverlayBase
-		p.overlayBaseFromRefs = append([]string(nil), prepared.OverlayBaseFromRefs...)
 		if p.profile == types.ProfileE2B && p.startCmd == "" {
-			p.startCmd = prepared.StartCmd
+			p.startCmd = s.SourceSandboxConfig.Metadata[sandboxcfg.E2BStartCommandMetadata]
 		}
 		if p.profile == types.ProfileE2B && p.readyCmd == "" {
-			p.readyCmd = prepared.ReadyCmd
+			p.readyCmd = s.SourceSandboxConfig.Metadata[sandboxcfg.E2BReadyCommandMetadata]
 		}
 		return nil
+	default:
+		return fmt.Errorf("base template %s has unsupported kind %q", s.FromTemplateRef, s.FromTemplateKind)
 	}
+}
+
+func (p *buildPipeline) resolveTarget() error {
+	// An explicit image deliberately ignores inherited source commands. Trigger
+	// commands already conflict at the API boundary, but enforce it again here.
+	if p.spec.RequestedTarget != nil && p.spec.RequestedTarget.Kind == types.BuildTargetImage {
+		if p.spec.StartCmd != "" || p.spec.ReadyCmd != "" {
+			return fmt.Errorf("explicit image target conflicts with trigger start/ready commands")
+		}
+		p.startCmd, p.readyCmd = "", ""
+	}
+	p.target = types.ResolveBuildTarget(p.spec.RequestedTarget, p.startCmd, p.readyCmd)
+	if err := p.target.Validate(); err != nil {
+		return err
+	}
+	switch {
+	case p.target.Kind == types.BuildTargetImage && (p.spec.HasSandboxConfig || p.spec.HasInstanceConfig):
+		return fmt.Errorf("image target cannot represent registered Sandbox configuration")
+	case p.target.Kind == types.BuildTargetSandbox && !p.target.Memory && p.spec.HasInstanceConfig:
+		return fmt.Errorf("sandbox target with memory=false cannot apply instance-only configuration")
+	}
+	return nil
 }

@@ -210,6 +210,26 @@ func TestBuildEventFencesArePerObjectWithoutExtensionObserver(t *testing.T) {
 	waitObserverSignal(t, sameDone)
 }
 
+func TestCloneBuildForObservationDeepCopiesTargetAndEnvironment(t *testing.T) {
+	target := &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	original := &types.Build{
+		Env:     map[string]string{"TOKEN": "original"},
+		Builder: types.BuildOptions{Target: target},
+	}
+
+	clone := cloneBuildForObservation(original)
+	clone.Env["TOKEN"] = "mutated"
+	clone.Builder.Target.Kind = types.BuildTargetImage
+	clone.Builder.Target.Memory = false
+
+	if original.Env["TOKEN"] != "original" {
+		t.Fatalf("observer clone mutated original environment: %+v", original.Env)
+	}
+	if original.Builder.Target == nil || *original.Builder.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {
+		t.Fatalf("observer clone mutated original target: %+v", original.Builder.Target)
+	}
+}
+
 func waitObserverSignal(t *testing.T, signal <-chan struct{}) {
 	t.Helper()
 	select {
@@ -294,7 +314,7 @@ func observerBuildingFixture(t *testing.T, id string) *types.Build {
 	return &types.Build{
 		BuildID: id, TemplateID: "transient-" + id,
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding,
 		Resources: types.BuildResources{CPU: 1000, Memory: 1 << 30}, ExecutionClaimed: true,
 		ExecutionClaimedUnix: time.Now().Unix(), CreatedUnix: time.Now().Unix(),
 	}
