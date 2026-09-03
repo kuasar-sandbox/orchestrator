@@ -192,11 +192,11 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"build"}` {
 		t.Fatalf("sandbox build header not normalized: %+v", got)
 	}
-	if _, ok := got[sandboxcfg.NsCredentials]; ok {
-		t.Fatalf("credentials header entered build metadata: %+v", got)
+	if got[sandboxcfg.NsCredentials] != `{"envd_access_token":"must-not-enter-build"}` {
+		t.Fatalf("credentials header was not forwarded to core extraction: %+v", got)
 	}
-	if _, ok := got[sandboxcfg.NsCheckpoint]; ok {
-		t.Fatalf("checkpoint header entered build metadata: %+v", got)
+	if got[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+		t.Fatalf("checkpoint header was not normalized for build registration: %+v", got)
 	}
 	if _, err := mergeBuildConfigHeaders(
 		map[string]string{buildcfg.NsBuilder: `{"resources":{"cpu":2},"future":true}`},
@@ -252,10 +252,13 @@ func TestBuildRegisterCanonicalizesAliasesAndAssertsBuilderHeader(t *testing.T) 
 	var got RegisterSpec
 	core := &buildMMDSCoreStub{register: func(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
 		got = spec
-		return &types.Build{TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B}, nil
+		return &types.Build{
+			TemplateID: "transient-template", BuildID: "build", Profile: types.ProfileE2B,
+			Builder: spec.Builder,
+		}, nil
 	}}
 	handler, apiKey := newMigrationTestHandler(t, core)
-	headers := header(builderHeader, `{"resources":{"cpu":2,"memory":"2GiB","storage":"64GiB"},"referer":{"enabled":false}}`)
+	headers := header(builderHeader, `{"target":{"kind":"sandbox","memory":false},"resources":{"cpu":2,"memory":"2GiB","storage":"64GiB"},"referer":{"enabled":false}}`)
 	response := migrationRequest(t, handler, apiKey, http.MethodPost, "/v3/templates",
 		strings.NewReader(`{"cpuCount":2,"cpu_count":2.0,"memoryMB":2048,"memory_mb":2048,"extension":null}`), headers)
 	if response.Code != http.StatusAccepted {
@@ -264,11 +267,21 @@ func TestBuildRegisterCanonicalizesAliasesAndAssertsBuilderHeader(t *testing.T) 
 	if got.Resources != (types.BuildResources{CPU: 2000, Memory: 2 << 30, Storage: 64 << 30}) {
 		t.Fatalf("canonical resources = %+v", got.Resources)
 	}
-	if got.Builder.Resources != nil || got.Builder.Referer == nil {
+	if got.Builder.Resources != nil || got.Builder.Referer == nil || got.Builder.Target == nil ||
+		got.Builder.Target.Kind != types.BuildTargetSandbox || got.Builder.Target.Memory {
 		t.Fatalf("builder resources were not extracted from build-only options: %+v", got.Builder)
 	}
 	if _, exists := got.Metadata[buildcfg.NsBuilder]; exists {
 		t.Fatalf("builder namespace leaked into template metadata: %+v", got.Metadata)
+	}
+	var responseBody struct {
+		Target *types.BuildTarget `json:"target"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &responseBody); err != nil {
+		t.Fatal(err)
+	}
+	if responseBody.Target == nil || *responseBody.Target != *got.Builder.Target {
+		t.Fatalf("register response target = %+v, want %+v", responseBody.Target, got.Builder.Target)
 	}
 }
 
@@ -1526,6 +1539,7 @@ type buildStatusCoreStub struct {
 	Core
 	build *types.Build
 	logs  []BuildLogEntry
+	list  []*types.Build
 }
 
 func (c *buildStatusCoreStub) BuildStatus(context.Context, string, string, string) (*types.Build, error) {
@@ -1534,6 +1548,10 @@ func (c *buildStatusCoreStub) BuildStatus(context.Context, string, string, strin
 
 func (c *buildStatusCoreStub) BuildLogs(context.Context, string, string, string, int) ([]BuildLogEntry, error) {
 	return c.logs, nil
+}
+
+func (c *buildStatusCoreStub) ListTemplates(context.Context, string) ([]*types.Build, error) {
+	return c.list, nil
 }
 
 func (c *buildMMDSCoreStub) RegisterBuild(ctx context.Context, apiKey string, spec RegisterSpec) (*types.Build, error) {
@@ -1547,6 +1565,9 @@ func (c *buildMMDSCoreStub) TriggerBuild(ctx context.Context, apiKey, templateID
 func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 	handler, apiKey := newMigrationTestHandler(t, &buildStatusCoreStub{build: &types.Build{
 		BuildID: "build-observed", TemplateID: "template-observed", Profile: types.ProfileE2B,
+		Builder: types.BuildOptions{Target: &types.BuildTarget{
+			Kind: types.BuildTargetSandbox, Memory: true,
+		}},
 		Status: types.BuildBuilding, Resources: types.BuildResources{
 			CPU: 2500, Memory: 3 << 30, Storage: 64 << 30,
 		},
@@ -1564,10 +1585,12 @@ func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 			MemoryBytes  int64 `json:"memoryBytes"`
 			StorageBytes int64 `json:"storageBytes"`
 		} `json:"resources"`
-		ExecutionClaimed   bool   `json:"executionClaimed"`
-		RunID              string `json:"runID"`
-		SystemdEnforcement string `json:"systemdEnforcement"`
-		StorageEnforcement string `json:"storageEnforcement"`
+		ExecutionClaimed   bool              `json:"executionClaimed"`
+		RunID              string            `json:"runID"`
+		SystemdEnforcement string            `json:"systemdEnforcement"`
+		StorageEnforcement string            `json:"storageEnforcement"`
+		Target             types.BuildTarget `json:"target"`
+		Kind               types.Kind        `json:"kind"`
 		Phase              struct {
 			Name      string `json:"name"`
 			SandboxID string `json:"sandboxID"`
@@ -1576,12 +1599,43 @@ func TestBuildStatusReportsAdmissionAndPhaseState(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := fields["kind"]; present {
+		t.Fatalf("nonterminal build status exposed terminal kind: %s", response.Body.String())
+	}
 	if body.Resources.CPUMilli != 2500 || body.Resources.MemoryBytes != 3<<30 ||
 		body.Resources.StorageBytes != 64<<30 || !body.ExecutionClaimed ||
 		body.RunID != "br-observed" || body.SystemdEnforcement != "cpu,memory" ||
 		body.StorageEnforcement != "admission-only" || body.Phase.Name != "b" ||
-		body.Phase.SandboxID != "build-build-observed-b" {
+		body.Phase.SandboxID != "build-build-observed-b" || body.Kind != "" ||
+		body.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {
 		t.Fatalf("build status observation = %+v; body=%s", body, response.Body.String())
+	}
+}
+
+func TestListTemplatesReportsRequestedTargetAndFinalKind(t *testing.T) {
+	target := &types.BuildTarget{Kind: types.BuildTargetSandbox}
+	core := &buildStatusCoreStub{list: []*types.Build{{
+		BuildID: "build-list", PersistID: "e2b-sbx-portable", Profile: types.ProfileE2B,
+		Kind: types.KindSbx, Status: types.BuildReady, Builder: types.BuildOptions{Target: target},
+	}}}
+	handler, apiKey := newMigrationTestHandler(t, core)
+	response := migrationRequest(t, handler, apiKey, http.MethodGet, "/templates", nil, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var items []struct {
+		Target types.BuildTarget `json:"target"`
+		Kind   types.Kind        `json:"kind"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Target != *target || items[0].Kind != types.KindSbx {
+		t.Fatalf("list response = %+v", items)
 	}
 }
 

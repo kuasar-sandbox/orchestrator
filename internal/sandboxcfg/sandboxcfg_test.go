@@ -47,8 +47,17 @@ func TestParseSpecNamespaces(t *testing.T) {
 	}
 	// stop_signal (snake_case) must bind via the runtime config's yaml tags.
 	if s.Launch == nil || s.Launch.Exec != "/app" || s.Launch.StopSignal != "SIGINT" ||
-		s.Launch.User != "1000:1000" || !s.Launch.CgroupControl {
+		s.Launch.User != "1000:1000" || !s.Launch.CgroupControl ||
+		s.LaunchCgroupControl == nil || !*s.LaunchCgroupControl {
 		t.Fatalf("launch parsed wrong: %+v", s.Launch)
+	}
+	omitted, err := ParseSpec(map[string]string{NsLaunch: `{"exec":"/new-app"}`})
+	if err != nil || omitted.LaunchCgroupControl != nil {
+		t.Fatalf("omitted launch.cgroup_control presence = %v, %v", omitted.LaunchCgroupControl, err)
+	}
+	explicitFalse, err := ParseSpec(map[string]string{NsLaunch: `{"cgroup_control":false}`})
+	if err != nil || explicitFalse.LaunchCgroupControl == nil || *explicitFalse.LaunchCgroupControl {
+		t.Fatalf("explicit false launch.cgroup_control presence = %v, %v", explicitFalse.LaunchCgroupControl, err)
 	}
 	if len(s.Mounts) != 1 || s.Mounts[0].Target != "/data" || s.Mounts[0].Type != "tmpfs" {
 		t.Fatalf("mounts parsed wrong: %+v", s.Mounts)
@@ -151,6 +160,120 @@ func TestBuildE2BForbidsLaunch(t *testing.T) {
 	}
 }
 
+func TestMarshalBuildColdConfigClearsOptionalSourceFields(t *testing.T) {
+	const digestA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const digestB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	deflate := true
+	source := &rtconfig.PortableSandboxConfig{
+		Version: rtconfig.PortableSandboxConfigVersion,
+		Resources: rtconfig.PortableResourcesConfig{
+			Capacity: rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: rtconfig.AllocatableConfig{
+				CPU: 2, Memory: "2GiB", DeflateOnOOM: &deflate,
+			},
+		},
+		Network: rtconfig.PortableNetworkConfig{Enabled: true, Interface: "eth0"},
+		Boot: rtconfig.PortableBootConfig{
+			Kernel:  "file://old-vmlinux@digest:" + digestA,
+			Runtime: "file://old-runtime@digest:" + digestB,
+			Root: rtconfig.PortableRootConfig{
+				Base:    "file://old-root@digest:" + digestA,
+				Overlay: &rtconfig.PortableOverlayConfig{Base: "self"},
+			},
+		},
+		Launch: rtconfig.PortableLaunchConfig{
+			Env: map[string]string{"OLD": "value"}, Restart: "always",
+			Placeholder: true, PIDNamespace: "private",
+			Plugin: []rtconfig.PluginConfig{{Exec: "/old/plugin"}},
+			User:   "1000:1000", StopSignal: "SIGINT", StopGracePeriod: "30s",
+		},
+		Mounts:   []rtconfig.MountConfig{{Target: "/old", Type: "tmpfs"}},
+		Files:    []rtconfig.FileConfig{{Path: "/old", Content: "old"}},
+		Init:     []rtconfig.InitConfig{{Exec: "/old/init"}},
+		Metadata: map[string]string{"old": "value"},
+	}
+	if err := source.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	host := &rtconfig.SandboxConfig{
+		Resources: rtconfig.ResourcesConfig{
+			Capacity:    rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			Allocatable: rtconfig.AllocatableConfig{CPU: 2, Memory: "2GiB"},
+		},
+		Network: rtconfig.NetworkConfig{
+			TAP: "tap-build", IP: "192.0.2.2/24", Interface: "eth0",
+		},
+		Boot: rtconfig.BootConfig{
+			Kernel: "file:///new-vmlinux", Runtime: "file:///new-runtime",
+			Root: rtconfig.RootConfig{
+				Base:    "manifest://" + digestA,
+				Overlay: &rtconfig.OverlayConfig{DiffTemplate: "file:///new-diff"},
+			},
+		},
+		Launch: rtconfig.LaunchConfig{
+			Exec: "/opt/sandbox-runtime/bin/envd", Args: []string{"-port", "49983"},
+			Env: map[string]string{"NEW": "value"}, Restart: "always",
+			CgroupControl: true, PIDNamespace: "shared",
+		},
+	}
+	document, err := MarshalBuildColdConfig(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, presence, err := rtconfig.LoadConfigBytesWithPresence(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"launch.cgroup_control", "launch.placeholder", "launch.pid_namespace",
+		"launch.plugin", "launch.user", "launch.stop_signal",
+		"launch.stop_grace_period", "resources.allocatable.deflate_on_oom",
+		"mounts", "files", "init", "metadata",
+	} {
+		if !presence.Has(path) {
+			t.Errorf("replacement document omitted %s:\n%s", path, document)
+		}
+	}
+	runtime, c0, err := rtconfig.ApplyFromRules(
+		source, loaded, presence, rtconfig.ApplyFromOptions{ReplaceBoot: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c0 != nil {
+		t.Fatalf("replacement retained a source-derived C0: %#v", c0)
+	}
+	if runtime.Launch.Placeholder || len(runtime.Launch.Plugin) != 0 ||
+		runtime.Launch.User != "" || runtime.Launch.StopSignal != "" ||
+		runtime.Launch.StopGracePeriod != "" {
+		t.Fatalf("optional source launch fields survived replacement: %#v", runtime.Launch)
+	}
+	if runtime.Launch.PIDNamespace != "shared" || !runtime.Launch.CgroupControl {
+		t.Fatalf("replacement launch policy was not applied: %#v", runtime.Launch)
+	}
+	if runtime.Resources.Allocatable.DeflateOnOOM != nil {
+		t.Fatalf("source deflate_on_oom survived explicit null: %#v", runtime.Resources.Allocatable)
+	}
+	if len(runtime.Mounts) != 0 || len(runtime.Files) != 0 || len(runtime.Init) != 0 ||
+		len(runtime.Metadata) != 0 {
+		t.Fatalf("source collections survived replacement: %#v", runtime)
+	}
+}
+
+func TestMergeBareBuildLaunchPreservesOmittedCgroupControl(t *testing.T) {
+	dst := rtconfig.LaunchConfig{Exec: "/source", CgroupControl: true}
+	mergeBareBuildLaunch(&dst, &rtconfig.LaunchConfig{Exec: "/registered"}, nil, nil)
+	if dst.Exec != "/registered" || !dst.CgroupControl {
+		t.Fatalf("partial launch override erased source boolean: %+v", dst)
+	}
+
+	explicitFalse := false
+	mergeBareBuildLaunch(&dst, &rtconfig.LaunchConfig{Exec: "/registered"}, &explicitFalse, nil)
+	if dst.CgroupControl {
+		t.Fatalf("explicit launch.cgroup_control=false was ignored: %+v", dst)
+	}
+}
+
 func TestBuildLaunchCgroupControl(t *testing.T) {
 	e2b := baseParams(types.ProfileE2B)
 	e2bConfig, err := e2b.buildImageColdConfig()
@@ -193,6 +316,9 @@ func TestBuildLaunchCgroupControl(t *testing.T) {
 
 func TestBuildUsesResolvedControllerIdentity(t *testing.T) {
 	p := baseParams(types.ProfileE2B)
+	p.OverlayDiffTpl = "/r/overlay.ext4"
+	p.TapFD.Exec = []string{"/r/open-tap"}
+	p.Resources.Allocatable.CPU = 1.5
 	p.Resources.Control.Controller = "/real/run/controller.sock"
 	p.Resources.Startup = &rtconfig.StartupConfig{Memory: "2GiB"}
 	cfg, err := p.buildImageColdConfig()
@@ -204,6 +330,9 @@ func TestBuildUsesResolvedControllerIdentity(t *testing.T) {
 	}
 	if cfg.Resources.Control.CgroupPath != "" || cfg.Resources.Control.CgroupFD != 0 {
 		t.Fatalf("renderer injected cgroup capability: %+v", cfg.Resources.Control)
+	}
+	if err := cfg.ValidateColdProjection(); err != nil {
+		t.Fatalf("offline projection rejected runtime-only resource policy: %v", err)
 	}
 }
 
@@ -469,7 +598,7 @@ func TestGeneratedSandboxHostConfigSatisfiesApplyFromRules(t *testing.T) {
 	if !presence.Has("ephemeral_files") {
 		t.Fatalf("cold network files are not ephemeral:\n%s", body)
 	}
-	runtime, c0, err := rtconfig.ApplyFromRules(rendererPortableConfig(), host, presence)
+	runtime, c0, err := rtconfig.ApplyFromRules(rendererPortableConfig(), host, presence, rtconfig.ApplyFromOptions{})
 	if err != nil {
 		t.Fatalf("ApplyFromRules rejected generated config: %v\n%s", err, body)
 	}
@@ -599,7 +728,7 @@ func TestArtifactHostRenderersPreserveMultiDataDiskTopology(t *testing.T) {
 			var c0 *rtconfig.PortableSandboxConfig
 			switch mode {
 			case types.LaunchCold:
-				runtime, c0, err = rtconfig.ApplyFromRules(artifact, host, presence)
+				runtime, c0, err = rtconfig.ApplyFromRules(artifact, host, presence, rtconfig.ApplyFromOptions{})
 			case types.LaunchMemory:
 				runtime, c0, err = rtconfig.ApplyRestoreRules(artifact, host, presence)
 			}

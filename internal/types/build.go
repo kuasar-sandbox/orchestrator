@@ -73,10 +73,69 @@ type TemplateStep struct {
 	Force     bool     `json:"force,omitempty"`
 }
 
+// BuildTargetKind is the public, registration-time output family. It uses
+// complete words deliberately; img/sbx/snp remain canonical artifact kinds.
+type BuildTargetKind string
+
+const (
+	BuildTargetImage   BuildTargetKind = "image"
+	BuildTargetSandbox BuildTargetKind = "sandbox"
+)
+
+// BuildTarget is both the requested target value and the resolved worker
+// result. A nil *BuildTarget in BuildOptions means auto selection. Memory is
+// meaningful only for the sandbox target.
+type BuildTarget struct {
+	Kind   BuildTargetKind `json:"kind" yaml:"kind"`
+	Memory bool            `json:"memory,omitempty" yaml:"memory,omitempty"`
+}
+
+func (t BuildTarget) Validate() error {
+	switch t.Kind {
+	case BuildTargetImage:
+		if t.Memory {
+			return fmt.Errorf("build target image does not support memory=true")
+		}
+	case BuildTargetSandbox:
+	default:
+		return fmt.Errorf("unknown build target kind %q", t.Kind)
+	}
+	return nil
+}
+
+// ResolveBuildTarget applies the sole auto rule: any effective start/ready
+// command selects a memory Sandbox; otherwise the output is an Image.
+func ResolveBuildTarget(requested *BuildTarget, startCmd, readyCmd string) BuildTarget {
+	if requested != nil {
+		return *requested
+	}
+	if startCmd != "" || readyCmd != "" {
+		return BuildTarget{Kind: BuildTargetSandbox, Memory: true}
+	}
+	return BuildTarget{Kind: BuildTargetImage}
+}
+
+// ArtifactKind returns the one canonical artifact kind represented by target.
+func (t BuildTarget) ArtifactKind() Kind {
+	switch {
+	case t.Kind == BuildTargetImage:
+		return KindImg
+	case t.Kind == BuildTargetSandbox && !t.Memory:
+		return KindSbx
+	case t.Kind == BuildTargetSandbox && t.Memory:
+		return KindSnp
+	default:
+		return ""
+	}
+}
+
 // BuildOptions are build-only controls. They are intentionally separate from
 // Build.Metadata, which configures artifact construction but is never recovered
 // from a retained Build row by a later canonical TemplateID Create.
 type BuildOptions struct {
+	// Target is immutable registration input. Nil means auto; resolution occurs
+	// in the tenant task after source-E defaults are available.
+	Target *BuildTarget `json:"target,omitempty" yaml:"target,omitempty"`
 	// Resources is accepted only in the registration-time builder namespace.
 	// Core normalizes it into Build.Resources and clears this definition copy
 	// before persistence so there is one durable resource authority.
@@ -113,12 +172,14 @@ type BuildRegistryTLSOptions struct {
 // can finish unit/runtime cleanup without losing a successful result. None of
 // these fields contains tenant credentials.
 type BuildResult struct {
-	ImageRef     string `json:"image_ref,omitempty"`
-	SnapshotRef  string `json:"snapshot_ref,omitempty"`
-	StartCmd     string `json:"start_cmd,omitempty"`
-	ReadyCmd     string `json:"ready_cmd,omitempty"`
-	Error        string `json:"error,omitempty"`
-	FailureStage string `json:"failure_stage,omitempty"`
+	Target       BuildTarget `json:"target"`
+	ImageRef     string      `json:"image_ref,omitempty"`
+	SandboxRef   string      `json:"sandbox_ref,omitempty"`
+	SnapshotRef  string      `json:"snapshot_ref,omitempty"`
+	StartCmd     string      `json:"start_cmd,omitempty"`
+	ReadyCmd     string      `json:"ready_cmd,omitempty"`
+	Error        string      `json:"error,omitempty"`
+	FailureStage string      `json:"failure_stage,omitempty"`
 }
 
 // Build is one template build plus its retention-bounded status/index history.
@@ -129,9 +190,9 @@ type Build struct {
 	APISecret    string  // per-tenant API authentication root (hex)
 	ManifestKey  string  // per-tenant manifest encryption root (hex)
 	Profile      Profile // immutable output profile selected at registration
-	Kind         Kind    // img (flatten only) | snp (boot+snapshot)
+	Kind         Kind    // terminal resolved artifact kind; empty while nonterminal
 	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
-	FromTemplate string  // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
+	FromTemplate string  // base template ref (its portable config supplies the base image + start/ready defaults)
 	RegistryAuth string  // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
 	// RegistrationImageRepo and RegistrationRegistryAuth retain the exact
 	// registry-owned cluster Register input for durable BuildID replay checks.
@@ -152,8 +213,8 @@ type Build struct {
 	// mutable candidate. Exact ACK replay checks this digest without re-running
 	// the Hook or retaining its confidential input in plaintext.
 	RegistrationRequestDigest string
-	StartCmd                  string // e2b only; non-empty => snapshot build (kind=snp)
-	ReadyCmd                  string // e2b only; readiness probe run after StartCmd (poll until exit 0)
+	StartCmd                  string // e2b trigger command; participates in auto target resolution
+	ReadyCmd                  string // e2b readiness probe; participates in auto target resolution
 	Steps                     []TemplateStep
 	Status                    BuildState
 	Reason                    string   // error detail
@@ -164,15 +225,18 @@ type Build struct {
 	// execution admission plus systemd enforcement. It never becomes sandbox
 	// capacity/allocatable/startup and never enters a snapshot.
 	Resources BuildResources
-	// PhaseResourcePatch is canonical kuasar-sandbox.resource JSON used only to
-	// resolve the A/B/C phase sandboxes on this node. It is not portable template
-	// metadata and therefore cannot affect a later IMG Create.
-	PhaseResourcePatch string
 	// Metadata configures the portable artifact produced by this Build. Build-only
-	// options and the phase resource patch are removed before it is stored here;
+	// options and instance-only secrets are removed before it is stored here;
 	// post-Build Create never treats this retained copy as template authority.
 	Metadata map[string]string
-	Builder  BuildOptions
+	Env      map[string]string
+	Secure   bool
+	// Registration-time instance credentials are encrypted at rest and used only
+	// by a memory target's Phase C. They never enter portable E/S configuration.
+	ServiceSecret      string
+	EnvdAccessToken    string
+	TrafficAccessToken string
+	Builder            BuildOptions
 	// ClusterGroup is node-internal durable ownership for registry-driven
 	// Builds. It is deliberately separate from portable template Metadata.
 	ClusterGroup string
@@ -196,7 +260,7 @@ type Build struct {
 	RuntimeEnvdAccessToken string
 	// RuntimePrepareJSON is the non-secret canonical final host preparation
 	// committed atomically with the runtime port. It lets a new conductor return
-	// an equivalent BuildSpec without rereading the source snapshot or applying
+	// an equivalent BuildSpec without rereading the source artifact or applying
 	// potentially changed node defaults.
 	RuntimePrepareJSON string
 	// ExecutionResult is set atomically before the config-socket acknowledges

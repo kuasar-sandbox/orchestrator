@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // --- plane stubs ---
@@ -313,21 +314,25 @@ func TestSandboxBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
-func TestSandboxBootstrapRejectsV1SchemaBeforeProviders(t *testing.T) {
+func TestSandboxBootstrapRejectsPreV3SchemasBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "task.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	var authCalls, secretCalls atomic.Int32
-	_, client := startTestServer(t, Deps{Provider: stubProvider{
-		pidFile: pf, sandboxAuthHits: &authCalls, bootstrapHits: &secretCalls,
-	}})
-	status, _ := rawPost(t, client, PathTaskSandboxBootstrap, SandboxTaskRequest{
-		SandboxID: "x", RunID: "sr-test", Version: 1,
-	})
-	if status != http.StatusBadRequest {
-		t.Fatalf("unsupported sandbox bootstrap status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if authCalls.Load() != 0 || secretCalls.Load() != 0 {
-		t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			var authCalls, secretCalls atomic.Int32
+			_, client := startTestServer(t, Deps{Provider: stubProvider{
+				pidFile: pf, sandboxAuthHits: &authCalls, bootstrapHits: &secretCalls,
+			}})
+			status, _ := rawPost(t, client, PathTaskSandboxBootstrap, SandboxTaskRequest{
+				SandboxID: "x", RunID: "sr-test", Version: version,
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("unsupported sandbox bootstrap status = %d, want %d", status, http.StatusBadRequest)
+			}
+			if authCalls.Load() != 0 || secretCalls.Load() != 0 {
+				t.Fatalf("unsupported schema reached providers: auth=%d secret=%d", authCalls.Load(), secretCalls.Load())
+			}
+		})
 	}
 }
 
@@ -440,10 +445,10 @@ func TestBuildBootstrapAuthenticatesBeforeSecretProvider(t *testing.T) {
 	}
 }
 
-func TestBuildBootstrapRejectsPreV3SchemasBeforeProviders(t *testing.T) {
+func TestBuildBootstrapRejectsPreV4SchemasBeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	for _, version := range []int{1, 2} {
+	for _, version := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			var authCalls, secretCalls atomic.Int32
 			_, client := startTestServer(t, Deps{Provider: stubProvider{
@@ -507,39 +512,45 @@ func TestBuildPrepareRejectsUnversionedV1BeforeProviders(t *testing.T) {
 	}
 }
 
-func TestBuildPrepareRejectsV2BeforeProviders(t *testing.T) {
+func TestBuildPrepareRejectsPreV4BeforeProviders(t *testing.T) {
 	pf := filepath.Join(t.TempDir(), "builder.pid")
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
-	var authCalls, completionCalls atomic.Int32
-	_, client := startTestServer(t, Deps{Provider: stubProvider{
-		pidFile: pf, buildAuthHits: &authCalls, buildPrepHits: &completionCalls,
-	}})
-	status, _ := rawPost(t, client, PathTaskBuildPrepare, BuildPrepareRequest{
-		BuildID: "x", RunID: "br-test", Version: 2, Summary: ArtifactPrepareSummary{
-			SchemaVersion: ArtifactPrepareSchemaVersion,
-		},
-	})
-	if status != http.StatusBadRequest {
-		t.Fatalf("v2 build prepare status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if authCalls.Load() != 0 || completionCalls.Load() != 0 {
-		t.Fatalf("v2 build prepare reached providers: auth=%d completion=%d",
-			authCalls.Load(), completionCalls.Load())
+	for _, version := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			var authCalls, completionCalls atomic.Int32
+			_, client := startTestServer(t, Deps{Provider: stubProvider{
+				pidFile: pf, buildAuthHits: &authCalls, buildPrepHits: &completionCalls,
+			}})
+			status, _ := rawPost(t, client, PathTaskBuildPrepare, BuildPrepareRequest{
+				BuildID: "x", RunID: "br-test", Version: version, Summary: ArtifactPrepareSummary{
+					SchemaVersion: ArtifactPrepareSchemaVersion,
+				},
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("v%d build prepare status = %d, want %d", version, status, http.StatusBadRequest)
+			}
+			if authCalls.Load() != 0 || completionCalls.Load() != 0 {
+				t.Fatalf("v%d build prepare reached providers: auth=%d completion=%d",
+					version, authCalls.Load(), completionCalls.Load())
+			}
+		})
 	}
 }
 
-func TestBuildSnapshotPreparationDoesNotCrossTaskWire(t *testing.T) {
+func TestBuildSourceDocumentsDoNotCrossTaskWire(t *testing.T) {
 	body, err := json.Marshal(BuildSpec{
-		BuildID: "build", SnapshotPreparation: &BuildSnapshotPreparation{
-			BaseRef: "manifest://task-local-only", StartCmd: "secret-local-metadata",
+		BuildID: "build", SourceSandboxRef: "manifest://task-local-only",
+		SourceSandboxConfig: &rtconfig.PortableSandboxConfig{
+			Metadata: map[string]string{"command": "secret-local-metadata"},
 		},
+		SourceImageConfig: []byte(`{"Env":["SECRET=value"]}`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(body), "task-local-only") || strings.Contains(string(body), "secret-local-metadata") ||
-		strings.Contains(string(body), "SnapshotPreparation") {
-		t.Fatalf("task-local snapshot preparation crossed wire: %s", body)
+		strings.Contains(string(body), "SECRET=value") {
+		t.Fatalf("task-local source documents crossed wire: %s", body)
 	}
 }
 

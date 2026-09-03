@@ -3,7 +3,9 @@ package taskartifact
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	acceleratorimage "github.com/kuasar-sandbox/accelerator/pkg/image"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
@@ -67,7 +70,7 @@ boot:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 4, Memory: "2GiB"}) {
+	if result.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 4, Memory: "2GiB", AllocatableCPU: 4, AllocatableMemory: "2GiB"}) {
 		t.Fatalf("capacity = %+v", result.Summary.Capacity)
 	}
 	if !reflect.DeepEqual(result.Summary.Network, configsock.ArtifactNetwork{Hostname: "inherited"}) {
@@ -101,9 +104,9 @@ boot:
 		t.Fatalf("location map = %#v, want five tenant artifact locations", result.RefLocationURIs)
 	}
 	// The parent path intentionally does not exist. Success proves the task did
-	// not reinterpret flattened FromRefs as snapshot.cfg graph edges.
-	if result.RootCfg.FromRefs[0] != "file://parent.snapshot@digest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@location:0198f7a11101-7234-9abc-012345670001-20260824" {
-		t.Fatalf("root config changed: %+v", result.RootCfg.FromRefs)
+	// not reinterpret flattened memory FromRefs as Sandbox disk graph edges.
+	if result.PreparedSource.Kind != types.ResumeSourceSnapshot || result.SourceSandboxConfig == nil {
+		t.Fatalf("source preparation did not retain its selected E config: %+v", result)
 	}
 	if result.ConfigReadDuration <= 0 || result.PrepareDuration < result.ConfigReadDuration {
 		t.Fatalf("durations read=%s prepare=%s", result.ConfigReadDuration, result.PrepareDuration)
@@ -210,15 +213,47 @@ boot:
 	if len(result.RefLocationURIs) != 3 {
 		t.Fatalf("location map = %#v, want only root/A/B", result.RefLocationURIs)
 	}
-	if result.RootCfg.FromRefs[0] != "manifest://"+strings.Repeat("a", 64) ||
-		result.RootCfg.Boot.Root.BaseRef != "manifest://"+strings.Repeat("b", 64) ||
-		result.RootCfg.Boot.Root.Overlay.Base != result.RootCfg.SandboxRef {
-		t.Fatalf("logical snapshot graph changed: %+v", result.RootCfg)
+	if result.PreparedSource.Kind != types.ResumeSourceSnapshot || result.SourceSandboxConfig == nil {
+		t.Fatalf("logical snapshot source did not retain selected E config: %+v", result)
 	}
 	// None of the listed files or location directories exists. Success proves
 	// discovery read only the current Bundle's metadata prefix: same-directory
 	// refs need no mapping, located refs are not opened, and refs are not
 	// followed recursively.
+}
+
+func TestPrepareSnapshotColdDropsMemoryOnlyBundleLocations(t *testing.T) {
+	parent := "file://" + filepath.Join(t.TempDir(), "locations")
+	rootLocation, err := reflocation.Resolve(parent, "root-20260824")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rootLocation.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{
+		"file://" + strings.Repeat("1", 64) + ".bundle@location:memory-a-20260824",
+		"file://" + strings.Repeat("2", 64) + ".bundle@location:memory-b-20260824",
+	}
+	rootPath, rootKey, manifestConfig := writeTaskManifestBundle(t, rootLocation.Path, refs,
+		"resources:\n  capacity: {cpu: 2, memory: 512MiB}\nboot: {}\n")
+	rootRef := manifest.Ref{
+		Scheme: manifest.RefSchemeFile, Path: filepath.Base(rootPath), Location: "root-20260824",
+		DigestScheme: "manifest", Digest: rootKey,
+	}.String()
+	result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{
+		RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchCold),
+		RootRef: rootRef, ManifestConfig: manifestConfig, RefLocationParent: parent, MaxRefs: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PreparedSource.Kind != types.ResumeSourceSandbox {
+		t.Fatalf("cold source = %+v", result.PreparedSource)
+	}
+	if len(result.RefLocationURIs) != 1 || result.RefLocationURIs["root-20260824"] == "" {
+		t.Fatalf("cold ref locations retained memory closure: %#v", result.RefLocationURIs)
+	}
 }
 
 func TestPrepareBundleLocationRequiresConfiguredParent(t *testing.T) {
@@ -263,7 +298,7 @@ func TestPrepareLocalSandboxAndSnapshotColdSelectResolvableSandbox(t *testing.T)
 	}
 	if direct.PreparedSource != (types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: sandboxPath}) ||
 		direct.Summary.PreparedSourceKind != string(types.ResumeSourceSandbox) ||
-		direct.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 3, Memory: "768MiB"}) ||
+		direct.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 3, Memory: "768MiB", AllocatableCPU: 3, AllocatableMemory: "768MiB"}) ||
 		!reflect.DeepEqual(direct.Summary.Network, configsock.ArtifactNetwork{Hostname: "artifact-host"}) {
 		t.Fatalf("direct Sandbox E preparation = %+v", direct)
 	}
@@ -290,8 +325,168 @@ func TestPrepareLocalSandboxAndSnapshotColdSelectResolvableSandbox(t *testing.T)
 		selected.DigestScheme != expected.DigestScheme || selected.Digest != expected.Digest {
 		t.Fatalf("selected Sandbox E = %#v, want path %q identity %#v", selected, sandboxPath, expected)
 	}
-	if cold.RootCfg == nil || cold.RootCfg.SandboxRef != sandboxRef || cold.Summary.Capacity != direct.Summary.Capacity {
+	if cold.SourceSandboxConfig == nil || cold.Summary.Capacity != direct.Summary.Capacity ||
+		!reflect.DeepEqual(cold.SourceSandboxConfig, direct.SourceSandboxConfig) {
 		t.Fatalf("Snapshot cold did not derive C0 from E: %+v", cold)
+	}
+}
+
+func TestPrepareSandboxReadsRuntimeConfigFromExternalBaseImage(t *testing.T) {
+	dir := t.TempDir()
+	flattenedPath := filepath.Join(dir, "flattened.img")
+	flattened := taskEROFSBytes()
+	if err := os.WriteFile(flattenedPath, flattened, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := &acceleratorimage.RuntimeConfig{
+		Env: []string{"BUILT=yes"}, WorkingDir: "/home/user", User: "1000:1000",
+	}
+	if err := acceleratorimage.AppendConfigZip(flattenedPath, want); err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := os.ReadFile(flattenedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := snapshot.NewFileSink(dir, "external-base", nil, false, nil)
+	imageRef, _, err := sink.AbsorbImageSource(context.Background(),
+		sparse.Dense(bytes.NewReader(flattened), uint64(len(flattened))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxSource, _ := taskSandboxSource(t, fmt.Sprintf(`resources:
+  capacity: {cpu: 2, memory: 512MiB}
+boot:
+  root:
+    base_ref: %s
+    overlay: {base: self}
+`, imageRef))
+	_, sandboxPath, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepareSpec := configsock.ArtifactPrepareSpec{
+		RootSourceKind: string(types.ResumeSourceSandbox), LaunchMode: string(types.LaunchCold),
+		RootRef: sandboxPath, RelativeDir: dir, MaxRefs: 16,
+	}
+	unread, err := Prepare(context.Background(), prepareSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unread.SourceImageConfig) != 0 {
+		t.Fatalf("ordinary artifact preparation read Build-only image config: %q", unread.SourceImageConfig)
+	}
+	prepareSpec.ReadSourceImageConfig = true
+	result, err := Prepare(context.Background(), prepareSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.ResolutionDigest == unread.Summary.ResolutionDigest {
+		t.Fatal("Build-only image-config capability was omitted from preparation identity")
+	}
+	var got acceleratorimage.RuntimeConfig
+	if err := json.Unmarshal(result.SourceImageConfig, &got); err != nil {
+		t.Fatalf("source image config = %q: %v", result.SourceImageConfig, err)
+	}
+	if !reflect.DeepEqual(got.Env, want.Env) || got.WorkingDir != want.WorkingDir || got.User != want.User {
+		t.Fatalf("source image config = %+v, want %+v", got, *want)
+	}
+}
+
+func TestPrepareSandboxReadsRuntimeConfigThroughDirectEROFSParent(t *testing.T) {
+	dir := t.TempDir()
+	sink := snapshot.NewFileSink(dir, "parent", nil, false, nil)
+	want := acceleratorimage.RuntimeConfig{
+		Env: []string{"PARENT=yes"}, WorkingDir: "/srv", User: "1001:1001",
+	}
+	imageConfig, err := json.Marshal(&want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	portable := &sandboxconfig.PortableSandboxConfig{
+		Version: sandboxconfig.PortableSandboxConfigVersion,
+		Resources: sandboxconfig.PortableResourcesConfig{
+			Capacity:    sandboxconfig.CapacityConfig{CPU: 1, Memory: "64MiB"},
+			Allocatable: sandboxconfig.AllocatableConfig{CPU: 1, Memory: "64MiB"},
+		},
+		Boot: sandboxconfig.PortableBootConfig{
+			Kernel: "file://vmlinux@digest:" + digest, Runtime: "file://runtime@digest:" + digest,
+			Root: sandboxconfig.PortableRootConfig{Base: "self", Overlay: &sandboxconfig.PortableOverlayConfig{}},
+		},
+		Launch: sandboxconfig.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"},
+	}
+	portableRaw, err := sandboxconfig.MarshalPortableSandboxConfig(portable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := taskEROFSBytes()
+	parentSource, err := sandboxfile.BuildSource(
+		sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), imageConfig, portableRaw,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentRef, _, err := sink.AbsorbSandbox(context.Background(), parentSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outerSource, _ := taskSandboxSource(t, fmt.Sprintf(`resources:
+  capacity: {cpu: 2, memory: 512MiB}
+boot:
+  root:
+    base_ref: %s
+    overlay: {base: self}
+`, parentRef))
+	_, outerPath, err := sink.AbsorbSandbox(context.Background(), outerSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{
+		RootSourceKind: string(types.ResumeSourceSandbox), LaunchMode: string(types.LaunchCold),
+		RootRef: outerPath, RelativeDir: dir, MaxRefs: 16, ReadSourceImageConfig: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got acceleratorimage.RuntimeConfig
+	if err := json.Unmarshal(result.SourceImageConfig, &got); err != nil {
+		t.Fatalf("source image config = %q: %v", result.SourceImageConfig, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("source image config = %+v, want %+v", got, want)
+	}
+}
+
+func TestPrepareSingleDiskSandboxDoesNotInterpretExt4BaseAsImage(t *testing.T) {
+	dir := t.TempDir()
+	sink := snapshot.NewFileSink(dir, "single", nil, false, nil)
+	baseRef, _, err := sink.AbsorbOverlay(context.Background(), bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxSource, _ := taskSandboxSource(t, fmt.Sprintf(`resources:
+  capacity: {cpu: 1, memory: 64MiB}
+boot:
+  root:
+    base: self
+    base_from_refs: [%s]
+`, baseRef))
+	_, sandboxPath, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{
+		RootSourceKind: string(types.ResumeSourceSandbox), LaunchMode: string(types.LaunchCold),
+		RootRef: sandboxPath, RelativeDir: dir, MaxRefs: 16, ReadSourceImageConfig: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SourceImageConfig) != 0 {
+		t.Fatalf("single-disk source unexpectedly exposed image config: %q", result.SourceImageConfig)
 	}
 }
 
@@ -375,6 +570,111 @@ func TestPrepareSnapshotColdSelectsSandboxManifestInSameBundle(t *testing.T) {
 	}
 }
 
+func TestPrepareColdSourceReadsBaseImageConfigFromSameBundle(t *testing.T) {
+	directory := t.TempDir()
+	customerKey := [32]byte{0x41, 0x42, 0x43}
+	manifestCfg := &manifest.Config{
+		Manifest: manifest.ManifestSubConfig{Key: hex.EncodeToString(customerKey[:])},
+		Chunker:  chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:   manifestcrypto.Config{Chunk: "aes", Manifest: "aes"},
+	}
+	admission, err := manifestCfg.WriteAdmission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := snapshot.NewPlannedBundleSink(directory, "task-root", manifestCfg,
+		func() ([32]byte, error) { return customerKey, nil }, admission, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	want := acceleratorimage.RuntimeConfig{
+		Env: []string{"BUNDLED=yes"}, WorkingDir: "/workspace", User: "1002:1002",
+	}
+	flattenedPath := filepath.Join(t.TempDir(), "flattened.img")
+	if err := os.WriteFile(flattenedPath, taskEROFSBytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := acceleratorimage.AppendConfigZip(flattenedPath, &want); err != nil {
+		t.Fatal(err)
+	}
+	flattened, err := os.ReadFile(flattenedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageRef, _, err := sink.AbsorbImageSource(context.Background(),
+		sparse.Dense(bytes.NewReader(flattened), uint64(len(flattened))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxSource, fromRefs := taskSandboxSource(t, fmt.Sprintf(`resources:
+  capacity: {cpu: 2, memory: 512MiB}
+boot:
+  root:
+    base_ref: %s
+    overlay: {base: self}
+`, imageRef))
+	sandboxRef, _, err := sink.AbsorbSandbox(context.Background(), sandboxSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRef, _, err := sink.AbsorbSnapshot(context.Background(), taskMemorySource(t, sandboxRef, fromRefs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.CommitSnapshot(context.Background(), snapshotRef, ""); err != nil {
+		t.Fatal(err)
+	}
+	snapshotKey, err := manifest.ParseKeyRef(snapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxKey, err := manifest.ParseKeyRef(sandboxRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBody, err := yaml.Marshal(manifestCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestConfig := filepath.Join(t.TempDir(), "accelerator.yaml")
+	if err := os.WriteFile(manifestConfig, configBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bundlePath := filepath.Join(directory, manifest.HexKey(snapshotKey)+".bundle")
+
+	for _, test := range []struct {
+		name string
+		kind types.ResumeSourceKind
+		key  string
+	}{
+		{name: "sandbox", kind: types.ResumeSourceSandbox, key: manifest.HexKey(sandboxKey)},
+		{name: "snapshot", kind: types.ResumeSourceSnapshot, key: manifest.HexKey(snapshotKey)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootRef := manifest.Ref{
+				Scheme: manifest.RefSchemeFile, Path: bundlePath,
+				DigestScheme: "manifest", Digest: test.key,
+			}.String()
+			result, err := Prepare(context.Background(), configsock.ArtifactPrepareSpec{
+				RootSourceKind: string(test.kind), LaunchMode: string(types.LaunchCold),
+				RootRef: rootRef, ManifestConfig: manifestConfig, MaxRefs: 16, ReadSourceImageConfig: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got acceleratorimage.RuntimeConfig
+			if err := json.Unmarshal(result.SourceImageConfig, &got); err != nil {
+				t.Fatalf("source image config = %q: %v", result.SourceImageConfig, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("source image config = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func TestPrepareManifestStoreSandboxAndSnapshotModes(t *testing.T) {
 	sandboxRef, snapshotRef, manifestConfig := writeTaskManifestStoreArtifacts(t,
 		"resources:\n  capacity: {cpu: 6, memory: 1536MiB}\nmetadata:\n  kuasar-sandbox.network: '{\"hostname\":\"remote-host\"}'\nboot: {}\n")
@@ -405,7 +705,7 @@ func TestPrepareManifestStoreSandboxAndSnapshotModes(t *testing.T) {
 			if result.PreparedSource != test.want || result.Summary.PreparedSourceKind != string(test.want.Kind) {
 				t.Fatalf("prepared source = %+v, summary=%+v, want %+v", result.PreparedSource, result.Summary, test.want)
 			}
-			if result.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 6, Memory: "1536MiB"}) ||
+			if result.Summary.Capacity != (configsock.ArtifactCapacity{CPU: 6, Memory: "1536MiB", AllocatableCPU: 6, AllocatableMemory: "1536MiB"}) ||
 				!reflect.DeepEqual(result.Summary.Network, configsock.ArtifactNetwork{Hostname: "remote-host"}) {
 				t.Fatalf("remote summary = %+v", result.Summary)
 			}
@@ -834,4 +1134,12 @@ func taskMemorySource(t testing.TB, sandboxRef string, fromRefs []string) sparse
 		t.Fatal(err)
 	}
 	return logical
+}
+
+func taskEROFSBytes() []byte {
+	payload := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(payload[1024:1028], 0xE0F5E1E2)
+	payload[1024+12] = 12
+	binary.LittleEndian.PutUint32(payload[1024+36:1024+40], 1)
+	return payload
 }

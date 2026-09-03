@@ -2,13 +2,30 @@ package extension
 
 import "context"
 
-// BuildKind selects the build output boot path.
+// BuildKind is the terminal artifact kind. It is empty until a Build resolves
+// its requested target and completes successfully.
 type BuildKind string
 
 const (
 	BuildKindImage    BuildKind = "img"
+	BuildKindSandbox  BuildKind = "sbx"
 	BuildKindSnapshot BuildKind = "snp"
 )
+
+// BuildTargetKind is the registration-time public output family.
+type BuildTargetKind string
+
+const (
+	BuildTargetImage   BuildTargetKind = "image"
+	BuildTargetSandbox BuildTargetKind = "sandbox"
+)
+
+// BuildTarget is an immutable requested target. A nil Target in BuildOptions
+// means automatic resolution from the final effective start/ready commands.
+type BuildTarget struct {
+	Kind   BuildTargetKind
+	Memory bool
+}
 
 // BuildState is the durable build lifecycle state.
 type BuildState string
@@ -39,6 +56,7 @@ type BuildStep struct {
 
 // BuildOptions contains durable, non-secret build-only controls.
 type BuildOptions struct {
+	Target    *BuildTarget
 	Resources *BuildResources
 	Referer   *BuildRefererOptions
 	Registry  *BuildRegistryOptions
@@ -81,7 +99,6 @@ type BuildView struct {
 	ReadyCommand           string
 	Metadata               map[string]string
 	Builder                BuildOptions
-	PhaseResourcePatch     string
 	RunID                  string
 	ExecutionClaimed       bool
 	EnforcementStatus      string

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"time"
@@ -357,15 +358,16 @@ func sameImmutableBuild(a, b *types.Build) bool {
 	// candidate. Replay cannot invoke that Hook again: policy may have changed
 	// after an ACK was lost. Its tenant-keyed original-request digest therefore
 	// becomes the immutable comparison authority while core IDs and credentials
-	// are still checked independently. Older rows and direct registrations keep
-	// the field-by-field comparison below.
-	if a.RegistrationRequestDigest != "" || b.RegistrationRequestDigest != "" {
+	// are still checked independently. Every cluster row must use this schema;
+	// direct registrations keep the field-by-field comparison below.
+	if a.ClusterGroup != "" || b.ClusterGroup != "" {
 		return a.BuildID == b.BuildID && a.TemplateID == b.TemplateID &&
+			a.ClusterGroup != "" && a.ClusterGroup == b.ClusterGroup &&
 			a.RegistrationRequestDigest != "" && a.RegistrationRequestDigest == b.RegistrationRequestDigest &&
 			hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
 	}
-	// Trigger and finalization intentionally mutate kind, work-order fields,
-	// names/aliases, and status. A delayed retry of the original registration
+	// Trigger intentionally mutates work-order fields; finalization alone sets
+	// kind and mutates names/aliases. A delayed retry of the original registration
 	// must therefore compare only the registration-owned definition. These
 	// fields remain immutable for the lifetime of the Build row.
 	return a.BuildID == b.BuildID && a.TemplateID == b.TemplateID && a.Profile == b.Profile &&
@@ -374,7 +376,10 @@ func sameImmutableBuild(a, b *types.Build) bool {
 		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
 		a.RegistrationMMDSRoutesDigest == b.RegistrationMMDSRoutesDigest &&
 		hmac.Equal([]byte(a.RegistrationMMDSValuesDigest), []byte(b.RegistrationMMDSValuesDigest)) &&
-		a.PhaseResourcePatch == b.PhaseResourcePatch && equalRegistrationMetadata(a, b) &&
+		equalRegistrationMetadata(a, b) &&
+		maps.Equal(a.Env, b.Env) && a.Secure == b.Secure &&
+		a.ServiceSecret == b.ServiceSecret && a.EnvdAccessToken == b.EnvdAccessToken &&
+		a.TrafficAccessToken == b.TrafficAccessToken &&
 		reflect.DeepEqual(a.Builder, b.Builder) &&
 		hmac.Equal([]byte(a.APISecret), []byte(b.APISecret)) && hmac.Equal([]byte(a.ManifestKey), []byte(b.ManifestKey))
 }

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
@@ -653,7 +654,16 @@ func (n *nodeStub) readLoop() {
 		case n.cmdCh <- &cmd:
 		default:
 		}
-		n.write(n.t, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
+		ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+		if cmd.Kind == routesync.CmdBuildRegister {
+			_, options, err := buildcfg.Extract(cmd.Config)
+			if err != nil {
+				ack.Status, ack.Reason, ack.HTTPStatus = routesync.AckRejected, err.Error(), http.StatusBadRequest
+			} else {
+				ack.BuildRegister = &routesync.BuildRegisterResult{Target: options.Target}
+			}
+		}
+		n.write(n.t, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack})
 		switch cmd.Kind {
 		case routesync.CmdCreate, routesync.CmdConnect:
 			n.sendRoute(n.t, routeForCommand(n.t, &cmd))

@@ -3,6 +3,7 @@ package routesync
 import (
 	"encoding/json"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -251,10 +252,13 @@ type Command struct {
 	// delivered WITH the immutable registration command. The node retains them in
 	// protected registration state for exact replay and restart recovery; neither
 	// field becomes portable template metadata.
-	BuildID        string          `json:"build_id,omitempty"`
-	BuildResources *BuildResources `json:"build_resources,omitempty"`
-	ImageRepo      string          `json:"image_repo,omitempty"`
-	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	BuildID          string                  `json:"build_id,omitempty"`
+	BuildResources   *BuildResources         `json:"build_resources,omitempty"`
+	ImageRepo        string                  `json:"image_repo,omitempty"`
+	RegistryAuth     string                  `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	BuildEnv         map[string]string       `json:"build_env,omitempty"`
+	BuildSecure      bool                    `json:"build_secure,omitempty"`
+	BuildCredentials *sandboxcfg.Credentials `json:"build_credentials,omitempty"`
 	// BuildMMDSSecrets carries request-scoped initial MMDS secret values to the
 	// selected node. The Registry deliberately excludes this field from its
 	// replicated BuildRecord; only the node persists the values, encrypted.
@@ -305,14 +309,21 @@ type ExecSessionResult struct {
 	ExecAccessToken string `json:"exec_access_token"`
 }
 
+// BuildRegisterResult is the registration value durably accepted by the node.
+// Target may be nil: that is the canonical auto request, not a missing result.
+type BuildRegisterResult struct {
+	Target *types.BuildTarget `json:"target"`
+}
+
 // CmdAck acknowledges a Command's receipt. CmdConnect and CmdExecSession
 // additionally return their synchronously prepared result; asynchronous resume
 // completion still arrives through the route stream.
 type CmdAck struct {
-	CmdID       string             `json:"cmd_id"`
-	Status      string             `json:"status"` // AckAccepted | AckRejected
-	Reason      string             `json:"reason,omitempty"`
-	HTTPStatus  int                `json:"http_status,omitempty"`
-	Connect     *ConnectResult     `json:"connect,omitempty"`
-	ExecSession *ExecSessionResult `json:"exec_session,omitempty"`
+	CmdID         string               `json:"cmd_id"`
+	Status        string               `json:"status"` // AckAccepted | AckRejected
+	Reason        string               `json:"reason,omitempty"`
+	HTTPStatus    int                  `json:"http_status,omitempty"`
+	Connect       *ConnectResult       `json:"connect,omitempty"`
+	ExecSession   *ExecSessionResult   `json:"exec_session,omitempty"`
+	BuildRegister *BuildRegisterResult `json:"build_register,omitempty"`
 }

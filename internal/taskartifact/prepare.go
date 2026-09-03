@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -25,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 )
 
 const (
@@ -45,13 +48,17 @@ type CarrierBinding struct {
 // Result remains in the tenant task process. Only Summary is sent to the
 // conductor; PreparedSource is appended to sandbox-ctl argv by node-ctl.
 type Result struct {
-	PreparedSource     types.ResumeSource
-	RootCfg            *restore.SnapshotCfg
-	Summary            configsock.ArtifactPrepareSummary
-	RefLocationURIs    map[string]string
-	CarrierBindings    []CarrierBinding
-	ConfigReadDuration time.Duration
-	PrepareDuration    time.Duration
+	PreparedSource types.ResumeSource
+	// SourceSandboxConfig and SourceImageConfig stay in the tenant task. Build
+	// source normalization uses them after an S root has converged to its E;
+	// neither document crosses back into the conductor.
+	SourceSandboxConfig *rtconfig.PortableSandboxConfig
+	SourceImageConfig   []byte
+	Summary             configsock.ArtifactPrepareSummary
+	RefLocationURIs     map[string]string
+	CarrierBindings     []CarrierBinding
+	ConfigReadDuration  time.Duration
+	PrepareDuration     time.Duration
 }
 
 type canonicalLocation struct {
@@ -65,6 +72,7 @@ type canonicalResolution struct {
 	SourceKind         string                      `json:"source_kind"`
 	SourceRef          string                      `json:"source_ref"`
 	LaunchMode         string                      `json:"launch_mode"`
+	ReadImageConfig    bool                        `json:"read_image_config"`
 	PreparedSourceKind string                      `json:"prepared_source_kind"`
 	PreparedSourceRef  string                      `json:"prepared_source_ref"`
 	Capacity           configsock.ArtifactCapacity `json:"capacity"`
@@ -130,13 +138,19 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	if binding.Format != "" {
 		bindings = append(bindings, binding)
 	}
-	for _, raw := range bundleRefs {
-		name, err := refLocationName(raw)
-		if err != nil {
-			return nil, fmt.Errorf("task artifact prepare: Bundle ref %q: %w", raw, err)
-		}
-		if err := addLocation(fmt.Sprintf("Bundle ref %q", raw), name); err != nil {
-			return nil, err
+	// A cold S source is only a selector for E. Do not resolve the Bundle's
+	// memory/ref-location closure; after E has been selected only E and its disk
+	// graph may reach the runner. Memory restore still needs the complete S
+	// carrier closure.
+	if launchMode == types.LaunchMemory {
+		for _, raw := range bundleRefs {
+			name, err := refLocationName(raw)
+			if err != nil {
+				return nil, fmt.Errorf("task artifact prepare: Bundle ref %q: %w", raw, err)
+			}
+			if err := addLocation(fmt.Sprintf("Bundle ref %q", raw), name); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -150,12 +164,13 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 
 	readStarted := time.Now()
 	var (
-		prepared types.ResumeSource
-		rootCfg  *restore.SnapshotCfg
-		capacity configsock.ArtifactCapacity
-		network  configsock.ArtifactNetwork
-		topology types.ArtifactDiskTopology
-		refs     []string
+		prepared            types.ResumeSource
+		sourceSandboxConfig *rtconfig.PortableSandboxConfig
+		sourceImageConfig   []byte
+		capacity            configsock.ArtifactCapacity
+		network             configsock.ArtifactNetwork
+		topology            types.ArtifactDiskTopology
+		refs                []string
 	)
 	switch sourceKind {
 	case types.ResumeSourceSnapshot:
@@ -177,7 +192,6 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			}
 			return nil, errors.Join(readErr, closeErr)
 		}
-		rootCfg = document.Config
 		selectedSandbox, err := selectSandboxFromSnapshot(spec.RootRef, document.Config.SandboxRef, spec.RelativeDir, pathLocations, binding)
 		if err != nil {
 			return nil, err
@@ -187,12 +201,24 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		} else if locationErr := addLocation("selected Sandbox E", name); locationErr != nil {
 			return nil, locationErr
 		}
-		sandboxCfg, inspectErr := inspectSandboxConfig(ctx, selectedSandbox, manifestCfg, pathLocations)
-		if inspectErr != nil {
-			return nil, inspectErr
+		sourceStorage, err := artifact.NewProcessStorage(manifestCfg)
+		if err != nil {
+			return nil, fmt.Errorf("task artifact prepare: initialize referenced Sandbox reader: %w", err)
 		}
+		sandboxCfg, imageConfig, inspectErr := inspectSandboxSource(
+			ctx, selectedSandbox, spec.RelativeDir, sourceStorage, pathLocations,
+			spec.ReadSourceImageConfig, addLocation,
+		)
+		closeErr = sourceStorage.Close()
+		if inspectErr != nil || closeErr != nil {
+			return nil, errors.Join(inspectErr, closeErr)
+		}
+		sourceSandboxConfig, sourceImageConfig = sandboxCfg, imageConfig
 		capacity = configsock.ArtifactCapacity{
 			CPU: sandboxCfg.Resources.Capacity.CPU, Memory: sandboxCfg.Resources.Capacity.Memory,
+			AllocatableCPU:    sandboxCfg.Resources.Allocatable.CPU,
+			AllocatableMemory: sandboxCfg.Resources.Allocatable.Memory,
+			DeflateOnOOM:      cloneBool(sandboxCfg.Resources.Allocatable.DeflateOnOOM),
 		}
 		network, err = summarizeNetwork(sandboxCfg.Metadata[sandboxcfg.NsNetwork])
 		if err != nil {
@@ -208,7 +234,6 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			refs = append(refs, document.Config.FromRefs...)
 		} else {
 			prepared = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: selectedSandbox}
-			refs = append(refs, spec.RootRef)
 		}
 		refs = append(refs, selectedSandbox)
 		refs = append(refs, portableArtifactRefs(sandboxCfg)...)
@@ -217,31 +242,32 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: initialize Sandbox reader: %w", err)
 		}
-		info, readErr := storage.Inspect(ctx, spec.RootRef, pathLocations)
+		sandboxCfg, imageConfig, readErr := inspectSandboxSource(
+			ctx, spec.RootRef, spec.RelativeDir, storage, pathLocations,
+			spec.ReadSourceImageConfig, addLocation,
+		)
 		closeErr := storage.Close()
 		if readErr != nil || closeErr != nil {
-			if readErr != nil {
-				readErr = fmt.Errorf("task artifact prepare: read Sandbox E: %w", readErr)
-			}
 			return nil, errors.Join(readErr, closeErr)
 		}
-		if info.Role != artifact.RoleSandbox || info.Sandbox == nil {
-			return nil, errors.New("task artifact prepare: ResumeSource sandbox is not a strict Sandbox E")
-		}
+		sourceSandboxConfig, sourceImageConfig = sandboxCfg, imageConfig
 		prepared = types.ResumeSource{Kind: types.ResumeSourceSandbox, Ref: spec.RootRef}
 		capacity = configsock.ArtifactCapacity{
-			CPU: info.Sandbox.Resources.Capacity.CPU, Memory: info.Sandbox.Resources.Capacity.Memory,
+			CPU: sandboxCfg.Resources.Capacity.CPU, Memory: sandboxCfg.Resources.Capacity.Memory,
+			AllocatableCPU:    sandboxCfg.Resources.Allocatable.CPU,
+			AllocatableMemory: sandboxCfg.Resources.Allocatable.Memory,
+			DeflateOnOOM:      cloneBool(sandboxCfg.Resources.Allocatable.DeflateOnOOM),
 		}
-		network, err = summarizeNetwork(info.Sandbox.Metadata[sandboxcfg.NsNetwork])
+		network, err = summarizeNetwork(sandboxCfg.Metadata[sandboxcfg.NsNetwork])
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: Sandbox E network metadata: %w", err)
 		}
-		topology, err = summarizeDiskTopology(info.Sandbox)
+		topology, err = summarizeDiskTopology(sandboxCfg)
 		if err != nil {
 			return nil, err
 		}
 		refs = append(refs, spec.RootRef)
-		refs = append(refs, portableArtifactRefs(info.Sandbox)...)
+		refs = append(refs, portableArtifactRefs(sandboxCfg)...)
 	}
 	readDuration := time.Since(readStarted)
 	if err := ctx.Err(); err != nil {
@@ -261,6 +287,27 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			return nil, err
 		}
 	}
+	// Discard locations used only while selecting E (notably the source S
+	// location). The final task handoff contains exactly the selected source and
+	// its required graph, so a cold build/run cannot accidentally pass memory
+	// locations into a phase.
+	if launchMode == types.LaunchCold {
+		reachableLocations := make(map[string]struct{})
+		for _, raw := range append(append([]string(nil), requiredRefs...), prepared.Ref) {
+			name, err := refLocationName(raw)
+			if err != nil {
+				return nil, fmt.Errorf("task artifact prepare: reachable ref %q: %w", raw, err)
+			}
+			if name != "" {
+				reachableLocations[name] = struct{}{}
+			}
+		}
+		for name := range uriLocations {
+			if _, reachable := reachableLocations[name]; !reachable {
+				delete(uriLocations, name)
+			}
+		}
+	}
 
 	names := make([]string, 0, len(uriLocations))
 	for name := range uriLocations {
@@ -276,6 +323,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	canonical := canonicalResolution{
 		SchemaVersion: configsock.ArtifactPrepareSchemaVersion,
 		SourceKind:    string(sourceKind), SourceRef: spec.RootRef, LaunchMode: string(launchMode),
+		ReadImageConfig:    spec.ReadSourceImageConfig,
 		PreparedSourceKind: string(prepared.Kind), PreparedSourceRef: prepared.Ref,
 		Capacity: capacity, Network: network, DiskTopology: topology, RequiredRefs: requiredRefs,
 		Locations: canonicalLocations, CarrierBindings: bindings,
@@ -286,8 +334,9 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	}
 	digest := sha256.Sum256(encoded)
 	return &Result{
-		PreparedSource: prepared,
-		RootCfg:        rootCfg,
+		PreparedSource:      prepared,
+		SourceSandboxConfig: sourceSandboxConfig,
+		SourceImageConfig:   append([]byte(nil), sourceImageConfig...),
 		Summary: configsock.ArtifactPrepareSummary{
 			SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
 			PreparedSourceKind: string(prepared.Kind), Capacity: capacity,
@@ -325,26 +374,197 @@ func summarizeNetwork(raw string) (configsock.ArtifactNetwork, error) {
 	}, nil
 }
 
-func inspectSandboxConfig(ctx context.Context, ref string, manifestCfg *rtconfig.ManifestConfig, locations rtconfig.RefLocations) (*rtconfig.PortableSandboxConfig, error) {
-	storage, err := artifact.NewProcessStorage(manifestCfg)
+func inspectSandboxSource(
+	ctx context.Context,
+	raw, relativeDir string,
+	storage *artifact.ProcessStorage,
+	locations rtconfig.RefLocations,
+	loadImageConfig bool,
+	addLocation func(string, string) error,
+) (*rtconfig.PortableSandboxConfig, []byte, error) {
+	if storage == nil {
+		return nil, nil, errors.New("task artifact prepare: initialize referenced Sandbox reader")
+	}
+	stream, err := openArtifactStream(ctx, raw, relativeDir, storage, locations)
 	if err != nil {
-		return nil, fmt.Errorf("task artifact prepare: initialize referenced Sandbox reader: %w", err)
+		return nil, nil, fmt.Errorf("task artifact prepare: referenced Sandbox E: %w", err)
 	}
-	info, readErr := storage.Inspect(ctx, ref, locations)
-	closeErr := storage.Close()
-	if readErr != nil || closeErr != nil {
-		if readErr != nil {
-			readErr = fmt.Errorf("task artifact prepare: read referenced Sandbox E: %w", readErr)
+	root, err := sandboxfile.Open(ctx, stream)
+	if err != nil {
+		return nil, nil, fmt.Errorf("task artifact prepare: read referenced Sandbox E: %w", err)
+	}
+	portable, err := root.Portable.Clone()
+	imageConfig := append([]byte(nil), root.ImageConfig...)
+	if err == nil && addLocation != nil {
+		err = addSourceImageRefLocation(portable, addLocation)
+	}
+	if err == nil && loadImageConfig {
+		var scoped fetch.Fetcher
+		if provider, ok := stream.(interface{ ScopedFetcher() fetch.Fetcher }); ok {
+			scoped = provider.ScopedFetcher()
 		}
-		if closeErr != nil {
-			closeErr = fmt.Errorf("task artifact prepare: close referenced Sandbox reader: %w", closeErr)
+		imageConfig, err = inspectSourceImageConfig(
+			ctx, portable, imageConfig, sourceRelativeDir(raw, relativeDir, locations),
+			storage, locations, scoped,
+		)
+	}
+	closeErr := root.Close()
+	if err != nil || closeErr != nil {
+		return nil, nil, errors.Join(err, closeErr)
+	}
+	return portable, imageConfig, nil
+}
+
+func addSourceImageRefLocation(cfg *rtconfig.PortableSandboxConfig, add func(string, string) error) error {
+	raw := sourceRootImageRef(cfg)
+	if raw == "" {
+		return nil
+	}
+	name, err := refLocationName(raw)
+	if err != nil {
+		return fmt.Errorf("task artifact prepare: Sandbox E base image ref %q: %w", raw, err)
+	}
+	return add(fmt.Sprintf("Sandbox E base image ref %q", raw), name)
+}
+
+// inspectSourceImageConfig preserves the container defaults used by Phase B.
+// Offline EROFS Sandboxes carry config.json in their own logical root; a
+// normally captured overlay E points at the flattened base image instead, so
+// read that image through the same task-local carrier and crypto boundary.
+func inspectSourceImageConfig(
+	ctx context.Context,
+	cfg *rtconfig.PortableSandboxConfig,
+	embedded []byte,
+	relativeDir string,
+	storage *artifact.ProcessStorage,
+	locations rtconfig.RefLocations,
+	scoped fetch.Fetcher,
+) ([]byte, error) {
+	if embedded != nil {
+		return append([]byte(nil), embedded...), nil
+	}
+	ref := sourceRootImageRef(cfg)
+	if ref == "" {
+		return nil, nil
+	}
+	stream, err := openArtifactStreamWithFetcher(ctx, ref, relativeDir, storage, locations, scoped)
+	if err != nil {
+		return nil, fmt.Errorf("task artifact prepare: open Sandbox E base image: %w", err)
+	}
+	payload, _, err := sandboxfile.PayloadIfSandbox(ctx, stream, false)
+	if err != nil {
+		return nil, fmt.Errorf("task artifact prepare: narrow Sandbox E base image: %w", err)
+	}
+	image, err := sandboxfile.OpenEROFSArtifact(ctx, payload)
+	if err != nil {
+		return nil, fmt.Errorf("task artifact prepare: read Sandbox E base image: %w", err)
+	}
+	config := append([]byte(nil), image.ImageConfig...)
+	if err := image.Close(); err != nil {
+		return nil, fmt.Errorf("task artifact prepare: close Sandbox E base image: %w", err)
+	}
+	return config, nil
+}
+
+// sourceRootImageRef returns the explicitly typed immutable root-image carrier.
+// Only overlay mode has one: single-disk roots are ext4 chains and require an
+// explicit launch command instead of container image defaults.
+func sourceRootImageRef(cfg *rtconfig.PortableSandboxConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	root := cfg.Boot.Root
+	if root.Overlay == nil || root.Base == "" || root.Base == "self" {
+		return ""
+	}
+	return root.Base
+}
+
+func openArtifactStream(ctx context.Context, raw, relativeDir string, storage *artifact.ProcessStorage, locations rtconfig.RefLocations) (fetch.Stream, error) {
+	return openArtifactStreamWithFetcher(ctx, raw, relativeDir, storage, locations, nil)
+}
+
+func openArtifactStreamWithFetcher(
+	ctx context.Context,
+	raw, relativeDir string,
+	storage *artifact.ProcessStorage,
+	locations rtconfig.RefLocations,
+	manifestFetcher fetch.Fetcher,
+) (fetch.Stream, error) {
+	ref, err := parseArtifactRef(raw, relativeDir)
+	if err != nil {
+		return nil, err
+	}
+	switch ref.Scheme {
+	case manifest.RefSchemeManifest:
+		if manifestFetcher == nil {
+			manifestFetcher = storage.Fetcher()
 		}
-		return nil, errors.Join(readErr, closeErr)
+		if manifestFetcher == nil {
+			return nil, errors.New("manifest configuration is required")
+		}
+		key, err := manifest.ParseKeyRef(ref.Path)
+		if err != nil {
+			return nil, err
+		}
+		return manifestFetcher.OpenManifest(ctx, key)
+	case manifest.RefSchemeFile:
+		path, err := locations.ResolveFile(ref, relativeDir)
+		if err != nil {
+			return nil, err
+		}
+		if !filepath.IsAbs(path) {
+			path, err = filepath.Abs(path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return storage.OpenFileWithLocations(ctx, path, ref, locations)
+	default:
+		return nil, fmt.Errorf("unsupported ref scheme %q", ref.Scheme)
 	}
-	if info.Role != artifact.RoleSandbox || info.Sandbox == nil {
-		return nil, errors.New("task artifact prepare: snapshot sandbox_ref is not a strict Sandbox E")
+}
+
+func sourceRelativeDir(raw, fallback string, locations rtconfig.RefLocations) string {
+	if strings.HasPrefix(raw, "file://") {
+		ref, err := manifest.ParseRef(raw)
+		if err == nil {
+			if path, resolveErr := locations.ResolveFile(ref, fallback); resolveErr == nil {
+				if absolute, absoluteErr := filepath.Abs(path); absoluteErr == nil {
+					return filepath.Dir(absolute)
+				}
+			}
+		}
+	} else if filepath.IsAbs(raw) {
+		return filepath.Dir(raw)
 	}
-	return info.Sandbox, nil
+	return fallback
+}
+
+func parseArtifactRef(raw, relativeDir string) (manifest.Ref, error) {
+	if strings.HasPrefix(raw, "manifest://") || strings.HasPrefix(raw, "file://") {
+		return manifest.ParseRef(raw)
+	}
+	path := raw
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(relativeDir, path)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return manifest.Ref{}, err
+	}
+	if _, err := os.Stat(absolute); err != nil {
+		return manifest.Ref{}, err
+	}
+	return manifest.Ref{Scheme: manifest.RefSchemeFile, Path: absolute}, nil
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	return &out
 }
 
 func summarizeDiskTopology(cfg *rtconfig.PortableSandboxConfig) (types.ArtifactDiskTopology, error) {

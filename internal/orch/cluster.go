@@ -123,10 +123,11 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		// registration image-pull credentials for exact replay, and report
 		// `registered` up. The e2b trigger (router-forwarded) then runs it; state
 		// flows back as BuildUpsert and retention eventually emits BuildDelete.
-		if err := o.registerClusterBuild(ctx, cmd); err != nil {
+		var target *types.BuildTarget
+		if err := o.registerClusterBuildWithResult(ctx, cmd, &target); err != nil {
 			return reject(cmd, err)
 		}
-		return accept(cmd)
+		return acceptBuildRegister(cmd, target)
 	default:
 		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
@@ -157,6 +158,10 @@ func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
 // registration image-pull credentials for exact retries and restart recovery,
 // and report `registered` up the node-link.
 func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
+	return o.registerClusterBuildWithResult(ctx, cmd, nil)
+}
+
+func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *routesync.Command, acceptedTarget **types.BuildTarget) error {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return fmt.Errorf("build_register: missing build_id / template_id")
 	}
@@ -200,12 +205,6 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	registrationRequestDigest, err := clusterBuildRegistrationRequestDigest(pair.ManifestKey, cmd)
 	if err != nil {
 		return err
-	}
-	if existing != nil && existing.RegistrationRequestDigest == "" {
-		// Rows accepted before the additive digest column keep the established
-		// field-by-field replay contract. Do not turn a compatible upgrade into a
-		// conflict merely because the old row could not record this identity.
-		registrationRequestDigest = ""
 	}
 	resources := cmd.BuildResources.Types()
 	if err := resources.ValidateRequired(); err != nil {
@@ -259,6 +258,23 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
 	}
+	if _, present := meta[sandboxcfg.NsCredentials]; present {
+		return fmt.Errorf("%w: build_register credentials must use the confidential command envelope", api.ErrBadRequest)
+	}
+	credentials := sandboxcfg.Credentials{}
+	if cmd.BuildCredentials != nil {
+		credentials = *cmd.BuildCredentials
+	}
+	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
+		return fmt.Errorf("%w: build_register credentials: %v", api.ErrBadRequest, err)
+	}
+	if _, present := meta[sandboxcfg.NsRestore]; present {
+		return fmt.Errorf("%w: build_register %s is not valid for template builds", api.ErrBadRequest, sandboxcfg.NsRestore)
+	}
+	meta, err = sandboxcfg.NormalizeCheckpointMetadata(meta)
+	if err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
+	}
 	spec, err := sandboxcfg.ParseSpec(meta)
 	if err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
@@ -266,9 +282,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
-	phaseResourcePatch := meta[sandboxcfg.NsResource]
-	if phaseResourcePatch != "" {
-		meta = cloneStringMapWithout(meta, sandboxcfg.NsResource)
+	if err := sandboxcfg.ValidateLaunchForProfile(profile, spec.Launch); err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
 	if existing == nil {
 		// Mutable node policy admits new ownership only. Exact replay is still
@@ -278,8 +293,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		if err := o.validateBuildOptions(builderOpts, false); err != nil {
 			return err
 		}
-		if err := o.validateBuildPhaseResources(phaseResourcePatch); err != nil {
-			return err
+		if err := validateExplicitBuildTargetConfig(builderOpts.Target, meta, cmd.BuildEnv, cmd.BuildSecure, mmdsDoc, credentials); err != nil {
+			return fmt.Errorf("%w: build_register: %v", api.ErrBadRequest, err)
 		}
 	}
 	b := &types.Build{
@@ -288,7 +303,6 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		APISecret:                 pair.APISecret,
 		ManifestKey:               pair.ManifestKey,
 		Profile:                   profile,
-		Kind:                      types.KindImg,
 		Status:                    types.BuildRegistered,
 		FromImage:                 o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
 		Resources:                 resources,
@@ -296,8 +310,12 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		RegistrationRegistryAuth:  cmd.RegistryAuth,
 		RegistrationRequestDigest: registrationRequestDigest,
 		ClusterGroup:              location.Group,
-		PhaseResourcePatch:        phaseResourcePatch,
 		Metadata:                  meta,
+		Env:                       cloneStringMap(cmd.BuildEnv),
+		Secure:                    cmd.BuildSecure,
+		ServiceSecret:             credentials.ServiceSecret,
+		EnvdAccessToken:           credentials.EnvdAccessToken,
+		TrafficAccessToken:        credentials.TrafficAccessToken,
 		Builder:                   builderOpts,
 		CreatedUnix:               time.Now().Unix(),
 	}
@@ -320,6 +338,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		}
 		secretHeader, err := mmdsSecretHeader(mmdsDoc)
 		if err != nil {
+			return err
+		}
+		if err := retainBuildRegistrationCredentials(request, credentials); err != nil {
 			return err
 		}
 		final, err := o.normalizeBuildRegistration(request, secretHeader)
@@ -388,6 +409,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		if err := o.publishBuildStateRequired(ctx, registered.BuildID, string(registered.Status), templateID, registered.Reason); err != nil {
 			return fmt.Errorf("build_register: republish durable terminal state: %w", err)
 		}
+		if acceptedTarget != nil {
+			*acceptedTarget = cloneBuildTarget(registered.Builder.Target)
+		}
 		return nil
 	}
 	o.clusterBuildMu.Lock()
@@ -396,6 +420,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if inserted {
 		o.publishBuildState(cmd.BuildID, "registered", "", "")
 		o.observeBuildUpsert(registered)
+	}
+	if acceptedTarget != nil {
+		*acceptedTarget = cloneBuildTarget(registered.Builder.Target)
 	}
 	return nil
 }
@@ -695,6 +722,13 @@ func acceptConnect(cmd *routesync.Command, result *routesync.ConnectResult) *rou
 
 func acceptExecSession(cmd *routesync.Command, result *routesync.ExecSessionResult) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, ExecSession: result}
+}
+
+func acceptBuildRegister(cmd *routesync.Command, target *types.BuildTarget) *routesync.CmdAck {
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: cloneBuildTarget(target)},
+	}
 }
 
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
@@ -1156,7 +1190,7 @@ func validateClusterExecSessionEnvelope(cmd *routesync.Command) error {
 		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
 		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
 		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" ||
-		len(cmd.BuildMMDSSecrets) != 0 {
+		len(cmd.BuildEnv) != 0 || cmd.BuildSecure || cmd.BuildCredentials != nil || len(cmd.BuildMMDSSecrets) != 0 {
 		return fmt.Errorf("cluster exec session: command contains fields for another operation")
 	}
 	return nil

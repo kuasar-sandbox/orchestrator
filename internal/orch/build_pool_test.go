@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -64,7 +65,6 @@ func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 		APISecret:   deriveTestAPISecret(t, manifestKey),
 		ManifestKey: manifestKey,
 		Profile:     types.ProfileE2B,
-		Kind:        types.KindImg,
 		Status:      types.BuildWaiting,
 		Resources:   types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		WaitingUnix: time.Now().Unix(),
@@ -108,7 +108,7 @@ func TestPrepareBuilderUnitAppliesAndVerifiesLimitsBeforeDurableAssignment(t *te
 	b := &types.Build{
 		BuildID: "build-property-order", TemplateID: "transient-build-property-order",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding,
 		Resources: types.BuildResources{CPU: 2501, Memory: 3 << 30}, ExecutionClaimed: true,
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {
@@ -148,7 +148,7 @@ func TestPrepareBuilderUnitPropertyFailureDoesNotBindRun(t *testing.T) {
 	b := &types.Build{
 		BuildID: "build-property-failure", TemplateID: "transient-build-property-failure",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding,
 		Resources: types.BuildResources{CPU: 1000, Memory: 1 << 30}, ExecutionClaimed: true,
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {
@@ -173,6 +173,7 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	b := &types.Build{
 		BuildID: "build-expired-before-assignment", Profile: types.ProfileBare,
 		FromImage: "example.invalid/base:latest", Status: types.BuildBuilding,
+		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Add(-2 * time.Minute).Unix(),
 	}
 	if _, err := o.runBuildUnit(context.Background(), b); !errors.Is(err, context.DeadlineExceeded) {
@@ -191,6 +192,35 @@ func TestRunBuildUnitDeadlineCoversRunnerAssignment(t *testing.T) {
 	}
 }
 
+func TestRunBuildUnitReusesUnchangedImageWithoutRuntimeSideEffects(t *testing.T) {
+	o := testOrch(t)
+	vs := &resourcePreflightVS{}
+	o.vs = vs
+	ref := "manifest://" + strings.Repeat("d", 64)
+	target := &types.BuildTarget{Kind: types.BuildTargetImage}
+	b := &types.Build{
+		BuildID: "build-phase-free-image", Profile: types.ProfileE2B,
+		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: ref}.String(),
+		Builder:      types.BuildOptions{Target: target},
+	}
+
+	result, err := o.runBuildUnit(context.Background(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Target != *target || result.ImageRef != ref {
+		t.Fatalf("phase-free image result = %+v", result)
+	}
+	if vs.attaches.Load() != 0 || b.RunID != "" || b.RuntimeVswitchPort != "" {
+		t.Fatalf("phase-free image acquired runtime state: attaches=%d build=%+v", vs.attaches.Load(), b)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := o.runBuildUnit(canceled, b); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled phase-free image = %v, want context canceled", err)
+	}
+}
+
 func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Builder.TotalTimeoutSec = 75
@@ -204,7 +234,10 @@ func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
 
 func TestWaitBuildResultRechecksAcceptedResultAfterInactiveReadback(t *testing.T) {
 	o := testOrch(t)
-	want := configsock.BuildResult{ImageRef: "manifest://accepted-after-exit"}
+	want := configsock.BuildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("a", 64),
+	}
 	pend := &pendingBuild{
 		handoff: newBuildTaskHandoff(false, ""),
 		result:  make(chan configsock.BuildResult, 1),
@@ -231,7 +264,8 @@ func TestRunBuildUnitCleansDirectoriesWhenRequestResolutionFails(t *testing.T) {
 	o.cfg.Paths.BaseRoot = t.TempDir()
 	b := &types.Build{
 		BuildID: "build-invalid-request-input", Profile: types.ProfileBare,
-		Status: types.BuildBuilding, ExecutionClaimed: true, PhaseResourcePatch: `{"capacity":`,
+		Status: types.BuildBuilding, ExecutionClaimed: true,
+		Metadata: map[string]string{sandboxcfg.NsResource: `{"capacity":`},
 	}
 	runDir := nodepath.BuildRunDir(o.cfg.Paths.RunRoot, b.BuildID)
 	baseDir := nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, b.BuildID)
@@ -258,7 +292,7 @@ func TestRunBuildUnitCleansDirectoriesWhenRequestResolutionFails(t *testing.T) {
 	}
 
 	if _, err := o.runBuildUnit(context.Background(), b); err == nil {
-		t.Fatal("malformed phase resource patch was accepted")
+		t.Fatal("malformed target Sandbox resource config was accepted")
 	}
 	if !seenRunDir || !seenBaseDir {
 		t.Fatalf("execution claim directory observations: run=%t base=%t", seenRunDir, seenBaseDir)
@@ -299,7 +333,7 @@ func TestRunBuildUnitFencesAssignedUnitBeforePreNetworkDirectoryCleanup(t *testi
 	build := &types.Build{
 		BuildID: "build-assigned-fence-order", TemplateID: "transient-build-assigned-fence-order",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileBare, Status: types.BuildBuilding,
 		FromImage: "example.invalid/base:latest", Resources: testBuildResources(),
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), CreatedUnix: time.Now().Unix(),
 	}
@@ -378,14 +412,14 @@ func TestBuildPoolTerminallyRejectsPermanentlyUnfitFIFOHead(t *testing.T) {
 		{
 			BuildID: "fifo-unfit", TemplateID: "transient-fifo-unfit",
 			APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileBare,
-			Kind: types.KindImg, Status: types.BuildWaiting,
+			Status:      types.BuildWaiting,
 			Resources:   types.BuildResources{CPU: 2000, Memory: 1 << 30},
 			WaitingUnix: time.Now().Unix(), WaitingSequence: 1, CreatedUnix: time.Now().Unix(),
 		},
 		{
 			BuildID: "fifo-fit", TemplateID: "transient-fifo-fit",
 			APISecret: apiSecret, ManifestKey: manifestKey, Profile: types.ProfileBare,
-			Kind: types.KindImg, Status: types.BuildWaiting,
+			Status:      types.BuildWaiting,
 			Resources:   types.BuildResources{CPU: 1000, Memory: 1 << 30},
 			WaitingUnix: time.Now().Unix(), WaitingSequence: 2, CreatedUnix: time.Now().Unix(),
 		},
@@ -441,7 +475,7 @@ func TestTerminalPersistenceFailureRetainsClaimAndRetriesSafely(t *testing.T) {
 	b := &types.Build{
 		BuildID: "build-terminal-persistence", TemplateID: "transient-build-terminal-persistence",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileE2B, Status: types.BuildBuilding,
 		Resources: types.BuildResources{CPU: 1000, Memory: 1 << 30}, ExecutionClaimed: true,
 		ExecutionClaimedUnix: time.Now().Unix(), CreatedUnix: time.Now().Unix(),
 	}

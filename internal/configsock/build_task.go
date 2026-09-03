@@ -3,10 +3,10 @@ package configsock
 import "errors"
 
 // BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
-// ArtifactPrepareSchemaVersion. Version 3 replaces the ambiguous build workdir
-// with explicit volatile RunDir and persistent BaseDir paths; old workers fail
-// closed instead of writing large artifacts below RunRoot.
-const BuildTaskSchemaVersion = 3
+// ArtifactPrepareSchemaVersion. Version 4 adds an explicit requested target and
+// replaces Snapshot-only local preparation with a generic cold Sandbox-E
+// source retained by run-builder.
+const BuildTaskSchemaVersion = 4
 
 // BuildTaskRequest identifies one exact assigned run-builder incarnation.
 type BuildTaskRequest struct {
@@ -15,9 +15,9 @@ type BuildTaskRequest struct {
 	Version int    `json:"version,omitempty"`
 }
 
-// BuildTaskSpec is the authenticated task bootstrap. Snapshot-template builds
-// receive Prepare and later complete the two-stage handoff. FromImage and image
-// template builds receive Final in this same, single RPC.
+// BuildTaskSpec is the authenticated task bootstrap. Sandbox/Snapshot template
+// sources receive Prepare and later complete the two-stage handoff. FromImage
+// and image-template builds receive Final in this same, single RPC.
 type BuildTaskSpec struct {
 	BuildID string               `json:"build_id"`
 	RunID   string               `json:"run_id"`
@@ -43,16 +43,6 @@ type BuildPrepareRequest struct {
 type BuildPrepareResponse struct {
 	Final *BuildSpec `json:"final,omitempty"`
 	Error string     `json:"error,omitempty"`
-}
-
-// BuildSnapshotPreparation never travels over the task plane. run-builder
-// fills it from the one RootCfg it retains locally before calling builder.Run.
-type BuildSnapshotPreparation struct {
-	BaseRef             string
-	OverlayBase         string
-	OverlayBaseFromRefs []string
-	StartCmd            string
-	ReadyCmd            string
 }
 
 // BuildPrepareRejection marks stale ownership or a conflicting completion.

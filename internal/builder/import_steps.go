@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"gopkg.in/yaml.v3"
 )
 
 // --- phase A: import -------------------------------------------------------
@@ -152,8 +153,6 @@ func (p *buildPipeline) useLocalImage(path string) error {
 	p.imagePath = path
 	p.baseImageRef = ""
 	p.baseRef = ref.String()
-	p.overlayBase = ""
-	p.overlayBaseFromRefs = nil
 	return nil
 }
 
@@ -225,7 +224,6 @@ func (p *buildPipeline) useImportRefererHit(id string) error {
 	p.baseImageRef = "manifest://" + id
 	p.baseRef = p.baseImageRef
 	p.imagePath = ""
-	p.overlayBase = ""
 	return nil
 }
 
@@ -324,8 +322,18 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 	ctxv := stepCtxFrom(baseCfg)
 
 	envdUDS := filepath.Join(p.phaseRunDir("b"), "envd-steps.sock")
-	sb, err := p.startSandbox("b", p.stepsYAML(),
-		[]string{envdUDS + ":127.0.0.1:49983"})
+	var sb *phaseSandbox
+	if s.SourceSandboxConfig != nil {
+		document, yamlErr := yaml.Marshal(p.sourceStepsYAML())
+		if yamlErr != nil {
+			return yamlErr
+		}
+		sb, err = p.startSandboxYAML("b", document,
+			[]string{envdUDS + ":127.0.0.1:49983"}, s.SourceSandboxRef, false)
+	} else {
+		sb, err = p.startSandbox("b", p.stepsYAML(),
+			[]string{envdUDS + ":127.0.0.1:49983"})
+	}
 	if err != nil {
 		return err
 	}
@@ -661,6 +669,19 @@ func normalizeCopySrc(s string) string {
 // the local artifact or the manifest store). It both seeds the step
 // context and is the base the exported config merges onto.
 func (p *buildPipeline) readBaseRuntimeConfig() (map[string]any, error) {
+	if p.spec.SourceSandboxConfig != nil {
+		if len(p.spec.SourceImageConfig) == 0 {
+			return map[string]any{}, nil
+		}
+		var config map[string]any
+		if err := json.Unmarshal(p.spec.SourceImageConfig, &config); err != nil {
+			return nil, fmt.Errorf("parse source Sandbox image config: %w", err)
+		}
+		if config == nil {
+			config = map[string]any{}
+		}
+		return config, nil
+	}
 	target := p.baseRef
 	if p.imagePath != "" {
 		target = p.imagePath

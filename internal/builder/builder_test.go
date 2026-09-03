@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
@@ -174,11 +175,9 @@ func TestUseLocalImageQualifiesTarstreamIdentity(t *testing.T) {
 	}
 
 	p := &buildPipeline{
-		imagePath:           "old.img",
-		baseImageRef:        "manifest://old",
-		baseRef:             "manifest://old",
-		overlayBase:         "manifest://overlay",
-		overlayBaseFromRefs: []string{"manifest://parent"},
+		imagePath:    "old.img",
+		baseImageRef: "manifest://old",
+		baseRef:      "manifest://old",
 	}
 	if err := p.useLocalImage(path); err != nil {
 		t.Fatal(err)
@@ -192,7 +191,7 @@ func TestUseLocalImageQualifiesTarstreamIdentity(t *testing.T) {
 	if p.baseRef != want {
 		t.Fatalf("baseRef = %q, want %q", p.baseRef, want)
 	}
-	if p.imagePath != path || p.baseImageRef != "" || p.overlayBase != "" || p.overlayBaseFromRefs != nil {
+	if p.imagePath != path || p.baseImageRef != "" {
 		t.Fatalf("pipeline image state = %+v", p)
 	}
 	ref, err := manifest.ParseRef(p.baseRef)
@@ -218,31 +217,82 @@ func TestUseLocalImageRejectsMalformedArtifactWithoutChangingState(t *testing.T)
 	}
 }
 
-func TestResolveBaseConsumesTaskLocalSnapshotPreparation(t *testing.T) {
+func TestResolveBaseConsumesTaskLocalSandboxSource(t *testing.T) {
 	p := &buildPipeline{
 		profile: types.ProfileE2B,
 		spec: &configsock.BuildSpec{
 			FromTemplateRef: "manifest://root", FromTemplateKind: "snp",
-			SnapshotPreparation: &configsock.BuildSnapshotPreparation{
-				BaseRef: "manifest://base", OverlayBase: "manifest://top",
-				OverlayBaseFromRefs: []string{"manifest://lower-1", "manifest://lower-2"},
-				StartCmd:            "node server.js", ReadyCmd: "curl -sf localhost:3000",
+			SourceSandboxRef: "manifest://selected-e",
+			SourceSandboxConfig: &rtconfig.PortableSandboxConfig{
+				Metadata: map[string]string{
+					sandboxcfg.E2BStartCommandMetadata: "node server.js",
+					sandboxcfg.E2BReadyCommandMetadata: "curl -sf localhost:3000",
+				},
 			},
 		},
 	}
 	if err := p.resolveBase(); err != nil {
 		t.Fatal(err)
 	}
-	if p.baseRef != "manifest://base" || p.overlayBase != "manifest://top" ||
-		strings.Join(p.overlayBaseFromRefs, ",") != "manifest://lower-1,manifest://lower-2" {
-		t.Fatalf("resolved disk = base %q overlay %q chain %v", p.baseRef, p.overlayBase, p.overlayBaseFromRefs)
+	if p.baseRef != "" || p.baseImageRef != "" {
+		t.Fatalf("source E graph leaked into final image state: %+v", p)
 	}
 	if p.startCmd != "node server.js" || p.readyCmd != "curl -sf localhost:3000" {
 		t.Fatalf("inherited commands = %q / %q", p.startCmd, p.readyCmd)
 	}
-	p.spec.SnapshotPreparation = nil
+	p.spec.SourceSandboxConfig = nil
 	if err := p.resolveBase(); err == nil {
-		t.Fatal("missing task-local snapshot preparation was accepted")
+		t.Fatal("missing task-local Sandbox preparation was accepted")
+	}
+}
+
+func TestPreparedSandboxImageConfigSeedsBuildStepContext(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		SourceSandboxConfig: &rtconfig.PortableSandboxConfig{},
+		SourceImageConfig:   []byte(`{"Env":["BUILT=yes"],"WorkingDir":"/home/user","User":"1000:1000"}`),
+	}}
+	base, err := p.readBaseRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := stepCtxFrom(base)
+	if ctx.env["BUILT"] != "yes" || ctx.workdir != "/home/user" || ctx.user != "1000:1000" {
+		t.Fatalf("prepared source step context = %+v", ctx)
+	}
+}
+
+func TestResolveTargetUsesOnlyEffectiveCommandsAndExplicitTarget(t *testing.T) {
+	image := types.BuildTarget{Kind: types.BuildTargetImage}
+	offline := types.BuildTarget{Kind: types.BuildTargetSandbox}
+	for _, test := range []struct {
+		name      string
+		requested *types.BuildTarget
+		start     string
+		ready     string
+		want      types.BuildTarget
+		wantStart string
+		wantReady string
+	}{
+		{name: "auto image", want: image},
+		{name: "auto start", start: "serve", want: types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}, wantStart: "serve"},
+		{name: "auto ready", ready: "probe", want: types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}, wantReady: "probe"},
+		{name: "explicit offline", requested: &offline, start: "declare", ready: "declared-ready", want: offline, wantStart: "declare", wantReady: "declared-ready"},
+		{name: "explicit image ignores inherited", requested: &image, start: "inherited", ready: "inherited-ready", want: image},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: test.requested}, startCmd: test.start, readyCmd: test.ready}
+			if err := p.resolveTarget(); err != nil {
+				t.Fatal(err)
+			}
+			if p.target != test.want || p.startCmd != test.wantStart || p.readyCmd != test.wantReady {
+				t.Fatalf("resolved = target %+v commands %q/%q", p.target, p.startCmd, p.readyCmd)
+			}
+		})
+	}
+
+	p := &buildPipeline{spec: &configsock.BuildSpec{RequestedTarget: &image, StartCmd: "explicit"}, startCmd: "explicit"}
+	if err := p.resolveTarget(); err == nil {
+		t.Fatal("explicit image accepted an explicit trigger command")
 	}
 }
 
@@ -305,7 +355,7 @@ func TestUploadImageReusesBaseImageRef(t *testing.T) {
 	}
 }
 
-func TestPrepareBundleTemplateBaseUsesPublishedManifest(t *testing.T) {
+func TestPrepareFinalImageRefUsesPublishedManifest(t *testing.T) {
 	ref := "manifest://" + strings.Repeat("a", 64)
 	p := &buildPipeline{
 		spec:         &configsock.BuildSpec{CheckpointMode: "bundle"},
@@ -313,49 +363,19 @@ func TestPrepareBundleTemplateBaseUsesPublishedManifest(t *testing.T) {
 		baseImageRef: ref,
 		baseRef:      "file:///build/image.img@digest:" + strings.Repeat("b", 64),
 	}
-	if err := p.prepareBundleTemplateBase(); err != nil {
+	if err := p.prepareFinalImageRef(); err != nil {
 		t.Fatal(err)
 	}
 	if p.baseRef != ref {
-		t.Fatalf("Bundle template base = %q, want %q", p.baseRef, ref)
+		t.Fatalf("final image ref = %q, want %q", p.baseRef, ref)
 	}
 }
 
-func TestPrepareBundleTemplateBaseLeavesOtherBaseStrategies(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		mode      string
-		imagePath string
-	}{
-		{name: "tarstream", mode: "local", imagePath: "/build/image.img"},
-		{name: "already remote", mode: "bundle"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			const base = "manifest://existing-base"
-			p := &buildPipeline{
-				spec: &configsock.BuildSpec{CheckpointMode: test.mode}, imagePath: test.imagePath,
-				baseImageRef: "manifest://" + strings.Repeat("a", 64), baseRef: base,
-			}
-			if err := p.prepareBundleTemplateBase(); err != nil {
-				t.Fatal(err)
-			}
-			if p.baseRef != base {
-				t.Fatalf("base = %q, want unchanged %q", p.baseRef, base)
-			}
-		})
-	}
-}
-
-func TestRootDocKeepsExplicitOverlayChain(t *testing.T) {
-	p := &buildPipeline{
-		baseRef:             "manifest://base",
-		overlayBase:         "manifest://top",
-		overlayBaseFromRefs: []string{"manifest://parent-1", "manifest://parent-2"},
-	}
+func TestRootDocContainsOnlyFinalImageAndFreshOverlay(t *testing.T) {
+	p := &buildPipeline{baseRef: "manifest://base"}
 	root := p.rootDoc("file:///tmp/diff")
 	overlay := root["overlay"].(map[string]any)
-	chain := overlay["base_from_refs"].([]string)
-	if overlay["base"] != p.overlayBase || strings.Join(chain, ",") != strings.Join(p.overlayBaseFromRefs, ",") {
+	if root["base"] != p.baseRef || overlay["diff_template"] != "file:///tmp/diff" || len(overlay) != 1 {
 		t.Fatalf("overlay = %#v", overlay)
 	}
 }
@@ -396,7 +416,20 @@ func TestNetworkDocTapFDSocket(t *testing.T) {
 	}
 }
 
-func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
+func decodeBuildColdConfig(t *testing.T, p *buildPipeline) *rtconfig.SandboxConfig {
+	t.Helper()
+	document, err := p.buildColdConfigYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg rtconfig.SandboxConfig
+	if err := yaml.Unmarshal(document, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	return &cfg
+}
+
+func TestBuildColdConfigPersistsTemplateNetwork(t *testing.T) {
 	network := sandboxcfg.NetworkSpec{
 		Hostname:         "sandbox",
 		DNS:              []string{"169.254.169.253"},
@@ -407,8 +440,11 @@ func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
 		TransitMAC:       "aa:bb:cc:dd:ee:ff",
 	}
 	p := &buildPipeline{
+		profile: types.ProfileE2B,
+		baseRef: "manifest://" + strings.Repeat("a", 64),
 		spec: &configsock.BuildSpec{
 			TemplateNetwork: network,
+			Paths:           configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
 			Net: configsock.BuildNet{
 				Hostname: "build-deadbeef",
 			},
@@ -416,14 +452,8 @@ func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
 		startCmd: "node server.js",
 		readyCmd: "curl -sf localhost:3000",
 	}
-	doc, err := p.templateYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, ok := doc["metadata"].(map[string]string)
-	if !ok {
-		t.Fatalf("metadata = %#v", doc["metadata"])
-	}
+	cfg := decodeBuildColdConfig(t, p)
+	meta := cfg.Metadata
 	if strings.Contains(meta[sandboxcfg.NsNetwork], "build-deadbeef") {
 		t.Fatalf("template metadata leaked temporary hostname: %s", meta[sandboxcfg.NsNetwork])
 	}
@@ -437,7 +467,10 @@ func TestTemplateYAMLPersistsTemplateNetwork(t *testing.T) {
 }
 
 func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
-	p := &buildPipeline{spec: &configsock.BuildSpec{}}
+	p := &buildPipeline{
+		profile: types.ProfileE2B, baseRef: "manifest://" + strings.Repeat("a", 64),
+		spec: &configsock.BuildSpec{Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"}},
+	}
 
 	stepsLaunch := p.stepsYAML()["launch"].(map[string]any)
 	if got := stepsLaunch["cgroup_control"]; got != true {
@@ -447,31 +480,22 @@ func TestEnvdYAMLDelegatesCgroupControl(t *testing.T) {
 		t.Fatalf("steps envd args = %#v", got)
 	}
 
-	template, err := p.templateYAML()
-	if err != nil {
-		t.Fatal(err)
+	template := decodeBuildColdConfig(t, p)
+	if !template.Launch.CgroupControl {
+		t.Fatalf("template launch.cgroup_control = false, want true")
 	}
-	templateLaunch := template["launch"].(map[string]any)
-	if got := templateLaunch["cgroup_control"]; got != true {
-		t.Fatalf("template launch.cgroup_control = %#v, want true", got)
-	}
-	if got := templateLaunch["args"]; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
+	if got := template.Launch.Args; !reflect.DeepEqual(got, []string{"-isnotfc", "-port", "49983"}) {
 		t.Fatalf("template envd args = %#v", got)
 	}
 
 	p.spec.MMDSEnabled = true
-	template, err = p.templateYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-	templateLaunch = template["launch"].(map[string]any)
-	if templateLaunch["cgroup_control"] != true ||
-		!reflect.DeepEqual(templateLaunch["args"], []string{"-port", "49983"}) {
-		t.Fatalf("MMDS template launch = %#v", templateLaunch)
+	template = decodeBuildColdConfig(t, p)
+	if !template.Launch.CgroupControl || !reflect.DeepEqual(template.Launch.Args, []string{"-port", "49983"}) {
+		t.Fatalf("MMDS template launch = %#v", template.Launch)
 	}
 }
 
-func TestEveryPhaseYAMLUsesTheCompleteResolvedSandboxResources(t *testing.T) {
+func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	deflate := true
 	resources := rtconfig.ResourcesConfig{
 		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
@@ -482,21 +506,136 @@ func TestEveryPhaseYAMLUsesTheCompleteResolvedSandboxResources(t *testing.T) {
 		Overhead: &rtconfig.OverheadConfig{Memory: "32MiB"},
 		Control:  rtconfig.ControlConfig{Controller: "/run/sandbox-resource.sock"},
 	}
-	p := &buildPipeline{spec: &configsock.BuildSpec{Resources: resources}}
+	targetResources := resources
+	targetResources.Capacity.CPU = 2
+	p := &buildPipeline{
+		profile: types.ProfileBare, baseRef: "manifest://" + strings.Repeat("a", 64),
+		spec: &configsock.BuildSpec{
+			Resources: resources, SandboxResources: targetResources,
+			Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
+		},
+	}
 	phaseA, err := p.importYAML()
 	if err != nil {
 		t.Fatal(err)
 	}
 	phaseB := p.stepsYAML()
-	phaseC, err := p.templateYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for phase, doc := range map[string]map[string]any{"a": phaseA, "b": phaseB, "c": phaseC} {
+	for phase, doc := range map[string]map[string]any{"a": phaseA, "b": phaseB} {
 		got, ok := doc["resources"].(rtconfig.ResourcesConfig)
 		if !ok || !reflect.DeepEqual(got, resources) {
 			t.Fatalf("phase %s resources = %#v, want %#v", phase, doc["resources"], resources)
 		}
+	}
+	phaseC := decodeBuildColdConfig(t, p)
+	if !reflect.DeepEqual(phaseC.Resources, targetResources) {
+		t.Fatalf("phase C resources = %#v, want target %#v", phaseC.Resources, targetResources)
+	}
+}
+
+func TestOfflineAndMemoryTargetsShareColdProjection(t *testing.T) {
+	p := &buildPipeline{
+		profile: types.ProfileE2B, baseRef: "manifest://" + strings.Repeat("a", 64),
+		startCmd: "serve", readyCmd: "probe",
+		spec: &configsock.BuildSpec{
+			MMDSEnabled: true,
+			Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
+			SandboxEnv:  map[string]string{"REGISTERED": "yes"},
+			SandboxResources: rtconfig.ResourcesConfig{
+				Capacity: rtconfig.CapacityConfig{CPU: 2, Memory: "2GiB"},
+			},
+			TemplateNetwork: sandboxcfg.NetworkSpec{Hostname: "target", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1"},
+			SourceSandboxConfig: &rtconfig.PortableSandboxConfig{
+				Version: rtconfig.PortableSandboxConfigVersion,
+				Resources: rtconfig.PortableResourcesConfig{
+					Capacity:    rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
+					Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"},
+				},
+				Network: rtconfig.PortableNetworkConfig{Enabled: true, Interface: "eth0"},
+				Boot: rtconfig.PortableBootConfig{
+					Kernel:  "file://kernel@digest:" + strings.Repeat("b", 64),
+					Runtime: "file://runtime@digest:" + strings.Repeat("c", 64),
+					Root: rtconfig.PortableRootConfig{
+						Base: "self", Overlay: &rtconfig.PortableOverlayConfig{},
+					},
+				},
+				Launch:   rtconfig.PortableLaunchConfig{Env: map[string]string{"SOURCE": "yes"}},
+				Files:    []rtconfig.FileConfig{{Path: "/source", Content: "source"}},
+				Metadata: map[string]string{"source": "default", "remove": "me"},
+			},
+			SandboxSpec: sandboxcfg.SandboxSpec{
+				Files:    []rtconfig.FileConfig{{Path: "/registered", Content: "registered"}},
+				Metadata: map[string]string{"registered": "wins"},
+			},
+			SandboxNamespaces: []string{sandboxcfg.NsFiles, sandboxcfg.NsMetadata},
+		},
+	}
+	offline := decodeBuildColdConfig(t, p)
+	if len(offline.Files) != 1 || offline.Files[0].Path != "/registered" {
+		t.Fatalf("registered files did not replace source defaults: %#v", offline.Files)
+	}
+	if offline.Metadata["registered"] != "wins" || offline.Metadata["remove"] != "" {
+		t.Fatalf("registered metadata did not replace source namespace: %#v", offline.Metadata)
+	}
+	if offline.Launch.Env["SOURCE"] != "yes" || offline.Launch.Env["REGISTERED"] != "yes" {
+		t.Fatalf("launch env precedence = %#v", offline.Launch.Env)
+	}
+	if offline.Network.Interface != "eth0" {
+		t.Fatalf("source portable network interface = %q, want eth0", offline.Network.Interface)
+	}
+}
+
+func TestSourceStepsYAMLClearsPersistentActions(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		Paths: configsock.BuildPaths{Kernel: "/k", Runtime: "/r", BuilderDiffTpl: "/d"},
+	}}
+	doc := p.sourceStepsYAML()
+	for _, field := range []string{"mounts", "files", "init"} {
+		values, ok := doc[field].([]any)
+		if !ok || len(values) != 0 {
+			t.Fatalf("source steps %s = %#v, want explicit empty list", field, doc[field])
+		}
+	}
+	launch := doc["launch"].(map[string]any)
+	if env, ok := launch["env"].(map[string]string); !ok || len(env) != 0 {
+		t.Fatalf("source steps launch.env = %#v", launch["env"])
+	}
+	if plugins, ok := launch["plugin"].([]any); !ok || len(plugins) != 0 {
+		t.Fatalf("source steps launch.plugin = %#v", launch["plugin"])
+	}
+	if ephemeral, ok := launch["ephemeral_env"].(map[string]string); !ok || len(ephemeral) != 0 {
+		t.Fatalf("source steps launch.ephemeral_env = %#v", launch["ephemeral_env"])
+	}
+	for _, field := range []string{"workdir", "stop_signal", "stop_grace_period", "start_timeout"} {
+		if got, ok := launch[field].(string); !ok || got != "" {
+			t.Fatalf("source steps launch.%s = %#v, want explicit empty string", field, launch[field])
+		}
+	}
+	for _, field := range []string{"placeholder"} {
+		if got, ok := launch[field].(bool); !ok || got {
+			t.Fatalf("source steps launch.%s = %#v, want explicit false", field, launch[field])
+		}
+	}
+}
+
+func TestFixedReadinessIsCancelable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if err := waitFixedReadiness(ctx, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitFixedReadiness = %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("canceled fixed readiness wait did not return promptly")
+	}
+}
+
+func TestEnvdInitPayloadCarriesRegisteredEnvironment(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		SandboxEnv: map[string]string{"REGISTERED": "yes"}, MMDSEnabled: true, EnvdToken: "token",
+	}}
+	payload := p.envdInitPayload()
+	if !reflect.DeepEqual(payload["envVars"], p.spec.SandboxEnv) || payload["accessToken"] != "token" {
+		t.Fatalf("envd init payload = %#v", payload)
 	}
 }
 
@@ -664,19 +803,17 @@ func TestStepsYAMLOmitsFlattenConfigFiles(t *testing.T) {
 
 func TestTemplateYAMLOmitsFlattenConfigFiles(t *testing.T) {
 	// Phase C never touches a registry, so TLS config must not be projected.
-	p := &buildPipeline{spec: &configsock.BuildSpec{
-		RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
-		Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
-	}}
-	doc, err := p.templateYAML()
-	if err != nil {
-		t.Fatal(err)
+	p := &buildPipeline{
+		profile: types.ProfileBare, baseRef: "manifest://" + strings.Repeat("a", 64),
+		spec: &configsock.BuildSpec{
+			RegistryTLS: &configsock.BuildRegistryTLS{CABundlePEM: testCACertPEM},
+			Paths:       configsock.BuildPaths{Kernel: "/k", Runtime: "/r", OverlayDiffTpl: "/d"},
+		},
 	}
-	if files, ok := doc["files"]; ok {
-		for _, f := range files.([]map[string]any) {
-			if f["path"] == guestCACert || f["path"] == guestFlattenCfg {
-				t.Fatalf("TLS file leaked into template YAML: %#v", f)
-			}
+	cfg := decodeBuildColdConfig(t, p)
+	for _, f := range cfg.Files {
+		if f.Path == guestCACert || f.Path == guestFlattenCfg {
+			t.Fatalf("TLS file leaked into template YAML: %#v", f)
 		}
 	}
 }

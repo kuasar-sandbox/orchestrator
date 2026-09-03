@@ -18,7 +18,7 @@ func admissionBuild(id string, resources types.BuildResources) *types.Build {
 	return &types.Build{
 		BuildID: id, TemplateID: "transient-" + id,
 		APISecret: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
-		Profile: types.ProfileE2B, Kind: types.KindImg, Status: types.BuildRegistered,
+		Profile: types.ProfileE2B, Status: types.BuildRegistered,
 		Resources: resources, CreatedUnix: time.Now().Unix(),
 	}
 }
@@ -129,8 +129,13 @@ func TestRegistrationReplayIsIdempotentAndConflictIsImmutable(t *testing.T) {
 		t.Fatalf("conflict error = %v", err)
 	}
 	for name, mutate := range map[string]func(*types.Build){
-		"image repo":    func(b *types.Build) { b.RegistrationImageRepo = "registry.test/other" },
-		"registry auth": func(b *types.Build) { b.RegistrationRegistryAuth = `{"auths":{"registry.test":{"auth":"other"}}}` },
+		"image repo":           func(b *types.Build) { b.RegistrationImageRepo = "registry.test/other" },
+		"registry auth":        func(b *types.Build) { b.RegistrationRegistryAuth = `{"auths":{"registry.test":{"auth":"other"}}}` },
+		"environment":          func(b *types.Build) { b.Env = map[string]string{"NAME": "other"} },
+		"secure":               func(b *types.Build) { b.Secure = !b.Secure },
+		"service secret":       func(b *types.Build) { b.ServiceSecret = "other" },
+		"envd access token":    func(b *types.Build) { b.EnvdAccessToken = "other" },
+		"traffic access token": func(b *types.Build) { b.TrafficAccessToken = "other" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := *build
@@ -149,7 +154,6 @@ func TestRegistrationReplayIsIdempotentAndConflictIsImmutable(t *testing.T) {
 	mutated := *registered
 	mutated.Status = types.BuildBuilding
 	mutated.ExecutionClaimed = true
-	mutated.Kind = types.KindSnp
 	mutated.FromImage = "registry.test/triggered:latest"
 	mutated.StartCmd = "serve"
 	mutated.Steps = []types.TemplateStep{{Type: "RUN", Args: []string{"echo", "triggered"}}}

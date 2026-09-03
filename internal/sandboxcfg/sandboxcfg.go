@@ -79,10 +79,14 @@ type SandboxSpec struct {
 	Network  NetworkSpec
 	Restore  RestoreSpec
 	Launch   *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
-	Init     []rtconfig.InitConfig
-	Mounts   []rtconfig.MountConfig
-	Files    []rtconfig.FileConfig
-	Metadata map[string]string // -> SANDBOX_CONFIG.metadata passthrough (e.g. e2b.start_cmd)
+	// LaunchCgroupControl preserves whether the boolean was explicitly present.
+	// LaunchConfig alone cannot distinguish an omitted value from false when a
+	// source Sandbox contributes lower-priority launch defaults.
+	LaunchCgroupControl *bool `json:"launch_cgroup_control,omitempty"`
+	Init                []rtconfig.InitConfig
+	Mounts              []rtconfig.MountConfig
+	Files               []rtconfig.FileConfig
+	Metadata            map[string]string // -> SANDBOX_CONFIG.metadata passthrough (e.g. e2b.start_cmd)
 }
 
 // ParseSpec decodes the kuasar-sandbox.<ns> metadata keys. Values are JSON; we parse
@@ -131,7 +135,14 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 		if err := yaml.Unmarshal([]byte(raw), &l); err != nil {
 			return s, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: %w", NsLaunch, err)
 		}
+		var presence struct {
+			CgroupControl *bool `yaml:"cgroup_control"`
+		}
+		if err := yaml.Unmarshal([]byte(raw), &presence); err != nil {
+			return s, fmt.Errorf("sandboxcfg: metadata[%q] is not valid JSON: %w", NsLaunch, err)
+		}
 		s.Launch = &l
+		s.LaunchCgroupControl = presence.CgroupControl
 	}
 	if err := dec(NsInit, &s.Init); err != nil {
 		return s, err
@@ -642,10 +653,10 @@ func (p Params) buildRuntimeNetwork() rtconfig.NetworkConfig {
 // buildLaunch fills launch. e2b is envd-owned (a tenant launch override is rejected);
 // bare uses the image entrypoint by default, overlaid by the tenant launch spec.
 func (p Params) buildLaunch(c *rtconfig.SandboxConfig) error {
+	if err := ValidateLaunchForProfile(p.Template.Profile, p.Spec.Launch); err != nil {
+		return err
+	}
 	if p.Template.Profile == types.ProfileE2B {
-		if p.Spec.Launch != nil {
-			return fmt.Errorf("sandboxcfg: launch override is not allowed for the e2b profile (envd owns launch)")
-		}
 		// FC mode (drop -isnotfc) when MMDS is enabled so envd polls the metadata
 		// service for the access-token hash and accepts re-keying at /init.
 		args := []string{"-isnotfc", "-port", "49983"}
@@ -686,6 +697,19 @@ func (p Params) buildLaunch(c *rtconfig.SandboxConfig) error {
 			c.Launch.Plugin = s.Plugin
 		}
 		c.Launch.Env = mergeStr(p.EnvVars, s.Env) // tenant launch env overrides create env
+	}
+	return nil
+}
+
+// ValidateLaunchForProfile applies the same profile ownership rule at request
+// normalization and at final rendering. e2b's launch is platform-owned by
+// envd; bare is the only profile that accepts a tenant launch override.
+func ValidateLaunchForProfile(profile types.Profile, launch *rtconfig.LaunchConfig) error {
+	if !profile.Valid() {
+		return fmt.Errorf("sandboxcfg: unknown profile %q", profile)
+	}
+	if profile == types.ProfileE2B && launch != nil {
+		return fmt.Errorf("sandboxcfg: launch override is not allowed for the e2b profile (envd owns launch)")
 	}
 	return nil
 }

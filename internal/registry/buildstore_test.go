@@ -77,13 +77,20 @@ func (a *recordingNodeOwner) SendCommandAndWait(ctx context.Context, nodeID stri
 	if a.ack != nil {
 		return a.ack, nil
 	}
-	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
+	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+	if cmd.Kind == routesync.CmdBuildRegister {
+		ack.BuildRegister = &routesync.BuildRegisterResult{}
+	}
+	return ack, nil
 }
 
 func buildAckConn(reg *Registry, nodeID string) *fakeConn {
 	return &fakeConn{nodeID: nodeID, onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind == routesync.CmdBuildRegister {
-			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+			go reg.ackCommand(&routesync.CmdAck{
+				CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+				BuildRegister: &routesync.BuildRegisterResult{},
+			})
 		}
 	}}
 }
@@ -97,6 +104,11 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	admitter := &recordingNodeOwner{allow: true, runtime: map[string]*NodeRecord{
 		"n1": {NodeID: "n1", APIEndpoint: "node-api:7443", DataEndpoint: "node-data:8443"},
 	}}
+	acceptedTarget := &types.BuildTarget{Kind: types.BuildTargetSandbox}
+	admitter.ack = &routesync.CmdAck{
+		Status:        routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: acceptedTarget},
+	}
 	reg.SetNodeOwner(admitter)
 
 	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileBare, Resources: testWireBuildResources()})
@@ -106,11 +118,34 @@ func TestReserveBuildDelegatesAdmissionToNodeCommand(t *testing.T) {
 	if res.Profile != types.ProfileBare || res.APIEndpoint != "node-api:7443" || len(admitter.commands) != 1 || admitter.commands[0].Profile != string(types.ProfileBare) {
 		t.Fatalf("profile did not reach build_register: result=%q commands=%+v", res.Profile, admitter.commands)
 	}
-	if resolved, found := reg.ResolveBuild(ctx, "/g", res.BuildID); !found || resolved.APIEndpoint != "node-api:7443" {
+	if res.Target == nil || *res.Target != *acceptedTarget {
+		t.Fatalf("ReserveBuild accepted target = %+v, want %+v", res.Target, acceptedTarget)
+	}
+	if resolved, found := reg.ResolveBuild(ctx, "/g", res.BuildID); !found || resolved.APIEndpoint != "node-api:7443" ||
+		resolved.Target == nil || *resolved.Target != *acceptedTarget {
 		t.Fatalf("ResolveBuild = %+v found=%v", resolved, found)
 	}
 	if got := admitter.commands[0].BuildResources; got == nil || got.CPU != 2000 || got.Memory != 2<<30 {
 		t.Fatalf("build resources did not reach node authority: %+v", got)
+	}
+}
+
+func TestReserveBuildRejectsAcceptedAckWithoutBuildResult(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	reg.SetNodeOwner(&recordingNodeOwner{ack: &routesync.CmdAck{Status: routesync.AckAccepted}})
+
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", BuildID: "missing-ack-result", Profile: types.ProfileBare,
+		Resources: testWireBuildResources(),
+	})
+	if err == nil || res != nil || !strings.Contains(err.Error(), "no build_register result") {
+		t.Fatalf("ReserveBuild result=%+v err=%v, want fail-closed protocol error", res, err)
+	}
+	rec, found, getErr := reg.stores.GetBuildInGroup(ctx, "/g", "missing-ack-result")
+	if getErr != nil || !found || rec.State != BuildStarting || rec.RegistrationTargetSet {
+		t.Fatalf("ambiguous registration = %+v, found=%t err=%v", rec, found, getErr)
 	}
 }
 
@@ -538,6 +573,50 @@ func TestReserveBuildRetriesSameNodeAfterAckTimeout(t *testing.T) {
 	}
 }
 
+func TestReserveBuildRecoversTargetWhenStateEventOutrunsAck(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
+	reg.SetNodeOwner(owner)
+	req := BuildReserveReq{
+		Group: "/g", BuildID: "target-recovery", TemplateID: "transient-target-recovery",
+		Profile: types.ProfileE2B, Resources: testWireBuildResources(),
+	}
+	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
+		t.Fatalf("ambiguous reserve result=%+v err=%v", res, err)
+	}
+	if err := reg.applyBuildUpsert(ctx, "n1", &routesync.BuildEvent{
+		BuildID: req.BuildID, State: string(BuildRegistered),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	projected, found, err := reg.stores.GetBuildInGroup(ctx, req.Group, req.BuildID)
+	if err != nil || !found || projected.RegistrationTargetSet ||
+		projected.RegistrationImageRepo == "" || projected.RegistrationRegistryAuth == "" {
+		t.Fatalf("pre-ACK projection = %+v, found=%t err=%v", projected, found, err)
+	}
+	if _, found := reg.ResolveBuild(ctx, req.Group, req.BuildID); found {
+		t.Fatal("state projection exposed build before accepted target was durable")
+	}
+
+	want := &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	owner.ackErr = nil
+	owner.ack = &routesync.CmdAck{
+		Status:        routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: want},
+	}
+	res, err := reg.ReserveBuild(ctx, req)
+	if err != nil || res == nil || res.Target == nil || *res.Target != *want {
+		t.Fatalf("target recovery result=%+v err=%v", res, err)
+	}
+	accepted, found, err := reg.stores.GetBuildInGroup(ctx, req.Group, req.BuildID)
+	if err != nil || !found || !accepted.RegistrationTargetSet || accepted.RegistrationTarget == nil ||
+		*accepted.RegistrationTarget != *want || accepted.RegistrationImageRepo != "" || accepted.RegistrationRegistryAuth != "" {
+		t.Fatalf("accepted target recovery = %+v, found=%t err=%v", accepted, found, err)
+	}
+}
+
 func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -545,10 +624,17 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
 	const secret = "cluster-initial-plaintext"
+	credentials := &sandboxcfg.Credentials{
+		ServiceSecret: strings.Repeat("a", 64), EnvdAccessToken: "cluster-envd-plaintext",
+		TrafficAccessToken: "cluster-traffic-plaintext",
+	}
 	req := BuildReserveReq{
 		Group: "/g", BuildID: "mmds-build", TemplateID: "transient-mmds", Profile: types.ProfileE2B,
 		Resources: testWireBuildResources(),
-		Metadata:  map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"` + secret + `"}}`},
+		Metadata: map[string]string{
+			sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"` + secret + `"}}`,
+		},
+		Env: map[string]string{"BUILD_NAME": "cluster-build"}, Secure: true, Credentials: credentials,
 	}
 	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
 		t.Fatalf("ambiguous reserve result=%+v err=%v", res, err)
@@ -564,11 +650,18 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(wire), secret) || strings.Contains(string(wire), `"secrets"`) || rec.RegistrationMMDSValuesDigest == "" {
-		t.Fatalf("replicated replay record retained MMDS values or lost digest: %s", wire)
+	for _, plaintext := range []string{secret, credentials.ServiceSecret, credentials.EnvdAccessToken, credentials.TrafficAccessToken} {
+		if strings.Contains(string(wire), plaintext) {
+			t.Fatalf("replicated replay record retained confidential value %q: %s", plaintext, wire)
+		}
 	}
-	if len(owner.commands) != 1 || owner.commands[0].BuildMMDSSecrets["key"] != secret {
-		t.Fatalf("node command did not receive request-scoped MMDS values: %+v", owner.commands)
+	if strings.Contains(string(wire), `"secrets"`) || rec.RegistrationMMDSValuesDigest == "" || rec.RegistrationCredentialsDigest == "" {
+		t.Fatalf("replicated replay record retained MMDS values or lost an identity digest: %s", wire)
+	}
+	if len(owner.commands) != 1 || owner.commands[0].BuildMMDSSecrets["key"] != secret ||
+		owner.commands[0].BuildCredentials == nil || *owner.commands[0].BuildCredentials != *credentials ||
+		owner.commands[0].BuildEnv["BUILD_NAME"] != "cluster-build" || !owner.commands[0].BuildSecure {
+		t.Fatalf("node command did not receive request-scoped registration values: %+v", owner.commands)
 	}
 
 	changed := req
@@ -576,12 +669,31 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
 		t.Fatalf("changed MMDS replay err=%v", err)
 	}
+	changed = req
+	changedCredentials := *credentials
+	changedCredentials.EnvdAccessToken = "changed-envd"
+	changed.Credentials = &changedCredentials
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed credential replay err=%v", err)
+	}
+	changed = req
+	changed.Env = map[string]string{"BUILD_NAME": "changed"}
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed environment replay err=%v", err)
+	}
+	changed = req
+	changed.Secure = false
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed secure replay err=%v", err)
+	}
 	owner.ackErr = nil
 	res, err := reg.ReserveBuild(ctx, req)
 	if err != nil || res == nil {
 		t.Fatalf("exact MMDS replay result=%+v err=%v", res, err)
 	}
-	if len(owner.commands) != 2 || owner.commands[1].BuildMMDSSecrets["key"] != secret {
+	if len(owner.commands) != 2 || owner.commands[1].BuildMMDSSecrets["key"] != secret ||
+		owner.commands[1].BuildCredentials == nil || *owner.commands[1].BuildCredentials != *credentials ||
+		owner.commands[1].BuildEnv["BUILD_NAME"] != "cluster-build" || !owner.commands[1].BuildSecure {
 		t.Fatalf("exact MMDS replay command=%+v", owner.commands)
 	}
 }
@@ -847,7 +959,11 @@ func TestReserveBuildReleasesAdmissionOnRejectedAck(t *testing.T) {
 		if reject {
 			status, reason, httpStatus = routesync.AckRejected, "no budget", http.StatusTooManyRequests
 		}
-		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus})
+		ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus}
+		if status == routesync.AckAccepted {
+			ack.BuildRegister = &routesync.BuildRegisterResult{}
+		}
+		go reg.ackCommand(ack)
 	}})
 
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Profile: types.ProfileE2B, Resources: testWireBuildResources()}); err == nil {

@@ -153,7 +153,10 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 
 func mergeBuildConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
 	var err error
-	meta, err = mergeConfigHeaders(meta, h)
+	// Build registration accepts the same Create configuration headers. The
+	// core applies target-specific instance/portable validation after target
+	// resolution; restore is always rejected there.
+	meta, err = mergeCreateConfigHeaders(meta, h)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +298,8 @@ type RegisterSpec struct {
 	Profile    types.Profile
 	Resources  types.BuildResources
 	Metadata   map[string]string
+	EnvVars    map[string]string
+	Secure     bool
 	Builder    types.BuildOptions
 	MMDSHeader *string
 }
@@ -885,17 +890,24 @@ func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name       string            `json:"name"`
-		Tags       []string          `json:"tags"`
-		Profile    string            `json:"profile"`
-		CPUCount   json.RawMessage   `json:"cpuCount"`
-		CPUCountSn json.RawMessage   `json:"cpu_count"`
-		MemoryMB   json.RawMessage   `json:"memoryMB"`
-		MemoryMBSn json.RawMessage   `json:"memory_mb"`
-		Metadata   map[string]string `json:"metadata"`
+		Name            string            `json:"name"`
+		Tags            []string          `json:"tags"`
+		Profile         string            `json:"profile"`
+		CPUCount        json.RawMessage   `json:"cpuCount"`
+		CPUCountSn      json.RawMessage   `json:"cpu_count"`
+		MemoryMB        json.RawMessage   `json:"memoryMB"`
+		MemoryMBSn      json.RawMessage   `json:"memory_mb"`
+		Metadata        map[string]string `json:"metadata"`
+		EnvVars         map[string]string `json:"envVars"`
+		Secure          bool              `json:"secure"`
+		AutoPauseMemory json.RawMessage   `json:"autoPauseMemory"`
 	}
 	if err := decodeBuildRequest(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad body: "+err.Error())
+		return
+	}
+	if len(body.AutoPauseMemory) != 0 {
+		writeErr(w, http.StatusBadRequest, "autoPauseMemory is not valid for template builds; select builder.target.memory")
 		return
 	}
 	profile, err := requestedBuildProfile(body.Profile)
@@ -942,7 +954,8 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
 		Name: body.Name, Tags: body.Tags, Profile: profile, Resources: resources,
-		Metadata: meta, Builder: builderOpts, MMDSHeader: mmdsValue,
+		Metadata: meta, EnvVars: body.EnvVars, Secure: body.Secure,
+		Builder: builderOpts, MMDSHeader: mmdsValue,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -956,6 +969,7 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		"tags":       b.Aliases,
 		"aliases":    b.Aliases,
 		"profile":    b.Profile,
+		"target":     b.Builder.Target,
 	})
 }
 
@@ -1119,6 +1133,7 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 		"templateID": tid,
 		"buildID":    b.BuildID,
 		"profile":    b.Profile,
+		"target":     b.Builder.Target,
 		"status":     b.Status.SDKStatus(),
 		"logs":       logs,
 		"logEntries": logEntries,
@@ -1131,6 +1146,9 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 		"runID":              b.RunID,
 		"systemdEnforcement": b.EnforcementStatus,
 		"storageEnforcement": "admission-only",
+	}
+	if b.Kind != "" {
+		resp["kind"] = b.Kind
 	}
 	if b.Phase != "" {
 		resp["phase"] = map[string]any{"name": b.Phase, "sandboxID": b.PhaseSandboxID}
@@ -1157,6 +1175,8 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 			"templateID":  b.PersistID, // list shows the persist id as the canonical template id
 			"buildID":     b.BuildID,
 			"profile":     b.Profile,
+			"target":      b.Builder.Target,
+			"kind":        b.Kind,
 			"names":       b.Names,
 			"aliases":     b.Aliases,
 			"public":      false,

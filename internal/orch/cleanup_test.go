@@ -313,7 +313,10 @@ func TestBuildBaseDirFailureRetainsExecutionClaimUntilRetry(t *testing.T) {
 	if retryErr != nil {
 		t.Fatalf("retry BuildBaseDir cleanup: %v", retryErr)
 	}
-	o.completeBuild(context.Background(), build, &buildResult{ImageRef: "manifest://" + strings.Repeat("e", 64)}, nil)
+	o.completeBuild(context.Background(), build, &buildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("e", 64),
+	}, nil)
 	stored, getErr = o.st.GetBuild(context.Background(), build.BuildID)
 	if getErr != nil || stored == nil || stored.ExecutionClaimed || stored.Status != types.BuildReady {
 		t.Fatalf("terminal Build after BaseDir retry = %+v, %v", stored, getErr)
@@ -346,6 +349,7 @@ func TestCompleteBuildRetriesTransientCleanupWithoutRestart(t *testing.T) {
 	}
 
 	o.completeBuild(context.Background(), build, &buildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
 		ImageRef: "manifest://" + strings.Repeat("d", 64),
 	}, &buildCleanupPendingError{cleanup: errors.New("initial cleanup attempt failed")})
 
@@ -382,7 +386,10 @@ func TestAcceptedBuildResultSurvivesTransientFenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := buildResult{ImageRef: "manifest://" + strings.Repeat("f", 64)}
+	want := buildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("f", 64),
+	}
 	accepted, err := o.fenceAcceptedBuildResultWithin(unit, want, time.Millisecond)
 	var pending *buildCleanupPendingError
 	if accepted == nil || *accepted != want || !errors.As(err, &pending) || pending.cause != nil || !errors.Is(err, stopErr) {
@@ -475,6 +482,7 @@ func TestCompleteBuildRetainsUnpersistedPortAcrossCleanupRetries(t *testing.T) {
 	}
 
 	o.completeBuild(context.Background(), build, &buildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
 		ImageRef: "manifest://" + strings.Repeat("e", 64),
 	}, &buildCleanupPendingError{
 		cleanup: errors.New("ownership persistence and initial detach failed"),

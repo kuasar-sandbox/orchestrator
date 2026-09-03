@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
@@ -1179,7 +1180,7 @@ func validateStubExecSessionEnvelope(cmd *routesync.Command) error {
 		cmd.APISecretType != "" || cmd.APISecret != "" || cmd.APISecretRef != "" ||
 		cmd.ManifestKeyFingerprint != "" || cmd.ManifestKeyType != "" || cmd.ManifestKey != "" || cmd.ManifestKeyRef != "" ||
 		cmd.ExpiresUnix != 0 || cmd.BuildID != "" || cmd.BuildResources != nil || cmd.ImageRepo != "" || cmd.RegistryAuth != "" ||
-		len(cmd.BuildMMDSSecrets) != 0 {
+		len(cmd.BuildEnv) != 0 || cmd.BuildSecure || cmd.BuildCredentials != nil || len(cmd.BuildMMDSSecrets) != 0 {
 		return errors.New("exec session command contains fields for another operation")
 	}
 	return nil
@@ -1233,17 +1234,34 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 	if !types.Profile(cmd.Profile).Valid() {
 		return ackHTTP(cmd, routesync.AckRejected, "valid profile is required", http.StatusBadRequest)
 	}
+	if _, present := cmd.Config[sandboxcfg.NsCredentials]; present {
+		return ackHTTP(cmd, routesync.AckRejected, "build credentials must use the confidential command envelope", http.StatusBadRequest)
+	}
+	credentials := sandboxcfg.Credentials{}
+	if cmd.BuildCredentials != nil {
+		credentials = *cmd.BuildCredentials
+	}
+	if err := sandboxcfg.ValidateCredentialsForProfile(types.Profile(cmd.Profile), credentials); err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
+	}
 	resources := cmd.BuildResources.Types()
 	if err := resources.ValidateRequired(); err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
+	}
+	_, builderOptions, err := buildcfg.Extract(cmd.Config)
+	if err != nil {
 		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
 	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
 	b := &stubBuild{
 		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
 		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
+		Env: cloneStringMap(cmd.BuildEnv), Secure: cmd.BuildSecure,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 		RegistrationImageRepo: cmd.ImageRepo, RegistrationRegistryAuth: cmd.RegistryAuth,
+		RegistrationCredentials: cloneStubBuildCredentials(cmd.BuildCredentials),
 		RegistrationMMDSSecrets: cloneStringMap(cmd.BuildMMDSSecrets),
+		Target:                  cloneStubBuildTarget(builderOptions.Target),
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
@@ -1260,7 +1278,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		if terminal {
 			n.publishBuildEvent(event)
 		}
-		return ack(cmd, routesync.AckAccepted, "")
+		return ackBuildRegister(cmd, existing.Target)
 	}
 	// An exact replay after an ambiguous/lost ACK must be recognized before the
 	// mutable credential lease and current admission policy are consulted. The
@@ -1322,7 +1340,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		}
 		_ = n.setBuildState(b.BuildID, state, b.TemplateID, "", true)
 	}()
-	return ack(cmd, routesync.AckAccepted, "")
+	return ackBuildRegister(cmd, b.Target)
 }
 
 func sameStubBuildRegistration(a, b *stubBuild) bool {
@@ -1331,8 +1349,10 @@ func sameStubBuildRegistration(a, b *stubBuild) bool {
 	}
 	return a.Profile == b.Profile && a.TemplateID == b.TemplateID &&
 		a.APISecretFingerprint == b.APISecretFingerprint && *a.Resources == *b.Resources &&
-		maps.Equal(a.Metadata, b.Metadata) && a.RegistrationImageRepo == b.RegistrationImageRepo &&
+		maps.Equal(a.Metadata, b.Metadata) && maps.Equal(a.Env, b.Env) && a.Secure == b.Secure &&
+		a.RegistrationImageRepo == b.RegistrationImageRepo &&
 		hmac.Equal([]byte(a.RegistrationRegistryAuth), []byte(b.RegistrationRegistryAuth)) &&
+		equalStubBuildCredentials(a.RegistrationCredentials, b.RegistrationCredentials) &&
 		maps.Equal(a.RegistrationMMDSSecrets, b.RegistrationMMDSSecrets)
 }
 
@@ -1943,13 +1963,17 @@ type stubBuild struct {
 	Profile                  string                    `json:"profile"`
 	APISecretFingerprint     string                    `json:"-"`
 	Metadata                 map[string]string         `json:"metadata,omitempty"`
+	Env                      map[string]string         `json:"env,omitempty"`
+	Secure                   bool                      `json:"secure,omitempty"`
 	State                    string                    `json:"state"`
 	TemplateID               string                    `json:"template_id,omitempty"`
 	Reason                   string                    `json:"reason,omitempty"`
 	Resources                *routesync.BuildResources `json:"resources,omitempty"`
 	RegistrationImageRepo    string                    `json:"-"`
 	RegistrationRegistryAuth string                    `json:"-"`
+	RegistrationCredentials  *sandboxcfg.Credentials   `json:"-"`
 	RegistrationMMDSSecrets  map[string]string         `json:"-"`
+	Target                   *types.BuildTarget        `json:"target,omitempty"`
 	Behavior                 stubBehavior              `json:"behavior,omitempty"`
 	CreatedAt                string                    `json:"created_at,omitempty"`
 	RegistrationSeq          int64                     `json:"-"`
@@ -2216,6 +2240,21 @@ func ackHTTP(cmd *routesync.Command, status, reason string, httpStatus int) *rou
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus}
 }
 
+func ackBuildRegister(cmd *routesync.Command, target *types.BuildTarget) *routesync.CmdAck {
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: cloneStubBuildTarget(target)},
+	}
+}
+
+func cloneStubBuildTarget(target *types.BuildTarget) *types.BuildTarget {
+	if target == nil {
+		return nil
+	}
+	copy := *target
+	return &copy
+}
+
 func sidFromHost(host string) string {
 	left := host
 	if i := strings.IndexByte(left, '.'); i >= 0 {
@@ -2277,6 +2316,21 @@ func cloneBuildResources(in *routesync.BuildResources) *routesync.BuildResources
 	}
 	cp := *in
 	return &cp
+}
+
+func cloneStubBuildCredentials(in *sandboxcfg.Credentials) *sandboxcfg.Credentials {
+	if in == nil {
+		return nil
+	}
+	clone := *in
+	return &clone
+}
+
+func equalStubBuildCredentials(a, b *sandboxcfg.Credentials) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func cloneBuildAdmissionLimit(in *routesync.BuildAdmissionLimit) *routesync.BuildAdmissionLimit {
