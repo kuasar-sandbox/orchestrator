@@ -660,7 +660,7 @@ APISecret+ManifestKey 凭据对在白名单,否则 **403**。
 | resource stats | `GET /sandboxes/{id}/stats/resource` | 只读 resource controller reservation/report;sparse JSON,不访问 envd |
 | traffic stats | `GET /sandboxes/{id}/stats/traffic` | 最终 node proxy 当前 parking/egress 与保守 `idleSince`;不 Wake/Resume |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,省略 state 时只列 running/paused,显式 state 可供内部故障诊断;分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(`cpuCount`/`memoryMB` 的合同仍是 capacity/SKU,不改成 memory headroom)与 ISO-8601 `startedAt`/`endAt` |
-| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,detach network,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
+| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404;先把当前完整 owner 原子转为内部 `deleting`,从节点 cache/full snapshot 排除并在返回前发布 route Delete,再由 finalizer 取消 launch,fence runner,在 allocation fence 内 detach 并 durable exact-clear network tuple,删除 RunDir/BaseDir 并 hard-delete row;route Delete 只表示 projection withdrawal,pending 时重复调用幂等 |
 | resume | `POST /sandboxes/{id}/connect` | body `{timeout:秒, memory?:bool|null}`;`memory` 是 Kuasar extension:nil=auto,true=memory,false=cold;paused 在返回前原子变为 `starting` 并持久化 `launch_mode`;目标缺失时可携 `X-Kuasar-Migration-Token` 同步 import paused 后执行同一受理;返回不等待异步 launch |
 | exec session | `POST /sandboxes/{id}/exec-sessions` → 201 | 只接受 `X-API-KEY`;为 native exec 签发一个 `execAccessToken`,body 可含 `ttlSeconds` 和 CEL `conditions`,并可携 `X-Kuasar-Migration-Token`;不创建 guest process |
 | pause | `POST /sandboxes/{id}/pause` → 204 | body `memory` omitted/null/true 保存 Snapshot S,false 保存 Sandbox E;false 与 snapshot-only merge/drop 字段组合返回 400;已暂停或正在 starting 回 409 |
@@ -1586,9 +1586,11 @@ Pause 原子覆盖它。
 unit identity,port,RunDir,BaseDir 与制品 owner,取消 attempt 并立即撤销节点 cache 与后续 full
 snapshot activation,同时发布 route Delete 撤销既有 live projection.该 Delete 不证明本地资源已完成清理.
 请求在 durable acceptance 后返回;节点 finalizer 等待 late launch owner 退出,再按
-Stop/Reset + inactive readback、Detach、RemoveAll RunDir、RemoveAll BaseDir、exact hard-delete
-收敛.hard-delete 后才发送 Extension/object terminal observation,不再发布第二次 route Delete.
-失败不清 ownership,当前进程持续重试,崩溃后由 startup Reconcile 重试.每次 fresh Create 必须在启动资源前通过
+Stop/Reset + inactive readback,allocation fence 内 Detach + full-owner exact CAS 清空 network tuple,
+RemoveAll RunDir,RemoveAll BaseDir,exact hard-delete 收敛.只有 durable network clear 成功才释放
+detached-port fence;其后的目录或 hard-delete 故障继续保留 path/runner owner,但不阻塞新的 Attach.
+hard-delete 后才发送 Extension/object terminal observation,不再发布第二次 route Delete.失败不清尚未
+完成的 ownership,当前进程持续重试,崩溃后由 startup Reconcile 重试.每次 fresh Create 必须在启动资源前通过
 route-applied barrier;失败在完成本地 cleanup 后以 exact owner CAS 收敛为零 ownership `dead`，
 并发布 Delete 撤销 route。
 
@@ -1948,8 +1950,9 @@ bookmark{full_sync}
 Delete,就立即从本地 cache 和后续 full sync route set 排除,并在既有 live 链路发送
 `delete{sid}`.该事件只撤销 route projection,不证明 unit/network/path cleanup 或 hard-delete 已完成.
 若进程在 durable transition 与增量发布之间退出,旧 stream 随进程失效;下一代完整 route snapshot
-因该 SID 已被排除而撤下旧 projection.node 重启仍能从完整 owner 重试清理,本地 finalizer 正确性
-不依赖 Registry projection,也不在完成时发送第二个 route Delete.
+因该 SID 已被排除而撤下旧 projection.node 重启仍能从 durable `deleting` row 中尚未完成的 owner
+重试清理;已经 exact-clear 的 network tuple 不再取得.本地 finalizer 正确性不依赖 Registry
+projection,也不在完成时发送第二个 route Delete.
 
 该 node route event 保留既有 `mmds_secret` 字段供节点 proxy/MMDS 路径使用;cluster Registry
 物化受保护 route 时不采纳该字段。starting 只表示 node-local launch 正在进行,Registry
@@ -2447,10 +2450,12 @@ AES-256-GCM、两项 `*_hash` 均为
 conductor 在开放 API、config-socket routesync 和 node-link 前先以
 `ListUnitsByPatterns("sandbox-runner@*.service")` 对账:
 
-- 库内 `deleting` 是已经接纳、尚未完成的显式删除。Reconcile 先取消同 SID 的 launch owner，
-  fence exact unit、detach exact port、依次删除 canonical RunDir/BaseDir，再 exact hard-delete；
-  任一步失败则启动 fail closed，完整 row 保留供重试。`deleting` 不进入 route full snapshot、
-  Wake、Resume、Exec 或任何 activation；
+- 库内 `deleting` 是已经接纳、尚未完成的显式删除.Reconcile 先取消同 SID 的 launch owner,
+  fence exact unit;network tuple 非空时在 allocation fence 内 detach exact port 并 full-owner
+  exact-clear 四个 network 字段,tuple 已空则直接跳过 Detach;随后依次删除 canonical
+  RunDir/BaseDir,再 exact hard-delete.任一步失败则启动 fail closed,尚未完成的 owner 保留供重试;
+  已 durable clear 的 network owner 不会因目录重试重新取得.`deleting` 不进入 route full snapshot,
+  Wake,Resume,Exec 或任何 activation;
 - 库内 starting 不直接收养为 running。fresh Create 先 Stop/Reset exact runner、detach network、
   清理 RunDir/BaseDir,再以 exact run-id CAS 到 dead。带合法 `ResumeSource` 的 starting
   是已接受 resume:同样先释放旧 ownership,但保持 `state=starting`、source 和 durable

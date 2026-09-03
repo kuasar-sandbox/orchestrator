@@ -625,8 +625,10 @@ park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 no
 持久转为 `deleting`,就立即从本地 cache 和后续 full sync route set 排除,并在既有 live node-link
 上发送 Delete 撤销 projection.该 Delete 不是 unit,network,RunDir/BaseDir cleanup 或 hard-delete
 的完成证明.若进程在 durable transition 与增量发布之间退出,旧 stream 随进程失效;下一代完整
-route snapshot 因该 SID 已被排除而撤下旧 projection.node 重启仍从完整 owner 重试本地清理,
-正确性不依赖 Registry 是否还保留 projection;finalizer 完成时不再发送第二个 route Delete.
+route snapshot 因该 SID 已被排除而撤下旧 projection.node 重启仍从 durable `deleting` row 中
+尚未完成的 owner 重试本地清理;已经 allocation-fenced Detach 并 exact-clear 的 network tuple
+直接跳过,不因目录故障重新取得.正确性不依赖 Registry 是否还保留 projection;finalizer 完成时
+不再发送第二个 route Delete.
 
 node 的 CmdCreate `cmd_ack` 只在其已 claim 唯一 launch attempt、insert durable
 `starting,run_id=""` 并 cache/publish starting 后返回;Ack 是 node-local launch acceptance,

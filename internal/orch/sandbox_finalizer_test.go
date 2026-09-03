@@ -93,27 +93,33 @@ func (l *sandboxFinalizerLauncher) stopSnapshot() (string, int) {
 }
 
 type sandboxFinalizerVS struct {
-	mu        sync.Mutex
-	detachErr error
-	detached  bool
-	calls     int
+	mu         sync.Mutex
+	detachErr  error
+	detachHook func(string)
+	detached   bool
+	calls      int
 }
 
 func (*sandboxFinalizerVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
 	return nil, nil
 }
-func (v *sandboxFinalizerVS) Detach(context.Context, string) error {
+func (v *sandboxFinalizerVS) Detach(_ context.Context, port string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.calls++
-	if v.detachErr != nil {
-		return v.detachErr
+	err := v.detachErr
+	if err == nil {
+		if v.detached {
+			err = vswitch.ErrPortNotAttached
+		} else {
+			v.detached = true
+		}
 	}
-	if v.detached {
-		return vswitch.ErrPortNotAttached
+	hook := v.detachHook
+	v.mu.Unlock()
+	if hook != nil {
+		hook(port)
 	}
-	v.detached = true
-	return nil
+	return err
 }
 func (*sandboxFinalizerVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
@@ -122,6 +128,25 @@ func (v *sandboxFinalizerVS) clearFault() {
 	v.detachErr = nil
 	v.mu.Unlock()
 }
+
+type serializedSandboxDeleteVS struct {
+	detachStarted chan struct{}
+	allowDetach   chan struct{}
+	attachStarted chan struct{}
+}
+
+func (v *serializedSandboxDeleteVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) {
+	close(v.attachStarted)
+	return &vswitch.Port{Port: "port-new"}, nil
+}
+
+func (v *serializedSandboxDeleteVS) Detach(context.Context, string) error {
+	close(v.detachStarted)
+	<-v.allowDetach
+	return nil
+}
+
+func (*serializedSandboxDeleteVS) TapFD(string) vswitch.TapFD { return vswitch.TapFD{} }
 
 type sandboxFinalizerFixture struct {
 	o      *Orchestrator
@@ -181,43 +206,61 @@ func beginDeletingForTest(t *testing.T, fixture sandboxFinalizerFixture) {
 
 func assertDeletingOwnership(t *testing.T, fixture sandboxFinalizerFixture) *types.Sandbox {
 	t.Helper()
+	return assertDeletingOwnershipState(t, fixture, true)
+}
+
+func assertDeletingOwnershipState(t *testing.T, fixture sandboxFinalizerFixture, wantNetwork bool) *types.Sandbox {
+	t.Helper()
 	got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID)
 	if err != nil || got == nil {
 		t.Fatalf("deleting owner = %+v, %v", got, err)
 	}
-	if got.State != types.StateDeleting || got.RunID != fixture.sb.RunID || got.VswitchPort != fixture.sb.VswitchPort ||
+	wantPort, wantFloatingIP, wantInnerIP, wantPortMAC := "", "", "", ""
+	if wantNetwork {
+		wantPort, wantFloatingIP, wantInnerIP, wantPortMAC = fixture.sb.VswitchPort, fixture.sb.FloatingIP, fixture.sb.InnerIP, fixture.sb.PortMAC
+	}
+	if got.State != types.StateDeleting || got.RunID != fixture.sb.RunID || got.VswitchPort != wantPort ||
+		got.FloatingIP != wantFloatingIP || got.InnerIP != wantInnerIP || got.PortMAC != wantPortMAC ||
 		got.RunDir != fixture.sb.RunDir || got.BaseDir != fixture.sb.BaseDir {
 		t.Fatalf("cleanup failure lost deleting ownership: %+v", got)
 	}
 	return got
 }
 
-func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
+func TestSandboxDeleteFinalizerRetainsOnlyPendingOwnershipAtEveryFailure(t *testing.T) {
 	fault := errors.New("injected finalizer failure")
 	for _, test := range []struct {
 		name          string
 		inject        func(*sandboxFinalizerFixture)
 		clear         func(*sandboxFinalizerFixture)
+		wantNetwork   bool
 		wantRunExists bool
 		wantBaseExist bool
+		wantDetaches  int
 	}{
 		{
 			name:          "stop",
 			inject:        func(f *sandboxFinalizerFixture) { f.lc.stopErr = fault },
 			clear:         func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+			wantNetwork:   true,
 			wantRunExists: true, wantBaseExist: true,
+			wantDetaches: 1,
 		},
 		{
 			name:          "reset",
 			inject:        func(f *sandboxFinalizerFixture) { f.lc.resetErr = fault },
 			clear:         func(f *sandboxFinalizerFixture) { f.lc.clearFaults() },
+			wantNetwork:   true,
 			wantRunExists: true, wantBaseExist: true,
+			wantDetaches: 1,
 		},
 		{
 			name:          "detach",
 			inject:        func(f *sandboxFinalizerFixture) { f.vs.detachErr = fault },
 			clear:         func(f *sandboxFinalizerFixture) { f.vs.clearFault() },
+			wantNetwork:   true,
 			wantRunExists: true, wantBaseExist: true,
+			wantDetaches: 2,
 		},
 		{
 			name: "run-dir",
@@ -226,6 +269,7 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 			},
 			clear:         func(f *sandboxFinalizerFixture) { f.o.removeSandboxRunDir = os.RemoveAll },
 			wantRunExists: true, wantBaseExist: true,
+			wantDetaches: 1,
 		},
 		{
 			name: "base-dir",
@@ -234,6 +278,7 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 			},
 			clear:         func(f *sandboxFinalizerFixture) { f.o.removeSandboxBaseDir = os.RemoveAll },
 			wantRunExists: false, wantBaseExist: true,
+			wantDetaches: 1,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -243,7 +288,18 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 			if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); !errors.Is(err, fault) {
 				t.Fatalf("first finalizer error = %v", err)
 			}
-			assertDeletingOwnership(t, fixture)
+			assertDeletingOwnershipState(t, fixture, test.wantNetwork)
+			if !test.wantNetwork {
+				fixture.o.networkAllocationMu.Lock()
+				_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+				fixture.o.networkAllocationMu.Unlock()
+				if fenced {
+					t.Fatal("durably cleared deleting port remained allocation-fenced")
+				}
+				if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err != nil {
+					t.Fatalf("new allocation after durable network clear: %v", err)
+				}
+			}
 			for path, wantExists := range map[string]bool{
 				fixture.sb.RunDir: test.wantRunExists, fixture.sb.BaseDir: test.wantBaseExist,
 			} {
@@ -259,6 +315,9 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 			if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); err != nil {
 				t.Fatalf("retry finalizer: %v", err)
 			}
+			if fixture.vs.calls != test.wantDetaches {
+				t.Fatalf("Detach calls = %d, want %d", fixture.vs.calls, test.wantDetaches)
+			}
 			if got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID); err != nil || got != nil {
 				t.Fatalf("finalized row = %+v, %v", got, err)
 			}
@@ -268,6 +327,180 @@ func TestSandboxDeleteFinalizerRetainsOwnershipAtEveryFailure(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSandboxDeleteDetachAndDurableClearFenceNewAllocation(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-allocation-fence")
+	vs := &serializedSandboxDeleteVS{
+		detachStarted: make(chan struct{}),
+		allowDetach:   make(chan struct{}),
+		attachStarted: make(chan struct{}),
+	}
+	fixture.o.vs = vs
+	beginDeletingForTest(t, fixture)
+	runErr := errors.New("injected RunDir failure after network clear")
+	fixture.o.removeSandboxRunDir = func(string) error { return runErr }
+
+	finalizeDone := make(chan error, 1)
+	go func() {
+		finalizeDone <- fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID)
+	}()
+	select {
+	case <-vs.detachStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delete finalizer did not start Detach")
+	}
+	attachDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"})
+		attachDone <- err
+	}()
+	select {
+	case <-vs.attachStarted:
+		t.Fatal("new allocation crossed the Detach-to-durable-clear fence")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(vs.allowDetach)
+	select {
+	case err := <-finalizeDone:
+		if !errors.Is(err, runErr) {
+			t.Fatalf("finalizer error = %v, want RunDir failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delete finalizer did not finish network clear")
+	}
+	select {
+	case <-vs.attachStarted:
+	case <-time.After(time.Second):
+		t.Fatal("new allocation did not resume after durable network clear")
+	}
+	if err := <-attachDone; err != nil {
+		t.Fatalf("attachNetwork after durable clear: %v", err)
+	}
+	assertDeletingOwnershipState(t, fixture, false)
+}
+
+func TestSandboxDeleteNetworkClearFailureKeepsFenceUntilLiveRetry(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-network-clear-retry")
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = fixture.o.DrainSandboxDeletes(drainCtx)
+	})
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_deleting_network_clear BEFORE UPDATE OF vswitch_port ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced deleting network clear failure'); END`)
+
+	if killed, err := fixture.o.Kill(context.Background(), fixture.sb.ID, fixture.apiKey); err != nil || !killed {
+		t.Fatalf("Kill = %t, %v", killed, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		fixture.o.networkAllocationMu.Lock()
+		_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+		fixture.o.networkAllocationMu.Unlock()
+		if fenced {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed durable network clear did not retain the port fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertDeletingOwnership(t, fixture)
+	if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err == nil ||
+		!strings.Contains(err.Error(), "network allocation blocked") {
+		t.Fatalf("allocation during failed durable clear = %v", err)
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_deleting_network_clear`)
+	waitForSandboxAbsent(t, fixture.o, context.Background(), fixture.sb.ID, "delete retry after durable network clear")
+	if err := fixture.o.DrainSandboxDeletes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("successful live retry retained the detached port fence")
+	}
+	if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err != nil {
+		t.Fatalf("allocation after live retry: %v", err)
+	}
+}
+
+func TestSandboxDeleteNetworkCASMissKeepsOldFenceAndSuccessorPort(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-network-cas-miss")
+	beginDeletingForTest(t, fixture)
+	oldPort := fixture.sb.VswitchPort
+	fixture.vs.detachHook = func(detached string) {
+		if detached != oldPort {
+			t.Fatalf("detached port = %q, want %q", detached, oldPort)
+		}
+		installStoreTrigger(t, fixture.dbPath, `UPDATE sandboxes
+			SET created_unix=288,vswitch_port='port-successor',floatingip='192.0.2.88'
+			WHERE id='delete-network-cas-miss'`)
+	}
+
+	err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID)
+	if err == nil || !strings.Contains(err.Error(), "ownership changed before durable clear") {
+		t.Fatalf("network CAS miss = %v", err)
+	}
+	stored, getErr := fixture.o.st.Get(context.Background(), fixture.sb.ID)
+	if getErr != nil || stored == nil || stored.CreatedUnix != 288 || stored.VswitchPort != "port-successor" {
+		t.Fatalf("CAS miss changed successor owner = %+v, %v", stored, getErr)
+	}
+	fixture.o.networkAllocationMu.Lock()
+	_, oldFenced := fixture.o.detachedPortsPending[oldPort]
+	_, successorFenced := fixture.o.detachedPortsPending[stored.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if !oldFenced || successorFenced {
+		t.Fatalf("CAS miss fences: old=%t successor=%t", oldFenced, successorFenced)
+	}
+	if fixture.vs.calls != 1 {
+		t.Fatalf("CAS miss detached %d ports, want only the old owner", fixture.vs.calls)
+	}
+	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("CAS miss removed successor-owned path %s: %v", path, err)
+		}
+	}
+}
+
+func TestSandboxDeleteHardDeleteFailureLeavesNetworkReleased(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-hard-delete-failure")
+	beginDeletingForTest(t, fixture)
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_final_sandbox_delete BEFORE DELETE ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced final delete failure'); END`)
+
+	err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID)
+	if err == nil || !strings.Contains(err.Error(), "forced final delete failure") {
+		t.Fatalf("hard-delete failure = %v", err)
+	}
+	assertDeletingOwnershipState(t, fixture, false)
+	fixture.o.networkAllocationMu.Lock()
+	_, fenced := fixture.o.detachedPortsPending[fixture.sb.VswitchPort]
+	fixture.o.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("hard-delete failure reacquired the cleared network owner")
+	}
+	if _, err := fixture.o.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err != nil {
+		t.Fatalf("allocation during hard-delete failure: %v", err)
+	}
+	for _, path := range []string{fixture.sb.RunDir, fixture.sb.BaseDir} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("hard-delete failure retained physical path %s: %v", path, err)
+		}
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_final_sandbox_delete`)
+	if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); err != nil {
+		t.Fatalf("hard-delete retry: %v", err)
+	}
+	if fixture.vs.calls != 1 {
+		t.Fatalf("hard-delete retry redetached released port: calls=%d", fixture.vs.calls)
 	}
 }
 
@@ -493,7 +726,7 @@ func TestSandboxDeleteRetryQuiescesOnShutdownAndRestartReconciles(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("delete worker did not reach the persistent cleanup failure")
 	}
-	assertDeletingOwnership(t, fixture)
+	assertDeletingOwnershipState(t, fixture, false)
 
 	// Orderly shutdown must not wait forever for a resource that this process
 	// cannot release. The deleting row is the durable handoff to startup.
@@ -509,7 +742,7 @@ func TestSandboxDeleteRetryQuiescesOnShutdownAndRestartReconciles(t *testing.T) 
 	if active {
 		t.Fatal("shutdown retained a process-local delete retry worker")
 	}
-	assertDeletingOwnership(t, fixture)
+	assertDeletingOwnershipState(t, fixture, false)
 
 	lc := &sandboxFinalizerLauncher{unit: fixture.lc.unit, state: "inactive"}
 	vs := &sandboxFinalizerVS{detached: true}
@@ -520,8 +753,57 @@ func TestSandboxDeleteRetryQuiescesOnShutdownAndRestartReconciles(t *testing.T) 
 	if got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID); err != nil || got != nil {
 		t.Fatalf("restart finalizer row = %+v, %v", got, err)
 	}
+	if vs.calls != 0 {
+		t.Fatalf("restart redetached durably cleared port: calls=%d", vs.calls)
+	}
 	if _, err := os.Stat(fixture.sb.BaseDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("restart retained BaseDir: %v", err)
+	}
+}
+
+func TestRestartKeepsAllocationFencedUntilDeletingNetworkClearSucceeds(t *testing.T) {
+	fixture := newSandboxFinalizerFixture(t, "delete-restart-network-clear")
+	beginDeletingForTest(t, fixture)
+	installStoreTrigger(t, fixture.dbPath, `CREATE TRIGGER fail_restart_network_clear BEFORE UPDATE OF vswitch_port ON sandboxes BEGIN SELECT RAISE(ABORT, 'forced restart network clear failure'); END`)
+	if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); err == nil ||
+		!strings.Contains(err.Error(), "forced restart network clear failure") {
+		t.Fatalf("pre-restart network clear = %v", err)
+	}
+
+	lc := &sandboxFinalizerLauncher{unit: fixture.lc.unit, state: "inactive"}
+	vs := &sandboxFinalizerVS{detached: true}
+	restarted := New(fixture.o.cfg, fixture.o.st, lc, vs, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	err := restarted.ReconcileSandboxes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "forced restart network clear failure") {
+		t.Fatalf("restart reconcile with failed durable clear = %v", err)
+	}
+	assertDeletingOwnership(t, fixture)
+	restarted.networkAllocationMu.Lock()
+	_, fenced := restarted.detachedPortsPending[fixture.sb.VswitchPort]
+	restarted.networkAllocationMu.Unlock()
+	if !fenced {
+		t.Fatal("restart durable-clear failure did not fence the detached port")
+	}
+	if _, err := restarted.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err == nil ||
+		!strings.Contains(err.Error(), "network allocation blocked") {
+		t.Fatalf("restart allocation before durable clear = %v", err)
+	}
+
+	installStoreTrigger(t, fixture.dbPath, `DROP TRIGGER fail_restart_network_clear`)
+	if err := restarted.ReconcileSandboxes(context.Background()); err != nil {
+		t.Fatalf("restart reconcile after durable clear recovery: %v", err)
+	}
+	if got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID); err != nil || got != nil {
+		t.Fatalf("restart recovery row = %+v, %v", got, err)
+	}
+	restarted.networkAllocationMu.Lock()
+	_, fenced = restarted.detachedPortsPending[fixture.sb.VswitchPort]
+	restarted.networkAllocationMu.Unlock()
+	if fenced {
+		t.Fatal("restart recovery retained detached port fence")
+	}
+	if _, err := restarted.attachNetwork(context.Background(), sandboxcfg.NetworkSpec{InnerIP: "169.254.1.1/31"}); err != nil {
+		t.Fatalf("restart allocation after durable clear: %v", err)
 	}
 }
 
@@ -556,7 +838,7 @@ func TestReconcileResumesDeletingFinalizerAfterRestart(t *testing.T) {
 	if err := fixture.o.finalizeSandboxDeleteOnce(context.Background(), fixture.sb.ID); !errors.Is(err, baseErr) {
 		t.Fatalf("pre-restart finalizer = %v", err)
 	}
-	assertDeletingOwnership(t, fixture)
+	assertDeletingOwnershipState(t, fixture, false)
 	if _, err := os.Stat(fixture.sb.RunDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pre-restart RunDir cleanup = %v", err)
 	}
@@ -579,6 +861,9 @@ func TestReconcileResumesDeletingFinalizerAfterRestart(t *testing.T) {
 	}
 	if got, err := fixture.o.st.Get(context.Background(), fixture.sb.ID); err != nil || got != nil {
 		t.Fatalf("restarted finalizer row = %+v, %v", got, err)
+	}
+	if vs.calls != 0 {
+		t.Fatalf("restart redetached durably cleared port: calls=%d", vs.calls)
 	}
 	if _, err := os.Stat(fixture.sb.BaseDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("restarted finalizer retained BaseDir: %v", err)

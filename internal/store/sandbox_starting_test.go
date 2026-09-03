@@ -539,6 +539,44 @@ func TestSandboxDeletingTransitionPreservesExactCleanupOwnership(t *testing.T) {
 	if changed, err := st.BeginSandboxDelete(ctx, deleting); err != nil || !changed {
 		t.Fatalf("repeated BeginSandboxDelete = %t, %v", changed, err)
 	}
+	staleNetwork := *deleting
+	staleNetwork.CreatedUnix++
+	if changed, err := st.ClearDeletingNetwork(ctx, &staleNetwork); err != nil || changed {
+		t.Fatalf("stale-incarnation ClearDeletingNetwork = %t, %v", changed, err)
+	}
+	staleNetwork = *deleting
+	staleNetwork.InnerIP = "198.51.100.200"
+	if changed, err := st.ClearDeletingNetwork(ctx, &staleNetwork); err != nil || changed {
+		t.Fatalf("stale-network ClearDeletingNetwork = %t, %v", changed, err)
+	}
+	if _, err := st.db.Exec(`
+		CREATE TRIGGER fail_clear_deleting_network
+		BEFORE UPDATE OF vswitch_port ON sandboxes
+		WHEN OLD.id='delete-durable-owner'
+		BEGIN SELECT RAISE(ABORT, 'forced deleting network clear failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.ClearDeletingNetwork(ctx, deleting); err == nil || changed {
+		t.Fatalf("forced ClearDeletingNetwork = %t, %v", changed, err)
+	}
+	retainedNetwork, err := st.Get(ctx, sb.ID)
+	if err != nil || retainedNetwork == nil || retainedNetwork.VswitchPort != sb.VswitchPort ||
+		retainedNetwork.FloatingIP != sb.FloatingIP || retainedNetwork.InnerIP != sb.InnerIP || retainedNetwork.PortMAC != sb.PortMAC {
+		t.Fatalf("failed network clear changed deleting owner: %+v, %v", retainedNetwork, err)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER fail_clear_deleting_network`); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.ClearDeletingNetwork(ctx, deleting); err != nil || !changed {
+		t.Fatalf("ClearDeletingNetwork = %t, %v", changed, err)
+	}
+	deleting.VswitchPort, deleting.FloatingIP, deleting.InnerIP, deleting.PortMAC = "", "", "", ""
+	clearedNetwork, err := st.Get(ctx, sb.ID)
+	if err != nil || clearedNetwork == nil || clearedNetwork.VswitchPort != "" || clearedNetwork.FloatingIP != "" ||
+		clearedNetwork.InnerIP != "" || clearedNetwork.PortMAC != "" || clearedNetwork.RunID != sb.RunID ||
+		clearedNetwork.RunDir != sb.RunDir || clearedNetwork.BaseDir != sb.BaseDir {
+		t.Fatalf("durable network clear changed non-network owner: %+v, %v", clearedNetwork, err)
+	}
 	staleDeleting := *deleting
 	staleDeleting.BaseDir += "-stale"
 	if changed, err := st.DeleteFinalizedSandbox(ctx, &staleDeleting); err != nil || changed {
@@ -555,7 +593,8 @@ func TestSandboxDeletingTransitionPreservesExactCleanupOwnership(t *testing.T) {
 		t.Fatalf("forced DeleteFinalizedSandbox = %t, %v", changed, err)
 	}
 	if retained, err := st.Get(ctx, sb.ID); err != nil || retained == nil || retained.State != types.StateDeleting ||
-		retained.RunID != sb.RunID || retained.VswitchPort != sb.VswitchPort || retained.RunDir != sb.RunDir || retained.BaseDir != sb.BaseDir {
+		retained.RunID != sb.RunID || retained.VswitchPort != "" || retained.FloatingIP != "" || retained.InnerIP != "" ||
+		retained.PortMAC != "" || retained.RunDir != sb.RunDir || retained.BaseDir != sb.BaseDir {
 		t.Fatalf("failed hard delete lost exact owner: %+v, %v", retained, err)
 	}
 	if _, err := st.db.Exec(`DROP TRIGGER fail_finalize_sandbox_delete`); err != nil {
