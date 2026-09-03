@@ -48,7 +48,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		p.serveExecConnect(w, r, sid)
 		return
 	}
-	route, flow, ok := p.admitRoute(w, r, sid, target)
+	route, flow, admission, ok := p.admitRoute(w, r, sid, target)
 	if !ok {
 		return
 	}
@@ -60,6 +60,10 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	backend = flow.AttachBackend(backend)
+	if !admission.Unlimited() && r.ProtoMajor == 2 {
+		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
+		defer stopContextClose()
+	}
 	p.mx.Inc(`data_requests_total{result="ok"}`)
 	Tunnel(w, r, backend)
 }

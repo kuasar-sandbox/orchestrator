@@ -307,7 +307,12 @@ wait_proxy_traffic_stats() { # $1=sid, $2=parking|idle|paused
 import json, sys
 stats = json.load(open(sys.argv[1]))
 mode = sys.argv[2]
-if set(stats) - {"state", "inflight", "idleSince", "services"}:
+if set(stats) - {"state", "maxInflight", "inflight", "idleSince", "services"}:
+    raise SystemExit(1)
+max_inflight = stats.get("maxInflight")
+if not isinstance(max_inflight, dict) or set(max_inflight) != {"total", "forward", "e2b:envd", "e2b:code-interpreter", "exec"}:
+    raise SystemExit(1)
+if any(type(value) is not int or value < 0 for value in max_inflight.values()):
     raise SystemExit(1)
 inflight = stats.get("inflight", {})
 services = stats.get("services", {})

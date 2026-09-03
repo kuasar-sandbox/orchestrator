@@ -10,6 +10,7 @@ import (
 	"time"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	internalproxy "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
@@ -21,6 +22,7 @@ type testCoreSink struct {
 	table       *proxyshm.Table
 	applyErr    error
 	beforeApply func(routesync.RouteEntry)
+	effective   *publicconfig.MaxInflight
 	invalidated bool
 }
 
@@ -32,6 +34,14 @@ func (s *testCoreSink) ApplyUpsert(route routesync.RouteEntry) error {
 	}
 	if s.applyErr != nil {
 		return s.applyErr
+	}
+	if s.effective != nil {
+		route.MaxInflightPatch = nil
+		route.EffectiveMaxInflight = *s.effective
+		if !route.EffectiveMaxInflight.Unlimited() {
+			route.AdmissionSlot = 1
+			route.AdmissionGeneration = 1
+		}
 	}
 	return s.table.Upsert(route)
 }
@@ -330,7 +340,9 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	host, sink, _ := newTestHost(t, 8, stats)
+	host, sink, core := newTestHost(t, 8, stats)
+	wantMaxInflight := publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2}
+	core.effective = &wantMaxInflight
 	if _, err := host.Traffic().Get(context.Background(), "s1"); !errors.Is(err, proxyextension.ErrTrafficUnavailable) {
 		t.Fatalf("traffic before sync = %v", err)
 	}
@@ -345,7 +357,8 @@ func TestTrafficSourceUsesInProcessAggregateAndReturnsCopies(t *testing.T) {
 		t.Fatal(err)
 	}
 	if view.SandboxID != "s1" || view.RunID != "run-1" || view.Profile != proxyextension.ProfileBare ||
-		view.State != proxyextension.RouteStateRunning || view.Inflight.Parking != 2 || view.Inflight.Egress != 3 {
+		view.State != proxyextension.RouteStateRunning || view.MaxInflight != wantMaxInflight ||
+		view.Inflight.Parking != 2 || view.Inflight.Egress != 3 {
 		t.Fatalf("traffic view = %+v", view)
 	}
 	forward := view.Services[string(internalproxy.ConnectServiceForward)]

@@ -105,6 +105,37 @@ func TestCreateSandboxMetadataResourceHeaderMergesLeaves(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxMetadataTrafficHeaderMergesLeavesStrictly(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.traffic":"{\"max_inflight\":{\"total\":32,\"forward\":8,\"exec\":4}}"}}`,
+	))
+	req.Header.Set(HeaderTraffic, `{"max_inflight":{"forward":0,"exec":2}}`)
+
+	got, err := createSandboxMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"max_inflight":{"total":32,"forward":0,"exec":2}}`
+	if got[sandboxcfg.NsTraffic] != want {
+		t.Fatalf("traffic metadata=%q, want %q", got[sandboxcfg.NsTraffic], want)
+	}
+
+	for name, values := range map[string][]string{
+		"duplicate": {`{"max_inflight":{"total":1}}`, `{"max_inflight":{"total":2}}`},
+		"empty":     {""},
+		"null":      {`{"max_inflight":{"total":null}}`},
+		"unknown":   {`{"max_inflight":{"future":1}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
+			request.Header[http.CanonicalHeaderKey(HeaderTraffic)] = values
+			if _, err := createSandboxMetadata(httptest.NewRecorder(), request); err == nil {
+				t.Fatalf("traffic header %s was accepted", name)
+			}
+		})
+	}
+}
+
 func TestCreateSandboxMetadataResourceHeaderCannotHideInvalidBody(t *testing.T) {
 	for name, body := range map[string]string{
 		"node owned": `{"metadata":{"kuasar-sandbox.resource":"{\"control\":{}}"}}`,
@@ -835,6 +866,7 @@ func TestStaleProxyResponseRequiresMatchingStatusAndType(t *testing.T) {
 		{status: http.StatusInternalServerError, kind: proxypkg.ProxyErrorNotFound},
 		{status: http.StatusNotFound, kind: proxypkg.ProxyErrorUnauthorized},
 		{status: http.StatusUnauthorized, kind: proxypkg.ProxyErrorRouteError},
+		{status: http.StatusTooManyRequests, kind: proxypkg.ProxyErrorMaxInflightReached},
 	}
 	for _, test := range tests {
 		if got := staleProxyResponse(test.status, test.kind); got != test.want {

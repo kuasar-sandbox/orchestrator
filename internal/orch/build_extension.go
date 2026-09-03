@@ -128,7 +128,15 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+	metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	spec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	phaseResourcePatch := metadata[sandboxcfg.NsResource]

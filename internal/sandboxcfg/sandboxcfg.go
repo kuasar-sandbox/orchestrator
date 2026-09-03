@@ -31,6 +31,7 @@ const (
 	NsCredentials = "kuasar-sandbox.credentials"
 	NsCheckpoint  = "kuasar-sandbox.checkpoint"
 	NsMMDS        = "kuasar-sandbox.mmds"
+	NsTraffic     = "kuasar-sandbox.traffic"
 )
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
@@ -74,6 +75,7 @@ func (t TapFD) runtime() rtconfig.TapFDConfig {
 // resources.control, network.tapfd) — those are the orchestrator's.
 type SandboxSpec struct {
 	Resource ResourcePatch
+	Traffic  TrafficPatch
 	Network  NetworkSpec
 	Restore  RestoreSpec
 	Launch   *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
@@ -103,6 +105,13 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 	if raw, present := meta[NsResource]; present {
 		var err error
 		s.Resource, err = ParseResourcePatch(raw)
+		if err != nil {
+			return s, err
+		}
+	}
+	if raw, present := meta[NsTraffic]; present {
+		var err error
+		s.Traffic, err = ParseTrafficPatch(raw)
 		if err != nil {
 			return s, err
 		}
@@ -206,43 +215,69 @@ func parseRestore(raw string) (RestoreSpec, error) {
 	return restore, nil
 }
 
-// MergeMetadata overlays over onto base per key (over wins) — used to layer a
-// Resource is the sole exception: its validated leaves are overlaid independently
-// and persisted as canonical JSON. Both layers are parsed before overlay so an
+// MergeMetadata overlays over onto base per key (over wins). Resource and
+// traffic are exceptions: their validated leaves are overlaid independently and
+// persisted as canonical JSON. Both layers are parsed before overlay so an
 // invalid lower-priority value cannot be hidden by a valid higher-priority one.
 func MergeMetadata(base, over map[string]string) (map[string]string, error) {
 	out := mergeStr(base, over)
 	baseRaw, basePresent := base[NsResource]
 	overRaw, overPresent := over[NsResource]
-	if !basePresent && !overPresent {
-		return out, nil
-	}
-	var basePatch, overPatch ResourcePatch
-	var err error
-	if basePresent {
-		basePatch, err = ParseResourcePatch(baseRaw)
+	if basePresent || overPresent {
+		var basePatch, overPatch ResourcePatch
+		var err error
+		if basePresent {
+			basePatch, err = ParseResourcePatch(baseRaw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if overPresent {
+			overPatch, err = ParseResourcePatch(overRaw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		merged, err := MergeResourcePatch(basePatch, overPatch)
 		if err != nil {
 			return nil, err
 		}
-	}
-	if overPresent {
-		overPatch, err = ParseResourcePatch(overRaw)
+		canonical, err := MarshalResourcePatch(merged)
 		if err != nil {
 			return nil, err
 		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[NsResource] = canonical
 	}
-	merged, err := MergeResourcePatch(basePatch, overPatch)
-	if err != nil {
-		return nil, err
+
+	baseTrafficRaw, baseTrafficPresent := base[NsTraffic]
+	overTrafficRaw, overTrafficPresent := over[NsTraffic]
+	if baseTrafficPresent || overTrafficPresent {
+		var basePatch, overPatch TrafficPatch
+		var err error
+		if baseTrafficPresent {
+			basePatch, err = ParseTrafficPatch(baseTrafficRaw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if overTrafficPresent {
+			overPatch, err = ParseTrafficPatch(overTrafficRaw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		canonical, err := MarshalTrafficPatch(MergeTrafficPatch(basePatch, overPatch))
+		if err != nil {
+			return nil, err
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[NsTraffic] = canonical
 	}
-	canonical, err := MarshalResourcePatch(merged)
-	if err != nil {
-		return nil, err
-	}
-	if out == nil {
-		out = map[string]string{}
-	}
-	out[NsResource] = canonical
 	return out, nil
 }
 

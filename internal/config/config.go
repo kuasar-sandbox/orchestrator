@@ -59,6 +59,8 @@ type FilesStorageConfig = publicconfig.FilesStorageConfig
 type CheckpointConfig = publicconfig.CheckpointConfig
 type CheckpointRemoteConfig = publicconfig.CheckpointRemoteConfig
 type ProxyPathsConfig = publicconfig.ProxyPathsConfig
+type ProxyTrafficConfig = publicconfig.ProxyTrafficConfig
+type MaxInflight = publicconfig.MaxInflight
 
 func Load(path string) (*Config, error)               { return publicconfig.LoadConductor(path) }
 func LoadProxy(path string) (*ProxyFileConfig, error) { return publicconfig.LoadProxy(path) }

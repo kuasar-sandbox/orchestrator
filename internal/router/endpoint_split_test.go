@@ -214,6 +214,63 @@ func TestOrdinaryHTTPUsesOnlyDataEndpoint(t *testing.T) {
 	}
 }
 
+func TestOrdinaryHTTPPassesThroughMaxInflightWithoutRouteRefresh(t *testing.T) {
+	var nodeHits, reserveHits atomic.Int32
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			t.Fatalf("node method=%s, want CONNECT", r.Method)
+		}
+		nodeHits.Add(1)
+		w.Header().Set(proxypkg.HeaderProxyError, proxypkg.ProxyErrorMaxInflightReached)
+		http.Error(w, "max inflight reached", http.StatusTooManyRequests)
+	}))
+	defer node.Close()
+	route := routerTestRouteResolve(t, "sb-1", "/g", "rk", strings.TrimPrefix(node.URL, "http://"), types.ProfileBare)
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/verify-key":
+			w.WriteHeader(http.StatusOK)
+		case "/route-link/route":
+			_ = json.NewEncoder(w).Encode(route)
+		case "/route-link/reserve":
+			reserveHits.Add(1)
+			http.Error(w, "must not refresh an overloaded route", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, discardRouterLogger())
+	rt.SetDataPlaneAuth("off")
+	front := httptest.NewServer(rt.Handler())
+	defer front.Close()
+	req, _ := http.NewRequest(http.MethodGet, front.URL+"/health", nil)
+	req.Host = "8080-sb-1.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusTooManyRequests ||
+		response.Header.Get(proxypkg.HeaderProxyError) != proxypkg.ProxyErrorMaxInflightReached ||
+		string(body) != "max inflight reached\n" {
+		t.Fatalf("response=%d error=%q body=%q", response.StatusCode,
+			response.Header.Get(proxypkg.HeaderProxyError), body)
+	}
+	if nodeHits.Load() != 1 || reserveHits.Load() != 0 {
+		t.Fatalf("node hits=%d reserve hits=%d, want 1/0", nodeHits.Load(), reserveHits.Load())
+	}
+	if cached := rt.cachedRoute("/g", "rk", "sb-1"); cached == nil || cached.NodeSandboxID != route.NodeSandboxID {
+		t.Fatalf("max_inflight response evicted route: %+v", cached)
+	}
+}
+
 func TestOrdinaryCONNECTUsesOnlyDataEndpoint(t *testing.T) {
 	var apiHits, dataHits atomic.Int32
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

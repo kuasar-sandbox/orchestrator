@@ -224,7 +224,8 @@ type MasterHost interface {
 ```
 
 There is one object for the master process. The master creates its shared route
-table and in-process traffic aggregate, calls `Start` exactly once, and only
+table, separate cross-worker admission arena, and in-process traffic aggregate,
+calls `Start` exactly once, and only
 then binds listeners or starts route synchronization and workers. A Start error
 aborts startup and removes the shared-memory and socket artifacts already
 created. The supplied context is canceled at master shutdown. As with the
@@ -279,11 +280,13 @@ RouteBarrier ACK, or affect Wake/activation.
 
 ### Master traffic source
 
-`TrafficSource.Get` combines the current applied route identity with
-`MasterStats` directly in process; it does not query the stats UDS. Returned
-maps and time pointers are independent copies. V1 intentionally has no traffic
-Watch. A route retained during reconnect remains queryable, so callers that
-require freshness also inspect `Routes().SyncState()`.
+`TrafficSource.Get` combines the current applied route identity and its effective
+per-Sandbox `maxInflight` policy with `MasterStats` directly in process; it does
+not query the stats UDS or derive limits from the conductor Sandbox row. Returned
+`TrafficView.MaxInflight` uses the canonical `config.MaxInflight` shape; maps and
+time pointers are independent copies. V1 intentionally has no traffic Watch. A
+route retained during reconnect remains queryable, so callers that require
+freshness also inspect `Routes().SyncState()`.
 
 ## Proxy worker extension
 
@@ -357,12 +360,22 @@ It intentionally does not verify Kuasar's `X-Access-Token`. A wrapper that needs
 that token contract should canonicalize the request and call `next` instead.
 
 The fixed sequence is side-effect-free route lookup and target validation,
-traffic parking, `ActivateRoute`/Wake plus binding revalidation, optional
+shared per-Sandbox admission plus traffic parking, `ActivateRoute`/Wake and
+admission/route binding revalidation, optional
 `Revalidate`, backend dial, ordinary HTTP or CONNECT transport, and traffic
 close/idle accounting. `Revalidate` runs after activation but before dial, so a
 private registration, policy generation, or lease revision can fence a resumed
 route. Its private error detail is logged and the client receives only a fixed
 stale-policy response; no old backend is dialed.
+
+Admission happens exactly once whether the wrapper calls `ForwardAuthorized`
+directly or canonicalizes a request and calls `next`; wrappers must not nest the
+two paths for one logical request. Rejection occurs before Wake, activation, or
+dial and uses the core `429 max_inflight_reached` response. The admission lease
+and parking/egress accounting share one lifecycle, including ordinary response,
+CONNECT relay, cancellation, and failure cleanup. The generic helper still
+rejects native exec, so it cannot bypass the KAT/CEL/first-frame gate or move exec
+admission ahead of that gate.
 
 For ordinary HTTP, `Rewrite` receives an independent guest-facing request clone.
 The core performs final hop-header and transport normalization after the

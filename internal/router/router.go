@@ -48,6 +48,7 @@ const (
 	HeaderGroup       = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderResource    = "X-Kuasar-Sandbox-Resource"
+	HeaderTraffic     = "X-Kuasar-Sandbox-Traffic"
 	HeaderBuilder     = "X-Kuasar-Sandbox-Builder"
 	HeaderMMDS        = "X-Kuasar-Sandbox-MMDS"
 	HeaderRestore     = "X-Kuasar-Sandbox-Restore"
@@ -379,11 +380,12 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// createSandboxMetadata selects portable resource plus request-scoped restore,
-// credential, and checkpoint objects from the cluster create request. Resource
-// headers overlay leaves; restore and credential headers replace whole objects;
-// checkpoint is overlaid fieldwise. The body is always decoded and validated so
-// a valid higher-priority header cannot hide malformed lower-priority metadata.
+// createSandboxMetadata selects portable resource and traffic plus
+// request-scoped restore, credential, and checkpoint objects from the cluster
+// create request. Resource and traffic headers overlay leaves; restore and
+// credential headers replace whole objects; checkpoint is overlaid fieldwise.
+// The body is always decoded and validated so a valid higher-priority header
+// cannot hide malformed lower-priority metadata.
 func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
 	return createSandboxMetadataWithAutoPauseMemory(w, r, nil)
 }
@@ -437,6 +439,17 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 	}
 	if raw, ok := mergedResource[sandboxcfg.NsResource]; ok {
 		selected[sandboxcfg.NsResource] = raw
+	}
+	var bodyTraffic map[string]string
+	if raw, ok := body.Metadata[sandboxcfg.NsTraffic]; ok {
+		bodyTraffic = map[string]string{sandboxcfg.NsTraffic: raw}
+	}
+	mergedTraffic, err := mergeTrafficHeader(bodyTraffic, r.Header)
+	if err != nil {
+		return nil, err
+	}
+	if raw, ok := mergedTraffic[sandboxcfg.NsTraffic]; ok {
+		selected[sandboxcfg.NsTraffic] = raw
 	}
 	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
 		selected[sandboxcfg.NsRestore] = raw
@@ -516,6 +529,21 @@ func mergeResourceHeader(metadata map[string]string, header http.Header) (map[st
 	return merged, nil
 }
 
+func mergeTrafficHeader(metadata map[string]string, header http.Header) (map[string]string, error) {
+	values, present := header[http.CanonicalHeaderKey(HeaderTraffic)]
+	if !present {
+		return sandboxcfg.MergeMetadata(nil, metadata)
+	}
+	if len(values) != 1 {
+		return nil, fmt.Errorf("%s must appear exactly once", HeaderTraffic)
+	}
+	merged, err := sandboxcfg.MergeMetadata(metadata, map[string]string{sandboxcfg.NsTraffic: values[0]})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", HeaderTraffic, err)
+	}
+	return merged, nil
+}
+
 func createHeaderValue(header http.Header, name string) (string, bool) {
 	_, present := header[http.CanonicalHeaderKey(name)]
 	return header.Get(name), present
@@ -581,6 +609,11 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	metadata, err := mergeResourceHeader(body.Metadata, r.Header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	metadata, err = mergeTrafficHeader(metadata, r.Header)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1527,7 +1560,15 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		return false
 	}
 	if resp.StatusCode != http.StatusOK {
-		backend.Close()
+		if resp.StatusCode == http.StatusTooManyRequests &&
+			resp.Header.Get(proxypkg.HeaderProxyError) == proxypkg.ProxyErrorMaxInflightReached {
+			defer backend.Close()
+			defer resp.Body.Close()
+			proxypkg.WriteHTTPResponse(w, resp)
+			return false
+		}
+		_ = resp.Body.Close()
+		_ = backend.Close()
 		if staleProxyResponse(resp.StatusCode, resp.Header.Get(proxypkg.HeaderProxyError)) {
 			rt.evictRouteIfCurrent(rr.Group, rr.RouteKey, sandboxID, rr.NodeSandboxID)
 			return true

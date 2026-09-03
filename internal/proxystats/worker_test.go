@@ -2,6 +2,7 @@ package proxystats
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -9,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 )
 
 type testAddr string
@@ -83,6 +86,60 @@ func TestTrafficFlowParkingEgressHalfCloseAndIdempotentClose(t *testing.T) {
 	if base.closes.Load() != 1 {
 		t.Fatalf("underlying Close calls = %d, want 1", base.closes.Load())
 	}
+}
+
+func TestLimitedTrafficFlowHoldsOneLeaseAcrossParkingEgressAndHalfClose(t *testing.T) {
+	master, err := proxyadmission.NewMaster(2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	if err := master.BeginWorker(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	file, err := master.DupFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := proxyadmission.OpenWorker(file, 2, 1, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admission.Close()
+	update, err := master.PrepareUpsert("s1", "identity", publicconfig.MaxInflight{Total: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := update.Binding()
+	update.Commit()
+	worker := NewWorkerStatsWithAdmission(admission)
+	flow, err := worker.TryBeginParking("s1", proxy.ConnectServiceForward, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFull := func(stage string) {
+		t.Helper()
+		if _, err := worker.TryBeginParking("s1", proxy.ConnectServiceExec, binding); !errors.Is(err, proxyadmission.ErrLimitReached) {
+			t.Fatalf("%s admission error=%v, want limit reached", stage, err)
+		}
+	}
+	assertFull("parking")
+	base := &testConn{}
+	tracked := flow.AttachBackend(base)
+	flow.Close()
+	assertFull("egress")
+	if err := tracked.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	assertFull("half-close")
+	if err := tracked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := worker.TryBeginParking("s1", proxy.ConnectServiceExec, binding)
+	if err != nil {
+		t.Fatalf("full close did not release admission: %v", err)
+	}
+	next.Close()
 }
 
 func TestTrafficFlowActivationOrDialFailureEndsParking(t *testing.T) {
@@ -314,4 +371,26 @@ func TestOldBatchAckPreservesRecreatedEntryDirtyState(t *testing.T) {
 	}
 	first.Close()
 	second.Close()
+}
+
+func BenchmarkUnlimitedAdmissionFastPath(b *testing.B) {
+	b.Run("main-BeginParking", func(b *testing.B) {
+		worker := NewWorkerStats()
+		b.ReportAllocs()
+		for range b.N {
+			flow := worker.BeginParking("s1", proxy.ConnectServiceForward)
+			flow.Close()
+		}
+	})
+	b.Run("TryBeginParking-unlimited", func(b *testing.B) {
+		worker := NewWorkerStats()
+		b.ReportAllocs()
+		for range b.N {
+			flow, err := worker.TryBeginParking("s1", proxy.ConnectServiceForward, proxyadmission.Binding{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			flow.Close()
+		}
+	})
 }

@@ -110,7 +110,7 @@ Build terminal TTL，并始终按 immutable registered-node binding 更新或删
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
 | `internal/{registry,router,placer}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权,export/import 扩展,ExecAccessToken 签发) |
-| `internal/proxy` `internal/proxyshm` `internal/routesync` | 数据面 L7 反代(service-addressed CONNECT,native exec gate),proxy master/worker 共享固定路由视图 + MMDS confidential heap(park/wake,世代清扫/fail closed),路由/node-link 同步协议(注册 + bookmark + typed command result) |
+| `internal/proxy` `internal/proxyshm` `internal/proxyadmission` `internal/routesync` | 数据面 L7 反代(service-addressed CONNECT,native exec gate),proxy master/worker 共享固定路由视图 + 独立 per-Sandbox inflight arena + MMDS confidential heap(park/wake,世代清扫/fail closed),路由/node-link 同步协议(注册 + bookmark + typed command result) |
 | `internal/configsock` | 本机控制 socket:task(exact-run sandbox bootstrap/prepare + BuildSpec)/ admin(manifest-key + Sandbox MMDS value + Builder admission status)/ plugin(proxy 注册 + 受控路由流)/ api,SO_PEERCRED + pidfile 鉴权 |
 | `internal/{apikey,secretbox,keys,regcreds}` | APISecret 派生与 api_key MAC,根凭据落盘 AES-GCM,Forward/Exec `kat1` 与数据面 token,ManifestKey 封装的镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys 凭据对) |
@@ -156,7 +156,8 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$API_SECRET")
 # 先启动 API-only conductor,再启动通过 config_socket 注册的 Proxy.
 # conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 时必须显式
 # 提供不同用途的 api_endpoint 和 data_endpoint.
-# 随附样例分别监听明文 :3000/:3443;生产 TLS 在 Cluster Router/LB 终止.
+# 随附样例分别监听明文 :3000/:3443,proxy.yaml 也展示可选的
+# traffic.max_inflight per-Sandbox 默认;生产 TLS 在 Cluster Router/LB 终止.
 node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
@@ -179,7 +180,8 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 - [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
 - [docs/node-proxy.md](docs/node-proxy.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
-  routesync / 数据面鉴权 / MMDS / service-addressed CONNECT / native exec gate.
+  routesync / per-Sandbox max inflight / traffic stats / 数据面鉴权 / MMDS / service-addressed CONNECT /
+  native exec gate.
 - [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、

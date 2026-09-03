@@ -16,6 +16,7 @@ import (
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/execsession"
@@ -31,6 +32,7 @@ import (
 // namespace the header wins. The header value is the same JSON the metadata key holds.
 var configHeaderNs = []struct{ header, metaKey string }{
 	{"X-Kuasar-Sandbox-Resource", sandboxcfg.NsResource},
+	{"X-Kuasar-Sandbox-Traffic", sandboxcfg.NsTraffic},
 	{"X-Kuasar-Sandbox-Network", sandboxcfg.NsNetwork},
 	{"X-Kuasar-Sandbox-Launch", sandboxcfg.NsLaunch},
 	{"X-Kuasar-Sandbox-Init", sandboxcfg.NsInit},
@@ -62,9 +64,9 @@ func singleOptionalHeader(h http.Header, name string) (*string, error) {
 }
 
 // mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta. Resource
-// leaves merge independently; every other namespace retains whole-value header
-// precedence. Presence is checked explicitly so an empty resource header fails
-// strict parsing instead of disappearing.
+// and traffic leaves merge independently; every other namespace retains
+// whole-value header precedence. Presence is checked explicitly so an empty
+// leaf-merged header fails strict parsing instead of disappearing.
 func mergeConfigHeaders(meta map[string]string, h http.Header) (map[string]string, error) {
 	out, err := sandboxcfg.MergeMetadata(nil, meta)
 	if err != nil {
@@ -76,7 +78,7 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) (map[string]strin
 			continue
 		}
 		value := h.Get(m.header)
-		if m.metaKey == sandboxcfg.NsResource {
+		if m.metaKey == sandboxcfg.NsResource || m.metaKey == sandboxcfg.NsTraffic {
 			if len(values) != 1 {
 				return nil, fmt.Errorf("%s must appear exactly once", m.header)
 			}
@@ -430,10 +432,11 @@ type ServiceTrafficStats struct {
 }
 
 type TrafficStats struct {
-	State     string                         `json:"state"`
-	Inflight  TrafficInflight                `json:"inflight"`
-	IdleSince *time.Time                     `json:"idleSince,omitempty"`
-	Services  map[string]ServiceTrafficStats `json:"services"`
+	State       string                         `json:"state"`
+	MaxInflight config.MaxInflight             `json:"maxInflight"`
+	Inflight    TrafficInflight                `json:"inflight"`
+	IdleSince   *time.Time                     `json:"idleSince,omitempty"`
+	Services    map[string]ServiceTrafficStats `json:"services"`
 }
 
 type API struct {

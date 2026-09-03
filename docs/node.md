@@ -593,13 +593,16 @@ registry。公共 View 不复制原始 secret/token，也不新增 route metadat
 master 在 Configure/final validation 后 deep-clone、canonical serialize 并 digest 冻结
 EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式是 node-ctl，custom 模式是
 xproxy。worker 通过 sealed bootstrap 验证 config digest、role/id/epoch、FD mapping 和 executable
-identity，调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync；它不读取
+identity,并映射独立 admission arena。`proxy.yaml` 的 `traffic.max_inflight` 是目标节点对每个
+Sandbox 的默认 logical inflight policy;全部字段 `0` 表示 unlimited,不是 QPS 或 Proxy global
+capacity。worker 调用 `BindRuntime(worker)` 并在 ready 前完成 stats/route sync；它不读取
 `proxy.yaml`，不调用 `Configure`。每个 worker epoch 的 `BindRuntime` 必须创建新 Extension；
 初始 route sync 后 core 调用其 `Start` 一次,再冻结可选 `IngressWrapper`,成功后才开放
 Data listener.wrapper 在 canonical parser 前接收 raw request,只服务节点 sandbox data ingress;
 MMDS 不经过它.`GetRoute` 只提供当前 SHM 点查副本,不提供 worker Watch.
 
-已完成私有认证的 wrapper 可调用拥有 HTTP 响应的 `ForwardAuthorized`，复用 lookup、parking、
+已完成私有认证的 wrapper 可调用拥有 HTTP 响应的 `ForwardAuthorized`，复用 lookup、traffic
+admission、parking、
 activation/Wake、binding revalidation、dial 和 traffic 生命周期；它不验证 Kuasar token。
 `Revalidate` 在 activation 后、dial 前 fence 私有 revision，`Rewrite` 只修改 ordinary HTTP 的
 guest clone，CONNECT 不调用它；generic helper 拒绝 native exec，标准 `next` 仍走 KAT/CEL。
@@ -775,6 +778,13 @@ egress  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 ```json
 {
   "state": "running",
+  "maxInflight": {
+    "total": 128,
+    "forward": 96,
+    "e2b:envd": 16,
+    "e2b:code-interpreter": 8,
+    "exec": 8
+  },
   "inflight": {"parking": 0, "egress": 0},
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
@@ -784,6 +794,10 @@ egress  = 最终 node proxy→sandbox backend 已建立且尚未最终 Close
 }
 ```
 
+`maxInflight` 来自 Proxy master 当前 applied route 的目标节点 effective policy,不是从
+conductor Sandbox row 推导;全零对象表示 unlimited。配置 `M` 是整个 node Proxy 对该
+Sandbox 的近似上限,`N` 个 worker 的短暂理论上界为 `M+N-1`,不是每 worker 的 `M`。
+
 e2b 的 service 集是 `forward/e2b:envd/e2b:code-interpreter/exec`,bare 是
 `forward/exec`。顶层 `inflight` 是各 service 求和。每个 service 仅在两项为零时附
 `idleSince`;顶层仅在 state=running 且全零时附所有适用 service 时间的最大值。
@@ -792,7 +806,9 @@ open/close、累计连接数、bytes/延迟/端口明细或 worker 信息。
 
 conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master cache,查询时不扇出 worker.master 未注册,
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
-完整 worker-local 状态机、绝对快照 stream 和故障窗口见 [node-proxy.md](node-proxy.md) §8。
+stats 的 503 窗口不影响 Proxy master 的 route/admission authority 或 Create barrier。完整共享
+admission算法、误差证明、worker-local状态机、绝对快照 stream 和故障窗口见
+[node-proxy.md](node-proxy.md) §8。
 
 ### 4.2 控制面:模板构建 API
 
@@ -870,7 +886,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
-- routesync(Proxy / 路由观察者):版本 6,帧 `[4B LE len][JSON]`,消息
+- routesync(Proxy / 路由观察者):版本 7,帧 `[4B LE len][JSON]`,消息
   `register|hello|upsert|delete|bookmark|wake|route_barrier|route_barrier_ack`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §4).
 
@@ -883,6 +899,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | 命名空间 | 去向 |
 |---|---|
 | `resource` | 严格 partial patch:`resources.{capacity.{cpu,memory},allocatable.{cpu,memory},startup.memory}` |
+| `traffic` | host-only 的 per-Sandbox `max_inflight.{total,forward,e2b:envd,e2b:code-interpreter,exec}` 显式 patch;不进入 guest |
 | `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin,cgroup_control}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
@@ -892,7 +909,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `checkpoint` | host-only、仅本次 Create 的 local Pause 缺省:`merge_ref`/`drop_caches` 各自为 `true`/`false`/`null`;只存 sandbox row,不进入 runtime YAML 或 snapshot.cfg |
 | `mmds` | portable exact `routes` + request-scoped initial `secrets`;持久化前拆分,metadata 最终只保留 routes |
 
-`resource` 是唯一按 leaf 合并而不是整段 namespace 覆盖的配置。公开 JSON 只允许:
+`resource` 与 `traffic` 按 leaf 合并,而不是整段 namespace 覆盖。`resource` 的公开 JSON 只允许:
 
 ```json
 {
@@ -925,6 +942,25 @@ node resource policy
 namespace 仍由高层整段覆盖。每一层都先
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
+
+`traffic` 的固定 leaf priority 是:
+
+```text
+template / group defaults
+  < create / reserve body metadata
+  < X-Kuasar-Sandbox-Traffic
+```
+
+其 JSON 形状为 `{"max_inflight":{"total":32,"exec":2,"forward":0}}`。每个
+leaf 可独立省略;显式 `0` 保留并清除低优先级 patch 或目标节点 Proxy 默认限制。整个
+metadata key 省略时保持省略,最终由目标 Proxy master 合并该节点
+`traffic.max_inflight`;目标节点默认值不写入 Sandbox row、MigrationToken 或 Registry。
+MigrationToken 已携 Metadata,所以 absent 在目标端继续 absent,显式 patch 原样迁移并改用
+目标节点默认值补齐其它 leaf。unknown、duplicate、`null`、负数、非整数和 `uint32`
+overflow 均返回 400。bare Sandbox 显式声明 `e2b:envd` 或
+`e2b:code-interpreter` 拒绝;节点默认可以包含这些 service,bare 只消费
+`total`、`forward`、`exec`。该限制是 inflight concurrency,不是 QPS 或 Proxy global capacity;
+完整算法与误差边界见 [node-proxy.md](node-proxy.md) §8。
 
 最终 resolver 先确定 capacity,再解析 allocatable/startup,最后添加 node-only
 overhead/watermark/deflate/controller。node policy 中省略的 allocatable.memory 超过最终
@@ -1768,7 +1804,8 @@ serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill �
 **routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(Proxy master 与路由
 观察者如平台 agent)。proxy master 把路由投影到共享内存,worker 只读;观察者持只读缓存
 感知状态。广播逐条 upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
-`RouteEntry` 字段(含驱动迁移的 `artifact_location`、MMDS 使用的 `mmds_secret`)见 node-proxy.md §4;
+`RouteEntry` 字段(含驱动迁移的 `artifact_location`、MMDS 使用的 `mmds_secret` 与
+presence-aware `max_inflight` patch)见 node-proxy.md §4;
 plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
 把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
 
@@ -1783,7 +1820,11 @@ Hello policy,不广播给 route observer.Proxy master 原子替换 registry,work
 - **starting 投影**:初始 `starting,run_id=""` durable insert 后即广播,此时没有 FloatingIP
   或可用 endpoint;network ownership 已 CAS 持久化且 YAML/ready.sock 已准备后再广播 enriched
   starting,供 Proxy MMDS 完成 envd `/init`.starting 不开放普通数据面,也不触发
-  Wake.每次 Create 在初始 Upsert 后发送 ordered route barrier;master apply+ACK且 lease
+  Wake.每次 Create 在初始 Upsert 后发送 ordered route barrier;Proxy master 先校验并将
+  目标节点默认与显式 patch 合并、事务化发布 admission binding 和 route SHM,全部成功后才
+  ACK。barrier 不等待 worker readiness、worker stats 或健康 worker 数;即使没有 serving worker,
+  master apply 成功仍可 ACK。任一 admission/route apply 失败不 ACK,也不会留下只发布一半的
+  route/admission 状态。master apply+ACK且 lease
   复核成功后才返回 201并启动 launch,因此 201 后的首个合法请求应直接看到 starting并
   parking,不再把正常 route propagation gap 当作 missing。launch 成功广播 running;create
   失败广播 Delete,resume 失败广播 paused。
@@ -2391,7 +2432,7 @@ phase、network、runtime prepare/result owner。候选扫描后的并发变化�
 
 以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
 publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 node-link 用 v6 Build full sync +
+权威不变；当前 main 仍有 post-registration Build projection，故 routesync v7 沿用 v6 引入的 Build full sync +
 live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
 节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
 cleanup stage 或第二份路径权威。
@@ -2404,7 +2445,7 @@ cleanup stage 或第二份路径权威。
 | 故障 | 影响 | 自愈 |
 |---|---|---|
 | conductor 崩溃/重启 | 控制面中断;沙箱(microVM/单元)与 running 数据流不受影响 | systemd 重启 → 重启对账收养;Proxy master 仍可用共享路由视图服务 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
-| Proxy worker 崩溃 | 该 worker 上的连接断;其余 worker 继续接新连接 | Proxy master 重启该 worker;worker 重新读取共享路由视图 |
+| Proxy worker 崩溃 | 该 worker 上的连接断;其共享 admission 绝对计数 stale-high,其余 worker 可继续接新连接或保守拒绝 | stats stream fault 先终止该 worker;仅 `cmd.Wait` 确认旧进程退出后 master 才清空该 index,再以同一 index、新 epoch 启动 replacement;不改 route/Sandbox state,不影响 Create |
 | Proxy master 崩溃 | 数据面中断,plugin 租约断开,Create fail closed | systemd 重启 master → 重新注册,重建共享表,启动 worker |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
 | routesync 断流 | Proxy 数据面视图停更;MMDS route/value/service 立即不可用 | Proxy master 清空 confidential heap 并指数退避重连重注册,完整同步 bookmark 后才重新服务(node-proxy.md §4) |
@@ -2416,7 +2457,8 @@ cleanup stage 或第二份路径权威。
 单元测试:`make test`(MMDS strict parser/top-level merge/minimal persistence、route value
 encrypted owner blob/AAD/CAS/cleanup、admin UDS、service relay、routesync confidential projection、
 Proxy master/worker resync/rotation;handler 路由,apikey/secretbox/regcreds,routesync(注册/bookmark
-往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
+往返)/proxyshm(共享路由表、park/wake、世代清扫)/proxyadmission(多 worker 有界误差、generation
+复用、crash-after-Wait 清理)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
 Exec KAT/64 KiB API/CmdExecSession/H1/H2 request gate 与
 buffered half-close tunnel,mmds(确定性密钥),launch ownership,沙箱配置注入(命名空间解析/容量折叠/网络合并),
 migrate,node-link(注册/事件/命令往返)等).

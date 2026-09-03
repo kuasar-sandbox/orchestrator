@@ -43,6 +43,7 @@ func TestExportImportKMT1RoundTripPreservesIdentityStateAndCredentials(t *testin
 	sb.Env = map[string]string{"FOO": "bar"}
 	sb.Metadata = map[string]string{
 		"k": "v", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+		sandboxcfg.NsTraffic: `{"max_inflight":{"total":9,"forward":0}}`,
 	}
 	sb.EnvdAccessToken = "source-envd-token"
 	sb.TrafficAccessToken = "source-traffic-token"
@@ -166,12 +167,13 @@ func TestArtifactKindRoundTripsThroughTemplateAndMigrationToken(t *testing.T) {
 	}
 }
 
-func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
+func TestMigrationTokenCarriesStrictPortableResourceAndTrafficMetadata(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	sb := migrationSandbox(t, dir, "portable-resource", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
 	sb.Metadata = map[string]string{
 		sandboxcfg.NsResource: ` { "startup" : { "memory" : "1GiB" }, "capacity" : { "memory" : "8GiB" } } `,
+		sandboxcfg.NsTraffic:  ` { "max_inflight" : { "total" : 9, "forward" : 0 } } `,
 		"ordinary":            "preserved",
 	}
 
@@ -191,10 +193,69 @@ func TestMigrationTokenCarriesOnlyStrictPortableResourceMetadata(t *testing.T) {
 	if payload.Metadata["ordinary"] != "preserved" {
 		t.Fatal("ordinary portable metadata was dropped")
 	}
+	if got, want := payload.Metadata[sandboxcfg.NsTraffic], `{"max_inflight":{"total":9,"forward":0}}`; got != want {
+		t.Fatalf("portable traffic metadata = %q, want %q", got, want)
+	}
 
 	sb.Metadata[sandboxcfg.NsResource] = `{"control":{"controller":"/run/foreign.sock"}}`
 	if _, err := o.mintSandboxToken(sb, sb.ResumeSource); err == nil || !strings.Contains(err.Error(), "node-managed") {
 		t.Fatalf("node-owned migration resource error = %v", err)
+	}
+}
+
+func TestMigrationTokenDoesNotMaterializeAbsentTrafficMetadata(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	sb := migrationSandbox(t, dir, "absent-traffic", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	apiSecret, apiKey := defaultTestCredentials(t, sb.ManifestKey)
+	if apiSecret != sb.APISecret {
+		t.Fatal("test credential derivation changed")
+	}
+	if _, err := o.st.AddKeyPair(context.Background(), store.KeyPair{
+		APISecret: apiSecret, ManifestKey: sb.ManifestKey,
+	}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	sb.Metadata = map[string]string{"ordinary": "preserved"}
+	token, err := o.mintSandboxToken(sb, sb.ResumeSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := migrationtoken.Open(migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey}, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payload.Metadata[sandboxcfg.NsTraffic]; present {
+		t.Fatalf("migration materialized absent traffic: %+v", payload.Metadata)
+	}
+	importedID, err := o.ImportSandbox(context.Background(), apiKey, token, "absent-traffic-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := o.st.Get(context.Background(), importedID)
+	if err != nil || imported == nil {
+		t.Fatalf("imported sandbox = %+v, %v", imported, err)
+	}
+	if _, present := imported.Metadata[sandboxcfg.NsTraffic]; present {
+		t.Fatalf("migration import materialized absent traffic: %+v", imported.Metadata)
+	}
+}
+
+func TestMigrationTokenRejectsBareE2BTrafficServices(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	sb := migrationSandbox(t, dir, "bare-traffic", strings.Repeat("6", 64), "manifest://"+strings.Repeat("b", 64))
+	sb.Profile = types.ProfileBare
+	sb.TemplateID = types.TemplateID{
+		Profile: types.ProfileBare,
+		Kind:    types.KindSnp,
+		Ref:     "manifest://" + strings.Repeat("a", 64),
+	}.String()
+	sb.Metadata = map[string]string{
+		sandboxcfg.NsTraffic: `{"max_inflight":{"e2b:envd":1}}`,
+	}
+	if _, err := o.mintSandboxToken(sb, sb.ResumeSource); err == nil || !strings.Contains(err.Error(), "bare") {
+		t.Fatalf("bare migration traffic error = %v", err)
 	}
 }
 

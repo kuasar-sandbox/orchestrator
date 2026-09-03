@@ -22,7 +22,7 @@ router
   ├────────────────────────────────────► node conductor
   │ ordinary data: known NodeSandboxID + DataEndpoint (ready/paused/starting)
   ├────────────────────────────────────► node Proxy
-  │                                      auth → parking → Activate/Wake → backend
+  │                                      auth → per-Sandbox admission → parking → Activate/Wake → backend
   │ exec: token gate → public 200 → first-frame gate → node proxy
   │
   │ data cache miss / missing target / typed stale
@@ -393,6 +393,14 @@ Router 在 public 200 后先执行首帧 gate,通过后才建立下一跳;最终
 `StableID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
 activation 和连接 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
 
+最终 Node Proxy 的 ordinary HTTP/non-exec CONNECT 达到 per-Sandbox 上限时返回
+`429` + `X-Kuasar-Proxy-Error: max_inflight_reached`。Router 原样透传 status、header 和
+fixed body;该 typed response 不是 stale route,不淘汰 cache、不调用 Reserve、不换 node 重试。
+Router 不实现第二套 limiter,因此限制仍由目标 Proxy 对同一 Sandbox 的全部 worker 统一执行,
+而不是 cluster-wide 或 per-Router capacity。native exec 的 admission 位于 Node 的 CONNECT 200
+与 CEL/首帧校验之后;达到上限时 Node 写已有 generic ctl error 并关闭,Router 只透明中继该 frame,
+不会合成 HTTP 429。
+
 CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL
 或 fail-fast 失效.Router→Node CONNECT 的 response reader 已预读字节会随 tunnel 保留;
 中继在单向 EOF 时只传播 half-close,等待另一方向的 `exec_ack`,stdout/stderr 和 exit status
@@ -408,6 +416,7 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 | registry owner 故障 | owner set 内按顺序 failover |
 | Reserve timeout | 返回 503/504;当前请求结束,Router 不保留 Reserve flight |
 | typed stale cache | 淘汰旧 target,ReserveData 重验并刷新后只重试一次 |
+| typed `max_inflight_reached` | 原样透传 429;不淘汰 route、不 Reserve、不换 node 重试 |
 | node API endpoint 失败 | 当前 control/build 请求失败;后续请求重新 Resolve,不改拨 DataEndpoint |
 | node data endpoint 失败 | 淘汰 route cache,下一次请求重新 Resolve,不改拨 APIEndpoint |
 | 旧代际迟到 | 低 RouteRevision 或同 revision 但不同 NodeSandboxID 不覆盖 cache;旧请求失败不驱逐新代际 |
@@ -418,6 +427,7 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
   router→node CONNECT;parking/Wake 在 node 完成。
 - data miss:一次 registry Resolve;只有 target 缺失或 typed stale 才增加 data Reserve。
 - router 不因 group 总量增长而维护全量 route 流。
+- per-Sandbox max inflight 只在最终 node Proxy 执行;router 无全局 limiter、共享 counter 或重试放大。
 - 控制面转发可使用 HTTP transport 连接池,连接池按 `api_endpoint` 隔离;数据面转发不使用 pooled transport.
 
 ## 11. See Also

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -24,6 +25,9 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 		EnvdUDS: "/run/s1/envd.sock", CiUDS: "/run/s1/ci.sock", FloatingIP: "100.100.0.2",
 		APISecret: apiSecret, ManifestKey: manifestKey, ServiceSecret: strings.Repeat("3", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
+		Metadata: map[string]string{
+			sandboxcfg.NsTraffic: `{"max_inflight":{"total":32,"forward":0}}`,
+		},
 		ResumeSource: types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://" + strings.Repeat("4", 64)},
 	}
 	apiFingerprint, err := store.APISecretHash(apiSecret)
@@ -44,12 +48,34 @@ func TestRouteEntryProjectsExplicitCredentials(t *testing.T) {
 		got.MmdsSecret != hex.EncodeToString(keys.MmdsSecret(manifestKey, sb.ID)) {
 		t.Fatalf("route entry = %+v", got)
 	}
+	if got.MaxInflightPatch == nil || got.MaxInflightPatch.Total == nil || *got.MaxInflightPatch.Total != 32 ||
+		got.MaxInflightPatch.Forward == nil || *got.MaxInflightPatch.Forward != 0 || got.MaxInflightPatch.Exec != nil {
+		t.Fatalf("traffic route projection = %+v", got.MaxInflightPatch)
+	}
 	wire, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(wire), manifestKey) {
 		t.Fatal("route entry exposed manifest encryption key")
+	}
+}
+
+func TestRouteEntryFailsClosedOnCorruptPersistedTraffic(t *testing.T) {
+	for name, raw := range map[string]string{
+		"syntax":  `{"max_inflight":{"total":null}}`,
+		"profile": `{"max_inflight":{"e2b:envd":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			sb := &types.Sandbox{
+				ID: "corrupt-" + name, Profile: types.ProfileBare, State: types.StateRunning,
+				Metadata: map[string]string{sandboxcfg.NsTraffic: raw},
+			}
+			entry := (&Orchestrator{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).routeEntry(sb)
+			if entry.State != routesync.StateDead || entry.MaxInflightPatch != nil {
+				t.Fatalf("corrupt traffic projection = %+v", entry)
+			}
+		})
 	}
 }
 

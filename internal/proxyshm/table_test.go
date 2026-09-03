@@ -19,18 +19,18 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func TestStableIDRenamePreservesRecordLayout(t *testing.T) {
-	if schema != 6 {
-		t.Fatalf("schema = %d, want unchanged schema 6", schema)
+func TestAdmissionProjectionBumpsRecordLayout(t *testing.T) {
+	if schema != 7 {
+		t.Fatalf("schema = %d, want schema 7", schema)
 	}
-	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1127 {
-		t.Fatalf("StableID offset = %d, want unchanged offset 1127", got)
+	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1163 {
+		t.Fatalf("StableID offset = %d, want 1163", got)
 	}
-	if got := unsafe.Offsetof(mmapRecord{}.APISecret); got != 1255 {
-		t.Fatalf("APISecret offset = %d, want unchanged offset 1255", got)
+	if got := unsafe.Offsetof(mmapRecord{}.APISecret); got != 1291 {
+		t.Fatalf("APISecret offset = %d, want 1291", got)
 	}
-	if got := unsafe.Sizeof(mmapRecord{}); got != 2568 {
-		t.Fatalf("mmapRecord size = %d, want unchanged size 2568", got)
+	if got := unsafe.Sizeof(mmapRecord{}); got != 2608 {
+		t.Fatalf("mmapRecord size = %d, want 2608", got)
 	}
 }
 

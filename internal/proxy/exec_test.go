@@ -19,9 +19,13 @@ import (
 	"testing"
 	"time"
 
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
@@ -70,17 +74,19 @@ func (r *execTestRouter) ActivateExec(ctx context.Context, _ string, expected pr
 }
 
 func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *testing.T) {
+	harness := newLimitedTrafficHarness(t)
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
 		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
 	router := &execTestRouter{
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
 	var dials atomic.Int32
-	traffic := &recordingTrafficTracker{}
+	traffic := &countingAdmissionTracker{traffic: harness.traffic}
 	px := proxy.NewWithDialer(router, func() string { return "off" }, discardExecLogger(), nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)
@@ -113,10 +119,11 @@ func TestExecRejectsNonConnectAndInvalidTokenWithoutLifecycleSideEffects(t *test
 		if resp.Code != http.StatusUnauthorized {
 			t.Fatalf("invalid KAT response = %d, want 401", resp.Code)
 		}
-		if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || router.routeCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
-			t.Fatalf("invalid KAT caused lifecycle side effects: lookup=%d activate=%d route=%d dial=%d parking=%d",
-				router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load(), dials.Load(), traffic.begins.Load())
+		if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || router.routeCalls.Load() != 0 || dials.Load() != 0 || traffic.tries.Load() != 0 {
+			t.Fatalf("invalid KAT caused lifecycle side effects: lookup=%d activate=%d route=%d dial=%d admission=%d",
+				router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load(), dials.Load(), traffic.tries.Load())
 		}
+		harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
 	})
 }
 
@@ -178,47 +185,72 @@ func TestExecNotFoundIsRetryableOnlyBeforeAdmission(t *testing.T) {
 }
 
 func TestExecConditionFailureHasNoParkingActivationOrDial(t *testing.T) {
-	identity := proxy.ExecIdentity{
-		NodeSandboxID: "node-condition",
-		StableID:      "stable-condition",
-		ServiceSecret: execTestServiceSecret,
-	}
-	token, err := keys.MintExecAccessTokenWithConditions(
-		identity.ServiceSecret, identity.StableID, 0,
-		[]string{`request.argv == ['/bin/allowed']`},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := &execTestRouter{
-		identity: identity, found: true,
-		activateResult: identity, activateFound: true,
-	}
-	var dials atomic.Int32
-	traffic := &recordingTrafficTracker{}
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
-		func(context.Context, proxy.Route) (net.Conn, error) {
-			dials.Add(1)
-			return nil, errors.New("unexpected dial")
-		}, t.TempDir()).WithTrafficTracker(traffic)
-	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(
-		execTestFrame(`{"type":"exec_request","exec":{"argv":["/bin/denied"]}}`)))
-	req.ProtoMajor = 2
-	req.Host = "sandbox:443"
-	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
-	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
-	req.Header.Set(proxy.HeaderAccessToken, token)
-	response := httptest.NewRecorder()
-	px.ServeHTTP(response, req)
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, want post-accept 200", response.Code)
-	}
-	assertExecRequestRejected(t, response.Body.Bytes())
-	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 ||
-		traffic.begins.Load() != 0 || traffic.attaches.Load() != 0 || traffic.closes.Load() != 0 {
-		t.Fatalf("denied request side effects lookup=%d activate=%d dial=%d parking=%d attach=%d close=%d",
-			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load(), traffic.begins.Load(),
-			traffic.attaches.Load(), traffic.closes.Load())
+	costArgv := `[` + strings.Repeat(`"x",`, int(limits.MaxRuntimeCost)) + `"x"]`
+	for _, test := range []struct {
+		name        string
+		condition   string
+		requestJSON string
+	}{
+		{
+			name:        "false",
+			condition:   `request.argv == ['/bin/allowed']`,
+			requestJSON: `{"type":"exec_request","exec":{"argv":["/bin/denied"]}}`,
+		},
+		{
+			name:        "evaluation error",
+			condition:   `request.argv[99] == 'missing'`,
+			requestJSON: `{"type":"exec_request","exec":{"argv":["true"]}}`,
+		},
+		{
+			name:        "cost exceeded",
+			condition:   `request.argv.exists(arg, arg == 'never')`,
+			requestJSON: `{"type":"exec_request","exec":{"argv":` + costArgv + `}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newLimitedTrafficHarness(t)
+			identity := proxy.ExecIdentity{
+				NodeSandboxID: "node-condition",
+				StableID:      "stable-condition",
+				ServiceSecret: execTestServiceSecret,
+			}
+			identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
+			token, err := keys.MintExecAccessTokenWithConditions(
+				identity.ServiceSecret, identity.StableID, 0, []string{test.condition},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router := &execTestRouter{
+				identity: identity, found: true,
+				activateResult: identity, activateFound: true,
+			}
+			var dials atomic.Int32
+			traffic := &countingAdmissionTracker{traffic: harness.traffic}
+			px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
+				func(context.Context, proxy.Route) (net.Conn, error) {
+					dials.Add(1)
+					return nil, errors.New("unexpected dial")
+				}, t.TempDir()).WithTrafficTracker(traffic)
+			req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(execTestFrame(test.requestJSON)))
+			req.ProtoMajor = 2
+			req.Host = "sandbox:443"
+			req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
+			req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+			req.Header.Set(proxy.HeaderAccessToken, token)
+			response := httptest.NewRecorder()
+			px.ServeHTTP(response, req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want post-accept 200", response.Code)
+			}
+			assertExecRequestRejected(t, response.Body.Bytes())
+			if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 ||
+				traffic.tries.Load() != 0 {
+				t.Fatalf("denied request side effects lookup=%d activate=%d dial=%d admission=%d",
+					router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load(), traffic.tries.Load())
+			}
+			harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
+		})
 	}
 }
 
@@ -329,21 +361,71 @@ func TestExecActivationFailureReturnsGenericPostAcceptErrorBeforeDial(t *testing
 	}
 }
 
-func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
-	runRoot := t.TempDir()
+func TestExecMaxInflightReachedAfterFirstFrameUsesCtlErrorWithoutActivation(t *testing.T) {
+	harness := newLimitedTrafficHarness(t)
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-s1",
 		StableID:      "stable-s1",
 		ServiceSecret: execTestServiceSecret,
 	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
+	held, err := harness.traffic.TryBeginParking(identity.NodeSandboxID, proxy.ConnectServiceExec, identity.Admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	token, err := keys.MintExecAccessToken(identity.ServiceSecret, identity.StableID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &execTestRouter{
+		identity: identity, found: true,
+		activateResult: identity, activateFound: true,
+	}
+	registry := metrics.New()
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), registry,
+		func(context.Context, proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			return nil, errors.New("unexpected dial")
+		}, t.TempDir()).WithTrafficTracker(harness.traffic)
+	req := httptest.NewRequest(http.MethodConnect, "http://sandbox:443", bytes.NewReader(validExecTestFrame()))
+	req.ProtoMajor = 2
+	req.Host = "sandbox:443"
+	req.Header.Set(proxy.HeaderSandboxID, identity.NodeSandboxID)
+	req.Header.Set(proxy.HeaderSandboxService, string(proxy.ConnectServiceExec))
+	req.Header.Set(proxy.HeaderAccessToken, token)
+	response := httptest.NewRecorder()
+	px.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || response.Header().Get(proxy.HeaderProxyError) != "" {
+		t.Fatalf("response=%d proxy-error=%q, want post-CONNECT ctl error", response.Code, response.Header().Get(proxy.HeaderProxyError))
+	}
+	assertExecRequestRejected(t, response.Body.Bytes())
+	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("calls lookup=%d activate=%d dial=%d, want 1/0/0",
+			router.lookupCalls.Load(), router.activateCalls.Load(), dials.Load())
+	}
+	if got := metricValue(t, registry, `data_requests_total{result="max_inflight_reached"}`); got != 1 {
+		t.Fatalf("max_inflight_reached counter=%d, want 1", got)
+	}
+}
+
+func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
+	runRoot := t.TempDir()
+	harness := newLimitedTrafficHarness(t)
+	identity := proxy.ExecIdentity{
+		NodeSandboxID: "node-s1",
+		StableID:      "stable-s1",
+		ServiceSecret: execTestServiceSecret,
+	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
 	backend, backendDone := startExecBackend(t, runRoot, identity.NodeSandboxID, []byte("exec-response-tail"))
 	router := &execTestRouter{
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 		activateCtx: make(chan context.Context, 1),
 	}
-	worker, master := newTrafficHarness(t)
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(worker)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(harness.traffic)
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 
@@ -380,7 +462,10 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
 	}
-	waitInflightFor(t, master, identity.NodeSandboxID, 0, 1)
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 1)
+	if _, err := harness.worker.TryAcquire(identity.Admission, proxyadmission.ServiceExec); !errors.Is(err, proxyadmission.ErrLimitReached) {
+		t.Fatalf("H1 exec tunnel did not hold its admission lease: %v", err)
+	}
 	if err := tcpConn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -411,23 +496,25 @@ func TestExecH1PreservesBufferedInputAndHalfCloseTail(t *testing.T) {
 	if router.lookupCalls.Load() != 1 || router.activateCalls.Load() != 1 || router.routeCalls.Load() != 0 {
 		t.Fatalf("calls lookup=%d activate=%d route=%d", router.lookupCalls.Load(), router.activateCalls.Load(), router.routeCalls.Load())
 	}
-	waitInflightFor(t, master, identity.NodeSandboxID, 0, 0)
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 0)
+	harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
 }
 
 func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	runRoot := t.TempDir()
+	harness := newLimitedTrafficHarness(t)
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-h2",
 		StableID:      "stable-h2",
 		ServiceSecret: execTestServiceSecret,
 	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
 	backend, backendDone := startExecBackend(t, runRoot, identity.NodeSandboxID, []byte("h2-response-tail"))
 	router := &execTestRouter{
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
-	worker, master := newTrafficHarness(t)
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(worker)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).WithTrafficTracker(harness.traffic)
 	ts := httptest.NewUnstartedServer(px)
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
@@ -466,7 +553,10 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
 		t.Fatalf("response = %s %d, want HTTP/2 200", resp.Proto, resp.StatusCode)
 	}
-	waitInflightFor(t, master, identity.NodeSandboxID, 0, 1)
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 1)
+	if _, err := harness.worker.TryAcquire(identity.Admission, proxyadmission.ServiceExec); !errors.Is(err, proxyadmission.ErrLimitReached) {
+		t.Fatalf("H2 exec tunnel did not hold its admission lease: %v", err)
+	}
 	close(releaseEOF)
 	gotResponse, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -484,22 +574,25 @@ func TestExecH2StreamsRequestAndFlushesTrailingResponse(t *testing.T) {
 	if err := <-backendDone; err != nil {
 		t.Fatal(err)
 	}
-	waitInflightFor(t, master, identity.NodeSandboxID, 0, 0)
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 0)
+	harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
 }
 
 func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 	runRoot := t.TempDir()
+	harness := newLimitedTrafficHarness(t)
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-gate",
 		StableID:      "stable-gate",
 		ServiceSecret: execTestServiceSecret,
 	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
 	router := &execTestRouter{
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
 	var dials atomic.Int32
-	traffic := &recordingTrafficTracker{}
+	traffic := &countingAdmissionTracker{traffic: harness.traffic}
 	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil,
 		func(context.Context, proxy.Route) (net.Conn, error) {
 			dials.Add(1)
@@ -539,19 +632,22 @@ func TestExecGateRejectsNonExecFirstFrameAfterConnect200(t *testing.T) {
 	}
 	_, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if router.activateCalls.Load() != 0 || dials.Load() != 0 || traffic.begins.Load() != 0 {
-		t.Fatalf("invalid frame crossed gate: activate=%d dial=%d parking=%d",
-			router.activateCalls.Load(), dials.Load(), traffic.begins.Load())
+	if router.activateCalls.Load() != 0 || dials.Load() != 0 || traffic.tries.Load() != 0 {
+		t.Fatalf("invalid frame crossed gate: activate=%d dial=%d admission=%d",
+			router.activateCalls.Load(), dials.Load(), traffic.tries.Load())
 	}
+	harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
 }
 
 func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 	runRoot := t.TempDir()
+	harness := newLimitedTrafficHarness(t)
 	identity := proxy.ExecIdentity{
 		NodeSandboxID: "node-cancel",
 		StableID:      "stable-cancel",
 		ServiceSecret: execTestServiceSecret,
 	}
+	identity.Admission = harness.bind(t, identity.NodeSandboxID, publicconfig.MaxInflight{Exec: 1})
 	dir := nodepath.SandboxRunDir(runRoot, identity.NodeSandboxID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -589,7 +685,8 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 		identity: identity, found: true,
 		activateResult: identity, activateFound: true,
 	}
-	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot)
+	px := proxy.NewWithDialer(router, func() string { return "enforce" }, discardExecLogger(), nil, nil, runRoot).
+		WithTrafficTracker(harness.traffic)
 	ts := httptest.NewUnstartedServer(px)
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
@@ -626,6 +723,7 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("ctl backend did not receive accepted exec frame")
 	}
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 1)
 	cancel()
 	_ = bodyWriter.Close()
 	_ = resp.Body.Close()
@@ -640,6 +738,8 @@ func TestExecH2ContextCancellationClosesCtlStream(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("request context cancellation did not close ctl stream")
 	}
+	waitInflightFor(t, harness.stats, identity.NodeSandboxID, 0, 0)
+	harness.assertAvailable(t, identity.Admission, proxyadmission.ServiceExec)
 }
 
 func TestExecH1FullClientCloseTerminatesHandlerAndCtlStream(t *testing.T) {

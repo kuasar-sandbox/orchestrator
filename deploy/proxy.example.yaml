@@ -49,4 +49,15 @@ workers: 2
 auth: enforce
 park_timeout: 30s
 
+# Target-node defaults for each Sandbox, enforced jointly across all workers.
+# Zero means unlimited; this is inflight concurrency, not QPS or Proxy-global
+# capacity. Explicit kuasar-sandbox.traffic leaves override these defaults.
+traffic:
+  max_inflight:
+    total: 128
+    forward: 96
+    "e2b:envd": 16
+    "e2b:code-interpreter": 8
+    exec: 8
+
 # metrics_listen: 127.0.0.1:9095 # master metrics endpoint (aggregates worker counters)
