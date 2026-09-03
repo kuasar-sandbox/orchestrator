@@ -190,7 +190,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 }
 
-func TestRouteSyncRejectsVersion4BeforeBusinessFrames(t *testing.T) {
+func TestRouteSyncRejectsVersion6BeforeBusinessFrames(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "cfg.sock")
 	ln, err := net.Listen("unix", sock)
@@ -204,7 +204,7 @@ func TestRouteSyncRejectsVersion4BeforeBusinessFrames(t *testing.T) {
 		if _, err := routesync.ReadRegister(r.Body); err != nil {
 			return
 		}
-		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: 4}})
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: 6}})
 		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
 			SandboxID: "must-not-apply", State: routesync.StateRunning,
 		}})

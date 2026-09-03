@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -30,6 +31,7 @@ type PreparedWorker struct {
 	effective *EffectiveConfig
 	process   Process
 	table     *proxyshm.Table
+	admission *proxyadmission.Worker
 
 	wakeFile    *os.File
 	notifyFile  *os.File
@@ -66,6 +68,18 @@ func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr err
 			_ = prepared.Close()
 		}
 	}()
+	admissionFile, returnErr := inheritedFile(fds.Admission, "proxy-admission")
+	if returnErr != nil {
+		return nil, returnErr
+	}
+	delete(owned, fds.Admission)
+	prepared.admission, returnErr = proxyadmission.OpenWorker(
+		admissionFile, bootstrap.effective.config.RouteCapacity, bootstrap.effective.config.Workers,
+		bootstrap.workerIndex, bootstrap.process.WorkerEpoch,
+	)
+	if returnErr != nil {
+		return nil, fmt.Errorf("proxy worker: open shared admission arena: %w", returnErr)
+	}
 
 	prepared.wakeFile, returnErr = inheritedFile(fds.Wake, "proxy-wake")
 	if returnErr != nil {
@@ -148,7 +162,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	}
 	defer mmdsClient.Close()
 
-	view := proxyshm.NewMMDSWorkerView(worker.table, updates, wakes.Wake, cfg.ParkTimeoutDur(), mmdsClient)
+	view := proxyshm.NewMMDSWorkerView(worker.table, worker.admission, updates, wakes.Wake, cfg.ParkTimeoutDur(), mmdsClient)
 	authMode := func() string {
 		if mode := view.Policy().AuthMode; mode != "" {
 			return mode
@@ -158,7 +172,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
-	workerStats := proxystats.NewWorkerStats()
+	workerStats := proxystats.NewWorkerStatsWithAdmission(worker.admission)
 	var proxyHandler *proxy.Proxy
 	var extensionHost proxyextension.WorkerHost
 	if runtime.WorkerExtension != nil {
@@ -246,6 +260,7 @@ func (worker *PreparedWorker) Close() error {
 			closeFile(worker.wakeFile), closeFile(worker.notifyFile), closeConn(worker.statsConn),
 			closeConn(worker.mmdsRPCConn), closeListener(worker.data),
 			closeListener(worker.mmds), closeTable(worker.table),
+			closeAdmission(worker.admission),
 		)
 	})
 	return worker.closeErr
@@ -307,13 +322,20 @@ func connectionFromFD(fd int, name string) (net.Conn, error) {
 }
 
 func workerDescriptors(fds workerFDMapping) map[int]struct{} {
-	result := make(map[int]struct{}, 6)
-	for _, fd := range []int{fds.Data, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC} {
+	result := make(map[int]struct{}, 7)
+	for _, fd := range []int{fds.Data, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC, fds.Admission} {
 		if fd >= 0 {
 			result[fd] = struct{}{}
 		}
 	}
 	return result
+}
+
+func closeAdmission(admission *proxyadmission.Worker) error {
+	if admission == nil {
+		return nil
+	}
+	return admission.Close()
 }
 
 func closeDescriptors(descriptors map[int]struct{}) {

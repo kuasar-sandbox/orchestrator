@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -44,9 +45,10 @@ type BatchResponse struct {
 }
 
 type RouteIdentity struct {
-	RunID   string
-	Profile types.Profile
-	State   types.State
+	RunID       string
+	Profile     types.Profile
+	State       types.State
+	MaxInflight config.MaxInflight
 }
 
 type StatsServer struct {
@@ -130,6 +132,7 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 			writeSocketError(w, status, "traffic stats unavailable")
 			return
 		}
+		stats.MaxInflight = identity.MaxInflight
 		response.Sandboxes = append(response.Sandboxes, BatchResult{SandboxID: query.SandboxID, Stats: stats})
 	}
 	w.Header().Set("Content-Type", "application/json")

@@ -22,7 +22,7 @@ func TestWorkerBootstrapSealedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	fds := validWorkerFDMapping()
-	file, err := newWorkerBootstrapFile("proxy-3", 7, effective, fds)
+	file, err := newWorkerBootstrapFile(0, "proxy-3", 7, effective, fds)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestWorkerBootstrapSealedRoundTrip(t *testing.T) {
 	if bootstrap.process != (Process{Role: RoleWorker, WorkerID: "proxy-3", WorkerEpoch: 7}) {
 		t.Fatalf("process=%+v", bootstrap.process)
 	}
-	if bootstrap.fds != fds || bootstrap.effective.Config().Paths.RunRoot != "/run/test-proxy" {
+	if bootstrap.fds != fds || bootstrap.workerIndex != 0 || bootstrap.effective.Config().Paths.RunRoot != "/run/test-proxy" {
 		t.Fatalf("bootstrap=%+v config=%+v", bootstrap.fds, bootstrap.effective.Config())
 	}
 	if err := bootstrap.VerifyExecutable(); err != nil {
@@ -60,13 +60,15 @@ func TestWorkerBootstrapSealedRoundTrip(t *testing.T) {
 func TestReceiveWorkerBootstrapRejectsMalformedInput(t *testing.T) {
 	base := validWorkerEnvelope(t)
 	tests := map[string]func() []byte{
-		"bad magic":         func() []byte { value := base; value.Magic = "bad"; return marshalWorkerEnvelope(t, value) },
-		"bad version":       func() []byte { value := base; value.ProtocolVersion++; return marshalWorkerEnvelope(t, value) },
-		"bad role":          func() []byte { value := base; value.Role = RoleMaster; return marshalWorkerEnvelope(t, value) },
-		"bad config schema": func() []byte { value := base; value.ConfigSchemaVersion++; return marshalWorkerEnvelope(t, value) },
-		"bad fd schema":     func() []byte { value := base; value.FDProtocolVersion++; return marshalWorkerEnvelope(t, value) },
-		"bad worker":        func() []byte { value := base; value.WorkerID = ""; return marshalWorkerEnvelope(t, value) },
-		"bad epoch":         func() []byte { value := base; value.WorkerEpoch = 0; return marshalWorkerEnvelope(t, value) },
+		"bad magic":          func() []byte { value := base; value.Magic = "bad"; return marshalWorkerEnvelope(t, value) },
+		"bad version":        func() []byte { value := base; value.ProtocolVersion++; return marshalWorkerEnvelope(t, value) },
+		"bad role":           func() []byte { value := base; value.Role = RoleMaster; return marshalWorkerEnvelope(t, value) },
+		"bad config schema":  func() []byte { value := base; value.ConfigSchemaVersion++; return marshalWorkerEnvelope(t, value) },
+		"bad fd schema":      func() []byte { value := base; value.FDProtocolVersion++; return marshalWorkerEnvelope(t, value) },
+		"bad worker":         func() []byte { value := base; value.WorkerID = ""; return marshalWorkerEnvelope(t, value) },
+		"bad epoch":          func() []byte { value := base; value.WorkerEpoch = 0; return marshalWorkerEnvelope(t, value) },
+		"bad worker index":   func() []byte { value := base; value.WorkerIndex = -1; return marshalWorkerEnvelope(t, value) },
+		"large worker index": func() []byte { value := base; value.WorkerIndex = 2; return marshalWorkerEnvelope(t, value) },
 		"bad identity": func() []byte {
 			value := base
 			value.ExecutableIdentity = componentexec.ExecutableIdentity{}
@@ -194,7 +196,7 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	descriptors := make([]int, 6)
+	descriptors := make([]int, 7)
 	for index := range descriptors {
 		descriptors[index], err = unix.Dup(int(file.Fd()))
 		if err != nil {
@@ -203,7 +205,7 @@ func TestWorkerBootstrapCloseReleasesUnconsumedDescriptors(t *testing.T) {
 	}
 	bootstrap := &WorkerBootstrap{fds: workerFDMapping{
 		Data: descriptors[0], MMDS: descriptors[1], Wake: descriptors[2],
-		Notify: descriptors[3], Stats: descriptors[4], MMDSRPC: descriptors[5],
+		Notify: descriptors[3], Stats: descriptors[4], MMDSRPC: descriptors[5], Admission: descriptors[6],
 	}}
 	if err := bootstrap.Close(); err != nil {
 		t.Fatal(err)
@@ -230,7 +232,7 @@ func validWorkerEnvelope(t *testing.T) workerEnvelope {
 	}
 	return workerEnvelope{
 		Magic: workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion, Role: RoleWorker,
-		WorkerID: "proxy-0", WorkerEpoch: 1,
+		WorkerID: "proxy-0", WorkerEpoch: 1, WorkerIndex: 0,
 		ConfigSchemaVersion: workerConfigSchemaVersion, FDProtocolVersion: workerFDProtocolVersion,
 		ExecutableIdentity: identity,
 		Config:             append(json.RawMessage(nil), effective.raw...), ConfigDigest: hex.EncodeToString(effective.digest[:]),
@@ -239,7 +241,7 @@ func validWorkerEnvelope(t *testing.T) workerEnvelope {
 }
 
 func validWorkerFDMapping() workerFDMapping {
-	return workerFDMapping{Data: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104}
+	return workerFDMapping{Data: 100, MMDS: -1, Wake: 101, Notify: 102, Stats: 103, MMDSRPC: 104, Admission: 105}
 }
 
 func marshalWorkerEnvelope(t *testing.T, value workerEnvelope) []byte {

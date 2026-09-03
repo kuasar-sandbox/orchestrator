@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	sandboxctl "github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 )
 
@@ -80,6 +81,7 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 	defer cancelTunnel()
 
 	var flow TrafficFlow
+	maxInflightRejected := false
 	defer func() {
 		if flow != nil {
 			flow.Close()
@@ -100,9 +102,16 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 			return programs.Evaluate(ctx, frame.Request.Exec)
 		},
 		DialBackend: func(ctx context.Context, _ *sandboxctl.ExecRequestFrame) (io.ReadWriteCloser, error) {
-			flow = p.traffic.BeginParking(identity.NodeSandboxID, ConnectServiceExec)
-			if flow == nil {
-				flow = noopTrafficFlow{}
+			var beginErr error
+			flow, beginErr = p.tryBeginParking(identity.NodeSandboxID, ConnectServiceExec, identity.Admission)
+			if errors.Is(beginErr, proxyadmission.ErrLimitReached) {
+				maxInflightRejected = true
+				p.mx.Inc(`data_requests_total{result="max_inflight_reached"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
+			if beginErr != nil {
+				p.mx.Inc(`data_requests_total{result="route_error"}`)
+				return nil, errors.New("exec backend unavailable")
 			}
 			ready, found, err := execRouter.ActivateExec(ctx, sid, identity)
 			if err != nil {
@@ -132,7 +141,9 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 		FirstRequestTimeout: limits.FirstRequestTimeout,
 	})
 	if err != nil {
-		p.logExecRelayError(tunnelCtx, err)
+		if !maxInflightRejected {
+			p.logExecRelayError(tunnelCtx, err)
+		}
 	}
 }
 

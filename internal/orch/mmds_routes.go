@@ -40,7 +40,10 @@ func validateMMDSRouteEntry(sb *types.Sandbox, secretValues store.MMDSRouteSecre
 	if err != nil {
 		return err
 	}
-	entry := routeEntryBase(sb)
+	entry, err := routeEntryBase(sb)
+	if err != nil {
+		return err
+	}
 	entry.MMDSRoutes = raw
 	if sandboxcfg.MMDSHasSecretRoutes(routes) {
 		values := make(routesync.MMDSRouteSecretValues, len(secretValues))

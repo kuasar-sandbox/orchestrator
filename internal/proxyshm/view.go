@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -14,11 +15,14 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdssvc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -29,12 +33,14 @@ var (
 
 // MasterView is the proxy master's routesync sink and wake source.
 type MasterView struct {
-	table     *Table
-	mmds      *MMDSView
-	wakes     *WakeQueue
-	notify    *Broadcaster
-	defaultPk time.Duration
-	log       *slog.Logger
+	table           *Table
+	mmds            *MMDSView
+	wakes           *WakeQueue
+	notify          *Broadcaster
+	defaultPk       time.Duration
+	log             *slog.Logger
+	admission       *proxyadmission.Master
+	trafficDefaults config.MaxInflight
 	// upsertPrimary is table.Upsert in production. Keeping the transaction's
 	// fallible commit point explicit lets tests inject every rollback shape.
 	upsertPrimary func(routesync.RouteEntry) error
@@ -46,17 +52,23 @@ type MasterView struct {
 }
 
 func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *MasterView {
+	return NewMasterViewWithAdmission(table, nil, config.MaxInflight{}, defaultPark, log)
+}
+
+func NewMasterViewWithAdmission(table *Table, admission *proxyadmission.Master, trafficDefaults config.MaxInflight, defaultPark time.Duration, log *slog.Logger) *MasterView {
 	if defaultPark <= 0 {
 		defaultPark = 30 * time.Second
 	}
 	view := &MasterView{
-		table:       table,
-		mmds:        NewMMDSView(table.Capacity()),
-		wakes:       NewWakeQueue(4096),
-		notify:      NewBroadcaster(),
-		defaultPk:   defaultPark,
-		log:         log,
-		policyReady: make(chan struct{}),
+		table:           table,
+		mmds:            NewMMDSView(table.Capacity()),
+		wakes:           NewWakeQueue(4096),
+		notify:          NewBroadcaster(),
+		defaultPk:       defaultPark,
+		log:             log,
+		admission:       admission,
+		trafficDefaults: trafficDefaults,
+		policyReady:     make(chan struct{}),
 	}
 	view.upsertPrimary = table.Upsert
 	return view
@@ -65,12 +77,37 @@ func NewMasterView(table *Table, defaultPark time.Duration, log *slog.Logger) *M
 func (v *MasterView) BeginSync() {
 	v.table.SetMMDSSynced(false)
 	v.table.BeginSync()
+	if v.admission != nil {
+		v.admission.BeginSync()
+	}
 	v.mmds.BeginSync()
 	v.table.clearAllMMDSSources()
 	v.notify.Notify()
 }
 
 func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
+	if err := validateRouteFields(r); err != nil {
+		return err
+	}
+	effective, err := effectiveMaxInflight(v.trafficDefaults, types.Profile(r.Profile), r.MaxInflightPatch)
+	if err != nil {
+		return err
+	}
+	var admissionUpdate *proxyadmission.Update
+	if v.admission != nil {
+		admissionUpdate, err = v.admission.PrepareUpsert(r.SandboxID, routeAdmissionIdentity(r), effective)
+		if err != nil {
+			return err
+		}
+		defer admissionUpdate.Rollback()
+		binding := admissionUpdate.Binding()
+		r.AdmissionSlot = binding.Slot
+		r.AdmissionGeneration = binding.Generation
+	} else if !effective.Unlimited() {
+		return errors.New("proxyshm: limited route requires admission arena")
+	}
+	r.EffectiveMaxInflight = effective
+	r.MaxInflightPatch = nil
 	if err := validateRoute(r); err != nil {
 		return err
 	}
@@ -123,11 +160,17 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
 	if sourceOwnerReplaced {
 		logMMDSSourceConflict(v.log, conflict)
 	}
+	if admissionUpdate != nil {
+		admissionUpdate.Commit()
+	}
 	v.notify.Notify()
 	return nil
 }
 
 func (v *MasterView) ApplyDelete(sid string) {
+	if v.admission != nil {
+		v.admission.Delete(sid)
+	}
 	oldRoute, oldFound := v.table.Lookup(sid)
 	v.mmds.Delete(sid)
 	v.table.removeRouteMMDSSource(oldRoute, oldFound)
@@ -136,6 +179,9 @@ func (v *MasterView) ApplyDelete(sid string) {
 }
 
 func (v *MasterView) Bookmark() {
+	if v.admission != nil {
+		v.admission.Bookmark()
+	}
 	v.table.Bookmark()
 	v.table.rebuildMMDSSources(v.log)
 	v.mmds.Bookmark()
@@ -286,6 +332,7 @@ func (b *Broadcaster) Notify() {
 // WorkerView is a read-only proxy.Router and MMDS source backed by shared memory.
 type WorkerView struct {
 	table       *Table
+	admission   *proxyadmission.Worker
 	updates     *Updates
 	wake        func(string)
 	defaultPark time.Duration
@@ -302,8 +349,9 @@ func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPar
 
 // NewMMDSWorkerView adds the inherited master RPC connection used only by an
 // independent Proxy worker. Existing non-MMDS callers retain NewWorkerView.
-func NewMMDSWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration, client *mmdsrpc.Client) *WorkerView {
+func NewMMDSWorkerView(table *Table, admission *proxyadmission.Worker, updates *Updates, wake func(string), defaultPark time.Duration, client *mmdsrpc.Client) *WorkerView {
 	view := NewWorkerView(table, updates, wake, defaultPark)
+	view.admission = admission
 	view.mmdsClient = client
 	view.mmdsTimeout = 2 * time.Second
 	return view
@@ -353,7 +401,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 	}
 	r, found, _ := v.table.LookupRevision(expected.SandboxID)
 	binding, present := workerRouteBinding(r, found, expected.Target)
-	if !present || binding != expected {
+	if !present || binding != expected || !v.admissionBindingValid(expected.Admission) {
 		return proxy.Route{}, false, nil
 	}
 	if r.State == routesync.StateRunning {
@@ -379,6 +427,9 @@ func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.Connect
 	if binding.SandboxID == "" || binding.StableID == "" {
 		return proxy.RouteBinding{}, false
 	}
+	binding.Admission = proxyadmission.Binding{
+		Slot: r.AdmissionSlot, Generation: r.AdmissionGeneration, Limits: r.EffectiveMaxInflight,
+	}
 	return binding, true
 }
 
@@ -395,7 +446,7 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 		rev := v.table.Rev()
 		r, found := v.table.Lookup(expected.SandboxID)
 		binding, present := workerRouteBinding(r, found, expected.Target)
-		if !present || binding != expected {
+		if !present || binding != expected || !v.admissionBindingValid(expected.Admission) {
 			return proxy.Route{}, false, nil
 		}
 		switch r.State {
@@ -471,7 +522,7 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	}
 	r, ok, initialRev := v.table.LookupRevision(sid)
 	identity, present := workerExecIdentity(r, ok)
-	if !present || identity != expected {
+	if !present || identity != expected || !v.admissionBindingValid(expected.Admission) {
 		return proxy.ExecIdentity{}, false, nil
 	}
 	if r.State == routesync.StateRunning {
@@ -494,11 +545,57 @@ func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity,
 		NodeSandboxID: r.SandboxID,
 		StableID:      r.StableID,
 		ServiceSecret: r.ServiceSecret,
+		Admission: proxyadmission.Binding{
+			Slot: r.AdmissionSlot, Generation: r.AdmissionGeneration, Limits: r.EffectiveMaxInflight,
+		},
 	}
 	if identity.NodeSandboxID == "" || identity.StableID == "" || identity.ServiceSecret == "" {
 		return proxy.ExecIdentity{}, false
 	}
 	return identity, true
+}
+
+func effectiveMaxInflight(defaults config.MaxInflight, profile types.Profile, patch *sandboxcfg.MaxInflightPatch) (config.MaxInflight, error) {
+	if !profile.Valid() {
+		if patch != nil || !defaults.Unlimited() {
+			return config.MaxInflight{}, fmt.Errorf("proxyshm: invalid profile %q for traffic policy", profile)
+		}
+		return config.MaxInflight{}, nil
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(profile, sandboxcfg.TrafficPatch{MaxInflight: patch}); err != nil {
+		return config.MaxInflight{}, err
+	}
+	if profile == types.ProfileBare {
+		defaults.E2BEnvd = 0
+		defaults.E2BCodeInterpreter = 0
+	}
+	if patch == nil {
+		return defaults, nil
+	}
+	if patch.Total != nil {
+		defaults.Total = *patch.Total
+	}
+	if patch.Forward != nil {
+		defaults.Forward = *patch.Forward
+	}
+	if patch.E2BEnvd != nil {
+		defaults.E2BEnvd = *patch.E2BEnvd
+	}
+	if patch.E2BCodeInterpreter != nil {
+		defaults.E2BCodeInterpreter = *patch.E2BCodeInterpreter
+	}
+	if patch.Exec != nil {
+		defaults.Exec = *patch.Exec
+	}
+	return defaults, nil
+}
+
+func routeAdmissionIdentity(r routesync.RouteEntry) string {
+	return strings.Join([]string{
+		r.SandboxID, r.StableID, r.Profile, r.TemplateID, r.APISecretFingerprint,
+		r.ManifestKeyFingerprint, r.ServiceSecret, r.EnvdAccessToken,
+		r.TrafficAccessToken, r.ForwardAccessToken,
+	}, "\x00")
 }
 
 func (v *WorkerView) waitExecRunning(
@@ -516,7 +613,7 @@ func (v *WorkerView) waitExecRunning(
 		rev := v.table.Rev()
 		r, ok, routeRev := v.table.LookupRevision(sid)
 		identity, present := workerExecIdentity(r, ok)
-		if !present || identity != expected {
+		if !present || identity != expected || !v.admissionBindingValid(expected.Admission) {
 			return proxy.ExecIdentity{}, false, nil
 		}
 		if r.State == routesync.StateRunning {
@@ -534,6 +631,13 @@ func (v *WorkerView) waitExecRunning(
 			return proxy.ExecIdentity{}, false, errExecActivationTimeout
 		}
 	}
+}
+
+func (v *WorkerView) admissionBindingValid(binding proxyadmission.Binding) bool {
+	if binding.Unlimited() {
+		return true
+	}
+	return v.admission != nil && v.admission.Valid(binding)
 }
 
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {

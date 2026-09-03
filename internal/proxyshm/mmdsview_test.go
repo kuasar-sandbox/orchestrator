@@ -168,7 +168,7 @@ func TestWorkerSeesRotationDeleteAndDisconnect(t *testing.T) {
 	go mmdsrpc.NewServer(serverConn, master.ResolveMMDS, nil).Serve()
 	client := mmdsrpc.NewClient(clientConn)
 	defer client.Close()
-	worker := NewMMDSWorkerView(table, nil, nil, time.Second, client)
+	worker := NewMMDSWorkerView(table, nil, nil, nil, time.Second, client)
 
 	resolve := func() (body string, present bool, err error) {
 		route, found, err := worker.MMDSRoute(context.Background(), "sandbox-1", "/secret")
@@ -241,7 +241,7 @@ func TestExternalWorkerRelaysServiceFromConductorPolicy(t *testing.T) {
 	go mmdsrpc.NewServer(serverConn, master.ResolveMMDS, nil).Serve()
 	client := mmdsrpc.NewClient(clientConn)
 	defer client.Close()
-	worker := NewMMDSWorkerView(table, nil, nil, time.Second, client)
+	worker := NewMMDSWorkerView(table, nil, nil, nil, time.Second, client)
 	route, found, err := worker.MMDSRoute(context.Background(), "sandbox-1", "/svc")
 	if err != nil || !found || route.StatusCode != http.StatusAccepted || route.ContentType != "application/json" || string(route.Body) != `{"external":true}` {
 		t.Fatalf("external service route metadata mismatch: found=%t status=%d content-type=%q err=%v", found, route.StatusCode, route.ContentType, err)

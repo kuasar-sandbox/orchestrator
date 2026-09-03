@@ -34,7 +34,10 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
 )
 
 // Version is the protocol version announced by the authority in Hello.
@@ -42,8 +45,10 @@ import (
 // specific route location field with kind-orthogonal artifact_location. Version
 // 5 splits node API and data endpoints and removes the proxy forwarding socket.
 // Version 6 adds rebuildable Build upsert/delete events and an explicit Build
-// full-snapshot bracket on every node-link session; mixed peers fail closed.
-const Version = 6
+// full-snapshot bracket on every node-link session. Version 7 adds the
+// presence-aware per-Sandbox max_inflight route projection; mixed peers fail
+// closed.
+const Version = 7
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -132,6 +137,43 @@ type RouteEntry struct {
 	// A pointer to an empty map means the store was read successfully and no
 	// values exist; nil means unavailable/not projected. It is never written to SHM.
 	MMDSRouteSecretValues *MMDSRouteSecretValues `json:"mmds_route_secret_values,omitempty"`
+	// MaxInflightPatch is the portable explicit metadata projection. The Proxy
+	// master merges it with target-node defaults, then clears it before writing
+	// the fixed route SHM record.
+	MaxInflightPatch *sandboxcfg.MaxInflightPatch `json:"max_inflight,omitempty"`
+
+	// The following fields are master-resolved fixed-layout state. They never
+	// cross routesync wire boundaries.
+	EffectiveMaxInflight config.MaxInflight `json:"-"`
+	AdmissionSlot        uint32             `json:"-"`
+	AdmissionGeneration  uint64             `json:"-"`
+}
+
+// UnmarshalJSON keeps the established extensible RouteEntry envelope while
+// making the owned max_inflight projection strict. Null, duplicate, and unknown
+// policy leaves must not alias an absent patch at a version-7 peer.
+func (r *RouteEntry) UnmarshalJSON(raw []byte) error {
+	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
+		return fmt.Errorf("routesync: route: %w", err)
+	}
+	type routeEntryWire RouteEntry
+	var decoded routeEntryWire
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if maxInflight, present := fields["max_inflight"]; present {
+		patch, err := sandboxcfg.ParseTrafficPatch(`{"max_inflight":` + string(maxInflight) + `}`)
+		if err != nil {
+			return fmt.Errorf("routesync: route: %w", err)
+		}
+		decoded.MaxInflightPatch = patch.MaxInflight
+	}
+	*r = RouteEntry(decoded)
+	return nil
 }
 
 // MMDSRouteSecretValues is pointer-wrapped in RouteEntry so RouteEntry remains

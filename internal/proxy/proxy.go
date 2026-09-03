@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -50,6 +52,7 @@ type RouteBinding struct {
 	Target              ConnectTarget
 	Kind                Kind
 	ExpectedAccessToken string
+	Admission           proxyadmission.Binding
 }
 
 const (
@@ -59,13 +62,14 @@ const (
 	HeaderAccessToken    = "X-Access-Token"
 	HeaderProxyError     = "X-Kuasar-Proxy-Error"
 
-	ProxyErrorBadRequest    = "bad_request"
-	ProxyErrorRouteError    = "route_error"
-	ProxyErrorNotFound      = "not_found"
-	ProxyErrorDenied        = "denied"
-	ProxyErrorUnauthorized  = "unauthorized"
-	ProxyErrorStale         = "stale"
-	ProxyErrorUpstreamError = "upstream_error"
+	ProxyErrorBadRequest         = "bad_request"
+	ProxyErrorRouteError         = "route_error"
+	ProxyErrorNotFound           = "not_found"
+	ProxyErrorDenied             = "denied"
+	ProxyErrorUnauthorized       = "unauthorized"
+	ProxyErrorStale              = "stale"
+	ProxyErrorUpstreamError      = "upstream_error"
+	ProxyErrorMaxInflightReached = "max_inflight_reached"
 )
 
 // ConnectService is the canonical logical service selected by a CONNECT request.
@@ -118,6 +122,7 @@ type ExecIdentity struct {
 	NodeSandboxID string
 	StableID      string
 	ServiceSecret string
+	Admission     proxyadmission.Binding
 }
 
 // ExecRouter separates the side-effect-free credential lookup from the
@@ -142,6 +147,10 @@ func (noopCounter) Inc(string) {}
 // parking→egress→idle state transition for the final backend connection.
 type TrafficTracker interface {
 	BeginParking(sandboxID string, service ConnectService) TrafficFlow
+}
+
+type admissionTrafficTracker interface {
+	TryBeginParking(sandboxID string, service ConnectService, binding proxyadmission.Binding) (TrafficFlow, error)
 }
 
 type TrafficFlow interface {
@@ -290,7 +299,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, flow, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
+	route, flow, admission, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
 	if !ok {
 		return
 	}
@@ -304,6 +313,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		backend = flow.AttachBackend(backend)
+		if !admission.Unlimited() {
+			stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
+			defer stopContextClose()
+		}
 		defer backend.Close()
 		resp, err := ForwardHTTPOnce(r, backend, nil, nil)
 		if err != nil {
@@ -363,6 +376,10 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 		return
 	}
 	backend = flow.AttachBackend(backend)
+	if !binding.Admission.Unlimited() {
+		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
+		defer stopContextClose()
+	}
 	if r.Method == http.MethodConnect {
 		p.mx.Inc(`data_requests_total{result="ok"}`)
 		Tunnel(w, r, backend)
@@ -396,17 +413,18 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 // admitRoute is the common ordinary HTTP/non-exec CONNECT admission sequence:
 // side-effect-free lookup, authorization, binding-revalidating activation, then
 // a freshly resolved dial route.
-func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, TrafficFlow, bool) {
+func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, TrafficFlow, proxyadmission.Binding, bool) {
 	binding, ok := p.lookupRoute(w, r, sid, target)
 	if !ok {
-		return Route{}, nil, false
+		return Route{}, nil, proxyadmission.Binding{}, false
 	}
 	if !p.authorized(r, binding) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
-		return Route{}, nil, false
+		return Route{}, nil, proxyadmission.Binding{}, false
 	}
-	return p.activateRoute(w, r, binding)
+	route, flow, activated := p.activateRoute(w, r, binding)
+	return route, flow, binding.Admission, activated
 }
 
 func (p *Proxy) lookupRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (RouteBinding, bool) {
@@ -436,9 +454,16 @@ func (p *Proxy) lookupRoute(w http.ResponseWriter, r *http.Request, sid string, 
 }
 
 func (p *Proxy) activateRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding) (Route, TrafficFlow, bool) {
-	flow := p.traffic.BeginParking(binding.SandboxID, trafficService(binding))
-	if flow == nil {
-		flow = noopTrafficFlow{}
+	flow, err := p.tryBeginParking(binding.SandboxID, trafficService(binding), binding.Admission)
+	if errors.Is(err, proxyadmission.ErrLimitReached) {
+		p.mx.Inc(`data_requests_total{result="max_inflight_reached"}`)
+		writeProxyError(w, http.StatusTooManyRequests, "max inflight reached", ProxyErrorMaxInflightReached)
+		return Route{}, nil, false
+	}
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusConflict, "sandbox route changed", ProxyErrorRouteError)
+		return Route{}, nil, false
 	}
 	route, found, err := p.router.ActivateRoute(r.Context(), binding)
 	if err != nil {
@@ -463,6 +488,25 @@ func (p *Proxy) activateRoute(w http.ResponseWriter, r *http.Request, binding Ro
 		return Route{}, nil, false
 	}
 	return route, flow, true
+}
+
+func (p *Proxy) tryBeginParking(sandboxID string, service ConnectService, binding proxyadmission.Binding) (TrafficFlow, error) {
+	if binding.Unlimited() {
+		flow := p.traffic.BeginParking(sandboxID, service)
+		if flow == nil {
+			flow = noopTrafficFlow{}
+		}
+		return flow, nil
+	}
+	tracker, ok := p.traffic.(admissionTrafficTracker)
+	if !ok {
+		return nil, proxyadmission.ErrStaleBinding
+	}
+	flow, err := tracker.TryBeginParking(sandboxID, service, binding)
+	if flow == nil && err == nil {
+		flow = noopTrafficFlow{}
+	}
+	return flow, err
 }
 
 func trafficService(binding RouteBinding) ConnectService {

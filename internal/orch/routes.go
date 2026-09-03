@@ -3,12 +3,15 @@ package orch
 import (
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -31,23 +34,23 @@ type routeLogEntry struct {
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	entry, err := o.routeEntryContext(context.Background(), sb)
 	if err != nil && o.log != nil {
-		o.log.Warn("MMDS route projection unavailable", "sid", sb.ID, "err", err)
+		o.log.Warn("route projection unavailable", "sid", sb.ID, "err", err)
 	}
 	return entry
 }
 
 func (o *Orchestrator) routeEntryContext(ctx context.Context, sb *types.Sandbox) (routesync.RouteEntry, error) {
-	e := routeEntryBase(sb)
+	e, trafficErr := routeEntryBase(sb)
 	routes, values, err := o.mmdsRouteProjection(ctx, sb)
 	e.MMDSRoutes = routes
 	if values != nil {
 		projected := routesync.MMDSRouteSecretValues(values)
 		e.MMDSRouteSecretValues = &projected
 	}
-	return e, err
+	return e, errors.Join(trafficErr, err)
 }
 
-func routeEntryBase(sb *types.Sandbox) routesync.RouteEntry {
+func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 	apiSecretFingerprint, _ := store.APISecretHash(sb.APISecret)
 	manifestKeyFingerprint, _ := store.ManifestKeyHash(sb.ManifestKey)
 	e := routesync.RouteEntry{
@@ -70,7 +73,17 @@ func routeEntryBase(sb *types.Sandbox) routesync.RouteEntry {
 		MmdsSecret:             hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 		RunID:                  sb.RunID,
 	}
-	return e
+	if raw, present := sb.Metadata[sandboxcfg.NsTraffic]; present {
+		patch, err := sandboxcfg.ParseTrafficPatch(raw)
+		if err != nil {
+			// Persisted metadata is validated before insertion. A corrupted row
+			// must nevertheless fail closed instead of becoming unlimited.
+			e.State = routesync.StateDead
+			return e, fmt.Errorf("project traffic metadata for %s: %w", sb.ID, err)
+		}
+		e.MaxInflightPatch = patch.MaxInflight
+	}
+	return e, nil
 }
 
 // artifactLocation classifies a retained ResumeSource independently of state
