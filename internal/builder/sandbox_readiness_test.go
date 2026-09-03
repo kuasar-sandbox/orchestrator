@@ -223,6 +223,47 @@ func TestStartSandboxFailureClosesReadinessPipe(t *testing.T) {
 	}
 }
 
+func TestPhaseSandboxSourceArgumentsSeparateMaterializationAndMemoryCapture(t *testing.T) {
+	spec := &configsock.BuildSpec{
+		RunDir: "/run/build", BaseDir: "/var/lib/build",
+		Paths:        configsock.BuildPaths{ManifestConfig: "/etc/manifest.yaml"},
+		RefLocations: map[string]string{"source": "file:///var/lib/source"},
+	}
+	const source = "manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, test := range []struct {
+		name        string
+		phase       string
+		from        string
+		replaceBoot bool
+		wantReplace bool
+	}{
+		{name: "image cold run", phase: "c"},
+		{name: "source materialization", phase: "b", from: source},
+		{name: "source memory capture", phase: "c", from: source, replaceBoot: true, wantReplace: true},
+		{name: "replacement requires source", phase: "c", replaceBoot: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := phaseSandboxRunArgs(spec, test.phase, "phase-sandbox", "/run/build/sandbox.yaml", nil, test.from, test.replaceBoot)
+			hasReplace, hasRestore, fromValue := false, false, ""
+			for i, arg := range args {
+				switch arg {
+				case "--replace-boot":
+					hasReplace = true
+				case "--restore":
+					hasRestore = true
+				case "--from":
+					if i+1 < len(args) {
+						fromValue = args[i+1]
+					}
+				}
+			}
+			if hasRestore || hasReplace != test.wantReplace || fromValue != test.from {
+				t.Fatalf("phase args = %#v; from=%q replace=%t restore=%t", args, fromValue, hasReplace, hasRestore)
+			}
+		})
+	}
+}
+
 func TestPhaseImportUsesRuntimeEventsWithoutExecProbe(t *testing.T) {
 	dir := t.TempDir()
 	script := writeSandboxCtlTestScript(t, dir)

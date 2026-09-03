@@ -2,7 +2,6 @@ package builder
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -140,18 +138,10 @@ func (p *buildPipeline) importYAML() (map[string]any, error) {
 	return doc, nil
 }
 
-// rootDoc renders boot.root for the steps/template phases: the base image plus
-// a writable overlay seeded from diffTpl. When building fromTemplate, the
-// template's accumulated overlay (p.overlayBase) is stacked read-only beneath
-// the fresh writable layer, so the build sees the template's filesystem.
+// rootDoc renders boot.root for image-based steps: the top-level base image plus
+// a fresh writable overlay. Sandbox sources use run --from E instead.
 func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
 	overlay := map[string]any{"diff_template": diffTpl}
-	if p.overlayBase != "" {
-		overlay["base"] = p.overlayBase
-	}
-	if len(p.overlayBaseFromRefs) > 0 {
-		overlay["base_from_refs"] = p.overlayBaseFromRefs
-	}
 	return map[string]any{"base": p.baseRef, "overlay": overlay}
 }
 
@@ -189,52 +179,44 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 	return doc
 }
 
-// templateYAML: a PRODUCTION e2b sandbox — the runtime is frozen into the
-// snapshot as runtime_ref, envd as the app (FC mode per the
-// deployment's MMDS posture), and the e2b start/ready metadata recorded
-// into snapshot.cfg so the template is self-describing.
-func (p *buildPipeline) templateYAML() (map[string]any, error) {
+// sourceStepsYAML is a host/instance overlay for a cold run --from E. It keeps
+// the source's complete root graph only for this materialization boot, replaces
+// its workload with the builder envd, and clears persistent actions so init,
+// files, and mounts are not applied a second time before flattening.
+func (p *buildPipeline) sourceStepsYAML() map[string]any {
 	s := p.spec
-	envdArgs := []string{"-isnotfc", "-port", "49983"}
-	if s.MMDSEnabled {
-		envdArgs = []string{"-port", "49983"}
+	root := map[string]any{"diff_template": "file://" + s.Paths.BuilderDiffTpl}
+	if s.SourceSandboxConfig != nil && s.SourceSandboxConfig.Boot.Root.Overlay != nil {
+		root = map[string]any{"overlay": map[string]any{
+			"diff_template": "file://" + s.Paths.BuilderDiffTpl,
+		}}
 	}
-	meta := map[string]string{"e2b.start_cmd": p.startCmd}
-	if p.readyCmd != "" {
-		meta["e2b.ready_cmd"] = p.readyCmd
-	}
-	networkJSON, err := json.Marshal(s.TemplateNetwork)
-	if err != nil {
-		return nil, fmt.Errorf("marshal template network metadata: %w", err)
-	}
-	meta[sandboxcfg.NsNetwork] = string(networkJSON)
 	doc := map[string]any{
 		"resources": p.resourcesDoc(),
-		"network":   p.networkDoc(),
-		"metadata":  meta,
+		// Persistent source actions describe a later Create from the template;
+		// materialization must not execute them and then preserve them to execute
+		// a second time in the produced Sandbox.
+		"mounts": []any{},
+		"files":  []any{},
+		"init":   []any{},
 		"boot": map[string]any{
-			"kernel":  "file://" + s.Paths.Kernel,
-			"runtime": "file://" + s.Paths.Runtime,
-			"root":    p.rootDoc("file://" + s.Paths.OverlayDiffTpl),
+			"kernel": "file://" + s.Paths.Kernel, "runtime": "file://" + s.Paths.Runtime,
+			"root": root,
 		},
 		"launch": map[string]any{
-			"exec":           "/opt/sandbox-runtime/bin/envd",
-			"args":           envdArgs,
-			"user":           "0:0",
-			"restart":        "always",
-			"cgroup_control": true,
-			// Production e2b posture (matches sandboxcfg's launch config): envd is
-			// not a PID-1-style reaper, so share sandbox-init's PID namespace —
-			// PID 1 reaps orphaned descendants of guest commands instead of them
-			// piling up as zombies under envd. The snapshot freezes this, so every
-			// sandbox created from the template inherits the reaper invariant.
-			"pid_namespace": "shared",
+			"exec": "/opt/sandbox-runtime/bin/envd", "args": []string{"-isnotfc", "-port", "49983"},
+			"env": map[string]string{}, "ephemeral_env": map[string]string{}, "workdir": "", "plugin": []any{},
+			"user": "0:0", "restart": "always", "cgroup_control": true,
+			"placeholder": false, "pid_namespace": "shared", "stop_signal": "", "stop_grace_period": "", "start_timeout": "",
 		},
 	}
-	if f := p.dnsFiles(); f != nil {
-		doc["files"] = f
+	if s.SourceSandboxConfig != nil && s.SourceSandboxConfig.Network.Enabled {
+		doc["network"] = p.networkDoc()
 	}
-	return doc, nil
+	if f := p.dnsFiles(); f != nil {
+		doc["ephemeral_files"] = f
+	}
+	return doc
 }
 
 // --- helpers -------------------------------------------------------------------

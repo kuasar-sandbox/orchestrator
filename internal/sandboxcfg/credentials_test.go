@@ -111,6 +111,11 @@ func TestValidateCredentialsForProfile(t *testing.T) {
 	if err := ValidateCredentialsForProfile(types.Profile("other"), Credentials{}); err == nil {
 		t.Fatal("invalid profile was accepted")
 	}
+	for _, secret := range []string{"short", strings.Repeat("A", 64), strings.Repeat("z", 64)} {
+		if err := ValidateCredentialsForProfile(types.ProfileE2B, Credentials{ServiceSecret: secret}); err == nil {
+			t.Fatalf("invalid service secret %q was accepted", secret)
+		}
+	}
 }
 
 func TestExtractCredentialsAbsent(t *testing.T) {

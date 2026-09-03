@@ -515,7 +515,9 @@ func TestReconcileAdoptsLiveBuildAndCompletesWithoutReexecution(t *testing.T) {
 	postDone := make(chan error, 1)
 	go func() {
 		close(postStarted)
-		postDone <- o.PostBuildResult(ctx, runID, build.BuildID, configsock.BuildResult{ImageRef: imageRef})
+		postDone <- o.PostBuildResult(ctx, runID, build.BuildID, configsock.BuildResult{
+			Target: types.BuildTarget{Kind: types.BuildTargetImage}, ImageRef: imageRef,
+		})
 	}()
 	<-postStarted
 	select {
@@ -601,7 +603,7 @@ func TestReconcileCompletesDurablyAcceptedResultWithoutLiveUnit(t *testing.T) {
 	}
 	imageRef := "manifest://" + strings.Repeat("f", 64)
 	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
-		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		configsock.BuildResult{Target: types.BuildTarget{Kind: types.BuildTargetImage}, ImageRef: imageRef}); err != nil || !accepted {
 		t.Fatalf("persist accepted result = %v, %v", accepted, err)
 	}
 
@@ -648,7 +650,7 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 	build := buildReconcileRow(t, runID)
 	// This deliberately cannot be parsed if recovery tries to reconstruct a
 	// completed pipeline. The already-acknowledged result must win first.
-	build.PhaseResourcePatch = `{"capacity":`
+	build.FromTemplate = "not-a-template-id"
 	runDir := nodepath.BuildRunDir(cfg.Paths.RunRoot, build.BuildID)
 	baseDir := nodepath.BuildBaseDir(cfg.Paths.BaseRoot, build.BuildID)
 	for _, path := range []string{runDir, baseDir} {
@@ -661,7 +663,7 @@ func TestReconcileLiveBuildFinalizesAcceptedResultBeforePhaseRebuild(t *testing.
 	}
 	imageRef := "manifest://" + strings.Repeat("e", 64)
 	if accepted, err := st.AcceptBuildResult(context.Background(), build.BuildID, runID,
-		configsock.BuildResult{ImageRef: imageRef}); err != nil || !accepted {
+		configsock.BuildResult{Target: types.BuildTarget{Kind: types.BuildTargetImage}, ImageRef: imageRef}); err != nil || !accepted {
 		t.Fatalf("persist accepted result = %v, %v", accepted, err)
 	}
 
@@ -709,7 +711,10 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 	}
 	pend := &pendingBuild{build: build, result: make(chan configsock.BuildResult, 1)}
 	o.pend[build.BuildID] = pend
-	result := configsock.BuildResult{ImageRef: "manifest://accepted"}
+	result := configsock.BuildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("a", 64),
+	}
 	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, result); err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +726,7 @@ func TestPostBuildResultPersistsBeforeIdempotentNotification(t *testing.T) {
 		t.Fatalf("identical result replay: %v", err)
 	}
 	conflict := result
-	conflict.ImageRef = "manifest://conflict"
+	conflict.ImageRef = "manifest://" + strings.Repeat("b", 64)
 	if err := o.PostBuildResult(context.Background(), runID, build.BuildID, conflict); !errors.Is(err, store.ErrBuildResultConflict) || !configsock.IsBuildReportRejection(err) {
 		t.Fatalf("conflicting result replay = %v", err)
 	}
@@ -755,7 +760,10 @@ func TestClosedBuildResultGateRejectsLateReportBeforePersistence(t *testing.T) {
 	}
 
 	err := o.PostBuildResult(context.Background(), runID, build.BuildID,
-		configsock.BuildResult{ImageRef: "manifest://too-late"})
+		configsock.BuildResult{
+			Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+			ImageRef: "manifest://" + strings.Repeat("c", 64),
+		})
 	if err == nil || !configsock.IsBuildReportRejection(err) {
 		t.Fatalf("late result was not definitively rejected: %v", err)
 	}
@@ -791,7 +799,10 @@ func TestRecoveredAcceptedResultWinsCanceledMonitor(t *testing.T) {
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	build := buildReconcileRow(t, runID)
-	accepted := configsock.BuildResult{ImageRef: "manifest://accepted-before-shutdown"}
+	accepted := configsock.BuildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("d", 64),
+	}
 	pend := &pendingBuild{
 		handoff: newBuildTaskHandoff(false, fastBuildPrepareDigest(build.BuildID)),
 		result:  make(chan configsock.BuildResult, 1),
@@ -1013,7 +1024,10 @@ func TestRangeClusterBuildsAfterAcceptedResultReconcileExceedsSubscriberBuffer(t
 	cfg := buildReconcileConfig(filepath.Join(t.TempDir(), "run"))
 	o := New(cfg, st, &reconcileLauncher{}, &reconcileVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	const total = 300
-	result := configsock.BuildResult{ImageRef: "manifest://" + strings.Repeat("a", 64)}
+	result := configsock.BuildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: "manifest://" + strings.Repeat("a", 64),
+	}
 	wantTemplateID := types.TemplateID{Profile: types.ProfileBare, Kind: types.KindImg, Ref: result.ImageRef}.String()
 	for i := 0; i < total; i++ {
 		build := buildReconcileRow(t, fmt.Sprintf("br-00000000-0000-7000-8000-%012d", i))
@@ -1266,6 +1280,11 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		Profile: types.ProfileE2B, Kind: types.KindSnp,
 		Ref: "manifest://" + strings.Repeat("f", 64),
 	}.String()
+	build.Metadata = map[string]string{
+		sandboxcfg.NsMetadata: `{"registered":"preserved"}`,
+	}
+	build.Env = map[string]string{"REGISTERED_ENV": "preserved"}
+	build.Builder.Target = &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
 	digest := strings.Repeat("9", 64)
 	durableResources := rtconfig.ResourcesConfig{
 		Capacity: rtconfig.CapacityConfig{CPU: 4, Memory: "8GiB"},
@@ -1275,7 +1294,8 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 	durableTemplateNetwork.Hostname = "frozen-template"
 	build.RuntimePrepareJSON, err = encodeBuildRuntimePreparation(buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest,
-		Network: durableNetwork, TemplateNetwork: durableTemplateNetwork, Resources: durableResources,
+		Network: durableNetwork, TemplateNetwork: durableTemplateNetwork,
+		Resources: durableResources, SandboxResources: durableResources,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1313,6 +1333,11 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		!reflect.DeepEqual(final.TemplateNetwork, durableTemplateNetwork) || final.Resources.Capacity != durableResources.Capacity {
 		cancel()
 		t.Fatalf("recovered final spec drifted: net=%+v template=%+v resources=%+v", final.Net, final.TemplateNetwork, final.Resources)
+	}
+	if final.SandboxSpec.Metadata["registered"] != "preserved" || final.SandboxEnv["REGISTERED_ENV"] != "preserved" ||
+		final.RequestedTarget == nil || *final.RequestedTarget != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {
+		cancel()
+		t.Fatalf("recovered final spec lost immutable registration config: %+v", final)
 	}
 	cancel()
 	if err := o.DrainBuilds(context.Background()); err != nil {
@@ -1471,6 +1496,7 @@ func buildReconcileConfig(runRoot string) *config.Config {
 			},
 			TotalTimeoutSec: 60,
 		},
+		Checkpoint: config.CheckpointConfig{Mode: config.CheckpointBundle},
 	}
 }
 
@@ -1490,6 +1516,10 @@ func buildReconcileRow(t *testing.T, runID string) *types.Build {
 			Capacity:    rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
 			Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"},
 		},
+		SandboxResources: rtconfig.ResourcesConfig{
+			Capacity:    rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
+			Allocatable: rtconfig.AllocatableConfig{CPU: 1, Memory: "1GiB"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1497,7 +1527,7 @@ func buildReconcileRow(t *testing.T, runID string) *types.Build {
 	return &types.Build{
 		BuildID: "00000000-0000-7000-8000-000000000003", TemplateID: "transient-00000000-0000-7000-8000-000000000004",
 		APISecret: deriveTestAPISecret(t, manifestKey), ManifestKey: manifestKey,
-		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildBuilding,
+		Profile: types.ProfileBare, Status: types.BuildBuilding,
 		Resources:        types.BuildResources{CPU: 1000, Memory: 1 << 30},
 		ExecutionClaimed: true, ExecutionClaimedUnix: time.Now().Unix(), RunID: runID,
 		EnforcementStatus: "cpu,memory", RuntimeVswitchPort: "17", RuntimeFloatingIP: "192.0.2.17",

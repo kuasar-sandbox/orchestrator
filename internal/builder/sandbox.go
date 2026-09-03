@@ -40,6 +40,14 @@ type phaseSandbox struct {
 // startSandbox writes the phase yaml and spawns `sandbox-ctl run` as a
 // direct child (this unit's cgroup). connect lists optional UDS forwards.
 func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect []string) (*phaseSandbox, error) {
+	b, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, err
+	}
+	return p.startSandboxYAML(phase, b, connect, "", false)
+}
+
+func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect []string, from string, replaceBoot bool) (*phaseSandbox, error) {
 	s := p.spec
 	sid := phaseSandboxID(phase, s.BuildID)
 	phaseRunDir := p.phaseRunDir(phase)
@@ -47,29 +55,11 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		return nil, err
 	}
 	yamlPath := filepath.Join(phaseRunDir, "sandbox.yaml")
-	b, err := yaml.Marshal(doc)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(yamlPath, b, 0o600); err != nil {
+	if err := os.WriteFile(yamlPath, document, 0o600); err != nil {
 		return nil, err
 	}
 
-	args := []string{"run", "--config", yamlPath,
-		"--run-root", s.RunDir, "--base-root", s.BaseDir,
-		"--path-id", phase, "--sandbox-id", sid,
-		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
-		// our child, in this run-id unit's cgroup). App output is tagged "build"
-		// with KUASAR_BUILD_ID for SDK-visible build logs; kernel output is tagged
-		// "console" for host-only diagnostics. No per-phase log file.
-		"--stdout-to", "journald=" + buildTag,
-		"--stderr-to", "journald=" + buildTag,
-		"--console", "journald=" + consoleTag}
-	args = append(args, "--manifest-config", s.Paths.ManifestConfig)
-	args = appendRefLocationArgs(args, s.RefLocations)
-	for _, c := range connect {
-		args = append(args, "--connect", c)
-	}
+	args := phaseSandboxRunArgs(s, phase, sid, yamlPath, connect, from, replaceBoot)
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
 	if p.vmmCgroup == nil || p.vmmCgroup.Fd() < 3 {
 		return nil, fmt.Errorf("phase %s has no trusted VMM cgroup descriptor", phase)
@@ -110,6 +100,32 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	}()
 	p.log.Info("phase sandbox up", "phase", phase, "sid", sid)
 	return sb, nil
+}
+
+func phaseSandboxRunArgs(s *configsock.BuildSpec, phase, sid, yamlPath string, connect []string, from string, replaceBoot bool) []string {
+	args := []string{"run"}
+	if from != "" {
+		args = append(args, "--from", from)
+		if replaceBoot {
+			args = append(args, "--replace-boot")
+		}
+	}
+	args = append(args, "--config", yamlPath,
+		"--run-root", s.RunDir, "--base-root", s.BaseDir,
+		"--path-id", phase, "--sandbox-id", sid,
+		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
+		// our child, in this run-id unit's cgroup). App output is tagged "build"
+		// with KUASAR_BUILD_ID for SDK-visible build logs; kernel output is tagged
+		// "console" for host-only diagnostics. No per-phase log file.
+		"--stdout-to", "journald="+buildTag,
+		"--stderr-to", "journald="+buildTag,
+		"--console", "journald="+consoleTag)
+	args = append(args, "--manifest-config", s.Paths.ManifestConfig)
+	args = appendRefLocationArgs(args, s.RefLocations)
+	for _, c := range connect {
+		args = append(args, "--connect", c)
+	}
+	return args
 }
 
 const phaseSandboxDigestBytes = 12

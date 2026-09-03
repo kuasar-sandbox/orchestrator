@@ -96,9 +96,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 	b := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
 		CmdID: "b1", Kind: CmdBuildRegister, BuildID: "build-1", TemplateRef: "transient-1", Profile: "bare",
+		BuildEnv: map[string]string{"NAME": "value"}, BuildSecure: true,
+		BuildCredentials: &sandboxcfg.Credentials{ServiceSecret: strings.Repeat("c", 64)},
 		BuildMMDSSecrets: map[string]string{"token": "initial"},
 	}})
-	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" || b.Cmd.BuildMMDSSecrets["token"] != "initial" {
+	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" ||
+		b.Cmd.BuildEnv["NAME"] != "value" || !b.Cmd.BuildSecure || b.Cmd.BuildCredentials == nil ||
+		b.Cmd.BuildCredentials.ServiceSecret != strings.Repeat("c", 64) || b.Cmd.BuildMMDSSecrets["token"] != "initial" {
 		t.Fatalf("build_register round-trip: %+v", b.Cmd)
 	}
 

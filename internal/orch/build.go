@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -97,6 +98,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		}
 		secretHeader, err := mmdsSecretHeader(preliminary.mmds)
 		if err != nil {
+			return nil, err
+		}
+		if err := retainBuildRegistrationCredentials(request, preliminary.credentials); err != nil {
 			return nil, err
 		}
 		final, err = o.normalizeBuildRegistration(request, secretHeader)
@@ -229,16 +233,13 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	switch {
 	case spec.FromTemplate != "":
 		// Resolve the base template ref to its canonical persist id; the
-		// pipeline extracts the base image (and inherits start/ready) from
-		// its snapshot.cfg.
+		// task normalizes SBX/SNP to a cold Sandbox E, while the pipeline
+		// materializes its complete root and inherits E start/ready defaults.
 		ref := o.resolveTemplateAlias(ctx, apiKey, spec.FromTemplate)
 		if _, perr := types.ParseTemplateID(ref); perr != nil {
 			return fmt.Errorf("build: fromTemplate %q: not a known template", spec.FromTemplate)
 		}
 		b.FromTemplate, b.FromImage = ref, ""
-		if len(spec.Steps) == 0 && spec.StartCmd == "" {
-			return fmt.Errorf("build: fromTemplate without steps or startCmd has nothing to do")
-		}
 	default:
 		// The real e2b CLI pushes its client-built image to <mask>/{templateID}:{buildID}
 		// and sends no image ref; derive fromImage from the configured mask
@@ -266,13 +267,9 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err
 	}
-	b.Kind = types.KindImg
-	if b.Profile == types.ProfileE2B && (spec.StartCmd != "" || b.FromTemplate != "") {
-		// snp is provisional: the pipeline reports what it actually
-		// produced (fromTemplate may inherit start/ready) and the
-		// finalizer recomputes the kind from the result.
-		b.Kind = types.KindSnp
-	}
+	// Kind remains unset until the worker returns a target-consistent terminal
+	// artifact. Requested target is immutable registration input.
+	b.Kind = ""
 	if b.RegistryAuth, err = o.resolveBuildCreds(ctx, b, auth.PullToken, auth.RegistryUsername, auth.RegistryPassword); err != nil {
 		return err
 	}
@@ -308,6 +305,10 @@ func validateBuildTriggerDefinition(build *types.Build, spec api.TriggerSpec) er
 	}
 	if build.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
 		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
+	}
+	if build.Builder.Target != nil && build.Builder.Target.Kind == types.BuildTargetImage &&
+		(spec.StartCmd != "" || spec.ReadyCmd != "") {
+		return fmt.Errorf("%w: explicit image target conflicts with trigger startCmd/readyCmd", api.ErrBadRequest)
 	}
 	if spec.FromImage != "" && spec.FromTemplate != "" {
 		return fmt.Errorf("%w: fromImage and fromTemplate are mutually exclusive", api.ErrBadRequest)
@@ -348,36 +349,63 @@ func cloneStringMapWithout(in map[string]string, excluded string) map[string]str
 	return out
 }
 
-// validateBuildPhaseResources applies the selected node's ordinary Sandbox
-// policy before registration consumes admission capacity. Execution resolves
-// the same immutable patch again to build the final YAML; this early pass has
-// no network, cgroup, controller, or systemd side effects.
-func (o *Orchestrator) validateBuildPhaseResources(raw string) error {
-	var patch sandboxcfg.ResourcePatch
-	var err error
-	if raw != "" {
-		patch, err = sandboxcfg.ParseResourcePatch(raw)
-		if err != nil {
-			return fmt.Errorf("%w: phase sandbox resources: %v", api.ErrBadRequest, err)
-		}
-	}
-	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
-	_, err = sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
-		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
-		Patch:                    patch,
-		Dynamic:                  dynamic,
-		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
-	})
-	if err == nil {
+func cloneBuildTarget(target *types.BuildTarget) *types.BuildTarget {
+	if target == nil {
 		return nil
 	}
-	if errors.Is(err, sandboxcfg.ErrInvalidResourceRequest) {
-		return fmt.Errorf("%w: phase sandbox resources: %v", api.ErrBadRequest, err)
+	copy := *target
+	return &copy
+}
+
+func buildHasSandboxConfig(build *types.Build) bool {
+	if build == nil {
+		return false
 	}
-	return fmt.Errorf("build: resolve phase sandbox resources: %w", err)
+	if len(build.Env) != 0 {
+		return true
+	}
+	for _, namespace := range []string{
+		sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
+		sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
+		sandboxcfg.NsFiles, sandboxcfg.NsMetadata,
+	} {
+		if _, present := build.Metadata[namespace]; present {
+			return true
+		}
+	}
+	return false
+}
+
+func buildHasInstanceConfig(build *types.Build) bool {
+	if build == nil {
+		return false
+	}
+	return build.Secure || build.ServiceSecret != "" || build.EnvdAccessToken != "" ||
+		build.TrafficAccessToken != "" || build.Metadata[sandboxcfg.NsTraffic] != "" ||
+		build.Metadata[sandboxcfg.NsMMDS] != "" ||
+		build.Metadata[sandboxcfg.NsCheckpoint] != ""
+}
+
+func buildSandboxNamespaces(metadata map[string]string) []string {
+	var namespaces []string
+	for _, namespace := range []string{
+		sandboxcfg.NsResource, sandboxcfg.NsTraffic, sandboxcfg.NsNetwork,
+		sandboxcfg.NsLaunch, sandboxcfg.NsInit, sandboxcfg.NsMounts,
+		sandboxcfg.NsFiles, sandboxcfg.NsMetadata,
+	} {
+		if _, present := metadata[namespace]; present {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	return namespaces
 }
 
 func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplate bool) error {
+	if opts.Target != nil {
+		if err := opts.Target.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+		}
+	}
 	if r := opts.Referer; r != nil {
 		explicitReferer := r.Enabled != nil && *r.Enabled
 		explicitWriteback := r.Writeback != nil && *r.Writeback
@@ -810,12 +838,13 @@ type pendingBuild struct {
 	build            *types.Build
 	runDir           string
 	baseDir          string
-	snapshotTemplate bool
+	sourceTemplate   bool
 	handoff          *buildTaskHandoff
 	spec             sandboxcfg.SandboxSpec
 	network          sandboxcfg.NetworkSpec
 	templateNetwork  sandboxcfg.NetworkSpec
 	resources        rtconfig.ResourcesConfig
+	sandboxResources rtconfig.ResourcesConfig
 	tapFD            vswitch.TapFD
 	mac              string
 	floating         string
@@ -834,12 +863,13 @@ func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
 	}
 }
 
-// executeBuild runs the three-phase pipeline in a sandbox-builder@<run-id> unit:
+// executeBuild runs the target-selected build pipeline in a
+// sandbox-builder@<run-id> unit:
 // node-ctl run-builder waits for a build assignment, fetches the BuildSpec over
-// the config-socket, and drives import/steps/template sandboxes itself (as direct
-// children, in the unit's cgroup). This side owns what spans the unit: the
+// the config-socket, and drives the required import/materialize/capture sandboxes
+// itself (as direct children, in the unit's cgroup). This side owns what spans the unit: the
 // BuildRunDir/BuildBaseDir, one vswitch slot the phases reuse sequentially, and —
-// for the template phase under mmds.enabled — a synthetic route entry so the
+// for the memory-capture phase under mmds.enabled — a synthetic route entry so the
 // build sandbox's FC-mode envd can resolve itself.
 func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	res, err := o.runBuildUnit(ctx, b)
@@ -870,6 +900,15 @@ func (o *Orchestrator) completeBuildWithPublisher(
 	}
 	unlockEvent := o.lockBuildEvent(b.BuildID)
 	defer unlockEventFence(unlockEvent)
+	if err == nil && res != nil {
+		if validationErr := validateBuildResult(b, *res); validationErr != nil {
+			b.Status, b.Reason = types.BuildError, "build produced an invalid result: "+validationErr.Error()
+			if o.persistTerminalBuild(ctx, b) {
+				o.publishTerminalBuild(publish, b, "")
+			}
+			return
+		}
+	}
 	switch {
 	case err == nil && res != nil && res.Error != "":
 		if res.FailureStage == "artifact_prepare" {
@@ -917,27 +956,17 @@ func (o *Orchestrator) completeBuildWithPublisher(
 		}
 		return
 	}
-	if b.Profile == types.ProfileBare && (res.SnapshotRef != "" || res.StartCmd != "" || res.ReadyCmd != "") {
-		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
-		if o.persistTerminalBuild(ctx, b) {
-			o.publishTerminalBuild(publish, b, "")
-		}
-		return
+	var ref string
+	switch res.Target.ArtifactKind() {
+	case types.KindImg:
+		ref = res.ImageRef
+	case types.KindSbx:
+		ref = res.SandboxRef
+	case types.KindSnp:
+		ref = res.SnapshotRef
 	}
-	switch {
-	case res.SnapshotRef != "":
-		b.Kind = types.KindSnp
-		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindSnp, Ref: res.SnapshotRef}.String()
-	case res.ImageRef != "":
-		b.Kind = types.KindImg
-		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Ref: res.ImageRef}.String()
-	default:
-		b.Status, b.Reason = types.BuildError, "build produced no artifact"
-		if o.persistTerminalBuild(ctx, b) {
-			o.publishTerminalBuild(publish, b, "")
-		}
-		return
-	}
+	b.Kind = res.Target.ArtifactKind()
+	b.PersistID = types.TemplateID{Profile: b.Profile, Kind: b.Kind, Ref: ref}.String()
 	if _, err := types.ParseTemplateID(b.PersistID); err != nil {
 		b.Status, b.Reason = types.BuildError, "build produced invalid portable ref: "+err.Error()
 		if o.persistTerminalBuild(ctx, b) {
@@ -1019,7 +1048,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if !b.Profile.Valid() {
 		return nil, buildFailed("resource_resolve", fmt.Errorf("build: unknown profile %q", b.Profile))
 	}
-	snapshotTemplate, err := buildUsesSnapshotTemplate(b)
+	sourceTemplate, err := buildUsesSandboxTemplate(b)
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
@@ -1058,14 +1087,14 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err := os.MkdirAll(nodepath.BuildCheckpointDir(o.cfg.Paths.BaseRoot, b.BuildID), 0o700); err != nil {
 		return nil, buildFailed("artifact_prepare", fmt.Errorf("create Build checkpoint directory: %w", err))
 	}
-	spec, resources, err := o.resolveBuildRequestInputs(b)
+	spec, resources, sandboxResources, err := o.resolveBuildRequestInputs(b, sourceTemplate)
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
 	pend := &pendingBuild{
-		build: b, runDir: runDir, baseDir: baseDir, snapshotTemplate: snapshotTemplate,
-		handoff: newBuildTaskHandoff(snapshotTemplate, ""),
-		spec:    spec, resources: resources,
+		build: b, runDir: runDir, baseDir: baseDir, sourceTemplate: sourceTemplate,
+		handoff: newBuildTaskHandoff(sourceTemplate, ""),
+		spec:    spec, resources: resources, sandboxResources: sandboxResources,
 		result: make(chan configsock.BuildResult, 1),
 	}
 	o.pendMu.Lock()
@@ -1101,7 +1130,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 
 	prepareDigest := fastBuildPrepareDigest(b.BuildID)
 	var inherited sandboxcfg.NetworkSpec
-	if snapshotTemplate {
+	if sourceTemplate {
 		summary, early, waitErr := o.waitBuildPrepare(buildCtx, pend, unit)
 		if early != nil || waitErr != nil {
 			if early != nil {
@@ -1113,9 +1142,17 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 			}
 			return nil, buildFailed("artifact_prepare", waitErr)
 		}
-		inherited, err = validateBuildPrepareSummary(summary)
+		artifactCapacity, inheritedNetwork, prepareErr := validateBuildPrepareSummary(summary)
+		err = prepareErr
 		if err != nil {
 			return nil, buildFailed("artifact_prepare", err)
+		}
+		inherited = inheritedNetwork
+		if buildMayProduceSandbox(b, sourceTemplate) {
+			pend.sandboxResources, err = o.resolveBuildTargetResources(pend.spec, &artifactCapacity)
+			if err != nil {
+				return nil, buildFailed("resource_resolve", err)
+			}
 		}
 		prepareDigest = summary.ResolutionDigest
 		o.log.Info("build task artifact prepared", "bid", b.BuildID, "run_id", b.RunID,
@@ -1132,15 +1169,19 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		return nil, buildFailed("network_attach", err)
 	}
 	envdTok := ""
-	if b.Profile == types.ProfileE2B {
-		envdTok, err = keys.MintToken()
-		if err != nil {
-			return nil, buildFailed("network_commit", fmt.Errorf("build: mint phase envd token: %w", err))
+	if b.Profile == types.ProfileE2B && buildMayProduceMemorySandbox(b, sourceTemplate) {
+		envdTok = b.EnvdAccessToken
+		if envdTok == "" {
+			envdTok, err = keys.MintToken()
+			if err != nil {
+				return nil, buildFailed("network_commit", fmt.Errorf("build: mint phase envd token: %w", err))
+			}
 		}
 	}
 	durable := buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
 		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
+		SandboxResources: pend.sandboxResources,
 	}
 	prepareJSON, err := encodeBuildRuntimePreparation(durable)
 	if err != nil {
@@ -1185,7 +1226,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	return result, buildFailed("runtime", err)
 }
 
-func buildUsesSnapshotTemplate(b *types.Build) (bool, error) {
+func buildUsesSandboxTemplate(b *types.Build) (bool, error) {
 	if b.FromTemplate == "" {
 		return false, nil
 	}
@@ -1193,7 +1234,14 @@ func buildUsesSnapshotTemplate(b *types.Build) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("build: fromTemplate %q: %w", b.FromTemplate, err)
 	}
-	return tmpl.Kind == types.KindSnp, nil
+	switch tmpl.Kind {
+	case types.KindImg:
+		return false, nil
+	case types.KindSbx, types.KindSnp:
+		return true, nil
+	default:
+		return false, fmt.Errorf("build: unsupported source template kind %q", tmpl.Kind)
+	}
 }
 
 func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
@@ -1201,7 +1249,7 @@ func (o *Orchestrator) buildExecutionDeadline(b *types.Build) time.Time {
 	if b.ExecutionClaimedUnix <= 0 {
 		start = time.Now()
 	}
-	// Snapshot preparation, host preparation, pipeline execution, and result
+	// Source-artifact preparation, host preparation, pipeline execution, and result
 	// reporting all consume the configured build budget. Unit fencing and host
 	// cleanup use their existing separately bounded contexts; exposing that
 	// cleanup headroom here would silently extend tenant execution.
@@ -1246,7 +1294,7 @@ func (o *Orchestrator) waitBuildPrepare(ctx context.Context, pend *pendingBuild,
 				if result, ok := closePendingBuildResultsAndTake(pend); ok {
 					return configsock.ArtifactPrepareSummary{}, result, nil
 				}
-				return configsock.ArtifactPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during snapshot preparation", unit)
+				return configsock.ArtifactPrepareSummary{}, nil, fmt.Errorf("build: unit %s exited during source preparation", unit)
 			}
 		}
 	}
@@ -1364,34 +1412,106 @@ func (o *Orchestrator) prepareBuilderUnit(ctx context.Context, b *types.Build, r
 	return unit, nil
 }
 
-// resolveBuildRequestInputs performs only request/policy parsing. Snapshot
-// metadata is supplied later by the tenant-bound task and never opened here.
-func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build) (sandboxcfg.SandboxSpec, rtconfig.ResourcesConfig, error) {
-	phaseMetadata := cloneStringMapWithout(b.Metadata, "")
-	if phaseMetadata == nil {
-		phaseMetadata = map[string]string{}
-	}
-	if b.PhaseResourcePatch != "" {
-		phaseMetadata[sandboxcfg.NsResource] = b.PhaseResourcePatch
-	}
-	spec, err := sandboxcfg.ParseSpec(phaseMetadata)
+// resolveBuildRequestInputs performs only request/policy parsing. Source
+// artifact metadata is supplied later by the tenant-bound task and never
+// opened here.
+func (o *Orchestrator) resolveBuildRequestInputs(b *types.Build, sourceTemplate bool) (sandboxcfg.SandboxSpec, rtconfig.ResourcesConfig, rtconfig.ResourcesConfig, error) {
+	spec, err := sandboxcfg.ParseSpec(b.Metadata)
 	if err != nil {
-		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, err
+		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
 	}
+	phaseResources, err := o.resolveBuildExecutionResources(b.Resources)
+	if err != nil {
+		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
+	}
+	var targetResources rtconfig.ResourcesConfig
+	// A Sandbox source owns the lower-priority portable capacity. Defer target
+	// resource resolution until its task-local summary arrives; resolving first
+	// against node defaults can incorrectly reject a request that is valid over
+	// the source capacity (for example a larger startup allocation).
+	if !sourceTemplate && buildMayProduceSandbox(b, false) {
+		targetResources, err = o.resolveBuildTargetResources(spec, nil)
+		if err != nil {
+			return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, rtconfig.ResourcesConfig{}, err
+		}
+	}
+	return spec, phaseResources, targetResources, nil
+}
+
+// buildMayProduceSandbox reports whether the request can resolve to either
+// Sandbox target. Auto builds sourced from a Sandbox are deliberately treated
+// as unknown until the task-local E supplies inherited commands.
+func buildMayProduceSandbox(build *types.Build, sourceTemplate bool) bool {
+	if build.Builder.Target != nil {
+		return build.Builder.Target.Kind == types.BuildTargetSandbox
+	}
+	return sourceTemplate || build.StartCmd != "" || build.ReadyCmd != ""
+}
+
+// buildMayProduceMemorySandbox is narrower than buildMayProduceSandbox because
+// offline Sandboxes never capture a checkpoint and must not depend on the
+// node's checkpoint backend configuration.
+func buildMayProduceMemorySandbox(build *types.Build, sourceTemplate bool) bool {
+	if build.Builder.Target != nil {
+		return build.Builder.Target.Kind == types.BuildTargetSandbox && build.Builder.Target.Memory
+	}
+	return sourceTemplate || build.StartCmd != "" || build.ReadyCmd != ""
+}
+
+// resolveBuildExecutionResources derives A/B VM sizing solely from immutable
+// Build admission resources. Sandbox target resource metadata never controls
+// the execution sandboxes.
+func (o *Orchestrator) resolveBuildExecutionResources(build types.BuildResources) (rtconfig.ResourcesConfig, error) {
+	cores := int(math.Ceil(float64(build.CPU) / 1000))
+	allocCPU := float64(build.CPU) / 1000
+	memory := fmt.Sprintf("%dB", build.Memory)
+	patch := sandboxcfg.ResourcePatch{
+		Capacity:    &sandboxcfg.CapacityPatch{CPU: &cores, Memory: &memory},
+		Allocatable: &sandboxcfg.AllocatablePatch{CPU: &allocCPU, Memory: &memory},
+	}
+	return o.resolveBuildResources(patch, nil)
+}
+
+// resolveBuildTargetResources layers Register Create resource options over a
+// source E's portable defaults. A nil source uses ordinary node defaults.
+func (o *Orchestrator) resolveBuildTargetResources(spec sandboxcfg.SandboxSpec, source *configsock.ArtifactCapacity) (rtconfig.ResourcesConfig, error) {
+	patch := spec.Resource
+	if source != nil {
+		cpu, memory := source.CPU, source.Memory
+		allocCPU, allocMemory := source.AllocatableCPU, source.AllocatableMemory
+		base := sandboxcfg.ResourcePatch{
+			Capacity:    &sandboxcfg.CapacityPatch{CPU: &cpu, Memory: &memory},
+			Allocatable: &sandboxcfg.AllocatablePatch{CPU: &allocCPU, Memory: &allocMemory},
+		}
+		var err error
+		patch, err = sandboxcfg.MergeResourcePatch(base, patch)
+		if err != nil {
+			return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: target Sandbox resources: %v", api.ErrBadRequest, err)
+		}
+	}
+	resources, err := o.resolveBuildResources(patch, source)
+	if err == nil && source != nil && source.DeflateOnOOM != nil {
+		value := *source.DeflateOnOOM
+		resources.Allocatable.DeflateOnOOM = &value
+	}
+	return resources, err
+}
+
+func (o *Orchestrator) resolveBuildResources(patch sandboxcfg.ResourcePatch, _ *configsock.ArtifactCapacity) (rtconfig.ResourcesConfig, error) {
 	dynamic := o.cfg.ResourceListen != nil && o.cfg.ResourceListen.Enabled
 	resources, err := sandboxcfg.ResolveResources(sandboxcfg.ResourceResolveInput{
 		Node:                     configresolve.SandboxResources(o.cfg.Sandbox.Resources),
-		Patch:                    spec.Resource,
+		Patch:                    patch,
 		Dynamic:                  dynamic,
 		ControllerSocketIdentity: o.resourceControllerSocketIdentity,
 	})
 	if err != nil {
 		if errors.Is(err, sandboxcfg.ErrInvalidResourceRequest) {
-			return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("%w: phase sandbox resources: %v", api.ErrBadRequest, err)
+			return rtconfig.ResourcesConfig{}, fmt.Errorf("%w: Sandbox resources: %v", api.ErrBadRequest, err)
 		}
-		return sandboxcfg.SandboxSpec{}, rtconfig.ResourcesConfig{}, fmt.Errorf("build: resolve phase sandbox resources: %w", err)
+		return rtconfig.ResourcesConfig{}, fmt.Errorf("build: resolve Sandbox resources: %w", err)
 	}
-	return spec, resources, nil
+	return resources, nil
 }
 
 func (o *Orchestrator) cleanupBuildRuntime(b *types.Build, port string, persisted bool) error {
@@ -1610,7 +1730,7 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 	}
 	b := pend.build
 	response := &configsock.BuildTaskSpec{BuildID: buildID, RunID: runID, Env: buildTaskEnv(b)}
-	if !pend.snapshotTemplate {
+	if !pend.sourceTemplate {
 		final, err := pend.handoff.WaitFinal(ctx)
 		if err != nil {
 			return nil, false, err
@@ -1619,8 +1739,8 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 		return response, true, nil
 	}
 	tmpl, err := types.ParseTemplateID(b.FromTemplate)
-	if err != nil || tmpl.Kind != types.KindSnp {
-		return nil, false, fmt.Errorf("build: invalid snapshot template %q", b.FromTemplate)
+	if err != nil || (tmpl.Kind != types.KindSbx && tmpl.Kind != types.KindSnp) {
+		return nil, false, fmt.Errorf("build: invalid Sandbox/Snapshot template %q", b.FromTemplate)
 	}
 	manifestConfig := o.cfg.ManifestConfig
 	if manifestConfig != "" && !filepath.IsAbs(manifestConfig) {
@@ -1634,11 +1754,15 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 	if err != nil {
 		return nil, false, err
 	}
+	sourceKind := types.ResumeSourceSandbox
+	if tmpl.Kind == types.KindSnp {
+		sourceKind = types.ResumeSourceSnapshot
+	}
 	response.Prepare = &configsock.ArtifactPrepareSpec{
-		RootSourceKind: string(types.ResumeSourceSnapshot),
-		RootRef:        rootRef, LaunchMode: string(types.LaunchMemory), ManifestConfig: manifestConfig,
+		RootSourceKind: string(sourceKind),
+		RootRef:        rootRef, LaunchMode: string(types.LaunchCold), ManifestConfig: manifestConfig,
 		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
-		RelativeDir:       checkpointDir, MaxRefs: maxRequiredArtifactRefs,
+		RelativeDir:       checkpointDir, MaxRefs: maxRequiredArtifactRefs, ReadSourceImageConfig: true,
 		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
 	}
 	return response, true, nil
@@ -1748,6 +1872,13 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	if err != nil {
 		return nil, err
 	}
+	var checkpointPolicy sandboxcfg.SnapshotPolicy
+	if buildMayProduceMemorySandbox(b, pend.sourceTemplate) {
+		checkpointPolicy, err = o.resolveSnapshotPolicy(b.Metadata, sandboxcfg.SnapshotPolicy{})
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	spec := &configsock.BuildSpec{
 		BuildID:               b.BuildID,
@@ -1758,6 +1889,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		FromImage:             b.FromImage,
 		FromTemplateRef:       fromTemplateRef,
 		FromTemplateKind:      fromTemplateKind,
+		RequestedTarget:       cloneBuildTarget(b.Builder.Target),
 		RefLocations:          refLocations,
 		CheckpointMode:        o.cfg.Checkpoint.Mode,
 		PublishLocationParent: publishParent,
@@ -1783,14 +1915,21 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			Hostname: pend.network.Hostname,
 			DNS:      pend.network.DNS,
 		},
-		TemplateNetwork: pend.templateNetwork,
-		Resources:       pend.resources,
-		MMDSEnabled:     b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
-		EnvdToken:       pend.envdToken,
-		Insecure:        o.cfg.Builder.InsecureRegistry,
-		Platform:        o.cfg.Builder.Platform,
-		ImportReferer:   importReferer,
-		RegistryTLS:     o.effectiveRegistryTLS(b),
+		TemplateNetwork:   pend.templateNetwork,
+		Resources:         pend.resources,
+		SandboxResources:  pend.sandboxResources,
+		SandboxSpec:       pend.spec,
+		SandboxNamespaces: buildSandboxNamespaces(b.Metadata),
+		SandboxEnv:        cloneStringMap(b.Env),
+		HasSandboxConfig:  buildHasSandboxConfig(b),
+		HasInstanceConfig: buildHasInstanceConfig(b),
+		CheckpointPolicy:  checkpointPolicy,
+		MMDSEnabled:       b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
+		EnvdToken:         pend.envdToken,
+		Insecure:          o.cfg.Builder.InsecureRegistry,
+		Platform:          o.cfg.Builder.Platform,
+		ImportReferer:     importReferer,
+		RegistryTLS:       o.effectiveRegistryTLS(b),
 		Timeouts: configsock.BuildTimeouts{
 			PullSec:                  o.cfg.Builder.PullTimeoutSec,
 			StepSec:                  o.cfg.Builder.StepTimeoutSec,
@@ -1807,7 +1946,8 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 // reversing these operations creates a real initialization race.
 func (o *Orchestrator) publishBuildFinal(pend *pendingBuild, spec *configsock.BuildSpec) *types.Sandbox {
 	var mmdsRow *types.Sandbox
-	if pend.build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
+	if pend.build.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled &&
+		buildMayProduceMemorySandbox(pend.build, pend.sourceTemplate) {
 		mmdsRow = o.publishRecoveredBuildMMDS(pend.build)
 	}
 	pend.handoff.PublishFinal(spec, nil)
@@ -1817,7 +1957,7 @@ func (o *Orchestrator) publishBuildFinal(pend *pendingBuild, spec *configsock.Bu
 // resolveBuildNetworks derives two roles from the same merged logical network:
 // the temporary build VMs use buildHostname when no hostname was declared, while
 // the produced template uses the normal sandbox hostname default. Both preserve
-// current-build fields over source snapshot fields and share every other default.
+// current-build fields over source Sandbox fields and share every other default.
 func (o *Orchestrator) resolveBuildNetworks(
 	profile types.Profile,
 	inherited sandboxcfg.NetworkSpec,

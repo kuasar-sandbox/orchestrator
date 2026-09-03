@@ -14,7 +14,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
-	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 func TestBuilderAssignmentPidfileMatchesBuildSpecRuntimeIdentity(t *testing.T) {
@@ -92,31 +91,7 @@ func TestRetryBuildConfigSocketDoesNotRetryProviderRejection(t *testing.T) {
 	}
 }
 
-func TestBuildSnapshotPreparationRetainsRootDiskAndCommands(t *testing.T) {
-	cfg := &restore.SnapshotCfg{Metadata: map[string]string{
-		"e2b.start_cmd": "node server.js",
-		"e2b.ready_cmd": "curl -sf localhost:3000",
-	}}
-	cfg.Boot.Root.BaseRef = "manifest://base"
-	cfg.Boot.Root.Overlay = &restore.SnapOverlayCfg{
-		Base: "manifest://top", BaseFromRefs: []string{"manifest://lower-1", "manifest://lower-2"},
-	}
-	got, err := buildSnapshotPreparation(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.BaseRef != "manifest://base" || got.OverlayBase != "manifest://top" ||
-		strings.Join(got.OverlayBaseFromRefs, ",") != "manifest://lower-1,manifest://lower-2" ||
-		got.StartCmd != "node server.js" || got.ReadyCmd != "curl -sf localhost:3000" {
-		t.Fatalf("snapshot preparation = %+v", got)
-	}
-	cfg.Boot.Root.Overlay.BaseFromRefs[0] = "changed"
-	if got.OverlayBaseFromRefs[0] != "manifest://lower-1" {
-		t.Fatalf("snapshot preparation retained mutable cfg storage: %+v", got)
-	}
-}
-
-func TestBuildTaskAbsoluteDeadlineCoversFastAndSnapshotPaths(t *testing.T) {
+func TestBuildTaskAbsoluteDeadlineCoversFastAndPreparedSourcePaths(t *testing.T) {
 	if got := buildTaskAbsoluteDeadline(&configsock.BuildTaskSpec{
 		Final: &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{AbsoluteDeadlineUnixNano: 11}},
 	}); got != 11 {
@@ -126,7 +101,7 @@ func TestBuildTaskAbsoluteDeadlineCoversFastAndSnapshotPaths(t *testing.T) {
 		Prepare: &configsock.ArtifactPrepareSpec{AbsoluteDeadlineUnixNano: 22},
 		Final:   &configsock.BuildSpec{Timeouts: configsock.BuildTimeouts{AbsoluteDeadlineUnixNano: 33}},
 	}); got != 22 {
-		t.Fatalf("snapshot path deadline = %d, want 22", got)
+		t.Fatalf("prepared source path deadline = %d, want 22", got)
 	}
 }
 

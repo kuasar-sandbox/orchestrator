@@ -245,11 +245,13 @@ func TestResolveBuildNetworksFromTemplatePrecedence(t *testing.T) {
 	}
 }
 
-func TestBuildPrepareSummaryStrictlyParsesSnapshotMetadata(t *testing.T) {
-	got, err := validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+func TestBuildPrepareSummaryStrictlyParsesSandboxMetadata(t *testing.T) {
+	_, got, err := validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
-		PreparedSourceKind: string(types.ResumeSourceSnapshot),
-		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
+		PreparedSourceKind: string(types.ResumeSourceSandbox),
+		Capacity: configsock.ArtifactCapacity{
+			CPU: 2, Memory: "2GiB", AllocatableCPU: 2, AllocatableMemory: "2GiB",
+		},
 		Network: configsock.ArtifactNetwork{
 			Hostname: "source", InnerIP: "10.0.0.5/24", Nexthop: "10.0.0.1", TransitGeneveVNI: 23,
 		},
@@ -265,14 +267,16 @@ func TestBuildPrepareSummaryStrictlyParsesSnapshotMetadata(t *testing.T) {
 		t.Fatalf("source network = %+v", got)
 	}
 
-	_, err = validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
+	_, _, err = validateBuildPrepareSummary(configsock.ArtifactPrepareSummary{
 		SchemaVersion:      configsock.ArtifactPrepareSchemaVersion,
-		PreparedSourceKind: string(types.ResumeSourceSnapshot),
-		Capacity:           configsock.ArtifactCapacity{CPU: 2, Memory: "2GiB"},
-		Network:            configsock.ArtifactNetwork{Nexthop: "not-an-ip"},
-		DiskTopology:       validArtifactDiskTopology(),
-		ResolutionDigest:   strings.Repeat("a", 64),
-		RequiredRefCount:   1,
+		PreparedSourceKind: string(types.ResumeSourceSandbox),
+		Capacity: configsock.ArtifactCapacity{
+			CPU: 2, Memory: "2GiB", AllocatableCPU: 2, AllocatableMemory: "2GiB",
+		},
+		Network:          configsock.ArtifactNetwork{Nexthop: "not-an-ip"},
+		DiskTopology:     validArtifactDiskTopology(),
+		ResolutionDigest: strings.Repeat("a", 64),
+		RequiredRefCount: 1,
 	})
 	if err == nil || !strings.Contains(err.Error(), "source-template network summary") {
 		t.Fatalf("invalid inherited network = %v", err)

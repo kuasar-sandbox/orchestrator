@@ -20,8 +20,8 @@ import (
 //     assignment, then exec-replaces into sandbox-ctl run with config pulled over
 //     the config-socket.
 //   - <builder> (sandbox-builder@.service): one run-id unit that waits for a build
-//     assignment, authenticates an exact-run bootstrap, prepares a snapshot root
-//     task-locally when required, then drives the three-phase pipeline and posts
+//     assignment, authenticates an exact-run bootstrap, prepares an artifact root
+//     task-locally when required, then drives the target-selected pipeline and posts
 //     the result back to the socket.
 //
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
@@ -99,7 +99,7 @@ StandardError=journal
 # thousands of sandboxes must not flood the journal.)
 LogRateLimitIntervalSec=0
 # run-builder pulls its assignment and BuildSpec (secrets in env, never on disk)
-# over the config-socket, drives the three-phase pipeline itself, and posts the
+# over the config-socket, drives the target-selected build pipeline itself, and posts the
 # result back to the socket. Its phase sandboxes (sandbox-ctl run +
 # cloud-hypervisor) are direct children, so the whole build accounts to this
 # unit's cgroup under sandbox-builder.slice.

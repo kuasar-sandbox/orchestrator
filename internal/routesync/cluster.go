@@ -3,6 +3,7 @@ package routesync
 import (
 	"encoding/json"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -251,10 +252,13 @@ type Command struct {
 	// delivered WITH the immutable registration command. The node retains them in
 	// protected registration state for exact replay and restart recovery; neither
 	// field becomes portable template metadata.
-	BuildID        string          `json:"build_id,omitempty"`
-	BuildResources *BuildResources `json:"build_resources,omitempty"`
-	ImageRepo      string          `json:"image_repo,omitempty"`
-	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	BuildID          string                  `json:"build_id,omitempty"`
+	BuildResources   *BuildResources         `json:"build_resources,omitempty"`
+	ImageRepo        string                  `json:"image_repo,omitempty"`
+	RegistryAuth     string                  `json:"registry_auth,omitempty"` // docker config.json; protected registration input
+	BuildEnv         map[string]string       `json:"build_env,omitempty"`
+	BuildSecure      bool                    `json:"build_secure,omitempty"`
+	BuildCredentials *sandboxcfg.Credentials `json:"build_credentials,omitempty"`
 	// BuildMMDSSecrets carries request-scoped initial MMDS secret values to the
 	// selected node. The Registry deliberately excludes this field from its
 	// replicated BuildRecord; only the node persists the values, encrypted.

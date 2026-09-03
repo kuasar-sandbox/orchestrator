@@ -6,8 +6,8 @@
 # network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
-# as an envd-managed process. One orchestrator, five successful builds, one
-# deterministic failed build, and three creates:
+# as an envd-managed process. One orchestrator, nine successful builds, one
+# deterministic failed build, and four creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -15,16 +15,24 @@
 #       (config merge), runs startCmd/readyCmd on the production runtime,
 #       snapshots, then ONE publish uploads bundle + image + overlay
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
-#       extracts the base image from B2's snapshot.cfg and INHERITS its
+#       reads S only to select E, materializes E's root, and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
 #   B4  COPY build context (versitygw required)            → e2b-img template
 #       files endpoint → presigned direct-to-bucket PUT → in-build extract via
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
 #   B5  profile=bare + fromImage                            → bare-img template
 #       rejects start/ready, uses bare build network, and remains image-only
+#   B6  fromTemplate(B2, snp), explicit image, no steps     → e2b-img template
+#       resolves S only to E, forces B materialization, ignores inherited
+#       start/ready, and leaves no source S/E/root dependency
+#   B7  fromTemplate(B1, img), explicit sandbox/cold        → e2b-sbx template
+#       offline assembly through sandbox-ctl; no Phase A/B/C VM execution
+#   B8  fromTemplate(B7, sbx), explicit sandbox/memory      → e2b-snp template
+#       forces B with no steps, cold-runs C with --replace-boot, and exercises
+#       the cancelable fixed 20-second readiness wait without commands
 #   BF  fromTemplate(B1) + failing RUN                     → error
 #       preserves journal logs while its failed systemd instance is collected
-#   create from B3, B1 and B5 → 201 → wait running → kill  (snapshot + e2b/bare cold boot)
+#   create from B8, B1, B5 and B7 after their Build rows expire → running → kill
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
@@ -95,9 +103,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Keep #205's finite CPUQuota assertions while avoiding an additional parent
-# throttle around each independently limited phase VM. A Build receives the
-# host's full CPU capacity; admission aggregate limits scale with max_builds.
-BUILDER_CPU="$(nproc)"
+# throttle around each independently limited phase VM. A Build leaves the
+# configured host reservation available; admission aggregate limits scale with
+# max_builds.
+HOST_CPU="$(nproc)"
+BUILDER_CPU=$((HOST_CPU > 2 ? 2 : 1))
 BUILDER_CPU_MILLI=$((BUILDER_CPU * 1000))
 BUILDER_EXECUTION_CPU=$((BUILDER_CPU * 2))
 BUILDER_EXECUTION_CPU_MILLI=$((BUILDER_EXECUTION_CPU * 1000))
@@ -295,6 +305,7 @@ builder:
       resources: { cpu: $BUILDER_EXECUTION_CPU, memory: 12GiB, storage: 16GiB }
   registration_ttl: 1h
   queue_ttl: 30m
+  terminal_ttl: 5s
   insecure_registry: true
   diff_template: $BLDDIFF
   pull_timeout_sec: 300
@@ -464,7 +475,7 @@ import sys
 
 try:
     profile, kind, payload = sys.argv[1].split("-", 2)
-    if profile not in {"e2b", "bare"} or kind not in {"img", "snp"}:
+    if profile not in {"e2b", "bare"} or kind not in {"img", "sbx", "snp"}:
         raise ValueError
     raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
     if base64.urlsafe_b64encode(raw).decode().rstrip("=") != payload:
@@ -531,15 +542,23 @@ PY
     cat "$WORK/phase-reservations-final.json" >&2 2>/dev/null || true
     return 1
 }
-register() { # name [profile] → sets TID/BID
-    local code body expected_profile got_profile
+register() { # name [profile] [target-json] [sandbox-config=0|1] → sets TID/BID
+    local code body expected_profile got_profile target_json sandbox_config target_suffix
     expected_profile="${2:-e2b}"
+    target_json="${3:-}"
+    sandbox_config="${4:-0}"
     # The finite, asserted Builder quota equals host capacity; the phase
-    # Sandbox independently remains 2 vCPU.
+    # A/B sandbox is derived from that Build quota. Target Sandbox capacity is
+    # a separate Create input and is included only for Sandbox-producing cases.
     body="{\"name\":\"$1\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
     [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":$BUILDER_CPU,\"memoryMB\":6144}"
-    REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}}"
-    REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
+    target_suffix=""
+    [ -z "$target_json" ] || target_suffix=",\"target\":$target_json"
+    REQ_BUILDER_HEADER="{\"resources\":{\"cpu\":$BUILDER_CPU,\"memory\":\"6GiB\",\"storage\":\"4GiB\"}$target_suffix}"
+    if [ "$sandbox_config" = "1" ]; then
+        REQ_RESOURCE_HEADER='{"capacity":{"cpu":2,"memory":"3GiB"},"allocatable":{"cpu":1,"memory":"512MiB"},"startup":{"memory":"3GiB"}}'
+        body="${body%?},\"envVars\":{\"BUILD_TARGET_ENV\":\"portable-e2e\"}}"
+    fi
     code=$(req POST /v3/templates "$AK" "$body")
     unset REQ_BUILDER_HEADER REQ_RESOURCE_HEADER
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
@@ -548,6 +567,15 @@ register() { # name [profile] → sets TID/BID
     got_profile=$(json_field "$WORK/resp.body" profile)
     [ "$got_profile" = "$expected_profile" ] \
         || fail "register $1 profile=$got_profile (want $expected_profile)"
+    python3 - "$WORK/resp.body" "$target_json" <<'PY' \
+        || fail "register $1 did not preserve requested target"
+import json, sys
+response = json.load(open(sys.argv[1]))
+expected = json.loads(sys.argv[2]) if sys.argv[2] else None
+if expected is not None and expected.get("memory") is False:
+    expected.pop("memory")
+assert response.get("target") == expected, response
+PY
     [ ! -e "$WORK/run/builds/$BID" ] \
         || fail "registered Build created BuildRunDir before execution claim"
     [ ! -e "$WORK/lib/builds/$BID" ] \
@@ -588,23 +616,22 @@ PY
 
     for _ in $(seq 1 120); do
         if "$BIN/node-ctl" resource list --socket "$WORK/sandbox-resource.sock" >"$WORK/phase-reservations.json" 2>/dev/null &&
-            SID="$sid" python3 - "$WORK/phase-reservations.json" 2>/dev/null <<'PY'
+            SID="$sid" BUILD_CPU_MILLI="$BUILDER_CPU_MILLI" python3 - "$WORK/phase-reservations.json" 2>/dev/null <<'PY'
 import json, os, sys
 rows = json.load(open(sys.argv[1]))
 assert len(rows) == 1, rows
 row = rows[0]
 assert row["sandbox_id"] == os.environ["SID"], row
-assert row["capacity"] == {"memory_bytes": 3 << 30, "cpu_milli": 2000}, row
-assert row["floor"] == {"memory_bytes": 512 << 20, "cpu_milli": 1000}, row
+assert row["capacity"] == {"memory_bytes": 6 << 30, "cpu_milli": int(os.environ["BUILD_CPU_MILLI"])}, row
+assert row["floor"] == {"memory_bytes": 6 << 30, "cpu_milli": int(os.environ["BUILD_CPU_MILLI"])}, row
 assert row.get("connected") is True, row
 assert row.get("provisional", False) is False, row
 assert row["stage"] == "settled", row
 # The existing admin-list wire name carries the sandbox's absolute safe
-# reservation baseline.  It is not the configured headroom (reported above as
-# floor.memory_bytes), and may move by one controller step while this poll runs.
+# reservation baseline. A/B resources come from Build.Resources and are
+# intentionally independent from the 3GiB target Sandbox configuration.
 reservation = row["allocatable_memory"]
-assert 512 << 20 <= reservation <= 3 << 30, row
-assert reservation % (64 << 20) == 0, row
+assert reservation == 6 << 30, row
 assert row["cgroup_path"].endswith("/vmm"), row
 assert row["peer_pid"] > 0, row
 PY
@@ -710,7 +737,7 @@ assert (unit / "memory.max").read_text().strip() == str(6 << 30), unit
 assert (pool / "memory.max").read_text().strip() == str(12 << 30), pool
 assert_cpu(unit, build_cpu)
 assert_cpu(pool, execution_cpu)
-assert_cpu(vmm, 2000)
+assert_cpu(vmm, build_cpu)
 PY
     echo "==> PASS: active phase $phase/$sid is the only nodectl reservation; Build limits and ctl/vmm isolation verified (memory.high=$memory_high)"
 }
@@ -720,8 +747,8 @@ diag() { # bid — failure diagnostics (BuildRunDir/BuildBaseDir are reaped by t
     echo "---- journal build $1 (tail) ----"
     journalctl KUASAR_BUILD_ID="$1" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
 }
-wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(portable-ref)>)
-    local tid="$1" bid="$2" label="$3" status="" code
+wait_ready() { # tid bid label requested-target-json-or-null kind → sets PERSIST
+    local tid="$1" bid="$2" label="$3" expected_target="$4" expected_kind="$5" status="" code
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
         [ "$code" = "200" ] || fail "$label status = $code (want 200)"
@@ -730,6 +757,16 @@ wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<base64url(
             ready)
                 PERSIST=$(json_field "$WORK/resp.body" templateID)
                 valid_persist_id "$PERSIST" || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
+                python3 - "$WORK/resp.body" "$expected_target" "$expected_kind" <<'PY' \
+                    || fail "$label status target/kind contract mismatch"
+import json, sys
+status = json.load(open(sys.argv[1]))
+expected = json.loads(sys.argv[2])
+if expected is not None and expected.get("memory") is False:
+    expected.pop("memory")
+assert status.get("target") == expected, status
+assert status.get("kind") == sys.argv[3], status
+PY
                 return 0;;
             error)
                 echo "    $label error response: $(cat "$WORK/resp.body")"
@@ -752,6 +789,38 @@ wait_error() { # tid bid label
         sleep 0.5
     done
     diag "$bid"; fail "$label did not reach error (last status=$status)"
+}
+wait_build_row_deleted() { # bid — terminal_ttl + 5s reaper cadence
+    local bid="$1"
+    for _ in $(seq 1 80); do
+        if python3 - "$WORK/lib/node-ctl.db" "$bid" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=5) as db:
+    count = db.execute("select count(*) from builds where build_id=?", (sys.argv[2],)).fetchone()[0]
+raise SystemExit(0 if count == 0 else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+assert_phase_history() { # bid required-phase-or-dash forbidden-phase-or-dash label
+    local bid="$1" required="$2" forbidden="$3" label="$4" unit journal required_sid forbidden_sid
+    unit=$(build_journal_unit "$bid") || fail "$label journal lost its builder unit identity"
+    journal="$WORK/$label-builder.journal"
+    journalctl --no-pager -o cat -u "$unit" >"$journal" 2>&1 || true
+    if [ "$required" != "-" ]; then
+        required_sid=$(phase_sandbox_id "$required" "$bid")
+        grep -Fq -- "$required_sid" "$journal" \
+            || { cat "$journal" >&2; fail "$label did not run required Phase $required"; }
+    fi
+    if [ "$forbidden" != "-" ]; then
+        forbidden_sid=$(phase_sandbox_id "$forbidden" "$bid")
+        ! grep -Fq -- "$forbidden_sid" "$journal" \
+            || { cat "$journal" >&2; fail "$label unexpectedly ran Phase $forbidden"; }
+    fi
 }
 
 # Exercise the installed templates without going through orchestrator cleanup:
@@ -801,7 +870,7 @@ fi
 echo "==> BM: Build Register MMDS routes/initial secret, Trigger immutability, real guest GET"
 MMDS_BUILD_SECRET=MMDS_BUILD_SECRET_GUEST_E2E
 REQ_MMDS_HEADER='{"secrets":{"build_secret":"MMDS_BUILD_SECRET_GUEST_E2E"},"routes":[{"path":"/e2e/build-static","data":"MMDS_BUILD_STATIC_GUEST_E2E"},{"path":"/e2e/build-secret","type":"secret","secret":"build_secret"},{"path":"/e2e/build-unresolved","type":"secret","secret":"build_unresolved"}]}'
-register e2e-mmds
+register e2e-mmds e2b '{"kind":"sandbox","memory":true}' 1
 BM_TID="$TID"; BM_BID="$BID"
 
 # Both Trigger entry points are forbidden from replacing Register's MMDS.
@@ -864,9 +933,9 @@ PY
 )
 code=$(req POST "/v2/templates/$BM_TID/builds/$BM_BID" "$AK" "$BM_BODY")
 [ "$code" = 202 ] || { cat "$WORK/resp.body"; fail "BM trigger=$code (want 202)"; }
-wait_ready "$BM_TID" "$BM_BID" BM
+wait_ready "$BM_TID" "$BM_BID" BM '{"kind":"sandbox","memory":true}' snp
 BM_PERSIST="$PERSIST"
-case "$BM_PERSIST" in e2b-img-*) : ;; *) fail "BM persist=$BM_PERSIST (want e2b-img-…)";; esac
+case "$BM_PERSIST" in e2b-snp-*) : ;; *) fail "BM persist=$BM_PERSIST (want e2b-snp-…)";; esac
 
 journalctl KUASAR_BUILD_ID="$BM_BID" --no-pager --output=cat >"$WORK/bm-mmds.journal" 2>/dev/null || true
 grep -q 'MMDS_BUILD_GUEST_OK' "$WORK/bm-mmds.journal" \
@@ -888,15 +957,15 @@ for path in pathlib.Path(db_path).parent.glob(pathlib.Path(db_path).name + "*"):
     assert secret.encode() not in path.read_bytes(), f"BM plaintext found in {path}"
 PY
 BM_REF=$(persist_ref "$BM_PERSIST") || fail "BM persistent id is invalid"
-MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
-    "$BM_REF" >"$WORK/bm-image.json" 2>"$WORK/bm-image.err" \
-    || { cat "$WORK/bm-image.err"; fail "flatten-ctl info BM image"; }
-for artifact in "$WORK/orch.log" "$WORK/bm-mmds.journal" "$WORK/bm-image.json" "$WORK/bm-image.err"; do
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$BM_REF" >"$WORK/bm-snapshot.json" 2>"$WORK/bm-snapshot.err" \
+    || { cat "$WORK/bm-snapshot.err"; fail "sandbox-ctl info BM snapshot"; }
+for artifact in "$WORK/orch.log" "$WORK/bm-mmds.journal" "$WORK/bm-snapshot.json" "$WORK/bm-snapshot.err"; do
     grep -a -F -q -- "$MMDS_BUILD_SECRET" "$artifact" \
         && fail "Build Register MMDS secret plaintext appeared in $artifact"
 done
-grep -Fq 'kuasar-sandbox.mmds' "$WORK/bm-image.json" \
-    && fail "Build Register MMDS routes leaked into final image config"
+grep -Fq 'kuasar-sandbox.mmds' "$WORK/bm-snapshot.json" \
+    && fail "Build Register MMDS routes leaked into final snapshot config"
 echo "==> PASS: BM real guest MMDS, Trigger immutability, terminal cleanup, and artifact/log secrecy"
 
 # ---- B1: fromImage → e2b-img -----------------------------------------------
@@ -907,7 +976,7 @@ code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
 wait_phase_reservation a "$B1_BID" \
     || fail "B1 phase A never exposed a connected settled nodectl reservation"
-wait_ready "$B1_TID" "$B1_BID" B1
+wait_ready "$B1_TID" "$B1_BID" B1 null img
 B1_PERSIST="$PERSIST"
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
 B1_BEFORE_RETRY=$(build_trigger_signature "$B1_BID")
@@ -922,7 +991,10 @@ code=$(req GET /templates "$AK")
 python3 - "$WORK/resp.body" "$B1_BID" "$B1_PERSIST" <<'PY'
 import json, sys
 items = json.load(open(sys.argv[1]))
-assert any(item.get("buildID") == sys.argv[2] and item.get("templateID") == sys.argv[3] for item in items), items
+matches = [item for item in items if item.get("buildID") == sys.argv[2] and item.get("templateID") == sys.argv[3]]
+assert len(matches) == 1, items
+assert matches[0].get("target") is None, matches[0]
+assert matches[0].get("kind") == "img", matches[0]
 PY
 echo "==> PASS: B1 ready → $B1_PERSIST"
 
@@ -963,7 +1035,7 @@ echo "==> PASS: BF status=error, journal retained, sandbox-builder instance coll
 
 # ---- B2: fromTemplate(img) + steps + startCmd/readyCmd → e2b-snp ------------
 echo "==> B2: fromTemplate=$B1_PERSIST + steps + startCmd/readyCmd"
-register e2e-tpl
+register e2e-tpl e2b '' 1
 B2_TID="$TID"; B2_BID="$BID"
 [ "$B2_BID" != "$B1_BID" ] || fail "new registration reused B1 build id"
 B2_BODY=$(cat <<EOF
@@ -989,7 +1061,7 @@ wait_phase_reservation c "$B2_BID" \
     || fail "B2 phase C never exposed a connected settled nodectl reservation"
 [ -f "$WORK/run/builds/$B2_BID/a/sibling-proof" ] \
     || fail "phase B cleanup removed sibling phase A"
-wait_ready "$B2_TID" "$B2_BID" B2
+wait_ready "$B2_TID" "$B2_BID" B2 null snp
 B2_PERSIST="$PERSIST"
 case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
 assert_terminal_build_unowned "$B2_BID" ready || fail "B2 terminal row retained execution ownership"
@@ -1041,12 +1113,12 @@ echo "==> PASS: phases A/B/C used precise nodectl reservations and left no reser
 
 # ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
 echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"
-register e2e-child
+register e2e-child e2b '' 1
 B3_TID="$TID"; B3_BID="$BID"
 code=$(req POST "/v2/templates/$B3_TID/builds/$B3_BID" "$AK" \
     "{\"fromTemplate\":\"$B2_PERSIST\",\"steps\":[{\"type\":\"RUN\",\"args\":[\"test -f /etc/b2-marker && test x\$BUILT = xyes && test x\$PWD = x/home/user\"]}]}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B3 trigger = $code (want 202)"; }
-wait_ready "$B3_TID" "$B3_BID" B3
+wait_ready "$B3_TID" "$B3_BID" B3 null snp
 B3_PERSIST="$PERSIST"
 case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-snp-…)";; esac
 assert_terminal_build_unowned "$B3_BID" ready || fail "B3 terminal row retained execution ownership"
@@ -1059,7 +1131,7 @@ grep -F -q 'task_artifact_ref_count' "$WORK/b3-builder.journal" \
     || { cat "$WORK/b3-builder.journal"; fail "B3 task artifact ref-count instrumentation missing"; }
 # ready is only reachable if the RUN saw B2's marker and merged ENV/WORKDIR,
 # and the inherited startCmd/readyCmd ran on the new template VM.
-echo "==> PASS: B3 ready → $B3_PERSIST (one task-local root cfg read; restored RUN/ENV/WORKDIR + start/ready inheritance)"
+echo "==> PASS: B3 ready → $B3_PERSIST (one task-local source preparation; materialized RUN/ENV/WORKDIR + start/ready inheritance)"
 
 # ---- B4: COPY build context via files endpoint + presigned direct upload ----
 # Acts as the e2b client: GET the files endpoint (present=false) → PUT the
@@ -1120,7 +1192,7 @@ EOF
 )
     code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" "$B4_BODY")
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B4 trigger = $code (want 202)"; }
-    wait_ready "$B4_TID" "$B4_BID" B4
+    wait_ready "$B4_TID" "$B4_BID" B4 null img
     B4_PERSIST="$PERSIST"
     case "$B4_PERSIST" in e2b-img-*) : ;; *) fail "B4 persist=$B4_PERSIST (want e2b-img-…)";; esac
     echo "==> PASS: B4 ready → $B4_PERSIST (COPY extract + default/--chown ownership verified in-build)"
@@ -1137,18 +1209,114 @@ code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" \
 [ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "B5 startCmd = $code (want 400)"; }
 code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B5 trigger = $code (want 202)"; }
-wait_ready "$B5_TID" "$B5_BID" B5
+wait_ready "$B5_TID" "$B5_BID" B5 null img
 B5_PERSIST="$PERSIST"
 case "$B5_PERSIST" in bare-img-*) : ;; *) fail "B5 persist=$B5_PERSIST (want bare-img-…)";; esac
 echo "==> PASS: B5 ready → $B5_PERSIST (bare profile remained image-only)"
 
-# ---- create a sandbox from the built template -------------------------------
-echo "==> create sandbox from $B3_PERSIST (snapshot restore path)"
-code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60}")
-[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B3_BID"; fail "create = $code (want 201)"; }
+# ---- B6: SNP source + explicit Image, no steps → forced B, no C -----------
+echo "==> B6: fromTemplate=$B2_PERSIST (SNP), explicit image, no steps"
+register e2e-reimage e2b '{"kind":"image"}'
+B6_TID="$TID"; B6_BID="$BID"
+code=$(req POST "/v2/templates/$B6_TID/builds/$B6_BID" "$AK" \
+    "{\"fromTemplate\":\"$B2_PERSIST\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B6 trigger = $code (want 202)"; }
+wait_ready "$B6_TID" "$B6_BID" B6 '{"kind":"image"}' img
+B6_PERSIST="$PERSIST"
+case "$B6_PERSIST" in e2b-img-*) : ;; *) fail "B6 persist=$B6_PERSIST (want e2b-img-…)";; esac
+assert_phase_history "$B6_BID" b c B6
+B6_REF=$(persist_ref "$B6_PERSIST") || fail "B6 persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B6_REF" >"$WORK/b6-image.json" 2>"$WORK/b6-image.err" \
+    || { cat "$WORK/b6-image.err"; fail "flatten-ctl info B6 image"; }
+python3 - "$WORK/b6-image.json" "$B2_REF" <<'PY' \
+    || fail "B6 image retained source Snapshot identity or commands"
+import json, sys
+config = json.load(open(sys.argv[1]))
+encoded = json.dumps(config, sort_keys=True)
+assert sys.argv[2] not in encoded, encoded
+assert "e2b.start_cmd" not in encoded and "e2b.ready_cmd" not in encoded, encoded
+PY
+echo "==> PASS: B6 SNP→E cold selection forced Phase B, ignored inherited commands, emitted only Image, and skipped C"
+
+# ---- B7: explicit offline Sandbox from Image → no phase VM ----------------
+echo "==> B7: fromTemplate=$B6_PERSIST (IMG), explicit sandbox memory=false"
+register e2e-offline e2b '{"kind":"sandbox","memory":false}' 1
+B7_TID="$TID"; B7_BID="$BID"
+code=$(req POST "/v2/templates/$B7_TID/builds/$B7_BID" "$AK" \
+    "{\"fromTemplate\":\"$B6_PERSIST\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B7 trigger = $code (want 202)"; }
+wait_ready "$B7_TID" "$B7_BID" B7 '{"kind":"sandbox","memory":false}' sbx
+B7_PERSIST="$PERSIST"
+case "$B7_PERSIST" in e2b-sbx-*) : ;; *) fail "B7 persist=$B7_PERSIST (want e2b-sbx-…)";; esac
+assert_phase_history "$B7_BID" - a B7
+assert_phase_history "$B7_BID" - b B7
+assert_phase_history "$B7_BID" - c B7
+B7_REF=$(persist_ref "$B7_PERSIST") || fail "B7 persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B7_REF" >"$WORK/b7-sandbox.json" 2>"$WORK/b7-sandbox.err" \
+    || { cat "$WORK/b7-sandbox.err"; fail "sandbox-ctl info B7 Sandbox"; }
+python3 - "$WORK/b7-sandbox.json" <<'PY' \
+    || fail "B7 offline Sandbox lost registered Create configuration"
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["Resources"]["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, config["Resources"]
+assert config["Launch"]["Env"]["BUILD_TARGET_ENV"] == "portable-e2e", config["Launch"]
+root = config["Boot"]["Root"]
+assert root["Base"] == "self" and isinstance(root.get("Overlay"), dict), root
+assert "manifest://" not in json.dumps(root), root
+metadata = config.get("Metadata") or {}
+assert "e2b.start_cmd" not in metadata and "e2b.ready_cmd" not in metadata, metadata
+PY
+echo "==> PASS: B7 offline sandbox-ctl assembly emitted E with target resources/env and started no A/B/C VM"
+
+# ---- B8: SBX source + explicit memory Sandbox, no commands -----------------
+echo "==> B8: fromTemplate=$B7_PERSIST (SBX), explicit sandbox memory=true, no steps/start/ready"
+register e2e-memory e2b '{"kind":"sandbox","memory":true}' 1
+B8_TID="$TID"; B8_BID="$BID"
+B8_STARTED=$(date +%s)
+code=$(req POST "/v2/templates/$B8_TID/builds/$B8_BID" "$AK" \
+    "{\"fromTemplate\":\"$B7_PERSIST\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B8 trigger = $code (want 202)"; }
+wait_ready "$B8_TID" "$B8_BID" B8 '{"kind":"sandbox","memory":true}' snp
+B8_ELAPSED=$(( $(date +%s) - B8_STARTED ))
+[ "$B8_ELAPSED" -ge 20 ] || fail "B8 completed in ${B8_ELAPSED}s; fixed no-ready wait was skipped"
+B8_PERSIST="$PERSIST"
+case "$B8_PERSIST" in e2b-snp-*) : ;; *) fail "B8 persist=$B8_PERSIST (want e2b-snp-…)";; esac
+assert_phase_history "$B8_BID" b a B8
+assert_phase_history "$B8_BID" c a B8
+B8_REF=$(persist_ref "$B8_PERSIST") || fail "B8 persistent id is invalid"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "$B8_REF" >"$WORK/b8-snapshot.json" 2>"$WORK/b8-snapshot.err" \
+    || { cat "$WORK/b8-snapshot.err"; fail "sandbox-ctl info B8 Snapshot"; }
+python3 - "$WORK/b8-snapshot.json" "$B7_REF" <<'PY' \
+    || fail "B8 Snapshot retained source E or lost shared cold configuration"
+import json, sys
+config = json.load(open(sys.argv[1]))
+encoded = json.dumps(config, sort_keys=True)
+assert sys.argv[2] not in encoded, encoded
+assert config["Resources"]["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, config["Resources"]
+assert config["Launch"]["Env"]["BUILD_TARGET_ENV"] == "portable-e2e", config["Launch"]
+metadata = config.get("Metadata") or {}
+assert "e2b.start_cmd" not in metadata and "e2b.ready_cmd" not in metadata, metadata
+PY
+echo "==> PASS: B8 SBX source forced B, cold C captured memory after fixed wait, and final S→E excludes source E"
+
+# ---- canonical Create after retention-bounded Build rows are reaped --------
+for terminal_bid in "$B1_BID" "$B5_BID" "$B7_BID" "$B8_BID"; do
+    wait_build_row_deleted "$terminal_bid" \
+        || fail "terminal Build row $terminal_bid survived builder.terminal_ttl"
+done
+code=$(req GET "/templates/$B8_TID/builds/$B8_BID/status" "$AK")
+[ "$code" = "404" ] || fail "B8 status after terminal TTL = $code (want 404)"
+echo "==> PASS: terminal Build rows expired; canonical artifacts remain the sole Create authority"
+
+echo "==> create sandbox from $B8_PERSIST (snapshot restore path)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B8_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B8_BID"; fail "create = $code (want 201)"; }
 SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$SID" ] || fail "create returned no sandboxID"
-wait_running "$SID" || { diag "$B3_BID"; fail "snapshot-template sandbox did not reach running"; }
+wait_running "$SID" || { diag "$B8_BID"; fail "snapshot-template sandbox did not reach running"; }
 wait_resource_capacity "$SID" "$((3 << 30))" \
     || fail "snapshot Create did not preserve the phase-C snapshot capacity"
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code (want 200)"
@@ -1167,6 +1335,17 @@ wait_resource_capacity "$E2B_COLD_SID" "$((2 << 30))" \
 code=$(req DELETE "/sandboxes/$E2B_COLD_SID" "$AK"); [ "$code" = "204" ] || fail "e2b cold kill = $code (want 204)"
 echo "==> PASS: e2b image cold Create reached running and cleaned up"
 
+echo "==> create e2b cold sandbox from $B7_PERSIST (offline Sandbox E path)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B7_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B7_BID"; fail "offline Sandbox create = $code (want 201)"; }
+OFFLINE_SID=$(json_field "$WORK/resp.body" sandboxID)
+[ -n "$OFFLINE_SID" ] || fail "offline Sandbox create returned no sandboxID"
+wait_running "$OFFLINE_SID" || { diag "$B7_BID"; fail "offline Sandbox did not reach running"; }
+wait_resource_capacity "$OFFLINE_SID" "$((3 << 30))" \
+    || fail "offline Sandbox Create did not preserve target capacity"
+code=$(req DELETE "/sandboxes/$OFFLINE_SID" "$AK"); [ "$code" = "204" ] || fail "offline Sandbox kill = $code (want 204)"
+echo "==> PASS: offline Sandbox E canonical Create reached running and cleaned up after Build-row TTL"
+
 echo "==> create bare sandbox from $B5_PERSIST (image cold-boot path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B5_PERSIST\",\"timeout\":60}")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B5_BID"; fail "bare create = $code (want 201)"; }
@@ -1184,4 +1363,4 @@ objs=$(find "$WORK/store" -type f | wc -l)
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST)"

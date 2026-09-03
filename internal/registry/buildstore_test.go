@@ -545,10 +545,17 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	owner := &recordingNodeOwner{ackErr: context.DeadlineExceeded}
 	reg.SetNodeOwner(owner)
 	const secret = "cluster-initial-plaintext"
+	credentials := &sandboxcfg.Credentials{
+		ServiceSecret: strings.Repeat("a", 64), EnvdAccessToken: "cluster-envd-plaintext",
+		TrafficAccessToken: "cluster-traffic-plaintext",
+	}
 	req := BuildReserveReq{
 		Group: "/g", BuildID: "mmds-build", TemplateID: "transient-mmds", Profile: types.ProfileE2B,
 		Resources: testWireBuildResources(),
-		Metadata:  map[string]string{sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"` + secret + `"}}`},
+		Metadata: map[string]string{
+			sandboxcfg.NsMMDS: `{"routes":[{"path":"/secret","type":"secret","secret":"key"}],"secrets":{"key":"` + secret + `"}}`,
+		},
+		Env: map[string]string{"BUILD_NAME": "cluster-build"}, Secure: true, Credentials: credentials,
 	}
 	if res, err := reg.ReserveBuild(ctx, req); err == nil || res != nil {
 		t.Fatalf("ambiguous reserve result=%+v err=%v", res, err)
@@ -564,11 +571,18 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(wire), secret) || strings.Contains(string(wire), `"secrets"`) || rec.RegistrationMMDSValuesDigest == "" {
-		t.Fatalf("replicated replay record retained MMDS values or lost digest: %s", wire)
+	for _, plaintext := range []string{secret, credentials.ServiceSecret, credentials.EnvdAccessToken, credentials.TrafficAccessToken} {
+		if strings.Contains(string(wire), plaintext) {
+			t.Fatalf("replicated replay record retained confidential value %q: %s", plaintext, wire)
+		}
 	}
-	if len(owner.commands) != 1 || owner.commands[0].BuildMMDSSecrets["key"] != secret {
-		t.Fatalf("node command did not receive request-scoped MMDS values: %+v", owner.commands)
+	if strings.Contains(string(wire), `"secrets"`) || rec.RegistrationMMDSValuesDigest == "" || rec.RegistrationCredentialsDigest == "" {
+		t.Fatalf("replicated replay record retained MMDS values or lost an identity digest: %s", wire)
+	}
+	if len(owner.commands) != 1 || owner.commands[0].BuildMMDSSecrets["key"] != secret ||
+		owner.commands[0].BuildCredentials == nil || *owner.commands[0].BuildCredentials != *credentials ||
+		owner.commands[0].BuildEnv["BUILD_NAME"] != "cluster-build" || !owner.commands[0].BuildSecure {
+		t.Fatalf("node command did not receive request-scoped registration values: %+v", owner.commands)
 	}
 
 	changed := req
@@ -576,12 +590,31 @@ func TestReserveBuildKeepsMMDSValuesOutOfReplicatedReplayRecord(t *testing.T) {
 	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
 		t.Fatalf("changed MMDS replay err=%v", err)
 	}
+	changed = req
+	changedCredentials := *credentials
+	changedCredentials.EnvdAccessToken = "changed-envd"
+	changed.Credentials = &changedCredentials
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed credential replay err=%v", err)
+	}
+	changed = req
+	changed.Env = map[string]string{"BUILD_NAME": "changed"}
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed environment replay err=%v", err)
+	}
+	changed = req
+	changed.Secure = false
+	if _, err := reg.ReserveBuild(ctx, changed); err == nil || !strings.Contains(err.Error(), "immutable definition conflicts") {
+		t.Fatalf("changed secure replay err=%v", err)
+	}
 	owner.ackErr = nil
 	res, err := reg.ReserveBuild(ctx, req)
 	if err != nil || res == nil {
 		t.Fatalf("exact MMDS replay result=%+v err=%v", res, err)
 	}
-	if len(owner.commands) != 2 || owner.commands[1].BuildMMDSSecrets["key"] != secret {
+	if len(owner.commands) != 2 || owner.commands[1].BuildMMDSSecrets["key"] != secret ||
+		owner.commands[1].BuildCredentials == nil || *owner.commands[1].BuildCredentials != *credentials ||
+		owner.commands[1].BuildEnv["BUILD_NAME"] != "cluster-build" || !owner.commands[1].BuildSecure {
 		t.Fatalf("exact MMDS replay command=%+v", owner.commands)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -27,25 +28,32 @@ const (
 // BuildRecord is the Registry's retention-bounded projection of a node Build.
 // It is query/routing state, never the authority for a canonical TemplateID.
 type BuildRecord struct {
-	Group                        string                    `json:"group"`
-	BuildID                      string                    `json:"build_id"`
-	NodeID                       string                    `json:"node_id"`
-	Profile                      types.Profile             `json:"profile"`
-	APISecretFingerprint         string                    `json:"api_secret_fingerprint"`
-	Resources                    *routesync.BuildResources `json:"resources,omitempty"`
-	RegistrationConfig           map[string]string         `json:"registration_config,omitempty"`
-	RegistrationMMDSValuesDigest string                    `json:"registration_mmds_values_digest,omitempty"`
-	RegistrationImageRepo        string                    `json:"registration_image_repo,omitempty"`
-	RegistrationRegistryAuth     string                    `json:"registration_registry_auth,omitempty"`
-	State                        BuildState                `json:"state"`
-	TemplateID                   string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
-	Reason                       string                    `json:"reason,omitempty"`
-	CreatedU                     int64                     `json:"created_unix,omitempty"`
+	Group                         string                    `json:"group"`
+	BuildID                       string                    `json:"build_id"`
+	NodeID                        string                    `json:"node_id"`
+	Profile                       types.Profile             `json:"profile"`
+	APISecretFingerprint          string                    `json:"api_secret_fingerprint"`
+	Resources                     *routesync.BuildResources `json:"resources,omitempty"`
+	RegistrationConfig            map[string]string         `json:"registration_config,omitempty"`
+	RegistrationEnv               map[string]string         `json:"registration_env,omitempty"`
+	RegistrationSecure            bool                      `json:"registration_secure,omitempty"`
+	RegistrationCredentialsDigest string                    `json:"registration_credentials_digest,omitempty"`
+	RegistrationMMDSValuesDigest  string                    `json:"registration_mmds_values_digest,omitempty"`
+	RegistrationImageRepo         string                    `json:"registration_image_repo,omitempty"`
+	RegistrationRegistryAuth      string                    `json:"registration_registry_auth,omitempty"`
+	State                         BuildState                `json:"state"`
+	TemplateID                    string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	Reason                        string                    `json:"reason,omitempty"`
+	CreatedU                      int64                     `json:"created_unix,omitempty"`
 
 	// registrationMMDSSecrets exists only on the current ReserveBuild call. It
 	// is intentionally unexported so shard serialization can never persist
 	// tenant MMDS values in the replicated Registry record.
 	registrationMMDSSecrets map[string]string
+	// registrationCredentials follows the same request-scoped replay boundary:
+	// only its digest is replicated, while the selected node persists the values
+	// encrypted in its Build record.
+	registrationCredentials *sandboxcfg.Credentials
 }
 
 // occupies reports whether the registry still considers the build live for node

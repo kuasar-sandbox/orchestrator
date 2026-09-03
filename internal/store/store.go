@@ -102,9 +102,9 @@ CREATE TABLE IF NOT EXISTS builds (
   resources_cpu      INTEGER NOT NULL,
   resources_memory   INTEGER NOT NULL,
   resources_storage  INTEGER NOT NULL DEFAULT 0,
-  phase_resource_json TEXT NOT NULL DEFAULT '',
   metadata_json     TEXT NOT NULL DEFAULT '{}',
   builder_json      TEXT NOT NULL DEFAULT '{}',
+  instance_config_enc TEXT NOT NULL,
   waiting_unix      INTEGER NOT NULL DEFAULT 0,
   waiting_sequence  INTEGER NOT NULL DEFAULT 0,
   execution_claimed INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +169,14 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
+	// Build target/config persistence is an intentional pre-release schema cut.
+	// Refuse a pre-#300 builds table before running any of the repository's
+	// independent additive migrations: there is no safe plaintext backfill for
+	// instance_config_enc and no legacy Build reader/writer path.
+	if err := requireColumn(ctx, db, "builds", "instance_config_enc"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := ensureColumn(ctx, db, "builds", "runtime_prepare_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, err
@@ -200,6 +208,19 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		}
 	}
 	return &Store{db: db, box: box}, nil
+}
+
+func requireColumn(ctx context.Context, db *sql.DB, table, column string) error {
+	var count int
+	if err := db.QueryRowContext(ctx,
+		"SELECT count(*) FROM pragma_table_info(?) WHERE name=?", table, column,
+	).Scan(&count); err != nil {
+		return fmt.Errorf("store: inspect %s schema: %w", table, err)
+	}
+	if count != 1 {
+		return fmt.Errorf("store: incompatible pre-release %s schema: missing %s; recreate the database", table, column)
+	}
+	return nil
 }
 
 // ensureColumn performs the repository's additive SQLite compatibility
@@ -363,6 +384,14 @@ func ub(s string) types.BuildOptions {
 	var o types.BuildOptions
 	_ = json.Unmarshal([]byte(s), &o)
 	return o
+}
+
+type buildInstanceConfig struct {
+	Env                map[string]string `json:"env,omitempty"`
+	Secure             bool              `json:"secure,omitempty"`
+	ServiceSecret      string            `json:"service_secret,omitempty"`
+	EnvdAccessToken    string            `json:"envd_access_token,omitempty"`
+	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
 }
 
 // --- sandboxes ---
@@ -1215,19 +1244,19 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 var buildCols = `build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
   from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
   registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
-  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
+  resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
   waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
   runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
 	var profile, kind, status, names, aliases, apiHash, apiEnc, manifestHash, manifestEnc, raEnc, registrationRAEnc, steps, meta, builder string
-	var runtimeEnvdAccessTokenEnc, executionResultJSON string
+	var runtimeEnvdAccessTokenEnc, executionResultJSON, instanceConfigEnc string
 	var executionClaimed int
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &apiHash, &apiEnc, &manifestHash, &manifestEnc, &profile, &kind,
 		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc,
 		&b.RegistrationImageRepo, &registrationRAEnc, &b.RegistrationMMDSRoutesDigest, &b.RegistrationMMDSValuesDigest, &b.RegistrationRequestDigest, &b.ClusterGroup,
-		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &b.PhaseResourcePatch, &meta, &builder,
+		&b.Resources.CPU, &b.Resources.Memory, &b.Resources.Storage, &meta, &builder, &instanceConfigEnc,
 		&b.WaitingUnix, &b.WaitingSequence, &executionClaimed, &b.ExecutionClaimedUnix, &b.EnforcementStatus, &b.Phase, &b.PhaseSandboxID,
 		&b.RuntimeVswitchPort, &b.RuntimeFloatingIP, &b.RuntimePortMAC, &runtimeEnvdAccessTokenEnc, &b.RuntimePrepareJSON, &executionResultJSON, &b.FinishedUnix); err != nil {
 		return nil, err
@@ -1235,6 +1264,16 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 	b.ExecutionClaimed = executionClaimed != 0
 	b.Metadata = uj(meta)
 	b.Builder = ub(builder)
+	plain, err := s.box.DecryptString(instanceConfigEnc)
+	if err != nil {
+		return nil, fmt.Errorf("store: decrypt instance config for build %s: %w", b.BuildID, err)
+	}
+	var instance buildInstanceConfig
+	if err := json.Unmarshal([]byte(plain), &instance); err != nil {
+		return nil, fmt.Errorf("store: decode instance config for build %s: %w", b.BuildID, err)
+	}
+	b.Env, b.Secure = instance.Env, instance.Secure
+	b.ServiceSecret, b.EnvdAccessToken, b.TrafficAccessToken = instance.ServiceSecret, instance.EnvdAccessToken, instance.TrafficAccessToken
 	if steps != "" && steps != "[]" {
 		if err := json.Unmarshal([]byte(steps), &b.Steps); err != nil {
 			return nil, fmt.Errorf("store: build %s steps: %w", b.BuildID, err)
@@ -1277,7 +1316,7 @@ const buildInsertSQL = `
 	INSERT INTO builds (build_id,template_id,persist_id,api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc,profile,kind,
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,
 	  registration_image_repo,registration_registry_auth_enc,registration_mmds_routes_digest,registration_mmds_values_digest,registration_request_digest,cluster_group,
-	  resources_cpu,resources_memory,resources_storage,phase_resource_json,metadata_json,builder_json,
+	  resources_cpu,resources_memory,resources_storage,metadata_json,builder_json,instance_config_enc,
 	  waiting_unix,waiting_sequence,execution_claimed,execution_claimed_unix,enforcement_status,phase,phase_sandbox_id,
 	  runtime_vswitch_port,runtime_floating_ip,runtime_port_mac,runtime_envd_access_token_enc,runtime_prepare_json,execution_result_json,finished_unix)
 	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
@@ -1292,8 +1331,9 @@ const buildUpsertSQL = buildInsertSQL + `
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
 	  registry_auth_enc=excluded.registry_auth_enc, cluster_group=excluded.cluster_group,
 	  resources_cpu=excluded.resources_cpu, resources_memory=excluded.resources_memory,
-	  resources_storage=excluded.resources_storage, phase_resource_json=excluded.phase_resource_json,
+	  resources_storage=excluded.resources_storage,
 	  metadata_json=excluded.metadata_json, builder_json=excluded.builder_json,
+	  instance_config_enc=excluded.instance_config_enc,
 	  waiting_unix=excluded.waiting_unix, waiting_sequence=excluded.waiting_sequence,
 	  execution_claimed=excluded.execution_claimed,
 	  execution_claimed_unix=excluded.execution_claimed_unix,
@@ -1354,6 +1394,17 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		}
 		executionResultJSON = string(encoded)
 	}
+	instanceJSON, err := json.Marshal(buildInstanceConfig{
+		Env: b.Env, Secure: b.Secure, ServiceSecret: b.ServiceSecret,
+		EnvdAccessToken: b.EnvdAccessToken, TrafficAccessToken: b.TrafficAccessToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: put build %s: instance config: %w", b.BuildID, err)
+	}
+	instanceConfigEnc, err := s.box.EncryptString(string(instanceJSON))
+	if err != nil {
+		return nil, fmt.Errorf("store: put build %s: encrypt instance config: %w", b.BuildID, err)
+	}
 	stepsJSON := "[]"
 	if len(b.Steps) > 0 {
 		sj, jerr := json.Marshal(b.Steps)
@@ -1367,8 +1418,8 @@ func (s *Store) prepareBuildWrite(b *types.Build) ([]any, error) {
 		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID,
 		mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc,
 		b.RegistrationImageRepo, registrationRAEnc, b.RegistrationMMDSRoutesDigest, b.RegistrationMMDSValuesDigest, b.RegistrationRequestDigest, b.ClusterGroup,
-		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage, b.PhaseResourcePatch,
-		mj(b.Metadata), mb(b.Builder), b.WaitingUnix, b.WaitingSequence,
+		b.Resources.CPU, b.Resources.Memory, b.Resources.Storage,
+		mj(b.Metadata), mb(b.Builder), instanceConfigEnc, b.WaitingUnix, b.WaitingSequence,
 		boolInt(b.ExecutionClaimed), b.ExecutionClaimedUnix,
 		b.EnforcementStatus, b.Phase, b.PhaseSandboxID,
 		b.RuntimeVswitchPort, b.RuntimeFloatingIP, b.RuntimePortMAC, runtimeEnvdAccessTokenEnc, b.RuntimePrepareJSON, executionResultJSON, b.FinishedUnix,
@@ -1406,6 +1457,9 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, e
 	if b.Status != types.BuildWaiting {
 		return false, fmt.Errorf("store: commit build trigger %s: status must be waiting", b.BuildID)
 	}
+	if b.Kind != "" {
+		return false, fmt.Errorf("store: commit build trigger %s: kind must remain unset until terminal result", b.BuildID)
+	}
 	stepsJSON := "[]"
 	if len(b.Steps) > 0 {
 		encoded, err := json.Marshal(b.Steps)
@@ -1423,13 +1477,13 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, b *types.Build) (bool, e
 		registryAuthEnc = encrypted
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET
-		kind=?, from_image=?, from_template=?, start_cmd=?, ready_cmd=?, steps_json=?,
+		from_image=?, from_template=?, start_cmd=?, ready_cmd=?, steps_json=?,
 		registry_auth_enc=?, status=?, waiting_unix=?,
 		waiting_sequence=(SELECT CASE
 			WHEN COALESCE(MAX(waiting_sequence),0) >= 9223372036854775807 THEN NULL
 			ELSE COALESCE(MAX(waiting_sequence),0)+1 END FROM builds)
 		WHERE build_id=? AND status=?`,
-		string(b.Kind), b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
+		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON,
 		registryAuthEnc, string(types.BuildWaiting), b.WaitingUnix,
 		b.BuildID, string(types.BuildRegistered))
 	if err != nil {

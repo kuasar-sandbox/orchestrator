@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 
@@ -19,17 +20,18 @@ import (
 	rtutil "github.com/kuasar-sandbox/sandboxer/pkg/util"
 )
 
-const buildRuntimePrepareSchemaVersion = 1
+const buildRuntimePrepareSchemaVersion = 2
 
 // buildRuntimePreparation is the non-secret durable authority committed in the
 // same SQLite UPDATE as the exact connector port. It freezes every node-policy
 // result needed to rebuild an equivalent final BuildSpec after restart.
 type buildRuntimePreparation struct {
-	SchemaVersion   int                      `json:"schema_version"`
-	PrepareDigest   string                   `json:"prepare_digest"`
-	Network         sandboxcfg.NetworkSpec   `json:"network"`
-	TemplateNetwork sandboxcfg.NetworkSpec   `json:"template_network"`
-	Resources       rtconfig.ResourcesConfig `json:"resources"`
+	SchemaVersion    int                      `json:"schema_version"`
+	PrepareDigest    string                   `json:"prepare_digest"`
+	Network          sandboxcfg.NetworkSpec   `json:"network"`
+	TemplateNetwork  sandboxcfg.NetworkSpec   `json:"template_network"`
+	Resources        rtconfig.ResourcesConfig `json:"resources"` // A/B execution
+	SandboxResources rtconfig.ResourcesConfig `json:"sandbox_resources"`
 }
 
 func encodeBuildRuntimePreparation(prep buildRuntimePreparation) (string, error) {
@@ -76,6 +78,15 @@ func validateBuildRuntimePreparation(prep buildRuntimePreparation) error {
 	if prep.Resources.Capacity.CPU <= 0 {
 		return errors.New("build: durable runtime preparation has invalid resources capacity CPU")
 	}
+	if prep.SandboxResources != (rtconfig.ResourcesConfig{}) {
+		if prep.SandboxResources.Capacity.CPU <= 0 {
+			return errors.New("build: durable runtime preparation has invalid sandbox resources capacity CPU")
+		}
+		sandboxMemory, err := rtutil.ParseSize(strings.TrimSpace(prep.SandboxResources.Capacity.Memory))
+		if err != nil || sandboxMemory == 0 {
+			return errors.New("build: durable runtime preparation has invalid sandbox resources capacity memory")
+		}
+	}
 	memory, err := rtutil.ParseSize(strings.TrimSpace(prep.Resources.Capacity.Memory))
 	if err != nil || memory == 0 {
 		return errors.New("build: durable runtime preparation has invalid resources capacity memory")
@@ -88,36 +99,48 @@ func fastBuildPrepareDigest(buildID string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (sandboxcfg.NetworkSpec, error) {
+func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (configsock.ArtifactCapacity, sandboxcfg.NetworkSpec, error) {
 	if summary.SchemaVersion != configsock.ArtifactPrepareSchemaVersion {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: unsupported artifact prepare schema %d", summary.SchemaVersion)
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: unsupported artifact prepare schema %d", summary.SchemaVersion)
 	}
 	if summary.RequiredRefCount < 1 || summary.RequiredRefCount > maxRequiredArtifactRefs {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredArtifactRefs)
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source required ref count %d outside 1..%d", summary.RequiredRefCount, maxRequiredArtifactRefs)
 	}
-	if types.ResumeSourceKind(summary.PreparedSourceKind) != types.ResumeSourceSnapshot {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: prepared source kind %q is not Snapshot", summary.PreparedSourceKind)
+	if types.ResumeSourceKind(summary.PreparedSourceKind) != types.ResumeSourceSandbox {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: prepared source kind %q is not Sandbox", summary.PreparedSourceKind)
 	}
 	digest, err := hex.DecodeString(summary.ResolutionDigest)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != summary.ResolutionDigest {
-		return sandboxcfg.NetworkSpec{}, errors.New("build: snapshot resolution digest is not SHA-256")
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: source resolution digest is not SHA-256")
 	}
 	memory := strings.TrimSpace(summary.Capacity.Memory)
 	if summary.Capacity.CPU <= 0 || memory == "" {
-		return sandboxcfg.NetworkSpec{}, errors.New("build: snapshot config has no usable resources.capacity")
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: source config has no usable resources.capacity")
 	}
-	bytes, err := rtutil.ParseSize(memory)
-	if err != nil || bytes == 0 {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: snapshot config has invalid resources.capacity.memory %q", summary.Capacity.Memory)
+	capacityBytes, err := rtutil.ParseSize(memory)
+	if err != nil || capacityBytes == 0 {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source config has invalid resources.capacity.memory %q", summary.Capacity.Memory)
+	}
+	if math.IsNaN(summary.Capacity.AllocatableCPU) || math.IsInf(summary.Capacity.AllocatableCPU, 0) ||
+		summary.Capacity.AllocatableCPU <= 0 || summary.Capacity.AllocatableCPU > float64(summary.Capacity.CPU) {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: source config has invalid resources.allocatable.cpu")
+	}
+	allocatableMemory := strings.TrimSpace(summary.Capacity.AllocatableMemory)
+	allocatableBytes, err := rtutil.ParseSize(allocatableMemory)
+	if err != nil || allocatableBytes == 0 || allocatableBytes > capacityBytes {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source config has invalid resources.allocatable.memory %q", summary.Capacity.AllocatableMemory)
 	}
 	inherited := artifactNetworkSpec(summary.Network)
 	if err := sandboxcfg.ValidateNetworkSpec(inherited); err != nil {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template network summary: %w", err)
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template network summary: %w", err)
 	}
 	if err := validateArtifactDiskTopology(summary.DiskTopology); err != nil {
-		return sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template disk summary: %w", err)
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, fmt.Errorf("build: source-template disk summary: %w", err)
 	}
-	return inherited, nil
+	if len(summary.DiskTopology.Disks) != 0 {
+		return configsock.ArtifactCapacity{}, sandboxcfg.NetworkSpec{}, errors.New("build: Sandbox sources with data disks are not supported")
+	}
+	return summary.Capacity, inherited, nil
 }
 
 // buildTaskHandoff owns one exact run's immutable prepare input and final
@@ -126,7 +149,7 @@ func validateBuildPrepareSummary(summary configsock.ArtifactPrepareSummary) (san
 type buildTaskHandoff struct {
 	mu sync.Mutex
 
-	snapshot       bool
+	source         bool
 	expectedDigest string
 	summary        *configsock.ArtifactPrepareSummary
 	prepareReady   chan struct{}
@@ -139,9 +162,9 @@ type buildTaskHandoff struct {
 	conflictReady chan struct{}
 }
 
-func newBuildTaskHandoff(snapshot bool, expectedDigest string) *buildTaskHandoff {
+func newBuildTaskHandoff(source bool, expectedDigest string) *buildTaskHandoff {
 	return &buildTaskHandoff{
-		snapshot: snapshot, expectedDigest: expectedDigest,
+		source: source, expectedDigest: expectedDigest,
 		prepareReady: make(chan struct{}), finalReady: make(chan struct{}), conflictReady: make(chan struct{}),
 	}
 }
@@ -149,8 +172,8 @@ func newBuildTaskHandoff(snapshot bool, expectedDigest string) *buildTaskHandoff
 func (h *buildTaskHandoff) Submit(summary configsock.ArtifactPrepareSummary) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.snapshot {
-		return false, errors.New("build: snapshot preparation is not required")
+	if !h.source {
+		return false, errors.New("build: source preparation is not required")
 	}
 	if h.conflict != nil {
 		return false, h.conflict

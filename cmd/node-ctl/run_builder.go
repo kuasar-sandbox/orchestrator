@@ -2,9 +2,9 @@ package main
 
 // run-builder is the ExecStart of sandbox-builder@<run-id>.service: the build
 // pipeline orchestrator. It waits for a build assignment, fetches the BuildSpec and
-// hands it to internal/builder, which drives up to three phases, each a
-// microVM it spawns as a DIRECT child (sandbox-ctl run, in this unit's
-// cgroup), reusing ONE pre-attached network slot sequentially:
+// hands it to internal/builder, which drives the target-selected work. Runtime
+// phases are microVMs spawned as DIRECT children (sandbox-ctl run, in this
+// unit's cgroup), reusing ONE pre-attached network slot sequentially:
 //
 //	A import   — an EMPTY single-disk sandbox on the single guest runtime
 //	             (flatten-ctl/mkfs.erofs ride /opt/sandbox-runtime, bind-
@@ -19,13 +19,11 @@ package main
 //	             (ARG substitutes only); then flatten-ctl exports the rootfs
 //	             (its tmpdir/output home is a self-bind mountpoint, excluded
 //	             by --skip-mounts) and streams the new image artifact back.
-//	C template — a PRODUCTION-runtime sandbox cold-booted from the final
-//	             image (the runtime ref freezes into the snapshot — template
-//	             children must not inherit the builder toolchain); startCmd
-//	             launches THROUGH ENVD and stays an envd-MANAGED process in
-//	             the snapshot (the stream is held until ready, then dropped
-//	             — envd never kills on stream loss), readyCmd polls every 2s
-//	             to success, then sandbox-ctl snapshot writes the bundle.
+//	C memory   — only for target={sandbox,memory:true}: a production-runtime
+//	             cold Sandbox using the final image as a complete replacement
+//	             boot. Optional startCmd runs through envd; readyCmd polls every
+//	             2s, or no readyCmd waits a fixed 20 seconds, before the memory
+//	             snapshot is captured.
 //
 // Two guest channels, deliberately distinct: e2b-SEMANTIC commands
 // (steps/startCmd/readyCmd) go through envd exactly as e2b's own template
@@ -33,10 +31,10 @@ package main
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// Publication normally happens at the finale. Bundle snapshot builds first
-// publish a newly built platform base before phase C so snapshot.cfg records
-// its existing manifest:// base_ref strategy; the finale exact-uploads the
-// byte-identical snapshot layers. The result returns over the config-socket.
+// Image targets publish the final image directly. Offline Sandbox targets use
+// sandbox-ctl export without another VM. Memory Sandbox targets publish the
+// final image before C, then publish the resulting S -> E graph. The result
+// returns over the config-socket with its resolved target and exactly one ref.
 
 import (
 	"context"
@@ -54,7 +52,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
-	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func runBuilder(args []string, log *slog.Logger) error {
@@ -131,19 +129,15 @@ func runBuilder(args []string, log *slog.Logger) error {
 		taskCtx, cancelDeadline = context.WithDeadline(ctx, deadline)
 		workCtx, cancelWork = context.WithDeadline(taskCtx, builder.PreResultDeadline(deadline, time.Now()))
 	} else if bootstrap.Prepare != nil {
-		return fmt.Errorf("build task snapshot bootstrap has no absolute deadline")
+		return fmt.Errorf("build task source bootstrap has no absolute deadline")
 	}
 	defer cancelDeadline()
 	defer cancelWork()
 
 	spec := bootstrap.Final
 	var prepared *taskartifact.Result
-	var localPreparation *configsock.BuildSnapshotPreparation
 	if bootstrap.Prepare != nil {
 		prepared, err = taskartifact.Prepare(workCtx, *bootstrap.Prepare)
-		if err == nil {
-			localPreparation, err = buildSnapshotPreparation(prepared.RootCfg)
-		}
 		if err == nil {
 			log.Info("build task artifact prepared", "bid", bid, "run_id", *runID,
 				"task_artifact_prepare_duration", prepared.PrepareDuration,
@@ -164,9 +158,9 @@ func runBuilder(args []string, log *slog.Logger) error {
 				})
 			})
 			if postErr != nil {
-				return fmt.Errorf("prepare build snapshot: %w (post result: %v)", err, postErr)
+				return fmt.Errorf("prepare build source: %w (post result: %v)", err, postErr)
 			}
-			return fmt.Errorf("prepare build snapshot: %w", err)
+			return fmt.Errorf("prepare build source: %w", err)
 		}
 	}
 	if spec == nil {
@@ -177,7 +171,12 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 	spec.Env = mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
 	if prepared != nil {
-		spec.SnapshotPreparation = localPreparation
+		if prepared.PreparedSource.Kind != types.ResumeSourceSandbox || prepared.PreparedSource.Ref == "" || prepared.SourceSandboxConfig == nil {
+			return fmt.Errorf("prepared build source is not a complete Sandbox E")
+		}
+		spec.SourceSandboxRef = prepared.PreparedSource.Ref
+		spec.SourceSandboxConfig = prepared.SourceSandboxConfig
+		spec.SourceImageConfig = append([]byte(nil), prepared.SourceImageConfig...)
 		spec.RefLocations = prepared.RefLocationURIs
 	}
 	if !filepath.IsAbs(spec.RunDir) || !filepath.IsAbs(spec.BaseDir) {
@@ -194,7 +193,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	}
 	res := builder.Run(workCtx, spec, vmmCgroup, reportPhase, log)
 	post := configsock.BuildResult{
-		ImageRef: res.ImageRef, SnapshotRef: res.SnapshotRef,
+		Target: res.Target, ImageRef: res.ImageRef, SandboxRef: res.SandboxRef, SnapshotRef: res.SnapshotRef,
 		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
 	}
 	if err := retryBuildConfigSocket(taskCtx, log, "result", func(callCtx context.Context) error {
@@ -208,7 +207,7 @@ func runBuilder(args []string, log *slog.Logger) error {
 	return nil
 }
 
-// installBuildTaskEnvironment gives the task-local snapshot reader only the
+// installBuildTaskEnvironment gives the task-local artifact reader only the
 // process-wide authority it needs. Registry credentials remain in the
 // authenticated bootstrap map and are merged into BuildSpec.Env for explicit
 // host/guest calls; they must never become ambient phase-process environment.
@@ -250,25 +249,6 @@ func buildTaskAbsoluteDeadline(task *configsock.BuildTaskSpec) int64 {
 		return task.Final.Timeouts.AbsoluteDeadlineUnixNano
 	}
 	return 0
-}
-
-func buildSnapshotPreparation(cfg *restore.SnapshotCfg) (*configsock.BuildSnapshotPreparation, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("build snapshot root config is nil")
-	}
-	if cfg.Boot.Root.BaseRef == "" {
-		return nil, fmt.Errorf("build snapshot has no base image ref (boot.root.base_ref)")
-	}
-	prepared := &configsock.BuildSnapshotPreparation{
-		BaseRef:  cfg.Boot.Root.BaseRef,
-		StartCmd: cfg.Metadata["e2b.start_cmd"],
-		ReadyCmd: cfg.Metadata["e2b.ready_cmd"],
-	}
-	if cfg.Boot.Root.Overlay != nil {
-		prepared.OverlayBase = cfg.Boot.Root.Overlay.Base
-		prepared.OverlayBaseFromRefs = append([]string(nil), cfg.Boot.Root.Overlay.BaseFromRefs...)
-	}
-	return prepared, nil
 }
 
 func retryBuildConfigSocket(ctx context.Context, log *slog.Logger, operation string, call func(context.Context) error) error {

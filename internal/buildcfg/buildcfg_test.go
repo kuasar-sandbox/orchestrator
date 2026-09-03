@@ -4,7 +4,32 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestExtractDecodesTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    string
+		kind   types.BuildTargetKind
+		memory bool
+	}{
+		{name: "image", raw: `{"target":{"kind":"image"}}`, kind: types.BuildTargetImage},
+		{name: "sandbox disk", raw: `{"target":{"kind":"sandbox"}}`, kind: types.BuildTargetSandbox},
+		{name: "sandbox memory", raw: `{"target":{"kind":"sandbox","memory":true}}`, kind: types.BuildTargetSandbox, memory: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, opts, err := Extract(map[string]string{NsBuilder: tt.raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if opts.Target == nil || opts.Target.Kind != tt.kind || opts.Target.Memory != tt.memory {
+				t.Fatalf("target = %+v, want kind=%q memory=%v", opts.Target, tt.kind, tt.memory)
+			}
+		})
+	}
+}
 
 func TestExtractStripsBuilderNamespace(t *testing.T) {
 	meta := map[string]string{
@@ -52,6 +77,13 @@ func TestExtractRejectsAmbiguousBuilderJSON(t *testing.T) {
 		`null`,
 		`[]`,
 		`{"resources":null}`,
+		`{"target":null}`,
+		`{"target":[]}`,
+		`{"target":{}}`,
+		`{"target":{"kind":"unknown"}}`,
+		`{"target":{"kind":"image","memory":true}}`,
+		`{"target":{"kind":"image","kind":"sandbox"}}`,
+		`{"target":{"kind":"image","unknown":true}}`,
 		`{"referer":{"enabled":null}}`,
 		`{"registry":{"tls":null}}`,
 		`{"referer":{},"referer":{}}`,

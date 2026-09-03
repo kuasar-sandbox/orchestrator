@@ -373,7 +373,9 @@ func TestBuildRegisterHookMutatesIndependentCandidateBeforeCapacity(t *testing.T
 		}
 		retained = operation.Register
 		operation.Register.Profile = conductorextension.ProfileBare
-		operation.Register.Kind = conductorextension.BuildKindSnapshot
+		operation.Register.Builder.Target = &conductorextension.BuildTarget{
+			Kind: conductorextension.BuildTargetSandbox, Memory: true,
+		}
 		operation.Register.Names = []string{"extension-name"}
 		operation.Register.Aliases = []string{"extension-alias"}
 		operation.Register.Resources = conductorextension.BuildResources{CPU: 1000, Memory: 1 << 30}
@@ -387,7 +389,8 @@ func TestBuildRegisterHookMutatesIndependentCandidateBeforeCapacity(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if build.Profile != types.ProfileBare || build.Kind != types.KindSnp ||
+	if build.Profile != types.ProfileBare || build.Kind != "" || build.Builder.Target == nil ||
+		*build.Builder.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) ||
 		!reflect.DeepEqual(build.Names, []string{"extension-name"}) ||
 		!reflect.DeepEqual(build.Aliases, []string{"extension-alias"}) ||
 		build.Resources.CPU != 1000 || build.Metadata["extension"] != "value" {
@@ -639,7 +642,6 @@ func TestBuildTriggerHookMutatesFinalWorkOrderAndRevalidatesConcurrentState(t *t
 		t.Fatal(err)
 	}
 	winner.Status = types.BuildWaiting
-	winner.Kind = types.KindImg
 	winner.FromImage = "registry.test/concurrent-winner:latest"
 	winner.WaitingUnix = time.Now().Unix()
 	if committed, err := concurrent.st.CommitBuildTrigger(context.Background(), winner); err != nil || !committed {

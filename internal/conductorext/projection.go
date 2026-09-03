@@ -62,7 +62,7 @@ func projectBuild(build *types.Build) conductorextension.BuildView {
 		Resources: conductorextension.BuildResources{CPU: build.Resources.CPU, Memory: build.Resources.Memory, Storage: build.Resources.Storage},
 		Steps:     projectSteps(build.Steps), StartCommand: build.StartCmd, ReadyCommand: build.ReadyCmd,
 		Metadata: cloneMap(build.Metadata), Builder: projectBuildOptions(build.Builder),
-		PhaseResourcePatch: build.PhaseResourcePatch, RunID: build.RunID, ExecutionClaimed: build.ExecutionClaimed,
+		RunID: build.RunID, ExecutionClaimed: build.ExecutionClaimed,
 		EnforcementStatus: build.EnforcementStatus, Phase: build.Phase, PhaseSandboxID: build.PhaseSandboxID,
 		RuntimeVSwitchPort: build.RuntimeVswitchPort, RuntimeFloatingIP: build.RuntimeFloatingIP,
 		RuntimePortMAC: build.RuntimePortMAC, ClusterGroup: build.ClusterGroup,
@@ -93,6 +93,11 @@ func projectSteps(steps []types.TemplateStep) []conductorextension.BuildStep {
 
 func projectBuildOptions(options types.BuildOptions) conductorextension.BuildOptions {
 	out := conductorextension.BuildOptions{}
+	if options.Target != nil {
+		out.Target = &conductorextension.BuildTarget{
+			Kind: conductorextension.BuildTargetKind(options.Target.Kind), Memory: options.Target.Memory,
+		}
+	}
 	if options.Resources != nil {
 		out.Resources = &conductorextension.BuildResources{
 			CPU: options.Resources.CPU, Memory: options.Resources.Memory, Storage: options.Resources.Storage,
@@ -141,6 +146,10 @@ func cloneBuildView(view conductorextension.BuildView) conductorextension.BuildV
 
 func cloneBuildOptions(options conductorextension.BuildOptions) conductorextension.BuildOptions {
 	out := conductorextension.BuildOptions{}
+	if options.Target != nil {
+		target := *options.Target
+		out.Target = &target
+	}
 	if options.Resources != nil {
 		resources := *options.Resources
 		out.Resources = &resources
