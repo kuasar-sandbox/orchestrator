@@ -379,6 +379,10 @@ func (o *Orchestrator) normalizeSandboxCreateDefinition(
 	if err != nil {
 		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	credentials, metadata, err := sandboxcfg.ExtractCredentials(metadata)
 	if err != nil {
 		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -389,7 +393,11 @@ func (o *Orchestrator) normalizeSandboxCreateDefinition(
 	if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+	spec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(tmpl.Profile, spec.Traffic); err != nil {
 		return types.TemplateID{}, nil, sandboxcfg.MMDSDocument{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	return tmpl, metadata, mmdsDocument, credentials, nil

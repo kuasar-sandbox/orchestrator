@@ -1316,6 +1316,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		}
 		placement.Config[sandboxcfg.NsRestore] = `{"prefetch":"memory"}`
 		placement.Config[sandboxcfg.NsCheckpoint] = `{"merge_ref":true}`
+		placement.Config[sandboxcfg.NsTraffic] = `{"max_inflight":{"total":20,"forward":8}}`
 		return placement, nil
 	}))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
@@ -1343,6 +1344,9 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	if got.TemplateRef != testTemplateRef || got.Config["a"] != "1" || got.Config["b"] != "2" {
 		t.Fatalf("create command did not use placement config: %+v", got)
+	}
+	if got.Config[sandboxcfg.NsTraffic] != `{"max_inflight":{"total":20,"forward":8}}` {
+		t.Fatalf("create command lost placement traffic config: %+v", got.Config)
 	}
 	if got.Profile != "e2b" || got.Cluster == nil || got.Cluster.Group != "/g" || got.Cluster.RouteKey != "rk" ||
 		got.Cluster.StableID == got.SID || got.SID != EncodeNodeSandboxID(got.Cluster.StableID, 0) {
@@ -1381,6 +1385,16 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	if got == nil || got.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
 		t.Fatalf("explicit Create checkpoint policy did not reach command canonically: %+v", got)
+	}
+
+	got = nil
+	if _, err := reg.ReserveSandbox(ctx, testCreateReserve("/g", "rk-traffic", map[string]string{
+		sandboxcfg.NsTraffic: ` { "max_inflight" : { "forward" : 0, "exec" : 2 } } `,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Config[sandboxcfg.NsTraffic] != `{"max_inflight":{"total":20,"forward":0,"exec":2}}` {
+		t.Fatalf("explicit Create traffic patch did not leaf-merge into command: %+v", got)
 	}
 }
 
@@ -2585,6 +2599,30 @@ func TestCreateRejectsProfileInvalidCredentialsBeforeRouteMutation(t *testing.T)
 	}
 	if route, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk"); getErr != nil || found {
 		t.Fatalf("invalid credentials mutated route: route=%+v found=%v err=%v", route, found, getErr)
+	}
+}
+
+func TestCreateRejectsProfileInvalidTrafficBeforeRouteMutation(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		return &Placement{
+			NodeID: "candidate",
+			TemplateRef: types.TemplateID{
+				Profile: types.ProfileBare, Kind: types.KindImg,
+				Ref: "manifest://" + strings.Repeat("b", 64),
+			}.String(),
+			APISecretFingerprint: testAPIFingerprint,
+		}, nil
+	}))
+	err := reg.placeAndCreate(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsTraffic: `{"max_inflight":{"e2b:envd":0}}`,
+	}, nil, nil, true)
+	if !errors.Is(err, errInvalidSandboxConfig) || !strings.Contains(err.Error(), "not applicable to bare") {
+		t.Fatalf("placeAndCreate error = %v", err)
+	}
+	if route, _, found, getErr := reg.stores.GetSandbox(ctx, "/g", "rk"); getErr != nil || found {
+		t.Fatalf("invalid traffic mutated route: route=%+v found=%v err=%v", route, found, getErr)
 	}
 }
 

@@ -316,6 +316,10 @@ func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
 	if err != nil {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: sandbox_config: %w", path, err)
 	}
+	rec.Config, err = sandboxcfg.NormalizeTrafficMetadata(rec.Config)
+	if err != nil {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: sandbox_config: %w", path, err)
+	}
 	return rec, nil
 }
 

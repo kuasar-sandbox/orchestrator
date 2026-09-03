@@ -16,6 +16,7 @@ import (
 	"time"
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -127,6 +128,33 @@ func TestMergeConfigHeadersMergesOnlyResourceLeaves(t *testing.T) {
 		header("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`),
 	); err == nil || !strings.Contains(err.Error(), "control") {
 		t.Fatalf("valid header hid invalid metadata resource: %v", err)
+	}
+}
+
+func TestMergeConfigHeadersMergesTrafficLeavesStrictly(t *testing.T) {
+	metadata := map[string]string{
+		sandboxcfg.NsTraffic: `{"max_inflight":{"total":32,"exec":4,"forward":7}}`,
+	}
+	headers := http.Header{}
+	headers.Set("X-Kuasar-Sandbox-Traffic", `{"max_inflight":{"exec":0,"forward":2}}`)
+	got := mustMergeConfigHeaders(t, metadata, headers)
+	want := `{"max_inflight":{"total":32,"forward":2,"exec":0}}`
+	if got[sandboxcfg.NsTraffic] != want {
+		t.Fatalf("traffic header merge = %s, want %s", got[sandboxcfg.NsTraffic], want)
+	}
+
+	for name, values := range map[string][]string{
+		"duplicate": {`{"max_inflight":{"total":1}}`, `{"max_inflight":{"total":2}}`},
+		"empty":     {""},
+		"null":      {`{"max_inflight":{"total":null}}`},
+		"unknown":   {`{"max_inflight":{"future":1}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := http.Header{"X-Kuasar-Sandbox-Traffic": values}
+			if _, err := mergeCreateConfigHeaders(metadata, h); err == nil {
+				t.Fatalf("traffic header %s was accepted", name)
+			}
+		})
 	}
 }
 
@@ -1673,9 +1701,10 @@ func TestResourceStatsSparseJSONAndStatusMapping(t *testing.T) {
 func TestTrafficStatsCompactJSONAndStatusMapping(t *testing.T) {
 	idle := time.Date(2026, time.August, 12, 14, 3, 21, 123456789, time.UTC)
 	handler, apiKey := newSandboxContractHandler(t, &trafficStatsCoreStub{stats: &TrafficStats{
-		State:     string(types.StateRunning),
-		Inflight:  TrafficInflight{},
-		IdleSince: &idle,
+		State:       string(types.StateRunning),
+		MaxInflight: publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2},
+		Inflight:    TrafficInflight{},
+		IdleSince:   &idle,
 		Services: map[string]ServiceTrafficStats{
 			"forward": {IdleSince: &idle},
 			"exec":    {Parking: 1},
@@ -1700,6 +1729,13 @@ func TestTrafficStatsCompactJSONAndStatusMapping(t *testing.T) {
 	var services map[string]map[string]json.RawMessage
 	if err := json.Unmarshal(body["services"], &services); err != nil {
 		t.Fatal(err)
+	}
+	var maxInflight publicconfig.MaxInflight
+	if err := json.Unmarshal(body["maxInflight"], &maxInflight); err != nil {
+		t.Fatal(err)
+	}
+	if maxInflight != (publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2}) {
+		t.Fatalf("maxInflight = %+v", maxInflight)
 	}
 	if len(services["forward"]) != 3 || services["forward"]["idleSince"] == nil ||
 		len(services["exec"]) != 2 || services["exec"]["idleSince"] != nil {
