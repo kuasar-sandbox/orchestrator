@@ -98,7 +98,9 @@ else
             || skip "failed to build examples/custom-proxy"
         CUSTOM_PROXY_EXTENSION_E2E=1
     else
-        CUSTOM_PROXY_BIN="$BIN/node-ctl"
+        # Exact-assets packages contain the E2E suite but no component source.
+        # Keep proxy_executable absent so node-ctl runs its built-in Proxy App.
+        CUSTOM_PROXY_BIN="-"
     fi
 fi
 declare -a PIDS=()
