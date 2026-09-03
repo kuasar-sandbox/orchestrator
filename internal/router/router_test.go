@@ -1061,6 +1061,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(buildReserveResult{
 				BuildID: "b1", TemplateID: "t1", NodeID: "n1", APIEndpoint: nodeHost, Profile: types.ProfileE2B,
+				Target: &types.BuildTarget{Kind: types.BuildTargetImage},
 			})
 		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
@@ -1164,7 +1165,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&reg)
 	resp.Body.Close()
 	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || reg.Target == nil ||
-		*reg.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) ||
+		*reg.Target != (types.BuildTarget{Kind: types.BuildTargetImage}) ||
 		len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
 		t.Fatalf("register result=%+v reserveProfiles=%v", reg, reserveProfiles)
 	}

@@ -20,11 +20,12 @@ import (
 // BuildReserveResult is the registry-assigned identity + placement for a build
 // (the router returns these to the e2b client + routes its follow-ups by build_id).
 type BuildReserveResult struct {
-	BuildID     string        `json:"build_id"`
-	TemplateID  string        `json:"template_id"`
-	NodeID      string        `json:"node_id"`
-	APIEndpoint string        `json:"api_endpoint"`
-	Profile     types.Profile `json:"profile"`
+	BuildID     string             `json:"build_id"`
+	TemplateID  string             `json:"template_id"`
+	NodeID      string             `json:"node_id"`
+	APIEndpoint string             `json:"api_endpoint"`
+	Profile     types.Profile      `json:"profile"`
+	Target      *types.BuildTarget `json:"target"`
 }
 
 // BuildReserveReq is the router's build-register ask: the group + profile, the
@@ -129,7 +130,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			if !sameBuildRegistrationDefinition(rec, req.Profile, resources, req.Metadata, req.Env, req.Secure, credentialsDigest, mmdsDigest, req.TemplateID) {
 				return nil, fmt.Errorf("registry: build %s immutable definition conflicts with existing registration", req.BuildID)
 			}
-			if rec.State != BuildStarting {
+			if rec.State != BuildStarting && rec.RegistrationTargetSet {
 				return r.buildReserveResult(ctx, rec), nil
 			}
 			rec.registrationMMDSSecrets = cloneStringMap(mmdsSecrets)
@@ -145,7 +146,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				return nil, fmt.Errorf("registry: build_register remains ambiguous on node %s: %w", rec.NodeID, err)
 			}
 			if ack != nil && ack.Status == routesync.AckAccepted {
-				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID)
+				target, err := acceptedBuildRegistrationTarget(ack)
+				if err != nil {
+					return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", rec.NodeID, err)
+				}
+				registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
 				if err != nil {
 					return nil, err
 				}
@@ -153,6 +158,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			}
 			if !definitiveBuildRegistrationRejection(ack) {
 				return nil, ambiguousBuildRegistrationError(rec.NodeID, ack)
+			}
+			if rec.State != BuildStarting {
+				return nil, fmt.Errorf("registry: build_register target recovery was rejected by node %s: %w", rec.NodeID, buildRegistrationRejectionError(ack))
 			}
 			if err := r.removeBuildRegistrationIntent(ctx, rec); err != nil {
 				return nil, err
@@ -260,7 +268,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			excluded.add(id)
 			continue
 		}
-		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID)
+		target, err := acceptedBuildRegistrationTarget(ack)
+		if err != nil {
+			return nil, fmt.Errorf("registry: build_register returned an invalid acceptance on node %s: %w", id, err)
+		}
+		registered, err := r.markBuildRegistrationAccepted(ctx, rec.Group, rec.BuildID, rec.NodeID, target)
 		if err != nil {
 			return nil, err
 		}
@@ -458,7 +470,7 @@ func (r *Registry) removeBuildRegistrationIntent(ctx context.Context, rec *Build
 	return r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
 }
 
-func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID string) (*BuildRecord, error) {
+func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, buildID, nodeID string, target *types.BuildTarget) (*BuildRecord, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		current, revision, found, err := r.stores.getRouteBuildShard(ctx, group, buildID)
 		if err != nil {
@@ -467,12 +479,27 @@ func (r *Registry) markBuildRegistrationAccepted(ctx context.Context, group, bui
 		if !found || current.NodeID != nodeID {
 			return nil, fmt.Errorf("registry: build %s registration intent changed before acceptance", buildID)
 		}
-		if current.State != BuildStarting {
-			return current, nil
+		if current.RegistrationTargetSet {
+			if !sameBuildTarget(current.RegistrationTarget, target) {
+				return nil, fmt.Errorf("registry: build %s accepted target conflicts with durable registration", buildID)
+			}
+			if current.State != BuildStarting {
+				return current, nil
+			}
 		}
-		current.State = BuildRegistered
+		current.RegistrationTarget = cloneBuildTarget(target)
+		current.RegistrationTargetSet = true
 		current.RegistrationImageRepo = ""
 		current.RegistrationRegistryAuth = ""
+		if current.State != BuildStarting {
+			if _, ok, err := r.stores.casRouteBuildShard(ctx, current, revision); err != nil {
+				return nil, err
+			} else if ok {
+				return current, nil
+			}
+			continue
+		}
+		current.State = BuildRegistered
 		if _, ok, err := r.stores.casRouteBuildShard(ctx, current, revision); err != nil {
 			return nil, err
 		} else if ok {
@@ -492,6 +519,7 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 		NodeID:      rec.NodeID,
 		APIEndpoint: r.nodeAPIEndpoint(ctx, rec.NodeID),
 		Profile:     rec.Profile,
+		Target:      cloneBuildTarget(rec.RegistrationTarget),
 	}
 }
 
@@ -525,8 +553,13 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 		return nil
 	}
 	rec.State = BuildState(e.State)
-	rec.RegistrationImageRepo = ""
-	rec.RegistrationRegistryAuth = ""
+	// A state event can outrun or survive loss of the synchronous registration
+	// ACK. Keep the exact replay envelope until that ACK's accepted target is
+	// durably recorded; markBuildRegistrationAccepted clears it atomically.
+	if rec.RegistrationTargetSet {
+		rec.RegistrationImageRepo = ""
+		rec.RegistrationRegistryAuth = ""
+	}
 	if e.TemplateID != "" {
 		rec.TemplateID = e.TemplateID
 	}
@@ -676,11 +709,43 @@ func (r *Registry) lookupNodeBuildRefVersion(ctx context.Context, nodeID, buildI
 // still group-sharded).
 func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool) {
 	b, found, err := r.stores.GetBuildInGroup(ctx, group, buildID)
-	if err != nil || !found || b.State == BuildStarting {
+	if err != nil || !found || b.State == BuildStarting || !b.RegistrationTargetSet {
 		return nil, false
 	}
 	return &BuildReserveResult{
 		BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID,
 		APIEndpoint: r.nodeAPIEndpoint(ctx, b.NodeID), Profile: b.Profile,
+		Target: cloneBuildTarget(b.RegistrationTarget),
 	}, true
+}
+
+func acceptedBuildRegistrationTarget(ack *routesync.CmdAck) (*types.BuildTarget, error) {
+	if ack == nil || ack.Status != routesync.AckAccepted {
+		return nil, errors.New("acceptance ACK is missing")
+	}
+	if ack.BuildRegister == nil {
+		return nil, errors.New("acceptance ACK has no build_register result")
+	}
+	target := cloneBuildTarget(ack.BuildRegister.Target)
+	if target != nil {
+		if err := target.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return target, nil
+}
+
+func cloneBuildTarget(target *types.BuildTarget) *types.BuildTarget {
+	if target == nil {
+		return nil
+	}
+	copy := *target
+	return &copy
+}
+
+func sameBuildTarget(a, b *types.BuildTarget) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }

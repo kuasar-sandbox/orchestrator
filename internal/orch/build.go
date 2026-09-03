@@ -845,6 +845,7 @@ type pendingBuild struct {
 	templateNetwork  sandboxcfg.NetworkSpec
 	resources        rtconfig.ResourcesConfig
 	sandboxResources rtconfig.ResourcesConfig
+	checkpointPolicy sandboxcfg.SnapshotPolicy
 	tapFD            vswitch.TapFD
 	mac              string
 	floating         string
@@ -1164,6 +1165,12 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
+	if buildMayProduceMemorySandbox(b, sourceTemplate) {
+		pend.checkpointPolicy, err = o.resolveSnapshotPolicy(b.Metadata, sandboxcfg.SnapshotPolicy{})
+		if err != nil {
+			return nil, buildFailed("resource_resolve", err)
+		}
+	}
 	port, err = o.attachNetwork(buildCtx, pend.network)
 	if err != nil {
 		return nil, buildFailed("network_attach", err)
@@ -1182,6 +1189,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
 		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
+		CheckpointPolicy: sandboxcfg.CloneSnapshotPolicy(pend.checkpointPolicy),
 	}
 	prepareJSON, err := encodeBuildRuntimePreparation(durable)
 	if err != nil {
@@ -1872,13 +1880,6 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	if err != nil {
 		return nil, err
 	}
-	var checkpointPolicy sandboxcfg.SnapshotPolicy
-	if buildMayProduceMemorySandbox(b, pend.sourceTemplate) {
-		checkpointPolicy, err = o.resolveSnapshotPolicy(b.Metadata, sandboxcfg.SnapshotPolicy{})
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	spec := &configsock.BuildSpec{
 		BuildID:               b.BuildID,
@@ -1923,7 +1924,7 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 		SandboxEnv:        cloneStringMap(b.Env),
 		HasSandboxConfig:  buildHasSandboxConfig(b),
 		HasInstanceConfig: buildHasInstanceConfig(b),
-		CheckpointPolicy:  checkpointPolicy,
+		CheckpointPolicy:  sandboxcfg.CloneSnapshotPolicy(pend.checkpointPolicy),
 		MMDSEnabled:       b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
 		EnvdToken:         pend.envdToken,
 		Insecure:          o.cfg.Builder.InsecureRegistry,

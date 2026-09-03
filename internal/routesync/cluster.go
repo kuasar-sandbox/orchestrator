@@ -309,14 +309,21 @@ type ExecSessionResult struct {
 	ExecAccessToken string `json:"exec_access_token"`
 }
 
+// BuildRegisterResult is the registration value durably accepted by the node.
+// Target may be nil: that is the canonical auto request, not a missing result.
+type BuildRegisterResult struct {
+	Target *types.BuildTarget `json:"target"`
+}
+
 // CmdAck acknowledges a Command's receipt. CmdConnect and CmdExecSession
 // additionally return their synchronously prepared result; asynchronous resume
 // completion still arrives through the route stream.
 type CmdAck struct {
-	CmdID       string             `json:"cmd_id"`
-	Status      string             `json:"status"` // AckAccepted | AckRejected
-	Reason      string             `json:"reason,omitempty"`
-	HTTPStatus  int                `json:"http_status,omitempty"`
-	Connect     *ConnectResult     `json:"connect,omitempty"`
-	ExecSession *ExecSessionResult `json:"exec_session,omitempty"`
+	CmdID         string               `json:"cmd_id"`
+	Status        string               `json:"status"` // AckAccepted | AckRejected
+	Reason        string               `json:"reason,omitempty"`
+	HTTPStatus    int                  `json:"http_status,omitempty"`
+	Connect       *ConnectResult       `json:"connect,omitempty"`
+	ExecSession   *ExecSessionResult   `json:"exec_session,omitempty"`
+	BuildRegister *BuildRegisterResult `json:"build_register,omitempty"`
 }

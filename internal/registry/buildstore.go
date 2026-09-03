@@ -41,6 +41,8 @@ type BuildRecord struct {
 	RegistrationMMDSValuesDigest  string                    `json:"registration_mmds_values_digest,omitempty"`
 	RegistrationImageRepo         string                    `json:"registration_image_repo,omitempty"`
 	RegistrationRegistryAuth      string                    `json:"registration_registry_auth,omitempty"`
+	RegistrationTarget            *types.BuildTarget        `json:"registration_target,omitempty"`
+	RegistrationTargetSet         bool                      `json:"registration_target_set,omitempty"`
 	State                         BuildState                `json:"state"`
 	TemplateID                    string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
 	Reason                        string                    `json:"reason,omitempty"`

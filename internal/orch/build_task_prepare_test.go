@@ -144,6 +144,9 @@ func TestBuildRuntimePreparationRoundTripFreezesResolvedInputs(t *testing.T) {
 		SandboxResources: rtconfig.ResourcesConfig{
 			Capacity: rtconfig.CapacityConfig{CPU: 1, Memory: "1GiB"},
 		},
+		CheckpointPolicy: sandboxcfg.SnapshotPolicy{
+			MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true),
+		},
 	}
 	raw, err := encodeBuildRuntimePreparation(want)
 	if err != nil {

@@ -467,14 +467,19 @@ func TestClusterBuildRegisterHookRunsOnceAndExactReplayUsesOriginalIdentity(t *t
 		}
 		operation.Register.Metadata["extension"] = "cluster"
 		operation.Register.Names = []string{"cluster-extension-name"}
+		operation.Register.Builder.Target = &conductorextension.BuildTarget{Kind: conductorextension.BuildTargetSandbox}
 		return nil
 	}))
-	if ack := o.HandleCommand(context.Background(), command); ack.Status != routesync.AckAccepted {
+	if ack := o.HandleCommand(context.Background(), command); ack.Status != routesync.AckAccepted ||
+		ack.BuildRegister == nil || ack.BuildRegister.Target == nil ||
+		*ack.BuildRegister.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox}) {
 		t.Fatalf("initial ACK = %+v", ack)
 	}
 	replay := *command
 	replay.CmdID = "replay-extension-cluster-replay"
-	if ack := o.HandleCommand(context.Background(), &replay); ack.Status != routesync.AckAccepted {
+	if ack := o.HandleCommand(context.Background(), &replay); ack.Status != routesync.AckAccepted ||
+		ack.BuildRegister == nil || ack.BuildRegister.Target == nil ||
+		*ack.BuildRegister.Target != (types.BuildTarget{Kind: types.BuildTargetSandbox}) {
 		t.Fatalf("exact replay ACK = %+v", ack)
 	}
 	if calls.Load() != 1 {

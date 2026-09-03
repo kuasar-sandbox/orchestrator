@@ -651,11 +651,12 @@ func createHeaderValue(header http.Header, name string) (string, bool) {
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
 // build/template ids + places the build, §7.5).
 type buildReserveResult struct {
-	BuildID     string        `json:"build_id"`
-	TemplateID  string        `json:"template_id"`
-	NodeID      string        `json:"node_id"`
-	APIEndpoint string        `json:"api_endpoint"`
-	Profile     types.Profile `json:"profile"`
+	BuildID     string             `json:"build_id"`
+	TemplateID  string             `json:"template_id"`
+	NodeID      string             `json:"node_id"`
+	APIEndpoint string             `json:"api_endpoint"`
+	Profile     types.Profile      `json:"profile"`
+	Target      *types.BuildTarget `json:"target"`
 }
 
 // handleBuildRegister asks the registry to assign identities and choose an
@@ -818,7 +819,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"templateID": res.TemplateID, "buildID": res.BuildID,
 		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
-		"profile": res.Profile, "target": builderOpts.Target,
+		"profile": res.Profile, "target": res.Target,
 	})
 }
 

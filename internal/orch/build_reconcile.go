@@ -176,7 +176,8 @@ func (o *Orchestrator) prepareLiveBuild(ctx context.Context, build *types.Build,
 		baseDir:        nodepath.BuildBaseDir(o.cfg.Paths.BaseRoot, build.BuildID),
 		sourceTemplate: prep.sourceTemplate,
 		spec:           prep.spec, resources: durable.Resources, sandboxResources: durable.SandboxResources,
-		network: durable.Network, templateNetwork: durable.TemplateNetwork,
+		checkpointPolicy: sandboxcfg.CloneSnapshotPolicy(durable.CheckpointPolicy),
+		network:          durable.Network, templateNetwork: durable.TemplateNetwork,
 		tapFD: o.vs.TapFD(build.RuntimeVswitchPort), mac: build.RuntimePortMAC,
 		floating: build.RuntimeFloatingIP, envdToken: build.RuntimeEnvdAccessToken,
 	}
@@ -234,6 +235,7 @@ func (o *Orchestrator) adoptLiveBuild(ctx context.Context, build *types.Build, u
 	if prep.durable != nil {
 		pend.network, pend.templateNetwork, pend.resources = prep.durable.Network, prep.durable.TemplateNetwork, prep.durable.Resources
 		pend.sandboxResources = prep.durable.SandboxResources
+		pend.checkpointPolicy = sandboxcfg.CloneSnapshotPolicy(prep.durable.CheckpointPolicy)
 		pend.tapFD, pend.mac = o.vs.TapFD(build.RuntimeVswitchPort), build.RuntimePortMAC
 		pend.floating, pend.envdToken = build.RuntimeFloatingIP, build.RuntimeEnvdAccessToken
 	}
@@ -399,6 +401,12 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 	if err != nil {
 		return nil, "", false, nil, buildFailed("resource_resolve", err)
 	}
+	if buildMayProduceMemorySandbox(build, pend.sourceTemplate) {
+		pend.checkpointPolicy, err = o.resolveSnapshotPolicy(build.Metadata, sandboxcfg.SnapshotPolicy{})
+		if err != nil {
+			return nil, "", false, nil, buildFailed("resource_resolve", err)
+		}
+	}
 	port, err := o.attachNetwork(buildCtx, pend.network)
 	if err != nil {
 		return nil, "", false, nil, buildFailed("network_attach", err)
@@ -418,6 +426,7 @@ func (o *Orchestrator) continueRecoveredBuildPreparation(
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: prepareDigest,
 		Network: pend.network, TemplateNetwork: pend.templateNetwork, Resources: pend.resources,
 		SandboxResources: pend.sandboxResources,
+		CheckpointPolicy: sandboxcfg.CloneSnapshotPolicy(pend.checkpointPolicy),
 	}
 	prepareJSON, err := encodeBuildRuntimePreparation(durable)
 	if err != nil {

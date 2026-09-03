@@ -1292,10 +1292,14 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 	durableNetwork := sandboxcfg.NetworkSpec{Hostname: "frozen-build", InnerIP: "10.44.0.5/24", Nexthop: "10.44.0.1"}
 	durableTemplateNetwork := durableNetwork
 	durableTemplateNetwork.Hostname = "frozen-template"
+	durableCheckpointPolicy := sandboxcfg.SnapshotPolicy{
+		MergeRef: orchCheckpointBool(false), DropCaches: orchCheckpointBool(true),
+	}
 	build.RuntimePrepareJSON, err = encodeBuildRuntimePreparation(buildRuntimePreparation{
 		SchemaVersion: buildRuntimePrepareSchemaVersion, PrepareDigest: digest,
 		Network: durableNetwork, TemplateNetwork: durableTemplateNetwork,
 		Resources: durableResources, SandboxResources: durableResources,
+		CheckpointPolicy: durableCheckpointPolicy,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1309,6 +1313,8 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 	cfg.Sandbox.Network.E2B.InnerIP = "192.0.2.5/24"
 	cfg.Sandbox.Network.E2B.Nexthop = "192.0.2.1"
 	cfg.Sandbox.Resources.Capacity.Memory = "invalid-current-policy"
+	cfg.Checkpoint.MergeRef = orchCheckpointBool(true)
+	cfg.Checkpoint.DropCaches = orchCheckpointBool(false)
 	lc := &reconcileLauncher{
 		units: []launcher.Unit{{Name: unit, ActiveState: "active"}},
 		resources: launcher.ResourceProperties{
@@ -1338,6 +1344,10 @@ func TestPreparedSnapshotRecoveryUsesDurableInputsAfterNodeDefaultsChange(t *tes
 		final.RequestedTarget == nil || *final.RequestedTarget != (types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}) {
 		cancel()
 		t.Fatalf("recovered final spec lost immutable registration config: %+v", final)
+	}
+	if !reflect.DeepEqual(final.CheckpointPolicy, durableCheckpointPolicy) {
+		cancel()
+		t.Fatalf("recovered checkpoint policy drifted: got %+v, want %+v", final.CheckpointPolicy, durableCheckpointPolicy)
 	}
 	cancel()
 	if err := o.DrainBuilds(context.Background()); err != nil {

@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission/limits"
@@ -1247,6 +1248,10 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 	if err := resources.ValidateRequired(); err != nil {
 		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
 	}
+	_, builderOptions, err := buildcfg.Extract(cmd.Config)
+	if err != nil {
+		return ackHTTP(cmd, routesync.AckRejected, err.Error(), http.StatusBadRequest)
+	}
 	beh := behaviorFromConfig(cmd.Config, n.CreateDelay, n.BuildDelay)
 	b := &stubBuild{
 		BuildID: cmd.BuildID, Profile: cmd.Profile, APISecretFingerprint: cmd.APISecretFingerprint,
@@ -1256,6 +1261,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		RegistrationImageRepo: cmd.ImageRepo, RegistrationRegistryAuth: cmd.RegistryAuth,
 		RegistrationCredentials: cloneStubBuildCredentials(cmd.BuildCredentials),
 		RegistrationMMDSSecrets: cloneStringMap(cmd.BuildMMDSSecrets),
+		Target:                  cloneStubBuildTarget(builderOptions.Target),
 	}
 	n.mu.Lock()
 	if existing := n.builds[b.BuildID]; existing != nil {
@@ -1272,7 +1278,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		if terminal {
 			n.publishBuildEvent(event)
 		}
-		return ack(cmd, routesync.AckAccepted, "")
+		return ackBuildRegister(cmd, existing.Target)
 	}
 	// An exact replay after an ambiguous/lost ACK must be recognized before the
 	// mutable credential lease and current admission policy are consulted. The
@@ -1334,7 +1340,7 @@ func (n *stubNode) handleBuildRegisterContext(ctx context.Context, cmd *routesyn
 		}
 		_ = n.setBuildState(b.BuildID, state, b.TemplateID, "", true)
 	}()
-	return ack(cmd, routesync.AckAccepted, "")
+	return ackBuildRegister(cmd, b.Target)
 }
 
 func sameStubBuildRegistration(a, b *stubBuild) bool {
@@ -1967,6 +1973,7 @@ type stubBuild struct {
 	RegistrationRegistryAuth string                    `json:"-"`
 	RegistrationCredentials  *sandboxcfg.Credentials   `json:"-"`
 	RegistrationMMDSSecrets  map[string]string         `json:"-"`
+	Target                   *types.BuildTarget        `json:"target,omitempty"`
 	Behavior                 stubBehavior              `json:"behavior,omitempty"`
 	CreatedAt                string                    `json:"created_at,omitempty"`
 	RegistrationSeq          int64                     `json:"-"`
@@ -2231,6 +2238,21 @@ func ack(cmd *routesync.Command, status, reason string) *routesync.CmdAck {
 
 func ackHTTP(cmd *routesync.Command, status, reason string, httpStatus int) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason, HTTPStatus: httpStatus}
+}
+
+func ackBuildRegister(cmd *routesync.Command, target *types.BuildTarget) *routesync.CmdAck {
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: cloneStubBuildTarget(target)},
+	}
+}
+
+func cloneStubBuildTarget(target *types.BuildTarget) *types.BuildTarget {
+	if target == nil {
+		return nil
+	}
+	copy := *target
+	return &copy
 }
 
 func sidFromHost(host string) string {

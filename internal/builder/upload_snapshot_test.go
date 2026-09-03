@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,38 @@ func TestPublishArtifactArgsWithoutPublishParent(t *testing.T) {
 	want := []string{"publish", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml", "/work/build"}
 	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %#v, want %#v", args, want)
+	}
+}
+
+func TestOfflineSandboxLocatedPublicationPlan(t *testing.T) {
+	spec := publishSpec("file:///mnt/shared/snapshots")
+	sandboxID := "e-" + spec.BuildID
+	artifactDir := filepath.Join("/run/build", "offline", "artifact")
+	artifact := filepath.Join(artifactDir, sandboxID+".sandbox")
+	export, gotArtifact := offlineSandboxExportArgs(spec, "manifest://base", "/run/build/offline/sandbox.yaml", sandboxID, "/run/build/offline")
+	if gotArtifact != artifact || indexOf(export, "--upload") >= 0 {
+		t.Fatalf("located offline Sandbox export argv=%#v artifact=%q", export, gotArtifact)
+	}
+	if i := indexOf(export, "--output"); i < 0 || i+1 >= len(export) || export[i+1] != artifactDir {
+		t.Fatalf("located offline Sandbox export argv = %#v", export)
+	}
+
+	publish, err := publishArtifactArgs(spec, artifact, time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := indexOf(publish, "--to-ref-location"); i < 0 || i+1 >= len(publish) ||
+		!strings.HasPrefix(publish[i+1], spec.BuildID+"-20260904=") {
+		t.Fatalf("located offline Sandbox publish argv = %#v", publish)
+	}
+	if got := publish[len(publish)-1]; got != artifact {
+		t.Fatalf("located offline Sandbox artifact = %q, want %q", got, artifact)
+	}
+
+	spec.PublishLocationParent = ""
+	direct, directArtifact := offlineSandboxExportArgs(spec, "manifest://base", "/run/build/offline/sandbox.yaml", sandboxID, "/run/build/offline")
+	if directArtifact != "" || indexOf(direct, "--upload") < 0 || indexOf(direct, "--output") >= 0 {
+		t.Fatalf("manifest offline Sandbox export argv=%#v artifact=%q", direct, directArtifact)
 	}
 }
 

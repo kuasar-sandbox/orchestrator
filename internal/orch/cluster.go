@@ -123,10 +123,11 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		// registration image-pull credentials for exact replay, and report
 		// `registered` up. The e2b trigger (router-forwarded) then runs it; state
 		// flows back as BuildUpsert and retention eventually emits BuildDelete.
-		if err := o.registerClusterBuild(ctx, cmd); err != nil {
+		var target *types.BuildTarget
+		if err := o.registerClusterBuildWithResult(ctx, cmd, &target); err != nil {
 			return reject(cmd, err)
 		}
-		return accept(cmd)
+		return acceptBuildRegister(cmd, target)
 	default:
 		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
@@ -157,6 +158,10 @@ func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
 // registration image-pull credentials for exact retries and restart recovery,
 // and report `registered` up the node-link.
 func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
+	return o.registerClusterBuildWithResult(ctx, cmd, nil)
+}
+
+func (o *Orchestrator) registerClusterBuildWithResult(ctx context.Context, cmd *routesync.Command, acceptedTarget **types.BuildTarget) error {
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return fmt.Errorf("build_register: missing build_id / template_id")
 	}
@@ -404,6 +409,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		if err := o.publishBuildStateRequired(ctx, registered.BuildID, string(registered.Status), templateID, registered.Reason); err != nil {
 			return fmt.Errorf("build_register: republish durable terminal state: %w", err)
 		}
+		if acceptedTarget != nil {
+			*acceptedTarget = cloneBuildTarget(registered.Builder.Target)
+		}
 		return nil
 	}
 	o.clusterBuildMu.Lock()
@@ -412,6 +420,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if inserted {
 		o.publishBuildState(cmd.BuildID, "registered", "", "")
 		o.observeBuildUpsert(registered)
+	}
+	if acceptedTarget != nil {
+		*acceptedTarget = cloneBuildTarget(registered.Builder.Target)
 	}
 	return nil
 }
@@ -711,6 +722,13 @@ func acceptConnect(cmd *routesync.Command, result *routesync.ConnectResult) *rou
 
 func acceptExecSession(cmd *routesync.Command, result *routesync.ExecSessionResult) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, ExecSession: result}
+}
+
+func acceptBuildRegister(cmd *routesync.Command, target *types.BuildTarget) *routesync.CmdAck {
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckAccepted,
+		BuildRegister: &routesync.BuildRegisterResult{Target: cloneBuildTarget(target)},
+	}
 }
 
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {

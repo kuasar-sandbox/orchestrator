@@ -325,16 +325,38 @@ func (p *buildPipeline) publishOfflineSandbox() (string, error) {
 	if err := os.WriteFile(configPath, document, 0o600); err != nil {
 		return "", err
 	}
-	args := []string{
-		"export", "--from", p.baseRef, "--config", configPath, "--upload",
-		"--sandbox-id", phaseSandboxID("e", p.spec.BuildID),
-		"--manifest-config", p.spec.Paths.ManifestConfig,
+	sandboxID := phaseSandboxID("e", p.spec.BuildID)
+	args, artifactPath := offlineSandboxExportArgs(p.spec, p.baseRef, configPath, sandboxID, dir)
+	if artifactPath != "" {
+		// Offline export has no located-publication flag. Materialize E into a
+		// task-private directory first, then use the same graph-aware publish
+		// path as captured Snapshots so --to-ref-location is honored.
+		if err := os.MkdirAll(filepath.Dir(artifactPath), 0o700); err != nil {
+			return "", err
+		}
 	}
-	args = appendRefLocationArgs(args, p.spec.RefLocations)
-	p.progress("uploading offline Sandbox to the content store")
+	if artifactPath == "" {
+		p.progress("uploading offline Sandbox to the content store")
+	} else {
+		p.progress("materializing offline Sandbox for located publication")
+	}
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
 	if err != nil {
 		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
+	}
+	if artifactPath != "" {
+		if _, err := os.Lstat(artifactPath); err != nil {
+			return "", fmt.Errorf("offline Sandbox export %s: %w", artifactPath, err)
+		}
+		args, err = publishArtifactArgs(p.spec, artifactPath, p.now())
+		if err != nil {
+			return "", err
+		}
+		p.progress("publishing offline Sandbox to the configured ref location")
+		out, err = p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
+		if err != nil {
+			return "", fmt.Errorf("%w (%s)", err, firstLine(out))
+		}
 	}
 	key := strings.TrimSpace(string(out))
 	ref := key
@@ -347,6 +369,23 @@ func (p *buildPipeline) publishOfflineSandbox() (string, error) {
 	}
 	p.progress("uploaded offline Sandbox: %s", ref)
 	return ref, nil
+}
+
+func offlineSandboxExportArgs(spec *configsock.BuildSpec, baseRef, configPath, sandboxID, runDir string) ([]string, string) {
+	args := []string{"export", "--from", baseRef, "--config", configPath}
+	artifactPath := ""
+	if spec.PublishLocationParent == "" {
+		args = append(args, "--upload")
+	} else {
+		artifactDir := filepath.Join(runDir, "artifact")
+		args = append(args, "--output", artifactDir)
+		artifactPath = filepath.Join(artifactDir, sandboxID+".sandbox")
+	}
+	args = append(args,
+		"--sandbox-id", sandboxID,
+		"--manifest-config", spec.Paths.ManifestConfig,
+	)
+	return appendRefLocationArgs(args, spec.RefLocations), artifactPath
 }
 
 // publishArtifactArgs builds the sandbox-ctl publish argv. The publication
