@@ -310,5 +310,13 @@ workers: 2                                       # worker processes supervised b
 # tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem } # standalone direct TLS only
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
+# per-Sandbox limits shared by all workers; 0 = unlimited (not QPS/global capacity)
+traffic:
+  max_inflight:
+    total: 128
+    forward: 96
+    "e2b:envd": 16
+    "e2b:code-interpreter": 8
+    exec: 8
 # metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)
 `
