@@ -479,6 +479,13 @@ func (r *Registry) reserveCreate(ctx context.Context, group, routeKey string, cr
 		return nil, err
 	}
 	if found && rec.State == StateReady {
+		profile, err := types.ParseProfile(rec.Profile)
+		if err != nil {
+			return nil, fmt.Errorf("registry: invalid ready Sandbox profile: %w", err)
+		}
+		if err := validateTrafficConfigForProfile(createConfig, profile); err != nil {
+			return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
 		res, live, err := r.readyResultFromRecord(ctx, rec, rev)
 		if err != nil {
 			return nil, err
@@ -786,6 +793,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 		}
+		if err := validateTrafficConfigForProfile(config, template.Profile); err != nil {
+			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+		}
 		config, err = attachCreateCredentials(config, template.Profile, selectedCredentials)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
@@ -941,6 +951,10 @@ func normalizeSandboxReserveConfig(config map[string]string) (map[string]string,
 	if err != nil {
 		return nil, nil, err
 	}
+	config, err = sandboxcfg.NormalizeTrafficMetadata(config)
+	if err != nil {
+		return nil, nil, err
+	}
 	_, present := config[sandboxcfg.NsCredentials]
 	credentials, cleaned, err := sandboxcfg.ExtractCredentials(config)
 	if err != nil {
@@ -950,6 +964,18 @@ func normalizeSandboxReserveConfig(config map[string]string) (map[string]string,
 		return cleaned, nil, nil
 	}
 	return cleaned, &credentials, nil
+}
+
+func validateTrafficConfigForProfile(config map[string]string, profile types.Profile) error {
+	raw, present := config[sandboxcfg.NsTraffic]
+	if !present {
+		return nil
+	}
+	patch, err := sandboxcfg.ParseTrafficPatch(raw)
+	if err != nil {
+		return err
+	}
+	return sandboxcfg.ValidateTrafficForProfile(profile, patch)
 }
 
 func attachCreateCredentials(config map[string]string, profile types.Profile, credentials *sandboxcfg.Credentials) (map[string]string, error) {

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -23,7 +24,10 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 	master := NewMasterStats(metrics.New(), []string{"w0"})
 	readyWorker(t, master, "w0", 1)
 	synced := false
-	identity := RouteIdentity{RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused}
+	identity := RouteIdentity{
+		RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused,
+		MaxInflight: publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2},
+	}
 	server := NewStatsServer(master, func() bool { return synced }, func(sandboxID string) (RouteIdentity, bool) {
 		return identity, sandboxID == "s1"
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -66,7 +70,10 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 	if got := startingResult.Sandboxes[0].Stats; got.State != string(types.StateStarting) || got.IdleSince != nil {
 		t.Fatalf("starting stats = %+v", got)
 	}
-	identity = RouteIdentity{RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused}
+	identity = RouteIdentity{
+		RunID: "run-1", Profile: types.ProfileBare, State: types.StatePaused,
+		MaxInflight: publicconfig.MaxInflight{Total: 32, Forward: 8, Exec: 2},
+	}
 	staleState := query
 	staleState.State = types.StateRunning
 	if resp := do(staleState); resp.Code != http.StatusServiceUnavailable {
@@ -85,6 +92,9 @@ func TestStatsServerRequiresReadySyncedExactRouteIdentity(t *testing.T) {
 	}
 	if result.Sandboxes[0].Stats.State != string(types.StatePaused) || result.Sandboxes[0].Stats.IdleSince != nil {
 		t.Fatalf("paused stats = %+v", result.Sandboxes[0].Stats)
+	}
+	if result.Sandboxes[0].Stats.MaxInflight != identity.MaxInflight {
+		t.Fatalf("effective maxInflight = %+v, want %+v", result.Sandboxes[0].Stats.MaxInflight, identity.MaxInflight)
 	}
 }
 

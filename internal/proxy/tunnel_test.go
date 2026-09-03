@@ -11,11 +11,14 @@ import (
 	"testing"
 	"time"
 
+	publicconfig "github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 )
 
 func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
-	worker, master := newTrafficHarness(t)
+	harness := newLimitedTrafficHarness(t)
+	binding := harness.bind(t, "node-s1", publicconfig.MaxInflight{Forward: 1})
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +70,12 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 			http.Error(w, "prefetch failed", http.StatusBadGateway)
 			return
 		}
-		flow := worker.BeginParking("node-s1", proxy.ConnectServiceForward)
+		flow, err := harness.traffic.TryBeginParking("node-s1", proxy.ConnectServiceForward, binding)
+		if err != nil {
+			_ = backend.Close()
+			http.Error(w, "admission failed", http.StatusInternalServerError)
+			return
+		}
 		backend = flow.AttachBackend(backend)
 		defer flow.Close()
 		close(attached)
@@ -100,7 +108,10 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("H1 backend was not attached")
 	}
-	waitInflight(t, master, 0, 1)
+	waitInflight(t, harness.stats, 0, 1)
+	if _, err := harness.worker.TryAcquire(binding, proxyadmission.ServiceForward); err == nil {
+		t.Fatal("H1 tunnel did not hold its admission lease")
+	}
 	if err := tcpConn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +133,13 @@ func TestTunnelBufferedPreservesBothReadersAndHalfCloseTail(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("half-closed tunnel handler did not finish")
 	}
-	waitInflight(t, master, 0, 0)
+	waitInflight(t, harness.stats, 0, 0)
+	harness.assertAvailable(t, binding, proxyadmission.ServiceForward)
 }
 
 func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
-	worker, master := newTrafficHarness(t)
+	harness := newLimitedTrafficHarness(t)
+	binding := harness.bind(t, "node-s1", publicconfig.MaxInflight{Forward: 1})
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +176,12 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 			http.Error(w, "dial failed", http.StatusBadGateway)
 			return
 		}
-		flow := worker.BeginParking("node-s1", proxy.ConnectServiceForward)
+		flow, err := harness.traffic.TryBeginParking("node-s1", proxy.ConnectServiceForward, binding)
+		if err != nil {
+			_ = backend.Close()
+			http.Error(w, "admission failed", http.StatusInternalServerError)
+			return
+		}
 		backend = flow.AttachBackend(backend)
 		defer flow.Close()
 		close(attached)
@@ -201,7 +219,10 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("H2 backend was not attached")
 	}
-	waitInflight(t, master, 0, 1)
+	waitInflight(t, harness.stats, 0, 1)
+	if _, err := harness.worker.TryAcquire(binding, proxyadmission.ServiceForward); err == nil {
+		t.Fatal("H2 tunnel did not hold its admission lease")
+	}
 	close(releaseEOF)
 	output, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -219,10 +240,13 @@ func TestTunnelH2FlushesTailAfterRequestEOF(t *testing.T) {
 	if err := <-backendDone; err != nil {
 		t.Fatal(err)
 	}
-	waitInflight(t, master, 0, 0)
+	waitInflight(t, harness.stats, 0, 0)
+	harness.assertAvailable(t, binding, proxyadmission.ServiceForward)
 }
 
 func TestTunnelH2CancellationClosesBackendAndHandler(t *testing.T) {
+	harness := newLimitedTrafficHarness(t)
+	binding := harness.bind(t, "node-s1", publicconfig.MaxInflight{Forward: 1})
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -254,6 +278,14 @@ func TestTunnelH2CancellationClosesBackendAndHandler(t *testing.T) {
 			http.Error(w, "dial failed", http.StatusBadGateway)
 			return
 		}
+		flow, err := harness.traffic.TryBeginParking("node-s1", proxy.ConnectServiceForward, binding)
+		if err != nil {
+			_ = backend.Close()
+			http.Error(w, "admission failed", http.StatusInternalServerError)
+			return
+		}
+		backend = flow.AttachBackend(backend)
+		defer flow.Close()
 		proxy.Tunnel(w, r, backend)
 	}))
 	front.EnableHTTP2 = true
@@ -301,4 +333,5 @@ func TestTunnelH2CancellationClosesBackendAndHandler(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("HTTP/2 cancellation left tunnel handler running")
 	}
+	harness.assertAvailable(t, binding, proxyadmission.ServiceForward)
 }

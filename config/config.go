@@ -1243,18 +1243,19 @@ func (c *Conductor) validateProxy() error {
 // conductor pushes the authoritative auth/park policy over the registration stream;
 // local values are bootstrap fallbacks until that handshake completes.
 type Proxy struct {
-	ConfigSocket  string           `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
-	Paths         ProxyPathsConfig `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
-	DataListen    string           `yaml:"data_listen" json:"data_listen"`       // required sandbox data ingress
-	ProxyNetNS    string           `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and MMDS listen
-	StatsSocket   string           `yaml:"stats_socket" json:"stats_socket"`     // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
-	ShmPath       string           `yaml:"shm_path" json:"shm_path"`             // shared route table path; default <dir(config_socket)>/proxy-routes.shm
-	RouteCapacity int              `yaml:"route_capacity" json:"route_capacity"` // fixed shared route slots; default 65536
-	Workers       int              `yaml:"workers" json:"workers"`               // worker processes supervised by this master; default 1
-	TLS           TLSConfig        `yaml:"tls" json:"tls"`                       // data-plane listener cert (= serve's wildcard); "" = h2c
-	Auth          string           `yaml:"auth" json:"auth"`                     // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
-	ParkTimeout   string           `yaml:"park_timeout" json:"park_timeout"`     // bootstrap fallback; default 30s
-	MetricsListen string           `yaml:"metrics_listen" json:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	ConfigSocket  string             `yaml:"config_socket" json:"config_socket"`   // serve control socket to register + sync on (= serve paths.config_socket)
+	Paths         ProxyPathsConfig   `yaml:"paths" json:"paths"`                   // node-local paths used directly by proxy workers
+	DataListen    string             `yaml:"data_listen" json:"data_listen"`       // required sandbox data ingress
+	ProxyNetNS    string             `yaml:"proxy_netns" json:"proxy_netns"`       // optional forwarding netns for floatingip TCP dials and MMDS listen
+	StatsSocket   string             `yaml:"stats_socket" json:"stats_socket"`     // master-only traffic stats UDS; default <dir(config_socket)>/proxy-stats.sock
+	ShmPath       string             `yaml:"shm_path" json:"shm_path"`             // shared route table path; default <dir(config_socket)>/proxy-routes.shm
+	RouteCapacity int                `yaml:"route_capacity" json:"route_capacity"` // fixed shared route slots; default 65536
+	Workers       int                `yaml:"workers" json:"workers"`               // worker processes supervised by this master; default 1
+	TLS           TLSConfig          `yaml:"tls" json:"tls"`                       // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth          string             `yaml:"auth" json:"auth"`                     // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout   string             `yaml:"park_timeout" json:"park_timeout"`     // bootstrap fallback; default 30s
+	MetricsListen string             `yaml:"metrics_listen" json:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	Traffic       ProxyTrafficConfig `yaml:"traffic" json:"traffic"`               // per-Sandbox traffic admission defaults
 }
 
 // Clone returns a deep copy of the independent proxy configuration.
@@ -1299,6 +1300,9 @@ func DecodeProxy(r io.Reader) (*Proxy, error) {
 	}
 	if len(b) > maxConfigBytes {
 		return nil, fmt.Errorf("configuration exceeds %d bytes", maxConfigBytes)
+	}
+	if err := validateProxyTrafficYAML(b); err != nil {
+		return nil, err
 	}
 	var p Proxy
 	if err := decodeKnownYAML(b, &p); err != nil {

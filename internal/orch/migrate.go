@@ -313,6 +313,17 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, source types.ResumeSo
 	if err != nil {
 		return "", fmt.Errorf("mint migration token: portable resource metadata: %w", err)
 	}
+	metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+	if err != nil {
+		return "", fmt.Errorf("mint migration token: portable traffic metadata: %w", err)
+	}
+	trafficSpec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return "", fmt.Errorf("mint migration token: portable traffic metadata: %w", err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(sb.Profile, trafficSpec.Traffic); err != nil {
+		return "", fmt.Errorf("mint migration token: portable traffic metadata: %w", err)
+	}
 	return migrationtoken.Seal(
 		migrationtoken.KeyMaterial{APISecret: sb.APISecret, ManifestKey: sb.ManifestKey},
 		migrationtoken.MigrationTokenPayloadV1{
@@ -430,6 +441,13 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	metadata, err := migrationSandboxMetadata(payload.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("import-sandbox: token resource metadata: %w: %v", migrationtoken.ErrInvalidPayload, err)
+	}
+	trafficSpec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("import-sandbox: token traffic metadata: %w: %v", migrationtoken.ErrInvalidPayload, err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(profile, trafficSpec.Traffic); err != nil {
+		return nil, fmt.Errorf("import-sandbox: token traffic metadata: %w: %v", migrationtoken.ErrInvalidPayload, err)
 	}
 	if raw, present := metadata[sandboxcfg.NsMMDS]; present {
 		_, routesJSON, err := sandboxcfg.ValidatePersistedMMDSRoutes(raw, o.mmdsPolicy())
@@ -584,7 +602,11 @@ func migrationSandboxMetadata(metadata map[string]string) (map[string]string, er
 			cleaned[key] = value
 		}
 	}
-	return sandboxcfg.NormalizeResourceMetadata(cleaned)
+	cleaned, err := sandboxcfg.NormalizeResourceMetadata(cleaned)
+	if err != nil {
+		return nil, err
+	}
+	return sandboxcfg.NormalizeTrafficMetadata(cleaned)
 }
 
 // runtimeFileFor returns the guest runtime erofs path.

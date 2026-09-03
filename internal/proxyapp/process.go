@@ -13,12 +13,13 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) error {
-	if effective == nil || logger == nil {
+func runWorkerProcess(ctx context.Context, workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) error {
+	if effective == nil || view == nil || admission == nil || stats == nil || logger == nil {
 		return fmt.Errorf("proxy worker process: unresolved startup state")
 	}
 	executable, err := os.Executable()
@@ -58,9 +59,17 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 		})
 		return err
 	}
+	admissionFile, err := admission.DupFile()
+	if err != nil {
+		closeFiles([]*os.File{
+			dataFile, mmdsFile, wakeRead, wakeWrite, notifyRead, notifyWrite,
+			statsMaster, statsWorker, mmdsRPCMaster, mmdsRPCWorker,
+		})
+		return err
+	}
 	parentFiles := []*os.File{wakeRead, notifyWrite, statsMaster, mmdsRPCMaster}
 	defer closeFiles(parentFiles)
-	workerFiles := make([]*os.File, 0, 7)
+	workerFiles := make([]*os.File, 0, 8)
 	nextDescriptor := 3
 	addWorkerFile := func(file *os.File) int {
 		if file == nil {
@@ -74,9 +83,10 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 	fds := workerFDMapping{
 		Data: addWorkerFile(dataFile), MMDS: addWorkerFile(mmdsFile),
 		Wake: addWorkerFile(wakeWrite), Notify: addWorkerFile(notifyRead), Stats: addWorkerFile(statsWorker),
-		MMDSRPC: addWorkerFile(mmdsRPCWorker),
+		MMDSRPC:   addWorkerFile(mmdsRPCWorker),
+		Admission: addWorkerFile(admissionFile),
 	}
-	bootstrapFile, err := newWorkerBootstrapFile(workerID, epoch, effective, fds)
+	bootstrapFile, err := newWorkerBootstrapFile(workerIndex, workerID, epoch, effective, fds)
 	if err != nil {
 		closeFiles(workerFiles)
 		return err
@@ -89,6 +99,15 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 	defer removeNotify()
 	go proxyshm.ReadWakeLoop(ctx, wakeRead, view.Wake)
 	go mmdsrpc.NewServer(mmdsRPCMaster, view.ResolveMMDS, logger).Serve()
+	if err := admission.BeginWorker(workerIndex, epoch); err != nil {
+		return err
+	}
+	admissionBegun := true
+	defer func() {
+		if admissionBegun {
+			_ = admission.ClearWorker(workerIndex, epoch)
+		}
+	}()
 
 	if err := stats.BeginWorker(workerID, epoch); err != nil {
 		return err
@@ -146,6 +165,10 @@ func runWorkerProcess(ctx context.Context, workerID string, epoch uint64, effect
 	}
 	stats.WorkerExited(workerID, epoch)
 	workerBegun = false
+	if err := admission.ClearWorker(workerIndex, epoch); err != nil && result == nil {
+		result = err
+	}
+	admissionBegun = false
 	if ctx.Err() != nil {
 		return nil
 	}

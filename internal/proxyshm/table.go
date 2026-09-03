@@ -18,13 +18,14 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 6
+	schema uint32 = 7
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -72,12 +73,20 @@ type mmapHeader struct {
 }
 
 type mmapRecord struct {
-	Seq     uint64
-	Hash    uint64
-	Status  uint32
-	_       uint32
-	SyncGen uint64
-	Rev     uint64
+	Seq                 uint64
+	Hash                uint64
+	Status              uint32
+	_                   uint32
+	SyncGen             uint64
+	Rev                 uint64
+	AdmissionGeneration uint64
+	AdmissionSlot       uint32
+	MaxInflightTotal    uint32
+	MaxInflightForward  uint32
+	MaxInflightEnvd     uint32
+	MaxInflightCI       uint32
+	MaxInflightExec     uint32
+	_Admission          uint32
 
 	SandboxID              [maxSandboxID]byte
 	Profile                [maxProfile]byte
@@ -362,6 +371,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	// Clear them before any fixed-layout comparison or write.
 	in.MMDSRoutes = ""
 	in.MMDSRouteSecretValues = nil
+	in.MaxInflightPatch = nil
 	startHeaderWrite(&t.header.TableSeq)
 	defer finishHeaderWrite(&t.header.TableSeq)
 	idx, ok := t.findSlot(in.SandboxID, true)
@@ -568,6 +578,12 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				ArtifactLocation:       fixedString(rec.ArtifactLocation[:]),
 				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
 				RunID:                  fixedString(rec.RunID[:]),
+				EffectiveMaxInflight: config.MaxInflight{
+					Total: rec.MaxInflightTotal, Forward: rec.MaxInflightForward,
+					E2BEnvd: rec.MaxInflightEnvd, E2BCodeInterpreter: rec.MaxInflightCI,
+					Exec: rec.MaxInflightExec,
+				},
+				AdmissionSlot: rec.AdmissionSlot, AdmissionGeneration: rec.AdmissionGeneration,
 			},
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
@@ -595,6 +611,13 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	rec.Status = snapshot.status
 	rec.SyncGen = snapshot.syncGen
 	rec.Rev = snapshot.rev
+	rec.AdmissionGeneration = snapshot.entry.AdmissionGeneration
+	rec.AdmissionSlot = snapshot.entry.AdmissionSlot
+	rec.MaxInflightTotal = snapshot.entry.EffectiveMaxInflight.Total
+	rec.MaxInflightForward = snapshot.entry.EffectiveMaxInflight.Forward
+	rec.MaxInflightEnvd = snapshot.entry.EffectiveMaxInflight.E2BEnvd
+	rec.MaxInflightCI = snapshot.entry.EffectiveMaxInflight.E2BCodeInterpreter
+	rec.MaxInflightExec = snapshot.entry.EffectiveMaxInflight.Exec
 	_ = putFixed(rec.SandboxID[:], snapshot.entry.SandboxID)
 	_ = putFixed(rec.Profile[:], snapshot.entry.Profile)
 	_ = putFixed(rec.TemplateID[:], snapshot.entry.TemplateID)
@@ -732,6 +755,20 @@ func finishHeaderWrite(seqp *uint64) {
 }
 
 func validateRoute(r routesync.RouteEntry) error {
+	if r.MaxInflightPatch != nil {
+		return errors.New("max_inflight patch was not resolved by Proxy master")
+	}
+	if r.EffectiveMaxInflight.Unlimited() {
+		if r.AdmissionSlot != 0 || r.AdmissionGeneration != 0 {
+			return errors.New("unlimited route has an admission binding")
+		}
+	} else if r.AdmissionSlot == 0 || r.AdmissionGeneration == 0 {
+		return errors.New("limited route is missing an admission binding")
+	}
+	return validateRouteFields(r)
+}
+
+func validateRouteFields(r routesync.RouteEntry) error {
 	checks := []struct {
 		name string
 		val  string

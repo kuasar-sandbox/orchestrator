@@ -13,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/appnet"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -34,6 +35,11 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	}
 	defer table.Close()
 	defer os.Remove(cfg.ShmPath)
+	admission, err := proxyadmission.NewMaster(cfg.RouteCapacity, cfg.Workers)
+	if err != nil {
+		return fmt.Errorf("proxy: create shared admission arena: %w", err)
+	}
+	defer admission.Close()
 	masterCtx, cancelMaster := context.WithCancel(ctx)
 	var masterGroup sync.WaitGroup
 	defer func() {
@@ -48,7 +54,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		}()
 	}
 
-	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), logger)
+	view := proxyshm.NewMasterViewWithAdmission(table, admission, cfg.Traffic.MaxInflight, cfg.ParkTimeoutDur(), logger)
 	if err := table.SetPolicy(routesync.Policy{
 		AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond),
 	}); err != nil {
@@ -98,7 +104,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 			return proxystats.RouteIdentity{}, false
 		}
 		return proxystats.RouteIdentity{
-			RunID: route.RunID, Profile: types.Profile(route.Profile), State: types.State(route.State),
+			RunID: route.RunID, Profile: types.Profile(route.Profile), State: types.State(route.State), MaxInflight: route.EffectiveMaxInflight,
 		}, true
 	}, logger)
 	managementHandler := statsServer.Handler()
@@ -156,7 +162,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 	for index := 0; index < cfg.Workers; index++ {
 		workerIndex := index
 		startMasterTask(func() {
-			superviseWorker(masterCtx, workerIndex, effective, proxyNamespace, dataListener, mmdsListener, view, masterStats, logger)
+			superviseWorker(masterCtx, workerIndex, effective, proxyNamespace, dataListener, mmdsListener, view, admission, masterStats, logger)
 		})
 	}
 
@@ -169,17 +175,21 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		"config_socket", cfg.ConfigSocket,
 		"shm_path", cfg.ShmPath,
 		"route_capacity", cfg.RouteCapacity,
+		"admission_mmap_bytes", func() int {
+			report, _ := proxyadmission.Report(cfg.RouteCapacity, cfg.Workers)
+			return report.MappedBytes
+		}(),
 	)
 	<-masterCtx.Done()
 	return nil
 }
 
-func superviseWorker(ctx context.Context, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, stats *proxystats.MasterStats, logger *slog.Logger) {
+func superviseWorker(ctx context.Context, index int, effective *EffectiveConfig, proxyNamespace *netns.NetNS, dataListener, mmdsListener net.Listener, view *proxyshm.MasterView, admission *proxyadmission.Master, stats *proxystats.MasterStats, logger *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", index)
 	var epoch uint64
 	for ctx.Err() == nil {
 		epoch++
-		err := runWorkerProcess(ctx, workerID, epoch, effective, proxyNamespace, dataListener, mmdsListener, view, stats, logger)
+		err := runWorkerProcess(ctx, index, workerID, epoch, effective, proxyNamespace, dataListener, mmdsListener, view, admission, stats, logger)
 		if ctx.Err() != nil {
 			return
 		}

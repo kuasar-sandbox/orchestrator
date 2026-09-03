@@ -23,7 +23,7 @@ func (s *trafficSource) Get(ctx context.Context, sandboxID string) (proxyextensi
 	if s == nil || s.routes == nil || s.stats == nil {
 		return proxyextension.TrafficView{}, proxyextension.ErrTrafficUnavailable
 	}
-	route, found, err := s.routes.Get(ctx, sandboxID)
+	route, maxInflight, found, err := s.routes.getTrafficRoute(ctx, sandboxID)
 	if err != nil {
 		return proxyextension.TrafficView{}, err
 	}
@@ -46,7 +46,8 @@ func (s *trafficSource) Get(ctx context.Context, sandboxID string) (proxyextensi
 	}
 	view := proxyextension.TrafficView{
 		SandboxID: sandboxID, RunID: route.RunID, Profile: route.Profile,
-		State: proxyextension.RouteState(stats.State),
+		State:       proxyextension.RouteState(stats.State),
+		MaxInflight: maxInflight,
 		Inflight: proxyextension.TrafficInflight{
 			Parking: stats.Inflight.Parking, Egress: stats.Inflight.Egress,
 		},

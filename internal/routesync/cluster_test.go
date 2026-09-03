@@ -2,10 +2,12 @@ package routesync
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -20,6 +22,28 @@ func roundTrip(t *testing.T, m *Msg) *Msg {
 		t.Fatalf("ReadMsg: %v", err)
 	}
 	return got
+}
+
+func TestRouteTrafficWireRejectsAmbiguousPatch(t *testing.T) {
+	for name, route := range map[string]string{
+		"null":             `{"sandbox_id":"s1","max_inflight":null}`,
+		"unknown leaf":     `{"sandbox_id":"s1","max_inflight":{"future":1}}`,
+		"null leaf":        `{"sandbox_id":"s1","max_inflight":{"total":null}}`,
+		"duplicate leaf":   `{"sandbox_id":"s1","max_inflight":{"total":1,"total":2}}`,
+		"duplicate policy": `{"sandbox_id":"s1","max_inflight":{},"max_inflight":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload := []byte(`{"type":"upsert","route":` + route + `}`)
+			var frame bytes.Buffer
+			var length [4]byte
+			binary.LittleEndian.PutUint32(length[:], uint32(len(payload)))
+			frame.Write(length[:])
+			frame.Write(payload)
+			if _, err := ReadMsg(&frame); err == nil {
+				t.Fatalf("ReadMsg accepted %s", payload)
+			}
+		})
+	}
 }
 
 func TestNodeLinkCodecRoundTrip(t *testing.T) {
@@ -81,19 +105,23 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	// Sandbox routes project the complete trusted credential view used by proxy and
 	// registry subscribers; the manifest encryption root and exec credentials are
 	// deliberately absent.
+	zero, two := uint32(0), uint32(2)
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
 		SandboxID: "s1", State: StateRunning,
 		FloatingIP: "100.100.96.5", StableID: "stable-s1",
 		APISecret: strings.Repeat("1", 64), APISecretFingerprint: strings.Repeat("2", 64),
 		ManifestKeyFingerprint: strings.Repeat("3", 64), ServiceSecret: strings.Repeat("4", 64),
 		EnvdAccessToken: "envd", TrafficAccessToken: "traffic", ForwardAccessToken: "forward",
+		MaxInflightPatch: &sandboxcfg.MaxInflightPatch{Forward: &zero, Exec: &two},
 	}})
 	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning ||
 		r.Route.StableID != "stable-s1" || r.Route.APISecret != strings.Repeat("1", 64) ||
 		r.Route.APISecretFingerprint != strings.Repeat("2", 64) ||
 		r.Route.ManifestKeyFingerprint != strings.Repeat("3", 64) ||
 		r.Route.ServiceSecret != strings.Repeat("4", 64) || r.Route.EnvdAccessToken != "envd" ||
-		r.Route.TrafficAccessToken != "traffic" || r.Route.ForwardAccessToken != "forward" {
+		r.Route.TrafficAccessToken != "traffic" || r.Route.ForwardAccessToken != "forward" ||
+		r.Route.MaxInflightPatch == nil || r.Route.MaxInflightPatch.Forward == nil || *r.Route.MaxInflightPatch.Forward != 0 ||
+		r.Route.MaxInflightPatch.Exec == nil || *r.Route.MaxInflightPatch.Exec != 2 {
 		t.Fatalf("sandbox route round-trip: %+v", r.Route)
 	}
 	wire, err := json.Marshal(r.Route)

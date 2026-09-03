@@ -219,6 +219,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
+	config, err = sandboxcfg.NormalizeTrafficMetadata(config)
+	if err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
+	}
 	meta, builderOpts, err := buildcfg.Extract(config)
 	if err != nil {
 		return fmt.Errorf("%w: build_register builder config: %v", api.ErrBadRequest, err)
@@ -255,7 +259,11 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return fmt.Errorf("%w: build_register MMDS config: %v", api.ErrBadRequest, err)
 	}
-	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
+	spec, err := sandboxcfg.ParseSpec(meta)
+	if err != nil {
+		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
 		return fmt.Errorf("%w: build_register sandbox config: %v", api.ErrBadRequest, err)
 	}
 	phaseResourcePatch := meta[sandboxcfg.NsResource]
@@ -798,6 +806,10 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
+	config, err = sandboxcfg.NormalizeTrafficMetadata(config)
+	if err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+	}
 	credentials, config, err := sandboxcfg.ExtractCredentials(config)
 	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
@@ -808,8 +820,12 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
 	}
-	if _, err := sandboxcfg.ParseSpec(config); err != nil {
+	spec, err := sandboxcfg.ParseSpec(config)
+	if err != nil {
 		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
+	}
+	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
+		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
 	}
 	cmd.Config = config
 	return pair, tmpl, credentials, nil
@@ -874,6 +890,10 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
 		}
+		metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
 		credentials, metadata, err = sandboxcfg.ExtractCredentials(metadata)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
@@ -884,7 +904,11 @@ func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.C
 		if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
 			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
 		}
-		if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
+		spec, err := sandboxcfg.ParseSpec(metadata)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
+		}
+		if err := sandboxcfg.ValidateTrafficForProfile(tmpl.Profile, spec.Traffic); err != nil {
 			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
 		}
 		timeoutSeconds = candidate.TimeoutSeconds

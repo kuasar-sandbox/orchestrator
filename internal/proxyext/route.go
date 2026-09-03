@@ -8,12 +8,14 @@ import (
 	"sync/atomic"
 
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
+	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 type routeRecord struct {
-	view proxyextension.RouteView
-	seen uint64
+	view        proxyextension.RouteView
+	maxInflight config.MaxInflight
+	seen        uint64
 }
 
 type changeKind uint8
@@ -54,16 +56,21 @@ func newRouteSource(capacity int) *routeSource {
 }
 
 func (s *routeSource) Get(ctx context.Context, sandboxID string) (proxyextension.RouteView, bool, error) {
+	view, _, found, err := s.getTrafficRoute(ctx, sandboxID)
+	return view, found, err
+}
+
+func (s *routeSource) getTrafficRoute(ctx context.Context, sandboxID string) (proxyextension.RouteView, config.MaxInflight, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return proxyextension.RouteView{}, false, err
+		return proxyextension.RouteView{}, config.MaxInflight{}, false, err
 	}
 	s.mu.RLock()
 	record, found := s.routes[sandboxID]
 	s.mu.RUnlock()
 	if !found {
-		return proxyextension.RouteView{}, false, nil
+		return proxyextension.RouteView{}, config.MaxInflight{}, false, nil
 	}
-	return cloneRouteView(record.view), true, nil
+	return cloneRouteView(record.view), record.maxInflight, true, nil
 }
 
 func (s *routeSource) SyncState() proxyextension.RouteSyncState {
@@ -224,7 +231,9 @@ func (s *routeSource) beginSync() {
 func (s *routeSource) upsert(route routesync.RouteEntry, revision uint64) {
 	view := projectRoute(route, revision)
 	s.mu.Lock()
-	s.routes[route.SandboxID] = routeRecord{view: view, seen: s.syncGeneration}
+	s.routes[route.SandboxID] = routeRecord{
+		view: view, maxInflight: route.EffectiveMaxInflight, seen: s.syncGeneration,
+	}
 	s.mu.Unlock()
 	s.hub.publish(routeChange{kind: changeUpsert, sandboxID: route.SandboxID, view: view})
 }

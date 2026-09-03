@@ -111,6 +111,33 @@ func TestMergeConfigUsesResourceLeavesAndDoesNotHideInvalidGroup(t *testing.T) {
 	}
 }
 
+func TestGroupTrafficConfigCanonicalizesAndMergesLeaves(t *testing.T) {
+	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
+		Group:       "/g",
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Config: map[string]string{
+			sandboxcfg.NsTraffic: ` { "max_inflight" : { "total" : 20, "forward" : 8 } } `,
+		},
+	})
+	group, found, err := src.Get(context.Background(), "/g")
+	if err != nil || !found {
+		t.Fatalf("Get found=%v err=%v", found, err)
+	}
+	if got, want := group.Config[sandboxcfg.NsTraffic], `{"max_inflight":{"total":20,"forward":8}}`; got != want {
+		t.Fatalf("canonical traffic = %q, want %q", got, want)
+	}
+
+	got, err := mergeConfig(group.Config, map[string]string{
+		sandboxcfg.NsTraffic: `{"max_inflight":{"forward":0,"exec":2}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"max_inflight":{"total":20,"forward":0,"exec":2}}`; got[sandboxcfg.NsTraffic] != want {
+		t.Fatalf("merged traffic = %q, want %q", got[sandboxcfg.NsTraffic], want)
+	}
+}
+
 func TestAnswerMarksCrossLayerResourceConflictAsInvalidConfig(t *testing.T) {
 	svc := testServiceWithGroups(t, clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},

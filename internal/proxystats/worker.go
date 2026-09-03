@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 )
 
 const trafficShardCount = 32
@@ -72,15 +73,21 @@ type WorkerStats struct {
 	removed          map[string]uint64
 	removeRevision   uint64
 	notify           chan struct{}
+	admission        *proxyadmission.Worker
 }
 
 func NewWorkerStats() *WorkerStats {
+	return NewWorkerStatsWithAdmission(nil)
+}
+
+func NewWorkerStatsWithAdmission(admission *proxyadmission.Worker) *WorkerStats {
 	w := &WorkerStats{
 		now:          currentTimePoint,
 		counters:     make(map[string]uint64),
 		dirtyTraffic: make(map[string]trafficVersion),
 		removed:      make(map[string]uint64),
 		notify:       make(chan struct{}, 1),
+		admission:    admission,
 	}
 	for i := range w.shards {
 		w.shards[i].entries = make(map[string]*trafficEntry)
@@ -111,6 +118,29 @@ func (w *WorkerStats) BeginParking(sandboxID string, service proxy.ConnectServic
 		return inertFlow{}
 	}
 	entry := w.lockEntry(sandboxID, true)
+	return w.beginParkingLocked(sandboxID, serviceName, entry, nil)
+}
+
+// TryBeginParking combines the shared admission lease and the existing
+// parking/egress stats lifecycle under the same per-Sandbox local mutex.
+func (w *WorkerStats) TryBeginParking(sandboxID string, service proxy.ConnectService, binding proxyadmission.Binding) (proxy.TrafficFlow, error) {
+	if binding.Unlimited() {
+		return w.BeginParking(sandboxID, service), nil
+	}
+	serviceName := string(service)
+	if w == nil || w.admission == nil || !validSandboxID(sandboxID) || !validService(serviceName) {
+		return nil, proxyadmission.ErrStaleBinding
+	}
+	entry := w.lockEntry(sandboxID, true)
+	lease, err := w.admission.TryAcquire(binding, admissionService(service))
+	if err != nil {
+		entry.mu.Unlock()
+		return nil, err
+	}
+	return w.beginParkingLocked(sandboxID, serviceName, entry, lease), nil
+}
+
+func (w *WorkerStats) beginParkingLocked(sandboxID, serviceName string, entry *trafficEntry, lease *proxyadmission.Lease) proxy.TrafficFlow {
 	state := entry.services[serviceName]
 	state.parking++
 	state.idle = timePoint{}
@@ -120,7 +150,22 @@ func (w *WorkerStats) BeginParking(sandboxID string, service proxy.ConnectServic
 	version := trafficVersion{generation: entry.generation, revision: entry.revision}
 	entry.mu.Unlock()
 	w.markTraffic(sandboxID, version)
-	return &trafficFlow{worker: w, sandboxID: sandboxID, service: serviceName, entry: entry, stage: flowParking}
+	return &trafficFlow{worker: w, sandboxID: sandboxID, service: serviceName, entry: entry, stage: flowParking, admission: lease}
+}
+
+func admissionService(service proxy.ConnectService) proxyadmission.Service {
+	switch service {
+	case proxy.ConnectServiceForward:
+		return proxyadmission.ServiceForward
+	case proxy.ConnectServiceE2BEnvd:
+		return proxyadmission.ServiceE2BEnvd
+	case proxy.ConnectServiceE2BInterpreter:
+		return proxyadmission.ServiceE2BCodeInterpreter
+	case proxy.ConnectServiceExec:
+		return proxyadmission.ServiceExec
+	default:
+		return proxyadmission.ServiceForward
+	}
 }
 
 func (w *WorkerStats) lockEntry(sandboxID string, create bool) *trafficEntry {
@@ -194,6 +239,7 @@ type trafficFlow struct {
 	service   string
 	entry     *trafficEntry
 	stage     flowStage
+	admission *proxyadmission.Lease
 }
 
 func (f *trafficFlow) AttachBackend(conn net.Conn) net.Conn {
@@ -240,6 +286,9 @@ func (f *trafficFlow) Close() {
 		state.idle = f.worker.now()
 	}
 	f.entry.services[f.service] = state
+	if f.admission != nil {
+		f.admission.Release()
+	}
 	f.entry.revision++
 	f.entry.lastChanged = f.worker.now()
 	version := trafficVersion{generation: f.entry.generation, revision: f.entry.revision}
@@ -264,6 +313,9 @@ func (f *trafficFlow) finishEgress() {
 		state.idle = f.worker.now()
 	}
 	f.entry.services[f.service] = state
+	if f.admission != nil {
+		f.admission.Release()
+	}
 	f.entry.revision++
 	f.entry.lastChanged = f.worker.now()
 	version := trafficVersion{generation: f.entry.generation, revision: f.entry.revision}

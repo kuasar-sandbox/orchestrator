@@ -1,6 +1,8 @@
 package proxyext
 
 import (
+	"fmt"
+
 	proxyextension "github.com/kuasar-sandbox/orchestrator/app/proxy/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -46,8 +48,11 @@ func (s *ObservingSink) ApplyUpsert(route routesync.RouteEntry) error {
 	if err := s.core.ApplyUpsert(route); err != nil {
 		return err
 	}
-	_, _, revision := s.table.LookupRevision(route.SandboxID)
-	s.routes.upsert(route, revision)
+	applied, found, revision := s.table.LookupRevision(route.SandboxID)
+	if !found {
+		return fmt.Errorf("proxy extension: applied route %q missing from core table", route.SandboxID)
+	}
+	s.routes.upsert(applied, revision)
 	return nil
 }
 

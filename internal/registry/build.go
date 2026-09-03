@@ -71,6 +71,19 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
 	}
+	metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, err)
+	}
+	if raw, present := metadata[sandboxcfg.NsTraffic]; present {
+		patch, parseErr := sandboxcfg.ParseTrafficPatch(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, parseErr)
+		}
+		if validateErr := sandboxcfg.ValidateTrafficForProfile(req.Profile, patch); validateErr != nil {
+			return nil, fmt.Errorf("%w: %v", errInvalidSandboxConfig, validateErr)
+		}
+	}
 	metadata, err = clusterstate.WithObjectLocation(metadata, clusterstate.ObjectLocation{Group: req.Group})
 	if err != nil {
 		return nil, err

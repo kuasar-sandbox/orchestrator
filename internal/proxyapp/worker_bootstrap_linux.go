@@ -25,9 +25,9 @@ import (
 const (
 	workerBootstrapEnvironment = "KUASAR_INTERNAL_PROXY_WORKER_BOOTSTRAP_FD"
 	workerBootstrapMagic       = "kuasar-proxy-worker-bootstrap"
-	workerBootstrapVersion     = 1
-	workerConfigSchemaVersion  = 1
-	workerFDProtocolVersion    = 1
+	workerBootstrapVersion     = 2
+	workerConfigSchemaVersion  = 2
+	workerFDProtocolVersion    = 2
 	maxWorkerBootstrapBytes    = maxEffectiveConfigBytes + 64<<10
 )
 
@@ -40,12 +40,13 @@ const (
 type Process = proxyextension.Process
 
 type workerFDMapping struct {
-	Data    int `json:"data"`
-	MMDS    int `json:"mmds"`
-	Wake    int `json:"wake"`
-	Notify  int `json:"notify"`
-	Stats   int `json:"stats"`
-	MMDSRPC int `json:"mmdsRPC"`
+	Data      int `json:"data"`
+	MMDS      int `json:"mmds"`
+	Wake      int `json:"wake"`
+	Notify    int `json:"notify"`
+	Stats     int `json:"stats"`
+	MMDSRPC   int `json:"mmdsRPC"`
+	Admission int `json:"admission"`
 }
 
 type workerEnvelope struct {
@@ -54,6 +55,7 @@ type workerEnvelope struct {
 	Role                proxyextension.Role              `json:"role"`
 	WorkerID            string                           `json:"workerID"`
 	WorkerEpoch         uint64                           `json:"workerEpoch"`
+	WorkerIndex         int                              `json:"workerIndex"`
 	ConfigSchemaVersion int                              `json:"configSchemaVersion"`
 	FDProtocolVersion   int                              `json:"fdProtocolVersion"`
 	ExecutableIdentity  componentexec.ExecutableIdentity `json:"executableIdentity"`
@@ -68,6 +70,7 @@ type WorkerBootstrap struct {
 	effective          *EffectiveConfig
 	executableIdentity componentexec.ExecutableIdentity
 	fds                workerFDMapping
+	workerIndex        int
 	fdsTaken           atomic.Bool
 }
 
@@ -135,12 +138,15 @@ func ClearWorkerEnvironment() {
 	}
 }
 
-func newWorkerBootstrapFile(workerID string, epoch uint64, effective *EffectiveConfig, fds workerFDMapping) (*os.File, error) {
+func newWorkerBootstrapFile(workerIndex int, workerID string, epoch uint64, effective *EffectiveConfig, fds workerFDMapping) (*os.File, error) {
 	if effective == nil || effective.config == nil || len(effective.raw) == 0 {
 		return nil, fmt.Errorf("proxy worker bootstrap: effective config is required")
 	}
 	if err := validateWorkerIdentity(workerID, epoch); err != nil {
 		return nil, err
+	}
+	if workerIndex < 0 || workerIndex >= effective.config.Workers {
+		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
 	}
 	if err := validateWorkerFDMapping(fds, -1); err != nil {
 		return nil, err
@@ -152,6 +158,7 @@ func newWorkerBootstrapFile(workerID string, epoch uint64, effective *EffectiveC
 	raw, err := json.Marshal(workerEnvelope{
 		Magic: workerBootstrapMagic, ProtocolVersion: workerBootstrapVersion,
 		Role: RoleWorker, WorkerID: workerID, WorkerEpoch: epoch,
+		WorkerIndex:         workerIndex,
 		ConfigSchemaVersion: workerConfigSchemaVersion, FDProtocolVersion: workerFDProtocolVersion,
 		ExecutableIdentity: executableIdentity,
 		Config:             append(json.RawMessage(nil), effective.raw...), ConfigDigest: hex.EncodeToString(effective.digest[:]),
@@ -227,6 +234,9 @@ func ReceiveWorkerBootstrap() (*WorkerBootstrap, error) {
 	if err := validateWorkerIdentity(encoded.WorkerID, encoded.WorkerEpoch); err != nil {
 		return nil, err
 	}
+	if encoded.WorkerIndex < 0 {
+		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
+	}
 	if encoded.ExecutableIdentity.Inode == 0 {
 		return nil, fmt.Errorf("proxy worker bootstrap: invalid executable identity")
 	}
@@ -246,9 +256,12 @@ func ReceiveWorkerBootstrap() (*WorkerBootstrap, error) {
 	if err != nil {
 		return nil, err
 	}
+	if encoded.WorkerIndex >= effective.config.Workers {
+		return nil, fmt.Errorf("proxy worker bootstrap: invalid worker index")
+	}
 	return &WorkerBootstrap{
 		process:   Process{Role: RoleWorker, WorkerID: encoded.WorkerID, WorkerEpoch: encoded.WorkerEpoch},
-		effective: effective, executableIdentity: encoded.ExecutableIdentity, fds: encoded.FDs,
+		effective: effective, executableIdentity: encoded.ExecutableIdentity, fds: encoded.FDs, workerIndex: encoded.WorkerIndex,
 	}, nil
 }
 
@@ -263,7 +276,7 @@ func validateWorkerIdentity(workerID string, epoch uint64) error {
 }
 
 func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
-	seen := make(map[int]string, 6)
+	seen := make(map[int]string, 7)
 	for _, field := range []struct {
 		name     string
 		fd       int
@@ -275,6 +288,7 @@ func validateWorkerFDMapping(fds workerFDMapping, bootstrapFD int) error {
 		{name: "notify", fd: fds.Notify},
 		{name: "stats", fd: fds.Stats},
 		{name: "mmdsRPC", fd: fds.MMDSRPC},
+		{name: "admission", fd: fds.Admission},
 	} {
 		if field.optional && field.fd == -1 {
 			continue

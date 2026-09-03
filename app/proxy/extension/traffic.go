@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/config"
 )
 
 var (
@@ -35,9 +37,13 @@ type TrafficView struct {
 	RunID     string
 	Profile   Profile
 	State     RouteState
-	Inflight  TrafficInflight
-	IdleSince *time.Time
-	Services  map[string]ServiceTrafficView
+	// MaxInflight is the effective policy applied by this Proxy master. Zero
+	// leaves mean unlimited and omitted Sandbox metadata has already been
+	// merged with this target node's Proxy defaults.
+	MaxInflight config.MaxInflight
+	Inflight    TrafficInflight
+	IdleSince   *time.Time
+	Services    map[string]ServiceTrafficView
 }
 
 // TrafficSource provides point-in-time traffic observations from the proxy

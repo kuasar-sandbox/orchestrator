@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyext"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
@@ -30,6 +31,7 @@ type PreparedWorker struct {
 	effective *EffectiveConfig
 	process   Process
 	table     *proxyshm.Table
+	admission *proxyadmission.Worker
 
 	wakeFile    *os.File
 	notifyFile  *os.File
@@ -38,8 +40,13 @@ type PreparedWorker struct {
 	data        net.Listener
 	mmds        net.Listener
 	run         atomic.Bool
-	closeOnce   sync.Once
-	closeErr    error
+	// admissionEscaped is set before the admission-backed handler is exposed to
+	// an extension or listener. HTTP/1 hijacked handlers are not awaited by
+	// http.Server.Shutdown, so their mapping must remain valid until process
+	// exit even after Run returns and Close releases the other worker resources.
+	admissionEscaped atomic.Bool
+	closeOnce        sync.Once
+	closeErr         error
 }
 
 // PrepareWorker reconstructs the shared table, inherited listeners, pipes, and
@@ -66,6 +73,18 @@ func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr err
 			_ = prepared.Close()
 		}
 	}()
+	admissionFile, returnErr := inheritedFile(fds.Admission, "proxy-admission")
+	if returnErr != nil {
+		return nil, returnErr
+	}
+	delete(owned, fds.Admission)
+	prepared.admission, returnErr = proxyadmission.OpenWorker(
+		admissionFile, bootstrap.effective.config.RouteCapacity, bootstrap.effective.config.Workers,
+		bootstrap.workerIndex, bootstrap.process.WorkerEpoch,
+	)
+	if returnErr != nil {
+		return nil, fmt.Errorf("proxy worker: open shared admission arena: %w", returnErr)
+	}
 
 	prepared.wakeFile, returnErr = inheritedFile(fds.Wake, "proxy-wake")
 	if returnErr != nil {
@@ -148,7 +167,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	}
 	defer mmdsClient.Close()
 
-	view := proxyshm.NewMMDSWorkerView(worker.table, updates, wakes.Wake, cfg.ParkTimeoutDur(), mmdsClient)
+	view := proxyshm.NewMMDSWorkerView(worker.table, worker.admission, updates, wakes.Wake, cfg.ParkTimeoutDur(), mmdsClient)
 	authMode := func() string {
 		if mode := view.Policy().AuthMode; mode != "" {
 			return mode
@@ -158,7 +177,7 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
-	workerStats := proxystats.NewWorkerStats()
+	workerStats := proxystats.NewWorkerStatsWithAdmission(worker.admission)
 	var proxyHandler *proxy.Proxy
 	var extensionHost proxyextension.WorkerHost
 	if runtime.WorkerExtension != nil {
@@ -181,6 +200,11 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 			view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
 		).WithTrafficTracker(workerStats)
 	}
+	// A CONNECT handler may outlive appnet.Serve because HTTP/1 hijacked
+	// connections are outside http.Server.Shutdown's wait set. Keep the mmap
+	// process-owned from this point; the kernel tears it down after every
+	// handler has necessarily stopped at process exit.
+	worker.admissionEscaped.Store(true)
 	var ingressHandler http.Handler = proxyHandler
 	if runtime.WorkerExtension != nil {
 		ingressHandler, err = startWorkerIngress(
@@ -242,10 +266,18 @@ func (worker *PreparedWorker) Close() error {
 		return nil
 	}
 	worker.closeOnce.Do(func() {
+		admission := worker.admission
+		if worker.admissionEscaped.Load() {
+			// Do not Munmap while an HTTP/1 hijacked handler can still execute
+			// Worker.Valid or Lease.Release. This is a worker subprocess; process
+			// exit is the safe and deterministic reclamation boundary.
+			admission = nil
+		}
 		worker.closeErr = errors.Join(
 			closeFile(worker.wakeFile), closeFile(worker.notifyFile), closeConn(worker.statsConn),
 			closeConn(worker.mmdsRPCConn), closeListener(worker.data),
 			closeListener(worker.mmds), closeTable(worker.table),
+			closeAdmission(admission),
 		)
 	})
 	return worker.closeErr
@@ -307,13 +339,20 @@ func connectionFromFD(fd int, name string) (net.Conn, error) {
 }
 
 func workerDescriptors(fds workerFDMapping) map[int]struct{} {
-	result := make(map[int]struct{}, 6)
-	for _, fd := range []int{fds.Data, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC} {
+	result := make(map[int]struct{}, 7)
+	for _, fd := range []int{fds.Data, fds.MMDS, fds.Wake, fds.Notify, fds.Stats, fds.MMDSRPC, fds.Admission} {
 		if fd >= 0 {
 			result[fd] = struct{}{}
 		}
 	}
 	return result
+}
+
+func closeAdmission(admission *proxyadmission.Worker) error {
+	if admission == nil {
+		return nil
+	}
+	return admission.Close()
 }
 
 func closeDescriptors(descriptors map[int]struct{}) {

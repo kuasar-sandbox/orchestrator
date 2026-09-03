@@ -45,6 +45,23 @@ func TestProxyConfigTemplateDocumentsCustomExecutable(t *testing.T) {
 	if !strings.Contains(proxyConfigSkeleton, "proxy_executable: /opt/kuasar/bin/xproxy") {
 		t.Fatal("proxy template does not document paths.proxy_executable")
 	}
+	for _, want := range []string{
+		"traffic:", "max_inflight:", "total: 128", "forward: 96",
+		`"e2b:envd": 16`, `"e2b:code-interpreter": 8`, "exec: 8", "0 = unlimited",
+	} {
+		if !strings.Contains(proxyConfigSkeleton, want) {
+			t.Errorf("proxy template does not document %q", want)
+		}
+	}
+	var cfg config.Proxy
+	if err := yaml.Unmarshal([]byte(proxyConfigSkeleton), &cfg); err != nil {
+		t.Fatalf("proxy template does not decode: %v", err)
+	}
+	if cfg.Traffic.MaxInflight != (config.MaxInflight{
+		Total: 128, Forward: 96, E2BEnvd: 16, E2BCodeInterpreter: 8, Exec: 8,
+	}) {
+		t.Fatalf("proxy template max_inflight=%+v", cfg.Traffic.MaxInflight)
+	}
 }
 
 func TestConfigTemplatesDescribeSplitEndpointsAndSingleProxyIngress(t *testing.T) {
