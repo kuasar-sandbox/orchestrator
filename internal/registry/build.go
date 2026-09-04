@@ -523,6 +523,27 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 	}
 }
 
+// updateBuildProjection merges a node event into a fresh record revision so it
+// cannot erase registration fields committed concurrently by the command ACK.
+func (r *Registry) updateBuildProjection(ctx context.Context, group, buildID, nodeID string, update func(*BuildRecord)) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		rec, revision, found, err := r.stores.getRouteBuildShard(ctx, group, buildID)
+		if err != nil {
+			return err
+		}
+		if !found || (rec.NodeID != "" && nodeID != "" && rec.NodeID != nodeID) {
+			return nil
+		}
+		update(rec)
+		if _, ok, err := r.stores.casRouteBuildShard(ctx, rec, revision); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("build %s projection update conflicted", buildID)
+}
+
 // applyBuildUpsert converges the Registry's rebuildable routing/query projection
 // from one retained node Build. Admission usage remains node-owned and comes
 // from the node's durable heartbeat.
@@ -542,38 +563,32 @@ func (r *Registry) applyBuildUpsert(ctx context.Context, nodeID string, e *route
 	if !found {
 		return nil
 	}
-	rec, found, err := r.stores.GetBuildInGroup(ctx, ref.Group, e.BuildID)
-	if err != nil {
-		return fmt.Errorf("read build record: %w", err)
+	state := BuildState(e.State)
+	update := func(writeCtx context.Context) error {
+		return r.updateBuildProjection(writeCtx, ref.Group, e.BuildID, nodeID, func(rec *BuildRecord) {
+			rec.State = state
+			// A state event can outrun or survive loss of the synchronous registration
+			// ACK. Keep the exact replay envelope until that ACK's accepted target is
+			// durably recorded; markBuildRegistrationAccepted clears it atomically.
+			if rec.RegistrationTargetSet {
+				rec.RegistrationImageRepo = ""
+				rec.RegistrationRegistryAuth = ""
+			}
+			if e.TemplateID != "" {
+				rec.TemplateID = e.TemplateID
+			}
+			rec.Reason = e.Reason
+		})
 	}
-	if !found {
-		return nil
-	}
-	if rec.NodeID != "" && nodeID != "" && rec.NodeID != nodeID {
-		return nil
-	}
-	rec.State = BuildState(e.State)
-	// A state event can outrun or survive loss of the synchronous registration
-	// ACK. Keep the exact replay envelope until that ACK's accepted target is
-	// durably recorded; markBuildRegistrationAccepted clears it atomically.
-	if rec.RegistrationTargetSet {
-		rec.RegistrationImageRepo = ""
-		rec.RegistrationRegistryAuth = ""
-	}
-	if e.TemplateID != "" {
-		rec.TemplateID = e.TemplateID
-	}
-	rec.Reason = e.Reason
-	terminal := !rec.occupies()
-	put := func(writeCtx context.Context) error { return r.stores.PutBuild(writeCtx, rec) }
+	terminal := state == BuildReady || state == BuildError
 	var writeErr error
 	if terminal {
-		writeErr = retryTerminalBuildStore(ctx, put)
+		writeErr = retryTerminalBuildStore(ctx, update)
 	} else {
-		writeErr = put(ctx)
+		writeErr = update(ctx)
 	}
 	if writeErr != nil {
-		return fmt.Errorf("persist build %s state %s: %w", rec.BuildID, rec.State, writeErr)
+		return fmt.Errorf("persist build %s state %s: %w", e.BuildID, state, writeErr)
 	}
 	return nil
 }

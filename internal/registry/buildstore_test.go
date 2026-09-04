@@ -491,6 +491,52 @@ func TestDeadBuildCASDoesNotOverwriteReplacement(t *testing.T) {
 	}
 }
 
+func TestBuildProjectionCASPreservesConcurrentRegistrationAcceptance(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const (
+		group   = "/g"
+		buildID = "concurrent-acceptance"
+		nodeID  = "n1"
+	)
+	if err := reg.stores.PutBuild(ctx, &BuildRecord{
+		Group: group, BuildID: buildID, NodeID: nodeID, State: BuildStarting,
+		RegistrationImageRepo: "registry.example/image", RegistrationRegistryAuth: "secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := &types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
+	firstUpdate := true
+	var acceptErr error
+	err := reg.updateBuildProjection(ctx, group, buildID, nodeID, func(rec *BuildRecord) {
+		// Force registration acceptance after this update has read its revision.
+		// The first CAS must lose, re-read the accepted record, and merge the
+		// projection without erasing its target.
+		if firstUpdate {
+			firstUpdate = false
+			_, acceptErr = reg.markBuildRegistrationAccepted(ctx, group, buildID, nodeID, want)
+		}
+		rec.State = BuildBuilding
+	})
+	if acceptErr != nil {
+		t.Fatalf("mark registration accepted: %v", acceptErr)
+	}
+	if err != nil {
+		t.Fatalf("update build projection: %v", err)
+	}
+	got, found, err := reg.stores.GetBuildInGroup(ctx, group, buildID)
+	if err != nil || !found {
+		t.Fatalf("build found=%v err=%v", found, err)
+	}
+	if got.State != BuildBuilding || !got.RegistrationTargetSet || got.RegistrationTarget == nil || *got.RegistrationTarget != *want {
+		t.Fatalf("merged build = %+v, want building with target %+v", got, want)
+	}
+	if got.RegistrationImageRepo != "" || got.RegistrationRegistryAuth != "" {
+		t.Fatalf("accepted build retained transient registration credentials: %+v", got)
+	}
+}
+
 func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
