@@ -26,6 +26,29 @@ type prepareWaitResult struct {
 	err     error
 }
 
+// awaitArtifactReadinessResult preserves a completed readiness failure over
+// the launch cancellation that failure triggers. The readiness worker publishes
+// its result before canceling launchCtx, so a context wake-up can safely check
+// the buffered result before falling back to the context error.
+func awaitArtifactReadinessResult(ctx context.Context, result <-chan error) error {
+	select {
+	case err := <-result:
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	case <-ctx.Done():
+		select {
+		case err := <-result:
+			if err != nil {
+				return err
+			}
+		default:
+		}
+		return ctx.Err()
+	}
+}
+
 // launchArtifactSandbox owns the host half of the exact-run two-stage protocol.
 // The conductor consumes only the task's non-secret summary; it never opens or
 // parses a tenant Artifact.
@@ -117,6 +140,8 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	readinessResult := make(chan error, 1)
 	go func() {
 		readyErr := waitRuntimeReadiness(launchCtx, readyListener)
+		// Publication must precede cancellation; awaitArtifactReadinessResult
+		// relies on this boundary to preserve the concrete readiness failure.
 		readinessResult <- readyErr
 		if readyErr != nil {
 			cancelLaunch()
@@ -132,6 +157,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	select {
 	case result := <-prepareResult:
 		if result.err != nil {
+			if ctxErr := launchCtx.Err(); ctxErr != nil && errors.Is(result.err, ctxErr) {
+				result.err = awaitArtifactReadinessResult(launchCtx, readinessResult)
+			}
 			return launchFailed("artifact_prepare", result.err)
 		}
 		summary = result.summary
@@ -141,7 +169,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		}
 		return launchFailed("artifact_prepare", readyErr)
 	case <-launchCtx.Done():
-		return launchFailed("artifact_prepare", launchCtx.Err())
+		return launchFailed("artifact_prepare", awaitArtifactReadinessResult(launchCtx, readinessResult))
 	}
 
 	artifactCapacity, inheritedNetwork, err := validateArtifactPrepareSummary(summary, sb.LaunchMode)
@@ -223,11 +251,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
 
 	runtimeStarted := time.Now()
-	select {
-	case err = <-readinessResult:
-	case <-launchCtx.Done():
-		err = launchCtx.Err()
-	}
+	err = awaitArtifactReadinessResult(launchCtx, readinessResult)
 	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
