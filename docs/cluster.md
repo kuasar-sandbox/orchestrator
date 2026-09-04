@@ -1083,8 +1083,8 @@ node BuildDelete removes projection/ref
 control HTTP 只缓存并拨该地址.结果不保留旧 `DataEndpoint` alias,BuildRecord 也不复制 endpoint.
 
 北向 `/v3/templates` 将省略的 profile 按 e2b 端点语义解析为 `e2b`;进入集群内部后 profile 必须
-显式存在。`X-Kuasar-Sandbox-Builder.target` 是 register-only immutable 定义：Image、offline
-Sandbox、memory Sandbox 三种 target 均随 canonical builder JSON、Registry replay identity、
+显式存在。`X-Kuasar-Sandbox-Builder.target` 是 register-only immutable 定义：Image、top-level
+Sandbox E、memory Sandbox 三种 target 均随 canonical builder JSON、Registry replay identity、
 `build_register` 和节点 Build row 传递；省略时只由 worker 根据最终 effective start/ready 自动解析。
 route owner 将 profile、target/config identity 与 placement 返回的 `APISecretFingerprint` 持久化进
 BuildRecord,并随 `build_register` 下发,节点按该完整指纹从同一凭据对写入本地 build,同时将
@@ -1094,7 +1094,7 @@ profile 写入 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bar
 Build Register 与普通 Create 共用 resource/network/launch/init/mounts/files/metadata 的 strict
 header/metadata 归一化，也传递 `envVars`。Registry 的 replicated BuildRecord 保存非秘密 config/env/
 secure 和 credentials/MMDS values 的不可逆 digest；原始 credentials 与 MMDS initial values 只存在于
-本次 dispatch envelope，节点验证后分别加密进 task-local Build 状态。显式 Image/offline Sandbox
+本次 dispatch envelope，节点验证后分别加密进 task-local Build 状态。显式 Image/顶层 Sandbox E
 对 instance-only 输入的拒绝、restore 的无条件拒绝、target 与输出 ref 的一致性由 Router、Registry、
 节点和 worker 各自 fail closed，不能靠某一跳的过滤作为信任边界。
 

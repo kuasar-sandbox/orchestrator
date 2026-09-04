@@ -1056,7 +1056,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (result
 	if err != nil {
 		return nil, buildFailed("resource_resolve", err)
 	}
-	if direct, handled, err := directImageBuildResult(b); handled {
+	if direct, handled, err := directImageBuildResult(b, o.cfg.Checkpoint.Remote.Manifest); handled {
 		if err != nil {
 			return nil, buildFailed("resource_resolve", err)
 		}
@@ -1265,7 +1265,10 @@ func buildUsesSandboxTemplate(b *types.Build) (bool, error) {
 // assigning a runner or attaching a network. An unchanged Image template is
 // already the required top-level artifact; all other sources or targets still
 // use the normal durable worker pipeline.
-func directImageBuildResult(build *types.Build) (*buildResult, bool, error) {
+func directImageBuildResult(build *types.Build, imageBundleLocation bool) (*buildResult, bool, error) {
+	if imageBundleLocation {
+		return nil, false, nil
+	}
 	if build == nil || build.FromImage != "" || build.FromTemplate == "" || len(build.Steps) != 0 {
 		return nil, false, nil
 	}
@@ -1492,8 +1495,8 @@ func buildMayProduceSandbox(build *types.Build, sourceTemplate bool) bool {
 }
 
 // buildMayProduceMemorySandbox is narrower than buildMayProduceSandbox because
-// offline Sandboxes never capture a checkpoint and must not depend on the
-// node's checkpoint backend configuration.
+// top-level Sandbox E builds never capture a checkpoint and must not depend on
+// the node's checkpoint backend configuration.
 func buildMayProduceMemorySandbox(build *types.Build, sourceTemplate bool) bool {
 	if build.Builder.Target != nil {
 		return build.Builder.Target.Kind == types.BuildTargetSandbox && build.Builder.Target.Memory
@@ -1817,6 +1820,7 @@ func (o *Orchestrator) BuildTaskSpecFor(ctx context.Context, buildID, runID stri
 		RootRef:        rootRef, LaunchMode: string(types.LaunchCold), ManifestConfig: manifestConfig,
 		RefLocationParent: o.cfg.Checkpoint.Remote.RefLocationParent,
 		RelativeDir:       checkpointDir, MaxRefs: maxRequiredArtifactRefs, ReadSourceImageConfig: true,
+		PreflightImageBundle:     o.cfg.Checkpoint.Remote.Manifest,
 		AbsoluteDeadlineUnixNano: o.buildExecutionDeadline(b).UnixNano(),
 	}
 	return response, true, nil
@@ -1915,12 +1919,10 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			}
 		}
 	}
-	// The publication name/URI is NOT derived here: the builder mints it
-	// right before the upload starts (see builder.uploadSnapshot), so the
-	// date bucket reflects the actual publication time, not spec-resolution
-	// time — a build that spans UTC midnight publishes into the day it
-	// actually uploads.
-	publishParent := o.cfg.Checkpoint.Remote.RefLocationParent
+	// Publication names/URIs are NOT derived here: the builder mints one for
+	// each actual image-class or checkpoint-class publication, so a build that
+	// crosses UTC midnight may correctly use different date buckets.
+	checkpointParent := o.cfg.Checkpoint.Remote.RefLocationParent
 
 	importReferer, err := o.effectiveImportReferer(b)
 	if err != nil {
@@ -1928,22 +1930,23 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 	}
 
 	spec := &configsock.BuildSpec{
-		BuildID:               b.BuildID,
-		Profile:               string(b.Profile),
-		RunID:                 b.RunID,
-		RunDir:                pend.runDir,
-		BaseDir:               pend.baseDir,
-		FromImage:             b.FromImage,
-		FromTemplateRef:       fromTemplateRef,
-		FromTemplateKind:      fromTemplateKind,
-		RequestedTarget:       cloneBuildTarget(b.Builder.Target),
-		RefLocations:          refLocations,
-		CheckpointMode:        o.cfg.Checkpoint.Mode,
-		PublishLocationParent: publishParent,
-		Steps:                 steps,
-		StartCmd:              b.StartCmd,
-		ReadyCmd:              b.ReadyCmd,
-		Env:                   nil,
+		BuildID:                     b.BuildID,
+		Profile:                     string(b.Profile),
+		RunID:                       b.RunID,
+		RunDir:                      pend.runDir,
+		BaseDir:                     pend.baseDir,
+		FromImage:                   b.FromImage,
+		FromTemplateRef:             fromTemplateRef,
+		FromTemplateKind:            fromTemplateKind,
+		RequestedTarget:             cloneBuildTarget(b.Builder.Target),
+		RefLocations:                refLocations,
+		CheckpointMode:              o.cfg.Checkpoint.Mode,
+		CheckpointRefLocationParent: checkpointParent,
+		CheckpointRemoteManifest:    o.cfg.Checkpoint.Remote.Manifest,
+		Steps:                       steps,
+		StartCmd:                    b.StartCmd,
+		ReadyCmd:                    b.ReadyCmd,
+		Env:                         nil,
 		Paths: configsock.BuildPaths{
 			Kernel:         o.cfg.Sandbox.Boot.Kernel,
 			Runtime:        o.cfg.Sandbox.Boot.Runtime,
@@ -1951,7 +1954,6 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			BuilderDiffTpl: o.cfg.Builder.DiffTemplate,
 			SandboxCtl:     o.executables.SandboxCtl(),
 			FlattenCtl:     o.executables.FlattenCtl(),
-			ManifestCtl:    o.executables.ManifestCtl(),
 			ManifestConfig: o.cfg.ManifestConfig,
 		},
 		Net: configsock.BuildNet{

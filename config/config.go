@@ -813,6 +813,10 @@ type CheckpointConfig struct {
 
 type CheckpointRemoteConfig struct {
 	RefLocationParent string `yaml:"ref_location_parent" json:"ref_location_parent"`
+	// Manifest materializes image-class Build artifacts as single-root Manifest
+	// Bundles in the checkpoint named location. It does not upload them to the
+	// Manifest store and requires RefLocationParent.
+	Manifest bool `yaml:"manifest" json:"manifest"`
 }
 
 // RefLocationURI derives the node-local path for a publication name
@@ -1165,7 +1169,11 @@ func (c *Conductor) validateDeclarative() error {
 	default:
 		return fmt.Errorf("config: checkpoint.mode %q (want local|bundle)", c.Checkpoint.Mode)
 	}
-	if parent := c.Checkpoint.Remote.RefLocationParent; parent != "" {
+	parent := c.Checkpoint.Remote.RefLocationParent
+	if c.Checkpoint.Remote.Manifest && parent == "" {
+		return fmt.Errorf("config: checkpoint.remote.manifest=true requires checkpoint.remote.ref_location_parent")
+	}
+	if parent != "" {
 		if _, err := parseAbsoluteFileURI(parent); err != nil {
 			return fmt.Errorf("config: checkpoint.remote.ref_location_parent: %w", err)
 		}

@@ -159,6 +159,49 @@ func TestPrepareLocatedRootBuildsPathMappingBeforeRead(t *testing.T) {
 	}
 }
 
+func TestPrepareImageBundlePreflightRunsBeforeSourceScan(t *testing.T) {
+	missingRoot := filepath.Join(t.TempDir(), "missing.sandbox")
+	base := configsock.ArtifactPrepareSpec{
+		RootSourceKind:       string(types.ResumeSourceSandbox),
+		RootRef:              missingRoot,
+		LaunchMode:           string(types.LaunchCold),
+		RelativeDir:          t.TempDir(),
+		MaxRefs:              4,
+		RefLocationParent:    "file://" + filepath.Join(t.TempDir(), "locations"),
+		PreflightImageBundle: true,
+	}
+	if _, err := Prepare(context.Background(), base); err == nil ||
+		!strings.Contains(err.Error(), "preflight requires manifest_config") ||
+		strings.Contains(err.Error(), "missing.sandbox") {
+		t.Fatalf("missing manifest preflight error = %v", err)
+	}
+
+	configBody, err := yaml.Marshal(&manifest.Config{
+		Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4KiB"}},
+		Crypto:  manifestcrypto.Config{Chunk: "aes", Manifest: "aes", Local: manifestcrypto.LocalOff},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "manifest.yaml")
+	if err := os.WriteFile(configPath, configBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base.ManifestConfig = configPath
+	t.Setenv(manifest.CustomerKeyEnv, "not-a-customer-key")
+	if _, err := Prepare(context.Background(), base); err == nil ||
+		!strings.Contains(err.Error(), "customer key") ||
+		strings.Contains(err.Error(), "missing.sandbox") {
+		t.Fatalf("invalid key preflight error = %v", err)
+	}
+
+	t.Setenv(manifest.CustomerKeyEnv, strings.Repeat("a", 64))
+	if _, err := Prepare(context.Background(), base); err == nil ||
+		!strings.Contains(err.Error(), "missing.sandbox") {
+		t.Fatalf("valid preflight did not proceed to source scan: %v", err)
+	}
+}
+
 func TestPrepareDiscoversFlatRootBundleLocations(t *testing.T) {
 	parent := "file://" + filepath.Join(t.TempDir(), "locations")
 	rootLocation, err := reflocation.Resolve(parent, "root-20260824")

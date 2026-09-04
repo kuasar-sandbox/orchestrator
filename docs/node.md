@@ -478,7 +478,8 @@ pointer 具有同一语义，`Clone` 与 component bootstrap JSON 都保留该 p
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;custom Runtime credentials provider 优先于静态 YAML/AWS 默认链、支持 session token/expiration/refresh 且失败不回退;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
 | `checkpoint.mode` | `local` | 暂停态本机 capture:`local` = 现有 tarstream,`bundle` = multi-Manifest ZIP Bundle；输出固定在 Sandbox `BaseDir/checkpoint`(§1.6、§8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | 未设置 | Pause 的节点级三态策略:`true`/`false` 显式传给 `sandbox-ctl snapshot`;省略或 YAML `null` 则交给 sandbox-ctl 缺省 |
-| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute `file://` URI,只用于 `export-sandbox`/Builder promote 的 ref-location 发布;不改变 Pause capture mode |
+| `checkpoint.remote.ref_location_parent` | 空 | 可选 absolute hostless `file://` URI；Builder checkpoint 类 graph 和 `export-sandbox` 的 named-location parent，也用于解析 located Build image Bundle；不改变 Pause capture mode |
+| `checkpoint.remote.manifest` | `false` | `false`：Build image 类进入 Manifest store；`true`：image 类不写 Manifest store，而以 single-root Manifest Bundle 物化到上述 named location，且 parent 必填。它不改变 `checkpoint.mode` 或 checkpoint 类 policy（§12） |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2,node-proxy.md §7):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `mmds.routes.enabled` | `false` | 是否接受租户声明的 static/secret/service exact route;要求 `mmds.enabled=true` |
@@ -1032,7 +1033,7 @@ metadata:  {"routes":[{"path":"/data","data":"x"}]}
 ```
 
 `metadata["kuasar-sandbox.mmds"]` 绝不包含 `secrets`。Build Register 的 routes 只服务
-可能运行 memory Phase C 的 synthetic builder sandbox；显式 Image/offline Sandbox target
+可能运行 memory Phase C 的 synthetic builder sandbox；显式 Image/顶层 Sandbox E target
 在注册期拒绝它，auto target 则在 task-local target 解析后 fail closed。initial values 以 build owner 加密保存。build 终态事务同时
 从 `builds.metadata_json` 删除 routes namespace 并删除 value blob,因此两者都不进入最终
 template/snapshot/image。Build Trigger 不接受 MMDS 覆盖。
@@ -1106,8 +1107,8 @@ metadata。node 不在事件中回传 Registry 自有的 group、route key 或�
 `target` 只接受 `{kind:"image"}`、`{kind:"sandbox",memory:false}`、
 `{kind:"sandbox",memory:true}`；省略表示 auto，显式 `null`、unknown/duplicate 字段、
 `image+memory:true` 均拒绝。`sandbox.memory` 省略等同 false。Auto 只在解析来源 E 默认值后按
-effective start/ready 决定：任一非空即 memory Sandbox，否则 Image；永不自动生成 offline
-Sandbox。显式 Image 与本次 trigger 显式 start/ready 冲突，来源 E 的命令则被忽略。
+effective start/ready 决定：任一非空即 memory Sandbox，否则 Image；永不自动生成
+top-level Sandbox E。显式 Image 与本次 trigger 显式 start/ready 冲突，来源 E 的命令则被忽略。
 
 其中 `resources` 只定义 Build execution/admission resources,referer/registry 只控制本次模板构建。
 target 和这些 build-only 字段解析后均从模板 metadata 中剥离,
@@ -1130,7 +1131,7 @@ target 和这些 build-only 字段解析后均从模板 metadata 中剥离,
   制品生成，不是 canonical TemplateID Create 的长期 metadata lookup。
   Build register 始终拒绝 `restore`/`autoPauseMemory`；traffic/credentials/MMDS/secure/checkpoint
   等 instance/action-only 输入只有 resolved `sandbox,memory:true` 可用，并单独加密存储/
-  task-local 注入，绝不进入 portable E/S。offline Sandbox 和 Image target 明确拒绝这些输入。
+  task-local 注入，绝不进入 portable E/S。顶层 Sandbox E 和 Image target 明确拒绝这些输入。
   对 auto target 的判断必须等来源 E 和 effective 命令解析后再作该校验。
   集群下 sandbox `create` 的所有权信息使用独立的 node-link 系统上下文(§10)。
 - **优先级**:resource 使用上面的固定 leaf chain；非 resource 使用节点/cluster group 与本次
@@ -2089,8 +2090,8 @@ plugin 平面,机群路由经 registry 聚合。
 
 Register-time `builder.target` 明确三种结果：`{kind:"image"}`、
 `{kind:"sandbox",memory:false}`、`{kind:"sandbox",memory:true}`。前两者不运行 C；
-offline Sandbox 由 final image + 普通 Create config 离线组装，不启动 VM。只有 memory
-Sandbox 冷启动 C 并捕获 Snapshot。省略 target 时，run-builder 在 task-local 读取来源 E
+顶层 Sandbox E 由 final image + 普通 Create config 无 VM 组装。只有 memory Sandbox
+冷启动 C 并捕获 Snapshot。省略 target 时，run-builder 在 task-local 读取来源 E
 默认命令后，只按 effective start/ready 是否任一非空选择 memory Sandbox 或 Image。
 source kind、steps、profile 和其它 Sandbox config 都不参与推导。
 
@@ -2126,6 +2127,13 @@ snapshot继承metadata的strict解析属于task summary后的异步prepare failu
 `vswitch.AttachReq` 与 guest `BuildNet`。`transit_*` 只在 host Attach 消费,不进入
 `BuildNet`;无 transit 时保持零值。
 
+node 配置加载首先验证 publication matrix，尤其
+`checkpoint.remote.manifest=true` 必须同时具有 absolute
+`checkpoint.remote.ref_location_parent`。run-builder 随后在任何 source image 扫描、目录大文件
+写入或 VM 启动之前加载 `manifest_config`、固定 task customer key，并为 image Bundle 取得和
+验证 write admission；SBX/SNP 两阶段 bootstrap 在 task-local E/S reader 打开 root carrier
+前执行同一预检。失败只产生 Build error，不启动 phase 或返回 artifact ref。
+
 MMDS synthetic route 只在 real builder run-id 已持久化后发布,其 `RunID` 同样约束
 MMDSv2 token incarnation。流水线结束先撤销 route view;所有 ready/error/cleanup 终态再与
 build row 更新原子删除 MMDS routes namespace 和 encrypted value blob。Register 的 MMDS
@@ -2158,11 +2166,13 @@ run-builder 对每阶段调用
   unsupported/error 时按 `fallback` 继续或失败。miss 时 guest 内
   `flatten-ctl export --output - <subject digest>` 拉取 + 展平,确保 lookup、export 与后续
   writeback 使用同一不可变镜像身份;tarstream 镜像工件经 exec
-  stdio 流回宿主 `BuildBaseDir/checkpoint/image.img`;若 lookup 已确认 registry 支持 Referrers 且
-  `writeback=true`,宿主立即 `manifest-ctl store BuildBaseDir/checkpoint/image.img` 得到 manifest id 并把 base
-  改为 `manifest://<id>`,随后在 guest 内 `flatten-ctl referer put --owner <owner>
-  --manifest-id <id> <subject>` 回写。writeback 失败即构建失败;禁用 writeback 时不做
-  这次中间上传。`MANIFEST_KEY` 只在宿主用于计算 owner token,不进入 guest referer 命令。
+  stdio 流回宿主 `BuildBaseDir/checkpoint/image.img`。若 lookup 已确认 registry 支持 Referrers 且
+  `writeback=true`，只有最终 image policy 本来就要求该 IMG 进入 Manifest store 时，宿主才经
+  sandboxer package publisher 得到 `manifest://<id>`，随后在 guest 内执行
+  `flatten-ctl referer put --owner <owner> --manifest-id <id> <subject>`。顶层 Sandbox E 是唯一
+  image-class root 时，以及 `checkpoint.remote.manifest=true` 时，writeback 被跳过，禁止为了
+  referrer 单独创建中间 IMG Manifest。`MANIFEST_KEY` 只在宿主用于 owner token 和 publication，
+  不进入 guest referer 命令。
 - **B build/materialize**(有 steps 或 source E 时):image source 以 base 镜像为 root
   (本地工件或 `manifest://`)+ builder runtime + 大可写 upper(同一 diff_template)；
   SBX/SNP source 则始终 `sandbox-ctl run --from <E>` 冷启其完整 root graph，并追加新的
@@ -2181,7 +2191,7 @@ run-builder 对每阶段调用
   挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。即使没有 steps，E source
   也必须走 B 并导出完整顶层 image，所以成品不引用 source E/root layers。
 - **C memory snapshot**(只在 resolved `target={kind:sandbox,memory:true}`):使用与普通
-  Sandbox Create/offline E 相同的 cold-config projection，以 final image 完整替换 boot。
+  Sandbox Create/顶层 E 相同的 cold-config projection，以 final image 完整替换 boot。
   image source 普通 cold run；有 source E defaults 时调用
   `sandbox-ctl run --from <E> --replace-boot --config <C0>`，绝不 `--restore S`。
   **生产 e2b runtime** 的 envd 姿态随部署(node-proxy.md §7)，`/init` 注入 register
@@ -2214,8 +2224,10 @@ summary 在 host Attach 前 strict 解析并按字段继承，优先级为
 IMG source 没有 artifact metadata 通道，也不从 retention-bounded Build row 回填。
 
 task-local ref-location mapping 只保留选中 E 及其 B 冷启所需 root refs；S memory-only Bundle
-locations和 source S ref 被过滤。B 导出的 image 是完整新顶层，之后 offline E 或 C 的
-`--replace-boot` 都只安装该 image，所以最终图不再携 source E/root/writable refs。
+locations和 source S ref 被过滤。B 导出的 image 是完整新顶层，之后顶层 E assembly 或 C 的
+`--replace-boot` 都只安装该 image，所以最终图不再携 source E/root/writable refs。若 C 的
+final image 按 policy 发布成 located Bundle，builder 把该次 publication 的实际 name→directory
+mapping 加入 C argv；checkpoint publication 继续携带所有仍被 graph 引用的 mapping。
 
 **COPY/ADD step(构建上下文经对象存储直传)**:COPY 的本质是"把一份 tar 摊进
 rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec + flatten-ctl(不经
@@ -2244,26 +2256,54 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 
 **发布与 target matrix**:
 
-- Image：A/B 后执行 `manifest-ctl store <BuildBaseDir>/checkpoint/image.img`（无变更的
-  IMG/referer hit 可直接复用 canonical manifest ref），只返回 `image_ref`，不运行 C。
-- Sandbox + memory=false：先取得同一 final image，再用 shared cold projection 生成完整
-  config，执行 `sandbox-ctl export --from <final-image> --config <config> --upload`。该路径
-  复用 sandboxer 的 offline assembly/carrier/upload，不在 orchestrator 复制 Sandbox ZIP；
-  不启动 VM、不分配 C resource/network/cgroup、不执行 launch/init/start/ready，只返回
-  `sandbox_ref`。
-- Sandbox + memory=true：先发布 final image 作为本次 C0 的 `base_ref`，C cold run 后只执行
-  memory snapshot，再以一条 `sandbox-ctl publish <artifact>` 发布 `S -> E`，只返回
-  `snapshot_ref`。不存在 C disk-only export/capture 分支。
+发布计划在 target 解析完成后一次性建立，不从 worker 的 result field 反推。Image 类包括
+最终 IMG、`sandbox,memory=false` 的顶层 E，以及 Phase C 使用的 immutable IMG；checkpoint
+类包括 Phase C 增量 E、S 及其 memory/disk 增量层。顶层 E 和增量 E 都是标准 Sandbox E，
+但只有前者携带完整 EROFS payload，因而采用 image policy。
 
-Bundle capture 保留 byte-identical `snapshot.cfg`；配置 `ref_location_parent` 时以 publication
-name（build ID + 实际上传时 UTC 日期，`reflocation.PublicationName`）发布到 named location，
-否则发布到 manifest。C 的 capture mode 取 node `checkpoint.mode`，只有本次 memory target
-显式注册的 checkpoint policy 可影响它。offline E 与 C 初始 C0 都由同一个
-`BuildColdConfig` 投影产生：source E non-boot defaults < register Create options < builder
-managed start/ready；resources/network/boot/launch/env/mounts/files/init/metadata 语义一致。
-start/ready 与最终有效 `NetworkSpec` 写入 E metadata，使 canonical TemplateID 在 Build row
-TTL 删除后仍完全自描述；未声明 hostname 时记录普通 sandbox 默认值，绝不记录
-`build-<id>`。
+| 配置 | Image target | Sandbox, memory=false | Sandbox, memory=true |
+|---|---|---|---|
+| parent 空，`manifest=false` | IMG → Manifest store | 顶层 E → Manifest store | IMG、EΔ、S → Manifest store |
+| parent 非空，`manifest=false` | IMG → Manifest store | 顶层 E → Manifest store | IMG → Manifest store；EΔ/S → named location |
+| parent 非空，`manifest=true` | IMG Bundle → named location | 顶层 E Bundle → named location | IMG Bundle → named location；EΔ/S → named location |
+| parent 空，`manifest=true` | 配置非法 | 配置非法 | 配置非法 |
+
+`checkpoint.remote.manifest=true` **不表示上传 Manifest store**；它表示把 manifest-backed
+image 类逻辑制品直接物化为 checkpoint named location 中的 single-root Manifest Bundle。
+`checkpoint.mode=local|bundle` 只选择 checkpoint 类的 role-specific tarstream 或 Snapshot
+Bundle carrier，对 image 类始终是 Bundle。`ref_location_parent` 在 `manifest=false` 时不改变
+Image target 或顶层 E 的 Manifest-store destination。
+
+- **Image**：当前 final image logical source 直接进入 sandboxer typed publisher。
+  `manifest=false` 返回 `manifest://IMG`；无 steps 的既有 IMG 可保留 identity fast path。
+  `manifest=true` 必须经过 Bundle publisher，既有 `manifest://` 或 located Bundle 也不得绕过
+  统一验证/内容地址复用，最终只返回 located `image_ref`。
+- **Sandbox + memory=false**：直接打开当前 final image carrier——digest-qualified
+  `file://<BuildBaseDir>/checkpoint/image.img@digest:...`、`manifest://` 或 located image Bundle——
+  物化 image defaults 和 canonical portable runtime config，并由 sandboxer 组装标准 direct-EROFS
+  self-layout Sandbox E logical source。该 source 直接进入最终 Manifest 或 Bundle publisher；
+  不发布独立 IMG、不调用 `manifest-ctl store`、不经 Manifest fetcher 回读本地 IMG，也不在
+  RunDir/BaseDir staging 完整 `.sandbox`。此 target 不启动 C，不执行 start/ready，只返回
+  `sandbox_ref`。
+- **Sandbox + memory=true**：先按 image policy 发布 final IMG，并把返回的 portable ref 设为
+  C replacement boot。located IMG Bundle 的实际 location mapping 进入
+  `sandbox-ctl run --from E --replace-boot`；C cold run 后捕获 EΔ/S，再按 checkpoint policy
+  发布，只返回 `snapshot_ref`。EΔ 保留该 IMG ref；local tarstream 与 Snapshot Bundle 都不重新
+  物化或复制 portable image Bundle。不存在来源 S memory restore 或 C disk-only 分支。
+
+每个 named publication 都在实际写入时用 build ID + 当时 UTC 日期生成 name；跨午夜时 image
+与 checkpoint 可以位于不同 date bucket，每个 located ref 自带自己的 name。single-root image
+Bundle 不创建 `.image`/`.sandbox` tarstream或 BuildID/SandboxID semantic alias，只提交
+`<manifest-root>.bundle`。提交使用 target-directory 临时文件、root-last finalize、完整校验、
+独占 final、file+directory fsync；并发/重试只复用严格验证通过的同-key regular final，损坏、
+symlink 或不匹配 final fail closed。失败不返回 terminal ref；现有 Build finalizer仍清理完整
+RunDir/BaseDir。
+
+顶层 E 与 C 初始 C0 都由同一个 `BuildColdConfig` 投影产生：source E non-boot defaults <
+register Create options < builder managed start/ready；resources/network/boot/launch/env/mounts/files/
+init/metadata 语义一致。start/ready 与最终有效 `NetworkSpec` 写入 E metadata，使 canonical
+TemplateID 在 Build row TTL 删除后仍完全自描述；未声明 hostname 时记录普通 sandbox 默认值，
+绝不记录 `build-<id>`。
 
 **构建日志流(journald 单汇 → status API → SDK on_build_logs)**:构建进度对 SDK
 实时可见,零临时文件——全部写 journald 标签 `build`(机制 + 标签词表见 §5.2),
@@ -2323,7 +2363,7 @@ Admit/heartbeat/Release，并在 teardown/Release 完成后才进入下一阶段
 resources 只从不可变 `Build.Resources` 派生；register Create resource 则以 source E portable
 capacity（如有）为默认、供最终 Sandbox E/C0 使用，Image target 为精确零值且不必解析。
 两者不互相推导。Build.Resources 本身不进入 nodectl，因此 active phase 只出现一条普通
-Sandbox reservation，不存在双重记账；offline target 没有 C reservation。
+Sandbox reservation，不存在双重记账；`target=sandbox,memory=false` 没有 C reservation。
 
 ready/error 都是 retention-bounded Build history。终态事务原子写 `finished_unix`；完整
 unit/cgroup、network、runtime/result 与 BuildRunDir/BuildBaseDir cleanup 完成并释放 execution
@@ -2364,12 +2404,13 @@ Create 或 `fromTemplate` 均不受影响。
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | run-sandbox(单元)最终 `execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动 A/B/C，source E 的 C 使用 `run --from E --replace-boot`，经 `exec --env/--stdin-from/--stdout-to` 做平台接力，memory 收尾 `snapshot`/`publish`，offline E 使用 `export --from <image> --config … --upload`;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
+| `sandbox-ctl`(runtime) | run-sandbox(单元)最终 `execve`:`run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`;run-builder 以直接子进程启动 A/B/C，source E 的 C 使用 `run --from E --replace-boot`，经 `exec --env/--stdin-from/--stdout-to` 做平台接力，memory 收尾 `snapshot`/`publish`;顶层 E 则直接调用 sandboxer package assembly/publication API，不启动 sandbox-ctl;serve 的 Capture 调用 `snapshot` 或 `export` | managed launch/build prepare 不启动 `sandbox-ctl info`;readiness wire 固定为 `control_ready`→`ready`→EOF;runner 的 VMM cgroup FD 仅由 node-ctl 本地注入;非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);dynamic sandbox 自动使用同一 canonical `SocketIdentity` 拨号(`pkg/resource` 协议) | `resource_listen` 是唯一 endpoint 来源;每个 runner 的 `vmm/` 是沙箱资源 cgroup,FD 由 run-sandbox 注入;controller disabled = static cgroup |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/Sandbox route 与 Build full-sync/upsert/delete，受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;Build projection 无 Registry-side TTL;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
-| `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
-| `manifest-ctl`(accelerator) | `store <image.img>`（Image 的收尾上传，也是 offline/memory Sandbox 固定 final image identity 的前置） | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
+| `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧只用 `info --json --manifest-config` 验证 registry referer hit | 三种 image carrier 的 config 读取和最终发布均走 sandboxer typed opener；租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
+| sandboxer `pkg/artifact` + `pkg/sandbox` | Builder 的 image/Sandbox logical source 直接 Manifest ingest 或 single-root Bundle publication；本地 IMG→顶层 E 无中间文件 | typed role、customer key、write admission、root-last、sparse semantics、named-location atomic/reuse validation 均由 sandboxer 统一实现；Build finale 不调用 `manifest-ctl store` |
+| `manifest-ctl`(accelerator) | 独立的 Manifest store CLI；Builder final publication 不经该 CLI | `MANIFEST_KEY` 经调用进程环境 |
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、§12) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
@@ -2552,7 +2593,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 |---|---|
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、exact-run bootstrap、cold单阶段/restore两阶段、execve、`TASK_*`和重复MANIFEST_KEY剥除;`config` CLI 往返 |
-| `e2e_run_builder.sh` | target-aware 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):真实 IMG/SBX/SNP、fromImage/fromTemplate(img/sbx/snp)、S→E cold selection、无 steps 强制 materialize、offline E 零 phase VM、memory C 固定等待、source-ref closure 与 Build-row TTL 后 canonical Create；另覆盖 COPY/bare、资源隔离、终态 cleanup、日志/DB/artifact secrecy |
+| `e2e_run_builder.sh` | target-aware 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):真实 IMG/SBX/SNP、fromImage/fromTemplate(img/sbx/snp)、image/checkpoint publication matrix、Manifest 与 named-location Bundle、顶层 E 无完整 staging/零 Phase C、portable Phase-C image ref、local/Bundle checkpoint mode、S→E cold selection、memory C 固定等待、source-ref closure 与 Build-row TTL 后 canonical Create；另覆盖 COPY/bare、资源隔离、终态 cleanup、日志/DB/artifact secrecy |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、持久 RunDir/BaseDir、BaseDir writable diff/checkpoint、RunRoot 无大工件、PathID native exec、local Pause→resume 与恢复策略、failed Create 的 dead 零 ownership、显式 delete finalizer 删除 row/RunDir/BaseDir 且不伤 node-level 文件 |
 | `e2e_mmds_routes.sh` | 复用 execute 的 Proxy 拓扑覆盖 static,secret 生命周期与 local UDS service |
 | `e2e_mmds_routes_proxy_restart.sh` | 复用 Proxy 拓扑覆盖 MMDS full resync/fail-closed 恢复 |

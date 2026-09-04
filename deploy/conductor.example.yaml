@@ -169,8 +169,12 @@ checkpoint:
   # merge_ref: false
   # drop_caches: false
   # remote:
-  #   # Used by export-sandbox/promote publication; it does not change Pause mode.
+  #   # Checkpoint-class E/S uses this location; it does not change Pause mode.
   #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
+  #   # false: Build image-class roots use Manifest store. true: materialize
+  #   # manifest-backed image-class roots as single-root Bundles in this named
+  #   # location (parent required); true does NOT mean upload to Manifest store.
+  #   manifest: false
 
 # mmds: optional envd metadata service for FC-mode token re-keying.
 #   disabled (default) — envd runs non-secure; the proxy enforces X-Access-Token as the

@@ -31,10 +31,11 @@ package main
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// Image targets publish the final image directly. Offline Sandbox targets use
-// sandbox-ctl export without another VM. Memory Sandbox targets publish the
-// final image before C, then publish the resulting S -> E graph. The result
-// returns over the config-socket with its resolved target and exactly one ref.
+// Image targets publish the final image directly. A top-level Sandbox E is
+// assembled without another VM and streamed into its final publisher. Memory
+// Sandbox targets publish the final image before C, then publish the resulting
+// S -> E graph. The result returns over the config-socket with its resolved
+// target and exactly one ref.
 
 import (
 	"context"

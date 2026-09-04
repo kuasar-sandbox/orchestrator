@@ -177,7 +177,12 @@ func TestConductorCloneIsDeep(t *testing.T) {
 			FilesStorage: &config.FilesStorageConfig{Bucket: "bucket"},
 		},
 		ResourceListen: &config.ResourceListenConfig{CgroupScanPaths: []string{"/a"}},
-		Checkpoint:     config.CheckpointConfig{MergeRef: &merge},
+		Checkpoint: config.CheckpointConfig{
+			MergeRef: &merge,
+			Remote: config.CheckpointRemoteConfig{
+				RefLocationParent: "file:///mnt/shared/snapshots", Manifest: true,
+			},
+		},
 		MMDS: config.MMDSConfig{
 			Routes:   config.MMDSRoutesConfig{ReservedPathPrefixes: []string{"/internal/"}},
 			Services: map[string]config.MMDSServiceRegistryEntry{"svc": {Endpoint: "unix:///run/svc.sock"}},
@@ -198,6 +203,8 @@ func TestConductorCloneIsDeep(t *testing.T) {
 	clone.Builder.FilesStorage.Bucket = "other"
 	clone.ResourceListen.CgroupScanPaths[0] = "/b"
 	*clone.Checkpoint.MergeRef = true
+	clone.Checkpoint.Remote.Manifest = false
+	clone.Checkpoint.Remote.RefLocationParent = "file:///changed"
 	clone.MMDS.Routes.ReservedPathPrefixes[0] = "/changed/"
 	clone.MMDS.Services["svc"] = config.MMDSServiceRegistryEntry{Endpoint: "unix:///run/other.sock"}
 
@@ -207,7 +214,9 @@ func TestConductorCloneIsDeep(t *testing.T) {
 		*cfg.Sandbox.Resources.WatermarkHigh.Ratio != 0.8 || *cfg.Builder.Admission.Execution.MaxBuilds != 3 ||
 		*cfg.Builder.Admission.Execution.Resources.CPU != "2" || *cfg.Builder.Admission.Execution.Resources.Memory != "4GiB" ||
 		cfg.Builder.FilesStorage.Bucket != "bucket" || cfg.ResourceListen.CgroupScanPaths[0] != "/a" ||
-		*cfg.Checkpoint.MergeRef || cfg.MMDS.Routes.ReservedPathPrefixes[0] != "/internal/" ||
+		*cfg.Checkpoint.MergeRef || !cfg.Checkpoint.Remote.Manifest ||
+		cfg.Checkpoint.Remote.RefLocationParent != "file:///mnt/shared/snapshots" ||
+		cfg.MMDS.Routes.ReservedPathPrefixes[0] != "/internal/" ||
 		cfg.MMDS.Services["svc"].Endpoint != "unix:///run/svc.sock" {
 		t.Fatalf("clone shares mutable state with source: source=%+v clone=%+v", cfg, clone)
 	}

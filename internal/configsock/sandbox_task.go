@@ -7,12 +7,14 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// ArtifactPrepareSchemaVersion 3 adds portable allocatable/deflate resource
-// defaults and an explicit Build-only source-image config read. Version 2
+// ArtifactPrepareSchemaVersion 4 binds the Build-only image Bundle publication
+// preflight into task-local source preparation. Version 3 added portable
+// allocatable/deflate resource defaults and an explicit Build-only source-image
+// config read. Version 2
 // replaced the v1 Snapshot-only wire with typed E/S sources, durable launch
 // mode, a selected prepared source, and bounded network/disk topology summaries.
 // Old runners fail closed before the secret-bearing provider call.
-const ArtifactPrepareSchemaVersion = 3
+const ArtifactPrepareSchemaVersion = 4
 
 // SandboxTaskRequest identifies one exact assigned sandbox-runner incarnation.
 type SandboxTaskRequest struct {
@@ -26,15 +28,19 @@ type SandboxTaskRequest struct {
 // values. Artifact bytes, MANIFEST_KEY, and the selected prepared reference
 // never cross back into the conductor process.
 type ArtifactPrepareSpec struct {
-	RootSourceKind           string `json:"root_source_kind"`
-	RootRef                  string `json:"root_ref"`
-	LaunchMode               string `json:"launch_mode"`
-	ManifestConfig           string `json:"manifest_config,omitempty"`
-	RefLocationParent        string `json:"ref_location_parent,omitempty"`
-	RelativeDir              string `json:"relative_dir,omitempty"`
-	MaxRefs                  int    `json:"max_refs"`
-	ReadSourceImageConfig    bool   `json:"read_source_image_config,omitempty"`
-	AbsoluteDeadlineUnixNano int64  `json:"absolute_deadline_unix_nano"`
+	RootSourceKind        string `json:"root_source_kind"`
+	RootRef               string `json:"root_ref"`
+	LaunchMode            string `json:"launch_mode"`
+	ManifestConfig        string `json:"manifest_config,omitempty"`
+	RefLocationParent     string `json:"ref_location_parent,omitempty"`
+	RelativeDir           string `json:"relative_dir,omitempty"`
+	MaxRefs               int    `json:"max_refs"`
+	ReadSourceImageConfig bool   `json:"read_source_image_config,omitempty"`
+	// PreflightImageBundle is Build-only. It verifies the named-location image
+	// Bundle configuration, task customer key, and write admission before the
+	// source E/S carrier or its image is scanned.
+	PreflightImageBundle     bool  `json:"preflight_image_bundle,omitempty"`
+	AbsoluteDeadlineUnixNano int64 `json:"absolute_deadline_unix_nano"`
 }
 
 // SandboxTaskSpec is the authenticated bootstrap response. Exactly one of

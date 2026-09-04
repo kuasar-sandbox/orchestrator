@@ -265,8 +265,12 @@ checkpoint:                                        # paused-state capture
   # merge_ref: false                              # omit/null => sandbox-ctl default
   # drop_caches: false                            # omit/null => sandbox-ctl default
   # remote:
-  #   # Used only by export-sandbox/promote publication; Pause always captures locally.
+  #   # Checkpoint-class E/S uses this location; Pause always captures locally.
   #   ref_location_parent: file:///mnt/shared/kuasar/snapshots
+  #   # false: image-class Build roots stay in Manifest store. true: materialize
+  #   # manifest-backed image-class roots as single-root Bundles in this named
+  #   # location (parent required); true does NOT mean upload to Manifest store.
+  #   manifest: false
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)

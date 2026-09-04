@@ -494,6 +494,88 @@ checkpoint:
 	}
 }
 
+func TestCheckpointRemoteManifestPolicy(t *testing.T) {
+	base := `
+api: { domain: example.test }
+encryption_key: test-key
+sandbox:
+  boot: { kernel: /kernel, runtime: /runtime }
+`
+
+	omitted, err := LoadConductor(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitted.Checkpoint.Remote.Manifest {
+		t.Fatal("omitted checkpoint.remote.manifest did not default to false")
+	}
+
+	explicitFalse, err := LoadConductor(writeConfig(t, base+`
+checkpoint:
+  remote:
+    ref_location_parent: file:///mnt/shared/snapshots
+    manifest: false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitFalse.Checkpoint.Remote.Manifest {
+		t.Fatal("explicit checkpoint.remote.manifest=false loaded as true")
+	}
+
+	explicitTrue, err := LoadConductor(writeConfig(t, base+`
+checkpoint:
+  remote:
+    ref_location_parent: file:///mnt/shared/snapshots
+    manifest: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !explicitTrue.Checkpoint.Remote.Manifest {
+		t.Fatal("explicit checkpoint.remote.manifest=true was not preserved")
+	}
+
+	_, err = LoadConductor(writeConfig(t, base+`
+checkpoint:
+  remote:
+    manifest: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "manifest=true requires") {
+		t.Fatalf("manifest=true without parent error = %v", err)
+	}
+
+	_, err = LoadConductor(writeConfig(t, base+`
+checkpoint:
+  remote:
+    ref_location_parent: file:///mnt/shared/snapshots
+    manifested: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "field manifested not found") {
+		t.Fatalf("unknown checkpoint remote YAML field error = %v", err)
+	}
+
+	_, err = DecodeConductor(strings.NewReader(`{
+  "api":{"domain":"example.test"},
+  "encryption_key":"test-key",
+  "sandbox":{"boot":{"kernel":"/kernel","runtime":"/runtime"}},
+  "checkpoint":{"remote":{"ref_location_parent":"file:///mnt/shared/snapshots","manifest":true}}
+}`))
+	if err != nil {
+		t.Fatalf("strict JSON manifest policy: %v", err)
+	}
+
+	_, err = DecodeConductor(strings.NewReader(`{
+  "api":{"domain":"example.test"},
+  "encryption_key":"test-key",
+  "sandbox":{"boot":{"kernel":"/kernel","runtime":"/runtime"}},
+  "checkpoint":{"remote":{"ref_location_parent":"file:///mnt/shared/snapshots","manifests":true}}
+}`))
+	if err == nil || !strings.Contains(err.Error(), "field manifests not found") {
+		t.Fatalf("unknown checkpoint remote JSON field error = %v", err)
+	}
+}
+
 func TestLoadSnapshotPolicyTriState(t *testing.T) {
 	base := `
 api:

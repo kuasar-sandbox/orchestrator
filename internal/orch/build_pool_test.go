@@ -221,6 +221,22 @@ func TestRunBuildUnitReusesUnchangedImageWithoutRuntimeSideEffects(t *testing.T)
 	}
 }
 
+func TestDirectImageBuildResultDoesNotBypassBundlePublication(t *testing.T) {
+	ref := "manifest://" + strings.Repeat("d", 64)
+	target := &types.BuildTarget{Kind: types.BuildTargetImage}
+	build := &types.Build{
+		BuildID: "build-bundle-image", Profile: types.ProfileE2B,
+		FromTemplate: types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Ref: ref}.String(),
+		Builder:      types.BuildOptions{Target: target},
+	}
+	if result, handled, err := directImageBuildResult(build, true); err != nil || handled || result != nil {
+		t.Fatalf("Bundle-policy direct image = result %+v handled=%t err=%v", result, handled, err)
+	}
+	if result, handled, err := directImageBuildResult(build, false); err != nil || !handled || result == nil || result.ImageRef != ref {
+		t.Fatalf("Manifest-policy direct image = result %+v handled=%t err=%v", result, handled, err)
+	}
+}
+
 func TestBuildExecutionDeadlineExcludesCleanupHeadroom(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Builder.TotalTimeoutSec = 75

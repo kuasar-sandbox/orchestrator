@@ -3,10 +3,10 @@ package configsock
 import "errors"
 
 // BuildTaskSchemaVersion gates the BuildSpec wire contract independently from
-// ArtifactPrepareSchemaVersion. Version 4 adds an explicit requested target and
-// replaces Snapshot-only local preparation with a generic cold Sandbox-E
-// source retained by run-builder.
-const BuildTaskSchemaVersion = 4
+// ArtifactPrepareSchemaVersion. Version 5 separates checkpoint-location policy
+// from image-class Bundle publication and intentionally removes the old broad
+// publish_location_parent field.
+const BuildTaskSchemaVersion = 5
 
 // BuildTaskRequest identifies one exact assigned run-builder incarnation.
 type BuildTaskRequest struct {
