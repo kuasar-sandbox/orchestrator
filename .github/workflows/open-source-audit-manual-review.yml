@@ -1,0 +1,63 @@
+name: Open Source Audit Manual Review
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/open-source-audit-manual-review.yml
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branches and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch retained pull-request refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --force origin '+refs/pull/*/head:refs/audit/pull/*/head'
+          unset auth
+      - name: Render redacted context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          candidates = [
+              ("af30eb996b82", 262),
+              ("d7ed6ebc842f", 262),
+              ("ebea3fe99b58", 262),
+              ("f29993893235", 329),
+          ]
+          redact = re.compile(r"(https?://)[^/@\s:]+:[^@\s/]+@", re.I)
+          out = ["# Manual review of redacted audit candidates", ""]
+          for short, target_line in candidates:
+              full = subprocess.check_output(["git", "rev-parse", short], text=True).strip()
+              data = subprocess.check_output(["git", "cat-file", "blob", full]).decode("utf-8", "replace").splitlines()
+              out.append(f"## `{short}` around line {target_line}")
+              out.append("```text")
+              for number in range(max(1, target_line - 3), min(len(data), target_line + 3) + 1):
+                  line = redact.sub(r"\1<userinfo-redacted>@", data[number - 1])
+                  line = re.sub(r"(?i)(password|secret|token|api[_-]?key)(\s*[:=]\s*)[\"']?[^\s\"']+", r"\1\2<value-redacted>", line)
+                  out.append(f"{number}: {line}")
+              out.append("```")
+              out.append("")
+          rendered = "\n".join(out) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as target:
+              target.write(rendered)
+          print(rendered)
+          PY
