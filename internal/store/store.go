@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -160,7 +162,20 @@ CREATE INDEX IF NOT EXISTS idx_manifest_keys_mkhash ON manifest_keys(manifest_ke
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for tenant and sandbox credentials at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve %s: %w", path, err)
+	}
+	query := url.Values{
+		"_txlock": {"immediate"},
+		"_pragma": {
+			"busy_timeout(5000)",
+			"journal_mode(WAL)",
+			"foreign_keys(1)",
+		},
+	}
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath), RawQuery: query.Encode()}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
