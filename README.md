@@ -76,14 +76,15 @@ pathname 上限；配置加载会 fail closed。
 
 Sandbox 显式删除先把完整 owner 原子转为内部 `deleting`,立即从节点 cache 与后续 route full
 snapshot 撤下并发布 route Delete 撤销既有 live projection,再由节点 finalizer 按 exact runner
-fence,network detach,RunDir,BaseDir,hard-delete 的顺序收敛.route Delete 只表示 projection
-withdrawal;terminal object observation 仍在 hard-delete 后发送.任一步失败都保留同一 row 供当前
-进程或下次启动重试.Pause 仍先原子提交 paused 与
-checkpoint source；旧 RunID、port、RunDir 是 cleanup-pending owner，Resume/Wake/Exec 必须先
-完成其清理；RunDir 删除成功后连同其 UDS 路径 exact-clear，下一次 Resume acceptance 原子恢复
-canonical RunDir/UDS，BaseDir/checkpoint 始终保留。非删除终态 `dead` 不持有 unit、network、RunDir、
-BaseDir 或 artifact owner。Build 同样只在 exact unit/cgroup、network 与两个派生目录均清理后
-释放 execution claim；phase 子进程自清理不承担最终正确性。
+fence,network detach + durable exact-clear,RunDir,BaseDir,hard-delete 的顺序收敛.route Delete 只表示
+projection withdrawal;terminal object observation 仍在 hard-delete 后发送.Detach 到 durable
+clear 由 network allocation fence 包围;clear 成功后目录或 hard-delete 故障不再阻塞新网络分配,
+尚未完成的 owner 仍保留在同一 row 供当前进程或下次启动重试.Pause 仍先原子提交 paused 与
+checkpoint source;旧 RunID,port,RunDir 是 cleanup-pending owner,Resume/Wake/Exec 必须先
+完成其清理;RunDir 删除成功后连同其 UDS 路径 exact-clear,下一次 Resume acceptance 原子恢复
+canonical RunDir/UDS,BaseDir/checkpoint 始终保留.非删除终态 `dead` 不持有 unit,network,RunDir,
+BaseDir 或 artifact owner.Build 同样只在 exact unit/cgroup,network 与两个派生目录均清理后
+释放 execution claim;phase 子进程自清理不承担最终正确性.
 
 cleanup 完成后的 `dead` Sandbox 与 `ready/error` Build 分别写入原子终态时间，默认保留
 24 小时（`sandbox.dead_ttl`、`builder.terminal_ttl`），随后由 conductor 每轮最多 128 条地

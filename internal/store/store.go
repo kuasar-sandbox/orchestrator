@@ -848,10 +848,34 @@ func (s *Store) BeginSandboxDelete(ctx context.Context, sb *types.Sandbox) (bool
 	return sandboxUpdateChanged("begin delete", sb.ID, result)
 }
 
+// ClearDeletingNetwork records that the exact deleting Sandbox incarnation no
+// longer owns its connector port. Every derived network field is cleared in
+// the same full-owner CAS so a stale finalizer cannot clear a changed row.
+func (s *Store) ClearDeletingNetwork(ctx context.Context, sb *types.Sandbox) (bool, error) {
+	if sb == nil || sb.ID == "" || sb.State != types.StateDeleting || sb.VswitchPort == "" {
+		return false, errors.New("store: clear deleting network requires a deleting sandbox with a port")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		   SET floatingip='', vswitch_port='', inner_ip='', port_mac=''
+		 WHERE id=? AND state=? AND launch_mode=?
+		   AND run_id=? AND floatingip=? AND vswitch_port=? AND inner_ip=? AND port_mac=?
+		   AND run_dir=? AND base_dir=? AND envd_uds=? AND ci_uds=?
+		   AND resume_source_kind=? AND resume_source_ref=? AND created_unix=?`,
+		sb.ID, string(types.StateDeleting), string(sb.LaunchMode),
+		sb.RunID, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC,
+		sb.RunDir, sb.BaseDir, sb.EnvdUDS, sb.CiUDS,
+		string(sb.ResumeSource.Kind), sb.ResumeSource.Ref, sb.CreatedUnix)
+	if err != nil {
+		return false, fmt.Errorf("store: clear deleting network sandbox %s: %w", sb.ID, err)
+	}
+	return sandboxUpdateChanged("clear deleting network", sb.ID, result)
+}
+
 // DeleteFinalizedSandbox hard-deletes only the exact deleting row whose local
-// ownership the caller has already fenced and removed. Cleanup fields remain
-// unchanged until this final CAS, so a process crash always leaves sufficient
-// information for startup reconciliation.
+// ownership the caller has already fenced and removed. Network fields may have
+// been durably cleared after Detach; every remaining field stays unchanged so
+// a process crash leaves sufficient information for startup reconciliation.
 func (s *Store) DeleteFinalizedSandbox(ctx context.Context, sb *types.Sandbox) (bool, error) {
 	if sb == nil || sb.ID == "" || sb.State != types.StateDeleting {
 		return false, errors.New("store: finalize sandbox delete requires a deleting sandbox")
