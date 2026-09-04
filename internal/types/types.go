@@ -43,7 +43,7 @@ func ParseProfile(s string) (Profile, error) {
 type Kind string
 
 const (
-	KindImg Kind = "img" // cold boot from an image manifest
+	KindImg Kind = "img" // cold boot from a portable image artifact
 	KindSbx Kind = "sbx" // cold boot from a portable sandbox
 	KindSnp Kind = "snp" // restore from a snapshot manifest
 )
@@ -280,8 +280,9 @@ func ParseTemplateID(s string) (TemplateID, error) {
 		return TemplateID{}, fmt.Errorf("templateID %q: %w", s, err)
 	}
 	if ref.Scheme == manifest.RefSchemeFile {
-		if t.Kind == KindImg && !strings.HasSuffix(ref.Path, ".image") {
-			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .image artifact", s, t.Kind)
+		if t.Kind == KindImg &&
+			!strings.HasSuffix(ref.Path, ".image") && !strings.HasSuffix(ref.Path, ".bundle") {
+			return TemplateID{}, fmt.Errorf("templateID %q: %s ref must name a .image or .bundle artifact", s, t.Kind)
 		}
 		if t.Kind == KindSbx &&
 			!strings.HasSuffix(ref.Path, ".sandbox") && !strings.HasSuffix(ref.Path, ".bundle") {
