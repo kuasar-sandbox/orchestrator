@@ -57,8 +57,10 @@ kind, and a running row may retain a source for node-local artifact ownership.
 `LaunchMode` is non-empty only while `starting`; it is the durable, already
 resolved launch decision rather than the trigger that requested it. The
 internal `deleting` state is durable cleanup ownership: it is never a route or
-activation state, and it retains exact runner, network, RunDir, and BaseDir
-fields until the core finalizer succeeds.
+activation state. It retains exact runner, RunDir, and BaseDir fields until the
+core finalizer succeeds. Its network tuple remains exact until connector Detach
+and the durable clear both succeed under the allocation fence; the clear removes
+all four network fields atomically.
 
 `SandboxSource.Watch` covers all durable sandbox rows. `BuildSource.Watch`
 covers the current `registered`, `waiting`, `building`, and `ready` set. A live
@@ -99,8 +101,9 @@ delete is projection withdrawal only; it does not prove that the unit, network,
 paths, or durable row have been finalized. The conductor object source emits its
 terminal sandbox removal only after the exact local cleanup and hard delete
 succeed. A restart-time snapshot may therefore contain a cleanup-pending
-`deleting` view. Extensions must treat it as diagnostic state and must not try
-to resume, route, or independently clean it.
+`deleting` view with either a pending or already cleared network tuple.
+Extensions must treat it as diagnostic state and must not try to resume, route,
+or independently clean it.
 
 For route consumers, both the live delete and omission from a reconnecting full
 snapshot withdraw an older projection. Durable local cleanup continues from the

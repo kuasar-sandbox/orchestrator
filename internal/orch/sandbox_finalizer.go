@@ -41,8 +41,8 @@ func (o *Orchestrator) acceptSandboxDeleteLocked(ctx context.Context, sb *types.
 // startSandboxDeleteFinalizer coalesces repeated direct/cluster Delete calls.
 // Once deleting is durable, cleanup outlives the request context and retries
 // while this node process remains live. Lifecycle shutdown stops later retries
-// after the bounded current attempt; the unchanged deleting row is recovered by
-// ReconcileSandboxes in the next process. DrainSandboxDeletes keeps process
+// after the bounded current attempt; the remaining deleting owner is recovered
+// by ReconcileSandboxes in the next process. DrainSandboxDeletes keeps process
 // dependencies open only until those accepted workers have quiesced.
 func (o *Orchestrator) startSandboxDeleteFinalizer(sid string) {
 	lifecycleCtx := o.launchContext()
@@ -291,9 +291,9 @@ func (o *Orchestrator) abandonPausedCleanupWorker(sid string) {
 	o.pausedCleanupMu.Unlock()
 }
 
-// finalizeSandboxDeleteOnce performs one complete, ordered finalizer pass. It
-// deliberately does not clear per-step fields: the unchanged deleting row is
-// the compact durable retry record required after any failure or crash.
+// finalizeSandboxDeleteOnce performs one complete, ordered finalizer pass.
+// Detaching a reusable connector port is durably recorded immediately; runner
+// and path fields remain the compact retry record until the final hard delete.
 func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string) error {
 	o.launches.Cancel(sid)
 	if found, err := o.launches.Wait(ctx, sid); found && err != nil && ctx.Err() != nil {
@@ -322,7 +322,7 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 		}
 	}
 	if sb.VswitchPort != "" {
-		if err := o.detachSandboxPort(cleanupCtx, sb.VswitchPort); err != nil {
+		if err := o.clearDeletingSandboxNetwork(cleanupCtx, sb); err != nil {
 			return err
 		}
 	}
@@ -352,14 +352,38 @@ func (o *Orchestrator) finalizeSandboxDeleteOnce(ctx context.Context, sid string
 	if !deleted {
 		return fmt.Errorf("orch: sandbox %s deleting ownership changed before hard delete", sid)
 	}
-	if sb.VswitchPort != "" {
-		o.networkAllocationMu.Lock()
-		delete(o.detachedPortsPending, sb.VswitchPort)
-		o.networkAllocationMu.Unlock()
-	}
 	o.clearDeadlineIntent(sid)
 	o.uncache(sid)
 	o.observeSandboxDelete(sb)
+	return nil
+}
+
+// clearDeletingSandboxNetwork makes physical Detach and the durable ownership
+// clear one allocation-fenced operation. Once the store CAS succeeds, later
+// directory or hard-delete failures no longer need to block new allocations.
+func (o *Orchestrator) clearDeletingSandboxNetwork(ctx context.Context, sb *types.Sandbox) error {
+	port := sb.VswitchPort
+	o.networkAllocationMu.Lock()
+	defer o.networkAllocationMu.Unlock()
+
+	if err := o.vs.Detach(ctx, port); err != nil && !errors.Is(err, vswitch.ErrPortNotAttached) {
+		return fmt.Errorf("detach sandbox port %s: %w", port, err)
+	}
+	if o.detachedPortsPending == nil {
+		o.detachedPortsPending = make(map[string]struct{})
+	}
+	o.detachedPortsPending[port] = struct{}{}
+
+	cleared, err := o.st.ClearDeletingNetwork(ctx, sb)
+	if err != nil {
+		return err
+	}
+	if !cleared {
+		return fmt.Errorf("orch: sandbox %s deleting network ownership changed before durable clear", sb.ID)
+	}
+
+	delete(o.detachedPortsPending, port)
+	sb.VswitchPort, sb.FloatingIP, sb.InnerIP, sb.PortMAC = "", "", "", ""
 	return nil
 }
 
@@ -443,9 +467,9 @@ func (o *Orchestrator) sandboxUnitActive(ctx context.Context, unit string) (bool
 	return false, nil
 }
 
-// detachSandboxPort keeps allocation excluded until the deleting row is gone.
-// Without this fence, a filesystem/store failure after Detach could let a retry
-// detach a connector slot that had already been reassigned to another owner.
+// detachSandboxPort keeps allocation excluded until its caller durably clears
+// the corresponding owner. Without this fence, a later retry could detach a
+// connector slot that had already been reassigned to another owner.
 func (o *Orchestrator) detachSandboxPort(ctx context.Context, port string) error {
 	o.networkAllocationMu.Lock()
 	defer o.networkAllocationMu.Unlock()
