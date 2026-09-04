@@ -25,7 +25,7 @@ A standalone deployment exposes an E2B-compatible API that can be used by the un
 `cluster-ctl` runs three independent roles:
 
 - **Registry** — replicated cluster state and node-channel hub;
-- **Router** — the cluster-wide E2B-compatible data-plane entry point and stable-sandbox routing layer;
+- **Router** — the cluster-wide E2B-compatible unified control- and data-plane entry point and stable-sandbox routing layer;
 - **Placer** — node selection, sandbox-group integration, on-demand creation, restore, and migration.
 
 The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration.
@@ -50,7 +50,7 @@ For the complete project security model and private vulnerability reporting, see
 | `node-ctl builder status` | Inspect build execution state |
 | `node-ctl export-sandbox` / `import-sandbox` | Move portable sandbox state across nodes |
 | `cluster-ctl registry` | Start a Registry process |
-| `cluster-ctl router` | Start the cluster data-plane router |
+| `cluster-ctl router` | Start the unified cluster control- and data-plane ingress |
 | `cluster-ctl placer` | Start the placement service |
 | `e2b-key-ctl ...` | Generate and derive tenant credentials |
 
@@ -98,7 +98,7 @@ Detailed design and reference documents are currently maintained primarily in Ch
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, active reclaim, and recovery;
 - [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;
-- [`docs/cluster-router.md`](docs/cluster-router.md) — cluster data-plane routing and stable/node-local identity translation;
+- [`docs/cluster-router.md`](docs/cluster-router.md) — unified cluster control- and data-plane ingress, routing, and stable/node-local identity translation;
 - [`docs/cluster-placer.md`](docs/cluster-placer.md) — providers, importers, node selection, placement, restore, and migration.
 
 The English README contains the complete public component entry path; translating every detailed design document is not required to build or contribute to the component.
