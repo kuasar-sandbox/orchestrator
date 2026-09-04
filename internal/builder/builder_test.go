@@ -263,7 +263,7 @@ func TestPreparedSandboxImageConfigSeedsBuildStepContext(t *testing.T) {
 
 func TestResolveTargetUsesOnlyEffectiveCommandsAndExplicitTarget(t *testing.T) {
 	image := types.BuildTarget{Kind: types.BuildTargetImage}
-	offline := types.BuildTarget{Kind: types.BuildTargetSandbox}
+	topLevelSandbox := types.BuildTarget{Kind: types.BuildTargetSandbox}
 	for _, test := range []struct {
 		name      string
 		requested *types.BuildTarget
@@ -276,7 +276,7 @@ func TestResolveTargetUsesOnlyEffectiveCommandsAndExplicitTarget(t *testing.T) {
 		{name: "auto image", want: image},
 		{name: "auto start", start: "serve", want: types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}, wantStart: "serve"},
 		{name: "auto ready", ready: "probe", want: types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}, wantReady: "probe"},
-		{name: "explicit offline", requested: &offline, start: "declare", ready: "declared-ready", want: offline, wantStart: "declare", wantReady: "declared-ready"},
+		{name: "explicit top-level Sandbox E", requested: &topLevelSandbox, start: "declare", ready: "declared-ready", want: topLevelSandbox, wantStart: "declare", wantReady: "declared-ready"},
 		{name: "explicit image ignores inherited", requested: &image, start: "inherited", ready: "inherited-ready", want: image},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -343,31 +343,15 @@ func TestBuildPipelineContextPropagatesTaskCancelAndReservesReportGrace(t *testi
 	}
 }
 
-func TestUploadImageReusesBaseImageRef(t *testing.T) {
+func TestManifestImagePublicationReusesManifestBaseRef(t *testing.T) {
 	ref := "manifest://" + strings.Repeat("a", 64)
 	p := &buildPipeline{baseImageRef: ref}
-	got, err := p.uploadImage()
+	got, err := p.publishCurrentImageManifest()
 	if err != nil {
-		t.Fatalf("uploadImage: %v", err)
+		t.Fatalf("publishCurrentImageManifest: %v", err)
 	}
 	if got != ref {
-		t.Fatalf("uploadImage = %q, want %q", got, ref)
-	}
-}
-
-func TestPrepareFinalImageRefUsesPublishedManifest(t *testing.T) {
-	ref := "manifest://" + strings.Repeat("a", 64)
-	p := &buildPipeline{
-		spec:         &configsock.BuildSpec{CheckpointMode: "bundle"},
-		imagePath:    "/build/image.img",
-		baseImageRef: ref,
-		baseRef:      "file:///build/image.img@digest:" + strings.Repeat("b", 64),
-	}
-	if err := p.prepareFinalImageRef(); err != nil {
-		t.Fatal(err)
-	}
-	if p.baseRef != ref {
-		t.Fatalf("final image ref = %q, want %q", p.baseRef, ref)
+		t.Fatalf("publishCurrentImageManifest = %q, want %q", got, ref)
 	}
 }
 
@@ -532,7 +516,7 @@ func TestBuildAndTargetResourcesRemainSeparate(t *testing.T) {
 	}
 }
 
-func TestOfflineAndMemoryTargetsShareColdProjection(t *testing.T) {
+func TestTopLevelSandboxAndMemoryTargetsShareColdProjection(t *testing.T) {
 	p := &buildPipeline{
 		profile: types.ProfileE2B, baseRef: "manifest://" + strings.Repeat("a", 64),
 		startCmd: "serve", readyCmd: "probe",
@@ -569,18 +553,18 @@ func TestOfflineAndMemoryTargetsShareColdProjection(t *testing.T) {
 			SandboxNamespaces: []string{sandboxcfg.NsFiles, sandboxcfg.NsMetadata},
 		},
 	}
-	offline := decodeBuildColdConfig(t, p)
-	if len(offline.Files) != 1 || offline.Files[0].Path != "/registered" {
-		t.Fatalf("registered files did not replace source defaults: %#v", offline.Files)
+	topLevel := decodeBuildColdConfig(t, p)
+	if len(topLevel.Files) != 1 || topLevel.Files[0].Path != "/registered" {
+		t.Fatalf("registered files did not replace source defaults: %#v", topLevel.Files)
 	}
-	if offline.Metadata["registered"] != "wins" || offline.Metadata["remove"] != "" {
-		t.Fatalf("registered metadata did not replace source namespace: %#v", offline.Metadata)
+	if topLevel.Metadata["registered"] != "wins" || topLevel.Metadata["remove"] != "" {
+		t.Fatalf("registered metadata did not replace source namespace: %#v", topLevel.Metadata)
 	}
-	if offline.Launch.Env["SOURCE"] != "yes" || offline.Launch.Env["REGISTERED"] != "yes" {
-		t.Fatalf("launch env precedence = %#v", offline.Launch.Env)
+	if topLevel.Launch.Env["SOURCE"] != "yes" || topLevel.Launch.Env["REGISTERED"] != "yes" {
+		t.Fatalf("launch env precedence = %#v", topLevel.Launch.Env)
 	}
-	if offline.Network.Interface != "eth0" {
-		t.Fatalf("source portable network interface = %q, want eth0", offline.Network.Interface)
+	if topLevel.Network.Interface != "eth0" {
+		t.Fatalf("source portable network interface = %q, want eth0", topLevel.Network.Interface)
 	}
 }
 

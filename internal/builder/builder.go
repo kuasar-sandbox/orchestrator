@@ -30,10 +30,10 @@
 // injection, artifact streaming, probes) goes through sandbox-ctl exec,
 // which works on any rootfs and carries raw stdio.
 //
-// A Sandbox output fixes the final image's manifest identity before offline E
-// assembly or Phase C, so neither output retains the source E/S graph. The
-// target then selects exactly one returned image, Sandbox, or Snapshot ref for
-// the orchestrator's fail-closed result validation.
+// A Sandbox output publishes the final image-class root according to the
+// resolved publication plan before direct Sandbox-E assembly or Phase C, so no
+// output retains the source E/S graph. The target then selects exactly one
+// returned image, Sandbox, or Snapshot ref for fail-closed result validation.
 package builder
 
 import (
@@ -92,6 +92,8 @@ type buildPipeline struct {
 	startCmd     string // effective (request else template-inherited)
 	readyCmd     string
 	target       types.BuildTarget
+	publication  BuildPublicationPlan
+	artifacts    *buildPublicationResources
 }
 
 func (p *buildPipeline) phaseRunDir(pathID string) string {
@@ -164,6 +166,20 @@ func (p *buildPipeline) run() (res Result) {
 	if err := p.resolveTarget(); err != nil {
 		return fail(err)
 	}
+	if err := p.preparePublication(); err != nil {
+		return fail(err)
+	}
+	defer func() {
+		if closeErr := p.artifacts.Close(); closeErr != nil {
+			closeErr = fmt.Errorf("close build publication resources: %w", closeErr)
+			if res.Error == "" {
+				res = fail(closeErr)
+			} else {
+				p.log.Error("build publication cleanup", "bid", s.BuildID, "err", closeErr)
+				res.Error = errors.Join(errors.New(res.Error), closeErr).Error()
+			}
+		}
+	}()
 
 	if s.FromImage != "" {
 		if err := p.runPhase("a", p.phaseImport); err != nil {
@@ -177,7 +193,7 @@ func (p *buildPipeline) run() (res Result) {
 	}
 	var bundle string
 	if p.target.Kind == types.BuildTargetSandbox && p.target.Memory {
-		if err := p.prepareFinalImageRef(); err != nil {
+		if err := p.publishPhaseCImage(); err != nil {
 			return fail(fmt.Errorf("final image: %w", err))
 		}
 		var b string
@@ -205,15 +221,15 @@ func (p *buildPipeline) run() (res Result) {
 		}
 		res.SnapshotRef = key
 	case p.target.Kind == types.BuildTargetSandbox:
-		ref, err := p.publishOfflineSandbox()
+		ref, err := p.publishSandboxTarget()
 		if err != nil {
 			return fail(fmt.Errorf("publish Sandbox: %w", err))
 		}
 		res.SandboxRef = ref
 	case p.target.Kind == types.BuildTargetImage:
-		ref, err := p.uploadImage()
+		ref, err := p.publishImageTarget()
 		if err != nil {
-			return fail(fmt.Errorf("upload image: %w", err))
+			return fail(fmt.Errorf("publish image: %w", err))
 		}
 		res.ImageRef = ref
 	default:

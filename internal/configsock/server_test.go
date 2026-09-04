@@ -554,6 +554,28 @@ func TestBuildSourceDocumentsDoNotCrossTaskWire(t *testing.T) {
 	}
 }
 
+func TestBuildPublicationPolicyWireUsesOnlyCheckpointSpecificFields(t *testing.T) {
+	body, err := json.Marshal(BuildSpec{
+		CheckpointRefLocationParent: "file:///mnt/checkpoints",
+		CheckpointRemoteManifest:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(body)
+	for _, want := range []string{
+		`"checkpoint_ref_location_parent":"file:///mnt/checkpoints"`,
+		`"checkpoint_remote_manifest":true`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("BuildSpec wire %s missing %s", raw, want)
+		}
+	}
+	if strings.Contains(raw, "publish_location_parent") {
+		t.Fatalf("BuildSpec wire retained removed field: %s", raw)
+	}
+}
+
 func TestBuildClientClassifiesOnlyTransportInterruptionsAsRetryable(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.sock")
 	if _, err := WaitAssignment(context.Background(), missing, "build", "br-test"); !IsTransportError(err) {

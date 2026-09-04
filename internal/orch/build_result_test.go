@@ -31,7 +31,7 @@ func TestValidateBuildResultAcceptsExactlyOneTargetArtifact(t *testing.T) {
 			},
 		},
 		{
-			name: "explicit offline sandbox",
+			name: "explicit top-level Sandbox E",
 			build: &types.Build{Profile: types.ProfileE2B, StartCmd: "declared-only", Builder: types.BuildOptions{
 				Target: &types.BuildTarget{Kind: types.BuildTargetSandbox},
 			}},
@@ -61,7 +61,7 @@ func TestValidateBuildResultAcceptsExactlyOneTargetArtifact(t *testing.T) {
 func TestValidateBuildResultFailsClosedOnTargetOrArtifactMismatch(t *testing.T) {
 	ref := "manifest://" + strings.Repeat("a", 64)
 	image := types.BuildTarget{Kind: types.BuildTargetImage}
-	offline := types.BuildTarget{Kind: types.BuildTargetSandbox}
+	topLevelSandbox := types.BuildTarget{Kind: types.BuildTargetSandbox}
 	memory := types.BuildTarget{Kind: types.BuildTargetSandbox, Memory: true}
 	for _, test := range []struct {
 		name   string
@@ -69,21 +69,21 @@ func TestValidateBuildResultFailsClosedOnTargetOrArtifactMismatch(t *testing.T) 
 		result types.BuildResult
 	}{
 		{name: "missing target", build: &types.Build{}, result: types.BuildResult{ImageRef: ref}},
-		{name: "explicit mismatch", build: &types.Build{Builder: types.BuildOptions{Target: &offline}}, result: types.BuildResult{Target: image, ImageRef: ref}},
+		{name: "explicit mismatch", build: &types.Build{Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: image, ImageRef: ref}},
 		{name: "auto mismatch", build: &types.Build{}, result: types.BuildResult{Target: memory, SnapshotRef: ref}},
 		{name: "image command", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: ref, StartCmd: "serve"}},
 		{name: "image with sandbox ref", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: ref, SandboxRef: ref}},
-		{name: "offline wrong ref", build: &types.Build{Builder: types.BuildOptions{Target: &offline}}, result: types.BuildResult{Target: offline, SnapshotRef: ref}},
+		{name: "top-level Sandbox E wrong ref", build: &types.Build{Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SnapshotRef: ref}},
 		{name: "memory wrong ref", build: &types.Build{Builder: types.BuildOptions{Target: &memory}}, result: types.BuildResult{Target: memory, SandboxRef: ref}},
 		{name: "auto image drops Sandbox config", build: &types.Build{Metadata: map[string]string{sandboxcfg.NsFiles: `[]`}}, result: types.BuildResult{Target: image, ImageRef: ref}},
-		{name: "offline drops instance config", build: &types.Build{Secure: true, Builder: types.BuildOptions{Target: &offline}}, result: types.BuildResult{Target: offline, SandboxRef: ref}},
-		{name: "offline drops traffic config", build: &types.Build{Metadata: map[string]string{sandboxcfg.NsTraffic: `{"max_inflight":{"total":1}}`}, Builder: types.BuildOptions{Target: &offline}}, result: types.BuildResult{Target: offline, SandboxRef: ref}},
+		{name: "top-level Sandbox E drops instance config", build: &types.Build{Secure: true, Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SandboxRef: ref}},
+		{name: "top-level Sandbox E drops traffic config", build: &types.Build{Metadata: map[string]string{sandboxcfg.NsTraffic: `{"max_inflight":{"total":1}}`}, Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SandboxRef: ref}},
 		{name: "malformed portable ref", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: "manifest://short"}},
 		{name: "successful failure stage", build: &types.Build{}, result: types.BuildResult{Target: image, ImageRef: ref, FailureStage: "runtime"}},
 		{name: "failed result with artifact", build: &types.Build{}, result: types.BuildResult{Error: "failed", Target: image, ImageRef: ref}},
 		{name: "changes explicit start", build: &types.Build{StartCmd: "serve"}, result: types.BuildResult{Target: memory, SnapshotRef: ref, StartCmd: "other"}},
 		{name: "changes explicit ready", build: &types.Build{ReadyCmd: "probe"}, result: types.BuildResult{Target: memory, SnapshotRef: ref, ReadyCmd: "other"}},
-		{name: "introduces command without source", build: &types.Build{Builder: types.BuildOptions{Target: &offline}}, result: types.BuildResult{Target: offline, SandboxRef: ref, StartCmd: "injected"}},
+		{name: "introduces command without source", build: &types.Build{Builder: types.BuildOptions{Target: &topLevelSandbox}}, result: types.BuildResult{Target: topLevelSandbox, SandboxRef: ref, StartCmd: "injected"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := validateBuildResult(test.build, test.result); err == nil {

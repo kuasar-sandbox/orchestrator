@@ -113,6 +113,36 @@ func TestTerminalObserverRunsAfterCorePublicationAndNotAfterFailedPersistence(t 
 	}
 }
 
+func TestCompleteBuildAcceptsLocatedImageBundleTemplateID(t *testing.T) {
+	o := testOrch(t)
+	build := observerBuildingFixture(t, "located-image-bundle")
+	if err := o.st.PutBuild(context.Background(), build); err != nil {
+		t.Fatal(err)
+	}
+	root := strings.Repeat("a", 64)
+	imageRef := "file://" + root + ".bundle@manifest:" + root + "@location:build-image"
+	var publishedState, publishedTemplate string
+	o.completeBuildWithPublisher(context.Background(), build, &buildResult{
+		Target:   types.BuildTarget{Kind: types.BuildTargetImage},
+		ImageRef: imageRef,
+	}, nil, func(_ string, state, templateID, _ string) {
+		publishedState, publishedTemplate = state, templateID
+	})
+
+	stored, err := o.st.GetBuild(context.Background(), build.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTemplate := types.TemplateID{Profile: build.Profile, Kind: types.KindImg, Ref: imageRef}.String()
+	if stored.Status != types.BuildReady || stored.PersistID != wantTemplate ||
+		publishedState != string(types.BuildReady) || publishedTemplate != wantTemplate {
+		t.Fatalf("located image Bundle completion = stored %+v, publication state=%q template=%q", stored, publishedState, publishedTemplate)
+	}
+	if parsed, err := types.ParseTemplateID(stored.PersistID); err != nil || parsed.Kind != types.KindImg || parsed.Ref != imageRef {
+		t.Fatalf("persisted image Bundle TemplateID = %+v, %v", parsed, err)
+	}
+}
+
 func TestSandboxObserverPublishesCommittedDeadlineAndDelete(t *testing.T) {
 	o := testOrch(t)
 	o.cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")

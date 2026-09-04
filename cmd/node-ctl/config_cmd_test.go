@@ -134,7 +134,7 @@ func TestConductorConfigTemplateDocumentsBundleCheckpointAndRemotePublication(t 
 		t.Fatal("conductor template has no checkpoint block")
 	}
 	block := conductorConfigSkeleton[start : start+end]
-	for _, want := range []string{"mode: local", "local | bundle", "ref_location_parent:"} {
+	for _, want := range []string{"mode: local", "local | bundle", "ref_location_parent:", "manifest: false", "image-class"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("checkpoint template does not contain %q:\n%s", want, block)
 		}
@@ -154,6 +154,7 @@ checkpoint:
   mode: bundle
   remote:
     ref_location_parent: file:///mnt/shared/snapshots
+    manifest: true
 `)
 	out, err := renderConductorConfig(false, false, path)
 	if err != nil {
@@ -164,7 +165,8 @@ checkpoint:
 		t.Fatal(err)
 	}
 	if rendered.Checkpoint.Mode != config.CheckpointBundle ||
-		rendered.Checkpoint.Remote.RefLocationParent != "file:///mnt/shared/snapshots" {
+		rendered.Checkpoint.Remote.RefLocationParent != "file:///mnt/shared/snapshots" ||
+		!rendered.Checkpoint.Remote.Manifest {
 		t.Fatalf("rendered checkpoint = %+v\n%s", rendered.Checkpoint, out)
 	}
 }

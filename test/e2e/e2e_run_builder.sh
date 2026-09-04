@@ -6,8 +6,9 @@
 # network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
-# as an envd-managed process. One orchestrator, nine successful builds, one
-# deterministic failed build, and four creates:
+# as an envd-managed process. One durable conductor database is exercised
+# across publication-policy restarts, fourteen successful builds, one
+# deterministic failed build, and six creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -26,13 +27,21 @@
 #       resolves S only to E, forces B materialization, ignores inherited
 #       start/ready, and leaves no source S/E/root dependency
 #   B7  fromTemplate(B1, img), explicit sandbox/cold        → e2b-sbx template
-#       offline assembly through sandbox-ctl; no Phase A/B/C VM execution
+#       top-level Sandbox E assembly; no Phase A/B/C VM execution
 #   B8  fromTemplate(B7, sbx), explicit sandbox/memory      → e2b-snp template
 #       forces B with no steps, cold-runs C with --replace-boot, and exercises
 #       the cancelable fixed 20-second readiness wait without commands
 #   BF  fromTemplate(B1) + failing RUN                     → error
 #       preserves journal logs while its failed systemd instance is collected
-#   create from B8, B1, B5 and B7 after their Build rows expire → running → kill
+#   P1  parent + manifest=false, fromImage → sandbox/cold (Manifest E)
+#   P2  parent + manifest=false + local, fromImage → sandbox/memory
+#       publishes IMG to Manifest and checkpoint E/S as located tarstreams
+#   P3  parent + manifest=true, fromImage → image Bundle
+#   P4  parent + manifest=true, fromImage → top-level Sandbox E Bundle
+#   P5  parent + manifest=true + bundle, fromImage → sandbox/memory
+#       boots Phase C from a located IMG Bundle and keeps it external to S
+#   create from B8, B1, B5, B7, P3 and P5 after their Build rows expire
+#       → running → kill
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
@@ -124,7 +133,8 @@ for u in "${UNIT_NAMES[@]}"; do
     [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u already exists (real deployment?); refusing to clobber"
     OURS+=("$UNIT_DIR/$u")
 done
-mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot" "$WORK/vgw"
+mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot" "$WORK/vgw" "$WORK/ref-locations"
+REF_LOCATION_PARENT="file://$WORK/ref-locations"
 declare -a PIDS=() TAGS=()
 cleanup() {
     set +e
@@ -324,13 +334,66 @@ resource_listen:
 checkpoint: { mode: bundle }
 EOF
 
-"$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
-PIDS+=($!)
-for _ in $(seq 1 30); do
-    curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
-    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
-    sleep 0.5
-done
+CONDUCTOR_PID=""
+start_conductor() {
+    "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >>"$WORK/orch.log" 2>&1 &
+    CONDUCTOR_PID=$!
+    PIDS+=("$CONDUCTOR_PID")
+    for _ in $(seq 1 60); do
+        if [ -S "$WORK/node-ctl.socket" ] && \
+            curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" \
+            -H "Host: api.$DOMAIN" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$CONDUCTOR_PID" 2>/dev/null \
+            || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
+        sleep 0.5
+    done
+    fail "orchestrator health endpoint did not become ready"
+}
+stop_conductor() {
+    [ -n "$CONDUCTOR_PID" ] || return 0
+    local stopped_pid="$CONDUCTOR_PID" index
+    kill "$stopped_pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+        kill -0 "$stopped_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$stopped_pid" 2>/dev/null; then
+        kill -KILL "$stopped_pid" 2>/dev/null || true
+    fi
+    wait "$stopped_pid" 2>/dev/null || true
+    for index in "${!PIDS[@]}"; do
+        [ "${PIDS[$index]}" != "$stopped_pid" ] || PIDS[index]=""
+    done
+    CONDUCTOR_PID=""
+}
+configure_checkpoint_policy() { # mode remote-manifest
+    python3 - "$WORK/config.yaml" "$1" "$2" "$REF_LOCATION_PARENT" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+head, marker, _ = text.partition("\ncheckpoint:")
+assert marker, "checkpoint config marker is missing"
+path.write_text(
+    head
+    + "\ncheckpoint:\n"
+    + f"  mode: {sys.argv[2]}\n"
+    + "  remote:\n"
+    + f"    ref_location_parent: {sys.argv[4]}\n"
+    + f"    manifest: {sys.argv[3]}\n"
+)
+PY
+}
+restart_conductor() { # mode remote-manifest
+    stop_conductor
+    configure_checkpoint_policy "$1" "$2"
+    start_conductor
+    echo "==> conductor restarted (checkpoint.mode=$1, parent configured, remote.manifest=$2)"
+}
+
+start_conductor
 write_proxy_config "$WORK/proxy.yaml" \
     "$WORK/node-ctl.socket" "$WORK/run" "127.0.0.1:$PROXY_PORT" - \
     "$WORK/proxy-stats.sock" "$WORK/proxy-routes.shm" 1024 2 enforce 30s -
@@ -481,7 +544,14 @@ try:
     if base64.urlsafe_b64encode(raw).decode().rstrip("=") != payload:
         raise ValueError
     ref = raw.decode()
-    if not re.fullmatch(r"manifest://[0-9a-f]{64}", ref):
+    manifest_ref = re.fullmatch(r"manifest://[0-9a-f]{64}", ref)
+    located_ref = re.fullmatch(
+        r"file://[0-9a-f]{64}\.(?:bundle|sandbox|snapshot|overlay)"
+        r"@(?:manifest|digest|hmac):[0-9a-f]{64}"
+        r"@location:[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+        ref,
+    )
+    if not manifest_ref and not located_ref:
         raise ValueError
 except (ValueError, UnicodeDecodeError):
     raise SystemExit(1)
@@ -489,6 +559,109 @@ print(ref)
 PY
 }
 valid_persist_id() { persist_ref "$1" >/dev/null; }
+manifest_count() {
+    if [ ! -d "$WORK/store/manifest/G1" ]; then
+        echo 0
+        return
+    fi
+    find "$WORK/store/manifest/G1" -type f | wc -l
+}
+snapshot_manifest_keys() { # output file
+    local output="$1"
+    if [ ! -d "$WORK/store/manifest/G1" ]; then
+        : >"$output"
+        return
+    fi
+    find "$WORK/store/manifest/G1" -type f -printf '%f\n' | sort -u >"$output"
+}
+assert_only_manifest_ref_added() { # before-list manifest-ref label
+    local before="$1" ref="$2" label="$3" key after additions final
+    [[ "$ref" == manifest://* ]] || fail "$label expected a Manifest ref, got $ref"
+    key=${ref#manifest://}
+    after="$WORK/$label-manifests.after"
+    additions="$WORK/$label-manifests.added"
+    snapshot_manifest_keys "$after"
+    comm -13 "$before" "$after" >"$additions"
+    if [ -s "$additions" ] && [ "$(wc -l <"$additions")" != "1" ]; then
+        cat "$additions" >&2
+        fail "$label created more than its one final Manifest root"
+    fi
+    if [ -s "$additions" ] && [ "$(cat "$additions")" != "$key" ]; then
+        cat "$additions" >&2
+        fail "$label created an intermediate Manifest instead of only $key"
+    fi
+    final="$WORK/store/manifest/G1/${key:0:2}/${key:2:2}/$key"
+    if [ ! -f "$final" ] || [ -L "$final" ]; then
+        fail "$label final Manifest root is missing or unsafe: $final"
+    fi
+}
+located_ref_details() { # ref -> "name<TAB>directory<TAB>file"
+    python3 - "$1" "$WORK/ref-locations" <<'PY'
+import hashlib, pathlib, re, sys
+
+ref, parent = sys.argv[1:]
+match = re.search(r"@location:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$", ref)
+assert match, ref
+name = match.group(1)
+assert len(name) > 9 and name[-9] == "-" and name[-8:].isdigit(), name
+payload = ref.removeprefix("file://").split("@", 1)[0]
+assert payload and "/" not in payload, payload
+digest = hashlib.sha256(name.encode()).hexdigest()
+directory = pathlib.Path(parent, name[-8:], digest[:2], digest[2:4], name)
+print(f"{name}\t{directory}\t{directory / payload}")
+PY
+}
+located_file_path() { # ref
+    local directory file
+    IFS=$'\t' read -r _ directory file < <(located_ref_details "$1")
+    printf '%s\n' "$file"
+}
+artifact_info() { # ref output stderr
+    local ref="$1" output="$2" error_output="$3" binding="" location_dir=""
+    local args=(info --json --manifest-config "$WORK/manifest.yaml")
+    if [[ "$ref" == *"@location:"* ]]; then
+        # Include every currently materialized publication mapping. This makes
+        # the assertion correct even when image and checkpoint publication
+        # straddle UTC midnight and therefore use different location names.
+        while IFS= read -r -d '' location_dir; do
+            binding="$(basename "$location_dir")=file://$location_dir"
+            args+=(--ref-location "$binding")
+        done < <(find "$WORK/ref-locations" -mindepth 4 -maxdepth 4 -type d -print0 | sort -z)
+    fi
+    MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" "${args[@]}" "$ref" >"$output" 2>"$error_output"
+}
+assert_located_final() { # ref extension
+    local ref="$1" extension="$2" final
+    [[ "$ref" == file://*"@location:"* ]] || fail "ref is not located: $ref"
+    final=$(located_file_path "$ref") || fail "cannot resolve located ref $ref"
+    if [ ! -f "$final" ] || [ -L "$final" ]; then
+        fail "located final is missing, non-regular, or a symlink: $final"
+    fi
+    [[ "$final" == *"$extension" ]] \
+        || fail "located final $final does not end in $extension"
+}
+assert_bundle_directory_only() { # ref expected-bundle-count
+    local ref="$1" expected="$2" final directory bundles others
+    assert_located_final "$ref" .bundle
+    final=$(located_file_path "$ref")
+    directory=$(dirname "$final")
+    bundles=$(find "$directory" -maxdepth 1 -type f -name '*.bundle' | wc -l)
+    others=$(find "$directory" -maxdepth 1 -type f ! -name '*.bundle' -print)
+    [ "$bundles" = "$expected" ] \
+        || { find "$directory" -maxdepth 1 -ls >&2; fail "Bundle count=$bundles in $directory (want $expected)"; }
+    [ -z "$others" ] \
+        || { printf '%s\n' "$others" >&2; fail "named Bundle location contains a tarstream/partial final"; }
+}
+assert_build_finalized() { # build id label
+    local bid="$1" label="$2"
+    [ ! -e "$WORK/run/builds/$bid" ] || fail "$label retained BuildRunDir"
+    [ ! -e "$WORK/lib/builds/$bid" ] || fail "$label retained BuildBaseDir"
+    if find "$WORK/run" -type f \( -name '*.sandbox' -o -name '*.snapshot' -o -name '*.bundle' \) \
+        -print -quit | grep -q .; then
+        find "$WORK/run" -type f -print >&2
+        fail "$label left a complete E/S/Bundle under run_root"
+    fi
+}
 phase_sandbox_id() { # $1=phase, $2=opaque build id
     python3 - "$1" "$2" <<'PY'
 import base64
@@ -979,6 +1152,8 @@ wait_phase_reservation a "$B1_BID" \
 wait_ready "$B1_TID" "$B1_BID" B1 null img
 B1_PERSIST="$PERSIST"
 case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
+B1_REF=$(persist_ref "$B1_PERSIST") || fail "B1 persistent id is invalid"
+[[ "$B1_REF" == manifest://* ]] || fail "B1 default manifest=false image result is not in Manifest store: $B1_REF"
 B1_BEFORE_RETRY=$(build_trigger_signature "$B1_BID")
 code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" \
     "{\"fromImage\":\"$PULL_REF\",\"force\":true}")
@@ -1239,9 +1414,9 @@ assert "e2b.start_cmd" not in encoded and "e2b.ready_cmd" not in encoded, encode
 PY
 echo "==> PASS: B6 SNP→E cold selection forced Phase B, ignored inherited commands, emitted only Image, and skipped C"
 
-# ---- B7: explicit offline Sandbox from Image → no phase VM ----------------
+# ---- B7: explicit top-level Sandbox E from Image → no phase VM ------------
 echo "==> B7: fromTemplate=$B6_PERSIST (IMG), explicit sandbox memory=false"
-register e2e-offline e2b '{"kind":"sandbox","memory":false}' 1
+register e2e-sandbox-e e2b '{"kind":"sandbox","memory":false}' 1
 B7_TID="$TID"; B7_BID="$BID"
 code=$(req POST "/v2/templates/$B7_TID/builds/$B7_BID" "$AK" \
     "{\"fromTemplate\":\"$B6_PERSIST\"}")
@@ -1257,7 +1432,7 @@ MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manif
     "$B7_REF" >"$WORK/b7-sandbox.json" 2>"$WORK/b7-sandbox.err" \
     || { cat "$WORK/b7-sandbox.err"; fail "sandbox-ctl info B7 Sandbox"; }
 python3 - "$WORK/b7-sandbox.json" <<'PY' \
-    || fail "B7 offline Sandbox lost registered Create configuration"
+    || fail "B7 top-level Sandbox E lost registered Create configuration"
 import json, sys
 config = json.load(open(sys.argv[1]))
 assert config["Resources"]["Capacity"] == {"CPU": 2, "Memory": "3GiB"}, config["Resources"]
@@ -1268,7 +1443,7 @@ assert "manifest://" not in json.dumps(root), root
 metadata = config.get("Metadata") or {}
 assert "e2b.start_cmd" not in metadata and "e2b.ready_cmd" not in metadata, metadata
 PY
-echo "==> PASS: B7 offline sandbox-ctl assembly emitted E with target resources/env and started no A/B/C VM"
+echo "==> PASS: B7 direct top-level Sandbox E assembly preserved target resources/env and started no A/B/C VM"
 
 # ---- B8: SBX source + explicit memory Sandbox, no commands -----------------
 echo "==> B8: fromTemplate=$B7_PERSIST (SBX), explicit sandbox memory=true, no steps/start/ready"
@@ -1344,16 +1519,16 @@ wait_resource_capacity "$E2B_COLD_SID" "$((2 << 30))" \
 code=$(req DELETE "/sandboxes/$E2B_COLD_SID" "$AK"); [ "$code" = "204" ] || fail "e2b cold kill = $code (want 204)"
 echo "==> PASS: e2b image cold Create reached running and cleaned up"
 
-echo "==> create e2b cold sandbox from $B7_PERSIST (offline Sandbox E path)"
+echo "==> create e2b cold sandbox from $B7_PERSIST (top-level Sandbox E path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B7_PERSIST\",\"timeout\":60}")
-[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B7_BID"; fail "offline Sandbox create = $code (want 201)"; }
-OFFLINE_SID=$(json_field "$WORK/resp.body" sandboxID)
-[ -n "$OFFLINE_SID" ] || fail "offline Sandbox create returned no sandboxID"
-wait_running "$OFFLINE_SID" || { diag "$B7_BID"; fail "offline Sandbox did not reach running"; }
-wait_resource_capacity "$OFFLINE_SID" "$((3 << 30))" \
-    || fail "offline Sandbox Create did not preserve target capacity"
-code=$(req DELETE "/sandboxes/$OFFLINE_SID" "$AK"); [ "$code" = "204" ] || fail "offline Sandbox kill = $code (want 204)"
-echo "==> PASS: offline Sandbox E canonical Create reached running and cleaned up after Build-row TTL"
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B7_BID"; fail "top-level Sandbox E create = $code (want 201)"; }
+SANDBOX_E_SID=$(json_field "$WORK/resp.body" sandboxID)
+[ -n "$SANDBOX_E_SID" ] || fail "top-level Sandbox E create returned no sandboxID"
+wait_running "$SANDBOX_E_SID" || { diag "$B7_BID"; fail "top-level Sandbox E did not reach running"; }
+wait_resource_capacity "$SANDBOX_E_SID" "$((3 << 30))" \
+    || fail "top-level Sandbox E Create did not preserve target capacity"
+code=$(req DELETE "/sandboxes/$SANDBOX_E_SID" "$AK"); [ "$code" = "204" ] || fail "top-level Sandbox E kill = $code (want 204)"
+echo "==> PASS: top-level Sandbox E canonical Create reached running and cleaned up after Build-row TTL"
 
 echo "==> create bare sandbox from $B5_PERSIST (image cold-boot path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B5_PERSIST\",\"timeout\":60}")
@@ -1366,10 +1541,196 @@ grep -q "$BARE_SID" "$WORK/resp.body" || fail "created bare sandbox $BARE_SID no
 code=$(req DELETE "/sandboxes/$BARE_SID" "$AK"); [ "$code" = "204" ] || fail "bare kill = $code (want 204)"
 echo "==> PASS: bare sandbox create → list → kill from bare-img build"
 
+# ---- #305 publication matrix: parent + false/local, then true/bundle ------
+# Keep the database, customer key, Store and API identity stable while the
+# conductor is restarted with each node policy. This exercises startup-time
+# policy validation and proves that durable TemplateIDs remain sufficient.
+restart_conductor local false
+
+# P1: a local Phase-A image must feed top-level E assembly directly. The only
+# Manifest root this Build may add is its final Sandbox E; an intermediate IMG
+# Manifest would appear as a second key in the exact before/after set.
+echo "==> P1: parent + remote.manifest=false, fromImage → top-level Sandbox E"
+snapshot_manifest_keys "$WORK/p1-manifests.before"
+register e2e-policy-false-sandbox e2b '{"kind":"sandbox","memory":false}' 1
+P1_TID="$TID"; P1_BID="$BID"
+code=$(req POST "/v2/templates/$P1_TID/builds/$P1_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P1 trigger = $code (want 202)"; }
+wait_ready "$P1_TID" "$P1_BID" P1 '{"kind":"sandbox","memory":false}' sbx
+P1_PERSIST="$PERSIST"
+P1_REF=$(persist_ref "$P1_PERSIST") || fail "P1 persistent id is invalid"
+assert_only_manifest_ref_added "$WORK/p1-manifests.before" "$P1_REF" p1
+assert_phase_history "$P1_BID" a - P1
+assert_phase_history "$P1_BID" - b P1
+assert_phase_history "$P1_BID" - c P1
+artifact_info "$P1_REF" "$WORK/p1-sandbox.json" "$WORK/p1-sandbox.err" \
+    || { cat "$WORK/p1-sandbox.err"; fail "sandbox-ctl info P1 top-level E"; }
+python3 - "$WORK/p1-sandbox.json" <<'PY' || fail "P1 is not a strict self-contained Sandbox E"
+import json, sys
+config = json.load(open(sys.argv[1]))
+root = config["Boot"]["Root"]
+assert root["Base"] == "self" and isinstance(root.get("Overlay"), dict), root
+assert "manifest://" not in json.dumps(root), root
+PY
+assert_build_finalized "$P1_BID" P1
+echo "==> PASS: P1 added only final manifest://E, with no intermediate IMG Manifest or complete E staging"
+
+# P2 pins checkpoint-class routing independently: the final image is a
+# Manifest root, while local mode writes incremental E/S tarstreams to the
+# named location. It also executes real Phase C from the published image.
+echo "==> P2: parent + remote.manifest=false + local, fromImage → sandbox/memory"
+snapshot_manifest_keys "$WORK/p2-manifests.before"
+register e2e-policy-false-memory e2b '{"kind":"sandbox","memory":true}' 1
+P2_TID="$TID"; P2_BID="$BID"
+P2_STARTED=$(date +%s)
+code=$(req POST "/v2/templates/$P2_TID/builds/$P2_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P2 trigger = $code (want 202)"; }
+wait_ready "$P2_TID" "$P2_BID" P2 '{"kind":"sandbox","memory":true}' snp
+P2_ELAPSED=$(( $(date +%s) - P2_STARTED ))
+[ "$P2_ELAPSED" -ge 20 ] || fail "P2 completed in ${P2_ELAPSED}s; Phase C fixed wait was skipped"
+P2_PERSIST="$PERSIST"
+P2_REF=$(persist_ref "$P2_PERSIST") || fail "P2 persistent id is invalid"
+assert_located_final "$P2_REF" .snapshot
+artifact_info "$P2_REF" "$WORK/p2-snapshot.json" "$WORK/p2-snapshot.err" \
+    || { cat "$WORK/p2-snapshot.err"; fail "sandbox-ctl info P2 Snapshot"; }
+P2_SANDBOX_REF=$(json_field "$WORK/p2-snapshot.json" SandboxRef)
+assert_located_final "$P2_SANDBOX_REF" .sandbox
+P2_IMAGE_REF=$(python3 - "$WORK/p2-snapshot.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+print(config["Boot"]["Root"]["BaseRef"])
+PY
+)
+assert_only_manifest_ref_added "$WORK/p2-manifests.before" "$P2_IMAGE_REF" p2
+assert_phase_history "$P2_BID" a - P2
+assert_phase_history "$P2_BID" - b P2
+assert_phase_history "$P2_BID" c - P2
+assert_build_finalized "$P2_BID" P2
+echo "==> PASS: P2 graph is located S → located EΔ → manifest://IMG; local mode emitted role-specific tarstreams"
+
+restart_conductor bundle true
+
+# Under remote.manifest=true, every image-class result is a single-root
+# Manifest Bundle in its actual publication location. None of these Builds may
+# add a Manifest-store root, including Phase A import and Phase-C boot setup.
+echo "==> P3: parent + remote.manifest=true, fromImage → IMG Bundle"
+P3_MANIFESTS_BEFORE=$(manifest_count)
+register e2e-policy-bundle-image e2b '{"kind":"image"}'
+P3_TID="$TID"; P3_BID="$BID"
+code=$(req POST "/v2/templates/$P3_TID/builds/$P3_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P3 trigger = $code (want 202)"; }
+wait_ready "$P3_TID" "$P3_BID" P3 '{"kind":"image"}' img
+P3_PERSIST="$PERSIST"
+P3_REF=$(persist_ref "$P3_PERSIST") || fail "P3 persistent id is invalid"
+[ "$(manifest_count)" = "$P3_MANIFESTS_BEFORE" ] \
+    || fail "P3 wrote the Manifest store under remote.manifest=true"
+assert_bundle_directory_only "$P3_REF" 1
+assert_phase_history "$P3_BID" a - P3
+assert_phase_history "$P3_BID" - b P3
+assert_phase_history "$P3_BID" - c P3
+assert_build_finalized "$P3_BID" P3
+echo "==> PASS: P3 returned a located image-root Bundle and left the Manifest store unchanged"
+
+echo "==> P4: parent + remote.manifest=true, fromImage → top-level Sandbox E Bundle"
+P4_MANIFESTS_BEFORE=$(manifest_count)
+register e2e-policy-bundle-sandbox e2b '{"kind":"sandbox","memory":false}' 1
+P4_TID="$TID"; P4_BID="$BID"
+code=$(req POST "/v2/templates/$P4_TID/builds/$P4_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P4 trigger = $code (want 202)"; }
+wait_ready "$P4_TID" "$P4_BID" P4 '{"kind":"sandbox","memory":false}' sbx
+P4_PERSIST="$PERSIST"
+P4_REF=$(persist_ref "$P4_PERSIST") || fail "P4 persistent id is invalid"
+[ "$(manifest_count)" = "$P4_MANIFESTS_BEFORE" ] \
+    || fail "P4 wrote an IMG or E root to the Manifest store"
+assert_bundle_directory_only "$P4_REF" 1
+artifact_info "$P4_REF" "$WORK/p4-sandbox.json" "$WORK/p4-sandbox.err" \
+    || { cat "$WORK/p4-sandbox.err"; fail "sandbox-ctl info P4 Sandbox Bundle"; }
+python3 - "$WORK/p4-sandbox.json" <<'PY' || fail "P4 Bundle root is not a self-contained Sandbox E"
+import json, sys
+config = json.load(open(sys.argv[1]))
+root = config["Boot"]["Root"]
+assert root["Base"] == "self" and isinstance(root.get("Overlay"), dict), root
+assert "manifest://" not in json.dumps(root), root
+PY
+assert_phase_history "$P4_BID" a - P4
+assert_phase_history "$P4_BID" - b P4
+assert_phase_history "$P4_BID" - c P4
+assert_build_finalized "$P4_BID" P4
+echo "==> PASS: P4 directly assembled and published a sandbox-root Bundle, with no IMG Manifest or complete E staging"
+
+echo "==> P5: parent + remote.manifest=true + bundle, fromImage → sandbox/memory"
+P5_MANIFESTS_BEFORE=$(manifest_count)
+register e2e-policy-bundle-memory e2b '{"kind":"sandbox","memory":true}' 1
+P5_TID="$TID"; P5_BID="$BID"
+P5_STARTED=$(date +%s)
+code=$(req POST "/v2/templates/$P5_TID/builds/$P5_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "P5 trigger = $code (want 202)"; }
+wait_ready "$P5_TID" "$P5_BID" P5 '{"kind":"sandbox","memory":true}' snp
+P5_ELAPSED=$(( $(date +%s) - P5_STARTED ))
+[ "$P5_ELAPSED" -ge 20 ] || fail "P5 completed in ${P5_ELAPSED}s; Phase C fixed wait was skipped"
+P5_PERSIST="$PERSIST"
+P5_REF=$(persist_ref "$P5_PERSIST") || fail "P5 persistent id is invalid"
+[ "$(manifest_count)" = "$P5_MANIFESTS_BEFORE" ] \
+    || fail "P5 wrote image/checkpoint roots to the Manifest store"
+assert_located_final "$P5_REF" .bundle
+artifact_info "$P5_REF" "$WORK/p5-snapshot.json" "$WORK/p5-snapshot.err" \
+    || { cat "$WORK/p5-snapshot.err"; fail "sandbox-ctl info P5 Snapshot Bundle"; }
+P5_IMAGE_REF=$(python3 - "$WORK/p5-snapshot.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+print(config["Boot"]["Root"]["BaseRef"])
+PY
+)
+assert_located_final "$P5_IMAGE_REF" .bundle
+P5_SNAPSHOT_DIR=$(dirname "$(located_file_path "$P5_REF")")
+P5_IMAGE_DIR=$(dirname "$(located_file_path "$P5_IMAGE_REF")")
+if [ "$P5_SNAPSHOT_DIR" = "$P5_IMAGE_DIR" ]; then
+    assert_bundle_directory_only "$P5_REF" 2
+else
+    # Publication names are intentionally minted at the actual publication
+    # time, so a build crossing UTC midnight has two valid date locations.
+    assert_bundle_directory_only "$P5_REF" 1
+    assert_bundle_directory_only "$P5_IMAGE_REF" 1
+fi
+assert_phase_history "$P5_BID" a - P5
+assert_phase_history "$P5_BID" - b P5
+assert_phase_history "$P5_BID" c - P5
+assert_build_finalized "$P5_BID" P5
+echo "==> PASS: P5 graph is Bundle S → EΔ → located IMG Bundle; Phase C reopened the portable image and Store count stayed fixed"
+
+# The opaque TemplateIDs, not terminal Build rows, remain the authority. P3
+# proves a located image-root Bundle can cold boot; P5 proves Snapshot Bundle
+# restore follows its external located image dependency.
+for terminal_bid in "$P3_BID" "$P4_BID" "$P5_BID"; do
+    wait_build_row_deleted "$terminal_bid" \
+        || fail "policy Build row $terminal_bid survived builder.terminal_ttl"
+done
+echo "==> create cold sandbox from $P3_PERSIST (located IMG Bundle)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$P3_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$P3_BID"; fail "P3 Create = $code (want 201)"; }
+P3_SID=$(json_field "$WORK/resp.body" sandboxID)
+wait_running "$P3_SID" || { diag "$P3_BID"; fail "P3 located image sandbox did not reach running"; }
+code=$(req DELETE "/sandboxes/$P3_SID" "$AK"); [ "$code" = "204" ] || fail "P3 kill = $code (want 204)"
+
+echo "==> restore sandbox from $P5_PERSIST (Snapshot Bundle + external IMG Bundle)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$P5_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$P5_BID"; fail "P5 Create = $code (want 201)"; }
+P5_SID=$(json_field "$WORK/resp.body" sandboxID)
+wait_running "$P5_SID" || { diag "$P5_BID"; fail "P5 Snapshot Bundle sandbox did not reach running"; }
+wait_resource_capacity "$P5_SID" "$((3 << 30))" \
+    || fail "P5 Snapshot Bundle Create did not preserve target capacity"
+code=$(req DELETE "/sandboxes/$P5_SID" "$AK"); [ "$code" = "204" ] || fail "P5 kill = $code (want 204)"
+echo "==> PASS: located IMG and Snapshot Bundle TemplateIDs created real sandboxes after Build-row TTL"
+
 # store actually holds the uploaded chunks/manifests
 objs=$(find "$WORK/store" -type f | wc -l)
 [ "$objs" -gt 0 ] || fail "store has no objects after the builds"
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST B6=$B6_PERSIST B7=$B7_PERSIST B8=$B8_PERSIST P1=$P1_PERSIST P2=$P2_PERSIST P3=$P3_PERSIST P4=$P4_PERSIST P5=$P5_PERSIST)"
