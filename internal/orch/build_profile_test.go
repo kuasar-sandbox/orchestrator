@@ -142,20 +142,20 @@ func TestRegisterBuildDefersAutoTargetResourcesUntilTargetResolution(t *testing.
 	}
 }
 
-func TestOfflineBuildTargetRejectsTrafficConfiguration(t *testing.T) {
+func TestTopLevelSandboxBuildTargetRejectsTrafficConfiguration(t *testing.T) {
 	o := testOrch(t)
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
-	offline := types.BuildTarget{Kind: types.BuildTargetSandbox}
+	topLevelSandbox := types.BuildTarget{Kind: types.BuildTargetSandbox}
 	_, err := o.RegisterBuild(context.Background(), apiKey, api.RegisterSpec{
 		Profile:   types.ProfileE2B,
 		Resources: testBuildResources(),
 		Metadata: map[string]string{
 			sandboxcfg.NsTraffic: `{"max_inflight":{"total":1}}`,
 		},
-		Builder: types.BuildOptions{Target: &offline},
+		Builder: types.BuildOptions{Target: &topLevelSandbox},
 	})
 	if !errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "memory=false") {
-		t.Fatalf("RegisterBuild traffic error = %v, want offline instance-only rejection", err)
+		t.Fatalf("RegisterBuild traffic error = %v, want top-level Sandbox E instance-only rejection", err)
 	}
 }
 
@@ -302,6 +302,10 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	cfg.Sandbox.Network.Bare.Nexthop = "169.254.1.0"
 	cfg.MMDS.Enabled = true
 	cfg.Checkpoint.Mode = config.CheckpointBundle
+	cfg.Checkpoint.Remote = config.CheckpointRemoteConfig{
+		RefLocationParent: "file:///mnt/shared/checkpoints",
+		Manifest:          true,
+	}
 	o := testOrchCfg(t, cfg)
 	b := &types.Build{BuildID: "build-bare", Profile: types.ProfileBare}
 	runDir, baseDir := t.TempDir(), t.TempDir()
@@ -322,6 +326,9 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	}
 	if spec.CheckpointMode != config.CheckpointBundle {
 		t.Fatalf("BuildSpec checkpoint mode = %q, want bundle", spec.CheckpointMode)
+	}
+	if spec.CheckpointRefLocationParent != cfg.Checkpoint.Remote.RefLocationParent || !spec.CheckpointRemoteManifest {
+		t.Fatalf("BuildSpec publication policy = parent %q manifest=%t", spec.CheckpointRefLocationParent, spec.CheckpointRemoteManifest)
 	}
 	if spec.MMDSEnabled || spec.EnvdToken != "" {
 		t.Fatalf("bare BuildSpec exposed e2b template controls: mmds=%t envd_token=%q", spec.MMDSEnabled, spec.EnvdToken)

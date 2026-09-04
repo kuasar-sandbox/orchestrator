@@ -14,9 +14,9 @@ const (
 	E2BReadyCommandMetadata = "e2b.ready_cmd"
 )
 
-// BuildColdParams is the shared cold-config projection used by both an
-// offline Sandbox-E target and the initial C0 of a memory target. Source is a
-// task-local E and contributes only portable non-boot defaults.
+// BuildColdParams is the shared cold-config projection used by both a
+// top-level Sandbox E target and the initial C0 of a memory target. Source is
+// a task-local E and contributes only portable non-boot defaults.
 type BuildColdParams struct {
 	Profile          types.Profile
 	ImageRef         string
@@ -39,7 +39,7 @@ type BuildColdParams struct {
 
 // BuildColdConfig projects one ordinary explicit image cold configuration,
 // then layers source-E non-boot defaults below registration options. Its result
-// is the sole input for both offline export and Phase C.
+// is the sole input for both direct top-level E assembly and Phase C.
 func (p BuildColdParams) BuildColdConfig() (*rtconfig.SandboxConfig, error) {
 	if !p.Profile.Valid() {
 		return nil, fmt.Errorf("sandboxcfg: unknown build profile %q", p.Profile)
@@ -180,7 +180,7 @@ func setBuildCommands(metadata map[string]string, start, ready string) map[strin
 // MarshalBuildColdConfig keeps every portable collection explicitly present.
 // This is important for run --from --replace-boot: an intentionally empty
 // collection must clear a source default rather than disappear through
-// omitempty. The same bytes are also accepted by offline export.
+// omitempty. The same bytes are also accepted by direct top-level E assembly.
 func MarshalBuildColdConfig(cfg *rtconfig.SandboxConfig) ([]byte, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("sandboxcfg: nil build cold config")
@@ -195,8 +195,8 @@ func MarshalBuildColdConfig(cfg *rtconfig.SandboxConfig) ([]byte, error) {
 	}
 	// run --from applies persistent non-boot fields by YAML presence. Emit the
 	// complete persistent launch surface so false/empty values clear source-E
-	// defaults instead of disappearing through omitempty. Offline export reads
-	// the same document directly, which keeps both target paths equivalent.
+	// defaults instead of disappearing through omitempty. Direct top-level E
+	// assembly reads the same projection, keeping both target paths equivalent.
 	document["launch"] = map[string]any{
 		"exec": cfg.Launch.Exec, "args": cfg.Launch.Args, "env": cfg.Launch.Env,
 		"ephemeral_env": cfg.Launch.EphemeralEnv, "workdir": cfg.Launch.Workdir,

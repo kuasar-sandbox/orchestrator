@@ -16,21 +16,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 // --- phase C: template snapshot ---------------------------------------------
-
-// prepareFinalImageRef fixes the final platform image identity before
-// phase C. Both Phase C and offline E export consume the same cold projection,
-// and neither result is allowed to retain the source E/S graph.
-func (p *buildPipeline) prepareFinalImageRef() error {
-	ref, err := p.uploadImage()
-	if err != nil {
-		return fmt.Errorf("publish platform image: %w", err)
-	}
-	p.baseRef = ref
-	return nil
-}
 
 func (p *buildPipeline) phaseTemplate() (result string, retErr error) {
 	s := p.spec
@@ -176,6 +165,14 @@ func templateSnapshotArgs(pathID, output, runRoot, mode string, policy sandboxcf
 }
 
 func (p *buildPipeline) buildColdConfigYAML() ([]byte, error) {
+	cfg, err := p.buildColdConfig()
+	if err != nil {
+		return nil, err
+	}
+	return sandboxcfg.MarshalBuildColdConfig(cfg)
+}
+
+func (p *buildPipeline) buildColdConfig() (*rtconfig.SandboxConfig, error) {
 	namespaces := make(map[string]bool, len(p.spec.SandboxNamespaces))
 	for _, namespace := range p.spec.SandboxNamespaces {
 		namespaces[namespace] = true
@@ -197,7 +194,12 @@ func (p *buildPipeline) buildColdConfigYAML() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return sandboxcfg.MarshalBuildColdConfig(cfg)
+	// The former CLI path loaded this document through config.LoadMerged,
+	// which applied canonical defaults before image-default materialization.
+	// Direct package assembly receives the typed value, so apply the identical
+	// defaults here for both top-level E assembly and Phase C.
+	cfg.ApplyDefaults()
+	return cfg, nil
 }
 
 // waitEnvd polls envd's /health within the phase boot context. Runtime events
@@ -267,33 +269,14 @@ func udsHTTP(uds string) *http.Client {
 	}
 }
 
-// --- finale: uploads ---------------------------------------------------------
-
-func (p *buildPipeline) uploadImage() (string, error) {
-	if p.baseImageRef != "" {
-		return p.baseImageRef, nil
-	}
-	p.progress("uploading image to the content store")
-	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.ManifestCtl,
-		"store", "--no-progress", "--manifest-config", p.spec.Paths.ManifestConfig, p.imagePath)
-	if err != nil {
-		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
-	}
-	key := strings.TrimSpace(string(out))
-	if len(key) != 64 {
-		return "", fmt.Errorf("manifest-ctl store output %q (want 64-hex key)", key)
-	}
-	p.baseImageRef = "manifest://" + key
-	p.progress("uploaded image: %s", key)
-	return p.baseImageRef, nil
-}
+// --- finale: checkpoint publication -----------------------------------------
 
 func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
-	// Bundle mode exact-uploads snapshot layers without rewriting snapshot.cfg;
-	// prepareFinalImageRef has already published a newly built platform
-	// base. Tarstream publication rewrites the graph into portable refs.
-	p.progress("uploading template snapshot to the content store")
-	args, err := publishArtifactArgs(p.spec, bundle, p.now())
+	// Bundle mode preserves snapshot.cfg and any already-portable located image
+	// Bundle reference. Local mode rewrites only the checkpoint-class graph into
+	// role-specific tarstreams before applying the same checkpoint destination.
+	p.progress("publishing template checkpoint snapshot")
+	args, err := publishCheckpointArtifactArgs(p.spec, p.publication.CheckpointClassTarget, bundle, p.now())
 	if err != nil {
 		return "", err
 	}
@@ -305,106 +288,28 @@ func (p *buildPipeline) publishSnapshot(bundle string) (string, error) {
 	if _, err := types.ParsePortableRef(ref); err != nil {
 		return "", fmt.Errorf("publish output %q: %w", ref, err)
 	}
-	p.progress("uploaded template snapshot: %s", ref)
+	p.progress("published template checkpoint snapshot: %s", ref)
 	return ref, nil
 }
 
-func (p *buildPipeline) publishOfflineSandbox() (string, error) {
-	if err := p.prepareFinalImageRef(); err != nil {
-		return "", err
-	}
-	document, err := p.buildColdConfigYAML()
-	if err != nil {
-		return "", err
-	}
-	dir := p.phaseRunDir("offline")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	configPath := filepath.Join(dir, "sandbox.yaml")
-	if err := os.WriteFile(configPath, document, 0o600); err != nil {
-		return "", err
-	}
-	sandboxID := phaseSandboxID("e", p.spec.BuildID)
-	args, artifactPath := offlineSandboxExportArgs(p.spec, p.baseRef, configPath, sandboxID, dir)
-	if artifactPath != "" {
-		// Offline export has no located-publication flag. Materialize E into a
-		// task-private directory first, then use the same graph-aware publish
-		// path as captured Snapshots so --to-ref-location is honored.
-		if err := os.MkdirAll(filepath.Dir(artifactPath), 0o700); err != nil {
-			return "", err
-		}
-	}
-	if artifactPath == "" {
-		p.progress("uploading offline Sandbox to the content store")
-	} else {
-		p.progress("materializing offline Sandbox for located publication")
-	}
-	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
-	if err != nil {
-		return "", fmt.Errorf("%w (%s)", err, firstLine(out))
-	}
-	if artifactPath != "" {
-		if _, err := os.Lstat(artifactPath); err != nil {
-			return "", fmt.Errorf("offline Sandbox export %s: %w", artifactPath, err)
-		}
-		args, err = publishArtifactArgs(p.spec, artifactPath, p.now())
-		if err != nil {
-			return "", err
-		}
-		p.progress("publishing offline Sandbox to the configured ref location")
-		out, err = p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl, args...)
-		if err != nil {
-			return "", fmt.Errorf("%w (%s)", err, firstLine(out))
-		}
-	}
-	key := strings.TrimSpace(string(out))
-	ref := key
-	if !strings.Contains(ref, "://") {
-		ref = "manifest://" + ref
-	}
-	_, err = types.ParsePortableRef(ref)
-	if err != nil {
-		return "", fmt.Errorf("export output %q: %w", key, err)
-	}
-	p.progress("uploaded offline Sandbox: %s", ref)
-	return ref, nil
-}
-
-func offlineSandboxExportArgs(spec *configsock.BuildSpec, baseRef, configPath, sandboxID, runDir string) ([]string, string) {
-	args := []string{"export", "--from", baseRef, "--config", configPath}
-	artifactPath := ""
-	if spec.PublishLocationParent == "" {
-		args = append(args, "--upload")
-	} else {
-		artifactDir := filepath.Join(runDir, "artifact")
-		args = append(args, "--output", artifactDir)
-		artifactPath = filepath.Join(artifactDir, sandboxID+".sandbox")
-	}
-	args = append(args,
-		"--sandbox-id", sandboxID,
-		"--manifest-config", spec.Paths.ManifestConfig,
-	)
-	return appendRefLocationArgs(args, spec.RefLocations), artifactPath
-}
-
-// publishArtifactArgs builds the sandbox-ctl publish argv. The publication
-// name is minted HERE, at publication time, not at spec-resolution
-// time: a build that spans UTC midnight publishes into the day it actually
-// uploads, not the day the orchestrator resolved the spec. now is a parameter
-// so tests can pin the clock across midnight.
-func publishArtifactArgs(spec *configsock.BuildSpec, artifact string, now time.Time) ([]string, error) {
-	// Bundle publication needs the Manifest store even when the root output is
-	// located, because its exact object graph is validated and published before
-	// the located carrier is committed.
+// publishCheckpointArtifactArgs builds the sandbox-ctl argv for the Phase-C
+// checkpoint-class graph. The name is minted at this publication, not while the
+// BuildSpec is resolved; image and checkpoint publications may therefore land
+// in different UTC date buckets. now is explicit so tests can cross midnight.
+func publishCheckpointArtifactArgs(spec *configsock.BuildSpec, target CheckpointClassPublicationTarget, artifact string, now time.Time) ([]string, error) {
 	args := []string{"publish", "--quiet", "--manifest-config", spec.Paths.ManifestConfig}
-	if spec.PublishLocationParent != "" {
+	switch target {
+	case CheckpointClassManifestStore:
+	case CheckpointClassRefLocation:
 		locName := reflocation.PublicationName(spec.BuildID, now)
-		location, err := reflocation.Resolve(spec.PublishLocationParent, locName)
+		location, err := reflocation.Resolve(spec.CheckpointRefLocationParent, locName)
 		if err != nil {
-			return nil, fmt.Errorf("publish location for %s: %w", locName, err)
+			return nil, fmt.Errorf("checkpoint publication location for %s: %w", locName, err)
 		}
 		args = append(args, "--to-ref-location", locName+"="+location.URI)
+	default:
+		return nil, fmt.Errorf("unsupported checkpoint-class publication target %q", target)
 	}
+	args = appendRefLocationArgs(args, spec.RefLocations)
 	return append(args, artifact), nil
 }

@@ -105,16 +105,22 @@ func (p *buildPipeline) phaseImport() (retErr error) {
 		return err
 	}
 	p.progress("import: image artifact ready")
-	if refSupported && s.ImportReferer.Writeback {
-		key, err := p.uploadImage()
+	if refSupported && s.ImportReferer.Writeback && p.allowsImportRefererManifestWriteback() {
+		ref, err := p.publishCurrentImageManifest()
 		if err != nil {
 			return fmt.Errorf("upload referer base image: %w", err)
 		}
-		p.baseRef = "manifest://" + key
-		if err := p.writeImportReferer(sb, refSubject, key); err != nil {
+		parsed, err := manifest.ParseRef(ref)
+		if err != nil || parsed.Scheme != manifest.RefSchemeManifest {
+			return fmt.Errorf("referer base image publication returned %q", ref)
+		}
+		p.baseRef = ref
+		if err := p.writeImportReferer(sb, refSubject, parsed.Path); err != nil {
 			return fmt.Errorf("referer writeback: %w", err)
 		}
 		p.progress("import: referer writeback complete")
+	} else if refSupported && s.ImportReferer.Writeback {
+		p.progress("import: referer writeback skipped by final image-class publication policy")
 	}
 	return nil
 }
@@ -665,9 +671,11 @@ func normalizeCopySrc(s string) string {
 	return s
 }
 
-// readBaseRuntimeConfig reads the base image's runtime config (through
-// the local artifact or the manifest store). It both seeds the step
-// context and is the base the exported config merges onto.
+// readBaseRuntimeConfig reads the base image's runtime config through the same
+// typed opener used by final publication. Besides local and Manifest carriers,
+// this is what lets Phase B consume a located image Bundle without converting
+// it to a tarstream or publishing it to the Manifest store first. It both seeds
+// the step context and is the base the exported config merges onto.
 func (p *buildPipeline) readBaseRuntimeConfig() (map[string]any, error) {
 	if p.spec.SourceSandboxConfig != nil {
 		if len(p.spec.SourceImageConfig) == 0 {
@@ -682,30 +690,22 @@ func (p *buildPipeline) readBaseRuntimeConfig() (map[string]any, error) {
 		}
 		return config, nil
 	}
-	target := p.baseRef
-	if p.imagePath != "" {
-		target = p.imagePath
-	} else {
-		target = strings.TrimPrefix(target, "file://")
-	}
-	args := []string{"info", "--json"}
-	if strings.HasPrefix(target, "manifest://") {
-		args = append(args, "--manifest-config", p.spec.Paths.ManifestConfig)
-	}
-	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.FlattenCtl, append(args, target)...)
+	image, err := p.openCurrentImage()
 	if err != nil {
 		return nil, fmt.Errorf("read base runtime config: %w", err)
 	}
-	var info struct {
-		Config map[string]any `json:"config"`
+	raw := append([]byte(nil), image.ImageConfig...)
+	if err := image.Close(); err != nil {
+		return nil, fmt.Errorf("read base runtime config: close image: %w", err)
 	}
-	if err := json.Unmarshal(out, &info); err != nil {
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
 		return nil, fmt.Errorf("parse base runtime config: %w", err)
 	}
-	if info.Config == nil {
+	if config == nil {
 		return map[string]any{}, nil
 	}
-	return info.Config, nil
+	return config, nil
 }
 
 // mergedRuntimeConfig overlays the accumulated context onto the base

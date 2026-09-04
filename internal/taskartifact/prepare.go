@@ -68,19 +68,21 @@ type canonicalLocation struct {
 }
 
 type canonicalResolution struct {
-	SchemaVersion      int                         `json:"schema_version"`
-	SourceKind         string                      `json:"source_kind"`
-	SourceRef          string                      `json:"source_ref"`
-	LaunchMode         string                      `json:"launch_mode"`
-	ReadImageConfig    bool                        `json:"read_image_config"`
-	PreparedSourceKind string                      `json:"prepared_source_kind"`
-	PreparedSourceRef  string                      `json:"prepared_source_ref"`
-	Capacity           configsock.ArtifactCapacity `json:"capacity"`
-	Network            configsock.ArtifactNetwork  `json:"network"`
-	DiskTopology       types.ArtifactDiskTopology  `json:"disk_topology"`
-	RequiredRefs       []string                    `json:"required_refs"`
-	Locations          []canonicalLocation         `json:"locations"`
-	CarrierBindings    []CarrierBinding            `json:"carrier_bindings,omitempty"`
+	SchemaVersion        int                         `json:"schema_version"`
+	SourceKind           string                      `json:"source_kind"`
+	SourceRef            string                      `json:"source_ref"`
+	LaunchMode           string                      `json:"launch_mode"`
+	ReadImageConfig      bool                        `json:"read_image_config"`
+	PreflightImageBundle bool                        `json:"preflight_image_bundle"`
+	PublicationParent    string                      `json:"publication_parent,omitempty"`
+	PreparedSourceKind   string                      `json:"prepared_source_kind"`
+	PreparedSourceRef    string                      `json:"prepared_source_ref"`
+	Capacity             configsock.ArtifactCapacity `json:"capacity"`
+	Network              configsock.ArtifactNetwork  `json:"network"`
+	DiskTopology         types.ArtifactDiskTopology  `json:"disk_topology"`
+	RequiredRefs         []string                    `json:"required_refs"`
+	Locations            []canonicalLocation         `json:"locations"`
+	CarrierBindings      []CarrierBinding            `json:"carrier_bindings,omitempty"`
 }
 
 // Prepare opens the claimed E/S root, validates its logical role, resolves the
@@ -105,6 +107,30 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+
+	manifestCfg, err := rtconfig.LoadManifestConfig(spec.ManifestConfig)
+	if err != nil {
+		if !errors.Is(err, manifest.ErrConfigNotProvided) {
+			return nil, fmt.Errorf("task artifact prepare: manifest config: %w", err)
+		}
+		manifestCfg = nil
+	}
+	if spec.PreflightImageBundle {
+		if manifestCfg == nil {
+			return nil, errors.New("task artifact prepare: image Bundle preflight requires manifest_config")
+		}
+		probeName := reflocation.PublicationName("build-preflight", time.Unix(0, 0))
+		if _, err := reflocation.Resolve(spec.RefLocationParent, probeName); err != nil {
+			return nil, fmt.Errorf("task artifact prepare: image Bundle location: %w", err)
+		}
+		admission, err := manifestCfg.WriteAdmission(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("task artifact prepare: image Bundle write admission: %w", err)
+		}
+		if err := artifact.ValidateSingleRootBundlePublication(manifestCfg, manifestCfg.CustomerKey, admission); err != nil {
+			return nil, fmt.Errorf("task artifact prepare: image Bundle preflight: %w", err)
+		}
 	}
 
 	pathLocations := rtconfig.RefLocations{}
@@ -152,14 +178,6 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 				return nil, err
 			}
 		}
-	}
-
-	manifestCfg, err := rtconfig.LoadManifestConfig(spec.ManifestConfig)
-	if err != nil {
-		if !errors.Is(err, manifest.ErrConfigNotProvided) {
-			return nil, fmt.Errorf("task artifact prepare: manifest config: %w", err)
-		}
-		manifestCfg = nil
 	}
 
 	readStarted := time.Now()
@@ -323,8 +341,10 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 	canonical := canonicalResolution{
 		SchemaVersion: configsock.ArtifactPrepareSchemaVersion,
 		SourceKind:    string(sourceKind), SourceRef: spec.RootRef, LaunchMode: string(launchMode),
-		ReadImageConfig:    spec.ReadSourceImageConfig,
-		PreparedSourceKind: string(prepared.Kind), PreparedSourceRef: prepared.Ref,
+		ReadImageConfig:      spec.ReadSourceImageConfig,
+		PreflightImageBundle: spec.PreflightImageBundle,
+		PublicationParent:    spec.RefLocationParent,
+		PreparedSourceKind:   string(prepared.Kind), PreparedSourceRef: prepared.Ref,
 		Capacity: capacity, Network: network, DiskTopology: topology, RequiredRefs: requiredRefs,
 		Locations: canonicalLocations, CarrierBindings: bindings,
 	}
@@ -428,8 +448,8 @@ func addSourceImageRefLocation(cfg *rtconfig.PortableSandboxConfig, add func(str
 }
 
 // inspectSourceImageConfig preserves the container defaults used by Phase B.
-// Offline EROFS Sandboxes carry config.json in their own logical root; a
-// normally captured overlay E points at the flattened base image instead, so
+// Top-level EROFS Sandboxes carry config.json in their own logical root; a
+// captured incremental overlay E points at the flattened base image instead, so
 // read that image through the same task-local carrier and crypto boundary.
 func inspectSourceImageConfig(
 	ctx context.Context,
