@@ -70,8 +70,10 @@ execution，pidfile 位于 `runners/`。
 `BuildID` 是 Build 业务身份，统一限制为 `[A-Za-z0-9_-]{1,48}` 并原样作为目录名；
 `BuildRunDir`/`BuildBaseDir` 由 BuildID 与两个 root 唯一派生，不存入 Build row，也没有
 hash、路径 fallback 或旧目录迁移。registered/waiting Build 不创建对象目录，execution
-claim 后才创建；镜像、Sandbox/Snapshot artifact 全部进入
-`BuildBaseDir/checkpoint`。本机 Sandbox snapshot/export 固定写入
+claim 后才创建；A/B 的本地 image carrier 与 Phase C 的本地 checkpoint capture 进入
+`BuildBaseDir/checkpoint`，最终 publisher 直接消费它们。顶层 Sandbox E 不在
+`BuildRunDir` 或 `BuildBaseDir` 形成完整 staging 文件，`BuildRunDir` 也不承载完整
+`.image`、`.sandbox`、`.snapshot` 或 `.bundle`。本机 Sandbox snapshot/export 固定写入
 `BaseDir/checkpoint`，不再配置独立的 `checkpoint.local_dir`。自定义 RunRoot 必须让最大
 SandboxID 的 sandboxer socket 与最大 BuildID 的最长 phase socket 都不超过 Linux 107-byte
 pathname 上限；配置加载会 fail closed。
@@ -99,6 +101,39 @@ launch authority；Build status、transient TemplateID、name/alias 和本机 li
 重连的 `BuildSyncBegin`/完整保留集/`BuildSyncEnd` 共同收敛丢失的 Delete。Registry 不运行独立
 Build terminal TTL，并始终按 immutable registered-node binding 更新或删除 projection；这不为
 #46 未来删除 post-registration projection 预留双路径。
+
+## Build 制品发布
+
+Build publication 明确分为两类。Image 类是 `target=image` 的 IMG、
+`target=sandbox,memory=false` 的顶层 Sandbox E，以及 memory target 在 Phase C 前使用的
+immutable IMG；checkpoint 类是 Phase C 捕获的增量 E、Snapshot S 和同一 checkpoint graph
+的 memory/disk 增量层。顶层 E 和增量 E 都是标准 Sandbox E，但只有前者携带完整 EROFS
+payload 并采用 image policy。
+
+```yaml
+checkpoint:
+  mode: local # local | bundle；只控制 checkpoint 类 carrier
+  remote:
+    ref_location_parent: file:///mnt/shared/kuasar/checkpoints
+    manifest: false
+```
+
+| 配置 | `target=image` | `sandbox,memory=false` | `sandbox,memory=true` |
+|---|---|---|---|
+| parent 空，`manifest=false` | IMG → Manifest store | 顶层 E → Manifest store | IMG、增量 E、S → Manifest store |
+| parent 非空，`manifest=false` | IMG → Manifest store | 顶层 E → Manifest store | IMG → Manifest store；增量 E/S → named location |
+| parent 非空，`manifest=true` | IMG Bundle → named location | 顶层 E Bundle → named location | IMG Bundle → named location；增量 E/S → named location |
+| parent 空，`manifest=true` | 配置非法 | 配置非法 | 配置非法 |
+
+`checkpoint.remote.manifest=true` **不表示写 Manifest store**；它表示把 manifest-backed
+image 类逻辑制品直接物化为 checkpoint named location 中的 single-root Manifest Bundle。
+image 类不先生成 tarstream `.image`/`.sandbox`，也不先上传 Manifest store；Bundle 只按
+内容地址命名，不创建 BuildID/SandboxID alias。顶层 E 从当前 digest-qualified local IMG、
+`manifest://` IMG 或 located IMG Bundle 直接组装并流向最终 publisher，没有中间 IMG
+Manifest 或完整 E staging。Bundle 以 target-directory 临时文件、严格验证、独占 final、
+file/directory fsync 提交；重试只复用验证通过的同 key final，损坏或不匹配的 final fail closed。
+memory target 把实际返回的 portable IMG ref（包括 located Bundle）及其 location mapping 交给
+Phase C，后续 checkpoint publication 保留该 ref，不把 image 复制进 Snapshot Bundle。
 
 ## 组成
 
