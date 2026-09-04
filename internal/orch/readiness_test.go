@@ -99,6 +99,45 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
 	}
 }
 
+func TestAwaitArtifactReadinessResultPreservesCompletedFailure(t *testing.T) {
+	want := errors.New("runtime readiness protocol failed")
+	for i := 0; i < 1000; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		result <- want
+		cancel()
+		if got := awaitArtifactReadinessResult(ctx, result); !errors.Is(got, want) {
+			t.Fatalf("iteration %d: result = %v, want readiness failure", i, got)
+		}
+	}
+
+	t.Run("cancellation without completed readiness", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got := awaitArtifactReadinessResult(ctx, make(chan error, 1)); !errors.Is(got, context.Canceled) {
+			t.Fatalf("result = %v, want context cancellation", got)
+		}
+	})
+
+	t.Run("cancellation takes precedence over completed success", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		result <- nil
+		cancel()
+		if got := awaitArtifactReadinessResult(ctx, result); !errors.Is(got, context.Canceled) {
+			t.Fatalf("result = %v, want context cancellation", got)
+		}
+	})
+
+	t.Run("completed success", func(t *testing.T) {
+		result := make(chan error, 1)
+		result <- nil
+		if got := awaitArtifactReadinessResult(context.Background(), result); got != nil {
+			t.Fatalf("result = %v, want success", got)
+		}
+	})
+}
+
 func TestListenRuntimeReadinessReplacesStaleSocket(t *testing.T) {
 	dir := shortOrchestratorTestDir(t)
 	runRoot, sid := filepath.Join(dir, "run"), "stale"
