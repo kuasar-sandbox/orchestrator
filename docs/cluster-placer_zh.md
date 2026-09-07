@@ -399,6 +399,6 @@ placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 
 ## 12. See Also
 
-- [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
+- [cluster.md](cluster_zh.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
 - [cluster-router.md](cluster-router_zh.md) — router Reserve 消费、route cache 和数据面转发.
 - [node.md](node.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

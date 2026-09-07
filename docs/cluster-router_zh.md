@@ -439,7 +439,7 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 
 ## 11. See Also
 
-- [cluster.md](cluster.md) — registry membership、route_link、Reserve 与数据模型。
+- [cluster.md](cluster_zh.md) — registry membership、route_link、Reserve 与数据模型。
 - [cluster-placer.md](cluster-placer_zh.md) — verify-key、Place 和 key distribution 来源。
 - [node-proxy.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
 
