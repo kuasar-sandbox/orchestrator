@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -226,6 +227,9 @@ func newPreparedWorkerHarness(t *testing.T) *preparedWorkerHarness {
 }
 
 func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
+	if runWorkerLifetimeSubprocess(t) {
+		return
+	}
 	harness := newPreparedWorkerHarness(t)
 	started := make(chan proxyextension.WorkerHost, 1)
 	startContext := make(chan context.Context, 1)
@@ -246,6 +250,7 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 		})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- harness.worker.Run(ctx, &Runtime{
@@ -326,12 +331,18 @@ func TestPreparedWorkerWaitsForSyncThenUsesWrapperForDataIngress(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker Run did not stop")
 	}
-	if !harness.worker.admissionEscaped.Load() {
-		t.Fatal("serving worker did not retain admission mapping for process lifetime")
+	if err := harness.worker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if route, found := host.GetRoute("s1"); !found || route.SandboxID != "s1" {
+		t.Fatalf("worker host lost process-owned route after Close: %+v, %v", route, found)
 	}
 }
 
 func TestPreparedWorkerStartFailureDoesNotServeListeners(t *testing.T) {
+	if runWorkerLifetimeSubprocess(t) {
+		return
+	}
 	harness := newPreparedWorkerHarness(t)
 	harness.table.BeginSync()
 	harness.table.Bookmark()
@@ -348,9 +359,36 @@ func TestPreparedWorkerStartFailureDoesNotServeListeners(t *testing.T) {
 	if extension.calls.Load() != 1 || harness.data.accepts.Load() != 0 {
 		t.Fatalf("Start=%d data accepts=%d", extension.calls.Load(), harness.data.accepts.Load())
 	}
+	if err := harness.worker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !harness.table.Synced() {
+		t.Fatal("successful mapping must survive preparation/runtime failure until process exit")
+	}
 }
 
-func TestPreparedWorkerCloseRetainsEscapedAdmissionUntilProcessExit(t *testing.T) {
+// Run lifecycle tests in their actual reclamation domain. Tests of low-level
+// mappings may still unmap explicitly after joining every reader.
+func runWorkerLifetimeSubprocess(t *testing.T) bool {
+	t.Helper()
+	const key = "KUASAR_WORKER_LIFETIME_TEST"
+	if os.Getenv(key) == t.Name() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
+	command.Env = append(os.Environ(), key+"="+t.Name())
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("worker lifetime subprocess: %v\n%s", err, output)
+	}
+	return true
+}
+
+func TestPreparedWorkerCloseKeepsBothMappingsUntilProcessExit(t *testing.T) {
+	if runWorkerLifetimeSubprocess(t) {
+		return
+	}
 	master, err := proxyadmission.NewMaster(2, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -367,25 +405,54 @@ func TestPreparedWorkerCloseRetainsEscapedAdmissionUntilProcessExit(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admission.Close()
 	update, err := master.PrepareUpsert("s1", "identity-1", publicconfig.MaxInflight{Total: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	binding := update.Binding()
 	update.Commit()
-
-	prepared := &PreparedWorker{admission: admission}
-	prepared.admissionEscaped.Store(true)
+	table, err := proxyshm.Create(filepath.Join(t.TempDir(), "routes.shm"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table.BeginSync()
+	if err := table.Upsert(routesync.RouteEntry{SandboxID: "s1", StableID: "s1", Profile: "bare", State: routesync.StateStarting}); err != nil {
+		t.Fatal(err)
+	}
+	table.Bookmark()
+	lease, err := admission.TryAcquire(binding, proxyadmission.ServiceForward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := &PreparedWorker{table: table, admission: admission}
+	resume := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		<-resume
+		if _, found := table.Lookup("s1"); !found || !table.Synced() || !admission.Valid(binding) {
+			done <- errors.New("Close invalidated a process-owned mapping")
+			return
+		}
+		lease.Release()
+		next, acquireErr := admission.TryAcquire(binding, proxyadmission.ServiceForward)
+		if acquireErr == nil {
+			next.Release()
+		}
+		done <- acquireErr
+	}()
 	if err := prepared.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !admission.Valid(binding) {
-		t.Fatal("Close unmapped admission after it escaped to a serving handler")
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
 	}
-	lease, err := admission.TryAcquire(binding, proxyadmission.ServiceForward)
-	if err != nil {
-		t.Fatalf("retained admission TryAcquire: %v", err)
+	close(resume)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader or release blocked after Close")
 	}
-	lease.Release()
 }

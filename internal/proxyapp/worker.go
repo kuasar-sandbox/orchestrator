@@ -24,9 +24,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 )
 
-// PreparedWorker owns every inherited worker resource after the bootstrap has
-// been verified. Preparation precedes the public BindRuntime hook; Run sends
-// stats readiness, waits for initial route sync, and only then serves traffic.
+// PreparedWorker owns inherited descriptors after bootstrap verification. The
+// worker is a dedicated one-shot subprocess: successful route and admission
+// mappings live until process exit, including on preparation or runtime failure.
+// Run sends stats readiness, waits for initial route sync, then serves traffic.
 type PreparedWorker struct {
 	effective *EffectiveConfig
 	process   Process
@@ -40,18 +41,14 @@ type PreparedWorker struct {
 	data        net.Listener
 	mmds        net.Listener
 	run         atomic.Bool
-	// admissionEscaped is set before the admission-backed handler is exposed to
-	// an extension or listener. HTTP/1 hijacked handlers are not awaited by
-	// http.Server.Shutdown, so their mapping must remain valid until process
-	// exit even after Run returns and Close releases the other worker resources.
-	admissionEscaped atomic.Bool
-	closeOnce        sync.Once
-	closeErr         error
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // PrepareWorker reconstructs the shared table, inherited listeners, pipes, and
 // process-local connections. It performs no hook invocation and advertises no
-// readiness. The caller must close the result on every path.
+// readiness. The caller must close descriptors and exit the worker process on
+// every return path; this is not an in-process restartable server.
 func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr error) {
 	if bootstrap == nil || bootstrap.effective == nil || bootstrap.effective.config == nil {
 		return nil, fmt.Errorf("proxy worker: verified bootstrap is required")
@@ -133,7 +130,8 @@ func PrepareWorker(bootstrap *WorkerBootstrap) (_ *PreparedWorker, returnErr err
 }
 
 // Run starts one prepared worker. It is one-shot and requires a fully resolved
-// process-local Runtime.
+// process-local Runtime. Returning ends the worker subprocess, not every handler:
+// no successful mapping is unmapped while a handler or extension can use it.
 func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 	if worker == nil || worker.effective == nil || worker.table == nil || runtime == nil || runtime.Logger == nil {
 		return fmt.Errorf("proxy worker: unresolved startup state")
@@ -200,11 +198,6 @@ func (worker *PreparedWorker) Run(ctx context.Context, runtime *Runtime) error {
 			view, authMode, logger.With("proxy_worker", process.WorkerID), workerStats, nil, cfg.Paths.RunRoot,
 		).WithTrafficTracker(workerStats)
 	}
-	// A CONNECT handler may outlive appnet.Serve because HTTP/1 hijacked
-	// connections are outside http.Server.Shutdown's wait set. Keep the mmap
-	// process-owned from this point; the kernel tears it down after every
-	// handler has necessarily stopped at process exit.
-	worker.admissionEscaped.Store(true)
 	var ingressHandler http.Handler = proxyHandler
 	if runtime.WorkerExtension != nil {
 		ingressHandler, err = startWorkerIngress(
@@ -260,24 +253,19 @@ func startWorkerIngress(
 	return handler, nil
 }
 
-// Close releases prepared resources and is safe to call more than once.
+// Close releases descriptors and is safe to call more than once. Successful
+// mappings are deliberately NOT unmapped here: asynchronous users need not have
+// stopped when Run returns. Kernel process teardown reclaims both mappings;
+// the master separately clears this worker's counters only after cmd.Wait.
 func (worker *PreparedWorker) Close() error {
 	if worker == nil {
 		return nil
 	}
 	worker.closeOnce.Do(func() {
-		admission := worker.admission
-		if worker.admissionEscaped.Load() {
-			// Do not Munmap while an HTTP/1 hijacked handler can still execute
-			// Worker.Valid or Lease.Release. This is a worker subprocess; process
-			// exit is the safe and deterministic reclamation boundary.
-			admission = nil
-		}
 		worker.closeErr = errors.Join(
 			closeFile(worker.wakeFile), closeFile(worker.notifyFile), closeConn(worker.statsConn),
 			closeConn(worker.mmdsRPCConn), closeListener(worker.data),
-			closeListener(worker.mmds), closeTable(worker.table),
-			closeAdmission(admission),
+			closeListener(worker.mmds),
 		)
 	})
 	return worker.closeErr
@@ -348,13 +336,6 @@ func workerDescriptors(fds workerFDMapping) map[int]struct{} {
 	return result
 }
 
-func closeAdmission(admission *proxyadmission.Worker) error {
-	if admission == nil {
-		return nil
-	}
-	return admission.Close()
-}
-
 func closeDescriptors(descriptors map[int]struct{}) {
 	for descriptor := range descriptors {
 		_ = unix.Close(descriptor)
@@ -380,11 +361,4 @@ func closeListener(listener net.Listener) error {
 		return nil
 	}
 	return listener.Close()
-}
-
-func closeTable(table *proxyshm.Table) error {
-	if table == nil {
-		return nil
-	}
-	return table.Close()
 }
