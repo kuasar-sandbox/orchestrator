@@ -75,7 +75,7 @@ func BenchmarkPrepareBundleRefLocations(b *testing.B) {
 	for _, count := range []int{0, 1, 8, 32} {
 		b.Run(fmt.Sprintf("refs=%d", count), func(b *testing.B) {
 			parent := "file://" + filepath.Join(b.TempDir(), "locations")
-			rootLocation, err := reflocation.Resolve(parent, "root-20260824")
+			rootLocation, err := reflocation.Resolve(parent, "root")
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -84,13 +84,13 @@ func BenchmarkPrepareBundleRefLocations(b *testing.B) {
 			}
 			refs := make([]string, 0, count)
 			for index := range count {
-				refs = append(refs, fmt.Sprintf("file://%064x.bundle@location:L%02d-20260824", index+1, index))
+				refs = append(refs, fmt.Sprintf("file://%064x.bundle@location:L%02d", index+1, index))
 			}
 			rootPath, rootKey, manifestConfig := writeTaskManifestBundle(b, rootLocation.Path, refs,
 				"resources:\n  capacity: {cpu: 2, memory: 2GiB}\nboot: {}\n")
 			rootRef := manifest.Ref{
 				Scheme: manifest.RefSchemeFile, Path: filepath.Base(rootPath), DigestScheme: "manifest",
-				Digest: rootKey, Location: "root-20260824",
+				Digest: rootKey, Location: "root",
 			}.String()
 			spec := configsock.ArtifactPrepareSpec{RootSourceKind: string(types.ResumeSourceSnapshot), LaunchMode: string(types.LaunchMemory),
 				RootRef: rootRef, ManifestConfig: manifestConfig, RefLocationParent: parent, MaxRefs: 4,

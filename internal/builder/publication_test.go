@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
@@ -98,46 +97,45 @@ func TestResolveBuildPublicationPlanMatrix(t *testing.T) {
 	}
 }
 
-// The checkpoint publication clock is independent of an earlier image Bundle
-// publication, so a Build crossing UTC midnight uses the actual date for each.
-func TestPublishCheckpointArtifactArgsMintPublicationDateAtUse(t *testing.T) {
+// The checkpoint publication name is the bare build id: image and checkpoint
+// publications of one build converge on the same directory, and the earlier
+// image-class mapping is carried through untouched.
+func TestPublishCheckpointArtifactArgsUseBareBuildID(t *testing.T) {
 	spec := publicationSpec("file:///mnt/shared/snapshots", true)
-	imageName := reflocation.PublicationName(spec.BuildID, time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC))
+	imageName := reflocation.PublicationName(spec.BuildID)
 	imageLocation, err := reflocation.Resolve(spec.CheckpointRefLocationParent, imageName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	spec.RefLocations = map[string]string{imageName: imageLocation.URI}
 
-	checkpointTime := time.Date(2026, 8, 25, 0, 1, 0, 0, time.UTC)
-	args, err := publishCheckpointArtifactArgs(spec, CheckpointClassRefLocation, "/work/build.snapshot", checkpointTime)
+	args, err := publishCheckpointArtifactArgs(spec, CheckpointClassRefLocation, "/work/build.snapshot")
 	if err != nil {
 		t.Fatal(err)
 	}
 	i := indexOf(args, "--to-ref-location")
-	if i < 0 || i+1 >= len(args) || !strings.HasPrefix(args[i+1], spec.BuildID+"-20260825=") ||
-		!strings.Contains(args[i+1], "/20260825/") {
+	if i < 0 || i+1 >= len(args) || !strings.HasPrefix(args[i+1], spec.BuildID+"=") {
 		t.Fatalf("checkpoint output location = %#v", args)
+	}
+	if want := imageName + "=" + imageLocation.URI; args[i+1] != want {
+		t.Fatalf("checkpoint output location = %q, want %q", args[i+1], want)
 	}
 	i = indexOf(args, "--ref-location")
 	if i < 0 || i+1 >= len(args) || args[i+1] != imageName+"="+imageLocation.URI {
 		t.Fatalf("image input location missing from checkpoint publication argv: %#v", args)
 	}
-	if strings.Contains(args[i+1], "20260825") {
-		t.Fatalf("earlier image mapping was rewritten into checkpoint date: %#v", args)
-	}
 }
 
 func TestPublishCheckpointArtifactArgsManifestStore(t *testing.T) {
 	spec := publicationSpec("file:///mnt/shared/snapshots", false)
-	spec.RefLocations = map[string]string{"source-20260824": "file:///mnt/source"}
-	args, err := publishCheckpointArtifactArgs(spec, CheckpointClassManifestStore, "/work/build.snapshot", time.Unix(0, 0))
+	spec.RefLocations = map[string]string{"source-image": "file:///mnt/source"}
+	args, err := publishCheckpointArtifactArgs(spec, CheckpointClassManifestStore, "/work/build.snapshot")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"publish", "--quiet", "--manifest-config", "/etc/flatten/manifest.yaml",
-		"--ref-location", "source-20260824=file:///mnt/source", "/work/build.snapshot",
+		"--ref-location", "source-image=file:///mnt/source", "/work/build.snapshot",
 	}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("argv = %#v, want %#v", args, want)
@@ -149,13 +147,13 @@ func TestPublishCheckpointArtifactArgsManifestStore(t *testing.T) {
 
 func TestBuildArtifactRefLocationsStrictlyConvertsURIs(t *testing.T) {
 	locations, err := buildArtifactRefLocations(map[string]string{
-		"b-20260825": "file:///mnt/b",
-		"a-20260824": "file:///mnt/a",
+		"b": "file:///mnt/b",
+		"a": "file:///mnt/a",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if locations["a-20260824"] != "/mnt/a" || locations["b-20260825"] != "/mnt/b" {
+	if locations["a"] != "/mnt/a" || locations["b"] != "/mnt/b" {
 		t.Fatalf("locations = %#v", locations)
 	}
 	for _, invalid := range []map[string]string{

@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -713,23 +712,19 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	cfg := o.cfg
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
-	// Pin the publication clock so the expected name is a constant even if
-	// the test straddles UTC midnight.
-	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
-	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
 	sid := "0198f7a1-1234-7234-9abc-0123456789ab"
 	localRef := makeLocalSnapshot(t, dir, sid)
-	// The publication name is the sandbox id plus the publication date; the
-	// fake sandbox-ctl echoes a ref carrying whatever name promote passed.
+	// The publication name is the bare sandbox id; the fake sandbox-ctl
+	// echoes a ref carrying whatever name promote passed.
 	argsPath := filepath.Join(dir, "promote.args")
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\n" +
 		"for a in \"$@\"; do\n" +
 		"  case \"$a\" in\n" +
-		"    *-20*=*)\n" +
+		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
 		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".bundle@location:'\"$n\"\n" +
 		"      ;;\n" +
@@ -768,7 +763,7 @@ func TestExportPublishesLocatedSnapshotAndReturnsTemplate(t *testing.T) {
 	if locName == "" {
 		t.Fatalf("promote args = %q, want a publication name=uri pair", args)
 	}
-	wantName := reflocation.PublicationName(sid, publishedAt)
+	wantName := reflocation.PublicationName(sid)
 	if locName != wantName {
 		t.Fatalf("publication name = %q, want %q", locName, wantName)
 	}
