@@ -221,7 +221,7 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 - [docs/node-proxy.md](docs/node-proxy.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
   routesync / per-Sandbox max inflight / traffic stats / 数据面鉴权 / MMDS / service-addressed CONNECT /
   native exec gate.
-- [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
+- [docs/node-resource.md](docs/node-resource_zh.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、
   node_link / route_link / node_list / placer_link、Reserve 状态机、成员变更与 e2e。

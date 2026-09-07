@@ -96,12 +96,12 @@ Detailed design and reference documents are currently maintained primarily in Ch
 
 - [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, builds, and reliability;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
-- [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, active reclaim, and recovery;
+- [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
 - [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;
 - [`docs/cluster-router.md`](docs/cluster-router.md) — unified cluster control- and data-plane ingress, routing, and stable/node-local identity translation;
 - [`docs/cluster-placer.md`](docs/cluster-placer.md) — providers, importers, node selection, placement, restore, and migration.
 
-The English README contains the complete public component entry path; translating every detailed design document is not required to build or contribute to the component.
+The English README provides the public component entry path. Full reference-document translation is tracked in [project #86](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/86); language selectors open complete counterparts where available.
 
 ## Project boundaries
 
