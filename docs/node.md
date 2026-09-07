@@ -2614,7 +2614,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 - [node-resource.md](node-resource_zh.md) —— 节点资源控制协议、sandbox resource policy
   与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,
-  Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口,[cluster-placer.md](cluster-placer.md)
+  Reserve 状态机;[cluster-router_zh.md](cluster-router_zh.md) 数据面入口,[cluster-placer_zh.md](cluster-placer_zh.md)
   放置与密钥分发
 - `sandboxer/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
   run/snapshot/restore/connect 原语、cgroup 模型
