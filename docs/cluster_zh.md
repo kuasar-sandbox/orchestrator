@@ -770,16 +770,16 @@ POST /route-link/reserve
 ```
 
 Reserve body 按 operation 使用独立 typed schema:create 携 create config,exec-session 携
-`{"ttl_seconds":N,"conditions":["..."]}`,connect/data body 为空.四种 operation 的凭据和
+`{"ttl_seconds":N,"conditions":["..."]}`；connect 可带可选的 `{"memory":true|false}`（最多 64 KiB），保留 absent/null 选择；data body 为空。create body 是可选 `config` map 与独立 `auto_pause_memory` bool，最多 16 MiB。四种 operation 的凭据和
 完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
-- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,body 只允许 restore/credentials
-  config。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
+  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。
-- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;Header 携 `X-API-KEY`,可选
+- `connect`:query 必须携期望的稳定 `sid`,可选 `timeout`;body 只允许可选 `memory`，不允许 config/auto_pause_memory，selector 原样进入 CmdConnect；Header 携 `X-API-KEY`,可选
   `X-Kuasar-Migration-Token`。Registry 使用 route 业务记录已绑定的 APISecret 验证 API key,
   对精确 NodeSandboxID 下发 CmdConnect。目标节点不可用且已提供 migration token 时,Registry
   排除原节点、分配新 generation 并向新节点下发 CmdConnect。node 同步完成校验、可选
@@ -1198,7 +1198,10 @@ node,但不启动 microVM.每个进程使用彼此不同的 admin,API 和 Data l
   Data listener 只模拟 ordinary data,CONNECT 与 exec.
 - 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
 
-`make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/placer` 与 `node-stub-ctl`。
+`make test-e2e` 不构建二进制：它把 `E2E_BIN`（默认兄弟项目主仓的组装后二进制目录）传给
+`test/e2e/run_all.sh`，要求事先准备多仓制品。只跑本地 stub 时，先 `make build`，再
+`make test-e2e-cluster-stub`；后者以本地 `BINDIR` 启动真实 `cluster-ctl registry/router/placer`
+与 `node-stub-ctl`。见 [Makefile](../Makefile)。
 `test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
 import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、SandboxID 与 NodeSandboxID
 转换,control/build 命中 API listener,data/exec 命中 Data listener,ExecSession Reserve/CmdExecSession 签发,
