@@ -390,6 +390,40 @@ func TestImportExplicitTargetPreservesStableIDAndCredentials(t *testing.T) {
 	}
 }
 
+// TestImportRejectsLocationUnsafeStableID covers admission for the stable id
+// carried by the token: the value later keys the entity's publication
+// location names, so it must satisfy the opaque-id contract (which is also a
+// location-name-safe subset) before the row is inserted.
+func TestImportRejectsLocationUnsafeStableID(t *testing.T) {
+	dir := t.TempDir()
+	o := migrationOrchestrator(t, dir, []byte("runtime"))
+	ctx := context.Background()
+	mk := strings.Repeat("6", 64)
+	apiSecret, apiKey := defaultTestCredentials(t, mk)
+	if _, err := o.st.AddKeyPair(ctx, store.KeyPair{APISecret: apiSecret, ManifestKey: mk}, "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Portable manifest ref: export skips promote entirely, so the test
+	// isolates the import admission check.
+	source := migrationSandbox(t, dir, "logical-g0", mk, "manifest://"+strings.Repeat("b", 64))
+	source.StableIDValue = "not/a valid id"
+	// Credentials bind the stable id; re-materialize after it is set.
+	if err := materializeSandboxCredentials(source, sandboxcfg.Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.Put(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	token, err := o.ExportSandbox(ctx, apiKey, source.ID, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ImportSandbox(ctx, apiKey, token, "other-target"); err == nil ||
+		!errors.Is(err, api.ErrBadRequest) || !strings.Contains(err.Error(), "stable ID") {
+		t.Fatalf("import = %v, want a bad-request stable ID rejection", err)
+	}
+}
+
 func TestImportIsInsertOnlyAndMapsDuplicateToAlreadyExists(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))

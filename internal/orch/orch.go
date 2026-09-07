@@ -2814,11 +2814,14 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 	}
 	args := []string{"publish", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
 	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
-		// Publication location name: the bare entity id. The name is the
-		// directory key, so every publication of one entity converges on one
-		// directory where content-addressed files accumulate as versions
-		// (same-content files are deduplicated by the publisher).
-		locName := reflocation.PublicationName(sb.ID)
+		// Publication location name: the sandbox's stable identity. The name
+		// is the directory key, so every publication of one logical entity —
+		// across renames (import with a new target id), node migrations, and
+		// cluster generations — converges on one directory where
+		// content-addressed files accumulate as versions (same-content files
+		// are deduplicated by the publisher). Rows sharing a stable id (an
+		// identity-preserving copy) publish into that one directory too.
+		locName := reflocation.PublicationName(sb.StableID())
 		uri, err := o.cfg.Checkpoint.RefLocationURI(locName)
 		if err != nil {
 			return types.ResumeSource{}, fmt.Errorf("orch: promote %s: %w", sb.ID, err)

@@ -1624,19 +1624,22 @@ sandbox-ctl publish --manifest-config <cfg> [--to-ref-location <name>=<uri>] <ar
 ```
 
 `promoteArtifact` 接受并返回 `ResumeSource`,kind 不变。没有 named location 时发布到 Manifest Store;
-配置 `checkpoint.remote.ref_location_parent` 时,publication name 为
-`<entity-id>-<YYYYMMDD>`,URI 为
-`<parent>/<YYYYMMDD>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
+配置 `checkpoint.remote.ref_location_parent` 时,publication name 为实体 id——sandbox 发布用
+StableID、build 发布用 BuildID(见 `reflocation.PublicationName`),URI 为
+`<parent>/<sha256(name)[0:2]>/<sha256(name)[2:4]>/<name>`。local tarstream 可得到 located
 `.sandbox`/`.snapshot`:plaintext carrier 使用 `@digest:<digest>`,encrypted carrier 使用
 `@hmac:<digest>`。Bundle 得到使用 `@manifest:<root-key>` 选择 root Manifest 的 located `.bundle`。
 即使发布到 named location 也始终传 `--manifest-config`,因为 Bundle exact publication 仍须验证并
 发布其 Manifest graph。Bundle->Store 验证 recorded admission、physical digest 和 salt domain,
 根 Manifest 最后提交。
 
-首层日期目录按实际 publication 日期有序分区,再用 name 的 SHA-256 两级扇出限制单目录条目;
-晚发布的旧实体落入当前日期分区。GC retention、可达性、在途发布和安全删除策略不属于 node
-生命周期职责。conductor 与 task reader 共用 `internal/reflocation` 的 deterministic 解析,
-location name 自足,恢复不依赖额外 side table。
+name 本身即目录键:同一逻辑 sandbox 的全部 publication——重试、跨进程重启、import 换 target id 后的
+再导出、cluster 各 generation——收敛到同一个 StableID 目录;同一 Build 的 image/checkpoint 等
+named publication 收敛到同一个 BuildID 目录。目录内内容寻址的 `<digest>.<role>` 文件累积成多个
+版本,相同内容由 publisher 去重复用。SHA-256 两级扇出限制单目录条目。GC 不按 publication 年龄或
+日期分区清理,而是基于引用可达性(portable ref / TemplateID / migration token 指向的目录与文件),
+属于未来 management plane 职责。conductor 与 task reader 共用 `internal/reflocation` 的
+deterministic 解析,location name 自足,恢复不依赖额外 side table。
 
 `TemplateID` 为 `<profile>-<kind>-<base64url(canonical-portable-ref)>`:
 
