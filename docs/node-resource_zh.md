@@ -405,8 +405,8 @@ pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure even
 ## 10. See Also
 
 - [node](node.md)
-- [sandboxer sandbox](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md)
-- [cluster](cluster.md)
+- [sandboxer sandbox](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md)
+- [cluster](cluster_zh.md)
 - `sandboxer/pkg/resource`
 - `internal/nodectl`
 - `internal/sandboxcfg/resource.go`

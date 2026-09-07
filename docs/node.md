@@ -1868,7 +1868,7 @@ Hello policy,不广播给 route observer.Proxy master 原子替换 registry,work
 (node-proxy.md §4),但角色相反:node 是本节点路由 / 构建权威,registry 是订阅者和命令下发方.
 
 本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、shardkv 复制和 membership 变更由
-[cluster.md](cluster.md) 定义。
+[cluster.md](cluster_zh.md) 定义。
 
 ```text
 node-ctl conductor serve
@@ -2613,7 +2613,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
   数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 的唯一数据入口,集群下 router 转发进入)
 - [node-resource.md](node-resource_zh.md) —— 节点资源控制协议、sandbox resource policy
   与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
-- [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,
+- [cluster.md](cluster_zh.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,
   Reserve 状态机;[cluster-router_zh.md](cluster-router_zh.md) 数据面入口,[cluster-placer_zh.md](cluster-placer_zh.md)
   放置与密钥分发
 - `sandboxer/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
