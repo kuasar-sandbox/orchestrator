@@ -1,18 +1,12 @@
-[English](cluster-placer.md) | [简体中文](cluster-placer_zh.md)
+# cluster-placer — group 导入、WATCH_LIST 与放置
 
-<a id="cluster-placer--group-导入watch_list-与放置"></a>
+`cluster-ctl placer` 是独立放置调度器。它不持 node 连接,不拥有 sandbox 生命周期,也不实现 registry
+状态复制。它通过 `SandboxGroupProvider` / `SandboxGroupImporter` 获取 group 配置与密钥材料,消费
+registry 的 `node_list` WATCH_LIST,并向 registry 提供 `PlaceSandbox` / `PlaceBuild` / `verify-key`。
 
-# cluster-placer — group import, WATCH_LIST, and placement
+## 1. 概述
 
-`cluster-ctl placer` is an independent placement scheduler. It holds no node connections, owns no sandbox lifecycle, and does not replicate registry state. It obtains group configuration and key material through `SandboxGroupProvider` / `SandboxGroupImporter`, consumes the registry's `node_list` WATCH_LIST, and provides `PlaceSandbox` / `PlaceBuild` / `verify-key` to the registry.
-
-<a id="1-概述"></a>
-
-## 1. Overview
-
-<a id="11-职责"></a>
-
-### 1.1 Responsibilities
+### 1.1 职责
 
 ```text
 SandboxGroupProvider / Importer
@@ -27,46 +21,42 @@ SandboxGroupProvider / Importer
         node
 ```
 
-The placer is responsible for:
+placer 负责:
 
-- Integrating group providers/importers.
-- Consuming the `node_list` WATCH_LIST.
-- Selector patches and APISecret/ManifestKey pair-cache refresh.
-- Shuffle sharding, static selectors, runtime matching, and P2C.
-- `PlaceSandbox` / `PlaceBuild` recommendations.
-- Provider-side API-key verification.
+- group provider/importer 接入。
+- `node_list` WATCH_LIST 消费。
+- selector patch 与 APISecret/ManifestKey pair cache refresh。
+- shuffle-sharding、静态 selector、runtime match、P2C。
+- `PlaceSandbox` / `PlaceBuild` 建议。
+- API key verify 的 provider 侧校验。
 
-The placer does not:
+placer 不负责:
 
-- Connect to nodes.
-- Dispatch `key_put`, create, delete, or build commands.
-- Maintain route/build execution state.
-- Store the registry's group/route records.
+- 连接 node。
+- 下发 `key_put` / create / delete / build 命令。
+- 维护 route/build 执行态。
+- 保存 registry 的 group/route 记录。
 
-<a id="12-原则"></a>
+### 1.2 原则
 
-### 1.2 Principles
+1. **registry 不实现 group provider**:Provider/Importer 属于 placer 或外部平台。
+2. **WATCH_LIST 仅给 placer**:router 不消费 node_list。
+3. **高频负载不走 WATCH_LIST**:WATCH_LIST 只承载低频目录字段;最终资源确认由 node owner admission 完成。
+4. **source_id 是 import 执行单元**:多个 placer 配置相同 `source_id` 时,竞争同一条 source lease。
+5. **shuffle 只影响新建**:不迁移正在运行的 sandbox。
+6. **凭据对分发只影响 create/build 前置条件**:drop、租约过期或 provider 更新不修改已经复制到
+   现有 sandbox/build 记录的凭据对。
 
-1. **The registry does not implement a group provider**: Provider/Importer belongs to the placer or an external platform.
-2. **WATCH_LIST serves the placer only**: the router does not consume node_list.
-3. **High-frequency load does not travel through WATCH_LIST**: WATCH_LIST carries only low-frequency directory fields; final resource confirmation occurs at node-owner admission.
-4. **source_id identifies the import execution unit**: placers configured with the same `source_id` compete for the same source lease.
-5. **Shuffle affects new placement only**: it does not migrate running sandboxes.
-6. **Credential-pair distribution affects create/build prerequisites only**: dropping a pair, lease expiry, or provider updates do not modify pairs already copied into existing sandbox/build records.
-
-<a id="2-命令行"></a>
-
-## 2. Command line
+## 2. 命令行
 
 ```text
 cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
-A standalone placer must configure at least one `import_groups` source. Embedded or production integrations can directly inject custom `SandboxGroupProvider` / `SandboxGroupImporter` implementations.
+standalone placer 必须配置至少一个 `import_groups` source。嵌入式或生产集成可以直接注入自定义
+`SandboxGroupProvider` / `SandboxGroupImporter`。
 
-<a id="3-配置"></a>
-
-## 3. Configuration
+## 3. 配置
 
 ```yaml
 placer:
@@ -95,26 +85,27 @@ placement:
   #     n: 2
 ```
 
-| Field | Meaning |
+| 字段 | 说明 |
 |---|---|
-| `registry.bootstrap` | Registry bootstrap endpoint for fetching membership. |
-| `placer.id` | Placer instance ID. |
-| `placer.listen` | Placer HTTP API listener. |
-| `placer.advertise` | Address used by the registry to call the placer, also its memberlist HTTP transport address. |
-| `placer.memberlist_label` | Placer memberlist label; defaults to `placer.default`. |
-| `import_groups[]` | Standalone placer group sources; built-in type: `source_type=file`. |
-| `placement.candidates` | Number of P2C candidates inside the placer. |
-| `placement.zone_admit_max` | Highest eligible placement water-level zone. |
-| `placement.import_source_owner_count` | Number of placer candidates allowed to compete for each source lease. |
-| `placement.import_source_lease_ttl` | Registry-side source lease TTL. |
-| `placement.selector_patch_refresh_interval` | Refresh interval for unchanged selector patches. |
-| `placement.shuffle_sharding` | Shuffle-sharding rules. |
+| `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
+| `placer.id` | placer 实例 id |
+| `placer.listen` | placer HTTP API 监听 |
+| `placer.advertise` | registry 调用 placer 的地址,同时作为 placer memberlist HTTP transport 地址 |
+| `placer.memberlist_label` | placer memberlist label,默认 `placer.default` |
+| `import_groups[]` | standalone placer 的 group source;内置 `source_type=file` |
+| `placement.candidates` | placer 内部 P2C 候选数量 |
+| `placement.zone_admit_max` | 可放置最高水位 |
+| `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 placer 候选数 |
+| `placement.import_source_lease_ttl` | registry 侧 source lease TTL |
+| `placement.selector_patch_refresh_interval` | unchanged selector patch 刷新周期 |
+| `placement.shuffle_sharding` | shuffle-sharding 规则 |
 
-On the registry, `placer_link.placer_label` selects the placer memberlist domain; `placer_link.placer_replica_count` selects the number of failover candidates used to call a placer for one group. It is not the owner count of the registry's internal `placer_link` namespace.
+registry 侧 `placer_link.placer_label` 指定 placer memberlist 域;`placer_link.placer_replica_count` 指定 registry
+对一个 group 调 placer 的 failover 候选数。它不是 registry 内部 `placer_link` namespace 的 owner count。
 
 ## 4. Provider / Importer
 
-The placer uses these common interfaces:
+placer 使用统一接口:
 
 ```text
 SandboxGroupProvider:
@@ -127,7 +118,7 @@ SandboxGroupImporter:
   Range(cursor, limit)
 ```
 
-The built-in file source is for local development and e2e use:
+内置 file source 只用于本地开发和 e2e:
 
 ```yaml
 import_groups:
@@ -136,9 +127,10 @@ import_groups:
     path: /path/to/dir
 ```
 
-It enumerates `*.json` files in the directory. Each file contains one `SandboxGroupRecord` JSON object. The expected file count is small, so `Get/GetPlacementHint/GetKey/GetAPISecret` can scan and parse the directory directly. Production deployments should integrate their actual group source through the interfaces.
+该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
+`Get/GetPlacementHint/GetKey/GetAPISecret` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
 
-Example:
+示例:
 
 ```json
 {
@@ -151,30 +143,35 @@ Example:
 }
 ```
 
-An explicit `api_secret` takes precedence. When an inline `manifest_key` omits `api_secret`, the placer derives the default using `HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")`. A referenced ManifestKey cannot be materialized locally by the placer and requires an explicit APISecret. Both roots and the complete fingerprints of references must be 64 lowercase hexadecimal characters.
+显式 `api_secret` 优先。inline `manifest_key` 缺省 `api_secret` 时,placer 按
+`HMAC-SHA256(decodeHex(ManifestKey), "kuasar-api-secret-v1")` 派生默认值;
+ref ManifestKey 无法在 placer 本地物化,必须显式提供 APISecret。两项 root 及 ref 的完整指纹
+都必须是 64-lowercase-hex。
 
-`target_port` is the enforced data-plane port returned with placement to route_link/router. It does not filter nodes; node selection still uses `node_selectors` and shuffle-sharding configuration.
+`target_port` 是数据面强制端口,随 Place 结果返回给 route_link/router。它不参与节点筛选;
+节点筛选仍只由 `node_selectors` 与 shuffle-sharding 配置决定。
 
-Distinguish these semantics when using multiple sources:
+多个 source 的语义需要区分:
 
-- Provider point lookups can search sources in order; defining the same group in multiple sources is an error.
-- Importer Range runs independently for each `source_id`; it does not combine sources into one Range view.
-- Each `source_id` maintains its own cursor and lease.
+- Provider 点查可以按 source 顺序查找 group,若同一个 group 被多个 source 定义则报错。
+- Importer Range 按 `source_id` 独立执行,不把多个 source 合并成一个 Range 视图。
+- 每个 `source_id` 的 cursor/lease 独立维护。
 
-After a group disappears from the provider, new Place requests have no matching group and verify-key rejects missing credentials; neither can use the removed group. Pairs already cached in node_link are not actively deleted; registry/node TTL eviction removes them. Durable credential copies in existing sandbox/build records remain unchanged.
+group 从 provider 消失后,新的 Place/verify-key 返回不可用。已经写入 node_link 的凭据对 cache
+不主动删除,由 registry/node 侧 TTL 淘汰;现有 sandbox/build 的持久凭据副本保持不变。
 
 ## 5. node_list WATCH_LIST
 
-Registry node owners project these low-frequency node fields into node_list:
+node_list 由 registry 的 node owner 投影低频节点字段:
 
 - node_id
 - labels
 - runtime_digest
 - api_endpoint
 - data_endpoint
-- Configured registration/execution Build capacity; usage/headroom does not enter this low-frequency view.
+- registration/execution Build configured capacity(usage/headroom 不进入低频视图)
 - draining
-- Liveness timestamp
+- liveness timestamp
 
 ```text
 registry node owners
@@ -186,21 +183,22 @@ node_list owner set
 placer local node view
 ```
 
-WATCH_LIST semantics:
+WATCH_LIST 语义:
 
-1. The placer derives node_list owner candidates from active membership and consumes one owner's complete WATCH_LIST at a time.
-2. The first frame is reset, followed by deltas; bookmark marks completion of the initial view.
-3. A watch token encodes the registry-local epoch, node_list shard-view label, and Rev.
-4. An epoch/label mismatch or compacted changelog requires a full resubscription.
-5. Ordinary heartbeats do not trigger WATCH_LIST. Draining changes and coarse liveness refresh do update node_list.
+1. placer 按 active membership 得到 node_list owner 候选,任一时刻只消费其中一个 owner 的完整 WATCH_LIST。
+2. 首帧为 reset,随后 delta,bookmark 标记初始视图完整。
+3. watch token 编入 registry 本地 epoch、node_list shard view label 和 Rev。
+4. epoch/label 不匹配或 changelog 已压缩时,placer 全量重订。
+5. 普通 heartbeat 不触发 WATCH_LIST;draining 变化和粗粒度 liveness refresh 触发 node_list 更新。
 
-The node_list shard is fully replicated across its owners. The placer neither needs nor may merge results from multiple node_list owners. If its current owner disconnects, the placer clears that source view, fails over to another candidate owner, and repeats reset + bookmark. It must not declare ready before bookmark completes.
+node_list owner 分片内全复制。placer 不需要也不能把多个 node_list owner 的结果合并。当前 owner 断线时,
+placer 清空该源视图并 failover 到另一个候选 owner,重新 reset + bookmark。完成 bookmark 前 placer
+不应声明 ready。
 
-<a id="6-placer-memberlist-域"></a>
+## 6. placer memberlist 域
 
-## 6. Placer memberlist domain
-
-At startup, the placer joins the memberlist selected by `placer.memberlist_label` and periodically registers a seed with active / next registry members:
+placer 启动后加入 `placer.memberlist_label` 指定的 placer memberlist,并周期性向 active / next registry
+成员注册 seed:
 
 ```json
 {"id":"s1","advertise":"https://s1:7800","memberlist_label":"placer.default"}
@@ -212,30 +210,27 @@ placer S1 ── register seed ──► registry A
     └──── placer.default memberlist ◄──── registry observer
 ```
 
-Placer readiness requires:
+placer ready 条件:
 
-- Current registry membership has been fetched.
-- One active node_list WATCH_LIST has completed reset/bookmark.
+- 已拉取当前 registry membership。
+- 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
 
-Group import is not a global readiness gate. Each Place resolves only its requested group. A missing group returns NoNode / unavailable without blocking other groups.
+group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中时返回 NoNode /
+不可用,不阻塞其他 group。
 
-The registry selects ready placers from memberlist metadata only:
+registry 只根据 memberlist meta 选择 ready placer:
 
 ```json
 {"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
-`placer_link/register` is neither the readiness source nor a placer directory store.
+`placer_link/register` 不是 ready 状态源,也不是 placer 目录存储。
 
-<a id="7-import-reconcile"></a>
+## 7. Import Reconcile
 
-## 7. Import reconciliation
+### 7.1 source owner 选择
 
-<a id="71-source-owner-选择"></a>
-
-### 7.1 Source-owner selection
-
-Each source runs independently:
+每个 source 独立执行:
 
 ```text
 readyPlacers = placer memberlist nodes where ready_label == active_registry_label
@@ -245,7 +240,7 @@ sourceOwners race:
   POST /placer-link/import-source-lease
 ```
 
-The source lease lives in registry shardkv:
+source lease 存在 registry shardkv:
 
 ```text
 namespace = placer_link
@@ -254,11 +249,10 @@ recordSet = import
 recordKey = state
 ```
 
-A lease request carries `source_id`, `owner_id`, `run_id`, and `ttl_ms`. Only the lease winner executes that source's `Importer.Range(cursor, limit)`.
+lease 请求携带 `source_id`、`owner_id`、`run_id` 和 `ttl_ms`。只有 lease 胜者执行该 source 的
+`Importer.Range(cursor, limit)`。
 
-<a id="72-page-处理"></a>
-
-### 7.2 Page processing
+### 7.2 page 处理
 
 ```text
 lease winner
@@ -279,21 +273,22 @@ registry refreshes node_link credential-pair cache
 cursor checkpoint after whole page succeeds
 ```
 
-A selector patch must carry `import_source_id/import_owner_id/import_run_id/import_term`. The registry accepts it only when it matches the current source lease. Missing fencing fields or a mismatched term/run_id cause rejection.
+selector patch 必须携带 `import_source_id/import_owner_id/import_run_id/import_term`。registry 只接受与当前
+source lease 匹配的 patch。缺失 fencing 字段或 term/run_id 不匹配时拒绝。
 
-`NextCursor==""` ends the round: the cursor is cleared and the round increments. Failure or owner crash does not advance the cursor; the next lease owner resumes from the last successful cursor or replays the same page.
+`NextCursor==""` 表示本轮结束:cursor 清空并递增 round。失败或 owner 崩溃时 cursor 不推进,后续 lease
+owner 从上次成功 cursor 继续或重放同一页。
 
-### 7.3 Selector-patch refresh
+### 7.3 selector patch refresh
 
-At `placement.selector_patch_refresh_interval`, the placer resends unchanged selector patches to keep the node_link credential-pair cache alive. A group disappearing from the provider does not actively delete the cache; entries expire by TTL.
+placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
+credential-pair cache。group 从 provider 消失时不主动删除 cache;TTL 到期后自动淘汰。
 
 ## 8. Placement
 
-<a id="81-registry-选择-placer"></a>
+### 8.1 Registry 选择 placer
 
-### 8.1 Registry selection of a placer
-
-For each group, the registry performs deterministic failover only:
+registry 对 group 只做确定性 failover:
 
 ```text
 readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
@@ -302,19 +297,20 @@ candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
 try candidates in order until success
 ```
 
-The registry does not use P2C to choose a placer. P2C is used only inside a placer to choose a placement target from node candidates.
+registry 不对 placer 做 P2C。P2C 只用于 placer 内部从 node 候选中选择放置目标。
 
 ### 8.2 PlaceSandbox
 
-Input:
+输入:
 
 ```text
 group, route_key, sandbox_id, target_runtime_digest?, config?, exclude_node_ids?
 ```
 
-`sandbox_id` is the stable public SandboxID owned by the registry. The placer does not allocate, parse, or receive NodeSandboxID or SandboxGeneration.
+`sandbox_id` 是 Registry 持有的稳定公开 SandboxID;placer 不分配、解析或接收 NodeSandboxID
+和 SandboxGeneration.
 
-Flow:
+流程:
 
 ```text
 provider.GetPlacementHint(group)
@@ -335,66 +331,68 @@ P2C over candidates
 return node_id + create_spec + APISecret fingerprint + runtime/template hints
 ```
 
-`node_list` is a low-frequency directory, not an online-status authority. Before committing, the route owner asks the node owner for the current node-link connection. Disconnected candidates, admission rejections, or command rejections add the candidate to `exclude_node_ids`, followed by another Place, until an online candidate is selected or the placer reports no candidate. The node owner is the sole liveness authority.
+`node_list` 只提供低频目录,不判定 node 是否在线。route owner 在提交前向 node owner 查询当前
+node-link 连接；断线、admission 拒绝或命令拒绝的候选加入 `exclude_node_ids`,随后重新 Place,直到选中
+在线候选或 placer 返回无候选。node owner 是唯一存活权威。
 
 ### 8.3 PlaceBuild
 
-Input:
+输入:
 
 ```text
 group, build_id, template_id, resources
 ```
 
-Build placement resembles sandbox placement, but the placer's low-frequency view uses configured registration capacity only to exclude nodes that cannot fit the single Build even in isolation. It receives no heartbeat usage. Current headroom is read only at the Holder/node boundary:
+Build placement 与 sandbox 类似,但 Placer 的低频视图只按 configured registration capacity
+排除永远装不下单个 Build 的节点,不接收 heartbeat usage。当前 headroom 只在 Holder/节点边界读取:
 
-1. The placer recommends a node whose static capacity can fit the request.
-2. Through the current Holder, the registry confirms that node-link is online and reads the latest durable registration usage.
-3. If headroom is insufficient, the registry excludes that candidate and reschedules before creating a registration intent.
-4. The registry persists a STARTING intent for the selected node/build, then sends `build_register`.
-5. The node performs final registration admission in a SQLite transaction. Only a definitive rejection without side effects permits excluding the candidate. Timeout, disconnect, or lost ACK pins queries/retries to that node/BuildID.
+1. placer 返回静态 capacity 可容纳的建议 node。
+2. Registry 通过当前 Holder 确认 node-link 在线并读取最新 durable registration usage。
+3. headroom 已不足时 Registry 排除该候选并重调度,尚不创建注册 intent。
+4. Registry 持久化选中 node/build 的 STARTING intent,再发送 `build_register`。
+5. node 在 SQLite 事务中作最终 registration admission；明确无副作用拒绝才允许排除候选,
+   timeout/断连/ACK 丢失则固定该 node/BuildID 查询或重试。
 
-## 9. Key distribution
+## 9. Key Distribution
 
-The placer owns selector patches and APISecret/ManifestKey pair-cache refresh:
+placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 
-1. Obtain the group's typed `manifest_key` and `api_secret`. A missing APISecret can be derived only from an inline ManifestKey using the fixed derivation.
-2. Compute the target node set from placement selectors and shuffle results.
-3. A selector patch carries either the complete pair or no credential fields. Each member includes a typed carrier and full 64-hex SHA-256 fingerprint; half-pairs are rejected.
-4. Registry/node owners use the full `APISecretFingerprint` as the record key, write the desired pair to node_link's `key_pair` recordSet, and replicate it by CAS across the owner set.
-5. A node_link heartbeat performs atomic `key_put` only for entries lacking `AckAccepted` or entering the renewal window. Delivery state advances only for an ACK matching the entire current desired pair and lease.
-6. One full APISecret fingerprint can bind only identical pair material; conflicts must not overwrite it.
-7. Nodes evict unrenewed pairs by TTL. `key_drop` addresses the full APISecret fingerprint and is not a correctness dependency.
+1. 获取 group 的 typed `manifest_key` 和 `api_secret`;缺省 APISecret 只可由 inline ManifestKey 固定派生。
+2. 根据 placement selectors 和 shuffle 结果得到目标 node set。
+3. selector patch 要么携带完整 pair,要么完全不携带凭据字段。两项各带 typed carrier 和完整
+   64-hex SHA-256 指纹;半对拒绝。
+4. registry/node owner 以完整 `APISecretFingerprint` 为 record key,把 desired pair 写入 node_link
+   `key_pair` recordSet,并在 owner set 内 CAS 复制。
+5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行原子 `key_put`;只有匹配
+   当前完整 desired pair 和 lease 的 ACK 才推进已交付状态。
+6. 同一 APISecret 完整指纹只能绑定完全相同的 pair material;冲突不得覆盖。
+7. 未续租 pair 由节点 TTL 淘汰,`key_drop` 以完整 APISecret 指纹定位,不作为正确性依赖。
 
-Credential pairs are create/build prerequisites. Cache removal, key_drop, lease expiry, or later provider updates do not affect pairs already copied into existing sandbox/build business records.
+凭据对是 create/build 前置条件。cache 删除、key_drop、租约过期或后续 provider 更新不影响已经复制
+到现有 sandbox/build 业务记录的凭据对。
 
-<a id="10-可靠性"></a>
+## 10. 可靠性
 
-## 10. Reliability
-
-| Event | Behavior |
+| 事件 | 行为 |
 |---|---|
-| Placer crash | The registry fails over to the next ready placer for the group; the hot path is unaffected. |
-| WATCH_LIST disconnect | The placer clears its node_list view and fully resubscribes through another owner; it remains not-ready until bookmark completes. |
-| Provider unavailable | Place/verify-key for affected groups return unavailable. |
-| Stale node labels | Node-owner admission/create provides the final rejection. |
-| Source-owner crash | After lease expiry, another candidate resumes from the committed cursor; fencing rejects old-owner patches/cursor updates. |
-| Key-renewal delivery failure | Timeout, disconnect, or rejection does not advance delivery state; create/build rejects at the node and the next heartbeat refresh retries. |
-| Build registration timeout or lost ACK | Keep the persisted selected-node/BuildID intent and query/retry that same node. Durable registration usage remains node-owned; the placer has no admission-lease timer that frees it. Node record deletion governs release and registry projection removal. |
+| placer 崩溃 | registry failover 到同 group 的下一个 ready placer;热路径不受影响 |
+| WATCH_LIST 断线 | placer 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
+| provider 不可用 | 受影响 group 的 Place/verify-key 返回不可用 |
+| node labels 旧 | node owner admission/create 兜底拒绝 |
+| source owner 崩溃 | source lease 到期后其他候选从已提交 cursor 接管;旧 owner patch/cursor 被 fencing 拒绝 |
+| key 续租投递失败 | timeout、断线或 reject 都不推进已交付状态；create/build 在 node 侧 reject，下一次 heartbeat refresh 重试 |
+| build 预算泄漏 | admission lease 超时释放 |
 
-See the authoritative [registration dispatch and projection reconciliation](../internal/registry/build.go) and [placement predicates](../internal/placer/scaler.go). In particular, ambiguous delivery cannot be treated as proof of a side-effect-free rejection.
+## 11. 性能
 
-<a id="11-性能"></a>
+- WATCH_LIST 只传低频字段,避免高频水位扇出。
+- Place QPS 通过 ready placer 集合按 group `LocateN` 分散。
+- placer 内部只对 P2C 候选做实时比较。
+- import/source 独立分页,不同 source 之间不做全量合并。
+- selector patch 是慢路径,可限速;unchanged patch 只用于刷新 TTL。
 
-## 11. Performance
+## 12. See Also
 
-- WATCH_LIST carries low-frequency fields only, avoiding high-frequency water-level fan-out.
-- Group `LocateN` distributes Place QPS across ready placers.
-- Inside the placer, P2C compares only sampled candidates using the current local directory view; it does not synchronously poll nodes for live load.
-- Import pagination is independent per source; sources are not fully merged.
-- Selector patches are a slow path and can be rate-limited; unchanged patches refresh TTL only.
-
-## 12. See also
-
-- [cluster.md](cluster.md) — overall registry membership, shardkv, node_link, route_link, and placer_link design.
-- [cluster-router.md](cluster-router.md) — router Reserve consumption, route cache, and data-plane forwarding.
-- [node.md](node.md) — node-side node-link registration, heartbeats, command execution, and key TTL.
+- [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
+- [cluster-router.md](cluster-router.md) — router Reserve 消费、route cache 和数据面转发.
+- [node.md](node.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

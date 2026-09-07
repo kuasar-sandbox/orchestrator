@@ -72,11 +72,11 @@ func TestArenaLayoutAndValidation(t *testing.T) {
 	if report.CounterBytes != 65536*2*4*8 || report.MappedBytes <= report.CounterBytes || report.ScratchBytes == 0 {
 		t.Fatalf("memory report = %+v", report)
 	}
-	if report.MappedBytes != 8388800 {
-		t.Fatalf("default two-worker mmap bytes = %d, want 8388800", report.MappedBytes)
+	if report.MappedBytes != 5767320 {
+		t.Fatalf("default two-worker mmap bytes = %d, want 5767320", report.MappedBytes)
 	}
-	t.Logf("default arena: counters=%d headers=%d guards=%d scratch=%d mapped=%d",
-		report.CounterBytes, report.HeaderBytes, report.GuardBytes, report.ScratchBytes, report.MappedBytes)
+	t.Logf("default arena: counters=%d headers=%d row-tags=%d scratch=%d mapped=%d",
+		report.CounterBytes, report.HeaderBytes, report.RowTagBytes, report.ScratchBytes, report.MappedBytes)
 	if _, err := Size(0, 2); err == nil {
 		t.Fatal("zero route capacity accepted")
 	}
@@ -348,7 +348,7 @@ func TestWorkerColumnClearsOnlyForReapedEpochAndReplacementReusesIndex(t *testin
 	if err := master.ClearWorker(0, 1); err != nil {
 		t.Fatal(err)
 	}
-	lease.Release() // the reaped process cannot do this in production; generation safety makes it harmless here.
+	lease.Release() // A reaped process cannot do this; the zero row tag also makes it harmless here.
 	if err := master.BeginWorker(0, 10); err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestProcessSharedCountersAndReapedWorkerCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("master cleanup blocked on a reaped worker's stale row guard")
+			t.Fatal("master cleanup blocked on a reaped worker")
 		}
 		lease, err := survivor.TryAcquire(binding, ServiceForward)
 		if err != nil {
