@@ -225,9 +225,9 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 预留 / 水位额度 / 清单恢复 / 统计。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、
   node_link / route_link / node_list / placer_link、Reserve 状态机、成员变更与 e2e。
-- [docs/cluster-router.md](docs/cluster-router.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
+- [docs/cluster-router.md](docs/cluster-router_zh.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
   ExecSession Reserve,两跳转发与 CONNECT,stable/NodeSandboxID 改写和 KAT 双验.
-- [docs/cluster-placer.md](docs/cluster-placer.md) — 放置调度器:SandboxGroupProvider/Importer、
+- [docs/cluster-placer.md](docs/cluster-placer_zh.md) — 放置调度器:SandboxGroupProvider/Importer、
   placer memberlist、node_list WATCH_LIST、source lease、selector patch、PlaceSandbox / PlaceBuild。
 
 ## License
