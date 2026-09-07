@@ -351,11 +351,13 @@ NodeSandboxID;普通 HTTP 的内层 Host 也改为 `<port>-<node_sandbox_id>.<do
 Router 完成本地鉴权后,若 route 已有 `NodeSandboxID + DataEndpoint`,不再按 state 在 Registry
 等待 READY:paused/starting 与 ready 一样立即建立一次性 node CONNECT。最终 node proxy 按
 `LookupRoute → authorize → BeginParking → ActivateRoute/Wake → fresh Route → dial` 处理等待,
-所以合法请求的 parking 只在最终 node 统计,cluster router/Registry 不重复计数。普通请求在
-`enforce` 模式下的无效 token 在 node CONNECT/Reserve 前失败。文件 signature 校验及
-`/files` 的显式 token 校验在所有模式下均强制执行,exec 也始终 enforce。普通请求的
-`log` 模式记录本地 token 不匹配后继续,`off` 跳过该本地 token 检查;两者都不关闭最终
-node 的鉴权,也不允许未授权请求 Wake/Resume/parking/backend dial。
+所以获准请求的 parking 只在最终 node 统计,cluster router/Registry 不重复计数。普通请求在
+Router 的 `enforce` 模式下,无效 token 在 node CONNECT/Reserve 前失败。Router 的文件 signature
+校验及 `/files` 显式 token 校验在所有 Router 模式下均强制执行,exec 也始终 enforce。
+普通请求的 Router `log` 模式记录本地 token 不匹配后继续,`off` 跳过该本地 token 检查。
+最终 node proxy 独立应用自身的有效鉴权策略:要阻止无效普通凭据触发 Wake/Resume/parking/backend
+dial,必须让 node proxy 保持 `enforce`。如果目标 node 也使用 `log` 或 `off`,它就可能接纳该
+请求并激活后端。Router 配置不会覆盖 node 的策略。
 
 只有 target 缺失时才先调用 `operation=data` fallback。普通请求把客户 token 传给 Registry;
 签名 `/files` 把已用于验签的受保护 EnvdAccessToken 传给 Registry。若已知 node 在接受内层
