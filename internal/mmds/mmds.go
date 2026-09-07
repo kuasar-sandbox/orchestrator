@@ -30,10 +30,14 @@ const (
 	readHeaderTimeout = 5 * time.Second
 	idleTimeout       = 30 * time.Second
 	maxHeaderBytes    = 16 * 1024
+
+	// clientCloseGrace bounds how long waitForClientClose parks after flushing
+	// a Connection: close response, waiting for the client's own close.
+	clientCloseGrace = 250 * time.Millisecond
 )
 
-// Source is the trusted route view used by an independent proxy worker. It must
-// fail closed when its backing sync/store is unavailable.
+// Source is the trusted route view used by the internal proxy or an external
+// proxy worker. It must fail closed when its backing sync/store is unavailable.
 type Source interface {
 	MMDSAvailable() bool
 	ByFloatingIP(ip string) (sandboxID string, ok bool)
@@ -78,7 +82,7 @@ type opts struct {
 func (s *Server) Handler() http.Handler {
 	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.src.MMDSAvailable() {
-			http.Error(w, "", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "")
 			return
 		}
 		switch {
@@ -87,10 +91,69 @@ func (s *Server) Handler() http.Handler {
 		case r.Method == http.MethodGet:
 			s.getMeta(w, r)
 		default:
-			http.Error(w, "", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "")
 		}
 	})
-	return secureHeaders(guardRequest(dispatch))
+	return waitForClientClose(secureHeaders(guardRequest(dispatch)))
+}
+
+// writeResponse publishes the complete MMDS body with explicit framing before
+// waitForClientClose flushes it: a Content-Length-delimited response lets the
+// client finish reading (and close) while the middleware is still parked. All
+// MMDS responses are materialized in memory already, so no response buffering
+// wrapper is needed here.
+func writeResponse(w http.ResponseWriter, status int, body []byte) {
+	if status >= http.StatusOK && status != http.StatusNoContent && status != http.StatusNotModified {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	} else {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(status)
+	if status != http.StatusNoContent && status != http.StatusNotModified && len(body) != 0 {
+		_, _ = w.Write(body)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writeResponse(w, status, []byte(message+"\n"))
+}
+
+// waitForClientClose keeps the guest the active closer of every HTTP/1.x
+// Connection: close exchange, so TIME_WAIT lands on the guest side — where it
+// dies with the sandbox and is reset by the next restore — instead of on this
+// server, where sandboxes restored from the same snapshot replay a frozen TCP
+// 4-tuple whose fresh SYN then draws a stale ACK, an RST, and a 21-40ms
+// retransmission on the launch critical path (connector#36). This is the
+// HTTP-layer form of the deferClose listener fix: no connection or listener is
+// wrapped; after the inner handler returns, the response is flushed and the
+// middleware parks until the client closes. The server's eventual close of an
+// already-half-closed connection is CLOSE_WAIT -> LAST_ACK -> CLOSED: no
+// TIME_WAIT. Only the server side changes — no guest agent (envd) or
+// connector behavior is involved.
+func waitForClientClose(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+
+		// Only HTTP/1.x Connection: close requests (every request the deployed
+		// envd makes) park; keep-alive connections are reused and closed by the
+		// client itself. r.Context() is canceled when the peer goes away
+		// (net/http's background read) or the server closes the connection, so
+		// both a prompt client and shutdown wake immediately — only a client
+		// that neither reuses nor closes the connection pays the grace.
+		if r.ProtoMajor == 1 && r.Close {
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				return
+			}
+			timer := time.NewTimer(clientCloseGrace)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+			case <-timer.C:
+			}
+		}
+	})
 }
 
 func secureHeaders(next http.Handler) http.Handler {
@@ -104,29 +167,29 @@ func secureHeaders(next http.Handler) http.Handler {
 func guardRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL == nil || r.URL.ForceQuery || r.URL.RawQuery != "" || r.URL.Fragment != "" || r.URL.RawFragment != "" {
-			http.Error(w, "", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "")
 			return
 		}
 		raw := r.URL.Path
 		if raw == "" || raw[0] != '/' || r.URL.RawPath != "" ||
 			strings.Contains(r.RequestURI, "%") || strings.ContainsAny(raw, "?#\\*") {
-			http.Error(w, "", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "")
 			return
 		}
 		if raw != "/" {
 			if strings.HasSuffix(raw, "/") {
-				http.Error(w, "", http.StatusBadRequest)
+				writeError(w, http.StatusBadRequest, "")
 				return
 			}
 			for _, segment := range strings.Split(strings.TrimPrefix(raw, "/"), "/") {
 				if segment == "" || segment == "." || segment == ".." {
-					http.Error(w, "", http.StatusBadRequest)
+					writeError(w, http.StatusBadRequest, "")
 					return
 				}
 			}
 		}
 		if r.Method == http.MethodGet && (r.ContentLength != 0 || len(r.TransferEncoding) != 0 || (r.Body != nil && r.Body != http.NoBody)) {
-			http.Error(w, "", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -142,6 +205,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 	go func() {
 		<-ctx.Done()
+		// Close cancels every in-flight request context, so handlers parked
+		// in waitForClientClose stop waiting immediately instead of each
+		// paying the grace period.
 		_ = srv.Close()
 	}()
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -153,12 +219,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 	ttlHeaders := r.Header.Values("X-metadata-token-ttl-seconds")
 	if len(ttlHeaders) != 1 {
-		http.Error(w, "", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "")
 		return
 	}
 	ttl, err := strconv.ParseInt(ttlHeaders[0], 10, 64)
 	if err != nil || ttl < minTokenTTLSeconds || ttl > maxTokenTTLSeconds {
-		http.Error(w, "", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "")
 		return
 	}
 
@@ -168,17 +234,17 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 		if s.log != nil {
 			s.log.Debug("mmds: no sandbox for source ip within park", "ip", ip)
 		}
-		http.Error(w, "", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "")
 		return
 	}
 	secret, ok := s.src.MmdsSecret(sid)
 	if !ok {
-		http.Error(w, "", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "")
 		return
 	}
 	incarnation, ok := s.src.Incarnation(sid)
 	if !ok {
-		http.Error(w, "", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "")
 		return
 	}
 	token, err := mintToken(tokenPayload{
@@ -189,18 +255,18 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 		ExpiresUnix: time.Now().Unix() + ttl,
 	}, secret)
 	if err != nil {
-		http.Error(w, "", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "")
 		return
 	}
 	w.Header().Set("X-metadata-token-ttl-seconds", strconv.FormatInt(ttl, 10))
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = w.Write([]byte(token))
+	writeResponse(w, http.StatusOK, []byte(token))
 }
 
 func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	sid, ok := s.verifyToken(r.Header.Get("X-metadata-token"), sourceIP(r.RemoteAddr))
 	if !ok {
-		http.Error(w, "", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "")
 		return
 	}
 	if r.URL.Path != "/" {
@@ -209,11 +275,11 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 			if s.log != nil {
 				s.log.Debug("mmds: route resolution failed", "sid", sid, "path", r.URL.Path, "err", err)
 			}
-			http.Error(w, "", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "")
 			return
 		}
 		if !found {
-			http.Error(w, "", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "")
 			return
 		}
 		s.writeRoute(w, route)
@@ -221,7 +287,7 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	templateID, accessToken, ok := s.src.SandboxInfo(sid)
 	if !ok {
-		http.Error(w, "{}", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "{}")
 		return
 	}
 	body, _ := json.Marshal(opts{
@@ -230,7 +296,7 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		AccessTokenHash: HashToken(accessToken),
 	})
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(body)
+	writeResponse(w, http.StatusOK, body)
 }
 
 func (s *Server) writeRoute(w http.ResponseWriter, route MMDSRoute) {
@@ -241,24 +307,23 @@ func (s *Server) writeRoute(w http.ResponseWriter, route MMDSRoute) {
 	switch route.Type {
 	case "", "static":
 		w.Header().Set("Content-Type", contentType)
-		_, _ = w.Write(route.Body)
+		writeResponse(w, http.StatusOK, route.Body)
 	case "secret":
 		if !route.Present {
-			http.Error(w, "", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "")
 			return
 		}
 		w.Header().Set("Content-Type", contentType)
-		_, _ = w.Write(route.Body)
+		writeResponse(w, http.StatusOK, route.Body)
 	case "service":
 		status := route.StatusCode
 		if status < 100 || status > 599 {
 			status = http.StatusServiceUnavailable
 		}
 		w.Header().Set("Content-Type", contentType)
-		w.WriteHeader(status)
-		_, _ = w.Write(route.Body)
+		writeResponse(w, status, route.Body)
 	default:
-		http.Error(w, "", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "")
 	}
 }
 
