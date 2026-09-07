@@ -441,6 +441,6 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 
 - [cluster.md](cluster.md) — registry membership、route_link、Reserve 与数据模型。
 - [cluster-placer.md](cluster-placer_zh.md) — verify-key、Place 和 key distribution 来源。
-- [node-proxy.md](node-proxy.md) — node 内部数据面转发、CONNECT 和 envd signature。
+- [node-proxy.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
 
 - [Router 实现](../internal/router/router.go) — 鉴权模式、缓存寿命、端点选择和 exec admission。
