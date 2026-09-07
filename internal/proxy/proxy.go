@@ -299,7 +299,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, flow, admission, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
+	route, flow, _, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
 	if !ok {
 		return
 	}
@@ -313,10 +313,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		backend = flow.AttachBackend(backend)
-		if !admission.Unlimited() {
-			stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
-			defer stopContextClose()
-		}
+		// Cancellation is a transport property, not an admission-policy option.
+		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
+		defer stopContextClose()
 		defer backend.Close()
 		resp, err := ForwardHTTPOnce(r, backend, nil, nil)
 		if err != nil {
@@ -376,7 +375,7 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 		return
 	}
 	backend = flow.AttachBackend(backend)
-	if !binding.Admission.Unlimited() && (r.Method != http.MethodConnect || r.ProtoMajor == 2) {
+	if r.Method != http.MethodConnect || r.ProtoMajor == 2 {
 		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
 		defer stopContextClose()
 	}
