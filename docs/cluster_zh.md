@@ -1213,6 +1213,6 @@ import、key 分发、显式 create/Reserve、稳定 SandboxID 的 CmdConnect、
 
 - [cluster-router_zh.md](cluster-router_zh.md) — router 入口、route cache 和数据面转发。
 - [cluster-placer_zh.md](cluster-placer_zh.md) — group provider/importer、WATCH_LIST、Place 与 key distribution。
-- [node.md](node.md) — node-ctl 单机主机与 node-link 节点侧行为。
+- [node.md](node_zh.md) — node-ctl 单机主机与 node-link 节点侧行为。
 - [node-proxy_zh.md](node-proxy_zh.md) — node 数据面 proxy、routesync 与 CONNECT。
 - [部署文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md) — 部署拓扑、端口、启停与故障域。
