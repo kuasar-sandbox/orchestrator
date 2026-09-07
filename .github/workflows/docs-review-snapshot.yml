@@ -1,0 +1,42 @@
+name: Documentation review snapshot
+
+on:
+  push:
+    branches: [docs/review-snapshot-20260907]
+    paths: [.github/workflows/docs-review-snapshot.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SOURCE_SHA: 6c47aaa035e587c983c7d26077d1e4d18fb9f5d3
+      BASE_SHA: 6c47aaa035e587c983c7d26077d1e4d18fb9f5d3
+    steps:
+      - name: Read this repository only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Archive tracked source without executing candidate code
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p "$RUNNER_TEMP/docs-review"
+          git archive --format=tar "$SOURCE_SHA" | gzip -n > "$RUNNER_TEMP/docs-review/source.tar.gz"
+          git archive --format=tar "$BASE_SHA" | gzip -n > "$RUNNER_TEMP/docs-review/base.tar.gz"
+          git ls-tree -rz --full-tree "$SOURCE_SHA" > "$RUNNER_TEMP/docs-review/source-tree.z"
+          git ls-tree -rz --full-tree "$BASE_SHA" > "$RUNNER_TEMP/docs-review/base-tree.z"
+          printf 'repository=%s\nsource=%s\nbase=%s\n' "$GITHUB_REPOSITORY" "$SOURCE_SHA" "$BASE_SHA" > "$RUNNER_TEMP/docs-review/revisions.txt"
+          sha256sum "$RUNNER_TEMP/docs-review/"*.tar.gz > "$RUNNER_TEMP/docs-review/SHA256SUMS"
+      - name: Keep evidence within this repository's artifact access boundary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation-review-source
+          path: ${{ runner.temp }}/docs-review/
+          retention-days: 1
+          if-no-files-found: error
