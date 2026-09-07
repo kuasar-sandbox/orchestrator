@@ -218,7 +218,7 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 
 - [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
-- [docs/node-proxy.md](docs/node-proxy.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
+- [docs/node-proxy.md](docs/node-proxy_zh.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
   routesync / per-Sandbox max inflight / traffic stats / 数据面鉴权 / MMDS / service-addressed CONNECT /
   native exec gate.
 - [docs/node-resource.md](docs/node-resource_zh.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
