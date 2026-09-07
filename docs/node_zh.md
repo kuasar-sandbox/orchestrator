@@ -874,7 +874,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
 ```
 
 - **持久 id 自描述**:payload 是 `manifest://<key>` 或
-  `file://<digest>.image@digest:<digest>#<location>`；encrypted carrier 使用 `@hmac:`，
+  `file://<digest>.image@digest:<digest>@location:<name>`；encrypted carrier 使用 `@hmac:`，
   Bundle 用 `@manifest:<root-key>`；运行期解析 profile（选择共享 runtime 的 guest 行为）、kind(img = image cold,sbx = Sandbox E cold,snp = Snapshot S memory restore)
   和 canonical portable ref。snp 可在 Connect 时显式选择 cold,但 TemplateID 的缺省仍是 memory。
   local file ref、宿主绝对路径、非 canonical ref 或 artifact kind 不匹配均拒绝。
