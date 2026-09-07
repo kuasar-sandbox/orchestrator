@@ -120,7 +120,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		if manifestCfg == nil {
 			return nil, errors.New("task artifact prepare: image Bundle preflight requires manifest_config")
 		}
-		probeName := reflocation.PublicationName("build-preflight", time.Unix(0, 0))
+		probeName := reflocation.PublicationName("build-preflight")
 		if _, err := reflocation.Resolve(spec.RefLocationParent, probeName); err != nil {
 			return nil, fmt.Errorf("task artifact prepare: image Bundle location: %w", err)
 		}

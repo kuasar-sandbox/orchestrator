@@ -2,32 +2,28 @@ package orch
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// TestPromoteBucketsByPublicationTimeNotEntityCreation covers the case where
-// an entity created long before it exports must still land in a current
-// (publication-date) partition: partitioning follows publication time, not
-// entity creation time. The sandbox id below carries a 2025-era v7
-// timestamp; the publication clock is pinned so the expected name (and
-// partition) is a constant, not whatever today is.
-func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
+// TestPromotePublishesUnderBareEntityID covers the undated publication
+// contract: the location name is the bare entity id (here the sandbox row id;
+// StableID-keying is covered separately) and the resolved URI carries only the
+// SHA fan-out below the parent.
+func TestPromotePublishesUnderBareEntityID(t *testing.T) {
 	dir := t.TempDir()
 	o := migrationOrchestrator(t, dir, []byte("runtime"))
 	cfg := o.cfg
 	cfg.Checkpoint.Remote.RefLocationParent = "file:///mnt/shared/snapshots"
-	publishedAt := time.Date(2026, 8, 24, 23, 59, 0, 0, time.UTC)
-	o.now = func() time.Time { return publishedAt }
 	ctx := context.Background()
 	mk := strings.Repeat("7", 64)
 	_, apiKey := defaultTestCredentials(t, mk)
-	// Old entity: 0194... is a 2025-era v7 timestamp.
 	sid := "0194a1b2-c3d4-7234-9abc-0123456789ab"
 	localRef := makeLocalSnapshot(t, dir, sid)
 	argsPath := filepath.Join(dir, "promote.args")
@@ -44,7 +40,7 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsPath + "\n" +
 		"for a in \"$@\"; do\n" +
 		"  case \"$a\" in\n" +
-		"    *-20*=*)\n" +
+		"    *=*)\n" +
 		"      n=${a%%=*}\n" +
 		"      printf '%s\\n' 'file://" + strings.Repeat("c", 64) + ".snapshot@location:'\"$n\"\n" +
 		"      ;;\n" +
@@ -63,29 +59,22 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Extract the publication name promote actually built from the recorded
-	// argv (the only <name>=<uri> pair).
+	// The publication name promote actually built is the value following
+	// --to-ref-location, up to its "=".
+	fields := strings.Fields(string(args))
 	var locName string
-	for _, f := range strings.Fields(string(args)) {
-		if i := strings.Index(f, "="); i > 0 {
-			candidate := f[:i]
-			if strings.HasSuffix(candidate, "-20260824") {
-				if _, err := cfg.Checkpoint.RefLocationURI(candidate); err == nil {
-					locName = candidate
-				}
+	for i, f := range fields {
+		if f == "--to-ref-location" && i+1 < len(fields) {
+			if j := strings.Index(fields[i+1], "="); j > 0 {
+				locName = fields[i+1][:j]
 			}
 		}
 	}
 	if locName == "" {
-		t.Fatalf("promote args = %q, want a publication name=uri pair dated 20260824", args)
+		t.Fatalf("promote args = %q, want a publication name=uri pair", args)
 	}
-	// The bucket must be the pinned publication date, not the entity's 2025
-	// timestamp: the name was built at publication time.
-	if got := locName[len(locName)-8:]; got != "20260824" {
-		t.Fatalf("publication date = %q, want %q", got, "20260824")
-	}
-	if !strings.HasPrefix(locName, sid+"-") {
-		t.Fatalf("publication name %q does not start with the entity id %q", locName, sid)
+	if locName != sid {
+		t.Fatalf("publication name = %q, want the bare entity id %q", locName, sid)
 	}
 	locationURI, err := cfg.Checkpoint.RefLocationURI(locName)
 	if err != nil {
@@ -94,8 +83,12 @@ func TestPromoteBucketsByPublicationTimeNotEntityCreation(t *testing.T) {
 	if !strings.Contains(string(args), "--to-ref-location "+locName+"="+locationURI) {
 		t.Fatalf("promote args = %q, want location %q resolved to %q", args, locName, locationURI)
 	}
-	if !strings.Contains(locationURI, "/20260824/") {
-		t.Fatalf("location URI %q is not bucketed by publication date", locationURI)
+	// The URI must be the parent plus the SHA fan-out plus the name, with no
+	// date-shaped segment anywhere between them.
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(locName)))
+	wantURI := "file:///mnt/shared/snapshots/" + digest[:2] + "/" + digest[2:4] + "/" + locName
+	if locationURI != wantURI {
+		t.Fatalf("location URI = %q, want %q", locationURI, wantURI)
 	}
 	// And the returned template ref must carry that same publication name.
 	tmpl, err := types.ParseTemplateID(templateID)

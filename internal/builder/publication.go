@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -113,9 +112,9 @@ func (p *buildPipeline) preparePublication() error {
 	}()
 
 	if plan.ImageClassTarget == ImageClassCheckpointBundleLocation {
-		// Validate the parent without fixing the real publication name/date. The
+		// Validate the parent without minting the real publication name. The
 		// actual name is minted immediately before each image-class publication.
-		probeName := reflocation.PublicationName(p.spec.BuildID, time.Unix(0, 0))
+		probeName := reflocation.PublicationName(p.spec.BuildID)
 		if _, err := reflocation.Resolve(p.spec.CheckpointRefLocationParent, probeName); err != nil {
 			return fmt.Errorf("build publication: image Bundle location: %w", err)
 		}
@@ -209,10 +208,7 @@ func (p *buildPipeline) publishManifestSource(role artifact.LogicalRole, source 
 }
 
 func (p *buildPipeline) publishBundleSource(role artifact.LogicalRole, source sparse.Source) (string, error) {
-	if p.now == nil {
-		return "", errors.New("build publication: publication clock is not initialized")
-	}
-	name := reflocation.PublicationName(p.spec.BuildID, p.now())
+	name := reflocation.PublicationName(p.spec.BuildID)
 	location, err := reflocation.Resolve(p.spec.CheckpointRefLocationParent, name)
 	if err != nil {
 		return "", fmt.Errorf("build publication: image Bundle location %q: %w", name, err)

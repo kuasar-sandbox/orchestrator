@@ -448,11 +448,11 @@ sandbox:
 
 func TestCheckpointRefLocationURI(t *testing.T) {
 	c := CheckpointConfig{Remote: CheckpointRemoteConfig{RefLocationParent: "file:///mnt/shared/snapshots"}}
-	// Publication names are entity ids with a publication-date suffix; the
-	// first path segment is that date, forming a time-ordered GC bucket.
-	name := "0198f7a1-1234-7234-9abc-0123456789ab-20260824"
+	// Publication names are bare entity ids; the SHA fan-out below the parent
+	// bounds directory size and no date segment appears.
+	name := "0198f7a1-1234-7234-9abc-0123456789ab"
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
-	want := "file:///mnt/shared/snapshots/20260824/" + digest[:2] + "/" + digest[2:4] + "/" + name
+	want := "file:///mnt/shared/snapshots/" + digest[:2] + "/" + digest[2:4] + "/" + name
 	got, err := c.RefLocationURI(name)
 	if err != nil {
 		t.Fatal(err)
@@ -462,13 +462,15 @@ func TestCheckpointRefLocationURI(t *testing.T) {
 	}
 }
 
-func TestCheckpointRefLocationURIRejectsNamesWithoutDate(t *testing.T) {
+func TestCheckpointRefLocationURIRejectsInvalidLocationNames(t *testing.T) {
 	c := CheckpointConfig{Remote: CheckpointRemoteConfig{RefLocationParent: "file:///mnt/shared/snapshots"}}
 	for _, name := range []string{
-		"0198f7a1-1234-7234-9abc-0123456789ab", // no date suffix
-		"20260824",                             // date only, no entity id
-		"x-2026082",                            // short date
-		"x-2026ab24",                           // non-numeric date
+		"",        // empty
+		"a/b",     // path separator
+		".",       // dot
+		".entity", // dot-prefixed
+		"-entity", // leading hyphen
+		"enti ty", // space
 	} {
 		if got, err := c.RefLocationURI(name); err == nil {
 			t.Fatalf("RefLocationURI(%q) = %q, want error", name, got)

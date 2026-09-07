@@ -218,7 +218,6 @@ func (f *publicationFixture) pipeline(t *testing.T, buildID, imageRef string, lo
 			SandboxResources: resources,
 		},
 		baseRef: imageRef, target: types.BuildTarget{Kind: types.BuildTargetImage},
-		now: func() time.Time { return time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC) },
 		log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 	if imageRef != f.localImageRef {
@@ -485,7 +484,6 @@ func TestManifestImagePolicyPublishesPhaseCBaseToStore(t *testing.T) {
 	}
 	args, err := publishCheckpointArtifactArgs(
 		pipeline.spec, CheckpointClassRefLocation, "/base/capture.snapshot",
-		time.Date(2026, 9, 4, 12, 1, 0, 0, time.UTC),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -512,9 +510,8 @@ func TestPublishPhaseCImageInstallsPortableMappingForRunAndCheckpoint(t *testing
 		t.Fatalf("Phase-C argv does not carry portable image mapping: %#v", args)
 	}
 
-	checkpointAt := time.Date(2026, 9, 5, 0, 1, 0, 0, time.UTC)
 	checkpointArgs, err := publishCheckpointArtifactArgs(
-		pipeline.spec, CheckpointClassRefLocation, "/base/capture.snapshot", checkpointAt,
+		pipeline.spec, CheckpointClassRefLocation, "/base/capture.snapshot",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -522,9 +519,9 @@ func TestPublishPhaseCImageInstallsPortableMappingForRunAndCheckpoint(t *testing
 	if !argumentPair(checkpointArgs, "--ref-location", parsed.Location+"="+pipeline.spec.RefLocations[parsed.Location]) {
 		t.Fatalf("checkpoint publisher lost image mapping: %#v", checkpointArgs)
 	}
-	checkpointName := reflocation.PublicationName(pipeline.spec.BuildID, checkpointAt)
-	if !argumentPrefix(checkpointArgs, "--to-ref-location", checkpointName+"=") || checkpointName == parsed.Location {
-		t.Fatalf("checkpoint publication did not mint its own date/name: image=%q argv=%#v", parsed.Location, checkpointArgs)
+	checkpointName := reflocation.PublicationName(pipeline.spec.BuildID)
+	if !argumentPrefix(checkpointArgs, "--to-ref-location", checkpointName+"=") {
+		t.Fatalf("checkpoint publication did not mint its own name: image=%q argv=%#v", parsed.Location, checkpointArgs)
 	}
 }
 
