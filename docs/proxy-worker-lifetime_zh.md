@@ -1,6 +1,6 @@
 # Proxy worker 生命周期与转发取消
 
-[English](proxy-worker-lifetime.md)
+[English](proxy-worker-lifetime.md) | [简体中文](proxy-worker-lifetime_zh.md)
 
 Proxy worker 是专用、单次运行的子进程。内置入口及定制 App 在 `Run` 返回后必须退出该进程；它们不是供常驻进程在内部反复重启 worker 的 API。
 

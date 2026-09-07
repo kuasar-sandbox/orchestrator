@@ -1,12 +1,12 @@
-# node-proxy — 节点数据面转发层
+[English](node-proxy.md) | [简体中文](node-proxy_zh.md)
 
-## 1. 概述
+<a id="node-proxy--节点数据面转发层"></a>
+# node-proxy — Node data-plane forwarding
 
-数据面 proxy 是沙箱流量的 L7 转发层:把外部 e2b SDK/CLI、端口转发或
-cluster-router 进入本节点的请求按 `(sid, target)` 路由到 guest envd/CI UDS,
-sandbox floatingip 用户端口或 native exec `ctl.sock`.普通 HTTP 的 target 仍是 legacy
-port;CONNECT 可以用 `E2b-Sandbox-Service` 显式选择逻辑服务.控制面 API,生命周期,密钥,构建由
-`node-ctl conductor serve` 承载,见 [node.md](node.md);本文只描述数据面转发层。
+<a id="1-概述"></a>
+## 1. Overview
+
+The data-plane proxy is the L7 forwarding layer for sandbox traffic. It routes requests from external e2b SDKs/CLIs, port forwarding, or the cluster router by `(sid, target)` to guest envd/CI UDS endpoints, user ports at a sandbox floating IP, or the native exec `ctl.sock`. Ordinary HTTP retains the legacy port target; CONNECT can explicitly select a logical service with `E2b-Sandbox-Service`. The control-plane API, lifecycle, keys, and builds belong to `node-ctl conductor serve`; see [node.md](node.md). This document covers the data-plane forwarding layer.
 
 ```text
 client / cluster-router
@@ -21,84 +21,62 @@ node proxy worker
   └─ exec ──────────────────► <run_root>/sandboxes/<sid>/ctl.sock
 ```
 
-### 1.1 设计原则
+<a id="11-设计原则"></a>
+### 1.1 Design principles
 
-- **转发层与控制面分离**:proxy 只做路由判定、鉴权和字节转发;沙箱生命周期权威在
-  conductor。
-- **单订阅 master,多 worker 数据面**:只有 proxy master 注册
-  config-socket plugin;worker 不连接 conductor,不持独立 routesync 订阅。
-- **分离路由视图**:固定长度的数据面字段写共享内存,worker mmap 只读;可变长的
-  `mmds_routes` 与 `mmds_route_secret_values` 只放 master 有界 heap,worker 经继承的
-  本机 socketpair RPC 按 exact path 查询。secret plaintext 不进入 mmap。
-- **listener fd 继承**:master 绑定 data/MMDS listener,把同一个 fd 传给所有
-  worker;worker 执行 accept 和转发。后续可把 master bind 替换为 systemd socket
-  activation,worker 模型不变。
-- **转发 netns 可配置**:`proxy_netns` 指向 connector 管理平面 netns 时,worker 进程
-  在该 netns 内运行,proxy 到 `floatingip:port` 的访问和 MMDS listener 都位于其中.
-- **无上游连接池**:普通 HTTP 每请求拨一次后端并关闭;CONNECT 是一条请求绑定一条
-  TCP/UDS 连接。不同 sandbox/port 不复用上游连接。
-- **鉴权先于生命周期副作用**:普通 HTTP 与 non-exec CONNECT 固定执行
-  `LookupRoute → authorize(RouteBinding) → TryBeginParking → ActivateRoute → fresh Route → dial`。
-  Lookup 不 Wake/Resume/park/dial;Activate 在生命周期副作用前后重验 binding。无效
-  credential 不能唤醒或占用 traffic parking/admission。
-- **逻辑服务只影响 CONNECT**:普通 HTTP 不解析 `E2b-Sandbox-Service`,应用层
-  Header 保持不变;CONNECT 中显式 service 是 backend 选择的权威输入.
-- **Exec 先鉴权后激活**:`service=exec` 始终验证绑定 `StableID` 的 KAT;
-  CONNECT 200 后还必须授权完整首个 ExecRequest.失败请求不得触发 parking、Wake/resume
-  或 backend dial.最终 node proxy 只将双重 gate 通过的请求交给 ctl tunnel helper,
-  不向租户开放任意 UDS 或其它 ctl capability.
-- **确定性 MMDS 密钥**:`MmdsSecret = MAC(manifest_key, sid)`,PUT 和 GET 即使落到
-  不同 worker 也一致。
+- **Separate forwarding and control planes:** the proxy decides routes, applies authentication policy, and forwards bytes. The conductor owns sandbox lifecycle authority.
+- **One subscribing master, multiple forwarding workers:** only the proxy master registers a config-socket plugin. Workers neither connect to the conductor nor hold independent routesync subscriptions.
+- **Separate route views:** fixed-length data-plane fields enter shared memory, which workers mmap read-only. Variable-length `mmds_routes` and `mmds_route_secret_values` remain in the master's bounded heap. Workers query an exact path through inherited local socketpair RPC. Secret-value plaintext never enters mmap.
+- **Inherited listener FDs:** the master binds the data/MMDS listeners and passes the same FD to all workers, which accept and forward connections. A future systemd socket-activation implementation could replace master-side binding without changing this worker model.
+- **Configurable forwarding network namespace:** with `proxy_netns` pointing to the connector management namespace, workers run there; their `floatingip:port` access and the MMDS listener also use that namespace.
+- **No upstream connection pool:** ordinary HTTP dials and closes a backend for each request. Each CONNECT binds one request to one TCP/UDS connection. Connections are never reused across sandboxes or ports.
+- **Authentication policy precedes lifecycle effects:** ordinary HTTP and non-exec CONNECT follow `LookupRoute → authorize(RouteBinding) → TryBeginParking → ActivateRoute → fresh Route → dial`. Lookup never wakes, resumes, parks, or dials; Activate revalidates the binding before and after lifecycle effects. Invalid ordinary credentials cannot wake a sandbox or consume traffic parking/admission when the node's effective policy is `enforce`. Node `log`/`off` modes admit ordinary requests according to §6.
+- **Logical service selection belongs to CONNECT:** ordinary HTTP does not use `E2b-Sandbox-Service` to choose a backend and otherwise forwards it as an application header. The explicit exception is the exact value `exec`, which returns 405 before activation. For CONNECT, an explicit service is authoritative for backend selection.
+- **Exec authenticates before activation:** `service=exec` always validates a KAT bound to `StableID`. After CONNECT 200, it must also authorize the complete first ExecRequest. Failure cannot trigger parking, Wake/resume, or a backend dial. The final node proxy gives the ctl tunnel helper only requests that pass both gates; it exposes neither arbitrary UDS endpoints nor other ctl capabilities to tenants.
+- **Deterministic MMDS keys:** `MmdsSecret = HMAC-SHA256(manifest_key, "kuasar-mmds-v1:" + sid)`, with the hex manifest key decoded to bytes. PUT and GET therefore agree even when different workers serve them.
 
+<a id="2-cli"></a>
 ## 2. CLI
 
-节点数据面由一个 proxy master 进程启动:
+Start the node data plane as one proxy master process:
 
 ```bash
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-`node-ctl` 运行内置 master，或按 `paths.proxy_executable` 原地 exec 静态定制 master；master
-始终 reexec 自己当前的 executable 启动 worker。内部 worker 模式不作为运维接口。
+`node-ctl` runs the built-in master or replaces itself with a statically customized master selected by `paths.proxy_executable`. The master always reexecutes its own current executable to start workers. The internal worker mode is not an operator interface.
 
-`proxy.yaml` 字段:
+`proxy.yaml` fields:
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Meaning |
 |---|---|---|
-| `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
-| `paths.proxy_executable` | 空 | 静态定制 Proxy master 的绝对 executable;空使用内置实现.静态 config 诊断检查 regular/executable,非 group/world-writable 和 same-file,不按诊断 EUID 判断 owner;实际 root dispatch 只接受 root-owned,非 root dispatch 接受 root-owned 或本 EUID-owned.只用于 node-ctl → master,不用于选择 worker executable |
-| `paths.run_root` | (必填) | 节点 RunRoot;worker 本地构造 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`,该路径不经 routesync `Policy` 或共享路由记录传递 |
-| `data_listen` | (必填) | 节点唯一 sandbox 数据入口;master 绑定一次并把同一 listener FD 交给 worker |
-| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns.非空时 worker 在该 netns 内运行,conductor 下发的 MMDS listen 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
-| `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | master 独占监听并注册给 conductor 的 traffic stats UDS;必须是绝对路径且不得与 config/SHM 路径冲突,权限 0600 |
-| `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
-| `route_capacity` | `65536` | 固定路由槽位数;满时 Upsert 失败并终止当前 routesync session,等待该 route 的 Create 返回 503 |
-| `workers` | `1` | worker 进程数 |
-| `tls` | 空 | 数据面 TLS `{cert,key}`;空 = h2c |
-| `auth` | `enforce` | routesync policy 到达前的数据面鉴权回退值 |
-| `park_timeout` | `30s` | routesync policy 到达前的 park 回退值 |
-| `metrics_listen` | 空 | master Prometheus 文本端点,聚合 worker 数据面计数 |
-| `traffic.max_inflight.total` | `0` | 每个 Sandbox 全部适用 service 的 Proxy 级 inflight 上限;`0` = unlimited |
-| `traffic.max_inflight.forward` | `0` | 每个 Sandbox 的 `forward` inflight 上限;`0` = unlimited |
-| `traffic.max_inflight."e2b:envd"` | `0` | 每个 e2b Sandbox 的 envd inflight 上限;`0` = unlimited |
-| `traffic.max_inflight."e2b:code-interpreter"` | `0` | 每个 e2b Sandbox 的 code-interpreter inflight 上限;`0` = unlimited |
-| `traffic.max_inflight.exec` | `0` | 每个 Sandbox 的 native exec inflight 上限;`0` = unlimited |
+| `config_socket` | `/run/sandbox/node-ctl.socket` | Conductor config-socket; the master registers on its plugin plane and synchronizes routes |
+| `paths.proxy_executable` | Empty | Absolute executable for a statically customized Proxy master; empty uses the built-in implementation. Static diagnostics check regular/executable status, absence of group/world writability, and same-file identity, without inferring ownership from the diagnostic command's EUID. Actual root dispatch requires root ownership; non-root dispatch accepts root or its own EUID. Used only for node-ctl → master dispatch, never to select a worker executable |
+| `paths.run_root` | Required | Node RunRoot; workers construct `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` locally. This path is not transmitted in routesync `Policy` or shared route records |
+| `data_listen` | Required | The node's only sandbox data ingress; the master binds once and gives workers the same listener FD |
+| `proxy_netns` | Empty | Forwarding namespace; empty uses the current namespace. Otherwise workers run there and the conductor-projected MMDS address is bound there; `data_listen` stays in the master's current namespace |
+| `stats_socket` | `<dir(config_socket)>/proxy-stats.sock` | Traffic-stats UDS owned and registered with the conductor by the master. Must be absolute, cannot conflict with config/SHM paths, and has mode 0600 |
+| `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | Shared route-table mmap file |
+| `route_capacity` | `65536` | Fixed route-slot capacity; exhaustion fails Upsert and terminates the current routesync session. A Create waiting for that route returns 503 |
+| `workers` | `1` | Number of worker processes |
+| `tls` | Empty | Data-plane TLS `{cert,key}`; empty means h2c |
+| `auth` | `enforce` | Data-plane authentication fallback before routesync policy arrives |
+| `park_timeout` | `30s` | Parking fallback before routesync policy arrives |
+| `metrics_listen` | Empty | Master Prometheus text endpoint aggregating worker data-plane counters |
+| `traffic.max_inflight.total` | `0` | Proxy-wide inflight limit across all applicable services of each sandbox; `0` means unlimited |
+| `traffic.max_inflight.forward` | `0` | Per-sandbox `forward` inflight limit; `0` means unlimited |
+| `traffic.max_inflight."e2b:envd"` | `0` | Per-e2b-sandbox envd inflight limit; `0` means unlimited |
+| `traffic.max_inflight."e2b:code-interpreter"` | `0` | Per-e2b-sandbox code-interpreter inflight limit; `0` means unlimited |
+| `traffic.max_inflight.exec` | `0` | Per-sandbox native exec inflight limit; `0` means unlimited |
 
-`proxy.yaml` 不含 `mmds_listen` 或 `services`:两者唯一来源是 conductor
-`mmds.listen` / `mmds.services`,经可信 plugin registration 的 `Hello{Policy}` 下发。
+`proxy.yaml` contains neither `mmds_listen` nor `services`. Their sole sources are conductor `mmds.listen` and `mmds.services`, delivered in `Hello{Policy}` through trusted plugin registration.
 
-### 2.1 静态定制 Proxy
+<a id="21-静态定制-proxy"></a>
+### 2.1 Statically customized Proxy
 
-运维入口仍只有 `node-ctl proxy serve --config ...`。公共 Load/Decode 只做环境无关的 strict
-decode、defaults 与 provided-value validation；内置路径由 node-ctl 显式 final validate，custom
-路径则延后到 master `Configure` 后。`paths.proxy_executable` 非空时，node-ctl 校验 protected
-absolute executable 的 runtime owner/mode/identity，再把公共 `config.Proxy` 的
-bootstrap snapshot 写入有大小上限且禁止 write/grow/shrink 的 sealed memfd；环境变量只传
-FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已验证的同一打开文件原地 exec
-xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
-不匹配均 fail closed；这是进程组织和防误用，不是抵抗同 UID 恶意进程的密码学认证。
+The sole operator entry point remains `node-ctl proxy serve --config ...`. Public Load/Decode performs only environment-independent strict decoding, defaults, and validation of provided values. node-ctl explicitly performs final validation for the built-in path; the custom path defers it until after master `Configure`. With a nonempty `paths.proxy_executable`, node-ctl validates the protected absolute executable's runtime owner, mode, and identity. It writes a bootstrap snapshot of public `config.Proxy` into a size-bounded sealed memfd that forbids writes, growth, and shrinking. Only the FD number enters the environment; configuration bodies and TLS material enter neither argv nor environment variables. node-ctl replaces itself with xproxy through the same validated open file and never falls back to the built-in implementation on failure. Direct xproxy execution, missing/corrupt bootstrap, and component/file identity mismatches fail closed. These checks organize processes and prevent misuse; they are not cryptographic authentication against a malicious process with the same UID.
 
-可编译示例见 `examples/custom-proxy`：
+See the buildable [custom-proxy example](../examples/custom-proxy/README.md):
 
 ```go
 app := proxy.New(proxy.Hooks{
@@ -122,79 +100,28 @@ if err := app.Run(); err != nil {
 }
 ```
 
-`New` 无副作用；`Run` one-shot、处理 SIGINT/SIGTERM且不调用 `os.Exit`，上层托管可用
-`RunContext`。零值/nil App 在 signal、component bootstrap 或 worker bootstrap 处理前返回
-必须由 `proxy.New` 构造的明确错误。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
-`paths.proxy_executable` 未改变 → final validation → 再 deep-clone/canonical serialize/digest
-冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Configure Hook、provider 或 final
-validation 失败时尚未创建 SHM、listener、routesync session 或 worker。若设置
-`MasterExtension`，core 创建共享路由表与进程内 traffic aggregate 后调用其
-`Start(ctx, MasterHost)` 恰好一次；Start 失败时尚未绑定 listener、启动 routesync 或 worker，
-已建 SHM 会清理。Start 成功后同一对象的可选 `ManagementWrapper` 能包装
-`stats_socket` handler；能力只检查一次并冻结，返回 nil handler 会中止启动。
+`New` has no side effects. `Run` is one-shot, handles SIGINT/SIGTERM, and does not call `os.Exit`; an embedding host can use `RunContext`. A zero-value/nil App returns an explicit error requiring construction through `proxy.New` before processing signals or component/worker bootstrap. The master's order is fixed: decode bootstrap → clone → call `Configure` exactly once → verify that `paths.proxy_executable` is unchanged → final validation → deep-clone, canonical serialization, and digest to freeze EffectiveConfig → `BindRuntime(master)` → start the core. Configure-hook, provider, or final-validation failure occurs before SHM, listeners, routesync sessions, or workers are created. If `MasterExtension` is set, the core creates the shared route table and in-process traffic aggregate, then calls `Start(ctx, MasterHost)` exactly once. Start failure occurs before listener binding, routesync, or workers, and cleans up the created SHM. After successful Start, the same object's optional `ManagementWrapper` can wrap the `stats_socket` handler. Capability detection happens once and is frozen; a nil returned handler aborts startup.
 
-worker 固定由 master 的 `/proc/self/exe` reexec：内置 master 得到 node-ctl worker，custom master
-得到 xproxy worker，配置中的 executable 不参与选择。master 通过另一 sealed memfd 传递 frozen
-EffectiveConfig、digest、worker id/epoch、FD protocol/mapping 与当前 executable identity；listener、
-wake/notify、stats、MMDS RPC、独立 admission arena 等作为继承 FD 传入,并同时校验 worker
-index/epoch、arena version/size/layout。worker 严格验证后调用
-`BindRuntime(worker)`。每个 worker epoch 都得到新的 `Runtime`，不得复用上一 epoch 的
-`WorkerExtension` 实例。worker 完成 stats hello/ready、构造 Host 并等待初始 route-table sync，
-随后调用 `WorkerExtension.Start` 恰好一次、冻结同一对象的可选 `IngressWrapper`，成功后才
-Serve.Start 错误或 nil wrapper 不开放 data listener,由既有 master supervisor 重启
-worker。worker 从不读取 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响
-replacement worker。
+Workers always reexecute the master's `/proc/self/exe`: a built-in master creates a node-ctl worker, and a custom master creates an xproxy worker. The configured executable does not select workers. Another sealed memfd carries frozen EffectiveConfig, its digest, worker ID/epoch, FD protocol/mapping, and current executable identity. Listeners, wake/notify, stats, MMDS RPC, and the independent admission arena are inherited FDs; worker index/epoch and arena version/size/layout are also validated. After strict validation, the worker calls `BindRuntime(worker)`. Each worker epoch receives a new `Runtime` and must not reuse the previous epoch's `WorkerExtension`. The worker completes stats hello/ready, constructs its Host, waits for the initial route-table sync, calls `WorkerExtension.Start` exactly once, and freezes the same object's optional `IngressWrapper`. Only then does it Serve. A Start error or nil wrapper keeps the data listener closed to serving; the existing master supervisor restarts the worker. Workers never read `proxy.yaml` or call `Configure`, so replacing or deleting that file does not affect replacement workers.
 
-公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
-启动期 TLS material provider，以及按 process role 使用的可信、静态编译
-`MasterExtension`/`WorkerExtension`。provider 返回
-certificate chain、`crypto.Signer` 与可选 client CA pool，不能替换任意 `*tls.Config`。
-provider 非 nil 即为权威来源，错误不回退 cert/key 文件；最低 TLS version、HTTP/2 ALPN 与
-client-auth 策略仍由 core 固定。V1 不支持配置、材料或 Extension 热更新，custom component
-与 node-ctl 必须来自兼容版本。
+Workers are dedicated one-shot subprocesses: built-in and custom entry points must exit the worker process after `Run` returns. Successful route SHM and admission mappings live until process exit; `PreparedWorker.Close` closes inherited descriptors without unmapping them, because handlers/extensions/traffic GC may still hold references. The supervisor still waits for confirmed exit before clearing shared counters. Ordinary HTTP and HTTP/2 CONNECT cancellation closes the backend independently of effective traffic limits; HTTP/1 hijacked CONNECT retains half-close semantics. See [worker lifetime and transport cancellation](proxy-worker-lifetime.md).
 
-`MasterHost.Routes()` 提供 applied route 的 `Get`、generation-based `Watch` 与
-`SyncState(initializing|syncing|synced|stale)`。完整 generation 是
-`sync_begin → snapshot upsert* → sync_end`，之后按发布顺序发送 live upsert/delete；断线发送
-`sync_lost`。慢 watcher 只使自身 generation 失效并自动 full resync；允许重复、不保证观察到
-每个中间变化，也不是 durable audit。View 复制身份、profile/template/state/RunID、当前 endpoint、
-artifact location、fingerprint 与 route revision，不复制原始 secret/token，也不增加 route metadata
-或 SHM schema。observer 只在 core SHM apply 成功后非阻塞发布，绝不影响 routesync、barrier ACK、
-Wake 或 worker notification。
+Public `Config` holds only serializable declarations. `Runtime` is a process object that rejects JSON encoding/decoding. It exposes a logger, a startup TLS-material provider, and trusted statically compiled `MasterExtension`/`WorkerExtension` objects selected by process role. The provider returns a certificate chain, `crypto.Signer`, and optional client CA pool; it cannot replace an arbitrary `*tls.Config`. A non-nil provider is authoritative and errors never fall back to cert/key files. The core still fixes the minimum TLS version, HTTP/2 ALPN, and client-auth policy. V1 supports no hot updates of configuration, material, or extensions. A custom component and node-ctl must use compatible versions.
 
-`MasterHost.Traffic().Get` 以当前 route identity 直接读取 master 的进程内 worker aggregate，
-不经 stats UDS 回环，返回 map/pointer 副本；V1 没有 Traffic Watch。断线期间保留 route 仍可查询，
-要求新鲜度的调用者同时检查 Route `SyncState`。Management wrapper 可添加、覆盖或透传任意本地
-route；框架不保留 namespace、不做 route conflict 检测，也不规定认证。
+`MasterHost.Routes()` exposes applied-route `Get`, generation-based `Watch`, and `SyncState(initializing|syncing|synced|stale)`. A full generation is `sync_begin → snapshot upsert* → sync_end`, followed by live upsert/delete in publication order; disconnect emits `sync_lost`. A slow watcher invalidates only its own generation and automatically receives a full resync. Duplicates are allowed, every intermediate change is not guaranteed, and this is not a durable audit stream. Views copy identity, profile/template/state/RunID, current endpoints, artifact location, fingerprints, and route revision. They copy no raw secrets/tokens and add neither route metadata nor an SHM schema. Observers publish nonblockingly only after successful core SHM application, never affecting routesync, barrier ACK, Wake, or worker notification.
 
-`WorkerHost.Process()` 返回当前 worker id/epoch；`GetRoute(sid)` 只做当前 SHM 点查并返回
-独立的非秘密 `RouteView` 副本，不暴露 raw record/Router/可变指针，也不提供 worker Route
-Watch.`IngressWrapper` 在 canonical Host/Header 与 CONNECT parser 之前接收 raw request;
-wrapped handler 只服务节点 `data_listen`,MMDS listener 不使用它.Extension
-可自行定义 Header/path/auth、覆盖或本地响应；未匹配请求调用 `next` 即保留 core token 与
-native exec 语义。
+`MasterHost.Traffic().Get` reads the master's in-process worker aggregate directly against current route identity, without looping through the stats UDS, and returns map/pointer copies. V1 has no Traffic Watch. Retained routes remain queryable during disconnection; callers requiring freshness must also check Route `SyncState`. A management wrapper may add, override, or pass through any local route. The framework reserves no namespace, detects no route conflicts, and prescribes no authentication.
 
-私有认证完成后，`WorkerHost.ForwardAuthorized` 可复用 core 的
-`LookupRoute → TryBeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate →
-dial → ordinary HTTP/CONNECT → traffic close`。该 helper 拥有 `ResponseWriter`，返回后调用方
-不得再写错误；它不校验 Kuasar `X-Access-Token`。`Revalidate` 在 activation 后、dial 前执行；
-普通 HTTP 的 `Rewrite` 只收到 guest-facing clone，失败时不写任何 guest request bytes；CONNECT
-不调用 Rewrite。generic helper 拒绝 native exec，后者继续经 `next` 走 KAT + per-command CEL。
-本接口不增加 WebSocket transport；WebSocket 仍由 #269 独立跟踪。
+`WorkerHost.Process()` returns the current worker ID/epoch. `GetRoute(sid)` performs only a current-SHM point lookup and returns an independent, non-secret `RouteView` copy. It exposes no raw record, Router, or mutable pointer, and offers no worker Route Watch. `IngressWrapper` receives raw requests before canonical Host/Header and CONNECT parsing. The wrapped handler serves only node `data_listen`, never the MMDS listener. An extension may define its own headers, paths, or authentication, override behavior, or respond locally. Calling `next` for unmatched requests preserves core token and native exec semantics.
 
-该 API 只对应独立 Proxy,不为 conductor 增加数据面 factory;也不开放原始 Router,
-SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
-可选 management wrapper 和同一 worker Extension 的可选 ingress wrapper 外，不引入 Go plugin、
-运行时发现、多 Extension registry、通用 lifecycle hook、secret resolver 或 DI container。
-`node-ctl config proxy` 只做 declarative/bootstrap 与
-executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
-启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md](extensions.md)。
+After private authentication, `WorkerHost.ForwardAuthorized` can reuse the core path `LookupRoute → TryBeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate → dial → ordinary HTTP/CONNECT → traffic close`. This helper owns `ResponseWriter`; its caller must not write another error after return. It does not validate Kuasar `X-Access-Token`. `Revalidate` runs after activation and before dial. Ordinary HTTP `Rewrite` receives only the guest-facing clone, and failure writes no guest-request bytes. CONNECT never calls Rewrite. The generic helper rejects native exec, which must continue through `next` and the KAT plus per-command CEL gates. This interface adds no WebSocket transport; [#269](https://github.com/kuasar-sandbox/orchestrator/issues/269) tracks that separately.
 
-## 3. 部署拓扑
+This API applies only to the independent Proxy and adds no conductor data-plane factory. It exposes no raw Router, SHM, listener, routesync, stats, dial target, or credential records. Beyond the optional management wrapper of the same master extension and ingress wrapper of the same worker extension, it introduces no Go plugins, runtime discovery, multi-extension registry, generic lifecycle hooks, secret resolver, or DI container. `node-ctl config proxy` diagnoses only declarative/bootstrap configuration and executable metadata. It never executes xproxy, invokes Runtime providers, or substitutes the diagnostic command's EUID for actual startup ownership checks. See [extensions.md](extensions.md) for the full extension contract.
 
-每个可承载 sandbox 的节点同时运行 conductor 与 Proxy.conductor 的 API listener 只承载
-控制面;Proxy 的必填 `data_listen` 是该节点唯一 sandbox 数据入口.两个 advertised endpoint
-分别指向这两个 listener,也不存在跨平面回退.
+<a id="3-部署拓扑"></a>
+## 3. Deployment topology
+
+Every sandbox-capable node runs both conductor and Proxy. The conductor API listener carries only the control plane; the Proxy's required `data_listen` is the node's only sandbox data ingress. The two advertised endpoints point to these separate listeners, with no cross-plane fallback.
 
 ```text
 client / cluster-router ── control ─► conductor APIEndpoint
@@ -212,23 +139,18 @@ client / cluster-router ── data ───► Proxy DataEndpoint
                                              worker[0..N)
 ```
 
-要点:
+Key points:
 
-- conductor 只看到一个固定 plugin id `proxy`;registration 的 `Proxy` 字段是可信 Proxy
-  marker,`StatsSocket` 是独立可选的 traffic stats 地址.
-- `stats_socket` 只由 master 监听;conductor 的公开 traffic GET 经该 UDS 读 master
-  聚合缓存,不会查询时扇出 worker.缺少 `StatsSocket` 不影响 route barrier participant.
-- worker 不注册 plugin,不保存独立全量路由表;route mmap 仍是 master 单写/worker 只读,
-  admission mmap 则由每个 worker 只写自己的 absolute-counter column。崩溃后由 master
-  重启,replacement 直接读取当前 route/admission view。
-- master 退出会带走其 worker;systemd 重启 master 后重新注册并重建共享表。
-- plugin id 必须精确为 `proxy`,且 registration 同时满足
-  `subscribe.kind=route_wake`、`proxy!=nil`、`mmds=true`,conductor 才投影 MMDS policy、
-  routes 和 secret values;普通 observer 与 node-link 均收不到这些 confidential values。
+- The conductor sees one fixed plugin ID, `proxy`. Registration's `Proxy` field is the trusted Proxy marker; `StatsSocket` is a separate optional traffic-stats address.
+- Only the master listens on `stats_socket`. The conductor's public traffic GET reads the master's aggregate cache through this UDS, without querying workers on demand. A missing `StatsSocket` does not remove the route-barrier participant.
+- Workers do not register plugins or hold independent complete route tables. Route mmap remains master-write/worker-read-only; in admission mmap, each worker writes only its own absolute-counter column. The master restarts crashed workers, and replacements read the current route/admission view directly.
+- Master exit takes its workers down. After systemd restarts the master, it registers again and rebuilds shared tables.
+- The plugin ID must be exactly `proxy`, and registration must satisfy `subscribe.kind=route_wake`, `proxy!=nil`, and `mmds=true` before the conductor projects MMDS policy, routes, and secret values. Ordinary observers and node-link never receive these confidential values.
 
-## 4. routesync 与共享路由视图
+<a id="4-routesync-与共享路由视图"></a>
+## 4. routesync and shared route views
 
-routesync 仍是帧化 JSON over h2c,由 proxy master 拨 conductor:
+routesync remains framed JSON over h2c; the proxy master dials the conductor:
 
 ```text
 master → conductor : register{subscribe: route_wake, proxy{stats_socket?}, mmds}
@@ -237,17 +159,15 @@ conductor → master : hello{policy}
 conductor → master : upsert* → bookmark → upsert/delete/route_barrier...
 ```
 
-master 把下行路由流投影到共享内存:
+The master projects the downstream route stream into shared memory:
 
-- `BeginSync` 开启新同步世代;
-- `Upsert` 写入或更新 `sid` 槽位;完全相同的重放只刷新同步世代,不推进生命周期
-  revision;
-- `Delete` 用 backshift 删除回收 live 槽位,并在独立的有界终态 cache 中记录无凭据的
-  `(sid, revision)`;
-- `Bookmark` 清理本世代未出现的旧记录,并标记首轮同步完成;
-- `Policy` 写入共享头部,worker 每请求读取当前 `auth_mode` / `park_timeout_ms`。
+- `BeginSync` starts a new synchronization generation.
+- `Upsert` inserts or updates the `sid` slot. An identical replay only refreshes its synchronization generation, without advancing the lifecycle revision.
+- `Delete` reclaims live slots through backshift deletion and records credential-free `(sid, revision)` in a separate bounded terminal-state cache.
+- `Bookmark` removes old records absent from this generation and marks initial sync complete.
+- `Policy` writes the shared header. Each worker request reads current `auth_mode` and `park_timeout_ms`.
 
-每个 Create 都使用同一有序 stream 建立 route-applied barrier:
+Every Create establishes a route-applied barrier on the same ordered stream:
 
 ```text
 conductor: Upsert(initial starting) → route_barrier{id}
@@ -255,100 +175,41 @@ master:    traffic patch validate/merge → admission apply → route SHM Upsert
            → notify workers → route_barrier_ack{id}
 ```
 
-`ApplyUpsert` 把 admission 与 route 作为一个可回滚事务处理:任一校验、arena allocation、MMDS
-projection 或 route SHM Upsert 失败都会恢复旧 admission/route view。master 的 ACK 只表示 parking
-所需的 `starting RouteBinding` 及其 effective limit 已进入 master-owned serving view,不表示 sandbox
-已 running、backend 可拨、envd 已完成 `/init` 或任何 worker healthy/ready。serving worker 数为 0、worker
-重启或 stats stream fault 都不进入 Create 条件。Wake 与 BarrierAck 由一个上行 writer 串行
-写帧。任一先行 Upsert 写表失败时,subscriber 不发送 ACK并终止 session;conductor 将等待中的
-Create 回滚并返回 503。barrier id 只存在于本次内存协调,不进入 route changelog、共享表、
-Sandbox schema 或日志字段。
+`ApplyUpsert` treats admission and route changes as one rollback-capable transaction. Failure in validation, arena allocation, MMDS projection, or route SHM Upsert restores the previous admission/route view. The master's ACK only means that the `starting RouteBinding` and effective limits needed for parking have entered its serving view. It does not mean the sandbox is running, a backend is dialable, envd has completed `/init`, or any worker is healthy/ready. Zero serving workers, worker restarts, and stats-stream faults do not enter the Create condition. One upstream writer serializes Wake and BarrierAck frames. If an earlier Upsert fails to apply, the subscriber sends no ACK and terminates the session; the conductor rolls back the waiting Create and returns 503. Barrier IDs exist only in this in-memory coordination, not the route changelog, shared table, Sandbox schema, or log fields.
 
-当前只有固定 plugin id `proxy` 的一个 master participant。Create 在 ACK 后再次核验该
-registration epoch 仍为当前租约;断连、同 id replacement、迟到或旧 session ACK 都不能完成
-barrier。完成规则内部按 all-of participant set 实现,不采用 quorum;若以后显式配置多个
-traffic-serving master,必须全部 ACK 后才能返回 201。
+Currently there is one master participant, fixed plugin ID `proxy`. After ACK, Create rechecks that the registration epoch is still the current lease. Disconnect, same-ID replacement, and late or old-session ACKs cannot complete the barrier. Internally completion requires all members of the participant set, not a quorum. If multiple traffic-serving masters are explicitly configured in the future, all must ACK before 201 can return.
 
-MMDS 扩展不写固定表。master 对每个 active sandbox 在一个锁内替换 routes + values;
-heap entry 总数受 `route_capacity` 限制。`BeginSync`、routesync 断开和 worker/master 重启
-都会立即清空 heap 并标记 unavailable,只有完整 `Bookmark` 后才重新开放查询。service
-registry 由每次 `Hello{Policy}` 原子整表替换。running/starting Upsert 先更新 heap 再公开
-SHM route;paused/Delete 先撤销 heap 再更新 SHM,让已采样旧 active row 的 worker 也 fail closed,
-避免把新生命周期与旧 secret
-组合。`RunID` 进入固定表用于 MMDSv2 token 的 incarnation 绑定;routes/value plaintext
-绝不进入固定记录、metrics 或日志。
+The MMDS extension is not stored in fixed records. For each active sandbox, the master replaces routes and values under one lock; `route_capacity` bounds the heap-entry count. `BeginSync` and routesync disconnection immediately clear the heap and mark it unavailable. A new master starts with an empty view; a full `Bookmark` is required before queries reopen. A worker-only restart does not clear the surviving master's heap; its replacement reconnects through inherited RPC and waits for the shared view to be synchronized before serving. Each `Hello{Policy}` atomically replaces the whole service registry. Running/starting Upsert updates the heap before publishing the SHM route; paused/Delete revokes the heap before updating SHM. Thus workers that sampled an old active row also fail closed, preventing a new lifecycle from being combined with old secrets. `RunID` enters fixed records to bind MMDSv2 tokens to an incarnation. MMDS route declarations and secret-value plaintext never enter fixed records, metrics, or logs.
 
-本文中 `RouteEntry.SandboxID`、`sid` 和共享表 key 均是 node-local SandboxID.集群路径下,它们是
-Registry 分配的 NodeSandboxID;cluster Router 已在进入 node 之前把公开稳定 SandboxID 转换为该值.
-`RouteEntry.StableID` 是跨 NodeSandboxID 变化保持的 sandbox identity，用于 KAT/credential
-binding，不参与共享表 lookup。routesync V3 将 identity 一次性切换为 `stable_id`；V4 将
-Snapshot-specific location 改为与 E/S kind 正交的 `artifact_location`;V5 将节点注册拆成
-`api_endpoint` 与 `data_endpoint` 并收缩 Proxy registration;subscriber
-和 node-link client 在首个 Hello 校验版本，不匹配时在处理 route/command 前终止 session。
+Here `RouteEntry.SandboxID`, `sid`, and shared-table keys are node-local SandboxIDs. In cluster operation they are Registry-allocated NodeSandboxIDs; the cluster Router translates the public stable SandboxID before reaching the node. `RouteEntry.StableID` preserves sandbox identity across NodeSandboxID changes for KAT/credential binding and is not the shared-table lookup key. routesync V3 made the hard switch to `stable_id`; V4 replaced Snapshot-specific location with `artifact_location`, orthogonal to E/S kind; V5 split node registration into `api_endpoint` and `data_endpoint` and narrowed Proxy registration. Subscribers and node-link clients validate the version in the first Hello and terminate mismatched sessions before handling routes or commands.
 
-共享表是固定容量开放寻址 hash 表。master 单写;每条记录带 seqlock,worker 读取时若遇到
-写中状态或版本变化会重试,不会看到半条路由。worker 只依赖共享表本地读取:
+The shared table is a fixed-capacity open-addressed hash table with a single master writer. Each record has a seqlock. Workers retry when a write is in progress or the version changes, never observing a partial route. Workers depend only on local shared-table reads:
 
 ```text
-sid hash ─► record slot ─► RouteEntry (Lookup 只读)
-                         ├─ running → auth 后 Activate 重验并转发
-                         ├─ starting → auth 后 park,不发 Wake;回滚即结束
-                         └─ paused → auth 后才发 wake pipe 并 park
+sid hash ─► record slot ─► RouteEntry (read-only Lookup)
+                         ├─ running → policy admission, Activate recheck, then forward
+                         ├─ starting → policy admission, park without Wake; end on rollback
+                         └─ paused → wake pipe and park only after policy admission
 ```
 
-普通 route Lookup 对 missing/paused/starting 都不写 wake pipe;只有请求已按返回的
-`RouteBinding` 完成鉴权后,Activate 才可对 paused sid 写 wake pipe。starting 已由 conductor
-launch owner 推进,Activate 只等待 running/delete/paused 更新,不得再发 Wake;后两种回滚更新
-立即结束 starting 请求。master 去重后通过 routesync
-上行 `Wake`。master 每次写共享表后通过 notify pipe 唤醒 worker 本地 park waiters。
-全局 revision/notify 只负责唤醒检查;worker 以该 SID 的 live 或终态 revision 判断 Wake
-是否已收到终态回应。live 路由、终态 cache 和 revision 在同一次 table seqlock snapshot
-中读取,waiter 不会把旧 missing/paused 路由与新 revision 混合为假终态。重复的相同 paused
-Upsert 不推进 per-SID revision,因此订阅重放不能伪装成 Wake 的完成响应。live hash 的删除
-会在同一 table seqlock 下 backshift 并立即回收槽位;终态 cache 固定最多 4096 条且不含任何
-凭据。极端 churn 下 cache 碰撞只会淘汰较旧的终态相关性,对应 waiter 保守地继续 park 到
-后续状态或 timeout,不会错误路由或把无关 SID 当作 Wake 结果。
-正常的单次 Wake 路径中,即使异步共享表收敛把中间 starting 与随后 paused/Delete 合并,
-终态 revision 仍会让 waiter 及时观察 rollback;只有前述极端 cache 淘汰才退化为保守 timeout。
-一个请求只允许在初始 missing/paused 发一次 Wake;观察过 starting 后回到 paused 不得再次
-Wake。
+Ordinary route Lookup never writes the wake pipe for missing, paused, or starting routes. Only after a request passes the returned `RouteBinding`'s authentication policy may Activate write a wake for a paused SID. A starting sandbox already has a conductor launch owner; Activate only waits for running/delete/paused updates and must not send another Wake. The latter two rollback updates immediately terminate the starting request. The master deduplicates requests and sends upstream routesync `Wake`. After each table write it wakes worker-local parking waiters through a notify pipe. Global revision/notification merely triggers rechecking; workers use that SID's live or terminal revision to determine whether Wake received a terminal response. Live route, terminal cache, and revision are read in one table-seqlock snapshot, preventing an old missing/paused route and new revision from forming a false terminal result. Identical paused Upserts do not advance per-SID revision, so subscription replay cannot impersonate Wake completion. Live-hash deletion backshifts and immediately reclaims slots under the same table seqlock. The terminal cache holds at most 4096 entries and no credentials. Under extreme churn, collisions only evict older terminal correlations; affected waiters conservatively keep parking until a later state or timeout, without misrouting or treating an unrelated SID as the Wake result.
 
-共享视图是异步收敛的路由缓存。默认创建使用 UUID,集群 NodeSandboxID 使用
-`<stableSandboxID>-g<SandboxGeneration>`,正常流程不会让不同逻辑沙箱复用同一个
-node-local ID。若外部系统显式把刚删除的 NodeSandboxID 立即分配给另一个逻辑沙箱,
-在 Delete/新 Upsert 尚未到达 Proxy 的极短窗口内,worker 仍可能持有旧实例的
-凭据投影和同名运行目录.节点不得主动执行这种跨逻辑沙箱的即时 ID 复用;
-为不同逻辑沙箱显式指定迁移 target 时应使用新的 NodeSandboxID,或先确认路由视图已经收敛。
+On the normal single-Wake path, terminal revision still exposes rollback promptly even when asynchronous convergence coalesces intermediate starting and subsequent paused/Delete updates. Only extreme cache eviction degrades to a conservative timeout. A request may send at most one Wake from an initial missing/paused state; after observing starting, a return to paused must not trigger another Wake. Ordinary Lookup itself never sends this Wake.
 
-受保护 `RouteEntry` 的 state 为 `starting|running|paused|dead`,并显式携带
-`StableID`、`APISecret`、`APISecretFingerprint`、
-`ManifestKeyFingerprint`、`ServiceSecret`、`EnvdAccessToken`、`TrafficAccessToken` 和
-`ForwardAccessToken`。
-ManifestKey 原文不进入路由。节点 proxy 转发时只按目标选择 EnvdAccessToken 或
-ForwardAccessToken;TrafficAccessToken 仅随受保护视图投影给外部网关及 e2b 数据面组件,
-不由 node 平台层消费.`StableID + ServiceSecret` 用于验证 exec KAT,
-其中共享表 key 和本地运行目录仍只使用 NodeSandboxID.既有 `MmdsSecret` 独立服务于
-MMDS token 签名,不等于 route secret values;后者仅经上述可信投影进入 master heap。
-`MaxInflightPatch` 只在 routesync wire 上携带 Sandbox 显式叶子;master 将目标节点
-`proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
-`{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
-本变更将 routesync 升级到 version 7、route SHM 升级到 schema 7、worker bootstrap/config/FD
-protocol 升级到 version 2,并新增 admission arena version 1;这些都是内部 hard cut,mixed
-conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
+The shared view is an asynchronously converging route cache. Default creation uses UUIDs; cluster NodeSandboxIDs use `<stableSandboxID>-g<SandboxGeneration>`. Normal operation does not reuse one node-local ID for distinct logical sandboxes. If an external system immediately assigns a just-deleted NodeSandboxID to a different logical sandbox, workers can briefly retain the previous instance's projected credentials and same-name run directory before Delete/new Upsert arrives. Nodes must not deliberately perform this immediate cross-sandbox ID reuse. Explicit migration targets for different logical sandboxes must use a fresh NodeSandboxID or first confirm route-view convergence.
 
-初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
-state park,绝不尝试使用这些空字段。node 持久化 network ownership 并完成 YAML/ready.sock
-后会发布 enriched starting,此时 MMDS 才能按 FloatingIP 反查身份。ordinary data plane 仍
-须等 running。
+Protected `RouteEntry` states are `starting|running|paused|dead`. Entries explicitly carry `StableID`, `APISecret`, `APISecretFingerprint`, `ManifestKeyFingerprint`, `ServiceSecret`, `EnvdAccessToken`, `TrafficAccessToken`, and `ForwardAccessToken`. Raw ManifestKey never enters routes. Node forwarding selects only EnvdAccessToken or ForwardAccessToken for its target. TrafficAccessToken is projected in the protected view for external gateways and e2b data-plane components, but the node platform layer does not consume it. `StableID + ServiceSecret` verifies exec KATs; shared-table keys and local run directories still use NodeSandboxID exclusively. Existing `MmdsSecret` independently signs MMDS tokens and is not a route secret value; route secret values enter only the master's heap through the trusted projection described above.
 
-## 5. 转发路径
+On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. The master merges it with destination-node `proxy.yaml` defaults and writes fixed effective values plus `{admission slot,generation}` into route SHM. Pointers enter neither SHM nor route equality. Current internal boundaries are routesync version 7, route SHM schema 7, worker bootstrap/config/FD protocol version 2, and admission arena version 1. These are hard compatibility cuts: mismatched conductor/proxy/registry/router protocol versions or old SHM/bootstrap formats fail closed.
 
-普通 HTTP 按 `Host: <port>-<sid>.<domain>` 或 `E2b-Sandbox-Id` /
-`E2b-Sandbox-Port` 解析 `(sid, port)`.它不解析 `E2b-Sandbox-Service`;该 Header 作为
-应用层 Header 原样转发,不改变 backend.CONNECT 解析 `(sid, service?, port?)`.
-cluster 第二跳的 `sid` 必须是当前 NodeSandboxID.
+The initial durable starting Upsert may lack a FloatingIP, UDS, or any other backend endpoint. Workers park by state and never attempt those empty fields. After the node persists network ownership and completes YAML/ready.sock preparation, it publishes enriched starting; only then can MMDS identify it by FloatingIP. Ordinary data traffic still waits for running.
 
-未显式携带 service 时,Node 从本地受信 profile 应用 legacy 映射:
+<a id="5-转发路径"></a>
+## 5. Forwarding paths
+
+Ordinary HTTP parses `(sid, port)` from `Host: <port>-<sid>.<domain>` or `E2b-Sandbox-Id` / `E2b-Sandbox-Port`. It does not select a backend from `E2b-Sandbox-Service`; that header is forwarded unchanged as an application header, except that the exact value `exec` returns 405 before activation. CONNECT parses `(sid, service?, port?)`. The second cluster hop must use the current NodeSandboxID as `sid`.
+
+Without an explicit service, the node applies the legacy mapping from its trusted local profile:
 
 ```text
 profile=e2b  and port ∈ {49983,49999} → envd / ci UDS
@@ -356,122 +217,79 @@ otherwise                              → floatingip:port
 unknown or not running before timeout   → 404
 ```
 
-因此 bare 的 49983/49999 与其它合法端口一样转发到 `floatingip:port`,不具有
-envd/CI 逻辑含义,也不返回 501.
+Thus bare ports 49983/49999 forward to `floatingip:port` just like any other valid port. They have no envd/CI logical meaning and do not return 501.
 
-CONNECT 显式携带 `E2b-Sandbox-Service` 时,service 取代 legacy 端口推导:
+An explicit CONNECT `E2b-Sandbox-Service` replaces legacy port inference:
 
-| Service | 支持 profile | Backend | Port 语义 |
+| Service | Supported profile | Backend | Port semantics |
 |---|---|---|---|
-| `forward` | e2b / bare | `floatingip:port` | 必须由 `E2b-Sandbox-Port`,legacy Host 或 CONNECT authority 之一提供 |
-| `e2b:envd` | e2b | envd UDS | 可携带,但不参与 backend 选择 |
-| `e2b:code-interpreter` | e2b | CI UDS | 可携带,但不参与 backend 选择 |
-| `exec` | e2b / bare | `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` | 可携带,但不参与 backend 选择 |
+| `forward` | e2b / bare | `floatingip:port` | Required from `E2b-Sandbox-Port`, legacy Host, or CONNECT authority |
+| `e2b:envd` | e2b | envd UDS | May be present but does not select the backend |
+| `e2b:code-interpreter` | e2b | CI UDS | May be present but does not select the backend |
+| `exec` | e2b / bare | `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock` | May be present but does not select the backend |
 
-bare 显式请求 `e2b:envd` 或 `e2b:code-interpreter` 返回 501.unknown/空 service 返回 400.
-service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显式 service.
+Explicit `e2b:envd` or `e2b:code-interpreter` on bare returns 501. An unknown or empty service returns 400. Service and port may coexist; the node never uses 49983/49999 to override an explicit service.
 
-普通 HTTP:
+Ordinary HTTP:
 
-1. worker 只读共享表,得到不含 backend 的 `RouteBinding`;
-2. 按目标选择 EnvdAccessToken 或 ForwardAccessToken,校验 `X-Access-Token`;符合条件的
-   `/files` 请求也可使用 EnvdAccessToken 验证 signature;
-3. 鉴权成功后执行 `TryBeginParking`:同时检查 Sandbox total 与目标 service 上限,成功后
-   发布共享计数并进入 parking;达到上限返回 429,不 Wake、不 Activate、不 dial;
-4. 进入 `ActivateRoute`:在 Wake/等待前重验包含 admission generation/effective policy 的
-   binding,完成生命周期动作后再
-   重验一次,并从最新 running route 构造最终 backend;binding 改变时 fail closed;
-5. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
-   netns 内拨号;
-6. 写入一条 HTTP 请求,流式复制响应,响应或完整 relay 结束后一次性关闭 flow并释放额度。
+1. The worker reads the shared table and obtains a `RouteBinding` without a backend.
+2. It selects EnvdAccessToken or ForwardAccessToken for the target and applies the node's effective authentication policy to `X-Access-Token`. Eligible `/files` requests can also verify a signature with EnvdAccessToken; §6 describes mode-specific enforcement.
+3. After admission by that policy, `TryBeginParking` checks sandbox total and target-service limits together. Success publishes the shared count and enters parking. Exhaustion returns 429 without Wake, Activate, or dial.
+4. `ActivateRoute` revalidates the binding, including admission generation/effective policy, before Wake/waiting and again after lifecycle work. It constructs the final backend from the latest running route and fails closed if the binding changes.
+5. It dials envd UDS or `floatingip:port` once. With `proxy_netns`, the floating-IP dial occurs in that namespace.
+6. It writes one HTTP request and streams the response. Response completion or final relay completion closes the flow and releases its quota exactly once.
 
 CONNECT:
 
-- sandbox id 来自 `E2b-Sandbox-Id` 或 legacy authority label;
-- legacy/`forward` 可从 CONNECT authority 取实际 port;无端口逻辑服务的 authority
-  只是 transport 占位,不会生成 `E2b-Sandbox-Port`;
-- 普通 forward/envd/CI 目标鉴权成功后,把客户端连接与后端连接双向 splice;
-- `service=exec` 只接受 CONNECT;普通 HTTP 携带该 service 返回 405,且不触发恢复.
+- Sandbox ID comes from `E2b-Sandbox-Id` or the legacy authority label.
+- Legacy/`forward` may obtain the actual port from CONNECT authority. For portless logical services, authority is only a transport placeholder and does not produce `E2b-Sandbox-Port`.
+- After ordinary forward/envd/CI targets pass the effective authentication policy, the client and backend connections are spliced bidirectionally.
+- `service=exec` accepts CONNECT only. Ordinary HTTP carrying this service returns 405 without triggering resume.
 
-node proxy 的 exec 路径分为三个有序阶段:
+Node exec has three ordered stages:
 
-1. CONNECT 200 前只做无副作用本地 `LookupExec`,以 route 中的
-   `StableID + ServiceSecret` 严格验证 `X-Access-Token` KAT,并在 HMAC 验证成功后
-   编译/读取有界缓存中的 CEL programs.该阶段不 parking、不 activation、不拨
-   `ctl.sock`;token/identity/expiry/conditions 失败以 HTTP 400/401/404/501 结束.
-2. 返回并 flush CONNECT 200 后,在固定 10 秒 first-request timeout 内读取完整首个 ctl
-   frame.解析严格覆盖顶层 `exec_request`、`ExecSpec` 和 `StdioSpec`,保留客户端原始
-   4-byte little-endian length + JSON bytes,重新检查 expiry,构造规范化 request view 并
-   以 AND 执行全部 conditions.false、error、unknown、cost exceeded 或 cancel 都 fail closed.
-3. 只有 request admission 成功后才 `TryBeginParking(exec) → ActivateExec → exact identity recheck →
-   ctl.sock dial → AttachBackend`,然后把首帧 Raw 原样写入一次并进入双向 relay.首帧一旦
-   写入 backend 就不 retry、reroute 或 replay.
+1. Before CONNECT 200, side-effect-free local `LookupExec` strictly verifies the `X-Access-Token` KAT using route `StableID + ServiceSecret`. Only after successful HMAC verification does it compile CEL programs or retrieve them from the bounded cache. It does not park, activate, or dial `ctl.sock`. Token/identity/expiry/condition failures end with HTTP 400/401/404/501.
+2. After returning and flushing CONNECT 200, it reads the complete first ctl frame within a fixed 10-second first-request timeout. Strict parsing covers top-level `exec_request`, `ExecSpec`, and `StdioSpec`, preserving the client's original four-byte little-endian length plus JSON bytes. It rechecks expiry, constructs the normalized request view, and ANDs all conditions. False, error, unknown, cost exhaustion, and cancellation all fail closed.
+3. Only successful request admission permits `TryBeginParking(exec) → ActivateExec → exact identity recheck → ctl.sock dial → AttachBackend`. It then writes the first Raw frame unchanged exactly once and starts bidirectional relay. Once that frame reaches the backend, it never retries, reroutes, or replays it.
 
-CEL view 将 nil argv/env 规范化为 `[]`/`{}`,空 cwd 与 `/` 规范化为 `/`,user 保留请求原值.
-TTY 模式中 stdin/stdout/stderr flags 沿用 ctl wire 的 ignored 语义,view 暴露规范化后的有效
-语义,不会因 flags 同时出现而拒绝合法请求.条件或结构 gate 失败不改变 parking/activity,
-不启动 guest child;因此也不会使 paused sandbox 恢复.
+The CEL view normalizes nil argv/env to `[]`/`{}`, and empty cwd or `/` to `/`; user retains its requested value. In TTY mode, stdin/stdout/stderr flags retain the ctl wire's ignored semantics. The view exposes normalized effective semantics and does not reject valid requests merely because those flags coexist. Failed condition or structural gates change neither parking nor activity and start no guest child, so they cannot resume a paused sandbox.
 
-worker 从 master 冻结的 EffectiveConfig 取得 `proxy.yaml` 中必填的 `paths.run_root`,不重新
-读取文件.该值应与同节点 conductor 的 `paths.run_root` 一致.routesync `Policy` 和共享路由
-视图只提供路由,凭据及鉴权策略,不投影 `ctl.sock` 路径.
+Workers obtain required `paths.run_root` from the master's frozen EffectiveConfig rather than rereading `proxy.yaml`. It must agree with the same node conductor's `paths.run_root`. routesync `Policy` and shared views project routes, credentials, and authentication policy, never the `ctl.sock` path.
 
-共享的 sandboxer tunnel helper 不理解 KAT、CEL、route 或 lifecycle;它只冻结 callback 顺序、
-严格首帧读取、Raw 单次转发和 half-close relay.H1 从 Hijack 返回的 buffered reader 继续读,
-H2 从 request body 读并及时 flush response;两者都保留 half-close,等待双向 relay 结束.
-CONNECT 200 后,已完整识别的 request denial 或 backend failure 返回统一脱敏 ctl frame
-`{"type":"error","msg":"exec request rejected"}`;framing 无法恢复时直接关闭 tunnel.
-`max_inflight.exec` 也只在首帧与 CEL 通过后检查;达到上限时 HTTP 200 已提交,因此使用同一
-generic ctl error frame并关闭,记录 `data_requests_total{result="max_inflight_reached"}`,不伪造
-HTTP 429 或 `X-Kuasar-Proxy-Error`,也不 Activate 或拨 `ctl.sock`。
+The shared sandboxer tunnel helper understands no KAT, CEL, route, or lifecycle. It fixes callback ordering, strict first-frame reading, one-time Raw forwarding, and half-close relay. H1 continues from Hijack's buffered reader; H2 reads the request body and promptly flushes responses. Both preserve half-close and wait for both relay directions. After CONNECT 200, a fully recognized request denial or backend failure returns the same sanitized ctl frame, `{"type":"error","msg":"exec request rejected"}`. Unrecoverable framing closes the tunnel directly. `max_inflight.exec` is checked only after the first frame and CEL pass. Since HTTP 200 is already committed, exhaustion uses that generic ctl error and closes, records `data_requests_total{result="max_inflight_reached"}`, and neither fabricates HTTP 429 / `X-Kuasar-Proxy-Error` nor activates or dials `ctl.sock`.
 
-KAT 在 CONNECT admission 时校验,并在首帧授权时重新检查 expiry;进入 backend relay 后
-过期不强制断开已建立 tunnel,有效期内同一 KAT
-可以建立多条独立 CONNECT.每条 tunnel 只承载一个 ctl exec session,不复用 backend 连接;
-新 CONNECT 在 route 切换后自动进入当前 NodeSandboxID,已建立 tunnel 不迁移.
+KAT validation occurs at CONNECT admission and expiry is rechecked during first-frame authorization. Expiry after backend relay begins does not forcibly close an established tunnel. One unexpired KAT can open multiple independent CONNECTs. Each tunnel carries exactly one ctl exec session and never reuses a backend connection. New CONNECTs use the current NodeSandboxID after a route change; established tunnels do not migrate.
 
-worker 在本进程执行上述完整 token + request + backend gate,用 frozen EffectiveConfig 的
-`paths.run_root` 构造 `sandboxes/<NodeSandboxID>/ctl.sock` 路径.路径和 CEL programs 不经 routesync `Policy` 或 SHM
-记录.conductor 不解析,不选择也不转发 ordinary HTTP,CONNECT 或 exec 字节;误发到
-APIEndpoint 的数据请求只得到 API handler 的自然响应.cluster-router 的 canonical chained
-CONNECT 只是中继,traffic 统计只发生在建立最终 sandbox backend 的 node worker.
+The worker performs the complete token, request, and backend gates in its own process, constructing `sandboxes/<NodeSandboxID>/ctl.sock` under frozen EffectiveConfig `paths.run_root`. Neither this path nor CEL programs enter routesync `Policy` or SHM records. The conductor does not parse, select, or forward ordinary HTTP, CONNECT, or exec bytes. Data requests sent to APIEndpoint receive only the API handler's natural response. The cluster router's canonical chained CONNECT is a relay; traffic accounting occurs only at the node worker establishing the final sandbox backend.
 
-## 6. 数据面鉴权
+<a id="6-数据面鉴权"></a>
+## 6. Data-plane authentication
 
-数据面请求头统一为 `X-Access-Token`,但期望值按转发目标选择:
+All data-plane requests use `X-Access-Token`, with the expected value selected by target:
 
-- e2b legacy 49983/49999 以及显式 `e2b:envd`/`e2b:code-interpreter` 使用 create
-  响应中的 `envdAccessToken`;
-- bare 的任意 legacy 端口,e2b 的其它 legacy 端口和显式 `forward` 使用
-  `forwardAccessToken`;
-- `trafficAccessToken` 只供外部网关及 e2b 数据面组件验证,node proxy 不消费;
-- `exec` 只接受以 ServiceSecret 直接 HMAC 签名,绑定 `StableID` 且
-  `aud=exec` 的 `kat1` ExecAccessToken.Envd/Forward/Traffic token 不能代替它.
+- e2b legacy ports 49983/49999 and explicit `e2b:envd` / `e2b:code-interpreter` use the create response's `envdAccessToken`.
+- Every bare legacy port, other e2b legacy ports, and explicit `forward` use `forwardAccessToken`.
+- `trafficAccessToken` is for verification by external gateways and e2b data-plane components; the node proxy does not consume it.
+- `exec` accepts only a `kat1` ExecAccessToken directly HMAC-signed with ServiceSecret, bound to `StableID`, with `aud=exec`. Envd/Forward/Traffic tokens cannot replace it.
 
-opaque Envd/Forward token 按各自线格式校验;exec KAT 执行严格格式,签名,SID,audience
-和可选过期时间校验.
+Opaque Envd/Forward tokens use their respective wire-format validation. Exec KATs strictly validate format, signature, SID, audience, and optional expiry.
 
 `auth` / policy `auth_mode`:
 
-| 模式 | 行为 |
+| Mode | Behavior |
 |---|---|
-| `enforce` | 不匹配返回 401 |
-| `log` | 记录但放行 |
-| `off` | 不校验 |
+| `enforce` | A mismatch returns 401 |
+| `log` | Log mismatches but allow forwarding |
+| `off` | Skip validation |
 
-上表只适用普通数据面.Exec 始终 enforce,不受 `auth_mode` 影响.
+This table applies only to ordinary data traffic. Exec always enforces authentication, regardless of `auth_mode`. The node uses its own effective policy; router `enforce` does not change it. In node `log`/`off`, invalid ordinary credentials can pass into parking, activation, and backend dial.
 
-e2b 49983 上的 `GET/POST /files` 在未携带 `X-Access-Token` 时,可用
-EnvdAccessToken 验证 envd signature query;proxy 先验签再转发,envd 收到原始请求后再次
-验证同一 signature。如果请求携带非空但错误的 `X-Access-Token`,不回退 signature。
+For e2b legacy 49983 `GET/POST /files` without `X-Access-Token`, the node can verify envd's signature query with EnvdAccessToken. In `enforce`, the proxy verifies before forwarding, and envd independently verifies the same original request. A nonempty wrong `X-Access-Token` never falls back to a signature. These checks follow the ordinary node policy: `log` can forward a mismatch and `off` skips verification. Explicit logical services and bare port 49983 do not inherit the legacy signed-file exception.
 
+<a id="7-mmds"></a>
 ## 7. MMDS
 
-`mmds.enabled=true` 时,envd 在 FC 模式下通过 Firecracker MMDS v2 获取当前身份的
-access-token hash;`mmds.routes.enabled=true` 还开放显式声明的 static/secret/service
-exact route.HTTP 只由 Proxy worker 承载,master 提供有界 route view.配置
-`proxy_netns` 时,master 在该 netns 绑定 conductor 下发的 `mmds.listen`,并把同一个
-listener fd 传给所有 worker;worker 不读取任何 proxy/MMDS YAML.
+With `mmds.enabled=true`, envd in FC mode obtains the current identity's access-token hash through Firecracker MMDS v2. `mmds.routes.enabled=true` additionally exposes explicitly declared static/secret/service exact routes. Only Proxy workers serve HTTP; the master supplies the bounded route view. With `proxy_netns`, the master binds the conductor-projected `mmds.listen` in that namespace and passes the same listener FD to all workers. Workers read no proxy/MMDS YAML.
 
 ```text
 guest envd
@@ -484,51 +302,29 @@ proxy worker ─┬─► shared route view(token identity + RunID)
               └─► master socketpair RPC(routes + values + service socket)
 ```
 
-两段式协议:
+The two-stage protocol mints a token and then uses it for either root or declared-path GET:
 
-1. `PUT /latest/api/token`:要求恰好一个 `X-metadata-token-ttl-seconds`,值为
-   `1..21600`;按请求源 IP 查 enriched starting/running route 的 floatingip。初始
-   starting 尚无 FloatingIP时仅此 token mint 路径可按 `park_timeout` 等待。返回的
-   HMAC token 绑定 sid、来源 IP、当前 `RunID`、`aud=mmds` 和 expiry。
-2. `GET /`:重新校验签名、来源、expiry、audience 与当前 `RunID`,返回
-   `{instanceID, envID, accessTokenHash}`。pause/resume 改变 incarnation,旧 token 立即失效。
-3. `GET <declared-path>`:完成相同认证后 exact lookup;未声明或声明但未配置的 secret
-   都返回 404,store/sync 不可用返回 503。static/secret 缺省 Content-Type 在响应时才取
-   `text/plain`,不写回配置。
+1. `PUT /latest/api/token` requires exactly one `X-metadata-token-ttl-seconds`, in `1..21600`. It finds the enriched starting/running route's FloatingIP using the request source IP. Before initial starting has a FloatingIP, only this minting path may wait for `park_timeout`. The returned HMAC token binds SID, source IP, current `RunID`, `aud=mmds`, and expiry.
+2. `GET /` revalidates signature, source, expiry, audience, and current `RunID`, then returns `{instanceID, envID, address, accessTokenHash}` (`address` is currently empty). Pause/resume changes the incarnation, invalidating previous tokens.
+3. `GET <declared-path>` performs the same authentication and then exact lookup. Undeclared routes or declared secrets without a configured value return 404; unavailable storage/sync returns 503. Static/secret Content-Type defaults to `text/plain` only at response time, without rewriting configuration.
 
-MMDS session token 使用每沙箱确定性 `mmds_secret`,因此 PUT 和 GET 落到不同 worker
-仍能互相验证。请求 path 不清理、不重定向:query、fragment、percent escape、需
-percent-encode 的字符、空/dot segment、backslash、wildcard 和非 root trailing slash 均拒绝。GET 的非零/未知
-Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不读取一个 byte
-来探测 body。内置 root 只精确匹配 `/`;所有 guest 响应统一带
-`Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
+The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers validate each other's session tokens. Request paths are neither cleaned nor redirected. Query, fragment, percent escapes, characters requiring percent encoding, empty/dot segments, backslashes, wildcards, and trailing slashes except root are rejected. GET with nonzero/unknown Content-Length, any Transfer-Encoding, or an unknown body returns 400; the handler does not probe by reading even one body byte. Built-in root matches only `/`. Every guest response includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
-三类自定义 route:
+Three custom route types exist:
 
-- `static`:直接返回声明的 UTF-8 `data`。
-- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换,DELETE 后立即 404,
-  不等待、不设 TTL,Content-Type 始终来自 route。
-- `service`:master 从唯一 registry 解析本机 Unix socket,worker/handler
-  构造全新 `GET <exact-path> HTTP/1.1`,`Host: mmds-service`,仅增加
-  `E2b-Sandbox-Id: <sid>` 与 `E2b-Sandbox-Service: <service>`。不发送 port,不透传 guest
-  Host/query/body/token/Authorization/Cookie 或任何 guest header。V1 只透传合法 status、
-  有界 body 和合法 Content-Type(缺省 `text/plain`),不跟随 redirect;超时/过大/非法响应
-  映射 504/502,service 缺失或 socket 不可达为 503。
+- `static` directly returns declared UTF-8 `data`.
+- `secret` retrieves current opaque bytes by the route's `secret` name. PUT replaces the whole value; DELETE immediately makes GET return 404. There is no waiting or TTL, and Content-Type always comes from the route.
+- `service` resolves a local Unix socket from the master's sole registry. The worker/handler creates a new `GET <exact-path> HTTP/1.1` with `Host: mmds-service` and only the additional headers `E2b-Sandbox-Id: <sid>` and `E2b-Sandbox-Service: <service>`. It sends no port and forwards no guest Host, query, body, token, Authorization, Cookie, or other guest headers. V1 relays only a valid status, bounded body, and valid Content-Type (default `text/plain`), without following redirects. Timeout maps to 504; oversized/invalid responses to 502; missing services or unreachable sockets to 503.
 
-安全边界:routes 是 portable declaration,secret values 则只存在 sqlite ciphertext 或受信
-Proxy master 的有界 heap.它们不写普通 metadata,共享 mmap,
-日志、metrics、migration token、template 或构建产物,也不发送给 observer/node-link。
-但 guest 主动 GET 后,value 已进入 guest/application memory;随后执行包含内存的 Pause/snapshot
-可能把该副本作为普通 guest working set 捕获。平台不能在宿主侧从任意 guest 内存中擦除它,
-调用方应在应用侧缩短驻留时间,并把包含已消费 secret 的 snapshot 按敏感制品保护。
+The security boundary distinguishes portable route declarations from secret values held only as SQLite ciphertext or in the trusted Proxy master's bounded heap. Values do not enter ordinary metadata, shared mmap, logs, metrics, migration tokens, templates, or build artifacts, and are never sent to observers/node-link. Once a guest actively GETs a value, however, it enters guest/application memory. A later Pause/snapshot including memory may capture that copy as ordinary guest working set. The platform cannot erase it from arbitrary guest memory from the host. Callers should limit application residency and protect snapshots containing consumed secrets as sensitive artifacts.
 
-## 8. per-Sandbox traffic admission 与 stats
+<a id="8-per-sandbox-traffic-admission-与-stats"></a>
+## 8. Per-sandbox traffic admission and stats
 
-### 8.1 配置与合并
+<a id="81-配置与合并"></a>
+### 8.1 Configuration and merging
 
-`traffic.max_inflight` 是每个 Sandbox 在整个 node Proxy 上可接纳的 logical inflight 规格,
-不是 QPS、带宽、worker capacity 或 Proxy global capacity。配置值 `M` 不会按 worker 各自
-应用,也不会静态切成 `ceil(M/N)`:
+`traffic.max_inflight` specifies each sandbox's admitted logical inflight concurrency across the whole node Proxy. It is not QPS, bandwidth, worker capacity, or global Proxy capacity. A configured `M` is neither independently applied to each worker nor statically split into `ceil(M/N)`:
 
 ```yaml
 traffic:
@@ -540,12 +336,9 @@ traffic:
     exec: 8
 ```
 
-`0` 表示该维度 unlimited。`total` 与目标 service 在同一次临界区中独立检查,不要求 service
-之和小于 `total`;`forward` 也不按 port 拆分。一个 Sandbox 达限不占用或拒绝其它 Sandbox
-的额度,因此不会形成 global failure amplification。
+`0` makes that dimension unlimited. Total and target service are checked independently in one critical section; service limits need not sum to less than total. `forward` is not split by port. Reaching one sandbox's limit consumes or rejects no other sandbox's quota, preventing global failure amplification.
 
-Sandbox 只在 metadata key `kuasar-sandbox.traffic` 保存显式 patch;create/build 也可用恰好
-一次的 `X-Kuasar-Sandbox-Traffic` 传入同形 JSON。合并优先级为:
+A sandbox stores only its explicit patch in metadata key `kuasar-sandbox.traffic`. Create/build may also provide the same JSON shape in exactly one `X-Kuasar-Sandbox-Traffic` header. Merge precedence is:
 
 ```text
 template/group/default explicit metadata
@@ -554,25 +347,16 @@ template/group/default explicit metadata
   < target Proxy resolution only for absent leaves
 ```
 
-前三层按 `max_inflight` 叶子合并并 canonical marshal。叶子 absent 继承低优先级显式 patch,
-最终继承当前目标节点 `proxy.yaml`;explicit `0` 则清除低优先级或节点默认限制。空 Header、重复
-Header、`null`、unknown、负数、非整数和 uint32 overflow 均拒绝。bare Sandbox 显式声明
-`e2b:envd` 或 `e2b:code-interpreter` 也拒绝;节点默认可包含全部 service,bare 只消费
-`total/forward/exec`。
+The first three layers merge by `max_inflight` leaf and marshal canonically. An absent leaf inherits lower-priority explicit patches and finally current destination `proxy.yaml`; explicit `0` clears lower-priority or node-default limits. Empty or duplicate headers, `null`, unknown fields, negative/non-integer values, and uint32 overflow are rejected. Bare sandboxes also reject explicit `e2b:envd` or `e2b:code-interpreter`. Node defaults may contain every service; bare consumes only `total/forward/exec`.
 
-目标节点默认值不写入 Sandbox metadata/struct/SQLite、Registry record 或 MigrationToken。
-MigrationToken 沿用已有 Metadata:absent traffic 在迁移后仍 absent,由目标 Proxy 使用自己的
-默认值;显式 patch 原样迁移并覆盖目标默认。V1 不支持运行时修改 metadata,降低 limit 也不
-驱逐已有连接,只影响后续 acquire。
+Destination-node defaults are not written into sandbox metadata/structs/SQLite, Registry records, or MigrationToken. MigrationToken retains existing Metadata: absent traffic remains absent after migration and resolves against destination Proxy defaults; explicit patches migrate unchanged and override those defaults. V1 cannot modify metadata at runtime. Lowering a limit does not evict existing connections and affects only later acquire attempts.
 
-### 8.2 共享 admission arena 与误差证明
+<a id="82-共享-admission-arena-与误差证明"></a>
+### 8.2 Shared admission arena and error-bound proof
 
-route mmap 与 mutable admission arena 分离。master 为所有 effective limit 全为 0 的 route
-发布零 binding,worker 直接执行既有 `BeginParking`,不扫描 arena、不 IPC。其它 route 得到
-稳定的 `{slot,generation,effective limits}`。每个 entry 含 identity/state、generation、fixed
-limits 以及 `counters[worker][forward/envd/CI/exec]`;worker 只写自己的 absolute cell。
+Route mmap is separate from the mutable admission arena. For a route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Other routes receive stable `{slot,generation,effective limits}`. Each entry holds identity/state, generation, fixed limits, and `counters[worker][forward/envd/CI/exec]`; a worker writes only its own absolute cells.
 
-acquire 在已有 worker-local per-Sandbox entry lock 内执行:
+Acquire runs under the existing worker-local per-sandbox entry lock:
 
 ```text
 verify active generation and effective limits
@@ -583,70 +367,39 @@ verify active generation and effective limits
 → unlock and return success
 ```
 
-同一 worker、同一 Sandbox 的所有 service 共用该锁,所以每个 worker 同时最多有一个 acquire
-临界区。先考虑没有 release 的单调执行。把使已发布值首次到达 `M` 的成功原子增量作为边界
-发布:边界时其它每个 worker 最多各有一个已经开始但尚未发布的 acquire,共至多 `N-1` 个;
-边界 worker 在解锁后才能开始下一次检查。边界之后才开始的检查逐列读取的都是不小于边界
-时刻的值,即使不是原子 snapshot,其和也至少为 `M`,必须拒绝。增量在解锁和返回 grant 前已经
-发布,所以只有边界时正在进行的其它 `N-1` 个 acquire 还可能成功,峰值至多为 `M + N - 1`。
+All services of one sandbox in one worker share this lock, so each worker can have at most one acquire critical section in progress. First consider a monotone execution with no releases. Take the successful atomic increment that first brings the published count to `M` as the boundary publication. At that boundary, each other worker can have at most one acquire already started but not yet published: at most `N-1` altogether. The boundary worker can begin its next check only after unlocking. Any check starting after the boundary reads each column at a value no smaller than at the boundary. Even though these reads are not an atomic snapshot, their sum is at least `M`, so the check must reject. The increment is published before unlocking and returning the grant. Thus only those other `N-1` acquires already in progress at the boundary may still succeed, bounding the peak by `M + N - 1`.
 
-concurrent release 不扩大该上界。固定任意观察时刻 `T`,从执行历史中删除所有在 `T` 前已经
-release 的 flow 的 acquire→release 完整区间。删除这种正计数区间只会让其余 acquire 的逐列
-读取值保持不变或降低,所以原执行中成功且在 `T` 仍 active 的每个 acquire 在缩减历史中仍会
-通过;同 worker 的串行关系也不变。缩减历史到 `T` 为止没有 release,其已发布计数恰好等于原
-执行在 `T` 的 actual active 数,因此适用上一段单调执行的 `M + N - 1` 上界。该论证不要求
-逐列读取构成原子 snapshot,并分别适用于同一次临界区内检查的 `total` 和目标 service。所以
-配置 `M`、worker 数 `N` 的合同是:
+Concurrent releases do not enlarge this bound. Fix any observation time `T`. Remove from the execution history every complete acquire→release interval of flows released before `T`. Removing positive-count intervals leaves the column values seen by remaining acquires unchanged or lower. Consequently every acquire that succeeded originally and remains active at `T` would still pass in the reduced history; same-worker serial order is also preserved. The reduced history has no release through `T`, and its published count equals the original execution's actual active count at `T`. The monotone-execution `M + N - 1` bound therefore applies. This argument requires no atomic snapshot across column reads and applies separately to total and target service checked within the same critical section. For configured `M` and `N` workers, the contract is:
 
 ```text
 actual admitted inflight <= M + N - 1
 ```
 
-parking→egress 不改 shared count。activation、dial、HTTP forward、context cancel、ordinary
-response 及完整 CONNECT/exec relay 的最终 Close 都由同一个 flow/lease exactly once 释放;
-half-close 不释放。
+The parking→egress transition does not change shared counts. Activation/dial/HTTP-forward failure, context cancellation, an ordinary response, and final Close of complete CONNECT/exec relay all release through the same flow/lease exactly once. Half-close does not release it.
 
-Delete 或 identity replacement 先把旧 generation 置为不可 acquire,再清零/复用 slot。旧 flow
-保留旧 generation,release mismatch 时不得减少新 route cell;starting/running/paused 的同一
-Sandbox lifecycle 更新保持 generation。route/policy 发布前后的 Activate 都重读 route identity
-与完整 binding;对已经 drain 的 limited generation 还直接重验 arena state,因此旧 lookup 不能在
-新 route 发布后绕过新 binding。
+Delete or identity replacement first makes the old generation unacquirable, then clears/reuses the slot. Old flows retain their old generation; a mismatched release must not decrement the new route's cell. Starting/running/paused updates in the same sandbox lifecycle retain generation. Activate rereads route identity and the complete binding around route/policy publication, and directly revalidates arena state for a drained limited generation. An old lookup therefore cannot bypass a newly published binding.
 
-worker stats stream fault 会先终止 worker。只有 supervisor 的 `cmd.Wait` 证明旧进程已退出、
-kernel 已关闭其连接后,master 才接管可能遗留的 row guard并清该 index;此前 stale-high 只能
-保守拒绝,不能漏计。replacement 复用 index 但使用新 epoch。master 退出会终止全部 child 和
-连接;新 master/full sync 重建 arena,不继承旧计数。
+A worker stats-stream fault first terminates the worker. Only after supervisor `cmd.Wait` proves the old process exited and the kernel closed its connections may the master take over a leftover row guard and clear that index. Until then, stale-high counts can only conservatively reject, never undercount. Replacements reuse the index with a new epoch. Master exit terminates every child and connection; a new master rebuilds the arena without inheriting old counts. A full routesync on a surviving master instead preserves counts for replayed, unchanged bindings and retires absent bindings at Bookmark; it does not reset active flows' counts.
 
-默认 `route_capacity=65536,workers=2` 时,counter 主体为
-`65536 × 2 × 4 × 8 = 4194304` bytes;连同 entry headers、row guards 和一个 transaction spare
-entry,实际 mmap 为 `8388800` bytes。size、stride、worker count/index 和 8-byte atomic alignment
-均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+For `route_capacity=65536,workers=2`, counters alone occupy `65536 × 2 × 4 × 8 = 4194304` bytes. Including entry headers, row guards, and one transaction spare entry, the mmap is `8388800` bytes. Master and worker mapping validate size, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope.
 
-普通 HTTP 与 non-exec CONNECT 达限返回 429、
-`X-Kuasar-Proxy-Error: max_inflight_reached` 和固定 body,不设置 `Retry-After`、不 Wake/Activate/dial、
-不逐次打印日志,并增加低基数 `data_requests_total{result="max_inflight_reached"}`。exec 的
-CONNECT 200 后差异见 §5。
+Exhaustion for ordinary HTTP/non-exec CONNECT returns 429, `X-Kuasar-Proxy-Error: max_inflight_reached`, and a fixed body. It sets no `Retry-After`, performs no Wake/Activate/dial, emits no per-rejection log, and increments low-cardinality `data_requests_total{result="max_inflight_reached"}`. See §5 for exec's behavior after CONNECT 200.
 
-### 8.3 Traffic stats 与统一 worker stream
+<a id="83-traffic-stats-与统一-worker-stream"></a>
+### 8.3 Traffic stats and the unified worker stream
 
-公开接口为 `GET /sandboxes/{sid}/stats/traffic`。统计的是最终 node proxy 已鉴权接纳的
-逻辑 ingress,不是客户端物理 TCP 数:
+The public API is `GET /sandboxes/{sid}/stats/traffic`. It counts logical ingress admitted by the final node proxy's authentication policy, not physical client TCP connections:
 
 ```text
 ingress = parking + egress
 
-parking: token 和 ExecRequest admission 成功后,ActivateRoute/ActivateExec 与最终 backend dial 尚未完成
-egress:  最终 node proxy → sandbox backend 已建立且尚未最终 Close
+parking: after authentication-policy and ExecRequest admission; ActivateRoute/ActivateExec and final backend dial are incomplete
+egress:  final node proxy → sandbox backend is established and has not reached final Close
 ```
 
-service 固定为 `forward`、`e2b:envd`、`e2b:code-interpreter`、`exec`。e2b 返回四项,
-bare 只返回 forward/exec。普通 HTTP 和每条 CONNECT/exec 各是一条逻辑 ingress。dial
-成功时在同一 worker-local entry lock 中原子执行 `parking--/egress++`;activation 或 dial
-失败只结束 parking。`CloseWrite` 只传播 half-close,不结束 egress;只有 tracked backend
-的最终 `Close` 以 `sync.Once` 结束 egress。token 或 ExecRequest admission 失败不进入
-parking/egress,也不刷新 sandbox activity/`idleSince`。
+Services are fixed to `forward`, `e2b:envd`, `e2b:code-interpreter`, and `exec`. e2b returns all four; bare returns only forward/exec. Each ordinary HTTP request and each CONNECT/exec tunnel counts as one logical ingress. Successful dial atomically performs `parking--/egress++` under the same worker-local entry lock. Activation/dial failure only ends parking. `CloseWrite` propagates half-close without ending egress; only the tracked backend's final `Close`, guarded by `sync.Once`, ends egress. Token or ExecRequest rejection does not enter parking/egress or refresh sandbox activity/`idleSince`.
 
-空闲响应示例:
+Example idle response for a bare sandbox (inapplicable e2b limits are zero):
 
 ```json
 {
@@ -654,31 +407,35 @@ parking/egress,也不刷新 sandbox activity/`idleSince`。
   "maxInflight": {
     "total": 128,
     "forward": 96,
-    "e2b:envd": 16,
-    "e2b:code-interpreter": 8,
+    "e2b:envd": 0,
+    "e2b:code-interpreter": 0,
     "exec": 8
   },
-  "inflight": {"parking": 0, "egress": 0},
+  "inflight": {
+    "parking": 0,
+    "egress": 0
+  },
   "idleSince": "2026-08-12T14:03:21.123456789Z",
   "services": {
-    "forward": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:03:21.123456789Z"},
-    "exec": {"parking": 0, "egress": 0, "idleSince": "2026-08-12T14:00:00Z"}
+    "forward": {
+      "parking": 0,
+      "egress": 0,
+      "idleSince": "2026-08-12T14:03:21.123456789Z"
+    },
+    "exec": {
+      "parking": 0,
+      "egress": 0,
+      "idleSince": "2026-08-12T14:00:00Z"
+    }
   }
 }
 ```
 
-`maxInflight` 由 Proxy master 从当前 applied route 的 effective policy 注入,不从 conductor
-Sandbox row 推导;全零对象明确表示 unlimited。worker stats unavailable 时该 API 仍可返回 503,
-但不影响 master route/admission authority 或 Create barrier。
+The Proxy master injects `maxInflight` from the current applied route's effective policy, not the conductor Sandbox row. An all-zero object explicitly means unlimited. Unavailable worker stats can still make this API return 503, without affecting master route/admission authority or the Create barrier.
 
-顶层 `idleSince` 仅在 state=running 且所有 inflight 为零时返回;starting/paused 即使零连接
-也不返回顶层时间。service 的 `idleSince` 也只在该 service 两项为零时出现。接口不返回
-`idle`、`idleForSeconds`、last-open/close、累计连接数、bytes、延迟、端口明细或 worker
-身份;`Cache-Control: no-store`.Proxy route 未完成同步,
-RunID/profile/state 不匹配或 worker 集不可信时返回 503。state 参与 conductor→master
-查询身份,避免 Pause 已提交但异步 route view 仍为 running 时返回旧的顶层 `idleSince`。
+Top-level `idleSince` appears only for state=running with all inflight counts zero. Starting/paused omits it even with zero connections. A service's `idleSince` likewise appears only when both of its counts are zero. The API returns no `idle`, `idleForSeconds`, last-open/close, cumulative connection counts, bytes, latency, port breakdown, or worker identity, and sets `Cache-Control: no-store`. Unsynchronized Proxy routes, RunID/profile/state mismatches, or an untrusted worker set return 503. State participates in the conductor→master query identity, preventing a stale top-level `idleSince` after Pause commits while the asynchronous route view still says running.
 
-每个 worker 使用一条 Unix socketpair 上报:
+Each worker reports through one Unix socketpair:
 
 ```text
 worker hot path
@@ -694,71 +451,39 @@ master: workerID/epoch/sequence/contribution → per-SID aggregate cache
         └─ stats UDS batchGet → conductor public GET
 ```
 
-热路径不写 socket。sender 可合并任意中间变化,写成功后只在 revision 未再次变化时清 dirty;
-因此 notify 合并和背压不会丢最终绝对状态。frame 有 1 MiB、每帧 SID/counter 数和标识长度
-上限;同 epoch 的 sequence 回退/跳号/异内容重用、counter 回退/遗漏或 malformed frame 都是
-协议错误。
+The hot path never writes the socket. One sender may coalesce arbitrary intermediate changes and clears dirty only if revision has not changed again after a successful write. Coalesced notifications and backpressure therefore cannot lose final absolute state. Frames have a 1 MiB limit plus bounds on SID/counter counts and identifier lengths. Within an epoch, backward/skipped sequence numbers, sequence reuse with different content, counter regression/omission, and malformed frames are protocol errors.
 
-master 查询只读持续维护的聚合 cache,不在 GET 时扇出 worker。它用 Linux boottime 比较
-`idleSince`,对外只输出 UTC wall time;有效值取 worker idle、当前 master/worker 集合可信起点
-和当前 RunID 首次被观察为 running 的时间的最大值。worker stats stream 断开后立即进入 503 窗口并终止
-worker;只有 `Wait` 确认进程退出、内核已关闭其 backend FD 后才删除该 worker 的全部贡献。
-replacement 以新 epoch 发 hello+ready,在 ready 前不开放 stats,并且 worker 也是在 stats ready
-后才开始 Serve 数据 listener。
+Master queries read a continuously maintained aggregate cache, without GET-time fan-out to workers. It compares `idleSince` using Linux boottime and emits only UTC wall time. The effective timestamp is the maximum of worker idle time, the trust start of the current master/worker set, and the first observation of current RunID as running. A disconnected worker stats stream immediately starts a 503 window and terminates that worker. Only after `Wait` confirms exit and kernel closure of backend FDs does the master remove all of its contributions. A replacement sends hello+ready with a new epoch. Stats remains unavailable until ready, and the worker starts serving data listeners only after stats readiness.
 
-worker 经 socketpair 把绝对状态交给 master,conductor 只经当前注册的 `stats_socket` 查询.
-route SHM 仍是 master 单写,worker 只读,没有 stats 区或 worker 写入;worker 的 mutable admission
-column 只存在于独立 arena,不进入会因 backshift 移动的 route record。
+Workers send absolute state to the master over socketpairs; the conductor queries only the currently registered `stats_socket`. Route SHM remains master-write/worker-read-only, without a stats area or worker writes. Mutable worker admission columns exist only in the separate arena, never in route records that can move during backshift.
 
-## 9. 可靠性
+<a id="9-可靠性"></a>
+## 9. Reliability
 
-- **worker 崩溃**:stats fault先触发旧 worker 终止;master 等 `cmd.Wait` 后才清其 admission
-  column并以新 epoch重启同 index。等待期间 stale-high 只会保守拒绝;其他 worker 继续
-  accept 同一 listener fd,route/Sandbox state和Create barrier均不改变。崩溃 worker 上的已有
-  连接由 kernel 关闭。
-- **master 崩溃**:plugin 租约断开,新 Create 无法通过 barrier,DataEndpoint 也不可用;
-  systemd 重启 master 后重新注册,重建共享表并启动 worker.已运行沙箱本身不受影响.
-- **routesync 断开**:master 指数退避重连;固定数据面共享表沿用原有保留/Bookmark
-  收敛语义,但 MMDS routes/value/service authority 立即清空并返回 503,完整同步 Bookmark
-  前不服务旧 secret 或执行旧 service route。断连同时使尚未返回的 Create barrier 失败;
-  已 ACK并完成 201 commit 后的断连按正常运行期 availability failure 处理。
-- **park / wake**:Lookup 不发送 Wake;已鉴权 Activate 才能对 paused sid 发 Wake 并等待
-  共享表更新。starting 只 park、不 Wake,变为 paused/Delete 时立即结束;resume ownership 和
-  当前 launch 的状态推进仍由 conductor 执行。
-- **stats stream**:任一 worker stream EOF、超时或协议错误都会停止该 worker;确认退出前
-  traffic GET 返回 503,确认后删除其贡献并等待 replacement ready。Prometheus counter 在
-  master 生命周期内保持单调,worker epoch 更换不会回退。
-- **失败码**:Create 无可用 proxy route stream,barrier 超时/断连或 route apply
-  失败 = 503;非法 target = 400;exec 的非 CONNECT method = 405;未知/已删除 sid = 404;
-  鉴权失败 = 401;已识别但 profile 不支持的 service = 501;
-  后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503;ordinary admission 达限 =
-  429 + `max_inflight_reached`,exec 达限 = CONNECT 200 后 generic ctl error。
+- **Worker crash:** a stats fault first terminates the old worker. The master waits for `cmd.Wait`, clears its admission column, and restarts the same index with a new epoch. Stale-high counts only conservatively reject while waiting. Other workers keep accepting on the same listener FD. Routes, sandbox state, and Create barriers do not change. The kernel closes existing connections on the crashed worker.
+- **Master crash:** the plugin lease disconnects, new Create cannot pass its barrier, and DataEndpoint becomes unavailable. systemd restart registers a new master, rebuilds shared tables, and starts workers. Already running sandboxes themselves are unaffected.
+- **routesync disconnect:** the master reconnects with exponential backoff. Fixed data-plane routes retain their existing retention/Bookmark convergence semantics, but MMDS route/value/service authority clears immediately and returns 503. Old secrets and service routes are not served before a full-sync Bookmark. Disconnect also fails pending Create barriers. A disconnect after ACK and completed 201 commit is an ordinary runtime availability failure.
+- **Park/wake:** Lookup sends no Wake. Only Activate admitted by the effective authentication policy may wake a paused SID and wait for shared-table updates. Starting only parks, never wakes; paused/Delete immediately ends that wait. Resume ownership and current-launch progression remain with the conductor.
+- **Stats stream:** EOF, timeout, or protocol error on any worker stream stops that worker. Traffic GET returns 503 until confirmed exit; then contributions are removed and readiness waits for the replacement. Prometheus counters remain monotone throughout the master's lifetime and do not regress on worker epoch changes.
+- **Failure codes:** unavailable Create proxy stream, barrier timeout/disconnect, or route-apply failure = 503; invalid target = 400; non-CONNECT exec = 405; unknown/deleted SID = 404; rejected authentication = 401; recognized service unsupported by the profile = 501; unregistered/unreachable backend or proxy = 502; authorized exec resume failure = 503; ordinary admission exhaustion = 429 plus `max_inflight_reached`; exec exhaustion = generic ctl error after CONNECT 200.
 
-## 10. 性能
+<a id="10-性能"></a>
+## 10. Performance
 
-- 普通数据面 route lookup 是 worker 本地 mmap hash 查找,不进 conductor,不跨进程 RPC;
-  只有 guest 自定义 MMDS path 走同机 worker→master socketpair。
-- unlimited traffic fast path 不访问 admission arena;limited flow 只扫描固定 `N × 4` absolute
-  cells,不做 per-flow master RPC。不同 Sandbox 使用不同 worker-local mutex,不争用一把进程级
-  global lock;同 SID并发只在本 worker entry和本 worker row上串行。
-- master 单写 route共享表;worker 只读。admission worker只写自己的 column,master不在
-  per-flow热路径中。
-- 普通 HTTP 和 CONNECT 都不使用上游连接池,避免跨 sandbox/port 连接复用。
-- `route_capacity` 是固定容量保护阈值;容量不足时应调大配置并重启 proxy master。
-- worker 数据面 metrics 与 traffic 经统一 stats socketpair 异步上报绝对快照;
-  `metrics_listen` 由 master 对 counter 绝对值求差后继续输出既有
-  `data_requests_total{result=...}`。背压只合并中间 snapshot,不会永久丢失计数或当前 traffic。
-- MMDS 按 floatingip 反查当前实现为共享表线性扫描,该路径只在 envd 初始化时使用,
-  不在高 QPS 数据面热路径。
+- Ordinary data-plane lookup is a worker-local mmap hash lookup, with no conductor call or cross-process RPC. Only custom guest MMDS paths use local worker→master socketpair RPC.
+- Unlimited traffic never accesses the admission arena. Limited flows scan fixed `N × 4` absolute cells without per-flow master RPC. Different sandboxes use different worker-local mutexes, avoiding a process-global lock; same-SID concurrency serializes only within that worker's entry and row.
+- The master alone writes route SHM; workers only read it. Admission workers write their own columns, and the master is absent from the per-flow hot path.
+- Neither ordinary HTTP nor CONNECT uses upstream connection pools, avoiding reuse across sandboxes/ports.
+- `route_capacity` is a fixed protective capacity. Increase it and restart the proxy master when more capacity is needed.
+- Worker metrics and traffic report absolute snapshots asynchronously over the unified stats socketpair. At `metrics_listen`, the master differences absolute counters and continues exposing existing `data_requests_total{result=...}` metrics. Backpressure coalesces intermediate snapshots without permanently losing counts or current traffic.
+- MMDS source-IP reverse lookup uses one reconstructible fixed slot indexed by IPv4 modulo connector `MaxPorts`, then validates the candidate SID against the authoritative primary route table, including active state and exact IP. It is no longer a linear table scan. Missing, mismatched, or stale hints fail closed; a modulo collision displaces the previous source hint rather than authorizing it as the new source. This hint holds no credentials and is not an ordinary data-plane route authority. Token minting uses the source lookup; authenticated GET validates the token's source/IP/incarnation binding, and custom GET additionally uses master RPC. MMDS is not limited to envd initialization.
 
-这里的 running 只证明 orchestrator readiness wire 与 mandatory e2b `/init` 已成功,不保证
-code interpreter、forward 业务端口或用户应用 health 已监听;业务 backend readiness 仍由
-[#125](https://github.com/kuasar-sandbox/orchestrator/issues/125) 独立跟踪,proxy 不在本阶段
-增加通用 dial retry。
+Here running proves only that the orchestrator readiness wire and mandatory e2b `/init` succeeded. It does not guarantee that the code interpreter, forwarded business port, or user application is listening/healthy. [#125](https://github.com/kuasar-sandbox/orchestrator/issues/125) separately tracks business-backend readiness; the proxy adds no generic dial retry in this phase.
 
+<a id="11-see-also"></a>
 ## 11. See Also
 
-- [node.md](node.md) — conductor 控制面,Proxy 部署,生命周期与密钥模型.
-- [cluster-router_zh.md](cluster-router_zh.md) — 集群入口如何转发到本节点数据面。
-- `connector/docs/vswitch.md` — mgmt-extract / MMDS VIP 转换。
-- `kuasar-sandbox/docs/deployment.md` — 部署拓扑、端口与故障域。
+- [node.md](node.md) — conductor control plane, Proxy deployment, lifecycle, and key model.
+- [cluster-router.md](cluster-router.md) — how cluster ingress forwards to this node's data plane.
+- [Connector vSwitch](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md) — mgmt-extract and MMDS VIP translation.
+- [Deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md) — topology, ports, and failure domains.
