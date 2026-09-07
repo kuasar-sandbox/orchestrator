@@ -149,6 +149,8 @@ Serve.Start 错误或 nil wrapper 不开放 data listener,由既有 master super
 worker。worker 从不读取 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响
 replacement worker。
 
+Worker 是专用、单次运行的子进程：内置与定制入口在 `Run` 返回后必须退出 worker 进程。成功建立的 route SHM 与 admission 映射存活到进程退出；`PreparedWorker.Close` 只关闭继承描述符，不卸载仍可能被 handler/extension/traffic GC 引用的映射。Supervisor 仍须确认进程退出后才清理共享计数。普通 HTTP 与 HTTP/2 CONNECT 的取消会关闭 backend，与有效流量限制无关；HTTP/1 hijacked CONNECT 保留半关闭语义。详见 [worker 生命周期与转发取消](proxy-worker-lifetime_zh.md)。
+
 公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
 启动期 TLS material provider，以及按 process role 使用的可信、静态编译
 `MasterExtension`/`WorkerExtension`。provider 返回
