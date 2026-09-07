@@ -2611,7 +2611,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 
 - [node-proxy.md](node-proxy.md) —— 独立数据面转发层:路由判定 / routesync /
   数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 的唯一数据入口,集群下 router 转发进入)
-- [node-resource.md](node-resource.md) —— 节点资源控制协议、sandbox resource policy
+- [node-resource.md](node-resource_zh.md) —— 节点资源控制协议、sandbox resource policy
   与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§6,本文 §10 的对端),注册表,
   Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口,[cluster-placer.md](cluster-placer.md)

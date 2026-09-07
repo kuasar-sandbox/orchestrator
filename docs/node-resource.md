@@ -1,15 +1,20 @@
-# node-resource — 节点 reservation 控制器
+[English](node-resource.md) | [简体中文](node-resource_zh.md)
 
-`node-ctl conductor serve` 可选地内置 node resource controller。它只处理节点侧
-reservation、admission、pool、水位、恢复 inventory 和统计投影。sandbox 的
-guest memory observation、Cloud Hypervisor balloon、`memory.high`、cold/restore/
-snapshot 生命周期均由 sandboxer 自闭环管理,不属于 node controller。
+<a id="node-resource--节点-reservation-控制器"></a>
 
-## 1. 概述
+# node-resource — node reservation controller
 
-### 1.1 责任边界
+`node-ctl conductor serve` optionally embeds the node resource controller. It owns node-side reservation, admission, pools, watermarks, recovery inventory and statistics projection. Sandboxer owns the sandbox-local loop for guest memory observations, Cloud Hypervisor ballooning, `memory.high` and cold/restore/snapshot lifecycle; those operations do not belong to the node controller.
 
-内存控制分成两个独立流程:
+<a id="1-概述"></a>
+
+## 1. Overview
+
+<a id="11-责任边界"></a>
+
+### 1.1 Responsibility boundaries
+
+Memory control comprises two independent flows:
 
 ```text
 sandbox-local loop
@@ -24,50 +29,44 @@ node reservation loop
     -> node aggregate / pool / zone / recovery
 ```
 
-node controller 不读取或写入 sandbox cgroup,不调用 CH API,不接收 guest
-`MemReport`,也不推送 balloon target。它只对 sandbox 主动发来的 reservation
-请求作原子处理。Heartbeat 返回 reservation echo,不是执行命令。
+The normal reservation loop neither samples nor writes sandbox cgroups, calls CH APIs, receives guest `MemReport`, nor sends balloon targets. Recovery inventory does read process/cgroup identity, liveness and conservative limits (§8.1); it does not use those reads to implement the guest Budget loop. The controller atomically handles sandbox-initiated reservation requests. Heartbeat returns a reservation echo, not an execution command.
 
-### 1.2 术语
+<a id="12-术语"></a>
 
-| 名称 | 定义 | 所有者 |
+### 1.2 Terminology
+
+| Name | Definition | Owner |
 |---|---|---|
-| Capacity | VM 固定最大内存 | sandbox config/snapshot |
-| Headroom | `resources.allocatable.memory`,settled guest headroom | sandbox policy |
-| StartupHeadroom | `resources.startup.memory`,cold 首份可信 report 前的 headroom | sandbox policy |
-| BudgetAtSnapshot | `Capacity - min(snapshot target,snapshot current)` | sandbox snapshot |
-| NodeReservation | node 已为某 sandbox 保留的绝对内存额度 | node controller |
-| HostMemoryCurrent | host VMM cgroup `memory.current`,仅诊断 | sandbox 上报,node 记录 |
-| reservedMemory | 所有 live `NodeReservation` 的和 | node state |
+| Capacity | Fixed maximum VM memory. | Sandbox config/snapshot. |
+| Headroom | `resources.allocatable.memory`, settled guest headroom. | Sandbox policy. |
+| StartupHeadroom | `resources.startup.memory`, headroom before the first trusted cold-start report. | Sandbox policy. |
+| BudgetAtSnapshot | `Capacity - min(snapshot target,snapshot current)`. | Sandbox snapshot. |
+| NodeReservation | Absolute memory amount reserved by the node for one sandbox. | Node controller. |
+| HostMemoryCurrent | Host VMM cgroup `memory.current`; diagnostic only. | Reported by sandbox, recorded by node. |
+| reservedMemory | Sum of all live `NodeReservation` values. | Node state. |
 
-`Headroom` 不是 total Budget。CPU `allocatable` 仍表示调度权重/保证,与 memory
-headroom 不完全同构。
+Headroom is not the total Budget. CPU `allocatable` still expresses scheduling weight/guarantee; it is not structurally identical to memory headroom.
 
-sandbox 内部另有 `TargetBudget`、`CurrentBudget`、`ObservedBudget` 和
-`DemandMemory`;node 不需要也不保存这些状态。正常受控路径中 sandbox 先取得足够
-`NodeReservation` 才扩大 Budget,并在 shrink 收敛后才释放 reservation。
-`deflate_on_oom` 的 guest 应急 deflate 是阶段化软保证的例外:它不改变 target 或
-reservation,原有 `memory.high` 继续限制 host VMM charge,sandbox 把 target/current
-标记为 unstable 并禁止 shrink。snapshot 仍按两侧安全上界计算
-`BudgetAtSnapshot`。
+Sandbox-local state also includes `TargetBudget`, `CurrentBudget`, `ObservedBudget` and `DemandMemory`; the node neither needs nor stores them. On the normal controlled path, the sandbox obtains enough NodeReservation before increasing Budget and releases reservation only after shrink converges. Emergency guest `deflate_on_oom` is an exception to the phased soft guarantee: it changes neither target nor reservation. Existing `memory.high` continues bounding host VMM charge, while the sandbox marks target/current unstable and prohibits shrink. Snapshot still computes BudgetAtSnapshot from the safe upper bound of both sides.
 
-### 1.3 核心不变量
+<a id="13-核心不变量"></a>
 
-- `0 < NodeReservation <= Capacity`。
-- `reservedMemory = sum(live NodeReservation)`。
-- admission、pool、zone、ResourceProbe、cluster projected load 和 recovery
-  replacement 只使用 `NodeReservation` 聚合。
-- grow 只由 sandbox 发起;node 先记账再返回 grant。
-- shrink 只由 sandbox 在 balloon current 收敛且 `memory.high` 已按顺序处理后提交。
-- `Settled` 是生命周期事实,不从 `memory.current` 推导或改写 reservation。
-- controller restart 先按 Capacity provisional charge,StateSync 后原子替换。
-- stale heartbeat、host charge 或 node 管理命令不能改变某个 sandbox 的
-  reservation。
+### 1.3 Core invariants
 
-## 2. 命令行接口
+- `0 < NodeReservation <= Capacity`.
+- `reservedMemory = sum(live NodeReservation)`.
+- Admission, pools, zones, ResourceProbe, cluster projected load and recovery replacement aggregate NodeReservation only.
+- Only the sandbox initiates growth; the node accounts for a grant before returning it.
+- Only the sandbox submits shrink, after balloon current converges and memory.high is handled in the required order.
+- `Settled` is a lifecycle fact; it does not derive or rewrite reservation from memory.current.
+- Controller restart provisionally charges Capacity, then atomically replaces that charge after StateSync.
+- Stale heartbeats, host charge and node administrative commands cannot alter an individual sandbox's reservation.
 
-controller 由 `node-ctl conductor serve` 的 `resource_listen` 启动,没有独立 daemon
-子命令。管理命令只提供观察和 admission drain:
+<a id="2-命令行接口"></a>
+
+## 2. Command-line interface
+
+Conductor starts the controller through `resource_listen`; there is no standalone controller daemon subcommand. Administration provides observation and admission drain:
 
 ```text
 node-ctl resource status [--socket PATH]
@@ -75,17 +74,15 @@ node-ctl resource list   [--socket PATH]
 node-ctl resource drain  [--socket PATH] [--disable]
 ```
 
-`status` 展示 node budget、host reserved、operational margin、allocatable pool、
-reserved memory、startup in-flight、zone 和 recovery 数量。`list` 输出逐 sandbox
-reservation。`drain` 只禁止新 admission,不改变任何 live reservation。
+`status` shows node budget, host reserved, operational margin, allocatable pool, reserved memory, startup in-flight, zone and recovery counts. `list` shows each sandbox reservation. `drain` prevents new admission without altering live reservations.
 
-不存在 `resource grant` 或 `resource reclaim`。运行期需要改变 headroom 时应修改
-sandbox policy 输入,由 sandbox 已有闭环根据后续 observation 自行收敛;node 不直接
-介入 balloon/cgroup 流程。
+There is no `resource grant` or `resource reclaim`. Headroom is a sandbox-policy input: select it through supported sandbox configuration/lifecycle inputs, and let the sandbox's existing loop converge from observations. This does not introduce a node command for live policy reload or direct balloon/cgroup adjustment.
 
-## 3. 配置
+<a id="3-配置"></a>
 
-### 3.1 sandbox resource policy
+## 3. Configuration
+
+### 3.1 Sandbox resource policy
 
 ```yaml
 sandbox:
@@ -98,28 +95,17 @@ sandbox:
     watermark_high: { ratio: 0.875 }
 ```
 
-- `capacity.memory` 是 Capacity。
-- `allocatable.memory` 是 settled headroom,缺省 `256MiB`;若继承缺省值大于最终
-  Capacity,resolver 收敛到 Capacity。request 显式越界则拒绝。
-- `startup.memory` 是 cold startup headroom,缺省为最终 Capacity,同时适用于 static
-  和 dynamic 模式。它与 settled headroom 独立,不要求更大或更小。
-- `overhead.memory` 是 node-owned host VMM overhead;sandbox-ctl 位于独立 control
-  cgroup,不消费该额度。`watermark_high.ratio` 同样由 node policy 拥有。两者都不允许
-  request/template 设置。
-- `0 < allocatable.memory <= capacity.memory`。
-- `0 < startup.memory <= capacity.memory`。
-- `0 < watermark_high.ratio < 1`,缺省 `0.875`。
+- `capacity.memory` is Capacity.
+- `allocatable.memory` is settled headroom, default `256MiB`. If an inherited default exceeds final Capacity, the resolver clamps it to Capacity. Explicit out-of-range request values are rejected.
+- `startup.memory` is cold-start headroom, defaulting to final Capacity in both static and dynamic modes. It is independent of settled headroom and need not be greater or smaller.
+- `overhead.memory` is node-owned host VMM overhead. Sandbox-ctl occupies a separate control cgroup and does not consume that allowance. `watermark_high.ratio` also belongs to node policy. Neither may be set by requests/templates.
+- `0 < allocatable.memory <= capacity.memory`.
+- `0 < startup.memory <= capacity.memory`.
+- `0 < watermark_high.ratio < 1`, default `0.875`.
 
-restore 的 Capacity 来自 snapshot。`startup.memory` 不参与 restore admission;
-sandboxer 上报的 `BudgetAtSnapshot` 是唯一 initial reservation。
+Restore obtains Capacity from the snapshot. StartupHeadroom does not participate in restore admission: sandboxer's BudgetAtSnapshot is the sole initial reservation.
 
-restore 的同步请求只校验 portable patch 结构。runner 绑定 exact run-id 后,task 在进程内
-读取根 `snapshot.cfg`;Manifest Bundle根会先只读metadata prefix,从平面 `bundle/refs`补全
-located来源mapping,但不会打开或递归扫描refs Bundle。task把 Capacity 作为非秘密 summary
-交给唯一 launch worker;conductor不打开 snapshot。request 显式 Capacity 可作为 assertion,不一致或 snapshot 读取失败成为
-异步 `resource_resolve` failure。失败发生在 network Attach、sandbox YAML、controller Admit
-和 VM 启动前,并且绝不回退 node default。`BudgetAtSnapshot` 仍由 sandboxer 从 CH
-snapshot target/current 计算,不由 orchestrator probe 或推导。
+A synchronous restore request validates only the portable patch structure. After the runner binds the exact run-id, its task reads the root snapshot.cfg in-process. For a Manifest Bundle root, it first reads only the metadata prefix and supplements located-source mappings from flat bundle/refs metadata; it does not open or recursively scan refs Bundles. The task returns Capacity as a nonsecret summary to the unique launch worker; conductor does not open the snapshot. Explicit request Capacity can act as an assertion. A mismatch or unreadable snapshot becomes an asynchronous `resource_resolve` failure, before network Attach, sandbox YAML, controller Admit or VM startup, with no fallback to node defaults. Sandboxer still computes BudgetAtSnapshot from CH snapshot target/current; orchestrator does not probe or derive it.
 
 ### 3.2 resource_listen
 
@@ -150,31 +136,23 @@ resource_listen:
     queue_max_depth: 256
 ```
 
-`operational_margin_factor` 从物理可用量中保留 node safety margin。
-`emergency_factor` 为 high-urgency grow 保留 pool。`startup_factor` 限制创建/恢复中
-reservation 的并发总量。admission `rate`/`burst` 是请求 token bucket,不是内存
-Budget。
+`operational_margin_factor` reserves a node safety margin from the post-host budget. `emergency_factor` reserves pool capacity for high-urgency growth. `startup_factor` bounds aggregate reservations for concurrent creation/restoration. Admission rate/burst form a request token bucket, not memory Budget.
 
-controller preflight 要求 `host_reserved.memory < physical_memory`,并验证
-`0 <= operational_margin_factor < 1`、`0 <= low_factor < high_factor < 1`、
-`0 <= emergency_factor < startup_factor <= 1` 和
-`0 < memory_grant_per_sec_factor <= 1`。非法值在计算 pool 前失败,不会进入无符号减法
-或 cluster load 投影。
+Preflight requires `host_reserved.memory < physical_memory` and validates `0 <= operational_margin_factor < 1`, `0 <= low_factor < high_factor < 1`, `0 <= emergency_factor < startup_factor <= 1` and `0 < memory_grant_per_sec_factor <= 1`. Invalid values fail before pool calculation, unsigned subtraction or cluster-load projection.
 
-`resource_listen.socket` 是 endpoint 的唯一配置源。node-ctl 以绝对路径 bind,并把父目录
-symlink 规范化为 owner lock、lease inventory 和 sandbox client 共用的 canonical identity;
-最终 socket symlink、dangling 或 ambiguous alias fail closed。`control.cgroup_path` 不写入
-sandbox YAML,runner 仍通过继承 cgroup FD 注入该 host capability。
+`resource_listen.socket` is the sole endpoint configuration. Node-ctl binds an absolute path and canonicalizes parent-directory symlinks into the identity shared by owner lock, lease inventory and sandbox client. A symlink at the final socket, dangling path or ambiguous alias fails closed. Sandbox YAML does not carry `control.cgroup_path`; the runner injects that host capability through an inherited cgroup FD. `resource_listen.state_path` is deprecated and ignored; it does not enable state.json recovery (§8.1).
 
-### 3.3 request/template 所有权
+<a id="33-requesttemplate-所有权"></a>
 
-tenant resource patch 只允许 `capacity`、`allocatable`、`startup`。`control`、
-`overhead`、`watermark_high`、sensor 和 `deflate_on_oom` 均由 node resolver 管理。
-parser 对未知字段和这些越权字段直接报错,不会静默忽略。
+### 3.3 Request/template ownership
 
-## 4. Node reservation 模型
+Tenant resource patches allow only `capacity`, `allocatable` and `startup`. The node resolver owns `control`, `overhead`, `watermark_high`, sensors and deflate_on_oom. The parser rejects unknown or unauthorized fields instead of silently ignoring them.
 
-### 4.1 pool
+<a id="4-node-reservation-模型"></a>
+
+## 4. Node reservation model
+
+### 4.1 Pool
 
 ```text
 Physical           = NodeBudget status field
@@ -186,29 +164,28 @@ MainHeadroom        = saturating_sub(AllocatablePool, Reserved + EmergencyPool)
 StartupPool         = AllocatablePool * startup_factor
 ```
 
-`NodeBudget` 是现役 status/wire 名称,其值为配置或探测到的物理资源总量;不能在公式
-中再次把它当作已经扣除 `HostReserved` 的结果。
+NodeBudget is the current status/wire name for configured or discovered physical resources. Do not treat it as an amount from which HostReserved was already subtracted.
 
-减法使用不下溢的资源运算。所有 reservation 更新与 aggregate 更新位于同一 State
-临界区。插入或 recovery replacement 在修改索引前验证 aggregate 加法不会溢出。
+Resource subtraction saturates instead of underflowing. Individual reservation and aggregate updates occur in the same State critical section. Insertion/recovery replacement validates aggregate-addition overflow before modifying indices.
 
-### 4.2 zone
+### 4.2 Zone
 
-zone 仅由 `Reserved / AllocatablePool` 推导:
+Zone derives solely from Reserved / AllocatablePool:
 
-| zone | 含义 |
+| Zone | Meaning |
 |---|---|
-| green | 正常 admission 和 grow |
-| yellow | 保守运行,仍可按 policy grant |
-| red | 拒绝新 admission;非 high urgency grow 暂缓 |
-| critical | 只保留安全/高紧急请求路径 |
+| green | Normal admission and growth. |
+| yellow | Conservative operation; policy can still grant. |
+| red | Reject new admission and defer non-high-urgency growth. |
+| critical | Retain only safety/high-urgency request paths. |
 
-zone 不读取 `MemAvailable`、balloon current、`memory.current` 或 sandbox lifecycle
-细节。
+Zone does not consume MemAvailable, balloon current, memory.current or sandbox lifecycle details.
 
-### 4.3 runtime grant
+<a id="43-runtime-grant"></a>
 
-现役 `RequestBudget` 是绝对 baseline 加 delta 的 reservation transaction:
+### 4.3 Runtime grants
+
+RequestBudget is a reservation transaction with an absolute baseline and delta:
 
 ```text
 request:  CurrentReservation, RequestedDelta, Urgency
@@ -218,59 +195,61 @@ NewReservation = CurrentReservation + GrantedDelta
 0 <= GrantedDelta <= RequestedDelta
 ```
 
-sandbox 可收到 partial grant。sandboxer 会先累积 reservation,只有当额度足以表示一个
-64MiB 对齐 Budget 时才执行 balloon deflate,因此取整不会制造未保留内存。
+Partial grants are allowed. Sandboxer accumulates reservation first and deflates the balloon only when it can represent a 64 MiB-aligned Budget, so rounding cannot create unreserved memory.
 
-shrink 使用同一消息,但 `RequestedDelta=0`:sandbox 在本地完成 balloon inflate、
-current convergence 和 `memory.high` 顺序后,以较小的绝对 baseline 提交释放。node
-不轮询 CH,也不判断 shrink 是否完成。
+Shrink uses the same message with RequestedDelta=0. After local balloon inflation, current convergence and ordered memory.high adjustment, the sandbox submits a smaller absolute baseline to release reservation. The node neither polls CH nor decides whether shrink has completed.
 
-## 5. Reservation 协议
+<a id="5-reservation-协议"></a>
 
-### 5.1 传输与认证
+## 5. Reservation protocol
 
-协议由 sandboxer `pkg/resource` 定义,使用 Unix socket 上的 length-prefixed JSON。
-每个 sandbox 使用长连接和 token。controller restart/reconnect 使用 lifecycle lease、
-`SO_PEERCRED`、managed pidfile/cgroup identity 和 `StateSync` 重建 session。
+<a id="51-传输与认证"></a>
 
-### 5.2 现役消息
+### 5.1 Transport and authentication
 
-| 消息 | 方向 | node 作用 |
+Sandboxer `pkg/resource` defines length-prefixed JSON over Unix sockets. Each sandbox uses a persistent connection and token. Controller restart/reconnect rebuilds sessions with lifecycle leases, SO_PEERCRED, managed pidfile/cgroup identity and StateSync.
+
+<a id="52-现役消息"></a>
+
+### 5.2 Current messages
+
+| Message | Direction | Node action |
 |---|---|---|
-| Admit | sandbox→node | 完整 initial reservation admission |
-| Settled | sandbox→node | 只切换生命周期 stage |
-| RequestBudget | sandbox→node | reconcile absolute baseline,可选 grow grant |
-| OOMReport | sandbox→node | 诊断计数,不直接修改 reservation |
-| Heartbeat | sandbox→node | liveness/host charge,返回 reservation echo |
-| StateSync | sandbox→node | 以 sandbox 的安全绝对 baseline 替换 provisional state |
-| Release | sandbox→node | 删除 reservation 和 aggregate charge |
-| AdminDrain/Status/List | admin→node | admission drain 与观察 |
+| Admit | Sandbox → node. | Admit the full initial reservation. |
+| Settled | Sandbox → node. | Change lifecycle stage only. |
+| RequestBudget | Sandbox → node. | Reconcile absolute baseline and optionally grant growth. |
+| OOMReport | Sandbox → node. | Count diagnostics; no direct reservation change. |
+| Heartbeat | Sandbox → node. | Record liveness/host charge and echo reservation. |
+| StateSync | Sandbox → node. | Replace provisional state with the sandbox's safe absolute baseline. |
+| Release | Sandbox → node. | Delete reservation and aggregate charge. |
+| AdminDrain/Status/List | Admin → node. | Admission drain and observation. |
 
-没有 node→sandbox 的 balloon/cgroup 命令,也没有 admin grant/reclaim。
+There are no node-to-sandbox balloon/cgroup commands or administrative grant/reclaim operations.
 
-### 5.3 现有 wire 字段语义
+<a id="53-现有-wire-字段语义"></a>
 
-本变更保持现役 reservation 报文形状,没有新增 Budget 协议。因而代码中的 wire 名称
-按以下方式解释:
+### 5.3 Existing wire-field semantics
 
-| wire/Go 名称 | 当前含义 |
+The current implementation retains the existing reservation message shape; it does not add a separate Budget protocol. Interpret wire names as follows:
+
+| Wire/Go name | Current meaning |
 |---|---|
-| `FloorMemoryBytes` | settled `HeadroomMemoryBytes` |
-| `StartupBudgetMemory` | 已按 target 对齐的 cold InitialBudget |
-| `AllocatableAtSnapshot` | restore `BudgetAtSnapshot` |
-| `GrantedInitialAlloc` | 完整 InitialBudget |
-| `CurrentAlloc` | sandbox 的安全绝对 NodeReservation baseline |
-| `NewAllocatable` | node 事务后的 NodeReservation/heartbeat echo |
-| `AppliedAllocatableMemory` | StateSync 的安全 NodeReservation baseline |
-| `CurrentRSS` | HostMemoryCurrent 诊断值,即 host VMM cgroup charge |
+| `FloorMemoryBytes` | Settled HeadroomMemoryBytes. |
+| `StartupBudgetMemory` | Cold InitialBudget aligned through the target calculation. |
+| `AllocatableAtSnapshot` | Restore BudgetAtSnapshot. |
+| `GrantedInitialAlloc` | Full InitialBudget. |
+| `CurrentAlloc` | Sandbox's safe absolute NodeReservation baseline. |
+| `NewAllocatable` | NodeReservation after the node transaction / heartbeat echo. |
+| `AppliedAllocatableMemory` | Safe NodeReservation baseline in StateSync. |
+| `CurrentRSS` | Diagnostic HostMemoryCurrent, the host VMM cgroup charge. |
 
-这些字段不表示 guest RSS、guest demand、balloon current 或 `memory.high` target。
-保留报文形状是已确认的架构边界,不是新旧语义双路径;实现中没有 negotiation、版本
-gate、alias decoder 或 mixed-version 分支。
+These fields do not mean guest RSS, demand, balloon current or a memory.high target. Keeping the message shape is the architecture boundary, not two old/new semantic paths. The implementation has no negotiation, version gate, alias decoder or mixed-version branch for this model; this does not establish an arbitrary cross-version compatibility guarantee.
 
-## 6. 生命周期
+<a id="6-生命周期"></a>
 
-### 6.1 cold admission
+## 6. Lifecycle
+
+### 6.1 Cold admission
 
 ```text
 sandbox resolve H/Hs/C
@@ -282,10 +261,9 @@ sandbox resolve H/Hs/C
   -> fresh report drives sandbox-local steady policy
 ```
 
-node 不能 partial-admit。首份 report 前不从 host `memory.current` 推导 Budget。
-`Settled` 清除 startup-in-flight charge,但不改变 `NodeReservation`。
+The node cannot partially admit initial memory. Before the first report, host memory.current does not determine Budget. Settled clears startup-in-flight charge without changing NodeReservation.
 
-### 6.2 restore admission
+### 6.2 Restore admission
 
 ```text
 sandbox reads Capacity,target,current from snapshot
@@ -295,112 +273,109 @@ sandbox reads Capacity,target,current from snapshot
   -> sandbox-local normalization/new epoch/steady loop
 ```
 
-node 不消费 startup headroom,不读取 snapshot balloon state,也不在 ACK/MUX 前触发
-调整。它只看到 sandbox 提交的 exact initial reservation。
+The node neither uses startup headroom nor reads snapshot balloon state, and it does not trigger adjustment before ACK/MUX. It sees only the exact initial reservation submitted by the sandbox.
 
-### 6.3 runtime shrink/grow
+### 6.3 Runtime shrink/grow
 
-grow 的跨边界顺序是:
+Cross-boundary growth ordering:
 
 ```text
 sandbox RequestBudget -> node charge/grant -> response
 sandbox memory.high up -> balloon deflate
 ```
 
-shrink 的跨边界顺序是:
+Cross-boundary shrink ordering:
 
 ```text
 sandbox balloon inflate -> wait current -> memory.high down
 sandbox RequestBudget(smaller baseline, delta=0) -> node release
 ```
 
-node 与 sandbox 流程没有共享状态机;reservation 请求/响应是唯一协调边界。
+Node and sandbox do not share a state machine. Reservation requests/responses are their sole coordination boundary.
 
-## 7. Admission 与调度投影
+<a id="7-admission-与调度投影"></a>
 
-### 7.1 admission
+## 7. Admission and scheduling projection
 
-Cold 使用 `StartupBudgetMemory`,restore 使用 `AllocatableAtSnapshot`。选择后的
-InitialBudget 必须同时满足:
+### 7.1 Admission
 
-- 不超过 sandbox Capacity。
-- 不超过 `AllocatablePool` 和 startup pool 的单请求上界。
-- 当前 main headroom 和 startup headroom 足够。
-- node 未 drain,zone 未进入 red/critical。
-- admission token bucket 可用。
+Cold uses StartupBudgetMemory; restore uses AllocatableAtSnapshot. The selected InitialBudget must satisfy all of the following:
 
-短期不足进入 FIFO queue;请求本身超过节点上界或 node protection 条件不允许时拒绝。
-任何路径都不会用较小 initial grant 继续启动/恢复。
+- It does not exceed sandbox Capacity.
+- It fits the per-request limits of AllocatablePool and startup pool.
+- Current main headroom and startup headroom suffice.
+- Node is not drained and zone is not red/critical.
+- An admission token is available.
 
-### 7.2 ResourceProbe 与 cluster load
+Temporary shortages can enter the FIFO queue. Requests beyond node limits, or disallowed by node-protection conditions, are rejected. No path proceeds with a smaller initial grant for startup/restore.
 
-`ResourceProbe.Allocated` 和 cluster projected memory load 使用
-`reservedMemory`,不是 host charge。E2B `memoryMB` 继续表示 Capacity/SKU。
+<a id="72-resourceprobe-与-cluster-load"></a>
 
-per-sandbox resource stats 中:
+### 7.2 ResourceProbe and cluster load
 
-- `memTotal` 是 Capacity。
-- `memAllocatable` 是现有 API 名称,值为 NodeReservation。
-- `memUsed` 是 HostMemoryCurrent/VMM cgroup charge。
+ResourceProbe.Allocated and cluster projected memory load use reservedMemory, not host charge. E2B memoryMB still means Capacity/SKU.
 
-`memUsed` 不是 DemandMemory,也不参与 RequestBudget、admission 或 recovery charge。
+Per-sandbox resource statistics:
 
-## 8. 可靠性
+- `memTotal`: Capacity.
+- `memAllocatable`: existing API name for NodeReservation.
+- `memUsed`: HostMemoryCurrent/VMM cgroup charge.
 
-### 8.1 inventory 与 controller restart
+MemUsed is not DemandMemory and does not participate in RequestBudget, admission or recovery charge.
 
-lifecycle lease 保存 sandbox identity、Capacity、headroom、cold startup headroom、cgroup
-identity 和 feature 信息。controller 启动扫描 lease、managed pidfile 与 configured
-cgroup roots:
+<a id="8-可靠性"></a>
 
-1. 已知 lease 按 Capacity provisional charge。
-2. identity 不完整的 live cgroup 按可证明的保守上界 charge。
-3. sandbox 重新连接后发送 StateSync。
-4. State 在一个临界区中删除 provisional charge 并插入 sandbox 上报的
-   NodeReservation。
+## 8. Reliability
 
-controller 不读取旧持久化 state schema,也不从 `memory.current` 重建 guest Budget。
+<a id="81-inventory-与-controller-restart"></a>
 
-### 8.2 response loss 与 reconnect
+### 8.1 Inventory and controller restart
 
-- grow 响应丢失时,sandbox 尚未据此执行 high/deflate,仍保留本地旧 baseline;
-  StateSync 原子替换 node provisional charge,不会少记。
-- shrink commit 响应丢失时,balloon current 已收敛且 `memory.high` 已降低;
-  sandbox 因而使用已完成的较小 baseline。node 已提交时双方相等,node 未提交时
-  StateSync 完成释放。继续使用旧的大 baseline 反而可能让 sandbox 复用 node
-  已释放并重新分配的 headroom。
-- Heartbeat mismatch 触发 reconnect/StateSync,不会把 echo 当作执行命令。
-- stale heartbeat 和 host charge 只能更新诊断时间/数值,不能改变 reservation。
+Lifecycle leases retain sandbox identity, Capacity, headroom, cold-start headroom, cgroup identity and feature information. At startup, inventory scans leases, managed pidfiles and configured cgroup roots:
 
-### 8.3 reservation 生命周期
+1. Provisionally charge known leases at Capacity.
+2. Charge live cgroups with incomplete identity at a provable conservative upper bound.
+3. Receive StateSync when each sandbox reconnects.
+4. Within one State critical section, remove provisional charge and insert the reported NodeReservation.
 
-startup TTL 只清理未达到 Settled 的失败创建。heartbeat timeout、release 和 inventory
-清理均按 reservation identity/token 原子删除索引与 aggregate。未知或 provisional
-reservation 不接受普通 grow transaction。
+The controller does not read the old persistent state schema or reconstruct guest Budget from memory.current. Read-only recovery checks include cgroup.events, cgroup.procs, process cgroup identity and memory.max; these establish liveness/conservative accounting, not a second guest-memory controller.
 
-## 9. 性能与可观测性
+<a id="82-response-loss-与-reconnect"></a>
 
-admission token bucket 限制创建请求洪峰;startup pool 限制创建/恢复中的内存总额;
-runtime grant token bucket 限制普通 grow 的节点总速率。high urgency 可使用 emergency
-pool。allocator 可返回 cooldown,由 sandbox 后续 observation/pressure event 重试。
+### 8.2 Lost responses and reconnects
 
-当前 reservation 与恢复状态通过 `resource status`、`resource list` 和 cluster heartbeat
-观察。异常 queue 诊断进入 conductor 标准日志出口,由部署环境统一采集与保留。重点口径包括:
+- If a growth response is lost, the sandbox has not raised high/deflated based on that response and retains its old local baseline. StateSync atomically replaces provisional node charge without undercounting.
+- If a shrink-commit response is lost, balloon current has already converged and memory.high is lower, so the sandbox uses the completed smaller baseline. If the node committed, both agree; otherwise StateSync completes the release. Reusing the old larger baseline could let the sandbox reuse headroom the node already released and reassigned.
+- A heartbeat mismatch triggers reconnect/StateSync; its echo is not an execution command.
+- Stale heartbeats and host charge can update diagnostic times/values only, never reservation.
 
-- reserved memory / pool / zone。
-- startup in-flight。
-- provisional/unknown reservation 数量。
-- per-sandbox HostMemoryCurrent 及最后上报时间。
-- grant/cooldown 和 admission queue 时延。
+<a id="83-reservation-生命周期"></a>
 
-这些指标不能混成一个“内存使用量”:reservation、host VMM charge 和 guest demand
-分别属于不同口径。
+### 8.3 Reservation lifecycle
 
-## 10. See Also
+Startup TTL cleans failed creations that never reached Settled. Heartbeat timeout, Release and inventory cleanup atomically remove indices/aggregate charge by reservation identity/token. Unknown or provisional reservations cannot use ordinary growth transactions.
 
-- [node](node.md)
-- [sandboxer sandbox](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md)
-- [cluster](cluster.md)
-- `sandboxer/pkg/resource`
-- `internal/nodectl`
-- `internal/sandboxcfg/resource.go`
+<a id="9-性能与可观测性"></a>
+
+## 9. Performance and observability
+
+The admission token bucket bounds creation bursts; startup pool bounds memory reserved for creating/restoring sandboxes; the runtime-grant token bucket bounds aggregate normal growth rate. High urgency can use emergency pool. The allocator may return cooldown, with retries driven by later sandbox observations/pressure events.
+
+Observe reservation/recovery state with resource status/list and cluster heartbeats. Abnormal queue diagnostics use conductor's standard logs, collected and retained by the deployment. Key measures are:
+
+- Reserved memory / pool / zone.
+- Startup in-flight.
+- Provisional/unknown reservation counts.
+- Per-sandbox HostMemoryCurrent and last-report time.
+- Grant/cooldown and admission queue latency.
+
+Do not combine these into one undifferentiated memory-usage value: reservation, host VMM charge and guest demand are separate measures.
+
+## 10. See also
+
+- [node](node.md).
+- [sandboxer sandbox](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md).
+- [cluster](cluster.md).
+- [sandboxer/pkg/resource](https://github.com/kuasar-sandbox/sandboxer/tree/main/pkg/resource).
+- [internal/nodectl](../internal/nodectl/).
+- [internal/sandboxcfg/resource.go](../internal/sandboxcfg/resource.go).
