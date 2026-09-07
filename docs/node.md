@@ -150,7 +150,7 @@ legacy `(sid, port)`.e2b profile 的 49983/49999 使用 EnvdAccessToken,拨 sand
 TrafficAccessToken 仅供外部网关及 e2b
 数据面组件使用,node 平台层不消费。对 paused
 沙箱的请求触发自动 resume(与其它入口共用 launch owner,§8).独立 Proxy 是唯一节点数据面,
-转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
+转发层设计见 [node-proxy.md](node-proxy_zh.md)。集群下,数据面由 cluster-ctl router 经
 把公开稳定 SandboxID 转换为当前 NodeSandboxID,再注入 `E2b-Sandbox-Id` +
 `X-Access-Token` 转发进本节点 proxy(cluster-router.md)。
 
@@ -263,7 +263,7 @@ node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 run
 ### 2.3 `node-ctl proxy`
 
 独立数据面 master;运维带外起,与 conductor 同节点.配置文件驱动
-(`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),worker 由 master
+(`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy_zh.md) §2),worker 由 master
 从自己的当前 executable 内部 reexec 和监督；worker 不经过 node-ctl CLI，也不重新读取配置:
 
 ```
@@ -610,7 +610,7 @@ activation/Wake、binding revalidation、dial 和 traffic 生命周期；它不�
 guest clone，CONNECT 不调用它；generic helper 拒绝 native exec，标准 `next` 仍走 KAT/CEL。
 配置中的 executable 仅选择 node-ctl → master，用户 Hook
 不得改变它。V1 不支持热更新，custom component 与 node-ctl 必须来自兼容版本。完整 API、
-示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy.md) §2.1。
+示例、进程模型、安全边界和非目标见 [node-proxy.md](node-proxy_zh.md) §2.1。
 
 该扩展仅覆盖独立 Proxy;cluster-router/registry/placer 不增加 Extension.
 除上述 master management 与 worker ingress wrapper 外，不开放 listener、原始
@@ -810,7 +810,7 @@ conductor 经当前 trusted Proxy registration 的 `stats_socket` 读取 master 
 route 未完成同步、RunID/profile/state 不匹配、worker stream 故障或 replacement 未 ready 为 503。
 stats 的 503 窗口不影响 Proxy master 的 route/admission authority 或 Create barrier。完整共享
 admission算法、误差证明、worker-local状态机、绝对快照 stream 和故障窗口见
-[node-proxy.md](node-proxy.md) §8。
+[node-proxy.md](node-proxy_zh.md) §8。
 
 ### 4.2 控制面:模板构建 API
 
@@ -854,7 +854,7 @@ authority 的 443 只是 transport 占位,不是 guest port;即使请求同时�
 且始终强制验证 KAT,不受普通 proxy `off|log|enforce` 模式影响.最终 proxy 在回复
 CONNECT 200 后严格读取并授权完整 `exec_request` 首帧;条件通过后才可以恢复 paused
 sandbox、连接 `ctl.sock` 并原样转发首帧;详见
-[node-proxy.md](node-proxy.md) §5.
+[node-proxy.md](node-proxy_zh.md) §5.
 
 ### 4.4 templateID 与模板形态(transient / persist,无 templates 表)
 
@@ -962,7 +962,7 @@ MigrationToken 已携 Metadata,所以 absent 在目标端继续 absent,显式 pa
 overflow 均返回 400。bare Sandbox 显式声明 `e2b:envd` 或
 `e2b:code-interpreter` 拒绝;节点默认可以包含这些 service,bare 只消费
 `total`、`forward`、`exec`。该限制是 inflight concurrency,不是 QPS 或 Proxy global capacity;
-完整算法与误差边界见 [node-proxy.md](node-proxy.md) §8。
+完整算法与误差边界见 [node-proxy.md](node-proxy_zh.md) §8。
 
 最终 resolver 先确定 capacity,再解析 allocatable/startup,最后添加 node-only
 overhead/watermark/deflate/controller。node policy 中省略的 allocatable.memory 超过最终
@@ -1797,7 +1797,7 @@ proxy 不读取 kind。Migration token 是 sandbox 级敏感凭据,不会随 rou
 ## 9. 数据面边界
 
 数据面**转发层**——L7 反代:按 `(sid, port)` 路由到 guest envd / floatingip,逐请求
-鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [node-proxy.md](node-proxy.md)。
+鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [node-proxy.md](node-proxy_zh.md)。
 conductor 只服务控制 API,生命周期和本节点路由权威;它不构造 proxy,不监听数据口,
 不接收或转发 sandbox data.独立 `node-ctl proxy` 的必填 `data_listen` 是唯一节点数据入口.
 
@@ -2609,7 +2609,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 
 ## 17. See Also
 
-- [node-proxy.md](node-proxy.md) —— 独立数据面转发层:路由判定 / routesync /
+- [node-proxy.md](node-proxy_zh.md) —— 独立数据面转发层:路由判定 / routesync /
   数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 的唯一数据入口,集群下 router 转发进入)
 - [node-resource.md](node-resource_zh.md) —— 节点资源控制协议、sandbox resource policy
   与控制器内部组织(serve 经唯一的 `resource_listen` endpoint 内置)
