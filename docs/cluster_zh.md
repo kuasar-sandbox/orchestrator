@@ -599,8 +599,7 @@ node_link 维护以下 recordSet:
 - `key_pair`:selector patch 刷新的 APISecret+ManifestKey pair cache。
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`key_pair`
-recordSet。sandbox/build 表由 cluster 在任务下发前写入。Build 终态在 exact host cleanup 后释放 execution claim；durable row 保留期间 registration claim
-仍然计费。归属记录保留到对应 node terminal retention 删除 Build row 并发送 `BuildDelete`；
+recordSet。sandbox/build 表由 cluster 在任务下发前写入。Registration usage 只统计非终态 Build row，在 ready/error transition 时释放；已执行 Build 必须先完成 exact host cleanup，才提交终态并释放 execution ownership。保留终态历史不会继续占用准入额度。归属记录保留到对应 node terminal retention 删除 Build row 并发送 `BuildDelete`；
 Registry 随后 exact-delete 对应 Build projection 与 owner ref。key_pair 由 selector patch 更新。
 node 不生成 group/route-key,但会校验并独立持久化 node-link 下发的 sandbox system context;
 build 的 cluster group 是节点 Build 行的独立系统字段,不进入 portable metadata。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
@@ -1086,10 +1085,10 @@ node_link build_register → node durable registration admission
   │ ambiguous dispatch: keep intent pinned to this node/BuildID
   ▼
 node BuildUpsert projects state; heartbeat projects durable usage
-  │ exact execution cleanup releases execution claim
-  │ terminal row/registration claim remain through retention
+  │ exact execution cleanup precedes terminal commit / execution release
+  │ ready/error no longer counts toward registration; history remains
   ▼
-node TTL deletion releases registration; BuildDelete removes projection/ref
+node TTL deletes history; BuildDelete removes projection/ref
 ```
 
 `ReserveBuild` 返回当前 node 的 `APIEndpoint`;Router 的 build status/trigger/files/log 等后续
@@ -1121,8 +1120,7 @@ ambiguous registration 静默改放另一节点。相同 build_id 在不同 node
 
 BuildUpsert/Delete 只携带 node-local Build 投影；nodelink owner 以 immutable `(node_id,build_id)` ref
 查得 group。终态 Upsert 更新查询投影，durable node heartbeat 报告 claim usage。exact execution owner
-cleanup 后释放 execution usage，但保留 row 时仍保留 registration claim；节点 TTL 删除时释放
-registration 并发送 `BuildDelete`，Registry 再删除 exact projection/ref。北向查询与 router cache 始终带 group。节点把每次 Build durable transition 与对应 live publication 放在无条件的
+cleanup 后的 terminal commit 释放 execution ownership，row 同时不再计入 registration usage；节点 TTL 随后删除保留历史并发送 `BuildDelete`，Registry 再删除 exact projection/ref。源码见 [durable usage query](../internal/store/build_admission.go) 与 [registration transaction](../internal/store/mmds_route_secret_values.go)。北向查询与 router cache 始终带 group。节点把每次 Build durable transition 与对应 live publication 放在无条件的
 per-Build fence 内；该顺序不依赖 conductor Extension 是否启用，因此 waiting 不会在 building/terminal
 之后迟到覆盖 Registry projection。
 
