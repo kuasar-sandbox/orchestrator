@@ -8,7 +8,7 @@
 cluster-router 进入本节点的请求按 `(sid, target)` 路由到 guest envd/CI UDS,
 sandbox floatingip 用户端口或 native exec `ctl.sock`.普通 HTTP 的 target 仍是 legacy
 port;CONNECT 可以用 `E2b-Sandbox-Service` 显式选择逻辑服务.控制面 API,生命周期,密钥,构建由
-`node-ctl conductor serve` 承载,见 [node.md](node.md);本文只描述数据面转发层。
+`node-ctl conductor serve` 承载,见 [node.md](node_zh.md);本文只描述数据面转发层。
 
 ```text
 client / cluster-router
@@ -102,7 +102,7 @@ FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已
 xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
 不匹配均 fail closed；这是进程组织和防误用，不是抵抗同 UID 恶意进程的密码学认证。
 
-可编译示例见 [examples/custom-proxy](../examples/custom-proxy/README.md)：
+可编译示例见 [examples/custom-proxy（英文）](../examples/custom-proxy/README.md)：
 
 ```go
 app := proxy.New(proxy.Hooks{
@@ -194,7 +194,7 @@ SHM、listener、routesync、stats、dial target 或 credential records。除同
 运行时发现、多 Extension registry、通用 lifecycle hook、secret resolver 或 DI container。
 `node-ctl config proxy` 只做 declarative/bootstrap 与
 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
-启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md](extensions.md)。
+启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md（英文）](extensions.md)。
 
 ## 3. 部署拓扑
 
@@ -786,7 +786,7 @@ code interpreter、forward 业务端口或用户应用 health 已监听;业务 b
 
 ## 11. See Also
 
-- [node.md](node.md) — conductor 控制面,Proxy 部署,生命周期与密钥模型.
+- [node.md](node_zh.md) — conductor 控制面,Proxy 部署,生命周期与密钥模型.
 - [cluster-router_zh.md](cluster-router_zh.md) — 集群入口如何转发到本节点数据面。
 - [Connector vSwitch](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch_zh.md) — mgmt-extract / MMDS VIP 转换。
 - [部署文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md) — 部署拓扑、端口与故障域。

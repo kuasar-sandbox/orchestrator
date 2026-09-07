@@ -211,12 +211,12 @@ export E2B_SANDBOX_URL=http://host:3443
 python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s.commands.run("uname -a").stdout)'
 ```
 
-命令与参数详见 [docs/node.md](docs/node.md) §2,配置字段 §3,e2b API 契约 §4,集群接入 §10;
+命令与参数详见 [docs/node.md](docs/node_zh.md) §2,配置字段 §3,e2b API 契约 §4,集群接入 §10;
 集群控制面见 [docs/cluster.md](docs/cluster_zh.md)。
 
 ## 文档
 
-- [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
+- [docs/node.md](docs/node_zh.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
 - [docs/node-proxy.md](docs/node-proxy_zh.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
   routesync / per-Sandbox max inflight / traffic stats / 数据面鉴权 / MMDS / service-addressed CONNECT /
@@ -233,4 +233,4 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 ## License
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
-贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+贡献授权说明见 [CONTRIBUTING.md（英文）](CONTRIBUTING.md).
