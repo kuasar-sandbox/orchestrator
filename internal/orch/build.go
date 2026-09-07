@@ -1919,9 +1919,10 @@ func (o *Orchestrator) buildSpecForPending(ctx context.Context, pend *pendingBui
 			}
 		}
 	}
-	// Publication names/URIs are NOT derived here: the builder mints one for
-	// each actual image-class or checkpoint-class publication, so a build that
-	// crosses UTC midnight may correctly use different date buckets.
+	// Publication names/URIs are NOT derived here: the builder mints the
+	// bare-build-id name for each actual image-class or checkpoint-class
+	// publication, so every publication of one build converges on one
+	// directory.
 	checkpointParent := o.cfg.Checkpoint.Remote.RefLocationParent
 
 	importReferer, err := o.effectiveImportReferer(b)

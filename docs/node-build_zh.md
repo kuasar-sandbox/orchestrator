@@ -438,8 +438,8 @@ Image target 或顶层 E 的 Manifest-store destination。
   发布，只返回 `snapshot_ref`。EΔ 保留该 IMG ref；local tarstream 与 Snapshot Bundle 都不重新
   物化或复制 portable image Bundle。不存在来源 S memory restore 或 C disk-only 分支。
 
-每个 named publication 都在实际写入时用 build ID + 当时 UTC 日期生成 name；跨午夜时 image
-与 checkpoint 可以位于不同 date bucket，每个 located ref 自带自己的 name。single-root image
+每个 named publication 都以裸 build ID 作为 name,因此同一 Build 的全部发布收敛到同一个
+BuildID 目录;每个 located ref 自带自己的 name。single-root image
 Bundle 不创建 `.image`/`.sandbox` tarstream或 BuildID/SandboxID semantic alias，只提交
 `<manifest-root>.bundle`。提交使用 target-directory 临时文件、root-last finalize、完整校验、
 独占 final、检查完整 write/Close 并重新打开校验 final path；publisher 明确不 fsync fresh final

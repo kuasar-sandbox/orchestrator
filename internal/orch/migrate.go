@@ -416,6 +416,13 @@ func (o *Orchestrator) importSandboxWithKeyOptions(
 	if err != nil {
 		return nil, fmt.Errorf("import-sandbox: open migration token: %w", err)
 	}
+	// The token StableID later keys the entity's publication location names
+	// (reflocation.PublicationName), so admission enforces the same opaque-id
+	// contract local IDs satisfy; a malformed identity would otherwise surface
+	// only as an export-time Resolve failure.
+	if !types.ValidLocalSandboxID(payload.StableID) {
+		return nil, fmt.Errorf("import-sandbox: invalid stable ID: %w", api.ErrBadRequest)
+	}
 	if err := migrationtoken.ValidateExpectations(payload, expected); err != nil {
 		return nil, fmt.Errorf("import-sandbox: validate target: %w", err)
 	}
