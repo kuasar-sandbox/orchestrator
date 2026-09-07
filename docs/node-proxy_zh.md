@@ -102,7 +102,7 @@ FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已
 xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
 不匹配均 fail closed；这是进程组织和防误用，不是抵抗同 UID 恶意进程的密码学认证。
 
-可编译示例见 [examples/custom-proxy](../examples/custom-proxy/README.md)：
+可编译示例见 [examples/custom-proxy（英文）](../examples/custom-proxy/README.md)：
 
 ```go
 app := proxy.New(proxy.Hooks{
@@ -194,7 +194,7 @@ SHM、listener、routesync、stats、dial target 或 credential records。除同
 运行时发现、多 Extension registry、通用 lifecycle hook、secret resolver 或 DI container。
 `node-ctl config proxy` 只做 declarative/bootstrap 与
 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
-启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md](extensions.md)。
+启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md（英文）](extensions.md)。
 
 ## 3. 部署拓扑
 

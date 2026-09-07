@@ -555,7 +555,7 @@ node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取�
 退出。`Host` 提供 Sandbox/Build `Get+Watch` 非秘密深拷贝视图。Watch 使用
 `sync_begin → snapshot → sync_end → live` generation；慢 watcher 只使自己的 generation
 失效并自动 full resync，不保证观察每个中间变化，也不是 durable audit。完整合同见
-[extensions.md](extensions.md)。
+[extensions.md（英文）](extensions.md)。
 
 同一 Extension 可选实现 `SandboxHook`、`BuildHook` 与 `APIWrapper`；这些能力只在 Start
 成功后检查一次并冻结。生命周期 Hook 都在认证后、durable/runner/network/snapshot 副作用前
@@ -594,7 +594,7 @@ audit；TrafficSource 直接读进程内聚合，不走 stats UDS。observer 只
 非阻塞发布，慢 callback 不影响 SHM、routesync、barrier ACK、Wake 或 worker。Start 后同一对象
 的可选 `ManagementWrapper` 可添加、覆盖或透传 `stats_socket` route；没有 namespace 或 conflict
 registry。公共 View 不复制原始 secret/token，也不新增 route metadata 或 SHM schema。详见
-[extensions.md](extensions.md)。
+[extensions.md（英文）](extensions.md)。
 
 master 在 Configure/final validation 后 deep-clone、canonical serialize 并 digest 冻结
 EffectiveConfig，再用自己的 `/proc/self/exe` 启动 worker：内置模式是 node-ctl，custom 模式是
