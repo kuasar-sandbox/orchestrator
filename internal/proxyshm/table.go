@@ -25,7 +25,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 7
+	schema uint32 = 8
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -73,20 +73,20 @@ type mmapHeader struct {
 }
 
 type mmapRecord struct {
-	Seq                 uint64
-	Hash                uint64
-	Status              uint32
-	_                   uint32
-	SyncGen             uint64
-	Rev                 uint64
-	AdmissionGeneration uint64
-	AdmissionSlot       uint32
-	MaxInflightTotal    uint32
-	MaxInflightForward  uint32
-	MaxInflightEnvd     uint32
-	MaxInflightCI       uint32
-	MaxInflightExec     uint32
-	_Admission          uint32
+	Seq                  uint64
+	Hash                 uint64
+	Status               uint32
+	_                    uint32
+	SyncGen              uint64
+	Rev                  uint64
+	AdmissionGeneration  uint64
+	AdmissionSlot        uint32
+	MaxInflightTotal     uint32
+	MaxInflightForward   uint32
+	MaxInflightEnvd      uint32
+	MaxInflightCI        uint32
+	MaxInflightExec      uint32
+	TrafficPolicyInvalid uint32
 
 	SandboxID              [maxSandboxID]byte
 	Profile                [maxProfile]byte
@@ -201,7 +201,7 @@ func Size(capacity int) int {
 
 func terminalCapacity(capacity int) int {
 	if capacity <= 0 {
-		capacity = defaultCapacity
+		return defaultCapacity
 	}
 	if capacity > maxTerminalRevisions {
 		return maxTerminalRevisions
@@ -578,6 +578,7 @@ func readRecordSnapshot(rec *mmapRecord) (recordSnapshot, bool) {
 				ArtifactLocation:       fixedString(rec.ArtifactLocation[:]),
 				MmdsSecret:             fixedString(rec.MmdsSecret[:]),
 				RunID:                  fixedString(rec.RunID[:]),
+				TrafficPolicyInvalid:   rec.TrafficPolicyInvalid != 0,
 				EffectiveMaxInflight: config.MaxInflight{
 					Total: rec.MaxInflightTotal, Forward: rec.MaxInflightForward,
 					E2BEnvd: rec.MaxInflightEnvd, E2BCodeInterpreter: rec.MaxInflightCI,
@@ -618,6 +619,10 @@ func writeRecordSnapshot(rec *mmapRecord, snapshot recordSnapshot) {
 	rec.MaxInflightEnvd = snapshot.entry.EffectiveMaxInflight.E2BEnvd
 	rec.MaxInflightCI = snapshot.entry.EffectiveMaxInflight.E2BCodeInterpreter
 	rec.MaxInflightExec = snapshot.entry.EffectiveMaxInflight.Exec
+	rec.TrafficPolicyInvalid = 0
+	if snapshot.entry.TrafficPolicyInvalid {
+		rec.TrafficPolicyInvalid = 1
+	}
 	_ = putFixed(rec.SandboxID[:], snapshot.entry.SandboxID)
 	_ = putFixed(rec.Profile[:], snapshot.entry.Profile)
 	_ = putFixed(rec.TemplateID[:], snapshot.entry.TemplateID)
@@ -757,6 +762,9 @@ func finishHeaderWrite(seqp *uint64) {
 func validateRoute(r routesync.RouteEntry) error {
 	if r.MaxInflightPatch != nil {
 		return errors.New("max_inflight patch was not resolved by Proxy master")
+	}
+	if r.TrafficPolicyInvalid && (!r.EffectiveMaxInflight.Unlimited() || r.AdmissionSlot != 0 || r.AdmissionGeneration != 0) {
+		return errors.New("invalid traffic policy must not publish effective limits or an admission slot")
 	}
 	if r.EffectiveMaxInflight.Unlimited() {
 		if r.AdmissionSlot != 0 || r.AdmissionGeneration != 0 {
