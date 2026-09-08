@@ -2261,9 +2261,7 @@ func normalizeSandboxTaskRootRef(raw, relativeDir string) (string, error) {
 
 func sandboxTaskEnv(sb *types.Sandbox) map[string]string {
 	return map[string]string{
-		"MANIFEST_KEY":      sb.ManifestKey,
-		"KUASAR_RUN_ID":     sb.RunID,
-		"KUASAR_SANDBOX_ID": sb.ID,
+		"MANIFEST_KEY": sb.ManifestKey,
 	}
 }
 
@@ -2308,12 +2306,12 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		"--manifest-config", o.cfg.ManifestConfig,
 		"--run-root", nodepath.SandboxRunRoot(o.cfg.Paths.RunRoot),
 		"--base-root", nodepath.SandboxBaseRoot(o.cfg.Paths.BaseRoot),
-		// Route the sandbox's stdio + kernel dmesg to journald from this run-id
-		// unit. App stdout/stderr is tagged "sandbox" with KUASAR_SANDBOX_ID; guest
-		// dmesg is tagged "console" for host-only diagnostics.
-		"--stdout-to", "journald=" + configsock.RunnerLogTag,
-		"--stderr-to", "journald=" + configsock.RunnerLogTag,
-		"--console", "journald=" + configsock.ConsoleTag,
+		// Each output carries its own explicit identity fields. The runtime
+		// interprets only the generic target syntax, not these business labels.
+		"--log-to", sandboxJournalTarget("sandbox-ctl", sb),
+		"--stdout-to", sandboxJournalTarget(configsock.RunnerLogTag, sb),
+		"--stderr-to", sandboxJournalTarget(configsock.RunnerLogTag, sb),
+		"--console", sandboxJournalTarget(configsock.ConsoleTag, sb),
 	}
 	args = appendRefLocationArgs(args, locations)
 	for _, c := range p.ConnectSpecs() {
