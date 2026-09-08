@@ -94,7 +94,7 @@ func (p *buildPipeline) phaseImport() (retErr error) {
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("import: pulling + flattening %s", importRef)
-	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: imagePath, stderrTo: "journald=" + buildTag},
+	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: imagePath, stderrTo: buildJournalTarget(s, buildTag)},
 		append([]string{guestFlatten}, args...)...); err != nil {
 		return err
 	}
@@ -207,7 +207,7 @@ func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLook
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("import: checking image referer")
-	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: outPath, stderrTo: "journald=" + buildTag},
+	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: outPath, stderrTo: buildJournalTarget(s, buildTag)},
 		append([]string{guestFlatten}, args...)...); err != nil {
 		return importRefererLookup{}, err
 	}
@@ -252,7 +252,7 @@ func (p *buildPipeline) writeImportReferer(sb *phaseSandbox, subject, manifestID
 	args = append(args, subject)
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
-	return sb.exec(ctx, execOpts{env: p.tenantEnv(), stderrTo: "journald=" + buildTag},
+	return sb.exec(ctx, execOpts{env: p.tenantEnv(), stderrTo: buildJournalTarget(s, buildTag)},
 		append([]string{guestFlatten}, args...)...)
 }
 
@@ -387,7 +387,7 @@ func (p *buildPipeline) phaseSteps() (retErr error) {
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
 	p.progress("steps: exporting rootfs")
-	if err := sb.exec(ctx, execOpts{stdoutTo: newImg, stderrTo: "journald=" + buildTag},
+	if err := sb.exec(ctx, execOpts{stdoutTo: newImg, stderrTo: buildJournalTarget(s, buildTag)},
 		guestFlatten, "export", "--skip-mounts",
 		"--runtime-config", "/.kuasar-build/config.json",
 		"--tmpdir", "/.kuasar-build", "--output", "-", "/"); err != nil {

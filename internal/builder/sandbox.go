@@ -72,12 +72,10 @@ func (p *buildPipeline) startSandboxYAML(phase string, document []byte, connect 
 		return nil, fmt.Errorf("create readiness pipe: %w", err)
 	}
 	cmd.Env = authoritativeProcessEnv(map[string]string{
-		"MANIFEST_KEY":    s.Env["MANIFEST_KEY"],
-		"KUASAR_RUN_ID":   s.RunID,
-		"KUASAR_BUILD_ID": s.BuildID,
+		"MANIFEST_KEY": s.Env["MANIFEST_KEY"],
 	})
-	// sandbox-ctl's own process stdio (the app/kernel are off on journald) inherit
-	// run-builder's stderr → builder unit journal for host diagnostics.
+	// Component/app/console logs use explicit targets. Original process stderr
+	// remains available for early CLI errors, CH stderr and journal fallback.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
 		_ = readyR.Close()
@@ -113,13 +111,12 @@ func phaseSandboxRunArgs(s *configsock.BuildSpec, phase, sid, yamlPath string, c
 	args = append(args, "--config", yamlPath,
 		"--run-root", s.RunDir, "--base-root", s.BaseDir,
 		"--path-id", phase, "--sandbox-id", sid,
-		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
-		// our child, in this run-id unit's cgroup). App output is tagged "build"
-		// with KUASAR_BUILD_ID for SDK-visible build logs; kernel output is tagged
-		// "console" for host-only diagnostics. No per-phase log file.
-		"--stdout-to", "journald="+buildTag,
-		"--stderr-to", "journald="+buildTag,
-		"--console", "journald="+consoleTag)
+		// Each target explicitly carries BuildID/RunID. App output stays on
+		// the SDK-visible build tag; component and console tags remain separate.
+		"--log-to", buildJournalTarget(s, "sandbox-ctl"),
+		"--stdout-to", buildJournalTarget(s, buildTag),
+		"--stderr-to", buildJournalTarget(s, buildTag),
+		"--console", buildJournalTarget(s, consoleTag))
 	args = append(args, "--manifest-config", s.Paths.ManifestConfig)
 	args = appendRefLocationArgs(args, s.RefLocations)
 	for _, c := range connect {
@@ -231,8 +228,8 @@ func (sb *phaseSandbox) waitRuntimeReady(ctx context.Context) error {
 // envd instead (envdExec).
 type execOpts struct {
 	env       []string // KEY=VALUE pairs forwarded as --env (tenant FLATTEN_*)
-	stdoutTo  string   // --stdout-to: host file (artifact) or journald=<tag>
-	stderrTo  string   // --stderr-to: host file or journald=<tag> ("" = capture for the error tail)
+	stdoutTo  string   // --stdout-to: host file (artifact) or complete journald target
+	stderrTo  string   // --stderr-to: host file or complete journald target ("" = capture for the error tail)
 	stdinFrom string   // feed command stdin from this host file
 	quiet     bool     // suppress stderr (readiness probes)
 }
