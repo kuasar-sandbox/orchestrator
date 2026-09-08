@@ -71,6 +71,11 @@ func (o *Orchestrator) mmdsPolicy() sandboxcfg.MMDSPolicy {
 	}
 }
 
+// buildMMDSID is an internal route-cache key, never a node-local SandboxID.
+// The colon makes this namespace disjoint from ValidLocalSandboxID so a
+// user-chosen build-* ID cannot replace (or be cleaned up by) a Build view.
+func buildMMDSID(buildID string) string { return "build:" + buildID }
+
 func (o *Orchestrator) setMMDSBuildOwner(sandboxID, buildID string) {
 	o.mu.Lock()
 	if buildID == "" {

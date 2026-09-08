@@ -294,7 +294,7 @@ func (o *Orchestrator) publishRecoveredBuildMMDS(build *types.Build) *types.Sand
 		return nil
 	}
 	row := &types.Sandbox{
-		ID: "build-" + build.BuildID, Profile: build.Profile, TemplateID: build.TemplateID,
+		ID: buildMMDSID(build.BuildID), Profile: build.Profile, TemplateID: build.TemplateID,
 		State: types.StateRunning, RunID: build.RunID, FloatingIP: build.RuntimeFloatingIP,
 		EnvdAccessToken: build.RuntimeEnvdAccessToken, APISecret: build.APISecret,
 		ServiceSecret: build.ServiceSecret, TrafficAccessToken: build.TrafficAccessToken,

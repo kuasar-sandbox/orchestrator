@@ -16,7 +16,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configresolve"
 	"github.com/kuasar-sandbox/orchestrator/internal/execadmission"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
-	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -55,12 +54,12 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	}
 	switch cmd.Kind {
 	case routesync.CmdCreate:
-		pair, tmpl, credentials, err := o.precheckCluster(ctx, cmd)
+		pair, tmpl, normalized, err := o.precheckCluster(ctx, cmd)
 		if err != nil {
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
-		if _, _, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, credentials); err != nil {
+		if _, _, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, normalized); err != nil {
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
@@ -741,6 +740,8 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 
 func clusterCommandRejection(err error) (int, string) {
 	switch {
+	case errors.Is(err, api.ErrAlreadyExists):
+		return http.StatusConflict, api.ErrAlreadyExists.Error()
 	case errors.Is(err, conductorextension.ErrRejected):
 		return http.StatusForbidden, conductorextension.ErrRejected.Error()
 	case errors.Is(err, api.ErrExtensionUnavailable):
@@ -778,11 +779,11 @@ func clusterCommandRejection(err error) (int, string) {
 // HandleCommand. It waits for that exact attempt; it does not maintain a second
 // launch implementation.
 func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
-	pair, tmpl, credentials, err := o.precheckCluster(ctx, cmd)
+	pair, tmpl, normalized, err := o.precheckCluster(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
-	_, attempt, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, credentials)
+	_, attempt, err := o.acceptClusterCreate(ctx, cmd, pair, tmpl, normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -797,199 +798,6 @@ func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command
 		return nil, fmt.Errorf("cluster create %s did not reach running", cmd.SID)
 	}
 	return cloneSandbox(current), nil
-}
-
-// precheckCluster resolves the manifest key (by the fingerprint the registry
-// predistributed) and the snapshot template — the fast, synchronous preconditions
-// whose failure is a rejected ack (rather than a slow create that fails only by
-// Reserve timeout).
-func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (store.KeyPair, types.TemplateID, sandboxcfg.Credentials, error) {
-	if cmd == nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: command is required")
-	}
-	if !types.ValidLocalSandboxID(cmd.SID) {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: invalid sandbox id")
-	}
-	profile, err := types.ParseProfile(cmd.Profile)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	if cmd.Cluster == nil || cmd.Cluster.Group == "" || cmd.Cluster.RouteKey == "" {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: group and route key are required")
-	}
-	pair, err := o.resolveByFingerprint(ctx, cmd.APISecretFingerprint)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, err
-	}
-	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
-	}
-	if tmpl.Profile != profile {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: profile %q does not match template profile %q", profile, tmpl.Profile)
-	}
-	config, err := sandboxcfg.NormalizeRestoreMetadata(cmd.Config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	config, err = sandboxcfg.NormalizeResourceMetadata(config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-	}
-	config, err = sandboxcfg.NormalizeCheckpointMetadata(config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	config, err = sandboxcfg.NormalizeTrafficMetadata(config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-	}
-	credentials, config, err := sandboxcfg.ExtractCredentials(config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	if err := o.validateCreateCheckpointMode(config); err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	if err := validateSandboxCredentialOverrides(profile, credentials); err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	spec, err := sandboxcfg.ParseSpec(config)
-	if err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("cluster create: %w", err)
-	}
-	if err := sandboxcfg.ValidateTrafficForProfile(profile, spec.Traffic); err != nil {
-		return store.KeyPair{}, types.TemplateID{}, sandboxcfg.Credentials{}, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-	}
-	cmd.Config = config
-	return pair, tmpl, credentials, nil
-}
-
-// acceptClusterCreate persists and publishes starting before returning, so an
-// Accepted ACK always names both a durable row and an active launch owner.
-func (o *Orchestrator) acceptClusterCreate(ctx context.Context, cmd *routesync.Command, pair store.KeyPair, tmpl types.TemplateID, credentials sandboxcfg.Credentials) (*types.Sandbox, *launchAttempt, error) {
-	admissionStarted := time.Now()
-	metadata := cloneStringMap(cmd.Config)
-	timeoutSeconds := o.cfg.Sandbox.TimeoutSec
-	var environment map[string]string
-	autoPauseMemory := true
-	if cmd.AutoPauseMemory != nil {
-		autoPauseMemory = *cmd.AutoPauseMemory
-	}
-	var err error
-	if o.extensionSandboxHook != nil {
-		// precheckCluster has already strictly parsed and removed credentials.
-		// Reconstruct their canonical request carrier so the Hook's final metadata
-		// is parsed again rather than applying a stale preliminary extraction.
-		if credentials.ServiceSecret != "" || credentials.EnvdAccessToken != "" || credentials.TrafficAccessToken != "" {
-			raw, err := json.Marshal(credentials)
-			if err != nil {
-				return nil, nil, fmt.Errorf("cluster create: marshal credential candidate: %w", err)
-			}
-			if metadata == nil {
-				metadata = make(map[string]string)
-			}
-			metadata[sandboxcfg.NsCredentials] = string(raw)
-		}
-		clusterMetadata, clusterMetadataPresent := metadata[clusterstate.ObjectMetadataKey]
-		candidate, err := o.prepareSandboxCreateHook(ctx, conductorextension.SandboxOriginCluster, cmd.SID, &conductorextension.SandboxCreateRequest{
-			TemplateID: tmpl.String(), Profile: conductorextension.Profile(tmpl.Profile), TimeoutSeconds: timeoutSeconds,
-			Metadata: cloneStringMap(metadata), AutoPauseMemory: cloneBool(cmd.AutoPauseMemory),
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		if candidate.TemplateID != tmpl.String() {
-			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned sandbox template identity", api.ErrBadRequest)
-		}
-		if candidate.TimeoutSeconds <= 0 {
-			return nil, nil, fmt.Errorf("%w: cluster sandbox timeout must be positive", api.ErrBadRequest)
-		}
-		if candidate.MMDS != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create does not accept a top-level MMDS candidate", api.ErrBadRequest)
-		}
-		finalClusterMetadata, finalClusterMetadataPresent := candidate.Metadata[clusterstate.ObjectMetadataKey]
-		if clusterMetadataPresent != finalClusterMetadataPresent || clusterMetadata != finalClusterMetadata {
-			return nil, nil, fmt.Errorf("%w: extension changed cluster-owned sandbox context", api.ErrBadRequest)
-		}
-		metadata, err = sandboxcfg.NormalizeRestoreMetadata(candidate.Metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		metadata, err = sandboxcfg.NormalizeResourceMetadata(metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		metadata, err = sandboxcfg.NormalizeCheckpointMetadata(metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		metadata, err = sandboxcfg.NormalizeTrafficMetadata(metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		credentials, metadata, err = sandboxcfg.ExtractCredentials(metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		if err := o.validateCreateCheckpointMode(metadata); err != nil {
-			return nil, nil, fmt.Errorf("cluster create: %w", err)
-		}
-		if err := validateSandboxCredentialOverrides(tmpl.Profile, credentials); err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		spec, err := sandboxcfg.ParseSpec(metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		if err := sandboxcfg.ValidateTrafficForProfile(tmpl.Profile, spec.Traffic); err != nil {
-			return nil, nil, fmt.Errorf("%w: cluster create: %v", api.ErrBadRequest, err)
-		}
-		timeoutSeconds = candidate.TimeoutSeconds
-		environment = cloneStringMap(candidate.Env)
-		if candidate.AutoPauseMemory == nil {
-			autoPauseMemory = true
-		} else {
-			autoPauseMemory = *candidate.AutoPauseMemory
-		}
-	}
-	meta := clusterSandboxMetadata(metadata)
-	launchMode, err := types.LaunchModeForTemplate(tmpl.Kind)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	sb := &types.Sandbox{
-		ID:              cmd.SID,
-		Profile:         tmpl.Profile,
-		Cluster:         &types.ClusterSandboxContext{Group: cmd.Cluster.Group, RouteKey: cmd.Cluster.RouteKey},
-		StableIDValue:   cmd.Cluster.StableID,
-		TemplateID:      tmpl.String(),
-		State:           types.StateStarting,
-		LaunchMode:      launchMode,
-		AutoPauseMemory: autoPauseMemory,
-		RunDir:          nodepath.SandboxRunDir(o.cfg.Paths.RunRoot, cmd.SID),
-		BaseDir:         nodepath.SandboxBaseDir(o.cfg.Paths.BaseRoot, cmd.SID),
-		APISecret:       pair.APISecret,
-		ManifestKey:     pair.ManifestKey,
-		Metadata:        meta,
-		Env:             environment,
-		CreatedUnix:     time.Now().Unix(),
-		DeadlineUnix:    time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix(),
-	}
-	if err := materializeSandboxCredentials(sb, credentials); err != nil {
-		return nil, nil, fmt.Errorf("cluster create: %w", err)
-	}
-	if tmpl.Profile == types.ProfileE2B {
-		sb.EnvdUDS = sb.RunDir + "/envd.sock"
-		sb.CiUDS = sb.RunDir + "/ci.sock"
-	}
-	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, tmpl, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	o.logLaunchPhase(attempt, accepted, "admission_duration", time.Since(admissionStarted))
-	return accepted, attempt, nil
 }
 
 func clusterSandboxMetadata(config map[string]string) map[string]string {
