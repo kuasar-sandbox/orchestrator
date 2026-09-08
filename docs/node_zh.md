@@ -2579,7 +2579,7 @@ phase、network、runtime prepare/result owner。候选扫描后的并发变化�
 
 以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
 publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 routesync v7 沿用 v6 引入的 Build full sync +
+权威不变；当前 main 仍有 post-registration Build projection，故 routesync v8 沿用 v6 引入的 Build full sync +
 live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
 节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
 cleanup stage 或第二份路径权威。

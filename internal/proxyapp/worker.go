@@ -254,9 +254,10 @@ func startWorkerIngress(
 }
 
 // Close releases descriptors and is safe after Run has already closed them,
-// and to call more than once. Successful mappings are deliberately NOT unmapped here: asynchronous users need not have
-// stopped when Run returns. Kernel process teardown reclaims both mappings;
-// the master separately clears this worker's counters only after cmd.Wait.
+// and to call more than once. Successful mappings are deliberately NOT unmapped
+// here: asynchronous users need not have stopped when Run returns. Kernel
+// process teardown reclaims both mappings; the master separately clears this
+// worker's counters only after cmd.Wait.
 func (worker *PreparedWorker) Close() error {
 	if worker == nil {
 		return nil
