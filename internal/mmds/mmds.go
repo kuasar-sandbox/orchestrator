@@ -13,6 +13,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,6 +32,10 @@ const (
 	readHeaderTimeout = 5 * time.Second
 	idleTimeout       = 30 * time.Second
 	maxHeaderBytes    = 16 * 1024
+
+	// peerCloseGrace bounds how long writeResponse waits, after a successful
+	// flush, for the peer's own close on a Connection: close exchange.
+	peerCloseGrace = 250 * time.Millisecond
 )
 
 // Source is the trusted route view used by an independent proxy worker. It must
@@ -93,6 +99,80 @@ func (s *Server) Handler() http.Handler {
 	return secureHeaders(guardRequest(dispatch))
 }
 
+// writeResponse publishes one complete, non-streaming MMDS body. The caller
+// pre-sets only business headers (e.g. the token TTL); the helper owns the
+// response type, a legal Content-Length computed before the first write, the
+// write itself, and the conditional peer-close wait. It must be the
+// response's only writer: no WriteHeader/Write before, no body appended
+// after. Write, short-write, and flush errors are returned for the caller's
+// logger; the close-wait itself never fails -- ending by grace expiry is a
+// normal return, not a response error.
+func writeResponse(w http.ResponseWriter, r *http.Request, status int, contentType string, body []byte) error {
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	bodyAllowed := status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
+	if bodyAllowed {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	} else {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(status)
+	if bodyAllowed && len(body) > 0 {
+		n, err := w.Write(body)
+		if err != nil {
+			return err
+		}
+		if n != len(body) {
+			return io.ErrShortWrite
+		}
+	}
+	if !bodyAllowed {
+		return nil
+	}
+	return waitForPeerClose(w, r)
+}
+
+// waitForPeerClose parks briefly after a flushed response so the peer -- not
+// this server -- closes first on Connection: close exchanges. TIME_WAIT then
+// lands on the guest side, where it dies with the sandbox and is reset by the
+// next restore, instead of accumulating on this server, where snapshot
+// restores replay a frozen TCP 4-tuple whose fresh SYN then draws a stale
+// ACK, an RST, and a 21-40ms retransmission on the launch critical path
+// (partial mitigation of the management-plane problem described in #308).
+//
+// The wait fits only plain HTTP/1.1 requests that already asked to close and
+// carry no request body or transfer encoding: such a response is fully
+// length-delimited, so a prompt peer can finish reading and close on its own
+// while net/http's background read cancels the request context within
+// microseconds. Every other shape -- keep-alive reuse, HTTP/1.0, bodied or
+// chunked requests, bodiless statuses, a writer without Flusher support --
+// skips the wait and keeps net/http's normal close semantics; server-side
+// TIME_WAIT after the grace expires is accepted, no RST is ever forced.
+// Request-context cancellation is only the wake signal, not proof of the
+// peer's FIN; the timer bounds the wait when no signal arrives.
+func waitForPeerClose(w http.ResponseWriter, r *http.Request) error {
+	if r.ProtoMajor != 1 || r.ProtoMinor != 1 || !r.Close ||
+		len(r.TransferEncoding) != 0 || r.ContentLength != 0 {
+		return nil
+	}
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			// No Flusher: the complete response is already handed to
+			// net/http, which will finish and close it; waiting cannot help.
+			return nil
+		}
+		return err
+	}
+	timer := time.NewTimer(peerCloseGrace)
+	defer timer.Stop()
+	select {
+	case <-r.Context().Done():
+	case <-timer.C:
+	}
+	return nil
+}
+
 func secureHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -136,12 +216,16 @@ func guardRequest(next http.Handler) http.Handler {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.Handler(),
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 	go func() {
 		<-ctx.Done()
+		// Close cancels every in-flight request context, so handlers parked
+		// in waitForPeerClose stop waiting immediately instead of each
+		// paying the grace period.
 		_ = srv.Close()
 	}()
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -193,8 +277,9 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("X-metadata-token-ttl-seconds", strconv.FormatInt(ttl, 10))
-	w.Header().Set("Content-Type", "text/plain")
-	_, _ = w.Write([]byte(token))
+	if err := writeResponse(w, r, http.StatusOK, "text/plain", []byte(token)); err != nil && s.log != nil {
+		s.log.Debug("mmds: token response write failed", "err", err)
+	}
 }
 
 func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +301,7 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "", http.StatusNotFound)
 			return
 		}
-		s.writeRoute(w, route)
+		s.writeRoute(w, r, route)
 		return
 	}
 	templateID, accessToken, ok := s.src.SandboxInfo(sid)
@@ -229,36 +314,41 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		EnvID:           templateID,
 		AccessTokenHash: HashToken(accessToken),
 	})
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(body)
+	if err := writeResponse(w, r, http.StatusOK, "application/json", body); err != nil && s.log != nil {
+		s.log.Debug("mmds: metadata response write failed", "err", err)
+	}
 }
 
-func (s *Server) writeRoute(w http.ResponseWriter, route MMDSRoute) {
+func (s *Server) writeRoute(w http.ResponseWriter, r *http.Request, route MMDSRoute) {
 	contentType := route.ContentType
 	if contentType == "" {
 		contentType = "text/plain"
 	}
 	switch route.Type {
 	case "", "static":
-		w.Header().Set("Content-Type", contentType)
-		_, _ = w.Write(route.Body)
+		s.writeBody(w, r, http.StatusOK, contentType, route.Body)
 	case "secret":
 		if !route.Present {
 			http.Error(w, "", http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", contentType)
-		_, _ = w.Write(route.Body)
+		s.writeBody(w, r, http.StatusOK, contentType, route.Body)
 	case "service":
 		status := route.StatusCode
 		if status < 100 || status > 599 {
 			status = http.StatusServiceUnavailable
 		}
-		w.Header().Set("Content-Type", contentType)
-		w.WriteHeader(status)
-		_, _ = w.Write(route.Body)
+		s.writeBody(w, r, status, contentType, route.Body)
 	default:
 		http.Error(w, "", http.StatusServiceUnavailable)
+	}
+}
+
+// writeBody publishes an assembled route body; a write failure only reaches
+// the logger, it can no longer alter the already-committed response.
+func (s *Server) writeBody(w http.ResponseWriter, r *http.Request, status int, contentType string, body []byte) {
+	if err := writeResponse(w, r, status, contentType, body); err != nil && s.log != nil {
+		s.log.Debug("mmds: route response write failed", "err", err)
 	}
 }
 

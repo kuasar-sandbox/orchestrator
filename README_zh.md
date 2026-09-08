@@ -211,19 +211,19 @@ export E2B_SANDBOX_URL=http://host:3443
 python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s.commands.run("uname -a").stdout)'
 ```
 
-命令与参数详见 [docs/node.md](docs/node.md) §2,配置字段 §3,e2b API 契约 §4,集群接入 §10;
-集群控制面见 [docs/cluster.md](docs/cluster.md)。
+命令与参数详见 [docs/node.md](docs/node_zh.md) §2,配置字段 §3,e2b API 契约 §4,集群接入 §10;
+集群控制面见 [docs/cluster.md](docs/cluster_zh.md)。
 
 ## 文档
 
-- [docs/node.md](docs/node.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
+- [docs/node.md](docs/node_zh.md) — 节点主机设计与命令参考:架构 / e2b 契约 / 进程管理 /
   密钥模型 / 数据面装配 / 集群接入(node-link)/ 模板构建 / 可靠性 / 测试。
-- [docs/node-proxy.md](docs/node-proxy.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
+- [docs/node-proxy.md](docs/node-proxy_zh.md) — 独立数据面转发层:单一 ingress / 路由判定 / master-worker/
   routesync / per-Sandbox max inflight / traffic stats / 数据面鉴权 / MMDS / service-addressed CONNECT /
   native exec gate.
 - [docs/node-resource.md](docs/node-resource_zh.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 预留 / 水位额度 / 清单恢复 / 统计。
-- [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、
+- [docs/cluster.md](docs/cluster_zh.md) — 集群控制面:registry membership、shardkv 状态模型、
   node_link / route_link / node_list / placer_link、Reserve 状态机、成员变更与 e2e。
 - [docs/cluster-router.md](docs/cluster-router_zh.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
   ExecSession Reserve,两跳转发与 CONNECT,stable/NodeSandboxID 改写和 KAT 双验.
@@ -233,4 +233,4 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 ## License
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
-贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+贡献授权说明见 [CONTRIBUTING.md（英文）](CONTRIBUTING.md).

@@ -384,7 +384,7 @@ placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 | node labels 旧 | node owner admission/create 兜底拒绝 |
 | source owner 崩溃 | source lease 到期后其他候选从已提交 cursor 接管;旧 owner patch/cursor 被 fencing 拒绝 |
 | key 续租投递失败 | timeout、断线或 reject 都不推进已交付状态；create/build 在 node 侧 reject，下一次 heartbeat refresh 重试 |
-| Build 注册超时或 ACK 丢失 | 保留已持久化的选定 node/BuildID intent,只查询或重试同一节点。持久 registration usage 由节点负责,placer 没有靠 admission lease 计时器释放它的机制;节点记录删除决定额度释放及 registry 投影删除。 |
+| Build 注册超时或 ACK 丢失 | 保留已持久化的选定 node/BuildID intent,只查询或重试同一节点。持久 registration usage 由节点负责,placer 没有靠 admission lease 计时器释放它的机制;节点在 ready/error transition 时释放 registration usage，之后删除终态历史才移除 Registry 投影；两者是不同事件。源码见 [durable usage query](../internal/store/build_admission.go)。 |
 
 权威实现见 [注册下发与投影恢复](../internal/registry/build.go) 和
 [放置谓词](../internal/placer/scaler.go)。尤其不能把投递结果不明当作无副作用拒绝的证据。
@@ -399,6 +399,6 @@ placer 主管 selector patch 和 APISecret/ManifestKey pair cache refresh:
 
 ## 12. See Also
 
-- [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
+- [cluster.md](cluster_zh.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
 - [cluster-router.md](cluster-router_zh.md) — router Reserve 消费、route cache 和数据面转发.
-- [node.md](node.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。
+- [node.md](node_zh.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

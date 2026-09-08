@@ -1,6 +1,6 @@
 # Proxy worker lifetime and transport cancellation
 
-[简体中文](proxy-worker-lifetime_zh.md)
+[English](proxy-worker-lifetime.md) | [简体中文](proxy-worker-lifetime_zh.md)
 
 A Proxy worker is a dedicated one-shot subprocess. The built-in and custom App
 entry points must exit that process after `Run` returns; they are not an API for
