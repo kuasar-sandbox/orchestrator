@@ -152,7 +152,91 @@ func TestServeReserveConnectStrictlyBoundsTypedBody(t *testing.T) {
 	}
 }
 
-func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
+func TestServeReserveAcceptsResourceAndTrafficConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config map[string]string
+	}{
+		{name: "resource", config: map[string]string{sandboxcfg.NsResource: `{"capacity":{"cpu":2}}`}},
+		{name: "traffic", config: map[string]string{sandboxcfg.NsTraffic: `{"max_inflight":{"total":3}}`}},
+		{name: "both", config: map[string]string{
+			sandboxcfg.NsResource: `{"allocatable":{"memory":"512MiB"}}`,
+			sandboxcfg.NsTraffic:  `{"max_inflight":{"forward":0,"exec":2}}`,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			placements := 0
+			reg := New(NewStores(), placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+				placements++
+				for key, want := range tc.config {
+					if got := req.Config[key]; got != want {
+						t.Errorf("placement config[%s]=%q, want %q", key, got, want)
+					}
+				}
+				return nil, ErrNoNode
+			}), 0, nil)
+			enableTestCreateAuth(t, reg)
+			mux := http.NewServeMux()
+			reg.ServeRouteLink(mux)
+			body, err := json.Marshal(SandboxReserveReq{Config: tc.config})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk&operation=create", bytes.NewReader(body))
+			req.Header.Set("X-API-KEY", testAPIKeyValue())
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable || placements != 1 {
+				t.Fatalf("status=%d body=%q placements=%d; want accepted config reaching unavailable placement once", rec.Code, rec.Body.String(), placements)
+			}
+			if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
+				t.Fatalf("unavailable placement wrote route state: found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
+func TestServeReserveRejectsInvalidResourceAndTrafficBeforePlacement(t *testing.T) {
+	for _, tc := range []struct {
+		name, operation, key, value string
+	}{
+		{"invalid resource", "create", sandboxcfg.NsResource, `{"control":{}}`},
+		{"invalid traffic", "create", sandboxcfg.NsTraffic, `{"max_inflight":{"total":-1}}`},
+		{"connect resource", "connect", sandboxcfg.NsResource, `{"capacity":{"cpu":2}}`},
+		{"connect traffic", "connect", sandboxcfg.NsTraffic, `{"max_inflight":{"total":3}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			placements := 0
+			reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+				placements++
+				return nil, ErrNoNode
+			}), 0, nil)
+			enableTestCreateAuth(t, reg)
+			mux := http.NewServeMux()
+			reg.ServeRouteLink(mux)
+			body, err := json.Marshal(SandboxReserveReq{Config: map[string]string{tc.key: tc.value}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := RouteLinkReservePath + "?group=/g&route_key=rk&operation=" + tc.operation
+			if tc.operation == "connect" {
+				path += "&sid=sb-route"
+			}
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+			req.Header.Set("X-API-KEY", testAPIKeyValue())
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || placements != 0 {
+				t.Fatalf("status=%d body=%q placements=%d; want 400 before placement", rec.Code, rec.Body.String(), placements)
+			}
+			if _, _, found, err := reg.stores.GetSandbox(context.Background(), "/g", "rk"); err != nil || found {
+				t.Fatalf("invalid config wrote route state: found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
+func TestServeReserveRejectsUnsupportedConfigBeforeReservation(t *testing.T) {
 	placements := 0
 	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		placements++
