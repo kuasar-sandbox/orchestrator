@@ -62,7 +62,7 @@ if err := app.Run(); err != nil {
 `New` 无副作用，`Run` one-shot 并处理 SIGINT/SIGTERM；托管方可用 `RunContext`。App 不调用
 `os.Exit`。执行顺序固定为：decode bootstrap → clone Config → `Configure` exactly once →
 校验 `paths.conductor_executable` 未改变 → final declarative validation → 再 clone/freeze →
-解析 Runtime 材料 → 启动共享 conductor core。Configure/provider/final-validation 失败时尚未打开
+解析 Runtime 材料 → 启动共享 conductor core。Configure、启动期 material provider 或 final-validation 失败时尚未打开
 durable store、listener、systemd launcher/unit 或 node-link。Hook 可整体替换 Config，但必须
 恢复最初冻结的 executable；Hook 后不会重新应用默认值。
 
@@ -76,9 +76,10 @@ validation 均延后到 component startup。
 TLS material、AES-256 ordered key set、builder files-storage neutral credentials provider，
 以及一个可信、静态编译的 `Extension`。
 TLS provider 返回 DER certificate chain、`crypto.Signer` 与 root/client CA pool，不能返回任意
-`*tls.Config`；最低 TLS 版本、ALPN、mTLS/client verification 仍由 core 固定。所有 provider
-只在启动/SDK credential refresh 使用，不进入请求热路径；provider 非 nil 即为权威来源，
-任何错误都不回退文件、环境或静态 credential。V1 不支持热更新。
+`*tls.Config`；最低 TLS 版本、ALPN、mTLS/client verification 仍由 core 固定。TLS 与 encryption
+provider 在启动时解析。Object-store credential 还会按下文所述按需刷新;这是请求路径上的工作,
+不是仅在后台执行的回调。provider 非 nil 即为权威来源,
+任何错误都不回退文件、环境或静态 credential。V1 不支持配置或 TLS/encryption material 热更新。
 
 Extension 的 `Start(ctx, Host)` 在 store/launcher/core 构造后、InstallUnits/reconcile/pool/
 node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取消通知 Extension 自有 goroutine
@@ -126,8 +127,10 @@ node-link 使用 `RootCAs`。Core 固定最低 TLS 1.2 与 ALPN(API 为 `h2`/`ht
 加密 provider 必须返回非空、有序的原始 32-byte AES key 集。索引零用于加密新记录,
 key 集支持解密此前记录;进程加密 key 集与租户凭据分发表更新是不同概念。
 自定义 object-store provider 要求已配置 `Builder.FilesStorage`、非空 access/secret key;
-`CanExpire` 为 true 时 `Expires` 必须非零且在未来。Core 启动前预取一次,后续 SDK refresh
-仍以该 provider 为权威;错误不得回退 YAML 或环境默认凭据链。
+`CanExpire` 为 true 时 `Expires` 必须非零且在未来。Core 启动前预取一次。
+此后,Build 的 S3 presign 或 HEAD 操作需要更新凭据时,AWS SDK credentials cache 会调用该 provider;
+刷新可以阻塞该操作或使其失败。实现须考虑请求延迟,不能假定回调只在启动时执行。
+错误不得回退 YAML 或环境默认凭据链。参见拥有该行为的 [filestore adapter](../internal/filestore/filestore.go)。
 
 ### Proxy bootstrap
 
