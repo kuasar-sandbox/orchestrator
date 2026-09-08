@@ -95,6 +95,7 @@ See the project [release documentation](https://github.com/kuasar-sandbox/kuasar
 Detailed design and reference documents are currently maintained primarily in Chinese:
 
 - [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, builds, and reliability;
+- [`docs/journald.md`](docs/journald.md) ([简体中文](docs/journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
 - [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;
