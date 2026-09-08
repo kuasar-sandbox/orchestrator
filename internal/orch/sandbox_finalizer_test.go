@@ -936,6 +936,16 @@ func TestSandboxDeleteWorkerConsumesSameIDSuccessorBeforeRetiring(t *testing.T) 
 
 func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 	fixture := newSandboxFinalizerFixture(t, "paused-run-dir-gate")
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.o.SetLifecycleContext(lifecycleCtx)
+	t.Cleanup(func() {
+		cancelLifecycle()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := fixture.o.DrainPauses(ctx); err != nil {
+			t.Errorf("drain paused cleanup: %v", err)
+		}
+	})
 	fixture.sb.State = types.StatePaused
 	fixture.sb.RunID, fixture.sb.VswitchPort, fixture.sb.FloatingIP = "", "", ""
 	fixture.sb.ResumeSource = types.ResumeSource{Kind: types.ResumeSourceSnapshot, Ref: "manifest://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
@@ -943,7 +953,15 @@ func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	runErr := errors.New("injected paused RunDir failure")
-	fixture.o.removeSandboxRunDir = func(string) error { return runErr }
+	// Install the callback before Connect can start a background retry. Only
+	// the atomic fault state changes while that retry is running.
+	var allowCleanup atomic.Bool
+	fixture.o.removeSandboxRunDir = func(path string) error {
+		if !allowCleanup.Load() {
+			return runErr
+		}
+		return os.RemoveAll(path)
+	}
 	if _, err := fixture.o.Connect(context.Background(), fixture.sb.ID, fixture.apiKey, "", api.ConnectOptions{}); !errors.Is(err, runErr) {
 		t.Fatalf("Resume cleanup gate = %v", err)
 	}
@@ -957,8 +975,10 @@ func TestPausedCleanupFailureBlocksResumeUntilRunDirIsRemoved(t *testing.T) {
 	if _, err := os.Stat(fixture.sb.RunDir); err != nil {
 		t.Fatalf("failed paused cleanup removed RunDir: %v", err)
 	}
-	fixture.o.removeSandboxRunDir = os.RemoveAll
-	if err := fixture.o.cleanupPausedOwnership(context.Background(), stored); err != nil {
+	allowCleanup.Store(true)
+	// The asynchronous retry may already have cleared the saved owner.
+	// Use the same lock-and-reload entry point, not that earlier snapshot.
+	if err := fixture.o.finalizePausedCleanupOnce(fixture.sb.ID); err != nil {
 		t.Fatalf("paused RunDir retry: %v", err)
 	}
 	stored, err = fixture.o.st.Get(context.Background(), fixture.sb.ID)
