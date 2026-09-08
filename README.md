@@ -25,7 +25,7 @@ A standalone deployment exposes an E2B-compatible API that can be used by the un
 `cluster-ctl` runs three independent roles:
 
 - **Registry** — replicated cluster state and node-channel hub;
-- **Router** — the cluster-wide E2B-compatible unified control- and data-plane entry point and stable-sandbox routing layer;
+- **Router** — the cluster-wide E2B-compatible unified control- and data-plane ingress and stable-sandbox routing layer;
 - **Placer** — node selection, sandbox-group integration, on-demand creation, restore, and migration.
 
 The control plane preserves a stable external sandbox identity while the actual node-local sandbox instance may change during restore or migration.
@@ -95,7 +95,7 @@ See the project [release documentation](https://github.com/kuasar-sandbox/kuasar
 Detailed design and reference documents are currently maintained primarily in Chinese:
 
 - [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, builds, and reliability;
-- [`docs/journald.md`](docs/journald.md) ([简体中文](docs/journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
+- [`docs/node-journald.md`](docs/node-journald.md) ([简体中文](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
 - [`docs/cluster.md`](docs/cluster.md) — Registry membership, replicated state, node links, reservation state, and cluster E2E;

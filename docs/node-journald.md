@@ -1,4 +1,4 @@
-[English](journald.md) | [简体中文](journald_zh.md)
+[English](node-journald.md) | [简体中文](node-journald_zh.md)
 
 # Journal identities for sandboxes and Builds
 
