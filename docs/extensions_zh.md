@@ -10,6 +10,27 @@ Conductor 和独立 Proxy 支持静态链接的运行期扩展，使部署能在
 
 ## 组件 bootstrap 与进程内材料
 
+### 公共配置入口
+
+公共 `config` 包提供 `LoadConductor(path string) (*Conductor, error)`、
+`DecodeConductor(io.Reader) (*Conductor, error)`,以及返回 `*Proxy` 的
+`LoadProxy`/`DecodeProxy`。Load 打开文件;Decode 接受最多 4 MiB 的单个严格 YAML document,
+应用默认值并检查显式字段,不解析 provider、不检查 executable/material 文件、不要求所有最终运行声明。
+`ValidateConductorFinal(*Conductor) error` 与 `ValidateProxyFinal(*Proxy) error`
+执行最终声明校验,不重新默认化或调用 provider。
+
+`(*Conductor).Clone() *Conductor`、`(*Proxy).Clone() *Proxy` 深拷贝声明并保持 nil;
+两者都有 `ParkTimeoutDur() time.Duration`。`(*ResourceAllocatable).SetMemory(string)`
+标记显式内存值;`InheritMemory()` 恢复 nil,表示继承默认值/裁剪,不同于显式填写 `256MiB`。
+字段语义由 [Node](node_zh.md)、[Build](node-build_zh.md)、[Proxy](node-proxy_zh.md) 与
+[资源策略](node-resource_zh.md) 维护;导出类型/helper 见 [config](../config/config.go)。
+
+`app/conductor` 和 `app/proxy` 重新导出各自 `app/*/extension` 叶包的类型、常量和 sentinel,
+调用方可选任一公共 import 入口,无需导入 internal 包。两个 App 包均提供
+`New(Hooks) *App`、`(*App).Run() error`、`(*App).RunContext(context.Context) error`,
+生命周期见下文。`Runtime.MarshalJSON() ([]byte, error)` 与
+`(*Runtime).UnmarshalJSON([]byte) error` 始终拒绝序列化/反序列化。
+
 ### Conductor bootstrap
 
 运维入口保持不变：`node-ctl conductor serve --config ...` 先做环境无关的严格解析、默认化和
@@ -66,8 +87,8 @@ node-link/listener 之前恰好调用一次；失败会中止启动，`ctx` 取�
 失效并自动 full resync，不保证观察每个中间变化，也不是 durable audit。详细的对象源与回调契约在下文定义。
 
 同一 Extension 可选实现 `SandboxHook`、`BuildHook` 与 `APIWrapper`；这些能力只在 Start
-成功后检查一次并冻结。生命周期 Hook 都在认证后、durable/runner/network/snapshot 副作用前
-调用，并采用“锁内捕获 precondition → 锁外 Hook → 锁内权威重读/重验 → commit”。普通显式
+成功后检查一次并冻结。生命周期 Hook 在认证后、本次新准入操作的执行副作用前调用;
+强制 ownership cleanup 可能先执行或绕过 Hook(例如 Resume 先清理旧 paused owner)。回调采用“锁内捕获 precondition → 锁外 Hook → 锁内权威重读/重验 → commit”。普通显式
 Delete 可拒绝，TTL/rollback/reconcile/shutdown 等 mandatory cleanup 永远绕过 Hook。
 Build Register Hook 位于 capacity transaction 前，Trigger Hook 位于最终 registry credential
 解析和 registered→waiting CAS 前；waiting→building claim 无 Hook。cluster BuildRegister 的
@@ -82,6 +103,31 @@ xconductor 从 bootstrap 得到最初 node-ctl 的精确路径。生成的 runne
 必须来自兼容版本。该 API 不开放 store/launcher/vswitch/orch/Router；API 只以
 `http.Handler` next 形式交给可信 wrapper，不暴露 internal 类型。它不引入 Go plugin、运行时
 发现,全局 registry,动态 middleware 注册或 DI container.conductor 始终只服务 control API.
+
+Conductor 的精确公共材料接口见 [app/conductor](../app/conductor/conductor.go):
+
+| 类型 | 字段或方法 |
+|---|---|
+| `Config` | `config.Conductor` 的 alias |
+| `Runtime` | `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `EncryptionKeys EncryptionKeyProvider`, `ObjectStoreCredentials ObjectStoreCredentialsProvider`, `Extension extension.Extension` |
+| `TLSMaterial` | `CertificateChain [][]byte`, `PrivateKey crypto.Signer`, `RootCAs *x509.CertPool`, `ClientCAs *x509.CertPool` |
+| `TLSMaterialProvider` | `TLSMaterial(context.Context, TLSPurpose) (TLSMaterial, error)` |
+| `EncryptionKeyProvider` | `EncryptionKeys(context.Context) ([][]byte, error)` |
+| `ObjectStoreCredentials` | `AccessKeyID`, `SecretAccessKey`, `SessionToken` 为 string;另有 `Expires time.Time`, `CanExpire bool` |
+| `ObjectStoreCredentialsProvider` | `RetrieveObjectStoreCredentials(context.Context) (ObjectStoreCredentials, error)` |
+
+`TLSMaterialProviderFunc`、`EncryptionKeyProviderFunc`、`ObjectStoreCredentialsProviderFunc`
+把相同参数/返回值签名的函数适配成对应 provider。先解析 `TLSPurposeAPI = "api"`;
+只有 `Cluster.NodeLink.Endpoint` 非空才解析 `TLSPurposeNodeLinkClient = "node-link-client"`。
+证书链为 leaf-first DER,signer 须匹配,chain 与 signer 必须成对提供;空材料关闭该用途 TLS。
+API `ClientCAs` 要求 server certificate 并启用必须通过验证的客户端证书;
+node-link 使用 `RootCAs`。Core 固定最低 TLS 1.2 与 ALPN(API 为 `h2`/`http/1.1`,node-link 为 `h2`)。
+
+加密 provider 必须返回非空、有序的原始 32-byte AES key 集。索引零用于加密新记录,
+key 集支持解密此前记录;进程加密 key 集与租户凭据分发表更新是不同概念。
+自定义 object-store provider 要求已配置 `Builder.FilesStorage`、非空 access/secret key;
+`CanExpire` 为 true 时 `Expires` 必须非零且在未来。Core 启动前预取一次,后续 SDK refresh
+仍以该 provider 为权威;错误不得回退 YAML 或环境默认凭据链。
 
 ### Proxy bootstrap
 
@@ -188,7 +234,48 @@ SHM、listener、routesync、stats、dial target 或 credential records。除同
 executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
 启动的 runtime owner 校验。详细 Extension 契约在下文定义。
 
+Proxy 的 [公共材料类型](../app/proxy/proxy.go) 与 Conductor 有明确区别:
+
+| 类型 | 字段或方法 |
+|---|---|
+| `Config` | `config.Proxy` 的 alias |
+| `Runtime` | `Logger *slog.Logger`, `TLS TLSMaterialProvider`, `MasterExtension extension.MasterExtension`, `WorkerExtension extension.WorkerExtension`;忽略另一角色的 extension 字段 |
+| `TLSMaterial` | `CertificateChain [][]byte`, `PrivateKey crypto.Signer`, `ClientCAs *x509.CertPool`;没有 `RootCAs` |
+| `TLSMaterialProvider` | `TLSMaterial(context.Context) (TLSMaterial, error)`;没有 purpose 参数 |
+| `TLSMaterialProviderFunc` | 与该方法签名完全一致的函数适配器 |
+| `Process` | `Role Role`, `WorkerID string`, `WorkerEpoch uint64`;master 的 worker 字段为零值 |
+
+`RoleMaster = "master"`,`RoleWorker = "worker"`。证书/signer 匹配与成对提供、空材料关闭 TLS、
+配置 `ClientCAs` 后要求通过验证的客户端证书,遵循相同 server-material 约束。
+Core 固定最低 TLS 1.2 与 `h2`/`http/1.1` ALPN。
+`Hooks.Configure` 签名为 `(context.Context, *Config) error`,
+`Hooks.BindRuntime` 为 `(context.Context, Process, *Runtime) error`,如上例。
+映射与传输清理统一见 [Proxy worker 生命周期](node-proxy_zh.md#91-worker-生命周期与传输取消);
+下述 source、Hook 与 wrapper 接口不构成另一套数据面实现。
+
 ## Conductor 对象源
+
+单点读取与 Watch 的精确签名为:
+
+```go
+type SandboxSource interface {
+    Get(context.Context, string) (SandboxView, bool, error)
+    Watch(context.Context, func(SandboxEvent) error) error
+}
+type BuildSource interface {
+    Get(context.Context, string) (BuildView, bool, error)
+    Watch(context.Context, func(BuildEvent) error) error
+}
+```
+
+对象不存在时返回 `false, nil`;nil Watch callback 非法。Event 含 `Generation uint64`、
+typed `Kind`、`SandboxID`/`BuildID string` 与 `View *SandboxView`/`*BuildView`;
+`BuildEvent` 另含 `Reason string`。Sandbox Delete 可缺少 View,Build Upsert/Remove 均携带 View。
+完整非秘密字段定义见 [SandboxView 与枚举](../app/conductor/extension/sandbox.go) 和
+[BuildView、BuildResources、BuildOptions](../app/conductor/extension/build.go)。BuildView 包含
+不可变 resources、requested Builder target、source/steps/commands、注册/排队/执行时间、
+当前 RunID/claim/enforcement/phase/network、cluster group 和凭据指纹。两类 source 都不暴露
+原始凭据、MMDS secret value 或可变 core 对象;下述快照/收敛规则适用于每个字段。
 
 在启动期 `Configure` hook 中设置 `conductor.Runtime.Extension`。该对象实现稳定的基本契约：
 
@@ -248,6 +335,18 @@ type BuildHook interface {
 
 operation 是独立可变副本，精确有一个 request 字段非 nil。`ID`、`Kind`、`Origin`、`SandboxID` 或 `BuildID` 和已分配的协议身份仍由 core 持有。Conductor 拒绝对 envelope 的修改，再对每个可变字段重新归一化和验证。存在 `Current` 时，它与对象源返回的非秘密深拷贝投影相同。
 
+公共 [Sandbox request 类型与枚举](../app/conductor/extension/sandbox_hook.go) 定义完整输入:
+
+| Request | 字段与约束 |
+|---|---|
+| `SandboxCreateRequest` | `TemplateID string`、不可变 `Profile Profile`、`TimeoutSeconds int`、`Metadata`/`Env map[string]string`、`Secure bool`、`AutoPauseMemory *bool`、`MMDS *string`;MMDS 保留顶层输入 presence。请求级 MMDS/metadata 可含 secret 或 credential,不得当作非秘密对象源投影记录日志 |
+| `SandboxPauseRequest` | 不可变 `CaptureKind CaptureKind`(`snapshot`/`sandbox`);`CheckpointMergeRef`/`CheckpointDropCaches *bool`,nil 继承 Sandbox/node policy |
+| `SandboxResumeRequest` | `RequestedDeadlineUnix *int64`,nil 使用 core resume-deadline policy;不可变 `Mode ResumeMode`(`auto`/`memory`/`cold`) 与 `Trigger ResumeTrigger`(`connect`/`wake`/`route`/`exec`/`exec-session`) |
+| `SandboxDeleteRequest` | `Reason string` 仅诊断,修改不改变 cleanup 行为 |
+
+直连 Create 可在不可变 profile 内更改模板;canonical cluster Create 必须保留模板及 cluster metadata,
+并让顶层 `MMDS` 保持 nil,不因此取得直连 Create 的覆盖权限。
+
 Sandbox 操作准入位置如下：
 
 - `create`：调用方鉴权、严格解析、初步模板解析、metadata 归一化与 ID 分配之后；launch claim、持久 starting、目录、network attach、路由发布和 runner 分配之前。Hook 可改模板引用、timeout、metadata、environment、secure 及支持的请求 MMDS 输入，也可改 `AutoPauseMemory`；最终模板需重新解析，并保留 core-owned profile。
@@ -255,7 +354,22 @@ Sandbox 操作准入位置如下：
 - `resume`：仅用于 API Connect、Proxy Wake、native exec 和 canonical cluster command 共用的真实 paused → starting 准入。running/starting 的幂等 join 不调用 Hook。Hook 可改请求 deadline；`Mode` 和 `Trigger` 可观察但由 core 持有。
 - `delete`：仅普通显式 API Delete 或 canonical cluster Delete，可拒绝该请求。失败 create/resume 的回滚、对账、shutdown、恢复和其他强制 cleanup 不调用 Hook，不能被扩展可用性阻止。
 
-Build `register` 在解析调用方身份与 ID 后、registration capacity 事务前运行。可以改 name、alias、profile、kind、resources、metadata（含 routes-only MMDS 声明）和 builder options；`BuildID`、`TemplateID` 保持 core-owned。原始 MMDS secret、registry credentials 和 pull token 不复制到 operation。Core 在 Hook 后把保留的初始 MMDS 值重新绑定到最终 routes 声明，再解析 registry 凭据。Canonical cluster BuildRegister 仅在新 ownership 时调用 Hook。对已持久 BuildID 的精确重放验证原始 tenant-keyed 请求身份和凭据指纹，不重复调用可变 Hook，因此后续策略变化不会破坏丢失 ACK 后的重放。
+Build `register` 在解析调用方身份与 ID 后、registration capacity 事务前运行。可以改 `Names`、`Aliases`、`Profile`、`Resources`、`Metadata`(含 routes-only MMDS 声明)、`Env`、`Secure` 和受支持的 `Builder` options;`BuildID`、`TemplateID` 保持 core-owned。不存在可变请求 `kind`:终态 `BuildKind`(`img`/`sbx`/`snp`) 只在成功时推导,此前为空。原始 MMDS secret、registry credentials 和 pull token 不复制到 operation。Core 在 Hook 后把保留的初始 MMDS 值重新绑定到最终 routes 声明，再解析 registry 凭据。Canonical cluster BuildRegister 仅在新 ownership 时调用 Hook。对已持久 BuildID 的精确重放验证原始 tenant-keyed 请求身份和凭据指纹，不重复调用可变 Hook，因此后续策略变化不会破坏丢失 ACK 后的重放。
+
+`Register.Resources` 是注册执行向量的唯一权威(`CPU` 为 milli-CPU,`Memory`/`Storage` 为 bytes)。
+Hook 必须让 `Builder.Resources` 保持 nil;重新引入重复权威会被拒绝。
+可变 Builder 控制为 `Target *BuildTarget {Kind BuildTargetKind; Memory bool}`、
+`Referer *BuildRefererOptions {Enabled, Writeback *bool}`、`Registry *BuildRegistryOptions`,
+后者的 `TLS *BuildRegistryTLSOptions` 含 `CABundlePEM string` 与 `InsecureSkipVerify bool`。
+Target kind 是 `image` 或 `sandbox`;nil 按最终 effective start/ready 自动解析,
+不是按任意配置是否存在推导,见 [Build target 契约](node-build_zh.md#31-请求级-builder-输入)。
+
+公共 [Build request 类型](../app/conductor/extension/build_hook.go) 中,`BuildTriggerRequest` 包含
+`FromImage`、`FromTemplate`、`StartCommand`、`ReadyCommand` string,`Steps []BuildStep` 与
+`ResourceAssertion BuildResourcePatch`。每个 [BuildStep](../app/conductor/extension/build.go) 包含
+`Type string`、`Args []string`、`FilesHash string`、`Force bool`。
+`BuildResourcePatch` 的 `CPU`、`Memory`、`Storage` 均为 `*int64`,单位与注册 execution vector 相同;
+nil leaf 不作断言,显式 leaf 必须等于不可变注册资源。
 
 Build `trigger` 在 ownership/state 检查与初步纯解析后、source 解析、registry credential 解析及 registered → waiting CAS 前运行。最终 `fromImage`/`fromTemplate`、steps、commands 和 resource assertion 均重新验证，凭据按最终 source 解析。waiting → building 的 execution claim 明确没有 Hook。
 
@@ -306,6 +420,20 @@ type ManagementWrapper interface {
 
 ### Master 路由源
 
+```go
+type RouteSource interface {
+    Get(context.Context, string) (RouteView, bool, error)
+    Watch(context.Context, func(RouteEvent) error) error
+    SyncState() RouteSyncState
+}
+```
+
+对象缺席时单点读取返回 `false, nil`;nil Watch callback 被拒绝。
+`RouteEvent` 含 `Generation uint64`、`Kind RouteEventKind`、`SandboxID string` 与
+`View *RouteView`,Upsert/Delete 均有 View。[RouteView 与枚举](../app/proxy/extension/route.go)
+定义本地/稳定身份、profile/template/lifecycle/RunID、Envd/CI socket、FloatingIP、artifact
+location、完整凭据指纹与 `Revision uint64`。
+
 `RouteSource.Get` 返回 master 成功应用到 core table 的 route 的独立非秘密投影。包括 Sandbox 与授权身份、profile、template、state、RunID、当前本地 endpoint、E/S artifact location、凭据指纹和 core route revision；省略原始 secret、access token、MMDS 值和内部 SHM record。这用于减少日常事件数据与误日志，不是受信同进程代码的权限边界，也不为扩展增加 metadata 字段或新 SHM schema。Proxy 投影特意只暴露 `ArtifactLocation`，不含 ResumeSource kind 或 launch-mode gate，不能据此判定 paused 路由是否可以 Wake。
 
 `SyncState` 返回 initializing、syncing、synced 或 stale。Routesync 断开将 source 改为 stale 并产生 sync_lost；服务中的 SHM 保留既有重连行为。后续 sync 在 bookmark 时替换投影，使 source 回到 synced。
@@ -315,6 +443,16 @@ type ManagementWrapper interface {
 Observing sink 仅在 core SHM 操作成功后更新扩展投影。发布有界且非阻塞，回调仅在调用 Watch 的 goroutine 运行。扩展滞后、回调错误或 resync 不能终止 routesync、阻塞 SHM 修改和 worker notification、推迟 RouteBarrier ACK，或影响 Wake/activation。
 
 ### Master traffic 源
+
+`TrafficSource.Get(context.Context, string) (TrafficView, error)` 没有 found boolean 或 Watch。
+`ErrTrafficUnavailable` 表示 route identity 或完整 worker contribution 不可用;
+`ErrTrafficConflict` 表示当前 route state 不能生成请求的观测。
+[TrafficView](../app/proxy/extension/traffic.go) 含 `SandboxID`、`RunID`、`Profile`、`State`、
+有效 `MaxInflight config.MaxInflight`、`Inflight TrafficInflight`、`IdleSince *time.Time` 和
+`Services map[string]ServiceTrafficView`。Inflight 含 `Parking`/`Egress uint64`,每 service
+另含 `IdleSince *time.Time`。`config.MaxInflight` 含 `Total`、`Forward`、`E2BEnvd`、
+`E2BCodeInterpreter`、`Exec uint32`(JSON 为 `total`、`forward`、`e2b:envd`、
+`e2b:code-interpreter`、`exec`);零表示无限,`Unlimited() bool` 检查整个向量。
 
 `TrafficSource.Get` 在进程内直接组合当前 applied route 身份、有效的 per-Sandbox maxInflight policy 和 MasterStats；它不查询 stats UDS，也不从 conductor Sandbox 行推导限额。`TrafficView.MaxInflight` 使用 canonical `config.MaxInflight` 结构；返回的 map 与时间指针是独立副本。V1 明确没有 traffic Watch。重连期间保留的 route 仍可查询，需要新鲜状态的调用方还必须检查 `Routes().SyncState()`。
 
@@ -351,6 +489,13 @@ type IngressWrapper interface {
 `GetRoute` 从 worker 当前 SHM point lookup 复制独立公共 RouteView，暴露与 master 投影相同的既有非秘密字段和 revision，而非原始 SHM record、router、token 或可变指针。Worker V1 不提供 route Watch；动态观察仅在 master。这个小接口面是 API 约束，不是受信同进程代码的安全边界。
 
 ### 已授权 core 转发
+
+`ConnectTarget {Service ConnectService; Port int}` 选择后端。Service 常量为
+`ConnectServiceLegacy = ""`、`ConnectServiceForward = "forward"`、
+`ConnectServiceE2BEnvd = "e2b:envd"`、`ConnectServiceE2BInterpreter = "e2b:code-interpreter"`、
+`ConnectServiceExec = "exec"`。Legacy/forward 要求 port 为 `1..65535`;
+`ForwardAuthorized` 拒绝 Exec,后者必须走内置 KAT/逐命令 CEL 路径。
+见 [公共 target 类型](../app/proxy/extension/worker.go)。
 
 `ForwardAuthorized` 供已完成私有鉴权、但需要复用 core 路由和传输流程的 wrapper 使用：
 

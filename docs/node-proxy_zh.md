@@ -419,8 +419,9 @@ Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不�
 三类自定义 route:
 
 - `static`:直接返回声明的 UTF-8 `data`。
-- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换,DELETE 后立即 404,
-  不等待、不设 TTL,Content-Type 始终来自 route。
+- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换。DELETE 先持久删除再异步发布 route,
+  Proxy 投影应用后 guest GET 才返回 404;没有 deletion barrier,不取消已解析的响应,不等待 value、无 TTL。
+  Content-Type 始终来自 route。
 - `service`:master 从唯一 registry 解析本机 Unix socket,worker/handler
   构造全新 `GET <exact-path> HTTP/1.1`,`Host: mmds-service`,仅增加
   `E2b-Sandbox-Id: <sid>` 与 `E2b-Sandbox-Service: <service>`。不发送 port,不透传 guest
@@ -428,12 +429,17 @@ Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不�
   有界 body 和合法 Content-Type(缺省 `text/plain`),不跟随 redirect;超时/过大/非法响应
   映射 504/502,service 缺失或 socket 不可达为 503。
 
-安全边界:routes 是 portable declaration,secret values 则只存在 sqlite ciphertext 或受信
-Proxy master 的有界 heap.它们不写普通 metadata,共享 mmap,
-日志、metrics、migration token、template 或构建产物,也不发送给 observer/node-link。
-但 guest 主动 GET 后,value 已进入 guest/application memory;随后执行包含内存的 Pause/snapshot
-可能把该副本作为普通 guest working set 捕获。平台不能在宿主侧从任意 guest 内存中擦除它,
-调用方应在应用侧缩短驻留时间,并把包含已消费 secret 的 snapshot 按敏感制品保护。
+安全边界:routes 是 portable declaration,secret values 的控制面存储为 SQLite ciphertext,运行期在受信 conductor/Proxy master 的有界 heap。
+平台不把 values 自动投影到普通 metadata、共享 mmap、日志、metrics、migration token、template 或 Build 制品,
+也不发给 observer/node-link。但 guest 主动 GET 后可以把 value 复制到应用内存或文件;
+后续 Pause/snapshot 或 image export 可能保留这些 guest 副本。宿主 DELETE 不会擦除 guest 已消费的副本。
+调用方应缩短应用驻留时间,并把包含这些副本的内存、磁盘或 image 制品按敏感数据保护。
+
+Sandbox-local MMDS 是本机对象/route 机制,不是 cluster Secret API、通用 CONNECT 配置面或 placement/admission 功能。
+Standalone CONNECT 的 secrets-only import 只在目标不存在且实际 import 时解析,目标已存在则跳过;
+完整迁移边界见 [Node §8.1.4](node_zh.md#814-publishtemplate-与-migration)。
+Build Register 的请求级 MMDS 仍在选定节点按 Build ownership 加密保存,见 [Build §3.1](node-build_zh.md#31-请求级-builder-输入)。
+普通 metadata 的偶然传递不构成 cluster-wide MMDS 支持或对应 E2E 验收承诺。
 
 ## 8. per-Sandbox traffic admission 与 stats
 
@@ -490,17 +496,19 @@ route 发布零 binding，worker 直接执行既有 `BeginParking`，不扫描 a
 route 的 `{slot,generation,effective limits}` 位于 route SHM。arena v2 仅保存 master 写入的
 每 slot active generation，以及携带 generation tag 的 `counters[worker][forward/envd/CI/exec]`。
 存活 worker 独占写入自己的 row；进程内 per-slot mutex 串行化初始化、acquire 和 release。
-master 不获取该锁、不清理存活 row；不存在 shared guard、draining state 或第二份可变 limit policy。
+master 不获取该锁、不清理存活 row；不存在 shared guard、identity hash、draining state 或第二份可变 limit policy。本地锁按 slot 而非仅按 SandboxID 组织。
 
 acquire 在进程内 per-slot mutex（该 slot 所有 service 共用）内执行:
 
 ```text
 verify active generation and effective limits
-→ atomically load every worker's four cells exactly once
+→ initialize own row for a new generation: tag=0, reset four cells, publish new tag
+→ read each row's tag, four cells, then tag again; include only unchanged matching tags
 → check total and target service together
-→ increment this worker's target-service cell
-→ enter local parking
-→ unlock and return success
+→ recheck active generation, increment own target-service cell, recheck again
+→ on revocation undo increment under the same local slot mutex and reject
+→ unlock the slot mutex and return the admission lease
+→ enter local parking under the distinct per-Sandbox traffic-entry mutex
 ```
 
 同一 worker、同一 Sandbox 的所有 service 共用该锁,所以每个 worker 同时最多有一个 acquire
@@ -516,7 +524,7 @@ release 的 flow 的 acquire→release 完整区间。删除这种正计数区�
 通过;同 worker 的串行关系也不变。缩减历史到 `T` 为止没有 release,其已发布计数恰好等于原
 执行在 `T` 的 actual active 数,因此适用上一段单调执行的 `M + N - 1` 上界。该论证不要求
 逐列读取构成原子 snapshot,并分别适用于同一次临界区内检查的 `total` 和目标 service。所以
-配置 `M`、worker 数 `N` 的合同是:
+对当前 generation、稳定的正上限 `M` 与 worker 数 `N`,合同是:
 
 ```text
 actual admitted inflight <= M + N - 1
@@ -526,12 +534,18 @@ parking→egress 不改 shared count。activation、dial、HTTP forward、contex
 response 及完整 CONNECT/exec relay 的最终 Close 都由同一个 flow/lease exactly once 释放;
 half-close 不释放。
 
-Delete 或 identity replacement 撤销旧 active generation，不等待存活 worker。slot 复用时
-发布新 generation；各 worker 在本地 slot mutex 下首次使用时初始化自己的 row。旧 release
-或者发生在初始化前，或者发现新 tag 后不再操作，因此不会减少新 identity 的计数。未改变身份
-的 starting/running/paused 更新保持 generation。Activate 重验完整 identity、policy validity、
-binding 与 arena generation 存活状态。route 发布失败时回滚 admission transaction，保留旧
-计数。暂停的 worker 不阻塞 master 发布或其它 worker；详见[分代所有权与回滚](proxy-admission-generations_zh.md)。
+Delete 或 identity replacement 撤销旧 active generation,不等待存活 worker,即使其停在 acquire 临界区。
+master 的分配事务保留一个 spare slot:先撤销旧 binding、分配新 binding,再发布 route;
+成功后回收旧 slot,失败则回收尚未发布的新 slot、恢复旧 generation,绝不清空旧连接计数。
+各 worker 首次使用新 generation 时只初始化自己的 row:先置 tag=0,清四个计数,最后发布新 tag。
+扫描在四计数前后读 tag,仅计入两次 tag 一致且匹配当前 generation 的 row。
+旧 release 或者在本 worker 初始化前完成,或者见新 tag 后不操作,不会减少新 identity 计数。
+acquire 在发布增量前后重验 generation;撤销则在同一本地 slot 锁内撤回增量。
+既有完整 RouteBinding/ExecIdentity 相等检查继续保护 activation 的凭据与策略;arena Valid 只表示 generation 存活。
+正常 starting/running/paused 更新与未改变 binding 的 full-sync 重放保留 generation/计数。
+本上界不把新旧身份合为一个 quota,也不承诺降低 limit 时驱逐已有 flow。
+worker 落点不是静态 M/N quota:单个 worker 可用全部 M,但多个 worker 不能各自独立用 M。
+不引入 watchdog、锁超时、争锁即杀进程、每 flow master RPC 或全局 limiter。
 
 worker stats stream fault 会先终止 worker。只有 supervisor 的 `cmd.Wait` 证明旧进程已退出、
 kernel 已关闭其连接后，master 才清理该 index，无需 shared lock；此前 stale-high 只能
@@ -544,7 +558,10 @@ kernel 已关闭其连接后，master 才清理该 index，无需 shared lock；
 `65536 × 2 × 4 × 8 = 4194304` bytes；连同 generation tags、headers 和一个 transaction spare
 entry，arena v2 mmap 为 `5767320` bytes。每个 worker 另持有 65537 个进程内 mutex，
 `sync.Mutex` 为 8 bytes 时占 `524296` bytes，不属于共享映射。size、stride、worker count/index 和 8-byte atomic alignment
-均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+及 layout version 均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+仅 admission arena 从 v1 升到 v2,不是用户配置或 routesync 版本变更;master/worker 必须使用同一 executable/bootstrap source set。
+保留 1/2/4/8-worker 阈值交错、service/total、偏斜、release 波次、rollback 和真实子进程退出清理测试。
+SIGSTOP 测试把真实 child 停在 acquire 内,要求 master 路由更新与 surviving worker 无需先唤醒或杀死它即可前进。
 
 worker 关闭后仍保留两种映射直到进程退出，包括异步扩展代码或 hijacked handler 超出
 `Run` 生命周期的情况。只有 `cmd.Wait` 后才清理对应 epoch 并启动 replacement；见

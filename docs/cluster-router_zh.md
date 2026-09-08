@@ -141,11 +141,11 @@ NodeSandboxID;公开响应不暴露 NodeSandboxID。
 校验 KAT `sid`，但 cache/route lookup 仍使用 `(group, route_key, SandboxID)`，不会把 StableID
 当作 node-local lookup key 或建立唯一索引。
 
-create 可在 body metadata 中携 `kuasar-sandbox.resource`、restore、credentials 与 checkpoint。
-`X-Kuasar-Sandbox-Resource` 只覆盖明确出现的 resource leaf;resource 的公开面严格限制为
-capacity/allocatable/startup,并与 group defaults 使用同一 merge helper。restore/credentials
+create 可在 body metadata 中携 `kuasar-sandbox.resource`、traffic、restore、credentials 与 checkpoint。
+`X-Kuasar-Sandbox-Resource` 与 `X-Kuasar-Sandbox-Traffic` 只覆盖各自 patch 中明确出现的 leaf；resource 的公开面严格限制为
+capacity/allocatable/startup，并与 group defaults 使用同一 merge helper；traffic 使用共享的 max-inflight patch 校验与叶子合并。restore/credentials
 Header 覆盖同名完整 object,checkpoint Header 按字段覆盖。router 始终解析并严格校验 body,
-所以合法 Header 不能隐藏非法低优先级 resource/checkpoint。未提供 restore、`{}` 与显式
+所以合法 Header 不能隐藏非法低优先级 resource/traffic/checkpoint。未提供 restore、`{}` 与显式
 `off` 均为关闭;只有本次 create 显式提供 `memory` 才启用。create body 上限为 16 MiB,
 超限返回 **413**。
 
@@ -305,7 +305,8 @@ Content-Type: application/json
 Router 先分离普通 legacy target 和 native exec 逻辑服务:
 
 - 普通 HTTP 只使用 Host/`E2b-Sandbox-Id + E2b-Sandbox-Port` 的 legacy port;
-  不解析 `E2b-Sandbox-Service`,该 Header 作为应用层 Header 在内层请求中保留.
+  除精确值 `exec` 外，不解释 `E2b-Sandbox-Service`，该 Header 作为应用层 Header 在内层请求中保留。
+  非 CONNECT 请求选择 `exec` 时，在 route lookup 或 activation 前返回 **405** 与 `Allow: CONNECT`。
 - 未携 service 的 CONNECT 同样使用 legacy raw port.
 - `E2b-Sandbox-Service: exec` 是已接入的 portless CONNECT target,可与 port 并存,
   但 port 不参与 backend 选择.
@@ -393,6 +394,8 @@ paused/starting 路径不增加 Registry 调用.Router 和 Node 都执行完整 
 Router 在 public 200 后先执行首帧 gate,通过后才建立下一跳;最终 Node 从本地 route 再次校验
 `StableID + ServiceSecret`,回复 node CONNECT 200 后再次执行首帧 gate,通过后才 parking、
 activation 和连接 `<run_root>/sandboxes/<NodeSandboxID>/ctl.sock`.Router 不拨 `ctl.sock`.
+
+KAT 绑定 StableID，不绑定 NodeSandboxID 或其 generation。因此，同一 lineage 的 resume、migration 或 replacement 本身不要求重新签发 token；有效期、claims 和当前凭据校验仍然适用。每次新的 node CONNECT 都使用当前 NodeSandboxID。
 
 最终 Node Proxy 的 ordinary HTTP/non-exec CONNECT 达到 per-Sandbox 上限时返回
 `429` + `X-Kuasar-Proxy-Error: max_inflight_reached`。Router 原样透传 status、header 和
