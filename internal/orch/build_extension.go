@@ -104,6 +104,9 @@ func (o *Orchestrator) normalizeBuildRegistration(request *conductorextension.Bu
 		return nil, fmt.Errorf("%w: build resources cannot fit builder.admission.execution", api.ErrBadRequest)
 	}
 	metadata := cloneStringMap(request.Metadata)
+	if _, present := metadata[sandboxcfg.NsIdentity]; present {
+		return nil, fmt.Errorf("%w: %s is not valid for template builds", api.ErrBadRequest, sandboxcfg.NsIdentity)
+	}
 	if _, present := metadata[clusterstate.ObjectMetadataKey]; present {
 		return nil, fmt.Errorf("%w: %s is node-managed cluster context", api.ErrBadRequest, clusterstate.ObjectMetadataKey)
 	}

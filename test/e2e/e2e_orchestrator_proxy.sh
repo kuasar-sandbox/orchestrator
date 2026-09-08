@@ -742,8 +742,17 @@ echo "==> PASS: Proxy re-registered after admission failure"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
+IDENTITY_ID="identity-$(cat /proc/sys/kernel/random/uuid)"
+IDENTITY_STABLE_ID="logical-$IDENTITY_ID"
+IDENTITY_CREATE_BODY="$(python3 - "$TEMPLATE" "$IDENTITY_ID" "$IDENTITY_STABLE_ID" <<'PY_IDENTITY'
+import json, sys
+print(json.dumps({"templateID": sys.argv[1], "timeout": 120, "metadata": {
+    "kuasar-sandbox.identity": json.dumps({"id": sys.argv[2], "stable_id": sys.argv[3]})
+}}))
+PY_IDENTITY
+)"
 REQ_ATTACH_MMDS="$MMDS_ROUTES_E2E"
-code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+code=$(req POST /sandboxes "$AK" "$IDENTITY_CREATE_BODY")
 unset REQ_ATTACH_MMDS
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
@@ -752,6 +761,7 @@ if [ "$code" != "201" ]; then
     fail "create=$code (want 201)"
 fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
+[ "$SID" = "$IDENTITY_ID" ] || fail "Create did not use the requested local ID"
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 FORWARD_TOKEN=$(json_field "$WORK/resp.body" forwardAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] && [ -n "$FORWARD_TOKEN" ] \
@@ -789,6 +799,22 @@ wait "$IMMEDIATE_EXEC_PID" || immediate_exec_status=$?
 IMMEDIATE_EXEC_PID=""
 [ "$immediate_exec_status" = "0" ] || { dump_logs; fail "immediate Proxy native exec did not park to running"; }
 echo "==> PASS: Proxy native exec parked post-Create CONNECT from ACKed starting to running"
+
+# Conflict must not replace the running object or disclose its credentials.
+code=$(req POST /sandboxes "$AK" "$IDENTITY_CREATE_BODY")
+[ "$code" = "409" ] || { cat "$WORK/resp.body"; fail "duplicate identity Create=$code (want 409)"; }
+code=$(req GET "/sandboxes/$SID" "$AK")
+[ "$code" = "200" ] || fail "identity readback=$code"
+python3 - "$WORK/resp.body" "$IDENTITY_ID" "$FORWARD_TOKEN" "$IDENTITY_STABLE_ID" <<'PY_IDENTITY'
+import base64, json, sys
+sandbox = json.load(open(sys.argv[1]))
+assert sandbox["sandboxID"] == sys.argv[2]
+assert "kuasar-sandbox.identity" not in sandbox.get("metadata", {})
+encoded = sys.argv[3].split(".")[1]
+claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+assert claims["sid"] == sys.argv[4]
+PY_IDENTITY
+echo "==> PASS: explicit local/stable identity survived real Proxy exec/envd; duplicate Create is 409"
 wait_traffic_stats "$SID" idle || { dump_logs; fail "Proxy traffic did not converge to idle"; }
 echo "==> PASS: Proxy master cache converged parking/egress to idle"
 

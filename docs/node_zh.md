@@ -2,6 +2,8 @@
 
 # node — 节点 e2b 兼容沙箱主机与集群接入
 
+直连 Create 的可选 ID、Header/metadata 优先级和 insert-only 冲突语义参见[创建时指定沙箱身份](sandbox-identity_zh.md)。
+
 `node-ctl conductor serve` 是计算节点上的单实例控制 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
 microVM 沙箱以 e2b 协议暴露给客户端——在本文协议与已验证版本支持的操作范围内，未改造的 e2b SDK（python/js `e2b`、
 `@e2b/code-interpreter`）与 e2b CLI 可直接指向本机运行。`node-ctl conductor serve` 一身兼数职:
@@ -118,7 +120,7 @@ profile 编码在 templateID 前缀里（§4.4），运行期据此选择共享 
               sandbox backend
 ```
 
-create 同步受理流程只做请求校验/纯解析、身份和 token 生成、进程内 launch ownership claim,
+create 同步受理流程只做请求校验/纯解析、选定请求身份或生成默认身份、生成 token、进程内 launch ownership claim,
 然后 insert `starting, run_id=""`(网络字段为空)并 cache/publish starting,在同一有序 routesync
 下发 `route_barrier`,等待当前 proxy
 master 成功应用先行 Upsert并 ACK,再次核验 registration lease 后才调度 launch并返回 HTTP

@@ -391,11 +391,15 @@ func TestPrecheckClusterSnapshotPolicy(t *testing.T) {
 			o := testOrchCfg(t, cfg)
 			_, _, fingerprint := allowlistedBuildIdentity(t, o)
 			cmd := newCommand(fingerprint, ` { "merge_ref" : false, "drop_caches" : null } `)
-			if _, _, _, err := o.precheckCluster(context.Background(), cmd); err != nil {
+			_, _, normalized, err := o.precheckCluster(context.Background(), cmd)
+			if err != nil {
 				t.Fatalf("%s checkpoint policy rejected: %v", mode, err)
 			}
-			if cmd.Config[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
-				t.Fatalf("cluster checkpoint policy was not canonicalized: %+v", cmd.Config)
+			if normalized.Metadata[sandboxcfg.NsCheckpoint] != `{"merge_ref":false}` {
+				t.Fatalf("cluster checkpoint policy was not canonicalized: %+v", normalized.Metadata)
+			}
+			if cmd.Config[sandboxcfg.NsCheckpoint] != ` { "merge_ref" : false, "drop_caches" : null } ` {
+				t.Fatal("precheck modified original checkpoint input")
 			}
 			if _, _, _, err := o.precheckCluster(context.Background(), newCommand(fingerprint, `{"merge_ref":0}`)); err == nil {
 				t.Fatal("malformed cluster checkpoint policy was accepted")
@@ -482,15 +486,19 @@ func TestPrecheckClusterExtractsCredentials(t *testing.T) {
 			"keep":                   "value",
 		},
 	}
-	_, _, credentials, err := o.precheckCluster(context.Background(), cmd)
+	_, _, normalized, err := o.precheckCluster(context.Background(), cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
+	credentials := normalized.Credentials
 	if credentials.ServiceSecret != secret || credentials.EnvdAccessToken != "envd" || credentials.TrafficAccessToken != "traffic" {
 		t.Fatalf("cluster credentials = %+v", credentials)
 	}
-	if _, found := cmd.Config[sandboxcfg.NsCredentials]; found || cmd.Config["keep"] != "value" {
-		t.Fatalf("cluster command config was not separated: %+v", cmd.Config)
+	if _, found := normalized.Metadata[sandboxcfg.NsCredentials]; found || normalized.Metadata["keep"] != "value" {
+		t.Fatalf("cluster config result was not separated: %+v", normalized.Metadata)
+	}
+	if _, found := cmd.Config[sandboxcfg.NsCredentials]; !found || cmd.Config["keep"] != "value" {
+		t.Fatal("precheck modified the original command credentials")
 	}
 }
 
