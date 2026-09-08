@@ -187,7 +187,7 @@ func TestBuildMMDSRouteIsIncludedInFullSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sandboxID := "build-" + build.BuildID
+	sandboxID := buildMMDSID(build.BuildID)
 	row := &types.Sandbox{
 		ID: sandboxID, Profile: types.ProfileE2B, TemplateID: build.TemplateID,
 		State: types.StateRunning, RunID: "builder-run", FloatingIP: "192.0.2.10",

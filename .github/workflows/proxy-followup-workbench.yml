@@ -1,5 +1,4 @@
-# Temporary branch-only source export. Remove before final review/merge.
-# This workflow never publishes a status or replaces the trusted BMS gate.
+# Temporary branch-only source export. Removed before final review/merge.
 name: Temporary proxy follow-up workbench
 on:
   push:
@@ -13,29 +12,14 @@ jobs:
   workbench:
     if: github.repository == 'kuasar-sandbox/orchestrator' && github.event_name == 'push' && github.ref == 'refs/heads/fix/proxy-invalid-traffic-policy'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
-        with:
-          go-version: '1.24.0'
-          cache: false
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
-        id: source-token
-        with:
-          client-id: Iv23liOE6BArlzz5Evgc
-          private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
-          owner: kuasar-sandbox
-          repositories: accelerator,connector,sandboxer
-          permission-contents: read
-      - name: Export exact source and offline dependencies
-        env:
-          GH_TOKEN: ${{ steps.source-token.outputs.token }}
-          GOWORK: 'off'
-          GOTOOLCHAIN: local
+      - name: Export refreshed source
         run: python3 .github/proxy-followup-workbench.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
