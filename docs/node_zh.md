@@ -958,10 +958,12 @@ namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆�
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
-`traffic` 的固定 leaf priority 是:
+Build traffic 仅作用于本次 Build runtime 及其 synthetic route，不会被输出制品后续创建的
+Sandbox 继承。canonical TemplateID Create 不查询保留的 Build metadata、Template catalog
+或制品 metadata 来取得 traffic 默认值。`traffic` 的固定 leaf priority 是:
 
 ```text
-template / group defaults
+cluster group explicit metadata (when present)
   < create / reserve body metadata
   < X-Kuasar-Sandbox-Traffic
 ```
@@ -2577,7 +2579,7 @@ phase、network、runtime prepare/result owner。候选扫描后的并发变化�
 
 以上 node-local finalizer 是 #132/#133 的 cleanup 合同实现边界。#196 的 Export 仍保持
 publish/finalize 两阶段竞争与 source cleanup 顺序；#205 的 Build resources、两级准入和 cgroup
-权威不变；当前 main 仍有 post-registration Build projection，故 routesync v7 沿用 v6 引入的 Build full sync +
+权威不变；当前 main 仍有 post-registration Build projection，故 routesync v8 沿用 v6 引入的 Build full sync +
 live delete 收敛它，但不改变 #46 的 immutable registered-node binding；若 #46 删除该 projection，
 节点 TTL 本身不要求重建 lifecycle event。这里不执行任何远端 artifact GC，也不增加逐步骤
 cleanup stage 或第二份路径权威。

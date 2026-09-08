@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -46,9 +47,9 @@ import (
 // 5 splits node API and data endpoints and removes the proxy forwarding socket.
 // Version 6 adds rebuildable Build upsert/delete events and an explicit Build
 // full-snapshot bracket on every node-link session. Version 7 adds the
-// presence-aware per-Sandbox max_inflight route projection; mixed peers fail
-// closed.
-const Version = 7
+// presence-aware per-Sandbox max_inflight route projection. Version 8 separates
+// invalid persisted traffic policy from lifecycle state; mixed peers fail closed.
+const Version = 8
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -143,6 +144,11 @@ type RouteEntry struct {
 	// master merges it with target-node defaults, then clears it before writing
 	// the fixed route SHM record.
 	MaxInflightPatch *sandboxcfg.MaxInflightPatch `json:"max_inflight,omitempty"`
+	// TrafficPolicyInvalid describes a failed projection of already-persisted
+	// metadata, not a lifecycle transition. It denies this Sandbox's data
+	// admission and effective-traffic queries without affecting MMDS or peers.
+	// Request metadata cannot set this internal projection field.
+	TrafficPolicyInvalid bool `json:"traffic_policy_invalid,omitempty"`
 
 	// The following fields are master-resolved fixed-layout state. They never
 	// cross routesync wire boundaries.
@@ -152,8 +158,8 @@ type RouteEntry struct {
 }
 
 // UnmarshalJSON keeps the established extensible RouteEntry envelope while
-// making the owned max_inflight projection strict. Null, duplicate, and unknown
-// policy leaves must not alias an absent patch at a version-7 peer.
+// making the owned traffic projection strict. Null, duplicate, and unknown
+// policy leaves must not alias a valid absent policy.
 func (r *RouteEntry) UnmarshalJSON(raw []byte) error {
 	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
 		return fmt.Errorf("routesync: route: %w", err)
@@ -167,12 +173,29 @@ func (r *RouteEntry) UnmarshalJSON(raw []byte) error {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
+	// encoding/json accepts case-insensitive field names. Do not let an alias
+	// bypass the owned projection's null/type/duplicate validation below.
+	for field := range fields {
+		for _, owned := range []string{"traffic_policy_invalid", "max_inflight"} {
+			if field != owned && strings.EqualFold(field, owned) {
+				return fmt.Errorf("routesync: non-canonical traffic field %q", field)
+			}
+		}
+	}
+	if invalid, present := fields["traffic_policy_invalid"]; present {
+		if err := strictjson.Decode(invalid, &decoded.TrafficPolicyInvalid); err != nil {
+			return fmt.Errorf("routesync: traffic_policy_invalid: %w", err)
+		}
+	}
 	if maxInflight, present := fields["max_inflight"]; present {
 		patch, err := sandboxcfg.ParseTrafficPatch(`{"max_inflight":` + string(maxInflight) + `}`)
 		if err != nil {
 			return fmt.Errorf("routesync: route: %w", err)
 		}
 		decoded.MaxInflightPatch = patch.MaxInflight
+	}
+	if decoded.TrafficPolicyInvalid && decoded.MaxInflightPatch != nil {
+		return errors.New("routesync: invalid traffic policy cannot carry a max_inflight patch")
 	}
 	*r = RouteEntry(decoded)
 	return nil

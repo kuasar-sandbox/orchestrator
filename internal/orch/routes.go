@@ -79,10 +79,10 @@ func routeEntryBase(sb *types.Sandbox) (routesync.RouteEntry, error) {
 			err = sandboxcfg.ValidateTrafficForProfile(sb.Profile, patch)
 		}
 		if err != nil {
-			// Persisted metadata is validated before insertion. A corrupted row
-			// must nevertheless fail closed instead of becoming unlimited or
-			// repeatedly breaking the Proxy's full route synchronization.
-			e.State = routesync.StateDead
+			// Inputs are validated before persistence. A corrupted policy must
+			// not fabricate a lifecycle terminal (Registry treats dead as a
+			// deletion), weaken limits, disable MMDS, or poison other routes.
+			e.TrafficPolicyInvalid = true
 			return e, fmt.Errorf("project traffic metadata for %s: %w", sb.ID, err)
 		}
 		e.MaxInflightPatch = patch.MaxInflight
@@ -117,10 +117,10 @@ func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) 
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
 			entry, err := o.routeEntryContext(ctx, sb)
 			if err != nil {
-				// Preserve the route lifecycle while making secret routes fail
-				// closed through a nil values projection.
+				// Preserve lifecycle facts. Traffic validity and confidential
+				// MMDS value availability fail closed independently per route.
 				if o.log != nil {
-					o.log.Warn("MMDS route projection unavailable", "sid", sb.ID, "err", err)
+					o.log.Warn("route projection unavailable", "sid", sb.ID, "err", err)
 				}
 			}
 			return fn(entry)
@@ -147,7 +147,7 @@ func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) 
 		}
 		entry, err := o.routeEntryContext(ctx, sb)
 		if err != nil && o.log != nil {
-			o.log.Warn("MMDS builder route projection unavailable", "sid", sb.ID, "err", err)
+			o.log.Warn("builder route projection unavailable", "sid", sb.ID, "err", err)
 		}
 		if err := fn(entry); err != nil {
 			return err

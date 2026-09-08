@@ -13,9 +13,10 @@ import (
 )
 
 type routeRecord struct {
-	view        proxyextension.RouteView
-	maxInflight config.MaxInflight
-	seen        uint64
+	view                 proxyextension.RouteView
+	trafficPolicyInvalid bool
+	maxInflight          config.MaxInflight
+	seen                 uint64
 }
 
 type changeKind uint8
@@ -56,8 +57,17 @@ func newRouteSource(capacity int) *routeSource {
 }
 
 func (s *routeSource) Get(ctx context.Context, sandboxID string) (proxyextension.RouteView, bool, error) {
-	view, _, found, err := s.getTrafficRoute(ctx, sandboxID)
-	return view, found, err
+	if err := ctx.Err(); err != nil {
+		return proxyextension.RouteView{}, false, err
+	}
+	s.mu.RLock()
+	record, found := s.routes[sandboxID]
+	s.mu.RUnlock()
+	if !found {
+		return proxyextension.RouteView{}, false, nil
+	}
+	// Route facts remain available even when effective traffic policy is not.
+	return cloneRouteView(record.view), true, nil
 }
 
 func (s *routeSource) getTrafficRoute(ctx context.Context, sandboxID string) (proxyextension.RouteView, config.MaxInflight, bool, error) {
@@ -69,6 +79,9 @@ func (s *routeSource) getTrafficRoute(ctx context.Context, sandboxID string) (pr
 	s.mu.RUnlock()
 	if !found {
 		return proxyextension.RouteView{}, config.MaxInflight{}, false, nil
+	}
+	if record.trafficPolicyInvalid {
+		return proxyextension.RouteView{}, config.MaxInflight{}, false, proxyextension.ErrTrafficUnavailable
 	}
 	return cloneRouteView(record.view), record.maxInflight, true, nil
 }
@@ -233,6 +246,7 @@ func (s *routeSource) upsert(route routesync.RouteEntry, revision uint64) {
 	s.mu.Lock()
 	s.routes[route.SandboxID] = routeRecord{
 		view: view, maxInflight: route.EffectiveMaxInflight, seen: s.syncGeneration,
+		trafficPolicyInvalid: route.TrafficPolicyInvalid,
 	}
 	s.mu.Unlock()
 	s.hub.publish(routeChange{kind: changeUpsert, sandboxID: route.SandboxID, view: view})
