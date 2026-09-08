@@ -2,17 +2,19 @@
 """Check native sandbox-ctl records captured around one real owner E2E case."""
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 kind, filename = sys.argv[1:]
 sandbox_tags = defaultdict(set)
 build_tags = defaultdict(set)
+observed = Counter()
 independent_stable = False
 count = 0
 with open(filename, encoding="utf-8") as source:
     for line in source:
         row = json.loads(line)
         tag = row.get("SYSLOG_IDENTIFIER")
+        observed[(str(row.get("_TRANSPORT")), str(tag))] += 1
         if row.get("_TRANSPORT") != "journal" or tag not in (
             "sandbox", "build", "console", "sandbox-ctl"
         ):
@@ -35,6 +37,13 @@ with open(filename, encoding="utf-8") as source:
             assert tag != "build", (kind, "sandbox output used Build tag")
             sandbox_tags[(sid, stable, run)].add(tag)
             independent_stable |= sid != stable
+# Diagnostics contain counts and non-secret identities, never guest MESSAGE,
+# credentials or complete journal rows. Keep the strict assertions below.
+print(f"Journal coverage ({kind}): transports/tags={dict(observed)}", flush=True)
+for identity, tags in sorted(sandbox_tags.items()):
+    print(f"  Sandbox (local, stable, run)={identity}: {sorted(tags)}", flush=True)
+for identity, tags in sorted(build_tags.items()):
+    print(f"  Build (build, run)={identity}: {sorted(tags)}", flush=True)
 assert count, (kind, "no native sandbox-ctl journal records in this invocation")
 if kind == "build":
     assert any({"build", "console", "sandbox-ctl"} <= tags for tags in build_tags.values()), (
