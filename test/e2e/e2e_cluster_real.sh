@@ -260,8 +260,32 @@ exec_through_cluster_connect() {
     local output="$WORK/native-exec.stdout"
     local error_output="$WORK/native-exec.stderr"
     local diagnostics="$WORK/native-exec.client.log"
-    local attempt status
+    local attempt status guest_command
 
+    # The pinned envd is quiet on successful requests. Write test data into its
+    # actual guest stdio pipes so the managed run, not this exec client's file
+    # destinations, exercises the application journal targets. Shared guest PID
+    # namespace and the root test capability allow this without changing envd
+    # verbosity or production launch policy. The outer timeout bounds all I/O.
+    guest_command="$(cat <<'SH'
+primary=
+for executable in /proc/[0-9]*/exe; do
+    case "$(readlink "$executable" 2>/dev/null)" in
+        */envd) primary=${executable%/exe}; break ;;
+    esac
+done
+[ -n "$primary" ] || { echo 'journal probe: envd not found' >&2; exit 48; }
+[ -p "$primary/fd/1" ] && [ -p "$primary/fd/2" ] || {
+    echo 'journal probe: primary stdio is not pipe-backed' >&2; exit 48;
+}
+printf 'journal-primary-stdout:%s\n' "$1" >"$primary/fd/1" || exit 49
+printf 'journal-primary-stderr:%s\n' "$1" >"$primary/fd/2" || exit 49
+IFS= read -r value
+printf 'stdout:%s:%s\n' "$1" "$value"
+printf 'stderr:%s\n' "$1" >&2
+exit 47
+SH
+)"
     printf 'stdin:%s\n' "$marker" >"$input"
     for attempt in $(seq 1 "$retries"); do
         : >"$output"; : >"$error_output"; : >"$diagnostics"
@@ -275,7 +299,7 @@ exec_through_cluster_connect() {
             --proxy-header "X-Kuasar-E2E-Duplicate: first" \
             --proxy-header "X-Kuasar-E2E-Duplicate: second" \
             --stdin-from "$input" --stdout-to "$output" --stderr-to "$error_output" -- \
-            /bin/sh -c "IFS= read -r value; printf 'stdout:%s:%s\\n' '$marker' \"\$value\"; printf 'stderr:%s\\n' '$marker' >&2; exit 47" \
+            /bin/sh -c "$guest_command" journal-probe "$marker" \
             >"$diagnostics" 2>&1; then
             status=0
         else

@@ -119,15 +119,27 @@ func (s *shutdownRouteSource) Policy() routesync.Policy     { return s.policy }
 
 func reserveLoopbackAddress(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Keep a bound, non-listening socket for the whole test. Listen-and-close
+	// leaves this ephemeral port available to unrelated clients between the
+	// repeated master runs and can falsely report a leaked data listener.
+	// SO_REUSEADDR permits the real Go listener beside this reservation, but
+	// not a second active listener; do not use SO_REUSEPORT or retry away leaks.
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		t.Fatal(err)
 	}
-	return addr
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	address, err := syscall.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("127.0.0.1:%d", address.(*syscall.SockaddrInet4).Port)
 }
 
 func readWorkerPIDs(path string) []int {
