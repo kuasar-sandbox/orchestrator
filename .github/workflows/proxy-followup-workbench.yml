@@ -1,0 +1,28 @@
+# Temporary exact-tree upload. The resulting tree deletes both helper files.
+name: Temporary proxy follow-up workbench
+on:
+  push:
+    branches: [fix/proxy-invalid-traffic-policy]
+    paths: [.github/workflows/proxy-followup-workbench.yml, .github/proxy-followup-workbench.py]
+permissions:
+  contents: write
+jobs:
+  workbench:
+    if: github.repository == 'kuasar-sandbox/orchestrator' && github.event_name == 'push' && github.ref == 'refs/heads/fix/proxy-invalid-traffic-policy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Upload documentation correction tree without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/proxy-followup-workbench.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: proxy-followup-workbench-${{ github.run_id }}
+          path: /tmp/proxy-followup-workbench/
+          retention-days: 3
