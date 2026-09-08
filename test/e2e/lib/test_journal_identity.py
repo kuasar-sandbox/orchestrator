@@ -1,0 +1,81 @@
+import contextlib
+import io
+import unittest
+
+from journal_identity import validate
+
+
+def records(tags, *, stable="local-1", run="run-1", build=False):
+    identity = {"KUASAR_RUN_ID": run}
+    if build:
+        identity["KUASAR_BUILD_ID"] = "build-1"
+    else:
+        identity.update(KUASAR_SANDBOX_ID="local-1", KUASAR_STABLE_ID=stable)
+    return [dict(identity, SYSLOG_IDENTIFIER=tag, _TRANSPORT="journal") for tag in tags]
+
+
+class JournalIdentityTest(unittest.TestCase):
+    def check(self, kind, rows):
+        with contextlib.redirect_stdout(io.StringIO()):
+            validate(kind, rows)
+
+    def reject(self, kind, rows):
+        with self.assertRaises(AssertionError):
+            self.check(kind, rows)
+
+    def test_quiet_standalone_requires_real_streams_and_default_stable_id(self):
+        self.check("sandbox", records(["console", "sandbox-ctl"]))
+        self.reject("sandbox", records(["console"]))
+        self.reject("sandbox", records(["sandbox-ctl"]))
+        self.reject("sandbox", records(["console", "sandbox-ctl"], stable="different"))
+
+    def test_emitting_cluster_requires_all_streams_with_distinct_identity(self):
+        tags = ["sandbox", "console", "sandbox-ctl"]
+        self.check("cluster", records(tags, stable="logical-1"))
+        for missing in tags:
+            self.reject("cluster", records([tag for tag in tags if tag != missing], stable="logical-1"))
+        self.reject("cluster", records(tags))
+
+    def test_emitting_build_requires_all_streams(self):
+        tags = ["build", "console", "sandbox-ctl"]
+        self.check("build", records(tags, build=True))
+        for missing in tags:
+            self.reject("build", records([tag for tag in tags if tag != missing], build=True))
+
+    def test_bad_actual_app_record_is_not_hidden_by_quiet_allowance(self):
+        for key in ("KUASAR_RUN_ID", "KUASAR_SANDBOX_ID", "KUASAR_STABLE_ID"):
+            for value in (None, "", 42):
+                rows = records(["console", "sandbox-ctl", "sandbox"])
+                rows[-1][key] = value
+                self.reject("sandbox", rows)
+
+    def test_conflicting_stable_ids_in_one_attempt_are_rejected(self):
+        rows = records(["console", "sandbox-ctl", "sandbox"])
+        rows[-1]["KUASAR_STABLE_ID"] = "other"
+        self.reject("sandbox", rows)
+
+    def test_cross_object_fields_and_tags_are_rejected(self):
+        for key in ("KUASAR_SANDBOX_ID", "KUASAR_STABLE_ID"):
+            rows = records(["build", "console", "sandbox-ctl"], build=True)
+            rows[0][key] = "leak"
+            self.reject("build", rows)
+        self.reject("build", records(["sandbox", "console", "sandbox-ctl"], build=True))
+        self.reject("sandbox", records(["build", "console", "sandbox-ctl"]))
+
+    def test_streams_from_different_attempts_cannot_fill_coverage(self):
+        self.reject("cluster", records(["console", "sandbox-ctl"], stable="logical-1") +
+                    records(["sandbox"], stable="logical-1", run="run-2"))
+        self.reject("sandbox", records(["console"]) + records(["sandbox-ctl"], run="run-2"))
+        self.reject("build", records(["console", "sandbox-ctl"], build=True) +
+                    records(["build"], build=True, run="run-2"))
+
+    def test_native_transport_and_nonempty_input_are_required(self):
+        rows = records(["console", "sandbox-ctl"])
+        for row in rows:
+            row["_TRANSPORT"] = "stdout"
+        self.reject("sandbox", rows)
+        self.reject("sandbox", [])
+
+
+if __name__ == "__main__":
+    unittest.main()

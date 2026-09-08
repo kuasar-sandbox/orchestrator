@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Check native sandbox-ctl records captured around one real owner E2E case."""
+"""Validate identities on native records from real owner lifecycle cases."""
 import json
 import sys
 from collections import Counter, defaultdict
 
-kind, filename = sys.argv[1:]
-sandbox_tags = defaultdict(set)
-build_tags = defaultdict(set)
-observed = Counter()
-independent_stable = False
-count = 0
-with open(filename, encoding="utf-8") as source:
-    for line in source:
-        row = json.loads(line)
+
+def validate(kind, rows):
+    if kind not in ("sandbox", "cluster", "build"):
+        raise ValueError("unknown journal case: " + kind)
+    sandbox_tags = defaultdict(set)
+    build_tags = defaultdict(set)
+    stable_by_run = {}
+    observed = Counter()
+    count = 0
+    for row in rows:
         tag = row.get("SYSLOG_IDENTIFIER")
         observed[(str(row.get("_TRANSPORT")), str(tag))] += 1
         if row.get("_TRANSPORT") != "journal" or tag not in (
@@ -35,25 +36,41 @@ with open(filename, encoding="utf-8") as source:
             assert isinstance(sid, str) and sid, (kind, tag, "missing SandboxID")
             assert isinstance(stable, str) and stable, (kind, tag, "missing StableID")
             assert tag != "build", (kind, "sandbox output used Build tag")
+            assert stable_by_run.setdefault((sid, run), stable) == stable, (
+                kind, "one sandbox attempt has conflicting StableIDs"
+            )
             sandbox_tags[(sid, stable, run)].add(tag)
-            independent_stable |= sid != stable
-# Diagnostics contain counts and non-secret identities, never guest MESSAGE,
-# credentials or complete journal rows. Keep the strict assertions below.
-print(f"Journal coverage ({kind}): transports/tags={dict(observed)}", flush=True)
-for identity, tags in sorted(sandbox_tags.items()):
-    print(f"  Sandbox (local, stable, run)={identity}: {sorted(tags)}", flush=True)
-for identity, tags in sorted(build_tags.items()):
-    print(f"  Build (build, run)={identity}: {sorted(tags)}", flush=True)
-assert count, (kind, "no native sandbox-ctl journal records in this invocation")
-if kind == "build":
-    assert any({"build", "console", "sandbox-ctl"} <= tags for tags in build_tags.values()), (
-        kind, "no Build attempt has application, console and component records"
-    )
-else:
-    assert any({"sandbox", "console", "sandbox-ctl"} <= tags for tags in sandbox_tags.values()), (
-        kind, "no sandbox attempt has application, console and component records"
-    )
-    if kind == "cluster":
-        assert independent_stable, "cluster did not exercise distinct stable and node-local identities"
-print(f"PASS: {kind} native journal identities; {count} records, "
-      f"{len(sandbox_tags)} sandbox attempts, {len(build_tags)} Build attempts")
+
+    # Print counts and identities, not guest messages or complete journal rows.
+    print(f"Journal coverage ({kind}): transports/tags={dict(observed)}", flush=True)
+    for identity, tags in sorted(sandbox_tags.items()):
+        print(f"  Sandbox (local, stable, run)={identity}: {sorted(tags)}", flush=True)
+    for identity, tags in sorted(build_tags.items()):
+        print(f"  Build (build, run)={identity}: {sorted(tags)}", flush=True)
+    assert count, (kind, "no native sandbox-ctl journal records in this invocation")
+    if kind == "build":
+        assert any({"build", "console", "sandbox-ctl"} <= tags for tags in build_tags.values()), (
+            kind, "no Build attempt has application, console and component records"
+        )
+    elif kind == "cluster":
+        # This fixture deliberately writes through the primary guest pipes.
+        assert any(sid != stable and {"sandbox", "console", "sandbox-ctl"} <= tags
+                   for (sid, stable, _), tags in sandbox_tags.items()), (
+            kind, "no distinct stable/local identity has all three native streams"
+        )
+    else:
+        # e2e_execute uses quiet envd and captures exec output separately.
+        # Silence is valid. Emitting application streams are mandatory in the
+        # cluster fixture above and sandboxer's cold/restore/exec native suite.
+        # Still require live native streams proving the standalone fallback.
+        assert any(sid == stable and {"console", "sandbox-ctl"} <= tags
+                   for (sid, stable, _), tags in sandbox_tags.items()), (
+            kind, "no standalone attempt proves default StableID on native streams"
+        )
+    print(f"PASS: {kind} native journal identities; {count} records, "
+          f"{len(sandbox_tags)} sandbox attempts, {len(build_tags)} Build attempts")
+
+
+if __name__ == "__main__":
+    with open(sys.argv[2], encoding="utf-8") as source:
+        validate(sys.argv[1], (json.loads(line) for line in source))

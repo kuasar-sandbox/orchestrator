@@ -92,9 +92,20 @@ logging or zero-blocking guarantee is implied.
 Tests cover generated runner/Build arguments, fallback and independent StableID,
 resume/import/new-object isolation, escaping and file/capture preservation.
 The owner E2E runner brackets its real sandbox, cluster and Build cases with
-journal cursors and filters by the exact sandbox-ctl executable, then validates
-native JSON fields across application, console and component outputs. Source
-workspaces also run the complete module unit tests, race tests and vet; binary
-packages do not require a Go toolchain. Sandboxer's companion suite exercises
-cold/restore/exec native output, partial tails, independent same-tag fields and
-startup failure without deliberate stderr duplication.
+journal cursors and filters by the exact sandbox-ctl executable. Every observed
+native application, console or component record must have the correct complete
+identity, without cross-object leakage or conflicting StableIDs in one attempt.
+
+The emitting cluster fixture requires application, console and component records
+for the same attempt with distinct stable and local IDs. The Build fixture also
+requires all three streams for one Build attempt. The standalone Envd fixture
+may be quiet and captures exec output separately: it instead requires native
+component and console records proving the default `StableID == SandboxID`.
+Any application records it does emit are still checked. The validator has
+positive and negative tests for quiet workloads, missing streams/fields, mixed
+identities, native transport and incorrectly combining different attempts.
+
+Source workspaces also run the complete module unit tests, race tests and vet;
+binary packages do not require a Go toolchain. Sandboxer's companion suite
+exercises cold/restore/exec native output, partial tails, independent same-tag
+fields and startup failure without deliberate stderr duplication.

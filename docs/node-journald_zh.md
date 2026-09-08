@@ -78,7 +78,17 @@ stderr、runtime panic、node-ctl pre-exec 信息或 systemd 事件。
 
 测试覆盖实际生成的 runner/Build 参数、StableID 回退及独立值、恢复/import/新对象
 隔离、转义和文件/捕获行为保留。owner E2E runner 用 journal cursor 包围真实沙箱、
-集群与 Build 用例，并按精确 sandbox-ctl 可执行文件筛选，然后验证应用、console 和
-组件输出中的原生 JSON 字段。源码工作区还执行完整模块单测、race 和 vet；二进制包
-不要求 Go 工具链。sandboxer 配套测试覆盖 cold/restore/exec 原生输出、尾部半行、
-同 tag 独立字段，以及启动失败时不主动重复写 stderr。
+集群与 Build 用例，并按精确 sandbox-ctl 可执行文件筛选。每条实际观测到的原生
+应用、console 或组件记录都必须具有正确、完整的身份，不能混入其他对象字段，
+同次运行的 StableID 也不能互相矛盾。
+
+确定产生输出的集群用例要求同次运行同时存在应用、console 和组件记录，并且
+StableID 与本地 ID 不同。Build 用例同样要求一个 Build 执行实例具有三个日志流。
+单机 Envd 用例可以静默，并单独捕获 exec 输出，因此改为要求原生组件与 console
+记录证明缺省的 `StableID == SandboxID`；它实际产生的任何应用记录仍全部校验。
+验证器有正反测试，覆盖静默应用、日志流或字段缺失、身份混用、原生传输，以及
+错误地把不同运行实例的记录拼成完整覆盖。
+
+源码工作区还执行完整模块单测、race 和 vet；二进制包不要求 Go 工具链。
+sandboxer 配套测试覆盖 cold/restore/exec 原生输出、尾部半行、同 tag 独立字段，
+以及启动失败时不主动重复写 stderr。
