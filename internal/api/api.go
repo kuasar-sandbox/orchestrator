@@ -102,6 +102,10 @@ func mergeCreateConfigHeaders(meta map[string]string, h http.Header) (map[string
 	if err != nil {
 		return nil, err
 	}
+	meta, err = mergeIdentityHeader(meta, h)
+	if err != nil {
+		return nil, err
+	}
 	for _, item := range []struct{ header, metaKey string }{
 		{restoreHeader, sandboxcfg.NsRestore},
 		{credentialsHeader, sandboxcfg.NsCredentials},
@@ -159,6 +163,9 @@ func mergeBuildConfigHeaders(meta map[string]string, h http.Header) (map[string]
 	meta, err = mergeCreateConfigHeaders(meta, h)
 	if err != nil {
 		return nil, err
+	}
+	if _, present := meta[sandboxcfg.NsIdentity]; present {
+		return nil, fmt.Errorf("%s is not valid for template builds", sandboxcfg.NsIdentity)
 	}
 	if values, present := h[http.CanonicalHeaderKey(builderHeader)]; present {
 		if len(values) != 1 {
@@ -264,7 +271,7 @@ func (e *BuildStateConflictError) Error() string {
 	return fmt.Sprintf("build cannot be triggered from state %s", e.State)
 }
 
-// ErrAlreadyExists is returned when a sandbox migration import target exists.
+// ErrAlreadyExists is returned when a fresh Create or migration import target exists.
 var ErrAlreadyExists = errors.New("sandbox already exists")
 
 // ErrExportPreempted is returned when a durable sandbox resume wins before an
@@ -1371,6 +1378,8 @@ func isoUnix(sec int64) string { return time.Unix(sec, 0).UTC().Format(time.RFC3
 
 func (a *API) fail(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrAlreadyExists):
+		writeErr(w, http.StatusConflict, ErrAlreadyExists.Error())
 	case errors.Is(err, conductorextension.ErrRejected):
 		writeErr(w, http.StatusForbidden, conductorextension.ErrRejected.Error())
 	case errors.Is(err, ErrExtensionUnavailable):

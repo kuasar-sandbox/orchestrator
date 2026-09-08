@@ -46,6 +46,7 @@ import (
 
 // Headers the cluster ingress reads (cluster.md).
 const (
+	HeaderIdentity    = "X-Kuasar-Sandbox-Identity"
 	HeaderGroup       = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey    = "X-Kuasar-Route-Key"
 	HeaderResource    = "X-Kuasar-Sandbox-Resource"
@@ -398,6 +399,9 @@ func createSandboxMetadata(w http.ResponseWriter, r *http.Request) (map[string]s
 }
 
 func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Request, autoPauseMemory **bool) (map[string]string, error) {
+	if _, present := r.Header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
+		return nil, fmt.Errorf("%s / %s is only supported by direct conductor Create", HeaderIdentity, sandboxcfg.NsIdentity)
+	}
 	restoreRaw, restoreHeader := createHeaderValue(r.Header, HeaderRestore)
 	credentialsRaw, credentialsHeader := createHeaderValue(r.Header, HeaderCredentials)
 	checkpointRaw, checkpointHeader := createHeaderValue(r.Header, HeaderCheckpoint)
@@ -431,6 +435,9 @@ func createSandboxMetadataWithAutoPauseMemory(w http.ResponseWriter, r *http.Req
 				return nil, fmt.Errorf("bad create body: %w", err)
 			}
 		}
+	}
+	if _, present := body.Metadata[sandboxcfg.NsIdentity]; present {
+		return nil, fmt.Errorf("%s is only supported by direct conductor Create", sandboxcfg.NsIdentity)
 	}
 	if autoPauseMemory != nil {
 		*autoPauseMemory = sandboxcfg.CloneBool(body.AutoPauseMemory)
@@ -557,6 +564,12 @@ func mergeTrafficHeader(metadata map[string]string, header http.Header) (map[str
 // builder are handled separately because their secret and build-only portions
 // use distinct cluster envelopes.
 func mergeBuildRegistrationHeaders(metadata map[string]string, header http.Header) (map[string]string, error) {
+	if _, present := header[http.CanonicalHeaderKey(HeaderIdentity)]; present {
+		return nil, fmt.Errorf("%s / %s is not valid for template builds", HeaderIdentity, sandboxcfg.NsIdentity)
+	}
+	if _, present := metadata[sandboxcfg.NsIdentity]; present {
+		return nil, fmt.Errorf("%s is not valid for template builds", sandboxcfg.NsIdentity)
+	}
 	out, err := sandboxcfg.MergeMetadata(nil, metadata)
 	if err != nil {
 		return nil, err

@@ -1,5 +1,7 @@
 # Runtime extensions
 
+Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](sandbox-identity.md).
+
 Kuasar's conductor and independent Proxy support statically linked runtime
 extensions for deployments that need process-local integration without carrying
 a long-lived fork. An extension is trusted code compiled into `xconductor` or

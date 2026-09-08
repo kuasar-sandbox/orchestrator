@@ -2,6 +2,8 @@
 
 # cluster-router — e2b 统一入口与路由缓存
 
+集群公共 Create 和 Build 注册拒绝单机 `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` 扩展，身份分配权仍属于 Registry。参见[创建时指定沙箱身份](sandbox-identity_zh.md)。
+
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
 不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
 Reserve operation;数据面 cache miss 先 Resolve.RouteResolve 同时返回 `APIEndpoint` 与

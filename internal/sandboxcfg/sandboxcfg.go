@@ -293,15 +293,15 @@ func MergeMetadata(base, over map[string]string) (map[string]string, error) {
 }
 
 // MergeCreateMetadata layers request configuration over template, group, or
-// placement defaults while keeping restore policy, credentials, and checkpoint
-// policy request-scoped. Only namespaces explicitly present in request are
+// placement defaults while keeping restore policy, credentials, checkpoint,
+// MMDS and identity request-scoped. Only namespaces explicitly present in request are
 // admitted for those values.
 func MergeCreateMetadata(defaults, request map[string]string) (map[string]string, error) {
 	out, err := MergeMetadata(defaults, request)
 	if err != nil {
 		return nil, err
 	}
-	for _, ns := range []string{NsRestore, NsCredentials, NsCheckpoint, NsMMDS} {
+	for _, ns := range []string{NsRestore, NsCredentials, NsCheckpoint, NsMMDS, NsIdentity} {
 		delete(out, ns)
 		if raw, ok := request[ns]; ok {
 			if out == nil {

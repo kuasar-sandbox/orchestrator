@@ -202,7 +202,7 @@ func TestPublishBuildFinalInstallsMMDSRouteBeforeReleasingTask(t *testing.T) {
 			observed <- errors.New("task received an unexpected final spec")
 			return
 		}
-		if o.lookup("build-"+b.BuildID) == nil {
+		if o.lookup(buildMMDSID(b.BuildID)) == nil {
 			observed <- errors.New("task observed final spec before MMDS route")
 			return
 		}
@@ -238,7 +238,7 @@ func TestPublishBuildFinalSkipsPhaseCMMDSRouteForNonMemoryTargets(t *testing.T) 
 			if row := o.publishBuildFinal(pend, &configsock.BuildSpec{BuildID: b.BuildID}); row != nil {
 				t.Fatalf("non-memory target published Phase C MMDS row: %+v", row)
 			}
-			if o.lookup("build-"+b.BuildID) != nil {
+			if o.lookup(buildMMDSID(b.BuildID)) != nil {
 				t.Fatal("non-memory target retained a synthetic MMDS route")
 			}
 		})
