@@ -379,7 +379,7 @@ Credential pairs are create/build prerequisites. Cache removal, key_drop, lease 
 | Stale node labels | Node-owner admission/create provides the final rejection. |
 | Source-owner crash | After lease expiry, another candidate resumes from the committed cursor; fencing rejects old-owner patches/cursor updates. |
 | Key-renewal delivery failure | Timeout, disconnect, or rejection does not advance delivery state; create/build rejects at the node and the next heartbeat refresh retries. |
-| Build registration timeout or lost ACK | Keep the persisted selected-node/BuildID intent and query/retry that same node. Durable registration usage remains node-owned; the placer has no admission-lease timer that frees it. Node record deletion governs release and registry projection removal. |
+| Build registration timeout or lost ACK | Keep the persisted selected-node/BuildID intent and query/retry that same node. Durable registration usage remains node-owned; the placer has no admission-lease timer that frees it. The node releases registration usage on its ready/error transition; terminal-history deletion later removes the Registry projection. These are separate events. See the [durable usage query](../internal/store/build_admission.go). |
 
 See the authoritative [registration dispatch and projection reconciliation](../internal/registry/build.go) and [placement predicates](../internal/placer/scaler.go). In particular, ambiguous delivery cannot be treated as proof of a side-effect-free rejection.
 
