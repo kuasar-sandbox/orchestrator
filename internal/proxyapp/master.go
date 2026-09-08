@@ -105,6 +105,7 @@ func RunMaster(ctx context.Context, effective *EffectiveConfig, runtime *Runtime
 		}
 		return proxystats.RouteIdentity{
 			RunID: route.RunID, Profile: types.Profile(route.Profile), State: types.State(route.State), MaxInflight: route.EffectiveMaxInflight,
+			TrafficPolicyInvalid: route.TrafficPolicyInvalid,
 		}, true
 	}, logger)
 	managementHandler := statsServer.Handler()

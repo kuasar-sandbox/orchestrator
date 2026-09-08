@@ -66,6 +66,23 @@ func TestPausedCleanupRetryReloadsAfterCompetingAttempt(t *testing.T) {
 		t.Fatal("first cleanup did not reach RunDir removal")
 	}
 	start()
+	// Observe the second reference under the keyed-lock map mutex. The first
+	// still owns the per-Sandbox lock and is blocked in removeSandboxRunDir,
+	// so refs == 2 proves the competing attempt reached Lock, even on one P.
+	deadline := time.Now().Add(time.Second)
+	for {
+		fixture.o.lifecycle.mu.Lock()
+		lock := fixture.o.lifecycle.locks[fixture.sb.ID]
+		waiting := lock != nil && lock.refs == 2
+		fixture.o.lifecycle.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second cleanup did not contend for the lifecycle lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	unblock()
 	for n := 0; n < 2; n++ {
 		select {

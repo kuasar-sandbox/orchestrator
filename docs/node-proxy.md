@@ -63,7 +63,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 | `auth` | `enforce` | Data-plane authentication fallback before routesync policy arrives |
 | `park_timeout` | `30s` | Parking fallback before routesync policy arrives |
 | `metrics_listen` | Empty | Master Prometheus text endpoint aggregating worker data-plane counters |
-| `traffic.max_inflight.total` | `0` | Proxy-wide inflight limit across all applicable services of each sandbox; `0` means unlimited |
+| `traffic.max_inflight.total` | `0` | Node-wide per-sandbox inflight limit across all applicable services; `0` means unlimited |
 | `traffic.max_inflight.forward` | `0` | Per-sandbox `forward` inflight limit; `0` means unlimited |
 | `traffic.max_inflight."e2b:envd"` | `0` | Per-e2b-sandbox envd inflight limit; `0` means unlimited |
 | `traffic.max_inflight."e2b:code-interpreter"` | `0` | Per-e2b-sandbox code-interpreter inflight limit; `0` means unlimited |
@@ -200,7 +200,7 @@ The shared view is an asynchronously converging route cache. Default creation us
 
 Protected `RouteEntry` states are `starting|running|paused|dead`. Entries explicitly carry `StableID`, `APISecret`, `APISecretFingerprint`, `ManifestKeyFingerprint`, `ServiceSecret`, `EnvdAccessToken`, `TrafficAccessToken`, and `ForwardAccessToken`. Raw ManifestKey never enters routes. Node forwarding selects only EnvdAccessToken or ForwardAccessToken for its target. TrafficAccessToken is projected in the protected view for external gateways and e2b data-plane components, but the node platform layer does not consume it. `StableID + ServiceSecret` verifies exec KATs; shared-table keys and local run directories still use NodeSandboxID exclusively. Existing `MmdsSecret` independently signs MMDS tokens and is not a route secret value; route secret values enter only the master's heap through the trusted projection described above.
 
-On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. The master merges it with destination-node `proxy.yaml` defaults and writes fixed effective values plus `{admission slot,generation}` into route SHM. Pointers enter neither SHM nor route equality. Current internal boundaries are routesync version 7, route SHM schema 7, worker bootstrap/config/FD protocol version 2, and admission arena version 1. These are hard compatibility cuts: mismatched conductor/proxy/registry/router protocol versions or old SHM/bootstrap formats fail closed.
+On the routesync wire, `MaxInflightPatch` carries only explicit sandbox leaves. The master merges it with destination-node `proxy.yaml` defaults and writes fixed effective values plus `{admission slot,generation}` into route SHM. Pointers enter neither SHM nor route equality. Current internal boundaries are routesync version 8, route SHM schema 8, worker bootstrap/config/FD protocol version 2, and admission arena version 2. These are hard compatibility cuts: mismatched conductor/proxy/registry/router protocol versions or old SHM/bootstrap formats fail closed.
 
 The initial durable starting Upsert may lack a FloatingIP, UDS, or any other backend endpoint. Workers park by state and never attempt those empty fields. After the node persists network ownership and completes YAML/ready.sock preparation, it publishes enriched starting; only then can MMDS identify it by FloatingIP. Ordinary data traffic still waits for running.
 
@@ -341,7 +341,7 @@ traffic:
 A sandbox stores only its explicit patch in metadata key `kuasar-sandbox.traffic`. Create/build may also provide the same JSON shape in exactly one `X-Kuasar-Sandbox-Traffic` header. Merge precedence is:
 
 ```text
-template/group/default explicit metadata
+cluster group explicit metadata (when present)
   < create metadata
   < X-Kuasar-Sandbox-Traffic
   < target Proxy resolution only for absent leaves
@@ -349,14 +349,16 @@ template/group/default explicit metadata
 
 The first three layers merge by `max_inflight` leaf and marshal canonically. An absent leaf inherits lower-priority explicit patches and finally current destination `proxy.yaml`; explicit `0` clears lower-priority or node-default limits. Empty or duplicate headers, `null`, unknown fields, negative/non-integer values, and uint32 overflow are rejected. Bare sandboxes also reject explicit `e2b:envd` or `e2b:code-interpreter`. Node defaults may contain every service; bare consumes only `total/forward/exec`.
 
+Build registration traffic applies only to the Build runtime and its synthetic route. It does not become a default for later Sandboxes created from the output artifact. Canonical TemplateID Create does not load retained Build rows, a Template catalog, or artifact metadata to recover traffic policy. Standalone Create starts with its explicit request patch; cluster Create may additionally carry explicit group defaults.
+
 Destination-node defaults are not written into sandbox metadata/structs/SQLite, Registry records, or MigrationToken. MigrationToken retains existing Metadata: absent traffic remains absent after migration and resolves against destination Proxy defaults; explicit patches migrate unchanged and override those defaults. V1 cannot modify metadata at runtime. Lowering a limit does not evict existing connections and affects only later acquire attempts.
 
 <a id="82-共享-admission-arena-与误差证明"></a>
 ### 8.2 Shared admission arena and error-bound proof
 
-Route mmap is separate from the mutable admission arena. For a route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Other routes receive stable `{slot,generation,effective limits}`. Each entry holds identity/state, generation, fixed limits, and `counters[worker][forward/envd/CI/exec]`; a worker writes only its own absolute cells.
+Route mmap is separate from the mutable admission arena. For a valid route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Limited routes receive `{slot,generation,effective limits}` in route SHM. Arena v2 stores only a master-written active generation per slot and generation-tagged `counters[worker][forward/envd/CI/exec]`. Each live worker alone writes its rows. Its process-local per-slot mutex serializes row initialization, acquire and release; master never acquires that mutex or clears a live row. There is no shared guard, draining state, or duplicate mutable limit policy.
 
-Acquire runs under the existing worker-local per-sandbox entry lock:
+Acquire runs under the process-local per-slot mutex (shared by all services for that slot):
 
 ```text
 verify active generation and effective limits
@@ -377,11 +379,17 @@ actual admitted inflight <= M + N - 1
 
 The parking→egress transition does not change shared counts. Activation/dial/HTTP-forward failure, context cancellation, an ordinary response, and final Close of complete CONNECT/exec relay all release through the same flow/lease exactly once. Half-close does not release it.
 
-Delete or identity replacement first makes the old generation unacquirable, then clears/reuses the slot. Old flows retain their old generation; a mismatched release must not decrement the new route's cell. Starting/running/paused updates in the same sandbox lifecycle retain generation. Activate rereads route identity and the complete binding around route/policy publication, and directly revalidates arena state for a drained limited generation. An old lookup therefore cannot bypass a newly published binding.
+Delete or identity replacement revokes the old active generation without waiting for any live worker. Slot reuse publishes a fresh generation; each worker lazily initializes its own row under its local slot mutex. Old releases either precede that initialization or see the new tag and do nothing. They cannot decrement the new identity. Unchanged starting/running/paused updates preserve generation. Activation revalidates the complete identity, policy validity and binding, plus arena generation liveness. A failed route publication rolls the admission transaction back without clearing outstanding old counts. A stopped worker therefore cannot block master route publication or surviving workers. See [generation ownership and rollback](proxy-admission-generations.md).
 
-A worker stats-stream fault first terminates the worker. Only after supervisor `cmd.Wait` proves the old process exited and the kernel closed its connections may the master take over a leftover row guard and clear that index. Until then, stale-high counts can only conservatively reject, never undercount. Replacements reuse the index with a new epoch. Master exit terminates every child and connection; a new master rebuilds the arena without inheriting old counts. A full routesync on a surviving master instead preserves counts for replayed, unchanged bindings and retires absent bindings at Bookmark; it does not reset active flows' counts.
+A worker stats-stream fault first terminates the worker. Only after supervisor `cmd.Wait` proves the old process exited and the kernel closed its connections may the master clear that index, without any shared lock. Until then, stale-high counts can only conservatively reject, never undercount. Replacements reuse the index with a new epoch. Master exit terminates every child and connection; a new master rebuilds the arena without inheriting old counts. A full routesync on a surviving master instead preserves counts for replayed, unchanged bindings and retires absent bindings at Bookmark; it does not reset active flows' counts.
 
-For `route_capacity=65536,workers=2`, counters alone occupy `65536 × 2 × 4 × 8 = 4194304` bytes. Including entry headers, row guards, and one transaction spare entry, the mmap is `8388800` bytes. Master and worker mapping validate size, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope.
+For `route_capacity=65536,workers=2`, counter payload occupies `65536 × 2 × 4 × 8 = 4194304` bytes. Including generation tags, headers and one transaction spare entry, arena v2 mmap is `5767320` bytes. Each worker separately holds 65537 local mutexes, or `524296` bytes when `sync.Mutex` is eight bytes. These mutexes are not shared mappings. Master and worker mapping validate size, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope.
+
+Worker shutdown retains both mappings until process exit, including when asynchronous extension code or hijacked handlers outlive `Run`. Only `cmd.Wait` permits clearing the exact worker epoch and starting its replacement; see [worker lifetime](proxy-worker-lifetime.md).
+
+If already-persisted traffic metadata is invalid, conductor keeps the actual Sandbox lifecycle and credentials and projects only `traffic_policy_invalid`. Master publishes no effective policy or enabled admission binding. This never fabricates `dead`/Delete, removes Registry ownership, disables MMDS, or interrupts full synchronization for other routes. Existing request and migration input validation remains strict.
+
+Ordinary HTTP/non-exec CONNECT first follows the existing credential policy, then returns HTTP 503 with `route_error` before parking/acquire/Wake/Activate/dial. Privately authenticated `ForwardAuthorized` uses the same gate. Native exec retains KAT → CONNECT 200 → strict first frame/expiry/CEL → generic ctl rejection, without backend side effects. Traffic stats and extension `TrafficSource.Get` return unavailable rather than reporting zero limits; route lookups, `RouteSource.Get` and `WorkerHost.GetRoute` retain true facts. An invalid batch member makes the entire stats batch unavailable.
 
 Exhaustion for ordinary HTTP/non-exec CONNECT returns 429, `X-Kuasar-Proxy-Error: max_inflight_reached`, and a fixed body. It sets no `Retry-After`, performs no Wake/Activate/dial, emits no per-rejection log, and increments low-cardinality `data_requests_total{result="max_inflight_reached"}`. See §5 for exec's behavior after CONNECT 200.
 

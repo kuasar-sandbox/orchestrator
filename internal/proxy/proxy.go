@@ -46,13 +46,14 @@ type Route struct {
 // run identity, and route revisions deliberately do not participate: they may
 // change during a legitimate activation.
 type RouteBinding struct {
-	SandboxID           string
-	StableID            string
-	Profile             types.Profile
-	Target              ConnectTarget
-	Kind                Kind
-	ExpectedAccessToken string
-	Admission           proxyadmission.Binding
+	SandboxID            string
+	StableID             string
+	Profile              types.Profile
+	Target               ConnectTarget
+	Kind                 Kind
+	ExpectedAccessToken  string
+	TrafficPolicyInvalid bool
+	Admission            proxyadmission.Binding
 }
 
 const (
@@ -119,10 +120,11 @@ type Router interface {
 // exec tunnel. ServiceSecret is trusted internal state and must never be logged
 // or returned to the client.
 type ExecIdentity struct {
-	NodeSandboxID string
-	StableID      string
-	ServiceSecret string
-	Admission     proxyadmission.Binding
+	NodeSandboxID        string
+	StableID             string
+	ServiceSecret        string
+	TrafficPolicyInvalid bool
+	Admission            proxyadmission.Binding
 }
 
 // ExecRouter separates the side-effect-free credential lookup from the
@@ -453,6 +455,14 @@ func (p *Proxy) lookupRoute(w http.ResponseWriter, r *http.Request, sid string, 
 }
 
 func (p *Proxy) activateRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding) (Route, TrafficFlow, bool) {
+	// Both canonical and privately authenticated ingress reach this point only
+	// after their existing authorization. Policy corruption is not a lifecycle
+	// failure and must not acquire, park, wake, or contact the backend.
+	if binding.TrafficPolicyInvalid {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		writeProxyError(w, http.StatusServiceUnavailable, "routing error", ProxyErrorRouteError)
+		return Route{}, nil, false
+	}
 	flow, err := p.tryBeginParking(binding.SandboxID, trafficService(binding), binding.Admission)
 	if errors.Is(err, proxyadmission.ErrLimitReached) {
 		p.mx.Inc(`data_requests_total{result="max_inflight_reached"}`)

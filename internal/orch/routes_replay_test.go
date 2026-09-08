@@ -72,7 +72,7 @@ func TestRouteEntryFailsClosedOnCorruptPersistedTraffic(t *testing.T) {
 				Metadata: map[string]string{sandboxcfg.NsTraffic: raw},
 			}
 			entry := (&Orchestrator{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).routeEntry(sb)
-			if entry.State != routesync.StateDead || entry.MaxInflightPatch != nil {
+			if entry.State != string(sb.State) || !entry.TrafficPolicyInvalid || entry.MaxInflightPatch != nil {
 				t.Fatalf("corrupt traffic projection = %+v", entry)
 			}
 		})

@@ -102,6 +102,12 @@ func (p *Proxy) serveExecConnect(w http.ResponseWriter, r *http.Request, sid str
 			return programs.Evaluate(ctx, frame.Request.Exec)
 		},
 		DialBackend: func(ctx context.Context, _ *sandboxctl.ExecRequestFrame) (io.ReadWriteCloser, error) {
+			// Keep KAT/CONNECT/first-frame/expiry/CEL ordering. The tunnel
+			// helper translates this post-200 failure to the existing ctl error.
+			if identity.TrafficPolicyInvalid {
+				p.mx.Inc(`data_requests_total{result="route_error"}`)
+				return nil, errors.New("exec backend unavailable")
+			}
 			var beginErr error
 			flow, beginErr = p.tryBeginParking(identity.NodeSandboxID, ConnectServiceExec, identity.Admission)
 			if errors.Is(beginErr, proxyadmission.ErrLimitReached) {

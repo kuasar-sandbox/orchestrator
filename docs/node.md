@@ -622,10 +622,10 @@ node resource policy
 
 The five leaves overlay independently: group capacity.memory and Create allocatable.memory both survive. Build-row metadata is not another Create layer. Other namespaces follow their own rules below, generally whole-namespace replacement. Every layer is parsed strictly before merging, so a valid higher layer cannot hide an invalid lower one. Group/reserve, standalone/cluster and Build registration share the helper.
 
-Traffic leaf priority is:
+Build traffic is request-scoped to the Build runtime and its synthetic route; it is not inherited by Sandboxes created from the output artifact. Canonical TemplateID Create never queries retained Build metadata, a Template catalog, or artifact metadata for traffic defaults. Traffic leaf priority is:
 
 ```text
-template / group defaults
+cluster group explicit metadata (when present)
   < create / reserve body metadata
   < X-Kuasar-Sandbox-Traffic
 ```
@@ -1422,7 +1422,7 @@ Build rows store no directory paths. Derive both Build directories from BuildID 
 
 The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
 
-These local finalizers implement #132/#133's cleanup contract. Export #196 retains its publish/finalize race and source cleanup order; #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v7 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
+These local finalizers implement #132/#133's cleanup contract. Export #196 retains its publish/finalize race and source cleanup order; #205's Build resources, two admission levels and cgroup authority remain. Current source still has post-registration Build projection, so routesync v8 retains v6 Build full-sync/live-delete convergence without changing #46's immutable registered-node binding. If #46 later removes that projection, node TTL itself needs no recreated lifecycle event. This adds neither remote-artifact GC, per-step cleanup stages nor another path authority.
 
 RouteSource.Range and later full snapshots therefore never mispublish abandoned starting as running. A crash after initial network ownership but before runner assignment deterministically releases the port and converges to dead/paused as appropriate.
 
