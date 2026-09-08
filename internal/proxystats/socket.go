@@ -45,10 +45,11 @@ type BatchResponse struct {
 }
 
 type RouteIdentity struct {
-	RunID       string
-	Profile     types.Profile
-	State       types.State
-	MaxInflight config.MaxInflight
+	RunID                string
+	Profile              types.Profile
+	State                types.State
+	MaxInflight          config.MaxInflight
+	TrafficPolicyInvalid bool
 }
 
 type StatsServer struct {
@@ -121,6 +122,10 @@ func (s *StatsServer) batchGet(w http.ResponseWriter, r *http.Request) {
 		identity, found := s.lookup(query.SandboxID)
 		if !found || identity.RunID != query.RunID || identity.Profile != query.Profile || identity.State != query.State {
 			writeSocketError(w, http.StatusServiceUnavailable, "route identity unavailable")
+			return
+		}
+		if identity.TrafficPolicyInvalid {
+			writeSocketError(w, http.StatusServiceUnavailable, "traffic stats unavailable")
 			return
 		}
 		stats, err := s.master.SandboxTrafficStats(r.Context(), query.SandboxID, query.RunID, query.Profile, query.State)

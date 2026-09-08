@@ -89,10 +89,20 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) error {
 	if err := validateRouteFields(r); err != nil {
 		return err
 	}
-	effective, err := effectiveMaxInflight(v.trafficDefaults, types.Profile(r.Profile), r.MaxInflightPatch)
-	if err != nil {
-		return err
+	if r.TrafficPolicyInvalid && r.MaxInflightPatch != nil {
+		return errors.New("proxyshm: invalid traffic policy cannot carry a max_inflight patch")
 	}
+	var effective config.MaxInflight
+	var err error
+	if !r.TrafficPolicyInvalid {
+		effective, err = effectiveMaxInflight(v.trafficDefaults, types.Profile(r.Profile), r.MaxInflightPatch)
+		if err != nil {
+			return err
+		}
+	}
+	// An invalid policy publishes no effective limits or admission binding.
+	// PrepareUpsert's zero binding transactionally revokes any old generation;
+	// the validity bit prevents interpreting this representation as unlimited.
 	var admissionUpdate *proxyadmission.Update
 	if v.admission != nil {
 		admissionUpdate, err = v.admission.PrepareUpsert(r.SandboxID, routeAdmissionIdentity(r), effective)
@@ -401,7 +411,7 @@ func (v *WorkerView) ActivateRoute(ctx context.Context, expected proxy.RouteBind
 	}
 	r, found, _ := v.table.LookupRevision(expected.SandboxID)
 	binding, present := workerRouteBinding(r, found, expected.Target)
-	if !present || binding != expected || !v.admissionBindingValid(expected.Admission) {
+	if !present || binding.TrafficPolicyInvalid || binding != expected || !v.admissionBindingValid(expected.Admission) {
 		return proxy.Route{}, false, nil
 	}
 	if r.State == routesync.StateRunning {
@@ -427,6 +437,7 @@ func workerRouteBinding(r routesync.RouteEntry, found bool, target proxy.Connect
 	if binding.SandboxID == "" || binding.StableID == "" {
 		return proxy.RouteBinding{}, false
 	}
+	binding.TrafficPolicyInvalid = r.TrafficPolicyInvalid
 	binding.Admission = proxyadmission.Binding{
 		Slot: r.AdmissionSlot, Generation: r.AdmissionGeneration, Limits: r.EffectiveMaxInflight,
 	}
@@ -446,7 +457,7 @@ func (v *WorkerView) waitRouteActivated(ctx context.Context, expected proxy.Rout
 		rev := v.table.Rev()
 		r, found := v.table.Lookup(expected.SandboxID)
 		binding, present := workerRouteBinding(r, found, expected.Target)
-		if !present || binding != expected || !v.admissionBindingValid(expected.Admission) {
+		if !present || binding.TrafficPolicyInvalid || binding != expected || !v.admissionBindingValid(expected.Admission) {
 			return proxy.Route{}, false, nil
 		}
 		switch r.State {
@@ -522,7 +533,7 @@ func (v *WorkerView) ActivateExec(ctx context.Context, sid string, expected prox
 	}
 	r, ok, initialRev := v.table.LookupRevision(sid)
 	identity, present := workerExecIdentity(r, ok)
-	if !present || identity != expected || !v.admissionBindingValid(expected.Admission) {
+	if !present || identity.TrafficPolicyInvalid || identity != expected || !v.admissionBindingValid(expected.Admission) {
 		return proxy.ExecIdentity{}, false, nil
 	}
 	if r.State == routesync.StateRunning {
@@ -542,9 +553,10 @@ func workerExecIdentity(r routesync.RouteEntry, found bool) (proxy.ExecIdentity,
 		return proxy.ExecIdentity{}, false
 	}
 	identity := proxy.ExecIdentity{
-		NodeSandboxID: r.SandboxID,
-		StableID:      r.StableID,
-		ServiceSecret: r.ServiceSecret,
+		NodeSandboxID:        r.SandboxID,
+		StableID:             r.StableID,
+		ServiceSecret:        r.ServiceSecret,
+		TrafficPolicyInvalid: r.TrafficPolicyInvalid,
 		Admission: proxyadmission.Binding{
 			Slot: r.AdmissionSlot, Generation: r.AdmissionGeneration, Limits: r.EffectiveMaxInflight,
 		},
@@ -613,7 +625,7 @@ func (v *WorkerView) waitExecRunning(
 		rev := v.table.Rev()
 		r, ok, routeRev := v.table.LookupRevision(sid)
 		identity, present := workerExecIdentity(r, ok)
-		if !present || identity != expected || !v.admissionBindingValid(expected.Admission) {
+		if !present || identity.TrafficPolicyInvalid || identity != expected || !v.admissionBindingValid(expected.Admission) {
 			return proxy.ExecIdentity{}, false, nil
 		}
 		if r.State == routesync.StateRunning {
