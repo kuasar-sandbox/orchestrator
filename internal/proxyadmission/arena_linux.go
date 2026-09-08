@@ -1,14 +1,13 @@
 //go:build linux
 
-// Package proxyadmission owns the mutable process-shared inflight arena used by
-// independent Proxy workers. Route SHM remains master-write/worker-read-only;
-// each admission worker writes only its own counter row.
+// Package proxyadmission owns process-shared per-Sandbox inflight counters.
+// The master publishes slot generations; each live worker exclusively writes
+// its own generation-tagged rows. No process-shared locks are used.
 package proxyadmission
 
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"os"
 	"runtime"
@@ -22,24 +21,17 @@ import (
 )
 
 const (
-	arenaMagic   uint64 = 0x6b757341444d3031 // "kusaADM01"
-	ArenaVersion uint32 = 1
-
-	stateEmpty    uint64 = 0
-	stateActive   uint64 = 1
-	stateDraining uint64 = 2
-	masterGuard   uint64 = math.MaxUint64
-
-	serviceCount = 4
+	arenaMagic   uint64 = 0x6b757341444d3031
+	ArenaVersion uint32 = 2
+	serviceCount        = 4
 )
 
 var (
 	ErrLimitReached = errors.New("proxy admission: max inflight reached")
 	ErrStaleBinding = errors.New("proxy admission: stale binding")
-
-	headerSize = align(int(unsafe.Sizeof(arenaHeader{})), 8)
-	entrySize  = align(int(unsafe.Sizeof(entryHeader{})), 8)
-	rowSize    = align(int(unsafe.Sizeof(counterRow{})), 8)
+	headerSize      = align(int(unsafe.Sizeof(arenaHeader{})), 8)
+	entrySize       = align(int(unsafe.Sizeof(entryHeader{})), 8)
+	rowSize         = align(int(unsafe.Sizeof(counterRow{})), 8)
 )
 
 type Service uint32
@@ -51,17 +43,15 @@ const (
 	ServiceExec
 )
 
-// Binding is the fixed route-view reference workers use for admission. Slot is
-// one-based; zero is the unlimited fast path.
+// Binding contains the master-resolved route policy and stable arena reference.
+// Limits live in route SHM, not in a second mutable arena policy copy.
 type Binding struct {
 	Slot       uint32
 	Generation uint64
 	Limits     config.MaxInflight
 }
 
-func (b Binding) Unlimited() bool {
-	return b.Slot == 0 && b.Generation == 0 && b.Limits.Unlimited()
-}
+func (b Binding) Unlimited() bool { return b.Slot == 0 && b.Generation == 0 && b.Limits.Unlimited() }
 
 type arenaHeader struct {
 	Magic         uint64
@@ -76,21 +66,16 @@ type arenaHeader struct {
 	_2            [16]byte
 }
 
-type entryHeader struct {
-	State      uint64
-	Generation uint64
-	Identity   uint64
-	Total      uint32
-	Forward    uint32
-	Envd       uint32
-	CI         uint32
-	Exec       uint32
-	_          uint32
-}
+// Only the master writes this field. Zero revokes the slot. A nonzero generation
+// is never reused for another identity during the lifetime of this arena.
+type entryHeader struct{ Generation uint64 }
 
+// A live worker is the sole writer of its rows. Generation is published only
+// after counters are initialized. The supervisor may clear a column only after
+// that exact worker process has been reaped and before starting its replacement.
 type counterRow struct {
-	Guard    uint64
-	Counters [serviceCount]uint64
+	Generation uint64
+	Counters   [serviceCount]uint64
 }
 
 type mapping struct {
@@ -102,15 +87,10 @@ type mapping struct {
 	entryStride   int
 }
 
-// Size returns the complete mmap size, including one spare transaction entry
-// used to make a full-table identity replacement rollback-safe. After commit,
-// the retired entry becomes the next spare.
+// Size includes one spare entry for rollback-safe full-table replacement.
 func Size(routeCapacity, workers int) (int, error) {
-	if routeCapacity <= 0 {
-		return 0, fmt.Errorf("proxy admission: route capacity must be positive")
-	}
-	if workers <= 0 {
-		return 0, fmt.Errorf("proxy admission: worker count must be positive")
+	if routeCapacity <= 0 || workers <= 0 {
+		return 0, fmt.Errorf("proxy admission: capacity and worker count must be positive")
 	}
 	if uint64(routeCapacity) >= uint64(math.MaxUint32) || uint64(workers) > uint64(math.MaxUint32) {
 		return 0, fmt.Errorf("proxy admission: capacity or worker count overflows layout")
@@ -123,24 +103,21 @@ func Size(routeCapacity, workers int) (int, error) {
 	if !ok || uint64(stride) > uint64(math.MaxUint32) {
 		return 0, fmt.Errorf("proxy admission: entry stride overflows layout")
 	}
-	entries := routeCapacity + 1
-	body, ok := checkedMul(entries, stride)
+	body, ok := checkedMul(routeCapacity+1, stride)
 	if !ok {
 		return 0, fmt.Errorf("proxy admission: entries overflow layout")
 	}
 	total, ok := checkedAdd(headerSize, body)
-	if !ok || uint64(total) > uint64(math.MaxInt) {
+	if !ok {
 		return 0, fmt.Errorf("proxy admission: mmap size overflows layout")
 	}
 	return total, nil
 }
 
-// MemoryReport separates the contract's absolute counter bytes from layout
-// coordination overhead.
 type MemoryReport struct {
 	CounterBytes int
 	HeaderBytes  int
-	GuardBytes   int
+	RowTagBytes  int
 	ScratchBytes int
 	MappedBytes  int
 }
@@ -150,27 +127,11 @@ func Report(routeCapacity, workers int) (MemoryReport, error) {
 	if err != nil {
 		return MemoryReport{}, err
 	}
-	workerCounterBytes, ok := checkedMul(workers, serviceCount*8)
-	if !ok {
-		return MemoryReport{}, fmt.Errorf("proxy admission: counter report overflows")
-	}
-	counters, ok := checkedMul(routeCapacity, workerCounterBytes)
-	if !ok {
-		return MemoryReport{}, fmt.Errorf("proxy admission: counter report overflows")
-	}
-	workerGuardBytes, ok := checkedMul(workers, 8)
-	if !ok {
-		return MemoryReport{}, fmt.Errorf("proxy admission: guard report overflows")
-	}
-	guards, ok := checkedMul(routeCapacity, workerGuardBytes)
-	if !ok {
-		return MemoryReport{}, fmt.Errorf("proxy admission: guard report overflows")
-	}
-	headers, _ := checkedMul(routeCapacity, entrySize)
+	// Successful Size already bounds these smaller products.
 	return MemoryReport{
-		CounterBytes: counters,
-		HeaderBytes:  headerSize + headers,
-		GuardBytes:   guards,
+		CounterBytes: routeCapacity * workers * serviceCount * 8,
+		HeaderBytes:  headerSize + routeCapacity*entrySize,
+		RowTagBytes:  routeCapacity * workers * 8,
 		ScratchBytes: entrySize + workers*rowSize,
 		MappedBytes:  mapped,
 	}, nil
@@ -181,12 +142,9 @@ type masterRecord struct {
 	binding  Binding
 	syncGen  uint64
 }
-
-// Master owns entry allocation and generation transitions.
 type Master struct {
 	mapping
-	file *os.File
-
+	file         *os.File
 	mu           sync.Mutex
 	records      map[string]masterRecord
 	free         []uint32
@@ -197,7 +155,6 @@ type Master struct {
 	workerEpochs []uint64
 }
 
-// NewMaster creates a size-sealed writable memfd and maps it shared.
 func NewMaster(routeCapacity, workers int) (*Master, error) {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return nil, fmt.Errorf("proxy admission: unsupported architecture %s", runtime.GOARCH)
@@ -211,47 +168,33 @@ func NewMaster(routeCapacity, workers int) (*Master, error) {
 		return nil, fmt.Errorf("proxy admission: memfd: %w", err)
 	}
 	file := os.NewFile(uintptr(fd), "kuasar-proxy-admission")
-	closeOnError := func(err error) (*Master, error) {
-		_ = file.Close()
-		return nil, err
-	}
+	fail := func(err error) (*Master, error) { _ = file.Close(); return nil, err }
 	if err := file.Truncate(int64(size)); err != nil {
-		return closeOnError(fmt.Errorf("proxy admission: truncate: %w", err))
+		return fail(err)
 	}
 	data, err := unix.Mmap(fd, 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return closeOnError(fmt.Errorf("proxy admission: mmap: %w", err))
+		return fail(err)
 	}
 	if _, err := unix.FcntlInt(file.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
 		_ = unix.Munmap(data)
-		return closeOnError(fmt.Errorf("proxy admission: seal size: %w", err))
+		return fail(err)
 	}
 	mapped, err := mappingFromBytes(data, routeCapacity, workers, false)
 	if err != nil {
 		_ = unix.Munmap(data)
-		return closeOnError(err)
+		return fail(err)
 	}
-	mapped.header.Magic = arenaMagic
-	mapped.header.Version = ArenaVersion
-	mapped.header.Workers = uint32(workers)
-	mapped.header.RouteCapacity = uint32(routeCapacity)
-	mapped.header.EntryCapacity = uint32(routeCapacity + 1)
-	mapped.header.EntryStride = uint32(mapped.entryStride)
-	mapped.header.RowStride = uint32(rowSize)
-	mapped.header.MappedSize = uint64(size)
-	master := &Master{
-		mapping: mapped, file: file, records: make(map[string]masterRecord),
-		free: make([]uint32, routeCapacity+1), nextGen: 1, workerEpochs: make([]uint64, workers),
-	}
+	*mapped.header = arenaHeader{Magic: arenaMagic, Version: ArenaVersion, Workers: uint32(workers), RouteCapacity: uint32(routeCapacity), EntryCapacity: uint32(routeCapacity + 1), EntryStride: uint32(mapped.entryStride), RowStride: uint32(rowSize), MappedSize: uint64(size)}
+	master := &Master{mapping: mapped, file: file, records: make(map[string]masterRecord), free: make([]uint32, routeCapacity+1), nextGen: 1, workerEpochs: make([]uint64, workers)}
 	for i := range master.free {
 		master.free[i] = uint32(routeCapacity + 1 - i)
 	}
 	return master, nil
 }
 
-// BeginWorker records the exact process epoch that owns one writable column.
 func (m *Master) BeginWorker(workerIndex int, epoch uint64) error {
-	if m == nil || workerIndex < 0 || workerIndex >= m.workers || epoch == 0 || epoch == masterGuard {
+	if m == nil || workerIndex < 0 || workerIndex >= m.workers || epoch == 0 {
 		return fmt.Errorf("proxy admission: invalid worker identity")
 	}
 	m.workerMu.Lock()
@@ -262,20 +205,16 @@ func (m *Master) BeginWorker(workerIndex int, epoch uint64) error {
 	m.workerEpochs[workerIndex] = epoch
 	return nil
 }
-
-// DupFile returns a CLOEXEC descriptor copy suitable for one worker's
-// ExtraFiles handoff. The caller owns the result.
 func (m *Master) DupFile() (*os.File, error) {
 	if m == nil || m.file == nil || m.closed.Load() {
 		return nil, fmt.Errorf("proxy admission: master is closed")
 	}
 	fd, err := unix.FcntlInt(m.file.Fd(), unix.F_DUPFD_CLOEXEC, 3)
 	if err != nil {
-		return nil, fmt.Errorf("proxy admission: duplicate memfd: %w", err)
+		return nil, err
 	}
 	return os.NewFile(uintptr(fd), "kuasar-proxy-admission-worker"), nil
 }
-
 func (m *Master) Close() error {
 	if m == nil || !m.closed.CompareAndSwap(false, true) {
 		return nil
@@ -284,7 +223,6 @@ func (m *Master) Close() error {
 	m.data = nil
 	return errors.Join(err, m.file.Close())
 }
-
 func (m *Master) BeginSync() {
 	m.mu.Lock()
 	m.syncGen++
@@ -293,33 +231,30 @@ func (m *Master) BeginSync() {
 	}
 	m.mu.Unlock()
 }
-
-// Bookmark retires bindings not replayed in the current full sync.
 func (m *Master) Bookmark() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for sid, record := range m.records {
 		if record.syncGen != m.syncGen {
-			m.retireBinding(record.binding)
+			m.retire(record.binding)
 			delete(m.records, sid)
 		}
 	}
-	m.mu.Unlock()
 }
-
-// Delete first prevents new acquire, then safely retires the old generation.
 func (m *Master) Delete(sid string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if record, found := m.records[sid]; found {
-		m.retireBinding(record.binding)
+		m.retire(record.binding)
 		delete(m.records, sid)
 	}
-	m.mu.Unlock()
 }
 
-// ClearWorker clears one absolute column only after the supervisor has reaped
-// that exact worker epoch. It intentionally does not touch route ownership.
+// ClearWorker is called only after cmd.Wait for this epoch. No live writer can
+// remain in the column, so it never claims another process's lock. Route apply
+// only changes entry generations and cannot form a wait cycle with cleanup.
 func (m *Master) ClearWorker(workerIndex int, epoch uint64) error {
-	if m == nil || workerIndex < 0 || workerIndex >= m.workers || epoch == 0 || epoch == masterGuard {
+	if m == nil || workerIndex < 0 || workerIndex >= m.workers || epoch == 0 {
 		return fmt.Errorf("proxy admission: invalid worker cleanup identity")
 	}
 	m.workerMu.Lock()
@@ -329,28 +264,25 @@ func (m *Master) ClearWorker(workerIndex int, epoch uint64) error {
 	}
 	for slot := 1; slot <= m.entryCapacity; slot++ {
 		row := m.row(uint32(slot), workerIndex)
-		claimExitedWorkerRow(row)
-		for index := range row.Counters {
-			atomic.StoreUint64(&row.Counters[index], 0)
+		atomic.StoreUint64(&row.Generation, 0)
+		for i := range row.Counters {
+			atomic.StoreUint64(&row.Counters[i], 0)
 		}
-		atomic.StoreUint64(&row.Guard, 0)
 	}
 	m.workerEpochs[workerIndex] = 0
 	return nil
 }
 
-// Update holds the master's allocation lock until Commit or Rollback.
+// Update keeps allocation serialization in the master only. Workers never
+// acquire m.mu; Commit/Rollback do not wait for any worker to make progress.
 type Update struct {
 	master       *Master
 	sid          string
 	old          masterRecord
-	hadOld       bool
 	next         masterRecord
 	newAllocated bool
-	oldDrained   bool
-	policySlot   uint32
-	oldLimits    config.MaxInflight
-	done         atomic.Bool
+	oldRevoked   bool
+	done         bool
 }
 
 func (u *Update) Binding() Binding {
@@ -359,9 +291,6 @@ func (u *Update) Binding() Binding {
 	}
 	return u.next.binding
 }
-
-// PrepareUpsert validates and publishes the effective entry before route SHM
-// publication. The caller must finish with Commit or Rollback.
 func (m *Master) PrepareUpsert(sid, identity string, limits config.MaxInflight) (_ *Update, returnErr error) {
 	if m == nil || sid == "" || identity == "" || m.closed.Load() {
 		return nil, fmt.Errorf("proxy admission: invalid route identity")
@@ -373,33 +302,23 @@ func (m *Master) PrepareUpsert(sid, identity string, limits config.MaxInflight) 
 		}
 	}()
 	old, hadOld := m.records[sid]
-	u := &Update{master: m, sid: sid, old: old, hadOld: hadOld}
-	u.next = masterRecord{identity: identity, syncGen: m.syncGen, binding: Binding{Limits: limits}}
-
-	sameIdentity := hadOld && old.identity == identity
-	switch {
-	case limits.Unlimited():
-		if hadOld && old.binding.Slot != 0 {
-			m.beginDrain(old.binding)
-			u.oldDrained = true
-		}
-	case sameIdentity && old.binding.Slot != 0:
+	u := &Update{master: m, sid: sid, old: old, next: masterRecord{identity: identity, syncGen: m.syncGen, binding: Binding{Limits: limits}}}
+	if hadOld && old.identity == identity && !limits.Unlimited() && old.binding.Slot != 0 {
+		// Normal lifecycle/replay preserves the generation and outstanding
+		// counts. Route binding equality fences effective policy changes.
 		u.next.binding.Slot = old.binding.Slot
 		u.next.binding.Generation = old.binding.Generation
-		if old.binding.Limits != limits {
-			u.policySlot = old.binding.Slot
-			u.oldLimits = old.binding.Limits
-			m.replaceLimits(old.binding.Slot, old.binding.Generation, limits)
-		}
-	default:
-		if hadOld && old.binding.Slot != 0 {
-			m.beginDrain(old.binding)
-			u.oldDrained = true
-		}
-		binding, err := m.allocate(limits, identity)
+		return u, nil
+	}
+	if old.binding.Slot != 0 {
+		m.revoke(old.binding)
+		u.oldRevoked = true
+	}
+	if !limits.Unlimited() {
+		binding, err := m.allocate(limits)
 		if err != nil {
-			if u.oldDrained {
-				m.reactivate(old.binding)
+			if u.oldRevoked {
+				m.activate(old.binding)
 			}
 			return nil, err
 		}
@@ -408,35 +327,31 @@ func (m *Master) PrepareUpsert(sid, identity string, limits config.MaxInflight) 
 	}
 	return u, nil
 }
-
 func (u *Update) Commit() {
-	if u == nil || !u.done.CompareAndSwap(false, true) {
+	if u == nil || u.done {
 		return
 	}
-	if u.oldDrained {
-		u.master.retireDrained(u.old.binding)
+	u.done = true
+	if u.oldRevoked {
+		u.master.retire(u.old.binding)
 	}
 	u.master.records[u.sid] = u.next
 	u.master.mu.Unlock()
 }
-
 func (u *Update) Rollback() {
-	if u == nil || !u.done.CompareAndSwap(false, true) {
+	if u == nil || u.done {
 		return
 	}
-	if u.policySlot != 0 {
-		u.master.replaceLimits(u.policySlot, u.next.binding.Generation, u.oldLimits)
-	}
+	u.done = true
 	if u.newAllocated {
-		u.master.retireBinding(u.next.binding)
+		u.master.retire(u.next.binding)
 	}
-	if u.oldDrained {
-		u.master.reactivate(u.old.binding)
+	if u.oldRevoked {
+		u.master.activate(u.old.binding)
 	}
 	u.master.mu.Unlock()
 }
-
-func (m *Master) allocate(limits config.MaxInflight, identity string) (Binding, error) {
+func (m *Master) allocate(limits config.MaxInflight) (Binding, error) {
 	if len(m.free) == 0 {
 		return Binding{}, fmt.Errorf("proxy admission: arena full")
 	}
@@ -445,128 +360,40 @@ func (m *Master) allocate(limits config.MaxInflight, identity string) (Binding, 
 	}
 	slot := m.free[len(m.free)-1]
 	m.free = m.free[:len(m.free)-1]
-	generation := m.nextGen
+	binding := Binding{Slot: slot, Generation: m.nextGen, Limits: limits}
 	m.nextGen++
-	entry := m.entry(slot)
-	guards := m.claimRows(slot)
-	clearEntry(entry)
-	atomic.StoreUint64(&entry.Generation, generation)
-	entry.Identity = hashIdentity(identity)
-	storeLimits(entry, limits)
-	atomic.StoreUint64(&entry.State, stateActive)
-	guards()
-	return Binding{Slot: slot, Generation: generation, Limits: limits}, nil
+	// Rows are not cleared here. Their owners initialize them lazily under a
+	// process-local slot mutex. Other generations contribute zero to this one.
+	m.activate(binding)
+	return binding, nil
 }
-
-func (m *Master) beginDrain(binding Binding) {
-	if binding.Slot == 0 {
-		return
-	}
-	entry := m.entry(binding.Slot)
-	if atomic.LoadUint64(&entry.Generation) == binding.Generation {
-		atomic.CompareAndSwapUint64(&entry.State, stateActive, stateDraining)
+func (m *Master) activate(binding Binding) {
+	atomic.StoreUint64(&m.entry(binding.Slot).Generation, binding.Generation)
+}
+func (m *Master) revoke(binding Binding) {
+	if binding.Slot != 0 {
+		atomic.CompareAndSwapUint64(&m.entry(binding.Slot).Generation, binding.Generation, 0)
 	}
 }
-
-func (m *Master) reactivate(binding Binding) {
-	if binding.Slot == 0 {
-		return
-	}
-	entry := m.entry(binding.Slot)
-	if atomic.LoadUint64(&entry.Generation) == binding.Generation {
-		atomic.StoreUint64(&entry.State, stateActive)
-	}
-}
-
-func (m *Master) replaceLimits(slot uint32, generation uint64, limits config.MaxInflight) {
-	entry := m.entry(slot)
-	atomic.StoreUint64(&entry.State, stateDraining)
-	release := m.claimRows(slot)
-	if atomic.LoadUint64(&entry.Generation) == generation {
-		storeLimits(entry, limits)
-		atomic.StoreUint64(&entry.State, stateActive)
-	}
-	release()
-}
-
-func (m *Master) retireBinding(binding Binding) {
-	if binding.Slot == 0 {
-		return
-	}
-	m.beginDrain(binding)
-	m.retireDrained(binding)
-}
-
-func (m *Master) retireDrained(binding Binding) {
-	if binding.Slot == 0 {
-		return
-	}
-	entry := m.entry(binding.Slot)
-	release := m.claimRows(binding.Slot)
-	if atomic.LoadUint64(&entry.Generation) == binding.Generation {
-		atomic.StoreUint64(&entry.State, stateEmpty)
-		clearEntry(entry)
-		for worker := 0; worker < m.workers; worker++ {
-			row := m.row(binding.Slot, worker)
-			for index := range row.Counters {
-				atomic.StoreUint64(&row.Counters[index], 0)
-			}
-		}
+func (m *Master) retire(binding Binding) {
+	if binding.Slot != 0 {
+		m.revoke(binding)
 		m.free = append(m.free, binding.Slot)
 	}
-	release()
 }
 
-func (m *Master) claimRows(slot uint32) func() {
-	rows := make([]*counterRow, 0, m.workers)
-	for worker := 0; worker < m.workers; worker++ {
-		row := m.row(slot, worker)
-		claimMasterRow(row)
-		rows = append(rows, row)
-	}
-	return func() {
-		for _, row := range rows {
-			atomic.StoreUint64(&row.Guard, 0)
-		}
-	}
-}
-
-func claimMasterRow(row *counterRow) {
-	for !atomic.CompareAndSwapUint64(&row.Guard, 0, masterGuard) {
-		runtime.Gosched()
-	}
-}
-
-// claimExitedWorkerRow may reclaim a worker epoch left in Guard by a process
-// killed inside TryAcquire or Release. The caller invokes this only after
-// cmd.Wait has proved that no process can still execute against this row.
-// Another master operation is represented by masterGuard and must finish
-// normally; it is never stolen.
-func claimExitedWorkerRow(row *counterRow) {
-	for {
-		guard := atomic.LoadUint64(&row.Guard)
-		if guard == masterGuard {
-			runtime.Gosched()
-			continue
-		}
-		if atomic.CompareAndSwapUint64(&row.Guard, guard, masterGuard) {
-			return
-		}
-	}
-}
-
-// Worker owns exactly one writable absolute-counter column.
 type Worker struct {
 	mapping
-	index     int
-	epoch     uint64
+	index int
+	epoch uint64
+	// Indexed by slot, not SID: a reused slot must serialize old releases and
+	// new initialization even when it now belongs to a different Sandbox.
+	slots     []sync.Mutex
 	closed    atomic.Bool
 	afterScan func()
 	afterAdd  func()
 }
 
-// OpenWorker maps one inherited admission descriptor and validates its exact
-// immutable layout against the frozen worker configuration.
 func OpenWorker(file *os.File, routeCapacity, workers, workerIndex int, epoch uint64) (*Worker, error) {
 	if file == nil {
 		return nil, fmt.Errorf("proxy admission: missing descriptor")
@@ -575,14 +402,14 @@ func OpenWorker(file *os.File, routeCapacity, workers, workerIndex int, epoch ui
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return nil, fmt.Errorf("proxy admission: unsupported architecture %s", runtime.GOARCH)
 	}
-	if workerIndex < 0 || workerIndex >= workers || epoch == 0 || epoch == masterGuard {
+	if workerIndex < 0 || workerIndex >= workers || epoch == 0 {
 		return nil, fmt.Errorf("proxy admission: invalid worker identity")
 	}
-	st, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("proxy admission: stat descriptor: %w", err)
-	}
 	expected, err := Size(routeCapacity, workers)
+	if err != nil {
+		return nil, err
+	}
+	st, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -591,16 +418,18 @@ func OpenWorker(file *os.File, routeCapacity, workers, workerIndex int, epoch ui
 	}
 	data, err := unix.Mmap(int(file.Fd()), 0, expected, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return nil, fmt.Errorf("proxy admission: mmap worker: %w", err)
+		return nil, err
 	}
 	mapped, err := mappingFromBytes(data, routeCapacity, workers, true)
 	if err != nil {
 		_ = unix.Munmap(data)
 		return nil, err
 	}
-	return &Worker{mapping: mapped, index: workerIndex, epoch: epoch}, nil
+	return &Worker{mapping: mapped, index: workerIndex, epoch: epoch, slots: make([]sync.Mutex, routeCapacity+1)}, nil
 }
 
+// Close is for an owner that has already stopped all readers. Production worker
+// assembly retains successful mappings for the one-shot subprocess lifetime.
 func (w *Worker) Close() error {
 	if w == nil || !w.closed.CompareAndSwap(false, true) {
 		return nil
@@ -609,78 +438,82 @@ func (w *Worker) Close() error {
 	w.data = nil
 	return err
 }
+func (w *Worker) validSlot(binding Binding) bool {
+	return w != nil && !w.closed.Load() && binding.Slot != 0 && binding.Generation != 0 && int(binding.Slot) <= w.entryCapacity
+}
 
-// TryAcquire reads every worker's four absolute cells once, checks total and
-// target-service limits together, then publishes this worker's increment before
-// returning the lease.
+// Valid checks generation liveness only. Effective policy and credentials are
+// fenced separately by the existing full RouteBinding equality in WorkerView.
+func (w *Worker) Valid(binding Binding) bool {
+	if binding.Unlimited() {
+		return true
+	}
+	return w.validSlot(binding) && atomic.LoadUint64(&w.entry(binding.Slot).Generation) == binding.Generation
+}
+
 func (w *Worker) TryAcquire(binding Binding, service Service) (*Lease, error) {
-	if w == nil || w.closed.Load() || binding.Slot == 0 || binding.Generation == 0 || int(service) >= serviceCount {
+	if !w.validSlot(binding) || int(service) >= serviceCount {
 		return nil, ErrStaleBinding
 	}
-	if int(binding.Slot) > w.entryCapacity {
-		return nil, ErrStaleBinding
-	}
-	entry := w.entry(binding.Slot)
-	if atomic.LoadUint64(&entry.State) != stateActive || atomic.LoadUint64(&entry.Generation) != binding.Generation {
+	lock := &w.slots[int(binding.Slot)-1]
+	lock.Lock()
+	defer lock.Unlock()
+	if !w.Valid(binding) {
 		return nil, ErrStaleBinding
 	}
 	row := w.row(binding.Slot, w.index)
-	for !atomic.CompareAndSwapUint64(&row.Guard, 0, w.epoch) {
-		runtime.Gosched()
+	if atomic.LoadUint64(&row.Generation) != binding.Generation {
+		atomic.StoreUint64(&row.Generation, 0)
+		for i := range row.Counters {
+			atomic.StoreUint64(&row.Counters[i], 0)
+		}
+		atomic.StoreUint64(&row.Generation, binding.Generation)
 	}
-	defer atomic.StoreUint64(&row.Guard, 0)
-	if atomic.LoadUint64(&entry.State) != stateActive || atomic.LoadUint64(&entry.Generation) != binding.Generation || loadLimits(entry) != binding.Limits {
-		return nil, ErrStaleBinding
-	}
-
 	var total, target uint64
 	for worker := 0; worker < w.workers; worker++ {
 		other := w.row(binding.Slot, worker)
-		for index := 0; index < serviceCount; index++ {
-			value := atomic.LoadUint64(&other.Counters[index])
-			total = saturatedAdd(total, value)
-			if index == int(service) {
-				target = saturatedAdd(target, value)
+		before := atomic.LoadUint64(&other.Generation)
+		if before != binding.Generation {
+			continue
+		}
+		var subtotal, subtarget uint64
+		for i := 0; i < serviceCount; i++ {
+			count := atomic.LoadUint64(&other.Counters[i])
+			subtotal = saturatedAdd(subtotal, count)
+			if i == int(service) {
+				subtarget = count
 			}
 		}
+		if atomic.LoadUint64(&other.Generation) != before {
+			continue
+		}
+		total = saturatedAdd(total, subtotal)
+		target = saturatedAdd(target, subtarget)
 	}
 	if w.afterScan != nil {
 		w.afterScan()
 	}
+	if !w.Valid(binding) {
+		return nil, ErrStaleBinding
+	}
 	serviceLimit := limitFor(binding.Limits, service)
-	if (binding.Limits.Total != 0 && total >= uint64(binding.Limits.Total)) ||
-		(serviceLimit != 0 && target >= uint64(serviceLimit)) {
+	if (binding.Limits.Total != 0 && total >= uint64(binding.Limits.Total)) || (serviceLimit != 0 && target >= uint64(serviceLimit)) {
+		return nil, ErrLimitReached
+	}
+	if atomic.LoadUint64(&row.Counters[service]) == math.MaxUint64 {
 		return nil, ErrLimitReached
 	}
 	atomic.AddUint64(&row.Counters[service], 1)
 	if w.afterAdd != nil {
 		w.afterAdd()
 	}
+	if !w.Valid(binding) {
+		// Only this worker can write this row while it is alive; the local
+		// slot lock excludes initialization by a new request in this process.
+		atomic.AddUint64(&row.Counters[service], ^uint64(0))
+		return nil, ErrStaleBinding
+	}
 	return &Lease{worker: w, binding: binding, service: service}, nil
-}
-
-// Valid reports whether a binding still names the active entry and policy.
-// Activation uses this after a successful acquire so an identity replacement
-// cannot pass through the interval between draining the old arena generation
-// and publishing the replacement route record. The unlimited path remains a
-// pure value check and does not touch the arena.
-func (w *Worker) Valid(binding Binding) bool {
-	if binding.Unlimited() {
-		return true
-	}
-	if w == nil || w.closed.Load() || binding.Slot == 0 || binding.Generation == 0 ||
-		int(binding.Slot) > w.entryCapacity {
-		return false
-	}
-	entry := w.entry(binding.Slot)
-	row := w.row(binding.Slot, w.index)
-	for !atomic.CompareAndSwapUint64(&row.Guard, 0, w.epoch) {
-		runtime.Gosched()
-	}
-	defer atomic.StoreUint64(&row.Guard, 0)
-	return atomic.LoadUint64(&entry.State) == stateActive &&
-		atomic.LoadUint64(&entry.Generation) == binding.Generation &&
-		loadLimits(entry) == binding.Limits
 }
 
 type Lease struct {
@@ -691,32 +524,20 @@ type Lease struct {
 }
 
 func (l *Lease) Release() {
-	if l == nil || !l.closed.CompareAndSwap(false, true) || l.worker == nil || l.worker.closed.Load() {
+	if l == nil || !l.closed.CompareAndSwap(false, true) || !l.worker.validSlot(l.binding) {
 		return
 	}
 	w := l.worker
-	if int(l.binding.Slot) > w.entryCapacity {
-		return
-	}
+	lock := &w.slots[int(l.binding.Slot)-1]
+	lock.Lock()
+	defer lock.Unlock()
 	row := w.row(l.binding.Slot, w.index)
-	for !atomic.CompareAndSwapUint64(&row.Guard, 0, w.epoch) {
-		runtime.Gosched()
-	}
-	defer atomic.StoreUint64(&row.Guard, 0)
-	entry := w.entry(l.binding.Slot)
-	state := atomic.LoadUint64(&entry.State)
-	if (state != stateActive && state != stateDraining) || atomic.LoadUint64(&entry.Generation) != l.binding.Generation {
+	if atomic.LoadUint64(&row.Generation) != l.binding.Generation {
 		return
 	}
 	cell := &row.Counters[l.service]
-	for {
-		current := atomic.LoadUint64(cell)
-		if current == 0 {
-			return
-		}
-		if atomic.CompareAndSwapUint64(cell, current, current-1) {
-			return
-		}
+	if atomic.LoadUint64(cell) > 0 {
+		atomic.AddUint64(cell, ^uint64(0))
 	}
 }
 
@@ -728,54 +549,30 @@ func mappingFromBytes(data []byte, routeCapacity, workers int, validate bool) (m
 	if len(data) != expected || len(data) < headerSize {
 		return mapping{}, fmt.Errorf("proxy admission: invalid mmap size %d, want %d", len(data), expected)
 	}
-	header := (*arenaHeader)(unsafe.Pointer(&data[0]))
+	first := uintptr(unsafe.Pointer(&data[0]))
 	stride := entrySize + workers*rowSize
+	if first%8 != 0 || headerSize%8 != 0 || stride%8 != 0 || rowSize%8 != 0 {
+		return mapping{}, fmt.Errorf("proxy admission: unaligned atomic layout")
+	}
+	header := (*arenaHeader)(unsafe.Pointer(&data[0]))
 	if validate {
 		if header.Magic != arenaMagic || header.Version != ArenaVersion {
 			return mapping{}, fmt.Errorf("proxy admission: unsupported arena version")
 		}
-		if int(header.Workers) != workers || int(header.RouteCapacity) != routeCapacity ||
-			int(header.EntryCapacity) != routeCapacity+1 || int(header.EntryStride) != stride ||
-			int(header.RowStride) != rowSize || header.MappedSize != uint64(expected) {
+		if int(header.Workers) != workers || int(header.RouteCapacity) != routeCapacity || int(header.EntryCapacity) != routeCapacity+1 || int(header.EntryStride) != stride || int(header.RowStride) != rowSize || header.MappedSize != uint64(expected) {
 			return mapping{}, fmt.Errorf("proxy admission: invalid arena layout")
 		}
 	}
-	first := uintptr(unsafe.Pointer(&data[0]))
-	if first%8 != 0 || uintptr(headerSize)%8 != 0 || uintptr(stride)%8 != 0 || uintptr(rowSize)%8 != 0 {
-		return mapping{}, fmt.Errorf("proxy admission: unaligned atomic layout")
-	}
 	return mapping{data: data, header: header, workers: workers, routeCapacity: routeCapacity, entryCapacity: routeCapacity + 1, entryStride: stride}, nil
 }
-
 func (m *mapping) entry(slot uint32) *entryHeader {
 	offset := headerSize + (int(slot)-1)*m.entryStride
 	return (*entryHeader)(unsafe.Pointer(&m.data[offset]))
 }
-
 func (m *mapping) row(slot uint32, worker int) *counterRow {
 	offset := headerSize + (int(slot)-1)*m.entryStride + entrySize + worker*rowSize
 	return (*counterRow)(unsafe.Pointer(&m.data[offset]))
 }
-
-func storeLimits(entry *entryHeader, limits config.MaxInflight) {
-	entry.Total = limits.Total
-	entry.Forward = limits.Forward
-	entry.Envd = limits.E2BEnvd
-	entry.CI = limits.E2BCodeInterpreter
-	entry.Exec = limits.Exec
-}
-
-func loadLimits(entry *entryHeader) config.MaxInflight {
-	return config.MaxInflight{Total: entry.Total, Forward: entry.Forward, E2BEnvd: entry.Envd, E2BCodeInterpreter: entry.CI, Exec: entry.Exec}
-}
-
-func clearEntry(entry *entryHeader) {
-	atomic.StoreUint64(&entry.State, stateEmpty)
-	atomic.StoreUint64(&entry.Generation, 0)
-	entry.Identity = 0
-	storeLimits(entry, config.MaxInflight{})
-}
-
 func limitFor(limits config.MaxInflight, service Service) uint32 {
 	switch service {
 	case ServiceForward:
@@ -790,32 +587,22 @@ func limitFor(limits config.MaxInflight, service Service) uint32 {
 		return 0
 	}
 }
-
-func hashIdentity(identity string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(identity))
-	return h.Sum64()
-}
-
 func saturatedAdd(left, right uint64) uint64 {
 	if math.MaxUint64-left < right {
 		return math.MaxUint64
 	}
 	return left + right
 }
-
 func checkedAdd(left, right int) (int, bool) {
 	if left < 0 || right < 0 || left > math.MaxInt-right {
 		return 0, false
 	}
 	return left + right, true
 }
-
 func checkedMul(left, right int) (int, bool) {
 	if left < 0 || right < 0 || (left != 0 && right > math.MaxInt/left) {
 		return 0, false
 	}
 	return left * right, true
 }
-
 func align(value, boundary int) int { return (value + boundary - 1) &^ (boundary - 1) }
