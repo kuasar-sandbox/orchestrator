@@ -774,8 +774,8 @@ Reserve body 按 operation 使用独立 typed schema:create 携 create config,ex
 完成条件不同;Registry 对 exec-session body 再做严格 schema/bounds 校验,不接受旧的
 `ttl_seconds` query 或把 conditions 塞入 Header/metadata/config map:
 
-- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
-  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
+- `create`:query 只携 group/route_key,Header 携 `X-API-KEY`,config map 只允许 `kuasar-sandbox.resource`、`kuasar-sandbox.traffic`、`kuasar-sandbox.restore`、`kuasar-sandbox.credentials` 与
+  `kuasar-sandbox.checkpoint`；`auto_pause_memory` 是独立 typed body 字段，拒绝 `memory`。Registry 在 placement 和 route 写入前校验并归一化 resource/traffic patch；提供的叶子覆盖 placement 携带的 group 默认配置，省略的叶子继承默认值。Registry 在 placement 和 route 写入前通过 group provider 验证 API key,生成稳定
   SandboxID 和首个 NodeSandboxID,下发 CmdCreate。node Ack 只表示 durable starting + active
   attempt;Registry 仍等待 node READY 事件后才向北向 create 返回 `Route`。并发 create 在
   Registry 内合并。
