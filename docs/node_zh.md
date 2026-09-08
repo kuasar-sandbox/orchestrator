@@ -958,10 +958,12 @@ namespace 遵循下文各自的合并规则，多数采用 whole-namespace 覆�
 严格解析,所以合法高层不能隐藏非法低层。group/reserve、standalone/cluster 与 build
 registration 共用同一 helper。
 
-`traffic` 的固定 leaf priority 是:
+Build traffic 仅作用于本次 Build runtime 及其 synthetic route，不会被输出制品后续创建的
+Sandbox 继承。canonical TemplateID Create 不查询保留的 Build metadata、Template catalog
+或制品 metadata 来取得 traffic 默认值。`traffic` 的固定 leaf priority 是:
 
 ```text
-template / group defaults
+cluster group explicit metadata (when present)
   < create / reserve body metadata
   < X-Kuasar-Sandbox-Traffic
 ```

@@ -201,7 +201,7 @@ func Size(capacity int) int {
 
 func terminalCapacity(capacity int) int {
 	if capacity <= 0 {
-		return defaultCapacity
+		capacity = defaultCapacity
 	}
 	if capacity > maxTerminalRevisions {
 		return maxTerminalRevisions

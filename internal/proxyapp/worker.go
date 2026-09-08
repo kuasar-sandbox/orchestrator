@@ -253,8 +253,8 @@ func startWorkerIngress(
 	return handler, nil
 }
 
-// Close releases descriptors and is safe to call more than once. Successful
-// mappings are deliberately NOT unmapped here: asynchronous users need not have
+// Close releases descriptors and is safe after Run has already closed them,
+// and to call more than once. Successful mappings are deliberately NOT unmapped here: asynchronous users need not have
 // stopped when Run returns. Kernel process teardown reclaims both mappings;
 // the master separately clears this worker's counters only after cmd.Wait.
 func (worker *PreparedWorker) Close() error {
@@ -346,19 +346,31 @@ func closeFile(file *os.File) error {
 	if file == nil {
 		return nil
 	}
-	return file.Close()
+	err := file.Close()
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func closeConn(connection net.Conn) error {
 	if connection == nil {
 		return nil
 	}
-	return connection.Close()
+	err := connection.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func closeListener(listener net.Listener) error {
 	if listener == nil {
 		return nil
 	}
-	return listener.Close()
+	err := listener.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }

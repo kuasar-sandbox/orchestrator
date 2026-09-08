@@ -340,8 +340,8 @@ MMDS token 签名,不等于 route secret values;后者仅经上述可信投影�
 `MaxInflightPatch` 只在 routesync wire 上携带 Sandbox 显式叶子;master 将目标节点
 `proxy.yaml` 默认值与该 patch 合并后,把 fixed effective value 及
 `{admission slot,generation}` 写入 route SHM,不会把 pointer 写入 SHM 或用于 route equality。
-当前内部兼容边界为 routesync version 7、route SHM schema 7、worker bootstrap/config/FD
-protocol version 2，以及 admission arena version 1。这些都是内部 hard cut；协议版本不匹配的
+当前内部兼容边界为 routesync version 8、route SHM schema 8、worker bootstrap/config/FD
+protocol version 2，以及 admission arena version 2。这些都是内部 hard cut；协议版本不匹配的
 conductor/proxy/registry/router 或旧 SHM/bootstrap 不兼容且 fail closed。
 
 初始 durable starting upsert 可以没有 FloatingIP、UDS 或其它 backend endpoint;worker 按
@@ -560,7 +560,7 @@ Sandbox 只在 metadata key `kuasar-sandbox.traffic` 保存显式 patch;create/b
 一次的 `X-Kuasar-Sandbox-Traffic` 传入同形 JSON。合并优先级为:
 
 ```text
-template/group/default explicit metadata
+cluster group explicit metadata (when present)
   < create metadata
   < X-Kuasar-Sandbox-Traffic
   < target Proxy resolution only for absent leaves
@@ -572,6 +572,11 @@ Header、`null`、unknown、负数、非整数和 uint32 overflow 均拒绝。ba
 `e2b:envd` 或 `e2b:code-interpreter` 也拒绝;节点默认可包含全部 service,bare 只消费
 `total/forward/exec`。
 
+Build 注册的 traffic 仅约束 Build runtime 及其 synthetic route，不成为输出制品后续创建
+Sandbox 的默认配置。canonical TemplateID Create 不查询保留的 Build row、Template catalog
+或制品 metadata 来恢复 traffic policy。单节点 Create 使用请求显式 patch；集群 Create
+还可以携带 group 显式默认值。
+
 目标节点默认值不写入 Sandbox metadata/struct/SQLite、Registry record 或 MigrationToken。
 MigrationToken 沿用已有 Metadata:absent traffic 在迁移后仍 absent,由目标 Proxy 使用自己的
 默认值;显式 patch 原样迁移并覆盖目标默认。V1 不支持运行时修改 metadata,降低 limit 也不
@@ -579,12 +584,14 @@ MigrationToken 沿用已有 Metadata:absent traffic 在迁移后仍 absent,由�
 
 ### 8.2 共享 admission arena 与误差证明
 
-route mmap 与 mutable admission arena 分离。master 为所有 effective limit 全为 0 的 route
-发布零 binding,worker 直接执行既有 `BeginParking`,不扫描 arena、不 IPC。其它 route 得到
-稳定的 `{slot,generation,effective limits}`。每个 entry 含 identity/state、generation、fixed
-limits 以及 `counters[worker][forward/envd/CI/exec]`;worker 只写自己的 absolute cell。
+route mmap 与 mutable admission arena 分离。master 为策略合法且 effective limit 全为 0 的
+route 发布零 binding，worker 直接执行既有 `BeginParking`，不扫描 arena、不 IPC。limited
+route 的 `{slot,generation,effective limits}` 位于 route SHM。arena v2 仅保存 master 写入的
+每 slot active generation，以及携带 generation tag 的 `counters[worker][forward/envd/CI/exec]`。
+存活 worker 独占写入自己的 row；进程内 per-slot mutex 串行化初始化、acquire 和 release。
+master 不获取该锁、不清理存活 row；不存在 shared guard、draining state 或第二份可变 limit policy。
 
-acquire 在已有 worker-local per-Sandbox entry lock 内执行:
+acquire 在进程内 per-slot mutex（该 slot 所有 service 共用）内执行:
 
 ```text
 verify active generation and effective limits
@@ -618,23 +625,41 @@ parking→egress 不改 shared count。activation、dial、HTTP forward、contex
 response 及完整 CONNECT/exec relay 的最终 Close 都由同一个 flow/lease exactly once 释放;
 half-close 不释放。
 
-Delete 或 identity replacement 先把旧 generation 置为不可 acquire,再清零/复用 slot。旧 flow
-保留旧 generation,release mismatch 时不得减少新 route cell;starting/running/paused 的同一
-Sandbox lifecycle 更新保持 generation。route/policy 发布前后的 Activate 都重读 route identity
-与完整 binding;对已经 drain 的 limited generation 还直接重验 arena state,因此旧 lookup 不能在
-新 route 发布后绕过新 binding。
+Delete 或 identity replacement 撤销旧 active generation，不等待存活 worker。slot 复用时
+发布新 generation；各 worker 在本地 slot mutex 下首次使用时初始化自己的 row。旧 release
+或者发生在初始化前，或者发现新 tag 后不再操作，因此不会减少新 identity 的计数。未改变身份
+的 starting/running/paused 更新保持 generation。Activate 重验完整 identity、policy validity、
+binding 与 arena generation 存活状态。route 发布失败时回滚 admission transaction，保留旧
+计数。暂停的 worker 不阻塞 master 发布或其它 worker；详见[分代所有权与回滚](proxy-admission-generations_zh.md)。
 
 worker stats stream fault 会先终止 worker。只有 supervisor 的 `cmd.Wait` 证明旧进程已退出、
-kernel 已关闭其连接后,master 才接管可能遗留的 row guard并清该 index;此前 stale-high 只能
+kernel 已关闭其连接后，master 才清理该 index，无需 shared lock；此前 stale-high 只能
 保守拒绝,不能漏计。replacement 复用 index 但使用新 epoch。master 退出会终止全部 child 和
 连接;新 master 重建 arena，不继承旧计数。
 仍存活 master 的完整 routesync 则保留重放且未改变 binding 的计数，只在 Bookmark 淘汰
 本轮未出现的 binding；它不会清零仍活跃 flow 的计数。
 
 在 `route_capacity=65536,workers=2` 配置下,counter 主体为
-`65536 × 2 × 4 × 8 = 4194304` bytes;连同 entry headers、row guards 和一个 transaction spare
-entry,实际 mmap 为 `8388800` bytes。size、stride、worker count/index 和 8-byte atomic alignment
+`65536 × 2 × 4 × 8 = 4194304` bytes；连同 generation tags、headers 和一个 transaction spare
+entry，arena v2 mmap 为 `5767320` bytes。每个 worker 另持有 65537 个进程内 mutex，
+`sync.Mutex` 为 8 bytes 时占 `524296` bytes，不属于共享映射。size、stride、worker count/index 和 8-byte atomic alignment
 均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+
+worker 关闭后仍保留两种映射直到进程退出，包括异步扩展代码或 hijacked handler 超出
+`Run` 生命周期的情况。只有 `cmd.Wait` 后才清理对应 epoch 并启动 replacement；见
+[worker 生命周期](proxy-worker-lifetime_zh.md)。
+
+已持久化的 traffic metadata 损坏时，conductor 保留真实 Sandbox lifecycle 和 credentials，
+仅投影 `traffic_policy_invalid`。master 不发布 effective policy 或可用 admission binding。
+它不伪造 `dead`/Delete、不移除 Registry ownership、不禁用 MMDS，也不影响其它 route 的
+完整同步。请求持久化前和 migration 输入仍严格校验。
+
+普通 HTTP/non-exec CONNECT 先执行既有 credential policy，再在 parking/acquire/Wake/
+Activate/dial 前返回 HTTP 503 与 `route_error`。私有鉴权后的 `ForwardAuthorized` 共用
+该路径。native exec 保持 KAT → CONNECT 200 → strict first frame/expiry/CEL → generic ctl
+拒绝，无 backend 副作用。traffic stats 与扩展 `TrafficSource.Get` 返回 unavailable，不能报告
+零限制；route lookup、`RouteSource.Get` 和 `WorkerHost.GetRoute` 仍保留真实事实。stats batch
+中任何无效成员使整批 unavailable，不返回部分成功结果。
 
 普通 HTTP 与 non-exec CONNECT 达限返回 429、
 `X-Kuasar-Proxy-Error: max_inflight_reached` 和固定 body,不设置 `Retry-After`、不 Wake/Activate/dial、

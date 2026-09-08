@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/migrationtoken"
@@ -57,7 +58,7 @@ const PluginRegisterPattern = "PUT /internal/plugin/{id}/register"
 
 const pluginPathPrefix = "/internal/plugin/"
 
-// PluginRegisterPath is the registration path the subscriber dials.
+// PluginRegisterPath is the registration path for a given plugin id.
 func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/register" }
 
 // ProxyPluginID is the one trusted independent Proxy registration identity.
@@ -171,6 +172,15 @@ func (r *RouteEntry) UnmarshalJSON(raw []byte) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
+	}
+	// encoding/json accepts case-insensitive field names. Do not let an alias
+	// bypass the owned projection's null/type/duplicate validation below.
+	for field := range fields {
+		for _, owned := range []string{"traffic_policy_invalid", "max_inflight"} {
+			if field != owned && strings.EqualFold(field, owned) {
+				return fmt.Errorf("routesync: non-canonical traffic field %q", field)
+			}
+		}
 	}
 	if invalid, present := fields["traffic_policy_invalid"]; present {
 		if err := strictjson.Decode(invalid, &decoded.TrafficPolicyInvalid); err != nil {

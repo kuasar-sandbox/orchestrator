@@ -622,10 +622,10 @@ node resource policy
 
 The five leaves overlay independently: group capacity.memory and Create allocatable.memory both survive. Build-row metadata is not another Create layer. Other namespaces follow their own rules below, generally whole-namespace replacement. Every layer is parsed strictly before merging, so a valid higher layer cannot hide an invalid lower one. Group/reserve, standalone/cluster and Build registration share the helper.
 
-Traffic leaf priority is:
+Build traffic is request-scoped to the Build runtime and its synthetic route; it is not inherited by Sandboxes created from the output artifact. Canonical TemplateID Create never queries retained Build metadata, a Template catalog, or artifact metadata for traffic defaults. Traffic leaf priority is:
 
 ```text
-template / group defaults
+cluster group explicit metadata (when present)
   < create / reserve body metadata
   < X-Kuasar-Sandbox-Traffic
 ```

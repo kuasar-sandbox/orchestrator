@@ -20,8 +20,8 @@ import (
 )
 
 func TestAdmissionProjectionBumpsRecordLayout(t *testing.T) {
-	if schema != 7 {
-		t.Fatalf("schema = %d, want schema 7", schema)
+	if schema != 8 {
+		t.Fatalf("schema = %d, want schema 8", schema)
 	}
 	if got := unsafe.Offsetof(mmapRecord{}.StableID); got != 1163 {
 		t.Fatalf("StableID offset = %d, want 1163", got)
