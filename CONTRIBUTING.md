@@ -2,6 +2,8 @@
 
 Thank you for contributing to `kuasar-sandbox/orchestrator`.
 
+Documentation changes follow the shared [documentation contribution policy](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/CONTRIBUTING.md#documentation-contributions).
+
 ## Current access model
 
 The organization currently uses a private-fork workflow:

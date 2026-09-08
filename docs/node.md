@@ -3,7 +3,7 @@
 <a id="node--节点-e2b-兼容沙箱主机与集群接入"></a>
 # node — An e2b-compatible sandbox host and cluster member
 
-For optional direct-Create IDs, Header/metadata precedence and insert-only conflicts, see [Sandbox identity on Create](sandbox-identity.md).
+For optional direct-Create IDs, Header/metadata precedence and insert-only conflicts, see [Sandbox identity on Create](#412-create-identity).
 
 `kuasar-sandbox.identity` is a direct Create request-only namespace (`id`, optional `stable_id`), also accepted through `X-Kuasar-Sandbox-Identity`. It is extracted before the Create Hook and never inherited or persisted as configuration. Template Build registration rejects it. The internal Build MMDS route cache uses a disjoint namespace, so legal caller IDs beginning with `build-` remain supported.
 
@@ -29,7 +29,7 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 ### 1.2 Design principles
 
 1. **Compose at explicit boundaries.** Lifecycle and networking use subprocess CLIs such as `sandbox-ctl` and `connector-ctl vswitch`; units use systemd D-Bus and envd forwarding uses UDS. The code also imports sibling repositories' public packages for typed artifact preparation, configuration, assembly and publication (§14), so this is not a CLI-only dependency graph. The binaries support pure-Go `CGO_ENABLED=0` builds.
-2. **Keep resource arbitration separable.** `sandbox-ctl`'s `pkg/resource` client negotiates sandbox admission and quota with the node resource controller. `node-ctl conductor serve` embeds it through `resource_listen`, with inline configuration ([node-resource.md](node-resource.md)). It remains separate from API, host and Proxy logic. Conductor manages the Build admission pool itself (§12).
+2. **Keep resource arbitration separable.** `sandbox-ctl`'s `pkg/resource` client negotiates sandbox admission and quota with the node resource controller. `node-ctl conductor serve` embeds it through `resource_listen`, with inline configuration ([node-resource.md](node-resource.md)). It remains separate from API, host and Proxy logic. Conductor manages the Build admission pool itself ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 3. **Delegate process supervision to systemd.** Runner/builder template instances use RunID and may start early to wait for config-socket assignment. Runner `ctl/vmm` subgroups separate the supervisor from sandbox resources; the entire builder unit is accounted. StopUnit and its completion checks reclaim the unit; conductor does not replace systemd as a process supervisor.
 4. **Keep root credentials encrypted at rest.** Tenant APISecret/ManifestKey pairs use AES-256-GCM in SQLite. Authenticated task bootstrap supplies authoritative ManifestKey environment values to single-tenant runner/builder processes. Conductor's managed sandbox/build preparation does not open or parse tenant artifacts with that key, and ManifestKey does not enter the guest (§6–7). Pairs received over node-link are also stored encrypted (§10).
 5. **Separate local and cluster routing authority.** Conductor owns local routes and lifecycle; independent Proxy is the sole sandbox data ingress (§9). Registry owns cluster routes. Node-link reports node events and accepts cluster commands (§10) without creating competing cluster authority.
@@ -43,7 +43,7 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 | **e2b** | Upstream envd in the guest for agent exec, file access and code execution | envd fs/process/pty/runCode plus platform native exec | envd/CI, floating-IP user ports and native exec |
 | **bare** | Run a customer image as a networked microVM without envd | Platform native exec; no envd API | Floating-IP networking and native exec |
 
-`bare` reuses `sandbox-runtime.bundle` and exposes the base sandbox through the northbound API. Build registration defaults to **e2b**, but explicitly accepts **bare** (§4.2); the output profile is immutable. The templateID prefix encodes profile (§4.4), which selects guest launch behavior and data services within the shared runtime Bundle.
+`bare` reuses `sandbox-runtime.bundle` and exposes the base sandbox through the northbound API. Build registration defaults to **e2b**, but explicitly accepts **bare** ([Build §1](node-build.md#1-build-api)); the output profile is immutable. The templateID prefix encodes profile ([Build §2](node-build.md#2-template-ids-and-artifact-authority)), which selects guest launch behavior and data services within the shared runtime Bundle.
 
 <a id="14-边界与依赖"></a>
 ### 1.4 Boundaries and dependencies
@@ -52,7 +52,7 @@ node-ctl supplies that layer using **e2b protocol compatibility**. The SDK ecosy
 - Standalone and cluster modes keep create/pause/kill/template execution on the node. Joining adds node-link (§10) without replacing the e2b contract.
 - The data plane forwards upstream guest envd protocols rather than implementing envd (§4.3).
 - There is no compatible `/sandboxes/{id}/metrics` time series or envd metrics collection. The platform instead exposes read-only instantaneous `/sandboxes/{id}/stats/resource` and `/sandboxes/{id}/stats/traffic` (§4.1.1).
-- The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs (§12).
+- The server does not parse Dockerfiles. It pulls/flattens existing images and executes the supported structured Build steps supplied by clients inside phase microVMs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - Routing, storage and units are node-local. Cross-node snapshots/templates use canonical portable refs in Manifest Store or uniformly mounted named locations (§8.1); cluster-ctl orchestrates through node-link (§10).
 - Dependencies include the standard library, pure-Go `modernc.org/sqlite`, `golang.org/x/net/http2` for config-socket/node-link h2c, `golang.org/x/sys` for pidfile locks/SO_PEERCRED/mmap, `coreos/go-systemd`, `google/uuid` v7 and `gopkg.in/yaml.v3`. The module also includes CEL/protobuf, AWS SDK and sibling public packages; see [go.mod](../go.mod). The hand-written envd client and node-link use JSON rather than a gRPC wire protocol.
 
@@ -135,7 +135,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `proxy serve` | Independent data-plane master/workers (§2.3 and [node-proxy.md](node-proxy.md)) |
 | `run-sandbox` / `run-builder` | Launchers inside systemd units, not interactive commands (§2.4 and §6) |
 | `resource` | `status`/`list`/`drain`: inspect reservations and drain admission ([node-resource.md](node-resource.md) §2) |
-| `builder status` | Inspect durable two-level Build admission (§12) |
+| `builder status` | Inspect durable two-level Build admission ([Build §5](node-build.md#5-target-aware-execution-and-publication)) |
 | `config` | Normalize/validate configuration or print a commented template |
 | `manifest-key` | `add`/`remove`/`check`/`list`: manage credential-pair allowlisting for create/build/import (§7); Registry also writes leased entries (§10) |
 | `export-sandbox` / `import-sandbox` | Promote paused sandboxes to templates or migrate them (§8.1) |
@@ -149,7 +149,7 @@ BuildID is restricted to `[A-Za-z0-9_-]{1,48}` and used verbatim as `builds/<Bui
 | `derive-api-secret [<MANIFEST_KEY>]` | Derive default APISecret with the fixed KDF (§7) |
 | `gen-apikey [<API_SECRET>]` | Sign an e2b API key with APISecret (`e2b_` plus hex, §7) |
 | `fingerprint [<API_SECRET>]` | Print APISecret's full 64-hex SHA-256 fingerprint |
-| `seal-pull-token [<MANIFEST_KEY>] …` | Seal an opaque image-pull token (`kpt_`, §12) |
+| `seal-pull-token [<MANIFEST_KEY>] …` | Seal an opaque image-pull token (`kpt_`, [Build §5](node-build.md#5-target-aware-execution-and-publication)) |
 | `version` | Print version |
 
 A typical standalone-node setup is:
@@ -179,7 +179,7 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 |---|---|---|
 | `--config` | `/etc/node-ctl/conductor.yaml` | Conductor configuration (§3) |
 
-Startup opens SQLite with file mode 0600, generates/installs systemd templates (§5), reconciles restart state (§15), starts the 5-second TTL reaper and optional embedded resource controller, binds and confirms the local control socket (§6), starts runner/builder pools and Build admission (§12), optionally dials `cluster.node_link.endpoint` (§10), then listens on `api.listen`. That listener serves only the wrapped control API; sandbox data Host requests and CONNECT do not reach backends. With no TLS certificates it serves plaintext h2c; development SDK control uses `E2B_API_URL`.
+Startup opens SQLite with file mode 0600, generates/installs systemd templates (§5), reconciles restart state (§15), starts the 5-second TTL reaper and optional embedded resource controller, binds and confirms the local control socket (§6), starts runner/builder pools and Build admission ([Build §5](node-build.md#5-target-aware-execution-and-publication)), optionally dials `cluster.node_link.endpoint` (§10), then listens on `api.listen`. That listener serves only the wrapped control API; sandbox data Host requests and CONNECT do not reach backends. With no TLS certificates it serves plaintext h2c; development SDK control uses `E2B_API_URL`.
 
 The supplied systemd service is [deploy/node-ctl.service](../deploy/node-ctl.service).
 
@@ -200,7 +200,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 These are systemd ExecStart launchers. Their common entry uses `--run-id` as the unit instance name and `--pidfile=<RunRoot>/runners/<RunID>.pid`. An exclusive `fcntl(F_SETLK)` lock prevents duplicate execution; the launcher writes its PID, then calls WaitAssignment over `--config-socket` to obtain its business ID (§6). They then diverge:
 
 - **run-sandbox:** immediately connect `<RunRoot>/sandboxes/<SandboxID>/ready.sock` with `FD_CLOEXEC` still set, lock `<RunDir>/<SandboxID>.pid`, and request bootstrap using SID plus exact RunID. Cold-image bootstrap returns final LaunchSpec in one RPC. E/S bootstrap returns task-local ArtifactPrepareSpec and authoritative `MANIFEST_KEY`; the runner overrides inherited environment, opens E/S according to kind and durable LaunchMode, submits the completion and waits for final LaunchSpec. It retains PreparedSource, carrier bindings and sorted ref-locations locally, explicitly closes readers/fetchers, then changes to LaunchSpec.Workdir, strips `TASK_*` and merges task/spec environment. Only immediately before final `execve` does it clear readiness FD's `FD_CLOEXEC`, append actual `--ready-fd=<fd>` and replace itself with `sandbox-ctl run`. The new program inherits PID, unit cgroup, pidfile lock FD and readiness FD. Any pre-exec/prepare failure closes readiness and conductor immediately observes EOF.
-- **run-builder:** lock `<BuildRunDir>/builder.pid` after assignment and request exact-BuildID/RunID bootstrap. fromImage and IMG fromTemplate return final BuildSpec in that RPC. SBX/SNP fromTemplate installs authoritative `MANIFEST_KEY` and performs cold/E-selection preparation in the task. SNP uses S only to locate E. Complete E/source-image config and filtered sorted ref-locations remain in the task; only a bounded non-secret summary goes to conductor before final BuildSpec. Readers/fetchers are explicitly closed before submission; conductor reads no tenant artifacts. run-builder merges retained local results into final spec and **remains resident** to drive the target-aware pipeline of at most three phases (§12). Each `sandbox-ctl run` is its direct child; the entire Build is charged to the unit cgroup. It returns `{target, exactly-one-of image_ref|sandbox_ref|snapshot_ref, start_cmd, ready_cmd, error, failure_stage}` over config-socket. Root-config reads, preparation RPCs, phase reports and pipeline share one absolute deadline, reserving at most the final five seconds for durable result reporting. With less than ten seconds left, half the remaining budget is reserved, preventing a short timeout from expiring before work starts without resetting/extending the total budget. Only the final result POST may use that tail window. BuildID remains durable business identity and the verbatim directory leaf; the 48-byte cap keeps the deepest phase UDS within supported RunRoot/Linux `sun_path` limits.
+- **run-builder:** complete task preparation, resident execution, deadlines and result handoff are in [Build §4](node-build.md#4-task-handoff).
 
 ```
 node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
@@ -244,7 +244,7 @@ node-ctl manifest-key list   [--socket S]
 
 - `--api-secret` explicitly pairs an APISecret with one `<KEY>` only; omission derives the default. `add/remove/check` always operate on the complete pair.
 - `--ttl` sets expiry duration (`0`/omitted means never). Repeated add refreshes expiry only for an identical complete pair. Binding the same full APISecret fingerprint to different credential material conflicts. Expired pairs are treated as absent and lazily removed by the reaper; `list` shows `expires`.
-- `--registry-auth`/`--registry-*` configure default tenant pull credentials encrypted in `registry_auth_enc`, selected by fromImage host during Build (§12).
+- `--registry-auth`/`--registry-*` configure default tenant pull credentials encrypted in `registry_auth_enc`, selected by fromImage host during Build ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 - `add/remove/check` prints `STATUS api=<64-hex> manifest=<64-hex>`; `list` prints both full fingerprints per row.
 - Authentication uses `SO_PEERCRED`: with `paths.admin_pidfile`, peer PID must be listed; otherwise socket mode 0600 is the boundary (same UID/root).
 
@@ -273,7 +273,7 @@ e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-p
                                               --registry-token T}
 ```
 
-The opaque `kpt_` token contains image-pull credentials sealed with AES-GCM using a tenant ManifestKey-derived key. SDK `api_headers` sends it as `X-Kuasar-Pull-Token` with the Build request; conductor opens it using the tenant's stored key (§12). ManifestKey comes from the first positional argument or `MANIFEST_KEY`.
+The opaque `kpt_` token contains image-pull credentials sealed with AES-GCM using a tenant ManifestKey-derived key. SDK `api_headers` sends it as `X-Kuasar-Pull-Token` with the Build request; conductor opens it using the tenant's stored key ([Build §5](node-build.md#5-target-aware-execution-and-publication)). ManifestKey comes from the first positional argument or `MANIFEST_KEY`.
 
 <a id="3-配置"></a>
 ## 3. Configuration
@@ -320,22 +320,10 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 | `sandbox.boot.kernel` | — | vmlinux path |
 | `sandbox.boot.runtime` | — | Single guest runtime Bundle: offset-zero EROFS plus digest-marker ZIP, containing envd, flatten-ctl and mkfs.erofs (§11) |
 | `sandbox.boot.overlay_diff_template` | — | Preformatted empty ext4, sparsely copied to img cold-start writable upper. An unformatted diff is rejected; deployment supplies a sparse file formatted with mkfs.ext4. Restore obtains the layer graph from artifacts |
-| `builder.admission.execution.max_builds` | `2` | Maximum simultaneous durable execution claims |
-| `builder.admission.execution.resources.{cpu,memory,storage}` | Unlimited | Aggregate execution vector; CPU/memory also constrain sandbox-builder.slice, while V1 storage is admission accounting only |
-| `builder.admission.registration` | Entire resolved execution block | Registration limits for nonterminal Builds. An explicit block does not inherit missing fields; each finite dimension must be at least execution's |
-| `builder.registration_ttl` / `.queue_ttl` | `1h` / `30m` | Durable expiry for untriggered registered and queued waiting Builds; terminal rows remain queryable but release registration usage |
-| `builder.terminal_ttl` | `24h` | Positive Go duration retaining ready/error history after cleanup and release of execution/runtime/result ownership |
-| `builder.insecure_registry` | `false` | Allow plaintext HTTP for base-image pulls, e.g. a local development registry |
-| `builder.platform` | Empty | Pull platform, e.g. linux/amd64 |
-| `builder.image_uri_mask` | Empty | Client-pushed image naming convention with templateID/buildID placeholders; match CLI E2B_IMAGE_URI_MASK. Used when trigger omits fromImage; must be reachable inside Build guests (§12) |
-| `builder.referer` | Disabled | fromImage OCI Referrers cache: enabled defaults false; fallback/writeback true. Public owner desc is required when enabled; empty key equals desc; validity is optional Go duration. Request Builder options may further disable lookup/writeback, never enable disallowed behavior (§4.6, §12) |
-| `builder.diff_template` | — | Preformatted sparse ext4 for pull cache, step changes and export scratch; suggested size at least three times the largest expected image |
-| `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | Guest pull/flatten, each RUN step, readyCmd polling and whole Build. Step budget also reaches the guest as Connect-Timeout-Ms. Ready polling interval is 2s; absent readyCmd waits 20s. Unit TimeoutStartSec is total+60 |
-| `builder.files_storage` | Empty | COPY context S3/OBS storage: endpoint/region/bucket (required)/prefix/access_key/secret_key/force_path_style/presign_expiry. Empty returns 501 for COPY. Conductor only presigns/HEADs. Custom Runtime credentials override YAML/AWS defaults, support session token/expiry/refresh and never fall back after error. force_path_style defaults false; versitygw/minio use true. PUT expiry defaults 1h; GET uses total+5m. Local deployments may use versitygw (§12) |
 | `checkpoint.mode` | `local` | Local paused capture: role tarstream or multi-Manifest ZIP Bundle; output stays in Sandbox BaseDir/checkpoint (§1.6, §8.1) |
 | `checkpoint.merge_ref` / `.drop_caches` | Unset | Node tri-state Pause policy. Explicit true/false reaches sandbox-ctl snapshot; omitted/YAML null uses sandboxer's default |
 | `checkpoint.remote.ref_location_parent` | Empty | Optional absolute hostless file URI. Named-location parent for Build checkpoint graphs/export-sandbox and located Build image Bundle resolution; does not change Pause mode |
-| `checkpoint.remote.manifest` | `false` | False sends image-class outputs to Manifest Store. True instead materializes single-root Manifest Bundles at the required named parent; it does not change checkpoint mode or checkpoint-class policy (§12) |
+| `checkpoint.remote.manifest` | `false` | False sends image-class outputs to Manifest Store. True instead materializes single-root Manifest Bundles at the required named parent; it does not change checkpoint mode or checkpoint-class policy ([Build §5](node-build.md#5-target-aware-execution-and-publication)) |
 | `mmds.enabled` | `false` | envd authentication posture (§9.2, node-proxy §7): false uses -isnotfc and the Proxy gate; true uses FC mode and MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS listener, targeted by vswitch --mgmt-service translation |
 | `mmds.routes.enabled` | `false` | Accept tenant static/secret/service exact routes; requires mmds.enabled |
@@ -356,60 +344,14 @@ Groups are `api`, `proxy`, `paths`, `units`, `sandbox` (instance defaults under 
 <a id="31-静态定制-conductor"></a>
 ### 3.1 Statically customized conductor
 
-Operations still starts `node-ctl conductor serve --config ...`, which first performs environment-independent strict decoding/defaulting/declarative validation. Empty `paths.conductor_executable` selects explicit final validation and built-in runtime key/TLS/credential resolution. Otherwise node-ctl opens a protected absolute executable, validates runtime owner/mode/file identity against that FD, and executes the same file through `/proc/self/fd`, without resolving a replaceable pathname again. Sealed bootstrap records its device/inode; xconductor compares them only with `/proc/self/exe`. Deployment-time pathname replacement/deletion cannot alter the validated identity. node-ctl replaces itself with xconductor through exec.
-
-Bootstrap environment contains FD numbers only; config bytes/digest live in a memfd sealed against writes, growth, shrinkage and further seal changes. Direct xconductor execution or missing/truncated/oversized/version/digest/component-mismatched bootstrap fails closed. This organizes processes and prevents misuse; it does not defend against a malicious same-UID process.
-
-A custom main needs public packages only; the complete compilable example is [examples/custom-conductor](../examples/custom-conductor/README.md):
-
-```go
-app := conductor.New(conductor.Hooks{
-    Configure: func(ctx context.Context, cfg *conductor.Config, rt *conductor.Runtime) error {
-        // Adjust declarative Config; bind startup Runtime providers.
-        rt.Extension = myExtension
-        return nil
-    },
-})
-if err := app.Run(); err != nil {
-    log.Fatal(err)
-}
-```
-
-`New` has no side effects. `Run` is one-shot and handles SIGINT/SIGTERM; embedders may use RunContext. App does not call os.Exit. Ordering is fixed: decode bootstrap → clone Config → Configure exactly once → verify unchanged conductor executable → final declarative validation → clone/freeze again → resolve Runtime materials → start shared core. Configure/provider/final-validation failures precede opening durable storage, listeners, systemd launchers/units or node-link. A hook may replace the whole Config but must preserve the originally frozen executable. Defaults are not reapplied after the hook.
-
-App must come from conductor.New. A zero value or nil receiver returns an explicit error from Run/RunContext before signal handlers, bootstrap reads or goroutines. `node-ctl config conductor` performs declarative/bootstrap and executable-metadata diagnosis only; it neither executes custom App/providers nor substitutes its diagnostic EUID for the actual service owner policy. Custom-mode output explicitly defers runtime ownership/final validation to component startup.
-
-Config contains only serializable declarations. Runtime is a process object that rejects JSON serialization and exposes logging, TLS material, an ordered AES-256 key set, neutral builder-files-storage credentials and one trusted statically compiled Extension. TLS providers return DER certificate chains, crypto.Signer and root/client CA pools, never arbitrary tls.Config; core retains minimum TLS version, ALPN and mTLS/client verification. Providers run at startup or SDK credential refresh, outside request hot paths. A non-nil provider is authoritative; errors never fall back to files/environment/static credentials. V1 has no hot reload.
-
-Extension.Start(ctx, Host) runs exactly once after store/launcher/core construction and before unit installation, reconciliation, pools, node-link or listeners. Failure aborts startup; context cancellation tells extension-owned goroutines to exit. Host exposes non-secret deep-copy Sandbox/Build Get+Watch views. Watch generations are `sync_begin → snapshot → sync_end → live`. A slow watcher invalidates only its own generation and automatically resynchronizes; intermediate transitions are not guaranteed and this is not a durable audit. See [extensions.md](extensions.md).
-
-The same Extension may implement SandboxHook, BuildHook and APIWrapper. Capabilities are detected once after successful Start and frozen. Lifecycle hooks run after authentication but before durable/runner/network/snapshot side effects, using locked precondition capture → unlocked Hook → locked authoritative reread/revalidation → commit. Ordinary explicit Delete can be rejected; mandatory TTL/rollback/reconcile/shutdown cleanup always bypasses hooks. Build Register Hook precedes capacity transaction; Trigger Hook precedes final registry-credential resolution and registered→waiting CAS. Waiting→building claims have no hook. Exact cluster BuildRegister replay does not rerun mutable hooks. APIWrapper may add, rewrite or override any core API route. The same wrapped handler serves public API and config-socket API fallback; internal config-socket routes bypass it. ErrRejected maps to fixed policy rejection; other hook errors map to fixed 503 without private details.
-
-Bootstrap retains original node-ctl's exact path. Generated runner/builder units execute that node-ctl. Adjacent sandbox-ctl/connector-ctl/flatten-ctl/manifest-ctl resolution also uses its release directory, not xconductor's. Custom component and node-ctl must be compatible versions. Public API exposes no store/launcher/vswitch/orch/Router internals; a trusted API wrapper receives only http.Handler next. There is no Go plugin, runtime discovery, global registry, dynamic middleware registration or DI container. Conductor serves control API only.
+The complete custom Conductor construction, protected configuration, runtime binding and provider contracts are maintained in [Extensions](extensions.md#conductor-bootstrap). Authorization, persisted records and lifecycle invariants remain core-owned and cannot be bypassed by configuration hooks.
 
 <a id="32-静态定制-proxy"></a>
 ### 3.2 Statically customized Proxy
 
-With no paths.proxy_executable, node-ctl Proxy explicitly validates final declarations and runs the built-in App. Otherwise it validates a protected absolute executable's runtime owner/mode/identity and hands off through sealed memfd and in-place exec, never falling back. xproxy must start through `node-ctl proxy serve`, not directly. Public app/proxy exposes New(Hooks), one-shot Run/RunContext, master-only Configure and master/every-worker BindRuntime. Config is declarative; nonserializable Runtime supplies logger/TLS materials plus separate trusted statically compiled MasterExtension/WorkerExtension bindings. Non-nil providers are authoritative, do not fall back after error, and cannot change core TLS policy.
+The complete Proxy configuration/binding lifecycle, Master/Worker hooks, public route sources and authorized-forwarding SDK are maintained in [Extensions](extensions.md#proxy-bootstrap). Core process, shared-memory and cancellation invariants remain in [node-proxy.md](node-proxy.md).
 
-After constructing shared routes/traffic aggregates and before listeners/routesync/workers, master calls MasterExtension.Start(ctx, MasterHost) once. Failure cleans SHM and aborts. RouteSource supplies applied-route Get+Watch+SyncState with repeatable generation/resync semantics, not durable audit. TrafficSource reads in-process aggregates without stats UDS. Observers publish bounded, nonblocking notifications only after successful core apply; slow callbacks do not affect SHM, routesync, barrier ACK, Wake or workers. After Start, optional ManagementWrapper on that object may add, override or forward stats_socket routes without a namespace/conflict registry. Public views do not copy raw secrets/tokens or add route metadata/SHM fields. See [extensions.md](extensions.md).
-
-After Configure/final validation, master deep-clones, canonically serializes and digests EffectiveConfig, then starts workers through its own `/proc/self/exe`: node-ctl in built-in mode, xproxy in custom mode. Sealed worker bootstrap validates config digest, role/ID/epoch, FD mapping and executable identity, then maps a separate admission arena. `proxy.yaml` traffic.max_inflight is this destination node's per-Sandbox logical inflight default; all-zero fields mean unlimited, not QPS or Proxy-global capacity. Workers call BindRuntime(worker) and complete stats/route synchronization before ready, without reading proxy.yaml or calling Configure. Each epoch must create a fresh Extension. After initial route sync, core calls Start once and freezes optional IngressWrapper; only success opens Data listening. Wrapper receives raw requests before the canonical parser, applies only to sandbox data ingress and excludes MMDS. GetRoute supplies a current SHM point-copy, without worker Watch. Worker Run is a one-shot process entry: its caller must exit afterward; process-owned mappings are not a promise of reusable in-process worker teardown. See [proxy-worker-lifetime.md](proxy-worker-lifetime.md).
-
-A wrapper that completed private authentication can call response-owning ForwardAuthorized to reuse lookup, traffic admission, parking, activation/Wake, binding revalidation, dial and traffic lifetime; this helper does not verify Kuasar tokens. Revalidate fences private revision after activation and before dial; Rewrite modifies only an ordinary HTTP guest clone, never CONNECT. Generic forwarding rejects native exec; standard next retains KAT/CEL checks. Configured executable selects node-ctl→master only and cannot be changed by hooks. V1 has no hot reload; custom component/node-ctl versions must match. Full API, examples, process model, security boundaries and non-goals are in [node-proxy.md](node-proxy.md) §2.1.
-
-Extensions apply only to independent Proxy, not cluster Router/Registry/Placer. Beyond master management and worker ingress wrappers, they expose no listeners, raw SHM/Router/routesync/stats, namespace/plugin registry, dynamic loading, general lifecycle hooks or DI. WebSocket work is tracked separately in #269 from #256.
-
-The Builder schema replaces these legacy names without aliases:
-
-```text
-builder.max_concurrent -> builder.admission.execution.max_builds
-builder.cpu_quota      -> builder.admission.execution.resources.cpu
-builder.memory_max     -> builder.admission.execution.resources.memory
-builder.vcpu/memory    -> Removed; A/B phases derive from immutable Build.Resources
-```
-
-An explicit registration block does not inherit omitted execution dimensions; an absent block inherits the entire resolved execution block. Legacy development databases must be rebuilt where the current schema rejects them; there is no old/new dual reader or migration fallback across that format boundary. This schema policy does not mean the project has never published releases (§15.1).
+Build configuration and its legacy-schema boundary are defined in [Build configuration](node-build.md#3-build-configuration).
 
 There is no node-global remote-memory prefetch switch. Each Sandbox's kuasar-sandbox.restore namespace selects it (§4.6).
 
@@ -440,7 +382,7 @@ Base URL is `https://api.<domain>`. Authentication accepts **X-API-KEY** for SDK
 
 Compatibility is bounded by the upstream API/SDK versions and actual tests. The upstream [Create](https://docs.e2b.dev/api-reference/sandboxes/create-sandbox), [Pause](https://docs.e2b.dev/api-reference/sandboxes/pause-sandbox) and [Connect](https://docs.e2b.dev/api-reference/sandboxes/connect-to-sandbox) references checked on 2026-09-07 document autoPauseMemory and memory selection, including Connect memory=false. Thus the field is not exclusively a Kuasar extension. Kuasar's nil→source-dependent auto behavior and its existing authorized-traffic Wake of both E and S are specific local semantics; upstream documents restrictions on traffic-triggered resume of filesystem-only snapshots. Kuasar does not claim the complete E2B autoResume policy.
 
-Create templateID accepts a persistent ID (§4.4), registration-time transient ID, or a ready Build's name/alias. The latter two resolve to persistent ID before the common path. envdVersion is `0.6.1` for e2b and compatibility stub `0.1.0` for bare (SDKs require at least 0.1.0). Bare has no envd or Envd/Traffic tokens. Both profiles return a separate forwardAccessToken signed at creation and persisted with the Sandbox.
+Create templateID accepts a persistent ID ([Build §2](node-build.md#2-template-ids-and-artifact-authority)), registration-time transient ID, or a ready Build's name/alias. The latter two resolve to persistent ID before the common path. envdVersion is `0.6.1` for e2b and compatibility stub `0.1.0` for bare (SDKs require at least 0.1.0). Bare has no envd or Envd/Traffic tokens. Both profiles return a separate forwardAccessToken signed at creation and persisted with the Sandbox.
 
 Create preserves the existing response body without adding state; response/cache/background worker use distinct copies. Get can show starting or cleanup-pending deleting. Default List still selects running/paused; explicit starting/deleting/dead supports diagnosis. Running Connect is idempotent. Starting Connect applies only explicit timeout updates and starts no duplicate attempt. Paused Connect durably accepts resume before returning, so success may correspond to starting but never the old paused state.
 
@@ -526,23 +468,163 @@ e2b services are forward/e2b:envd/e2b:code-interpreter/exec; bare uses forward/e
 
 Conductor queries the current trusted Proxy registration's stats_socket master cache, without worker fan-out. Unregistered master, unsynchronized route, mismatched RunID/profile/state, failed worker stream or unready replacement returns 503. This stats window does not alter master route/admission authority or Create barrier. The complete shared-admission algorithm, error proof, worker state machine, absolute snapshots and failure windows are in [node-proxy.md](node-proxy.md) §8.
 
+#### 4.1.2 Create identity
+
+A direct conductor `POST /sandboxes` can select its node-local SandboxID and,
+optionally, an independent StableID. This is a creation-time configuration input,
+not an identity reservation API or idempotent result replay.
+
+**Two equivalent inputs**
+
+Use the existing namespaced metadata carrier (the value is a JSON **string**):
+
+```json
+{
+  "templateID": "<canonical-template-id-or-alias>",
+  "timeout": 300,
+  "metadata": {
+    "kuasar-sandbox.identity": "{\"id\":\"worker-42-instance-3\",\"stable_id\":\"worker-42\"}",
+    "application": "worker"
+  }
+}
+```
+
+Alternatively, supply the same identity object through the configuration Header:
+
+```http
+X-Kuasar-Sandbox-Identity: {"id":"worker-42-instance-3","stable_id":"worker-42"}
+```
+
+No new top-level Create body field is introduced. SDK callers can use their
+existing `metadata` option. The Header overrides the **entire** metadata identity
+object; it does not merge individual fields. Both supplied input layers must be
+valid, so a valid Header cannot hide malformed identity metadata.
+
+For example, metadata `{"id":"body-instance","stable_id":"body-stable"}`
+with Header `{"id":"header-instance"}` selects `header-instance` for both the
+local ID and effective StableID. Header `{}` clears both lower-priority choices
+and uses normal defaults.
+
+**Field contract**
+
+| Input | Node-local SandboxID | Effective StableID |
+|---|---|---|
+| Absent identity or `{}` | New UUIDv7 | Node-local ID |
+| `id` only | Supplied `id` | Node-local ID |
+| `stable_id` only | New UUIDv7 | Supplied `stable_id` |
+| Both fields | Supplied `id` | Supplied `stable_id` |
+
+An empty string field means unspecified. An absent StableID remains empty in the
+stored optional field; `Sandbox.StableID()` supplies the local-ID fallback.
+
+Both nonempty fields in this new Create configuration use the existing
+`ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
+hyphens, starting and ending with a letter or digit. The exact pattern is
+`^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
+NUL and longer values are rejected rather than normalized. This does not change
+the historical migration-token or trusted cluster StableID contracts.
+
+The object accepts exactly `id` and `stable_id`. Empty Header values, non-object
+JSON, null (including null field values), duplicate Headers, duplicate or unknown
+JSON fields, trailing JSON, invalid ID strings and non-string fields return 400.
+
+The Create response's `sandboxID` remains the **local** ID. Node lifecycle URLs,
+Proxy host/header addressing, local paths and route-table keys use that ID.
+StableID is not a lookup alias or a separate endpoint. Merely selecting StableID
+without `id` does not provide local-ID deduplication or a predictable local URL.
+There is no required string relationship between the two IDs; `-g0` is not an
+input format imposed by conductor.
+
+**Scope and ownership**
+
+Identity is interpreted once for this Create request and removed from the
+metadata passed to the Hook and stored on the Sandbox. Dedicated `Sandbox.ID`
+and `StableIDValue` fields are authoritative afterwards. Ordinary application
+metadata is preserved. Templates, group defaults and placement defaults cannot
+supply inherited identity; `MergeCreateMetadata` admits it only from the current
+request.
+
+Selecting an ID grants no permission and does not create cluster ownership.
+Direct conductor Create remains `OriginDirect` with `Cluster == nil`, even when
+the conductor is connected to a Registry. Existing credential-pair allowlisting
+and API-key ownership checks are unchanged.
+
+Create Hooks see the final local ID in the protected operation envelope. They
+cannot change it or reintroduce `kuasar-sandbox.identity` into mutable metadata.
+Other supported request changes are revalidated as before. The final StableID is
+set before generating any sandbox credentials.
+
+Default ServiceSecret is derived from APISecret and StableID; the forward token
+is bound to that StableID. Reusing a StableID with the same default credential
+inputs therefore does not automatically invalidate all old credentials. StableID
+is a security-relevant stable identity, not an arbitrary display label.
+
+| Entry point | Identity configuration |
+|---|---|
+| Direct conductor Create | Accepts metadata and Header |
+| Direct or cluster Build registration | Rejects explicit identity with 400; never stores it in a Build or template |
+| Cluster Router public Create | Rejects both carriers; Registry retains identity allocation authority |
+| Trusted node-link Create | Uses existing typed `SID` and cluster StableID fields; rejects an identity namespace in `Config` |
+| Import / Connect | Existing target-ID and migration-token semantics remain unchanged; no new identity override |
+
+**Conflict, retry and deletion**
+
+Create is insert-only. A retained row in any state, or an active launch owner for
+the local ID, prevents a second creation. At the identity-conflict stage both
+sources are classified as 409 with the existing message response shape:
+
+```json
+{"message":"sandbox already exists"}
+```
+
+The loser never replaces the existing record, cancels the winner, tears down its
+resources or returns its credentials. Requests can still fail earlier for invalid
+credentials/configuration or unavailable Proxy admission; conflict detection does
+not reorder those checks.
+
+409 is not a successful replay and does not assert that the existing object has
+the same definition or originated from this request. After a lost response the
+caller can use the known local ID and its existing credentials to query the
+object and handle its state. There is no stored Create-result replay. This is
+node-local conflict protection, not cross-node global uniqueness.
+
+A failed Create can retain a `dead` row: for example, the Proxy route barrier can
+fail after durable starting admission. That ID remains occupied. Deleting or
+requesting deletion is not automatically equivalent to having completed cleanup;
+reuse is possible only after the existing finalizer/retention has actually
+released the row and active launch ownership. Create never implicitly resumes,
+replaces or cleans an existing object. The unchanged list cursor orders by local
+ID, so caller-selected IDs do not imply creation-time order.
+
+**Shared implementation**
+
+Direct API and trusted node-link adapters retain their own authentication,
+template ownership, timeout and MMDS boundaries. They share pure configuration
+normalization, final Sandbox construction and `acceptFreshLaunch`. Cluster
+prechecks return independent parsed output instead of modifying `Command.Config`.
+The direct template alias policy and the cluster canonical-template restriction
+remain distinct; no new public Hook or wire protocol is introduced.
+
+Common admission still claims launch ownership, atomically inserts the Sandbox
+and optional MMDS values, publishes starting, waits for the Proxy route-applied
+barrier, and only then schedules the asynchronous launch. Direct HTTP returns 201
+for this durable acceptance, not guest readiness. Node-link returns its accepted
+ACK at the same boundary; `CreateCluster` remains a synchronous wrapper waiting
+for that exact attempt.
+
+See [Node](node.md), [Cluster Router](cluster-router.md) and
+[Extensions](extensions.md) for the surrounding contracts.
+
+
 <a id="42-控制面模板构建-api"></a>
 ### 4.2 Control plane: template Build API
 
-These implement the e2b v2 Build-system endpoint family used by SDK Template.build and CLI; pipeline/resource semantics are in §12.
-
-| Operation | Method and path | Contract |
-|---|---|---|
-| Register | POST /v3/templates → 202 | name/tags/profile?/cpuCount/memoryMB/metadata?/envVars?/secure? define immutable Build.Resources, never Sandbox capacity. X-Kuasar-Sandbox-Builder.resources may assert identical CPU/memory and add storage; disagreement returns 400. Builder target is register-only immutable input. X-Kuasar-Sandbox-Resource configures final template resources, not A/B. Profile defaults e2b and accepts e2b/bare. Response exposes requested target, auto when omitted |
-| Trigger | POST /v2/templates/{tid}/builds/{bid} → 202 | fromImage/fromTemplate/fromImageRegistry username/password/steps/startCmd/readyCmd. Only one registered→waiting transition. Compatibility cpuCount/memoryMB may only assert registration values; increase/decrease returns 400 before credential/COPY/queue side effects. Trigger metadata, Builder/Resource and other general configuration headers are rejected. Insufficient execution capacity leaves FIFO waiting on the fixed node |
-| Status | GET /templates/{tid}/builds/{bid}/status | SDK fields, requested target, terminal derived kind, canonical resources cpuMilli/memoryBytes/storageBytes, executionClaimed/runID/systemdEnforcement/storageEnforcement and phase name/sandboxID. In-progress SDK status remains building while retaining internal phase/claim details |
-| Files | GET /templates/{tid}/files/{hash} → 201 | Resolve tid→Build→owner, then return present/url. present skips duplicate upload; URL is a direct-bucket presigned PUT, never bytes through control plane. No files_storage returns 501; missing/non-owned tid returns 404 (§12) |
-| List | GET /templates | Tenant's ready templates with persistent templateID, immutable profile, requested target and resolved artifact kind |
+The complete registration, trigger, status and upload contracts are maintained in [Build API](node-build.md#1-build-api).
 
 <a id="43-数据面协议envd-与-native-exec"></a>
 ### 4.3 Data protocols: envd and native exec
 
-envd uses port **49983**, HTTP/1.1 plus h2c and unversioned Connect-RPC process.Process/filesystem.Filesystem packages. Filesystem RPC handles metadata; contents use GET/POST /files with signed query. Other endpoints include /health, /init and /metrics. Per-operation user uses `Authorization: Basic base64("user:")`. Code-interpreter POSTs NDJSON to `https://49999-<sid>.<domain>/execute`, reaching guest FastAPI on 49999 and Jupyter on 8888. Envd exec is POST /process.Process/Start with X-Access-Token. Tenant traffic is forwarded, not reimplemented; Build supplies a minimal hand-written connect+JSON process.Start client for steps/startCmd/readyCmd, without generated protobuf/gRPC stubs (§12).
+envd uses port **49983**, HTTP/1.1 plus h2c and unversioned Connect-RPC process.Process/filesystem.Filesystem packages. Filesystem RPC handles metadata; contents use GET/POST /files with signed query. Other endpoints include /health, /init and /metrics. Per-operation user uses `Authorization: Basic base64("user:")`. Code-interpreter POSTs NDJSON to `https://49999-<sid>.<domain>/execute`, reaching guest FastAPI on 49999 and Jupyter on 8888. Envd exec is POST /process.Process/Start with X-Access-Token. Tenant traffic is forwarded, not reimplemented; Build supplies a minimal hand-written connect+JSON process.Start client for steps/startCmd/readyCmd, without generated protobuf/gRPC stubs ([Build §5](node-build.md#5-target-aware-execution-and-publication)).
 
 sandbox-ctl --connect maps guest envd/CI control ports to host `<rundir>/envd.sock` and `ci.sock`. Proxy reaches these UDS paths directly without floating-IP routing or a cross-sandbox path.
 
@@ -560,15 +642,7 @@ Authority port 443 is a transport placeholder, not a guest port. Even an accompa
 <a id="44-templateid-与模板形态transient--persist无-templates-表"></a>
 ### 4.4 Template IDs and transient/persistent forms
 
-```
-persist  templateID = <profile>-<kind>-<base64url(canonical-portable-ref)>
-                                            profile∈{e2b,bare}; kind∈{img,sbx,snp}
-transient templateID = transient-<uuidv7>       Temporary registration handle; use the persistent ID after Build
-```
-
-- **Persistent IDs are self-describing.** Their payload is canonical manifest:// or a content-identified located file ref, e.g. `file://<digest>.image@digest:<digest>@location:<name>`; encrypted tarstreams use @hmac, Bundles use @manifest. Runtime parses profile, kind (img cold image, sbx cold Sandbox E, snp memory Snapshot S) and portable ref. Connect may explicitly cold-start an snp source, while that template's default is memory. Unlocated local refs, host absolute paths, noncanonical refs or mismatched artifact kinds fail.
-- **Transient IDs** originate at registration. Build completion returns a persistent ID and stores names/aliases against that Build. Later launches use the persistent ID. Status, transient ID, name/alias and node-local list exist only during terminal-row retention.
-- **There is no templates table.** TemplateID encodes profile/kind/ref; its artifact remains long-term launch authority. Builds hold execution and short-lived status/index/aliases, not a template catalog. After terminal-row deletion, canonical IDs still create img/sbx/snp sandboxes and serve directly as later fromTemplate. Snapshot promotion (§8.1) likewise requires no Build row.
+Persistent/transient TemplateID, artifact kinds and retention boundaries are defined in [Template IDs and artifact authority](node-build.md#2-template-ids-and-artifact-authority).
 
 <a id="45-sdk--cli-对接与协议-pin"></a>
 ### 4.5 SDK/CLI integration and protocol pins
@@ -577,7 +651,7 @@ transient templateID = transient-<uuidv7>       Temporary registration handle; u
 - API keys are `e2b_` plus 72 hex digits, 76 characters total. SDK syntax checking uses `/^e2b_[0-9a-f]+$/`; server separately checks MAC (§7).
 - Envd is pinned through e2b-dev/infra release tarball ENVD_TARBALL in guest-runtime/native-deps, default tag 2026.22 and envd 0.6.x. The recorded SDK compatibility baseline is JavaScript e2b 2.27.x and Python 2.25.x; this is not a claim about every later version.
 - X-Access-Token carries envdAccessToken. Secure Sandbox behavior is enabled by default from SDK v2.0.0, which attaches it to data requests.
-- Routesync for Proxy/observers is version 7: four-byte little-endian length followed by JSON. Messages include register/hello/upsert/delete/bookmark/wake/route_barrier/route_barrier_ack, over PUT /internal/plugin/{id}/register on config-socket's plugin plane (§6; node-proxy §4).
+- Routesync for Proxy/observers is version 8: four-byte little-endian length followed by JSON. Messages include register/hello/upsert/delete/bookmark/wake/route_barrier/route_barrier_ack, over PUT /internal/plugin/{id}/register on config-socket's plugin plane (§6; node-proxy §4).
 
 <a id="46-沙箱配置传递链"></a>
 ### 4.6 Sandbox configuration propagation
@@ -681,7 +755,7 @@ input:     {"routes":[{"path":"/data","type":"static","data":"x"}]}
 metadata:  {"routes":[{"path":"/data","data":"x"}]}
 ```
 
-Metadata kuasar-sandbox.mmds never contains secrets. Build Register routes serve only its synthetic builder sandbox that might run memory Phase C. Explicit Image/top-level E rejects them during registration; auto fails closed after task-local target resolution if incompatible. Initial values are encrypted under Build ownership. Terminal transaction removes both routes namespace from builds.metadata_json and the value blob; neither enters final template/snapshot/image. Trigger cannot override MMDS.
+Metadata kuasar-sandbox.mmds never contains secrets. Build-specific scope and terminal cleanup are in [Build §3.1](node-build.md#31-request-scoped-builder-input).
 
 Equivalent per-Sandbox prefetch inputs are:
 
@@ -717,29 +791,17 @@ X-Kuasar-Sandbox-Checkpoint: {"merge_ref":false,"drop_caches":null}
 {"metadata":{"kuasar-sandbox.checkpoint":"{\"merge_ref\":true,\"drop_caches\":false}"}}
 ```
 
-Both use the same strict object parser allowing only merge_ref/drop_caches and true/false/null. Unknown fields, wrong types or trailing/second values return 400. Header overrides by field; null/absence means no override, not clearing a lower value. If all fields remain null/absent, remove the namespace. Source templates do not supply it. Build registration accepts it only for resolved sandbox,memory:true and uses it for Phase C capture, never portable config. Local/Bundle use identical parsing, precedence and side-effect boundaries.
+Both use the same strict object parser allowing only merge_ref/drop_caches and true/false/null. Unknown fields, wrong types or trailing/second values return 400. Header overrides by field; null/absence means no override, not clearing a lower value. If all fields remain null/absent, remove the namespace. Source templates do not supply it. Build checkpoint input is defined in [Build §3.1](node-build.md#31-request-scoped-builder-input). Local/Bundle use identical parsing, precedence and side-effect boundaries.
 
 kuasar-sandbox.cluster is not tenant configuration. Cluster Build group uses a separate durable system field, outside portable metadata. Ordinary Sandbox Profile/Group/RouteKey/optional StableID arrive through structured node-link context and persist separately. Node events do not echo Registry-owned group/route key/authentication identity; Registry restores them from ownership records.
 
-Build endpoints additionally accept build-only kuasar-sandbox.builder / X-Kuasar-Sandbox-Builder:
-
-```json
-{
-  "target":{"kind":"sandbox","memory":false},
-  "resources":{"cpu":4,"memory":"8GiB","storage":"64GiB"},
-  "referer":{"enabled":false,"writeback":false}
-}
-```
-
-Target allows image, sandbox+memory:false or sandbox+memory:true. Omission means auto; explicit null, unknown/duplicate fields or image+memory:true fails. Omitted sandbox.memory means false. Auto resolves only after source E defaults: either nonempty effective start/ready command selects memory Sandbox, otherwise Image. It never automatically selects top-level E. Explicit Image conflicts with explicit trigger start/ready and ignores inherited source commands.
-
-Build resources govern execution/admission only; referer/registry govern this Build. Parsed target/build-only fields leave template metadata and persist in builds.builder_json, never in later create/resume runtime config.
+The complete request-scoped `kuasar-sandbox.builder` input and target rules are in [Builder input](node-build.md#31-request-scoped-builder-input). The rules below continue to govern shared Sandbox configuration.
 
 - **Rendering:** cold images use a pure resolver to create complete ResourcesConfig before Attach/Assign. Artifact launch resolves capacity from the task summary in the sole launch worker; conductor never opens the snapshot. Renderer installs the canonical object without reinterpreting fields. YAML has no control.cgroup_path; run-sandbox adds inherited cgroup-FD capability at final exec. Dynamic controller comes only from resolved resource_listen.SocketIdentity; node injects watermark_high.ratio and leaves sensor absent. Boot/tapfd/resolved network and allowed tenant fields follow the config-socket handoff.
-- **Two injection surfaces:** e2b metadata and X-Kuasar-Sandbox-* Headers normalize at the API edge. Resource/traffic use leaf precedence; MMDS/checkpoint use the special merge rules above; remaining namespaces generally use whole-object Header precedence. Create/Register share the same typed parser for resource/network/traffic/launch/init/mounts/files/metadata, envVars and instance options. Trigger rejects nonempty general metadata/headers. Sandbox runtime inputs use sandboxes.metadata_json; Build runtime inputs use builds.metadata_json; build-only input uses builds.builder_json. The latter two serve this Build and artifact generation, not long-term canonical TemplateID lookup. Register always rejects restore/autoPauseMemory. Traffic/credentials/MMDS/secure/checkpoint instance/action inputs are allowed only for resolved memory Sandbox, separately encrypted/injected into the task and excluded from portable E/S. Image/top-level E rejects them; auto waits for source defaults/effective commands before validation. Cluster Sandbox ownership uses separate system context (§10).
+- **Two injection surfaces:** e2b metadata and X-Kuasar-Sandbox-* Headers normalize at the API edge. Resource/traffic use leaf precedence; MMDS/checkpoint use the special merge rules above; remaining namespaces generally use whole-object Header precedence. Create runtime inputs use sandboxes.metadata_json. The shared parser, target admission and Build persistence rules are defined completely in [Build §3.1](node-build.md#31-request-scoped-builder-input). Cluster Sandbox ownership uses separate system context (§10).
 - **Precedence:** resources follow the fixed leaf chain; remaining inputs follow their declared namespace rules across node/group/current Create. Canonical TemplateID Create never reads builds.metadata_json. Build resources and final Sandbox resources are independent, without mutual defaults/comparisons/derivation. Trigger cpuCount/memoryMB only assert immutable Build resources.
 - **Capacity:** img Create uses request/group/node defaults. sbx/snp Create, paused resume and migration take portable E capacity as authority. Synchronous acceptance checks patch structure only; after runner preparation, explicit matching capacity is an assertion, while any differing leaf causes asynchronous resource_resolve failure. Unreadable capacity fails rather than falling back. Runner is already assigned, but networking/YAML/controller reservation/VM side effects have not begun; the runner delegation cgroup may already exist. Initial restore reservation exactly equals sandboxer's BudgetAtSnapshot derived from captured CH target/current; startup headroom and partial grants do not apply.
-- **Network travels with E:** cold rendering records logical network in SANDBOX_CONFIG.metadata[kuasar-sandbox.network], which enters E's sandbox.runtime.cfg. S refers to E; snapshot.cfg itself contains no metadata. Artifact tasks strictly parse/validate it and submit typed bounded network summaries, never raw metadata to conductor. Explicit current fields win over inherited artifact fields. Build temporary VMs and final template derive from one NetworkSpec: absent hostname uses build-short-ID temporarily and node sandbox hostname in the template, excluding the temporary name. Phase C stores final effective network metadata in its E so Create/restore remains self-describing without Build history. Precedence is current request, then artifact, then node/profile defaults. Image outputs have no Sandbox-metadata channel and cannot recover it from old retained Build rows; SBX/SNP use their E. MigrationToken also carries metadata. Other runtime namespaces apply at cold start or are captured in memory; host restore/checkpoint policies stay separate.
+- **Network travels with E:** cold rendering records logical network in SANDBOX_CONFIG.metadata[kuasar-sandbox.network], which enters E's sandbox.runtime.cfg. S refers to E; snapshot.cfg itself contains no metadata. Artifact tasks strictly parse/validate it and submit typed bounded network summaries, never raw metadata to conductor. Explicit current fields win over inherited artifact fields. Build template network projection is in [Build §3.1](node-build.md#31-request-scoped-builder-input). MigrationToken also carries metadata. Other runtime namespaces apply at cold start or are captured in memory; host restore/checkpoint policies stay separate.
 - **Host policy stays outside artifacts/templates:** restore/checkpoint originate in Create metadata. Image cold boot does not render them into runtime YAML. snp Create, later resume and migration rerender restore policy when restoring S. Checkpoint is read only by host Pause and never enters SANDBOX_CONFIG/snapshot.cfg. Connect/resume offers no temporary override.
 - **Persistence:** sandboxes.metadata_json holds launch input. Build metadata/builder JSON are retention-bounded execution records, never a second template authority.
 
@@ -768,33 +830,15 @@ Slice=sandbox-runner.slice
 Delegate=yes
 ```
 
-**Builder unit** (`%i` is RunID, §12):
+The complete Builder unit and aggregate enforcement rules are in [Build §4.1](node-build.md#41-builder-unit-and-process-enforcement).
 
-```ini
-# sandbox-builder@.service (Generated)
-[Service]
-Type=exec
-WorkingDirectory=/run/sandbox
-StandardError=journal
-# Disable unit rate limiting for Build detail; journal failures can still lose logs (§5.2)
-LogRateLimitIntervalSec=0
-ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/runners/%i.pid \
-          --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
-ExecStopPost=/bin/rm -f /run/sandbox/runners/%i.pid
-KillMode=control-group
-# Defensive aggregate execution CPU/memory limits
-Slice=sandbox-builder.slice
-# Phase ctl/vmm subgroups and trusted VMM cgroup FD
-Delegate=yes
-```
-
-Both ExecStart programs lock the RunID pidfile, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID, locks `<RunDir>/<SandboxID>.pid` and requests exact-run bootstrap. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec, then execve sandbox-ctl run with the same unit PID/cgroup. Type=exec requires no sd_notify. Builder locks `<BuildRunDir>/builder.pid`, obtains exact-run bootstrap and, for artifacts, prepares the root before final BuildSpec; images receive final spec directly. It remains resident for the target-aware pipeline of up to three phases. Phase sandbox-ctl/CH processes are its descendants, charged to the entire builder unit. Results return through config-socket. KillMode=control-group makes StopUnit/timeouts cover phase VMs as well; normal systemd termination starts with SIGTERM and uses SIGKILL after the stop timeout if processes remain.
+Both ExecStart programs lock the RunID pidfile, then wait for business-ID assignment over config-socket. Runner connects readiness immediately after obtaining SID, locks `<RunDir>/<SandboxID>.pid` and requests exact-run bootstrap. Artifact tasks prepare E/S locally and complete the second stage before obtaining final LaunchSpec, then execve sandbox-ctl run with the same unit PID/cgroup. Type=exec requires no sd_notify. Builder process/child-VM and result behavior is defined in [Build §4](node-build.md#4-task-handoff).
 
 Conductor maintains target idle counts for each pool. Assignment consumes a unit already waiting in WaitAssignment and schedules asynchronous replenishment. With no idle unit, it creates a RunID and uses the same StartUnit/WaitAssignment path. A fixed control loop serializes Start/Stop requests received over a channel; there is no newly spawned start goroutine for every replenishment. pool_wait_timeout covers the full StartUnit-to-WaitAssignment interval. Start failure, wait timeout or canceled waiting connection triggers StopUnit plus ResetFailedUnit, then a new UUIDv7 RunID to refill the pool.
 
 Runner assignment budget begins at pool Assign and covers queuing, on-demand StartUnit and WaitAssignment. After selecting an idle runner, the pool calls the commit callback to bind RunID; only success publishes task ID and returns success. This is assignment's linearization point: later caller cancellation cannot reverse it. Pool loop alone answers pending cancellation/shutdown, exactly once per request.
 
-Aggregate Builder CPU/memory limits require builder_pool_size=0. On-demand units still enter WaitAssignment but already have a durable execution claim. Before publishing assignment, orchestrator sets and reads back unit properties. This prevents unclaimed idle CPU/RSS from occupying the slice's active-Build ceiling without hidden idle budgets.
+
 
 - **Kill:** under the SID fence, exact-CAS full ownership into deleting, cancel active launch, withdraw cache and publish route Delete. Asynchronous finalization stops the unit and all CH descendants, resets failed state, releases TAPFD or detaches vswitch, removes directories and hard-deletes row. Route withdrawal does not await cleanup. The old launch claim remains until its attempt finishes local cleanup, preventing late CAS resurrection or an early same-SID successor. Guest restart policy cannot block host unit termination.
 - **Readiness:** before assigning a runner, conductor binds `<RunDir>/ready.sock` with directory 0700/socket 0600. Runner immediately connects. Conductor waits for artifact completion, readiness EOF, cancellation and absolute deadline together, so a task exiting during root reads fails immediately. The one-shot stream must be `control_ready\nready\nEOF`. Bare is ready then; e2b next sends mandatory POST /init as the first envd request, without /health as a startup gate. Health is for external checks after initialization. Artifact-launch absolute budget begins at successful Assign and covers root read, completion RPC, host resource/network preparation, final-spec wait, exec/startup, runtime wire and /init; final spec does not reset it. Cold fast path retains its post-handoff runtime budget. /init starts immediately, retries only connection/transport errors at 1ms/2ms/4ms/capped-5ms backoff, with at most 50ms per request. Only 204 succeeds; other statuses expose the status code without potentially sensitive response body. Protocol errors, early EOF, cancellation or total timeout fail launch: fresh starting becomes dead; resume returns paused. After durable acceptance but before runner assignment, failure uses the empty-RunID fence. Only /init success commits starting→running with the exact RunID and publishes running route.
@@ -821,18 +865,16 @@ KillMode=control-group covers ctl/vmm recursively. systemd reclaims the delegate
 <a id="52-日志journald-单汇--标签词表"></a>
 ### 5.2 Journald and log labels
 
-Application stdio and guest kernel dmesg stream directly to journald, without temporary log files. SYSLOG_IDENTIFIER distinguishes streams, with KUASAR_RUN_ID/KUASAR_SANDBOX_ID/KUASAR_BUILD_ID fields. Users query business IDs without knowing unit RunIDs. Writers are sandbox-ctl's stdio bridge (`--stdout-to/--stderr-to/--console journald=<tag>`; [sandbox lifecycle](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md) §2.2) and run-builder's milestones/envd RUN replay through pure-Go go-systemd/journal.
+Conductor constructs independent journald targets for runtime component diagnostics, app stdio and guest console. Every managed Sandbox target explicitly carries `KUASAR_STABLE_ID`, `KUASAR_SANDBOX_ID` and `KUASAR_RUN_ID`; Build phase targets carry `KUASAR_BUILD_ID` and `KUASAR_RUN_ID`. Fields are not inferred from environment, units or artifacts and do not inherit across outputs. Complete identity, encoding, query and delivery rules live in the [journal identity guide](node-journald.md); runtime argument syntax belongs to [sandboxer's journal guide](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/journald.md).
 
-| Label | Writer/unit identity | Content | Audience |
+| Label | Writer | Content | Audience |
 |---|---|---|---|
-| sandbox | Runner with KUASAR_SANDBOX_ID | Sandbox app stdio | Host diagnosis only |
-| build | Builder phases/run-builder with KUASAR_BUILD_ID | App stdio, milestones, RUN replay and flatten progress | SDK Build logs (§12) and host |
-| console | Runner and builder sandboxes | Guest kernel dmesg | Host only; excluded from SDK Build logs |
+| `sandbox-ctl` | Runner/Build phase `--log-to` | Runtime component diagnostics | Host only |
+| `sandbox` | Runner `--stdout-to`/`--stderr-to` | Sandbox app stdio | Host only |
+| `build` | Build phases/run-builder | App stdio, milestones, envd RUN replay and flatten progress | SDK and host; complete reading/pagination/failure rules in [Build §5](node-build.md#5-target-aware-execution-and-publication) |
+| `console` | Runner/Build phase `--console` | Guest kernel dmesg | Host only; excluded from SDK Build logs |
 
-- Runner LaunchSpec supplies --stdout-to journald=sandbox, --stderr-to journald=sandbox and --console journald=console. After exec, it writes within its unit with KUASAR_SANDBOX_ID. Query `journalctl KUASAR_SANDBOX_ID=<sid> SYSLOG_IDENTIFIER=sandbox`.
-- Builder phases use journald=build for apps and journald=console for kernels, with KUASAR_BUILD_ID. LogRateLimitIntervalSec=0 disables that unit's journald rate limiting; it does not promise lossless storage under every journal/storage failure.
-- Builder disables rate limiting to retain detailed, relatively infrequent Build output; runners keep defaults so thousands of sandboxes cannot overwhelm journal.
-- sandbox-ctl's own stderr reaches unit journal without these labels, serving host diagnosis rather than labeled SDK streams.
+Native streams write directly to journal without temporary log files. Run-builder milestones and envd RUN replay use pure-Go `go-systemd/journal`. `--log-to` does not replace original process stderr: early CLI output, CH stderr, panics and failed-send fallback retain their existing sinks. Builder units set `LogRateLimitIntervalSec=0`; runners keep default rate limits. Neither policy guarantees lossless storage under journal/storage failure, exactly-once durability or nonblocking sends.
 
 <a id="6-本机控制-socketrun--task--admin--plugin--api-平面"></a>
 ## 6. Local control socket: run, task, admin, plugin and API planes
@@ -844,13 +886,9 @@ Conductor serves h2c/HTTP1.1 on paths.config_socket, default `/run/sandbox/node-
 **① Task plane:** launchers obtain work specifications. Artifact-backed Sandbox and Build use exact-run two-stage endpoints; cold/image retains one-RPC bootstrap:
 
 - POST /internal/task/sandbox/bootstrap takes sandbox_id/run_id/version. It first obtains non-secret exact-run pidfile identity and authenticates SO_PEERCRED+pidfile before the secret-bearing provider. Cold-image returns final LaunchSpec; artifact returns ArtifactPrepareSpec plus environment. The task submits sandbox_id/run_id/summary to POST /internal/task/sandbox/prepare and waits for LaunchSpec `{exec,args,workdir}`. Identical-digest replay waits for/returns the same result without duplicate host effects; conflicting replay returns 409. A disconnected HTTP request cancels only its wait. Exec is sandbox-ctl with run, sandbox-id/path-id, config, shared manifest config and invocation roots `<RunRoot>/sandboxes`/`<BaseRoot>/sandboxes`, plus selected --from E or --restore S and --connect mappings. PathID/roots fix ch.sock/ctl.sock/staging to stored RunDir/BaseDir; pause/snapshot/exec use that same locator. Final exec forcibly adds the local cgroup FD, which LaunchSpec cannot override.
-- POST /internal/task/build/bootstrap takes build_id/run_id/version. **BuildTask schema is v5**: v5 separates checkpoint-location policy from image-class Bundle publication and removes broad publish_location_parent; v4 added immutable requested target and cold-E source normalization; v3 separated run_dir/base_dir; checkpoint_mode is required since v2. **ArtifactPrepare is independently v4**: v4 adds Build-only image Bundle publication preflight; v3 added Build-only source-image config reads, same-Bundle E/image scope and portable allocatable/deflate defaults; v2 replaced Snapshot-only v1 with typed E/S, durable LaunchMode and bounded network/disk summaries. Version mismatches fail before secret-bearing providers rather than silently dropping required publication semantics. See [build_task.go](../internal/configsock/build_task.go) and [sandbox_task.go](../internal/configsock/sandbox_task.go).
-
-  Authenticated Build bootstrap returns task environment and exactly one Final/Prepare. Final BuildSpec includes build_id/profile/run_dir/base_dir, from_image or from_template plus kind, requested_target, checkpoint_mode, steps/start_cmd/ready_cmd, paths/net, Build resources, final Sandbox resources/spec/namespaces/environment, mmds_enabled/envd_token, insecure/platform and timeouts. Task environment contains MANIFEST_KEY plus tenant FLATTEN_* pull credentials. Artifact Prepare includes source kind/ref, LaunchMode, manifest config, ref-location parent, ref limits and absolute deadline from execution claim. Task reads root config and POSTs build_id/run_id/version/summary to /internal/task/build/prepare. Equal digest returns the same final result; conflict returns 409; waiter cancellation does not revoke accepted summary.
-
-  Paths contain host kernel/runtime, two diff templates, sandbox-ctl/flatten-ctl/manifest-ctl/manifest config. Net contains the conductor-attached slot: TAPFD transport, MAC, inner IP, nexthop, hostname and DNS, reused throughout sequential phases. SBX reads E directly. SNP reads S's sandbox_ref to locate E and excludes S memory/from-refs. Only a bounded summary reaches conductor; full E and selected ref stay in run-builder, which must materialize Phase B. Final work is available only while that assigned Build unit is alive; its exit invalidates pending ownership.
+- Complete Build bootstrap/prepare versions, payloads and recovery rules are in [Build task handoff](node-build.md#4-task-handoff); the identity and shared-plane rules below apply to both Sandbox and Build.
 - Sandbox/Build authentication first resolves business ID plus exact RunID to non-secret task identity, then verifies peer PID against locked `<RunDir>/<sid>.pid` or `<BuildRunDir>/builder.pid`. Only then may providers decrypt ManifestKey/registry credentials. Stale runs or unauthorized peers cannot reach them.
-- Root-credential-free bulk config uses files: Sandbox YAML or phase YAML in phase RunDir. Tenant root/pull credentials use authenticated spec/environment instead. This does not make arbitrary caller-supplied workload files/env nonsensitive; their declarations retain normal config/artifact semantics.
+- Root-credential-free bulk config uses files: Sandbox YAML (0600) or phase YAML (0600) in phase RunDir (0700). Tenant root/pull credentials use authenticated spec/environment instead. This does not make arbitrary caller-supplied workload files/env nonsensitive; their declarations retain normal config/artifact semantics.
 
 **② Admin plane:** /internal/admin/manifest-keys uses GET for list and POST `{op:add|remove|check,manifest_key,api_secret?,label,ttl_seconds,registry_auth}` for pair allowlisting (§7). Responses contain fingerprints only. Optional admin_pidfile checks peer PID; otherwise socket 0600 applies. manifest-key CLI uses this plane. Cluster key_put writes/refreshes atomic leased pairs through node-link; expiry without renewal evicts entries, while key_drop is best-effort (§10).
 
@@ -1240,90 +1278,7 @@ Cluster integration and the local plugin plane share the routesync engine/wire f
 <a id="12-模板构建target-aware最多三阶段的流水线构建在沙箱内进行"></a>
 ## 12. Template builds (target-aware, up to three phases, inside Sandboxes)
 
-Builds arrive through e2b APIs (§4.2; there is no separate build-submission CLI), enter the builds table and are scheduled by resource pools. Each execution binds one sandbox-builder@<run-id> unit. Image pulls and build steps execute inside microVMs. Host run-builder relays artifact streams, fetches/decompresses COPY contexts and publishes outputs; therefore the boundary is guest execution of tenant build commands, not absence of tenant bytes from host userspace.
-
-Register-time builder.target names three outputs: `{kind:"image"}`, `{kind:"sandbox",memory:false}` and `{kind:"sandbox",memory:true}`. The first two skip C; top-level Sandbox E is assembled from final image plus ordinary Create config without a VM. Only memory Sandbox cold-starts C and captures a Snapshot. With target omitted, run-builder reads source E's default commands task-locally, then selects memory Sandbox if either effective start/ready command is nonempty, otherwise Image. Source kind, steps, profile and other Sandbox config do not infer target.
-
-Every source first becomes an image or cold Sandbox E, then A/B yields this Build's top-level image. Builds never restore source S memory/VMM state: S only locates E. Final Image/E/S must not reference source S/E, writable/data disks or memory parents. A memory result permits only the S→E relation created by this Build itself.
-
-**Conductor, once per Build:** registered/waiting creates no object directories. A durable execution claim precedes BuildRunDir=`<RunRoot>/builds/<BuildID>` and BuildBaseDir=`<BaseRoot>/builds/<BuildID>`, including checkpoint. Parse request-only spec/resource policy, allocate from builder pool, set/read back systemd limits, then durably bind exact run ID, starting a unit on demand if no idle one exists. Run-builder retrieves bootstrap. For SBX/SNP fromTemplate, task reads root config under cold/E-selection semantics and submits a summary; image fast path needs no second RPC. Strictly parse inherited network and merge current request; allocate one slot through TAPFD/1 PREPARE when tapfd_socket is configured, otherwise connector-ctl vswitch attach. All phases sequentially reuse that slot/tapfd. Mint envd token, then atomically write port/token and nonsecret runtime_prepare_json in one exact-run SQLite CAS. Preparation records digest, resolved build/template network and independent A/B execution versus target Sandbox resources. For e2b+MMDS where target may still be memory Sandbox, publish a synthetic Sandbox route before handing off final BuildSpec: C may start immediately and needs floating-IP self-resolution. This route projects registration MMDS routes and initial build-owner values to the builder guest. Run-builder executes the pipeline and reports `{target, exactly-one-of image_ref|sandbox_ref|snapshot_ref, start_cmd,ready_cmd,error,failure_stage}` through config-socket. While retaining execution claim, conductor first durably stores and fail-closed validates the result against requested/auto target. Terminal derived kind is img/sbx/snp; names/aliases store `<profile>-<kind>-<base64url(portable-ref)>`. Nonterminal Build.Kind stays empty and is never a second target authority. Profile is explicit throughout registration→BuildSpec; checkpoint.mode travels as checkpoint_mode to C. Register/trigger validate request network metadata before enqueueing; strict inherited artifact metadata validation follows task summary and can fail asynchronously during preparation. Resolve network once, supplementing profile/node defaults: the same NetworkSpec derives host AttachReq and guest BuildNet. Transit fields affect host Attach only and remain absent from BuildNet; without transit they stay zero.
-
-Node config first validates publication matrix, especially that checkpoint.remote.manifest=true requires an absolute ref_location_parent. Before scanning any source image, writing large directory files or starting a VM, run-builder loads manifest_config, pins the task customer key and obtains/verifies image Bundle write admission. SBX/SNP two-stage bootstrap performs the same preflight before task-local E/S readers open the root carrier. Failure yields Build error without starting a phase or returning an artifact ref.
-
-Synthetic MMDS routes publish only after durable real builder RunID, which also fences MMDSv2 token incarnation. Pipeline completion first withdraws the route view. Every ready/error/cleanup terminal update atomically removes MMDS route namespace and encrypted values with the Build row update. Registration MMDS input is request-scoped: it enters neither final template metadata, snapshot.cfg, images nor later Sandboxes; Trigger cannot rewrite it.
-
-**Inside run-builder (§2.4):** BuildSpec (§6) drives at most three phases, each one microVM launched as a direct sandbox-ctl child. Per-phase anonymous pipes pass `--ready-fd=<actual child fd>` through ExtraFiles. Parent strictly waits for `control_ready\nready\nEOF` and closes its writer immediately after successful Start; early child exit becomes EOF. A waits only for this runtime wire with a 60-second deadline, without guest-exec polling. B/C additionally wait for envd /health under the same per-boot 90-second deadline.
-
-Each phase keeps its globally unique logical SandboxID but has PathID a, b or c. Run-builder invokes `sandbox-ctl run --run-root <BuildRunDir> --base-root <BuildBaseDir> --path-id <a|b|c> --sandbox-id <logical-phase-sid>`. Phase YAML, envd/ctl sockets and small JSON live in BuildRunDir/<phase>; writable diffs live in BuildBaseDir/<phase> with logical SandboxID retained in filenames. Phase exec/snapshot locates ctl.sock only by PathID. A sandboxer exit removes only its own RunDir, preserving BuildRunDir and siblings. Final node-local Build cleanup removes both complete Build directories.
-
-- **A import (fromImage):** an empty single-disk Sandbox uses writable ext4 copied from builder.diff_template as root, with no base image and launch.placeholder as anchor. The shared guest runtime supplies flatten-ctl/mkfs.erofs under /opt/sandbox-runtime. With builder.referer.enabled, guest first runs `flatten-ctl referer lookup --json --owner <owner> <fromImage>` using tenant registry credentials. Lookup accepts only valid, unexpired referrers. On a hit, host validates the returned manifest ID and directly selects manifest://<id>, skipping pull/flatten. Unsupported/error follows fallback policy. On miss, guest `flatten-ctl export --output - <subject digest>` pulls/flattens the exact immutable identity shared by lookup, export and writeback; exec stdio relays the tarstream artifact to BuildBaseDir/checkpoint/image.img. If lookup confirmed Referrers support and writeback=true, host publishes via sandboxer and guest runs `flatten-ctl referer put --owner <owner> --manifest-id <id> <subject>` only when final image policy already requires that IMG in Manifest Store. Skip writeback when top-level E is the sole image-class root or remote.manifest=true; never create an intermediate IMG Manifest solely for a referrer. MANIFEST_KEY remains host-side for owner tokens/publication and never enters guest referer commands.
-- **B build/materialize (steps or source E):** image sources use their local/Manifest base image, builder runtime and a large writable upper from the same diff_template. SBX/SNP always cold-run `sandbox-ctl run --from <E>` with E's complete root graph and a fresh builder upper. Clear source mounts/files/init/workload during B, preventing materialization from executing actions that would run again during final Create; separately inherit non-boot config through shared cold projection. Envd is the app in tool posture: always -isnotfc, no /init/token, with its only /run/e2b disk footprint on excluded tmpfs. Execute RUN steps sequentially through envd process.Start using `/bin/bash -l -c <cmd>`, operation-user Basic authorization and Connect-Timeout-Ms for each step budget; guest also kills on expiry. Host accumulates ENV/WORKDIR/USER starting from base image config, so RUN sees Docker-style context. ARG only substitutes `${k}` and never enters the image. Bash is thus an image contract for steps/startCmd, as in e2b. After steps, host overlays accumulated context on base config and writes it into guest. `flatten-ctl mountpoint /.kuasar-build` creates a self-bind mount, then `export --skip-mounts --runtime-config … --tmpdir /.kuasar-build --output - /` streams a new image back. The export mount and /opt/sandbox-runtime are excluded mounts, avoiding self-inclusion/toolchain leakage. E always runs B even without steps, producing a complete top-level image independent of source E/root layers.
-- **C memory snapshot (only resolved sandbox,memory=true):** use the same cold-config projection as ordinary Create/top-level E and fully replace boot with the final image. Image sources cold-run normally. With E defaults, use `sandbox-ctl run --from <E> --replace-boot --config <C0>`, never --restore S. Production e2b envd posture follows deployment (node-proxy.md §7); /init supplies registration envVars and optional instance credentials, with subsequent RPCs carrying X-Access-Token. Optional startCmd runs through envd as default user in /home/user. Retain its stream until ready, then disconnect; envd does not kill on stream loss, so the process freezes into the snapshot as envd-managed. Poll readyCmd every two seconds within ready_timeout_sec. Without readyCmd, wait a fixed 20 seconds regardless of startCmd, subject to absolute Build deadline/cancellation. Omitting startCmd is also valid in C. Close its stream first, failing if the command already failed, then run `sandbox-ctl snapshot --path-id c --output <BuildBaseDir>/checkpoint` for the local snapshot carrier.
-
-**Two guest channels:** e2b semantic commands—steps/startCmd/readyCmd—use envd, matching its build operations. Platform mechanisms—flatten pull/export, runtime-config injection and artifact relay—use sandbox-ctl exec with raw stdio, available on arbitrary rootfs without image userland dependencies.
-
-**FromTemplate:** sources are canonical artifacts. IMG is already an image carrier and can be reused without steps; steps require B. SBX opens E task-locally. SNP opens only S root config to find sandbox_ref, then follows the identical E path. No phase receives S, reads/prefetches memory payload, includes memory from-refs in closure or runs --restore. Complete PortableSandboxConfig remains inside run-builder for B materialization and Sandbox target's non-boot defaults. Any source boot.disks entry is explicitly unsupported in this version.
-
-FromTemplate and fromImage are mutually exclusive. All E/S sources run B even without steps, so only an IMG without steps permits zero-VM reuse. E metadata's e2b.start_cmd/e2b.ready_cmd supplies e2b-profile defaults, overridden by nonempty Trigger commands. Explicit Image clears inherited commands without execution, and explicit Image plus Trigger commands is synchronously rejected. Strict network inheritance before host Attach is current explicit Build NetworkSpec > source E NetworkSpec > current profile/node defaults. IMG has no artifact-metadata channel and never recovers defaults from retention-bounded Build rows.
-
-Task-local ref-location mapping retains only selected E and root refs required for B cold launch, filtering S memory-only Bundle locations and source S. B exports a complete top-level image; E assembly or C --replace-boot then installs only that image, removing source E/root/writable refs from the final graph. If C's final image publishes as a located Bundle, pass its actual publication name→directory mapping in C argv and retain all mappings still referenced by checkpoint graph during publication.
-
-**COPY/ADD (context uploaded directly to object storage):** COPY extracts a tar into rootfs, a filesystem mechanism rather than an e2b process operation. It therefore uses sandbox-ctl exec + flatten-ctl, without envd or image-provided tar/gzip. Flatten's pure-Go extraction supports scratch/distroless. Three stages:
-
-1. **Upload negotiation (§4.2 files endpoint):** client GETs /templates/{tid}/files/{hash}. After ownership validation, server returns {present,url}; if absent, client directly PUTs gzip(tar) to the presigned bucket URL, with no upload bytes through control. Object key is `{prefix}/files/{aaaa}/{bb}/{uuid}/{hash}`, where uuid is tid's UUIDv7 part, aaaa=uuid[0:4] spans about 50 days and bb=uuid[4:6] about five hours. Time-bucketed fan-out supports date-based GC. Endpoint ownership limits signed URLs to the caller's tid path; bucket stays private and clients receive no storage credentials.
-2. **Trigger validation:** HeadObject checks each COPY (tid,hash). Missing files_storage returns 501; missing upload returns 400 before execution.
-3. **Build extraction:** BuildSpecFor presigns each GET for total+5m. Host run-builder fetches and gunzips the context, then calls `sandbox-ctl exec --stdin-from <tar> -- flatten-ctl tar extract --dense [--chown O][--chmod M] <rule>`. Derive rules from src/dst and context entries: whole-root `:dst/`, directory-prefix `src/:dst/`, single-file `src:out`. Relative dst resolves under accumulated WORKDIR, default /. Default owner is Docker-style 0:0, overridden by --chown; names resolve using extraction-root /etc/passwd. Dense preserves the sparse rule: without authoritative hole metadata, zeros are data. COPY accepts one source, matching e2b executor's limit.
-
-**Object storage (builder.files_storage, §3):** S3/OBS. Conductor only presigns and HEADs, the AWS SDK integration point. Local deployments can use versitygw built with `make -C guest-runtime/native-deps versitygw`. Force_path_style defaults false for virtual-host addressing; use true for versitygw/minio.
-
-**Publication and target matrix:**
-
-Create the publication plan once after resolving target; never infer it from a worker result field. Image class comprises final IMG, top-level disk-only E and C's immutable IMG. Checkpoint class comprises C's incremental E, S and memory/disk incremental layers. Both E forms are standard Sandbox E, but only top-level E contains complete EROFS payload and uses image policy.
-
-| Configuration | Image target | Sandbox, memory=false | Sandbox, memory=true |
-|---|---|---|---|
-| Empty parent, manifest=false | IMG → Manifest Store | Top-level E → Manifest Store | IMG, EΔ, S → Manifest Store |
-| Nonempty parent, manifest=false | IMG → Manifest Store | Top-level E → Manifest Store | IMG → Manifest Store; EΔ/S → named location |
-| Nonempty parent, manifest=true | IMG Bundle → named location | Top-level E Bundle → named location | IMG Bundle → named location; EΔ/S → named location |
-| Empty parent, manifest=true | Invalid configuration | Invalid configuration | Invalid configuration |
-
-Checkpoint.remote.manifest=true means directly materializing manifest-backed image-class logical artifacts as single-root Manifest Bundles in the named location, rather than uploading them to Manifest Store. Checkpoint.mode=local|bundle chooses role-specific tarstream or Snapshot Bundle for checkpoint class only; image class always uses Bundle in this named mode. With manifest=false, ref_location_parent does not change Image/top-level-E's Manifest Store destination.
-
-- **Image:** send current logical source directly to sandboxer's typed publisher. Manifest=false returns manifest://IMG and may preserve the identity fast path for an existing IMG without steps. Manifest=true always uses Bundle publisher, including existing manifest/located Bundle sources, with common validation/content-address reuse, returning only located image_ref.
-- **Sandbox, memory=false:** directly open final image—digest-qualified `file://<BuildBaseDir>/checkpoint/image.img@digest:...`, manifest:// or located image Bundle—materialize image defaults/canonical portable runtime config and assemble a standard direct-EROFS self-layout Sandbox E logical source. Publish it directly through Manifest/Bundle API, without separate IMG publication, manifest-ctl store, fetching a local IMG back through Manifest or staging a complete .sandbox under RunDir/BaseDir. Skip C and start/ready; return only sandbox_ref.
-- **Sandbox, memory=true:** publish final IMG under image policy and use its portable ref as C replacement boot. Pass actual located IMG mapping into --from E --replace-boot. After C cold run, capture EΔ/S and publish under checkpoint policy, returning only snapshot_ref. EΔ retains that IMG ref. Neither local tarstream nor Snapshot Bundle rematerializes/copies portable image Bundle. There is no source-memory restoration or disk-only C branch.
-
-Each named publication derives its name from BuildID and actual UTC publication date. Across midnight, image/checkpoint can occupy different buckets; each ref carries its own name. Single-root image Bundles create no .image/.sandbox tarstream or semantic BuildID/SandboxID alias; they commit only `<manifest-root>.bundle`. Publication uses target-directory temporary files, root-last finalization, complete validation, exclusive final creation, checked full writes/Close and reopening/validating the final path. The publisher intentionally does not fsync the fresh final or parent directory: success is logical publication, without a power-loss durability guarantee ([implementation](https://github.com/kuasar-sandbox/sandboxer/blob/main/pkg/artifact/location_target.go)). Concurrent/retried publication reuses only strictly verified same-key regular finals; corrupt, symlinked or mismatched finals fail closed. Failure returns no terminal ref; existing Build finalizer still removes complete RunDir/BaseDir.
-
-Top-level E and C's initial C0 use one BuildColdConfig projection: source E non-boot defaults < registration Create options < builder-managed start/ready. Resources/network/boot/launch/env/mounts/files/init/metadata have identical semantics. Effective start/ready and NetworkSpec enter E metadata, preserving a self-describing canonical TemplateID after Build-row TTL. Omitted hostname records the ordinary Sandbox default, never build-<id>.
-
-**Build logs (journald → status API → SDK on_build_logs):** SDK sees progress in real time without temporary log files. All Build output uses journald identifier build (§5.2), queried on demand. Writes carry KUASAR_BUILD_ID=<bid>. Run-builder milestones—import: pulling…, step N: RUN…, template: ready, uploading…—use go-systemd/journal directly. It replays retained RUN/startCmd envd streams into the same sink, since envd itself has no journal. Sandbox-ctl sends phase app stdio with --stdout-to/--stderr-to journald=build. Flatten progress uses exec --stderr-to journald=build without --no-progress, exposing pull layer counts and flatten updates. Pipeline failure adds build failed: <err>. Guest kernel console and sandbox-ctl's own logs are excluded. Status paginates by ?logsOffset count (§4.2): conductor runs `journalctl KUASAR_BUILD_ID=<bid> SYSLOG_IDENTIFIER=build --output=json`, reads MESSAGE/PRIORITY/timestamp, maps ≤3 to error, 4 warn, ≥7 debug and others info, and returns the [offset:] slice as logs[] and logEntries[{timestamp,level,message}]. Reading is best-effort: non-systemd/missing logs yields an empty list without blocking status. Journalctl avoids CGO-dependent sdjournal; writes use pure Go. Pipeline failure returns generic reason.message `build failed; see build logs`, with detail in the stream. Infrastructure failure before pipeline/result has no pipeline logs and reports the host error directly. Disabling unit rate limiting does not guarantee log delivery across every journal failure.
-
-**FromImage selection:** Trigger can explicitly supply it. In the e2b CLI workflow that locally docker-builds/pushes and omits a trigger image, builder.image_uri_mask replaces `{templateID}` and `{buildID}` in the complete configured string, for example `registry/repo/{templateID}:{buildID}`, without appending a path and must match CLI E2B_IMAGE_URI_MASK. Guest must reach this registry: local registries bind a non-loopback address reachable through vswitch management VIP; external registries use NAT. Missing both sources rejects Trigger. For local/private registries, configure builder.insecure_registry and builder.platform.
-
-**Registry TLS (HTTPS with internal/self-signed CA):** --insecure selects an HTTP-capable URL scheme; it does not disable TLS certificate validation. HTTPS internal CAs use flatten TLS configuration. This is per-Build trust policy supplied at registration through X-Kuasar-Sandbox-Builder, builder.registry.tls, outside Node configuration:
-
-- Either ca_bundle_pem, at most 16 KiB of inline PEM containing parseable X.509 CERTIFICATE blocks, or insecure_skip_verify=true; mutually exclusive, with empty tls rejected.
-- Register-only; Trigger with builder.registry returns 400.
-- Only fromImage; fromTemplate plus registry.tls is rejected.
-- Mutually exclusive with node insecure_registry's plain HTTP for the same Build.
-- Builder projects PEM and generated flatten YAML into Phase A read-only files /run/kuasar-build/flatten/registry-ca.pem and config.yaml, mode 0444+read_only on /run tmpfs, outside the Build root disk. Import export/referer lookup/referer put all receive --config. Flatten appends the CA to system roots rather than replacing them. This policy never enters final metadata or other Builds.
-
-**Two-level admission/enforcement:** in one SQLite transaction, Register checks count/CPU/memory/storage against builder.admission.registration and inserts/charges the immutable definition. Trigger only moves registered→waiting. Scheduler uses stable `(waiting_unix,build_id)` FIFO and transactionally claims builder.admission.execution. Insufficient capacity stays waiting until queue_ttl makes it durably terminal. After claiming, set/read back CPUQuota/MemoryMax on the exact builder unit, bind run ID, then publish assignment. Execution CPU/memory also limits sandbox-builder.slice; storage is admission-only in V1. Builder status/metrics expose configured/durable usage, headroom, queues and rejection/expiry counters. Legacy max_concurrent/cpu_quota/memory_max/vcpu/memory settings are rejected.
-
-Each actual A/B/C phase has its own SID and uses ordinary sandbox-ctl controller Admit/heartbeat/Release, fully tearing down/releasing before the next phase. A/B resources derive only from immutable Build.Resources. Registration Create resources instead use E portable capacity defaults where present for final E/C0; Image has exact-zero target resources and need not resolve them. Neither derives from the other. Build.Resources itself never enters nodectl, so each active phase has one ordinary Sandbox reservation without double accounting. Disk-only E has no C reservation.
-
-Ready/error are retained Build history. Terminal transition atomically records finished_unix and releases registration usage. An executed Build first completes unit/cgroup/network/runtime/result/directory cleanup, then terminal commit releases its execution claim. Only fully cleaned, unclaimed rows can be reaped after terminal_ttl. Status, transient registration TemplateID, names/aliases and local listing disappear with the row; previously returned canonical TemplateIDs still work for Create/fromTemplate.
-
-**Image-pull credentials, in priority order, otherwise anonymous:**
-
-1. Task pull token: SDK api_headers X-Kuasar-Pull-Token contains kpt_, sealed by e2b-key-ctl seal-pull-token using a tenant-manifest-key derivative; conductor unseals with the installed tenant key.
-2. SDK plaintext: Trigger fromImageRegistry{username,password}.
-3. Tenant defaults: manifest_keys.registry_auth_enc stores docker config.json bound to the complete pair. Manifest-key add --registry-auth or username/password/token flags can assemble a catch-all `*`; resolve by image host, then `*`.
-
-Encrypt selected credentials into builds.registry_auth_enc. During Build, decrypt into FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}; flatten pkg/remote prefers token. Exec environment carries only FLATTEN_* into import guest, never MANIFEST_KEY. Tenant roots/pull credentials remain encrypted at rest and in runtime environments, absent from generated phase YAML; caller-supplied workload env/files can themselves contain sensitive values and are a separate input category.
-
-**Unsupported:** multi-source COPY (e2b executor likewise uses one src/dst), step caching (force is accepted but ignored; steps execute fully) and server-side Dockerfile parsing (CLI expands it into steps).
+The complete Build execution, resource admission, steps, publication and recovery contract is in [Node template builds](node-build.md#5-target-aware-execution-and-publication). Conductor retains node process/shared-resource ownership; this section does not duplicate the pipeline.
 
 <a id="13-dns--tls"></a>
 ## 13. DNS / TLS
@@ -1335,15 +1290,15 @@ Production uses operator-provided wildcard DNS/TLS for *.<domain> and api.<domai
 
 | Object | Mechanism | Contract |
 |---|---|---|
-| Sandbox-ctl runtime | Run-sandbox ultimately execves `run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`. Run-builder directly spawns A/B/C; E-based C uses --from E --replace-boot. Platform relay uses exec --env/--stdin-from/--stdout-to; memory finalization uses snapshot/publish. Top-level E calls sandboxer assembly/publication packages without a sandbox-ctl process. Conductor Capture calls snapshot or export. | Managed launch/Build preparation never calls sandbox-ctl info. Readiness is control_ready→ready→EOF. Node-ctl injects the local VMM cgroup FD. Non-root-credential config files plus key environment; runtime owns resource admission. E2b semantic commands use envd (§12). |
+| Sandbox-ctl runtime | Run-sandbox ultimately execves `run --ready-fd=<fd> --cgroup-path=fd=<vmm-fd> --config <sid>.yaml --manifest-config … --run-root … --base-root … [--from E\|--restore S] [--connect]`. Run-builder directly spawns A/B/C; E-based C uses --from E --replace-boot. Platform relay uses exec --env/--stdin-from/--stdout-to; memory finalization uses snapshot/publish. Top-level E calls sandboxer assembly/publication packages without a sandbox-ctl process. Conductor Capture calls snapshot or export. | Managed launch/Build preparation never calls sandbox-ctl info. Readiness is control_ready→ready→EOF. Node-ctl injects the local VMM cgroup FD. Non-root-credential config files plus key environment; runtime owns resource admission. E2b semantic commands use envd ([Build §5](node-build.md#5-target-aware-execution-and-publication)). |
 | Resource controller (node-resource.md) | Embedded in serve with resource_listen and inline tuning; dynamic Sandboxes dial the same canonical SocketIdentity through pkg/resource protocol. | Resource_listen is the sole endpoint source. Per-runner vmm/ is the Sandbox resource cgroup, with FD injected by run-sandbox. Disabled controller means static cgroup. |
 | Registry (cluster-ctl) | Node-link: serve dials Registry, registers as route authority, sends registration/heartbeat/Sandbox routes/Build full-sync-upsert-delete and accepts create/connect/delete/key_put/key_drop/build_register (§10, cluster.md). | MTLS; cluster kill uses node-link delete. Registry has no Build projection TTL. Empty node_link.endpoint means standalone. |
 | Connector-ctl vswitch | Without tapfd_socket, CLI attach <switch> --inner-ip [--transit-*] / detach --port; with it, resident TAPFD/1 PREPARE/OPEN/RELEASE. Render network.tapfd.socket/request in Sandbox config. | Prestart the kernel-data-plane switch with start/serve. Public port differs from internal slot. One Build reuses one slot. |
 | Flatten-ctl builder | Guest runtime supplies export --output - for import/export and mountpoint, driven by sandbox-ctl exec. Host uses info --json --manifest-config only to verify registry referrer hits. | Sandboxer typed openers read all three image-carrier configs and publish outputs. Tenant FLATTEN_* enters guest only through exec env; stdio relays tarstream artifacts. |
 | Sandboxer pkg/artifact + pkg/sandbox | Direct Manifest ingest/single-root Bundle publication of image/E logical sources; local IMG→top-level E has no intermediate file. | Sandboxer owns typed roles, customer keys, write admission, root-last, sparse rules and named-location atomic/reuse validation. Finalization never invokes manifest-ctl store. |
 | Manifest-ctl (accelerator) | Independent Manifest Store CLI, outside Builder final publication. | Calling-process environment supplies MANIFEST_KEY. |
-| Mkfs.erofs (deps) | Guest-runtime make sandbox-runtime and guest flatten backend. | Deterministic runtime packaging; guest exports EROFS images (§11/§12). |
-| Guest envd | UDS mapped by sandbox-ctl --connect. Build uses a minimal Connect+JSON process.Start client for steps/startCmd/readyCmd (§12). | Unmodified upstream; protocol pins in §4.3/§4.5. |
+| Mkfs.erofs (deps) | Guest-runtime make sandbox-runtime and guest flatten backend. | Deterministic runtime packaging; guest exports EROFS images (§11/[Build §5](node-build.md#5-target-aware-execution-and-publication)). |
+| Guest envd | UDS mapped by sandbox-ctl --connect. Build uses a minimal Connect+JSON process.Start client for steps/startCmd/readyCmd ([Build §5](node-build.md#5-target-aware-execution-and-publication)). | Unmodified upstream; protocol pins in §4.3/§4.5. |
 | Systemd | D-Bus StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload. | Process management and unit installation (§5). |
 | Node-ctl proxy serve | Bidirectional framed-JSON h2c routesync UDS plus separate data listener. | Independently operated on the same node. Master registers once; workers inherit data-listener FDs and shared routes. Frozen EffectiveConfig includes paths.run_root; workers never reread proxy.yaml (node-proxy.md §2.1/§3/§4). |
 
@@ -1368,36 +1323,18 @@ sandboxes      id(node-local SandboxID,1..57 bytes DNS-label subset) PK,
                service_secret_enc, envd_access_token_enc, traffic_access_token_enc,
                forward_access_token_enc, metadata_json, env_json,
                created_unix
-builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<base64url-ref>),
-               api_secret_hash, api_secret_enc, manifest_key_hash, manifest_key_enc,
-               profile, kind, from_image, from_template, start_cmd, ready_cmd, steps_json,
-               status(registered|waiting|building|ready|error), reason, run_id,
-               names_json, aliases_json, registry_auth_enc,
-               registration_image_repo, registration_registry_auth_enc,
-               registration_mmds_routes_digest, registration_mmds_values_digest,
-               registration_request_digest, cluster_group,
-               resources_cpu(milli-CPU), resources_memory(bytes), resources_storage(bytes),
-               metadata_json, builder_json, instance_config_enc,
-               waiting_unix, execution_claimed, execution_claimed_unix,
-               enforcement_status, phase, phase_sandbox_id,
-               runtime_vswitch_port, runtime_floating_ip, runtime_port_mac,
-               runtime_envd_access_token_enc, runtime_prepare_json,
-               execution_result_json, created_unix, finished_unix
 sandbox_mmds_route_secret_values
                sandbox_id PK/FK sandboxes(id) ON DELETE CASCADE,
-               routes_digest, revision, ciphertext, updated_unix
-build_mmds_route_secret_values
-               build_id PK/FK builds(build_id) ON DELETE CASCADE,
                routes_digest, revision, ciphertext, updated_unix
 manifest_keys  api_secret_hash PK, api_secret_enc, manifest_key_hash,
                manifest_key_enc, label, created_unix, expires_unix, registry_auth_enc
 ```
 
-Builds is durable authority for registration/execution admission and execution state, plus status/index/alias within retention; it is not a permanent template catalog (§4.4). Resume_source_kind/ref is paused E/S's typed root, auto_pause_memory selects only TTL CaptureKind, and launch_mode records accepted image/cold/memory in starting. This lifecycle schema replaces the old single-string model without dual reading/writing or a migration shim; incompatible development databases must be rebuilt.
+Build schema, admission and record authority are in [Build §6](node-build.md#6-persistence-recovery-and-retention). Resume_source_kind/ref is paused E/S's typed root, auto_pause_memory selects only TTL CaptureKind, and launch_mode records accepted image/cold/memory in starting. This lifecycle schema replaces the old single-string model without dual reading/writing or a migration shim; incompatible development databases must be rebuilt.
 
-Immutable resources_* belongs to Build execution/admission; final Sandbox resources belong to Create config in metadata_json and neither derives from the other. Instance_config_enc encrypts registration envVars (portable launch env for Sandbox targets) together with secure/credentials input used only by memory C. Readers still separate these categories before target validation/portable projection. There is no legacy Build-row dual reader. Startup uses instance_config_enc as the #300 schema-break marker, explicitly rejecting incompatible development databases before queries and requiring rebuild; it never infers/backfills plaintext. Execution_claimed and runtime/phase fields reconstruct usage and fence live units before releasing claims. Additive migration adds runtime_prepare_json; exact-run CAS commits it with the runtime port and terminal/cleanup clears both. Root/service credentials in *_enc use AES-256-GCM; both *_hash values are full SHA-256. The first 24 hash characters only index candidate preselection (§7).
+Root/service credentials in *_enc use AES-256-GCM; both *_hash values are full SHA-256. The first 24 hash characters only index candidate preselection (§7).
 
-Each MMDS value table has at most one secretbox ciphertext row per owner; §7 defines AAD/transaction/CAS/cleanup. Only current Build schemas already carrying #300's marker receive existing independent additive maintenance: CREATE TABLE IF NOT EXISTS for the two value tables and idempotent ALTER TABLE ADD COLUMN for runtime_prepare_json, dead_unix and finished_unix. Existing terminal rows get a complete retention window starting at migration, without plaintext backfill or compatibility dual writes.
+Each MMDS owner has at most one secretbox ciphertext row; §7 owns AAD/transaction/CAS/cleanup. Build schema markers, additive migration and terminal timestamp initialization are in [Build §6](node-build.md#6-persistence-recovery-and-retention).
 
 <a id="152-重启对账"></a>
 ### 15.2 Restart reconciliation
@@ -1411,14 +1348,7 @@ Before opening APIs, config-socket routesync or node-link, conductor reconciles 
 - **Runner units without running rows:** old-pool idle/orphan run IDs are stopped/reset; the new pool replenishes configured idle capacity.
 - **Paused:** retry complete stop/reset/inactive fencing, detach, exact CAS and RunDir removal even if RunID/port already cleared. Preserve source and BaseDir/checkpoint. Resume/Wake/Exec use the same admission gate and cannot enter starting before old cleanup completes. Run_root is tmpfs: host reboot makes lost running instances dead, while paused E/S and sbx/snp templates survive and can Connect/Wake from persistent BaseDir/checkpoint.
 
-Builder reconciles in the same startup gate. All live ownership is reconstructed before task bootstrap/results pass buildRecoveryReady:
-
-- Bound run_id with no port is valid preparing. Adopt the same live run-builder and restore completion ownership. Artifact tasks may retrieve bootstrap or resubmit the same summary; conductor never reads artifacts.
-- Port plus valid runtime_prepare_json is prepared/pipeline-running. Restore final BuildSpec from frozen network/resources. Same-digest retries neither reattach nor inherit changed node defaults.
-- Port with absent, corrupt or unknown-schema preparation requires exact-unit fencing, detach and terminal failure; never invent potentially mismatched configuration.
-- A durably accepted execution_result_json takes precedence over preparation recovery: fence worker and finalize that result without rereading snapshots. Task/host preparation, pipeline and result reporting share the original execution_claimed_unix+total_timeout deadline. The following 60 seconds is only for fencing/host cleanup; restart extends neither budget.
-
-Build rows store no directory paths. Derive both Build directories from BuildID and current RunRoot/BaseRoot. Every terminal path first fences exact unit/cgroup, detaches, clears runtime ownership and removes both directories; terminal commit atomically clears RunID/result and releases execution claim. Phase child cleanup is not final correctness authority. Node database, config socket and runner pidfile are outside object directories and unaffected by object RemoveAll.
+The same startup gate reconstructs Builder ownership under [Build recovery](node-build.md#6-persistence-recovery-and-retention) before allowing bootstrap/results. Builds remain subject to the shared reaper and failure-domain rules below.
 
 The same conductor reaper runs terminal retention every five seconds, without another timer/unit. Dead and ready/error transitions atomically write dead_unix/finished_unix. Each pass processes at most 128 rows of each type. Exact-delete only after dead_ttl/terminal_ttl and complete owner release. Sandbox must have no unit, network, RunDir/BaseDir, UDS, ResumeSource or launch owner. Build must have no execution claim, unit/cgroup, phase, network, prepare/result owner. Concurrent changes after candidate scanning fail the delete CAS and preserve the row. Restart resumes using database timestamps. No automatic VACUUM or remote-artifact mutation occurs.
 
@@ -1472,7 +1402,7 @@ Make test-e2e executes test/e2e/run_all.sh. The project repository supplies the 
 - [Node resources](node-resource.md): resource protocol, Sandbox policy and controller organization, embedded in serve at the sole resource_listen endpoint.
 - [Cluster](cluster.md): node-link wire (§6, counterpart to this document's §10), Registry and Reserve; [Router](cluster-router.md) data ingress and [Placer](cluster-placer.md) placement/key distribution.
 - [Sandbox lifecycle](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md): SANDBOX_CONFIG modes, run/snapshot/restore/connect and cgroups.
-- [Virtual switch](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md): attach/detach/open-port, floating IP and mgmt-service/MMDS VIP translation.
+- [vSwitch operations](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch-operations.md): attach/detach/open-port; [vSwitch design](https://github.com/kuasar-sandbox/connector/blob/main/docs/vswitch.md) owns floating IP and mgmt-service/MMDS VIP translation.
 - [Flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md): export, idempotent OCI Referrers and FLATTEN_REGISTRY_*.
 - [Manifest](https://github.com/kuasar-sandbox/accelerator/blob/main/docs/manifest.md): content keys, convergent encryption and deduplication domains (§7's storage side).
 - [Deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md): topology and unit installation.

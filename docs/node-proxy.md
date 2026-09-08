@@ -74,49 +74,9 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 <a id="21-静态定制-proxy"></a>
 ### 2.1 Statically customized Proxy
 
-The sole operator entry point remains `node-ctl proxy serve --config ...`. Public Load/Decode performs only environment-independent strict decoding, defaults, and validation of provided values. node-ctl explicitly performs final validation for the built-in path; the custom path defers it until after master `Configure`. With a nonempty `paths.proxy_executable`, node-ctl validates the protected absolute executable's runtime owner, mode, and identity. It writes a bootstrap snapshot of public `config.Proxy` into a size-bounded sealed memfd that forbids writes, growth, and shrinking. Only the FD number enters the environment; configuration bodies and TLS material enter neither argv nor environment variables. node-ctl replaces itself with xproxy through the same validated open file and never falls back to the built-in implementation on failure. Direct xproxy execution, missing/corrupt bootstrap, and component/file identity mismatches fail closed. These checks organize processes and prevent misuse; they are not cryptographic authentication against a malicious process with the same UID.
+The full static customization interfaces, configuration hooks, runtime binding, private route sources and authorized forwarding contract is maintained in [Extensions](extensions.md#proxy-bootstrap). This specification retains the core routing, credential and process-ownership invariants.
 
-See the buildable [custom-proxy example](../examples/custom-proxy/README.md):
-
-```go
-app := proxy.New(proxy.Hooks{
-    Configure: func(ctx context.Context, cfg *proxy.Config) error {
-        // master-only declarative override
-        return nil
-    },
-    BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
-        // bind process-local logger / TLS provider
-        if process.Role == proxy.RoleMaster {
-            rt.MasterExtension = newMasterExtension()
-        } else if process.Role == proxy.RoleWorker {
-            // Construct a fresh instance for this worker epoch.
-            rt.WorkerExtension = newWorkerExtension()
-        }
-        return nil
-    },
-})
-if err := app.Run(); err != nil {
-    log.Fatal(err)
-}
-```
-
-`New` has no side effects. `Run` is one-shot, handles SIGINT/SIGTERM, and does not call `os.Exit`; an embedding host can use `RunContext`. A zero-value/nil App returns an explicit error requiring construction through `proxy.New` before processing signals or component/worker bootstrap. The master's order is fixed: decode bootstrap → clone → call `Configure` exactly once → verify that `paths.proxy_executable` is unchanged → final validation → deep-clone, canonical serialization, and digest to freeze EffectiveConfig → `BindRuntime(master)` → start the core. Configure-hook, provider, or final-validation failure occurs before SHM, listeners, routesync sessions, or workers are created. If `MasterExtension` is set, the core creates the shared route table and in-process traffic aggregate, then calls `Start(ctx, MasterHost)` exactly once. Start failure occurs before listener binding, routesync, or workers, and cleans up the created SHM. After successful Start, the same object's optional `ManagementWrapper` can wrap the `stats_socket` handler. Capability detection happens once and is frozen; a nil returned handler aborts startup.
-
-Workers always reexecute the master's `/proc/self/exe`: a built-in master creates a node-ctl worker, and a custom master creates an xproxy worker. The configured executable does not select workers. Another sealed memfd carries frozen EffectiveConfig, its digest, worker ID/epoch, FD protocol/mapping, and current executable identity. Listeners, wake/notify, stats, MMDS RPC, and the independent admission arena are inherited FDs; worker index/epoch and arena version/size/layout are also validated. After strict validation, the worker calls `BindRuntime(worker)`. Each worker epoch receives a new `Runtime` and must not reuse the previous epoch's `WorkerExtension`. The worker completes stats hello/ready, constructs its Host, waits for the initial route-table sync, calls `WorkerExtension.Start` exactly once, and freezes the same object's optional `IngressWrapper`. Only then does it Serve. A Start error or nil wrapper keeps the data listener closed to serving; the existing master supervisor restarts the worker. Workers never read `proxy.yaml` or call `Configure`, so replacing or deleting that file does not affect replacement workers.
-
-Workers are dedicated one-shot subprocesses: built-in and custom entry points must exit the worker process after `Run` returns. Successful route SHM and admission mappings live until process exit; `PreparedWorker.Close` closes inherited descriptors without unmapping them, because handlers/extensions/traffic GC may still hold references. The supervisor still waits for confirmed exit before clearing shared counters. Ordinary HTTP and HTTP/2 CONNECT cancellation closes the backend independently of effective traffic limits; HTTP/1 hijacked CONNECT retains half-close semantics. See [worker lifetime and transport cancellation](proxy-worker-lifetime.md).
-
-Public `Config` holds only serializable declarations. `Runtime` is a process object that rejects JSON encoding/decoding. It exposes a logger, a startup TLS-material provider, and trusted statically compiled `MasterExtension`/`WorkerExtension` objects selected by process role. The provider returns a certificate chain, `crypto.Signer`, and optional client CA pool; it cannot replace an arbitrary `*tls.Config`. A non-nil provider is authoritative and errors never fall back to cert/key files. The core still fixes the minimum TLS version, HTTP/2 ALPN, and client-auth policy. V1 supports no hot updates of configuration, material, or extensions. A custom component and node-ctl must use compatible versions.
-
-`MasterHost.Routes()` exposes applied-route `Get`, generation-based `Watch`, and `SyncState(initializing|syncing|synced|stale)`. A full generation is `sync_begin → snapshot upsert* → sync_end`, followed by live upsert/delete in publication order; disconnect emits `sync_lost`. A slow watcher invalidates only its own generation and automatically receives a full resync. Duplicates are allowed, every intermediate change is not guaranteed, and this is not a durable audit stream. Views copy identity, profile/template/state/RunID, current endpoints, artifact location, fingerprints, and route revision. They copy no raw secrets/tokens and add neither route metadata nor an SHM schema. Observers publish nonblockingly only after successful core SHM application, never affecting routesync, barrier ACK, Wake, or worker notification.
-
-`MasterHost.Traffic().Get` reads the master's in-process worker aggregate directly against current route identity, without looping through the stats UDS, and returns map/pointer copies. V1 has no Traffic Watch. Retained routes remain queryable during disconnection; callers requiring freshness must also check Route `SyncState`. A management wrapper may add, override, or pass through any local route. The framework reserves no namespace, detects no route conflicts, and prescribes no authentication.
-
-`WorkerHost.Process()` returns the current worker ID/epoch. `GetRoute(sid)` performs only a current-SHM point lookup and returns an independent, non-secret `RouteView` copy. It exposes no raw record, Router, or mutable pointer, and offers no worker Route Watch. `IngressWrapper` receives raw requests before canonical Host/Header and CONNECT parsing. The wrapped handler serves only node `data_listen`, never the MMDS listener. An extension may define its own headers, paths, or authentication, override behavior, or respond locally. Calling `next` for unmatched requests preserves core token and native exec semantics.
-
-After private authentication, `WorkerHost.ForwardAuthorized` can reuse the core path `LookupRoute → TryBeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate → dial → ordinary HTTP/CONNECT → traffic close`. This helper owns `ResponseWriter`; its caller must not write another error after return. It does not validate Kuasar `X-Access-Token`. `Revalidate` runs after activation and before dial. Ordinary HTTP `Rewrite` receives only the guest-facing clone, and failure writes no guest-request bytes. CONNECT never calls Rewrite. The generic helper rejects native exec, which must continue through `next` and the KAT plus per-command CEL gates. This interface adds no WebSocket transport; [#269](https://github.com/kuasar-sandbox/orchestrator/issues/269) tracks that separately.
-
-This API applies only to the independent Proxy and adds no conductor data-plane factory. It exposes no raw Router, SHM, listener, routesync, stats, dial target, or credential records. Beyond the optional management wrapper of the same master extension and ingress wrapper of the same worker extension, it introduces no Go plugins, runtime discovery, multi-extension registry, generic lifecycle hooks, secret resolver, or DI container. `node-ctl config proxy` diagnoses only declarative/bootstrap configuration and executable metadata. It never executes xproxy, invokes Runtime providers, or substitutes the diagnostic command's EUID for actual startup ownership checks. See [extensions.md](extensions.md) for the full extension contract.
+Process exit, mapping ownership and transport cancellation are defined in [§9.1](#91-worker-lifetime-and-transport-cancellation).
 
 <a id="3-部署拓扑"></a>
 ## 3. Deployment topology
@@ -313,10 +273,12 @@ The deterministic per-sandbox `mmds_secret` lets different PUT/GET workers valid
 Three custom route types exist:
 
 - `static` directly returns declared UTF-8 `data`.
-- `secret` retrieves current opaque bytes by the route's `secret` name. PUT replaces the whole value; DELETE immediately makes GET return 404. There is no waiting or TTL, and Content-Type always comes from the route.
+- `secret` retrieves current opaque bytes by the route's `secret` name. PUT replaces the whole value. DELETE commits removal before publishing an asynchronous route update; guest GET returns 404 after the Proxy projection applies it. There is no deletion barrier, cancellation of an already-resolved response, value wait or TTL. Content-Type always comes from the route.
 - `service` resolves a local Unix socket from the master's sole registry. The worker/handler creates a new `GET <exact-path> HTTP/1.1` with `Host: mmds-service` and only the additional headers `E2b-Sandbox-Id: <sid>` and `E2b-Sandbox-Service: <service>`. It sends no port and forwards no guest Host, query, body, token, Authorization, Cookie, or other guest headers. V1 relays only a valid status, bounded body, and valid Content-Type (default `text/plain`), without following redirects. Timeout maps to 504; oversized/invalid responses to 502; missing services or unreachable sockets to 503.
 
-The security boundary distinguishes portable route declarations from secret values held only as SQLite ciphertext or in the trusted Proxy master's bounded heap. Values do not enter ordinary metadata, shared mmap, logs, metrics, migration tokens, templates, or build artifacts, and are never sent to observers/node-link. Once a guest actively GETs a value, however, it enters guest/application memory. A later Pause/snapshot including memory may capture that copy as ordinary guest working set. The platform cannot erase it from arbitrary guest memory from the host. Callers should limit application residency and protect snapshots containing consumed secrets as sensitive artifacts.
+The security boundary distinguishes portable route declarations from secret values: control-plane persistence is SQLite ciphertext, with bounded trusted conductor/Proxy-master heap use at runtime. The platform does not automatically project values into ordinary metadata, shared mmap, logs, metrics, migration tokens, templates or Build artifacts, or send them to observers/node-link. Once a guest actively GETs a value, it can copy it into application memory or files. Later Pause/snapshot or image export may retain those guest copies. Host DELETE cannot erase already-consumed copies. Callers should limit application residency and protect any memory, disk or image artifacts containing them as sensitive data.
+
+Sandbox-local MMDS is a local object/route mechanism, not a cluster Secret API, generic CONNECT configuration surface or placement/admission feature. Standalone CONNECT parses secrets-only import only when the target is absent and actually imported; an existing target skips it. The complete migration boundary is in [Node §8.1.4](node.md#814-publication-templates-and-migration). Request-scoped Build Register MMDS remains encrypted under Build ownership on the selected node ([Build §3.1](node-build.md#31-request-scoped-builder-input)). Incidental ordinary metadata propagation is not a cluster-wide MMDS support or E2E acceptance claim.
 
 <a id="8-per-sandbox-traffic-admission-与-stats"></a>
 ## 8. Per-sandbox traffic admission and stats
@@ -356,22 +318,24 @@ Destination-node defaults are not written into sandbox metadata/structs/SQLite, 
 <a id="82-共享-admission-arena-与误差证明"></a>
 ### 8.2 Shared admission arena and error-bound proof
 
-Route mmap is separate from the mutable admission arena. For a valid route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Limited routes receive `{slot,generation,effective limits}` in route SHM. Arena v2 stores only a master-written active generation per slot and generation-tagged `counters[worker][forward/envd/CI/exec]`. Each live worker alone writes its rows. Its process-local per-slot mutex serializes row initialization, acquire and release; master never acquires that mutex or clears a live row. There is no shared guard, draining state, or duplicate mutable limit policy.
+Route mmap is separate from the mutable admission arena. For a valid route whose effective limits are all zero, the master publishes a zero binding. Workers take the existing `BeginParking` path without scanning the arena or IPC. Limited routes receive `{slot,generation,effective limits}` in route SHM. Arena v2 stores only a master-written active generation per slot and generation-tagged `counters[worker][forward/envd/CI/exec]`. Each live worker alone writes its rows. Its process-local per-slot mutex serializes row initialization, acquire and release; master never acquires that mutex or clears a live row. There is no shared guard, identity hash, draining state, or duplicate mutable limit policy. Local locks are indexed by slot, not merely by SandboxID.
 
 Acquire runs under the process-local per-slot mutex (shared by all services for that slot):
 
 ```text
 verify active generation and effective limits
-→ atomically load every worker's four cells exactly once
+→ initialize own row for a new generation: tag=0, reset four cells, publish new tag
+→ read each row's tag, four cells, then tag again; include only unchanged matching tags
 → check total and target service together
-→ increment this worker's target-service cell
-→ enter local parking
-→ unlock and return success
+→ recheck active generation, increment own target-service cell, recheck again
+→ on revocation undo increment under the same local slot mutex and reject
+→ unlock the slot mutex and return the admission lease
+→ enter local parking under the distinct per-Sandbox traffic-entry mutex
 ```
 
 All services of one sandbox in one worker share this lock, so each worker can have at most one acquire critical section in progress. First consider a monotone execution with no releases. Take the successful atomic increment that first brings the published count to `M` as the boundary publication. At that boundary, each other worker can have at most one acquire already started but not yet published: at most `N-1` altogether. The boundary worker can begin its next check only after unlocking. Any check starting after the boundary reads each column at a value no smaller than at the boundary. Even though these reads are not an atomic snapshot, their sum is at least `M`, so the check must reject. The increment is published before unlocking and returning the grant. Thus only those other `N-1` acquires already in progress at the boundary may still succeed, bounding the peak by `M + N - 1`.
 
-Concurrent releases do not enlarge this bound. Fix any observation time `T`. Remove from the execution history every complete acquire→release interval of flows released before `T`. Removing positive-count intervals leaves the column values seen by remaining acquires unchanged or lower. Consequently every acquire that succeeded originally and remains active at `T` would still pass in the reduced history; same-worker serial order is also preserved. The reduced history has no release through `T`, and its published count equals the original execution's actual active count at `T`. The monotone-execution `M + N - 1` bound therefore applies. This argument requires no atomic snapshot across column reads and applies separately to total and target service checked within the same critical section. For configured `M` and `N` workers, the contract is:
+Concurrent releases do not enlarge this bound. Fix any observation time `T`. Remove from the execution history every complete acquire→release interval of flows released before `T`. Removing positive-count intervals leaves the column values seen by remaining acquires unchanged or lower. Consequently every acquire that succeeded originally and remains active at `T` would still pass in the reduced history; same-worker serial order is also preserved. The reduced history has no release through `T`, and its published count equals the original execution's actual active count at `T`. The monotone-execution `M + N - 1` bound therefore applies. This argument requires no atomic snapshot across column reads and applies separately to total and target service checked within the same critical section. For the current generation, stable positive limit `M` and `N` workers, the contract is:
 
 ```text
 actual admitted inflight <= M + N - 1
@@ -379,13 +343,17 @@ actual admitted inflight <= M + N - 1
 
 The parking→egress transition does not change shared counts. Activation/dial/HTTP-forward failure, context cancellation, an ordinary response, and final Close of complete CONNECT/exec relay all release through the same flow/lease exactly once. Half-close does not release it.
 
-Delete or identity replacement revokes the old active generation without waiting for any live worker. Slot reuse publishes a fresh generation; each worker lazily initializes its own row under its local slot mutex. Old releases either precede that initialization or see the new tag and do nothing. They cannot decrement the new identity. Unchanged starting/running/paused updates preserve generation. Activation revalidates the complete identity, policy validity and binding, plus arena generation liveness. A failed route publication rolls the admission transaction back without clearing outstanding old counts. A stopped worker therefore cannot block master route publication or surviving workers. See [generation ownership and rollback](proxy-admission-generations.md).
+Delete or identity replacement revokes the old active generation without waiting for a live worker, including one stopped inside acquire. The master's allocation transaction retains one spare slot: revoke the old binding and allocate the new binding before publishing the route; commit retires the old slot, while rollback retires the unpublished slot and reactivates the old generation without clearing outstanding counts. On first use of a new generation, each worker initializes only its own row: store tag=0, reset all four counters, then publish the new tag. Scans read tag/counters/tag and include only unchanged tags matching the current generation. A late release either precedes that worker's initialization or sees the new tag and does nothing; it cannot decrement the new identity. Acquire rechecks generation before and after publishing its increment and undoes a revoked increment under the same local slot mutex. Complete RouteBinding/ExecIdentity equality still fences activation credentials and policy; arena Valid checks generation liveness only. Ordinary starting/running/paused updates and unchanged full-sync replay preserve generation and counts.
+
+This bound does not combine old and new identities into one quota or promise to evict existing flows when a limit decreases. Worker placement is not a static M/N quota: one worker may use all M, but multiple workers cannot each independently use M. No watchdog, lock timeout, kill-on-contention policy, per-flow master RPC or global limiter is introduced.
 
 A worker stats-stream fault first terminates the worker. Only after supervisor `cmd.Wait` proves the old process exited and the kernel closed its connections may the master clear that index, without any shared lock. Until then, stale-high counts can only conservatively reject, never undercount. Replacements reuse the index with a new epoch. Master exit terminates every child and connection; a new master rebuilds the arena without inheriting old counts. A full routesync on a surviving master instead preserves counts for replayed, unchanged bindings and retires absent bindings at Bookmark; it does not reset active flows' counts.
 
-For `route_capacity=65536,workers=2`, counter payload occupies `65536 × 2 × 4 × 8 = 4194304` bytes. Including generation tags, headers and one transaction spare entry, arena v2 mmap is `5767320` bytes. Each worker separately holds 65537 local mutexes, or `524296` bytes when `sync.Mutex` is eight bytes. These mutexes are not shared mappings. Master and worker mapping validate size, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope.
+For `route_capacity=65536,workers=2`, counter payload occupies `65536 × 2 × 4 × 8 = 4194304` bytes. Including generation tags, headers and one transaction spare entry, arena v2 mmap is `5767320` bytes. Each worker separately holds 65537 local mutexes, or `524296` bytes when `sync.Mutex` is eight bytes. These mutexes are not shared mappings. Master and worker mapping validate size, layout version, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope. Only the admission arena changes from v1 to v2, not user configuration or routesync; master and workers must share the same executable/bootstrap source set.
 
-Worker shutdown retains both mappings until process exit, including when asynchronous extension code or hijacked handlers outlive `Run`. Only `cmd.Wait` permits clearing the exact worker epoch and starting its replacement; see [worker lifetime](proxy-worker-lifetime.md).
+Tests retain 1/2/4/8-worker threshold interleavings, service/total checks, skew, release waves, rollback and real child-process crash cleanup. SIGSTOP tests stop a real child inside acquire and require master route changes and a surviving worker to progress without first waking or killing it.
+
+Worker shutdown retains both mappings until process exit, including when asynchronous extension code or hijacked handlers outlive `Run`. Only `cmd.Wait` permits clearing the exact worker epoch and starting its replacement; see [worker lifetime](#91-worker-lifetime-and-transport-cancellation).
 
 If already-persisted traffic metadata is invalid, conductor keeps the actual Sandbox lifecycle and credentials and projects only `traffic_policy_invalid`. Master publishes no effective policy or enabled admission binding. This never fabricates `dead`/Delete, removes Registry ownership, disables MMDS, or interrupts full synchronization for other routes. Existing request and migration input validation remains strict.
 
@@ -474,6 +442,37 @@ Workers send absolute state to the master over socketpairs; the conductor querie
 - **Park/wake:** Lookup sends no Wake. Only Activate admitted by the effective authentication policy may wake a paused SID and wait for shared-table updates. Starting only parks, never wakes; paused/Delete immediately ends that wait. Resume ownership and current-launch progression remain with the conductor.
 - **Stats stream:** EOF, timeout, or protocol error on any worker stream stops that worker. Traffic GET returns 503 until confirmed exit; then contributions are removed and readiness waits for the replacement. Prometheus counters remain monotone throughout the master's lifetime and do not regress on worker epoch changes.
 - **Failure codes:** unavailable Create proxy stream, barrier timeout/disconnect, or route-apply failure = 503; invalid target = 400; non-CONNECT exec = 405; unknown/deleted SID = 404; rejected authentication = 401; recognized service unsupported by the profile = 501; unregistered/unreachable backend or proxy = 502; authorized exec resume failure = 503; ordinary admission exhaustion = 429 plus `max_inflight_reached`; exec exhaustion = generic ctl error after CONNECT 200.
+
+### 9.1 Worker lifetime and transport cancellation
+
+A Proxy worker is a dedicated one-shot subprocess. The built-in and custom App
+entry points must exit that process after `Run` returns; they are not an API for
+restarting workers inside an otherwise long-lived process.
+
+Successful route SHM and admission arena mappings belong to the worker process.
+`PreparedWorker.Close` closes inherited descriptors but does not unmap either
+mapping. Existing handlers, extensions and traffic GC may still hold references
+when `Run` returns. No ownership flag, reference count, graceful-drain protocol or
+`http.Server.Shutdown` join is needed to reclaim process-owned mappings. The
+kernel reclaims them when the subprocess exits. Mapping constructors still clean
+up their own unsuccessful operations; low-level mapping tests can explicitly
+unmap only after every reader has stopped. Worker lifecycle tests use child
+processes instead of requiring production teardown to serve test-only reuse.
+
+This does not change normal request cleanup. A finished request or complete tunnel
+still closes its backend and releases its inflight contribution exactly once.
+The supervisor must still wait for process exit before clearing that worker's
+shared counters and stats contribution: unmapping a process does not zero shared
+memory used by surviving processes. Master route apply and Create barriers do not
+wait for worker health or handler shutdown.
+
+Traffic limits decide whether a new flow is admitted, not how an admitted flow
+is transported. Ordinary HTTP cancellation and HTTP/2 CONNECT stream cancellation
+close the associated backend with or without an effective limit. HTTP/1 hijacked
+CONNECT retains half-close semantics; its original HTTP request context is not a
+universal tunnel-close signal. Native exec keeps its existing KAT / first-frame /
+CEL / traffic-admission ordering.
+
 
 <a id="10-性能"></a>
 ## 10. Performance

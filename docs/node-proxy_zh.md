@@ -93,108 +93,9 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 
 ### 2.1 静态定制 Proxy
 
-运维入口仍只有 `node-ctl proxy serve --config ...`。公共 Load/Decode 只做环境无关的 strict
-decode、defaults 与 provided-value validation；内置路径由 node-ctl 显式 final validate，custom
-路径则延后到 master `Configure` 后。`paths.proxy_executable` 非空时，node-ctl 校验 protected
-absolute executable 的 runtime owner/mode/identity，再把公共 `config.Proxy` 的
-bootstrap snapshot 写入有大小上限且禁止 write/grow/shrink 的 sealed memfd；环境变量只传
-FD 编号，配置正文与 TLS 材料不进入 argv 或环境。node-ctl 从已验证的同一打开文件原地 exec
-xproxy，失败不回退内置实现。xproxy 直接运行、bootstrap 缺失/损坏或 component/file identity
-不匹配均 fail closed；这是进程组织和防误用，不是抵抗同 UID 恶意进程的密码学认证。
+静态定制的完整接口、配置 Hook、运行期绑定、私有路由以及授权转发说明统一见 [扩展指南](extensions_zh.md#proxy-bootstrap)。本篇继续定义 Core 的路由、凭据和进程所有权不变量。
 
-可编译示例见 [examples/custom-proxy（英文）](../examples/custom-proxy/README.md)：
-
-```go
-app := proxy.New(proxy.Hooks{
-    Configure: func(ctx context.Context, cfg *proxy.Config) error {
-        // master-only declarative override
-        return nil
-    },
-    BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
-        // bind process-local logger / TLS provider
-        if process.Role == proxy.RoleMaster {
-            rt.MasterExtension = newMasterExtension()
-        } else if process.Role == proxy.RoleWorker {
-            // Construct a fresh instance for this worker epoch.
-            rt.WorkerExtension = newWorkerExtension()
-        }
-        return nil
-    },
-})
-if err := app.Run(); err != nil {
-    log.Fatal(err)
-}
-```
-
-`New` 无副作用；`Run` one-shot、处理 SIGINT/SIGTERM且不调用 `os.Exit`，上层托管可用
-`RunContext`。零值/nil App 在 signal、component bootstrap 或 worker bootstrap 处理前返回
-必须由 `proxy.New` 构造的明确错误。master 固定执行 bootstrap decode → clone → `Configure` exactly once → 校验
-`paths.proxy_executable` 未改变 → final validation → 再 deep-clone/canonical serialize/digest
-冻结 EffectiveConfig → `BindRuntime(master)` → 启动 core。Configure Hook、provider 或 final
-validation 失败时尚未创建 SHM、listener、routesync session 或 worker。若设置
-`MasterExtension`，core 创建共享路由表与进程内 traffic aggregate 后调用其
-`Start(ctx, MasterHost)` 恰好一次；Start 失败时尚未绑定 listener、启动 routesync 或 worker，
-已建 SHM 会清理。Start 成功后同一对象的可选 `ManagementWrapper` 能包装
-`stats_socket` handler；能力只检查一次并冻结，返回 nil handler 会中止启动。
-
-worker 固定由 master 的 `/proc/self/exe` reexec：内置 master 得到 node-ctl worker，custom master
-得到 xproxy worker，配置中的 executable 不参与选择。master 通过另一 sealed memfd 传递 frozen
-EffectiveConfig、digest、worker id/epoch、FD protocol/mapping 与当前 executable identity；listener、
-wake/notify、stats、MMDS RPC、独立 admission arena 等作为继承 FD 传入,并同时校验 worker
-index/epoch、arena version/size/layout。worker 严格验证后调用
-`BindRuntime(worker)`。每个 worker epoch 都得到新的 `Runtime`，不得复用上一 epoch 的
-`WorkerExtension` 实例。worker 完成 stats hello/ready、构造 Host 并等待初始 route-table sync，
-随后调用 `WorkerExtension.Start` 恰好一次、冻结同一对象的可选 `IngressWrapper`，成功后才
-Serve.Start 错误或 nil wrapper 不开放 data listener,由既有 master supervisor 重启
-worker。worker 从不读取 `proxy.yaml`，也不调用 `Configure`；因此配置文件被替换或删除不影响
-replacement worker。
-
-Worker 是专用、单次运行的子进程：内置与定制入口在 `Run` 返回后必须退出 worker 进程。成功建立的 route SHM 与 admission 映射存活到进程退出；`PreparedWorker.Close` 只关闭继承描述符，不卸载仍可能被 handler/extension/traffic GC 引用的映射。Supervisor 仍须确认进程退出后才清理共享计数。普通 HTTP 与 HTTP/2 CONNECT 的取消会关闭 backend，与有效流量限制无关；HTTP/1 hijacked CONNECT 保留半关闭语义。详见 [worker 生命周期与转发取消](proxy-worker-lifetime_zh.md)。
-
-公共 `Config` 仅含可序列化声明。`Runtime` 是拒绝 JSON 编解码的进程对象，开放 logger、
-启动期 TLS material provider，以及按 process role 使用的可信、静态编译
-`MasterExtension`/`WorkerExtension`。provider 返回
-certificate chain、`crypto.Signer` 与可选 client CA pool，不能替换任意 `*tls.Config`。
-provider 非 nil 即为权威来源，错误不回退 cert/key 文件；最低 TLS version、HTTP/2 ALPN 与
-client-auth 策略仍由 core 固定。V1 不支持配置、材料或 Extension 热更新，custom component
-与 node-ctl 必须来自兼容版本。
-
-`MasterHost.Routes()` 提供 applied route 的 `Get`、generation-based `Watch` 与
-`SyncState(initializing|syncing|synced|stale)`。完整 generation 是
-`sync_begin → snapshot upsert* → sync_end`，之后按发布顺序发送 live upsert/delete；断线发送
-`sync_lost`。慢 watcher 只使自身 generation 失效并自动 full resync；允许重复、不保证观察到
-每个中间变化，也不是 durable audit。View 复制身份、profile/template/state/RunID、当前 endpoint、
-artifact location、fingerprint 与 route revision，不复制原始 secret/token，也不增加 route metadata
-或 SHM schema。observer 只在 core SHM apply 成功后非阻塞发布，绝不影响 routesync、barrier ACK、
-Wake 或 worker notification。
-
-`MasterHost.Traffic().Get` 以当前 route identity 直接读取 master 的进程内 worker aggregate，
-不经 stats UDS 回环，返回 map/pointer 副本；V1 没有 Traffic Watch。断线期间保留 route 仍可查询，
-要求新鲜度的调用者同时检查 Route `SyncState`。Management wrapper 可添加、覆盖或透传任意本地
-route；框架不保留 namespace、不做 route conflict 检测，也不规定认证。
-
-`WorkerHost.Process()` 返回当前 worker id/epoch；`GetRoute(sid)` 只做当前 SHM 点查并返回
-独立的非秘密 `RouteView` 副本，不暴露 raw record/Router/可变指针，也不提供 worker Route
-Watch.`IngressWrapper` 在 canonical Host/Header 与 CONNECT parser 之前接收 raw request;
-wrapped handler 只服务节点 `data_listen`,MMDS listener 不使用它.Extension
-可自行定义 Header/path/auth、覆盖或本地响应；未匹配请求调用 `next` 即保留 core token 与
-native exec 语义。
-
-私有认证完成后，`WorkerHost.ForwardAuthorized` 可复用 core 的
-`LookupRoute → TryBeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate →
-dial → ordinary HTTP/CONNECT → traffic close`。该 helper 拥有 `ResponseWriter`，返回后调用方
-不得再写错误；它不校验 Kuasar `X-Access-Token`。`Revalidate` 在 activation 后、dial 前执行；
-普通 HTTP 的 `Rewrite` 只收到 guest-facing clone，失败时不写任何 guest request bytes；CONNECT
-不调用 Rewrite。generic helper 拒绝 native exec，后者继续经 `next` 走 KAT + per-command CEL。
-本接口不增加 WebSocket transport；WebSocket 仍由 [#269](https://github.com/kuasar-sandbox/orchestrator/issues/269) 独立跟踪。
-
-该 API 只对应独立 Proxy,不为 conductor 增加数据面 factory;也不开放原始 Router,
-SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
-可选 management wrapper 和同一 worker Extension 的可选 ingress wrapper 外，不引入 Go plugin、
-运行时发现、多 Extension registry、通用 lifecycle hook、secret resolver 或 DI container。
-`node-ctl config proxy` 只做 declarative/bootstrap 与
-executable metadata 诊断，绝不执行 xproxy、调用 Runtime provider，或用诊断命令 EUID 代替实际
-启动的 runtime owner 校验。完整 Extension 合同见 [extensions.md（英文）](extensions.md)。
+进程退出、mmap 与传输取消的完整规则见 [§9.1](#91-worker-生命周期与传输取消)。
 
 ## 3. 部署拓扑
 
@@ -518,8 +419,9 @@ Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不�
 三类自定义 route:
 
 - `static`:直接返回声明的 UTF-8 `data`。
-- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换,DELETE 后立即 404,
-  不等待、不设 TTL,Content-Type 始终来自 route。
+- `secret`:按 route 的 `secret` 名查当前 opaque bytes;PUT 完整替换。DELETE 先持久删除再异步发布 route,
+  Proxy 投影应用后 guest GET 才返回 404;没有 deletion barrier,不取消已解析的响应,不等待 value、无 TTL。
+  Content-Type 始终来自 route。
 - `service`:master 从唯一 registry 解析本机 Unix socket,worker/handler
   构造全新 `GET <exact-path> HTTP/1.1`,`Host: mmds-service`,仅增加
   `E2b-Sandbox-Id: <sid>` 与 `E2b-Sandbox-Service: <service>`。不发送 port,不透传 guest
@@ -527,12 +429,17 @@ Content-Length、任意 Transfer-Encoding 或未知 body 直接 400,handler 不�
   有界 body 和合法 Content-Type(缺省 `text/plain`),不跟随 redirect;超时/过大/非法响应
   映射 504/502,service 缺失或 socket 不可达为 503。
 
-安全边界:routes 是 portable declaration,secret values 则只存在 sqlite ciphertext 或受信
-Proxy master 的有界 heap.它们不写普通 metadata,共享 mmap,
-日志、metrics、migration token、template 或构建产物,也不发送给 observer/node-link。
-但 guest 主动 GET 后,value 已进入 guest/application memory;随后执行包含内存的 Pause/snapshot
-可能把该副本作为普通 guest working set 捕获。平台不能在宿主侧从任意 guest 内存中擦除它,
-调用方应在应用侧缩短驻留时间,并把包含已消费 secret 的 snapshot 按敏感制品保护。
+安全边界:routes 是 portable declaration,secret values 的控制面存储为 SQLite ciphertext,运行期在受信 conductor/Proxy master 的有界 heap。
+平台不把 values 自动投影到普通 metadata、共享 mmap、日志、metrics、migration token、template 或 Build 制品,
+也不发给 observer/node-link。但 guest 主动 GET 后可以把 value 复制到应用内存或文件;
+后续 Pause/snapshot 或 image export 可能保留这些 guest 副本。宿主 DELETE 不会擦除 guest 已消费的副本。
+调用方应缩短应用驻留时间,并把包含这些副本的内存、磁盘或 image 制品按敏感数据保护。
+
+Sandbox-local MMDS 是本机对象/route 机制,不是 cluster Secret API、通用 CONNECT 配置面或 placement/admission 功能。
+Standalone CONNECT 的 secrets-only import 只在目标不存在且实际 import 时解析,目标已存在则跳过;
+完整迁移边界见 [Node §8.1.4](node_zh.md#814-publishtemplate-与-migration)。
+Build Register 的请求级 MMDS 仍在选定节点按 Build ownership 加密保存,见 [Build §3.1](node-build_zh.md#31-请求级-builder-输入)。
+普通 metadata 的偶然传递不构成 cluster-wide MMDS 支持或对应 E2E 验收承诺。
 
 ## 8. per-Sandbox traffic admission 与 stats
 
@@ -589,17 +496,19 @@ route 发布零 binding，worker 直接执行既有 `BeginParking`，不扫描 a
 route 的 `{slot,generation,effective limits}` 位于 route SHM。arena v2 仅保存 master 写入的
 每 slot active generation，以及携带 generation tag 的 `counters[worker][forward/envd/CI/exec]`。
 存活 worker 独占写入自己的 row；进程内 per-slot mutex 串行化初始化、acquire 和 release。
-master 不获取该锁、不清理存活 row；不存在 shared guard、draining state 或第二份可变 limit policy。
+master 不获取该锁、不清理存活 row；不存在 shared guard、identity hash、draining state 或第二份可变 limit policy。本地锁按 slot 而非仅按 SandboxID 组织。
 
 acquire 在进程内 per-slot mutex（该 slot 所有 service 共用）内执行:
 
 ```text
 verify active generation and effective limits
-→ atomically load every worker's four cells exactly once
+→ initialize own row for a new generation: tag=0, reset four cells, publish new tag
+→ read each row's tag, four cells, then tag again; include only unchanged matching tags
 → check total and target service together
-→ increment this worker's target-service cell
-→ enter local parking
-→ unlock and return success
+→ recheck active generation, increment own target-service cell, recheck again
+→ on revocation undo increment under the same local slot mutex and reject
+→ unlock the slot mutex and return the admission lease
+→ enter local parking under the distinct per-Sandbox traffic-entry mutex
 ```
 
 同一 worker、同一 Sandbox 的所有 service 共用该锁,所以每个 worker 同时最多有一个 acquire
@@ -615,7 +524,7 @@ release 的 flow 的 acquire→release 完整区间。删除这种正计数区�
 通过;同 worker 的串行关系也不变。缩减历史到 `T` 为止没有 release,其已发布计数恰好等于原
 执行在 `T` 的 actual active 数,因此适用上一段单调执行的 `M + N - 1` 上界。该论证不要求
 逐列读取构成原子 snapshot,并分别适用于同一次临界区内检查的 `total` 和目标 service。所以
-配置 `M`、worker 数 `N` 的合同是:
+对当前 generation、稳定的正上限 `M` 与 worker 数 `N`,合同是:
 
 ```text
 actual admitted inflight <= M + N - 1
@@ -625,12 +534,18 @@ parking→egress 不改 shared count。activation、dial、HTTP forward、contex
 response 及完整 CONNECT/exec relay 的最终 Close 都由同一个 flow/lease exactly once 释放;
 half-close 不释放。
 
-Delete 或 identity replacement 撤销旧 active generation，不等待存活 worker。slot 复用时
-发布新 generation；各 worker 在本地 slot mutex 下首次使用时初始化自己的 row。旧 release
-或者发生在初始化前，或者发现新 tag 后不再操作，因此不会减少新 identity 的计数。未改变身份
-的 starting/running/paused 更新保持 generation。Activate 重验完整 identity、policy validity、
-binding 与 arena generation 存活状态。route 发布失败时回滚 admission transaction，保留旧
-计数。暂停的 worker 不阻塞 master 发布或其它 worker；详见[分代所有权与回滚](proxy-admission-generations_zh.md)。
+Delete 或 identity replacement 撤销旧 active generation,不等待存活 worker,即使其停在 acquire 临界区。
+master 的分配事务保留一个 spare slot:先撤销旧 binding、分配新 binding,再发布 route;
+成功后回收旧 slot,失败则回收尚未发布的新 slot、恢复旧 generation,绝不清空旧连接计数。
+各 worker 首次使用新 generation 时只初始化自己的 row:先置 tag=0,清四个计数,最后发布新 tag。
+扫描在四计数前后读 tag,仅计入两次 tag 一致且匹配当前 generation 的 row。
+旧 release 或者在本 worker 初始化前完成,或者见新 tag 后不操作,不会减少新 identity 计数。
+acquire 在发布增量前后重验 generation;撤销则在同一本地 slot 锁内撤回增量。
+既有完整 RouteBinding/ExecIdentity 相等检查继续保护 activation 的凭据与策略;arena Valid 只表示 generation 存活。
+正常 starting/running/paused 更新与未改变 binding 的 full-sync 重放保留 generation/计数。
+本上界不把新旧身份合为一个 quota,也不承诺降低 limit 时驱逐已有 flow。
+worker 落点不是静态 M/N quota:单个 worker 可用全部 M,但多个 worker 不能各自独立用 M。
+不引入 watchdog、锁超时、争锁即杀进程、每 flow master RPC 或全局 limiter。
 
 worker stats stream fault 会先终止 worker。只有 supervisor 的 `cmd.Wait` 证明旧进程已退出、
 kernel 已关闭其连接后，master 才清理该 index，无需 shared lock；此前 stale-high 只能
@@ -643,11 +558,14 @@ kernel 已关闭其连接后，master 才清理该 index，无需 shared lock；
 `65536 × 2 × 4 × 8 = 4194304` bytes；连同 generation tags、headers 和一个 transaction spare
 entry，arena v2 mmap 为 `5767320` bytes。每个 worker 另持有 65537 个进程内 mutex，
 `sync.Mutex` 为 8 bytes 时占 `524296` bytes，不属于共享映射。size、stride、worker count/index 和 8-byte atomic alignment
-均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+及 layout version 均在 master/worker 映射时检查;当前仅支持项目 Linux `amd64`/`arm64` 范围。
+仅 admission arena 从 v1 升到 v2,不是用户配置或 routesync 版本变更;master/worker 必须使用同一 executable/bootstrap source set。
+保留 1/2/4/8-worker 阈值交错、service/total、偏斜、release 波次、rollback 和真实子进程退出清理测试。
+SIGSTOP 测试把真实 child 停在 acquire 内,要求 master 路由更新与 surviving worker 无需先唤醒或杀死它即可前进。
 
 worker 关闭后仍保留两种映射直到进程退出，包括异步扩展代码或 hijacked handler 超出
 `Run` 生命周期的情况。只有 `cmd.Wait` 后才清理对应 epoch 并启动 replacement；见
-[worker 生命周期](proxy-worker-lifetime_zh.md)。
+[worker 生命周期](#91-worker-生命周期与传输取消)。
 
 已持久化的 traffic metadata 损坏时，conductor 保留真实 Sandbox lifecycle 和 credentials，
 仅投影 `traffic_policy_invalid`。master 不发布 effective policy 或可用 admission binding。
@@ -783,6 +701,19 @@ column 只存在于独立 arena,不进入会因 backshift 移动的 route record
   鉴权失败 = 401;已识别但 profile 不支持的 service = 501;
   后端/proxy 未注册或不可达 = 502;已授权的 exec 恢复失败 = 503;ordinary admission 达限 =
   429 + `max_inflight_reached`,exec 达限 = CONNECT 200 后 generic ctl error。
+
+### 9.1 Worker 生命周期与传输取消
+
+Proxy worker 是专用、单次运行的子进程。内置入口及定制 App 在 `Run` 返回后必须退出该进程；它们不是供常驻进程在内部反复重启 worker 的 API。
+
+成功建立的 route SHM 和 admission arena 映射由 worker 进程拥有。`PreparedWorker.Close` 关闭继承的描述符，但不卸载这两份映射。`Run` 返回时，已有 handler、扩展和 traffic GC 仍可能持有引用。回收进程级映射不需要所有权标志、引用计数、优雅排空协议或等待 `http.Server.Shutdown`；内核在子进程退出时统一回收。映射构造函数仍清理自己尚未成功返回的操作；底层映射测试只有在所有读者退出后才可显式卸载。worker 生命周期测试使用子进程，不让生产退出路径为测试中的进程内复用增加机制。
+
+这不改变正常请求的清理。请求或完整隧道结束时仍关闭 backend，并恰好释放一次 inflight 贡献。supervisor 仍必须等待进程退出，才清理该 worker 的共享计数和统计贡献：卸载一个进程的映射不会清零其他进程仍使用的共享内存。master route apply 和 Create barrier 不等待 worker 健康或 handler 退出。
+
+流量限制只决定是否接纳新 flow，不决定已接纳 flow 的转发行为。普通 HTTP 请求取消和 HTTP/2 CONNECT stream 取消，无论是否配置有效限制，都关闭对应 backend。HTTP/1 hijacked CONNECT 保持半关闭语义，原 HTTP request context 不是通用的隧道关闭信号。native exec 保持既有 KAT、首帧、CEL、traffic admission 顺序。
+
+本修正不新增 worker 优雅排空、连接池、全局限流或公开配置，也不修改内部 wire/layout。
+
 
 ## 10. 性能
 
