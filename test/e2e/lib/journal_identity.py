@@ -10,7 +10,7 @@ def validate(kind, rows):
         raise ValueError("unknown journal case: " + kind)
     sandbox_tags = defaultdict(set)
     build_tags = defaultdict(set)
-    stable_by_run = {}
+    identity_by_run = {}
     observed = Counter()
     count = 0
     for row in rows:
@@ -30,16 +30,18 @@ def validate(kind, rows):
                 kind, tag, "sandbox identity leaked into Build"
             )
             assert tag != "sandbox", (kind, "Build output used sandbox tag")
+            identity = ("build", build)
             build_tags[(build, run)].add(tag)
         else:
             sid, stable = row.get("KUASAR_SANDBOX_ID"), row.get("KUASAR_STABLE_ID")
             assert isinstance(sid, str) and sid, (kind, tag, "missing SandboxID")
             assert isinstance(stable, str) and stable, (kind, tag, "missing StableID")
             assert tag != "build", (kind, "sandbox output used Build tag")
-            assert stable_by_run.setdefault((sid, run), stable) == stable, (
-                kind, "one sandbox attempt has conflicting StableIDs"
-            )
+            identity = ("sandbox", sid, stable)
             sandbox_tags[(sid, stable, run)].add(tag)
+        assert identity_by_run.setdefault(run, identity) == identity, (
+            kind, "one RunID has conflicting object identities"
+        )
 
     # Print counts and identities, not guest messages or complete journal rows.
     print(f"Journal coverage ({kind}): transports/tags={dict(observed)}", flush=True)

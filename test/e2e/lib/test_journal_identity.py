@@ -54,6 +54,32 @@ class JournalIdentityTest(unittest.TestCase):
         rows[-1]["KUASAR_STABLE_ID"] = "other"
         self.reject("sandbox", rows)
 
+    def test_same_run_cannot_change_both_sandbox_identity_fields(self):
+        rows = records(["console", "sandbox-ctl", "sandbox"])
+        rows[-1].update(KUASAR_SANDBOX_ID="wrong", KUASAR_STABLE_ID="wrong")
+        self.reject("sandbox", rows)
+        self.reject("sandbox", list(reversed(rows)))
+
+    def test_distinct_runs_can_have_distinct_sandbox_identities(self):
+        rows = records(["console", "sandbox-ctl"])
+        other = records(["console", "sandbox-ctl"], run="run-2", stable="local-2")
+        for row in other:
+            row["KUASAR_SANDBOX_ID"] = "local-2"
+        self.check("sandbox", rows + other)
+
+    def test_same_run_cannot_change_build_or_object_kind(self):
+        rows = records(["build", "console", "sandbox-ctl"], build=True)
+        wrong = records(["build"], build=True)
+        wrong[0]["KUASAR_BUILD_ID"] = "different-build"
+        self.reject("build", rows + wrong)
+        self.reject("build", list(reversed(rows + wrong)))
+        mixed = records(["console", "sandbox-ctl"]) + records(["build"], build=True)
+        self.reject("sandbox", mixed)
+        self.reject("sandbox", list(reversed(mixed)))
+
+    def test_repeated_build_phases_keep_the_same_owner(self):
+        self.check("build", records(["build", "console", "sandbox-ctl"], build=True) * 2)
+
     def test_cross_object_fields_and_tags_are_rejected(self):
         for key in ("KUASAR_SANDBOX_ID", "KUASAR_STABLE_ID"):
             rows = records(["build", "console", "sandbox-ctl"], build=True)
