@@ -261,7 +261,7 @@ func (o *Orchestrator) validateInitialBuildMMDS(build *types.Build, document san
 		return nil, nil
 	}
 	transportRow := &types.Sandbox{
-		ID: "build-" + build.BuildID, Profile: build.Profile, TemplateID: build.TemplateID,
+		ID: buildMMDSID(build.BuildID), Profile: build.Profile, TemplateID: build.TemplateID,
 		State: types.StateRunning, RunID: "build-registration-check",
 		APISecret: build.APISecret, ManifestKey: build.ManifestKey, Metadata: build.Metadata,
 	}

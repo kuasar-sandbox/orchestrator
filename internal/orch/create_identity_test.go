@@ -308,7 +308,9 @@ func TestCreateIdentityHookBoundary(t *testing.T) {
 }
 
 func TestClusterCreatePreservesOriginalCredentialInput(t *testing.T) {
-	o, ctx := newAsyncConnectTestOrchestrator(t, &config.Config{}, &countingLauncher{})
+	cfg := &config.Config{}
+	cfg.Sandbox.TimeoutSec = 60
+	o, ctx := newAsyncConnectTestOrchestrator(t, cfg, &countingLauncher{})
 	blocked := &blockedCreateVS{entered: make(chan struct{}), gate: make(chan struct{})}
 	o.vs = blocked
 	_, _, fingerprint := allowlistedBuildIdentity(t, o)

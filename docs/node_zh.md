@@ -4,6 +4,8 @@
 
 直连 Create 的可选 ID、Header/metadata 优先级和 insert-only 冲突语义参见[创建时指定沙箱身份](sandbox-identity_zh.md)。
 
+`kuasar-sandbox.identity` 是直连 Create 的请求级命名空间（`id` 和可选 `stable_id`），也接受等价的 `X-Kuasar-Sandbox-Identity` Header。核心在 Create Hook 前提取它，不继承或原样持久化为配置；模板 Build 注册拒绝该项。Build 内部 MMDS 路由索引使用独立命名空间，因此合法的 `build-` 前缀用户 ID 仍然受支持。
+
 `node-ctl conductor serve` 是计算节点上的单实例控制 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
 microVM 沙箱以 e2b 协议暴露给客户端——在本文协议与已验证版本支持的操作范围内，未改造的 e2b SDK（python/js `e2b`、
 `@e2b/code-interpreter`）与 e2b CLI 可直接指向本机运行。`node-ctl conductor serve` 一身兼数职:

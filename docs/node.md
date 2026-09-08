@@ -5,6 +5,8 @@
 
 For optional direct-Create IDs, Header/metadata precedence and insert-only conflicts, see [Sandbox identity on Create](sandbox-identity.md).
 
+`kuasar-sandbox.identity` is a direct Create request-only namespace (`id`, optional `stable_id`), also accepted through `X-Kuasar-Sandbox-Identity`. It is extracted before the Create Hook and never inherited or persisted as configuration. Template Build registration rejects it. The internal Build MMDS route cache uses a disjoint namespace, so legal caller IDs beginning with `build-` remain supported.
+
 `node-ctl` runs one resident conductor per compute node and exposes its microVM sandboxes through an **e2b-compatible API**. The supported operations can be used by unmodified Python/JavaScript `e2b`, `@e2b/code-interpreter` SDKs and the e2b CLI, subject to the compatibility boundaries and pinned versions below. `node-ctl conductor serve` provides the **API** (control-plane REST for sandbox lifecycle, template builds and authentication), **host orchestration** (systemd template units for `sandbox-ctl`/builder tasks and `connector-ctl vswitch` networking), an optional **resource controller** (node arbitration through `resource_listen`; see [node-resource.md](node-resource.md)), and the **node-link client** that joins cluster-ctl orchestration (§10). The separately deployed `node-ctl proxy serve` owns guest data-plane forwarding; conductor does not serve it.
 
 A node can run **standalone**, serving e2b SDK/CLI clients on one machine, or **join a cluster** managed by Registry, Router and Placer ([cluster.md](cluster.md)). Both modes share the same e2b control plane and lifecycle primitives. **Create, pause, kill and template execution remain node-local**; cluster commands reuse these primitives (§10).
