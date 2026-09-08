@@ -1,6 +1,8 @@
+[English](extensions.md) | [简体中文](extensions_zh.md)
+
 # Runtime extensions
 
-Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](sandbox-identity.md).
+Create identity is selected before the Hook. `SandboxOperation.SandboxID` stays immutable, and reintroducing `kuasar-sandbox.identity` into the cleaned mutable metadata is rejected. See [Sandbox identity on Create](node.md#412-create-identity).
 
 Kuasar's conductor and independent Proxy support statically linked runtime
 extensions for deployments that need process-local integration without carrying
@@ -15,6 +17,75 @@ discover or load plugins at runtime, maintain an extension registry, assign
 priorities, provide a dependency-injection container, or reserve URL
 namespaces. A private project can compose any modules it needs behind the one
 object for that role and lifetime.
+
+## Component bootstrap and process-local material
+
+### Conductor bootstrap
+
+Operations still starts `node-ctl conductor serve --config ...`, which first performs environment-independent strict decoding/defaulting/declarative validation. Empty `paths.conductor_executable` selects explicit final validation and built-in runtime key/TLS/credential resolution. Otherwise node-ctl opens a protected absolute executable, validates runtime owner/mode/file identity against that FD, and executes the same file through `/proc/self/fd`, without resolving a replaceable pathname again. Sealed bootstrap records its device/inode; xconductor compares them only with `/proc/self/exe`. Deployment-time pathname replacement/deletion cannot alter the validated identity. node-ctl replaces itself with xconductor through exec.
+
+Bootstrap environment contains FD numbers only; config bytes/digest live in a memfd sealed against writes, growth, shrinkage and further seal changes. Direct xconductor execution or missing/truncated/oversized/version/digest/component-mismatched bootstrap fails closed. This organizes processes and prevents misuse; it does not defend against a malicious same-UID process.
+
+A custom main needs public packages only; the complete compilable example is [examples/custom-conductor](../examples/custom-conductor/README.md):
+
+```go
+app := conductor.New(conductor.Hooks{
+    Configure: func(ctx context.Context, cfg *conductor.Config, rt *conductor.Runtime) error {
+        // Adjust declarative Config; bind startup Runtime providers.
+        rt.Extension = myExtension
+        return nil
+    },
+})
+if err := app.Run(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`New` has no side effects. `Run` is one-shot and handles SIGINT/SIGTERM; embedders may use RunContext. App does not call os.Exit. Ordering is fixed: decode bootstrap → clone Config → Configure exactly once → verify unchanged conductor executable → final declarative validation → clone/freeze again → resolve Runtime materials → start shared core. Configure/provider/final-validation failures precede opening durable storage, listeners, systemd launchers/units or node-link. A hook may replace the whole Config but must preserve the originally frozen executable. Defaults are not reapplied after the hook.
+
+App must come from conductor.New. A zero value or nil receiver returns an explicit error from Run/RunContext before signal handlers, bootstrap reads or goroutines. `node-ctl config conductor` performs declarative/bootstrap and executable-metadata diagnosis only; it neither executes custom App/providers nor substitutes its diagnostic EUID for the actual service owner policy. Custom-mode output explicitly defers runtime ownership/final validation to component startup.
+
+Config contains only serializable declarations. Runtime is a process object that rejects JSON serialization and exposes logging, TLS material, an ordered AES-256 key set, neutral builder-files-storage credentials and one trusted statically compiled Extension. TLS providers return DER certificate chains, crypto.Signer and root/client CA pools, never arbitrary tls.Config; core retains minimum TLS version, ALPN and mTLS/client verification. Providers run at startup or SDK credential refresh, outside request hot paths. A non-nil provider is authoritative; errors never fall back to files/environment/static credentials. V1 has no hot reload.
+
+Bootstrap retains original node-ctl's exact path. Generated runner/builder units execute that node-ctl. Adjacent sandbox-ctl/connector-ctl/flatten-ctl/manifest-ctl resolution also uses its release directory, not xconductor's. Custom component and node-ctl must be compatible versions. Public API exposes no store/launcher/vswitch/orch/Router internals; a trusted API wrapper receives only http.Handler next. There is no Go plugin, runtime discovery, global registry, dynamic middleware registration or DI container. Conductor serves control API only.
+
+### Proxy bootstrap
+
+The sole operator entry point remains `node-ctl proxy serve --config ...`. Public Load/Decode performs only environment-independent strict decoding, defaults, and validation of provided values. node-ctl explicitly performs final validation for the built-in path; the custom path defers it until after master `Configure`. With a nonempty `paths.proxy_executable`, node-ctl validates the protected absolute executable's runtime owner, mode, and identity. It writes a bootstrap snapshot of public `config.Proxy` into a size-bounded sealed memfd that forbids writes, growth, and shrinking. Only the FD number enters the environment; configuration bodies and TLS material enter neither argv nor environment variables. node-ctl replaces itself with xproxy through the same validated open file and never falls back to the built-in implementation on failure. Direct xproxy execution, missing/corrupt bootstrap, and component/file identity mismatches fail closed. These checks organize processes and prevent misuse; they are not cryptographic authentication against a malicious process with the same UID.
+
+See the buildable [custom-proxy example](../examples/custom-proxy/README.md):
+
+```go
+app := proxy.New(proxy.Hooks{
+    Configure: func(ctx context.Context, cfg *proxy.Config) error {
+        // master-only declarative override
+        return nil
+    },
+    BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
+        // bind process-local logger / TLS provider
+        if process.Role == proxy.RoleMaster {
+            rt.MasterExtension = newMasterExtension()
+        } else if process.Role == proxy.RoleWorker {
+            // Construct a fresh instance for this worker epoch.
+            rt.WorkerExtension = newWorkerExtension()
+        }
+        return nil
+    },
+})
+if err := app.Run(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`New` has no side effects. `Run` is one-shot, handles SIGINT/SIGTERM, and does not call `os.Exit`; an embedding host can use `RunContext`. A zero-value/nil App returns an explicit error requiring construction through `proxy.New` before processing signals or component/worker bootstrap. The master's order is fixed: decode bootstrap → clone → call `Configure` exactly once → verify that `paths.proxy_executable` is unchanged → final validation → deep-clone, canonical serialization, and digest to freeze EffectiveConfig → `BindRuntime(master)` → start the core. Configure-hook, provider, or final-validation failure occurs before SHM, listeners, routesync sessions, or workers are created. If `MasterExtension` is set, the core creates the shared route table and in-process traffic aggregate, then calls `Start(ctx, MasterHost)` exactly once. Start failure occurs before listener binding, routesync, or workers, and cleans up the created SHM. After successful Start, the same object's optional `ManagementWrapper` can wrap the `stats_socket` handler. Capability detection happens once and is frozen; a nil returned handler aborts startup.
+
+Workers always reexecute the master's `/proc/self/exe`: a built-in master creates a node-ctl worker, and a custom master creates an xproxy worker. The configured executable does not select workers. Another sealed memfd carries frozen EffectiveConfig, its digest, worker ID/epoch, FD protocol/mapping, and current executable identity. Listeners, wake/notify, stats, MMDS RPC, and the independent admission arena are inherited FDs; worker index/epoch and arena version/size/layout are also validated. After strict validation, the worker calls `BindRuntime(worker)`. Each worker epoch receives a new `Runtime` and must not reuse the previous epoch's `WorkerExtension`. The worker completes stats hello/ready, constructs its Host, waits for the initial route-table sync, calls `WorkerExtension.Start` exactly once, and freezes the same object's optional `IngressWrapper`. Only then does it Serve. A Start error or nil wrapper keeps the data listener closed to serving; the existing master supervisor restarts the worker. Workers never read `proxy.yaml` or call `Configure`, so replacing or deleting that file does not affect replacement workers.
+
+Public `Config` holds only serializable declarations. `Runtime` is a process object that rejects JSON encoding/decoding. It exposes a logger, a startup TLS-material provider, and trusted statically compiled `MasterExtension`/`WorkerExtension` objects selected by process role. The provider returns a certificate chain, `crypto.Signer`, and optional client CA pool; it cannot replace an arbitrary `*tls.Config`. A non-nil provider is authoritative and errors never fall back to cert/key files. The core still fixes the minimum TLS version, HTTP/2 ALPN, and client-auth policy. V1 supports no hot updates of configuration, material, or extensions. A custom component and node-ctl must use compatible versions.
+
+This API applies only to the independent Proxy and adds no conductor data-plane factory. It exposes no raw Router, SHM, listener, routesync, stats, dial target, or credential records. Beyond the optional management wrapper of the same master extension and ingress wrapper of the same worker extension, it introduces no Go plugins, runtime discovery, multi-extension registry, generic lifecycle hooks, secret resolver, or DI container. `node-ctl config proxy` diagnoses only declarative/bootstrap configuration and executable metadata. It never executes xproxy, invokes Runtime providers, or substitutes the diagnostic command's EUID for actual startup ownership checks. See [extensions.md](extensions.md) for the full extension contract.
+
+Process-owned mapping and transport cleanup are defined once in the [Proxy worker lifetime contract](node-proxy.md#91-worker-lifetime-and-transport-cancellation). Public source, Hook and wrapper interfaces follow below; those are not another data-plane implementation.
 
 ## Conductor object sources
 

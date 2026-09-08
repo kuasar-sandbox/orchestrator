@@ -729,67 +729,14 @@ Registry does not implement `SandboxGroupProvider` / `SandboxGroupImporter`. Gro
 
 Once a group disappears from its provider, new Place/verify-key calls treat it as nonexistent. Credential pairs already cached in node_link are not proactively deleted; Registry/node TTLs evict them. Credential pairs already copied into existing sandbox/build records are unaffected.
 
-<a id="10-router"></a>
+<a id="10-router-1"></a>
 ## 10. Router
 
-Router is a stateless northbound entry with local caches:
+Router is the stateless northbound E2B control/data entry. Registry supplies authenticated, group-scoped route and Build state through the protocols defined in this document; the node remains lifecycle/resource authority. Public clients retain stable SandboxID, while the selected node target may change. Protected route credentials must not be exposed through public observation or ordinary watch/list responses (§11).
 
-- Route-resolution cache: `(group, route_key, stable sandbox_id)` → NodeSandboxID / APIEndpoint / DataEndpoint / profile / StableID / APISecret / both root fingerprints / ServiceSecret / EnvdAccessToken / TrafficAccessToken / ForwardAccessToken / RouteRevision.
-- Build-forwarding cache: `(group, build_id)` → APIEndpoint; build_id alone is insufficient.
-- In-flight requests hold only their own route copy and counters. They neither provide a routing cache for new requests nor prevent a new RouteRevision from replacing an old NodeSandboxID.
+The complete [Router contract](cluster-router.md) owns cache keys/revisions, membership discovery, operation-specific request conversion, API/data endpoint selection, native-exec token and first-frame admission, retry boundaries, and forwarding. A complete node target can be forwarded to even while paused/starting; the node owns parking/activation. Registry Reserve/Resolve schemas remain defined in [§8](#8-route_link), rather than copied into the Router implementation guide.
 
-```text
-request(group, route_key, sandbox_id)
-  │
-  ├─ cache hit with node target ───► node proxy (ready/paused/starting)
-  ├─ cache hit without target ─────► data Reserve ──► node proxy
-  │
-  └─ miss ─────────────────────────► route owner Resolve
-                                      │
-                                      ├─ complete target ───► node proxy
-                                      └─ missing target ────► Reserve ──► node proxy
-```
-
-When a node proxy returns typed `not_found`/`unauthorized` during the CONNECT handshake, Router evicts the old target, calls `ReserveData` once with the same credential to revalidate/refresh the route, then retries only once. Ordinary connection failures only evict the cache entry.
-
-Data requests for unknown routes return not-found after Resolve and do not create sandboxes. Once a route is found, Router translates public SandboxID to NodeSandboxID at the node boundary: control rewrites the path and dials only APIEndpoint; outer data-plane CONNECT, Host and existing sandbox-identity headers use NodeSandboxID and dial only DataEndpoint. Either missing endpoint fails closed, with no cross-plane fallback. Public create/connect/list/get results continue to expose only stable SandboxID.
-
-A newly received route cannot overwrite the cache with a lower RouteRevision or replace NodeSandboxID at an equal RouteRevision. An old-generation in-flight failure may evict only if the cache still points to that NodeSandboxID, protecting a newer generation already installed there.
-
-All requests must carry group. Router bootstraps `/cluster/membership` and resolves the route owner using active membership. Membership refresh tries bootstrap and known active/next/old_grace members, selecting the response with the newest active version.
-
-Reserve always validates the client's raw API key for create/connect/exec-session. Create's group admission uses provider APISecret through a ready placer; connect/exec-session uses the APISecret bound to the sandbox business record. For other control operations, Router asks the route owner's verify-key endpoint, which fails over only among ready placers. Once the sandbox is READY, its node projects the business record's bound APISecret, ServiceSecret and purpose-specific access tokens into the protected route for trusted Registry/router/proxy use. Raw ManifestKey does not enter this path and is not used for API authentication.
-
-Cluster native exec control does not reverse-proxy the public node API to the current node:
-
-```text
-POST /sandboxes/<stableSID>/exec-sessions
-  X-Kuasar-Sandbox-Group + X-Kuasar-Route-Key + X-API-KEY
-  empty / {} / {"ttlSeconds":N,"conditions":[{"expr":"..."}]} + optional MigrationToken
-    ↓ Router strict 64 KiB decode
-Reserve(operation=exec-session, expected stableSID, typed TTL + conditions body)
-    ↓ Registry verifies API key and sends CmdExecSession
-Node validates/imports, compiles conditions, signs, accepts async resume
-    ↓ Route + ExecSessionResult
-201 Cache-Control:no-store {"execAccessToken":"kat1..."}
-```
-
-Router neither signs tokens, sends raw API keys through node-link, nor exposes NodeSandboxID. Its body shares the direct Node endpoint's strict decoder: at most 64 KiB for the entire raw body, with an empty body allowed. Missing `conditions` and `[]` normalize to unrestricted nil. Explicit `null`, unknown/duplicate fields, an empty expr, negative values, a trailing second JSON value and out-of-bounds TTL are rejected. Internal Registry/node failures map to fixed, sanitized exec-session errors without NodeSandboxID, socket path, fingerprint, ServiceSecret or token payload.
-
-The data plane interprets `E2b-Sandbox-Service` for backend selection only on CONNECT. Ordinary HTTP uses legacy-port forwarding and preserves the application header, except that exact `service=exec` is rejected with 405 before activation. Without a CONNECT service, raw-port behavior remains. The node selects the final backend using its locally trusted profile. In particular, bare legacy 49983/49999 are ordinary TCP forwarding targets and do not return 501. Cluster Router currently has a service-aware branch only for `service=exec`; the other three explicit service values are not claimed as supported. [#63](https://github.com/kuasar-sandbox/orchestrator/issues/63) tracks the complete cluster passthrough boundary.
-
-`service=exec` accepts only CONNECT and always enforces KAT. Router first performs a side-effect-free Resolve/cache lookup, validates the original `X-Access-Token` with `StableID + ServiceSecret`, and compiles conditions only after successful HMAC verification. After public CONNECT 200, Router strictly reads the first ExecRequest, rechecks expiry and evaluates conditions. Failure neither calls `Reserve(operation=data)` nor connects to the node. After successful request admission, a complete node target connects directly to the node proxy; a missing target calls `Reserve(operation=data)` and revalidates stable lineage/credentials against the fresh route. It then constructs the second-hop CONNECT:
-
-```text
-E2b-Sandbox-Id:      <current NodeSandboxID>
-E2b-Sandbox-Service: exec
-E2b-Sandbox-Port:    <original port, if present>
-X-Access-Token:      <same KAT>
-```
-
-Only stable SID is rewritten to NodeSandboxID between hops. Service/port/token values and the token header stay unchanged; Router sends the first frame's Raw bytes unchanged exactly once. The final node does not trust Router: it validates the same KAT against its local route, rereads and evaluates the complete ExecRequest gate, and only then permits parking, resume and connection to `ctl.sock`. A complete-target cache hot path adds no Registry RPC, while retaining both Router and node validation. KAT binds StableID, not NodeSandboxID/generation, so same-node resume, cross-node migration or re-placement of one logical sandbox needs no client re-signing; a new CONNECT always targets current NodeSandboxID. Typed stale retry is allowed only before Raw has been written to any node. After node CONNECT 200 and Raw transmission, retry/reroute/replay is forbidden and ctl errors are relayed unchanged.
-
-Ordinary non-exec traffic follows each hop's own effective authentication policy. Router `log`/`off` can admit invalid ordinary credentials; enforcing Router policy does not alter node policy. Preventing invalid ordinary credentials from parking, waking or reaching a backend at the final node requires that node's effective `enforce` policy. Native exec always enforces both token and request gates regardless of ordinary policy.
+Read these as two ends of one protocol: this document defines what Registry accepts, persists and returns; the Router guide defines how its caller uses those results. Neither ordinary data lookup nor stale-route retry is permission to create an unknown Sandbox, skip authentication, or replay admitted exec bytes.
 
 <a id="11-密钥与鉴权"></a>
 ## 11. Keys and authentication

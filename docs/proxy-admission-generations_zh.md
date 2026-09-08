@@ -1,6 +1,7 @@
+[English](proxy-admission-generations.md) | [简体中文](proxy-admission-generations_zh.md)
+
 # worker 自有的 admission 世代计数
 
-[English](proxy-admission-generations.md)
 
 ## 用所有权消除跨进程锁恢复
 

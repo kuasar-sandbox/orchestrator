@@ -74,49 +74,9 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 <a id="21-静态定制-proxy"></a>
 ### 2.1 Statically customized Proxy
 
-The sole operator entry point remains `node-ctl proxy serve --config ...`. Public Load/Decode performs only environment-independent strict decoding, defaults, and validation of provided values. node-ctl explicitly performs final validation for the built-in path; the custom path defers it until after master `Configure`. With a nonempty `paths.proxy_executable`, node-ctl validates the protected absolute executable's runtime owner, mode, and identity. It writes a bootstrap snapshot of public `config.Proxy` into a size-bounded sealed memfd that forbids writes, growth, and shrinking. Only the FD number enters the environment; configuration bodies and TLS material enter neither argv nor environment variables. node-ctl replaces itself with xproxy through the same validated open file and never falls back to the built-in implementation on failure. Direct xproxy execution, missing/corrupt bootstrap, and component/file identity mismatches fail closed. These checks organize processes and prevent misuse; they are not cryptographic authentication against a malicious process with the same UID.
+The full static customization interfaces, configuration hooks, runtime binding, private route sources and authorized forwarding contract is maintained in [Extensions](extensions.md#proxy-bootstrap). This specification retains the core routing, credential and process-ownership invariants.
 
-See the buildable [custom-proxy example](../examples/custom-proxy/README.md):
-
-```go
-app := proxy.New(proxy.Hooks{
-    Configure: func(ctx context.Context, cfg *proxy.Config) error {
-        // master-only declarative override
-        return nil
-    },
-    BindRuntime: func(ctx context.Context, process proxy.Process, rt *proxy.Runtime) error {
-        // bind process-local logger / TLS provider
-        if process.Role == proxy.RoleMaster {
-            rt.MasterExtension = newMasterExtension()
-        } else if process.Role == proxy.RoleWorker {
-            // Construct a fresh instance for this worker epoch.
-            rt.WorkerExtension = newWorkerExtension()
-        }
-        return nil
-    },
-})
-if err := app.Run(); err != nil {
-    log.Fatal(err)
-}
-```
-
-`New` has no side effects. `Run` is one-shot, handles SIGINT/SIGTERM, and does not call `os.Exit`; an embedding host can use `RunContext`. A zero-value/nil App returns an explicit error requiring construction through `proxy.New` before processing signals or component/worker bootstrap. The master's order is fixed: decode bootstrap → clone → call `Configure` exactly once → verify that `paths.proxy_executable` is unchanged → final validation → deep-clone, canonical serialization, and digest to freeze EffectiveConfig → `BindRuntime(master)` → start the core. Configure-hook, provider, or final-validation failure occurs before SHM, listeners, routesync sessions, or workers are created. If `MasterExtension` is set, the core creates the shared route table and in-process traffic aggregate, then calls `Start(ctx, MasterHost)` exactly once. Start failure occurs before listener binding, routesync, or workers, and cleans up the created SHM. After successful Start, the same object's optional `ManagementWrapper` can wrap the `stats_socket` handler. Capability detection happens once and is frozen; a nil returned handler aborts startup.
-
-Workers always reexecute the master's `/proc/self/exe`: a built-in master creates a node-ctl worker, and a custom master creates an xproxy worker. The configured executable does not select workers. Another sealed memfd carries frozen EffectiveConfig, its digest, worker ID/epoch, FD protocol/mapping, and current executable identity. Listeners, wake/notify, stats, MMDS RPC, and the independent admission arena are inherited FDs; worker index/epoch and arena version/size/layout are also validated. After strict validation, the worker calls `BindRuntime(worker)`. Each worker epoch receives a new `Runtime` and must not reuse the previous epoch's `WorkerExtension`. The worker completes stats hello/ready, constructs its Host, waits for the initial route-table sync, calls `WorkerExtension.Start` exactly once, and freezes the same object's optional `IngressWrapper`. Only then does it Serve. A Start error or nil wrapper keeps the data listener closed to serving; the existing master supervisor restarts the worker. Workers never read `proxy.yaml` or call `Configure`, so replacing or deleting that file does not affect replacement workers.
-
-Workers are dedicated one-shot subprocesses: built-in and custom entry points must exit the worker process after `Run` returns. Successful route SHM and admission mappings live until process exit; `PreparedWorker.Close` closes inherited descriptors without unmapping them, because handlers/extensions/traffic GC may still hold references. The supervisor still waits for confirmed exit before clearing shared counters. Ordinary HTTP and HTTP/2 CONNECT cancellation closes the backend independently of effective traffic limits; HTTP/1 hijacked CONNECT retains half-close semantics. See [worker lifetime and transport cancellation](proxy-worker-lifetime.md).
-
-Public `Config` holds only serializable declarations. `Runtime` is a process object that rejects JSON encoding/decoding. It exposes a logger, a startup TLS-material provider, and trusted statically compiled `MasterExtension`/`WorkerExtension` objects selected by process role. The provider returns a certificate chain, `crypto.Signer`, and optional client CA pool; it cannot replace an arbitrary `*tls.Config`. A non-nil provider is authoritative and errors never fall back to cert/key files. The core still fixes the minimum TLS version, HTTP/2 ALPN, and client-auth policy. V1 supports no hot updates of configuration, material, or extensions. A custom component and node-ctl must use compatible versions.
-
-`MasterHost.Routes()` exposes applied-route `Get`, generation-based `Watch`, and `SyncState(initializing|syncing|synced|stale)`. A full generation is `sync_begin → snapshot upsert* → sync_end`, followed by live upsert/delete in publication order; disconnect emits `sync_lost`. A slow watcher invalidates only its own generation and automatically receives a full resync. Duplicates are allowed, every intermediate change is not guaranteed, and this is not a durable audit stream. Views copy identity, profile/template/state/RunID, current endpoints, artifact location, fingerprints, and route revision. They copy no raw secrets/tokens and add neither route metadata nor an SHM schema. Observers publish nonblockingly only after successful core SHM application, never affecting routesync, barrier ACK, Wake, or worker notification.
-
-`MasterHost.Traffic().Get` reads the master's in-process worker aggregate directly against current route identity, without looping through the stats UDS, and returns map/pointer copies. V1 has no Traffic Watch. Retained routes remain queryable during disconnection; callers requiring freshness must also check Route `SyncState`. A management wrapper may add, override, or pass through any local route. The framework reserves no namespace, detects no route conflicts, and prescribes no authentication.
-
-`WorkerHost.Process()` returns the current worker ID/epoch. `GetRoute(sid)` performs only a current-SHM point lookup and returns an independent, non-secret `RouteView` copy. It exposes no raw record, Router, or mutable pointer, and offers no worker Route Watch. `IngressWrapper` receives raw requests before canonical Host/Header and CONNECT parsing. The wrapped handler serves only node `data_listen`, never the MMDS listener. An extension may define its own headers, paths, or authentication, override behavior, or respond locally. Calling `next` for unmatched requests preserves core token and native exec semantics.
-
-After private authentication, `WorkerHost.ForwardAuthorized` can reuse the core path `LookupRoute → TryBeginParking → ActivateRoute/Wake/binding revalidation → optional Revalidate → dial → ordinary HTTP/CONNECT → traffic close`. This helper owns `ResponseWriter`; its caller must not write another error after return. It does not validate Kuasar `X-Access-Token`. `Revalidate` runs after activation and before dial. Ordinary HTTP `Rewrite` receives only the guest-facing clone, and failure writes no guest-request bytes. CONNECT never calls Rewrite. The generic helper rejects native exec, which must continue through `next` and the KAT plus per-command CEL gates. This interface adds no WebSocket transport; [#269](https://github.com/kuasar-sandbox/orchestrator/issues/269) tracks that separately.
-
-This API applies only to the independent Proxy and adds no conductor data-plane factory. It exposes no raw Router, SHM, listener, routesync, stats, dial target, or credential records. Beyond the optional management wrapper of the same master extension and ingress wrapper of the same worker extension, it introduces no Go plugins, runtime discovery, multi-extension registry, generic lifecycle hooks, secret resolver, or DI container. `node-ctl config proxy` diagnoses only declarative/bootstrap configuration and executable metadata. It never executes xproxy, invokes Runtime providers, or substitutes the diagnostic command's EUID for actual startup ownership checks. See [extensions.md](extensions.md) for the full extension contract.
+Process exit, mapping ownership and transport cancellation are defined in [§9.1](#91-worker-lifetime-and-transport-cancellation).
 
 <a id="3-部署拓扑"></a>
 ## 3. Deployment topology
@@ -385,7 +345,7 @@ A worker stats-stream fault first terminates the worker. Only after supervisor `
 
 For `route_capacity=65536,workers=2`, counter payload occupies `65536 × 2 × 4 × 8 = 4194304` bytes. Including generation tags, headers and one transaction spare entry, arena v2 mmap is `5767320` bytes. Each worker separately holds 65537 local mutexes, or `524296` bytes when `sync.Mutex` is eight bytes. These mutexes are not shared mappings. Master and worker mapping validate size, stride, worker count/index, and eight-byte atomic alignment. Current support is limited to the project's Linux `amd64`/`arm64` scope.
 
-Worker shutdown retains both mappings until process exit, including when asynchronous extension code or hijacked handlers outlive `Run`. Only `cmd.Wait` permits clearing the exact worker epoch and starting its replacement; see [worker lifetime](proxy-worker-lifetime.md).
+Worker shutdown retains both mappings until process exit, including when asynchronous extension code or hijacked handlers outlive `Run`. Only `cmd.Wait` permits clearing the exact worker epoch and starting its replacement; see [worker lifetime](#91-worker-lifetime-and-transport-cancellation).
 
 If already-persisted traffic metadata is invalid, conductor keeps the actual Sandbox lifecycle and credentials and projects only `traffic_policy_invalid`. Master publishes no effective policy or enabled admission binding. This never fabricates `dead`/Delete, removes Registry ownership, disables MMDS, or interrupts full synchronization for other routes. Existing request and migration input validation remains strict.
 
@@ -474,6 +434,37 @@ Workers send absolute state to the master over socketpairs; the conductor querie
 - **Park/wake:** Lookup sends no Wake. Only Activate admitted by the effective authentication policy may wake a paused SID and wait for shared-table updates. Starting only parks, never wakes; paused/Delete immediately ends that wait. Resume ownership and current-launch progression remain with the conductor.
 - **Stats stream:** EOF, timeout, or protocol error on any worker stream stops that worker. Traffic GET returns 503 until confirmed exit; then contributions are removed and readiness waits for the replacement. Prometheus counters remain monotone throughout the master's lifetime and do not regress on worker epoch changes.
 - **Failure codes:** unavailable Create proxy stream, barrier timeout/disconnect, or route-apply failure = 503; invalid target = 400; non-CONNECT exec = 405; unknown/deleted SID = 404; rejected authentication = 401; recognized service unsupported by the profile = 501; unregistered/unreachable backend or proxy = 502; authorized exec resume failure = 503; ordinary admission exhaustion = 429 plus `max_inflight_reached`; exec exhaustion = generic ctl error after CONNECT 200.
+
+### 9.1 Worker lifetime and transport cancellation
+
+A Proxy worker is a dedicated one-shot subprocess. The built-in and custom App
+entry points must exit that process after `Run` returns; they are not an API for
+restarting workers inside an otherwise long-lived process.
+
+Successful route SHM and admission arena mappings belong to the worker process.
+`PreparedWorker.Close` closes inherited descriptors but does not unmap either
+mapping. Existing handlers, extensions and traffic GC may still hold references
+when `Run` returns. No ownership flag, reference count, graceful-drain protocol or
+`http.Server.Shutdown` join is needed to reclaim process-owned mappings. The
+kernel reclaims them when the subprocess exits. Mapping constructors still clean
+up their own unsuccessful operations; low-level mapping tests can explicitly
+unmap only after every reader has stopped. Worker lifecycle tests use child
+processes instead of requiring production teardown to serve test-only reuse.
+
+This does not change normal request cleanup. A finished request or complete tunnel
+still closes its backend and releases its inflight contribution exactly once.
+The supervisor must still wait for process exit before clearing that worker's
+shared counters and stats contribution: unmapping a process does not zero shared
+memory used by surviving processes. Master route apply and Create barriers do not
+wait for worker health or handler shutdown.
+
+Traffic limits decide whether a new flow is admitted, not how an admitted flow
+is transported. Ordinary HTTP cancellation and HTTP/2 CONNECT stream cancellation
+close the associated backend with or without an effective limit. HTTP/1 hijacked
+CONNECT retains half-close semantics; its original HTTP request context is not a
+universal tunnel-close signal. Native exec keeps its existing KAT / first-frame /
+CEL / traffic-admission ordering.
+
 
 <a id="10-性能"></a>
 ## 10. Performance

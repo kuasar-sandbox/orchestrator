@@ -92,9 +92,11 @@ See the project [release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-Detailed design and reference documents are currently maintained primarily in Chinese:
+Detailed design and reference documents provide complete English and Chinese editions:
 
-- [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, builds, and reliability;
+- [`docs/node.md`](docs/node.md) — node architecture, commands, configuration, E2B API, lifecycle, credentials, and reliability;
+- [Node template builds](docs/node-build.md): full Build API, configuration, execution, publication and recovery.
+- [Runtime extensions](docs/extensions.md): complete Conductor/Proxy SDK lifecycle, object sources, Hooks and wrappers.
 - [`docs/node-journald.md`](docs/node-journald.md) ([简体中文](docs/node-journald_zh.md)) — explicit sandbox/Build output identities, StableID, queries, and validation;
 - [`docs/node-proxy.md`](docs/node-proxy.md) — the independent node data-plane proxy, routing, authentication, MMDS, and native exec;
 - [`docs/node-resource.md`](docs/node-resource.md) — node admission, reservations, watermarks, inventory recovery, and statistics;
@@ -102,7 +104,7 @@ Detailed design and reference documents are currently maintained primarily in Ch
 - [`docs/cluster-router.md`](docs/cluster-router.md) — unified cluster control- and data-plane ingress, routing, and stable/node-local identity translation;
 - [`docs/cluster-placer.md`](docs/cluster-placer.md) — providers, importers, node selection, placement, restore, and migration.
 
-The English README provides the public component entry path. Full reference-document translation is tracked in [project #86](https://github.com/kuasar-sandbox/kuasar-sandbox/issues/86); language selectors open complete counterparts where available.
+Use the language selector at the beginning of each paired specification. Shared contracts have one complete owner; the guides link to that owner instead of maintaining parallel schemas.
 
 ## Project boundaries
 

@@ -2,7 +2,7 @@
 
 # cluster-router — e2b 统一入口与路由缓存
 
-集群公共 Create 和 Build 注册拒绝单机 `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` 扩展，身份分配权仍属于 Registry。参见[创建时指定沙箱身份](sandbox-identity_zh.md)。
+集群公共 Create 和 Build 注册拒绝单机 `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` 扩展，身份分配权仍属于 Registry。参见[创建时指定沙箱身份](node_zh.md#412-create-身份)。
 
 `cluster-ctl router` 是 cluster 的北向入口,同时承载 e2b 控制面和数据面。它不持路由权威,
 不订阅 route 或 node_list;它通过 group 定位 route owner.显式 create/connect/exec-session 调用对应
@@ -149,17 +149,9 @@ Header 覆盖同名完整 object,checkpoint Header 按字段覆盖。router 始�
 `off` 均为关闭;只有本次 create 显式提供 `memory` 才启用。create body 上限为 16 MiB,
 超限返回 **413**。
 
-Router 调用同一 `POST /route-link/reserve` 时按 operation 组装不同请求:
+Router 按 [Registry Reserve 协议](cluster_zh.md) 为共同的 `POST /route-link/reserve` 端点组装请求，传递对应操作的已认证上下文并保留期望的稳定身份。Create 在准入前严格归一化；Connect 保留可选 memory 选择及其缺省状态；exec-session 先严格解析公共 TTL/conditions 再转换为 Registry typed request；Data 使用既有 access-token/service/port 上下文。
 
-- `create`:query 为 `operation=create&group=&route_key=`,Header 携 `X-API-KEY`,body只携上述 portable/request-scoped create config。
-- `connect`:query 为 `operation=connect&group=&route_key=&sid=[&timeout=]`,Header 携 `X-API-KEY`
-  和可选 `X-Kuasar-Migration-Token`,body 为空。
-- `exec-session`:query 为 `operation=exec-session&group=&route_key=&sid=`,Header 携
-  `X-API-KEY` 和可选 `X-Kuasar-Migration-Token`,body 使用专用 typed
-  `{"ttl_seconds":N,"conditions":["..."]}`.Router 已先严格解析 public body;Registry
-  再做 schema/bounds 校验,不接受 ttl query、Header 或普通 metadata 传递 conditions.
-- `data`:query 为 `operation=data&group=&route_key=&sid=[&port=]`,Header 携 `X-Access-Token`;
-  exec 目标同时携 `E2b-Sandbox-Service: exec`,body 为空.
+精确 query/Header/body schema 由 Registry 规范唯一维护，并在其边界重复校验。Conditions 不借无关 metadata、query 参数或配置 Header 传递；本篇只定义转换边界，不再维护一份可能失步的 schema 表。
 
 connect/exec-session/data 中的 `sid` 均是客户期望的稳定 SandboxID,用于防止 route_key 被删除重建后请求
 跨越 lineage。
@@ -441,8 +433,8 @@ retry;Raw 一旦写入 node 后禁止 retry/reroute/replay,node ctl error 透明
 
 ## 11. See Also
 
-- [cluster.md](cluster_zh.md) — registry membership、route_link、Reserve 与数据模型。
-- [cluster-placer.md](cluster-placer_zh.md) — verify-key、Place 和 key distribution 来源。
-- [node-proxy.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
+- [cluster_zh.md](cluster_zh.md) — registry membership、route_link、Reserve 与数据模型。
+- [cluster-placer_zh.md](cluster-placer_zh.md) — verify-key、Place 和 key distribution 来源。
+- [node-proxy_zh.md](node-proxy_zh.md) — node 内部数据面转发、CONNECT 和 envd signature。
 
 - [Router 实现](../internal/router/router.go) — 鉴权模式、缓存寿命、端点选择和 exec admission。

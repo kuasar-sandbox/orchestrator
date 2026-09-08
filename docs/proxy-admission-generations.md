@@ -1,6 +1,7 @@
+[English](proxy-admission-generations.md) | [简体中文](proxy-admission-generations_zh.md)
+
 # Worker-owned admission generations
 
-[简体中文](proxy-admission-generations_zh.md)
 
 ## Ownership, not cross-process lock recovery
 

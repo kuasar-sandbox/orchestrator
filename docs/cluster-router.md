@@ -4,7 +4,7 @@
 
 # cluster-router — unified e2b ingress and route cache
 
-The standalone `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` extension is rejected by public cluster Create and Build registration; Registry keeps allocation authority. See [Sandbox identity on Create](sandbox-identity.md).
+The standalone `kuasar-sandbox.identity` / `X-Kuasar-Sandbox-Identity` extension is rejected by public cluster Create and Build registration; Registry keeps allocation authority. See [Sandbox identity on Create](node.md#412-create-identity).
 
 `cluster-ctl router` is the cluster's northbound ingress for both the e2b control plane and data plane. It is not a routing authority and subscribes to neither routes nor node_list. It locates route owners by group. Explicit create/connect/exec-session calls use their corresponding Reserve operation; a data-plane cache miss starts with Resolve. RouteResolve returns both `APIEndpoint` and `DataEndpoint`, each with a fixed purpose. Once a route has `NodeSandboxID + DataEndpoint`, ordinary data traffic connects directly to the final node proxy even in paused/starting states; the node handles authorized parking, Wake, and backend connection. Exec CONNECT is the exception: after public 200, the router reads and authorizes the first ctl frame before connecting to the final node. `Reserve(operation=data)` remains only a fallback for a missing target after request admission, a typed stale target before sending Raw, or the ordinary data-plane compatibility path.
 
@@ -129,12 +129,9 @@ The protected route's `stable_id` is the same sandbox's StableID across NodeSand
 
 Create body metadata can carry `kuasar-sandbox.resource`, restore, credentials, and checkpoint. `X-Kuasar-Sandbox-Resource` overrides only explicitly present resource leaves. The public resource surface is strictly limited to capacity/allocatable/startup and uses the same merge helper as group defaults. Restore/credentials headers replace the complete object of the same name; the checkpoint header overrides individual fields. The router always parses and strictly validates the body, so a valid header cannot conceal an invalid lower-priority resource/checkpoint. Omitted restore, `{}`, and explicit `off` all disable restore; only an explicit `memory` on this create enables it. The create-body limit is 16 MiB; larger bodies return **413**.
 
-For the shared `POST /route-link/reserve` endpoint, the router constructs operation-specific requests:
+The router constructs requests to the shared `POST /route-link/reserve` endpoint according to the [Registry Reserve protocol](cluster.md#83-reserve). It forwards operation-specific authenticated context and preserves the requested stable identity. Create is strictly normalized before admission; Connect preserves the optional memory selection, including absence; exec-session first strictly parses public TTL/conditions and converts them to the typed Registry request. Data uses the existing access-token/service/port context.
 
-- `create`: query `operation=create&group=&route_key=`, header `X-API-KEY`, and a body containing only the portable/request-scoped create configuration above.
-- `connect`: query `operation=connect&group=&route_key=&sid=[&timeout=]`, header `X-API-KEY`, optional `X-Kuasar-Migration-Token`, and an empty body.
-- `exec-session`: query `operation=exec-session&group=&route_key=&sid=`, header `X-API-KEY`, optional `X-Kuasar-Migration-Token`, and a dedicated typed body `{"ttl_seconds":N,"conditions":["..."]}`. The router first strictly parses the public body; the registry repeats schema/bounds checks. Conditions cannot be passed through a ttl query, header, or ordinary metadata.
-- `data`: query `operation=data&group=&route_key=&sid=[&port=]`, header `X-Access-Token`, and an empty body. Exec targets also carry `E2b-Sandbox-Service: exec`.
+The Registry specification owns the exact query/header/body schemas and repeats validation at its boundary. Conditions are not carried in unrelated metadata, query parameters or configuration Headers. Keeping this transformation boundary separate avoids a second, potentially stale schema table here.
 
 For connect/exec-session/data, `sid` is the customer's expected stable SandboxID. It prevents requests from crossing lineage when a route_key is deleted and recreated.
 
