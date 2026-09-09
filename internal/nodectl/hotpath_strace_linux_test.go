@@ -194,6 +194,9 @@ func isAllowedHotPathWrite(line, socket string) bool {
 		strings.Contains(line, "<pipe:") ||
 		strings.Contains(line, "<socket:[") ||
 		strings.Contains(line, "<anon_inode:[eventfd]>") ||
+		// strace >= 6.x renders eventfd with extended details, e.g.
+		// write(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, ...).
+		strings.Contains(line, "<{eventfd") ||
 		isLegacyUnixSocketAnnotation(line, socket)
 }
 
@@ -333,6 +336,37 @@ func TestLegacyUnixSocketAnnotation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isLegacyUnixSocketAnnotation(tt.line, socket); got != tt.want {
 				t.Fatalf("isLegacyUnixSocketAnnotation() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAllowedHotPathWriteEventfd(t *testing.T) {
+	const socket = "/tmp/TestResourceRPCHotPathDoesNotPerformFileIO/001/controller.sock"
+	for _, tt := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "legacy eventfd annotation",
+			line: `474607 write(5<anon_inode:[eventfd]>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: true,
+		},
+		{
+			name: "extended eventfd annotation (strace 6.x)",
+			line: `474607 write(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: true,
+		},
+		{
+			name: "regular file still rejected",
+			line: `474607 write(5</tmp/output>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAllowedHotPathWrite(tt.line, socket); got != tt.want {
+				t.Fatalf("isAllowedHotPathWrite() = %t, want %t", got, tt.want)
 			}
 		})
 	}
