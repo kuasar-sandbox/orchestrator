@@ -197,7 +197,7 @@ Ordinary HTTP:
 3. After admission by that policy, `TryBeginParking` checks sandbox total and target-service limits together. Success publishes the shared count and enters parking. Exhaustion returns 429 without Wake, Activate, or dial.
 4. `ActivateRoute` revalidates the binding, including admission generation/effective policy, before Wake/waiting and again after lifecycle work. It constructs the final backend from the latest running route and fails closed if the binding changes.
 5. It dials envd UDS or `floatingip:port` once. With `proxy_netns`, the floating-IP dial occurs in that namespace.
-6. It writes one HTTP request and streams the response. Response completion or final relay completion closes the flow and releases its quota exactly once.
+6. It writes one HTTP request and streams the response, or relays a negotiated HTTP/1.1 WebSocket upgrade. Response completion or final relay completion closes the flow and releases its quota exactly once.
 
 CONNECT:
 
@@ -221,6 +221,34 @@ The shared sandboxer tunnel helper understands no KAT, CEL, route, or lifecycle.
 KAT validation occurs at CONNECT admission and expiry is rechecked during first-frame authorization. Expiry after backend relay begins does not forcibly close an established tunnel. One unexpired KAT can open multiple independent CONNECTs. Each tunnel carries exactly one ctl exec session and never reuses a backend connection. New CONNECTs use the current NodeSandboxID after a route change; established tunnels do not migrate.
 
 The worker performs the complete token, request, and backend gates in its own process, constructing `sandboxes/<NodeSandboxID>/ctl.sock` under frozen EffectiveConfig `paths.run_root`. Neither this path nor CEL programs enter routesync `Policy` or SHM records. The conductor does not parse, select, or forward ordinary HTTP, CONNECT, or exec bytes. Data requests sent to APIEndpoint receive only the API handler's natural response. The cluster router's canonical chained CONNECT is a relay; traffic accounting occurs only at the node worker establishing the final sandbox backend.
+
+### 5.1 HTTP/1.1 WebSocket forwarding
+
+Standard ingress and privately authenticated `ForwardAuthorized` use the same
+HTTP exchange. The latter applies `Rewrite` to a clone before final transport
+normalization; rejection writes no guest request bytes. An HTTP/1.1 GET carrying
+`Connection: Upgrade` and `Upgrade: websocket` keeps the upgrade handshake.
+Connection tokens may be mixed-case, comma-separated, or split across header
+values. Unrelated hop-by-hop headers, including fields nominated by Connection,
+are removed. Endpoint handshake headers, cookies, Origin and application
+authorization remain unless nominated as hop-by-hop fields. The endpoints
+validate the key, version, origin and subprotocol.
+
+A regular upstream response, including handshake rejection, is streamed normally.
+Only a matching HTTP/1.1 WebSocket 101 transfers the response to a bidirectional
+relay. An unexpected or mismatched 101 returns 502 before hijack; a writer that
+cannot hijack, including through `Unwrap`, returns 500 `upgrade unsupported`.
+After hijack, failures close the transport without writing another HTTP error.
+Both readers' prefetched bytes survive. A clean EOF half-closes the peer and
+drains its tail; request cancellation closes both sides and joins the relay.
+
+One upgraded connection retains the original tracked backend, admission lease
+and egress count until relay completion. Frames do not create new ingress or
+request-result counts. The cluster router uses this same HTTP exchange over its
+existing node CONNECT tunnel, retaining its buffered reader and identity rewrite;
+there is no second WebSocket implementation or replay of the inner request.
+No new configuration, extension API, frame processing, or HTTP/2 extended CONNECT
+is introduced.
 
 <a id="6-数据面鉴权"></a>
 ## 6. Data-plane authentication

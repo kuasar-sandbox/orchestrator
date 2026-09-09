@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,26 +47,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		p.serveExecConnect(w, r, sid)
 		return
 	}
-	route, flow, _, ok := p.admitRoute(w, r, sid, target)
-	if !ok {
-		return
-	}
-	defer flow.Close()
-	backend, err := p.dial(r.Context(), route)
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
-		return
-	}
-	backend = flow.AttachBackend(backend)
-	// H2 stream cancellation closes its backend independently of traffic limits.
-	// Do not apply this to an H1 hijack: request EOF may be a valid half-close.
-	if r.ProtoMajor == 2 {
-		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
-		defer stopContextClose()
-	}
-	p.mx.Inc(`data_requests_total{result="ok"}`)
-	Tunnel(w, r, backend)
+	p.forwardCanonical(w, r, sid, target)
 }
 
 // ParseConnect resolves the sandbox identity and canonical CONNECT target. An
@@ -247,71 +227,6 @@ func DialSandboxConnect(ctx context.Context, network, addr, sid string, target C
 		return nil, nil, nil, err
 	}
 	return conn, br, resp, nil
-}
-
-// ForwardHTTPOnce sends r through one already-connected backend connection and
-// reads exactly one response. It does not retain or pool the connection.
-func ForwardHTTPOnce(r *http.Request, backend net.Conn, br *bufio.Reader, mutate func(*http.Request)) (*http.Response, error) {
-	out := cloneForwardHTTPRequest(r)
-	normalizeForwardHTTPRequest(out)
-	if mutate != nil {
-		mutate(out)
-	}
-	return writeForwardHTTPRequest(out, backend, br)
-}
-
-func cloneForwardHTTPRequest(r *http.Request) *http.Request {
-	out := r.Clone(r.Context())
-	if out.URL == nil {
-		out.URL = &url.URL{}
-	} else {
-		u := *out.URL
-		out.URL = &u
-	}
-	return out
-}
-
-func forwardClonedHTTPOnce(out *http.Request, backend net.Conn, br *bufio.Reader) (*http.Response, error) {
-	normalizeForwardHTTPRequest(out)
-	return writeForwardHTTPRequest(out, backend, br)
-}
-
-func normalizeForwardHTTPRequest(out *http.Request) {
-	out.RequestURI = ""
-	out.URL.Scheme = "http"
-	if out.Host != "" {
-		out.URL.Host = out.Host
-	} else if out.URL.Host == "" {
-		out.URL.Host = "sandbox"
-	}
-	out.Close = true
-	removeHopHeaders(out.Header)
-}
-
-func writeForwardHTTPRequest(out *http.Request, backend net.Conn, br *bufio.Reader) (*http.Response, error) {
-	if br == nil {
-		br = bufio.NewReader(backend)
-	}
-	if err := out.Write(backend); err != nil {
-		return nil, err
-	}
-	return http.ReadResponse(br, out)
-}
-
-func removeHopHeaders(h http.Header) {
-	for _, k := range []string{
-		"Connection",
-		"Proxy-Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Te",
-		"Trailer",
-		"Transfer-Encoding",
-		"Upgrade",
-	} {
-		h.Del(k)
-	}
 }
 
 // h1ConnectStream keeps both the raw hijacked connection and net/http's

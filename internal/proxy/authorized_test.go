@@ -167,6 +167,14 @@ func TestForwardAuthorizedRevalidateFailureDoesNotDial(t *testing.T) {
 }
 
 func TestForwardAuthorizedRewriteFailureWritesNoGuestBytes(t *testing.T) {
+	for _, websocket := range []bool{false, true} {
+		t.Run(fmt.Sprintf("websocket=%v", websocket), func(t *testing.T) {
+			testAuthorizedRewriteFailure(t, websocket)
+		})
+	}
+}
+
+func testAuthorizedRewriteFailure(t *testing.T, websocket bool) {
 	target := proxy.ConnectTarget{Service: proxy.ConnectServiceForward, Port: 8080}
 	router := &admissionRouter{
 		binding: proxy.BindRoute("node-s1", "stable-s1", types.ProfileE2B, "envd", "forward", target),
@@ -185,6 +193,9 @@ func TestForwardAuthorizedRewriteFailureWritesNoGuestBytes(t *testing.T) {
 	px := proxy.NewWithDialer(router, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 		func(context.Context, proxy.Route) (net.Conn, error) { return client, nil }, "").WithTrafficTracker(traffic)
 	request := httptest.NewRequest(http.MethodGet, "http://private/original", nil)
+	if websocket {
+		websocketHeaders(request)
+	}
 	response := httptest.NewRecorder()
 	px.ForwardAuthorized(response, request, proxy.AuthorizedForwardRequest{
 		SandboxID: "node-s1", Target: target,
