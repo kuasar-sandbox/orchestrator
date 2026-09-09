@@ -2110,7 +2110,7 @@ vmlinux、cloud-hypervisor、mkfs.erofs、sandbox-runtime.bundle 等多仓制品
 用例使用同一个 `run_all.sh`。直接调用脚本时通过 `BIN` 指向项目主仓组装的二进制目录；
 `make test-e2e` 传入 `E2E_BIN`，默认 sibling 主仓 `bin/<architecture>`，没有 build prerequisite，需先组装；
 本地 stub 则使用 `make build` 后 `make test-e2e-cluster-stub`。
-组件 PR 的 BMS 则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
+组件 PR 的集成测试则把候选仓与其余仓源码组成统一环境后执行该入口。缺少重型前置时单脚本可
 跳过,完整门禁设置 `REQUIRE_*=1` 后硬失败。
 
 | 脚本 | 覆盖 |

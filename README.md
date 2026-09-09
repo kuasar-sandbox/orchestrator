@@ -36,7 +36,7 @@ The node and cluster paths keep platform credentials, content-protection keys, a
 
 Node resource admission is also part of the multi-tenant boundary: the reservation controller owns node-wide admission, resource-pool accounting, grants, watermarks, and recovery. Per-sandbox cgroup, balloon, and VMM execution remains owned by `sandboxer`; the node controller does not take over the sandbox-internal resource loop.
 
-For the complete project security model and private vulnerability reporting, see the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
+For security architecture and deployment trust boundaries, see the [project system overview](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md) and [deployment guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment.md). Report vulnerabilities privately through the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy).
 
 ## Main commands
 
@@ -97,7 +97,18 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 Running real sandboxes requires Linux with systemd, root privileges, KVM, `sandboxer`, `connector`, and the Runtime/VMLinux artifacts produced by `guest-runtime`.
 
-A component-local change can use this repository directly. A change that modifies cross-repository contracts must use linked companion pull requests and the project repository's exact-source BMS validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
+Source builds require Go 1.24 or newer and sibling checkouts of `accelerator`,
+`connector` and `sandboxer`, even for a change confined to this repository. The
+internal `require` versions identify each dependency's target formal release;
+Daily Preview development uses the same target without its preview suffix. A
+target tag need not exist yet because the tracked local `replace` directives
+select the actual sibling sources. `GOWORK=off` does not disable those directives.
+Do not infer which source revision was tested from the version label: record the
+exact sibling SHAs. Runtime/Kernel artifacts are additional prerequisites for
+real sandbox tests, not Go-only compilation.
+
+Cross-repository contract changes require linked companion PRs and exact-source
+integration validation. See the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md).
 
 ## Deployment overview
 
@@ -166,7 +177,7 @@ Use the language selector at the beginning of each paired specification. Shared 
 
 ## Project boundaries
 
-- system-level design, shared BMS infrastructure, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox);
+- system-level design, shared integration tests infrastructure, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox);
 - MicroVM lifecycle and guest control belong to [`sandboxer`](https://github.com/kuasar-sandbox/sandboxer);
 - image and snapshot data infrastructure belongs to [`accelerator`](https://github.com/kuasar-sandbox/accelerator);
 - high-density MicroVM networking belongs to [`connector`](https://github.com/kuasar-sandbox/connector);
