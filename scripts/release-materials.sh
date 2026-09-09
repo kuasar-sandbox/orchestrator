@@ -171,6 +171,40 @@ release_materials_add_go_binary() {
     ' "$raw"
 }
 
+release_materials_require_go_revision() {
+  local binary="$1" sha="$2" revision modified info
+  info="$(go version -m "$binary" 2>/dev/null)" \
+    || fail "Go build info is missing from $binary"
+  revision="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ { print substr($3, 14) }' <<< "$info")"
+  modified="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.modified=/ { print substr($3, 14) }' <<< "$info")"
+  if [ "$revision" != "$sha" ] || [ "$modified" != false ]; then
+    fail "Go payload must be built from the clean selected commit $sha: $binary"
+  fi
+}
+
+release_materials_verified_go_source() {
+  local module="$1" version="$2" checksum="$3" verify_root json directory
+  verify_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/verify-go.XXXXXX")"
+  # Use a temporary module so packaging cannot change the caller's go.mod/sum.
+  # Verify the extracted cache as well as the download sum; download alone does
+  # not detect edits to an already-extracted LICENSE.
+  (
+    cd "$verify_root" || exit
+    GOWORK=off go mod init release-material-verification.invalid >/dev/null 2>&1 || exit 1
+    GOWORK=off go mod edit "-require=$module@$version" || exit 1
+    GOWORK=off go mod download -json "$module@$version" > source.json || exit 1
+    GOWORK=off go mod verify > verify.log 2>&1 \
+      || { cat verify.log >&2; exit 1; }
+  ) || fail "Go module cache verification failed for $module@$version"
+  json="$(cat "$verify_root/source.json")"
+  if [ "$checksum" = - ] || [ "$(jq -er '.Sum' <<< "$json")" != "$checksum" ]; then
+    fail "Go module source checksum differs from the binary: $module@$version"
+  fi
+  directory="$(jq -er '.Dir' <<< "$json")" \
+    || fail "Go module source directory is missing for $module@$version"
+  printf '%s\n' "$directory"
+}
+
 release_materials_hash_tree() {
   local root="$1" unit="$2" output="$3"
   (
@@ -184,7 +218,7 @@ release_materials_hash_tree() {
 
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
-  local module version json directory toolchain toolchain_root installed_toolchain
+  local module version checksum directory toolchain toolchain_root installed_toolchain
   command -v jq >/dev/null || fail "jq is required to collect Go module license material"
   while IFS= read -r toolchain; do
     [ -n "$toolchain" ] || continue
@@ -197,15 +231,12 @@ release_materials_finish() {
   done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
-  while IFS=$'\t' read -r module version _; do
+  while IFS=$'\t' read -r module version checksum; do
     [ -n "$module" ] || continue
     case "$module" in
       github.com/kuasar-sandbox/*) continue ;;
     esac
-    json="$(GOWORK=off go mod download -json "$module@$version")" \
-      || fail "cannot resolve Go module source for $module@$version"
-    directory="$(jq -er '.Dir' <<< "$json")" \
-      || fail "Go module source directory is missing for $module@$version"
+    directory="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
     release_materials_copy_licenses "$directory" "go/$module@$version"
   done < "$RELEASE_MATERIALS_WORK/go-modules-sorted"
 

@@ -14,6 +14,8 @@ fail() {
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+bash "$ROOT/scripts/test-release-materials.sh"
+
 init_fixture_repo() {
   local directory="$1"
   shift
@@ -246,8 +248,33 @@ if grep -Fq 'proxy_executable:' "$TMP/built-in-proxy.yaml"; then
 fi
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"
-printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
-GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
+fixture_root="$TMP/project"
+mkdir -p "$fixture_root/scripts"
+install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
+printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
+install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
+install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
+printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+mkdir -p "$fixture_root/."
+cp -a "$ROOT/deploy" "$fixture_root/deploy"
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go deploy)"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
+release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
+printf '// dirty fixture\n' >> "$fixture_root/main.go"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
+if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
+  fail "release accepted a binary built from dirty source"
+fi
+printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+if (release_materials_require_go_revision "$TMP/go-fixture" \
+  0000000000000000000000000000000000000000 >/dev/null 2>&1); then
+  fail "release accepted a binary built from another commit"
+fi
+GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/main.go"
+if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
+  fail "release accepted a binary without source stamping"
+fi
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
@@ -268,8 +295,8 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
-"$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+"$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/orchestrator v1.2.3 \
   1111111111111111111111111111111111111111 main
@@ -312,27 +339,27 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
   RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
   fail "validator accepted a tampered archive"
 fi
 
 cp -a "$TMP/bundle" "$TMP/extra"
 touch "$TMP/extra/assets/release.json"
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
   fail "validator accepted an extra asset"
 fi
 
-if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted an unvalidated release architecture"
 fi

@@ -182,6 +182,10 @@ package_release() {
   [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
+  release_materials_require_go_revision "$STAGE/bin/node-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/cluster-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/node-stub-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/e2b-key-ctl" "$project_sha"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
