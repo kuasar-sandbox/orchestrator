@@ -264,6 +264,15 @@ common_env=(
 )
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
+if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
+  0000000000000000000000000000000000000000 "$BUNDLE" "$SOURCE_REF" > "$TMP/wrong-commit.log" 2>&1; then
+  echo "test-publisher: accepted a bundle from another source commit" >&2
+  exit 1
+fi
+grep -Fq 'Go payload must be built from the clean selected commit' "$TMP/wrong-commit.log" \
+  || { echo "test-publisher: wrong source failed for an unrelated reason" >&2; exit 1; }
+[ ! -e "$TMP/state/tag" ] \
+  || { echo "test-publisher: wrong-source validation wrote a tag" >&2; exit 1; }
 if env "${common_env[@]}" FAKE_GH_FAIL_CREATE_ONCE=1 \
   "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF" >/dev/null 2>&1; then
   echo "test-publisher: interrupted draft creation unexpectedly succeeded" >&2

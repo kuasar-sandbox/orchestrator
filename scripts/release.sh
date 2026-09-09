@@ -118,7 +118,8 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_source "$extract" "$NAME" 'bin/*,deploy/*' 'orchestrator' "$version"
+  release_materials_require_project_source "$extract" "$NAME" 'bin/*,deploy/*' "$version" \
+    bin/node-ctl bin/cluster-ctl bin/node-stub-ctl bin/e2b-key-ctl
   release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'accelerator' ""
   release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' 'connector' ""
   release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'sandboxer' ""
@@ -190,6 +191,8 @@ package_release() {
   [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
+  local project_version
+  project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
   release_materials_require_go_revision "$STAGE/bin/node-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/cluster-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/node-stub-ctl" "$project_sha"
@@ -208,7 +211,7 @@ package_release() {
   release_materials_copy_licenses "$accelerator_source" accelerator
   release_materials_copy_licenses "$connector_source" connector
   release_materials_copy_licenses "$sandboxer_source" sandboxer
-  release_materials_record_source 'bin/*,deploy/*' orchestrator "$version" \
+  release_materials_record_source 'bin/*,deploy/*' orchestrator "$project_version" \
     "https://github.com/kuasar-sandbox/orchestrator/commit/$project_sha" \
     "git:$project_sha" project
   release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator "$accelerator_version" \

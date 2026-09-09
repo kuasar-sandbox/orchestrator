@@ -219,7 +219,7 @@ publish_bundle() {
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase SHA"
   [[ "$source_ref" = main || "$source_ref" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.x$ ]] \
     || fail "source-ref must be main or release/vMAJOR.MINOR.x"
-  release_cli validate "$tag" "$arch" "$bundle"
+  SOURCE_SHA="$commit" release_cli validate "$tag" "$arch" "$bundle"
 
   local tag_state="$TMP/tag"
   if api_optional "repos/$REPOSITORY/git/ref/tags/$tag" "$tag_state"; then

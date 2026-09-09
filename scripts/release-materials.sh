@@ -197,6 +197,28 @@ release_materials_require_go_revision() {
   fi
 }
 
+release_materials_require_project_source() {
+  local root="$1" unit="$2" payload="$3" version="$4"
+  shift 4
+  [ "$#" -gt 0 ] || fail "project source validation requires its Go payloads"
+  local sha="${SOURCE_SHA:-}" info file recorded_version
+  if [ -z "$sha" ]; then
+    info="$(go version -m "$root/$1" 2>/dev/null)" || fail "project Go build info is missing"
+    sha="$(awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}' <<< "$info")"
+  fi
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "project source must bind a full lowercase commit"
+  for file in "$@"; do
+    release_materials_require_go_revision "$root/$file" "$sha"
+  done
+  recorded_version="$(awk -F '\t' -v payload="$payload" -v unit="$unit" \
+    'NR > 1 && $1 == payload && $2 == unit {print $3}' "$root/share/sources/$unit/SOURCES.tsv")"
+  if [ "$recorded_version" != "$version" ] && [ "$recorded_version" != "git:$sha" ]; then
+    fail "project source version differs from its target release or exact pre-tag commit"
+  fi
+  release_materials_require_source "$root" "$unit" "$payload" "$unit" "$recorded_version" \
+    "https://github.com/kuasar-sandbox/$unit/commit/$sha" "git:$sha"
+}
+
 release_materials_verified_go_source() {
   local module="$1" version="$2" checksum="$3" verify_root json directory
   verify_root="$(mktemp -d "$RELEASE_MATERIALS_WORK/verify-go.XXXXXX")"
