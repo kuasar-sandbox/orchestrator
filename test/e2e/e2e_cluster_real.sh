@@ -669,13 +669,14 @@ EOF
 }
 
 write_group_record() {
+    # Per-request ports cover both envd (49983) and the WebSocket user port (8001).
     cat > "$WORK/g/group.json" <<EOF
 {
   "group": "$GROUP",
   "manifest_key": { "type": "inline", "value": "$MANIFEST_KEY" },
   "api_secret": { "type": "inline", "value": "$API_SECRET" },
   "template_ref": "$TEMPLATE_REF",
-  "target_port": 49983,
+  "target_port": 0,
   "node_selectors": [{ "pool": "real" }]
 }
 EOF

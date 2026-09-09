@@ -92,7 +92,8 @@ def probe(args):
         with conn.makefile("rb") as reader:
             status = reader.readline().split()
             if len(status) < 2 or status[1] != b"101":
-                raise RuntimeError("WebSocket handshake did not return 101")
+                code = status[1].decode() if len(status) > 1 and status[1].isdigit() else "malformed status"
+                raise RuntimeError(f"WebSocket handshake returned {code}, expected 101")
             response = http.client.parse_headers(reader)
             expected = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
             if (response.get("Sec-WebSocket-Accept") != expected or
