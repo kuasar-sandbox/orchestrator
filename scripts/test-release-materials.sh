@@ -8,6 +8,37 @@ fail() { echo "test-release-materials: $*" >&2; exit 1; }
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+# Neither source selection nor copied notices may trust hidden index changes.
+mkdir -p "$TMP/git-index"
+git -C "$TMP/git-index" init -q
+git -C "$TMP/git-index" config --local user.name 'Chen Xiaohui'
+git -C "$TMP/git-index" config --local user.email 'graych@gmail.com'
+printf 'committed license\n' > "$TMP/git-index/LICENSE"
+git -C "$TMP/git-index" add -- LICENSE
+git -C "$TMP/git-index" commit -qm 'test: create indexed license fixture'
+for flag in assume-unchanged skip-worktree; do
+  git -C "$TMP/git-index" update-index "--$flag" -- LICENSE
+  printf 'hidden modified license\n' > "$TMP/git-index/LICENSE"
+  [ -z "$(git -C "$TMP/git-index" status --porcelain)" ] \
+    || fail "fixture did not hide its tracked change"
+  if (release_materials_resolve_git_source "$TMP/git-index" "" fixture > "$TMP/index-$flag.log" 2>&1); then
+    fail "source selection accepted $flag"
+  fi
+  grep -Fq 'uses assume-unchanged or skip-worktree' "$TMP/index-$flag.log" \
+    || fail "hidden source index failed for an unrelated reason"
+  if (
+    release_materials_init "$TMP/index-stage" "$TMP/index-work" fixture
+    release_materials_copy_licenses "$TMP/git-index" project > "$TMP/license-$flag.log" 2>&1
+  ); then
+    fail "license collection accepted a hidden tracked change"
+  fi
+  grep -Fq 'license material differs from the selected source commit' "$TMP/license-$flag.log" \
+    || fail "hidden license change failed for an unrelated reason"
+  git -C "$TMP/git-index" update-index "--no-$flag" -- LICENSE
+  git -C "$TMP/git-index" cat-file blob HEAD:LICENSE > "$TMP/git-index/LICENSE"
+done
+release_materials_resolve_git_source "$TMP/git-index" "" fixture >/dev/null
+
 export GOWORK=off GOMODCACHE="$TMP/mod-cache" GOPROXY="file://$TMP/proxy"
 # The fixture module is deliberately local and has no public checksum entry.
 export GOSUMDB=off GOFLAGS=
@@ -87,6 +118,39 @@ cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$modu
 mkdir -p "$TMP/replacement-stage/bin" "$TMP/validation"
 install -m 0755 "$TMP/replaced-tool" "$TMP/replacement-stage/bin/tool"
 WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
+# A valid row cannot conceal a second contradictory row for that same source.
+for mismatch in duplicate version source integrity license; do
+  altered="$TMP/source-record-$mismatch"
+  cp -a "$TMP/replacement-stage" "$altered"
+  awk -F '\t' -v mismatch="$mismatch" 'BEGIN { OFS=FS }
+    { print }
+    $2 == "Go toolchain" {
+      if (mismatch == "version") $3="go0.0.0"
+      if (mismatch == "source") $4="https://example.invalid/other-source"
+      if (mismatch == "integrity") $5="other-integrity"
+      if (mismatch == "license") $6="share/licenses/fixture/project"
+      print
+    }' "$TMP/replacement-stage/share/sources/fixture/SOURCES.tsv" \
+    > "$altered/share/sources/fixture/SOURCES.tsv"
+  mkdir -p "$altered/share/licenses/fixture/project"
+  install -m 0644 "$directory/LICENSE" "$altered/share/licenses/fixture/project/LICENSE"
+  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/source-$mismatch.log" 2>&1); then
+    fail "validator accepted an ambiguous source record: $mismatch"
+  fi
+  grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/source-$mismatch.log" \
+    || fail "ambiguous source failed for an unrelated reason"
+done
+
+altered="$TMP/changed-published-license"
+cp -a "$TMP/replacement-stage" "$altered"
+printf 'unrelated license bytes\n' > "$altered/share/licenses/fixture/go/$module@$version/LICENSE"
+release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/published-license.log" 2>&1); then
+  fail "validator accepted altered module licenses with regenerated checksums"
+fi
+grep -Fq 'Go module license bytes differ from the verified source' "$TMP/published-license.log" \
+  || fail "changed published license failed for an unrelated reason"
 # Recomputing the material hashes must not allow an inventory to revert to
 # the original (unbuilt) module or advertise another replacement checksum.
 for mismatch in original checksum; do

@@ -29,7 +29,7 @@ release_materials_init() {
 release_materials_resolve_git_source() {
   [ "$#" -eq 3 ] \
     || fail "release_materials_resolve_git_source requires source directory, expected SHA and name"
-  local source="$1" expected="$2" name="$3" actual source_root status
+  local source="$1" expected="$2" name="$3" actual source_root status index_flags
   [ -d "$source" ] || fail "$name source directory is missing: $source"
   source_root="$(git -C "$source" rev-parse --show-toplevel 2>/dev/null || true)"
   [ -n "$source_root" ] || fail "$name source directory is not a Git worktree: $source"
@@ -39,6 +39,13 @@ release_materials_resolve_git_source() {
   [[ "$actual" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the $name source commit"
   if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
     fail "$name source commit $actual does not match the selected commit $expected"
+  fi
+  # Status/diff may trust these index flags and hide changed tracked inputs.
+  # Never clear a developer's flags: require a normal, inspectable checkout.
+  index_flags="$(git -C "$source" -c core.quotePath=true ls-files -v)" \
+    || fail "cannot inspect the $name source index"
+  if LC_ALL=C grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+    fail "$name source uses assume-unchanged or skip-worktree; use a fresh checkout"
   fi
   status="$(git -C "$source" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
   [ -z "$status" ] || fail "$name source worktree is dirty"
@@ -85,7 +92,7 @@ release_materials_copy_licenses() {
     if [ "$source_root" = "$(cd "$source" && pwd -P)" ]; then
       git -C "$source" ls-files --error-unmatch -- "$relative" >/dev/null 2>&1 \
         || fail "license material is absent from the selected source commit: $relative"
-      git -C "$source" diff --quiet HEAD -- "$relative" \
+      git -C "$source" cat-file blob "HEAD:$relative" | cmp -s "$file" - \
         || fail "license material differs from the selected source commit: $relative"
     fi
     mkdir -p "$destination/$(dirname "$relative")"
@@ -339,10 +346,12 @@ release_materials_require_source() {
   [ -z "$label" ] || label="share/licenses/$unit/$label"
   awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" \
     -v source="$source" -v integrity="$integrity" -v label="$label" '
-    NR > 1 && $1 == payload && $2 == name && (version == "" || $3 == version) &&
-      (source == "" || $4 == source) && (integrity == "" || $5 == integrity) &&
-      (label == "" || $6 == label) { rows++ }
-    END { exit rows != 1 }
+    NR > 1 && $1 == payload && $2 == name {
+      rows++
+      if ((version != "" && $3 != version) || (source != "" && $4 != source) ||
+          (integrity != "" && $5 != integrity) || (label != "" && $6 != label)) invalid=1
+    }
+    END { exit rows != 1 || invalid }
   ' "$root/share/sources/$unit/SOURCES.tsv" \
     || fail "missing or inconsistent source record for $name ($payload)"
 }
@@ -379,7 +388,7 @@ release_materials_require_go() {
 release_materials_validate() {
   [ "$#" -eq 2 ] || fail "release_materials_validate requires extracted root and unit"
   local root="$1" unit="$2" source_root="$1/share/sources/$2"
-  local file actual header directory payload module version
+  local file actual header directory payload module version checksum
   release_materials_safe_relative "$unit" \
     || fail "unsafe release material unit: $unit"
   for directory in "$root/share" "$root/share/licenses" "$root/share/sources" \
@@ -471,12 +480,23 @@ release_materials_validate() {
     release_materials_validate_payload "$root" "$payload"
     release_materials_require_go "$root" "$unit" "$payload"
   done < <(awk -F '\t' 'NR > 1 { print $1 }' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u)
-  while IFS=$'\t' read -r module version _ || [ -n "$module" ]; do
+  while IFS=$'\t' read -r module version checksum || [ -n "$module" ]; do
     case "$module" in github.com/kuasar-sandbox/*) continue ;; esac
     directory="share/licenses/$unit/go/$module@$version"
     release_materials_safe_relative "$directory" || fail "unsafe Go module license path"
     if [ ! -d "$root/$directory" ] || [ -z "$(find "$root/$directory" -type f -print -quit)" ]; then
       fail "Go module license material is missing: $module@$version"
+    fi
+    if [ "$checksum" != - ]; then
+      (
+        local verify_work verified_source
+        verify_work="$(mktemp -d "$WORK/verify-module-license.XXXXXX")"
+        release_materials_init "$verify_work/stage" "$verify_work/materials" "$unit"
+        verified_source="$(release_materials_verified_go_source "$module" "$version" "$checksum")"
+        release_materials_copy_licenses "$verified_source" "go/$module@$version"
+        diff -r "$verify_work/stage/$directory" "$root/$directory" >/dev/null \
+          || fail "Go module license bytes differ from the verified source: $module@$version"
+      ) || return 1
     fi
   done < <(sed -n '2,$p' "$source_root/GO-MODULES.tsv")
   if find "$root/share/licenses/$unit" "$source_root" -type l -print -quit | grep -q .; then
