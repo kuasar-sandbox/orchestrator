@@ -6,7 +6,7 @@ umask 022
 NAME=orchestrator
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
@@ -53,6 +53,45 @@ copy_root_executable() {
   [ -x "$ROOT/$source" ] || fail "missing executable release input: $ROOT/$source"
   mkdir -p "$(dirname "$STAGE/$destination")"
   install -m 0755 "$ROOT/$source" "$STAGE/$destination"
+}
+
+stage_release_go_source() {
+  local source="$1" sha="$2" destination="$3"
+  [ ! -e "$destination" ] || fail "fresh release checkout already exists"
+  mkdir -p "$destination"
+  local -a git_env=(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
+  "${git_env[@]}" git -C "$destination" init --quiet --template=
+  "${git_env[@]}" git -C "$destination" fetch --quiet --depth=1 "$source" "$sha"
+  "${git_env[@]}" git -C "$destination" -c advice.detachedHead=false checkout --quiet --detach "$sha"
+}
+
+build_release_go_payloads() {
+  local arch="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}" route variable value
+  local -a routes build_env
+  IFS=',|' read -r -a routes <<< "$proxy"
+  for route in "${routes[@]}"; do
+    case "$route" in direct|off) continue ;; esac
+    [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
+      || fail "release Go proxy routing must use credential-free HTTPS"
+  done
+  mkdir -p "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
+  chmod 0700 "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
+  build_env=(env -i PATH="$PATH" HOME="$WORK/go-home" LANG=C
+    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOPROXY="$proxy"
+    GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod"
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
+  for variable in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy \
+    SSL_CERT_FILE SSL_CERT_DIR; do
+    value="${!variable:-}"
+    [ -n "$value" ] || continue
+    case "$variable" in
+      HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy)
+        [[ "$value" != *[@?#[:space:]]* ]] || fail "release build cannot pass an authenticated proxy"
+        ;;
+    esac
+    build_env+=("$variable=$value")
+  done
+  "${build_env[@]}" make --no-print-directory -C "$WORK/go-build/$NAME" TARGET_ARCH="$arch" build
 }
 
 check_go_binary() {
@@ -158,15 +197,7 @@ package_release() {
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
-  bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
-  copy_executable "$bin_dir/node-ctl" bin/node-ctl
-  copy_executable "$bin_dir/cluster-ctl" bin/cluster-ctl
-  copy_executable "$bin_dir/node-stub-ctl" bin/node-stub-ctl
-  copy_executable "$bin_dir/e2b-key-ctl" bin/e2b-key-ctl
-  check_go_binary "$STAGE/bin/node-ctl"
-  check_go_binary "$STAGE/bin/cluster-ctl"
-  check_go_binary "$STAGE/bin/node-stub-ctl"
-  check_go_binary "$STAGE/bin/e2b-key-ctl"
+  [ -z "${RELEASE_BIN_DIR:-}" ] || fail "RELEASE_BIN_DIR is not supported: release Go payloads are rebuilt"
   copy_file deploy/node-ctl.service deploy/node-ctl.service
   copy_file deploy/node-proxy.service deploy/node-proxy.service
   copy_file deploy/cluster-registry.service deploy/cluster-registry.service
@@ -193,16 +224,24 @@ package_release() {
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
   local project_version
   project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
-  release_materials_require_go_revision "$STAGE/bin/node-ctl" "$project_sha"
-  release_materials_require_go_revision "$STAGE/bin/cluster-ctl" "$project_sha"
-  release_materials_require_go_revision "$STAGE/bin/node-stub-ctl" "$project_sha"
-  release_materials_require_go_revision "$STAGE/bin/e2b-key-ctl" "$project_sha"
   accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
     "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
   connector_sha="$(release_materials_resolve_git_source "$connector_source" \
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
     "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
+  stage_release_go_source "$ROOT" "$project_sha" "$WORK/go-build/orchestrator"
+  stage_release_go_source "$accelerator_source" "$accelerator_sha" "$WORK/go-build/accelerator"
+  stage_release_go_source "$connector_source" "$connector_sha" "$WORK/go-build/connector"
+  stage_release_go_source "$sandboxer_source" "$sandboxer_sha" "$WORK/go-build/sandboxer"
+  build_release_go_payloads "$arch"
+  bin_dir="$WORK/go-build/orchestrator/bin/$arch"
+  local binary
+  for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
+    copy_executable "$bin_dir/$binary" "bin/$binary"
+    check_go_binary "$STAGE/bin/$binary"
+    release_materials_require_go_revision "$STAGE/bin/$binary" "$project_sha"
+  done
   accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
   connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
   sandboxer_version="$(release_materials_git_version "$sandboxer_source" "$sandboxer_version" "$sandboxer_sha")"
@@ -227,7 +266,7 @@ package_release() {
   release_materials_add_go_binary "$STAGE/bin/cluster-ctl" bin/cluster-ctl
   release_materials_add_go_binary "$STAGE/bin/node-stub-ctl" bin/node-stub-ctl
   release_materials_add_go_binary "$STAGE/bin/e2b-key-ctl" bin/e2b-key-ctl
-  release_materials_finish
+  GOMODCACHE="$WORK/go-mod" release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \

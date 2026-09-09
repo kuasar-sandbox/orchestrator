@@ -248,6 +248,12 @@ if grep -Fq 'proxy_executable:' "$TMP/built-in-proxy.yaml"; then
 fi
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"
+printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
+printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
+printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
+accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
+connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
+sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE)"
 fixture_root="$TMP/project"
 mkdir -p "$fixture_root/scripts"
 install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
@@ -258,7 +264,27 @@ printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
 mkdir -p "$fixture_root/."
 cp -a "$ROOT/deploy" "$fixture_root/deploy"
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go deploy)"
+printf 'accelerator_commit := %s\nconnector_commit := %s\nsandboxer_commit := %s\n' \
+  "$accelerator_sha" "$connector_sha" "$sandboxer_sha" > "$fixture_root/Makefile"
+cat >> "$fixture_root/Makefile" <<'EOF'
+.PHONY: build
+build:
+	test "$$GOWORK" = off && test "$$GOFLAGS" = -mod=readonly
+	test -z "$${GH_TOKEN:-}" && test -z "$${AWS_SECRET_ACCESS_KEY:-}"
+	test ! -e ignored-release-input.go
+	test ! -e ../accelerator/ignored-release-input.go
+	test ! -e ../connector/ignored-release-input.go
+	test ! -e ../sandboxer/ignored-release-input.go
+	test "$$(git -C ../accelerator rev-parse HEAD)" = "$(accelerator_commit)"
+	test "$$(git -C ../connector rev-parse HEAD)" = "$(connector_commit)"
+	test "$$(git -C ../sandboxer rev-parse HEAD)" = "$(sandboxer_commit)"
+	mkdir -p bin/x86_64
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/node-ctl .
+	cp bin/x86_64/node-ctl bin/x86_64/cluster-ctl
+	cp bin/x86_64/node-ctl bin/x86_64/node-stub-ctl
+	cp bin/x86_64/node-ctl bin/x86_64/e2b-key-ctl
+EOF
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go deploy Makefile)"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/main.go"
@@ -278,14 +304,17 @@ fi
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
-printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
-printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
-printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
-accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
-connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
-sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE)"
-
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+for source in "$fixture_root" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"; do
+  printf 'ignored-release-input.go\n' >> "$source/.git/info/exclude"
+  printf 'ignored invalid Go input must not enter the release build\n' > "$source/ignored-release-input.go"
+done
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
+  "$TMP/prebuilt-override" > "$TMP/prebuilt-override.log" 2>&1; then
+  fail "packager accepted a prebuilt payload override"
+fi
+grep -Fq 'RELEASE_BIN_DIR is not supported' "$TMP/prebuilt-override.log" \
+  || fail "prebuilt override failed for an unrelated reason"
+SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-private AWS_SECRET_ACCESS_KEY=fixture-private \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
@@ -329,7 +358,7 @@ if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$'
   fail "archive contains release metadata JSON"
 fi
 
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+SOURCE_DATE_EPOCH=1700000000 \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
   RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \

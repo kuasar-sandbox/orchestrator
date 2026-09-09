@@ -153,6 +153,12 @@ Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintai
 
 ## Release model
 
+Packaging rebuilds Go payloads in fresh checkouts of the selected Orchestrator, Accelerator, Connector and Sandboxer commits,
+with `GOWORK=off` and read-only module resolution. Ignored development files and
+prebuilt binaries are not reused; `RELEASE_BIN_DIR` is rejected. Build commands use
+a private home and caches without cloud/release credentials. Credential-free
+HTTPS module/network proxy routing remains available.
+
 Package source records keep the project's or an internal dependency's release
 version only when its local Git tag matches the selected source commit. Untagged
 sources record `git:<commit>`; the archive name still identifies the requested

@@ -100,7 +100,7 @@ ACCELERATOR_VERSION ?= v0.1.3
 CONNECTOR_VERSION ?= v0.1.2
 SANDBOXER_VERSION ?= v0.1.3
 
-release: build
+release:
 	@mkdir -p build
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
