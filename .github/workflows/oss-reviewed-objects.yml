@@ -1,0 +1,45 @@
+name: Assemble reviewed preparation objects
+on:
+  push:
+    branches: [ops/oss-review-c49b72]
+    paths: [.ops/reviewed-plan.json, .github/workflows/oss-reviewed-objects.yml]
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: 5f943c170b84128319f6e2440f7350f93b4664e7
+          path: control
+          persist-credentials: false
+      - name: Encode data without executing candidate source
+        working-directory: candidate
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, zlib
+          from pathlib import Path
+          plan = json.loads(Path('.ops/reviewed-plan.json').read_text())
+          raw = json.dumps(plan, ensure_ascii=False, separators=(',', ':')).encode()
+          Path(os.environ['RUNNER_TEMP'], 'plan.b64').write_bytes(base64.b64encode(zlib.compress(raw)))
+          PY
+      - name: Create exact source and output verified objects only
+        id: objects
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ../control/.ops/apply-reviewed.py --plan "$RUNNER_TEMP/plan.b64" --expected-plan-sha256 9ef2c101b1946f17f4d8fc9ce6fe826f4ee9afef7f73f1263eb0b0008d929dcd --output "$RUNNER_TEMP/result"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: oss-reviewed-${{ steps.objects.outputs.sha }}
+          path: ${{ runner.temp }}/result/
+          retention-days: 1
+          if-no-files-found: error
