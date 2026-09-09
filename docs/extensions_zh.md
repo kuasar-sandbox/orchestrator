@@ -227,7 +227,7 @@ dial → ordinary HTTP/CONNECT → traffic close`。该 helper 拥有 `ResponseW
 不得再写错误；它不校验 Kuasar `X-Access-Token`。`Revalidate` 在 activation 后、dial 前执行；
 普通 HTTP 的 `Rewrite` 只收到 guest-facing clone，失败时不写任何 guest request bytes；CONNECT
 不调用 Rewrite。generic helper 拒绝 native exec，后者继续经 `next` 走 KAT + per-command CEL。
-本接口不增加 WebSocket transport；WebSocket 仍由 [#269](https://github.com/kuasar-sandbox/orchestrator/issues/269) 独立跟踪。
+本接口复用 core 的 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#51-http11-websocket-转发)，不增加扩展专用传输接口。
 
 该 API 只对应独立 Proxy,不为 conductor 增加数据面 factory;也不开放原始 Router,
 SHM、listener、routesync、stats、dial target 或 credential records。除同一 master Extension 的
@@ -517,7 +517,7 @@ type ForwardRequest struct {
 
 一个逻辑请求无论直接 ForwardAuthorized，还是 canonicalize 后调用 next，admission 都只发生一次；wrapper 不能嵌套这两条路径。拒绝先于 Wake、activation 或 dial，使用 core 的 429 max_inflight_reached。Admission lease 和 parking/egress 记账共享普通响应、CONNECT relay、取消及失败 cleanup 的单一生命周期。Generic helper 仍拒绝 native exec，因此不能绕过 KAT/CEL/首帧 gate，也不能把 exec admission 提前到 gate 之前。
 
-普通 HTTP 的 Rewrite 收到独立的 Guest 请求副本。回调后 core 完成最终 hop-header/transport 归一化，回调失败则不写任何 Guest 请求字节。CONNECT 没有 Guest HTTP 请求，绝不调用 Rewrite。Generic helper 拒绝 native exec target，标准 exec 继续走 next 与 KAT、逐命令 CEL 路径。Helper 复用仓库现有普通 HTTP 和 CONNECT 传输，不实现 WebSocket。
+普通 HTTP 的 Rewrite 收到独立的 Guest 请求副本。回调后 core 完成最终 hop-header/transport 归一化，回调失败则不写任何 Guest 请求字节。CONNECT 没有 Guest HTTP 请求，绝不调用 Rewrite。Generic helper 拒绝 native exec target，标准 exec 继续走 next 与 KAT、逐命令 CEL 路径。Helper 共享 core 的 HTTP/CONNECT 传输，包括 [HTTP/1.1 WebSocket 转发](node-proxy_zh.md#51-http11-websocket-转发)；升级后等待 relay 结束才返回，wrapper 不维护另一套 WebSocket 传输或流量生命周期。
 
 ## Ingress 边界
 
@@ -527,6 +527,6 @@ Worker IngressWrapper 只在 Proxy data_listen 可达。Conductor 公共 listene
 
 Conductor、Proxy master 或 worker 扩展为 nil 时保留内置启动与请求行为，不创建 event hub、watcher goroutine、lifecycle callback 或 wrapper。Cluster router、registry、placer 没有扩展对象；节点本地 Hook 和观察不改变 node-link ACK、exact replay、幂等或 stable SandboxID → NodeSandboxID 的权威关系。
 
-此 API 没有 namespace、固定 extension URI、动态加载、热更新或 component compatibility version。WebSocket 不属于 #256，由 #269 独立跟踪。
+此 API 没有 namespace、固定 extension URI、动态加载、热更新或 component compatibility version。WebSocket 属于共享 core transport，不增加扩展专用 API。
 
 可构建程序见 [`examples/custom-conductor`](../examples/custom-conductor) 与 [`examples/custom-proxy`](../examples/custom-proxy)。

@@ -292,7 +292,7 @@ service 与 port 并存不是冲突;Node 不会用 49983/49999 反向覆盖显�
    重验一次,并从最新 running route 构造最终 backend;binding 改变时 fail closed;
 5. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
    netns 内拨号;
-6. 写入一条 HTTP 请求,流式复制响应,响应或完整 relay 结束后一次性关闭 flow并释放额度。
+6. 写入一条 HTTP 请求，流式复制响应，或转发协商成功的 HTTP/1.1 WebSocket Upgrade；响应或完整 relay 结束后一次性关闭 flow 并释放额度。
 
 CONNECT:
 
@@ -344,6 +344,27 @@ worker 在本进程执行上述完整 token + request + backend gate,用 frozen 
 记录.conductor 不解析,不选择也不转发 ordinary HTTP,CONNECT 或 exec 字节;误发到
 APIEndpoint 的数据请求只得到 API handler 的自然响应.cluster-router 的 canonical chained
 CONNECT 只是中继,traffic 统计只发生在建立最终 sandbox backend 的 node worker.
+
+### 5.1 HTTP/1.1 WebSocket 转发
+
+标准入口与私有鉴权后的 `ForwardAuthorized` 使用同一个 HTTP exchange。后者先在副本上执行
+`Rewrite`，再做最终传输归一化；回调拒绝时不写任何 Guest 请求字节。携带
+`Connection: Upgrade` 和 `Upgrade: websocket` 的 HTTP/1.1 GET 保留升级握手。
+Connection token 支持大小写混合、逗号分隔和多个 Header value。清除无关的逐跳 Header，
+包括 Connection 指定的字段；握手 Header、Cookie、Origin 和应用鉴权字段在未被指定为
+逐跳字段时保留。Key、version、origin 和 subprotocol 由端点校验。
+
+上游普通响应（包括握手拒绝）照常流式转发。只有匹配的 HTTP/1.1 WebSocket 101 才进入
+双向 relay。非预期或不匹配的 101 在 Hijack 前返回 502；ResponseWriter 无法直接或通过
+`Unwrap` 支持 Hijack 时，返回 500 `upgrade unsupported`。Hijack 后失败只关闭传输，
+不再写 HTTP 错误。两侧 reader 已预读的字节均保留；正常 EOF 对另一侧执行半关闭并排空
+尾部数据，请求取消则关闭两侧并等待 relay 结束。
+
+一条升级连接持续持有原 tracked backend、admission lease 和 egress 计数，直到 relay
+结束。Frame 不产生新的 ingress 或请求结果计数。Cluster-router 在现有到节点的 CONNECT
+隧道上使用同一个 HTTP exchange，保留 buffered reader 和 identity rewrite；不增加第二套
+WebSocket 实现，也不重放内部请求。本功能不增加配置、扩展 API、Frame 处理或 HTTP/2
+extended CONNECT。
 
 ## 6. 数据面鉴权
 

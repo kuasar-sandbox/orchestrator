@@ -540,8 +540,10 @@ The core performs final hop-header and transport normalization after the
 callback and writes no guest request bytes if it fails. CONNECT has no guest
 HTTP request and never invokes `Rewrite`. Native exec targets are rejected by
 this generic helper: standard exec continues through `next` and its KAT plus
-per-command CEL path. The helper uses the repository's current ordinary HTTP
-and CONNECT transport and does not implement WebSocket support.
+per-command CEL path. The helper shares the core HTTP/CONNECT transport, including
+[HTTP/1.1 WebSocket forwarding](node-proxy.md#51-http11-websocket-forwarding).
+It returns only after the upgraded relay finishes; wrappers do not own a separate
+WebSocket transport or traffic lifecycle.
 
 ## Ingress boundary
 
@@ -562,8 +564,8 @@ node-link ACK, exact replay, idempotency, or stable SandboxID to NodeSandboxID
 authority.
 
 This API has no namespace, fixed extension URI, dynamic loading, hot reload, or
-component compatibility version. WebSocket transport is outside Issue #256 and
-is tracked independently by Issue #269.
+component compatibility version. WebSocket support belongs to the shared core
+transport and adds no extension-specific API.
 
 See [`examples/custom-conductor`](../examples/custom-conductor) and
 [`examples/custom-proxy`](../examples/custom-proxy) for buildable programs.

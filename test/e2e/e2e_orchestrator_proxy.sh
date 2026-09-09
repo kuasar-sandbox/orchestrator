@@ -926,6 +926,23 @@ done
 [ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; dump_logs; fail "user port via proxy_netns -> floatingip did not return marker"; }
 echo "==> PASS: proxy_netns worker reached sandbox floatingip:8000 (real user port, marker=$USER_MARK)"
 
+# WebSocket uses the same user-port route and traffic lifecycle as HTTP/CONNECT.
+WS_GUEST_COMMAND=$(python3 "$SCRIPT_DIR/lib/websocket_probe.py" guest-command)
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "$WS_GUEST_COMMAND" \
+    >"$WORK/start-websocket.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/start-websocket.out" \
+    || { cat "$WORK/start-websocket.out"; fail "start guest WebSocket fixture"; }
+python3 "$SCRIPT_DIR/lib/websocket_probe.py" probe --port "$PROXY_PORT" \
+    --authority "8001-$SID.$DOMAIN" --token "$FORWARD_TOKEN" \
+    || { dump_logs; fail "canonical WebSocket through Proxy"; }
+if [ "$CUSTOM_PROXY_EXTENSION_E2E" = 1 ]; then
+    python3 "$SCRIPT_DIR/lib/websocket_probe.py" probe --port "$PROXY_PORT" \
+        --authority private.example --path "/private/sandboxes/$SID/8001/ws" \
+        --header 'X-Private-Authorization: example-only' \
+        || { dump_logs; fail "private ForwardAuthorized WebSocket through Proxy"; }
+fi
+wait_traffic_stats "$SID" idle || { dump_logs; fail "WebSocket traffic did not return to idle"; }
+
 # A signed envd /files request carries no X-Access-Token. Both the Proxy and
 # envd verify the same signature; the file bytes still travel only through the
 # independent DataEndpoint.
