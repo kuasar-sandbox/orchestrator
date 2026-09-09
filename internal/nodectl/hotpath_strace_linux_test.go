@@ -189,14 +189,43 @@ func isLegacyUnixSocketAnnotation(line, socket string) bool {
 	return true
 }
 
+// isEventfdAnnotation reports whether the write target's descriptor
+// annotation is an eventfd, covering both the legacy
+// <anon_inode:[eventfd]> rendering and the strace >= 6.x extended form,
+// e.g. write(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, ...).
+// Only the descriptor annotation is inspected so a regular-file write whose
+// payload merely contains "<{eventfd" cannot bypass the gate.
+func isEventfdAnnotation(line string) bool {
+	for _, syscall := range []string{"write(", "writev(", "pwrite64("} {
+		start := strings.Index(line, syscall)
+		if start < 0 {
+			continue
+		}
+		rest := line[start+len(syscall):]
+		i := 0
+		for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+			i++
+		}
+		if i == 0 || i >= len(rest) || rest[i] != '<' {
+			continue
+		}
+		annotation := rest[i+1:]
+		end := strings.IndexByte(annotation, '>')
+		if end < 0 {
+			continue
+		}
+		annotation = annotation[:end]
+		return annotation == "anon_inode:[eventfd]" ||
+			strings.HasPrefix(annotation, "{eventfd")
+	}
+	return false
+}
+
 func isAllowedHotPathWrite(line, socket string) bool {
 	return strings.Contains(line, "<UNIX") ||
 		strings.Contains(line, "<pipe:") ||
 		strings.Contains(line, "<socket:[") ||
-		strings.Contains(line, "<anon_inode:[eventfd]>") ||
-		// strace >= 6.x renders eventfd with extended details, e.g.
-		// write(5<{eventfd-count=0, eventfd-id=112, eventfd-semaphore=0}>, ...).
-		strings.Contains(line, "<{eventfd") ||
+		isEventfdAnnotation(line) ||
 		isLegacyUnixSocketAnnotation(line, socket)
 }
 
@@ -361,6 +390,11 @@ func TestAllowedHotPathWriteEventfd(t *testing.T) {
 		{
 			name: "regular file still rejected",
 			line: `474607 write(5</tmp/output>, "\1\0\0\0\0\0\0\0", 8) = 8`,
+			want: false,
+		},
+		{
+			name: "regular file with eventfd text in payload still rejected",
+			line: `474607 write(5</tmp/output>, "<{eventfd", 9) = 9`,
 			want: false,
 		},
 	} {
