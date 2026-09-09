@@ -693,4 +693,3 @@ func TestServer_AdmitQueueFullWireRejectionAndDiagnostic(t *testing.T) {
 		t.Fatalf("unexpected state reservations after queue_full rejection: %+v", snapshot)
 	}
 }
-
