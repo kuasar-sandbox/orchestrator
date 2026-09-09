@@ -1008,7 +1008,9 @@ func installPromoteRecordingStub(t *testing.T, mref, argsPath string) {
 
 func installStoreTrigger(t *testing.T, dbPath, statement string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	// Fault injection can race a cleanup worker's transaction. Use the same
+	// bounded busy wait as the store so trigger removal does not fail spuriously.
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}
