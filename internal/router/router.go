@@ -1711,21 +1711,24 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		return false
 	}
 	defer backend.Close()
-	resp, err = proxypkg.ForwardHTTPOnce(r, backend, br, func(req *http.Request) {
+	err = proxypkg.ForwardHTTP(w, r, backend, br, func(req *http.Request) error {
 		req.Host = nodeSandboxHost
 		req.URL.Host = nodeSandboxHost
 		if _, present := req.Header[http.CanonicalHeaderKey(proxypkg.HeaderSandboxID)]; present {
 			req.Header.Set(proxypkg.HeaderSandboxID, rr.NodeSandboxID)
 		}
-	})
+		return nil
+	}, nil)
 	if err != nil {
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sandboxID, "node", rr.NodeID, "err", err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+		if errors.Is(err, http.ErrNotSupported) {
+			http.Error(w, "upgrade unsupported", http.StatusInternalServerError)
+		} else {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
 		return false
 	}
-	defer resp.Body.Close()
-	proxypkg.WriteHTTPResponse(w, resp)
 	return false
 }
 

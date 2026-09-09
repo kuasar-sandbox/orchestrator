@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -301,37 +300,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, flow, _, ok := p.admitRoute(w, r, sid, LegacyTarget(port))
-	if !ok {
-		return
-	}
-	defer flow.Close()
-	switch route.Kind {
-	case KindUDS, KindTCP:
-		backend, err := p.dial(r.Context(), route)
-		if err != nil {
-			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
-			return
-		}
-		backend = flow.AttachBackend(backend)
-		// Cancellation is a transport property, not an admission-policy option.
-		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
-		defer stopContextClose()
-		defer backend.Close()
-		resp, err := ForwardHTTPOnce(r, backend, nil, nil)
-		if err != nil {
-			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
-			return
-		}
-		defer resp.Body.Close()
-		p.mx.Inc(`data_requests_total{result="ok"}`)
-		WriteHTTPResponse(w, resp)
-	default: // ActivateRoute returned a non-dialable route despite admission.
-		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
-	}
+	p.forwardCanonical(w, r, sid, LegacyTarget(port))
 }
 
 // ForwardAuthorized owns w and completes one privately authenticated ordinary
@@ -353,6 +322,12 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 	if !ok {
 		return
 	}
+	p.forwardRoute(w, r, binding, request)
+}
+
+// forwardRoute is shared after canonical or private authorization. It owns one
+// parking/activation/dial/transport lifecycle; native exec has its own admission.
+func (p *Proxy) forwardRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding, request AuthorizedForwardRequest) {
 	route, flow, ok := p.activateRoute(w, r, binding)
 	if !ok {
 		return
@@ -377,55 +352,52 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 		return
 	}
 	backend = flow.AttachBackend(backend)
-	if r.Method != http.MethodConnect || r.ProtoMajor == 2 {
-		stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
-		defer stopContextClose()
-	}
 	if r.Method == http.MethodConnect {
+		// H2 stream cancellation closes its backend independently of limits.
+		// An H1 CONNECT EOF may instead be a valid half-close.
+		if r.ProtoMajor == 2 {
+			stopContextClose := context.AfterFunc(r.Context(), func() { _ = backend.Close() })
+			defer stopContextClose()
+		}
 		p.mx.Inc(`data_requests_total{result="ok"}`)
 		Tunnel(w, r, backend)
 		return
 	}
 	defer backend.Close()
-	outbound := cloneForwardHTTPRequest(r)
-	if request.Rewrite != nil {
-		if err := request.Rewrite(outbound); err != nil {
-			if p.log != nil {
-				p.log.Warn("proxy extension guest request rewrite failed",
-					"sandbox_id", request.SandboxID, "service", request.Target.Service,
-					"port", request.Target.Port, "err", err)
-			}
-			p.mx.Inc(`data_requests_total{result="badrequest"}`)
-			writeProxyError(w, http.StatusBadRequest, "guest request rewrite rejected", ProxyErrorBadRequest)
-			return
+	err = ForwardHTTP(w, r, backend, nil, request.Rewrite, func() {
+		p.mx.Inc(`data_requests_total{result="ok"}`)
+	})
+	if errors.Is(err, errHTTPRequestRewrite) {
+		if p.log != nil {
+			p.log.Warn("proxy extension guest request rewrite failed",
+				"sandbox_id", binding.SandboxID, "service", binding.Target.Service,
+				"port", binding.Target.Port, "err", err)
+		}
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		writeProxyError(w, http.StatusBadRequest, "guest request rewrite rejected", ProxyErrorBadRequest)
+	} else if err != nil {
+		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+		if errors.Is(err, http.ErrNotSupported) {
+			writeProxyError(w, http.StatusInternalServerError, "upgrade unsupported", ProxyErrorUpstreamError)
+		} else {
+			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
 		}
 	}
-	resp, err := forwardClonedHTTPOnce(outbound, backend, nil)
-	if err != nil {
-		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
-		return
-	}
-	defer resp.Body.Close()
-	p.mx.Inc(`data_requests_total{result="ok"}`)
-	WriteHTTPResponse(w, resp)
 }
 
-// admitRoute is the common ordinary HTTP/non-exec CONNECT admission sequence:
-// side-effect-free lookup, authorization, binding-revalidating activation, then
-// a freshly resolved dial route.
-func (p *Proxy) admitRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (Route, TrafficFlow, proxyadmission.Binding, bool) {
+// forwardCanonical keeps the built-in credential check before any parking or
+// activation, then joins the same flow used by privately authorized ingress.
+func (p *Proxy) forwardCanonical(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) {
 	binding, ok := p.lookupRoute(w, r, sid, target)
 	if !ok {
-		return Route{}, nil, proxyadmission.Binding{}, false
+		return
 	}
 	if !p.authorized(r, binding) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
-		return Route{}, nil, proxyadmission.Binding{}, false
+		return
 	}
-	route, flow, activated := p.activateRoute(w, r, binding)
-	return route, flow, binding.Admission, activated
+	p.forwardRoute(w, r, binding, AuthorizedForwardRequest{})
 }
 
 func (p *Proxy) lookupRoute(w http.ResponseWriter, r *http.Request, sid string, target ConnectTarget) (RouteBinding, bool) {
@@ -582,23 +554,4 @@ func writeProxyError(w http.ResponseWriter, status int, msg, kind string) {
 		w.Header().Set(HeaderProxyError, kind)
 	}
 	http.Error(w, msg, status)
-}
-
-// WriteHTTPResponse copies an upstream response to the client and flushes as data
-// arrives, preserving streaming semantics without keeping a reusable upstream
-// connection alive.
-func WriteHTTPResponse(w http.ResponseWriter, resp *http.Response) {
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if resp.Body != nil {
-		_, _ = io.Copy(flushWriter{w}, resp.Body)
-	}
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vals := range src {
-		for _, v := range vals {
-			dst.Add(k, v)
-		}
-	}
 }

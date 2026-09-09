@@ -434,7 +434,7 @@ fields = [created.get(name) for name in (
 )]
 if not all(isinstance(value, str) and value for value in fields):
     raise SystemExit("create response omitted e2b sandbox credentials")
-print("\t".join(fields[:2]))
+print("\t".join([fields[0], fields[1], fields[3]]))
 PY
 }
 
@@ -909,7 +909,7 @@ wait_cluster_node_key_pair() {
 }
 
 run_cluster_flow() {
-    local code sid envd_token create_response="$WORK/create.credentials"
+    local code sid envd_token forward_token create_response="$WORK/create.credentials"
     step "creating sandbox explicitly through router"
     code="$(retry_create_sandbox "$create_response" || true)"
     if [ "$code" != "201" ]; then
@@ -920,7 +920,7 @@ run_cluster_flow() {
         rm -f "$create_response"
         fail "create response exposed a default exec token"
     }
-    if ! IFS=$'\t' read -r sid envd_token < <(sandbox_route "$create_response"); then
+    if ! IFS=$'\t' read -r sid envd_token forward_token < <(sandbox_route "$create_response"); then
         rm -f "$create_response"
         fail "sandbox create returned an invalid e2b response"
     fi
@@ -956,6 +956,24 @@ run_cluster_flow() {
     wait_cluster_traffic_stats "$sid" idle \
         || fail "cluster exec traffic did not converge to idle"
     assert_cluster_resource_yaml "$node_yaml" || fail "cluster restore resource policy differs from cold create"
+
+    local websocket_command
+    websocket_command=$(python3 "$SCRIPT_DIR/lib/websocket_probe.py" guest-command)
+    timeout -k 5s 60 "$BIN/sandbox-ctl" exec \
+        --proxy "http://127.0.0.1:$ROUTER_PORT" \
+        --proxy-header "E2b-Sandbox-Id: $sid" \
+        --proxy-header 'E2b-Sandbox-Service: exec' \
+        --proxy-header "X-Access-Token: $exec_token" \
+        --proxy-header "X-Kuasar-Sandbox-Group: $GROUP" \
+        --proxy-header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        -- /bin/sh -c "$websocket_command" >"$WORK/start-websocket.out" 2>&1 \
+        || fail "start cluster guest WebSocket fixture"
+    python3 "$SCRIPT_DIR/lib/websocket_probe.py" probe --port "$ROUTER_PORT" \
+        --authority "8001-$sid.$DOMAIN" --token "$forward_token" \
+        --header "X-Kuasar-Sandbox-Group: $GROUP" \
+        --header "X-Kuasar-Route-Key: $ROUTE_KEY" \
+        || fail "WebSocket through cluster router and node CONNECT relay"
+    wait_cluster_traffic_stats "$sid" idle || fail "cluster WebSocket traffic did not return to idle"
     unset exec_token
     step "PASS: cluster Pause(memory=false) produced wakeable E; stable-SID exec cold-resumed it with traffic parking -> idle"
 
