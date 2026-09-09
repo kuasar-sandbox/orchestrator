@@ -110,6 +110,14 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
+  release_materials_require_source "$extract" "$NAME" 'bin/*,deploy/*' 'orchestrator' "$version"
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'accelerator' ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl' 'connector' ""
+  release_materials_require_source "$extract" "$NAME" 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' 'sandboxer' ""
+  release_materials_require_go "$extract" "$NAME" 'bin/node-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/cluster-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/node-stub-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/e2b-key-ctl'
   local file
   for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"

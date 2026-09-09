@@ -40,6 +40,14 @@ printf 'untracked source\n' > "$TMP/git-source/untracked.go"
 if (release_materials_resolve_git_source "$TMP/git-source" "" fixture >/dev/null 2>&1); then
   fail "source resolver accepted a dirty source worktree"
 fi
+printf 'LICENSE.generated\n' > "$TMP/git-source/.git/info/exclude"
+printf 'ignored material\n' > "$TMP/git-source/LICENSE.generated"
+if (
+  release_materials_init "$TMP/ignored-material/stage" "$TMP/ignored-material/work" fixture
+  release_materials_copy_licenses "$TMP/git-source" project >/dev/null 2>&1
+); then
+  fail "license collection accepted material absent from the selected commit"
+fi
 printf 'nested license manifest\n' \
   > "$TMP/material-hash/share/licenses/hash-test/LICENSES/MATERIALS.sha256"
 printf 'generated inventory\n' \
@@ -53,6 +61,8 @@ fi
 
 material_root="$TMP/material-validation"
 material_unit=validation
+mkdir -p "$material_root/bin"
+printf 'payload\n' > "$material_root/bin/tool"
 mkdir -p "$material_root/share/licenses/$material_unit/project" \
   "$material_root/share/sources/$material_unit" "$TMP/material-validation-work"
 printf 'fixture license\n' > "$material_root/share/licenses/$material_unit/project/LICENSE"
@@ -114,6 +124,36 @@ if (
     >/dev/null 2>&1
 ); then
   fail "release material validator accepted an unsafe parent directory mode"
+fi
+
+cp -a "$material_root" "$TMP/material-empty-license"
+rm "$TMP/material-empty-license/share/licenses/$material_unit/project/LICENSE"
+release_materials_hash_tree "$TMP/material-empty-license" "$material_unit" \
+  "$TMP/material-empty-license/share/sources/$material_unit/MATERIALS.sha256"
+if (
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$TMP/material-empty-license" "$material_unit" >/dev/null 2>&1
+); then
+  fail "release material validator accepted an empty license directory"
+fi
+if (
+  release_materials_require_source "$material_root" "$material_unit" bin/tool fixture v2.0.0 \
+    >/dev/null 2>&1
+); then
+  fail "release material validator accepted a different release version"
+fi
+if (
+  release_materials_require_go "$material_root" "$material_unit" bin/tool >/dev/null 2>&1
+); then
+  fail "release material validator accepted missing Go build records"
+fi
+cp -a "$material_root" "$TMP/material-missing-payload"
+rm "$TMP/material-missing-payload/bin/tool"
+if (
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$TMP/material-missing-payload" "$material_unit" >/dev/null 2>&1
+); then
+  fail "release material validator accepted a record for an unshipped payload"
 fi
 
 bash "$ROOT/scripts/test-preview-line.sh"
