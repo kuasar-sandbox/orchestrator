@@ -38,7 +38,7 @@
 节点 reservation controller 拥有全节点准入、资源池记账、grant、水位与恢复,也是多租户边界的一部分。
 每个 Sandbox 的 cgroup、balloon 与 VMM 执行由 sandboxer 维护;节点控制器不接管 Sandbox 内部资源闭环。
 
-完整项目安全模型与私密漏洞报告见 [Kuasar Sandbox 安全策略](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy)。
+安全架构与部署信任边界见[项目系统概览](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md)和[部署指南](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/deployment_zh.md)。漏洞通过 [Kuasar Sandbox 安全策略](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy)中的私密渠道报告。
 
 ## 主要命令
 
@@ -90,6 +90,8 @@
 <a id="构建"></a>
 ## 构建与测试
 
+Go 源码构建需要 Go 1.24+，并将 `accelerator`、`connector`、`sandboxer` 放在本仓的兄弟目录；修改范围仅在本仓也不免除构建依赖。内部 `require` 使用各组件目标正式版本（Daily Preview 去掉预发布后缀），目标 Tag 可以尚不存在，因为实际构建由本地 `replace` 选择兄弟仓源码。`GOWORK=off` 不会禁用这些替换。验证必须记录实际源码 SHA，不能把版本标签当作已编译提交。运行真实沙箱还需 Runtime/Kernel 等运行工件，不能与 Go 编译前置混同。
+
 Go 二进制使用 `CGO_ENABLED=0` 构建。
 
 ```bash
@@ -100,7 +102,7 @@ make test-e2e                   # 组件 owner suite,需要项目组装的完整
 ```
 
 真实沙箱要求 Linux、systemd、root 权限、KVM、sandboxer、connector 及 guest-runtime 产生的 Runtime/VMLinux 制品。
-组件本地变更可直接使用本仓库;跨仓契约变更必须关联 companion PR 并使用项目 exact-source BMS 验证,
+变更范围可以限定在本仓，构建仍需上述依赖闭包；跨仓契约变更必须关联 companion PR 并使用精确源码组合的集成测试验证，
 见 [Organization 贡献指南](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md)。
 
 ## 部署概览
@@ -184,7 +186,7 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 项目边界
 
-- 系统设计、共享 BMS、Demo 与聚合发布属于 [kuasar-sandbox/kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)。
+- 系统设计、共享集成测试、Demo 与聚合发布属于 [kuasar-sandbox/kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)。
 - microVM 生命周期与 guest 控制属于 [sandboxer](https://github.com/kuasar-sandbox/sandboxer)。
 - image/snapshot 数据基础设施属于 [accelerator](https://github.com/kuasar-sandbox/accelerator)。
 - 高密度 microVM 网络属于 [connector](https://github.com/kuasar-sandbox/connector)。
