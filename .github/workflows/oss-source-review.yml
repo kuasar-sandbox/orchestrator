@@ -1,0 +1,31 @@
+name: Open-source preparation source review
+on:
+  push:
+    branches: [ops/oss-review-c49b72]
+    paths: [.github/workflows/oss-source-review.yml]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Export parent source without executing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-review"
+          git archive --format=tar HEAD^ | gzip -n > "$RUNNER_TEMP/source-review/source.tar.gz"
+          git ls-tree -rz --full-tree HEAD^ > "$RUNNER_TEMP/source-review/tree.z"
+          git rev-parse HEAD^ HEAD^: > "$RUNNER_TEMP/source-review/revisions.txt"
+          sha256sum "$RUNNER_TEMP/source-review/source.tar.gz" > "$RUNNER_TEMP/source-review/SHA256SUMS"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: oss-source-c49b72
+          path: ${{ runner.temp }}/source-review/
+          retention-days: 1
+          if-no-files-found: error
