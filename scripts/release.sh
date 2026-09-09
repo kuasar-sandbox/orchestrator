@@ -75,8 +75,8 @@ validate_archive_paths() {
     { path=$0; sub(/^\.\//, "", path) }
     path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// && path !~ /^share\/(licenses|sources)\/orchestrator\// { exit 1 }
   ' "$listing" || fail "$archive contains a file outside the orchestrator release layout"
-  tar -tvzf "$archive" | awk '$1 !~ /^[-d]/ { exit 1 }' \
-    || fail "$archive contains a non-regular, non-directory entry"
+  tar --numeric-owner -tvzf "$archive" | awk '$1 !~ /^[-d]/ || $2 != "0/0" { exit 1 }' \
+    || fail "$archive contains a non-regular entry or non-root ownership"
 }
 
 validate_bundle() {

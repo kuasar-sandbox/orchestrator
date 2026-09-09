@@ -118,16 +118,18 @@ release_materials_record_source() {
 
 release_materials_add_go_binary() {
   [ "$#" -eq 2 ] || fail "release_materials_add_go_binary requires binary and archive path"
-  local binary="$1" archive_path="$2" raw toolchain
+  local binary="$1" archive_path="$2" raw toolchain toolchain_full
   [ -f "$binary" ] || fail "Go release payload is missing: $binary"
   release_materials_safe_relative "$archive_path" \
     || fail "unsafe Go payload archive path: $archive_path"
   raw="$RELEASE_MATERIALS_WORK/go-version-$(( $(find "$RELEASE_MATERIALS_WORK" -maxdepth 1 -name 'go-version-*' | wc -l) + 1 ))"
   go version -m "$binary" > "$raw" 2>/dev/null \
     || fail "Go build info is missing from $binary"
-  toolchain="$(awk 'NR == 1 { sub(/^.*: /, ""); print; exit }' "$raw")"
+  toolchain_full="$(awk 'NR == 1 { sub(/^.*: /, ""); print; exit }' "$raw")"
+  toolchain="${toolchain_full%% *}"
+  toolchain="${toolchain%%-X:*}"
   [[ "$toolchain" =~ ^go[0-9] ]] || fail "cannot read the Go toolchain from $binary"
-  printf '%s\ttoolchain\tgo\t%s\t-\n' "$archive_path" "$toolchain" \
+  printf '%s\ttoolchain\tgo\t%s\t-\n' "$archive_path" "$toolchain_full" \
     >> "$RELEASE_MATERIALS_WORK/go-build-info"
   printf '%s\n' "$toolchain" >> "$RELEASE_MATERIALS_WORK/go-toolchains"
   release_materials_record_source "$archive_path" "Go toolchain" "$toolchain" \
@@ -136,6 +138,11 @@ release_materials_add_go_binary() {
   awk -F '\t' -v payload="$archive_path" \
     -v info="$RELEASE_MATERIALS_WORK/go-build-info" \
     -v modules="$RELEASE_MATERIALS_WORK/go-modules" '
+      function flush_module() {
+        if (previous != "") print previous "\t" previous_version "\t" previous_checksum >> modules
+        previous = ""
+      }
+      $2 != "=>" { flush_module() }
       $2 == "path" {
         print payload "\tmain-package\t" $3 "\t-\t-" >> info
       }
@@ -148,26 +155,34 @@ release_materials_add_go_binary() {
         version = ($4 == "" ? "-" : $4)
         checksum = ($5 == "" ? "-" : $5)
         print payload "\tmodule\t" $3 "\t" version "\t" checksum >> info
-        print $3 "\t" version "\t" checksum >> modules
         previous = $3
+        previous_version = version
+        previous_checksum = checksum
       }
       $2 == "=>" && previous != "" {
+        previous_module = previous
         if ($3 ~ /^\// || $3 ~ /^\.\.?\// || $4 == "(devel)" || $4 == "") {
           target = "local-source"
+          checksum = "-"
+          flush_module()
         } else {
           target = $3 "@" $4
+          checksum = ($5 == "" ? "-" : $5)
+          print $3 "\t" $4 "\t" checksum >> modules
         }
-        print payload "\treplacement\t" previous "\t" target "\t-" >> info
+        print payload "\treplacement\t" previous_module "\t" target "\t" checksum >> info
+        previous = ""
       }
       $2 == "build" {
         split($3, setting, "=")
         if (setting[1] == "GOOS" || setting[1] == "GOARCH" ||
-            setting[1] == "CGO_ENABLED" || setting[1] == "-tags" ||
+            setting[1] == "CGO_ENABLED" || setting[1] == "GOEXPERIMENT" || setting[1] == "-tags" ||
             setting[1] == "vcs" || setting[1] == "vcs.revision" ||
             setting[1] == "vcs.time" || setting[1] == "vcs.modified") {
           print payload "\tbuild-setting\t" setting[1] "\t" substr($3, length(setting[1]) + 2) "\t-" >> info
         }
       }
+      END { flush_module() }
     ' "$raw"
 }
 
@@ -290,9 +305,11 @@ release_materials_validate_payload() {
 }
 
 release_materials_require_source() {
-  local root="$1" unit="$2" payload="$3" name="$4" version="$5"
-  awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" '
-    NR > 1 && $1 == payload && $2 == name && (version == "" || $3 == version) { rows++ }
+  local root="$1" unit="$2" payload="$3" name="$4" version="$5" source="${6:-}" integrity="${7:-}"
+  awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" \
+    -v source="$source" -v integrity="$integrity" '
+    NR > 1 && $1 == payload && $2 == name && (version == "" || $3 == version) &&
+      (source == "" || $4 == source) && (integrity == "" || $5 == integrity) { rows++ }
     END { exit rows != 1 }
   ' "$root/share/sources/$unit/SOURCES.tsv" \
     || fail "missing or inconsistent source record for $name ($payload)"
@@ -304,13 +321,14 @@ release_materials_require_go() {
   toolchain="$(awk -F '\t' -v payload="$payload" '
     NR > 1 && $1 == payload && $2 == "toolchain" && $3 == "go" { print $4 }
   ' "$info")"
-  [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?$ ]] \
+  [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?(-X:[A-Za-z0-9_,]+|\ X:[A-Za-z0-9_,]+)?$ ]] \
     || fail "missing or inconsistent Go toolchain for $payload"
   awk -F '\t' -v payload="$payload" '
     NR > 1 && $1 == payload && $2 == "main-package" { rows++ }
     END { exit rows != 1 }
   ' "$info" || fail "missing or inconsistent Go package record for $payload"
-  release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "$toolchain"
+  toolchain="${toolchain%% *}"
+  release_materials_require_source "$root" "$unit" "$payload" "Go toolchain" "${toolchain%%-X:*}"
   if [[ "$payload" != *:* ]]; then
     (
       local validation_work

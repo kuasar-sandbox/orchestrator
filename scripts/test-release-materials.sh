@@ -58,6 +58,45 @@ if (release_materials_verified_go_source "$module" "$version" \
   h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= >/dev/null 2>&1); then
   fail "source verification accepted a checksum different from the binary"
 fi
+mkdir -p "$TMP/replacement-consumer"
+printf 'module replacement-consumer.invalid\n\ngo 1.24\nrequire example.invalid/original-fixture v0.0.0\nreplace example.invalid/original-fixture => %s %s\n' \
+  "$module" "$version" > "$TMP/replacement-consumer/go.mod"
+printf 'package main\nimport f "example.invalid/original-fixture"\nfunc main() { println(f.Value()) }\n' \
+  > "$TMP/replacement-consumer/main.go"
+(cd "$TMP/replacement-consumer" && go mod download "$module@$version" && go build -o "$TMP/replaced-tool" .)
+release_materials_init "$TMP/replacement-stage" "$TMP/replacement-work" fixture
+release_materials_add_go_binary "$TMP/replaced-tool" bin/tool
+printf '%s\t%s\t%s\n' "$module" "$version" "$checksum" > "$TMP/effective-module"
+cmp "$TMP/effective-module" "$RELEASE_MATERIALS_WORK/go-modules" \
+  || fail "replacement inventory does not select the actual module and checksum"
+grep -Fqx "bin/tool"$'\t'"replacement"$'\t'"example.invalid/original-fixture"$'\t'"$module@$version"$'\t'"$checksum" \
+  "$RELEASE_MATERIALS_WORK/go-build-info" || fail "replacement metadata lost its source checksum"
+release_materials_finish
+cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$module@$version/LICENSE"
+
+(cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
+release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture
+release_materials_add_go_binary "$TMP/experimental-tool" bin/tool
+grep -Eq '[- ]X:arenas|GOEXPERIMENT[[:space:]]+arenas' "$RELEASE_MATERIALS_WORK/go-build-info" \
+  || fail "Go experiment information was not retained"
+if grep -q ' ' "$RELEASE_MATERIALS_WORK/go-toolchains"; then
+  fail "Go experiment suffix was included in the toolchain path"
+fi
+release_materials_finish
+
+# Older Go versions append experiment names to the first build-info line.
+# Exercise that representation independently of the installed Go release.
+release_materials_init "$TMP/suffix-stage" "$TMP/suffix-work" fixture
+(
+  go() { command go "$@" | awk 'NR == 1 { $0 = $0 " X:arenas" } { print }'; }
+  release_materials_add_go_binary "$TMP/tool" bin/tool
+)
+grep -Fq ' X:arenas' "$RELEASE_MATERIALS_WORK/go-build-info"
+if grep -q ' ' "$RELEASE_MATERIALS_WORK/go-toolchains"; then
+  fail "historical Go experiment suffix was included in the toolchain path"
+fi
+release_materials_finish
+
 chmod u+w "$directory/LICENSE"
 printf 'locally changed license\n' > "$directory/LICENSE"
 if (release_materials_verified_go_source "$module" "$version" "$checksum" \
@@ -66,4 +105,4 @@ if (release_materials_verified_go_source "$module" "$version" "$checksum" \
 fi
 grep -Fq 'dir has been modified' "$TMP/tamper-error" \
   || fail "tampered source failed for an unrelated reason"
-echo "test-release-materials: PASS (binary checksum and extracted-cache tampering)"
+echo "test-release-materials: PASS (checksum, effective replacement, Go experiment and cache tampering)"

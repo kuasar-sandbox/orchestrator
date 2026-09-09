@@ -364,4 +364,14 @@ if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 
   fail "packager accepted an unvalidated release architecture"
 fi
 
+cp -a "$TMP/bundle" "$TMP/nonroot-owner"
+mkdir "$TMP/nonroot-owner/root"
+tar -xzf "$archive" -C "$TMP/nonroot-owner/root"
+tar --sort=name --owner=1234 --group=0 --numeric-owner --mtime=@1700000000 \
+  -czf "$TMP/nonroot-owner/assets/$(basename "$archive")" -C "$TMP/nonroot-owner/root" .
+(cd "$TMP/nonroot-owner/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/nonroot-owner" >/dev/null 2>&1; then
+  fail "validator accepted non-root numeric ownership with regenerated checksums"
+fi
+
 echo "test-release: PASS"
