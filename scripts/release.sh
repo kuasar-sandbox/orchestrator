@@ -188,6 +188,9 @@ package_release() {
     "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
   sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
     "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
+  accelerator_version="$(release_materials_git_version "$accelerator_source" "$accelerator_version" "$accelerator_sha")"
+  connector_version="$(release_materials_git_version "$connector_source" "$connector_version" "$connector_sha")"
+  sandboxer_version="$(release_materials_git_version "$sandboxer_source" "$sandboxer_version" "$sandboxer_sha")"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$accelerator_source" accelerator

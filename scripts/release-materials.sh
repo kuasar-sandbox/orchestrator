@@ -45,6 +45,20 @@ release_materials_resolve_git_source() {
   printf '%s\n' "$actual"
 }
 
+release_materials_git_version() {
+  local source="$1" version="$2" sha="$3" tagged
+  tagged="$(git -C "$source" rev-parse --verify --quiet "refs/tags/$version^{commit}" || true)"
+  if [ -z "$tagged" ]; then
+    # Local source builds may target a release whose tag does not exist yet.
+    # Record the exact source identity instead of claiming that tag's contents.
+    printf 'git:%s\n' "$sha"
+  elif [ "$tagged" = "$sha" ]; then
+    printf '%s\n' "$version"
+  else
+    fail "$version does not identify the selected source commit $sha"
+  fi
+}
+
 release_materials_copy_licenses() {
   [ "$#" -eq 2 ] || fail "release_materials_copy_licenses requires source directory and destination label"
   local source="$1" label="$2" destination file relative source_root count=0

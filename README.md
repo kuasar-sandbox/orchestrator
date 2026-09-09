@@ -153,6 +153,10 @@ Node roots, object RunDir/BaseDir, RunID/PathID and cleanup ordering are maintai
 
 ## Release model
 
+Package source records keep an internal dependency's release version only when
+its local Git tag matches the selected source commit. Untagged source builds
+record `git:<commit>`; this does not require creating target release tags.
+
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the node and cluster binaries plus deployment files. Documentation and E2E sources are collected from the selected component tag into the project platform archive rather than duplicated in the component archive.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact component tags and validating the combined system on real KVM infrastructure. An orchestrator component version and a project aggregate version are related by the aggregate selection; they are not required to have the same number.

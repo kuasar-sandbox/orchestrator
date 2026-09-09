@@ -30,6 +30,15 @@ mkdir -p "$TMP/git-source" \
   "$TMP/material-hash/share/sources/hash-test"
 printf 'fixture license\n' > "$TMP/git-source/LICENSE"
 fixture_git_sha="$(init_fixture_repo "$TMP/git-source" LICENSE)"
+[ "$(release_materials_git_version "$TMP/git-source" v1.2.3 "$fixture_git_sha")" = "git:$fixture_git_sha" ] \
+  || fail "untagged source was recorded as a component release"
+git -C "$TMP/git-source" tag v1.2.3 "$fixture_git_sha"
+[ "$(release_materials_git_version "$TMP/git-source" v1.2.3 "$fixture_git_sha")" = v1.2.3 ] \
+  || fail "matching source tag was not retained"
+if (release_materials_git_version "$TMP/git-source" v1.2.3 \
+  0000000000000000000000000000000000000000 >/dev/null 2>&1); then
+  fail "source version resolver accepted a tag for another commit"
+fi
 [ "$(release_materials_resolve_git_source "$TMP/git-source" "$fixture_git_sha" fixture)" = "$fixture_git_sha" ] \
   || fail "clean source worktree did not resolve to its selected commit"
 if (release_materials_resolve_git_source "$TMP/git-source" \
