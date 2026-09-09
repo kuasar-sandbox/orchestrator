@@ -29,11 +29,11 @@ Commands and results:
 - [ ] Review conversations are resolved.
 - [ ] The current base SHA and reviewed pull request head SHA have been recorded.
 - [ ] The integration commit has exactly two parents: the recorded base, then the recorded head.
-- [ ] The current `kuasar-bms-companions` block (or its absence) matches the
+- [ ] The current companion declaration from the central CI contract (or its absence) matches the
   admitted source set recorded below; any later body or companion change
   received fresh exact-head evidence.
-- [ ] `kuasar/bms-exact-head` is `success` on that integration SHA.
-- [ ] The exact-head status points to a completed, successful `pull_request_target` BMS run.
+- [ ] The exact-integration status defined in the [central CI contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci.md) is `success` on that integration SHA.
+- [ ] The exact-head status points to a completed, successful `pull_request_target` integration-test run.
 - [ ] A final query confirmed that the base, head, and integration SHA are unchanged and the exact-head status still succeeds for the recorded run.
 - [ ] The pull request will be squash merged manually; auto-merge is not used.
 
@@ -62,7 +62,7 @@ base/head/integration SHAs):
 
 ```
 
-BMS exact-head status / run URL:
+Integration-test exact-head status / run URL:
 
 ```text
 
