@@ -234,7 +234,6 @@ release_materials_hash_tree() {
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
   local module version checksum directory toolchain toolchain_root installed_toolchain
-  command -v jq >/dev/null || fail "jq is required to collect Go module license material"
   while IFS= read -r toolchain; do
     [ -n "$toolchain" ] || continue
     toolchain_root="$(GOTOOLCHAIN="$toolchain" go env GOROOT 2>/dev/null)" \
@@ -246,6 +245,9 @@ release_materials_finish() {
   done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
+  if [ -s "$RELEASE_MATERIALS_WORK/go-modules-sorted" ]; then
+    command -v jq >/dev/null || fail "jq is required to collect Go module license material"
+  fi
   while IFS=$'\t' read -r module version checksum; do
     [ -n "$module" ] || continue
     case "$module" in
@@ -306,10 +308,18 @@ release_materials_validate_payload() {
 
 release_materials_require_source() {
   local root="$1" unit="$2" payload="$3" name="$4" version="$5" source="${6:-}" integrity="${7:-}"
+  local label=""
+  case "$name" in
+    "Go toolchain") label="go-toolchain/$version" ;;
+    "$unit") label=project ;;
+    accelerator|connector|sandboxer) label="$name" ;;
+  esac
+  [ -z "$label" ] || label="share/licenses/$unit/$label"
   awk -F '\t' -v payload="$payload" -v name="$name" -v version="$version" \
-    -v source="$source" -v integrity="$integrity" '
+    -v source="$source" -v integrity="$integrity" -v label="$label" '
     NR > 1 && $1 == payload && $2 == name && (version == "" || $3 == version) &&
-      (source == "" || $4 == source) && (integrity == "" || $5 == integrity) { rows++ }
+      (source == "" || $4 == source) && (integrity == "" || $5 == integrity) &&
+      (label == "" || $6 == label) { rows++ }
     END { exit rows != 1 }
   ' "$root/share/sources/$unit/SOURCES.tsv" \
     || fail "missing or inconsistent source record for $name ($payload)"
@@ -404,8 +414,22 @@ release_materials_validate() {
     NR == 1 { next }
     NF != 3 || $1 == "" || $2 == "" || $3 == "" { exit 1 }
   ' "$source_root/GO-MODULES.tsv" || fail "invalid Go module records"
-  awk -F '\t' 'NR > 1 && $2 == "module" { print $3 "\t" $4 "\t" $5 }' \
-    "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u > "$WORK/expected-go-modules-$unit"
+  # Records are sorted by payload/type, not by dependency order. Apply each
+  # replacement to the module in that SAME binary before taking the union.
+  awk -F '\t' '
+    NR > 1 && $2 == "module" { modules[$1 SUBSEP $3] = $3 FS $4 FS $5 }
+    NR > 1 && $2 == "replacement" && $4 != "local-source" {
+      separator = index($4, "@")
+      if (separator <= 1 || separator == length($4)) { invalid = 1; next }
+      replacements[$1 SUBSEP $3] = substr($4, 1, separator - 1) FS substr($4, separator + 1) FS $5
+    }
+    END {
+      if (invalid) exit 1
+      for (key in replacements) if (!(key in modules)) exit 1
+      for (key in modules) print (key in replacements ? replacements[key] : modules[key])
+    }
+  ' "$source_root/GO-BUILD-INFO.tsv" | LC_ALL=C sort -u > "$WORK/expected-go-modules-$unit" \
+    || fail "invalid effective Go module records"
   sed -n '2,$p' "$source_root/GO-MODULES.tsv" > "$WORK/actual-go-modules-$unit"
   cmp -s "$WORK/expected-go-modules-$unit" "$WORK/actual-go-modules-$unit" \
     || fail "Go module inventory differs from the build records"

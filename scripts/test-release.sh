@@ -364,6 +364,27 @@ if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 
   fail "packager accepted an unvalidated release architecture"
 fi
 
+for mutation in setuid setgid writable-directory writable-binary; do
+  candidate="$TMP/unsafe-mode-$mutation"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  case "$mutation" in
+    setuid) chmod 4755 "$candidate/root/bin/node-ctl" ;;
+    setgid) chmod 2755 "$candidate/root/bin/node-ctl" ;;
+    writable-directory) chmod 0777 "$candidate/root/bin" ;;
+    writable-binary) chmod 0777 "$candidate/root/bin/node-ctl" ;;
+  esac
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted $mutation with regenerated checksums"
+  fi
+  grep -Fq 'unsafe type, mode or ownership' "$candidate/result.log" \
+    || fail "$mutation was rejected for an unrelated reason"
+done
+
 cp -a "$TMP/bundle" "$TMP/nonroot-owner"
 mkdir "$TMP/nonroot-owner/root"
 tar -xzf "$archive" -C "$TMP/nonroot-owner/root"

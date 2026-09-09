@@ -14,6 +14,17 @@ export GOSUMDB=off GOFLAGS=
 module=example.invalid/license-fixture
 version=v1.0.0
 mkdir -p "$TMP/proxy/$module/@v" "$TMP/consumer" "$TMP/material-work"
+(
+  # Kernel-only material collection has no module JSON and must work without jq.
+  command() {
+    if [ "$1" = -v ] && [ "${2:-}" = jq ]; then return 1; fi
+    builtin command "$@"
+  }
+  release_materials_init "$TMP/no-go-stage" "$TMP/no-go-work" fixture
+  release_materials_finish
+)
+[ "$(wc -l < "$TMP/no-go-stage/share/sources/fixture/GO-MODULES.tsv")" -eq 1 ] \
+  || fail "no-Go materials unexpectedly contain module records"
 RELEASE_MATERIALS_WORK="$TMP/material-work"
 printf 'module %s\n\ngo 1.24\n' "$module" > "$TMP/proxy/$module/@v/$version.mod"
 printf '{"Version":"%s","Time":"2020-01-01T00:00:00Z"}\n' "$version" \
@@ -73,6 +84,43 @@ grep -Fqx "bin/tool"$'\t'"replacement"$'\t'"example.invalid/original-fixture"$'\
   "$RELEASE_MATERIALS_WORK/go-build-info" || fail "replacement metadata lost its source checksum"
 release_materials_finish
 cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$module@$version/LICENSE"
+mkdir -p "$TMP/replacement-stage/bin" "$TMP/validation"
+install -m 0755 "$TMP/replaced-tool" "$TMP/replacement-stage/bin/tool"
+WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
+# Recomputing the material hashes must not allow an inventory to revert to
+# the original (unbuilt) module or advertise another replacement checksum.
+for mismatch in original checksum; do
+  altered="$TMP/replacement-$mismatch"
+  cp -a "$TMP/replacement-stage" "$altered"
+  {
+    printf 'module\tversion\tchecksum\n'
+    if [ "$mismatch" = original ]; then
+      printf 'example.invalid/original-fixture\tv0.0.0\t-\n'
+    else
+      printf '%s\t%s\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n' "$module" "$version"
+    fi
+  } > "$altered/share/sources/fixture/GO-MODULES.tsv"
+  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/$mismatch.log" 2>&1); then
+    fail "validator accepted a mismatched effective module inventory: $mismatch"
+  fi
+  grep -Fq 'Go module inventory differs from the build records' "$TMP/$mismatch.log" \
+    || fail "effective module inventory mismatch failed for an unrelated reason"
+done
+
+altered="$TMP/replacement-license-redirect"
+cp -a "$TMP/replacement-stage" "$altered"
+mkdir -p "$altered/share/licenses/fixture/project"
+install -m 0644 "$directory/LICENSE" "$altered/share/licenses/fixture/project/LICENSE"
+awk -F '\t' 'BEGIN { OFS=FS } $2 == "Go toolchain" { $6="share/licenses/fixture/project" } { print }' \
+  "$altered/share/sources/fixture/SOURCES.tsv" > "$TMP/redirected-sources"
+mv "$TMP/redirected-sources" "$altered/share/sources/fixture/SOURCES.tsv"
+release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/redirect.log" 2>&1); then
+  fail "validator accepted a Go toolchain license redirected to the project"
+fi
+grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/redirect.log" \
+  || fail "Go toolchain license redirect failed for an unrelated reason"
 
 (cd "$TMP/consumer" && GOEXPERIMENT=arenas go build -o "$TMP/experimental-tool" .)
 release_materials_init "$TMP/experiment-stage" "$TMP/experiment-work" fixture
