@@ -51,6 +51,71 @@ if grep -Fq 'share/sources/hash-test/MATERIALS.sha256' "$TMP/material-hash-actua
   fail "generated material inventory included itself"
 fi
 
+material_root="$TMP/material-validation"
+material_unit=validation
+mkdir -p "$material_root/share/licenses/$material_unit/project" \
+  "$material_root/share/sources/$material_unit" "$TMP/material-validation-work"
+printf 'fixture license\n' > "$material_root/share/licenses/$material_unit/project/LICENSE"
+{
+  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
+  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\tshare/licenses/%s/project\n' \
+    "$material_unit"
+} > "$material_root/share/sources/$material_unit/SOURCES.tsv"
+printf 'payload\trecord\tname\tversion_or_value\tchecksum\n' \
+  > "$material_root/share/sources/$material_unit/GO-BUILD-INFO.tsv"
+printf 'module\tversion\tchecksum\n' \
+  > "$material_root/share/sources/$material_unit/GO-MODULES.tsv"
+release_materials_hash_tree "$material_root" "$material_unit" \
+  "$material_root/share/sources/$material_unit/MATERIALS.sha256"
+find "$material_root/share" -type d -exec chmod 0755 {} +
+find "$material_root/share" -type f -exec chmod 0644 {} +
+(
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$material_root" "$material_unit"
+)
+
+cp -a "$material_root" "$TMP/material-unsafe-license-path"
+{
+  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
+  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\t../../../etc\n'
+} > "$TMP/material-unsafe-license-path/share/sources/$material_unit/SOURCES.tsv"
+release_materials_hash_tree "$TMP/material-unsafe-license-path" "$material_unit" \
+  "$TMP/material-unsafe-license-path/share/sources/$material_unit/MATERIALS.sha256"
+chmod 0644 "$TMP/material-unsafe-license-path/share/sources/$material_unit/MATERIALS.sha256"
+if (
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$TMP/material-unsafe-license-path" "$material_unit" \
+    >/dev/null 2>&1
+); then
+  fail "release material validator accepted a license directory outside its unit"
+fi
+
+cp -a "$material_root" "$TMP/material-invalid-record"
+{
+  printf 'payload\tname\tversion\tsource\tintegrity\tlicense_directory\n'
+  printf 'bin/tool\tfixture\tv1.0.0\thttps://example.invalid/source.tar.gz\tsha256:fixture\n'
+} > "$TMP/material-invalid-record/share/sources/$material_unit/SOURCES.tsv"
+release_materials_hash_tree "$TMP/material-invalid-record" "$material_unit" \
+  "$TMP/material-invalid-record/share/sources/$material_unit/MATERIALS.sha256"
+chmod 0644 "$TMP/material-invalid-record/share/sources/$material_unit/MATERIALS.sha256"
+if (
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$TMP/material-invalid-record" "$material_unit" \
+    >/dev/null 2>&1
+); then
+  fail "release material validator accepted a SOURCES.tsv row with fewer than six fields"
+fi
+
+cp -a "$material_root" "$TMP/material-unsafe-parent-mode"
+chmod 0777 "$TMP/material-unsafe-parent-mode/share"
+if (
+  WORK="$TMP/material-validation-work"
+  release_materials_validate "$TMP/material-unsafe-parent-mode" "$material_unit" \
+    >/dev/null 2>&1
+); then
+  fail "release material validator accepted an unsafe parent directory mode"
+fi
+
 bash "$ROOT/scripts/test-preview-line.sh"
 bash "$ROOT/scripts/test-delete-preview.sh"
 

@@ -207,24 +207,61 @@ release_materials_finish() {
 
 release_materials_validate() {
   [ "$#" -eq 2 ] || fail "release_materials_validate requires extracted root and unit"
-  local root="$1" unit="$2" source_root="$1/share/sources/$2" file actual
+  local root="$1" unit="$2" source_root="$1/share/sources/$2"
+  local file actual header directory
+  release_materials_safe_relative "$unit" \
+    || fail "unsafe release material unit: $unit"
+  for directory in "$root/share" "$root/share/licenses" "$root/share/sources" \
+    "$root/share/licenses/$unit" "$source_root"; do
+    [ -d "$directory" ] || fail "release material directory is missing: $directory"
+    [ ! -L "$directory" ] || fail "release material directory is a symbolic link: $directory"
+    [ "$(stat -c '%a' "$directory")" = 755 ] \
+      || fail "release material directory has unsafe mode: $directory"
+  done
   for file in SOURCES.tsv GO-BUILD-INFO.tsv GO-MODULES.tsv MATERIALS.sha256; do
     [ -s "$source_root/$file" ] || fail "release source material is missing: share/sources/$unit/$file"
     [ "$(stat -c '%a' "$source_root/$file")" = 644 ] \
       || fail "release source material has unsafe mode: share/sources/$unit/$file"
   done
-  grep -Fqx $'payload\tname\tversion\tsource\tintegrity\tlicense_directory' \
-    "$source_root/SOURCES.tsv" || fail "invalid SOURCES.tsv header"
-  grep -Fqx $'payload\trecord\tname\tversion_or_value\tchecksum' \
-    "$source_root/GO-BUILD-INFO.tsv" || fail "invalid GO-BUILD-INFO.tsv header"
-  grep -Fqx $'module\tversion\tchecksum' "$source_root/GO-MODULES.tsv" \
+  awk -F '\t' '
+    NR == 1 {
+      if ($0 != "payload\tname\tversion\tsource\tintegrity\tlicense_directory") {
+        exit 1
+      }
+      next
+    }
+    NF != 6 { exit 1 }
+    {
+      for (field = 1; field <= 6; field++) {
+        if ($field == "") {
+          exit 1
+        }
+      }
+      rows++
+    }
+    END {
+      if (rows < 1) {
+        exit 1
+      }
+    }
+  ' "$source_root/SOURCES.tsv" || fail "invalid SOURCES.tsv records"
+  IFS= read -r header < "$source_root/GO-BUILD-INFO.tsv" \
+    || fail "invalid GO-BUILD-INFO.tsv header"
+  [ "$header" = $'payload\trecord\tname\tversion_or_value\tchecksum' ] \
+    || fail "invalid GO-BUILD-INFO.tsv header"
+  IFS= read -r header < "$source_root/GO-MODULES.tsv" \
     || fail "invalid GO-MODULES.tsv header"
-  [ "$(wc -l < "$source_root/SOURCES.tsv")" -gt 1 ] \
-    || fail "SOURCES.tsv contains no payload source"
+  [ "$header" = $'module\tversion\tchecksum' ] \
+    || fail "invalid GO-MODULES.tsv header"
   while IFS=$'\t' read -r _ _ _ _ _ file; do
-    [ "$file" = license_directory ] && continue
+    release_materials_safe_relative "$file" \
+      || fail "unsafe declared license directory: $file"
+    case "$file" in
+      "share/licenses/$unit/"?*) ;;
+      *) fail "declared license directory is outside share/licenses/$unit: $file" ;;
+    esac
     [ -d "$root/$file" ] || fail "declared license directory is missing: $file"
-  done < "$source_root/SOURCES.tsv"
+  done < <(sed -n '2,$p' "$source_root/SOURCES.tsv")
   if find "$root/share/licenses/$unit" "$source_root" -type l -print -quit | grep -q .; then
     fail "release materials contain a symbolic link"
   fi
