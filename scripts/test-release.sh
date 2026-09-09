@@ -11,6 +11,46 @@ fail() {
   exit 1
 }
 
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
+
+init_fixture_repo() {
+  local directory="$1"
+  shift
+  git -C "$directory" init -q
+  git -C "$directory" config --local user.name "Chen Xiaohui"
+  git -C "$directory" config --local user.email "graych@gmail.com"
+  git -C "$directory" add -- "$@"
+  git -C "$directory" commit -q -m "test: create release source fixture"
+  git -C "$directory" rev-parse HEAD
+}
+
+mkdir -p "$TMP/git-source" \
+  "$TMP/material-hash/share/licenses/hash-test/LICENSES" \
+  "$TMP/material-hash/share/sources/hash-test"
+printf 'fixture license\n' > "$TMP/git-source/LICENSE"
+fixture_git_sha="$(init_fixture_repo "$TMP/git-source" LICENSE)"
+[ "$(release_materials_resolve_git_source "$TMP/git-source" "$fixture_git_sha" fixture)" = "$fixture_git_sha" ] \
+  || fail "clean source worktree did not resolve to its selected commit"
+if (release_materials_resolve_git_source "$TMP/git-source" \
+  0000000000000000000000000000000000000000 fixture >/dev/null 2>&1); then
+  fail "source resolver accepted a commit that differs from the selected commit"
+fi
+printf 'untracked source\n' > "$TMP/git-source/untracked.go"
+if (release_materials_resolve_git_source "$TMP/git-source" "" fixture >/dev/null 2>&1); then
+  fail "source resolver accepted a dirty source worktree"
+fi
+printf 'nested license manifest\n' \
+  > "$TMP/material-hash/share/licenses/hash-test/LICENSES/MATERIALS.sha256"
+printf 'generated inventory\n' \
+  > "$TMP/material-hash/share/sources/hash-test/MATERIALS.sha256"
+release_materials_hash_tree "$TMP/material-hash" hash-test "$TMP/material-hash-actual"
+grep -Fq 'share/licenses/hash-test/LICENSES/MATERIALS.sha256' "$TMP/material-hash-actual" \
+  || fail "license file named MATERIALS.sha256 was omitted from the material inventory"
+if grep -Fq 'share/sources/hash-test/MATERIALS.sha256' "$TMP/material-hash-actual"; then
+  fail "generated material inventory included itself"
+fi
+
 bash "$ROOT/scripts/test-preview-line.sh"
 bash "$ROOT/scripts/test-delete-preview.sh"
 
@@ -100,16 +140,19 @@ done
 printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
 printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
 printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
+accelerator_sha="$(init_fixture_repo "$TMP/accelerator" LICENSE)"
+connector_sha="$(init_fixture_repo "$TMP/connector" LICENSE)"
+sandboxer_sha="$(init_fixture_repo "$TMP/sandboxer" LICENSE)"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
-  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
-  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
-  RELEASE_SANDBOXER_SOURCE_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
@@ -121,18 +164,23 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   1111111111111111111111111111111111111111 release/v1.2.x
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
+go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
   ./bin/e2b-key-ctl ./deploy/node-ctl.service \
   ./share/licenses/orchestrator/accelerator/LICENSE \
   ./share/licenses/orchestrator/connector/LICENSE \
   ./share/licenses/orchestrator/project/LICENSE \
   ./share/licenses/orchestrator/sandboxer/LICENSE \
+  ./share/licenses/orchestrator/go-toolchain/"$go_toolchain"/LICENSE \
   ./share/sources/orchestrator/SOURCES.tsv \
   ./share/sources/orchestrator/GO-BUILD-INFO.tsv \
   ./share/sources/orchestrator/GO-MODULES.tsv \
   ./share/sources/orchestrator/MATERIALS.sha256; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
+tar -xOf "$archive" ./share/sources/orchestrator/SOURCES.tsv \
+  | grep -Fq $'\tGo toolchain\t'"$go_toolchain"$'\t' \
+  || fail "archive does not associate its Go toolchain with license material"
 if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e|test/orchestrator)(/|$)' >/dev/null; then
   fail "component archive contains documentation or E2E sources"
 fi
@@ -142,13 +190,13 @@ fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
-  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_SOURCE_SHA="$accelerator_sha" \
   RELEASE_ACCELERATOR_VERSION=v0.1.3 \
   RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
-  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_SOURCE_SHA="$connector_sha" \
   RELEASE_CONNECTOR_VERSION=v0.1.2 \
   RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
-  RELEASE_SANDBOXER_SOURCE_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  RELEASE_SANDBOXER_SOURCE_SHA="$sandboxer_sha" \
   RELEASE_SANDBOXER_VERSION=v0.1.3 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \

@@ -173,14 +173,13 @@ package_release() {
     || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
   [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
     || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
-  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
-  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the orchestrator source commit"
-  accelerator_sha="${RELEASE_ACCELERATOR_SOURCE_SHA:-$(git -C "$accelerator_source" rev-parse HEAD 2>/dev/null || true)}"
-  connector_sha="${RELEASE_CONNECTOR_SOURCE_SHA:-$(git -C "$connector_source" rev-parse HEAD 2>/dev/null || true)}"
-  sandboxer_sha="${RELEASE_SANDBOXER_SOURCE_SHA:-$(git -C "$sandboxer_source" rev-parse HEAD 2>/dev/null || true)}"
-  [[ "$accelerator_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected accelerator source commit"
-  [[ "$connector_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected connector source commit"
-  [[ "$sandboxer_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected sandboxer source commit"
+  project_sha="$(release_materials_resolve_git_source "$ROOT" "" orchestrator)"
+  accelerator_sha="$(release_materials_resolve_git_source "$accelerator_source" \
+    "${RELEASE_ACCELERATOR_SOURCE_SHA:-}" accelerator)"
+  connector_sha="$(release_materials_resolve_git_source "$connector_source" \
+    "${RELEASE_CONNECTOR_SOURCE_SHA:-}" connector)"
+  sandboxer_sha="$(release_materials_resolve_git_source "$sandboxer_source" \
+    "${RELEASE_SANDBOXER_SOURCE_SHA:-}" sandboxer)"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$accelerator_source" accelerator

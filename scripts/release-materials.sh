@@ -22,6 +22,26 @@ release_materials_init() {
   : > "$RELEASE_MATERIALS_WORK/sources"
   : > "$RELEASE_MATERIALS_WORK/go-build-info"
   : > "$RELEASE_MATERIALS_WORK/go-modules"
+  : > "$RELEASE_MATERIALS_WORK/go-toolchains"
+}
+
+release_materials_resolve_git_source() {
+  [ "$#" -eq 3 ] \
+    || fail "release_materials_resolve_git_source requires source directory, expected SHA and name"
+  local source="$1" expected="$2" name="$3" actual source_root status
+  [ -d "$source" ] || fail "$name source directory is missing: $source"
+  source_root="$(git -C "$source" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$source_root" ] || fail "$name source directory is not a Git worktree: $source"
+  [ "$(cd "$source" && pwd -P)" = "$(cd "$source_root" && pwd -P)" ] \
+    || fail "$name source directory is not the Git worktree root: $source"
+  actual="$(git -C "$source" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$actual" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the $name source commit"
+  if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+    fail "$name source commit $actual does not match the selected commit $expected"
+  fi
+  status="$(git -C "$source" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+  [ -z "$status" ] || fail "$name source worktree is dirty"
+  printf '%s\n' "$actual"
 }
 
 release_materials_copy_licenses() {
@@ -87,6 +107,10 @@ release_materials_add_go_binary() {
   [[ "$toolchain" =~ ^go[0-9] ]] || fail "cannot read the Go toolchain from $binary"
   printf '%s\ttoolchain\tgo\t%s\t-\n' "$archive_path" "$toolchain" \
     >> "$RELEASE_MATERIALS_WORK/go-build-info"
+  printf '%s\n' "$toolchain" >> "$RELEASE_MATERIALS_WORK/go-toolchains"
+  release_materials_record_source "$archive_path" "Go toolchain" "$toolchain" \
+    "https://go.dev/dl/$toolchain.src.tar.gz" "go-version:$toolchain" \
+    "go-toolchain/$toolchain"
   awk -F '\t' -v payload="$archive_path" \
     -v info="$RELEASE_MATERIALS_WORK/go-build-info" \
     -v modules="$RELEASE_MATERIALS_WORK/go-modules" '
@@ -130,7 +154,7 @@ release_materials_hash_tree() {
   (
     cd "$root" || exit
     find "share/licenses/$unit" "share/sources/$unit" -type f \
-      ! -name MATERIALS.sha256 -print \
+      ! -path "share/sources/$unit/MATERIALS.sha256" -print \
       | LC_ALL=C sort \
       | while IFS= read -r file; do sha256sum "$file"; done
   ) > "$output"
@@ -138,8 +162,17 @@ release_materials_hash_tree() {
 
 release_materials_finish() {
   local source_root="$RELEASE_MATERIALS_STAGE/share/sources/$RELEASE_MATERIALS_UNIT"
-  local module version json directory
+  local module version json directory toolchain toolchain_root installed_toolchain
   command -v jq >/dev/null || fail "jq is required to collect Go module license material"
+  while IFS= read -r toolchain; do
+    [ -n "$toolchain" ] || continue
+    toolchain_root="$(GOTOOLCHAIN="$toolchain" go env GOROOT 2>/dev/null)" \
+      || fail "cannot locate license material for Go toolchain $toolchain"
+    installed_toolchain="$(GOTOOLCHAIN="$toolchain" go version 2>/dev/null | awk '{print $3}')"
+    [ "$installed_toolchain" = "$toolchain" ] \
+      || fail "resolved Go toolchain $installed_toolchain does not match $toolchain"
+    release_materials_copy_licenses "$toolchain_root" "go-toolchain/$toolchain"
+  done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
   while IFS=$'\t' read -r module version _; do
