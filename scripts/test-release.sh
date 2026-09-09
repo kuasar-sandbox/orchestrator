@@ -91,14 +91,26 @@ if grep -Fq 'proxy_executable:' "$TMP/built-in-proxy.yaml"; then
   fail "built-in Proxy sentinel emitted paths.proxy_executable"
 fi
 
-mkdir -p "$TMP/bin" "$TMP/src"
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/accelerator" "$TMP/connector" "$TMP/sandboxer"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
 GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
 for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
   install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
+printf 'fixture accelerator license\n' > "$TMP/accelerator/LICENSE"
+printf 'fixture connector license\n' > "$TMP/connector/LICENSE"
+printf 'fixture sandboxer license\n' > "$TMP/sandboxer/LICENSE"
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
+  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_VERSION=v0.1.3 \
+  RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
+  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_VERSION=v0.1.2 \
+  RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
+  RELEASE_SANDBOXER_SOURCE_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  RELEASE_SANDBOXER_VERSION=v0.1.3 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
@@ -110,7 +122,15 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
 
 archive="$TMP/bundle/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz"
 for path in ./bin/node-ctl ./bin/cluster-ctl ./bin/node-stub-ctl \
-  ./bin/e2b-key-ctl ./deploy/node-ctl.service; do
+  ./bin/e2b-key-ctl ./deploy/node-ctl.service \
+  ./share/licenses/orchestrator/accelerator/LICENSE \
+  ./share/licenses/orchestrator/connector/LICENSE \
+  ./share/licenses/orchestrator/project/LICENSE \
+  ./share/licenses/orchestrator/sandboxer/LICENSE \
+  ./share/sources/orchestrator/SOURCES.tsv \
+  ./share/sources/orchestrator/GO-BUILD-INFO.tsv \
+  ./share/sources/orchestrator/GO-MODULES.tsv \
+  ./share/sources/orchestrator/MATERIALS.sha256; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
 if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e|test/orchestrator)(/|$)' >/dev/null; then
@@ -121,6 +141,15 @@ if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$'
 fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_ACCELERATOR_SOURCE_DIR="$TMP/accelerator" \
+  RELEASE_ACCELERATOR_SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  RELEASE_ACCELERATOR_VERSION=v0.1.3 \
+  RELEASE_CONNECTOR_SOURCE_DIR="$TMP/connector" \
+  RELEASE_CONNECTOR_SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  RELEASE_CONNECTOR_VERSION=v0.1.2 \
+  RELEASE_SANDBOXER_SOURCE_DIR="$TMP/sandboxer" \
+  RELEASE_SANDBOXER_SOURCE_SHA=cccccccccccccccccccccccccccccccccccccccc \
+  RELEASE_SANDBOXER_VERSION=v0.1.3 \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/orchestrator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"

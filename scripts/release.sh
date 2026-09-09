@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 022
 
 NAME=orchestrator
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -70,8 +73,10 @@ validate_archive_paths() {
   fi
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/ or deploy/"
+    path != "" && path !~ /\/$/ && path !~ /^(bin|deploy)\// && path !~ /^share\/(licenses|sources)\/orchestrator\// { exit 1 }
+  ' "$listing" || fail "$archive contains a file outside the orchestrator release layout"
+  tar -tvzf "$archive" | awk '$1 !~ /^[-d]/ { exit 1 }' \
+    || fail "$archive contains a non-regular, non-directory entry"
 }
 
 validate_bundle() {
@@ -104,6 +109,7 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  release_materials_validate "$extract" "$NAME"
   local file
   for file in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
@@ -120,7 +126,9 @@ validate_bundle() {
 
 package_release() {
   [ "$#" -eq 3 ] || fail "usage: release.sh package <version> <arch> <output-dir>"
-  local version="$1" arch output="$3" archive epoch bin_dir
+  local version="$1" arch output="$3" archive epoch bin_dir project_sha
+  local accelerator_source connector_source sandboxer_source accelerator_version connector_version sandboxer_version
+  local accelerator_sha connector_sha sandboxer_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -152,6 +160,49 @@ package_release() {
   copy_file deploy/registry.example.yaml deploy/registry.example.yaml
   copy_file deploy/router.example.yaml deploy/router.example.yaml
   copy_file deploy/placer.example.yaml deploy/placer.example.yaml
+
+  accelerator_source="${RELEASE_ACCELERATOR_SOURCE_DIR:-$ROOT/../accelerator}"
+  connector_source="${RELEASE_CONNECTOR_SOURCE_DIR:-$ROOT/../connector}"
+  sandboxer_source="${RELEASE_SANDBOXER_SOURCE_DIR:-$ROOT/../sandboxer}"
+  accelerator_version="${RELEASE_ACCELERATOR_VERSION:-${ACCELERATOR_VERSION:-}}"
+  connector_version="${RELEASE_CONNECTOR_VERSION:-${CONNECTOR_VERSION:-}}"
+  sandboxer_version="${RELEASE_SANDBOXER_VERSION:-${SANDBOXER_VERSION:-}}"
+  [[ "$accelerator_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_ACCELERATOR_VERSION must identify the selected accelerator release"
+  [[ "$connector_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_CONNECTOR_VERSION must identify the selected connector release"
+  [[ "$sandboxer_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]{8})?$ ]] \
+    || fail "RELEASE_SANDBOXER_VERSION must identify the selected sandboxer release"
+  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
+  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the orchestrator source commit"
+  accelerator_sha="${RELEASE_ACCELERATOR_SOURCE_SHA:-$(git -C "$accelerator_source" rev-parse HEAD 2>/dev/null || true)}"
+  connector_sha="${RELEASE_CONNECTOR_SOURCE_SHA:-$(git -C "$connector_source" rev-parse HEAD 2>/dev/null || true)}"
+  sandboxer_sha="${RELEASE_SANDBOXER_SOURCE_SHA:-$(git -C "$sandboxer_source" rev-parse HEAD 2>/dev/null || true)}"
+  [[ "$accelerator_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected accelerator source commit"
+  [[ "$connector_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected connector source commit"
+  [[ "$sandboxer_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the selected sandboxer source commit"
+  release_materials_init "$STAGE" "$WORK/materials" "$NAME"
+  release_materials_copy_licenses "$ROOT" project
+  release_materials_copy_licenses "$accelerator_source" accelerator
+  release_materials_copy_licenses "$connector_source" connector
+  release_materials_copy_licenses "$sandboxer_source" sandboxer
+  release_materials_record_source 'bin/*,deploy/*' orchestrator "$version" \
+    "https://github.com/kuasar-sandbox/orchestrator/commit/$project_sha" \
+    "git:$project_sha" project
+  release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' accelerator "$accelerator_version" \
+    "https://github.com/kuasar-sandbox/accelerator/commit/$accelerator_sha" \
+    "git:$accelerator_sha" accelerator
+  release_materials_record_source bin/node-ctl connector "$connector_version" \
+    "https://github.com/kuasar-sandbox/connector/commit/$connector_sha" \
+    "git:$connector_sha" connector
+  release_materials_record_source 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' sandboxer "$sandboxer_version" \
+    "https://github.com/kuasar-sandbox/sandboxer/commit/$sandboxer_sha" \
+    "git:$sandboxer_sha" sandboxer
+  release_materials_add_go_binary "$STAGE/bin/node-ctl" bin/node-ctl
+  release_materials_add_go_binary "$STAGE/bin/cluster-ctl" bin/cluster-ctl
+  release_materials_add_go_binary "$STAGE/bin/node-stub-ctl" bin/node-stub-ctl
+  release_materials_add_go_binary "$STAGE/bin/e2b-key-ctl" bin/e2b-key-ctl
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
