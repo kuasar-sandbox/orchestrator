@@ -521,8 +521,9 @@ Both nonempty fields in this new Create configuration use the existing
 `ValidLocalSandboxID` contract: 1..57 bytes, lowercase ASCII letters, digits and
 hyphens, starting and ending with a letter or digit. The exact pattern is
 `^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$`. Uppercase, dots, slashes, whitespace,
-NUL and longer values are rejected rather than normalized. This does not change
-the historical migration-token or trusted cluster StableID contracts.
+NUL and longer values are rejected rather than normalized. Migration-token
+encoding retains its historical StableID contract; node Import admission
+independently enforces the same 1..57-byte format (§7).
 
 The object accepts exactly `id` and `stable_id`. Empty Header values, non-object
 JSON, null (including null field values), duplicate Headers, duplicate or unknown
