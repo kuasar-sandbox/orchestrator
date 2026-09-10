@@ -189,6 +189,14 @@ not rebuild or authenticate an arbitrary producer's binaries. Publication uses
 the independent completed-build digest above, not those fields, to authenticate
 the artifact received from the selected trusted build.
 
+Release verification requires credential-free, proxy-only HTTPS module routing:
+`direct` fallback is rejected and `GOVCS=*:off` prevents module-selected VCS hosts.
+Collection and validation permit at most 512 effective Go modules. Each Go
+verification subprocess has a five-minute deadline; publication jobs have a
+30-minute deadline. Every notice file and directory must belong to a validated
+source, module, toolchain or system-material root; layout parents do not authorize
+unclaimed siblings. These limits do not change ordinary development routing.
+
 Go dependency and toolchain downloads use fresh private module/VCS state, an
 enabled checksum database and `GOAUTH=off`. They clear persisted Go settings, private-module
 bypasses, Git configuration and caller credentials while retaining validated,

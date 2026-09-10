@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Exercise source checks with a private, file-backed Go proxy and module cache.
 set -euo pipefail
+# Mutation fixtures use the release tree's explicit public modes. Private test
+# work roots still come from mktemp; package-level umask regressions are separate.
+umask 022
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'chmod -R u+w "$TMP"; rm -rf "$TMP"' EXIT
@@ -9,7 +12,7 @@ fail() { echo "test-release-materials: $*" >&2; exit 1; }
 source "$ROOT/scripts/release-materials.sh"
 
 # Reject unsigned/private transport before invoking Go or creating work files.
-for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authenticated-sumdb; do
+for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authenticated-sumdb direct-proxy direct-fallback; do
   policy_proxy=https://proxy.golang.org
   policy_sumdb=sum.golang.org
   case "$policy" in
@@ -18,6 +21,8 @@ for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authentica
     authenticated-proxy) policy_proxy=https://fixture:placeholder@example.invalid ;;
     insecure-proxy) policy_proxy=http://example.invalid ;;
     authenticated-sumdb) policy_sumdb='sum.golang.org https://fixture:placeholder@example.invalid' ;;
+    direct-proxy) policy_proxy=direct ;;
+    direct-fallback) policy_proxy=https://proxy.golang.org,direct ;;
   esac
   if (
     GOPROXY="$policy_proxy" GOSUMDB="$policy_sumdb" \
@@ -25,13 +30,13 @@ for policy in sumdb-off file-proxy authenticated-proxy insecure-proxy authentica
   ); then
     fail "Go distribution verification accepted $policy"
   fi
-  grep -Eq 'requires credential-free HTTPS|requires an enabled checksum database|must use credential-free HTTPS' \
+  grep -Eq 'requires credential-free HTTPS|requires an enabled checksum database|must use credential-free HTTPS|requires proxy-only routing' \
     "$TMP/policy-$policy.log" || fail "Go distribution policy rejection failed for an unrelated reason"
 done
 
 # Only fixture dependencies use the unsigned file proxy below. Authenticate
 # the real compiler distribution with the caller's unchanged release routing.
-fixture_toolchain_proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+fixture_toolchain_proxy="${GOPROXY:-https://proxy.golang.org}"
 fixture_toolchain_sumdb="${GOSUMDB:-sum.golang.org}"
 fixture_toolchain_cache="$(go env GOMODCACHE)"
 release_materials_download_go_toolchain() {
@@ -197,6 +202,36 @@ cmp "$directory/LICENSE" "$TMP/replacement-stage/share/licenses/fixture/go/$modu
 mkdir -p "$TMP/replacement-stage/bin" "$TMP/validation"
 install -m 0755 "$TMP/replaced-tool" "$TMP/replacement-stage/bin/tool"
 WORK="$TMP/validation" release_materials_validate "$TMP/replacement-stage" fixture
+# Reject excess work before any source/toolchain authentication is reached.
+altered="$TMP/too-many-modules"
+cp -a "$TMP/replacement-stage" "$altered"
+awk 'BEGIN {
+  print "module\tversion\tchecksum"
+  for (i=1; i<=513; i++)
+    printf "example.invalid/module-%d\tv1.0.0\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", i
+}' > "$altered/share/sources/fixture/GO-MODULES.tsv"
+if (
+  release_materials_require_go() { fail 'work bound reached authentication'; }
+  WORK="$TMP/validation" release_materials_validate "$altered" fixture
+) > "$TMP/work-bound.log" 2>&1; then
+  fail "validator accepted an excessive module inventory"
+fi
+grep -Fq 'Go module inventory exceeds the 512-module release work bound' "$TMP/work-bound.log" \
+  || fail "module work bound failed for an unrelated reason"
+for extra in file empty-directory; do
+  altered="$TMP/unclaimed-$extra"
+  cp -a "$TMP/replacement-stage" "$altered"
+  mkdir -p "$altered/share/licenses/fixture/unclaimed"
+  if [ "$extra" = file ]; then
+    printf 'unclaimed bytes\n' > "$altered/share/licenses/fixture/unclaimed/payload"
+  fi
+  release_materials_hash_tree "$altered" fixture "$altered/share/sources/fixture/MATERIALS.sha256"
+  if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP/unclaimed-$extra.log" 2>&1); then
+    fail "validator accepted unclaimed license $extra"
+  fi
+  grep -Fq 'unclaimed release license material' "$TMP/unclaimed-$extra.log" \
+    || fail "unclaimed license $extra failed for an unrelated reason"
+done
 # A valid row cannot conceal a second contradictory row for that same source.
 for mismatch in duplicate version source integrity license; do
   altered="$TMP/source-record-$mismatch"
@@ -275,7 +310,7 @@ if (WORK="$TMP/validation" release_materials_validate "$altered" fixture > "$TMP
   fail "validator accepted a Go toolchain license redirected to the project"
 fi
 grep -Fq 'missing or inconsistent source record for Go toolchain' "$TMP/redirect.log" \
-  || fail "Go toolchain license redirect failed for an unrelated reason"
+  || { sed -n '1,$p' "$TMP/redirect.log" >&2; fail "Go toolchain license redirect failed for an unrelated reason"; }
 
 for mismatch in source integrity license-bytes nested-license-bytes; do
   altered="$TMP/toolchain-$mismatch"

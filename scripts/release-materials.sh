@@ -283,7 +283,8 @@ release_materials_validate_go_routing() {
   local -a routes
   IFS=',|' read -r -a routes <<< "$proxy"
   for route in "${routes[@]}"; do
-    case "$route" in direct|off) continue ;; esac
+    [ "$route" != direct ] || fail "Go source verification requires proxy-only routing; direct fallback is forbidden"
+    case "$route" in off) continue ;; esac
     [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
       || fail "Go source verification requires credential-free HTTPS module routing"
   done
@@ -300,7 +301,7 @@ release_materials_validate_go_routing() {
 }
 
 release_materials_go_command() {
-  local verification="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+  local verification="$1" proxy="${GOPROXY:-https://proxy.golang.org}"
   local sumdb="${GOSUMDB:-sum.golang.org}" name value
   shift
   release_materials_validate_go_routing "$proxy" "$sumdb" || return 1
@@ -312,7 +313,7 @@ release_materials_go_command() {
     "GOMODCACHE=$verification/module-cache" "GOCACHE=$verification/go-cache"
     "GOENV=off" "GOAUTH=off" "GOFLAGS=" "GO111MODULE=on" "GOWORK=off" "GOTOOLCHAIN=local"
     "GOPROXY=$proxy" "GOSUMDB=$sumdb" "GOPRIVATE=" "GONOPROXY="
-    "GONOSUMDB=" "GOINSECURE=" "GIT_CONFIG_NOSYSTEM=1"
+    "GONOSUMDB=" "GOINSECURE=" "GOVCS=*:off" "GIT_CONFIG_NOSYSTEM=1"
     "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_SYSTEM=/dev/null"
     "GIT_TERMINAL_PROMPT=0" "GIT_ASKPASS=/bin/false"
     "GIT_SSH_COMMAND=/bin/false" "SSH_ASKPASS=/bin/false")
@@ -327,7 +328,7 @@ release_materials_go_command() {
     esac
     clean+=("$name=$value")
   done
-  "${clean[@]}" go "$@"
+  "${clean[@]}" timeout --signal=TERM --kill-after=5s 300s go "$@"
 }
 
 release_materials_go_payload_allowed() {
@@ -363,14 +364,15 @@ release_materials_verified_go_source() {
 }
 
 _release_materials_download_go_toolchain() {
-  local toolchain="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}"
+  local toolchain="$1" proxy="${GOPROXY:-https://proxy.golang.org}"
   local sumdb="${GOSUMDB:-sum.golang.org}" route verify_root sumdb_identity sumdb_url sumdb_extra
   local -a routes
   [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)$ ]] \
     || fail "unsupported official Go toolchain version"
   IFS=',|' read -r -a routes <<< "$proxy"
   for route in "${routes[@]}"; do
-    case "$route" in direct|off) continue ;; esac
+    [ "$route" != direct ] || fail "Go distribution verification requires proxy-only routing; direct fallback is forbidden"
+    case "$route" in off) continue ;; esac
     [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
       || fail "Go distribution verification requires credential-free HTTPS module routing"
   done
@@ -480,6 +482,8 @@ release_materials_finish() {
   done < <(LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-toolchains")
   LC_ALL=C sort -u "$RELEASE_MATERIALS_WORK/go-modules" \
     > "$RELEASE_MATERIALS_WORK/go-modules-sorted"
+  [ "$(wc -l < "$RELEASE_MATERIALS_WORK/go-modules-sorted")" -le 512 ] \
+    || fail "Go module inventory exceeds the 512-module release work bound"
   if [ -s "$RELEASE_MATERIALS_WORK/go-modules-sorted" ]; then
     command -v jq >/dev/null || fail "jq is required to collect Go module license material"
   fi
@@ -667,6 +671,8 @@ release_materials_validate() {
     || fail "invalid GO-MODULES.tsv header"
   [ "$header" = $'module\tversion\tchecksum' ] \
     || fail "invalid GO-MODULES.tsv header"
+  awk 'NR > 513 { exit 1 }' "$source_root/GO-MODULES.tsv" \
+    || fail "Go module inventory exceeds the 512-module release work bound"
   awk -F '\t' '
     NR == 1 { next }
     NF != 5 || NR > 16385 { exit 1 }
@@ -703,6 +709,8 @@ release_materials_validate() {
   sed -n '2,$p' "$source_root/GO-MODULES.tsv" > "$WORK/actual-go-modules-$unit"
   cmp -s "$WORK/expected-go-modules-$unit" "$WORK/actual-go-modules-$unit" \
     || fail "Go module inventory differs from the build records"
+  local claims="$WORK/license-claims-$unit"
+  : > "$claims"
   while IFS=$'\t' read -r payload _ _ _ _ file || [ -n "$payload" ]; do
     release_materials_validate_payload "$root" "$payload"
     release_materials_safe_relative "$file" \
@@ -714,6 +722,7 @@ release_materials_validate() {
     [ -d "$root/$file" ] || fail "declared license directory is missing: $file"
     [ -n "$(find "$root/$file" -type f -print -quit)" ] \
       || fail "declared license directory is empty: $file"
+    printf '%s\n' "$file" >> "$claims"
   done < <(sed -n '2,$p' "$source_root/SOURCES.tsv")
   while IFS= read -r payload; do
     release_materials_validate_payload "$root" "$payload"
@@ -739,7 +748,29 @@ release_materials_validate() {
           || fail "Go module license bytes differ from the verified source: $module@$version"
       ) || return 1
     fi
+    printf '%s\n' "$directory" >> "$claims"
   done < <(sed -n '2,$p' "$source_root/GO-MODULES.tsv")
+  # All material entries must belong to a source already validated above.
+  # Parent directories are layout only, not claims over arbitrary siblings.
+  local license_paths_file="$WORK/license-paths-$unit"
+  find "$root/share/licenses/$unit" -mindepth 1 \
+    -printf "share/licenses/$unit/%P\n" > "$license_paths_file" \
+    || fail "cannot enumerate release license paths"
+  [ -s "$claims" ] || [ ! -s "$license_paths_file" ] \
+    || fail "unclaimed release license material"
+  awk '
+    NR == FNR { claims[$0]=1; next }
+    {
+      claimed=0
+      for (root in claims) {
+        if ($0 == root || index($0, root "/") == 1 || index(root, $0 "/") == 1) {
+          claimed=1
+          break
+        }
+      }
+      if (!claimed) exit 1
+    }
+  ' "$claims" "$license_paths_file" || fail "unclaimed release license material"
   if find "$root/share/licenses/$unit" "$source_root" -type l -print -quit | grep -q .; then
     fail "release materials contain a symbolic link"
   fi

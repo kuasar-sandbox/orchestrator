@@ -67,7 +67,7 @@ stage_release_go_source() {
 }
 
 build_release_go_payloads() {
-  local arch="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}" route variable value
+  local arch="$1" proxy="${GOPROXY:-https://proxy.golang.org}" route variable value
   local sumdb="${GOSUMDB:-sum.golang.org}" sumdb_identity sumdb_url sumdb_extra
   local toolchain="${GOTOOLCHAIN:-local}"
   local -a routes build_env
@@ -152,7 +152,8 @@ validate_copied_source_files() {
 
 validate_archive_paths() {
   local archive="$1"
-  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+  GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 

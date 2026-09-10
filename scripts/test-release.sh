@@ -40,6 +40,7 @@ export FIXTURE_GO_DISTRIBUTION_CACHE
 FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-go-environment.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 bash "$ROOT/scripts/test-release-license-traversal.sh"
 GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
@@ -212,6 +213,14 @@ if env PATH="$TMP/source-bin:$PATH" GITHUB_REPOSITORY=kuasar-sandbox/orchestrato
   fail "release source validator accepted a tag from another version line"
 fi
 bash -n "$ROOT/scripts/delete-preview.sh" "$ROOT/scripts/validate-release-source.sh"
+bounded_workflow=component-release.yml
+awk '
+  $0 == "  publish:" { inside=1; next }
+  inside && /^  [A-Za-z0-9_-]+:/ { exit }
+  inside && /^    steps:/ { exit }
+  inside { print }
+' "$ROOT/.github/workflows/$bounded_workflow" | grep -Fx '    timeout-minutes: 30' >/dev/null \
+  || fail "$bounded_workflow does not bound privileged publication work"
 
 WORKFLOW="$ROOT/.github/workflows/component-release.yml"
 grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [accelerator=${{ inputs.accelerator_version }},connector=${{ inputs.connector_version }},sandboxer=${{ inputs.sandboxer_version }}]' \
@@ -220,7 +229,7 @@ grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelera
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
 workflow="$ROOT/.github/workflows/component-release.yml"
 for job in build publish; do
-  for routing in 'GOPROXY: https://goproxy.cn,direct' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
+  for routing in 'GOPROXY: https://goproxy.cn' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
     awk -v job="$job" '
       $0 == "  " job ":" { inside=1; next }
       inside && /^  [A-Za-z0-9_-]+:/ { exit }

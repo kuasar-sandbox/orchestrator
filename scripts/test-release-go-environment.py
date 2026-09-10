@@ -27,7 +27,7 @@ class GoSourceEnvironment(unittest.TestCase):
         executable.chmod(0o755)
         self.environment = {
             "PATH": str(self.bin) + ":/usr/bin:/bin",
-            "GOPROXY": "https://proxy.example.invalid,direct",
+            "GOPROXY": "https://proxy.example.invalid",
             "GOSUMDB": "sum.golang.org https://sum.example.invalid",
         }
 
@@ -79,7 +79,7 @@ class GoSourceEnvironment(unittest.TestCase):
         expected = {
             "GOENV": "off", "GOAUTH": "off", "GOFLAGS": "", "GO111MODULE": "on", "GOWORK": "off",
             "GOTOOLCHAIN": "local", "GOPRIVATE": "", "GONOPROXY": "", "GONOSUMDB": "",
-            "GOINSECURE": "", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GOINSECURE": "", "GOVCS": "*:off", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "/bin/false", "GIT_SSH_COMMAND": "/bin/false",
             "GOPROXY": self.environment["GOPROXY"], "GOSUMDB": self.environment["GOSUMDB"],
@@ -119,6 +119,7 @@ class GoSourceEnvironment(unittest.TestCase):
     def test_unsigned_or_credentialed_routing_is_rejected_before_go(self):
         for values in (
             {"GOSUMDB": "off"}, {"GOPROXY": "file:///fixture"},
+            {"GOPROXY": "direct"}, {"GOPROXY": "https://proxy.example.invalid,direct"},
             {"GOPROXY": "http://proxy.example.invalid"},
             {"GOPROXY": "https://fixture:fixture@proxy.example.invalid"},
             {"GOSUMDB": "sum.golang.org https://fixture:fixture@sum.example.invalid"},
