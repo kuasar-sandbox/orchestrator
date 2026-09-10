@@ -67,6 +67,8 @@ stage_release_go_source() {
 
 build_release_go_payloads() {
   local arch="$1" proxy="${GOPROXY:-https://proxy.golang.org,direct}" route variable value
+  local sumdb="${GOSUMDB:-sum.golang.org}" sumdb_identity sumdb_url sumdb_extra
+  local toolchain="${GOTOOLCHAIN:-local}"
   local -a routes build_env
   IFS=',|' read -r -a routes <<< "$proxy"
   for route in "${routes[@]}"; do
@@ -74,10 +76,21 @@ build_release_go_payloads() {
     [[ "$route" == https://?* && "$route" != *[@?#[:space:]]* ]] \
       || fail "release Go proxy routing must use credential-free HTTPS"
   done
+  [[ "$sumdb" != *$'\n'* && "$sumdb" != *$'\r'* ]] \
+    || fail "release checksum database routing must be a single line"
+  read -r sumdb_identity sumdb_url sumdb_extra <<< "$sumdb"
+  [[ "$sumdb_identity" =~ ^[A-Za-z0-9._+/:=-]+$ && -z "$sumdb_extra" ]] \
+    || fail "invalid release checksum database identity"
+  if [ -n "$sumdb_url" ]; then
+    [[ "$sumdb_url" == https://?* && "$sumdb_url" != *[@?#[:space:]]* ]] \
+      || fail "release checksum database routing must use credential-free HTTPS"
+  fi
+  [[ "$toolchain" =~ ^(local|auto|path|go[0-9]+\.[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)?(\+(auto|path))?)$ ]] \
+    || fail "invalid release Go toolchain selection"
   mkdir -p "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
   chmod 0700 "$WORK/go-home" "$WORK/go-cache" "$WORK/go-mod"
   build_env=(env -i PATH="$PATH" HOME="$WORK/go-home" LANG=C
-    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOPROXY="$proxy"
+    GOWORK=off GOENV=off GOFLAGS=-mod=readonly GOPROXY="$proxy" GOSUMDB="$sumdb" GOTOOLCHAIN="$toolchain"
     GOCACHE="$WORK/go-cache" GOMODCACHE="$WORK/go-mod"
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
   for variable in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy \

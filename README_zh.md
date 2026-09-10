@@ -163,6 +163,9 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 checkout,以 `GOWORK=off` 和只读 module 解析重新构建 Go 载荷。不复用被忽略的开发
 文件或预制二进制,拒绝 `RELEASE_BIN_DIR`。构建命令使用私有 home/缓存,不继承云/
 发布凭据;可保留无凭据的 HTTPS module/network proxy 路由。
+构建保留 `GOSUMDB`(包括无凭据的 HTTPS checksum mirror)与 `GOTOOLCHAIN`,
+不会把发行工作流的 `local` 策略静默改为自动下载工具链。未显式设置时,打包使用
+`sum.golang.org` 和本地 Go 工具链。
 
 本仓库独立发布 `vX.Y.Z`。x86_64 组件包包含节点/集群二进制和部署文件;
 文档与 E2E 从所选组件 tag 收集进项目 platform 包,不在组件包重复携带。

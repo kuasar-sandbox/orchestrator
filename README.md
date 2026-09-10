@@ -158,6 +158,10 @@ with `GOWORK=off` and read-only module resolution. Ignored development files and
 prebuilt binaries are not reused; `RELEASE_BIN_DIR` is rejected. Build commands use
 a private home and caches without cloud/release credentials. Credential-free
 HTTPS module/network proxy routing remains available.
+The build preserves `GOSUMDB` (including a credential-free HTTPS checksum mirror)
+and `GOTOOLCHAIN`; the release workflow's `local` policy is not silently replaced
+by automatic toolchain download. Without an explicit setting, packaging uses
+`sum.golang.org` and the local Go toolchain.
 
 Package source records keep the project's or an internal dependency's release
 version only when its local Git tag matches the selected source commit. Untagged

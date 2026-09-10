@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Match the release workflow's checksum mirror and local-only Go policy.
+export GOSUMDB=sum.golang.google.cn GOTOOLCHAIN=local
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -13,6 +16,25 @@ fail() {
 
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
+
+# Reject credential-bearing routing before starting any build subprocess.
+# shellcheck disable=SC1090
+source <(sed -n '/^build_release_go_payloads() {/,/^}/p' "$ROOT/scripts/release.sh")
+for invalid_sumdb in \
+  'sum.golang.org https://fixture:fixture@sum.example.invalid' \
+  'sum.golang.org https://sum.example.invalid?fixture=value' \
+  'sum.golang.org https://sum.example.invalid extra'; do
+  if (GOSUMDB="$invalid_sumdb" build_release_go_payloads x86_64 > "$TMP/invalid-sumdb.log" 2>&1); then
+    fail "Go build environment accepted unsafe checksum routing"
+  fi
+  grep -Eq 'release checksum database|invalid release checksum database' "$TMP/invalid-sumdb.log" \
+    || fail "unsafe checksum routing failed for an unrelated reason"
+done
+if (GOTOOLCHAIN='local invalid' build_release_go_payloads x86_64 > "$TMP/invalid-toolchain.log" 2>&1); then
+  fail "Go build environment accepted malformed toolchain selection"
+fi
+grep -Fq 'invalid release Go toolchain selection' "$TMP/invalid-toolchain.log" \
+  || fail "invalid toolchain selection failed for an unrelated reason"
 
 bash "$ROOT/scripts/test-release-materials.sh"
 
@@ -270,6 +292,7 @@ cat >> "$fixture_root/Makefile" <<'EOF'
 .PHONY: build
 build:
 	test "$$GOWORK" = off && test "$$GOFLAGS" = -mod=readonly
+	test "$$GOSUMDB" = sum.golang.google.cn && test "$$GOTOOLCHAIN" = local
 	test -z "$${GH_TOKEN:-}" && test -z "$${AWS_SECRET_ACCESS_KEY:-}"
 	test ! -e ignored-release-input.go
 	test ! -e ../accelerator/ignored-release-input.go
