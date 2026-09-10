@@ -35,8 +35,16 @@ fixture_toolchain_proxy="${GOPROXY:-https://proxy.golang.org,direct}"
 fixture_toolchain_sumdb="${GOSUMDB:-sum.golang.org}"
 fixture_toolchain_cache="$(go env GOMODCACHE)"
 release_materials_download_go_toolchain() {
-  GOPROXY="$fixture_toolchain_proxy" GOSUMDB="$fixture_toolchain_sumdb" GOMODCACHE="$fixture_toolchain_cache" \
-    _release_materials_download_go_toolchain "$@"
+  # Seed only public distribution cache files, never HOME/netrc/VCS/auth state.
+  # The real filtered downloader still checks sumdb; the ZIP verifier checks h1.
+  local cached="$fixture_toolchain_cache/cache/download/golang.org/toolchain/@v"
+  local destination="${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download/module-cache/cache/download/golang.org/toolchain/@v"
+  local suffix identity="v0.0.1-$1.linux-amd64"
+  mkdir -p "$destination"
+  for suffix in zip ziphash info mod; do
+    [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
+  done
+  GOPROXY="$fixture_toolchain_proxy" GOSUMDB="$fixture_toolchain_sumdb" _release_materials_download_go_toolchain "$@"
 }
 
 # Neither source selection nor copied notices may trust hidden index changes.

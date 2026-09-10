@@ -322,7 +322,16 @@ install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/r
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
 release_materials_download_go_toolchain() {
-  GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
+  # Seed only public distribution cache files, never HOME/netrc/VCS/auth state.
+  # The real filtered downloader still checks sumdb; the ZIP verifier checks h1.
+  local cached="${FIXTURE_GO_DISTRIBUTION_CACHE:?}/cache/download/golang.org/toolchain/@v"
+  local destination="${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download/module-cache/cache/download/golang.org/toolchain/@v"
+  local suffix identity="v0.0.1-$1.linux-amd64"
+  mkdir -p "$destination"
+  for suffix in zip ziphash info mod; do
+    [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
+  done
+  _release_materials_download_go_toolchain "$@"
 }
 EOF
 printf 'module github.com/kuasar-sandbox/orchestrator\n\ngo 1.24\n' > "$fixture_root/go.mod"
@@ -560,6 +569,27 @@ for binary in node-ctl cluster-ctl node-stub-ctl e2b-key-ctl; do
     fail "validator accepted a CGO_ENABLED=1 payload with regenerated metadata and checksums: $binary"
   fi
   grep -Fq 'with CGO_ENABLED=0' "$candidate/result.log" || fail "CGO fixture failed for an unrelated reason"
+done
+
+for attribution in unknown-project unknown-toolchain wrong-project-payload extra-dependency; do
+  candidate="$TMP/undeclared-source-$attribution"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  case "$attribution" in
+    unknown-project) payload=bin/node-ctl; name=undeclared-project ;;
+    unknown-toolchain) payload=bin/node-ctl; name=undeclared-toolchain ;;
+    wrong-project-payload) payload=bin/node-ctl; name=orchestrator ;;
+    extra-dependency) payload=bin/cluster-ctl; name=connector ;;
+  esac
+  printf '%s\t%s\tv1.2.3\thttps://example.invalid/unverified\tsha256:fixture\tshare/licenses/orchestrator/project\n' \
+    "$payload" "$name" >> "$candidate/root/share/sources/orchestrator/SOURCES.tsv"
+  repack_candidate "$candidate"
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted an undeclared source attribution: $attribution"
+  fi
+  grep -Fq 'source inventory contains an undeclared payload attribution' "$candidate/result.log" \
+    || fail "undeclared attribution failed for an unrelated reason: $attribution"
 done
 
 for extra in bin/unexpected-tool deploy/unexpected.service bin/extra/; do

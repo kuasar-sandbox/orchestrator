@@ -183,14 +183,16 @@ checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
 
-Go dependency-source verification uses fresh private module/VCS state and an
-enabled checksum database. It clears persisted Go settings, private-module
+Go dependency and toolchain downloads use fresh private module/VCS state, an
+enabled checksum database and `GOAUTH=off`. They clear persisted Go settings, private-module
 bypasses, Git configuration and caller credentials while retaining validated,
 credential-free routing. Uploaded Go record keys must match the exact official
 payload names before any source or toolchain download; path aliases are rejected.
 These release checks do not change ordinary development module authentication.
 Source inventories reject duplicate or excessive records before per-row work;
 each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
+Only the exact project, selected internal-dependency and per-payload Go toolchain
+source keys are accepted; extra attributions are not validated provenance.
 
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local

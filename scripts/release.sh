@@ -196,6 +196,20 @@ validate_dependency_source() {
   release_materials_require_git_licenses "$extract" "$NAME" "$source" "$sha" "$name"
 }
 
+validate_source_record_keys() {
+  # Other fields and uniqueness are authenticated by the existing required-row
+  # checks. Do not accept extra attributions merely because those rows exist.
+  awk -F '\t' '
+    NR == 1 { next }
+    $1 == "bin/*,deploy/*" && $2 == "orchestrator" { next }
+    $1 == "bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl" && ($2 == "accelerator" || $2 == "sandboxer") { next }
+    $1 == "bin/node-ctl" && $2 == "connector" { next }
+    $1 ~ /^bin\/(node-ctl|cluster-ctl|node-stub-ctl|e2b-key-ctl)$/ && $2 == "Go toolchain" { next }
+    { exit 1 }
+  ' "$1/share/sources/orchestrator/SOURCES.tsv" \
+    || fail "source inventory contains an undeclared payload attribution"
+}
+
 validate_bundle() {
   [ "$#" -eq 3 ] || fail "usage: release.sh validate <version> <arch> <bundle-dir>"
   local version="$1" arch archive bundle="$3"
@@ -244,6 +258,7 @@ validate_bundle() {
   validate_dependency_source "$extract" accelerator 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_accelerator"
   validate_dependency_source "$extract" connector 'bin/node-ctl' "$expected_connector"
   validate_dependency_source "$extract" sandboxer 'bin/node-ctl,bin/cluster-ctl,bin/node-stub-ctl' "$expected_sandboxer"
+  validate_source_record_keys "$extract"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_go_key "$extract" "$NAME" 'bin/node-ctl'
   release_materials_require_go_key "$extract" "$NAME" 'bin/cluster-ctl'

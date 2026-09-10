@@ -1,6 +1,7 @@
 """Exercise the real filtered subprocess and exact payload gate, without network."""
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,7 +52,7 @@ class GoSourceEnvironment(unittest.TestCase):
         observed = json.loads(self.capture.read_text())
         self.assertNotIn("fixture-must-not-propagate", observed.values())
         expected = {
-            "GOENV": "off", "GOFLAGS": "", "GO111MODULE": "on", "GOWORK": "off",
+            "GOENV": "off", "GOAUTH": "off", "GOFLAGS": "", "GO111MODULE": "on", "GOWORK": "off",
             "GOTOOLCHAIN": "local", "GOPRIVATE": "", "GONOPROXY": "", "GONOSUMDB": "",
             "GOINSECURE": "", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
@@ -65,6 +66,30 @@ class GoSourceEnvironment(unittest.TestCase):
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual(observed["GOMODCACHE"], str(self.root / "verification/module-cache"))
         self.assertEqual(observed["HOME"], str(self.root / "verification/home"))
+
+    def test_toolchain_download_uses_the_same_private_unauthenticated_environment(self):
+        jq = shutil.which("jq")
+        self.assertIsNotNone(jq, "release tests require jq")
+        (self.bin / "jq").symlink_to(jq)
+        executable = self.bin / "go"
+        executable.write_text("#!/usr/bin/python3\nimport json, os\n"
+            + "with open(" + repr(str(self.capture)) + ", 'w') as out: json.dump(dict(os.environ), out)\n"
+            + 'print(json.dumps({"Path":"golang.org/toolchain", "Version":"v0.0.1-go1.26.4.linux-amd64", "Sum":"h1:fixture", "Zip":"/fixture/toolchain.zip"}))\n')
+        executable.chmod(0o755)
+        command = 'WORK="$2"; RELEASE_MATERIALS_WORK="$2"; mkdir -p "$2"; _release_materials_download_go_toolchain go1.26.4'
+        extra = {key: "fixture-secret-must-not-propagate" for key in
+                 ("GOAUTH", "NETRC", "GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_PARAMETERS", "SSH_AUTH_SOCK")}
+        result = self.run_shell(command, extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(self.capture.read_text())
+        self.assertNotIn("fixture-secret-must-not-propagate", observed.values())
+        self.assertEqual(observed["GOAUTH"], "off")
+        self.assertEqual(observed["HOME"], str(self.root / "verification/toolchain-download/home"))
+        self.assertEqual(observed["GOMODCACHE"], str(self.root / "verification/toolchain-download/module-cache"))
+        self.capture.unlink()
+        result = self.run_shell(command, {"HTTPS_PROXY": "https://fixture:fixture@proxy.example.invalid"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.capture.exists())
 
     def test_unsigned_or_credentialed_routing_is_rejected_before_go(self):
         for values in (

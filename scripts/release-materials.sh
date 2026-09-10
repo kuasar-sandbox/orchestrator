@@ -310,7 +310,7 @@ release_materials_go_command() {
   # Go private-module bypasses and all caller authentication are excluded.
   local -a clean=(env -i "PATH=$PATH" "HOME=$verification/home"
     "GOMODCACHE=$verification/module-cache" "GOCACHE=$verification/go-cache"
-    "GOENV=off" "GOFLAGS=" "GO111MODULE=on" "GOWORK=off" "GOTOOLCHAIN=local"
+    "GOENV=off" "GOAUTH=off" "GOFLAGS=" "GO111MODULE=on" "GOWORK=off" "GOTOOLCHAIN=local"
     "GOPROXY=$proxy" "GOSUMDB=$sumdb" "GOPRIVATE=" "GONOPROXY="
     "GONOSUMDB=" "GOINSECURE=" "GIT_CONFIG_NOSYSTEM=1"
     "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_SYSTEM=/dev/null"
@@ -390,10 +390,9 @@ _release_materials_download_go_toolchain() {
     cd "$verify_root" || exit
     # Toolchain modules require sumdb authentication. Do not inherit Go's
     # private distpack/proxy bootstrap exceptions, or alter the selected compiler.
-    GOWORK=off GOENV=off GOTOOLCHAIN=local GOFLAGS='' GO111MODULE=on \
-      GOPROXY="$proxy" GOSUMDB="$sumdb" GONOSUMDB='' GOPRIVATE='' GONOPROXY='' \
-      GOINSECURE='' GIT_HTTP_USER_AGENT='' \
-      command go mod download -json "golang.org/toolchain@v0.0.1-$toolchain.linux-amd64" \
+    GOPROXY="$proxy" GOSUMDB="$sumdb" \
+      release_materials_go_command "${WORK:-$RELEASE_MATERIALS_WORK}/toolchain-download" \
+      mod download -json "golang.org/toolchain@v0.0.1-$toolchain.linux-amd64" \
       > source.json 2> download.log
   ) || fail "could not authenticate the official Go distribution; check module/checksum routing or the verified cache"
   jq -e --arg version "v0.0.1-$toolchain.linux-amd64" \
