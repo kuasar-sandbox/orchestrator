@@ -246,7 +246,14 @@ exit 2
 EOF
 chmod +x "$TMP/bin/gh"
 
+bundle_archives=("$BUNDLE"/assets/*.tar.gz)
+[[ "${#bundle_archives[@]}" -eq 1 && -f "${bundle_archives[0]}" ]] \
+  || { echo "test-publisher: expected one fixture archive" >&2; exit 1; }
+build_digest="$(sha256sum -- "${bundle_archives[0]}")"
+build_digest="${build_digest%% *}"
+
 common_env=(
+  RELEASE_ARCHIVE_SHA256="$build_digest"
   PATH="$TMP/bin:$PATH"
   GH_REPO="$REPOSITORY"
   FAKE_GH_STATE="$TMP/state"
@@ -264,6 +271,56 @@ common_env=(
 )
 
 env "${common_env[@]}" "$PUBLISHER" check "$TAG" x86_64
+for invalid_digest in "" invalid 0000000000000000000000000000000000000000000000000000000000000000; do
+  if env "${common_env[@]}" RELEASE_ARCHIVE_SHA256="$invalid_digest" \
+      "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" "$BUNDLE" "$SOURCE_REF" \
+      > "$TMP/build-digest-rejection.log" 2>&1; then
+    echo "test-publisher: accepted a missing, invalid or conflicting build digest" >&2
+    exit 1
+  fi
+  grep -Fq 'independently recorded build digest' "$TMP/build-digest-rejection.log" \
+    || { echo "test-publisher: digest failed for an unrelated reason" >&2; exit 1; }
+  [[ ! -e "$TMP/state/tag" && ! -e "$TMP/state/release-draft" ]] \
+    || { echo "test-publisher: invalid build digest caused an external write" >&2; exit 1; }
+done
+
+# Repack a structurally valid archive and recompute both checksum layers. The
+# independently retained build result, never the modified bundle, is authoritative.
+cp -a "$BUNDLE" "$TMP/repacked"
+mkdir "$TMP/repacked-root"
+tar -xzf "${bundle_archives[0]}" -C "$TMP/repacked-root"
+case "$UNIT" in
+  sandboxer)
+    inventory="$TMP/repacked-root/share/sources/$UNIT/SOURCES.tsv"
+    awk -F '\t' -v OFS='\t' \
+      '$2 ~ /^rust-build-input:/ {$4="https://example.invalid/not-the-build-input"} {print}' \
+      "$inventory" > "$TMP/changed-sources.tsv"
+    mv "$TMP/changed-sources.tsv" "$inventory"
+    ;;
+  runtime) printf 'not the built EROFS tool\n' > "$TMP/repacked-root/bin/mkfs.erofs" ;;
+  vmlinux) printf 'not the built Linux kernel\n' > "$TMP/repacked-root/bin/vmlinux" ;;
+  *)
+    files=("$TMP/repacked-root"/bin/*)
+    printf '\nchanged payload bytes\n' >> "${files[0]}"
+    ;;
+esac
+# shellcheck source=scripts/release-materials.sh
+source "$(dirname "$PUBLISHER")/release-materials.sh"
+release_materials_hash_tree "$TMP/repacked-root" "$UNIT" \
+  "$TMP/repacked-root/share/sources/$UNIT/MATERIALS.sha256"
+archive_name="$(basename "${bundle_archives[0]}")"
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+  -czf "$TMP/repacked/assets/$archive_name" -C "$TMP/repacked-root" .
+(cd "$TMP/repacked/assets" && sha256sum "$archive_name" > SHA256SUMS)
+if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 "$COMMIT" \
+    "$TMP/repacked" "$SOURCE_REF" > "$TMP/repacked-result.log" 2>&1; then
+  echo "test-publisher: accepted a repacked bundle with regenerated checksums" >&2
+  exit 1
+fi
+grep -Fq 'release archive differs from the independently recorded build digest' "$TMP/repacked-result.log" \
+  || { echo "test-publisher: repacked fixture failed for an unrelated reason" >&2; exit 1; }
+[[ ! -e "$TMP/state/tag" && ! -e "$TMP/state/release-draft" ]] \
+  || { echo "test-publisher: repacked fixture caused an external write" >&2; exit 1; }
 if env "${common_env[@]}" "$PUBLISHER" publish "$TAG" x86_64 \
   0000000000000000000000000000000000000000 "$BUNDLE" "$SOURCE_REF" > "$TMP/wrong-commit.log" 2>&1; then
   echo "test-publisher: accepted a bundle from another source commit" >&2

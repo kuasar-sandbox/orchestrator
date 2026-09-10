@@ -108,6 +108,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build:
+    outputs:
+      archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}
     needs: preflight
     runs-on:
       - self-hosted
@@ -291,6 +293,16 @@ jobs:
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
           bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
 
+      - name: Record the completed build archive digest
+        id: release-archive-digest
+        working-directory: src/orchestrator
+        run: |
+          set -euo pipefail
+          set -- release-bundle/assets/*.tar.gz
+          [[ "$#" -eq 1 && -f "$1" && ! -L "$1" ]]
+          digest=$(sha256sum -- "$1")
+          printf 'archive_sha256=%s\n' "${digest%% *}" >> "$GITHUB_OUTPUT"
+
       - name: Upload validated release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -328,6 +340,7 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          RELEASE_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
           RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}

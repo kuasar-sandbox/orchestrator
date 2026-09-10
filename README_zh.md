@@ -159,6 +159,12 @@ Create 身份输入、stable/node-local 区分、凭据绑定、冲突与重试�
 
 ## 发布模型
 
+发行工作流在上传前把已完成归档的 SHA-256 记录为 build job output。发布者通过
+`RELEASE_ARCHIVE_SHA256` 接收这一独立值,在任何 Tag/Release 写入前核对;不能用
+下载后从 bundle 重新计算的值代替。即使重算 bundle 自身的校验和,全部载荷与材料
+仍须匹配该次已完成构建。本地打包和独立验证不要求这个发布输入。该记录不证明
+编译器来源,也不构成对不可信候选代码的隔离。
+
 打包从选定的 Orchestrator、Accelerator、Connector、Sandboxer commit 建立全新
 checkout,以 `GOWORK=off` 和只读 module 解析重新构建 Go 载荷。不复用被忽略的开发
 文件或预制二进制,拒绝 `RELEASE_BIN_DIR`。构建命令使用私有 home/缓存,不继承云/

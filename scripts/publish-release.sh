@@ -219,6 +219,17 @@ publish_bundle() {
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "commit must be a full lowercase SHA"
   [[ "$source_ref" = main || "$source_ref" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.x$ ]] \
     || fail "source-ref must be main or release/vMAJOR.MINOR.x"
+  # This digest comes from the completed build job, not downloaded SHA256SUMS.
+  local expected_digest="${RELEASE_ARCHIVE_SHA256:-}" archive digest
+  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "RELEASE_ARCHIVE_SHA256 must be the independently recorded build digest"
+  archive="$(release_cli archive-name "$tag" "$arch")"
+  if [ ! -f "$bundle/assets/$archive" ] || [ -L "$bundle/assets/$archive" ]; then
+    fail "release build archive is missing or is a symbolic link"
+  fi
+  digest="$(sha256sum -- "$bundle/assets/$archive")"
+  [ "${digest%% *}" = "$expected_digest" ] \
+    || fail "release archive differs from the independently recorded build digest"
   SOURCE_SHA="$commit" release_cli validate "$tag" "$arch" "$bundle"
 
   local tag_state="$TMP/tag"

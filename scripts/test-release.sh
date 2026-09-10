@@ -212,6 +212,13 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }} [ac
   "$WORKFLOW" || fail "release run identity does not pin source and dependencies"
 grep -Fq 'RELEASE_DEPENDENCIES: accelerator=${{ needs.preflight.outputs.accelerator_version }},connector=${{ needs.preflight.outputs.connector_version }},sandboxer=${{ needs.preflight.outputs.sandboxer_version }}' \
   "$WORKFLOW" || fail "Preview publisher does not receive dependency binding"
+workflow="$ROOT/.github/workflows/component-release.yml"
+[ "$(grep -Fc 'archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}' \
+  "$workflow")" -eq 1 ] \
+  || fail "$workflow does not expose exactly one independent build archive digest"
+[ "$(grep -Fc 'RELEASE_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}' \
+  "$workflow")" -eq 1 ] \
+  || fail "$workflow does not pass the independent build digest to publication"
 grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
   || fail "Preview publisher does not record its build binding"
 for workflow in component-release.yml delete-preview.yml; do
@@ -260,6 +267,7 @@ grep -Fq 'CUSTOM_PROXY_BIN="-"' "$PROXY_E2E" \
 if grep -Fq 'CUSTOM_PROXY_BIN="$BIN/node-ctl"' "$PROXY_E2E"; then
   fail "exact-assets Proxy E2E configures node-ctl as its own custom executable"
 fi
+# shellcheck source=test/e2e/lib/proxy.sh
 . "$ROOT/test/e2e/lib/proxy.sh"
 write_proxy_config "$TMP/built-in-proxy.yaml" \
   /run/test/node-ctl.socket /run/test 127.0.0.1:3443 \
